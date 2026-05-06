@@ -76,5 +76,24 @@ the `0.0.x` series; semver starts at 1.0.
 - Local state at `.apprafter/state.json` (JSON in the skeleton
   phase) with `load_or_default` / `save` API and the expected
   error semantics.
+- **`HetznerCloudProvider`** — first real built-in infrastructure
+  provider. Blocking HTTP client (`ureq`) with handcrafted wire
+  types; `apply` provisions a CX22 (idempotent via the
+  `apprafter=true` label diff); new `destroy --yes` command tears
+  it down. Mocked tests via `mockito`; one `#[ignore]`-tagged
+  end-to-end test runs against a real Hetzner project when
+  `APPRAFTER_HCLOUD_E2E=1` and `HCLOUD_TOKEN` are set.
+- **`Provider` trait** — gained `destroy()` and a typed `Action`
+  enum (`CreateServer`, `DestroyServer`, `Noop`); `Plan.changes`
+  → `Plan.actions: Vec<Action>`.
+- **`HetznerCloudState`** — `cli-state` carries `server_id` +
+  `server_name` for the managed server.
+
+### Changed
+
+- `platform-cli init` now persists state (provider/tier/region/
+  cluster_name) instead of just printing.
+- `platform-cli apply` is no longer a stub — it requires
+  `HCLOUD_TOKEN` and a state with `provider: hetzner-cloud`.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/

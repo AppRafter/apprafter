@@ -305,20 +305,43 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.2 Hetzner Cloud built-in provider
 
-**Цель:** нативный provider в `platform-cli` через `hcloud` Rust SDK.
+**Статус:** 🚧 partial — `v0.1.2` закрывает server-CRUD ветку acceptance (apply/destroy/idempotent CX22). Network, firewall, SSH key, floating IP и `import` команда — отдельные циклы `v0.1.3` / `v0.1.4` / `v0.1.5`, под одной плановой подфазой 1.2.
 
-**Поставка:**
-- [ ] `cli-providers/hetzner-cloud/`: создать сервер, network, firewall, SSH ключ из CUE.
-- [ ] `kind: Infrastructure` ресурс из §3.7 валидируется и применяется.
-- [ ] State-importer: `platform-cli import` читает существующие ресурсы по тэгу.
-- [ ] Обработка `floatingIP` (для будущего egress).
-- [ ] Acceptance-тесты против реального Hetzner (с маркерами `#[ignore]`, запуск только по env-флагу).
+**Цель:** нативный provider в `platform-cli` через прямую интеграцию с Hetzner Cloud REST API (через `ureq`, blocking).
 
-**Acceptance:** `platform-cli apply` поднимает 1× CX22 и удаляет его командой `destroy`; idempotent повторный `apply` — no-op.
+**Решения по ходу:**
+- Используем `ureq` (blocking) + ручные wire-types вместо third-party `hcloud`-crate'ов: тоньше, без async, без неактивных внешних зависимостей.
+- Mock-тесты через `mockito` 1.x (sync HTTP).
+- Метим все managed-ресурсы лейблом `apprafter=true` — идемпотентность и будущий `import` строятся вокруг этого фильтра.
+- `Provider` trait расширен: добавлен `destroy()`, `Plan.changes` переименован в `Plan.actions: Vec<Action>` (типизированные `CreateServer` / `DestroyServer` / `Noop`).
+- `State` дополнен `hetzner_cloud: Option<HetznerCloudState>` (server_id + server_name).
+- Server boot пока без SSH-ключей (Hetzner возвращает root-password). SSH-keys приедут вместе с network/firewall в следующем цикле.
+
+**Поставка (server-CRUD ветка, v0.1.2):**
+- [x] `cli-providers/hetzner_cloud/`: серверный CRUD (list / create / delete) с mockito-тестами.
+- [x] `Provider::destroy()` + типизированный `Action`.
+- [x] `HetznerCloudClient` (list / create / delete server) с idempotent 404-on-delete.
+- [x] `HetznerCloudProvider` impl `Provider`: refresh + diff + apply + destroy.
+- [x] CLI `destroy --yes` команда + дисциплина `apply` (требует `HCLOUD_TOKEN`, без него — внятная ошибка).
+- [x] `examples/infrastructure/tier-1-hetzner.cue` фикстура.
+- [x] `#[ignore]`-тагнутый e2e-тест против реального Hetzner.
+
+**Поставка (отложено в 1.2.x циклы, оригинальные пункты plan.md):**
+- [ ] Network, firewall, SSH key — `v0.1.3`.
+- [ ] floatingIP — `v0.1.4`.
+- [ ] `kind: Infrastructure` CUE→Spec parsing (полный маршрут вместо хардкода) — `v0.1.3`.
+- [ ] `platform-cli import` — `v0.1.5`.
+- [ ] Полное закрытие 1.2 в `plan.md` — после `v0.1.5`.
+
+**Acceptance (v0.1.2):**
+- ✅ `platform-cli apply` (с валидным state + `HCLOUD_TOKEN`) поднимает 1× CX22.
+- ✅ Повторный `platform-cli apply` — no-op (refresh видит сервер, Plan = пустой).
+- ✅ `platform-cli destroy --yes` сносит сервер и чистит state.
+- ✅ Mocked-тесты (12 шт.) + `#[ignore]` integration test компилируются и запускаются вручную с реальным Hetzner.
 
 **Зависит от:** 1.1
 
-**Размер:** M
+**Размер:** L (разбит на 4 цикла, текущий — 1 из 4)
 
 ---
 
@@ -1761,4 +1784,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 0.8 — spec.md M0 полностью закрыт, UNRELEASED changelog заведён | initial |
 | 2026-05-06 | Phase 1 стартовал — версия `0.1.x` (минор=фаза, патч=подфаза) | initial |
 | 2026-05-06 | Закрыта подфаза 1.1 — Cargo workspace `cli/` + skeleton subcommands; v0.1.1 | initial |
+| 2026-05-06 | 1.2 (server-CRUD ветка) — `HetznerCloudProvider` (apply/destroy/idempotent CX22); v0.1.2 | initial |
 

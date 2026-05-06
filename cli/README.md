@@ -38,6 +38,27 @@ cd cli && cargo run -- --help
 cd cli && cargo run -- plan
 ```
 
-`platform-cli` currently prints `would …` stubs for every command.
-Real provisioning, GitOps wiring, and OIDC login arrive in the
-following plan.md phases (1.2 / 1.3 / 4.7 / …).
+Most commands still print `would …` stubs; only `apply` and
+`destroy` against the Hetzner Cloud provider perform real work.
+
+### Hetzner Cloud (real apply / destroy)
+
+```sh
+export HCLOUD_TOKEN=...   # https://docs.hetzner.cloud/#getting-started
+cd cli
+cargo run --bin platform-cli -- init --provider hetzner-cloud --tier solo --region nbg1
+cargo run --bin platform-cli -- apply
+cargo run --bin platform-cli -- destroy --yes
+```
+
+The first `apply` provisions one CX22; the second is a no-op
+(idempotent). `destroy` requires the `--yes` flag.
+
+Run the real-Hetzner integration test manually:
+
+```sh
+APPRAFTER_HCLOUD_E2E=1 \
+HCLOUD_TOKEN=... \
+cargo test -p cli-providers --test hetzner_cloud_test \
+    e2e_real_hetzner_test -- --ignored
+```
