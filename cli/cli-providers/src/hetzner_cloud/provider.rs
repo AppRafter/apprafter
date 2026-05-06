@@ -40,6 +40,7 @@ impl HetznerCloudProvider {
             location: self.spec.location.clone(),
             labels,
             start_after_create: true,
+            ssh_keys: None,
         }
     }
 }

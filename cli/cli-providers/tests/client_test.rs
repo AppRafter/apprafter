@@ -91,6 +91,7 @@ fn create_server_posts_json_and_returns_id() {
         location: "nbg1".into(),
         labels,
         start_after_create: true,
+        ssh_keys: None,
     };
 
     let resp = client.create_server(&req).expect("create_server");

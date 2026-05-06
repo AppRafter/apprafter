@@ -11,5 +11,6 @@ pub use provider::HetznerCloudProvider;
 pub use server::{ServerSpec, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
 pub use types::{
     ApiErrorDetails, ApiErrorEnvelope, Server, ServerCreateRequest, ServerCreateResponse,
-    ServerListResponse, ServerStatus,
+    ServerListResponse, ServerStatus, SshKey, SshKeyCreateRequest, SshKeyCreateResponse,
+    SshKeyListResponse,
 };
