@@ -55,6 +55,8 @@ pub struct HetznerCloudState {
     pub network_id: Option<u64>,
     #[serde(default)]
     pub firewall_id: Option<u64>,
+    #[serde(default)]
+    pub floating_ip_ids: Vec<u64>,
 }
 
 impl State {

@@ -25,6 +25,10 @@ pub enum Action {
     CreateFirewall(String),
     /// Destroy a Hetzner Cloud firewall by id.
     DestroyFirewall(u64),
+    /// Provision a Hetzner Cloud floating IP by spec name.
+    CreateFloatingIp(String),
+    /// Destroy a Hetzner Cloud floating IP by id.
+    DestroyFloatingIp(u64),
     /// Placeholder for future actions; kept so tests can build
     /// `Plan` instances without depending on a real resource.
     Noop,

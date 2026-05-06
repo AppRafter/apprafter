@@ -49,6 +49,15 @@ pub struct FirewallRuleSpec {
     pub destination_ips: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FloatingIpSpec {
+    pub name: String,
+    /// "ipv4" or "ipv6".
+    pub kind: String,
+    /// Hetzner location, e.g. "nbg1".
+    pub home_location: String,
+}
+
 /// Tag every AppRafter-managed Hetzner resource with this label so
 /// `import` / `destroy` can find them later.
 pub const APPRAFTER_LABEL: &str = "apprafter";
