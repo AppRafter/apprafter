@@ -5,8 +5,8 @@ use std::path::Path;
 use cli_core::manifest::{self, FirewallIngressRule, InfrastructureManifest};
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
-    FirewallRuleSpec, FirewallSpec, HetznerCloudClient, HetznerCloudProvider, NetworkSpec,
-    ServerSpec, SshKeySpec, DEFAULT_BASE_URL,
+    FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient, HetznerCloudProvider,
+    NetworkSpec, ServerSpec, SshKeySpec, DEFAULT_BASE_URL,
 };
 use cli_providers::Provider;
 use cli_state::{HetznerCloudState, State, StatePaths};
@@ -66,6 +66,7 @@ pub fn run() -> Result<()> {
     let ssh_keys = build_ssh_specs(manifest.as_ref(), &cluster);
     let networks = vec![build_network_spec(manifest.as_ref(), &cluster)];
     let firewalls = vec![build_firewall_spec(manifest.as_ref(), &cluster)];
+    let floating_ips = build_floating_ip_specs(manifest.as_ref(), &cluster, &region);
 
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
@@ -73,6 +74,7 @@ pub fn run() -> Result<()> {
         ssh_keys,
         networks,
         firewalls,
+        floating_ips,
     };
 
     let outcome = provider.apply()?;
@@ -193,6 +195,27 @@ fn default_ingress_rules() -> Vec<FirewallRuleSpec> {
         .collect()
 }
 
+fn build_floating_ip_specs(
+    manifest: Option<&InfrastructureManifest>,
+    cluster: &str,
+    region: &str,
+) -> Vec<FloatingIpSpec> {
+    let names = manifest
+        .and_then(|m| m.spec.network.as_ref())
+        .and_then(|n| n.floating_ips.as_ref());
+    match names {
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .map(|n| FloatingIpSpec {
+                name: format!("{cluster}-{n}"),
+                kind: "ipv4".into(),
+                home_location: region.into(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn persist_state(
     provider: &HetznerCloudProvider,
     state: &mut State,
@@ -203,6 +226,7 @@ fn persist_state(
     let live_keys = provider.client.list_ssh_keys()?;
     let live_nets = provider.client.list_networks()?;
     let live_fws = provider.client.list_firewalls()?;
+    let live_fips = provider.client.list_floating_ips()?;
     if let Some(server) = live_servers.servers.into_iter().find(|s| s.name == cluster) {
         let key_ids: Vec<u64> = live_keys
             .ssh_keys
@@ -220,12 +244,19 @@ fn persist_state(
             .iter()
             .find(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
             .map(|f| f.id);
+        let fip_ids: Vec<u64> = live_fips
+            .floating_ips
+            .iter()
+            .filter(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
+            .map(|f| f.id)
+            .collect();
         state.hetzner_cloud = Some(HetznerCloudState {
             server_id: server.id,
             server_name: server.name,
             ssh_key_ids: key_ids,
             network_id: net_id,
             firewall_id: fw_id,
+            floating_ip_ids: fip_ids,
         });
         state.save(paths)?;
     }

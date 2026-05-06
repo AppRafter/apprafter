@@ -63,6 +63,7 @@ pub fn run(yes: bool) -> Result<()> {
         ssh_keys: Vec::new(),
         networks: Vec::new(),
         firewalls: Vec::new(),
+        floating_ips: Vec::new(),
     };
 
     let outcome = provider.destroy()?;
