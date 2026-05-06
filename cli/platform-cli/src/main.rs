@@ -1,7 +1,30 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
+//! Entry point for `platform-cli`.
+
+mod cli;
+mod commands;
+
+use clap::Parser;
+use cli_core::logging;
+
+use crate::cli::{Cli, Commands};
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    println!("platform-cli skeleton — implement me");
+    logging::init();
+
+    let args = Cli::parse();
+    match &args.command {
+        Commands::Init {
+            provider,
+            tier,
+            region,
+        } => commands::init::run(provider, tier, region)?,
+        Commands::Plan => commands::plan::run()?,
+        Commands::Apply => commands::apply::run()?,
+        Commands::Status => commands::status::run()?,
+        Commands::Login => commands::login::run()?,
+        Commands::UpgradeTier { to } => commands::upgrade_tier::run(to)?,
+    }
     Ok(())
 }
