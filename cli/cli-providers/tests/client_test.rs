@@ -99,3 +99,36 @@ fn create_server_posts_json_and_returns_id() {
     assert_eq!(resp.root_password.as_deref(), Some("rootpw"));
     m.assert();
 }
+
+#[test]
+fn delete_server_returns_unit_on_success() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("DELETE", "/v1/servers/12345")
+        .match_header("Authorization", "Bearer test-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"action":{"id":99,"status":"success"}}"#)
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client.delete_server(12345).expect("delete_server");
+    m.assert();
+}
+
+#[test]
+fn delete_server_404_is_treated_as_already_gone() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/servers/99999")
+        .with_status(404)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"not_found","message":"server not found"}}"#)
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    // Idempotent delete: 404 is not an error from our perspective.
+    client
+        .delete_server(99999)
+        .expect("delete should be idempotent");
+}
