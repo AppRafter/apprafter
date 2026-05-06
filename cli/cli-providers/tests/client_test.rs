@@ -188,3 +188,31 @@ fn create_ssh_key_posts_json_and_returns_id() {
     assert_eq!(resp.ssh_key.name, "platform-1-key");
     m.assert();
 }
+
+#[test]
+fn delete_ssh_key_returns_unit_on_success() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("DELETE", "/v1/ssh_keys/42")
+        .match_header("Authorization", "Bearer test-token")
+        .with_status(204)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client.delete_ssh_key(42).expect("delete_ssh_key");
+    m.assert();
+}
+
+#[test]
+fn delete_ssh_key_404_is_treated_as_already_gone() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/ssh_keys/9999")
+        .with_status(404)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"not_found","message":"ssh key not found"}}"#)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client
+        .delete_ssh_key(9999)
+        .expect("delete should be idempotent");
+}
