@@ -9,11 +9,33 @@ infra: v1alpha1.#Infrastructure & {
 	}
 	spec: {
 		provider: "hetzner-cloud"
+		region:   "nbg1"
 		nodes: [{
 			role:  "control-plane"
 			type:  "cx22"
 			count: 1
 		}]
+		network: {
+			ip_range: "10.0.0.0/16"
+			subnet: {
+				ip_range: "10.0.0.0/24"
+				zone:     "eu-central"
+			}
+		}
+		firewall: {
+			ingress: [
+				{
+					port:     "22"
+					protocol: "tcp"
+					source_ips: ["0.0.0.0/0", "::/0"]
+				},
+				{
+					port:     "443"
+					protocol: "tcp"
+					source_ips: ["0.0.0.0/0", "::/0"]
+				},
+			]
+		}
 		osImage: "ubuntu-24.04"
 	}
 }
