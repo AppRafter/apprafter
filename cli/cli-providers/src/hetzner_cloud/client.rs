@@ -1,11 +1,70 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Thin blocking HTTP wrapper around the Hetzner Cloud API.
+//! Blocking HTTP wrapper around the Hetzner Cloud REST API.
 //!
-//! Implementation lands in Task 4; this file currently only
-//! declares the type so the module compiles.
+//! Pure I/O — no business logic. The provider in
+//! `hetzner_cloud/provider.rs` calls these methods.
+
+use cli_core::{CliError, Result};
+
+use super::types::{ApiErrorEnvelope, ServerListResponse};
+
+/// Default base URL for the public Hetzner Cloud API.
+pub const DEFAULT_BASE_URL: &str = "https://api.hetzner.cloud";
 
 #[derive(Debug, Clone)]
 pub struct HetznerCloudClient {
     pub base_url: String,
     pub token: String,
+}
+
+impl HetznerCloudClient {
+    /// Construct a client. Pass `DEFAULT_BASE_URL` for production;
+    /// tests pass a `mockito::Server::url()`.
+    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token: token.into(),
+        }
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}/v1{}", self.base_url.trim_end_matches('/'), path)
+    }
+
+    fn auth_header(&self) -> String {
+        format!("Bearer {}", self.token)
+    }
+
+    pub fn list_servers(&self) -> Result<ServerListResponse> {
+        let endpoint = self.endpoint("/servers");
+        let resp = ureq::get(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(r) => r
+                .into_json::<ServerListResponse>()
+                .map_err(|e| CliError::Other(format!("parse list_servers response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("GET {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
 }

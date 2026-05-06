@@ -20,6 +20,15 @@ pub enum CliError {
     #[error("cue export failed (exit {exit}): {stderr}")]
     CueExport { exit: i32, stderr: String },
 
+    /// Hetzner Cloud API call failed.
+    #[error("hetzner-cloud {endpoint} failed (status {status}): {code}: {message}")]
+    Hetzner {
+        endpoint: String,
+        status: u16,
+        code: String,
+        message: String,
+    },
+
     /// State file present but unparseable.
     #[error("state file at {path}: {message}")]
     InvalidState { path: PathBuf, message: String },
