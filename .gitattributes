@@ -1,0 +1,43 @@
+* text=auto eol=lf
+
+# Forced text formats
+*.md         text
+*.cue        text
+*.rs         text
+*.ts         text
+*.tsx        text
+*.js         text
+*.json       text
+*.yaml       text
+*.yml        text
+*.toml       text
+*.sh         text eol=lf
+Dockerfile   text
+*.nix        text
+
+# Binary
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.gif        binary
+*.svg        text
+*.ico        binary
+*.pdf        binary
+*.tar        binary
+*.tar.gz     binary
+*.zip        binary
+*.wasm       binary
+
+# Generated files (avoid noisy diffs)
+**/Cargo.lock          linguist-generated=false
+**/bun.lock*           linguist-generated=true
+**/package-lock.json   linguist-generated=true
+**/pnpm-lock.yaml      linguist-generated=true
+**/yarn.lock           linguist-generated=true
+
+# CUE-formatted files
+*.cue        diff=cue
+
+# Linguist overrides
+docs/**      linguist-documentation=true
+examples/**  linguist-documentation=true

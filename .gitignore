@@ -1,0 +1,52 @@
+# Editors / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local Claude Code state (per-user)
+CLAUDE.md
+.claude/
+docs/superpowers
+
+# Node / Bun / TypeScript
+node_modules/
+.bun/
+bun.lockb
+*.tsbuildinfo
+dist/
+out/
+.next/
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# CUE
+cue.out/
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / coverage / temp
+*.log
+coverage/
+.nyc_output/
+.cache/
+tmp/
+.tmp/
+
+# Local env / secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/age.pub.key
+
+# Encrypted state (kept in repo via age/sops, never raw)
+.apprafter/state.cue
+!.apprafter/state.cue.age
