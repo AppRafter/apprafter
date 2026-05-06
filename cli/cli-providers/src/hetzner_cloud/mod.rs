@@ -8,3 +8,7 @@ pub mod types;
 
 pub use client::HetznerCloudClient;
 pub use provider::HetznerCloudProvider;
+pub use types::{
+    ApiErrorDetails, ApiErrorEnvelope, Server, ServerCreateRequest, ServerCreateResponse,
+    ServerListResponse, ServerStatus,
+};
