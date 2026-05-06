@@ -334,9 +334,18 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `HetznerCloudState.ssh_key_ids` cache (back-compat через `#[serde(default)]`).
 - [x] `apply` читает `APPRAFTER_SSH_PUBLIC_KEY` env: при наличии — boot с SSH-key (без root-password).
 
+**Поставка (Network + Firewall, v0.1.4):**
+- [x] `HetznerCloudClient` методы для Network: list / create / delete.
+- [x] `HetznerCloudClient` методы для Firewall: list / create / delete.
+- [x] `ServerCreateRequest.networks` + `ServerCreateRequest.firewalls` (Option, serde-skip).
+- [x] `Action::CreateNetwork` / `DestroyNetwork` / `CreateFirewall` / `DestroyFirewall`.
+- [x] `NetworkSpec`, `FirewallSpec`, `FirewallRuleSpec`.
+- [x] `HetznerCloudProvider.{networks,firewalls}` — ordered apply (ssh → net → fw → server) и destroy (server → fw → net → ssh).
+- [x] `HetznerCloudState.{network_id,firewall_id}` cache.
+- [x] CLI `apply` строит дефолтные `NetworkSpec` (10.0.0.0/16 + 10.0.0.0/24 в `eu-central`) и `FirewallSpec` (SSH 22 + HTTPS 443 ingress) из имени кластера.
+
 **Поставка (отложено в 1.2.x циклы):**
-- [ ] Network + firewall — `v0.1.4`.
-- [ ] `kind: Infrastructure` CUE→Spec parsing (полный маршрут вместо хардкода cluster-name) — `v0.1.5`.
+- [ ] `kind: Infrastructure` CUE→Spec parsing (полный маршрут вместо хардкода defaults) — `v0.1.5`.
 - [ ] floatingIP — `v0.1.6`.
 - [ ] `platform-cli import` — `v0.1.7`.
 - [ ] Полное закрытие 1.2 в `plan.md` — после `v0.1.7`.
@@ -1794,4 +1803,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 1.1 — Cargo workspace `cli/` + skeleton subcommands; v0.1.1 | initial |
 | 2026-05-06 | 1.2 (server-CRUD ветка) — `HetznerCloudProvider` (apply/destroy/idempotent CX22); v0.1.2 | initial |
 | 2026-05-06 | 1.2 (SSH-keys ветка) — `HetznerCloudProvider.ssh_keys` + APPRAFTER_SSH_PUBLIC_KEY; v0.1.3 | initial |
+| 2026-05-06 | 1.2 (Network + Firewall ветка) — default 10.0.0.0/16 net + SSH/HTTPS firewall, server attached; v0.1.4 | initial |
 

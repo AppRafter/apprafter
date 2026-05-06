@@ -53,9 +53,12 @@ cargo run --bin platform-cli -- apply
 cargo run --bin platform-cli -- destroy --yes
 ```
 
-The first `apply` provisions one CX22 (and an SSH-key resource if
-`APPRAFTER_SSH_PUBLIC_KEY` is set); the second is a no-op
-(idempotent). `destroy` requires the `--yes` flag.
+`apply` provisions one private network (10.0.0.0/16 with a
+10.0.0.0/24 cloud subnet in `eu-central`), one firewall (SSH 22 +
+HTTPS 443 inbound), and one CX22 server attached to both. The
+second `apply` is a no-op (idempotent). `destroy` requires
+`--yes` and tears everything down (server → firewall → network →
+SSH key).
 
 Run the real-Hetzner integration test manually:
 

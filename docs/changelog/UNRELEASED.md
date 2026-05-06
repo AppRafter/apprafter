@@ -95,6 +95,16 @@ the `0.0.x` series; semver starts at 1.0.
   apply (ssh → server) and destroy (server → ssh); CLI `apply`
   reads `APPRAFTER_SSH_PUBLIC_KEY` from env; `HetznerCloudState`
   caches `ssh_key_ids`.
+- **Network + Firewall for Hetzner Cloud** (v0.1.4) —
+  `HetznerCloudClient` list/create/delete networks and firewalls;
+  four new `Action` variants (`CreateNetwork`, `DestroyNetwork`,
+  `CreateFirewall`, `DestroyFirewall`); `NetworkSpec`,
+  `FirewallSpec`, `FirewallRuleSpec`. `HetznerCloudProvider`
+  applies in order ssh → net → fw → server (with all attached via
+  `ServerCreateRequest.networks` / `firewalls`) and destroys in
+  reverse. CLI `apply` builds default specs (10.0.0.0/16 net +
+  SSH 22 / HTTPS 443 firewall, both keyed off the cluster name).
+  `HetznerCloudState` caches `network_id` and `firewall_id`.
 
 ### Changed
 
