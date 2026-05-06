@@ -14,7 +14,8 @@ pub use server::{
 };
 pub use types::{
     ApiErrorDetails, ApiErrorEnvelope, Firewall, FirewallCreateRequest, FirewallCreateResponse,
-    FirewallListResponse, FirewallReference, FirewallRule, Network, NetworkCreateRequest,
+    FirewallListResponse, FirewallReference, FirewallRule, FloatingIp, FloatingIpCreateRequest,
+    FloatingIpCreateResponse, FloatingIpListResponse, HomeLocation, Network, NetworkCreateRequest,
     NetworkCreateResponse, NetworkListResponse, Server, ServerCreateRequest, ServerCreateResponse,
     ServerListResponse, ServerStatus, SshKey, SshKeyCreateRequest, SshKeyCreateResponse,
     SshKeyListResponse, Subnet,

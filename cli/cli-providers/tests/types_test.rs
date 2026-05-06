@@ -229,3 +229,65 @@ fn server_create_request_networks_and_firewalls_serialise_optionally() {
     assert_eq!(json_some["networks"], serde_json::json!([11]));
     assert_eq!(json_some["firewalls"], serde_json::json!([{"firewall":21}]));
 }
+
+#[test]
+fn deserialize_floating_ip_list_response() {
+    let json = r#"{
+      "floating_ips": [
+        {
+          "id": 31,
+          "type": "ipv4",
+          "ip": "1.2.3.4",
+          "name": "platform-1-egress",
+          "server": 42,
+          "home_location": { "name": "nbg1" },
+          "labels": {"apprafter": "true"}
+        }
+      ]
+    }"#;
+    use cli_providers::hetzner_cloud::types::FloatingIpListResponse;
+    let parsed: FloatingIpListResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.floating_ips.len(), 1);
+    assert_eq!(parsed.floating_ips[0].id, 31);
+    assert_eq!(parsed.floating_ips[0].kind, "ipv4");
+    assert_eq!(parsed.floating_ips[0].ip, "1.2.3.4");
+    assert_eq!(parsed.floating_ips[0].server, Some(42));
+    assert_eq!(parsed.floating_ips[0].home_location.name, "nbg1");
+}
+
+#[test]
+fn floating_ip_create_request_serialises_required_fields() {
+    use cli_providers::hetzner_cloud::types::FloatingIpCreateRequest;
+    use std::collections::BTreeMap;
+    let req = FloatingIpCreateRequest {
+        kind: "ipv4".into(),
+        home_location: "nbg1".into(),
+        server: Some(42),
+        name: Some("platform-1-egress".into()),
+        labels: [("apprafter".to_string(), "true".to_string())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert_eq!(json["type"], "ipv4");
+    assert_eq!(json["home_location"], "nbg1");
+    assert_eq!(json["server"], 42);
+    assert_eq!(json["name"], "platform-1-egress");
+    assert_eq!(json["labels"]["apprafter"], "true");
+}
+
+#[test]
+fn floating_ip_create_request_skips_none_fields() {
+    use cli_providers::hetzner_cloud::types::FloatingIpCreateRequest;
+    use std::collections::BTreeMap;
+    let req = FloatingIpCreateRequest {
+        kind: "ipv4".into(),
+        home_location: "nbg1".into(),
+        server: None,
+        name: None,
+        labels: BTreeMap::new(),
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert!(json.get("server").is_none());
+    assert!(json.get("name").is_none());
+}

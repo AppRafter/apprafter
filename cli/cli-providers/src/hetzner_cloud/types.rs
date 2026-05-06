@@ -189,3 +189,52 @@ pub struct FirewallCreateResponse {
 pub struct FirewallReference {
     pub firewall: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeLocation {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FloatingIp {
+    pub id: u64,
+    /// Hetzner uses "type" for the address family; renamed to
+    /// `kind` so it doesn't collide with the Rust keyword.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub ip: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Currently-assigned server id (None when unassigned).
+    #[serde(default)]
+    pub server: Option<u64>,
+    pub home_location: HomeLocation,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FloatingIpListResponse {
+    pub floating_ips: Vec<FloatingIp>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FloatingIpCreateRequest {
+    /// "ipv4" or "ipv6". `type` is a Rust keyword; serialised
+    /// as the JSON key `type`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Plain location name in the request (e.g. "nbg1"); the
+    /// list/get response wraps it in a `HomeLocation` object.
+    pub home_location: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FloatingIpCreateResponse {
+    pub floating_ip: FloatingIp,
+}
