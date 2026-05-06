@@ -386,3 +386,81 @@ fn delete_firewall_404_is_treated_as_already_gone() {
         .delete_firewall(999)
         .expect("delete_firewall idempotent");
 }
+
+#[test]
+fn list_floating_ips_returns_filtered_list() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(
+            r#"{"floating_ips":[{"id":31,"type":"ipv4","ip":"1.2.3.4","name":"egress","server":42,"home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let resp = client.list_floating_ips().expect("list_floating_ips");
+    assert_eq!(resp.floating_ips.len(), 1);
+    assert_eq!(resp.floating_ips[0].id, 31);
+    m.assert();
+}
+
+#[test]
+fn create_floating_ip_posts_json_with_server_and_returns_id() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("POST", "/v1/floating_ips")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "type": "ipv4",
+            "home_location": "nbg1",
+            "server": 42,
+            "name": "platform-1-egress"
+        })))
+        .with_status(201)
+        .with_body(
+            r#"{"floating_ip":{"id":31,"type":"ipv4","ip":"1.2.3.4","name":"platform-1-egress","server":42,"home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}}"#,
+        )
+        .create();
+
+    use cli_providers::hetzner_cloud::FloatingIpCreateRequest;
+    use std::collections::BTreeMap;
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let mut labels = BTreeMap::new();
+    labels.insert("apprafter".into(), "true".into());
+    let req = FloatingIpCreateRequest {
+        kind: "ipv4".into(),
+        home_location: "nbg1".into(),
+        server: Some(42),
+        name: Some("platform-1-egress".into()),
+        labels,
+    };
+    let resp = client.create_floating_ip(&req).expect("create_floating_ip");
+    assert_eq!(resp.floating_ip.id, 31);
+    assert_eq!(resp.floating_ip.ip, "1.2.3.4");
+    m.assert();
+}
+
+#[test]
+fn delete_floating_ip_returns_unit_on_success() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("DELETE", "/v1/floating_ips/31")
+        .with_status(204)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client.delete_floating_ip(31).expect("delete_floating_ip");
+    m.assert();
+}
+
+#[test]
+fn delete_floating_ip_404_is_treated_as_already_gone() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/floating_ips/999")
+        .with_status(404)
+        .with_body(r#"{"error":{"code":"not_found","message":"x"}}"#)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client
+        .delete_floating_ip(999)
+        .expect("delete_floating_ip is idempotent");
+}

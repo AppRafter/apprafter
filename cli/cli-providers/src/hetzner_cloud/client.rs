@@ -443,4 +443,106 @@ impl HetznerCloudClient {
             ))),
         }
     }
+
+    pub fn list_floating_ips(&self) -> Result<super::types::FloatingIpListResponse> {
+        let endpoint = self.endpoint("/floating_ips");
+        let resp = ureq::get(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::FloatingIpListResponse>()
+                .map_err(|e| CliError::Other(format!("parse list_floating_ips response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("GET {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
+    pub fn create_floating_ip(
+        &self,
+        req: &super::types::FloatingIpCreateRequest,
+    ) -> Result<super::types::FloatingIpCreateResponse> {
+        let endpoint = self.endpoint("/floating_ips");
+        let resp = ureq::post(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_json(req);
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::FloatingIpCreateResponse>()
+                .map_err(|e| CliError::Other(format!("parse create_floating_ip response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("POST {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
+    pub fn delete_floating_ip(&self, id: u64) -> Result<()> {
+        let endpoint = self.endpoint(&format!("/floating_ips/{id}"));
+        let resp = ureq::delete(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("DELETE {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
 }
