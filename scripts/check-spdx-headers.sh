@@ -48,6 +48,8 @@ PATTERNS=(
   'mise.toml'
   'Justfile'
   'mkdocs.yml'
+  'cli/**/Cargo.toml'
+  'cli/**/rust-toolchain.toml'
 )
 
 # Collect tracked files matching any pattern. `git ls-files` honours

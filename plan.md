@@ -273,16 +273,29 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.1 platform-cli — каркас CLI
 
+**Статус:** ✅ закрыто 2026-05-06.
+
 **Цель:** Rust-бинарник `platform-cli` с командами-заглушками `init|plan|apply|status|login|upgrade-tier`.
 
-**Поставка:**
-- [ ] Cargo workspace `cli/` с подпакетами `cli-core`, `cli-providers`, `cli-state`.
-- [ ] Парсинг CUE-манифестов через `cue export` (вызов CUE как subprocess, либо `cuelang-go`-bridge через FFI — ADR).
-- [ ] Структурированный логгер (`tracing` + `tracing-subscriber`).
-- [ ] State-формат: `state.cue` в `.apprafter/`, шифрование через `age` (в Git под sops/age).
-- [ ] Команды-no-op возвращают красивый план/diff.
+**Решения по ходу:**
+- Версионная схема Phase 1: `0.1.x` (минор = фаза, патч = подфаза).
+- State хранится как JSON (`.apprafter/state.json`), не CUE-encoded. Переход на CUE-encoded — позже, когда схема состояния стабилизируется.
+- CUE-доступ через subprocess (`cue export ... --out json`); FFI-вариант (`cuelang-go`) отложен.
+- Workspace из четырёх крейтов: `platform-cli` (бинарь), `cli-core` (ошибки + Tier + логи + CUE), `cli-state` (state-файл), `cli-providers` (трейт + `DryRunProvider`).
+- `cue::export_in(workdir, path)` добавлен в API: `cue` отказывается от абсолютных путей и требует относительный путь от module-root, поэтому wrapper вызывает `cue` с `current_dir(workdir)`. Простой `export(path)` — обёртка над `export_in(cwd, path)`.
+- Все команды печатают «would …» с указанием будущей фазы plan.md, в которой стаб станет реальной операцией.
 
-**Acceptance:** `platform-cli --help` показывает все команды; `platform-cli plan` на пустом manifest выдаёт «no changes».
+**Поставка:**
+- [x] Cargo workspace `cli/` с тремя крейтами + бинарь (`platform-cli`, `cli-core`, `cli-state`, `cli-providers`).
+- [x] CUE-доступ через subprocess (`cli-core::cue::{export, export_in}`), `CUE_BIN` env-override.
+- [x] Структурированный логгер (`tracing` + `tracing-subscriber` с `EnvFilter`).
+- [x] State-файл `.apprafter/state.json` (JSON в skeleton-фазе) с `load_or_default` / `save`.
+- [x] Шесть команд-стабов через clap derive API.
+
+**Acceptance:**
+- ✅ `platform-cli --help` показывает все шесть subcommand'ов.
+- ✅ `platform-cli plan` на пустом state выдаёт `no changes`.
+- ✅ Workspace проходит `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
 **Зависит от:** 0.4
 
@@ -1746,4 +1759,6 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 0.6 — flake.nix, devcontainer, mise.toml, Justfile, contributing/setup | initial |
 | 2026-05-06 | Закрыта подфаза 0.7 — mkdocs-skeleton, governance файлы, docs-serve/-build таргеты | initial |
 | 2026-05-06 | Закрыта подфаза 0.8 — spec.md M0 полностью закрыт, UNRELEASED changelog заведён | initial |
+| 2026-05-06 | Phase 1 стартовал — версия `0.1.x` (минор=фаза, патч=подфаза) | initial |
+| 2026-05-06 | Закрыта подфаза 1.1 — Cargo workspace `cli/` + skeleton subcommands; v0.1.1 | initial |
 

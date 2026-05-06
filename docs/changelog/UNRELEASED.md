@@ -57,4 +57,24 @@ the `0.0.x` series; semver starts at 1.0.
   the actual decision (FSL-1.1-MIT for core, MIT for plugins;
   see ADR 0001).
 
+## Phase 1 — MVP single-node (in progress)
+
+### Added
+
+- **`platform-cli` workspace** — Cargo workspace under `cli/` with
+  one binary crate (`platform-cli`) and three library crates
+  (`cli-core`, `cli-state`, `cli-providers`).
+- All six top-level subcommands (`init`, `plan`, `apply`, `status`,
+  `login`, `upgrade-tier`) wired as no-op stubs that print
+  structured "would-do" output and point at the future plan.md
+  phase that fills each one in.
+- `cli-core::cue::export` / `export_in` — subprocess wrappers
+  around `cue export --out json`; `export_in(workdir, path)`
+  invokes `cue` from the module-root directory because `cue`
+  rejects absolute directory paths. Honours `CUE_BIN` env override;
+  test skips gracefully when `cue` is absent.
+- Local state at `.apprafter/state.json` (JSON in the skeleton
+  phase) with `load_or_default` / `save` API and the expected
+  error semantics.
+
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
