@@ -55,6 +55,8 @@ impl HetznerCloudProvider {
             } else {
                 Some(ssh_key_ids.to_vec())
             },
+            networks: None,
+            firewalls: None,
         }
     }
 

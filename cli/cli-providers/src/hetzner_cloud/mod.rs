@@ -10,7 +10,9 @@ pub use client::{HetznerCloudClient, DEFAULT_BASE_URL};
 pub use provider::HetznerCloudProvider;
 pub use server::{ServerSpec, SshKeySpec, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
 pub use types::{
-    ApiErrorDetails, ApiErrorEnvelope, Server, ServerCreateRequest, ServerCreateResponse,
+    ApiErrorDetails, ApiErrorEnvelope, Firewall, FirewallCreateRequest, FirewallCreateResponse,
+    FirewallListResponse, FirewallReference, FirewallRule, Network, NetworkCreateRequest,
+    NetworkCreateResponse, NetworkListResponse, Server, ServerCreateRequest, ServerCreateResponse,
     ServerListResponse, ServerStatus, SshKey, SshKeyCreateRequest, SshKeyCreateResponse,
-    SshKeyListResponse,
+    SshKeyListResponse, Subnet,
 };
