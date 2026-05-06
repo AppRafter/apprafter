@@ -48,3 +48,54 @@ fn http_error_maps_to_cli_error_hetzner() {
         other => panic!("expected Hetzner error, got {other:?}"),
     }
 }
+
+#[test]
+fn create_server_posts_json_and_returns_id() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("POST", "/v1/servers")
+        .match_header("Authorization", "Bearer test-token")
+        .match_header("Content-Type", "application/json")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "name": "platform-1",
+            "server_type": "cx22",
+            "image": "ubuntu-24.04",
+            "location": "nbg1",
+            "start_after_create": true
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{
+              "server": {
+                "id": 12345,
+                "name": "platform-1",
+                "status": "initializing",
+                "labels": {"apprafter": "true"}
+              },
+              "root_password": "rootpw"
+            }"#,
+        )
+        .create();
+
+    use cli_providers::hetzner_cloud::ServerCreateRequest;
+    use std::collections::BTreeMap;
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let mut labels = BTreeMap::new();
+    labels.insert("apprafter".into(), "true".into());
+    let req = ServerCreateRequest {
+        name: "platform-1".into(),
+        server_type: "cx22".into(),
+        image: "ubuntu-24.04".into(),
+        location: "nbg1".into(),
+        labels,
+        start_after_create: true,
+    };
+
+    let resp = client.create_server(&req).expect("create_server");
+    assert_eq!(resp.server.id, 12345);
+    assert_eq!(resp.server.name, "platform-1");
+    assert_eq!(resp.root_password.as_deref(), Some("rootpw"));
+    m.assert();
+}

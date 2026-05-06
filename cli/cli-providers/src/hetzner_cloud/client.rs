@@ -67,4 +67,41 @@ impl HetznerCloudClient {
             ))),
         }
     }
+
+    pub fn create_server(
+        &self,
+        req: &super::types::ServerCreateRequest,
+    ) -> Result<super::types::ServerCreateResponse> {
+        let endpoint = self.endpoint("/servers");
+        let resp = ureq::post(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_json(req);
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::ServerCreateResponse>()
+                .map_err(|e| CliError::Other(format!("parse create_server response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("POST {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
 }
