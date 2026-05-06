@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: FSL-1.1-MIT
+//! Integration tests for cli_core::manifest.
+//!
+//! Skips at runtime when `cue` is absent from PATH (mirrors the
+//! cue_test pattern).
+
+use std::path::{Path, PathBuf};
+
+use cli_core::manifest::{self, InfrastructureManifest};
+use cli_core::CliError;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .to_path_buf()
+}
+
+#[test]
+fn parse_full_infrastructure_fixture() {
+    let root = repo_root();
+    let path = Path::new("./examples/infrastructure");
+
+    let parsed: InfrastructureManifest = match manifest::parse_infrastructure(&root, path) {
+        Ok(m) => m,
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(other) => panic!("unexpected: {other}"),
+    };
+
+    assert_eq!(parsed.api_version, "apprafter.io/v1alpha1");
+    assert_eq!(parsed.kind, "Infrastructure");
+    assert_eq!(parsed.metadata.name, "platform-1");
+    assert_eq!(parsed.spec.provider, "hetzner-cloud");
+    assert_eq!(parsed.spec.region.as_deref(), Some("nbg1"));
+    assert_eq!(parsed.spec.nodes.len(), 1);
+    assert_eq!(parsed.spec.nodes[0].kind, "cx22");
+    assert_eq!(parsed.spec.nodes[0].count, 1);
+    assert_eq!(parsed.spec.os_image.as_deref(), Some("ubuntu-24.04"));
+
+    let net = parsed.spec.network.as_ref().expect("network present");
+    assert_eq!(net.ip_range.as_deref(), Some("10.0.0.0/16"));
+    let subnet = net.subnet.as_ref().expect("subnet present");
+    assert_eq!(subnet.ip_range.as_deref(), Some("10.0.0.0/24"));
+    assert_eq!(subnet.zone.as_deref(), Some("eu-central"));
+
+    let fw = parsed.spec.firewall.as_ref().expect("firewall present");
+    let ingress = fw.ingress.as_ref().expect("ingress present");
+    assert_eq!(ingress.len(), 2);
+    assert_eq!(ingress[0].port, "22");
+    assert_eq!(ingress[0].protocol.as_deref(), Some("tcp"));
+    assert_eq!(ingress[1].port, "443");
+}
+
+#[test]
+fn parse_returns_error_on_missing_path() {
+    let root = repo_root();
+    let path = Path::new("./examples/infrastructure-does-not-exist");
+    match manifest::parse_infrastructure(&root, path) {
+        Err(CliError::CueExport { .. }) => {
+            // Expected: cue export prints an error and exits non-zero.
+        }
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+        }
+        Err(other) => panic!("expected CueExport or CueNotFound, got {other}"),
+        Ok(_) => panic!("missing path should not parse successfully"),
+    }
+}
