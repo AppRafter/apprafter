@@ -61,6 +61,8 @@ pub fn run(yes: bool) -> Result<()> {
         },
         // destroy() reads live state from the API; no spec needed.
         ssh_keys: Vec::new(),
+        networks: Vec::new(),
+        firewalls: Vec::new(),
     };
 
     let outcome = provider.destroy()?;

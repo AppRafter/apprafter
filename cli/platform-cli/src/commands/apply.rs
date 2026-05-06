@@ -3,11 +3,16 @@ use std::collections::BTreeMap;
 
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
-    HetznerCloudClient, HetznerCloudProvider, ServerSpec, SshKeySpec, DEFAULT_BASE_URL,
+    FirewallRuleSpec, FirewallSpec, HetznerCloudClient, HetznerCloudProvider, NetworkSpec,
+    ServerSpec, SshKeySpec, DEFAULT_BASE_URL,
 };
 use cli_providers::Provider;
 use cli_state::{HetznerCloudState, State, StatePaths};
 use tracing::info;
+
+const DEFAULT_NETWORK_IP_RANGE: &str = "10.0.0.0/16";
+const DEFAULT_SUBNET_IP_RANGE: &str = "10.0.0.0/24";
+const DEFAULT_NETWORK_ZONE: &str = "eu-central";
 
 pub fn run() -> Result<()> {
     info!("apply invoked");
@@ -35,11 +40,9 @@ pub fn run() -> Result<()> {
         .unwrap_or_else(|| "platform-1".into());
     let region = state.region.clone().unwrap_or_else(|| "nbg1".into());
 
-    // Optional SSH key from env. If APPRAFTER_SSH_PUBLIC_KEY is
-    // present, the server boots attached to that key (no root pwd).
     let ssh_keys = match std::env::var("APPRAFTER_SSH_PUBLIC_KEY") {
         Ok(public_key) => {
-            tracing::info!(cluster = %cluster, "configuring SSH key from env");
+            info!(cluster = %cluster, "configuring SSH key from env");
             vec![SshKeySpec {
                 name: format!("{cluster}-key"),
                 public_key,
@@ -47,6 +50,33 @@ pub fn run() -> Result<()> {
         }
         Err(_) => Vec::new(),
     };
+
+    let networks = vec![NetworkSpec {
+        name: format!("{cluster}-net"),
+        ip_range: DEFAULT_NETWORK_IP_RANGE.into(),
+        subnet_ip_range: DEFAULT_SUBNET_IP_RANGE.into(),
+        network_zone: DEFAULT_NETWORK_ZONE.into(),
+    }];
+
+    let firewalls = vec![FirewallSpec {
+        name: format!("{cluster}-fw"),
+        rules: vec![
+            FirewallRuleSpec {
+                direction: "in".into(),
+                port: Some("22".into()),
+                protocol: "tcp".into(),
+                source_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                destination_ips: vec![],
+            },
+            FirewallRuleSpec {
+                direction: "in".into(),
+                port: Some("443".into()),
+                protocol: "tcp".into(),
+                source_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+                destination_ips: vec![],
+            },
+        ],
+    }];
 
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
@@ -58,15 +88,18 @@ pub fn run() -> Result<()> {
             labels: BTreeMap::new(),
         },
         ssh_keys,
+        networks,
+        firewalls,
     };
 
     let outcome = provider.apply()?;
     println!("apply complete: {} action(s)", outcome.applied);
 
-    // Persist the server we just created (or confirmed) so future
-    // applies / destroys see it.
+    // Persist all ids for diagnostics / later destroy.
     let live_servers = provider.client.list_servers()?;
     let live_keys = provider.client.list_ssh_keys()?;
+    let live_nets = provider.client.list_networks()?;
+    let live_fws = provider.client.list_firewalls()?;
     if let Some(server) = live_servers.servers.into_iter().find(|s| s.name == cluster) {
         let key_ids: Vec<u64> = live_keys
             .ssh_keys
@@ -74,12 +107,22 @@ pub fn run() -> Result<()> {
             .filter(|k| k.labels.get("apprafter").map(String::as_str) == Some("true"))
             .map(|k| k.id)
             .collect();
+        let net_id: Option<u64> = live_nets
+            .networks
+            .iter()
+            .find(|n| n.labels.get("apprafter").map(String::as_str) == Some("true"))
+            .map(|n| n.id);
+        let fw_id: Option<u64> = live_fws
+            .firewalls
+            .iter()
+            .find(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
+            .map(|f| f.id);
         state.hetzner_cloud = Some(HetznerCloudState {
             server_id: server.id,
             server_name: server.name,
             ssh_key_ids: key_ids,
-            network_id: None,
-            firewall_id: None,
+            network_id: net_id,
+            firewall_id: fw_id,
         });
         state.save(&paths)?;
     }
