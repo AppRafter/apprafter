@@ -44,4 +44,10 @@ pub enum Commands {
         #[arg(long = "to")]
         to: String,
     },
+    /// Destroy infrastructure managed by this state.
+    Destroy {
+        /// Confirm without prompting.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }

@@ -25,6 +25,7 @@ fn main() -> color_eyre::Result<()> {
         Commands::Status => commands::status::run()?,
         Commands::Login => commands::login::run()?,
         Commands::UpgradeTier { to } => commands::upgrade_tier::run(to)?,
+        Commands::Destroy { yes } => commands::destroy::run(*yes)?,
     }
     Ok(())
 }

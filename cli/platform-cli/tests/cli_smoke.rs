@@ -17,7 +17,8 @@ fn help_lists_all_subcommands() {
         .stdout(contains("apply"))
         .stdout(contains("status"))
         .stdout(contains("login"))
-        .stdout(contains("upgrade-tier"));
+        .stdout(contains("upgrade-tier"))
+        .stdout(contains("destroy"));
 }
 
 #[test]
@@ -30,7 +31,7 @@ fn version_flag_works() {
 }
 
 #[test]
-fn init_prints_would_init() {
+fn init_prints_would_init_and_writes_state() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .current_dir(dir.path())
@@ -49,6 +50,10 @@ fn init_prints_would_init() {
         .stdout(contains("hetzner-cloud"))
         .stdout(contains("solo"))
         .stdout(contains("nbg1"));
+    assert!(
+        dir.path().join(".apprafter/state.json").exists(),
+        "init should write the state file"
+    );
 }
 
 #[test]
@@ -63,14 +68,29 @@ fn plan_on_empty_state_says_no_changes() {
 }
 
 #[test]
-fn apply_prints_would_apply() {
+fn apply_without_token_reports_missing_token() {
     let dir = tempfile::tempdir().unwrap();
+    // Run init first so state has provider=hetzner-cloud.
     cli()
         .current_dir(dir.path())
+        .args([
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ])
+        .assert()
+        .success();
+    cli()
+        .current_dir(dir.path())
+        .env_remove("HCLOUD_TOKEN")
         .arg("apply")
         .assert()
-        .success()
-        .stdout(contains("would apply"));
+        .failure()
+        .stderr(contains("HCLOUD_TOKEN"));
 }
 
 #[test]
@@ -105,4 +125,16 @@ fn upgrade_tier_prints_target() {
         .success()
         .stdout(contains("would upgrade tier"))
         .stdout(contains("team"));
+}
+
+#[test]
+fn destroy_with_empty_state_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .current_dir(dir.path())
+        .env_remove("HCLOUD_TOKEN")
+        .args(["destroy", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("nothing to destroy"));
 }

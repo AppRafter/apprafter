@@ -6,18 +6,20 @@ use cli_providers::hetzner_cloud::{
     HetznerCloudClient, HetznerCloudProvider, ServerSpec, DEFAULT_BASE_URL,
 };
 use cli_providers::Provider;
-use cli_state::{HetznerCloudState, State, StatePaths};
+use cli_state::{State, StatePaths};
 use tracing::info;
 
-pub fn run() -> Result<()> {
-    info!("apply invoked");
+pub fn run(yes: bool) -> Result<()> {
+    info!(yes, "destroy invoked");
     let cwd = std::env::current_dir()?;
     let paths = StatePaths::for_root(&cwd);
     let mut state = State::load_or_default(&paths)?;
 
-    let provider_id = state.provider.clone().ok_or_else(|| {
-        CliError::Other("state has no provider — run `platform-cli init …` first".to_string())
-    })?;
+    let provider_id = state.provider.clone();
+    let Some(provider_id) = provider_id else {
+        println!("nothing to destroy: no provider in state");
+        return Ok(());
+    };
 
     if provider_id != "hetzner-cloud" {
         return Err(CliError::Other(format!(
@@ -25,9 +27,22 @@ pub fn run() -> Result<()> {
         )));
     }
 
-    let token = std::env::var("HCLOUD_TOKEN").map_err(|_| {
-        CliError::Other("HCLOUD_TOKEN env var is required for hetzner-cloud apply".to_string())
-    })?;
+    let Ok(token) = std::env::var("HCLOUD_TOKEN") else {
+        if yes && state.hetzner_cloud.is_none() {
+            println!("nothing to destroy: state has no Hetzner resources");
+            return Ok(());
+        }
+        return Err(CliError::Other(
+            "HCLOUD_TOKEN env var is required for hetzner-cloud destroy".to_string(),
+        ));
+    };
+
+    if !yes {
+        return Err(CliError::Other(
+            "refusing to destroy without --yes (this would tear down live infrastructure)"
+                .to_string(),
+        ));
+    }
 
     let cluster = state
         .cluster_name
@@ -38,7 +53,7 @@ pub fn run() -> Result<()> {
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
         spec: ServerSpec {
-            name: cluster.clone(),
+            name: cluster,
             server_type: "cx22".into(),
             image: "ubuntu-24.04".into(),
             location: region,
@@ -46,19 +61,13 @@ pub fn run() -> Result<()> {
         },
     };
 
-    let outcome = provider.apply()?;
-    println!("apply complete: {} action(s)", outcome.applied);
+    let outcome = provider.destroy()?;
+    println!(
+        "destroy complete: {} resource(s) removed",
+        outcome.destroyed
+    );
 
-    // Persist the server we just created (or confirmed) so future
-    // applies / destroys see it.
-    let live = provider.client.list_servers()?;
-    if let Some(server) = live.servers.into_iter().find(|s| s.name == cluster) {
-        state.hetzner_cloud = Some(HetznerCloudState {
-            server_id: server.id,
-            server_name: server.name,
-        });
-        state.save(&paths)?;
-    }
-
+    state.hetzner_cloud = None;
+    state.save(&paths)?;
     Ok(())
 }
