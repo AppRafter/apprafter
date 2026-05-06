@@ -42,6 +42,13 @@ pub struct State {
     pub tier: Option<Tier>,
     pub provider: Option<String>,
     pub region: Option<String>,
+    pub hetzner_cloud: Option<HetznerCloudState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HetznerCloudState {
+    pub server_id: u64,
+    pub server_name: String,
 }
 
 impl State {

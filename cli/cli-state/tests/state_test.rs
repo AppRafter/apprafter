@@ -41,3 +41,23 @@ fn load_rejects_corrupt_state_file() {
         "got: {err}"
     );
 }
+
+#[test]
+fn hetzner_cloud_state_round_trips_through_save_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StatePaths::for_root(dir.path());
+
+    let original = State {
+        cluster_name: Some("solo-1".into()),
+        tier: Some(Tier::Solo),
+        provider: Some("hetzner-cloud".into()),
+        region: Some("nbg1".into()),
+        hetzner_cloud: Some(cli_state::HetznerCloudState {
+            server_id: 12345,
+            server_name: "platform-1".into(),
+        }),
+    };
+    original.save(&paths).unwrap();
+    let reloaded = State::load_or_default(&paths).unwrap();
+    assert_eq!(reloaded, original);
+}

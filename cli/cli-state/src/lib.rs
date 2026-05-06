@@ -3,4 +3,4 @@
 
 pub mod state;
 
-pub use state::{State, StatePaths};
+pub use state::{HetznerCloudState, State, StatePaths};
