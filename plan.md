@@ -90,24 +90,27 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 0.3 ADR-процесс и шаблон
 
+**Статус:** ✅ закрыто 2026-05-06.
+
 **Цель:** зафиксировать формат принятия архитектурных решений.
 
 **Поставка:**
-- [ ] `docs/adr/0000-template.md` (по шаблону Майкла Найгарда + risk/owner/expires).
-- [ ] `docs/adr/0001-license-fsl-1-1-mit.md` (зафиксировать §7-решение задним числом).
-- [ ] `docs/adr/0002-codename-apprafter.md`.
-- [ ] `docs/adr/0003-rust-operator-over-crossplane.md` (выписать §8).
-- [ ] `docs/adr/0004-cue-over-pkl.md` (выписать §7 + точка пересмотра M5).
-- [ ] `docs/adr/0005-kine-nats-over-etcd.md`.
-- [ ] `docs/adr/0006-openbao-over-vault.md`.
-- [ ] `docs/adr/0007-fsl-license-for-core.md`.
-- [ ] `docs/adr/0008-http-first-notifications-api.md`.
-- [ ] `docs/adr/0009-platform-only-templates.md`.
-- [ ] `docs/adr/0010-dockerfile-first-build.md`.
-- [ ] `docs/adr/0011-hybrid-rust-sdk-tofu-shim.md`.
-- [ ] `docs/adr/0012-migrationplan-as-first-class.md`.
+- [x] `docs/adr/0000-template.md` (по шаблону Майкла Найгарда + risk/owner/re-evaluation).
+- [x] `docs/adr/0001-license-fsl-1-1-mit.md` — FSL-1.1-MIT для core, MIT для плагинов (§7 + §8).
+- [x] `docs/adr/0002-codename-apprafter.md` — выбор кодового имени (§7 open-question 9).
+- [x] `docs/adr/0003-rust-operator-over-crossplane.md` (§8).
+- [x] `docs/adr/0004-cue-over-pkl.md` (§7 + точка пересмотра M5).
+- [x] `docs/adr/0005-kine-nats-over-etcd.md` (§4.2 + §8).
+- [x] `docs/adr/0006-openbao-over-vault.md` (§4.4 + §8).
+- [x] `docs/adr/0007-tier-1-sealedsecrets-tier-2-openbao.md` — переназначено с дублирующего FSL-обоснования на принцип 1.8 (§1.8 + §4.4 + §8).
+- [x] `docs/adr/0008-http-first-notifications-api.md` (§4.6 + §8).
+- [x] `docs/adr/0009-platform-only-templates.md` (§4.6 + §8).
+- [x] `docs/adr/0010-dockerfile-first-build.md` (§4.9 + §8).
+- [x] `docs/adr/0011-hybrid-rust-sdk-tofu-shim.md` (§3.7 + §4.12 + §8).
+- [x] `docs/adr/0012-migrationplan-as-first-class.md` (§3.8 + §8).
+- [x] `docs/adr/README.md` обновлён индексом всех ADR.
 
-**Acceptance:** все «Resolved»-решения §7 и тех-обоснования §8 закодифицированы как ADR.
+**Acceptance:** все «Resolved»-решения §7 и тех-обоснования §8 закодифицированы как ADR; индекс соответствует фактическому содержимому каталога.
 
 **Размер:** S
 
@@ -1668,4 +1671,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Первая версия плана из spec.md rev.4 | initial |
 | 2026-05-06 | Закрыта подфаза 0.1 — структура монорепы и README | initial |
 | 2026-05-06 | Закрыта подфаза 0.2 — LICENSE / NOTICE / SPDX-шаблон | initial |
+| 2026-05-06 | Закрыта подфаза 0.3 — ADR-шаблон + 12 ADR; 0007 переназначен на SealedSecrets/OpenBao | initial |
 
