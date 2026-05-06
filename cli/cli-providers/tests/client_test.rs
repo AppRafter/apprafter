@@ -153,3 +153,38 @@ fn list_ssh_keys_returns_filtered_list() {
     assert_eq!(resp.ssh_keys[0].id, 7);
     m.assert();
 }
+
+#[test]
+fn create_ssh_key_posts_json_and_returns_id() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("POST", "/v1/ssh_keys")
+        .match_header("Authorization", "Bearer test-token")
+        .match_header("Content-Type", "application/json")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "name": "platform-1-key",
+            "public_key": "ssh-ed25519 AAAA"
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"ssh_key":{"id":42,"name":"platform-1-key","public_key":"ssh-ed25519 AAAA","fingerprint":"f","labels":{"apprafter":"true"}}}"#,
+        )
+        .create();
+
+    use cli_providers::hetzner_cloud::SshKeyCreateRequest;
+    use std::collections::BTreeMap;
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let mut labels = BTreeMap::new();
+    labels.insert("apprafter".into(), "true".into());
+    let req = SshKeyCreateRequest {
+        name: "platform-1-key".into(),
+        public_key: "ssh-ed25519 AAAA".into(),
+        labels,
+    };
+    let resp = client.create_ssh_key(&req).expect("create_ssh_key");
+    assert_eq!(resp.ssh_key.id, 42);
+    assert_eq!(resp.ssh_key.name, "platform-1-key");
+    m.assert();
+}

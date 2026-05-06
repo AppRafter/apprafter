@@ -101,6 +101,43 @@ impl HetznerCloudClient {
         }
     }
 
+    pub fn create_ssh_key(
+        &self,
+        req: &super::types::SshKeyCreateRequest,
+    ) -> Result<super::types::SshKeyCreateResponse> {
+        let endpoint = self.endpoint("/ssh_keys");
+        let resp = ureq::post(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_json(req);
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::SshKeyCreateResponse>()
+                .map_err(|e| CliError::Other(format!("parse create_ssh_key response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("POST {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
     pub fn delete_server(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/servers/{id}"));
         let resp = ureq::delete(&endpoint)
