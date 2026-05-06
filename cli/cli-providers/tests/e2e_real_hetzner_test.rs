@@ -55,6 +55,7 @@ fn create_then_destroy_real_cx22() {
         ssh_keys: vec![],
         networks: vec![],
         firewalls: vec![],
+        floating_ips: vec![],
     };
 
     // First apply: should create.

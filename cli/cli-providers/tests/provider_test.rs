@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use cli_providers::hetzner_cloud::{
-    FirewallRuleSpec, FirewallSpec, HetznerCloudClient, HetznerCloudProvider, NetworkSpec,
-    ServerSpec, SshKeySpec,
+    FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient, HetznerCloudProvider,
+    NetworkSpec, ServerSpec, SshKeySpec,
 };
 use cli_providers::{Action, Provider};
 
@@ -50,6 +50,14 @@ fn fw_spec(name: &str) -> FirewallSpec {
     }
 }
 
+fn fip_spec(name: &str) -> FloatingIpSpec {
+    FloatingIpSpec {
+        name: name.into(),
+        kind: "ipv4".into(),
+        home_location: "nbg1".into(),
+    }
+}
+
 #[test]
 fn plan_creates_when_server_missing() {
     let mut srv = mockito::Server::new();
@@ -73,6 +81,11 @@ fn plan_creates_when_server_missing() {
         .with_status(200)
         .with_body(r#"{"servers":[]}"#)
         .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(r#"{"floating_ips":[]}"#)
+        .create();
 
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(srv.url(), "tok"),
@@ -80,6 +93,7 @@ fn plan_creates_when_server_missing() {
         ssh_keys: vec![],
         networks: vec![],
         firewalls: vec![],
+        floating_ips: vec![],
     };
 
     let plan = provider.plan().unwrap();
@@ -114,6 +128,11 @@ fn plan_noop_when_server_already_present() {
             r#"{"servers":[{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}]}"#,
         )
         .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(r#"{"floating_ips":[]}"#)
+        .create();
 
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(srv.url(), "tok"),
@@ -121,6 +140,7 @@ fn plan_noop_when_server_already_present() {
         ssh_keys: vec![],
         networks: vec![],
         firewalls: vec![],
+        floating_ips: vec![],
     };
 
     let plan = provider.plan().unwrap();
@@ -158,6 +178,11 @@ fn destroy_deletes_each_tagged_server() {
         .with_status(200)
         .with_body(r#"{"firewalls":[]}"#)
         .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(r#"{"floating_ips":[]}"#)
+        .create();
 
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(srv.url(), "tok"),
@@ -165,6 +190,7 @@ fn destroy_deletes_each_tagged_server() {
         ssh_keys: vec![],
         networks: vec![],
         firewalls: vec![],
+        floating_ips: vec![],
     };
 
     let outcome = provider.destroy().unwrap();
@@ -194,6 +220,11 @@ fn plan_creates_network_firewall_and_server_when_all_missing() {
         .with_status(200)
         .with_body(r#"{"servers":[]}"#)
         .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(r#"{"floating_ips":[]}"#)
+        .create();
 
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(srv.url(), "tok"),
@@ -201,6 +232,7 @@ fn plan_creates_network_firewall_and_server_when_all_missing() {
         ssh_keys: vec![ssh_spec("platform-1-key")],
         networks: vec![net_spec("platform-1-net")],
         firewalls: vec![fw_spec("platform-1-fw")],
+        floating_ips: vec![],
     };
 
     let plan = provider.plan().unwrap();
@@ -283,6 +315,7 @@ fn apply_creates_all_resources_in_order_and_attaches_to_server() {
         ssh_keys: vec![ssh_spec("platform-1-key")],
         networks: vec![net_spec("platform-1-net")],
         firewalls: vec![fw_spec("platform-1-fw")],
+        floating_ips: vec![],
     };
 
     let outcome = provider.apply().unwrap();
@@ -341,6 +374,11 @@ fn destroy_removes_in_order_server_firewall_network_ssh() {
         .with_status(204)
         .expect(1)
         .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(r#"{"floating_ips":[]}"#)
+        .create();
 
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(srv.url(), "tok"),
@@ -348,8 +386,132 @@ fn destroy_removes_in_order_server_firewall_network_ssh() {
         ssh_keys: vec![ssh_spec("k")],
         networks: vec![net_spec("platform-1-net")],
         firewalls: vec![fw_spec("platform-1-fw")],
+        floating_ips: vec![],
     };
 
     let outcome = provider.destroy().unwrap();
     assert_eq!(outcome.destroyed, 4);
+}
+
+#[test]
+fn apply_creates_floating_ip_after_server_with_server_attach() {
+    let mut srv = mockito::Server::new();
+    let _list_keys = srv
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+    let _list_nets = srv
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    let _list_fws = srv
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    let _list_servers = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(r#"{"floating_ips":[]}"#)
+        .create();
+    let _create_server = srv
+        .mock("POST", "/v1/servers")
+        .with_status(201)
+        .with_body(
+            r#"{"server":{"id":42,"name":"platform-1","status":"initializing","labels":{"apprafter":"true"}}}"#,
+        )
+        .expect(1)
+        .create();
+    let _create_fip = srv
+        .mock("POST", "/v1/floating_ips")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "type": "ipv4",
+            "home_location": "nbg1",
+            "server": 42,
+            "name": "platform-1-egress"
+        })))
+        .with_status(201)
+        .with_body(
+            r#"{"floating_ip":{"id":31,"type":"ipv4","ip":"1.2.3.4","name":"platform-1-egress","server":42,"home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}}"#,
+        )
+        .expect(1)
+        .create();
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(srv.url(), "tok"),
+        spec: spec("platform-1"),
+        ssh_keys: vec![],
+        networks: vec![],
+        firewalls: vec![],
+        floating_ips: vec![fip_spec("platform-1-egress")],
+    };
+
+    let outcome = provider.apply().unwrap();
+    // 1 server + 1 floating ip.
+    assert_eq!(outcome.applied, 2);
+}
+
+#[test]
+fn destroy_removes_floating_ip_first_then_others() {
+    let mut srv = mockito::Server::new();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(
+            r#"{"floating_ips":[{"id":31,"type":"ipv4","ip":"1.2.3.4","name":"egress","server":42,"home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    let _del_fip = srv
+        .mock("DELETE", "/v1/floating_ips/31")
+        .with_status(204)
+        .expect(1)
+        .create();
+    let _list_servers = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(
+            r#"{"servers":[{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    let _del_server = srv
+        .mock("DELETE", "/v1/servers/42")
+        .with_status(200)
+        .with_body(r#"{"action":{"id":1,"status":"success"}}"#)
+        .expect(1)
+        .create();
+    let _list_fws = srv
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    let _list_nets = srv
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    let _list_keys = srv
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(srv.url(), "tok"),
+        spec: spec("platform-1"),
+        ssh_keys: vec![],
+        networks: vec![],
+        firewalls: vec![],
+        floating_ips: vec![fip_spec("platform-1-egress")],
+    };
+
+    let outcome = provider.destroy().unwrap();
+    // 1 floating ip + 1 server.
+    assert_eq!(outcome.destroyed, 2);
 }

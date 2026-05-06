@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 //! Implementation of the `Provider` trait against Hetzner Cloud.
 
+use std::collections::BTreeMap;
+
 use cli_core::Result;
 use tracing::info;
 
@@ -8,12 +10,13 @@ use crate::provider::{Action, ApplyOutcome, DestroyOutcome, Plan, Provider};
 
 use super::client::HetznerCloudClient;
 use super::server::{
-    FirewallRuleSpec, FirewallSpec, NetworkSpec, ServerSpec, SshKeySpec, APPRAFTER_LABEL,
-    APPRAFTER_LABEL_VALUE,
+    FirewallRuleSpec, FirewallSpec, FloatingIpSpec, NetworkSpec, ServerSpec, SshKeySpec,
+    APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
 };
 use super::types::{
-    Firewall, FirewallCreateRequest, FirewallReference, FirewallRule, Network,
-    NetworkCreateRequest, Server, ServerCreateRequest, SshKey, SshKeyCreateRequest, Subnet,
+    Firewall, FirewallCreateRequest, FirewallReference, FirewallRule, FloatingIp,
+    FloatingIpCreateRequest, Network, NetworkCreateRequest, Server, ServerCreateRequest, SshKey,
+    SshKeyCreateRequest, Subnet,
 };
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,7 @@ pub struct HetznerCloudProvider {
     pub ssh_keys: Vec<SshKeySpec>,
     pub networks: Vec<NetworkSpec>,
     pub firewalls: Vec<FirewallSpec>,
+    pub floating_ips: Vec<FloatingIpSpec>,
 }
 
 impl HetznerCloudProvider {
@@ -70,6 +74,17 @@ impl HetznerCloudProvider {
             .collect())
     }
 
+    fn refresh_floating_ips(&self) -> Result<Vec<FloatingIp>> {
+        let resp = self.client.list_floating_ips()?;
+        Ok(resp
+            .floating_ips
+            .into_iter()
+            .filter(|f| {
+                f.labels.get(APPRAFTER_LABEL).map(String::as_str) == Some(APPRAFTER_LABEL_VALUE)
+            })
+            .collect())
+    }
+
     fn create_request(
         &self,
         ssh_key_ids: &[u64],
@@ -110,7 +125,7 @@ impl HetznerCloudProvider {
     }
 
     fn ssh_create_request(&self, spec: &SshKeySpec) -> SshKeyCreateRequest {
-        let mut labels = std::collections::BTreeMap::new();
+        let mut labels = BTreeMap::new();
         labels.insert(APPRAFTER_LABEL.into(), APPRAFTER_LABEL_VALUE.into());
         SshKeyCreateRequest {
             name: spec.name.clone(),
@@ -120,7 +135,7 @@ impl HetznerCloudProvider {
     }
 
     fn network_create_request(&self, spec: &NetworkSpec) -> NetworkCreateRequest {
-        let mut labels = std::collections::BTreeMap::new();
+        let mut labels = BTreeMap::new();
         labels.insert(APPRAFTER_LABEL.into(), APPRAFTER_LABEL_VALUE.into());
         NetworkCreateRequest {
             name: spec.name.clone(),
@@ -135,11 +150,27 @@ impl HetznerCloudProvider {
     }
 
     fn firewall_create_request(&self, spec: &FirewallSpec) -> FirewallCreateRequest {
-        let mut labels = std::collections::BTreeMap::new();
+        let mut labels = BTreeMap::new();
         labels.insert(APPRAFTER_LABEL.into(), APPRAFTER_LABEL_VALUE.into());
         FirewallCreateRequest {
             name: spec.name.clone(),
             rules: spec.rules.iter().map(rule_spec_to_wire).collect(),
+            labels,
+        }
+    }
+
+    fn floating_ip_create_request(
+        &self,
+        spec: &FloatingIpSpec,
+        server_id: u64,
+    ) -> FloatingIpCreateRequest {
+        let mut labels = BTreeMap::new();
+        labels.insert(APPRAFTER_LABEL.into(), APPRAFTER_LABEL_VALUE.into());
+        FloatingIpCreateRequest {
+            kind: spec.kind.clone(),
+            home_location: spec.home_location.clone(),
+            server: Some(server_id),
+            name: Some(spec.name.clone()),
             labels,
         }
     }
@@ -162,6 +193,7 @@ impl Provider for HetznerCloudProvider {
         let live_networks = self.refresh_networks()?;
         let live_firewalls = self.refresh_firewalls()?;
         let live_servers = self.refresh_servers()?;
+        let live_fips = self.refresh_floating_ips()?;
 
         let mut actions = Vec::new();
         for s in &self.ssh_keys {
@@ -181,6 +213,14 @@ impl Provider for HetznerCloudProvider {
         }
         if !live_servers.iter().any(|s| s.name == self.spec.name) {
             actions.push(Action::CreateServer(self.spec.name.clone()));
+        }
+        for s in &self.floating_ips {
+            if !live_fips
+                .iter()
+                .any(|f| f.name.as_deref() == Some(s.name.as_str()))
+            {
+                actions.push(Action::CreateFloatingIp(s.name.clone()));
+            }
         }
         Ok(Plan { actions })
     }
@@ -234,14 +274,48 @@ impl Provider for HetznerCloudProvider {
             }
         }
 
-        // 4) Server.
+        // 4) Server (resolve id even if it already exists, so
+        // floating-IP attach has somewhere to point).
+        let mut server_id: Option<u64> = None;
         let live_servers = self.refresh_servers()?;
-        if !live_servers.iter().any(|s| s.name == self.spec.name) {
+        if let Some(existing) = live_servers.iter().find(|s| s.name == self.spec.name) {
+            server_id = Some(existing.id);
+        } else if !self.spec.name.is_empty() {
             info!(server = %self.spec.name, "creating Hetzner server");
             let req = self.create_request(&ssh_ids, &net_ids, &fw_ids);
             let resp = self.client.create_server(&req)?;
             info!(server = %self.spec.name, id = resp.server.id, "server created");
+            server_id = Some(resp.server.id);
             applied += 1;
+        }
+
+        // 5) Floating IPs (need server id; skipped entirely when
+        // no specs are declared so we don't make a needless list
+        // call against the API).
+        if !self.floating_ips.is_empty() {
+            if let Some(sid) = server_id {
+                let live_fips = self.refresh_floating_ips()?;
+                for spec in &self.floating_ips {
+                    if !live_fips
+                        .iter()
+                        .any(|f| f.name.as_deref() == Some(spec.name.as_str()))
+                    {
+                        info!(
+                            floating_ip = %spec.name,
+                            server = sid,
+                            "creating Hetzner floating IP"
+                        );
+                        let req = self.floating_ip_create_request(spec, sid);
+                        let resp = self.client.create_floating_ip(&req)?;
+                        info!(
+                            floating_ip = %spec.name,
+                            id = resp.floating_ip.id,
+                            "floating IP created"
+                        );
+                        applied += 1;
+                    }
+                }
+            }
         }
 
         Ok(ApplyOutcome { applied })
@@ -250,28 +324,39 @@ impl Provider for HetznerCloudProvider {
     fn destroy(&self) -> Result<DestroyOutcome> {
         let mut destroyed = 0;
 
-        // 1) Servers (they reference firewalls and networks).
+        // 1) Floating IPs first (they reference the server).
+        for fip in self.refresh_floating_ips()? {
+            info!(
+                floating_ip = ?fip.name,
+                id = fip.id,
+                "destroying Hetzner floating IP"
+            );
+            self.client.delete_floating_ip(fip.id)?;
+            destroyed += 1;
+        }
+
+        // 2) Servers.
         for server in self.refresh_servers()? {
             info!(server = %server.name, id = server.id, "destroying Hetzner server");
             self.client.delete_server(server.id)?;
             destroyed += 1;
         }
 
-        // 2) Firewalls.
+        // 3) Firewalls.
         for fw in self.refresh_firewalls()? {
             info!(firewall = %fw.name, id = fw.id, "destroying Hetzner firewall");
             self.client.delete_firewall(fw.id)?;
             destroyed += 1;
         }
 
-        // 3) Networks.
+        // 4) Networks.
         for net in self.refresh_networks()? {
             info!(network = %net.name, id = net.id, "destroying Hetzner network");
             self.client.delete_network(net.id)?;
             destroyed += 1;
         }
 
-        // 4) SSH keys.
+        // 5) SSH keys.
         for key in self.refresh_ssh_keys()? {
             info!(ssh_key = %key.name, id = key.id, "destroying Hetzner SSH key");
             self.client.delete_ssh_key(key.id)?;
