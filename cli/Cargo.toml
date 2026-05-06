@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.1.1"
+version      = "0.1.2"
 edition      = "2021"
 rust-version = "1.83"
 license      = "FSL-1.1-MIT"
@@ -27,6 +27,8 @@ color-eyre           = "0.6"
 assert_cmd           = "2.0"
 predicates           = "3.1"
 tempfile             = "3.10"
+ureq                 = { version = "2.10", features = ["json"] }
+mockito              = "1.5"
 
 [profile.release]
 lto         = "thin"
