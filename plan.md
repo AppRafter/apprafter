@@ -178,15 +178,29 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 0.6 DevContainer / dev-окружение 🌱
 
+**Статус:** ✅ закрыто 2026-05-06.
+
 **Цель:** контрибьютор клонирует repo и в один шаг получает всё нужное.
 
-**Поставка:**
-- [ ] `.devcontainer/devcontainer.json` с Rust toolchain, Bun, CUE, kubectl, k9s, talosctl, helm, argocd CLI, cosign.
-- [ ] `flake.nix` (или `mise.toml`) как нативная альтернатива.
-- [ ] `docs/contributing/setup.md`: «как поднять локальный k3d-кластер за 5 минут».
-- [ ] `Justfile` (или `Makefile`): таргеты `bootstrap`, `lint`, `test`, `e2e-up`, `e2e-down`.
+**Решения по ходу:**
+- Три параллельных install-пути: Nix flake (рекомендуемый), VS Code Dev Container (postCreate скачивает CUE/k3d/just/lefthook/cosign), и manual через `mise.toml` для language runtimes + ручная установка остальных. Все три ведут к одному `just bootstrap && just e2e-up`.
+- `Justfile` вместо Makefile — современный синтаксис, рекурсивные shebang-блоки для условных шагов.
+- `flake.lock` закоммичен — pinning nixpkgs revision для воспроизводимости.
 
-**Acceptance:** новый разработчик от `git clone` до `just bootstrap && just e2e-up` без чтения дополнительных доков.
+**Поставка:**
+- [x] `.devcontainer/devcontainer.json` (Rust + Node + Bun + Go + kubectl + helm + docker-in-docker через features) и `.devcontainer/post-create.sh` (CUE, k3d, just, lefthook, cosign).
+- [x] `flake.nix` — полный devShell: cue, cargo+rustc+rustfmt+clippy+rust-analyzer, bun, kubectl, k9s, helm, k3d, argocd, cilium-cli, talosctl, cosign, syft, trivy, grype, just, lefthook, age, sops, jq, git. `nix flake check` — зелёный.
+- [x] `flake.lock` — пин nixpkgs (rev 549bd84d…) и flake-utils.
+- [x] `mise.toml` — rust/bun/node/just/go (language runtimes; для остальных тулз ссылка на Nix flake / dev container).
+- [x] `Justfile` — 8 таргетов: `default`, `bootstrap`, `lint`, `fmt`, `test`, `e2e-up`, `e2e-down`, `stats`. `just --list` рендерит дерево.
+- [x] `docs/contributing/setup.md` — три install-пути, bootstrap, e2e-up/-down, common issues.
+- [x] `docs/contributing/README.md` — индекс contributor-документов.
+- [x] Корневой `README.md` дополнен секцией Quick Start.
+
+**Acceptance:**
+- ✅ `nix flake check --no-build` — зелёный (devShell + formatter эвалюируются).
+- ✅ `nix run nixpkgs#just -- --justfile Justfile --list` — выводит все 8 рецептов.
+- ✅ Контрибьютор: `git clone` → `nix develop` (или Dev Container reopen) → `just bootstrap && just e2e-up` без чтения дополнительных доков (Quick Start в корневом README покрывает базовый flow).
 
 **Размер:** S
 
@@ -1699,4 +1713,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 0.3 — ADR-шаблон + 12 ADR; 0007 переназначен на SealedSecrets/OpenBao | initial |
 | 2026-05-06 | Закрыта подфаза 0.4 — CUE-модуль `apprafter.io` + skeleton 9 CRD + lint-скрипт | initial |
 | 2026-05-06 | Закрыта подфаза 0.5 — CI workflows, GitHub meta, lefthook, SPDX/commit-msg скрипты | initial |
+| 2026-05-06 | Закрыта подфаза 0.6 — flake.nix, devcontainer, mise.toml, Justfile, contributing/setup | initial |
 

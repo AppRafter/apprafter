@@ -18,25 +18,35 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
 PATTERNS=(
+  # Schemas + examples (CUE)
   'cue.mod/module.cue'
   'schemas/**/*.cue'
   'examples/**/*.cue'
+  # Scripts
   'scripts/*.sh'
+  '.devcontainer/*.sh'
+  # Source code
   'cli/**/*.rs'
   'operator/**/*.rs'
   'providers/**/*.rs'
   'backstage-plugins/**/*.ts'
   'backstage-plugins/**/*.tsx'
+  # Platform manifests
   'manifests/**/*.yaml'
   'manifests/**/*.yml'
+  # CI / GitHub meta
   '.github/workflows/*.yml'
   '.github/workflows/*.yaml'
   '.github/ISSUE_TEMPLATE/*.yml'
   '.github/ISSUE_TEMPLATE/*.yaml'
   '.github/CODEOWNERS'
   '.github/PULL_REQUEST_TEMPLATE.md'
+  # Repo tooling
   'lefthook.yml'
   'lefthook.yaml'
+  'flake.nix'
+  'mise.toml'
+  'Justfile'
 )
 
 # Collect tracked files matching any pattern. `git ls-files` honours

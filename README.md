@@ -41,6 +41,20 @@ The dev-facing API is identical across tiers. Migrating between tiers is a platf
 | [`docs/`](./docs/)                              | TechDocs sources, ADRs, visual assets                             |
 | [`examples/`](./examples/)                      | Reference `Application`s and golden-path templates                |
 
+## Quick start
+
+```sh
+git clone <this repo>
+cd apprafter
+nix develop          # or open in VS Code Dev Container
+just bootstrap       # install local Git hooks
+just lint            # CUE + SPDX
+just e2e-up          # local k3d cluster
+```
+
+Three install paths (Nix flake, Dev Container, manual via `mise`)
+are documented in [`docs/contributing/setup.md`](./docs/contributing/setup.md).
+
 ## Status
 
 Pre-MVP. Under active development.

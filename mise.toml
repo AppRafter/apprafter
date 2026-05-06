@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+#
+# mise (https://mise.jdx.dev) configuration for the AppRafter dev
+# environment. Covers language runtimes; the full platform tool-belt
+# (CUE, kubectl, k9s, talosctl, cosign, ...) is best installed via
+# the Nix flake or the dev container — see docs/contributing/setup.md.
+
+[tools]
+rust = "stable"
+bun = "latest"
+node = "lts"   # for Backstage build tooling
+just = "latest"
+go  = "latest" # for plugins / occasional Go dependencies
+
+[env]
+APPRAFTER_DEV = "1"
+
+[settings]
+experimental = true
