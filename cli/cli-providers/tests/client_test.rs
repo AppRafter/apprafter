@@ -301,3 +301,88 @@ fn delete_network_404_is_treated_as_already_gone() {
         .delete_network(999)
         .expect("delete_network is idempotent");
 }
+
+#[test]
+fn list_firewalls_returns_filtered_list() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(
+            r#"{"firewalls":[{"id":21,"name":"f1","rules":[],"labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let resp = client.list_firewalls().expect("list_firewalls");
+    assert_eq!(resp.firewalls.len(), 1);
+    assert_eq!(resp.firewalls[0].id, 21);
+    m.assert();
+}
+
+#[test]
+fn create_firewall_posts_json_with_rules_and_returns_id() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("POST", "/v1/firewalls")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "name": "platform-1-fw",
+            "rules": [{
+                "direction": "in",
+                "port": "22",
+                "protocol": "tcp",
+                "source_ips": ["0.0.0.0/0", "::/0"]
+            }]
+        })))
+        .with_status(201)
+        .with_body(
+            r#"{"firewall":{"id":21,"name":"platform-1-fw","rules":[{"direction":"in","port":"22","protocol":"tcp","source_ips":["0.0.0.0/0","::/0"],"destination_ips":[]}],"labels":{"apprafter":"true"}}}"#,
+        )
+        .create();
+
+    use cli_providers::hetzner_cloud::{FirewallCreateRequest, FirewallRule};
+    use std::collections::BTreeMap;
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let mut labels = BTreeMap::new();
+    labels.insert("apprafter".into(), "true".into());
+    let req = FirewallCreateRequest {
+        name: "platform-1-fw".into(),
+        rules: vec![FirewallRule {
+            direction: "in".into(),
+            port: Some("22".into()),
+            protocol: "tcp".into(),
+            source_ips: vec!["0.0.0.0/0".into(), "::/0".into()],
+            destination_ips: vec![],
+            description: None,
+        }],
+        labels,
+    };
+    let resp = client.create_firewall(&req).expect("create_firewall");
+    assert_eq!(resp.firewall.id, 21);
+    m.assert();
+}
+
+#[test]
+fn delete_firewall_returns_unit_on_success() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("DELETE", "/v1/firewalls/21")
+        .with_status(204)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client.delete_firewall(21).expect("delete_firewall");
+    m.assert();
+}
+
+#[test]
+fn delete_firewall_404_is_treated_as_already_gone() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/firewalls/999")
+        .with_status(404)
+        .with_body(r#"{"error":{"code":"not_found","message":"x"}}"#)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client
+        .delete_firewall(999)
+        .expect("delete_firewall idempotent");
+}
