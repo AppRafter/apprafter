@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Higher-level resource specs: ServerSpec carries the desired
-//! server shape; SshKeySpec carries the desired Hetzner SSH-key.
-//! The provider diffs these specs against the API view.
+//! Higher-level resource specs for the Hetzner Cloud provider.
+//! Each spec is the desired shape; the provider diffs it against
+//! the API view and emits Actions.
 
 use std::collections::BTreeMap;
 
@@ -18,6 +18,35 @@ pub struct ServerSpec {
 pub struct SshKeySpec {
     pub name: String,
     pub public_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkSpec {
+    pub name: String,
+    /// e.g. "10.0.0.0/16"
+    pub ip_range: String,
+    /// e.g. "10.0.0.0/24"
+    pub subnet_ip_range: String,
+    /// Hetzner network zone (e.g. "eu-central").
+    pub network_zone: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FirewallSpec {
+    pub name: String,
+    pub rules: Vec<FirewallRuleSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FirewallRuleSpec {
+    /// "in" or "out".
+    pub direction: String,
+    /// Port number, range ("80-90"), or "any". `None` for icmp.
+    pub port: Option<String>,
+    /// "tcp", "udp", "icmp", "esp", "gre".
+    pub protocol: String,
+    pub source_ips: Vec<String>,
+    pub destination_ips: Vec<String>,
 }
 
 /// Tag every AppRafter-managed Hetzner resource with this label so

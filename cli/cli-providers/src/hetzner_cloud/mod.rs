@@ -8,7 +8,10 @@ pub mod types;
 
 pub use client::{HetznerCloudClient, DEFAULT_BASE_URL};
 pub use provider::HetznerCloudProvider;
-pub use server::{ServerSpec, SshKeySpec, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
+pub use server::{
+    FirewallRuleSpec, FirewallSpec, NetworkSpec, ServerSpec, SshKeySpec, APPRAFTER_LABEL,
+    APPRAFTER_LABEL_VALUE,
+};
 pub use types::{
     ApiErrorDetails, ApiErrorEnvelope, Firewall, FirewallCreateRequest, FirewallCreateResponse,
     FirewallListResponse, FirewallReference, FirewallRule, Network, NetworkCreateRequest,

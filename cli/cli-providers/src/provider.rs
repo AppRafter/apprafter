@@ -17,6 +17,14 @@ pub enum Action {
     CreateSshKey(String),
     /// Destroy a Hetzner Cloud SSH-key resource by id.
     DestroySshKey(u64),
+    /// Provision a Hetzner Cloud network by spec name.
+    CreateNetwork(String),
+    /// Destroy a Hetzner Cloud network by id.
+    DestroyNetwork(u64),
+    /// Provision a Hetzner Cloud firewall by spec name.
+    CreateFirewall(String),
+    /// Destroy a Hetzner Cloud firewall by id.
+    DestroyFirewall(u64),
     /// Placeholder for future actions; kept so tests can build
     /// `Plan` instances without depending on a real resource.
     Noop,
