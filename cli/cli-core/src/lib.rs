@@ -2,5 +2,6 @@
 //! Shared utilities for `platform-cli` and its sister crates.
 
 pub mod error;
+pub mod logging;
 
 pub use error::{CliError, Result};
