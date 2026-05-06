@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+[package]
+name        = "platform-cli"
+description = "AppRafter platform CLI: bootstrap and lifecycle of clusters."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "platform-cli"
+path = "src/main.rs"
+
+[dependencies]
+cli-core      = { path = "../cli-core" }
+cli-state     = { path = "../cli-state" }
+cli-providers = { path = "../cli-providers" }
+clap          = { workspace = true }
+color-eyre    = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile   = { workspace = true }

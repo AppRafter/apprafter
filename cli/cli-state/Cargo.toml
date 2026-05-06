@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+[package]
+name        = "cli-state"
+description = "Local state file (.apprafter/state.json) load/save for platform-cli."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+cli-core   = { path = "../cli-core" }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
