@@ -118,16 +118,26 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 0.4 CUE-модуль и валидация
 
+**Статус:** ✅ закрыто 2026-05-06.
+
 **Цель:** инициализировать единый CUE-модуль для всех схем платформы.
 
-**Поставка:**
-- [ ] `schemas/cue.mod/module.cue` с именем `github.com/apprafter/schemas`.
-- [ ] `schemas/k8s/` — импорт core/apps k8s типов через `cue import`.
-- [ ] `schemas/apprafter/v1alpha1/` — каркас для всех CRD (`Application`, `ServiceProvider`, `ResourceClaim`, `AccessGrant`, `MigrationPlan`, `ExternalSurface`, `Infrastructure`, `ServiceProviderPlugin`, `InfrastructureProviderPlugin`).
-- [ ] CI-таргет `cue vet ./...` и `cue fmt --check ./...`.
-- [ ] Пример валидного `Application` манифеста из §3.1 как тест-фикстура.
+**Решения по ходу:**
+- `cue.mod/` положен **в корень репо**, не в `schemas/` — стандартная CUE-практика для monorepo (один модуль, schemas + examples в нём).
+- Имя модуля — `apprafter.io` (вместо `github.com/apprafter/schemas`); короче, согласовано с `apiVersion: apprafter.io/v1alpha1`.
+- Каркас 9 CRD — skeleton с минимальным набором полей. Полные production-grade схемы (`Application` с env-overrides, `ServiceProvider` с tier-defaults, и т.д.) докручиваются в фазах 1.7 / 2.1 / 2.2 / 4.1 / 4.5 / 4.16 / 5.x.
+- `schemas/k8s/` пока пустой каталог с README — импорт upstream Kubernetes типов через `cue import` подключается в фазе 1.7, когда renderer операторa получит конкретные `Deployment`/`Service`/Gateway типы.
 
-**Acceptance:** `cue vet examples/parser.cue ./schemas/...` зелёный; неправильно типизированный пример валится с понятной ошибкой.
+**Поставка:**
+- [x] `cue.mod/module.cue` (`module: "apprafter.io"`, language v0.10.0).
+- [x] `schemas/k8s/` — placeholder с README; импорт отложен до фазы 1.7.
+- [x] `schemas/v1alpha1/` — skeleton всех 9 CRD: `Application`, `ServiceProvider`, `ResourceClaim`, `AccessGrant`, `MigrationPlan`, `ExternalSurface`, `Infrastructure`, `ServiceProviderPlugin`, `InfrastructureProviderPlugin`, плюс общий `types.cue`.
+- [x] `scripts/lint-cue.sh` — `cue fmt --check` + `cue vet` для schemas и examples; fallback на `nix run nixpkgs#cue` если нет локального бинарника.
+- [x] `examples/applications/parser.cue` — валидная фикстура (упрощённая версия §3.1).
+
+**Acceptance:**
+- ✅ `scripts/lint-cue.sh` зелёный (CUE 0.16.0 через `nix run`).
+- ✅ Невалидный пример (`replicas: "three"`, `port: "not-a-port"`, `public: "yes"`) валится с понятными сообщениями `conflicting values <wrong> and <expected> (mismatched types ...)` со ссылками на line:column в schema и в example.
 
 **Размер:** M
 
@@ -1672,4 +1682,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 0.1 — структура монорепы и README | initial |
 | 2026-05-06 | Закрыта подфаза 0.2 — LICENSE / NOTICE / SPDX-шаблон | initial |
 | 2026-05-06 | Закрыта подфаза 0.3 — ADR-шаблон + 12 ADR; 0007 переназначен на SealedSecrets/OpenBao | initial |
+| 2026-05-06 | Закрыта подфаза 0.4 — CUE-модуль `apprafter.io` + skeleton 9 CRD + lint-скрипт | initial |
 
