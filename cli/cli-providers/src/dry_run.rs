@@ -3,7 +3,7 @@
 
 use cli_core::Result;
 
-use crate::provider::{ApplyOutcome, Plan, Provider};
+use crate::provider::{ApplyOutcome, DestroyOutcome, Plan, Provider};
 
 #[derive(Debug, Default, Clone)]
 pub struct DryRunProvider;
@@ -21,5 +21,9 @@ impl Provider for DryRunProvider {
 
     fn apply(&self) -> Result<ApplyOutcome> {
         Ok(ApplyOutcome::default())
+    }
+
+    fn destroy(&self) -> Result<DestroyOutcome> {
+        Ok(DestroyOutcome::default())
     }
 }

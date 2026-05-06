@@ -3,22 +3,34 @@
 //!
 //! Built-in providers (Hetzner Cloud, Hetzner Robot, AWS) and
 //! community InfrastructureProviderPlugins both speak this trait.
-//! For phase 1.1 we ship only `DryRunProvider`; real providers
-//! arrive in phases 1.2 / 5.2 / 6.2.
 
 use cli_core::Result;
 
+/// A single declarative change a provider plans to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Provision a Hetzner Cloud server. The string carries a
+    /// human-readable identifier (e.g., the server name) for
+    /// summary output; the full spec lives in the provider.
+    CreateServer(String),
+    /// Destroy a Hetzner Cloud server by id.
+    DestroyServer(u64),
+    /// Placeholder for future actions; kept so tests can build
+    /// `Plan` instances without depending on a real resource.
+    Noop,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Plan {
-    pub changes: Vec<String>,
+    pub actions: Vec<Action>,
 }
 
 impl Plan {
     pub fn summary(&self) -> String {
-        if self.changes.is_empty() {
-            "no changes".to_string()
-        } else {
-            format!("{} change(s)", self.changes.len())
+        match self.actions.len() {
+            0 => "no changes".to_string(),
+            1 => "1 action".to_string(),
+            n => format!("{n} actions"),
         }
     }
 }
@@ -28,7 +40,13 @@ pub struct ApplyOutcome {
     pub applied: usize,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DestroyOutcome {
+    pub destroyed: usize,
+}
+
 pub trait Provider {
     fn plan(&self) -> Result<Plan>;
     fn apply(&self) -> Result<ApplyOutcome>;
+    fn destroy(&self) -> Result<DestroyOutcome>;
 }
