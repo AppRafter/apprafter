@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+#
+# Default owners for everything in this repo. Update once a real
+# team handle is established; @apprafter-authors is a placeholder
+# that does not yet exist on GitHub.
+
+*                       @apprafter-authors
+
+# Schemas, ADRs, and the project plan are decision-bearing — they
+# need extra review.
+/schemas/               @apprafter-authors
+/docs/adr/              @apprafter-authors
+/spec.md                @apprafter-authors
+/plan.md                @apprafter-authors
+
+# License surface — security/legal-sensitive.
+/LICENSE                @apprafter-authors
+/LICENSE-MIT            @apprafter-authors
+/NOTICE                 @apprafter-authors
+/providers/LICENSE      @apprafter-authors
+/backstage-plugins/LICENSE @apprafter-authors

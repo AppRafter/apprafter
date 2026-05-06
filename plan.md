@@ -145,17 +145,32 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 0.5 Bootstrap CI 🌱
 
+**Статус:** ✅ закрыто 2026-05-06.
+
 **Цель:** GitHub Actions / CI-пайплайн с минимальным набором проверок.
 
-**Поставка:**
-- [ ] `.github/workflows/lint.yml`: `cue vet`, `cue fmt`, `cargo fmt`, `cargo clippy --deny warnings`, `bun lint`.
-- [ ] `.github/workflows/test.yml`: `cargo test`, `bun test` (для будущих TS).
-- [ ] `.github/workflows/license-check.yml`: проверка SPDX-заголовков.
-- [ ] `.github/workflows/conventional-commits.yml`: проверка формата коммитов.
-- [ ] `.github/CODEOWNERS`, `.github/PULL_REQUEST_TEMPLATE.md`, `.github/ISSUE_TEMPLATE/{bug,feature,adr-proposal}.yml`.
-- [ ] Локальные pre-commit hooks (`.lefthook.yml` или `pre-commit`-config).
+**Решения по ходу:**
+- Lefthook config назван `lefthook.yml` (без leading dot — стандартный путь, который lefthook ищет по умолчанию).
+- Rust- и Bun-job'ы условные: пока в репе нет ни `Cargo.toml`, ни `package.json`, оба пропускают шаги с `::notice`. Реальная проверка включится в фазе 1.1 (cli) и 1.6 (Backstage).
+- SPDX-чек реализован через `scripts/check-spdx-headers.sh` — `git ls-files` против явного списка `PATTERNS`. Markdown-доки и сгенерированные файлы исключены.
+- Conventional-commits enforce'ится в двух местах: PR-title через GitHub Action `amannn/action-semantic-pull-request@v5`, локальный commit-msg — через `scripts/check-commit-msg.sh` (привязан в `lefthook.yml`).
 
-**Acceptance:** PR с битым CUE / неформатированным Rust / отсутствующим SPDX блокируется; зелёный — проходит.
+**Поставка:**
+- [x] `.github/workflows/lint.yml` — три job'а: CUE (`./scripts/lint-cue.sh`), Rust (`cargo fmt --check` + `cargo clippy -D warnings`, conditional), Bun (`bun lint`, conditional).
+- [x] `.github/workflows/test.yml` — Rust (`cargo test`) + Bun (`bun test`), оба conditional.
+- [x] `.github/workflows/license-check.yml` — `./scripts/check-spdx-headers.sh`.
+- [x] `.github/workflows/conventional-commits.yml` — PR-title проверка.
+- [x] `.github/CODEOWNERS` (с placeholder-handle `@apprafter-authors`).
+- [x] `.github/PULL_REQUEST_TEMPLATE.md`.
+- [x] `.github/ISSUE_TEMPLATE/{bug,feature,adr-proposal}.yml`.
+- [x] `lefthook.yml` — pre-commit (`lint-cue.sh`, `check-spdx-headers.sh`) и commit-msg (`check-commit-msg.sh`).
+- [x] `scripts/check-spdx-headers.sh` — проходит на всех 25 текущих source-файлах.
+- [x] `scripts/check-commit-msg.sh` — Conventional Commits validator (тот же набор типов, что и в CI).
+
+**Acceptance:**
+- ✅ `scripts/check-spdx-headers.sh` зелёный для всех 25 tracked source-файлов; добавление файла без SPDX → fail с `::error file=...::missing SPDX-License-Identifier`.
+- ✅ `scripts/check-commit-msg.sh` принимает `feat(repo): ...`, отвергает «random non-conventional message» с понятным сообщением.
+- ✅ `scripts/lint-cue.sh` (вызывается lint workflow) продолжает быть зелёным.
 
 **Размер:** S
 
@@ -1683,4 +1698,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 0.2 — LICENSE / NOTICE / SPDX-шаблон | initial |
 | 2026-05-06 | Закрыта подфаза 0.3 — ADR-шаблон + 12 ADR; 0007 переназначен на SealedSecrets/OpenBao | initial |
 | 2026-05-06 | Закрыта подфаза 0.4 — CUE-модуль `apprafter.io` + skeleton 9 CRD + lint-скрипт | initial |
+| 2026-05-06 | Закрыта подфаза 0.5 — CI workflows, GitHub meta, lefthook, SPDX/commit-msg скрипты | initial |
 

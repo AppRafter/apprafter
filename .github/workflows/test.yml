@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: detect
+        run: |
+          if find . -name Cargo.toml -not -path './target/*' \
+              -not -path '*/node_modules/*' | head -1 | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no Cargo.toml yet — skipping cargo test"
+          fi
+      - if: steps.detect.outputs.found == 'true'
+        run: cargo test --all --all-features
+
+  bun:
+    name: bun test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - id: detect
+        run: |
+          if find . -name package.json -not -path '*/node_modules/*' \
+              | head -1 | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no package.json yet — skipping bun test"
+          fi
+      - if: steps.detect.outputs.found == 'true'
+        run: bun install --frozen-lockfile
+      - if: steps.detect.outputs.found == 'true'
+        run: bun test

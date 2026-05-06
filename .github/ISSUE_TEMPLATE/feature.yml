@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+name: Feature request
+description: Suggest a new capability or behaviour.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user-visible problem are you solving? Who is
+        affected, and what do they currently have to do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Sketch the proposed UX / API. Concrete examples
+        beat abstract description.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: input
+    id: tier
+    attributes:
+      label: Affected tier(s)
+      placeholder: Tier 1 / Tier 2 / Tier 3 / Tier 4 / all

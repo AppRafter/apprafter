@@ -5,6 +5,8 @@ Repository-level utility scripts. Each is a standalone executable
 development. Future phase 0.6 will wire these into a Justfile;
 phase 0.5 will invoke them from CI.
 
-| Script         | Purpose                                       |
-| -------------- | --------------------------------------------- |
-| `lint-cue.sh`  | Format check and vet of all CUE files.        |
+| Script                    | Purpose                                                     |
+| ------------------------- | ----------------------------------------------------------- |
+| `lint-cue.sh`             | Format check and vet of all CUE files.                      |
+| `check-spdx-headers.sh`   | Verify SPDX-License-Identifier in tracked source files.     |
+| `check-commit-msg.sh`     | Validate Conventional Commits format for commit messages.   |

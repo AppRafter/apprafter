@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+#
+# Local Git hooks managed by lefthook (https://lefthook.dev).
+# Install with `lefthook install` after `nix run nixpkgs#lefthook --`
+# or `bun add -D lefthook && bun lefthook install`.
+
+pre-commit:
+  parallel: true
+  commands:
+    cue:
+      glob: "{cue.mod/**,schemas/**,examples/**}/*.cue"
+      run: ./scripts/lint-cue.sh
+    spdx:
+      run: ./scripts/check-spdx-headers.sh
+
+commit-msg:
+  commands:
+    conventional:
+      run: ./scripts/check-commit-msg.sh "{1}"

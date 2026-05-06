@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  cue:
+    name: CUE (fmt + vet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cue-lang/setup-cue@v1
+        with:
+          version: v0.10.0
+      - name: lint-cue.sh
+        run: ./scripts/lint-cue.sh
+
+  rust:
+    name: Rust (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Detect Cargo workspaces
+        id: detect
+        run: |
+          if find . -name Cargo.toml -not -path './target/*' -not -path '*/node_modules/*' \
+              | head -1 | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no Cargo.toml yet — skipping rustfmt/clippy"
+          fi
+      - name: cargo fmt --check
+        if: steps.detect.outputs.found == 'true'
+        run: cargo fmt --all -- --check
+      - name: cargo clippy --deny warnings
+        if: steps.detect.outputs.found == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  bun:
+    name: Bun / TypeScript (lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Detect Bun workspaces
+        id: detect
+        run: |
+          if find . -name package.json -not -path '*/node_modules/*' \
+              | head -1 | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no package.json yet — skipping bun lint"
+          fi
+      - name: bun install
+        if: steps.detect.outputs.found == 'true'
+        run: bun install --frozen-lockfile
+      - name: bun lint
+        if: steps.detect.outputs.found == 'true'
+        run: bun run lint

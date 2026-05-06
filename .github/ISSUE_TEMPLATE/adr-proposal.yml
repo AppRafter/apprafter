@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+name: ADR proposal
+description: Propose a new Architecture Decision Record.
+labels: [adr]
+body:
+  - type: input
+    id: title
+    attributes:
+      label: ADR title
+      description: One short sentence in the form "Use X instead of Y".
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Background and forces that make this decision
+        necessary. Use neutral language.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed decision
+      description: State as a clear imperative ("We will use X").
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other options on the table and why they were
+        rejected.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks
+      description: Failure modes or unknowns this decision introduces.
