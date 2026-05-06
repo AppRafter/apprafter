@@ -3,5 +3,7 @@
 
 pub mod error;
 pub mod logging;
+pub mod tier;
 
 pub use error::{CliError, Result};
+pub use tier::Tier;
