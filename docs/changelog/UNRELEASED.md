@@ -105,6 +105,14 @@ the `0.0.x` series; semver starts at 1.0.
   reverse. CLI `apply` builds default specs (10.0.0.0/16 net +
   SSH 22 / HTTPS 443 firewall, both keyed off the cluster name).
   `HetznerCloudState` caches `network_id` and `firewall_id`.
+- **CUE Infrastructure manifest parsing** (v0.1.5) — new
+  `cli-core::manifest` module mirrors the v1alpha1 Infrastructure
+  schema in typed Rust and exposes `parse_infrastructure`. The
+  CUE schema now declares optional `region`, `network` (with
+  `subnet`), `firewall.ingress`, `sshKeys`, and `osImage` fields.
+  Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
+  manifest values onto the v0.1.4 defaults; without the env var
+  the v0.1.4 behaviour is unchanged.
 
 ### Changed
 

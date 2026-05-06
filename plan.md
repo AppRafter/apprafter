@@ -344,8 +344,13 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `HetznerCloudState.{network_id,firewall_id}` cache.
 - [x] CLI `apply` строит дефолтные `NetworkSpec` (10.0.0.0/16 + 10.0.0.0/24 в `eu-central`) и `FirewallSpec` (SSH 22 + HTTPS 443 ingress) из имени кластера.
 
+**Поставка (CUE Infrastructure parsing, v0.1.5):**
+- [x] CUE schema `Infrastructure` расширена optional полями (`region`, `network` с `subnet`, `firewall.ingress`, `sshKeys`, `osImage`).
+- [x] `examples/infrastructure/tier-1-hetzner.cue` — полный пример (network 10.0.0.0/16 + subnet eu-central + SSH/HTTPS ingress + osImage).
+- [x] `cli-core::manifest` модуль — `InfrastructureManifest` типы и `parse_infrastructure(workdir, path)` через `cue::export_in`.
+- [x] `apply.rs`: при `APPRAFTER_MANIFEST=<path>` читает manifest и накладывает на v0.1.4-дефолты (server_type, image, network/subnet/zone, firewall rules, ssh keys). Без env var поведение v0.1.4 не изменилось.
+
 **Поставка (отложено в 1.2.x циклы):**
-- [ ] `kind: Infrastructure` CUE→Spec parsing (полный маршрут вместо хардкода defaults) — `v0.1.5`.
 - [ ] floatingIP — `v0.1.6`.
 - [ ] `platform-cli import` — `v0.1.7`.
 - [ ] Полное закрытие 1.2 в `plan.md` — после `v0.1.7`.
@@ -1804,4 +1809,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | 1.2 (server-CRUD ветка) — `HetznerCloudProvider` (apply/destroy/idempotent CX22); v0.1.2 | initial |
 | 2026-05-06 | 1.2 (SSH-keys ветка) — `HetznerCloudProvider.ssh_keys` + APPRAFTER_SSH_PUBLIC_KEY; v0.1.3 | initial |
 | 2026-05-06 | 1.2 (Network + Firewall ветка) — default 10.0.0.0/16 net + SSH/HTTPS firewall, server attached; v0.1.4 | initial |
+| 2026-05-06 | 1.2 (CUE Infrastructure parsing ветка) — APPRAFTER_MANIFEST overlays defaults; v0.1.5 | initial |
 
