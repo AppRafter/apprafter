@@ -1,0 +1,52 @@
+AppRafter — Licensing Notice
+============================
+
+The AppRafter platform core is licensed under the Functional Source License
+v1.1 with MIT Future License (SPDX: FSL-1.1-MIT). See LICENSE for the full
+text.
+
+How the Future License conversion works
+---------------------------------------
+
+Each release of the platform core is published under FSL-1.1-MIT. On the
+second anniversary of the date a given release is made available, that
+release converts to the MIT License. The MIT text used by the conversion is
+reproduced verbatim in LICENSE-MIT for transparency.
+
+In practice this means:
+
+  - Active development always lives under FSL-1.1-MIT.
+  - Each release has a fixed expiry: two years to MIT.
+  - The most recent release is always at most two years away from being
+    plain MIT — even if upstream development stops, the codebase eventually
+    becomes fully OSI-open.
+
+Plugins
+-------
+
+First-party and community plugins under providers/, backstage-plugins/, and
+the InfrastructureProviderPlugin / ServiceProviderPlugin SDKs are licensed
+under the MIT License from day one (no FSL window). Each such directory
+carries its own LICENSE file.
+
+Why FSL-1.1-MIT?
+----------------
+
+The FSL Permitted-Purpose clause restricts other parties from offering the
+platform as a competing managed service while it is under active
+development. After two years, that protection naturally relaxes as the
+release converts to MIT. This approach follows the model adopted by Sentry
+in 2023 and provides a single, well-understood license to communicate.
+
+Third-party components
+----------------------
+
+This repository's dependencies retain their respective licenses. See the
+individual Cargo.toml / package.json / go.mod files for component-level
+licensing.
+
+Trademarks
+----------
+
+"AppRafter" is a project codename. No trademark rights are granted by
+either the FSL or the MIT license. See the Trademarks clause in LICENSE.

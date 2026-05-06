@@ -47,4 +47,4 @@ Pre-MVP. Under active development.
 
 ## License
 
-Platform core — **FSL-1.1-MIT** (Functional Source License → MIT after 2 years, modeled on Sentry). Plugins (`providers/*`, `backstage-plugins/*`, community SDKs) — **MIT**. See `LICENSE` and `docs/adr/0001-license-fsl-1-1-mit.md`.
+Platform core — **FSL-1.1-MIT** (Functional Source License → MIT after 2 years, modeled on Sentry). Plugins (`providers/*`, `backstage-plugins/*`, community SDKs) — **MIT** from day one. See [`LICENSE`](./LICENSE), [`LICENSE-MIT`](./LICENSE-MIT), and [`NOTICE`](./NOTICE).
