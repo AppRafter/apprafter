@@ -218,3 +218,86 @@ fn delete_ssh_key_404_is_treated_as_already_gone() {
         .delete_ssh_key(9999)
         .expect("delete should be idempotent");
 }
+
+#[test]
+fn list_networks_returns_filtered_list() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("GET", "/v1/networks")
+        .match_header("Authorization", "Bearer test-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"networks":[{"id":11,"name":"n1","ip_range":"10.0.0.0/16","subnets":[],"labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let resp = client.list_networks().expect("list_networks");
+    assert_eq!(resp.networks.len(), 1);
+    assert_eq!(resp.networks[0].id, 11);
+    m.assert();
+}
+
+#[test]
+fn create_network_posts_json_with_subnet_and_returns_id() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("POST", "/v1/networks")
+        .match_header("Content-Type", "application/json")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "name": "platform-1-net",
+            "ip_range": "10.0.0.0/16",
+            "subnets": [{"type":"cloud","ip_range":"10.0.0.0/24","network_zone":"eu-central"}]
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"network":{"id":11,"name":"platform-1-net","ip_range":"10.0.0.0/16","subnets":[{"type":"cloud","ip_range":"10.0.0.0/24","network_zone":"eu-central"}],"labels":{"apprafter":"true"}}}"#,
+        )
+        .create();
+
+    use cli_providers::hetzner_cloud::{NetworkCreateRequest, Subnet};
+    use std::collections::BTreeMap;
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let mut labels = BTreeMap::new();
+    labels.insert("apprafter".into(), "true".into());
+    let req = NetworkCreateRequest {
+        name: "platform-1-net".into(),
+        ip_range: "10.0.0.0/16".into(),
+        subnets: vec![Subnet {
+            kind: "cloud".into(),
+            ip_range: "10.0.0.0/24".into(),
+            network_zone: "eu-central".into(),
+        }],
+        labels,
+    };
+    let resp = client.create_network(&req).expect("create_network");
+    assert_eq!(resp.network.id, 11);
+    m.assert();
+}
+
+#[test]
+fn delete_network_returns_unit_on_success() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("DELETE", "/v1/networks/11")
+        .with_status(204)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client.delete_network(11).expect("delete_network");
+    m.assert();
+}
+
+#[test]
+fn delete_network_404_is_treated_as_already_gone() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/networks/999")
+        .with_status(404)
+        .with_body(r#"{"error":{"code":"not_found","message":"x"}}"#)
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client
+        .delete_network(999)
+        .expect("delete_network is idempotent");
+}

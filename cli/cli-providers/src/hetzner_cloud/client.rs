@@ -101,6 +101,108 @@ impl HetznerCloudClient {
         }
     }
 
+    pub fn list_networks(&self) -> Result<super::types::NetworkListResponse> {
+        let endpoint = self.endpoint("/networks");
+        let resp = ureq::get(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::NetworkListResponse>()
+                .map_err(|e| CliError::Other(format!("parse list_networks response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("GET {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
+    pub fn create_network(
+        &self,
+        req: &super::types::NetworkCreateRequest,
+    ) -> Result<super::types::NetworkCreateResponse> {
+        let endpoint = self.endpoint("/networks");
+        let resp = ureq::post(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_json(req);
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::NetworkCreateResponse>()
+                .map_err(|e| CliError::Other(format!("parse create_network response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("POST {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
+    pub fn delete_network(&self, id: u64) -> Result<()> {
+        let endpoint = self.endpoint(&format!("/networks/{id}"));
+        let resp = ureq::delete(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("DELETE {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
     pub fn delete_ssh_key(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/ssh_keys/{id}"));
         let resp = ureq::delete(&endpoint)
