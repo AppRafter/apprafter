@@ -793,8 +793,8 @@ platform-cli login
 - [x] Tier model defined
 - [x] Initial CUE schemas drafted
 - [x] Codename chosen
-- [ ] Repository structure defined
-- [ ] License chosen (candidates: MPL-2.0, Apache-2.0)
+- [x] Repository structure defined
+- [x] License chosen (FSL-1.1-MIT for core, MIT for plugins; see ADR 0001)
 
 ### Milestone M1 — MVP single-node
 

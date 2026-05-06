@@ -245,13 +245,21 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 0.8 Закрытие чек-листа M0 spec
 
+**Статус:** ✅ закрыто 2026-05-06.
+
 **Цель:** обновить `spec.md` §6 (M0): зачеркнуть «Repository structure defined» и «License chosen».
 
-**Поставка:**
-- [ ] PR, помечающий пункты в spec.md как `[x]`.
-- [ ] Запись в `docs/changelog/UNRELEASED.md`.
+**Решения по ходу:**
+- Версия не `v0.0.0-foundations` (как было в первоначальной редакции плана), а `v0.0.8` — в соответствии с патч-нумерацией, которой мы ведём всю Phase 0 (по решению пользователя «начнём с 0.0.1 и пойдём по патч-версиям»).
+- License-комментарий в spec.md переписан с «candidates: MPL-2.0, Apache-2.0» на «FSL-1.1-MIT for core, MIT for plugins; see ADR 0001» — фактическое решение.
 
-**Acceptance:** spec.md M0 полностью закрыт; tag `v0.0.0-foundations`.
+**Поставка:**
+- [x] `spec.md` §6 M0 — оба оставшихся пункта переведены в `[x]`.
+- [x] `docs/changelog/UNRELEASED.md` — Keep a Changelog v1.1 формат, секция Phase 0 (v0.0.1 → v0.0.8) с Added/Changed.
+
+**Acceptance:**
+- ✅ spec.md M0 полностью закрыт.
+- ✅ Tag `v0.0.8` (заменяет упомянутый в исходном плане `v0.0.0-foundations`).
 
 **Размер:** XS
 
@@ -1737,4 +1745,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 0.5 — CI workflows, GitHub meta, lefthook, SPDX/commit-msg скрипты | initial |
 | 2026-05-06 | Закрыта подфаза 0.6 — flake.nix, devcontainer, mise.toml, Justfile, contributing/setup | initial |
 | 2026-05-06 | Закрыта подфаза 0.7 — mkdocs-skeleton, governance файлы, docs-serve/-build таргеты | initial |
+| 2026-05-06 | Закрыта подфаза 0.8 — spec.md M0 полностью закрыт, UNRELEASED changelog заведён | initial |
 
