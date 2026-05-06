@@ -78,6 +78,8 @@ pub fn run() -> Result<()> {
             server_id: server.id,
             server_name: server.name,
             ssh_key_ids: key_ids,
+            network_id: None,
+            firewall_id: None,
         });
         state.save(&paths)?;
     }

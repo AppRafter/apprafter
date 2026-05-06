@@ -51,6 +51,10 @@ pub struct HetznerCloudState {
     pub server_name: String,
     #[serde(default)]
     pub ssh_key_ids: Vec<u64>,
+    #[serde(default)]
+    pub network_id: Option<u64>,
+    #[serde(default)]
+    pub firewall_id: Option<u64>,
 }
 
 impl State {

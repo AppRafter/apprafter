@@ -56,6 +56,8 @@ fn hetzner_cloud_state_round_trips_through_save_load() {
             server_id: 12345,
             server_name: "platform-1".into(),
             ssh_key_ids: vec![],
+            network_id: None,
+            firewall_id: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -77,6 +79,31 @@ fn hetzner_cloud_state_carries_ssh_key_ids() {
             server_id: 42,
             server_name: "platform-1".into(),
             ssh_key_ids: vec![7, 9],
+            network_id: None,
+            firewall_id: None,
+        }),
+    };
+    original.save(&paths).unwrap();
+    let reloaded = State::load_or_default(&paths).unwrap();
+    assert_eq!(reloaded, original);
+}
+
+#[test]
+fn hetzner_cloud_state_carries_network_and_firewall_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StatePaths::for_root(dir.path());
+
+    let original = State {
+        cluster_name: Some("solo-1".into()),
+        tier: Some(Tier::Solo),
+        provider: Some("hetzner-cloud".into()),
+        region: Some("nbg1".into()),
+        hetzner_cloud: Some(cli_state::HetznerCloudState {
+            server_id: 42,
+            server_name: "platform-1".into(),
+            ssh_key_ids: vec![7],
+            network_id: Some(11),
+            firewall_id: Some(21),
         }),
     };
     original.save(&paths).unwrap();
