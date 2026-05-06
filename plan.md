@@ -208,14 +208,36 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 0.7 Базовый docs-skeleton
 
+**Статус:** ✅ закрыто 2026-05-06.
+
 **Цель:** заготовка под TechDocs (M7), сейчас — навигационный каркас.
 
-**Поставка:**
-- [ ] `docs/index.md`, `docs/architecture/`, `docs/concepts/`, `docs/operator-guide/`, `docs/dev-guide/`, `docs/reference/` с stub-страницами.
-- [ ] `mkdocs.yml` (TechDocs-совместимый) и preview-таргет в Justfile.
-- [ ] CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md, GOVERNANCE.md (минимум — кто решает архитектурные споры).
+**Решения по ходу:**
+- `docs/README.md` (Phase 0.1) удалён — конфликтовал с `docs/index.md` и блокировал mkdocs strict mode. Содержимое перенесено в `docs/index.md` (mkdocs landing page).
+- mkdocs `exclude_docs` исключает `superpowers/` (локальный gitignored каталог, который физически виден mkdocs на диске).
+- `validation.nav.omitted_files: info` — ADR-страницы доступны по URL, но не дублируются в боковом nav (одной ссылкой «ADRs» → `adr/README.md` достаточно).
+- mkdocs-material в `flake.nix` (вместе с базовым mkdocs) — `nix develop` сразу даёт `mkdocs serve/build`.
+- В `Justfile` добавлены `docs-serve` (live preview) и `docs-build` (strict).
 
-**Acceptance:** `just docs-serve` локально открывает сайт; навигация согласована с разделами spec.
+**Поставка:**
+- [x] `docs/index.md` — landing page с tier-таблицей и ссылками на разделы.
+- [x] `docs/architecture/index.md` — stub, ссылки на §2/§4 spec.md.
+- [x] `docs/concepts/index.md` — stub, таблица §3-объектов и порядок чтения.
+- [x] `docs/operator-guide/index.md` — stub.
+- [x] `docs/dev-guide/index.md` — stub.
+- [x] `docs/reference/index.md` — stub.
+- [x] `mkdocs.yml` с Material theme, plugins (search), pymdownx-расширениями и валидной nav.
+- [x] `CONTRIBUTING.md` (root) — entry point для новых контрибьюторов.
+- [x] `CODE_OF_CONDUCT.md` — Contributor Covenant 2.1.
+- [x] `SECURITY.md` — disclosure policy.
+- [x] `GOVERNANCE.md` — роли и decision-making (lazy consensus + ADR-process).
+- [x] `Justfile` — таргеты `docs-serve`, `docs-build`.
+- [x] `flake.nix` дополнен `python3Packages.mkdocs-material`.
+- [x] `.gitignore` дополнен `site/`.
+
+**Acceptance:**
+- ✅ `mkdocs build --strict` (через `nix-shell -p (python3.withPackages [mkdocs mkdocs-material])`) — зелёный, 0 warnings, build за 0.39 s.
+- ✅ Навигация согласована со spec: Architecture/Concepts/Operator/Dev/Reference + Contributing + ADRs соответствуют §2/§3/§4/§7/§8.
 
 **Размер:** S
 
@@ -1714,4 +1736,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Закрыта подфаза 0.4 — CUE-модуль `apprafter.io` + skeleton 9 CRD + lint-скрипт | initial |
 | 2026-05-06 | Закрыта подфаза 0.5 — CI workflows, GitHub meta, lefthook, SPDX/commit-msg скрипты | initial |
 | 2026-05-06 | Закрыта подфаза 0.6 — flake.nix, devcontainer, mise.toml, Justfile, contributing/setup | initial |
+| 2026-05-06 | Закрыта подфаза 0.7 — mkdocs-skeleton, governance файлы, docs-serve/-build таргеты | initial |
 

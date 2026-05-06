@@ -81,6 +81,27 @@ e2e-up:
 e2e-down:
     k3d cluster delete apprafter-dev
 
+# Serve the TechDocs site locally for preview.
+docs-serve:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v mkdocs >/dev/null 2>&1; then
+        mkdocs serve
+    else
+        echo "mkdocs not on PATH; running via Nix..."
+        nix shell nixpkgs#python3Packages.mkdocs-material -c mkdocs serve
+    fi
+
+# Build the TechDocs site (output to ./site/).
+docs-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v mkdocs >/dev/null 2>&1; then
+        mkdocs build --strict
+    else
+        nix shell nixpkgs#python3Packages.mkdocs-material -c mkdocs build --strict
+    fi
+
 # Quick repo statistics — lines of code per language.
 stats:
     @echo "Lines of code (tracked source files):"

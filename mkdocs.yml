@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+site_name: AppRafter
+site_description: Opinionated, vertically-integrated PaaS on Kubernetes
+site_url: https://apprafter.dev/docs
+docs_dir: docs
+
+repo_url: https://github.com/apprafter/apprafter
+edit_uri: edit/main/docs/
+
+# Local-only artefacts (gitignored) physically present in docs/
+# during development. Skip them at build time.
+exclude_docs: |
+  superpowers/
+
+# Tone down the "page exists but not in nav" message for ADR pages
+# we deliberately keep accessible by URL only — the ADR index is
+# linked from nav as a single page.
+validation:
+  nav:
+    omitted_files: info
+    not_found: warn
+    absolute_links: ignore
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Architecture: architecture/index.md
+  - Concepts: concepts/index.md
+  - Operator Guide: operator-guide/index.md
+  - Developer Guide: dev-guide/index.md
+  - Reference: reference/index.md
+  - Contributing:
+      - Setup: contributing/setup.md
+      - License Headers: contributing/license-headers.md
+  - ADRs: adr/README.md

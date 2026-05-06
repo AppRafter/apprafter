@@ -26,6 +26,9 @@ target/
 # CUE
 cue.out/
 
+# MkDocs build output
+site/
+
 # OS artefacts
 .DS_Store
 Thumbs.db

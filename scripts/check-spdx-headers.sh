@@ -47,6 +47,7 @@ PATTERNS=(
   'flake.nix'
   'mise.toml'
   'Justfile'
+  'mkdocs.yml'
 )
 
 # Collect tracked files matching any pattern. `git ls-files` honours

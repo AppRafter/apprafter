@@ -60,6 +60,9 @@
             sops
             jq
             git
+
+            # Documentation site (TechDocs / mkdocs-material).
+            python3Packages.mkdocs-material
           ];
 
           shellHook = ''
