@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
-    HetznerCloudClient, HetznerCloudProvider, ServerSpec, DEFAULT_BASE_URL,
+    HetznerCloudClient, HetznerCloudProvider, ServerSpec, SshKeySpec, DEFAULT_BASE_URL,
 };
 use cli_providers::Provider;
 use cli_state::{HetznerCloudState, State, StatePaths};
@@ -35,6 +35,19 @@ pub fn run() -> Result<()> {
         .unwrap_or_else(|| "platform-1".into());
     let region = state.region.clone().unwrap_or_else(|| "nbg1".into());
 
+    // Optional SSH key from env. If APPRAFTER_SSH_PUBLIC_KEY is
+    // present, the server boots attached to that key (no root pwd).
+    let ssh_keys = match std::env::var("APPRAFTER_SSH_PUBLIC_KEY") {
+        Ok(public_key) => {
+            tracing::info!(cluster = %cluster, "configuring SSH key from env");
+            vec![SshKeySpec {
+                name: format!("{cluster}-key"),
+                public_key,
+            }]
+        }
+        Err(_) => Vec::new(),
+    };
+
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
         spec: ServerSpec {
@@ -44,6 +57,7 @@ pub fn run() -> Result<()> {
             location: region,
             labels: BTreeMap::new(),
         },
+        ssh_keys,
     };
 
     let outcome = provider.apply()?;
@@ -51,11 +65,19 @@ pub fn run() -> Result<()> {
 
     // Persist the server we just created (or confirmed) so future
     // applies / destroys see it.
-    let live = provider.client.list_servers()?;
-    if let Some(server) = live.servers.into_iter().find(|s| s.name == cluster) {
+    let live_servers = provider.client.list_servers()?;
+    let live_keys = provider.client.list_ssh_keys()?;
+    if let Some(server) = live_servers.servers.into_iter().find(|s| s.name == cluster) {
+        let key_ids: Vec<u64> = live_keys
+            .ssh_keys
+            .iter()
+            .filter(|k| k.labels.get("apprafter").map(String::as_str) == Some("true"))
+            .map(|k| k.id)
+            .collect();
         state.hetzner_cloud = Some(HetznerCloudState {
             server_id: server.id,
             server_name: server.name,
+            ssh_key_ids: key_ids,
         });
         state.save(&paths)?;
     }

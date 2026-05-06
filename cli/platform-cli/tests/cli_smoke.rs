@@ -128,6 +128,32 @@ fn upgrade_tier_prints_target() {
 }
 
 #[test]
+fn apply_with_ssh_public_key_env_still_requires_token() {
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ])
+        .assert()
+        .success();
+    cli()
+        .current_dir(dir.path())
+        .env_remove("HCLOUD_TOKEN")
+        .env("APPRAFTER_SSH_PUBLIC_KEY", "ssh-ed25519 AAAA")
+        .arg("apply")
+        .assert()
+        .failure()
+        .stderr(contains("HCLOUD_TOKEN"));
+}
+
+#[test]
 fn destroy_with_empty_state_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     cli()

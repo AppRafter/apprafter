@@ -52,6 +52,7 @@ fn create_then_destroy_real_cx22() {
             location: "nbg1".into(),
             labels,
         },
+        ssh_keys: vec![],
     };
 
     // First apply: should create.

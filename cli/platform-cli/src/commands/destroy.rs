@@ -59,6 +59,8 @@ pub fn run(yes: bool) -> Result<()> {
             location: region,
             labels: BTreeMap::new(),
         },
+        // destroy() reads live state from the API; no spec needed.
+        ssh_keys: Vec::new(),
     };
 
     let outcome = provider.destroy()?;
