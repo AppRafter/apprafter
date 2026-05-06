@@ -34,3 +34,14 @@ fn plan_summary_pluralises() {
     };
     assert_eq!(p2.summary(), "2 actions");
 }
+
+#[test]
+fn plan_summary_handles_mixed_actions() {
+    let p = Plan {
+        actions: vec![
+            Action::CreateSshKey("k".into()),
+            Action::CreateServer("s".into()),
+        ],
+    };
+    assert_eq!(p.summary(), "2 actions");
+}

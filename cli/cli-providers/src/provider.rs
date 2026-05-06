@@ -9,12 +9,14 @@ use cli_core::Result;
 /// A single declarative change a provider plans to make.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Provision a Hetzner Cloud server. The string carries a
-    /// human-readable identifier (e.g., the server name) for
-    /// summary output; the full spec lives in the provider.
+    /// Provision a Hetzner Cloud server.
     CreateServer(String),
     /// Destroy a Hetzner Cloud server by id.
     DestroyServer(u64),
+    /// Provision a Hetzner Cloud SSH-key resource by spec name.
+    CreateSshKey(String),
+    /// Destroy a Hetzner Cloud SSH-key resource by id.
+    DestroySshKey(u64),
     /// Placeholder for future actions; kept so tests can build
     /// `Plan` instances without depending on a real resource.
     Noop,

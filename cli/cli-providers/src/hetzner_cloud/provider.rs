@@ -68,8 +68,12 @@ impl Provider for HetznerCloudProvider {
                     info!(server = %name, id = resp.server.id, "server created");
                     applied += 1;
                 }
-                Action::DestroyServer(_) | Action::Noop => {
-                    // Plan() never emits these for apply.
+                Action::CreateSshKey(_)
+                | Action::DestroyServer(_)
+                | Action::DestroySshKey(_)
+                | Action::Noop => {
+                    // Plan() never emits these here in this match;
+                    // SSH-key handling is wired up in Task 6.
                 }
             }
         }
