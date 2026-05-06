@@ -133,3 +133,23 @@ fn delete_server_404_is_treated_as_already_gone() {
         .delete_server(99999)
         .expect("delete should be idempotent");
 }
+
+#[test]
+fn list_ssh_keys_returns_filtered_list() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("GET", "/v1/ssh_keys")
+        .match_header("Authorization", "Bearer test-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"ssh_keys":[{"id":7,"name":"k1","public_key":"ssh-ed25519 AAAA","fingerprint":"a","labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let resp = client.list_ssh_keys().expect("list_ssh_keys");
+    assert_eq!(resp.ssh_keys.len(), 1);
+    assert_eq!(resp.ssh_keys[0].id, 7);
+    m.assert();
+}
