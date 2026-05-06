@@ -87,7 +87,14 @@ the `0.0.x` series; semver starts at 1.0.
   enum (`CreateServer`, `DestroyServer`, `Noop`); `Plan.changes`
   → `Plan.actions: Vec<Action>`.
 - **`HetznerCloudState`** — `cli-state` carries `server_id` +
-  `server_name` for the managed server.
+  `server_name` for the managed server (extended with
+  `ssh_key_ids` in v0.1.3).
+- **SSH-keys for Hetzner Cloud** (v0.1.3) — `HetznerCloudClient`
+  list/create/delete ssh-keys; `Action::CreateSshKey/DestroySshKey`;
+  `SshKeySpec`; `HetznerCloudProvider.ssh_keys` with ordered
+  apply (ssh → server) and destroy (server → ssh); CLI `apply`
+  reads `APPRAFTER_SSH_PUBLIC_KEY` from env; `HetznerCloudState`
+  caches `ssh_key_ids`.
 
 ### Changed
 

@@ -45,13 +45,16 @@ Most commands still print `would …` stubs; only `apply` and
 
 ```sh
 export HCLOUD_TOKEN=...   # https://docs.hetzner.cloud/#getting-started
+# Optional: SSH-key boot (server skips the random root password).
+export APPRAFTER_SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
 cd cli
 cargo run --bin platform-cli -- init --provider hetzner-cloud --tier solo --region nbg1
 cargo run --bin platform-cli -- apply
 cargo run --bin platform-cli -- destroy --yes
 ```
 
-The first `apply` provisions one CX22; the second is a no-op
+The first `apply` provisions one CX22 (and an SSH-key resource if
+`APPRAFTER_SSH_PUBLIC_KEY` is set); the second is a no-op
 (idempotent). `destroy` requires the `--yes` flag.
 
 Run the real-Hetzner integration test manually:

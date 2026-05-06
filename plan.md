@@ -326,12 +326,20 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `examples/infrastructure/tier-1-hetzner.cue` фикстура.
 - [x] `#[ignore]`-тагнутый e2e-тест против реального Hetzner.
 
-**Поставка (отложено в 1.2.x циклы, оригинальные пункты plan.md):**
-- [ ] Network, firewall, SSH key — `v0.1.3`.
-- [ ] floatingIP — `v0.1.4`.
-- [ ] `kind: Infrastructure` CUE→Spec parsing (полный маршрут вместо хардкода) — `v0.1.3`.
-- [ ] `platform-cli import` — `v0.1.5`.
-- [ ] Полное закрытие 1.2 в `plan.md` — после `v0.1.5`.
+**Поставка (SSH-keys, v0.1.3):**
+- [x] `HetznerCloudClient` методы для SSH-keys: list / create / delete.
+- [x] `Action::CreateSshKey` / `DestroySshKey`, `SshKeySpec`.
+- [x] `ServerCreateRequest.ssh_keys` (`Option<Vec<u64>>`, serde-skip).
+- [x] `HetznerCloudProvider.ssh_keys: Vec<SshKeySpec>` — refresh + idempotent create + ordered apply (ssh-keys → server) + ordered destroy (server → ssh-keys).
+- [x] `HetznerCloudState.ssh_key_ids` cache (back-compat через `#[serde(default)]`).
+- [x] `apply` читает `APPRAFTER_SSH_PUBLIC_KEY` env: при наличии — boot с SSH-key (без root-password).
+
+**Поставка (отложено в 1.2.x циклы):**
+- [ ] Network + firewall — `v0.1.4`.
+- [ ] `kind: Infrastructure` CUE→Spec parsing (полный маршрут вместо хардкода cluster-name) — `v0.1.5`.
+- [ ] floatingIP — `v0.1.6`.
+- [ ] `platform-cli import` — `v0.1.7`.
+- [ ] Полное закрытие 1.2 в `plan.md` — после `v0.1.7`.
 
 **Acceptance (v0.1.2):**
 - ✅ `platform-cli apply` (с валидным state + `HCLOUD_TOKEN`) поднимает 1× CX22.
@@ -341,7 +349,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 **Зависит от:** 1.1
 
-**Размер:** L (разбит на 4 цикла, текущий — 1 из 4)
+**Размер:** L (разбит на 5 циклов: server-CRUD `v0.1.2` ✅, SSH-keys `v0.1.3` ✅, network+firewall `v0.1.4`, CUE-parsing `v0.1.5`, floatingIP `v0.1.6`, import `v0.1.7`)
 
 ---
 
@@ -1785,4 +1793,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | Phase 1 стартовал — версия `0.1.x` (минор=фаза, патч=подфаза) | initial |
 | 2026-05-06 | Закрыта подфаза 1.1 — Cargo workspace `cli/` + skeleton subcommands; v0.1.1 | initial |
 | 2026-05-06 | 1.2 (server-CRUD ветка) — `HetznerCloudProvider` (apply/destroy/idempotent CX22); v0.1.2 | initial |
+| 2026-05-06 | 1.2 (SSH-keys ветка) — `HetznerCloudProvider.ssh_keys` + APPRAFTER_SSH_PUBLIC_KEY; v0.1.3 | initial |
 
