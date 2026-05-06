@@ -113,6 +113,19 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **Floating IPs for Hetzner Cloud** (v0.1.6) —
+  `HetznerCloudClient` list/create/delete floating IPs (404
+  idempotent on delete); two new `Action` variants
+  (`CreateFloatingIp`, `DestroyFloatingIp`); `FloatingIpSpec`.
+  `HetznerCloudProvider.floating_ips` applies after the server
+  exists (so each IP is reserved with `server` already attached)
+  and destroys first (so detach completes before the server is
+  removed). `HetznerCloudState` caches `floating_ip_ids`. The
+  `network.floatingIPs: [...string]` CUE field — reserved in
+  v0.1.5 — is now wired end-to-end: each name is prefixed with
+  the cluster name on the provider side, the IP type defaults to
+  `ipv4`, and `home_location` follows the cluster region. The
+  example fixture declares `floatingIPs: ["egress"]`.
 
 ### Changed
 

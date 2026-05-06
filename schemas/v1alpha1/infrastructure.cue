@@ -6,9 +6,10 @@ package v1alpha1
 // (provider, nodes, network, firewall, OS image). Applied by
 // `platform-cli`. See spec.md §3.7 and phase 1.2 / 5.2 / 6.2.
 //
-// Skeleton schema. Network / firewall / SSH-key fields are
-// optional and read by the v0.1.5 manifest parser; the v1alpha1
-// CRD admission webhook (phase 1.7) tightens validation later.
+// Skeleton schema. Network / firewall / SSH-key / floating-IP
+// fields are optional and read by the v0.1.5+ manifest parser;
+// the v1alpha1 CRD admission webhook (phase 1.7) tightens
+// validation later.
 #Infrastructure: {
 	#TypeMeta
 	kind:     "Infrastructure"
@@ -38,7 +39,9 @@ package v1alpha1
 				ip_range?: string
 				zone?:     string
 			}
-			// Floating IPs for static egress. Reserved for v0.1.6.
+			// Floating IPs for static egress. Each entry is a short
+			// name (e.g. "egress"); the CLI prefixes it with the
+			// cluster name on the provider side. Wired by v0.1.6.
 			floatingIPs?: [...string]
 		}
 

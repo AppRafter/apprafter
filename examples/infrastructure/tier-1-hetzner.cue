@@ -21,6 +21,7 @@ infra: v1alpha1.#Infrastructure & {
 				ip_range: "10.0.0.0/24"
 				zone:     "eu-central"
 			}
+			floatingIPs: ["egress"]
 		}
 		firewall: {
 			ingress: [

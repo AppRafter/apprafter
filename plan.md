@@ -350,8 +350,17 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `cli-core::manifest` модуль — `InfrastructureManifest` типы и `parse_infrastructure(workdir, path)` через `cue::export_in`.
 - [x] `apply.rs`: при `APPRAFTER_MANIFEST=<path>` читает manifest и накладывает на v0.1.4-дефолты (server_type, image, network/subnet/zone, firewall rules, ssh keys). Без env var поведение v0.1.4 не изменилось.
 
+**Поставка (Floating IP, v0.1.6):**
+- [x] `HetznerCloudClient` методы для Floating IPs: list / create / delete (404-idempotent).
+- [x] Wire-types `FloatingIp`, `FloatingIpListResponse`, `FloatingIpCreateRequest`/`Response`, `HomeLocation`.
+- [x] `Action::CreateFloatingIp` / `DestroyFloatingIp`, `FloatingIpSpec`.
+- [x] `HetznerCloudProvider.floating_ips` — refresh + idempotent create + ordered apply (ssh → net → fw → server → fip с `server` атрибутом сразу при создании) + ordered destroy (fip → server → fw → net → ssh).
+- [x] `HetznerCloudState.floating_ip_ids` cache (back-compat через `#[serde(default)]`).
+- [x] CUE schema: `network.floatingIPs: [...string]` (оставалось зарезервированным с v0.1.5).
+- [x] CLI `apply` читает `network.floatingIPs` из manifest, префиксует имена кластером и передаёт как `FloatingIpSpec` (`ipv4`, `home_location = region`).
+- [x] `examples/infrastructure/tier-1-hetzner.cue` — `floatingIPs: ["egress"]`.
+
 **Поставка (отложено в 1.2.x циклы):**
-- [ ] floatingIP — `v0.1.6`.
 - [ ] `platform-cli import` — `v0.1.7`.
 - [ ] Полное закрытие 1.2 в `plan.md` — после `v0.1.7`.
 
@@ -363,7 +372,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 **Зависит от:** 1.1
 
-**Размер:** L (разбит на 5 циклов: server-CRUD `v0.1.2` ✅, SSH-keys `v0.1.3` ✅, network+firewall `v0.1.4`, CUE-parsing `v0.1.5`, floatingIP `v0.1.6`, import `v0.1.7`)
+**Размер:** L (разбит на 6 циклов: server-CRUD `v0.1.2` ✅, SSH-keys `v0.1.3` ✅, network+firewall `v0.1.4` ✅, CUE-parsing `v0.1.5` ✅, floatingIP `v0.1.6` ✅, import `v0.1.7`)
 
 ---
 

@@ -65,8 +65,15 @@ cargo run --bin platform-cli -- destroy --yes
 10.0.0.0/24 cloud subnet in `eu-central`), one firewall (SSH 22 +
 HTTPS 443 inbound), and one CX22 server attached to both. The
 second `apply` is a no-op (idempotent). `destroy` requires
-`--yes` and tears everything down (server → firewall → network →
-SSH key).
+`--yes` and tears everything down (floating IPs → server →
+firewall → network → SSH key).
+
+If the manifest declares `network.floatingIPs: [...string]`, each
+name is provisioned as an `ipv4` Hetzner Floating IP attached to
+the cluster server (so egress traffic exits with that fixed
+address). The reserved IPs are also tagged `apprafter=true`, which
+keeps `apply` idempotent across re-runs and makes them visible to
+`destroy`.
 
 Run the real-Hetzner integration test manually:
 
