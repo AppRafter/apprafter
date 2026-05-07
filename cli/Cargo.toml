@@ -29,6 +29,7 @@ predicates           = "3.1"
 tempfile             = "3.10"
 ureq                 = { version = "2.10", features = ["json"] }
 mockito              = "1.5"
+age                  = { version = "0.10", default-features = false, features = ["armor"] }
 
 [profile.release]
 lto         = "thin"

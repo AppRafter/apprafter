@@ -5,6 +5,7 @@ pub mod cue;
 pub mod error;
 pub mod logging;
 pub mod manifest;
+pub mod secrets;
 pub mod tier;
 
 pub use error::{CliError, Result};
