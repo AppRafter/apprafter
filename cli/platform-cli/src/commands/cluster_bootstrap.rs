@@ -229,6 +229,7 @@ mod tests {
             floating_ip_ids: vec![],
             kubeconfig_yaml: Some("apiVersion: v1\nfrom: legacy\n".into()),
             kubeconfig_age: None,
+            argocd_admin_password_age: None,
         };
         let out = decrypt_cached_kubeconfig(&hetzner).unwrap();
         assert!(out.contains("from: legacy"), "{out}");
@@ -245,6 +246,7 @@ mod tests {
             floating_ip_ids: vec![],
             kubeconfig_yaml: None,
             kubeconfig_age: None,
+            argocd_admin_password_age: None,
         };
         let err = decrypt_cached_kubeconfig(&hetzner).unwrap_err();
         let msg = format!("{err:?}");

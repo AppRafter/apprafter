@@ -67,6 +67,10 @@ pub struct HetznerCloudState {
     /// `platform-cli kubeconfig` on cold-fetch and re-fetch.
     #[serde(default)]
     pub kubeconfig_age: Option<String>,
+    /// age-encrypted (ASCII-armored) Argo CD admin password.
+    /// Populated by `platform-cli argocd-password` on first call.
+    #[serde(default)]
+    pub argocd_admin_password_age: Option<String>,
 }
 
 impl State {

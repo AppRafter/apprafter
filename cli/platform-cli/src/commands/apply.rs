@@ -272,6 +272,7 @@ fn persist_state(
             floating_ip_ids: fip_ids,
             kubeconfig_yaml: None,
             kubeconfig_age: None,
+            argocd_admin_password_age: None,
         });
         state.save(paths)?;
     }

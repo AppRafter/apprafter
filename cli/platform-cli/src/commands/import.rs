@@ -111,6 +111,7 @@ fn build_snapshot(client: &HetznerCloudClient, cluster: &str) -> Result<Option<H
         floating_ip_ids,
         kubeconfig_yaml: None,
         kubeconfig_age: None,
+        argocd_admin_password_age: None,
     }))
 }
 
@@ -330,6 +331,7 @@ mod tests {
             floating_ip_ids: vec![],
             kubeconfig_yaml: None,
             kubeconfig_age: None,
+            argocd_admin_password_age: None,
         };
         print_summary(true, "cl", &s);
         print_summary(false, "cl", &s);
