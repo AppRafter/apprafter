@@ -7,9 +7,11 @@
 pub mod cilium_values;
 pub mod helm;
 pub mod kubectl;
+pub mod network_policy;
 
 pub use cilium_values::cilium_values_yaml;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs, CILIUM_CHART_VERSION};
 pub use kubectl::{
     gateway_api_crds_url, KubectlCli, KubectlRunner, ManifestSource, GATEWAY_API_VERSION,
 };
+pub use network_policy::default_deny_network_policy_yaml;
