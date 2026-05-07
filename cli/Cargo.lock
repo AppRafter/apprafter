@@ -924,7 +924,9 @@ dependencies = [
  "cli-providers",
  "cli-state",
  "color-eyre",
+ "mockito",
  "predicates",
+ "serde_json",
  "tempfile",
  "tracing",
 ]
