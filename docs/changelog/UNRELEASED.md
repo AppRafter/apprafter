@@ -113,6 +113,20 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **`platform-cli kubeconfig`** (v0.1.9) — new subcommand that
+  reads the k3s kubeconfig from a freshly provisioned cluster.
+  First call: SSHes to the server's public IPv4 (private key
+  resolved from `APPRAFTER_SSH_PRIVATE_KEY`, default
+  `~/.ssh/id_ed25519`), reads `/etc/rancher/k3s/k3s.yaml`,
+  rewrites the loopback `server:` URL to the public address, and
+  caches the result in `state.hetzner_cloud.kubeconfig_yaml`.
+  Subsequent calls print the cache in O(1); `--refresh` forces a
+  re-fetch. New module
+  `cli-providers::hetzner_cloud::kubeconfig` exposes
+  `rewrite_server_url`, the `KubeconfigFetcher` trait, and
+  `SshKubeconfigFetcher`. `Server` wire type now decodes
+  `public_net.ipv4`. The cached YAML is plaintext for this cycle;
+  age-encryption arrives in v0.1.10.
 - **k3s cloud-init bootstrap** (v0.1.8) — every newly provisioned
   Hetzner server gets a `#cloud-config` `user_data` payload that
   installs k3s in single-node mode (with traefik + servicelb

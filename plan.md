@@ -394,9 +394,17 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] CLI `apply` ставит `user_data = Some(build_k3s_user_data(...))`; default Hetzner-firewall расширен до tier-1 whitelist (тот же набор портов, что и в ufw).
 
 **Поставка (kubeconfig retrieval, v0.1.9):**
-- [ ] SSH в server (используя ключ из state), чтение `/etc/rancher/k3s/k3s.yaml`, перезапись server URL на public IP.
-- [ ] Шифрование kubeconfig через age (ключ генерируется и хранится локально), запись в state.
-- [ ] `platform-cli kubeconfig` — выводит расшифрованный kubeconfig в stdout.
+- [x] `Server.public_net.ipv4.ip` wire field — `cli-providers::hetzner_cloud::types` теперь декодирует public IPv4 с list-ответа.
+- [x] `cli-providers::hetzner_cloud::kubeconfig` — `rewrite_server_url(yaml, public_ip)` + `KubeconfigFetcher` trait + `SshKubeconfigFetcher` impl (shell out на системный `ssh`, BatchMode/StrictHostKeyChecking=accept-new); `default_ssh_identity_path()` читает `APPRAFTER_SSH_PRIVATE_KEY` с фолбэком на `~/.ssh/id_ed25519`.
+- [x] `HetznerCloudState.kubeconfig_yaml: Option<String>` (`#[serde(default)]`).
+- [x] `Commands::Kubeconfig { refresh }` + `commands::kubeconfig::run` + `compute_kubeconfig` orchestrator (cached / cold-fetch / `--refresh`).
+- [x] Unit-тесты на `rewrite_server_url`, argv-shape `SshKubeconfigFetcher`, `compute_kubeconfig` через `FakeFetcher` (cold/cached/--refresh); integration на missing-state error + cached print без SSH.
+- [ ] (defer to v0.1.10) age-encryption кеша — на этом цикле сохраняем plaintext.
+
+**Поставка (age-encryption, v0.1.10):**
+- [ ] `cli-core::secrets` — генерация/загрузка age-identity по пути из `APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`); encrypt/decrypt-помощники.
+- [ ] `HetznerCloudState.kubeconfig_yaml` переезжает на `kubeconfig_age` (armored). Migration-аккуратность: `#[serde(default)]` для обоих, plaintext path остаётся читаемым один цикл для обратной совместимости.
+- [ ] `commands::kubeconfig::run` шифрует перед записью, расшифровывает при чтении.
 
 **Acceptance (v0.1.8):** `platform-cli apply` отправляет в Hetzner POST `/v1/servers` с непустым `user_data`-полем; mocked-тесты + unit-тесты builder'а пинят форму YAML.
 

@@ -106,6 +106,30 @@ pass `--force`. It picks the server whose name matches
 `state.cluster_name` (default `platform-1`); if no labelled server
 matches, it prints a friendly message and writes nothing.
 
+### Reading kubeconfig from the cluster
+
+After `apply` finishes (the cloud-init bootstrap on the new server
+takes ~3-5 minutes — be patient on the first call), retrieve the
+kubeconfig:
+
+```sh
+export HCLOUD_TOKEN=...
+export APPRAFTER_SSH_PRIVATE_KEY="$HOME/.ssh/id_ed25519"  # optional, default
+
+cargo run --bin platform-cli -- kubeconfig | KUBECONFIG=/dev/stdin kubectl get nodes
+```
+
+The command shells out to `ssh root@<public-ip> cat
+/etc/rancher/k3s/k3s.yaml`, rewrites the `server:` URL from the
+loopback to the server's public IPv4, caches the result in
+`.apprafter/state.json`, and prints it on stdout. Subsequent calls
+print the cached copy instantly. Pass `--refresh` to force a
+re-fetch (useful after a node rebuild or certificate rotation).
+
+> **Heads up:** the cached kubeconfig is currently stored as
+> plaintext. age-encryption (so it can live in a shared
+> `state.json`) lands in v0.1.10.
+
 Run the real-Hetzner integration test manually:
 
 ```sh
