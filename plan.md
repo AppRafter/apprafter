@@ -384,7 +384,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.3 k3s bootstrap на свежем VDS
 
-**Статус:** 🚧 partial — `v0.1.8` (1.3a) поднимает k3s через cloud-init и расширяет default-firewall до tier-1 whitelist; `v0.1.9` (1.3b) добавит kubeconfig retrieval + `platform-cli kubeconfig`.
+**Статус:** ✅ shipped — sub-phase 1.3 закрыта серией циклов `v0.1.8`–`v0.1.10`: cloud-init bootstrap (k3s + ufw + fail2ban) → kubeconfig retrieval (SSH fetch + URL rewrite) → age-encryption кеша.
 
 **Цель:** автоматическая установка k3s в single-node режиме после провижионинга VM.
 
@@ -402,9 +402,10 @@ Phase 7 запускается параллельно с 3+ как только 
 - [ ] (defer to v0.1.10) age-encryption кеша — на этом цикле сохраняем plaintext.
 
 **Поставка (age-encryption, v0.1.10):**
-- [ ] `cli-core::secrets` — генерация/загрузка age-identity по пути из `APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`); encrypt/decrypt-помощники.
-- [ ] `HetznerCloudState.kubeconfig_yaml` переезжает на `kubeconfig_age` (armored). Migration-аккуратность: `#[serde(default)]` для обоих, plaintext path остаётся читаемым один цикл для обратной совместимости.
-- [ ] `commands::kubeconfig::run` шифрует перед записью, расшифровывает при чтении.
+- [x] `cli-core::secrets` — wrapper над `age` 0.10: `load_or_create_identity` (mode 0600, parent dirs auto), `encrypt_for_recipient` (armored), `decrypt_with_identity`, `default_age_key_path()` (env override + `~/.config/apprafter/age.key` fallback).
+- [x] `HetznerCloudState.kubeconfig_age: Option<String>` (armored, serde-default); `kubeconfig_yaml` остаётся читаемым один цикл как legacy-fallback и обнуляется на ближайшем `--refresh`.
+- [x] `commands::kubeconfig::run` шифрует на запись (recipient = .to_public() identity), расшифровывает на чтение, fallback на plaintext-поле.
+- [x] Integration round-trip через предзаписанный age-blob + `APPRAFTER_AGE_KEY` env override; in-file тесты `cli-core::secrets` (round-trip / wrong-identity / persist+reload / mode-0600 / env override / bech32 sanity).
 
 **Acceptance (v0.1.8):** `platform-cli apply` отправляет в Hetzner POST `/v1/servers` с непустым `user_data`-полем; mocked-тесты + unit-тесты builder'а пинят форму YAML.
 
@@ -412,7 +413,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 **Зависит от:** 1.2
 
-**Размер:** M (разбит на 2 цикла: cloud-init `v0.1.8`, kubeconfig retrieval `v0.1.9`)
+**Размер:** M (разбит на 3 цикла: cloud-init `v0.1.8` ✅, kubeconfig retrieval `v0.1.9` ✅, age encryption `v0.1.10` ✅)
 
 ---
 

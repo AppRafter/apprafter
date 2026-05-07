@@ -113,6 +113,18 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **age-encrypted kubeconfig** (v0.1.10) — `platform-cli kubeconfig`
+  now persists the cached cluster YAML in
+  `state.hetzner_cloud.kubeconfig_age` (ASCII-armored) instead of
+  plaintext. New module `cli_core::secrets` exposes
+  `load_or_create_identity`, `encrypt_for_recipient`, and
+  `decrypt_with_identity`; the on-disk identity defaults to
+  `~/.config/apprafter/age.key` (mode 0600 on Unix) with
+  `APPRAFTER_AGE_KEY` honoured as an override. The legacy
+  `kubeconfig_yaml` plaintext slot is read as fallback for one
+  cycle so state files written by v0.1.9 keep working; the next
+  cold-fetch / `--refresh` migrates them forward. Sub-phase 1.3
+  in plan.md flips from 🚧 partial to ✅ shipped.
 - **`platform-cli kubeconfig`** (v0.1.9) — new subcommand that
   reads the k3s kubeconfig from a freshly provisioned cluster.
   First call: SSHes to the server's public IPv4 (private key

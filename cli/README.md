@@ -115,20 +115,23 @@ kubeconfig:
 ```sh
 export HCLOUD_TOKEN=...
 export APPRAFTER_SSH_PRIVATE_KEY="$HOME/.ssh/id_ed25519"  # optional, default
+export APPRAFTER_AGE_KEY="$HOME/.config/apprafter/age.key" # optional, default; auto-created on first run, mode 0600
 
 cargo run --bin platform-cli -- kubeconfig | KUBECONFIG=/dev/stdin kubectl get nodes
 ```
 
 The command shells out to `ssh root@<public-ip> cat
 /etc/rancher/k3s/k3s.yaml`, rewrites the `server:` URL from the
-loopback to the server's public IPv4, caches the result in
-`.apprafter/state.json`, and prints it on stdout. Subsequent calls
-print the cached copy instantly. Pass `--refresh` to force a
-re-fetch (useful after a node rebuild or certificate rotation).
+loopback to the server's public IPv4, encrypts the result with age
+under the on-disk identity, caches the armored ciphertext in
+`.apprafter/state.json` (`hetzner_cloud.kubeconfig_age`), and
+prints the plaintext on stdout. Subsequent calls decrypt the cache
+in O(1); pass `--refresh` to force a re-fetch.
 
-> **Heads up:** the cached kubeconfig is currently stored as
-> plaintext. age-encryption (so it can live in a shared
-> `state.json`) lands in v0.1.10.
+State files written by v0.1.9 (plaintext `kubeconfig_yaml` field)
+are still readable: the v0.1.9 entry is treated as a one-cycle
+legacy fallback. The next `--refresh` migrates the entry forward
+to the age field and clears the plaintext slot.
 
 Run the real-Hetzner integration test manually:
 
