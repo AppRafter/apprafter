@@ -113,6 +113,16 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **`platform-cli import`** (v0.1.7) — new read-only subcommand
+  that rebuilds `.apprafter/state.json` from live Hetzner Cloud
+  resources tagged `apprafter=true`. Picks the server whose name
+  matches `state.cluster_name`; collects ssh-keys / network /
+  firewall / floating-IP ids by label only. Refuses to overwrite an
+  existing `state.hetzner_cloud` unless `--force` is passed; supports
+  `--dry-run` for preview. Backed by a new `commands::hcloud`
+  helper that reads `APPRAFTER_HCLOUD_BASE_URL` (test-only seam used
+  by the new mockito-driven integration tests) with a fallback to
+  `DEFAULT_BASE_URL`. Closes sub-phase 1.2 in plan.md.
 - **Floating IPs for Hetzner Cloud** (v0.1.6) —
   `HetznerCloudClient` list/create/delete floating IPs (404
   idempotent on delete); two new `Action` variants

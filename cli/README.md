@@ -2,7 +2,7 @@
 
 `platform-cli` — Rust binary for cluster bootstrap, lifecycle
 management, and tier upgrades. Subcommands: `init`, `plan`,
-`apply`, `status`, `login`, `upgrade-tier`.
+`apply`, `import`, `destroy`, `status`, `login`, `upgrade-tier`.
 
 ## Layout
 
@@ -74,6 +74,26 @@ the cluster server (so egress traffic exits with that fixed
 address). The reserved IPs are also tagged `apprafter=true`, which
 keeps `apply` idempotent across re-runs and makes them visible to
 `destroy`.
+
+### Recovering state with `import`
+
+If `.apprafter/state.json` is lost (or you cloned the repo on a new
+machine), `platform-cli import` rebuilds the Hetzner section by
+scanning the live API for resources tagged with `apprafter=true`:
+
+```sh
+export HCLOUD_TOKEN=...
+cargo run --bin platform-cli -- import --dry-run   # preview only
+cargo run --bin platform-cli -- import             # write state
+cargo run --bin platform-cli -- import --force     # overwrite an
+                                                   # existing snapshot
+```
+
+`import` is read-only (no `create_*` / `delete_*` calls) and refuses
+to overwrite an already-populated `state.hetzner_cloud` unless you
+pass `--force`. It picks the server whose name matches
+`state.cluster_name` (default `platform-1`); if no labelled server
+matches, it prints a friendly message and writes nothing.
 
 Run the real-Hetzner integration test manually:
 

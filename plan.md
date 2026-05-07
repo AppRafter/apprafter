@@ -305,7 +305,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.2 Hetzner Cloud built-in provider
 
-**Статус:** 🚧 partial — `v0.1.2` закрывает server-CRUD ветку acceptance (apply/destroy/idempotent CX22). Network, firewall, SSH key, floating IP и `import` команда — отдельные циклы `v0.1.3` / `v0.1.4` / `v0.1.5`, под одной плановой подфазой 1.2.
+**Статус:** ✅ shipped — sub-phase 1.2 полностью закрыта серией циклов `v0.1.2`–`v0.1.7`, покрывающих server / SSH-keys / network / firewall / CUE-parsing / floating IP / state import.
 
 **Цель:** нативный provider в `platform-cli` через прямую интеграцию с Hetzner Cloud REST API (через `ureq`, blocking).
 
@@ -360,9 +360,15 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] CLI `apply` читает `network.floatingIPs` из manifest, префиксует имена кластером и передаёт как `FloatingIpSpec` (`ipv4`, `home_location = region`).
 - [x] `examples/infrastructure/tier-1-hetzner.cue` — `floatingIPs: ["egress"]`.
 
-**Поставка (отложено в 1.2.x циклы):**
-- [ ] `platform-cli import` — `v0.1.7`.
-- [ ] Полное закрытие 1.2 в `plan.md` — после `v0.1.7`.
+**Поставка (`platform-cli import`, v0.1.7):**
+- [x] `Commands::Import { force, dry_run }` clap-вариант + dispatch в `main.rs`.
+- [x] `commands::hcloud::hcloud_base_url()` — общий хелпер для `apply`/`destroy`/`import`, читает `APPRAFTER_HCLOUD_BASE_URL` (test-only) с фолбэком на `DEFAULT_BASE_URL`.
+- [x] `commands::import::run` — read-only сканирование `apprafter=true` ресурсов, сборка `HetznerCloudState` по `cluster_name`, флаги `--dry-run` (печатает summary, не пишет state) и `--force` (перезаписывает существующий `state.hetzner_cloud`).
+- [x] Integration-тесты на `assert_cmd` + `mockito`: happy-path с записью state, `--dry-run` без записи, "no matching server" → friendly message, фильтр по `apprafter` лейблу, `--force` overwrite-guard.
+- [x] `cli/README.md` — новая секция "Recovering state with `import`".
+
+**Полное закрытие 1.2:**
+- [x] `plan.md` отражает все 6 циклов как ✅; sub-phase 1.2 переведён из 🚧 partial в ✅ shipped.
 
 **Acceptance (v0.1.2):**
 - ✅ `platform-cli apply` (с валидным state + `HCLOUD_TOKEN`) поднимает 1× CX22.
@@ -372,7 +378,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 **Зависит от:** 1.1
 
-**Размер:** L (разбит на 6 циклов: server-CRUD `v0.1.2` ✅, SSH-keys `v0.1.3` ✅, network+firewall `v0.1.4` ✅, CUE-parsing `v0.1.5` ✅, floatingIP `v0.1.6` ✅, import `v0.1.7`)
+**Размер:** L (разбит на 6 циклов: server-CRUD `v0.1.2` ✅, SSH-keys `v0.1.3` ✅, network+firewall `v0.1.4` ✅, CUE-parsing `v0.1.5` ✅, floatingIP `v0.1.6` ✅, import `v0.1.7` ✅)
 
 ---
 
