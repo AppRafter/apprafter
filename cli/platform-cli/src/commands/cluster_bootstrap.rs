@@ -9,11 +9,11 @@ use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    argocd_gateway_yaml, argocd_values_yaml, bootstrap_application_yaml, cert_manager_values_yaml,
-    cilium_values_yaml, default_deny_network_policy_yaml, gateway_api_crds_url,
-    selfsigned_cluster_issuer_yaml, HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli,
-    KubectlRunner, ManifestSource, ARGOCD_CHART_VERSION, BOOTSTRAP_APP_DEFAULT_PATH,
-    CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
+    argocd_gateway_yaml, argocd_values_yaml, backstage_manifests_yaml, bootstrap_application_yaml,
+    cert_manager_values_yaml, cilium_values_yaml, default_deny_network_policy_yaml,
+    gateway_api_crds_url, selfsigned_cluster_issuer_yaml, HelmCli, HelmRunner, HelmUpgradeArgs,
+    KubectlCli, KubectlRunner, ManifestSource, ARGOCD_CHART_VERSION, BACKSTAGE_DEFAULT_IMAGE,
+    BOOTSTRAP_APP_DEFAULT_PATH, CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -30,7 +30,7 @@ pub fn run() -> Result<()> {
         )
     })?;
 
-    let argocd = read_argocd_settings_from_manifest(&cwd)?;
+    let cluster = read_cluster_settings_from_manifest(&cwd)?;
 
     let plaintext = decrypt_cached_kubeconfig(&hetzner)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
@@ -50,7 +50,7 @@ pub fn run() -> Result<()> {
         &selfsigned_cluster_issuer_yaml(),
     )?;
 
-    let argocd_gateway_file = match &argocd.domain {
+    let argocd_gateway_file = match &cluster.argocd_domain {
         Some(domain) => Some(write_tempfile_with(
             "apprafter-argocd-gateway-",
             &argocd_gateway_yaml(domain),
@@ -58,15 +58,29 @@ pub fn run() -> Result<()> {
         None => None,
     };
 
-    let bootstrap_app_file = match &argocd.bootstrap_repo {
+    let bootstrap_app_file = match &cluster.bootstrap_repo {
         Some(repo) => {
-            let path = argocd
+            let path = cluster
                 .bootstrap_path
                 .as_deref()
                 .unwrap_or(BOOTSTRAP_APP_DEFAULT_PATH);
             Some(write_tempfile_with(
                 "apprafter-bootstrap-app-",
                 &bootstrap_application_yaml(repo, path),
+            )?)
+        }
+        None => None,
+    };
+
+    let backstage_file = match &cluster.backstage_domain {
+        Some(domain) => {
+            let image = cluster
+                .backstage_image
+                .as_deref()
+                .unwrap_or(BACKSTAGE_DEFAULT_IMAGE);
+            Some(write_tempfile_with(
+                "apprafter-backstage-",
+                &backstage_manifests_yaml(domain, image),
             )?)
         }
         None => None,
@@ -83,14 +97,18 @@ pub fn run() -> Result<()> {
         selfsigned_issuer_file.path(),
         argocd_gateway_file.as_ref().map(|f| f.path()),
         bootstrap_app_file.as_ref().map(|f| f.path()),
+        backstage_file.as_ref().map(|f| f.path()),
     )?;
 
     let mut suffix = String::new();
-    if let Some(d) = &argocd.domain {
+    if let Some(d) = &cluster.argocd_domain {
         suffix.push_str(&format!(" + Argo CD Gateway/HTTPRoute on {d}"));
     }
-    if let Some(repo) = &argocd.bootstrap_repo {
+    if let Some(repo) = &cluster.bootstrap_repo {
         suffix.push_str(&format!(" + bootstrap Application from {repo}"));
+    }
+    if let Some(d) = &cluster.backstage_domain {
+        suffix.push_str(&format!(" + Backstage on {d}"));
     }
     println!(
         "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer{suffix} applied"
@@ -99,27 +117,29 @@ pub fn run() -> Result<()> {
 }
 
 #[derive(Debug, Default, Clone)]
-struct ArgocdSettings {
-    domain: Option<String>,
+struct ClusterSettings {
+    argocd_domain: Option<String>,
     bootstrap_repo: Option<String>,
     bootstrap_path: Option<String>,
+    backstage_domain: Option<String>,
+    backstage_image: Option<String>,
 }
 
-fn read_argocd_settings_from_manifest(cwd: &Path) -> Result<ArgocdSettings> {
+fn read_cluster_settings_from_manifest(cwd: &Path) -> Result<ClusterSettings> {
     let path = match std::env::var("APPRAFTER_MANIFEST") {
         Ok(p) => p,
-        Err(_) => return Ok(ArgocdSettings::default()),
+        Err(_) => return Ok(ClusterSettings::default()),
     };
-    info!(path = %path, "reading Infrastructure manifest for argocd settings");
+    info!(path = %path, "reading Infrastructure manifest for cluster settings");
     let parsed: InfrastructureManifest = manifest::parse_infrastructure(cwd, Path::new(&path))?;
-    let argocd = match parsed.spec.argocd {
-        Some(a) => a,
-        None => return Ok(ArgocdSettings::default()),
-    };
-    Ok(ArgocdSettings {
-        domain: argocd.domain.filter(|d| !d.is_empty()),
+    let argocd = parsed.spec.argocd.unwrap_or_default();
+    let backstage = parsed.spec.backstage.unwrap_or_default();
+    Ok(ClusterSettings {
+        argocd_domain: argocd.domain.filter(|d| !d.is_empty()),
         bootstrap_repo: argocd.bootstrap_repo.filter(|d| !d.is_empty()),
         bootstrap_path: argocd.bootstrap_path.filter(|d| !d.is_empty()),
+        backstage_domain: backstage.domain.filter(|d| !d.is_empty()),
+        backstage_image: backstage.image.filter(|d| !d.is_empty()),
     })
 }
 
@@ -149,9 +169,9 @@ fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
 /// Pure orchestration — installs Cilium + Gateway API CRDs +
 /// default-deny NetworkPolicy + Argo CD + cert-manager + the
 /// self-signed ClusterIssuer in that order, optionally followed
-/// by the Argo CD Gateway/HTTPRoute/Certificate manifest, and
-/// optionally the bootstrap `Application` resource. Easily driven
-/// with fake runners in tests.
+/// by the Argo CD Gateway/HTTPRoute/Certificate manifest, the
+/// bootstrap `Application` resource, and the tier-1 Backstage
+/// manifest set. Easily driven with fake runners in tests.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm: &H,
@@ -164,6 +184,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     selfsigned_issuer_path: &Path,
     argocd_gateway_path: Option<&Path>,
     bootstrap_app_path: Option<&Path>,
+    backstage_manifests_path: Option<&Path>,
 ) -> Result<()> {
     helm.repo_add("cilium", "https://helm.cilium.io/")?;
     helm.upgrade_install(&HelmUpgradeArgs {
@@ -217,6 +238,13 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     if let Some(bootstrap_path) = bootstrap_app_path {
         kubectl.apply_manifest(
             &ManifestSource::Path(bootstrap_path.to_path_buf()),
+            kubeconfig_path,
+        )?;
+    }
+
+    if let Some(bs_path) = backstage_manifests_path {
+        kubectl.apply_manifest(
+            &ManifestSource::Path(bs_path.to_path_buf()),
             kubeconfig_path,
         )?;
     }
@@ -292,6 +320,7 @@ mod tests {
             &issuer,
             None, // Argo CD Gateway opt-in not exercised here
             None, // bootstrap Application opt-in not exercised here
+            None, // Backstage opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -372,6 +401,7 @@ mod tests {
             &issuer,
             Some(&gateway),
             None, // bootstrap Application opt-in not exercised here
+            None, // Backstage opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -410,6 +440,7 @@ mod tests {
             &issuer,
             Some(&gateway),
             Some(&bootstrap),
+            None, // Backstage opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -422,6 +453,47 @@ mod tests {
             other => panic!("fifth apply must be the bootstrap Application Path, got {other:?}"),
         }
         assert_eq!(applies[4].1, kc);
+    }
+
+    #[test]
+    fn perform_bootstrap_applies_backstage_when_path_provided() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let gateway = PathBuf::from("/tmp/argocd-gateway.yaml");
+        let bootstrap = PathBuf::from("/tmp/bootstrap-app.yaml");
+        let backstage = PathBuf::from("/tmp/backstage.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            Some(&gateway),
+            Some(&bootstrap),
+            Some(&backstage),
+        )
+        .expect("bootstrap");
+
+        let applies = kubectl.applies.borrow();
+        // 6 applies: Gateway CRDs URL, default-deny Path,
+        // ClusterIssuer Path, Argo CD Gateway Path, bootstrap App
+        // Path, Backstage Path.
+        assert_eq!(applies.len(), 6);
+        match &applies[5].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &backstage),
+            other => panic!("sixth apply must be the Backstage Path, got {other:?}"),
+        }
+        assert_eq!(applies[5].1, kc);
     }
 
     #[test]
