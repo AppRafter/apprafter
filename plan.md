@@ -496,20 +496,33 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.6 Backstage минимальный деплой
 
+**Статус:** 🚧 partial — `v0.1.18` (1.6a) даёт tier-1 Kubernetes-манифесты + cluster-bootstrap wiring; `v0.1.19` (1.6b) добавит app-скаффолд через `@backstage/create-app` и Dockerfile; `v0.1.20` (1.6c) — OAuth stub + закрытие подфазы.
+
 **Цель:** Backstage как pod в кластере, доступный через Gateway.
 
-**Поставка:**
-- [ ] Backstage скаффолд (`@backstage/create-app`) в `backstage-plugins/host/`.
-- [ ] Dockerfile + helm chart.
-- [ ] OAuth — пока заглушка (basic admin login).
-- [ ] HTTPRoute через Gateway, TLS.
-- [ ] Manifests в `manifests/tier-1/backstage/`.
+**Поставка (k8s-манифесты + cluster-bootstrap, v0.1.18):**
+- [x] CUE schema: `spec.backstage.domain?` + `spec.backstage.image?`.
+- [x] Rust manifest mirror: `BackstageBlock { domain, image }`; `Default` derived.
+- [x] `cli-providers::k8s::backstage_manifests::backstage_manifests_yaml(domain, image)` — pure builder для 6-document манифеста (Namespace + Deployment + Service + HTTPRoute + Gateway + Certificate); `BACKSTAGE_DEFAULT_IMAGE = "ghcr.io/apprafter/backstage:placeholder"` для пустого image.
+- [x] `read_argocd_settings_from_manifest` переименован в `read_cluster_settings_from_manifest`, struct расширен backstage-полями.
+- [x] `perform_bootstrap` подросла `backstage_manifests_path: Option<&Path>` параметром; при Some — kubectl apply после bootstrap-Application.
+- [x] `manifests/tier-1/backstage/{example.yaml, README.md}` — статический рендеринг builder'а + recipe для refresh через `cargo run --example backstage_example`.
 
-**Acceptance:** `https://backstage.<domain>` открывается, виден catalog (пустой).
+**Поставка (app-скаффолд + Dockerfile, v0.1.19):**
+- [ ] `backstage-plugins/host/` — output `@backstage/create-app` (Bun/Node).
+- [ ] `Dockerfile` рядом с app для multi-stage build.
+- [ ] CI workflow для build+push image (deferred to phase 2.x когда GHCR-токен есть).
+
+**Поставка (OAuth stub + закрытие 1.6, v0.1.20):**
+- [ ] OAuth stub в `app-config.yaml` (basic admin).
+- [ ] `manifests/tier-1/backstage/example.yaml` обновлён ConfigMap'ом для `app-config.yaml`.
+- [ ] Sub-phase 1.6 status: ✅ shipped.
+
+**Acceptance (v0.1.18):** `perform_bootstrap` производит 6 kubectl applies в правильном порядке (Gateway CRDs → default-deny NP → ClusterIssuer → Argo CD Gateway → bootstrap App → Backstage) при полном manifest opt-in (mocked).
 
 **Зависит от:** 1.5
 
-**Размер:** M
+**Размер:** M (разбит на 3 цикла: k8s-манифесты `v0.1.18` ✅, app-скаффолд `v0.1.19`, OAuth + закрытие `v0.1.20`)
 
 ---
 

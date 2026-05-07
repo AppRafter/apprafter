@@ -48,5 +48,15 @@ infra: v1alpha1.#Infrastructure & {
 		//     bootstrapRepo: "https://github.com/acme/platform-state.git"
 		//     bootstrapPath: "clusters/tier-1"
 		// }
+
+		// Optional: deploy a tier-1 Backstage instance (Namespace +
+		// Deployment + Service + HTTPRoute + Gateway + Certificate)
+		// alongside Argo CD. Uncomment + set the FQDN you control
+		// and (optionally) the container image you built from your
+		// `@backstage/create-app` scaffold.
+		// backstage: {
+		//     domain: "backstage.example.com"
+		//     image:  "ghcr.io/acme/backstage:1.0.0"
+		// }
 	}
 }

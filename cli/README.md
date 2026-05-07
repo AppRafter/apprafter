@@ -208,6 +208,14 @@ Under the hood the command:
    `bootstrapPath`). Auto-prune + self-heal are on, so committing
    to the repo continuously syncs the platform manifests into the
    cluster.
+10. **(Optional)** When the manifest declares
+    `spec.backstage.domain`, applies the tier-1 Backstage manifest
+    set (Namespace + Deployment + Service + HTTPRoute + Gateway +
+    cert-manager Certificate) to the `backstage` namespace.
+    `spec.backstage.image` overrides the placeholder container
+    image; the Backstage app scaffold + Dockerfile land in v0.1.19.
+    Without the manifest opt-in, Backstage is skipped — the
+    bootstrap finishes after step 9.
 
 Both shell-outs require `helm` and `kubectl` on `$PATH`.
 

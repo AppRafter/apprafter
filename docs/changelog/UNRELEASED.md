@@ -113,6 +113,22 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **Backstage tier-1 manifests** (v0.1.18) — when
+  `Infrastructure.spec.backstage.domain` is set,
+  `platform-cli cluster-bootstrap` applies a 6-document Backstage
+  manifest set (Namespace + Deployment + Service + HTTPRoute +
+  Gateway + Certificate) to the `backstage` namespace.
+  `spec.backstage.image` overrides the placeholder container
+  image (`ghcr.io/apprafter/backstage:placeholder`). New module
+  `cli-providers::k8s::backstage_manifests`; CUE schema gains
+  `spec.backstage`; Rust manifest mirror gets `BackstageBlock`;
+  `perform_bootstrap` accepts `Option<&Path>` for the Backstage
+  manifest. A static rendering of the placeholder values lives at
+  `manifests/tier-1/backstage/example.yaml` (refreshable via
+  `cargo run -p cli-providers --example backstage_example`) — the
+  starting point for operators populating their
+  `spec.argocd.bootstrapRepo`. Backstage app scaffold + Dockerfile
+  + OAuth land in v0.1.19/v0.1.20.
 - **Argo CD bootstrap Application + sub-phase 1.5 ✅** (v0.1.17) —
   when `Infrastructure.spec.argocd.bootstrapRepo` is set,
   `platform-cli cluster-bootstrap` applies an Argo CD `Application`
