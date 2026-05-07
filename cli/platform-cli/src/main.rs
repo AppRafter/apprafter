@@ -29,6 +29,7 @@ fn main() -> color_eyre::Result<()> {
         Commands::Import { force, dry_run } => commands::import::run(*force, *dry_run)?,
         Commands::Kubeconfig { refresh } => commands::kubeconfig::run(*refresh)?,
         Commands::ClusterBootstrap => commands::cluster_bootstrap::run()?,
+        Commands::ArgocdPassword { refresh } => commands::argocd_password::run(*refresh)?,
     }
     Ok(())
 }

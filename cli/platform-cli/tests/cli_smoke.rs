@@ -21,7 +21,8 @@ fn help_lists_all_subcommands() {
         .stdout(contains("destroy"))
         .stdout(contains("import"))
         .stdout(contains("kubeconfig"))
-        .stdout(contains("cluster-bootstrap"));
+        .stdout(contains("cluster-bootstrap"))
+        .stdout(contains("argocd-password"));
 }
 
 #[test]
@@ -224,6 +225,30 @@ fn cluster_bootstrap_without_hetzner_cloud_state_errors_with_hint() {
     cli()
         .current_dir(dir.path())
         .arg("cluster-bootstrap")
+        .assert()
+        .failure()
+        .stderr(contains("apply"));
+}
+
+#[test]
+fn argocd_password_without_hetzner_cloud_state_errors_with_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ])
+        .assert()
+        .success();
+    cli()
+        .current_dir(dir.path())
+        .arg("argocd-password")
         .assert()
         .failure()
         .stderr(contains("apply"));

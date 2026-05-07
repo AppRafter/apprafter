@@ -74,4 +74,14 @@ pub enum Commands {
     /// pointed to by the cached kubeconfig.
     #[command(name = "cluster-bootstrap")]
     ClusterBootstrap,
+    /// Print the Argo CD admin password (decrypted), fetching it
+    /// from the cluster on first use. The plaintext is cached
+    /// age-encrypted in state for subsequent O(1) reads.
+    #[command(name = "argocd-password")]
+    ArgocdPassword {
+        /// Force a re-fetch of the secret even if a cached
+        /// password is already in state.
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+    },
 }
