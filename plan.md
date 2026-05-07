@@ -462,17 +462,30 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `HetznerCloudState.argocd_admin_password_age: Option<String>` (serde-default).
 - [x] In-file FakeKubectl tests + cli_smoke missing-state error + integration test для cached-path round-trip через `APPRAFTER_AGE_KEY`.
 
-**Поставка (cert-manager + HTTPRoute + bootstrap-Application, v0.1.15):**
-- [ ] cert-manager helm install (LetsEncrypt staging issuer для tier-1 self-signed fallback).
-- [ ] `HTTPRoute` + `Gateway` для Argo CD UI; manifest opt-in для домена.
-- [ ] Bootstrap-`Application` указывает на `platform-state.git` (URL из manifest или env).
+**Поставка (cert-manager + self-signed ClusterIssuer, v0.1.15):**
+- [x] `cli-providers::k8s::cert_manager_values::cert_manager_values_yaml()` — pure builder для tier-1 Helm-values (`installCRDs: true`, single replicas, Prometheus off).
+- [x] `CERT_MANAGER_CHART_VERSION = "v1.16.2"` в том же модуле.
+- [x] `cli-providers::k8s::issuer::selfsigned_cluster_issuer_yaml()` — pure builder для `cert-manager.io/v1 ClusterIssuer` `apprafter-selfsigned` (`spec.selfSigned: {}`, label `apprafter=true`); имя issuer'а как `pub const APPRAFTER_SELFSIGNED_ISSUER` чтобы будущие HTTPRoute / Certificate manifests могли ссылаться без магических строк.
+- [x] `perform_bootstrap` теперь делает helm repo add `jetstack` + helm upgrade --install `cert-manager` после Argo CD, и kubectl apply self-signed issuer; renamed FakeRunner test пинит 3 helm repos / 3 installs / 3 kubectl applies в правильном порядке.
+- [x] `cluster-bootstrap` дропает 5-й и 6-й tempfile (cert-manager values + selfsigned issuer) рядом с существующими.
+
+**Поставка (Gateway + HTTPRoute для Argo CD UI, v0.1.16):**
+- [ ] `cli-providers::k8s::argocd_gateway::argocd_gateway_yaml(domain)` — pure builder для `Gateway` (TLS listener) + `HTTPRoute` (routes `/` to argocd-server).
+- [ ] `Certificate` resource ссылается на `apprafter-selfsigned` ClusterIssuer.
+- [ ] Manifest opt-in: новое поле `argocd.domain` в `Infrastructure` schema; без него Argo CD остаётся ClusterIP-only.
+- [ ] `perform_bootstrap` (или новый шаг) применяет Gateway + HTTPRoute + Certificate когда manifest declares domain.
+
+**Поставка (bootstrap-Application + закрытие 1.5, v0.1.17):**
+- [ ] `cli-providers::k8s::bootstrap_app::bootstrap_application_yaml(repo_url, path)` — pure builder для Argo CD `Application` ресурса, ссылающегося на `platform-state.git` (URL из manifest или env var).
+- [ ] `Infrastructure` schema: новое поле `argocd.bootstrapRepo` (опциональный URL).
 - [ ] Real-cluster smoke в `cluster_smoke_test.rs`: `argocd app list` показывает root app.
+- [ ] Sub-phase 1.5 status: ✅ shipped.
 
 **Acceptance (v0.1.13):** `perform_bootstrap` производит `helm install cilium`, `kubectl apply` Gateway CRDs, `kubectl apply` default-deny NP, `helm install argocd` в этом порядке (mocked). Реальный smoke (Argo CD pods Ready, UI reachable, root app sync) — после v0.1.15.
 
 **Зависит от:** 1.4
 
-**Размер:** M (разбит на 3 цикла: helm install `v0.1.13` ✅, admin password `v0.1.14`, cert-manager + HTTPRoute + bootstrap-Application `v0.1.15`)
+**Размер:** M (разбит на 5 циклов: helm install `v0.1.13` ✅, admin password `v0.1.14` ✅, cert-manager + ClusterIssuer `v0.1.15` ✅, Gateway + HTTPRoute `v0.1.16`, bootstrap-Application + smoke `v0.1.17`)
 
 ---
 

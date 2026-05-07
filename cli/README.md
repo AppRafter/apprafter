@@ -184,9 +184,17 @@ Under the hood the command:
    --namespace argocd --create-namespace --wait` against tier-1
    values (single replicas across all sub-charts, Dex off, Redis-HA
    off, notifications off). The Argo CD server runs as ClusterIP —
-   the HTTPRoute + cert-manager exposure path lands in v0.1.15.
-   The admin password retrieval (`platform-cli argocd-password`)
-   lands in v0.1.14.
+   the HTTPRoute exposure path lands in v0.1.16.
+6. Adds the upstream Jetstack Helm repo and runs
+   `helm upgrade --install cert-manager jetstack/cert-manager
+   --version <pinned> --namespace cert-manager --create-namespace
+   --wait` against tier-1 values (installCRDs: true, single
+   replicas across controller / webhook / cainjector, Prometheus
+   off).
+7. Applies a self-signed `ClusterIssuer` named
+   `apprafter-selfsigned`. Future cycles' `Gateway` HTTPRoutes
+   reference this issuer by name to mint TLS certs (no DNS
+   validation needed for tier-1).
 
 Both shell-outs require `helm` and `kubectl` on `$PATH`.
 

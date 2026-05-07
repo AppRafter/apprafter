@@ -113,6 +113,19 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **cert-manager + self-signed ClusterIssuer** (v0.1.15) —
+  `platform-cli cluster-bootstrap` now ends with `helm repo add
+  jetstack https://charts.jetstack.io` + `helm upgrade --install
+  cert-manager jetstack/cert-manager --version v1.16.2 --namespace
+  cert-manager --create-namespace --wait` against the tier-1
+  values from the new `cli-providers::k8s::cert_manager_values`
+  module (installCRDs: true, single replicas, Prometheus off);
+  then `kubectl apply -f` for the self-signed `ClusterIssuer`
+  named `apprafter-selfsigned` (new module
+  `cli-providers::k8s::issuer`, `pub const`
+  `APPRAFTER_SELFSIGNED_ISSUER` so future HTTPRoute / Certificate
+  manifests reference it by name). Renamed FakeRunner test pins
+  the now-3-helm-installs / 3-kubectl-applies sequence.
 - **`platform-cli argocd-password`** (v0.1.14) — new subcommand
   that reads the Argo CD admin password from the cluster on first
   call (`kubectl get secret argocd-initial-admin-secret -n argocd
