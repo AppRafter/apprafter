@@ -204,3 +204,27 @@ fn destroy_with_empty_state_is_noop() {
         .success()
         .stdout(contains("nothing to destroy"));
 }
+
+#[test]
+fn cluster_bootstrap_without_hetzner_cloud_state_errors_with_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ])
+        .assert()
+        .success();
+    cli()
+        .current_dir(dir.path())
+        .arg("cluster-bootstrap")
+        .assert()
+        .failure()
+        .stderr(contains("apply"));
+}
