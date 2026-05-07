@@ -3,6 +3,7 @@
 
 pub mod dry_run;
 pub mod hetzner_cloud;
+pub mod k8s;
 pub mod provider;
 
 pub use dry_run::DryRunProvider;
