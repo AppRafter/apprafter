@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT
+# Skip everything we don't want in the build context. The Dockerfile
+# is in the same directory as the scaffolded Backstage app; the
+# operator runs `docker build .` from there.
+
+# Build outputs
+dist/
+**/dist/
+**/dist-types/
+**/build/
+node_modules/
+**/node_modules/
+
+# Caches
+.yarn/cache/
+.yarn/install-state.gz
+.yarn/unplugged/
+
+# Local config + secrets
+app-config.local.yaml
+*.local.yaml
+.env
+.env.*
+*.pem
+*.key
+
+# Source control + IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+
+# Test artefacts
+coverage/
+.nyc_output/
+*.log
+
+# Scaffold helper itself — built image doesn't need it
+scripts/
