@@ -24,12 +24,25 @@ pub enum ServerStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicIpv4 {
+    pub ip: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicNet {
+    #[serde(default)]
+    pub ipv4: Option<PublicIpv4>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
     pub id: u64,
     pub name: String,
     pub status: ServerStatus,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub public_net: Option<PublicNet>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

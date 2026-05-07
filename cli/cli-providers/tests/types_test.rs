@@ -339,3 +339,28 @@ fn server_create_request_skips_user_data_when_none() {
     let json = serde_json::to_value(&req).unwrap();
     assert!(json.get("user_data").is_none());
 }
+
+#[test]
+fn server_decodes_public_net_when_present() {
+    use cli_providers::hetzner_cloud::Server;
+    let json = r#"{
+        "id": 42, "name": "n", "status": "running",
+        "labels": {"apprafter": "true"},
+        "public_net": {"ipv4": {"ip": "203.0.113.10"}}
+    }"#;
+    let s: Server = serde_json::from_str(json).unwrap();
+    let pn = s.public_net.expect("public_net should decode");
+    let v4 = pn.ipv4.expect("ipv4 should decode");
+    assert_eq!(v4.ip, "203.0.113.10");
+}
+
+#[test]
+fn server_decodes_when_public_net_is_omitted() {
+    use cli_providers::hetzner_cloud::Server;
+    let json = r#"{
+        "id": 42, "name": "n", "status": "running",
+        "labels": {"apprafter": "true"}
+    }"#;
+    let s: Server = serde_json::from_str(json).unwrap();
+    assert!(s.public_net.is_none());
+}
