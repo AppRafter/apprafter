@@ -5,6 +5,7 @@ pub mod client;
 pub mod provider;
 pub mod server;
 pub mod types;
+pub mod user_data;
 
 pub use client::{HetznerCloudClient, DEFAULT_BASE_URL};
 pub use provider::HetznerCloudProvider;
@@ -20,3 +21,4 @@ pub use types::{
     ServerListResponse, ServerStatus, SshKey, SshKeyCreateRequest, SshKeyCreateResponse,
     SshKeyListResponse, Subnet,
 };
+pub use user_data::{build_k3s_user_data, K3sBootstrapOptions};
