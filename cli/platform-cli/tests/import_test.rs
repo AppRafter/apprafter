@@ -211,6 +211,74 @@ fn import_with_no_matching_server_says_so_and_writes_nothing() {
 }
 
 #[test]
+fn import_refuses_to_overwrite_existing_state_without_force() {
+    let mut server = mockito::Server::new();
+    mock_all_lists(&mut server, "platform-1", 0);
+    let dir = workspace_with_state("platform-1");
+
+    let path = dir.path().join(".apprafter/state.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    state["hetzner_cloud"] = serde_json::json!({
+        "server_id": 1,
+        "server_name": "stale",
+        "ssh_key_ids": [],
+        "network_id": null,
+        "firewall_id": null,
+        "floating_ip_ids": []
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    cli()
+        .current_dir(dir.path())
+        .env("HCLOUD_TOKEN", "test-token")
+        .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
+        .arg("import")
+        .assert()
+        .failure()
+        .stderr(contains("--force"));
+
+    let raw_after = std::fs::read_to_string(&path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
+    assert_eq!(v["hetzner_cloud"]["server_id"], 1);
+    assert_eq!(v["hetzner_cloud"]["server_name"], "stale");
+}
+
+#[test]
+fn import_force_overwrites_existing_state() {
+    let mut server = mockito::Server::new();
+    mock_all_lists(&mut server, "platform-1", 0);
+    let dir = workspace_with_state("platform-1");
+
+    let path = dir.path().join(".apprafter/state.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    state["hetzner_cloud"] = serde_json::json!({
+        "server_id": 1,
+        "server_name": "stale",
+        "ssh_key_ids": [],
+        "network_id": null,
+        "firewall_id": null,
+        "floating_ip_ids": []
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    cli()
+        .current_dir(dir.path())
+        .env("HCLOUD_TOKEN", "test-token")
+        .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
+        .args(["import", "--force"])
+        .assert()
+        .success()
+        .stdout(contains("server: platform-1 (id 42)"));
+
+    let raw_after = std::fs::read_to_string(&path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
+    assert_eq!(v["hetzner_cloud"]["server_id"], 42);
+    assert_eq!(v["hetzner_cloud"]["server_name"], "platform-1");
+}
+
+#[test]
 fn import_skips_servers_without_apprafter_label() {
     let mut server = mockito::Server::new();
     server
