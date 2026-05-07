@@ -5,12 +5,14 @@
 //! ship.
 
 pub mod argocd_values;
+pub mod cert_manager_values;
 pub mod cilium_values;
 pub mod helm;
 pub mod kubectl;
 pub mod network_policy;
 
 pub use argocd_values::{argocd_values_yaml, ARGOCD_CHART_VERSION};
+pub use cert_manager_values::{cert_manager_values_yaml, CERT_MANAGER_CHART_VERSION};
 pub use cilium_values::cilium_values_yaml;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs, CILIUM_CHART_VERSION};
 pub use kubectl::{
