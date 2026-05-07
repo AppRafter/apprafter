@@ -146,17 +146,34 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Quality
 
-- **CLI test coverage uplift** — added 14 mockito error-path tests
-  for `HetznerCloudClient` (every `list_*` / `create_*` / `delete_*`
-  method now exercises both the happy path and at least one
-  `Err::Status` mapping to `CliError::Hetzner`), plus three small
-  fillers in `cli-core` (`Tier::level`, `Tier::from_str` unknown
-  branch, `cli_core::manifest::parse_infrastructure`
-  missing-document branch). Workspace coverage 78% → **85.6%**;
-  `hetzner_cloud/client.rs` 45% → **95%**; `cli-core/src/tier.rs`
-  and `manifest.rs` reach **100%**. The only remaining gap in
-  `client.rs` is the `Err::Transport` arm of each method, which
-  isn't reachable from a mockito test. Numbers measured with
+- **CLI test coverage uplift (round 1)** — added 14 mockito
+  error-path tests for `HetznerCloudClient` (every `list_*` /
+  `create_*` / `delete_*` method now exercises both the happy path
+  and at least one `Err::Status` mapping to `CliError::Hetzner`),
+  plus three small fillers in `cli-core` (`Tier::level`,
+  `Tier::from_str` unknown branch,
+  `cli_core::manifest::parse_infrastructure` missing-document
+  branch). `hetzner_cloud/client.rs` 45% → 95%; `cli-core/src/tier.rs`
+  and `manifest.rs` reach 100%.
+- **CLI test coverage uplift (round 2)** — moved most testable
+  logic in `platform-cli` out of subprocess-only territory by adding
+  `#[cfg(test)] mod tests` blocks inside the source modules:
+  - `commands/apply.rs` — 12 unit tests covering every builder
+    helper (`build_server_spec`, `build_ssh_specs`, `build_network_spec`,
+    `build_firewall_spec`, `rule_from_manifest`,
+    `default_ingress_rules`, `build_floating_ip_specs`) with both
+    "manifest absent" and "manifest overrides defaults" paths.
+    apply.rs jumps from 0% to 51%.
+  - `commands/hcloud.rs` — env-var fallback covered. 0% → 100%.
+  - `commands/import.rs` — 5 in-process tests of the private
+    `build_snapshot` helper against a `mockito` server: matched
+    server, no apprafter label, name mismatch, per-category
+    label filter, and a smoke for `print_summary`. 0% → 57%.
+  Workspace coverage 78% → **89.6%**. Remaining gaps in
+  `platform-cli` (the orchestration body of `run` in apply / destroy /
+  import / init plus the `would …` stub commands) are subprocess-tested
+  by the `cli_smoke` and `import_test` integration suites — tarpaulin
+  cannot see them but they ARE exercised. Numbers measured with
   cargo-tarpaulin 0.35.2, e2e test excluded.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/

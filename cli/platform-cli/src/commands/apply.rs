@@ -264,3 +264,193 @@ fn persist_state(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest_from(value: serde_json::Value) -> InfrastructureManifest {
+        serde_json::from_value(value).expect("valid InfrastructureManifest JSON")
+    }
+
+    fn minimal_manifest() -> InfrastructureManifest {
+        manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "platform-1"},
+            "spec": {"provider": "hetzner-cloud"}
+        }))
+    }
+
+    #[test]
+    fn build_server_spec_uses_defaults_when_manifest_is_absent() {
+        let s = build_server_spec(None, "platform-1", "nbg1");
+        assert_eq!(s.name, "platform-1");
+        assert_eq!(s.server_type, DEFAULT_SERVER_TYPE);
+        assert_eq!(s.image, DEFAULT_OS_IMAGE);
+        assert_eq!(s.location, "nbg1");
+        assert!(s.labels.is_empty());
+    }
+
+    #[test]
+    fn build_server_spec_overrides_from_manifest_first_node_and_os_image() {
+        let m = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "platform-1"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "nodes": [
+                    {"role": "control-plane", "type": "cpx21", "count": 1},
+                    {"role": "worker", "type": "cx32", "count": 2}
+                ],
+                "osImage": "debian-12"
+            }
+        }));
+        let s = build_server_spec(Some(&m), "cluster-x", "fsn1");
+        // Picks the FIRST node's type, ignores subsequent ones.
+        assert_eq!(s.server_type, "cpx21");
+        assert_eq!(s.image, "debian-12");
+        assert_eq!(s.name, "cluster-x");
+        assert_eq!(s.location, "fsn1");
+    }
+
+    #[test]
+    fn build_ssh_specs_returns_manifest_keys_with_default_names_when_unnamed() {
+        let m = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "sshKeys": [
+                    {"public_key": "ssh-ed25519 AAAA"},
+                    {"name": "named", "public_key": "ssh-ed25519 BBBB"}
+                ]
+            }
+        }));
+        // Env override must NOT be consulted when manifest declares keys.
+        std::env::remove_var("APPRAFTER_SSH_PUBLIC_KEY");
+        let specs = build_ssh_specs(Some(&m), "cl");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "cl-key-0");
+        assert_eq!(specs[0].public_key, "ssh-ed25519 AAAA");
+        assert_eq!(specs[1].name, "named");
+    }
+
+    #[test]
+    fn build_ssh_specs_returns_empty_when_no_manifest_and_no_env() {
+        std::env::remove_var("APPRAFTER_SSH_PUBLIC_KEY");
+        assert!(build_ssh_specs(None, "cl").is_empty());
+    }
+
+    #[test]
+    fn build_network_spec_falls_back_to_defaults_when_block_is_absent() {
+        let n = build_network_spec(None, "cl");
+        assert_eq!(n.name, "cl-net");
+        assert_eq!(n.ip_range, DEFAULT_NETWORK_IP_RANGE);
+        assert_eq!(n.subnet_ip_range, DEFAULT_SUBNET_IP_RANGE);
+        assert_eq!(n.network_zone, DEFAULT_NETWORK_ZONE);
+    }
+
+    #[test]
+    fn build_network_spec_overlays_manifest_values() {
+        let m = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "network": {
+                    "ip_range": "192.168.0.0/16",
+                    "subnet": {"ip_range": "192.168.10.0/24", "zone": "us-east"}
+                }
+            }
+        }));
+        let n = build_network_spec(Some(&m), "p");
+        assert_eq!(n.ip_range, "192.168.0.0/16");
+        assert_eq!(n.subnet_ip_range, "192.168.10.0/24");
+        assert_eq!(n.network_zone, "us-east");
+    }
+
+    #[test]
+    fn build_firewall_spec_uses_default_ingress_when_absent() {
+        let f = build_firewall_spec(None, "cl");
+        assert_eq!(f.name, "cl-fw");
+        // Default ports are 22 + 443.
+        let ports: Vec<String> = f.rules.iter().filter_map(|r| r.port.clone()).collect();
+        assert!(ports.iter().any(|p| p == "22"));
+        assert!(ports.iter().any(|p| p == "443"));
+        for r in &f.rules {
+            assert_eq!(r.direction, "in");
+            assert_eq!(r.protocol, "tcp");
+            assert_eq!(r.source_ips, vec!["0.0.0.0/0", "::/0"]);
+        }
+    }
+
+    #[test]
+    fn build_firewall_spec_uses_manifest_rules_when_present() {
+        let m = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "firewall": {
+                    "ingress": [
+                        {"port": "8080", "protocol": "udp", "source_ips": ["10.0.0.0/8"]}
+                    ]
+                }
+            }
+        }));
+        let f = build_firewall_spec(Some(&m), "p");
+        assert_eq!(f.rules.len(), 1);
+        assert_eq!(f.rules[0].port.as_deref(), Some("8080"));
+        assert_eq!(f.rules[0].protocol, "udp");
+        assert_eq!(f.rules[0].source_ips, vec!["10.0.0.0/8"]);
+    }
+
+    #[test]
+    fn rule_from_manifest_defaults_protocol_to_tcp_and_global_sources() {
+        let r = rule_from_manifest(&FirewallIngressRule {
+            port: "9000".into(),
+            protocol: None,
+            source_ips: None,
+        });
+        assert_eq!(r.protocol, "tcp");
+        assert_eq!(r.source_ips, vec!["0.0.0.0/0", "::/0"]);
+    }
+
+    #[test]
+    fn default_ingress_rules_emits_one_rule_per_default_port() {
+        let r = default_ingress_rules();
+        assert_eq!(r.len(), DEFAULT_INGRESS_PORTS.len());
+    }
+
+    #[test]
+    fn build_floating_ip_specs_is_empty_when_no_floating_ips_declared() {
+        assert!(build_floating_ip_specs(None, "cl", "nbg1").is_empty());
+        let m = minimal_manifest();
+        assert!(build_floating_ip_specs(Some(&m), "cl", "nbg1").is_empty());
+    }
+
+    #[test]
+    fn build_floating_ip_specs_prefixes_names_with_cluster() {
+        let m = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "network": {"floatingIPs": ["egress", "ingress"]}
+            }
+        }));
+        let v = build_floating_ip_specs(Some(&m), "cl", "nbg1");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "cl-egress");
+        assert_eq!(v[0].kind, "ipv4");
+        assert_eq!(v[0].home_location, "nbg1");
+        assert_eq!(v[1].name, "cl-ingress");
+    }
+}
