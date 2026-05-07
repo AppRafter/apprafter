@@ -457,9 +457,10 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `cluster-bootstrap` дропает 4-й tempfile (Argo CD values) рядом с kubeconfig / Cilium values / default-deny NP.
 
 **Поставка (admin password retrieval, v0.1.14):**
-- [ ] `KubectlRunner::get_secret_value(name, namespace, key)` extension — base64-decode наружу.
-- [ ] `Commands::ArgocdPassword` + `commands::argocd_password::run` — fetches `argocd-initial-admin-secret`, шифрует через age, пишет в `state.hetzner_cloud.argocd_admin_password_age`, выводит plaintext в stdout.
-- [ ] `HetznerCloudState.argocd_admin_password_age: Option<String>` (serde-default).
+- [x] `KubectlRunner::get_secret_value(name, namespace, key, kubeconfig)` — wraps `kubectl get secret -o jsonpath={.data.<key>}` + base64-decodes; argv-shape unit test.
+- [x] `Commands::ArgocdPassword { refresh }` + `commands::argocd_password::run` + pure `compute_argocd_password<K>` orchestrator.
+- [x] `HetznerCloudState.argocd_admin_password_age: Option<String>` (serde-default).
+- [x] In-file FakeKubectl tests + cli_smoke missing-state error + integration test для cached-path round-trip через `APPRAFTER_AGE_KEY`.
 
 **Поставка (cert-manager + HTTPRoute + bootstrap-Application, v0.1.15):**
 - [ ] cert-manager helm install (LetsEncrypt staging issuer для tier-1 self-signed fallback).

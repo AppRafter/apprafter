@@ -113,6 +113,19 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **`platform-cli argocd-password`** (v0.1.14) — new subcommand
+  that reads the Argo CD admin password from the cluster on first
+  call (`kubectl get secret argocd-initial-admin-secret -n argocd
+  -o jsonpath` → base64 decode), encrypts the plaintext with the
+  same age identity used for kubeconfig, caches the armored
+  ciphertext in `state.hetzner_cloud.argocd_admin_password_age`,
+  and prints the plaintext on stdout. Subsequent calls decrypt the
+  cache in O(1); `--refresh` forces a re-fetch.
+  `KubectlRunner` trait gains `get_secret_value` (real impl pulls
+  in `base64 = "0.22"` for the decode); `KubectlCli` argv-shape is
+  pinned by a new unit test. The cluster-bootstrap FakeKubectl
+  gets a no-op `unreachable!()` impl since that orchestrator
+  doesn't read secrets.
 - **Argo CD Helm install** (v0.1.13) — `platform-cli
   cluster-bootstrap` now ends with `helm repo add argo
   https://argoproj.github.io/argo-helm` + `helm upgrade --install

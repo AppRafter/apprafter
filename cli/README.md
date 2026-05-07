@@ -133,6 +133,28 @@ are still readable: the v0.1.9 entry is treated as a one-cycle
 legacy fallback. The next `--refresh` migrates the entry forward
 to the age field and clears the plaintext slot.
 
+### Reading the Argo CD admin password
+
+After `cluster-bootstrap` finishes (Argo CD pods need a moment to
+generate their initial admin secret), retrieve the password:
+
+```sh
+cargo run --bin platform-cli -- argocd-password
+```
+
+First call: decrypts the cached kubeconfig from state, runs
+`kubectl get secret argocd-initial-admin-secret -n argocd -o
+jsonpath='{.data.password}'`, base64-decodes the value, encrypts
+the plaintext with the same age identity used for kubeconfig, and
+caches the armored ciphertext in
+`state.hetzner_cloud.argocd_admin_password_age`. Subsequent calls
+decrypt the cache instantly. Pass `--refresh` to force a re-fetch
+(useful after a manual `kubectl patch secret …` rotation).
+
+The cluster-bootstrap step uses Argo CD's default randomly-generated
+admin password. Best practice on first login: change it via the UI
+and re-run `argocd-password --refresh`.
+
 ### Bootstrapping the cluster
 
 After `kubeconfig` works (so the cluster is reachable), install the
