@@ -5,8 +5,8 @@ use std::path::Path;
 use cli_core::manifest::{self, FirewallIngressRule, InfrastructureManifest};
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
-    FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient, HetznerCloudProvider,
-    NetworkSpec, ServerSpec, SshKeySpec,
+    build_k3s_user_data, FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient,
+    HetznerCloudProvider, K3sBootstrapOptions, NetworkSpec, ServerSpec, SshKeySpec,
 };
 use cli_providers::Provider;
 use cli_state::{HetznerCloudState, State, StatePaths};
@@ -20,7 +20,8 @@ const DEFAULT_NETWORK_ZONE: &str = "eu-central";
 const DEFAULT_SERVER_TYPE: &str = "cx22";
 const DEFAULT_OS_IMAGE: &str = "ubuntu-24.04";
 
-const DEFAULT_INGRESS_PORTS: &[&str] = &["22", "443"];
+const DEFAULT_INGRESS_PORTS_TCP: &[&str] = &["22", "6443", "80", "443"];
+const DEFAULT_INGRESS_PORTS_UDP: &[&str] = &["51820"];
 const DEFAULT_INGRESS_SOURCES: &[&str] = &["0.0.0.0/0", "::/0"];
 
 pub fn run() -> Result<()> {
@@ -105,7 +106,7 @@ fn build_server_spec(
         image,
         location: region.into(),
         labels: BTreeMap::new(),
-        user_data: None,
+        user_data: Some(build_k3s_user_data(&K3sBootstrapOptions::default())),
     }
 }
 
@@ -183,19 +184,28 @@ fn rule_from_manifest(r: &FirewallIngressRule) -> FirewallRuleSpec {
 }
 
 fn default_ingress_rules() -> Vec<FirewallRuleSpec> {
-    DEFAULT_INGRESS_PORTS
+    let sources: Vec<String> = DEFAULT_INGRESS_SOURCES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut rules: Vec<FirewallRuleSpec> = DEFAULT_INGRESS_PORTS_TCP
         .iter()
         .map(|p| FirewallRuleSpec {
             direction: "in".into(),
             port: Some((*p).to_string()),
             protocol: "tcp".into(),
-            source_ips: DEFAULT_INGRESS_SOURCES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            source_ips: sources.clone(),
             destination_ips: vec![],
         })
-        .collect()
+        .collect();
+    rules.extend(DEFAULT_INGRESS_PORTS_UDP.iter().map(|p| FirewallRuleSpec {
+        direction: "in".into(),
+        port: Some((*p).to_string()),
+        protocol: "udp".into(),
+        source_ips: sources.clone(),
+        destination_ips: vec![],
+    }));
+    rules
 }
 
 fn build_floating_ip_specs(
@@ -379,13 +389,18 @@ mod tests {
     fn build_firewall_spec_uses_default_ingress_when_absent() {
         let f = build_firewall_spec(None, "cl");
         assert_eq!(f.name, "cl-fw");
-        // Default ports are 22 + 443.
+        // Defaults whitelist ssh + kube API + HTTP + HTTPS over tcp
+        // and wireguard over udp; all rules are inbound from
+        // 0.0.0.0/0 + ::/0.
         let ports: Vec<String> = f.rules.iter().filter_map(|r| r.port.clone()).collect();
-        assert!(ports.iter().any(|p| p == "22"));
-        assert!(ports.iter().any(|p| p == "443"));
+        for expected in ["22", "6443", "80", "443", "51820"] {
+            assert!(
+                ports.iter().any(|p| p == expected),
+                "missing port {expected} in {ports:?}"
+            );
+        }
         for r in &f.rules {
             assert_eq!(r.direction, "in");
-            assert_eq!(r.protocol, "tcp");
             assert_eq!(r.source_ips, vec!["0.0.0.0/0", "::/0"]);
         }
     }
@@ -426,7 +441,35 @@ mod tests {
     #[test]
     fn default_ingress_rules_emits_one_rule_per_default_port() {
         let r = default_ingress_rules();
-        assert_eq!(r.len(), DEFAULT_INGRESS_PORTS.len());
+        assert_eq!(
+            r.len(),
+            DEFAULT_INGRESS_PORTS_TCP.len() + DEFAULT_INGRESS_PORTS_UDP.len()
+        );
+    }
+
+    #[test]
+    fn default_ingress_rules_now_include_kube_api_and_http_and_wireguard() {
+        let r = default_ingress_rules();
+        let ports: Vec<String> = r
+            .iter()
+            .map(|rule| {
+                let p = rule.port.clone().unwrap_or_default();
+                format!("{p}/{}", rule.protocol)
+            })
+            .collect();
+        assert!(ports.contains(&"22/tcp".into()), "{ports:?}");
+        assert!(ports.contains(&"6443/tcp".into()), "{ports:?}");
+        assert!(ports.contains(&"80/tcp".into()), "{ports:?}");
+        assert!(ports.contains(&"443/tcp".into()), "{ports:?}");
+        assert!(ports.contains(&"51820/udp".into()), "{ports:?}");
+    }
+
+    #[test]
+    fn build_server_spec_attaches_cloud_init_user_data_by_default() {
+        let s = build_server_spec(None, "platform-1", "nbg1");
+        let yaml = s.user_data.expect("user_data set by default");
+        assert!(yaml.starts_with("#cloud-config"), "{yaml}");
+        assert!(yaml.contains("get.k3s.io"));
     }
 
     #[test]
