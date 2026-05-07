@@ -18,6 +18,7 @@ fn spec(name: &str) -> ServerSpec {
         image: "ubuntu-24.04".into(),
         location: "nbg1".into(),
         labels,
+        user_data: None,
     }
 }
 

@@ -121,7 +121,7 @@ impl HetznerCloudProvider {
                         .collect(),
                 )
             },
-            user_data: None,
+            user_data: self.spec.user_data.clone(),
         }
     }
 

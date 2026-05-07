@@ -12,6 +12,9 @@ pub struct ServerSpec {
     pub image: String,
     pub location: String,
     pub labels: BTreeMap<String, String>,
+    /// cloud-init `#cloud-config` payload, attached at server
+    /// creation. None means no user_data is sent.
+    pub user_data: Option<String>,
 }
 
 #[derive(Debug, Clone)]

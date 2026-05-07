@@ -58,6 +58,7 @@ pub fn run(yes: bool) -> Result<()> {
             image: "ubuntu-24.04".into(),
             location: region,
             labels: BTreeMap::new(),
+            user_data: None,
         },
         // destroy() reads live state from the API; no spec needed.
         ssh_keys: Vec::new(),

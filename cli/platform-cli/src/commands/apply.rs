@@ -105,6 +105,7 @@ fn build_server_spec(
         image,
         location: region.into(),
         labels: BTreeMap::new(),
+        user_data: None,
     }
 }
 

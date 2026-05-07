@@ -51,6 +51,7 @@ fn create_then_destroy_real_cx22() {
             image: "ubuntu-24.04".into(),
             location: "nbg1".into(),
             labels,
+            user_data: None,
         },
         ssh_keys: vec![],
         networks: vec![],
