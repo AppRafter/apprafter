@@ -68,13 +68,17 @@ package v1alpha1
 		// OS image identifier (e.g. "ubuntu-24.04").
 		osImage?: string
 
-		// Optional Argo CD UI exposure. When `domain` is set,
-		// `platform-cli cluster-bootstrap` provisions a Gateway +
-		// HTTPRoute + cert-manager Certificate so the UI is
-		// reachable at https://<domain>. Without it, Argo CD stays
-		// ClusterIP-only.
+		// Optional Argo CD UI exposure + bootstrap. When `domain` is
+		// set, `platform-cli cluster-bootstrap` provisions a Gateway
+		// + HTTPRoute + cert-manager Certificate so the UI is
+		// reachable at https://<domain>. When `bootstrapRepo` is
+		// set, an Argo CD `Application` named `bootstrap` is applied
+		// pointing at that Git repo (default path: `.`); subsequent
+		// commits to the repo are auto-synced (`prune + selfHeal`).
 		argocd?: {
-			domain?: string
+			domain?:        string
+			bootstrapRepo?: string
+			bootstrapPath?: string
 		}
 	}
 }

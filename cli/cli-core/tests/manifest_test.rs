@@ -134,3 +134,36 @@ out: {\n\
     let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
     assert!(m.spec.argocd.is_none());
 }
+
+#[test]
+fn parse_infrastructure_decodes_argocd_bootstrap_repo_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("infra.cue");
+    std::fs::write(
+        &cue_path,
+        "package x\n\
+out: {\n\
+    apiVersion: \"apprafter.io/v1alpha1\"\n\
+    kind: \"Infrastructure\"\n\
+    metadata: name: \"p\"\n\
+    spec: {\n\
+        provider: \"hetzner-cloud\"\n\
+        argocd: {\n\
+            domain: \"argo.example.com\"\n\
+            bootstrapRepo: \"https://github.com/acme/platform-state.git\"\n\
+            bootstrapPath: \"clusters/prod\"\n\
+        }\n\
+    }\n\
+}\n",
+    )
+    .unwrap();
+
+    let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
+    let argocd = m.spec.argocd.expect("argocd block decoded");
+    assert_eq!(argocd.domain.as_deref(), Some("argo.example.com"));
+    assert_eq!(
+        argocd.bootstrap_repo.as_deref(),
+        Some("https://github.com/acme/platform-state.git")
+    );
+    assert_eq!(argocd.bootstrap_path.as_deref(), Some("clusters/prod"));
+}

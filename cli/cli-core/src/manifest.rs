@@ -55,6 +55,10 @@ pub struct InfrastructureSpec {
 pub struct ArgocdBlock {
     #[serde(default)]
     pub domain: Option<String>,
+    #[serde(rename = "bootstrapRepo", default)]
+    pub bootstrap_repo: Option<String>,
+    #[serde(rename = "bootstrapPath", default)]
+    pub bootstrap_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
