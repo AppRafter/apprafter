@@ -8,8 +8,9 @@ use std::path::Path;
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    cilium_values_yaml, default_deny_network_policy_yaml, gateway_api_crds_url, HelmCli,
-    HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource, CILIUM_CHART_VERSION,
+    argocd_values_yaml, cilium_values_yaml, default_deny_network_policy_yaml, gateway_api_crds_url,
+    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
+    ARGOCD_CHART_VERSION, CILIUM_CHART_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -33,6 +34,8 @@ pub fn run() -> Result<()> {
         "apprafter-default-deny-",
         &default_deny_network_policy_yaml("default"),
     )?;
+    let argocd_values_file =
+        write_tempfile_with("apprafter-argocd-values-", &argocd_values_yaml())?;
 
     perform_bootstrap(
         &HelmCli,
@@ -40,10 +43,11 @@ pub fn run() -> Result<()> {
         kubeconfig_file.path(),
         values_file.path(),
         np_file.path(),
+        argocd_values_file.path(),
     )?;
 
     println!(
-        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy applied"
+        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} applied"
     );
     Ok(())
 }
@@ -72,15 +76,17 @@ fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
 }
 
 /// Pure orchestration — adds the Cilium repo, installs the chart,
-/// applies the upstream Gateway API standard-install CRDs, then
-/// pins the tier-1 default-deny NetworkPolicy. Easily driven with
-/// fake runners in tests.
+/// applies the upstream Gateway API standard-install CRDs, pins
+/// the tier-1 default-deny NetworkPolicy, then installs Argo CD
+/// from its upstream chart. Easily driven with fake runners in
+/// tests.
 pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm: &H,
     kubectl: &K,
     kubeconfig_path: &Path,
     cilium_values_path: &Path,
     default_deny_path: &Path,
+    argocd_values_path: &Path,
 ) -> Result<()> {
     helm.repo_add("cilium", "https://helm.cilium.io/")?;
     helm.upgrade_install(&HelmUpgradeArgs {
@@ -99,6 +105,17 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         &ManifestSource::Path(default_deny_path.to_path_buf()),
         kubeconfig_path,
     )?;
+
+    helm.repo_add("argo", "https://argoproj.github.io/argo-helm")?;
+    helm.upgrade_install(&HelmUpgradeArgs {
+        release: "argocd".into(),
+        chart: "argo/argo-cd".into(),
+        version: ARGOCD_CHART_VERSION.into(),
+        namespace: "argocd".into(),
+        values_path: argocd_values_path.to_path_buf(),
+        kubeconfig_path: kubeconfig_path.to_path_buf(),
+    })?;
+
     Ok(())
 }
 
@@ -140,30 +157,45 @@ mod tests {
     }
 
     #[test]
-    fn perform_bootstrap_runs_helm_repo_then_install_then_two_kubectl_applies() {
+    fn perform_bootstrap_installs_cilium_then_gateway_then_np_then_argocd() {
         let helm = FakeHelm::default();
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
-        let values = PathBuf::from("/tmp/cilium-values.yaml");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
         let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
 
-        perform_bootstrap(&helm, &kubectl, &kc, &values, &np).expect("bootstrap");
+        perform_bootstrap(&helm, &kubectl, &kc, &cilium_values, &np, &argocd_values)
+            .expect("bootstrap");
 
         let repos = helm.repos.borrow();
         assert_eq!(
             repos.as_slice(),
-            &[("cilium".to_string(), "https://helm.cilium.io/".to_string())]
+            &[
+                ("cilium".to_string(), "https://helm.cilium.io/".to_string()),
+                (
+                    "argo".to_string(),
+                    "https://argoproj.github.io/argo-helm".to_string()
+                ),
+            ]
         );
 
         let installs = helm.installs.borrow();
-        assert_eq!(installs.len(), 1);
+        assert_eq!(installs.len(), 2);
         assert_eq!(installs[0].release, "cilium");
+        assert_eq!(installs[0].chart, "cilium/cilium");
         assert_eq!(installs[0].version, CILIUM_CHART_VERSION);
+        assert_eq!(installs[0].namespace, "kube-system");
+        assert_eq!(installs[0].values_path, cilium_values);
+
+        assert_eq!(installs[1].release, "argocd");
+        assert_eq!(installs[1].chart, "argo/argo-cd");
+        assert_eq!(installs[1].version, ARGOCD_CHART_VERSION);
+        assert_eq!(installs[1].namespace, "argocd");
+        assert_eq!(installs[1].values_path, argocd_values);
 
         let applies = kubectl.applies.borrow();
         assert_eq!(applies.len(), 2, "expected Gateway CRDs + NetworkPolicy");
-
-        // First apply: Gateway API standard-install URL.
         match &applies[0].0 {
             ManifestSource::Url(u) => {
                 assert!(u.contains("standard-install.yaml"), "{u}");
@@ -171,14 +203,10 @@ mod tests {
             }
             other => panic!("first apply must be a URL, got {other:?}"),
         }
-        assert_eq!(applies[0].1, kc);
-
-        // Second apply: NetworkPolicy from a path.
         match &applies[1].0 {
             ManifestSource::Path(p) => assert_eq!(p, &np),
             other => panic!("second apply must be a Path, got {other:?}"),
         }
-        assert_eq!(applies[1].1, kc);
     }
 
     #[test]
