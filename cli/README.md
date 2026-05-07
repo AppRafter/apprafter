@@ -133,6 +133,32 @@ are still readable: the v0.1.9 entry is treated as a one-cycle
 legacy fallback. The next `--refresh` migrates the entry forward
 to the age field and clears the plaintext slot.
 
+### Bootstrapping Cilium + Gateway API
+
+After `kubeconfig` works (so the cluster is reachable), install the
+in-cluster components:
+
+```sh
+cargo run --bin platform-cli -- cluster-bootstrap
+```
+
+Under the hood the command:
+
+1. Decrypts the cached kubeconfig (age) from state and writes it to
+   a tempfile.
+2. Adds the upstream Cilium Helm repo and runs
+   `helm upgrade --install cilium cilium/cilium --version <pinned>
+   --namespace kube-system --create-namespace --wait` against tier-1
+   values (kube-proxy replacement, IPAM kubernetes mode, Hubble off,
+   single operator replica).
+3. Applies the upstream Gateway API `standard-install.yaml` for the
+   pinned version (`v1.2.1`) so `Gateway` / `HTTPRoute` /
+   `GRPCRoute` / `ReferenceGrant` resources pass admission.
+
+Both shell-outs require `helm` and `kubectl` on `$PATH`. The
+default-deny `NetworkPolicy` baseline + the smoke verifier land in
+v0.1.12.
+
 Run the real-Hetzner integration test manually:
 
 ```sh

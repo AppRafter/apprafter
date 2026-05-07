@@ -113,6 +113,18 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **`platform-cli cluster-bootstrap`** (v0.1.11) — new subcommand
+  that, after `apply` + `kubeconfig` give us a working cluster,
+  installs Cilium 1.16.5 via Helm (kube-proxy replacement, IPAM
+  kubernetes, Hubble off, single operator replica) and applies the
+  upstream Gateway API v1.2.1 standard-install CRDs. New module
+  `cli-providers::k8s` exposes `HelmRunner` / `KubectlRunner`
+  trait seams (real impls shell out to `helm` and `kubectl`,
+  fakes drive the unit tests) plus `cilium_values_yaml()` and
+  `gateway_api_crds_url()` pure builders. The cloud-init payload
+  now adds `--disable-kube-proxy` to the k3s install command so the
+  Cilium-side replacement actually takes effect. Default-deny
+  NetworkPolicy + the live smoke verifier land in v0.1.12.
 - **age-encrypted kubeconfig** (v0.1.10) — `platform-cli kubeconfig`
   now persists the cached cluster YAML in
   `state.hetzner_cloud.kubeconfig_age` (ASCII-armored) instead of

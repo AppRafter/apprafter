@@ -419,19 +419,26 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.4 Cilium + Gateway API установка
 
+**Статус:** 🚧 partial — `v0.1.11` (1.4a) ставит Cilium через Helm + применяет Gateway API CRD; `v0.1.12` (1.4b) добавит default-deny NetworkPolicy и smoke verifier.
+
 **Цель:** заменить flannel на Cilium с kube-proxy replacement и Gateway API.
 
-**Поставка:**
-- [ ] Helm-values для Cilium (CNI, kube-proxy replacement, Hubble выключен на Tier 1).
-- [ ] Установка Gateway API CRD (стандартные).
-- [ ] Default-deny NetworkPolicy в `kube-system` исключён, в остальных namespace — включён по умолчанию.
-- [ ] Smoke-тест: pod-to-pod связь работает; cross-namespace без NetworkPolicy — заблокирован.
+**Поставка (Cilium + Gateway API CRDs, v0.1.11):**
+- [x] `cli-providers::k8s::cilium_values::cilium_values_yaml()` — pure builder для tier-1 Helm-values (`kubeProxyReplacement: true`, `ipam: kubernetes`, `hubble: enabled: false`, `operator: replicas: 1`).
+- [x] `cli-providers::k8s::helm` — `HelmRunner` trait + `HelmCli` shell-out + `HelmUpgradeArgs` + `CILIUM_CHART_VERSION = "1.16.5"`.
+- [x] `cli-providers::k8s::kubectl` — `KubectlRunner` trait + `KubectlCli` shell-out + `ManifestSource` enum + `gateway_api_crds_url()` (pinned `v1.2.1`).
+- [x] `Commands::ClusterBootstrap` + `commands::cluster_bootstrap::run()` + pure `perform_bootstrap<H, K>` orchestrator (helm repo add → helm upgrade --install → kubectl apply -f gateway CRDs); driven с fake runners в in-file tests.
+- [x] `build_k3s_user_data` теперь добавляет `--disable-kube-proxy` к k3s install line — без этого `kubeProxyReplacement: true` бессмыслен.
 
-**Acceptance:** `cilium status` зелёный; `kubectl apply` Gateway / HTTPRoute проходит admission.
+**Поставка (NetworkPolicy + smoke, v0.1.12):**
+- [ ] Default-deny NetworkPolicy для всех namespace кроме `kube-system`; включается опционально из manifest.
+- [ ] Smoke-проверка: pod-to-pod связь работает, cross-namespace без NetworkPolicy — заблокирован (тег `#[ignore]` для real-cluster).
+
+**Acceptance (v0.1.11):** `platform-cli cluster-bootstrap` выводит сводку и завершается успешно (mocked-runner test); реальный smoke (`cilium status` зелёный, `kubectl apply` Gateway проходит admission) — после v0.1.12.
 
 **Зависит от:** 1.3
 
-**Размер:** M
+**Размер:** M (разбит на 2 цикла: Cilium + Gateway API CRDs `v0.1.11`, NetworkPolicy + smoke `v0.1.12`)
 
 ---
 
