@@ -60,4 +60,13 @@ pub enum Commands {
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
     },
+    /// Print the cached k3s kubeconfig (decrypted), fetching it
+    /// over SSH on first use. Intended pipe target: `KUBECONFIG=
+    /// /dev/stdin kubectl ...`.
+    Kubeconfig {
+        /// Force a re-fetch over SSH even if a cached kubeconfig
+        /// is already in state.
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+    },
 }
