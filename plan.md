@@ -446,19 +446,32 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.5 Argo CD установка и bootstrap
 
+**Статус:** 🚧 partial — `v0.1.13` (1.5a) ставит Argo CD через Helm; `v0.1.14` (1.5b) добавит admin-password retrieval + `platform-cli argocd-password`; `v0.1.15` (1.5c) cert-manager + HTTPRoute + bootstrap-Application и закроет подфазу.
+
 **Цель:** Argo CD как единственный механизм применения манифестов в кластер.
 
-**Поставка:**
-- [ ] Установка Argo CD через helm/manifests, persistence на local-path.
-- [ ] Bootstrap-Application указывает на ту же Git-репу (`platform-state.git`).
-- [ ] Доступ через Gateway API (HTTPRoute с TLS — на Tier 1 self-signed или Let's Encrypt через cert-manager).
-- [ ] Admin-пароль одноразовый, в state с пометкой «сменить при первом логине».
+**Поставка (Argo CD Helm install, v0.1.13):**
+- [x] `cli-providers::k8s::argocd_values::argocd_values_yaml()` — pure builder для tier-1 Helm-values (Dex off, Redis-HA off, ApplicationSet on, Notifications off, ClusterIP server, single replicas).
+- [x] `ARGOCD_CHART_VERSION = "7.7.7"` в том же модуле.
+- [x] `perform_bootstrap` теперь делает helm repo add `argo` + helm upgrade --install `argocd` после default-deny NP; renamed FakeRunner test пинит call sequence для обеих helm releases (cilium → argocd) и обоих kubectl applies.
+- [x] `cluster-bootstrap` дропает 4-й tempfile (Argo CD values) рядом с kubeconfig / Cilium values / default-deny NP.
 
-**Acceptance:** `argocd app list` показывает root app; коммит в Git → автосинк.
+**Поставка (admin password retrieval, v0.1.14):**
+- [ ] `KubectlRunner::get_secret_value(name, namespace, key)` extension — base64-decode наружу.
+- [ ] `Commands::ArgocdPassword` + `commands::argocd_password::run` — fetches `argocd-initial-admin-secret`, шифрует через age, пишет в `state.hetzner_cloud.argocd_admin_password_age`, выводит plaintext в stdout.
+- [ ] `HetznerCloudState.argocd_admin_password_age: Option<String>` (serde-default).
+
+**Поставка (cert-manager + HTTPRoute + bootstrap-Application, v0.1.15):**
+- [ ] cert-manager helm install (LetsEncrypt staging issuer для tier-1 self-signed fallback).
+- [ ] `HTTPRoute` + `Gateway` для Argo CD UI; manifest opt-in для домена.
+- [ ] Bootstrap-`Application` указывает на `platform-state.git` (URL из manifest или env).
+- [ ] Real-cluster smoke в `cluster_smoke_test.rs`: `argocd app list` показывает root app.
+
+**Acceptance (v0.1.13):** `perform_bootstrap` производит `helm install cilium`, `kubectl apply` Gateway CRDs, `kubectl apply` default-deny NP, `helm install argocd` в этом порядке (mocked). Реальный smoke (Argo CD pods Ready, UI reachable, root app sync) — после v0.1.15.
 
 **Зависит от:** 1.4
 
-**Размер:** M
+**Размер:** M (разбит на 3 цикла: helm install `v0.1.13` ✅, admin password `v0.1.14`, cert-manager + HTTPRoute + bootstrap-Application `v0.1.15`)
 
 ---
 

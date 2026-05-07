@@ -133,7 +133,7 @@ are still readable: the v0.1.9 entry is treated as a one-cycle
 legacy fallback. The next `--refresh` migrates the entry forward
 to the age field and clears the plaintext slot.
 
-### Bootstrapping Cilium + Gateway API
+### Bootstrapping the cluster
 
 After `kubeconfig` works (so the cluster is reachable), install the
 in-cluster components:
@@ -156,9 +156,15 @@ Under the hood the command:
    `GRPCRoute` / `ReferenceGrant` resources pass admission.
 4. Applies a default-deny `NetworkPolicy` to the `default`
    namespace (kube-system is intentionally exempt — Cilium and
-   Gateway API system pods need free egress). AppRafter
-   applications opt back in via per-app allow rules in later
-   phases.
+   Gateway API system pods need free egress).
+5. Adds the upstream Argo Helm repo and runs
+   `helm upgrade --install argocd argo/argo-cd --version <pinned>
+   --namespace argocd --create-namespace --wait` against tier-1
+   values (single replicas across all sub-charts, Dex off, Redis-HA
+   off, notifications off). The Argo CD server runs as ClusterIP —
+   the HTTPRoute + cert-manager exposure path lands in v0.1.15.
+   The admin password retrieval (`platform-cli argocd-password`)
+   lands in v0.1.14.
 
 Both shell-outs require `helm` and `kubectl` on `$PATH`.
 

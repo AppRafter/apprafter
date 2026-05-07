@@ -113,6 +113,17 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **Argo CD Helm install** (v0.1.13) — `platform-cli
+  cluster-bootstrap` now ends with `helm repo add argo
+  https://argoproj.github.io/argo-helm` + `helm upgrade --install
+  argocd argo/argo-cd --version 7.7.7 --namespace argocd
+  --create-namespace --wait` against the tier-1 values from the
+  new `cli-providers::k8s::argocd_values` module (Dex off,
+  Redis-HA off, ApplicationSet on, Notifications off, ClusterIP
+  server, single replicas across every sub-chart). The HTTPRoute
+  exposure path + admin password retrieval are explicitly deferred
+  to v0.1.14 (admin password) and v0.1.15 (cert-manager +
+  HTTPRoute + bootstrap-Application).
 - **NetworkPolicy default-deny + cluster smoke** (v0.1.12) —
   `platform-cli cluster-bootstrap` now ends with a `kubectl apply`
   of a default-deny `NetworkPolicy` on the `default` namespace
