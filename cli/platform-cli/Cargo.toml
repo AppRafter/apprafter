@@ -19,6 +19,7 @@ cli-state     = { path = "../cli-state" }
 cli-providers = { path = "../cli-providers" }
 clap          = { workspace = true }
 color-eyre    = { workspace = true }
+tempfile      = { workspace = true }
 tracing       = { workspace = true }
 
 [dev-dependencies]
