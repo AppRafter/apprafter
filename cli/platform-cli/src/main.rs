@@ -28,6 +28,7 @@ fn main() -> color_eyre::Result<()> {
         Commands::Destroy { yes } => commands::destroy::run(*yes)?,
         Commands::Import { force, dry_run } => commands::import::run(*force, *dry_run)?,
         Commands::Kubeconfig { refresh } => commands::kubeconfig::run(*refresh)?,
+        Commands::ClusterBootstrap => commands::cluster_bootstrap::run()?,
     }
     Ok(())
 }

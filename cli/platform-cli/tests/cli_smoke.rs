@@ -20,7 +20,8 @@ fn help_lists_all_subcommands() {
         .stdout(contains("upgrade-tier"))
         .stdout(contains("destroy"))
         .stdout(contains("import"))
-        .stdout(contains("kubeconfig"));
+        .stdout(contains("kubeconfig"))
+        .stdout(contains("cluster-bootstrap"));
 }
 
 #[test]

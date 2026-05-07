@@ -69,4 +69,9 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         refresh: bool,
     },
+    /// Install Cilium (CNI + kube-proxy replacement) and apply
+    /// the Gateway API standard-install CRDs into the cluster
+    /// pointed to by the cached kubeconfig.
+    #[command(name = "cluster-bootstrap")]
+    ClusterBootstrap,
 }
