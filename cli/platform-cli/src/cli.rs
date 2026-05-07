@@ -50,4 +50,14 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Rebuild local state from live Hetzner Cloud resources tagged
+    /// with `apprafter=true`. Read-only — never deletes or creates.
+    Import {
+        /// Overwrite an already-populated `state.hetzner_cloud`.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Print what would be imported without writing state.
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+    },
 }

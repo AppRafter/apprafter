@@ -4,6 +4,7 @@
 pub mod apply;
 pub mod destroy;
 pub mod hcloud;
+pub mod import;
 pub mod init;
 pub mod login;
 pub mod plan;

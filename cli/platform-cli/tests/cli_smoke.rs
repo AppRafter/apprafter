@@ -18,7 +18,8 @@ fn help_lists_all_subcommands() {
         .stdout(contains("status"))
         .stdout(contains("login"))
         .stdout(contains("upgrade-tier"))
-        .stdout(contains("destroy"));
+        .stdout(contains("destroy"))
+        .stdout(contains("import"));
 }
 
 #[test]
