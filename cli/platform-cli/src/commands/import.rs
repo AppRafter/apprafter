@@ -109,6 +109,7 @@ fn build_snapshot(client: &HetznerCloudClient, cluster: &str) -> Result<Option<H
         network_id,
         firewall_id,
         floating_ip_ids,
+        kubeconfig_yaml: None,
     }))
 }
 
@@ -326,6 +327,7 @@ mod tests {
             network_id: None,
             firewall_id: None,
             floating_ip_ids: vec![],
+            kubeconfig_yaml: None,
         };
         print_summary(true, "cl", &s);
         print_summary(false, "cl", &s);

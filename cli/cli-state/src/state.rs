@@ -57,6 +57,10 @@ pub struct HetznerCloudState {
     pub firewall_id: Option<u64>,
     #[serde(default)]
     pub floating_ip_ids: Vec<u64>,
+    /// Cached k3s kubeconfig with `server:` URL rewritten to the
+    /// public IPv4. Populated lazily by `platform-cli kubeconfig`.
+    #[serde(default)]
+    pub kubeconfig_yaml: Option<String>,
 }
 
 impl State {
