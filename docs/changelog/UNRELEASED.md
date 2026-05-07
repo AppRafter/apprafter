@@ -113,6 +113,20 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **k3s cloud-init bootstrap** (v0.1.8) — every newly provisioned
+  Hetzner server gets a `#cloud-config` `user_data` payload that
+  installs k3s in single-node mode (with traefik + servicelb
+  disabled, since Cilium + Gateway API replace them in phase 1.4),
+  enables UFW with the AppRafter port whitelist, and turns on
+  fail2ban for the SSH jail. New module
+  `cli-providers::hetzner_cloud::user_data` exposes
+  `K3sBootstrapOptions` + `build_k3s_user_data`. `ServerSpec` and
+  `ServerCreateRequest` gain an optional `user_data: String`
+  (serde-skipped when `None`, so existing apply paths that don't
+  set it produce identical wire JSON). The default cloud-side
+  firewall is broadened to mirror the in-VM ufw whitelist: 22 +
+  6443 + 80 + 443 / tcp + 51820 / udp (ssh, kube API, HTTP, HTTPS,
+  wireguard).
 - **`platform-cli import`** (v0.1.7) — new read-only subcommand
   that rebuilds `.apprafter/state.json` from live Hetzner Cloud
   resources tagged `apprafter=true`. Picks the server whose name

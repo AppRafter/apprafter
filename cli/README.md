@@ -62,11 +62,22 @@ cargo run --bin platform-cli -- destroy --yes
 ```
 
 `apply` provisions one private network (10.0.0.0/16 with a
-10.0.0.0/24 cloud subnet in `eu-central`), one firewall (SSH 22 +
-HTTPS 443 inbound), and one CX22 server attached to both. The
-second `apply` is a no-op (idempotent). `destroy` requires
-`--yes` and tears everything down (floating IPs → server →
-firewall → network → SSH key).
+10.0.0.0/24 cloud subnet in `eu-central`), one cloud-side firewall
+(whitelisting 22 + 6443 + 80 + 443 / tcp + 51820 / udp inbound —
+ssh, kube API, HTTP, HTTPS, wireguard), and one CX22 server
+attached to both. The server is provisioned with a cloud-init
+`#cloud-config` payload that:
+
+- updates apt and installs `ufw` + `fail2ban`;
+- enables UFW with the same port whitelist (default-deny inbound);
+- enables fail2ban for the SSH jail;
+- runs the canonical `get.k3s.io` installer with
+  `--disable=traefik --disable=servicelb` (Cilium + Gateway API
+  replace them in phase 1.4).
+
+The second `apply` is a no-op (idempotent — server name + apprafter
+label match). `destroy` requires `--yes` and tears everything down
+(floating IPs → server → firewall → network → SSH key).
 
 If the manifest declares `network.floatingIPs: [...string]`, each
 name is provisioned as an `ipv4` Hetzner Floating IP attached to

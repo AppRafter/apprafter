@@ -384,20 +384,27 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.3 k3s bootstrap на свежем VDS
 
+**Статус:** 🚧 partial — `v0.1.8` (1.3a) поднимает k3s через cloud-init и расширяет default-firewall до tier-1 whitelist; `v0.1.9` (1.3b) добавит kubeconfig retrieval + `platform-cli kubeconfig`.
+
 **Цель:** автоматическая установка k3s в single-node режиме после провижионинга VM.
 
-**Поставка:**
-- [ ] cloud-init скрипт (или Talos-compat path для будущего): `curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=...`.
-- [ ] Отключение встроенного traefik, servicelb (заменим на Cilium + Gateway API).
-- [ ] Запись kubeconfig в state, шифрование age.
-- [ ] `platform-cli kubeconfig` — вывод kubeconfig в stdout.
-- [ ] Базовая защита: SSH key only, fail2ban, ufw в whitelist-режиме (только 6443, 80, 443, ssh, wireguard).
+**Поставка (cloud-init bootstrap, v0.1.8):**
+- [x] `cli-providers::hetzner_cloud::user_data::build_k3s_user_data` — pure builder для `#cloud-config` YAML; собирает install-команду для k3s c `--disable=traefik --disable=servicelb`, ufw default-deny + whitelist (22/6443/80/443 tcp + 51820 udp), fail2ban для SSH jail.
+- [x] `ServerCreateRequest.user_data: Option<String>` (serde-skip when None) + `ServerSpec.user_data` + проброс через `HetznerCloudProvider::create_request`.
+- [x] CLI `apply` ставит `user_data = Some(build_k3s_user_data(...))`; default Hetzner-firewall расширен до tier-1 whitelist (тот же набор портов, что и в ufw).
 
-**Acceptance:** через 5 минут после `platform-cli init` — `kubectl get nodes` показывает Ready single node.
+**Поставка (kubeconfig retrieval, v0.1.9):**
+- [ ] SSH в server (используя ключ из state), чтение `/etc/rancher/k3s/k3s.yaml`, перезапись server URL на public IP.
+- [ ] Шифрование kubeconfig через age (ключ генерируется и хранится локально), запись в state.
+- [ ] `platform-cli kubeconfig` — выводит расшифрованный kubeconfig в stdout.
+
+**Acceptance (v0.1.8):** `platform-cli apply` отправляет в Hetzner POST `/v1/servers` с непустым `user_data`-полем; mocked-тесты + unit-тесты builder'а пинят форму YAML.
+
+**Acceptance (1.3 целиком, после v0.1.9):** через ~5 минут после `platform-cli init && platform-cli apply` команда `platform-cli kubeconfig | KUBECONFIG=/dev/stdin kubectl get nodes` показывает Ready single node.
 
 **Зависит от:** 1.2
 
-**Размер:** M
+**Размер:** M (разбит на 2 цикла: cloud-init `v0.1.8`, kubeconfig retrieval `v0.1.9`)
 
 ---
 
