@@ -14,6 +14,7 @@ name = "platform-cli"
 path = "src/main.rs"
 
 [dependencies]
+age           = { workspace = true }
 cli-core      = { path = "../cli-core" }
 cli-state     = { path = "../cli-state" }
 cli-providers = { path = "../cli-providers" }
@@ -23,7 +24,6 @@ tempfile      = { workspace = true }
 tracing       = { workspace = true }
 
 [dev-dependencies]
-age        = { workspace = true }
 assert_cmd = { workspace = true }
 mockito    = { workspace = true }
 predicates = { workspace = true }
