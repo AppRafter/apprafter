@@ -84,10 +84,13 @@ fn parse_infrastructure_errors_when_no_infrastructure_document() {
 
     let err = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).unwrap_err();
     match err {
+        CliError::CueNotFound => {
+            eprintln!("skip: cue not on PATH");
+        }
         CliError::Other(msg) => {
             assert!(msg.contains("Infrastructure"), "{msg}");
         }
-        other => panic!("expected Other, got {other:?}"),
+        other => panic!("expected Other or CueNotFound, got {other:?}"),
     }
 }
 
@@ -110,7 +113,14 @@ out: {\n\
     )
     .unwrap();
 
-    let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
+    let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
+        Ok(m) => m,
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(other) => panic!("unexpected: {other}"),
+    };
     let argocd = m.spec.argocd.expect("argocd block decoded");
     assert_eq!(argocd.domain.as_deref(), Some("argo.example.com"));
 }
@@ -131,7 +141,14 @@ out: {\n\
     )
     .unwrap();
 
-    let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
+    let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
+        Ok(m) => m,
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(other) => panic!("unexpected: {other}"),
+    };
     assert!(m.spec.argocd.is_none());
 }
 
@@ -158,7 +175,14 @@ out: {\n\
     )
     .unwrap();
 
-    let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
+    let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
+        Ok(m) => m,
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(other) => panic!("unexpected: {other}"),
+    };
     let argocd = m.spec.argocd.expect("argocd block decoded");
     assert_eq!(argocd.domain.as_deref(), Some("argo.example.com"));
     assert_eq!(
@@ -190,7 +214,14 @@ out: {\n\
     )
     .unwrap();
 
-    let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
+    let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
+        Ok(m) => m,
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(other) => panic!("unexpected: {other}"),
+    };
     let bs = m.spec.backstage.expect("backstage block decoded");
     assert_eq!(bs.domain.as_deref(), Some("backstage.example.com"));
     assert_eq!(bs.image.as_deref(), Some("ghcr.io/acme/backstage:1.42.0"));
