@@ -47,6 +47,14 @@ pub struct InfrastructureSpec {
     pub ssh_keys: Option<Vec<SshKeyBlock>>,
     #[serde(rename = "osImage", default)]
     pub os_image: Option<String>,
+    #[serde(default)]
+    pub argocd: Option<ArgocdBlock>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArgocdBlock {
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -90,3 +90,47 @@ fn parse_infrastructure_errors_when_no_infrastructure_document() {
         other => panic!("expected Other, got {other:?}"),
     }
 }
+
+#[test]
+fn parse_infrastructure_decodes_optional_argocd_domain() {
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("infra.cue");
+    std::fs::write(
+        &cue_path,
+        "package x\n\
+out: {\n\
+    apiVersion: \"apprafter.io/v1alpha1\"\n\
+    kind: \"Infrastructure\"\n\
+    metadata: name: \"p\"\n\
+    spec: {\n\
+        provider: \"hetzner-cloud\"\n\
+        argocd: domain: \"argo.example.com\"\n\
+    }\n\
+}\n",
+    )
+    .unwrap();
+
+    let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
+    let argocd = m.spec.argocd.expect("argocd block decoded");
+    assert_eq!(argocd.domain.as_deref(), Some("argo.example.com"));
+}
+
+#[test]
+fn parse_infrastructure_argocd_block_is_optional() {
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("infra.cue");
+    std::fs::write(
+        &cue_path,
+        "package x\n\
+out: {\n\
+    apiVersion: \"apprafter.io/v1alpha1\"\n\
+    kind: \"Infrastructure\"\n\
+    metadata: name: \"p\"\n\
+    spec: provider: \"hetzner-cloud\"\n\
+}\n",
+    )
+    .unwrap();
+
+    let m = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).expect("parse");
+    assert!(m.spec.argocd.is_none());
+}
