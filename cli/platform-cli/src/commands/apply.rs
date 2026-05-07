@@ -6,11 +6,13 @@ use cli_core::manifest::{self, FirewallIngressRule, InfrastructureManifest};
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
     FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient, HetznerCloudProvider,
-    NetworkSpec, ServerSpec, SshKeySpec, DEFAULT_BASE_URL,
+    NetworkSpec, ServerSpec, SshKeySpec,
 };
 use cli_providers::Provider;
 use cli_state::{HetznerCloudState, State, StatePaths};
 use tracing::info;
+
+use crate::commands::hcloud::hcloud_base_url;
 
 const DEFAULT_NETWORK_IP_RANGE: &str = "10.0.0.0/16";
 const DEFAULT_SUBNET_IP_RANGE: &str = "10.0.0.0/24";
@@ -69,7 +71,7 @@ pub fn run() -> Result<()> {
     let floating_ips = build_floating_ip_specs(manifest.as_ref(), &cluster, &region);
 
     let provider = HetznerCloudProvider {
-        client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
+        client: HetznerCloudClient::new(hcloud_base_url(), token),
         spec: server_spec,
         ssh_keys,
         networks,

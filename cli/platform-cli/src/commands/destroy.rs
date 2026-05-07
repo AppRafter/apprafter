@@ -2,12 +2,12 @@
 use std::collections::BTreeMap;
 
 use cli_core::{CliError, Result};
-use cli_providers::hetzner_cloud::{
-    HetznerCloudClient, HetznerCloudProvider, ServerSpec, DEFAULT_BASE_URL,
-};
+use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
 use cli_providers::Provider;
 use cli_state::{State, StatePaths};
 use tracing::info;
+
+use crate::commands::hcloud::hcloud_base_url;
 
 pub fn run(yes: bool) -> Result<()> {
     info!(yes, "destroy invoked");
@@ -51,7 +51,7 @@ pub fn run(yes: bool) -> Result<()> {
     let region = state.region.clone().unwrap_or_else(|| "nbg1".into());
 
     let provider = HetznerCloudProvider {
-        client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
+        client: HetznerCloudClient::new(hcloud_base_url(), token),
         spec: ServerSpec {
             name: cluster,
             server_type: "cx22".into(),
