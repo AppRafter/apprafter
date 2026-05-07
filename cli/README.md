@@ -213,9 +213,13 @@ Under the hood the command:
     set (Namespace + Deployment + Service + HTTPRoute + Gateway +
     cert-manager Certificate) to the `backstage` namespace.
     `spec.backstage.image` overrides the placeholder container
-    image; the Backstage app scaffold + Dockerfile land in v0.1.19.
-    Without the manifest opt-in, Backstage is skipped — the
+    image. Without the manifest opt-in, Backstage is skipped — the
     bootstrap finishes after step 9.
+
+> The container image referenced by `spec.backstage.image` is
+> built outside this CLI — see
+> [`backstage-plugins/host/README.md`](../backstage-plugins/host/README.md)
+> for the scaffold + Dockerfile + push workflow.
 
 Both shell-outs require `helm` and `kubectl` on `$PATH`.
 

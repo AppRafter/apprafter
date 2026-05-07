@@ -509,9 +509,11 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `manifests/tier-1/backstage/{example.yaml, README.md}` — статический рендеринг builder'а + recipe для refresh через `cargo run --example backstage_example`.
 
 **Поставка (app-скаффолд + Dockerfile, v0.1.19):**
-- [ ] `backstage-plugins/host/` — output `@backstage/create-app` (Bun/Node).
-- [ ] `Dockerfile` рядом с app для multi-stage build.
-- [ ] CI workflow для build+push image (deferred to phase 2.x когда GHCR-токен есть).
+- [x] `backstage-plugins/host/Dockerfile` — multi-stage Backstage 1.x шаблон (Node 20 builder + slim runtime, копия skeleton/bundle tarballs, EXPOSE 7007, USER node).
+- [x] `backstage-plugins/host/.dockerignore` — node_modules, build-output, local config, secrets out of context.
+- [x] `backstage-plugins/host/scripts/scaffold.sh` — обёртка над `npx @backstage/create-app@latest --skip-install` с preflight'ом (Node 20+, target пустой), drop'ом Dockerfile/.dockerignore рядом, печатью next-steps. Shellchecked.
+- [x] `backstage-plugins/host/README.md` — 6-step workflow scaffold → install → build → push → manifest → cluster-bootstrap; cross-links к Dockerfile, scaffold-скрипту, rendered example manifest, Rust-builder'у.
+- [x] `cli/README.md` — blockquote-cross-link к host-app README рядом со step 10.
 
 **Поставка (OAuth stub + закрытие 1.6, v0.1.20):**
 - [ ] OAuth stub в `app-config.yaml` (basic admin).

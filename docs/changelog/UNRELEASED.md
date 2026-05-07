@@ -113,6 +113,19 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **Backstage scaffold helpers + Dockerfile** (v0.1.19) — adds
+  `backstage-plugins/host/{Dockerfile,.dockerignore,scripts/
+  scaffold.sh,README.md}`. The Dockerfile is the canonical
+  Backstage 1.x multi-stage shape (Node 20 builder + slim
+  runtime, EXPOSE 7007, unprivileged `node` user). The scaffold
+  script wraps `npx @backstage/create-app@latest --skip-install`
+  with a Node-20 preflight, refuses to overwrite a non-empty
+  target, and drops the Dockerfile + .dockerignore alongside the
+  generated app. README walks operators through the 6-step
+  scaffold → install → build → push → manifest →
+  cluster-bootstrap loop. We deliberately don't vendor the
+  Backstage app itself — operators own their bootstrap repo. OAuth
+  + ConfigMap mount land in v0.1.20.
 - **Backstage tier-1 manifests** (v0.1.18) — when
   `Infrastructure.spec.backstage.domain` is set,
   `platform-cli cluster-bootstrap` applies a 6-document Backstage
