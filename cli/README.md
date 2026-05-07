@@ -154,10 +154,25 @@ Under the hood the command:
 3. Applies the upstream Gateway API `standard-install.yaml` for the
    pinned version (`v1.2.1`) so `Gateway` / `HTTPRoute` /
    `GRPCRoute` / `ReferenceGrant` resources pass admission.
+4. Applies a default-deny `NetworkPolicy` to the `default`
+   namespace (kube-system is intentionally exempt — Cilium and
+   Gateway API system pods need free egress). AppRafter
+   applications opt back in via per-app allow rules in later
+   phases.
 
-Both shell-outs require `helm` and `kubectl` on `$PATH`. The
-default-deny `NetworkPolicy` baseline + the smoke verifier land in
-v0.1.12.
+Both shell-outs require `helm` and `kubectl` on `$PATH`.
+
+To verify the install end-to-end against a live cluster:
+
+```sh
+APPRAFTER_K8S_SMOKE=1 \
+  cargo test -p platform-cli --test cluster_smoke_test smoke -- --ignored
+```
+
+The smoke test asserts `cilium status` is green, a minimal Gateway
+passes server-side admission, and the default-deny NetworkPolicy is
+present. It expects `KUBECONFIG` to be exported (e.g.
+`KUBECONFIG=$(platform-cli kubeconfig | tee /tmp/kc; echo /tmp/kc)`).
 
 Run the real-Hetzner integration test manually:
 

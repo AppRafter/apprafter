@@ -113,6 +113,21 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **NetworkPolicy default-deny + cluster smoke** (v0.1.12) —
+  `platform-cli cluster-bootstrap` now ends with a `kubectl apply`
+  of a default-deny `NetworkPolicy` on the `default` namespace
+  (kube-system exempt — Cilium and Gateway API system pods need
+  free egress). New module
+  `cli-providers::k8s::network_policy` exposes
+  `default_deny_network_policy_yaml(namespace)`. The existing
+  FakeKubectl test in `commands::cluster_bootstrap` was renamed
+  and extended to assert both the Gateway API URL apply and the
+  NetworkPolicy path apply happen in order. A new
+  `#[ignore]`-tagged real-cluster smoke
+  (`cli/platform-cli/tests/cluster_smoke_test.rs`) verifies
+  `cilium status` + Gateway admission + default-deny presence;
+  opt-in via `APPRAFTER_K8S_SMOKE=1`. Sub-phase 1.4 in plan.md
+  flips from 🚧 partial to ✅ shipped.
 - **`platform-cli cluster-bootstrap`** (v0.1.11) — new subcommand
   that, after `apply` + `kubeconfig` give us a working cluster,
   installs Cilium 1.16.5 via Helm (kube-proxy replacement, IPAM

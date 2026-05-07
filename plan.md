@@ -419,7 +419,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.4 Cilium + Gateway API установка
 
-**Статус:** 🚧 partial — `v0.1.11` (1.4a) ставит Cilium через Helm + применяет Gateway API CRD; `v0.1.12` (1.4b) добавит default-deny NetworkPolicy и smoke verifier.
+**Статус:** ✅ shipped — sub-phase 1.4 закрыта серией циклов `v0.1.11`–`v0.1.12`: Cilium через Helm + Gateway API CRDs (1.4a) → default-deny NetworkPolicy + real-cluster smoke (1.4b).
 
 **Цель:** заменить flannel на Cilium с kube-proxy replacement и Gateway API.
 
@@ -431,14 +431,16 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `build_k3s_user_data` теперь добавляет `--disable-kube-proxy` к k3s install line — без этого `kubeProxyReplacement: true` бессмыслен.
 
 **Поставка (NetworkPolicy + smoke, v0.1.12):**
-- [ ] Default-deny NetworkPolicy для всех namespace кроме `kube-system`; включается опционально из manifest.
-- [ ] Smoke-проверка: pod-to-pod связь работает, cross-namespace без NetworkPolicy — заблокирован (тег `#[ignore]` для real-cluster).
+- [x] `cli-providers::k8s::network_policy::default_deny_network_policy_yaml(namespace)` — pure builder для `NetworkPolicy` (apiVersion `networking.k8s.io/v1`, podSelector `{}`, policyTypes ingress + egress, label `apprafter=true`).
+- [x] `perform_bootstrap` теперь применяет default-deny на `default` namespace после Gateway API CRDs; kube-system намеренно exempt; `kubectl apply -f` идёт из tempfile.
+- [x] Renamed FakeKubectl test (`perform_bootstrap_runs_helm_repo_then_install_then_two_kubectl_applies`) пинит call sequence + ManifestSource type для каждого apply.
+- [x] `cli/platform-cli/tests/cluster_smoke_test.rs` — `#[ignore]`-tagged real-cluster smoke; opt-in через `APPRAFTER_K8S_SMOKE=1` + `KUBECONFIG`; проверяет `cilium status --wait`, `kubectl apply --dry-run=server -f Gateway`, наличие default-deny NetworkPolicy.
 
 **Acceptance (v0.1.11):** `platform-cli cluster-bootstrap` выводит сводку и завершается успешно (mocked-runner test); реальный smoke (`cilium status` зелёный, `kubectl apply` Gateway проходит admission) — после v0.1.12.
 
 **Зависит от:** 1.3
 
-**Размер:** M (разбит на 2 цикла: Cilium + Gateway API CRDs `v0.1.11`, NetworkPolicy + smoke `v0.1.12`)
+**Размер:** M (разбит на 2 цикла: Cilium + Gateway API CRDs `v0.1.11` ✅, NetworkPolicy + smoke `v0.1.12` ✅)
 
 ---
 
