@@ -5,10 +5,11 @@
 use std::io::Write;
 use std::path::Path;
 
+use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    argocd_values_yaml, cert_manager_values_yaml, cilium_values_yaml,
+    argocd_gateway_yaml, argocd_values_yaml, cert_manager_values_yaml, cilium_values_yaml,
     default_deny_network_policy_yaml, gateway_api_crds_url, selfsigned_cluster_issuer_yaml,
     HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
     ARGOCD_CHART_VERSION, CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
@@ -28,6 +29,8 @@ pub fn run() -> Result<()> {
         )
     })?;
 
+    let argocd_domain = read_argocd_domain_from_manifest(&cwd)?;
+
     let plaintext = decrypt_cached_kubeconfig(&hetzner)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
     let values_file = write_tempfile_with("apprafter-cilium-values-", &cilium_values_yaml())?;
@@ -46,6 +49,14 @@ pub fn run() -> Result<()> {
         &selfsigned_cluster_issuer_yaml(),
     )?;
 
+    let argocd_gateway_file = match &argocd_domain {
+        Some(domain) => Some(write_tempfile_with(
+            "apprafter-argocd-gateway-",
+            &argocd_gateway_yaml(domain),
+        )?),
+        None => None,
+    };
+
     perform_bootstrap(
         &HelmCli,
         &KubectlCli,
@@ -55,12 +66,31 @@ pub fn run() -> Result<()> {
         argocd_values_file.path(),
         cert_manager_values_file.path(),
         selfsigned_issuer_file.path(),
+        argocd_gateway_file.as_ref().map(|f| f.path()),
     )?;
 
+    let exposure = match argocd_domain {
+        Some(d) => format!(" + Argo CD Gateway/HTTPRoute on {d}"),
+        None => String::new(),
+    };
     println!(
-        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer applied"
+        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer{exposure} applied"
     );
     Ok(())
+}
+
+fn read_argocd_domain_from_manifest(cwd: &Path) -> Result<Option<String>> {
+    let path = match std::env::var("APPRAFTER_MANIFEST") {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    info!(path = %path, "reading Infrastructure manifest for argocd.domain");
+    let parsed: InfrastructureManifest = manifest::parse_infrastructure(cwd, Path::new(&path))?;
+    Ok(parsed
+        .spec
+        .argocd
+        .and_then(|a| a.domain)
+        .filter(|d| !d.is_empty()))
 }
 
 fn decrypt_cached_kubeconfig(hetzner: &cli_state::HetznerCloudState) -> Result<String> {
@@ -88,8 +118,9 @@ fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
 
 /// Pure orchestration — installs Cilium + Gateway API CRDs +
 /// default-deny NetworkPolicy + Argo CD + cert-manager + the
-/// self-signed ClusterIssuer in that order. Easily driven with
-/// fake runners in tests.
+/// self-signed ClusterIssuer in that order, optionally followed
+/// by the Argo CD Gateway/HTTPRoute/Certificate manifest. Easily
+/// driven with fake runners in tests.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm: &H,
@@ -100,6 +131,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     argocd_values_path: &Path,
     cert_manager_values_path: &Path,
     selfsigned_issuer_path: &Path,
+    argocd_gateway_path: Option<&Path>,
 ) -> Result<()> {
     helm.repo_add("cilium", "https://helm.cilium.io/")?;
     helm.upgrade_install(&HelmUpgradeArgs {
@@ -142,6 +174,13 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         &ManifestSource::Path(selfsigned_issuer_path.to_path_buf()),
         kubeconfig_path,
     )?;
+
+    if let Some(gw_path) = argocd_gateway_path {
+        kubectl.apply_manifest(
+            &ManifestSource::Path(gw_path.to_path_buf()),
+            kubeconfig_path,
+        )?;
+    }
 
     Ok(())
 }
@@ -212,6 +251,7 @@ mod tests {
             &argocd_values,
             &cm_values,
             &issuer,
+            None, // Argo CD Gateway opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -267,6 +307,42 @@ mod tests {
             ManifestSource::Path(p) => assert_eq!(p, &issuer),
             other => panic!("third apply must be the ClusterIssuer Path, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn perform_bootstrap_applies_argocd_gateway_when_path_provided() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let gateway = PathBuf::from("/tmp/argocd-gateway.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            Some(&gateway),
+        )
+        .expect("bootstrap");
+
+        let applies = kubectl.applies.borrow();
+        // 4 applies: Gateway CRDs URL, default-deny Path, ClusterIssuer
+        // Path, Argo CD Gateway Path.
+        assert_eq!(applies.len(), 4);
+        match &applies[3].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &gateway),
+            other => panic!("fourth apply must be the Argo CD Gateway Path, got {other:?}"),
+        }
+        assert_eq!(applies[3].1, kc);
     }
 
     #[test]
