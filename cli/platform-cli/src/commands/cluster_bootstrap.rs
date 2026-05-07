@@ -154,6 +154,15 @@ mod tests {
                 .push((source.clone(), kubeconfig_path.to_path_buf()));
             Ok(())
         }
+        fn get_secret_value(
+            &self,
+            _secret_name: &str,
+            _namespace: &str,
+            _key: &str,
+            _kubeconfig_path: &Path,
+        ) -> Result<String> {
+            unreachable!("cluster-bootstrap never reads secrets")
+        }
     }
 
     #[test]

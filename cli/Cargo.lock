@@ -363,6 +363,7 @@ dependencies = [
 name = "cli-providers"
 version = "0.1.2"
 dependencies = [
+ "base64 0.22.1",
  "cli-core",
  "mockito",
  "serde",
