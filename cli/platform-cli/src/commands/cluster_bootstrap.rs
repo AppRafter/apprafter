@@ -8,9 +8,10 @@ use std::path::Path;
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    argocd_values_yaml, cilium_values_yaml, default_deny_network_policy_yaml, gateway_api_crds_url,
+    argocd_values_yaml, cert_manager_values_yaml, cilium_values_yaml,
+    default_deny_network_policy_yaml, gateway_api_crds_url, selfsigned_cluster_issuer_yaml,
     HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
-    ARGOCD_CHART_VERSION, CILIUM_CHART_VERSION,
+    ARGOCD_CHART_VERSION, CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -36,6 +37,14 @@ pub fn run() -> Result<()> {
     )?;
     let argocd_values_file =
         write_tempfile_with("apprafter-argocd-values-", &argocd_values_yaml())?;
+    let cert_manager_values_file = write_tempfile_with(
+        "apprafter-cert-manager-values-",
+        &cert_manager_values_yaml(),
+    )?;
+    let selfsigned_issuer_file = write_tempfile_with(
+        "apprafter-selfsigned-issuer-",
+        &selfsigned_cluster_issuer_yaml(),
+    )?;
 
     perform_bootstrap(
         &HelmCli,
@@ -44,10 +53,12 @@ pub fn run() -> Result<()> {
         values_file.path(),
         np_file.path(),
         argocd_values_file.path(),
+        cert_manager_values_file.path(),
+        selfsigned_issuer_file.path(),
     )?;
 
     println!(
-        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} applied"
+        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer applied"
     );
     Ok(())
 }
@@ -75,11 +86,11 @@ fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
     Ok(f)
 }
 
-/// Pure orchestration — adds the Cilium repo, installs the chart,
-/// applies the upstream Gateway API standard-install CRDs, pins
-/// the tier-1 default-deny NetworkPolicy, then installs Argo CD
-/// from its upstream chart. Easily driven with fake runners in
-/// tests.
+/// Pure orchestration — installs Cilium + Gateway API CRDs +
+/// default-deny NetworkPolicy + Argo CD + cert-manager + the
+/// self-signed ClusterIssuer in that order. Easily driven with
+/// fake runners in tests.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm: &H,
     kubectl: &K,
@@ -87,6 +98,8 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     cilium_values_path: &Path,
     default_deny_path: &Path,
     argocd_values_path: &Path,
+    cert_manager_values_path: &Path,
+    selfsigned_issuer_path: &Path,
 ) -> Result<()> {
     helm.repo_add("cilium", "https://helm.cilium.io/")?;
     helm.upgrade_install(&HelmUpgradeArgs {
@@ -115,6 +128,20 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         values_path: argocd_values_path.to_path_buf(),
         kubeconfig_path: kubeconfig_path.to_path_buf(),
     })?;
+
+    helm.repo_add("jetstack", "https://charts.jetstack.io")?;
+    helm.upgrade_install(&HelmUpgradeArgs {
+        release: "cert-manager".into(),
+        chart: "jetstack/cert-manager".into(),
+        version: CERT_MANAGER_CHART_VERSION.into(),
+        namespace: "cert-manager".into(),
+        values_path: cert_manager_values_path.to_path_buf(),
+        kubeconfig_path: kubeconfig_path.to_path_buf(),
+    })?;
+    kubectl.apply_manifest(
+        &ManifestSource::Path(selfsigned_issuer_path.to_path_buf()),
+        kubeconfig_path,
+    )?;
 
     Ok(())
 }
@@ -166,16 +193,27 @@ mod tests {
     }
 
     #[test]
-    fn perform_bootstrap_installs_cilium_then_gateway_then_np_then_argocd() {
+    fn perform_bootstrap_installs_full_stack_in_order() {
         let helm = FakeHelm::default();
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
         let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
         let np = PathBuf::from("/tmp/default-deny.yaml");
         let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
 
-        perform_bootstrap(&helm, &kubectl, &kc, &cilium_values, &np, &argocd_values)
-            .expect("bootstrap");
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+        )
+        .expect("bootstrap");
 
         let repos = helm.repos.borrow();
         assert_eq!(
@@ -186,25 +224,34 @@ mod tests {
                     "argo".to_string(),
                     "https://argoproj.github.io/argo-helm".to_string()
                 ),
+                (
+                    "jetstack".to_string(),
+                    "https://charts.jetstack.io".to_string()
+                ),
             ]
         );
 
         let installs = helm.installs.borrow();
-        assert_eq!(installs.len(), 2);
+        assert_eq!(installs.len(), 3);
         assert_eq!(installs[0].release, "cilium");
-        assert_eq!(installs[0].chart, "cilium/cilium");
         assert_eq!(installs[0].version, CILIUM_CHART_VERSION);
-        assert_eq!(installs[0].namespace, "kube-system");
-        assert_eq!(installs[0].values_path, cilium_values);
 
         assert_eq!(installs[1].release, "argocd");
-        assert_eq!(installs[1].chart, "argo/argo-cd");
         assert_eq!(installs[1].version, ARGOCD_CHART_VERSION);
-        assert_eq!(installs[1].namespace, "argocd");
-        assert_eq!(installs[1].values_path, argocd_values);
+
+        assert_eq!(installs[2].release, "cert-manager");
+        assert_eq!(installs[2].chart, "jetstack/cert-manager");
+        assert_eq!(installs[2].version, CERT_MANAGER_CHART_VERSION);
+        assert_eq!(installs[2].namespace, "cert-manager");
+        assert_eq!(installs[2].values_path, cm_values);
 
         let applies = kubectl.applies.borrow();
-        assert_eq!(applies.len(), 2, "expected Gateway CRDs + NetworkPolicy");
+        assert_eq!(
+            applies.len(),
+            3,
+            "expected Gateway CRDs + NetworkPolicy + ClusterIssuer"
+        );
+
         match &applies[0].0 {
             ManifestSource::Url(u) => {
                 assert!(u.contains("standard-install.yaml"), "{u}");
@@ -214,7 +261,11 @@ mod tests {
         }
         match &applies[1].0 {
             ManifestSource::Path(p) => assert_eq!(p, &np),
-            other => panic!("second apply must be a Path, got {other:?}"),
+            other => panic!("second apply must be the default-deny Path, got {other:?}"),
+        }
+        match &applies[2].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &issuer),
+            other => panic!("third apply must be the ClusterIssuer Path, got {other:?}"),
         }
     }
 
