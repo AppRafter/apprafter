@@ -80,4 +80,22 @@ spec:\n\
         st.success(),
         "default-deny NetworkPolicy not found in `default` namespace"
     );
+
+    // 4. Bootstrap Application present iff caller opts in. We gate
+    //    on a second env var so smoke runs against a v0.1.16
+    //    cluster (no bootstrap-Application) don't fail.
+    if std::env::var("APPRAFTER_BOOTSTRAP_REPO_SMOKE").as_deref() == Ok("1") {
+        let st = Command::new("kubectl")
+            .args(["get", "application", "bootstrap", "-n", "argocd"])
+            .status()
+            .expect("spawn kubectl");
+        assert!(
+            st.success(),
+            "bootstrap Application not found in argocd namespace"
+        );
+    } else {
+        eprintln!(
+            "skip: APPRAFTER_BOOTSTRAP_REPO_SMOKE not set; not asserting bootstrap Application"
+        );
+    }
 }
