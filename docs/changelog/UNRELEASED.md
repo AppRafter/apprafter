@@ -113,6 +113,20 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **Argo CD Gateway + HTTPRoute** (v0.1.16) — when the
+  `Infrastructure` manifest declares `spec.argocd.domain`,
+  `platform-cli cluster-bootstrap` provisions a `Gateway` (HTTPS
+  listener on 443 with hostname + TLS terminate), an `HTTPRoute`
+  routing the same hostname to `argocd-server:80`, and a
+  cert-manager `Certificate` issued by the v0.1.15 self-signed
+  `apprafter-selfsigned` ClusterIssuer. New module
+  `cli-providers::k8s::argocd_gateway`; CUE schema gains
+  `spec.argocd.domain` (optional); Rust manifest mirror gets
+  `ArgocdBlock`. Without the manifest opt-in, Argo CD stays
+  ClusterIP-only — the bootstrap finishes at the v0.1.15 step.
+  Existing FakeRunner test now passes `None` for the optional
+  Gateway path; a new test exercises the `Some(path)` branch and
+  asserts 4 kubectl applies in order.
 - **cert-manager + self-signed ClusterIssuer** (v0.1.15) —
   `platform-cli cluster-bootstrap` now ends with `helm repo add
   jetstack https://charts.jetstack.io` + `helm upgrade --install

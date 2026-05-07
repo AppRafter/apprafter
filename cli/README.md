@@ -195,6 +195,12 @@ Under the hood the command:
    `apprafter-selfsigned`. Future cycles' `Gateway` HTTPRoutes
    reference this issuer by name to mint TLS certs (no DNS
    validation needed for tier-1).
+8. **(Optional)** When the `Infrastructure` manifest declares
+   `spec.argocd.domain`, applies a `Gateway` (HTTPS on 443 +
+   hostname + TLS terminate), an `HTTPRoute` to `argocd-server`,
+   and a cert-manager `Certificate` issued by
+   `apprafter-selfsigned`. Without the manifest opt-in, Argo CD
+   stays ClusterIP-only — the bootstrap finishes after step 7.
 
 Both shell-outs require `helm` and `kubectl` on `$PATH`.
 

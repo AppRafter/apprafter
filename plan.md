@@ -470,10 +470,12 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `cluster-bootstrap` дропает 5-й и 6-й tempfile (cert-manager values + selfsigned issuer) рядом с существующими.
 
 **Поставка (Gateway + HTTPRoute для Argo CD UI, v0.1.16):**
-- [ ] `cli-providers::k8s::argocd_gateway::argocd_gateway_yaml(domain)` — pure builder для `Gateway` (TLS listener) + `HTTPRoute` (routes `/` to argocd-server).
-- [ ] `Certificate` resource ссылается на `apprafter-selfsigned` ClusterIssuer.
-- [ ] Manifest opt-in: новое поле `argocd.domain` в `Infrastructure` schema; без него Argo CD остаётся ClusterIP-only.
-- [ ] `perform_bootstrap` (или новый шаг) применяет Gateway + HTTPRoute + Certificate когда manifest declares domain.
+- [x] CUE schema: `spec.argocd.domain?` optional поле в `#Infrastructure`.
+- [x] Rust manifest mirror: `cli_core::manifest::ArgocdBlock { domain: Option<String> }` + `InfrastructureSpec.argocd: Option<ArgocdBlock>`.
+- [x] `cli-providers::k8s::argocd_gateway::argocd_gateway_yaml(domain)` — pure builder для 3-document манифеста (Gateway + HTTPRoute + Certificate); все ресурсы в namespace `argocd`, label `apprafter=true`, Certificate ссылается на `apprafter-selfsigned` ClusterIssuer.
+- [x] `perform_bootstrap` подросла `argocd_gateway_path: Option<&Path>` параметром; при Some — kubectl apply после self-signed ClusterIssuer; при None — bootstrap идентичен v0.1.15.
+- [x] `cluster_bootstrap::run` парсит `APPRAFTER_MANIFEST` если установлен, извлекает domain, conditionally дропает 7-й tempfile.
+- [x] `examples/infrastructure/tier-1-hetzner.cue` — закомментированный пример opt-in.
 
 **Поставка (bootstrap-Application + закрытие 1.5, v0.1.17):**
 - [ ] `cli-providers::k8s::bootstrap_app::bootstrap_application_yaml(repo_url, path)` — pure builder для Argo CD `Application` ресурса, ссылающегося на `platform-state.git` (URL из manifest или env var).
