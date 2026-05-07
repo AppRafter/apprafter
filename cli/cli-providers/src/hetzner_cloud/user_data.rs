@@ -45,7 +45,7 @@ runcmd:\n\
 {ufw_rules}\
   - ufw --force enable\n\
   - systemctl enable --now fail2ban\n\
-  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--disable=traefik --disable=servicelb\" sh -'\n",
+  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--disable=traefik --disable=servicelb --disable-kube-proxy\" sh -'\n",
     )
 }
 
@@ -84,11 +84,12 @@ mod tests {
     }
 
     #[test]
-    fn k3s_install_disables_traefik_and_servicelb() {
+    fn k3s_install_disables_traefik_servicelb_and_kube_proxy() {
         let s = build_k3s_user_data(&K3sBootstrapOptions::default());
         assert!(s.contains("get.k3s.io"));
         assert!(s.contains("--disable=traefik"));
         assert!(s.contains("--disable=servicelb"));
+        assert!(s.contains("--disable-kube-proxy"));
     }
 
     #[test]
