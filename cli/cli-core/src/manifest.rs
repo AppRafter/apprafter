@@ -49,9 +49,11 @@ pub struct InfrastructureSpec {
     pub os_image: Option<String>,
     #[serde(default)]
     pub argocd: Option<ArgocdBlock>,
+    #[serde(default)]
+    pub backstage: Option<BackstageBlock>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ArgocdBlock {
     #[serde(default)]
     pub domain: Option<String>,
@@ -59,6 +61,14 @@ pub struct ArgocdBlock {
     pub bootstrap_repo: Option<String>,
     #[serde(rename = "bootstrapPath", default)]
     pub bootstrap_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackstageBlock {
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

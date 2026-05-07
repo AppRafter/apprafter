@@ -80,5 +80,15 @@ package v1alpha1
 			bootstrapRepo?: string
 			bootstrapPath?: string
 		}
+
+		// Optional Backstage tier-1 deploy. When `domain` is set,
+		// `platform-cli cluster-bootstrap` provisions a Namespace +
+		// Deployment + Service + HTTPRoute + cert-manager
+		// Certificate so the UI is reachable at https://<domain>.
+		// `image` defaults to a placeholder; supply your own.
+		backstage?: {
+			domain?: string
+			image?:  string
+		}
 	}
 }
