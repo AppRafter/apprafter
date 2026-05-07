@@ -18,14 +18,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - id: detect
         run: |
-          if find . -name Cargo.toml -not -path './target/*' \
-              -not -path '*/node_modules/*' | head -1 | grep -q .; then
+          manifest=$(find . -name Cargo.toml -not -path './target/*' \
+              -not -path '*/node_modules/*' | head -1)
+          if [ -n "$manifest" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "dir=$(dirname "$manifest")" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "::notice::no Cargo.toml yet — skipping cargo test"
           fi
       - if: steps.detect.outputs.found == 'true'
+        working-directory: ${{ steps.detect.outputs.dir }}
         run: cargo test --all --all-features
 
   bun:
