@@ -39,11 +39,14 @@ infra: v1alpha1.#Infrastructure & {
 		}
 		osImage: "ubuntu-24.04"
 
-		// Optional: expose Argo CD UI through Gateway API + cert-manager.
-		// Uncomment + set the FQDN you control (DNS A/AAAA → Hetzner
-		// public IP) to opt in. Without this block, Argo CD stays
-		// ClusterIP-only and `platform-cli cluster-bootstrap` skips
-		// the Gateway / HTTPRoute / Certificate apply.
-		// argocd: domain: "argo.example.com"
+		// Optional: expose Argo CD UI through Gateway API + cert-manager,
+		// and/or wire a bootstrap Application at a Git repo. Uncomment
+		// + adjust the FQDN (DNS A/AAAA → Hetzner public IP) and the
+		// repo URL to opt in.
+		// argocd: {
+		//     domain:        "argo.example.com"
+		//     bootstrapRepo: "https://github.com/acme/platform-state.git"
+		//     bootstrapPath: "clusters/tier-1"
+		// }
 	}
 }

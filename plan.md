@@ -446,7 +446,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.5 Argo CD установка и bootstrap
 
-**Статус:** 🚧 partial — `v0.1.13` (1.5a) ставит Argo CD через Helm; `v0.1.14` (1.5b) добавит admin-password retrieval + `platform-cli argocd-password`; `v0.1.15` (1.5c) cert-manager + HTTPRoute + bootstrap-Application и закроет подфазу.
+**Статус:** ✅ shipped — sub-phase 1.5 закрыта серией циклов `v0.1.13`–`v0.1.17`: helm install (1.5a) → admin password (1.5b) → cert-manager + ClusterIssuer (1.5c) → Gateway + HTTPRoute (1.5d) → bootstrap-Application + smoke (1.5e).
 
 **Цель:** Argo CD как единственный механизм применения манифестов в кластер.
 
@@ -478,16 +478,19 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `examples/infrastructure/tier-1-hetzner.cue` — закомментированный пример opt-in.
 
 **Поставка (bootstrap-Application + закрытие 1.5, v0.1.17):**
-- [ ] `cli-providers::k8s::bootstrap_app::bootstrap_application_yaml(repo_url, path)` — pure builder для Argo CD `Application` ресурса, ссылающегося на `platform-state.git` (URL из manifest или env var).
-- [ ] `Infrastructure` schema: новое поле `argocd.bootstrapRepo` (опциональный URL).
-- [ ] Real-cluster smoke в `cluster_smoke_test.rs`: `argocd app list` показывает root app.
-- [ ] Sub-phase 1.5 status: ✅ shipped.
+- [x] CUE schema: `spec.argocd.bootstrapRepo?` + `spec.argocd.bootstrapPath?` optional поля.
+- [x] Rust manifest mirror: `ArgocdBlock.bootstrap_repo: Option<String>` (rename `bootstrapRepo`) + `bootstrap_path: Option<String>` (rename `bootstrapPath`).
+- [x] `cli-providers::k8s::bootstrap_app::bootstrap_application_yaml(repo_url, path)` — pure builder для `argoproj.io/v1alpha1 Application` `bootstrap` (namespace `argocd`, syncPolicy.automated.prune+selfHeal, label `apprafter=true`); `BOOTSTRAP_APP_DEFAULT_PATH = "."` для пустого пути.
+- [x] `read_argocd_settings_from_manifest` возвращает struct (domain + bootstrap_repo + bootstrap_path); `cluster_bootstrap::run` conditionally дропает 8-й tempfile.
+- [x] `perform_bootstrap` подросла `bootstrap_app_path: Option<&Path>` параметром; при Some — kubectl apply после optional Argo CD Gateway.
+- [x] Real-cluster smoke в `cluster_smoke_test.rs`: `kubectl get application bootstrap -n argocd` под gate `APPRAFTER_BOOTSTRAP_REPO_SMOKE=1`.
+- [x] Sub-phase 1.5 status: ✅ shipped.
 
 **Acceptance (v0.1.13):** `perform_bootstrap` производит `helm install cilium`, `kubectl apply` Gateway CRDs, `kubectl apply` default-deny NP, `helm install argocd` в этом порядке (mocked). Реальный smoke (Argo CD pods Ready, UI reachable, root app sync) — после v0.1.15.
 
 **Зависит от:** 1.4
 
-**Размер:** M (разбит на 5 циклов: helm install `v0.1.13` ✅, admin password `v0.1.14` ✅, cert-manager + ClusterIssuer `v0.1.15` ✅, Gateway + HTTPRoute `v0.1.16`, bootstrap-Application + smoke `v0.1.17`)
+**Размер:** M (разбит на 5 циклов: helm install `v0.1.13` ✅, admin password `v0.1.14` ✅, cert-manager + ClusterIssuer `v0.1.15` ✅, Gateway + HTTPRoute `v0.1.16` ✅, bootstrap-Application + smoke `v0.1.17` ✅)
 
 ---
 

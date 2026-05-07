@@ -201,6 +201,13 @@ Under the hood the command:
    and a cert-manager `Certificate` issued by
    `apprafter-selfsigned`. Without the manifest opt-in, Argo CD
    stays ClusterIP-only — the bootstrap finishes after step 7.
+9. **(Optional)** When the manifest also declares
+   `spec.argocd.bootstrapRepo`, applies an Argo CD `Application`
+   named `bootstrap` that watches the Git repo at
+   `bootstrapRepo` (path defaults to `.`, override with
+   `bootstrapPath`). Auto-prune + self-heal are on, so committing
+   to the repo continuously syncs the platform manifests into the
+   cluster.
 
 Both shell-outs require `helm` and `kubectl` on `$PATH`.
 

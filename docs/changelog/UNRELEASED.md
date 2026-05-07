@@ -113,6 +113,18 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **Argo CD bootstrap Application + sub-phase 1.5 ✅** (v0.1.17) —
+  when `Infrastructure.spec.argocd.bootstrapRepo` is set,
+  `platform-cli cluster-bootstrap` applies an Argo CD `Application`
+  named `bootstrap` that auto-syncs (prune + selfHeal) the named
+  Git repo into the cluster (path defaults to `.`, override via
+  `spec.argocd.bootstrapPath`). New module
+  `cli-providers::k8s::bootstrap_app`; `ArgocdBlock` gains
+  `bootstrap_repo` + `bootstrap_path`; `perform_bootstrap` accepts
+  `Option<&Path>` for the bootstrap Application manifest. The
+  real-cluster smoke (`cluster_smoke_test.rs`) gains a 4th
+  assertion behind `APPRAFTER_BOOTSTRAP_REPO_SMOKE=1`. Sub-phase
+  1.5 in plan.md flips from 🚧 partial to ✅ shipped.
 - **Argo CD Gateway + HTTPRoute** (v0.1.16) — when the
   `Infrastructure` manifest declares `spec.argocd.domain`,
   `platform-cli cluster-bootstrap` provisions a `Gateway` (HTTPS
