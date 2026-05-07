@@ -2,6 +2,9 @@
 //! Print the k3s kubeconfig for the current cluster, fetching it
 //! over SSH on first use and caching the result in state.
 
+use cli_core::secrets::{
+    decrypt_with_identity, default_age_key_path, encrypt_for_recipient, load_or_create_identity,
+};
 use cli_core::{CliError, Result};
 use cli_providers::hetzner_cloud::{
     default_ssh_identity_path, rewrite_server_url, HetznerCloudClient, KubeconfigFetcher,
@@ -24,8 +27,16 @@ pub fn run(refresh: bool) -> Result<()> {
         )
     })?;
 
-    let cached = hetzner.kubeconfig_yaml.clone();
-    if let Some(yaml) = &cached {
+    // Decrypt cached value if present. age-encrypted preferred;
+    // legacy plaintext field used as fallback for one cycle.
+    let cached_plaintext: Option<String> = if let Some(armored) = &hetzner.kubeconfig_age {
+        let identity = load_or_create_identity(&default_age_key_path())?;
+        Some(decrypt_with_identity(armored, &identity)?)
+    } else {
+        hetzner.kubeconfig_yaml.clone()
+    };
+
+    if let Some(yaml) = &cached_plaintext {
         if !refresh {
             print!("{yaml}");
             return Ok(());
@@ -42,10 +53,15 @@ pub fn run(refresh: bool) -> Result<()> {
     let public_ip = resolve_public_ip(&client, hetzner.server_id)?;
 
     let fetcher = SshKubeconfigFetcher::new(default_ssh_identity_path());
-    let yaml = compute_kubeconfig(&fetcher, &public_ip, cached.as_deref(), refresh)?;
+    let yaml = compute_kubeconfig(&fetcher, &public_ip, cached_plaintext.as_deref(), refresh)?;
 
+    // Encrypt before writing back; clear the legacy plaintext slot
+    // so future runs go through the age path exclusively.
+    let identity = load_or_create_identity(&default_age_key_path())?;
+    let armored = encrypt_for_recipient(&yaml, &identity.to_public())?;
     let mut updated = hetzner.clone();
-    updated.kubeconfig_yaml = Some(yaml.clone());
+    updated.kubeconfig_yaml = None;
+    updated.kubeconfig_age = Some(armored);
     state.hetzner_cloud = Some(updated);
     state.save(&paths)?;
     print!("{yaml}");
