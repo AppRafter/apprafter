@@ -4,11 +4,13 @@
 //! shell-outs, plus pure builders for the manifests / values we
 //! ship.
 
+pub mod argocd_values;
 pub mod cilium_values;
 pub mod helm;
 pub mod kubectl;
 pub mod network_policy;
 
+pub use argocd_values::{argocd_values_yaml, ARGOCD_CHART_VERSION};
 pub use cilium_values::cilium_values_yaml;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs, CILIUM_CHART_VERSION};
 pub use kubectl::{
