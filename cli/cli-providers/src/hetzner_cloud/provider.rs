@@ -121,6 +121,7 @@ impl HetznerCloudProvider {
                         .collect(),
                 )
             },
+            user_data: None,
         }
     }
 

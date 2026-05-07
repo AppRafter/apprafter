@@ -94,6 +94,7 @@ fn create_server_posts_json_and_returns_id() {
         ssh_keys: None,
         networks: None,
         firewalls: None,
+        user_data: None,
     };
 
     let resp = client.create_server(&req).expect("create_server");
@@ -557,6 +558,7 @@ fn create_server_maps_status_error_to_hetzner() {
         ssh_keys: None,
         networks: None,
         firewalls: None,
+        user_data: None,
     };
     assert_hetzner(
         client.create_server(&req).unwrap_err(),

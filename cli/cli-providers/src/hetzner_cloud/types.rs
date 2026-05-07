@@ -55,6 +55,10 @@ pub struct ServerCreateRequest {
     /// Hetzner Firewall references to apply to the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub firewalls: Option<Vec<FirewallReference>>,
+    /// cloud-init `#cloud-config` YAML the server is provisioned
+    /// with. Consumed by Hetzner verbatim and never echoed back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

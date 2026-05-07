@@ -66,6 +66,7 @@ fn server_create_request_serialises_required_fields() {
         ssh_keys: None,
         networks: None,
         firewalls: None,
+        user_data: None,
     };
 
     let json = serde_json::to_value(&req).unwrap();
@@ -125,6 +126,7 @@ fn server_create_request_ssh_keys_optional_serialisation() {
         ssh_keys: None,
         networks: None,
         firewalls: None,
+        user_data: None,
     };
     let json_none = serde_json::to_value(&req).unwrap();
     assert!(
@@ -217,6 +219,7 @@ fn server_create_request_networks_and_firewalls_serialise_optionally() {
         ssh_keys: None,
         networks: None,
         firewalls: None,
+        user_data: None,
     };
     let json_none = serde_json::to_value(&req).unwrap();
     assert!(json_none.get("networks").is_none());
@@ -290,4 +293,49 @@ fn floating_ip_create_request_skips_none_fields() {
     let json = serde_json::to_value(&req).unwrap();
     assert!(json.get("server").is_none());
     assert!(json.get("name").is_none());
+}
+
+#[test]
+fn server_create_request_serialises_user_data_when_some() {
+    use cli_providers::hetzner_cloud::ServerCreateRequest;
+    use std::collections::BTreeMap;
+
+    let req = ServerCreateRequest {
+        name: "cl".into(),
+        server_type: "cx22".into(),
+        image: "ubuntu-24.04".into(),
+        location: "nbg1".into(),
+        labels: BTreeMap::new(),
+        start_after_create: true,
+        ssh_keys: None,
+        networks: None,
+        firewalls: None,
+        user_data: Some("#cloud-config\nfoo: bar\n".into()),
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        json.get("user_data").and_then(|v| v.as_str()),
+        Some("#cloud-config\nfoo: bar\n")
+    );
+}
+
+#[test]
+fn server_create_request_skips_user_data_when_none() {
+    use cli_providers::hetzner_cloud::ServerCreateRequest;
+    use std::collections::BTreeMap;
+
+    let req = ServerCreateRequest {
+        name: "cl".into(),
+        server_type: "cx22".into(),
+        image: "ubuntu-24.04".into(),
+        location: "nbg1".into(),
+        labels: BTreeMap::new(),
+        start_after_create: true,
+        ssh_keys: None,
+        networks: None,
+        firewalls: None,
+        user_data: None,
+    };
+    let json = serde_json::to_value(&req).unwrap();
+    assert!(json.get("user_data").is_none());
 }
