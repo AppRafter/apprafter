@@ -516,3 +516,68 @@ fn destroy_removes_floating_ip_first_then_others() {
     // 1 floating ip + 1 server.
     assert_eq!(outcome.destroyed, 2);
 }
+
+#[test]
+fn apply_forwards_user_data_into_the_create_server_request() {
+    use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
+    use cli_providers::Provider;
+    use std::collections::BTreeMap;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+    server
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    server
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    server
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+
+    let create = server
+        .mock("POST", "/v1/servers")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "user_data": "#cloud-config\nfoo: bar\n"
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"server":{"id":7,"name":"cl","status":"initializing","labels":{"apprafter":"true"}},"root_password":null}"#,
+        )
+        .create();
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(server.url(), "test-token"),
+        spec: ServerSpec {
+            name: "cl".into(),
+            server_type: "cx22".into(),
+            image: "ubuntu-24.04".into(),
+            location: "nbg1".into(),
+            labels: BTreeMap::new(),
+            user_data: Some("#cloud-config\nfoo: bar\n".into()),
+        },
+        ssh_keys: vec![],
+        networks: vec![],
+        firewalls: vec![],
+        floating_ips: vec![],
+    };
+
+    let outcome = provider.apply().expect("apply");
+    assert_eq!(outcome.applied, 1);
+    create.assert();
+}
