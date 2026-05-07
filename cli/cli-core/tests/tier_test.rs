@@ -23,3 +23,26 @@ fn tier_display_round_trips() {
         assert_eq!(Tier::from_str(&s).unwrap(), t);
     }
 }
+
+#[test]
+fn from_str_rejects_unknown_tier_with_helpful_message() {
+    use cli_core::CliError;
+    use std::str::FromStr;
+    let err = cli_core::Tier::from_str("staging").unwrap_err();
+    match err {
+        CliError::Other(msg) => {
+            assert!(msg.contains("staging"), "{msg}");
+            assert!(msg.contains("solo"), "{msg}");
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+}
+
+#[test]
+fn tier_level_assigns_monotonic_ordinals() {
+    use cli_core::Tier;
+    assert_eq!(Tier::Solo.level(), 1);
+    assert_eq!(Tier::Team.level(), 2);
+    assert_eq!(Tier::Prod.level(), 3);
+    assert_eq!(Tier::Regulated.level(), 4);
+}

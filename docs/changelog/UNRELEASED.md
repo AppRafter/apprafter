@@ -144,4 +144,19 @@ the `0.0.x` series; semver starts at 1.0.
 - `platform-cli apply` is no longer a stub — it requires
   `HCLOUD_TOKEN` and a state with `provider: hetzner-cloud`.
 
+### Quality
+
+- **CLI test coverage uplift** — added 14 mockito error-path tests
+  for `HetznerCloudClient` (every `list_*` / `create_*` / `delete_*`
+  method now exercises both the happy path and at least one
+  `Err::Status` mapping to `CliError::Hetzner`), plus three small
+  fillers in `cli-core` (`Tier::level`, `Tier::from_str` unknown
+  branch, `cli_core::manifest::parse_infrastructure`
+  missing-document branch). Workspace coverage 78% → **85.6%**;
+  `hetzner_cloud/client.rs` 45% → **95%**; `cli-core/src/tier.rs`
+  and `manifest.rs` reach **100%**. The only remaining gap in
+  `client.rs` is the `Err::Transport` arm of each method, which
+  isn't reachable from a mockito test. Numbers measured with
+  cargo-tarpaulin 0.35.2, e2e test excluded.
+
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/

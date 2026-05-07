@@ -70,3 +70,23 @@ fn parse_returns_error_on_missing_path() {
         Ok(_) => panic!("missing path should not parse successfully"),
     }
 }
+
+#[test]
+fn parse_infrastructure_errors_when_no_infrastructure_document() {
+    use cli_core::CliError;
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("not-infra.cue");
+    std::fs::write(
+        &cue_path,
+        "package x\n#Other: { kind: \"Other\" }\nout: #Other & { kind: \"Other\" }\n",
+    )
+    .unwrap();
+
+    let err = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).unwrap_err();
+    match err {
+        CliError::Other(msg) => {
+            assert!(msg.contains("Infrastructure"), "{msg}");
+        }
+        other => panic!("expected Other, got {other:?}"),
+    }
+}

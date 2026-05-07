@@ -464,3 +464,287 @@ fn delete_floating_ip_404_is_treated_as_already_gone() {
         .delete_floating_ip(999)
         .expect("delete_floating_ip is idempotent");
 }
+
+/// Standard Hetzner error envelope used in every Err::Status test.
+fn hetzner_error_body(code: &str, message: &str) -> String {
+    format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#)
+}
+
+#[track_caller]
+fn assert_hetzner(err: CliError, expected_status: u16, expected_code: &str) {
+    match err {
+        CliError::Hetzner { status, code, .. } => {
+            assert_eq!(status, expected_status, "status code");
+            assert_eq!(code, expected_code, "error code");
+        }
+        other => panic!("expected Hetzner error, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_ssh_keys_maps_status_error_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(401)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("unauthorized", "bad token"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "wrong");
+    assert_hetzner(client.list_ssh_keys().unwrap_err(), 401, "unauthorized");
+}
+
+#[test]
+fn list_networks_maps_status_error_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/networks")
+        .with_status(403)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("forbidden", "no access"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(client.list_networks().unwrap_err(), 403, "forbidden");
+}
+
+#[test]
+fn list_firewalls_maps_status_error_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/firewalls")
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("internal_error", "boom"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(client.list_firewalls().unwrap_err(), 500, "internal_error");
+}
+
+#[test]
+fn list_floating_ips_maps_status_error_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/floating_ips")
+        .with_status(429)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("rate_limited", "slow down"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(client.list_floating_ips().unwrap_err(), 429, "rate_limited");
+}
+
+#[test]
+fn create_server_maps_status_error_to_hetzner() {
+    use cli_providers::hetzner_cloud::ServerCreateRequest;
+    use std::collections::BTreeMap;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/v1/servers")
+        .with_status(422)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("invalid_input", "image not found"))
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let req = ServerCreateRequest {
+        name: "platform-1".into(),
+        server_type: "cx22".into(),
+        image: "ubuntu-bogus".into(),
+        location: "nbg1".into(),
+        labels: BTreeMap::new(),
+        start_after_create: true,
+        ssh_keys: None,
+        networks: None,
+        firewalls: None,
+    };
+    assert_hetzner(
+        client.create_server(&req).unwrap_err(),
+        422,
+        "invalid_input",
+    );
+}
+
+#[test]
+fn create_ssh_key_maps_status_error_to_hetzner() {
+    use cli_providers::hetzner_cloud::SshKeyCreateRequest;
+    use std::collections::BTreeMap;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/v1/ssh_keys")
+        .with_status(409)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("uniqueness_error", "name taken"))
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let req = SshKeyCreateRequest {
+        name: "k1".into(),
+        public_key: "ssh-ed25519 AAAA".into(),
+        labels: BTreeMap::new(),
+    };
+    assert_hetzner(
+        client.create_ssh_key(&req).unwrap_err(),
+        409,
+        "uniqueness_error",
+    );
+}
+
+#[test]
+fn create_network_maps_status_error_to_hetzner() {
+    use cli_providers::hetzner_cloud::{NetworkCreateRequest, Subnet};
+    use std::collections::BTreeMap;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/v1/networks")
+        .with_status(422)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("invalid_input", "ip range overlap"))
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let req = NetworkCreateRequest {
+        name: "net".into(),
+        ip_range: "10.0.0.0/16".into(),
+        subnets: vec![Subnet {
+            kind: "cloud".into(),
+            ip_range: "10.0.0.0/24".into(),
+            network_zone: "eu-central".into(),
+        }],
+        labels: BTreeMap::new(),
+    };
+    assert_hetzner(
+        client.create_network(&req).unwrap_err(),
+        422,
+        "invalid_input",
+    );
+}
+
+#[test]
+fn create_firewall_maps_status_error_to_hetzner() {
+    use cli_providers::hetzner_cloud::FirewallCreateRequest;
+    use std::collections::BTreeMap;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/v1/firewalls")
+        .with_status(422)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("invalid_input", "bad rule"))
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let req = FirewallCreateRequest {
+        name: "fw".into(),
+        rules: vec![],
+        labels: BTreeMap::new(),
+    };
+    assert_hetzner(
+        client.create_firewall(&req).unwrap_err(),
+        422,
+        "invalid_input",
+    );
+}
+
+#[test]
+fn create_floating_ip_maps_status_error_to_hetzner() {
+    use cli_providers::hetzner_cloud::FloatingIpCreateRequest;
+    use std::collections::BTreeMap;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/v1/floating_ips")
+        .with_status(403)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("forbidden", "quota exceeded"))
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let req = FloatingIpCreateRequest {
+        kind: "ipv4".into(),
+        home_location: "nbg1".into(),
+        server: Some(42),
+        name: Some("egress".into()),
+        labels: BTreeMap::new(),
+    };
+    assert_hetzner(
+        client.create_floating_ip(&req).unwrap_err(),
+        403,
+        "forbidden",
+    );
+}
+
+#[test]
+fn delete_server_maps_5xx_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/servers/42")
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("internal_error", "boom"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(client.delete_server(42).unwrap_err(), 500, "internal_error");
+}
+
+#[test]
+fn delete_ssh_key_maps_5xx_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/ssh_keys/7")
+        .with_status(503)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("service_unavailable", "down"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(
+        client.delete_ssh_key(7).unwrap_err(),
+        503,
+        "service_unavailable",
+    );
+}
+
+#[test]
+fn delete_network_maps_5xx_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/networks/100")
+        .with_status(409)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("locked", "in use"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(client.delete_network(100).unwrap_err(), 409, "locked");
+}
+
+#[test]
+fn delete_firewall_maps_5xx_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/firewalls/200")
+        .with_status(409)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("locked", "attached"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(client.delete_firewall(200).unwrap_err(), 409, "locked");
+}
+
+#[test]
+fn delete_floating_ip_maps_5xx_to_hetzner() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("DELETE", "/v1/floating_ips/300")
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(hetzner_error_body("internal_error", "boom"))
+        .create();
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    assert_hetzner(
+        client.delete_floating_ip(300).unwrap_err(),
+        500,
+        "internal_error",
+    );
+}
