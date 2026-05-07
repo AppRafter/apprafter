@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Tier-1 Backstage manifest set: Namespace + Deployment + Service
-//! + HTTPRoute + Gateway + cert-manager Certificate. Pure string
+//! Tier-1 Backstage manifest set.
+//!
+//! Emits a 6-document YAML — Namespace, Deployment, Service,
+//! HTTPRoute, Gateway, cert-manager Certificate — via pure string
 //! composition.
 //!
 //! The Deployment runs a single replica on Backstage's default
@@ -20,13 +22,11 @@ const BACKSTAGE_NAMESPACE: &str = "backstage";
 
 /// Cluster-side YAML for the tier-1 Backstage stack on the given
 /// domain. Emits a 6-document manifest in the `backstage`
-/// namespace:
-/// - Namespace,
-/// - Deployment (1 replica, the supplied or placeholder image),
-/// - Service (ClusterIP, port 80 → backend port 7007),
-/// - HTTPRoute (Gateway API, hostname → Service),
-/// - Gateway (Cilium, HTTPS+TLS terminate),
-/// - cert-manager Certificate (issued by `apprafter-selfsigned`).
+/// namespace: Namespace; Deployment (1 replica, the supplied or
+/// placeholder image); Service (ClusterIP, port 80 → backend port
+/// 7007); HTTPRoute (Gateway API, hostname → Service); Gateway
+/// (Cilium, HTTPS+TLS terminate); cert-manager Certificate
+/// (issued by `apprafter-selfsigned`).
 ///
 /// All resources carry `apprafter=true` so destroy / import flows
 /// can find them.
