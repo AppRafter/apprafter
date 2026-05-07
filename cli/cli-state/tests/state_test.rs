@@ -60,6 +60,7 @@ fn hetzner_cloud_state_round_trips_through_save_load() {
             firewall_id: None,
             floating_ip_ids: vec![],
             kubeconfig_yaml: None,
+            kubeconfig_age: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -85,6 +86,7 @@ fn hetzner_cloud_state_carries_ssh_key_ids() {
             firewall_id: None,
             floating_ip_ids: vec![],
             kubeconfig_yaml: None,
+            kubeconfig_age: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -110,6 +112,7 @@ fn hetzner_cloud_state_carries_network_and_firewall_ids() {
             firewall_id: Some(21),
             floating_ip_ids: vec![],
             kubeconfig_yaml: None,
+            kubeconfig_age: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -135,6 +138,7 @@ fn hetzner_cloud_state_carries_floating_ip_ids() {
             firewall_id: Some(21),
             floating_ip_ids: vec![31, 32],
             kubeconfig_yaml: None,
+            kubeconfig_age: None,
         }),
     };
     original.save(&paths).unwrap();
@@ -154,6 +158,7 @@ fn hetzner_cloud_state_round_trips_cached_kubeconfig_yaml() {
         firewall_id: None,
         floating_ip_ids: vec![],
         kubeconfig_yaml: Some("apiVersion: v1\n".into()),
+        kubeconfig_age: None,
     };
     let json = serde_json::to_string(&s).unwrap();
     let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
@@ -170,4 +175,42 @@ fn hetzner_cloud_state_kubeconfig_yaml_defaults_to_none_when_absent() {
     }"#;
     let s: HetznerCloudState = serde_json::from_str(json).unwrap();
     assert!(s.kubeconfig_yaml.is_none());
+}
+
+#[test]
+fn hetzner_cloud_state_round_trips_cached_kubeconfig_age() {
+    use cli_state::HetznerCloudState;
+
+    let s = HetznerCloudState {
+        server_id: 42,
+        server_name: "platform-1".into(),
+        ssh_key_ids: vec![],
+        network_id: None,
+        firewall_id: None,
+        floating_ip_ids: vec![],
+        kubeconfig_yaml: None,
+        kubeconfig_age: Some(
+            "-----BEGIN AGE ENCRYPTED FILE-----\nfake\n-----END AGE ENCRYPTED FILE-----\n".into(),
+        ),
+    };
+    let json = serde_json::to_string(&s).unwrap();
+    let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back.kubeconfig_age.as_deref(),
+        Some("-----BEGIN AGE ENCRYPTED FILE-----\nfake\n-----END AGE ENCRYPTED FILE-----\n")
+    );
+    assert!(back.kubeconfig_yaml.is_none());
+}
+
+#[test]
+fn hetzner_cloud_state_kubeconfig_age_defaults_to_none_when_absent() {
+    use cli_state::HetznerCloudState;
+    let json = r#"{
+        "server_id": 1, "server_name": "n",
+        "ssh_key_ids": [], "network_id": null,
+        "firewall_id": null, "floating_ip_ids": [],
+        "kubeconfig_yaml": null
+    }"#;
+    let s: HetznerCloudState = serde_json::from_str(json).unwrap();
+    assert!(s.kubeconfig_age.is_none());
 }

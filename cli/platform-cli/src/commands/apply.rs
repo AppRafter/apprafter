@@ -271,6 +271,7 @@ fn persist_state(
             firewall_id: fw_id,
             floating_ip_ids: fip_ids,
             kubeconfig_yaml: None,
+            kubeconfig_age: None,
         });
         state.save(paths)?;
     }

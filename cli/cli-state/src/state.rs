@@ -57,10 +57,16 @@ pub struct HetznerCloudState {
     pub firewall_id: Option<u64>,
     #[serde(default)]
     pub floating_ip_ids: Vec<u64>,
-    /// Cached k3s kubeconfig with `server:` URL rewritten to the
-    /// public IPv4. Populated lazily by `platform-cli kubeconfig`.
+    /// Plain-text k3s kubeconfig — legacy, kept for one cycle so
+    /// existing state.json files still print something useful via
+    /// `platform-cli kubeconfig`. New caches go to
+    /// `kubeconfig_age` instead.
     #[serde(default)]
     pub kubeconfig_yaml: Option<String>,
+    /// age-encrypted (ASCII-armored) k3s kubeconfig. Populated by
+    /// `platform-cli kubeconfig` on cold-fetch and re-fetch.
+    #[serde(default)]
+    pub kubeconfig_age: Option<String>,
 }
 
 impl State {
