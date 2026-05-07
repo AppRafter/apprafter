@@ -6,6 +6,7 @@
 
 pub mod argocd_gateway;
 pub mod argocd_values;
+pub mod bootstrap_app;
 pub mod cert_manager_values;
 pub mod cilium_values;
 pub mod helm;
@@ -15,6 +16,7 @@ pub mod network_policy;
 
 pub use argocd_gateway::argocd_gateway_yaml;
 pub use argocd_values::{argocd_values_yaml, ARGOCD_CHART_VERSION};
+pub use bootstrap_app::{bootstrap_application_yaml, BOOTSTRAP_APP_DEFAULT_PATH};
 pub use cert_manager_values::{cert_manager_values_yaml, CERT_MANAGER_CHART_VERSION};
 pub use cilium_values::cilium_values_yaml;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs, CILIUM_CHART_VERSION};
