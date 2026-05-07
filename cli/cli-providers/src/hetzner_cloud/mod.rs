@@ -2,12 +2,16 @@
 //! Built-in provider for the Hetzner Cloud API.
 
 pub mod client;
+pub mod kubeconfig;
 pub mod provider;
 pub mod server;
 pub mod types;
 pub mod user_data;
 
 pub use client::{HetznerCloudClient, DEFAULT_BASE_URL};
+pub use kubeconfig::{
+    default_ssh_identity_path, rewrite_server_url, KubeconfigFetcher, SshKubeconfigFetcher,
+};
 pub use provider::HetznerCloudProvider;
 pub use server::{
     FirewallRuleSpec, FirewallSpec, FloatingIpSpec, NetworkSpec, ServerSpec, SshKeySpec,
