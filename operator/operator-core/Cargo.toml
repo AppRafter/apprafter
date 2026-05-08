@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+[package]
+name        = "operator-core"
+description = "Shared types for the AppRafter operator (CRDs, errors, helpers)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kube         = { workspace = true }
+k8s-openapi  = { workspace = true }
+schemars     = { workspace = true }
+serde        = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
