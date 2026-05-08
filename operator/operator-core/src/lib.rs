@@ -2,7 +2,9 @@
 //! Shared types and helpers for the AppRafter operator.
 
 pub mod application;
+pub mod metrics;
 
 pub use application::{
     Application, ApplicationBaseSpec, ApplicationExpose, ApplicationSpec, ApplicationStatus,
 };
+pub use metrics::Metrics;
