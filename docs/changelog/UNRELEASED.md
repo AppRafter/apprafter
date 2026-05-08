@@ -61,6 +61,26 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Backstage applications-backend plugin scaffold (sub-phase
+  1.10a)** (v0.1.33) — new TypeScript + Bun package at
+  `backstage-plugins/applications-backend/`. v0.1.33 ships the
+  scaffold (package.json, tsconfig.json, .gitignore, bun.lock), TS
+  mirrors of `operator-core::Application` and friends
+  (`Application`, `ApplicationSpec`, `ApplicationBaseSpec`,
+  `ApplicationExpose`, `ApplicationStatus`, `ApplicationCondition`,
+  `ObjectMeta`), an `isApplication(unknown)` shape guard, and pure
+  async handlers (`listApplicationsHandler`,
+  `getApplicationHandler`) backed by an `ApplicationStore`
+  interface. The only `ApplicationStore` impl in v0.1.33 is the
+  no-op `StubApplicationStore`; v0.1.34 (sub-phase 1.10b) wires up
+  a `KubeApplicationStore` that proxies the kube apiserver via the
+  in-cluster service-account token, then bolts on the Backstage
+  `createBackendPlugin` glue. 5 router tests + 5 types tests = 10
+  unit tests via `bun test`. CI workflows (`test.yml`, `lint.yml`)
+  update so `bun install + bun test` / `bun run lint` iterate every
+  depth-≤3 `package.json` directory. License is MIT (plugin tier).
+  React frontend lands in v0.1.35 (sub-phase 1.10c); per-env tabs
+  + closure in v0.1.36 (sub-phase 1.10d).
 - **Application per-environment expansion + sub-phase 1.9 ✅**
   (v0.1.32) — `operator-rendering` gains `effective_spec(&app,
   env_name) -> ApplicationBaseSpec` that unifies `spec.base` with
