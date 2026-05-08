@@ -51,7 +51,7 @@ export APPRAFTER_SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
 
 # Optional: read network / firewall / server-type / image from a
 # CUE Infrastructure manifest. Without this, hardcoded defaults
-# are used (10.0.0.0/16 net, SSH 22 + HTTPS 443 firewall, cx22,
+# are used (10.0.0.0/16 net, SSH 22 + HTTPS 443 firewall, cpx22,
 # ubuntu-24.04).
 export APPRAFTER_MANIFEST=examples/infrastructure/tier-1-hetzner.cue
 
@@ -64,7 +64,7 @@ cargo run --bin platform-cli -- destroy --yes
 `apply` provisions one private network (10.0.0.0/16 with a
 10.0.0.0/24 cloud subnet in `eu-central`), one cloud-side firewall
 (whitelisting 22 + 6443 + 80 + 443 / tcp + 51820 / udp inbound —
-ssh, kube API, HTTP, HTTPS, wireguard), and one CX22 server
+ssh, kube API, HTTP, HTTPS, wireguard), and one CPX22 server
 attached to both. The server is provisioned with a cloud-init
 `#cloud-config` payload that:
 

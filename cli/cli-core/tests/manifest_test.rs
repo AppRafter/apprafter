@@ -37,7 +37,7 @@ fn parse_full_infrastructure_fixture() {
     assert_eq!(parsed.spec.provider, "hetzner-cloud");
     assert_eq!(parsed.spec.region.as_deref(), Some("nbg1"));
     assert_eq!(parsed.spec.nodes.len(), 1);
-    assert_eq!(parsed.spec.nodes[0].kind, "cx22");
+    assert_eq!(parsed.spec.nodes[0].kind, "cpx22");
     assert_eq!(parsed.spec.nodes[0].count, 1);
     assert_eq!(parsed.spec.os_image.as_deref(), Some("ubuntu-24.04"));
 
