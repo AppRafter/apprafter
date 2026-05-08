@@ -9,11 +9,12 @@ use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    argocd_gateway_yaml, argocd_values_yaml, backstage_manifests_yaml, bootstrap_application_yaml,
-    cert_manager_values_yaml, cilium_values_yaml, default_deny_network_policy_yaml,
-    gateway_api_crds_url, selfsigned_cluster_issuer_yaml, HelmCli, HelmRunner, HelmUpgradeArgs,
-    KubectlCli, KubectlRunner, ManifestSource, ARGOCD_CHART_VERSION, BACKSTAGE_DEFAULT_IMAGE,
-    BOOTSTRAP_APP_DEFAULT_PATH, CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
+    application_crd_yaml, argocd_gateway_yaml, argocd_values_yaml, backstage_manifests_yaml,
+    bootstrap_application_yaml, cert_manager_values_yaml, cilium_values_yaml,
+    default_deny_network_policy_yaml, gateway_api_crds_url, selfsigned_cluster_issuer_yaml,
+    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
+    ARGOCD_CHART_VERSION, BACKSTAGE_DEFAULT_IMAGE, BOOTSTRAP_APP_DEFAULT_PATH,
+    CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -35,6 +36,8 @@ pub fn run() -> Result<()> {
     let plaintext = decrypt_cached_kubeconfig(&hetzner)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
     let values_file = write_tempfile_with("apprafter-cilium-values-", &cilium_values_yaml())?;
+    let application_crd_file =
+        write_tempfile_with("apprafter-application-crd-", &application_crd_yaml())?;
     let np_file = write_tempfile_with(
         "apprafter-default-deny-",
         &default_deny_network_policy_yaml("default"),
@@ -91,6 +94,7 @@ pub fn run() -> Result<()> {
         &KubectlCli,
         kubeconfig_file.path(),
         values_file.path(),
+        application_crd_file.path(),
         np_file.path(),
         argocd_values_file.path(),
         cert_manager_values_file.path(),
@@ -111,7 +115,7 @@ pub fn run() -> Result<()> {
         suffix.push_str(&format!(" + Backstage on {d}"));
     }
     println!(
-        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer{suffix} applied"
+        "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + Application CRD + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer{suffix} applied"
     );
     Ok(())
 }
@@ -166,18 +170,20 @@ fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
     Ok(f)
 }
 
-/// Pure orchestration — installs Cilium + Gateway API CRDs +
-/// default-deny NetworkPolicy + Argo CD + cert-manager + the
-/// self-signed ClusterIssuer in that order, optionally followed
-/// by the Argo CD Gateway/HTTPRoute/Certificate manifest, the
-/// bootstrap `Application` resource, and the tier-1 Backstage
-/// manifest set. Easily driven with fake runners in tests.
+/// Pure orchestration — installs Cilium + Gateway API CRDs + the
+/// AppRafter Application CRD + default-deny NetworkPolicy + Argo
+/// CD + cert-manager + the self-signed ClusterIssuer in that
+/// order, optionally followed by the Argo CD Gateway / HTTPRoute /
+/// Certificate manifest, the bootstrap `Application` resource, and
+/// the tier-1 Backstage manifest set. Easily driven with fake
+/// runners in tests.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm: &H,
     kubectl: &K,
     kubeconfig_path: &Path,
     cilium_values_path: &Path,
+    application_crd_path: &Path,
     default_deny_path: &Path,
     argocd_values_path: &Path,
     cert_manager_values_path: &Path,
@@ -197,6 +203,10 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     })?;
     kubectl.apply_manifest(
         &ManifestSource::Url(gateway_api_crds_url()),
+        kubeconfig_path,
+    )?;
+    kubectl.apply_manifest(
+        &ManifestSource::Path(application_crd_path.to_path_buf()),
         kubeconfig_path,
     )?;
     kubectl.apply_manifest(
@@ -304,6 +314,7 @@ mod tests {
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
         let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
         let np = PathBuf::from("/tmp/default-deny.yaml");
         let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
         let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
@@ -314,6 +325,7 @@ mod tests {
             &kubectl,
             &kc,
             &cilium_values,
+            &app_crd,
             &np,
             &argocd_values,
             &cm_values,
@@ -357,8 +369,8 @@ mod tests {
         let applies = kubectl.applies.borrow();
         assert_eq!(
             applies.len(),
-            3,
-            "expected Gateway CRDs + NetworkPolicy + ClusterIssuer"
+            4,
+            "expected Gateway CRDs + Application CRD + NetworkPolicy + ClusterIssuer"
         );
 
         match &applies[0].0 {
@@ -369,12 +381,16 @@ mod tests {
             other => panic!("first apply must be a URL, got {other:?}"),
         }
         match &applies[1].0 {
-            ManifestSource::Path(p) => assert_eq!(p, &np),
-            other => panic!("second apply must be the default-deny Path, got {other:?}"),
+            ManifestSource::Path(p) => assert_eq!(p, &app_crd),
+            other => panic!("second apply must be the Application CRD Path, got {other:?}"),
         }
         match &applies[2].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &np),
+            other => panic!("third apply must be the default-deny Path, got {other:?}"),
+        }
+        match &applies[3].0 {
             ManifestSource::Path(p) => assert_eq!(p, &issuer),
-            other => panic!("third apply must be the ClusterIssuer Path, got {other:?}"),
+            other => panic!("fourth apply must be the ClusterIssuer Path, got {other:?}"),
         }
     }
 
@@ -384,6 +400,7 @@ mod tests {
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
         let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
         let np = PathBuf::from("/tmp/default-deny.yaml");
         let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
         let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
@@ -395,6 +412,7 @@ mod tests {
             &kubectl,
             &kc,
             &cilium_values,
+            &app_crd,
             &np,
             &argocd_values,
             &cm_values,
@@ -406,14 +424,14 @@ mod tests {
         .expect("bootstrap");
 
         let applies = kubectl.applies.borrow();
-        // 4 applies: Gateway CRDs URL, default-deny Path, ClusterIssuer
-        // Path, Argo CD Gateway Path.
-        assert_eq!(applies.len(), 4);
-        match &applies[3].0 {
+        // 5 applies: Gateway CRDs URL, Application CRD Path,
+        // default-deny Path, ClusterIssuer Path, Argo CD Gateway Path.
+        assert_eq!(applies.len(), 5);
+        match &applies[4].0 {
             ManifestSource::Path(p) => assert_eq!(p, &gateway),
-            other => panic!("fourth apply must be the Argo CD Gateway Path, got {other:?}"),
+            other => panic!("fifth apply must be the Argo CD Gateway Path, got {other:?}"),
         }
-        assert_eq!(applies[3].1, kc);
+        assert_eq!(applies[4].1, kc);
     }
 
     #[test]
@@ -422,6 +440,7 @@ mod tests {
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
         let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
         let np = PathBuf::from("/tmp/default-deny.yaml");
         let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
         let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
@@ -434,6 +453,7 @@ mod tests {
             &kubectl,
             &kc,
             &cilium_values,
+            &app_crd,
             &np,
             &argocd_values,
             &cm_values,
@@ -445,14 +465,15 @@ mod tests {
         .expect("bootstrap");
 
         let applies = kubectl.applies.borrow();
-        // 5 applies: Gateway CRDs URL, default-deny Path, ClusterIssuer
-        // Path, Argo CD Gateway Path, bootstrap Application Path.
-        assert_eq!(applies.len(), 5);
-        match &applies[4].0 {
+        // 6 applies: Gateway CRDs URL, Application CRD Path,
+        // default-deny Path, ClusterIssuer Path, Argo CD Gateway Path,
+        // bootstrap Application Path.
+        assert_eq!(applies.len(), 6);
+        match &applies[5].0 {
             ManifestSource::Path(p) => assert_eq!(p, &bootstrap),
-            other => panic!("fifth apply must be the bootstrap Application Path, got {other:?}"),
+            other => panic!("sixth apply must be the bootstrap Application Path, got {other:?}"),
         }
-        assert_eq!(applies[4].1, kc);
+        assert_eq!(applies[5].1, kc);
     }
 
     #[test]
@@ -461,6 +482,7 @@ mod tests {
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
         let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
         let np = PathBuf::from("/tmp/default-deny.yaml");
         let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
         let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
@@ -474,6 +496,7 @@ mod tests {
             &kubectl,
             &kc,
             &cilium_values,
+            &app_crd,
             &np,
             &argocd_values,
             &cm_values,
@@ -485,15 +508,15 @@ mod tests {
         .expect("bootstrap");
 
         let applies = kubectl.applies.borrow();
-        // 6 applies: Gateway CRDs URL, default-deny Path,
-        // ClusterIssuer Path, Argo CD Gateway Path, bootstrap App
-        // Path, Backstage Path.
-        assert_eq!(applies.len(), 6);
-        match &applies[5].0 {
+        // 7 applies: Gateway CRDs URL, Application CRD Path,
+        // default-deny Path, ClusterIssuer Path, Argo CD Gateway
+        // Path, bootstrap App Path, Backstage Path.
+        assert_eq!(applies.len(), 7);
+        match &applies[6].0 {
             ManifestSource::Path(p) => assert_eq!(p, &backstage),
-            other => panic!("sixth apply must be the Backstage Path, got {other:?}"),
+            other => panic!("seventh apply must be the Backstage Path, got {other:?}"),
         }
-        assert_eq!(applies[5].1, kc);
+        assert_eq!(applies[6].1, kc);
     }
 
     #[test]
