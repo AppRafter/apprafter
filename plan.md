@@ -642,6 +642,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.12 End-to-end MVP smoke-тест
 
+> v0.1.39 — sub-phase 1.12a shipped: `e2e/mvp.sh` orchestration script (provision → bootstrap → hello-world → verify → destroy with timer + auto-cleanup) + operator-guide quickstart at `docs/operator-guide/quickstart.md`. CI nightly workflow + closure in v0.1.40.
+
 **Цель:** воспроизводимый E2E-тест полного пути: чистый Hetzner-аккаунт → задеплоенный hello-world.
 
 **Поставка:**
