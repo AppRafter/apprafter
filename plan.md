@@ -265,7 +265,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-## Фаза 1 — MVP single-node (M1) ⚡
+## Фаза 1 — MVP single-node (M1) ✅
 
 **Цель фазы:** на чистом Hetzner CX22 за один `platform-cli init` поднять Tier 1 кластер и задеплоить hello-world `Application` через GitOps.
 
@@ -661,12 +661,12 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.13 Закрытие чек-листа M1 spec
+### 1.13 Закрытие чек-листа M1 spec ✅
 
 **Поставка:**
-- [ ] Обновить `spec.md` §6 M1 — все пункты `[x]`.
-- [ ] Tag `v0.1.0-mvp`.
-- [ ] Release notes.
+- [x] Обновить `spec.md` §6 M1 — все пункты `[x]` (v0.1.41).
+- [x] Tag `v0.1.0-mvp` (v0.1.41 — the v0.1.41 commit also carries an annotated `v0.1.0-mvp` tag pointing at the same SHA).
+- [x] Release notes (v0.1.41 — `docs/changelog/UNRELEASED.md` graduates the Phase 1 section into a `v0.1.0-mvp` release block).
 
 **Размер:** XS
 
