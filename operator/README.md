@@ -94,6 +94,27 @@ curl -s http://127.0.0.1:8080/metrics
 `HTTP_PORT` (default 8080) overrides the listener port. Tracing
 filter follows `RUST_LOG` (e.g. `RUST_LOG=apprafter_operator=debug`).
 
+### What reconcile does
+
+Each reconcile cycle (one Application → one pass):
+
+1. Renders a `Deployment` and (if `spec.base.expose` is set) a
+   `Service` via `operator-rendering::render_application`.
+2. Applies each child via server-side apply with field manager
+   `apprafter-operator` (so co-owners can patch other fields
+   without conflict). Both children carry `ownerReferences` back
+   to the Application — `kubectl delete application/<name>`
+   cascades.
+3. Updates the Application's `status` subresource: `phase` =
+   `Ready`, `observedGeneration` = current `metadata.generation`,
+   `conditions` = `[Ready/True/ReconcileSucceeded]`, `endpointURL`
+   = `http://<service>.<namespace>.svc.cluster.local:80` (when a
+   Service is rendered).
+
+Per-environment expansion (`spec.environments.<env>` overrides) +
+HTTPRoute (`expose.network: public`) land in v0.1.32 (sub-phase
+1.9c, closes phase 1.9).
+
 ### Leader election
 
 The binary acquires a `coordination.k8s.io/v1` `Lease` named
