@@ -9,6 +9,7 @@
 //! values with their own constants so the parser stays a pure
 //! shape-translator.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -156,5 +157,70 @@ fn parse_infrastructure_from_value(value: &Value) -> Result<InfrastructureManife
     }
     Err(CliError::Other(
         "cue export did not contain an Infrastructure document".to_string(),
+    ))
+}
+
+/// Top-level CUE-exported document for a `kind: Application` manifest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplicationManifest {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: Metadata,
+    #[serde(default)]
+    pub base: Option<ApplicationSpec>,
+    #[serde(default)]
+    pub environments: Option<BTreeMap<String, ApplicationSpec>>,
+}
+
+/// Mirror of CUE `#ApplicationSpec` — used both as the `base` block
+/// and as the value of every `environments[name]` entry.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApplicationSpec {
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub replicas: Option<u32>,
+    #[serde(default)]
+    pub expose: Option<ApplicationExpose>,
+    #[serde(default)]
+    pub env: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplicationExpose {
+    pub port: u16,
+    #[serde(default)]
+    pub public: Option<bool>,
+    #[serde(default)]
+    pub network: Option<String>,
+}
+
+/// Run `cue export <path> --out json` from `workdir` and parse the
+/// result as an [`ApplicationManifest`]. Walks the top-level object
+/// the same way `parse_infrastructure` does, picking the first
+/// value whose `kind == "Application"`.
+pub fn parse_application(workdir: &Path, path: &Path) -> Result<ApplicationManifest> {
+    let value = cue::export_in(workdir, path)?;
+    parse_application_from_value(&value)
+}
+
+fn parse_application_from_value(value: &Value) -> Result<ApplicationManifest> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| CliError::Other("cue export did not yield a JSON object".to_string()))?;
+
+    for (_, candidate) in obj {
+        if candidate
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(|k| k == "Application")
+            .unwrap_or(false)
+        {
+            return serde_json::from_value(candidate.clone()).map_err(CliError::from);
+        }
+    }
+    Err(CliError::Other(
+        "cue export did not contain an Application document".to_string(),
     ))
 }
