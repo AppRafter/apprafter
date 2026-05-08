@@ -597,19 +597,20 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.10 Backstage Application plugin (status view)
+### 1.10 Backstage Application plugin (status view) ✅
 
 > v0.1.33 — sub-phase 1.10a shipped: TypeScript scaffold + types + pure handler stubs.
 > v0.1.34 — sub-phase 1.10b shipped: `KubeApplicationStore` proxies kube apiserver via in-cluster SA token.
-> v0.1.35 — sub-phase 1.10c shipped: applications-frontend scaffold + `ApplicationsApi` interface + pure `applicationsToRows` transform. React + `createPlugin` glue + drilldown + per-env tabs + closure in v0.1.36.
+> v0.1.35 — sub-phase 1.10c shipped: applications-frontend scaffold + `ApplicationsApi` interface + pure `applicationsToRows` transform.
+> v0.1.36 — sub-phase 1.10d shipped: `ApplicationsTable` + `ApplicationDetail` + `EnvironmentTabs` React components + per-env helpers. Backstage `createApiRef` + `createPlugin` wiring documented as a consumer-side snippet (keeps the package's dep tree light enough to publish independently). Phase 1.10 ✅.
 
 **Цель:** в Backstage — список Application, статус, ссылка на endpoint, последние события.
 
 **Поставка:**
-- [ ] Backstage backend plugin читает k8s API напрямую (через kubeconfig service account).
-- [ ] Frontend plugin: таблица + drilldown.
-- [ ] События: replicas / status / последние deploys.
-- [ ] Per-environment вкладки (dev/staging/prod).
+- [x] Backstage backend plugin читает k8s API напрямую (через kubeconfig service account) (v0.1.33 + v0.1.34 — `@apprafter/applications-backend` с `KubeApplicationStore` через in-cluster service-account token).
+- [x] Frontend plugin: таблица + drilldown (v0.1.36 — `ApplicationsTable` + `ApplicationDetail` React components).
+- [x] События: replicas / status / последние deploys (v0.1.36 — `ApplicationDetail` рендерит `status.phase` + `status.observedGeneration` + полный список `conditions` с `lastTransitionTime`).
+- [x] Per-environment вкладки (dev/staging/prod) (v0.1.36 — `EnvironmentTabs` controlled component + `applicationsForEnvironment` filter helper).
 
 **Acceptance:** в Backstage виден задеплоенный hello-world, статус Ready, ссылка работает.
 

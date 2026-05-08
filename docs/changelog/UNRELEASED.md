@@ -61,6 +61,23 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **applications-frontend React components + sub-phase 1.10 ✅**
+  (v0.1.36) — three pure props-driven React components ship in
+  `@apprafter/applications-frontend`: `ApplicationsTable`
+  (renders `ApplicationRow[]` with optional `onSelect` for
+  drilldown), `ApplicationDetail` (drilldown — base config,
+  per-environment overrides, status with phase + observedGeneration
+  + endpointURL + full conditions table), `EnvironmentTabs`
+  (controlled tab strip — operators own selection state). Two new
+  pure helpers in `helpers.ts` (`environmentsOf`,
+  `applicationsForEnvironment`) drive the tab + filter UX; 4 unit
+  tests cover them. React 18 is a peer dep — no @backstage/* in
+  the package's dep graph, so it publishes light. Backstage
+  `createApiRef` + `createPlugin` wiring is a consumer-side
+  snippet in the README. tsconfig flips to `jsx: react-jsx` (DOM
+  + dom.iterable libs added). Sub-phase 1.10 in plan.md flips
+  from 🚧 partial to ✅ shipped — backend (1.10a/b) + frontend
+  (1.10c/d) all done.
 - **applications-frontend plugin scaffold (sub-phase 1.10c)**
   (v0.1.35) — new TypeScript + Bun package at
   `backstage-plugins/applications-frontend/`. Mirrors the v0.1.33
