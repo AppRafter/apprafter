@@ -3,21 +3,27 @@
 //!
 //! Spawns:
 //!   - the axum HTTP server (`/healthz` + `/readyz` + `/metrics`)
-//!     on `HTTP_PORT` (default 8080);
-//!   - the `Application` Controller against a `kube::Client`
-//!     resolved via `Client::try_default()` (in-cluster config or
-//!     `~/.kube/config` fallback).
+//!     on `HTTP_PORT` (default 8080) — runs unconditionally so the
+//!     pod's probes succeed even before leadership is acquired;
+//!   - a Lease-based leader election loop (`operator-core::leader`)
+//!     against `apprafter-system/apprafter-operator`;
+//!   - the `Application` Controller — but only after we hold the
+//!     Lease.
 //!
-//! Either task exiting (or ctrl-c) tears the whole process down.
+//! Any task exiting (HTTP server crash, controller stream end,
+//! leader-loss after 3 consecutive renewal failures, ctrl-c) tears
+//! the whole process down so the Deployment restart picks up.
 
 use std::env;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use apprafter_operator::build_router;
 use kube::Client;
 use operator_controllers_application as application_controller;
-use operator_core::Metrics;
+use operator_core::{LeaderConfig, LeaderElection, Metrics};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -48,6 +54,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Leader election — derive holder id from POD_NAME (set by the
+    // downward API in the Helm chart, v0.1.29) or fall back to a
+    // process-id stamp for local runs.
+    let holder_id =
+        env::var("POD_NAME").unwrap_or_else(|_| format!("local-{}", std::process::id()));
+    let leader = LeaderElection::new(
+        client.clone(),
+        LeaderConfig::for_apprafter_operator(&holder_id),
+    );
+    let is_leader = leader.is_leader_handle();
+
+    let leader_handle = tokio::spawn(async move {
+        if let Err(err) = leader.run().await {
+            error!(%err, "leader election exited");
+        }
+    });
+
+    info!(holder = %holder_id, "waiting for leadership");
+    while !is_leader.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    info!("leadership acquired — starting Application controller");
+
     let controller_handle = tokio::spawn({
         let client = client.clone();
         let metrics = metrics.clone();
@@ -61,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
+        _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }
 
