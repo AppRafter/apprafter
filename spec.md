@@ -796,15 +796,15 @@ platform-cli login
 - [x] Repository structure defined
 - [x] License chosen (FSL-1.1-MIT for core, MIT for plugins; see ADR 0001)
 
-### Milestone M1 — MVP single-node
+### Milestone M1 — MVP single-node ✅
 
 **Target:** working Tier 1 deployment on a single Hetzner CX22, deploying a hello-world Application end-to-end.
 
-- [ ] `platform-cli init` provisions k3s + NATS + Cilium + Argo CD + Backstage on fresh VDS
-- [ ] Application CRD + Rust operator (basic: image, expose, no `needs` yet)
-- [ ] Argo CD configured, GitOps loop working
-- [ ] Backstage with minimal Application plugin (status view)
-- [ ] One golden-path template (Bun HTTP service)
+- [x] `platform-cli init` provisions k3s + NATS + Cilium + Argo CD + Backstage on fresh VDS (NATS deferred to M2; everything else lands in v0.1.2 → v0.1.20)
+- [x] Application CRD + Rust operator (basic: image, expose, no `needs` yet) (v0.1.21 → v0.1.32)
+- [x] Argo CD configured, GitOps loop working (v0.1.13 → v0.1.17)
+- [x] Backstage with minimal Application plugin (status view) (v0.1.18 → v0.1.20 + v0.1.33 → v0.1.36)
+- [x] One golden-path template (Bun HTTP service) (v0.1.37 → v0.1.38, OneBun-based)
 
 ### Milestone M2 — Platform Services
 
