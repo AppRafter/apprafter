@@ -1,0 +1,17 @@
+{
+  "name": "@apprafter/applications-backend",
+  "version": "0.1.33",
+  "private": true,
+  "license": "MIT",
+  "description": "Backstage backend plugin: Application CRD reader.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "bun test",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  }
+}
