@@ -68,3 +68,31 @@ The cert-manager `Certificate`, `Service`, `Deployment`, and
 `ValidatingWebhookConfiguration` manifests, plus
 `platform-cli cluster-bootstrap` wiring, land in v0.1.24 (closes
 plan.md sub-phase 1.7).
+
+## apprafter-operator
+
+Runs the operator. The binary builds a `kube::Client` via
+`Client::try_default()` (in-cluster config inside a pod, or the
+`~/.kube/config` fallback when run locally), spawns the Application
+Controller, and serves three HTTP routes:
+
+| Route       | Purpose                                          |
+| ----------- | ------------------------------------------------ |
+| `/healthz`  | Liveness probe — returns 200 OK with body `ok`.   |
+| `/readyz`   | Readiness probe — returns 200 OK with body `ready`. |
+| `/metrics`  | Prometheus text format — three `apprafter_reconcile_*` metrics. |
+
+Run locally against your current kubeconfig:
+
+```sh
+cd operator && cargo run --bin apprafter-operator
+# → in another shell:
+curl -s http://127.0.0.1:8080/healthz
+curl -s http://127.0.0.1:8080/metrics
+```
+
+`HTTP_PORT` (default 8080) overrides the listener port. Tracing
+filter follows `RUST_LOG` (e.g. `RUST_LOG=apprafter_operator=debug`).
+
+The cert-manager + Service + Deployment + Helm chart for in-cluster
+deployment land in v0.1.28 (closes plan.md sub-phase 1.8).
