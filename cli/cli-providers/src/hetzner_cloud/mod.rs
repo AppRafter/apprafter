@@ -18,11 +18,12 @@ pub use server::{
     APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
 };
 pub use types::{
-    ApiErrorDetails, ApiErrorEnvelope, Firewall, FirewallCreateRequest, FirewallCreateResponse,
-    FirewallListResponse, FirewallReference, FirewallRule, FloatingIp, FloatingIpCreateRequest,
-    FloatingIpCreateResponse, FloatingIpListResponse, HomeLocation, Network, NetworkCreateRequest,
-    NetworkCreateResponse, NetworkListResponse, PublicIpv4, PublicNet, Server, ServerCreateRequest,
-    ServerCreateResponse, ServerListResponse, ServerStatus, SshKey, SshKeyCreateRequest,
+    ApiErrorDetails, ApiErrorEnvelope, Deprecation, Firewall, FirewallCreateRequest,
+    FirewallCreateResponse, FirewallListResponse, FirewallReference, FirewallRule, FloatingIp,
+    FloatingIpCreateRequest, FloatingIpCreateResponse, FloatingIpListResponse, HomeLocation,
+    Network, NetworkCreateRequest, NetworkCreateResponse, NetworkListResponse, PublicIpv4,
+    PublicNet, Server, ServerCreateRequest, ServerCreateResponse, ServerListResponse, ServerStatus,
+    ServerType, ServerTypeListResponse, ServerTypeLocation, SshKey, SshKeyCreateRequest,
     SshKeyCreateResponse, SshKeyListResponse, Subnet,
 };
 pub use user_data::{build_k3s_user_data, K3sBootstrapOptions};

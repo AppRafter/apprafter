@@ -255,3 +255,39 @@ pub struct FloatingIpCreateRequest {
 pub struct FloatingIpCreateResponse {
     pub floating_ip: FloatingIp,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerType {
+    pub id: u64,
+    pub name: String,
+    pub architecture: String,
+    pub cpu_type: String,
+    pub cores: u32,
+    pub memory: f64,
+    pub disk: u32,
+    /// `null` when the type is alive; an object with announced /
+    /// unavailable_after timestamps when it has been retired.
+    #[serde(default)]
+    pub deprecation: Option<Deprecation>,
+    #[serde(default)]
+    pub locations: Vec<ServerTypeLocation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Deprecation {
+    #[serde(default)]
+    pub announced: Option<String>,
+    #[serde(default)]
+    pub unavailable_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerTypeLocation {
+    pub name: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerTypeListResponse {
+    pub server_types: Vec<ServerType>,
+}

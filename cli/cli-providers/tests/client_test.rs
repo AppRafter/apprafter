@@ -466,6 +466,96 @@ fn delete_floating_ip_404_is_treated_as_already_gone() {
         .expect("delete_floating_ip is idempotent");
 }
 
+#[test]
+fn list_server_types_decodes_typed_payload() {
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("GET", "/v1/server_types")
+        .match_header("Authorization", "Bearer test-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{
+              "server_types": [
+                {
+                  "id": 109,
+                  "name": "cpx22",
+                  "architecture": "x86",
+                  "cpu_type": "shared",
+                  "cores": 2,
+                  "memory": 4,
+                  "disk": 80,
+                  "deprecation": null,
+                  "locations": [
+                    {"name": "nbg1", "available": true},
+                    {"name": "fsn1", "available": true}
+                  ]
+                },
+                {
+                  "id": 104,
+                  "name": "cx22",
+                  "architecture": "x86",
+                  "cpu_type": "shared",
+                  "cores": 2,
+                  "memory": 4,
+                  "disk": 40,
+                  "deprecation": {
+                    "announced": "2025-10-01T00:00:00Z",
+                    "unavailable_after": "2026-04-01T00:00:00Z"
+                  },
+                  "locations": [
+                    {"name": "nbg1", "available": false}
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    let resp = client
+        .list_server_types()
+        .expect("list_server_types should succeed");
+    assert_eq!(resp.server_types.len(), 2);
+    let cpx22 = &resp.server_types[0];
+    assert_eq!(cpx22.id, 109);
+    assert_eq!(cpx22.name, "cpx22");
+    assert_eq!(cpx22.architecture, "x86");
+    assert_eq!(cpx22.cpu_type, "shared");
+    assert_eq!(cpx22.cores, 2);
+    assert_eq!(cpx22.memory, 4.0);
+    assert_eq!(cpx22.disk, 80);
+    assert!(cpx22.deprecation.is_none());
+    assert_eq!(cpx22.locations.len(), 2);
+    assert_eq!(cpx22.locations[0].name, "nbg1");
+    assert!(cpx22.locations[0].available);
+    let cx22 = &resp.server_types[1];
+    assert!(cx22.deprecation.is_some());
+    assert!(!cx22.locations[0].available);
+    m.assert();
+}
+
+#[test]
+fn list_server_types_maps_4xx_to_hetzner_error() {
+    let mut server = mockito::Server::new();
+    server
+        .mock("GET", "/v1/server_types")
+        .with_status(401)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"unauthorized","message":"bad token"}}"#)
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "wrong");
+    let err = client.list_server_types().unwrap_err();
+    match err {
+        CliError::Hetzner { status, code, .. } => {
+            assert_eq!(status, 401);
+            assert_eq!(code, "unauthorized");
+        }
+        other => panic!("expected Hetzner error, got {other:?}"),
+    }
+}
+
 /// Standard Hetzner error envelope used in every Err::Status test.
 fn hetzner_error_body(code: &str, message: &str) -> String {
     format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#)

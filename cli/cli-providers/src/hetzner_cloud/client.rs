@@ -68,6 +68,41 @@ impl HetznerCloudClient {
         }
     }
 
+    pub fn list_server_types(&self) -> Result<super::types::ServerTypeListResponse> {
+        // Pagination defaults to 25 results; the full list is typically small
+        // enough that a single page suffices for pre-flight validation.
+        let endpoint = self.endpoint("/server_types");
+        let resp = ureq::get(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::ServerTypeListResponse>()
+                .map_err(|e| CliError::Other(format!("parse list_server_types response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("GET {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
     pub fn list_ssh_keys(&self) -> Result<super::types::SshKeyListResponse> {
         let endpoint = self.endpoint("/ssh_keys");
         let resp = ureq::get(&endpoint)
