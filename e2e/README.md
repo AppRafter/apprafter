@@ -74,3 +74,41 @@ cd cli && cargo run --bin platform-cli -- destroy --yes
 `destroy` is idempotent and label-driven — it'll clean up
 whatever's tagged `apprafter=true` regardless of the local state
 file.
+
+## Nightly CI
+
+`.github/workflows/nightly.yml` runs this script every night at
+04:00 UTC against a real Hetzner project. It also exposes a
+`workflow_dispatch` trigger so operators can kick a run manually
+from the Actions tab.
+
+### Repository secrets
+
+Set these in **Settings → Secrets and variables → Actions** before
+the first scheduled run:
+
+| Secret                       | Purpose                                                  |
+| ---------------------------- | -------------------------------------------------------- |
+| `HCLOUD_TOKEN`               | Hetzner Cloud API token (Read+Write).                    |
+| `APPRAFTER_SSH_PUBLIC_KEY`   | Single-line OpenSSH public key — `ssh-ed25519 AAAA…`.    |
+
+Without those secrets the workflow runs but `mvp.sh` exits 2 on
+the precondition check, leaving a clear failure in the Actions UI.
+The runner doesn't touch Hetzner.
+
+### Cost
+
+Each successful run provisions one CX22 for ~10 minutes (plus
+tear-down). Hetzner bills hourly — typical cost is single-digit
+cents per night. The `mvp.sh` `EXIT` trap destroys the cluster on
+failure, so crashes don't leave servers idling.
+
+### Closure criterion (plan.md §1.12)
+
+> Acceptance: nightly зелёный 5 раз подряд; ручной прогон по docs
+> работает у нового человека.
+
+Operators flip the §1.12 ✅ box once five consecutive nightly runs
+are green and one new operator has walked the manual quickstart
+end-to-end. Both criteria are judgment calls — there's no
+automated tracking.
