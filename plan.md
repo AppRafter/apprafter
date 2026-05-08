@@ -622,6 +622,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.11 Golden-path template: Bun HTTP service
 
+> v0.1.37 — sub-phase 1.11a shipped: `examples/templates/bun-http/` starter (OneBun + multi-stage Dockerfile + v1alpha1 Application.cue). Backstage Software Template + quickstart doc + closure in v0.1.38.
+
 **Цель:** Backstage Software Template, генерирующий стартер на OneBun.
 
 **Поставка:**

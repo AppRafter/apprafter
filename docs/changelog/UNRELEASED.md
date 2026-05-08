@@ -61,6 +61,25 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **bun-http golden-path starter (sub-phase 1.11a)** (v0.1.37) —
+  new template at `examples/templates/bun-http/`, the artifact the
+  v0.1.38 Backstage Software Template will scaffold. Built on
+  [OneBun](https://github.com/RemRyahirev/onebun) (`@onebun/core`
+  ^0.4.0) — `@Module` + `@Controller('/api')` + `@Get('/health')`
+  + `@Get('/ready')` mirroring the canonical
+  `withEffect/examples/crud-api` shape (controllers return plain
+  data — auto-wrapped to `{ success, result }` by the framework).
+  Typed `envSchema` in `src/config.ts` with `InferConfigType`
+  module augmentation. `OneBunApplication` bootstrap with metrics
+  + tracing enabled. Multi-stage `Dockerfile` (oven/bun:1-debian
+  builder → `distroless/nodejs20-debian12:nonroot` runtime; bundles
+  to a self-contained CommonJS via `bun build --target node` so
+  Bun isn't shipped in the runtime layer). `apprafter/Application.cue`
+  opt-in vets against the v1alpha1 schema (placeholder image, port
+  3000, env vars, per-environment `prod` override with replicas=3).
+  License is MIT (template / plugin tier). Backstage Software
+  Template (`template.yaml`) + the `docs/dev-guide/quickstart.md`
+  doc + phase 1.11 closure land in v0.1.38 (sub-phase 1.11b).
 - **applications-frontend React components + sub-phase 1.10 ✅**
   (v0.1.36) — three pure props-driven React components ship in
   `@apprafter/applications-frontend`: `ApplicationsTable`
