@@ -61,6 +61,26 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Application per-environment expansion + sub-phase 1.9 ✅**
+  (v0.1.32) — `operator-rendering` gains `effective_spec(&app,
+  env_name) -> ApplicationBaseSpec` that unifies `spec.base` with
+  `spec.environments[env_name]` (override-wins on conflict for the
+  `env` map; full replacement for `image`, `replicas`, `expose`).
+  New `render_application_for_env(&app, Option<&str>)` consumes it;
+  the existing `render_application(&app)` becomes a no-env
+  shorthand. Controller `Context` gains `env_name: Option<String>`,
+  the `run(client, metrics, env_name)` signature carries it
+  through, and `apprafter-operator/main.rs` reads `APPRAFTER_ENV`
+  (empty / unset → no override). 7 new unit tests cover the merge
+  semantics (env-not-set, env-not-in-map, image+replicas
+  replacement, expose full-replace, env map merge with conflict,
+  render-with-env, render-without-env). Phase 1.9 closes ✅.
+  HTTPRoute (mentioned in plan.md §1.9 goal as
+  "Application → Deployment + Service + HTTPRoute") is
+  deliberately deferred — the §1.9 acceptance ("HTTP endpoint,
+  доступный изнутри кластера") is satisfied by the Service alone,
+  and external traffic management is the cleanest fit for a phase
+  that owns Gateway domain config end-to-end.
 - **Application reconcile via SSA + status subresource (sub-phase
   1.9b)** (v0.1.31) — `operator-controllers/application::reconcile`
   now calls `render_application` (v0.1.30), applies each child

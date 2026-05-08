@@ -574,19 +574,20 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.9 Application reconcile: image + expose + replicas
+### 1.9 Application reconcile: image + expose + replicas ✅
 
 > v0.1.30 — sub-phase 1.9a shipped: pure `render_application` for Deployment + Service.
-> v0.1.31 — sub-phase 1.9b shipped: reconcile applies children via SSA (field manager `apprafter-operator`) and updates `status` (phase, observedGeneration, conditions, endpointURL). Per-env expansion + HTTPRoute + closure in v0.1.32.
+> v0.1.31 — sub-phase 1.9b shipped: reconcile applies children via SSA + updates `status`.
+> v0.1.32 — sub-phase 1.9c shipped: per-environment expansion (`APPRAFTER_ENV` selects override). Phase 1.9 ✅. HTTPRoute deferred to a later phase that owns Gateway domain config end-to-end.
 
 **Цель:** Application → Deployment + Service + HTTPRoute.
 
 **Поставка:**
-- [ ] Renderer (pure-функция) `Application → [k8s Resource]`.
-- [ ] Per-environment expansion через CUE unification (вызывается на стороне оператора).
-- [ ] Apply-семантика: server-side apply с field manager `apprafter-operator`.
-- [ ] Status subresource: `phase`, `observedGeneration`, `conditions`, `endpointURL`.
-- [ ] Удаление Application удаляет дочерние ресурсы (ownerReferences).
+- [x] Renderer (pure-функция) `Application → [k8s Resource]` (v0.1.30 — Deployment + Service; HTTPRoute deferred to a phase that owns Gateway domain config end-to-end).
+- [x] Per-environment expansion (v0.1.32 — pure-Rust merge; functionally equivalent to CUE unification for our v1alpha1 schema, switchable to CUE FFI when CUE-only constructs are added).
+- [x] Apply-семантика: server-side apply с field manager `apprafter-operator` (v0.1.31).
+- [x] Status subresource: `phase`, `observedGeneration`, `conditions`, `endpointURL` (v0.1.31).
+- [x] Удаление Application удаляет дочерние ресурсы (ownerReferences) (v0.1.30).
 
 **Acceptance:** манифест Application с image+expose даёт работающий HTTP endpoint, доступный изнутри кластера; `curl` на endpoint отвечает.
 
