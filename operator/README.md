@@ -94,5 +94,23 @@ curl -s http://127.0.0.1:8080/metrics
 `HTTP_PORT` (default 8080) overrides the listener port. Tracing
 filter follows `RUST_LOG` (e.g. `RUST_LOG=apprafter_operator=debug`).
 
-The cert-manager + Service + Deployment + Helm chart for in-cluster
-deployment land in v0.1.28 (closes plan.md sub-phase 1.8).
+### Leader election
+
+The binary acquires a `coordination.k8s.io/v1` `Lease` named
+`apprafter-operator` in the `apprafter-system` namespace before
+starting the Application Controller. Holder identity is read from
+`POD_NAME` (set by the Kubernetes downward API in the Helm chart
+shipping in v0.1.29) and falls back to `local-<pid>` for local
+runs. The Lease is renewed every 10 seconds with a 30-second
+expiry. Three consecutive renewal failures exit the process so the
+Deployment restart picks up.
+
+The HTTP server runs unconditionally — `/healthz` and `/readyz`
+return 200 even before leadership is acquired so the pod's probes
+don't flap during the (typically sub-second) acquire phase.
+
+### What's still pending
+
+The Helm chart for in-cluster deployment (ServiceAccount + RBAC +
+Deployment + Service for `/metrics`) lands in v0.1.29 and closes
+plan.md sub-phase 1.8.
