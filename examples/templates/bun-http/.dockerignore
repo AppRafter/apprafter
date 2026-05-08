@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+*.log
+.DS_Store
+apprafter
