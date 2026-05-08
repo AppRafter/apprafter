@@ -65,68 +65,71 @@ spec:
               type: string
             metadata:
               type: object
-            base:
+            spec:
               type: object
               properties:
-                image:
-                  type: string
-                  pattern: "^.+$"
-                replicas:
-                  type: integer
-                  minimum: 0
-                expose:
+                base:
                   type: object
-                  required:
-                    - port
                   properties:
-                    port:
-                      type: integer
-                      minimum: 1
-                      maximum: 65535
-                    public:
-                      type: boolean
-                    network:
+                    image:
                       type: string
-                      enum:
-                        - public
-                        - internal
-                        - vpn
-                env:
+                      pattern: "^.+$"
+                    replicas:
+                      type: integer
+                      minimum: 0
+                    expose:
+                      type: object
+                      required:
+                        - port
+                      properties:
+                        port:
+                          type: integer
+                          minimum: 1
+                          maximum: 65535
+                        public:
+                          type: boolean
+                        network:
+                          type: string
+                          enum:
+                            - public
+                            - internal
+                            - vpn
+                    env:
+                      type: object
+                      additionalProperties:
+                        type: string
+                environments:
                   type: object
                   additionalProperties:
-                    type: string
-            environments:
-              type: object
-              additionalProperties:
-                type: object
-                properties:
-                  image:
-                    type: string
-                    pattern: "^.+$"
-                  replicas:
-                    type: integer
-                    minimum: 0
-                  expose:
                     type: object
-                    required:
-                      - port
                     properties:
-                      port:
-                        type: integer
-                        minimum: 1
-                        maximum: 65535
-                      public:
-                        type: boolean
-                      network:
+                      image:
                         type: string
-                        enum:
-                          - public
-                          - internal
-                          - vpn
-                  env:
-                    type: object
-                    additionalProperties:
-                      type: string
+                        pattern: "^.+$"
+                      replicas:
+                        type: integer
+                        minimum: 0
+                      expose:
+                        type: object
+                        required:
+                          - port
+                        properties:
+                          port:
+                            type: integer
+                            minimum: 1
+                            maximum: 65535
+                          public:
+                            type: boolean
+                          network:
+                            type: string
+                            enum:
+                              - public
+                              - internal
+                              - vpn
+                      env:
+                        type: object
+                        additionalProperties:
+                          type: string
 "#
     )
 }
@@ -218,19 +221,19 @@ mod tests {
         let y = application_crd_yaml();
         // The env block must be a string→string map (object with
         // additionalProperties: type: string). It appears twice —
-        // once under `base.env`, once under `environments.*.env`.
+        // once under `spec.base.env`, once under `spec.environments.*.env`.
         // Assert the literal shape at both indentation levels.
         assert!(
             y.contains(
-                "env:\n                  type: object\n                  additionalProperties:\n                    type: string"
+                "env:\n                      type: object\n                      additionalProperties:\n                        type: string"
             ),
-            "base.env shape missing: {y}"
+            "spec.base.env shape missing: {y}"
         );
         assert!(
             y.contains(
-                "env:\n                    type: object\n                    additionalProperties:\n                      type: string"
+                "env:\n                        type: object\n                        additionalProperties:\n                          type: string"
             ),
-            "environments.*.env shape missing: {y}"
+            "spec.environments.*.env shape missing: {y}"
         );
     }
 }
