@@ -20,7 +20,7 @@ use cli_providers::Provider;
 
 #[test]
 #[ignore = "real Hetzner Cloud — set APPRAFTER_HCLOUD_E2E=1 + HCLOUD_TOKEN to run"]
-fn create_then_destroy_real_cx22() {
+fn create_then_destroy_real_cpx22() {
     if std::env::var("APPRAFTER_HCLOUD_E2E").as_deref() != Ok("1") {
         eprintln!("skip: APPRAFTER_HCLOUD_E2E is not set to 1");
         return;
@@ -47,7 +47,7 @@ fn create_then_destroy_real_cx22() {
         client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
         spec: ServerSpec {
             name: name.clone(),
-            server_type: "cx22".into(),
+            server_type: "cpx22".into(),
             image: "ubuntu-24.04".into(),
             location: "nbg1".into(),
             labels,
