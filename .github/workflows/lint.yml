@@ -32,23 +32,25 @@ jobs:
       - name: Detect Cargo workspaces
         id: detect
         run: |
-          manifest=$(find . -name Cargo.toml -not -path './target/*' \
-              -not -path '*/node_modules/*' | head -1)
-          if [ -n "$manifest" ]; then
+          dirs=$(find . -mindepth 2 -maxdepth 2 -name Cargo.toml \
+              -not -path './target/*' -not -path '*/node_modules/*' \
+              | xargs -r -n1 dirname | sort -u | tr '\n' ' ')
+          if [ -n "$dirs" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "dir=$(dirname "$manifest")" >> "$GITHUB_OUTPUT"
+            echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "::notice::no Cargo.toml yet — skipping rustfmt/clippy"
           fi
-      - name: cargo fmt --check
+      - name: cargo fmt + clippy
         if: steps.detect.outputs.found == 'true'
-        working-directory: ${{ steps.detect.outputs.dir }}
-        run: cargo fmt --all -- --check
-      - name: cargo clippy --deny warnings
-        if: steps.detect.outputs.found == 'true'
-        working-directory: ${{ steps.detect.outputs.dir }}
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: |
+          for dir in ${{ steps.detect.outputs.dirs }}; do
+            echo "::group::cargo fmt + clippy in $dir"
+            (cd "$dir" && cargo fmt --all -- --check)
+            (cd "$dir" && cargo clippy --all-targets --all-features -- -D warnings)
+            echo "::endgroup::"
+          done
 
   bun:
     name: Bun / TypeScript (lint)
