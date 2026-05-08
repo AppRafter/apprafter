@@ -531,6 +531,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.7 Application CRD v1alpha1 ✅
 
+> v0.1.25 — schema refactor: `base` + `environments` moved under `spec` for k8s-convention alignment before phase 1.8.
+
 **Цель:** зарегистрировать CRD `Application` в кластере, схема валидируется через CUE.
 
 **Поставка:**

@@ -61,6 +61,20 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Application schema fixup — `spec` wrapper** (v0.1.25) —
+  refactor cycle that brings the v1alpha1 `Application` shape in
+  line with k8s conventions: `base` + `environments` move under a
+  `spec` object instead of sitting at the top level. CUE schema,
+  hand-rolled OpenAPI v3 CRD, the `cli-core::manifest::ApplicationManifest`
+  Rust mirror, the parser fixture (`examples/applications/parser.cue`),
+  and both static manifests (`manifests/tier-1/application/example-app.yaml`,
+  `…/example-crd.yaml`) flip together. The admission webhook
+  (v0.1.23) already extracts `request.object.spec` — no webhook
+  changes; the divergence between top-level CRD shape and
+  spec-extraction logic is now resolved. Refactor is contained to
+  shape only — no new fields, no behavior changes. This unblocks
+  phase 1.8 (operator) using the `kube::CustomResource` derive
+  macro, which assumes the standard `spec`/`status` shape.
 - **Admission-webhook deployment + sub-phase 1.7 ✅** (v0.1.24) —
   the v0.1.23 webhook binary now serves HTTPS via `axum-server` +
   `rustls` (loads `tls.crt` / `tls.key` from `/tls`, falls back to
