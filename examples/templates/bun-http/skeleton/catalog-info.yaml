@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: ${{ values.name }}
+  description: ${{ values.description }}
+  annotations:
+    apprafter.io/application: ${{ values.namespace }}/${{ values.name }}
+spec:
+  type: service
+  lifecycle: experimental
+  owner: ${{ values.owner }}
