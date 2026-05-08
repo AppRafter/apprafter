@@ -17,7 +17,7 @@ use crate::commands::hcloud::hcloud_base_url;
 const DEFAULT_NETWORK_IP_RANGE: &str = "10.0.0.0/16";
 const DEFAULT_SUBNET_IP_RANGE: &str = "10.0.0.0/24";
 const DEFAULT_NETWORK_ZONE: &str = "eu-central";
-const DEFAULT_SERVER_TYPE: &str = "cx22";
+const DEFAULT_SERVER_TYPE: &str = "cpx22";
 const DEFAULT_OS_IMAGE: &str = "ubuntu-24.04";
 
 const DEFAULT_INGRESS_PORTS_TCP: &[&str] = &["22", "6443", "80", "443"];

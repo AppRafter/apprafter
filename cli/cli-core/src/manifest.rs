@@ -83,7 +83,7 @@ pub struct AdmissionWebhookBlock {
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeSpec {
     pub role: String,
-    /// Hetzner-style server type, e.g. "cx22". `type` is a
+    /// Hetzner-style server type, e.g. "cpx22". `type` is a
     /// keyword in Rust, so the field is renamed.
     #[serde(rename = "type")]
     pub kind: String,

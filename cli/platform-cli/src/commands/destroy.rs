@@ -54,7 +54,7 @@ pub fn run(yes: bool) -> Result<()> {
         client: HetznerCloudClient::new(hcloud_base_url(), token),
         spec: ServerSpec {
             name: cluster,
-            server_type: "cx22".into(),
+            server_type: "cpx22".into(),
             image: "ubuntu-24.04".into(),
             location: region,
             labels: BTreeMap::new(),

@@ -12,7 +12,7 @@ infra: v1alpha1.#Infrastructure & {
 		region:   "nbg1"
 		nodes: [{
 			role:  "control-plane"
-			type:  "cx22"
+			type:  "cpx22"
 			count: 1
 		}]
 		network: {
