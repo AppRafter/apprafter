@@ -4,6 +4,7 @@
 //! shell-outs, plus pure builders for the manifests / values we
 //! ship.
 
+pub mod application_crd;
 pub mod argocd_gateway;
 pub mod argocd_values;
 pub mod backstage_app_config;
@@ -16,6 +17,9 @@ pub mod issuer;
 pub mod kubectl;
 pub mod network_policy;
 
+pub use application_crd::{
+    application_crd_yaml, APPLICATION_CRD_GROUP, APPLICATION_CRD_PLURAL, APPLICATION_CRD_VERSION,
+};
 pub use argocd_gateway::argocd_gateway_yaml;
 pub use argocd_values::{argocd_values_yaml, ARGOCD_CHART_VERSION};
 pub use backstage_app_config::backstage_app_config_yaml;

@@ -216,15 +216,21 @@ mod tests {
     #[test]
     fn env_is_string_to_string_map() {
         let y = application_crd_yaml();
-        // `env: object` with `additionalProperties: type: string`
-        // — we count the distinct "type: string" appearances under
-        // additionalProperties (one per inlined spec block).
-        let env_string_count = y
-            .matches("additionalProperties:\n                  type: string")
-            .count();
-        assert_eq!(
-            env_string_count, 1,
-            "expected env additionalProperties: type: string under base: {y}"
+        // The env block must be a string→string map (object with
+        // additionalProperties: type: string). It appears twice —
+        // once under `base.env`, once under `environments.*.env`.
+        // Assert the literal shape at both indentation levels.
+        assert!(
+            y.contains(
+                "env:\n                  type: object\n                  additionalProperties:\n                    type: string"
+            ),
+            "base.env shape missing: {y}"
+        );
+        assert!(
+            y.contains(
+                "env:\n                    type: object\n                    additionalProperties:\n                      type: string"
+            ),
+            "environments.*.env shape missing: {y}"
         );
     }
 }
