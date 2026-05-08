@@ -32,8 +32,7 @@ parser: v1alpha1.#Application & {
 			}
 		}
 		prod: {
-			replicas:     3
-			confidential: true
+			replicas: 3
 		}
 	}
 }
