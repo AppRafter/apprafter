@@ -1,0 +1,13 @@
+target
+**/target
+.git
+.github
+docs
+manifests
+backstage-plugins
+landing
+mkdocs.yml
+mise.toml
+flake.lock
+flake.nix
+**/*.md
