@@ -599,7 +599,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.10 Backstage Application plugin (status view)
 
-> v0.1.33 — sub-phase 1.10a shipped: TypeScript scaffold + types + pure handler stubs. Real kube proxy in v0.1.34; React frontend in v0.1.35; per-env tabs + closure in v0.1.36.
+> v0.1.33 — sub-phase 1.10a shipped: TypeScript scaffold + types + pure handler stubs.
+> v0.1.34 — sub-phase 1.10b shipped: `KubeApplicationStore` proxies kube apiserver via in-cluster SA token. React frontend + Backstage glue in v0.1.35; per-env tabs + closure in v0.1.36.
 
 **Цель:** в Backstage — список Application, статус, ссылка на endpoint, последние события.
 

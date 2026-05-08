@@ -61,6 +61,24 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **applications-backend KubeApplicationStore (sub-phase 1.10b)**
+  (v0.1.34) — replaces the v0.1.33 `StubApplicationStore` with a
+  real `KubeApplicationStore` that proxies the kube apiserver via
+  the in-cluster service-account token. Implements the
+  `ApplicationStore` interface unchanged, so the v0.1.33
+  `listApplicationsHandler` / `getApplicationHandler` work without
+  modification. Bun's `fetch` carries the `tls: { ca }` option for
+  the in-cluster CA cert (no `https.Agent` plumbing). New
+  `inClusterConfig(): Promise<KubeStoreConfig>` reads
+  `/var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt}` +
+  `KUBERNETES_SERVICE_HOST`/`KUBERNETES_SERVICE_PORT_HTTPS`. URL
+  shapes: cluster-wide list, namespaced list, and namespaced get.
+  10 unit tests via mocked `fetchImpl` cover URL construction,
+  header shape, namespace flow-through, `isApplication` filtering,
+  404 → null, error propagation with status + body, and the
+  `inClusterConfig()` env-var precondition. Backstage
+  `createBackendPlugin` glue + the React frontend land together in
+  v0.1.35 (sub-phase 1.10c).
 - **Backstage applications-backend plugin scaffold (sub-phase
   1.10a)** (v0.1.33) — new TypeScript + Bun package at
   `backstage-plugins/applications-backend/`. v0.1.33 ships the
