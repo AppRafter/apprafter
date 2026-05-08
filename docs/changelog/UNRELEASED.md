@@ -61,6 +61,27 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **bun-http Backstage Software Template + sub-phase 1.11 ✅**
+  (v0.1.38) — Backstage scaffolder `template.yaml` (v1beta3)
+  layered on top of the v0.1.37 starter. The
+  `examples/templates/bun-http/skeleton/` subdir mirrors the
+  runnable starter file-by-file with three light Nunjucks
+  templates (`${{ values.name }}` / `namespace` / `image` /
+  `description` / `owner`) in `package.json`,
+  `apprafter/Application.cue`, `catalog-info.yaml`, and
+  `README.md`; the rest of the skeleton (tsconfig, Dockerfile,
+  `.gitignore`, `.dockerignore`, `src/{app.module,health.controller,
+  health.controller.test,config}.ts`) is verbatim. `src/index.ts`
+  is templated for `serviceName` via a `SERVICE_NAME` constant
+  (decouples the scaffolder substitution from the runtime template
+  literal). The scaffolder steps are `fetch:template` (skeleton →
+  new repo), `publish:github` (creates the repo), and
+  `catalog:register` (adds it to the Backstage catalog). Operators
+  register the template by adding the URL to their `app-config.yaml`'s
+  `catalog.locations`. New `docs/dev-guide/quickstart.md` walks
+  the 4-step flow (cluster → scaffold → build/push → Argo CD
+  picks up + operator reconciles → curl the endpoint). Sub-phase
+  1.11 in plan.md flips from 🚧 partial to ✅ shipped.
 - **bun-http golden-path starter (sub-phase 1.11a)** (v0.1.37) —
   new template at `examples/templates/bun-http/`, the artifact the
   v0.1.38 Backstage Software Template will scaffold. Built on

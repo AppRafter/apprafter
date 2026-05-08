@@ -620,16 +620,17 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.11 Golden-path template: Bun HTTP service
+### 1.11 Golden-path template: Bun HTTP service ✅
 
-> v0.1.37 — sub-phase 1.11a shipped: `examples/templates/bun-http/` starter (OneBun + multi-stage Dockerfile + v1alpha1 Application.cue). Backstage Software Template + quickstart doc + closure in v0.1.38.
+> v0.1.37 — sub-phase 1.11a shipped: `examples/templates/bun-http/` starter (OneBun + multi-stage Dockerfile + v1alpha1 Application.cue).
+> v0.1.38 — sub-phase 1.11b shipped: Backstage Software Template (`template.yaml` + `skeleton/`) + operator quickstart at `docs/dev-guide/quickstart.md`. Phase 1.11 ✅.
 
 **Цель:** Backstage Software Template, генерирующий стартер на OneBun.
 
 **Поставка:**
-- [ ] Template в `examples/templates/bun-http/`: `package.json`, `Dockerfile` (multi-stage, distroless), `app.ts` (минимальный OneBun controller), `apprafter/Application.cue`.
-- [ ] Backstage software template manifest с параметрами (имя, репо, домен).
-- [ ] Документация в `docs/dev-guide/quickstart.md`.
+- [x] Template в `examples/templates/bun-http/`: `package.json`, `Dockerfile` (multi-stage, distroless), `src/index.ts` + `app.module.ts` + `health.controller.ts` + `config.ts` (OneBun controllers + envSchema), `apprafter/Application.cue` (v0.1.37).
+- [x] Backstage software template manifest с параметрами (имя, репо, домен) (v0.1.38 — `template.yaml` + `skeleton/` subdir со scaffolder Nunjucks templating).
+- [x] Документация в `docs/dev-guide/quickstart.md` (v0.1.38).
 
 **Acceptance:** через UI Backstage за 3 клика создаётся репо с готовым стартером; коммит → Argo CD → задеплоилось.
 
