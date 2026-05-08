@@ -61,6 +61,27 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Application renderer (sub-phase 1.9a)** (v0.1.30) —
+  `operator-rendering::render_application(&Application) ->
+  RenderedApplication { deployment: Deployment, service:
+  Option<Service> }` replaces the v0.1.26 stub. The Deployment is
+  always rendered; the Service is `Some(...)` only when
+  `spec.base.expose` is set. Both children get an
+  `ownerReferences` entry back to the Application
+  (`controller: true`, `blockOwnerDeletion: true`) so deleting the
+  Application cascades. Common labels follow the standard
+  `app.kubernetes.io/name`, `app.kubernetes.io/managed-by:
+  apprafter-operator`, plus the project-wide `apprafter: "true"`.
+  Image, replicas (default 1), env vars (string→string only —
+  v1alpha1 limit), and containerPort flow from `spec.base`. Service
+  is ClusterIP, port 80 → targetPort = `expose.port`. New direct
+  dep on `k8s-openapi` (the workspace already pinned `v1_31` for
+  v0.1.26). 9 in-file unit tests cover replicas defaulting,
+  per-field flow-through, no-Service when expose is unset, label
+  shape, and ownerReferences-with-UID. SSA wiring + status
+  subresource land in v0.1.31 (sub-phase 1.9b);
+  per-environment expansion + HTTPRoute (`expose.network: public`)
+  land in v0.1.32 (sub-phase 1.9c).
 - **Operator Helm chart + sub-phase 1.8 ✅** (v0.1.29) — new
   Helm 3 chart at `operator/charts/apprafter-operator/` packages
   the v0.1.27 operator binary with the v0.1.28 leader election as

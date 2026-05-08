@@ -576,6 +576,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.9 Application reconcile: image + expose + replicas
 
+> v0.1.30 — sub-phase 1.9a shipped: pure `render_application` for Deployment + Service. SSA + status in v0.1.31; per-env expansion + HTTPRoute + closure in v0.1.32.
+
 **Цель:** Application → Deployment + Service + HTTPRoute.
 
 **Поставка:**
