@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+name: nightly
+
+# Runs the full E2E smoke against real Hetzner Cloud. Required
+# repository secrets (Settings → Secrets and variables → Actions):
+#
+#   HCLOUD_TOKEN              — Hetzner Cloud API token (Read+Write).
+#   APPRAFTER_SSH_PUBLIC_KEY  — single-line OpenSSH public key.
+#
+# Without those secrets the smoke fails fast (exit 2) with a
+# clear error — the workflow stays safe to merge before
+# credentials are wired.
+#
+# Cost: each successful run provisions one Hetzner CX22 for ~10
+# minutes (plus tear-down) — single-digit cents per night. The
+# `e2e/mvp.sh` `EXIT` trap auto-destroys on failure, so a crashed
+# run won't leave a server idling.
+#
+# Security note: this workflow only consumes secrets via the
+# `env:` block (the safe pattern). It does NOT inject any
+# untrusted `github.event.*` content into shell commands, so the
+# action-injection class of risks does not apply.
+
+on:
+  schedule:
+    # 04:00 UTC nightly. Off-peak for both EU + US Pacific.
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e/mvp.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('cli/**/Cargo.lock', 'cli/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Run E2E MVP smoke
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+          APPRAFTER_SSH_PUBLIC_KEY: ${{ secrets.APPRAFTER_SSH_PUBLIC_KEY }}
+          APPRAFTER_E2E_REGION: nbg1
+        run: |
+          ./e2e/mvp.sh
