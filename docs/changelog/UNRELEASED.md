@@ -61,6 +61,28 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Admission-webhook crate (sub-phase 1.7c)** (v0.1.23) —
+  new `operator/` Cargo workspace with one member crate
+  `admission-webhook`. Pure validator
+  (`validate_application_spec(spec)`) catches what the OpenAPI v3
+  CRD can't: cross-field "image must be reachable" (either
+  `spec.base.image` or every `spec.environments[*].image` must be
+  set), environment names that aren't DNS-1123 labels, and env keys
+  that don't match `^[A-Z_][A-Z0-9_]*$`. axum 0.7 router exposes
+  `POST /validate` (AdmissionReview in/out, hand-rolled via
+  `serde_json::Value` to avoid pulling in the heavy `kube` crate),
+  `GET /healthz`, and `GET /readyz`. tokio binary listens on
+  `0.0.0.0:$PORT` (default 8443). Multi-stage Dockerfile (rust:1.83-
+  alpine + musl → `distroless/static-debian12:nonroot`) ships
+  alongside. 14 validator unit tests + 2 server unit tests + 7
+  integration tests via `tower::ServiceExt::oneshot`. CI workflows
+  (`test.yml`, `lint.yml`) updated to discover every top-level
+  Cargo.toml and run `cargo test` / `cargo clippy` / `cargo fmt
+  --check` in each, so cli + operator are both covered. v0.1.23
+  ships HTTP-only — TLS termination via the cert-manager-issued
+  Secret arrives in v0.1.24 along with the
+  Certificate/Service/Deployment/ValidatingWebhookConfiguration
+  manifests and `cluster-bootstrap` wiring (closes phase 1.7).
 - **Application CRD OpenAPI v3 manifest (sub-phase 1.7b)** (v0.1.22) —
   hand-rolled `apiextensions.k8s.io/v1` CRD in
   `cli-providers::k8s::application_crd`, mirroring the v0.1.21 CUE
