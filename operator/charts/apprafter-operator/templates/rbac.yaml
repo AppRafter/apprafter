@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: MIT
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "apprafter-operator.fullname" . }}
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+rules:
+  # Application CRD — watch + status update.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - applications
+      - applications/status
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  # Owned children — phase 1.9 will create + manage these.
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - httproutes
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  # Events — operators emit events on Application status changes.
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "apprafter-operator.fullname" . }}
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "apprafter-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "apprafter-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Lease for leader election — namespaced to the operator's own
+# namespace so the blast radius stays small.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "apprafter-operator.fullname" . }}-leader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "apprafter-operator.fullname" . }}-leader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "apprafter-operator.fullname" . }}-leader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "apprafter-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
