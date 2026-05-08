@@ -576,7 +576,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.9 Application reconcile: image + expose + replicas
 
-> v0.1.30 — sub-phase 1.9a shipped: pure `render_application` for Deployment + Service. SSA + status in v0.1.31; per-env expansion + HTTPRoute + closure in v0.1.32.
+> v0.1.30 — sub-phase 1.9a shipped: pure `render_application` for Deployment + Service.
+> v0.1.31 — sub-phase 1.9b shipped: reconcile applies children via SSA (field manager `apprafter-operator`) and updates `status` (phase, observedGeneration, conditions, endpointURL). Per-env expansion + HTTPRoute + closure in v0.1.32.
 
 **Цель:** Application → Deployment + Service + HTTPRoute.
 

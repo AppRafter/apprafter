@@ -61,6 +61,26 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Application reconcile via SSA + status subresource (sub-phase
+  1.9b)** (v0.1.31) — `operator-controllers/application::reconcile`
+  now calls `render_application` (v0.1.30), applies each child
+  (Deployment + optional Service) via server-side apply with field
+  manager `apprafter-operator` (and `force = true` to take
+  ownership of fields the operator manages), and writes the
+  Application's `status` subresource: `phase = "Ready"`,
+  `observedGeneration` from `metadata.generation`, `conditions`
+  carrying a `Ready/True/ReconcileSucceeded` entry with an RFC3339
+  `lastTransitionTime`, `endpointURL` set to
+  `http://<service>.<namespace>.svc.cluster.local:80` when a
+  Service is rendered. New `ApplicationCondition` type added to
+  `operator-core::application` (project-local rather than
+  `meta/v1.Condition` because the latter doesn't derive
+  `JsonSchema`). New deps on `chrono`, `k8s-openapi`, `serde_json`
+  in the controller crate. 4 in-file unit tests cover the pure
+  helpers (endpoint FQDN, apply-payload injection, status builder
+  with observedGeneration flow-through, RFC3339 timestamp shape).
+  Per-environment expansion + HTTPRoute land in v0.1.32 (sub-phase
+  1.9c, closes phase 1.9).
 - **Application renderer (sub-phase 1.9a)** (v0.1.30) —
   `operator-rendering::render_application(&Application) ->
   RenderedApplication { deployment: Deployment, service:
