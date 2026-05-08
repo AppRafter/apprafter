@@ -15,10 +15,10 @@ This is a Cargo workspace with the following crates:
 | `operator-core`                        | Shared types — kube-rs `Application` CRD type (library).           |
 | `operator-rendering`                   | Pure renderer: `Application` -> Vec of k8s resources (library).    |
 | `operator-controllers/application`     | kube-rs Controller for `Application` (library).                    |
+| `apprafter-operator`                   | Operator binary — wires controllers + metrics + health endpoints.  |
 
-The `apprafter-operator` binary (which wires the controllers + a
-metrics + health HTTP server) lands in v0.1.27. Leader election +
-the Helm chart land in v0.1.28 and close plan.md sub-phase 1.8.
+Leader election + the Helm chart land in v0.1.28 and close plan.md
+sub-phase 1.8.
 `ResourceClaim` / `AccessGrant` / `MigrationPlan` controllers come
 in their own subphases under phase 2.x / 4.x.
 
