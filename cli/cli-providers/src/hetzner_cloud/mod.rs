@@ -5,6 +5,7 @@ pub mod client;
 pub mod kubeconfig;
 pub mod provider;
 pub mod server;
+pub mod server_type;
 pub mod types;
 pub mod user_data;
 
@@ -17,6 +18,7 @@ pub use server::{
     FirewallRuleSpec, FirewallSpec, FloatingIpSpec, NetworkSpec, ServerSpec, SshKeySpec,
     APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
 };
+pub use server_type::validate_server_type;
 pub use types::{
     ApiErrorDetails, ApiErrorEnvelope, Deprecation, Firewall, FirewallCreateRequest,
     FirewallCreateResponse, FirewallListResponse, FirewallReference, FirewallRule, FloatingIp,

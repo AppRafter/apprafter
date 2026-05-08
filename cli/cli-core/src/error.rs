@@ -29,6 +29,24 @@ pub enum CliError {
         message: String,
     },
 
+    /// Pre-flight rejection: the requested Hetzner server type is
+    /// unknown / deprecated / unavailable in the requested region.
+    /// `alternatives` carries up to 3 suggested live names for the
+    /// same region.
+    #[error(
+        "server type `{requested}` is unavailable in region `{location}`: {reason}\n  \
+         try one of: {alternatives}\n  \
+         (override via APPRAFTER_MANIFEST or `--server-type` once it lands)"
+    )]
+    ServerTypeUnavailable {
+        requested: String,
+        location: String,
+        reason: String,
+        /// Comma-separated list of suggestions (already formatted
+        /// for the error message).
+        alternatives: String,
+    },
+
     /// State file present but unparseable.
     #[error("state file at {path}: {message}")]
     InvalidState { path: PathBuf, message: String },
