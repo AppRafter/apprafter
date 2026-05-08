@@ -69,6 +69,7 @@ fn format_alternatives(types: &[ServerType], location: &str, requested: &str) ->
         candidates.sort_by_key(|t| {
             (
                 (t.cores as i64 - target.cores as i64).abs(),
+                // scale memory (f64) to i64 with 0.001 GB granularity for sort-key inclusion
                 ((t.memory - target.memory).abs() * 1000.0) as i64,
                 (t.disk as i64 - target.disk as i64).abs(),
             )
@@ -240,6 +241,18 @@ mod tests {
                     !alternatives.contains("cpx32"),
                     "fsn1-only cpx32 leaked into nbg1 alternatives: {alternatives}"
                 );
+            }
+            other => panic!("expected ServerTypeUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alternatives_show_placeholder_when_no_live_options_in_region() {
+        let types = vec![dead("cx22", "nbg1"), dead("cx32", "nbg1")];
+        let err = validate_server_type(&types, "cx22", "nbg1").unwrap_err();
+        match err {
+            CliError::ServerTypeUnavailable { alternatives, .. } => {
+                assert_eq!(alternatives, "(no live alternatives found in this region)");
             }
             other => panic!("expected ServerTypeUnavailable, got {other:?}"),
         }
