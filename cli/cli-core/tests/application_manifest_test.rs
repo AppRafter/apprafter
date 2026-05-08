@@ -55,3 +55,74 @@ fn parse_full_application_fixture() {
     let prod = envs.get("prod").expect("prod override present");
     assert_eq!(prod.replicas, Some(3));
 }
+
+#[test]
+fn parse_application_returns_error_on_missing_path() {
+    let root = repo_root();
+    let path = Path::new("./examples/applications-does-not-exist");
+    match manifest::parse_application(&root, path) {
+        Err(CliError::CueExport { .. }) => {}
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+        }
+        Err(other) => panic!("expected CueExport or CueNotFound, got {other}"),
+        Ok(_) => panic!("missing path should not parse successfully"),
+    }
+}
+
+#[test]
+fn parse_application_errors_when_no_application_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("not-app.cue");
+    std::fs::write(
+        &cue_path,
+        "package x\n#Other: { kind: \"Other\" }\nout: #Other & { kind: \"Other\" }\n",
+    )
+    .unwrap();
+
+    let err = manifest::parse_application(dir.path(), &cue_path).unwrap_err();
+    match err {
+        CliError::CueNotFound => {
+            eprintln!("skip: cue not on PATH");
+        }
+        CliError::Other(msg) => {
+            assert!(msg.contains("Application"), "{msg}");
+        }
+        other => panic!("expected Other or CueNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_application_decodes_minimal_manifest_without_environments() {
+    // The base block alone (no environments map) is a valid
+    // v1alpha1 Application — the parser must accept it.
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("app.cue");
+    std::fs::write(
+        &cue_path,
+        "package x\n\
+out: {\n\
+    apiVersion: \"apprafter.io/v1alpha1\"\n\
+    kind: \"Application\"\n\
+    metadata: name: \"web\"\n\
+    base: {\n\
+        image:    \"ghcr.io/acme/web:1.0\"\n\
+        replicas: 1\n\
+    }\n\
+}\n",
+    )
+    .unwrap();
+
+    let m = match manifest::parse_application(dir.path(), &cue_path) {
+        Ok(m) => m,
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(other) => panic!("unexpected: {other}"),
+    };
+    assert_eq!(m.kind, "Application");
+    let base = m.base.expect("base decoded");
+    assert_eq!(base.image.as_deref(), Some("ghcr.io/acme/web:1.0"));
+    assert!(m.environments.is_none());
+}
