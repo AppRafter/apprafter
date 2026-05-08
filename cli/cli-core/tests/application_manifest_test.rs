@@ -35,7 +35,7 @@ fn parse_full_application_fixture() {
     assert_eq!(parsed.kind, "Application");
     assert_eq!(parsed.metadata.name, "parser");
 
-    let base = parsed.base.expect("base block decoded");
+    let base = parsed.spec.base.expect("base block decoded");
     assert_eq!(base.image.as_deref(), Some("ghcr.io/example/parser:latest"));
     assert_eq!(base.replicas, Some(3));
 
@@ -46,7 +46,7 @@ fn parse_full_application_fixture() {
     let env = base.env.expect("env decoded");
     assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("info"));
 
-    let envs = parsed.environments.expect("environments decoded");
+    let envs = parsed.spec.environments.expect("environments decoded");
     let dev = envs.get("dev").expect("dev override present");
     assert_eq!(dev.replicas, Some(1));
     let dev_expose = dev.expose.as_ref().expect("dev expose present");
@@ -105,9 +105,11 @@ out: {\n\
     apiVersion: \"apprafter.io/v1alpha1\"\n\
     kind: \"Application\"\n\
     metadata: name: \"web\"\n\
-    base: {\n\
-        image:    \"ghcr.io/acme/web:1.0\"\n\
-        replicas: 1\n\
+    spec: {\n\
+        base: {\n\
+            image:    \"ghcr.io/acme/web:1.0\"\n\
+            replicas: 1\n\
+        }\n\
     }\n\
 }\n",
     )
@@ -122,9 +124,9 @@ out: {\n\
         Err(other) => panic!("unexpected: {other}"),
     };
     assert_eq!(m.kind, "Application");
-    let base = m.base.expect("base decoded");
+    let base = m.spec.base.expect("base decoded");
     assert_eq!(base.image.as_deref(), Some("ghcr.io/acme/web:1.0"));
-    assert!(m.environments.is_none());
+    assert!(m.spec.environments.is_none());
 }
 
 #[test]
