@@ -176,39 +176,46 @@ Under the hood the command:
 3. Applies the upstream Gateway API `standard-install.yaml` for the
    pinned version (`v1.2.1`) so `Gateway` / `HTTPRoute` /
    `GRPCRoute` / `ReferenceGrant` resources pass admission.
-4. Applies a default-deny `NetworkPolicy` to the `default`
+4. Applies the AppRafter `Application` CRD (group
+   `apprafter.io`, version `v1alpha1`, scope namespaced). The CRD
+   carries an OpenAPI v3 schema mirroring the v0.1.21 CUE
+   `#Application`: `image` non-empty, `replicas` ≥ 0, `expose.port`
+   1..=65535, `expose.network` enum {public,internal,vpn}, `env`
+   string→string, plus the `environments` map of overrides.
+   Stronger CUE-shaped admission lands with the v0.1.23 webhook.
+5. Applies a default-deny `NetworkPolicy` to the `default`
    namespace (kube-system is intentionally exempt — Cilium and
    Gateway API system pods need free egress).
-5. Adds the upstream Argo Helm repo and runs
+6. Adds the upstream Argo Helm repo and runs
    `helm upgrade --install argocd argo/argo-cd --version <pinned>
    --namespace argocd --create-namespace --wait` against tier-1
    values (single replicas across all sub-charts, Dex off, Redis-HA
    off, notifications off). The Argo CD server runs as ClusterIP —
    the HTTPRoute exposure path lands in v0.1.16.
-6. Adds the upstream Jetstack Helm repo and runs
+7. Adds the upstream Jetstack Helm repo and runs
    `helm upgrade --install cert-manager jetstack/cert-manager
    --version <pinned> --namespace cert-manager --create-namespace
    --wait` against tier-1 values (installCRDs: true, single
    replicas across controller / webhook / cainjector, Prometheus
    off).
-7. Applies a self-signed `ClusterIssuer` named
+8. Applies a self-signed `ClusterIssuer` named
    `apprafter-selfsigned`. Future cycles' `Gateway` HTTPRoutes
    reference this issuer by name to mint TLS certs (no DNS
    validation needed for tier-1).
-8. **(Optional)** When the `Infrastructure` manifest declares
+9. **(Optional)** When the `Infrastructure` manifest declares
    `spec.argocd.domain`, applies a `Gateway` (HTTPS on 443 +
    hostname + TLS terminate), an `HTTPRoute` to `argocd-server`,
    and a cert-manager `Certificate` issued by
    `apprafter-selfsigned`. Without the manifest opt-in, Argo CD
-   stays ClusterIP-only — the bootstrap finishes after step 7.
-9. **(Optional)** When the manifest also declares
-   `spec.argocd.bootstrapRepo`, applies an Argo CD `Application`
-   named `bootstrap` that watches the Git repo at
-   `bootstrapRepo` (path defaults to `.`, override with
-   `bootstrapPath`). Auto-prune + self-heal are on, so committing
-   to the repo continuously syncs the platform manifests into the
-   cluster.
-10. **(Optional)** When the manifest declares
+   stays ClusterIP-only — the bootstrap finishes after step 8.
+10. **(Optional)** When the manifest also declares
+    `spec.argocd.bootstrapRepo`, applies an Argo CD `Application`
+    named `bootstrap` that watches the Git repo at
+    `bootstrapRepo` (path defaults to `.`, override with
+    `bootstrapPath`). Auto-prune + self-heal are on, so committing
+    to the repo continuously syncs the platform manifests into the
+    cluster.
+11. **(Optional)** When the manifest declares
     `spec.backstage.domain`, applies the tier-1 Backstage manifest
     set (Namespace + ConfigMap + Deployment + Service + HTTPRoute +
     Gateway + cert-manager Certificate) to the `backstage`
@@ -219,7 +226,7 @@ Under the hood the command:
     true` (Backstage's basic-admin stub). `spec.backstage.image`
     overrides the placeholder container image. Without the
     manifest opt-in, Backstage is skipped — the bootstrap finishes
-    after step 9.
+    after step 10.
 
 > The container image referenced by `spec.backstage.image` is
 > built outside this CLI — see
