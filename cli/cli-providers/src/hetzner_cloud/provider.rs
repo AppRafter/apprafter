@@ -13,6 +13,7 @@ use super::server::{
     FirewallRuleSpec, FirewallSpec, FloatingIpSpec, NetworkSpec, ServerSpec, SshKeySpec,
     APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
 };
+use super::server_type::validate_server_type;
 use super::types::{
     Firewall, FirewallCreateRequest, FirewallReference, FirewallRule, FloatingIp,
     FloatingIpCreateRequest, Network, NetworkCreateRequest, Server, ServerCreateRequest, SshKey,
@@ -247,7 +248,7 @@ impl Provider for HetznerCloudProvider {
                 "validating server_type pre-flight"
             );
             let types = self.client.list_server_types()?;
-            super::server_type::validate_server_type(
+            validate_server_type(
                 &types.server_types,
                 &self.spec.server_type,
                 &self.spec.location,
