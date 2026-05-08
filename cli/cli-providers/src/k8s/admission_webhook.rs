@@ -166,7 +166,10 @@ mod tests {
     fn namespace_pins_apprafter_system_and_label() {
         let y = admission_webhook_yaml("ghcr.io/acme/webhook:1.0");
         assert!(y.contains("kind: Namespace"), "{y}");
-        assert!(y.contains(&format!("name: {APPRAFTER_SYSTEM_NAMESPACE}")), "{y}");
+        assert!(
+            y.contains(&format!("name: {APPRAFTER_SYSTEM_NAMESPACE}")),
+            "{y}"
+        );
         assert!(y.contains("apprafter: \"true\""), "{y}");
     }
 

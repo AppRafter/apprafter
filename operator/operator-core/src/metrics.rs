@@ -105,9 +105,7 @@ mod tests {
         m.reconcile_duration
             .with_label_values(&["Application"])
             .observe(0.0);
-        m.reconcile_errors
-            .with_label_values(&["Application"])
-            .inc();
+        m.reconcile_errors.with_label_values(&["Application"]).inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -134,9 +132,7 @@ mod tests {
     #[test]
     fn reconcile_errors_counter_independent_from_total() {
         let m = Metrics::new();
-        m.reconcile_errors
-            .with_label_values(&["Application"])
-            .inc();
+        m.reconcile_errors.with_label_values(&["Application"]).inc();
         let body = String::from_utf8(m.encode()).unwrap();
         // The error counter has its own family — visible even when
         // reconcile_total is empty.

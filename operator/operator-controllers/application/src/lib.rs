@@ -87,10 +87,7 @@ pub async fn run(
 /// Reconcile fn — renders the Application, applies the children
 /// via SSA, updates the Application status. Returns Action::requeue
 /// 60s on success.
-pub async fn reconcile(
-    app: Arc<Application>,
-    ctx: Arc<Context>,
-) -> Result<Action, ReconcileError> {
+pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     let name = app.name_any();
     let namespace = app.namespace().unwrap_or_default();
     let _timer = ctx
@@ -134,11 +131,7 @@ pub async fn reconcile(
 /// Error policy — logs the error, increments the error counters,
 /// and requeues with a fixed 30s delay. Phase 1.9c will distinguish
 /// transient vs terminal errors and wire up exponential backoff.
-pub fn error_policy(
-    app: Arc<Application>,
-    err: &ReconcileError,
-    ctx: Arc<Context>,
-) -> Action {
+pub fn error_policy(app: Arc<Application>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = app.name_any();
     let namespace = app.namespace().unwrap_or_default();
     warn!(%name, %namespace, %err, "reconcile error");

@@ -29,6 +29,15 @@ echo "==> cue vet ./schemas/..."
 "${CUE_CMD[@]}" vet ./schemas/...
 
 echo "==> cue vet ./examples/..."
-"${CUE_CMD[@]}" vet ./examples/...
+# Skip Backstage scaffolder skeletons — they contain template placeholders
+# (e.g. "${{ values.name }}") that intentionally violate v1alpha1 schemas.
+example_dirs=()
+while IFS= read -r f; do
+    example_dirs+=("$(dirname "$f")")
+done < <(find ./examples -type d -name skeleton -prune -o -name '*.cue' -print)
+if [[ ${#example_dirs[@]} -gt 0 ]]; then
+    mapfile -t example_dirs < <(printf '%s\n' "${example_dirs[@]}" | sort -u)
+    "${CUE_CMD[@]}" vet "${example_dirs[@]}"
+fi
 
 echo "==> all CUE checks passed"

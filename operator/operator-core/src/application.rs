@@ -133,7 +133,11 @@ mod tests {
         let env = base.env.as_ref().expect("env decoded");
         assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("info"));
 
-        let envs = app.spec.environments.as_ref().expect("environments decoded");
+        let envs = app
+            .spec
+            .environments
+            .as_ref()
+            .expect("environments decoded");
         let prod = envs.get("prod").expect("prod decoded");
         assert_eq!(prod.replicas, Some(5));
 

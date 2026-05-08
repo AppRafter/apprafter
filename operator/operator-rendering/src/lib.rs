@@ -318,7 +318,16 @@ mod tests {
             "u",
         );
         let r = render_application(&app);
-        let envs = r.deployment.spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+        let envs = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
             .env
             .as_ref()
             .expect("env present");
@@ -350,7 +359,16 @@ mod tests {
             "u",
         );
         let r = render_application(&app);
-        let ports = r.deployment.spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+        let ports = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
             .ports
             .as_ref()
             .expect("ports present");

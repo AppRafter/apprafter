@@ -114,11 +114,7 @@ impl LeaderElection {
                 }
                 Err(err) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    warn!(
-                        ?err,
-                        consecutive_failures,
-                        "leader election step failed"
-                    );
+                    warn!(?err, consecutive_failures, "leader election step failed");
                     if consecutive_failures >= RENEWAL_FAILURE_BUDGET
                         && self.is_leader.load(Ordering::SeqCst)
                     {

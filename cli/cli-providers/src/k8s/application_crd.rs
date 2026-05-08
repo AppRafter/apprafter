@@ -155,7 +155,10 @@ mod tests {
     #[test]
     fn spec_pins_group_and_namespaced_scope() {
         let y = application_crd_yaml();
-        assert!(y.contains(&format!("group: {APPLICATION_CRD_GROUP}")), "{y}");
+        assert!(
+            y.contains(&format!("group: {APPLICATION_CRD_GROUP}")),
+            "{y}"
+        );
         assert!(y.contains("scope: Namespaced"), "{y}");
     }
 
@@ -164,7 +167,10 @@ mod tests {
         let y = application_crd_yaml();
         assert!(y.contains("kind: Application"), "{y}");
         assert!(y.contains("listKind: ApplicationList"), "{y}");
-        assert!(y.contains(&format!("plural: {APPLICATION_CRD_PLURAL}")), "{y}");
+        assert!(
+            y.contains(&format!("plural: {APPLICATION_CRD_PLURAL}")),
+            "{y}"
+        );
         assert!(y.contains("singular: application"), "{y}");
         assert!(y.contains("- apr"), "{y}");
     }

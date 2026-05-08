@@ -41,7 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve(build_router().into_make_service())
             .await?;
     } else {
-        info!(?addr, "admission-webhook listening (HTTP — TLS files not found)");
+        info!(
+            ?addr,
+            "admission-webhook listening (HTTP — TLS files not found)"
+        );
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, build_router()).await?;
     }

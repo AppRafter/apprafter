@@ -35,10 +35,7 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     let Some(obj) = spec.as_object() else {
-        errors.push(ValidationError::new(
-            "spec",
-            "spec must be a JSON object",
-        ));
+        errors.push(ValidationError::new("spec", "spec must be a JSON object"));
         return errors;
     };
 
@@ -103,11 +100,7 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
                 .and_then(|o| o.get("env"))
                 .and_then(|v| v.as_object())
             {
-                validate_env_keys(
-                    &format!("spec.environments.{name}.env"),
-                    env,
-                    &mut errors,
-                );
+                validate_env_keys(&format!("spec.environments.{name}.env"), env, &mut errors);
             }
         }
     }
