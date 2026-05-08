@@ -23,12 +23,14 @@ pub const APPLICATION_CRD_VERSION: &str = "v1alpha1";
 pub const APPLICATION_CRD_PLURAL: &str = "applications";
 
 /// Cluster-side YAML for the Application CRD. Single document
-/// (`apiextensions.k8s.io/v1`). The schema accepts the same field
-/// set as the v0.1.21 CUE `#Application`: `image` (non-empty),
-/// `replicas` (≥0), `expose` (port required, public bool, network
-/// enum), `env` (string→string), and `environments` map of
-/// overrides. `apprafter=true` label is set so destroy / import
-/// flows can find it.
+/// (`apiextensions.k8s.io/v1`). Mirrors the field set of
+/// `schemas/v1alpha1/application.cue`: `image` (any string in CUE,
+/// pinned non-empty here via `pattern: "^.+$"`), `replicas` (≥0),
+/// `expose` (port required, public bool, network enum — CUE adds a
+/// `*"internal"` default; the kube-apiserver does not, so an absent
+/// field stays absent in the stored object), `env` (string→string),
+/// and `environments` map of overrides. The `apprafter=true` label
+/// lets destroy / import flows find it.
 pub fn application_crd_yaml() -> String {
     format!(
         r#"# SPDX-License-Identifier: MIT

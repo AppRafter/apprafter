@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 //! Pure validator for the v1alpha1 Application spec.
 //!
-//! Mirrors the CUE constraints from `schemas/v1alpha1/application.cue`
-//! plus the cross-field rule that the OpenAPI v3 CRD can't express:
-//! image must be reachable through `base.image` OR through every
-//! `environments[*].image`. Also enforces that environment names
-//! are DNS-1123 labels and env keys match `^[A-Z_][A-Z0-9_]*$`.
+//! Enforces v1alpha1 invariants the OpenAPI v3 CRD layer can't
+//! express: image must be reachable through `base.image` OR through
+//! every `environments[*].image` (cross-field; CUE itself accepts
+//! any string for `image`, so non-empty is enforced here plus by
+//! the CRD's `pattern: "^.+$"`), environment names are DNS-1123
+//! labels, and env keys match `^[A-Z_][A-Z0-9_]*$`.
 //!
 //! No `kube` types are pulled in — the validator works directly on
 //! `serde_json::Value`. The HTTP layer (`server.rs`) extracts the

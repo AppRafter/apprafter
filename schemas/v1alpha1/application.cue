@@ -31,19 +31,28 @@ package v1alpha1
 }
 
 #ApplicationSpec: {
-	// OCI image reference. The regex enforces non-empty; deeper
-	// digest/tag validation is left to the renderer + admission
-	// webhook (1.7c).
-	image?: string & =~"^.+$"
+	// OCI image reference. Deliberately unconstrained in CUE: a
+	// regex like =~"^.+$" on an optional field is a half-measure
+	// that hints at stricter validation without actually buying
+	// it. Non-empty + the cross-field rule (image reachable
+	// through `base.image` OR every `environments[*].image`) are
+	// enforced at runtime by the OpenAPI v3 CRD's
+	// `pattern: "^.+$"` and the admission webhook. Digest/tag
+	// shape lands with the renderer + webhook in 1.7c.
+	image?: string
 
 	// Replica count. Zero is valid (scale-to-zero); negative is
 	// rejected by CUE.
 	replicas?: int & >=0
 
 	expose?: {
-		port:     int & >0 & <=65535
-		public?:  bool | *false
-		network?: "public" | "internal" | "vpn"
+		port:    int & >0 & <=65535
+		public?: bool | *false
+		// Defaults to "internal" when the field is unset in the
+		// manifest. The OpenAPI v3 CRD enforces the enum at the
+		// kube-apiserver layer; the renderer consumes the field
+		// for HTTPRoute emission in phase 1.9c.
+		network?: "public" | "internal" | "vpn" | *"internal"
 	}
 
 	// Literal string values only — no secret refs in v1alpha1.
