@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: MIT
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: bun-http
+  title: Bun HTTP service (OneBun)
+  description: |
+    AppRafter golden-path starter — minimal HTTP service on
+    OneBun (Bun.js + Effect.ts). Generates a runnable repo with
+    Dockerfile and an apprafter/Application.cue manifest pre-wired
+    to your image.
+  tags:
+    - apprafter
+    - bun
+    - typescript
+    - golden-path
+
+spec:
+  owner: apprafter/maintainers
+  type: service
+
+  parameters:
+    - title: Application
+      required:
+        - name
+        - owner
+      properties:
+        name:
+          type: string
+          title: Name
+          description: Lowercase DNS-1123 — a-z, 0-9, hyphens; 1..63 chars.
+          pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+          maxLength: 63
+        description:
+          type: string
+          title: Description
+          default: AppRafter Application — bun-http
+        namespace:
+          type: string
+          title: Kubernetes namespace
+          default: default
+          pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+          maxLength: 63
+        owner:
+          type: string
+          title: Owner
+          ui:field: OwnerPicker
+          ui:options:
+            allowedKinds:
+              - Group
+              - User
+        image:
+          type: string
+          title: Container image (registry/path:tag)
+          description: |
+            The image you'll build + push from the generated repo.
+            Format: registry-host/owner/name:tag (e.g.,
+            ghcr.io/your-org/parser:0.1.0).
+          default: ghcr.io/your-org/bun-http-app:0.1.0
+
+    - title: Repository
+      required:
+        - repoUrl
+      properties:
+        repoUrl:
+          type: string
+          title: Git repository URL
+          ui:field: RepoUrlPicker
+          ui:options:
+            allowedHosts:
+              - github.com
+
+  steps:
+    - id: fetch
+      name: Fetch skeleton
+      action: fetch:template
+      input:
+        url: ./skeleton
+        values:
+          name: ${{ parameters.name }}
+          description: ${{ parameters.description }}
+          namespace: ${{ parameters.namespace }}
+          image: ${{ parameters.image }}
+          owner: ${{ parameters.owner }}
+
+    - id: publish
+      name: Publish to Git
+      action: publish:github
+      input:
+        repoUrl: ${{ parameters.repoUrl }}
+        description: ${{ parameters.description }}
+        defaultBranch: main
+        repoVisibility: private
+
+    - id: register
+      name: Register in Backstage
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
+        catalogInfoPath: /catalog-info.yaml
+
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps.publish.output.remoteUrl }}
+      - title: Open in Backstage catalog
+        icon: catalog
+        entityRef: ${{ steps.register.output.entityRef }}
