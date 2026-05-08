@@ -44,8 +44,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - id: detect
         run: |
-          dirs=$(find . -maxdepth 3 -name package.json \
+          dirs=$(find . -maxdepth 4 -name package.json \
               -not -path '*/node_modules/*' \
+              -not -path '*/skeleton/*' \
               | xargs -r -n1 dirname | sort -u | tr '\n' ' ')
           if [ -n "$dirs" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
