@@ -22,7 +22,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use operator_core::{Application, ApplicationCondition, ApplicationStatus, Metrics};
-use operator_rendering::render_application;
+use operator_rendering::render_application_for_env;
 
 /// Resource kind label used for every metric tagged with `kind`.
 const KIND: &str = "Application";
@@ -36,6 +36,11 @@ pub const FIELD_MANAGER: &str = "apprafter-operator";
 pub struct Context {
     pub client: Client,
     pub metrics: Arc<Metrics>,
+    /// Active environment name — when `Some(...)`, reconcile
+    /// applies the matching `spec.environments[env_name]` override
+    /// on top of `spec.base`. Sourced from `APPRAFTER_ENV` env var
+    /// in the binary; `None` falls back to `spec.base` only.
+    pub env_name: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -51,9 +56,17 @@ pub enum ReconcileError {
 /// `Application` resources cluster-wide and reconciles them through
 /// [`reconcile`]. Errors from individual reconcile calls go through
 /// [`error_policy`].
-pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
+pub async fn run(
+    client: Client,
+    metrics: Arc<Metrics>,
+    env_name: Option<String>,
+) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
-    let context = Arc::new(Context { client, metrics });
+    let context = Arc::new(Context {
+        client,
+        metrics,
+        env_name,
+    });
 
     Controller::new(apps, watcher::Config::default())
         .run(reconcile, error_policy, context)
@@ -86,9 +99,9 @@ pub async fn reconcile(
         .with_label_values(&[KIND])
         .start_timer();
 
-    info!(%name, %namespace, "reconciling Application");
+    info!(%name, %namespace, env = ?ctx.env_name, "reconciling Application");
 
-    let rendered = render_application(&app);
+    let rendered = render_application_for_env(&app, ctx.env_name.as_deref());
     let pp = PatchParams::apply(FIELD_MANAGER).force();
 
     apply_deployment(&ctx.client, &namespace, &rendered.deployment, &pp).await?;
