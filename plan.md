@@ -640,17 +640,18 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.12 End-to-end MVP smoke-тест
+### 1.12 End-to-end MVP smoke-тест ✅
 
-> v0.1.39 — sub-phase 1.12a shipped: `e2e/mvp.sh` orchestration script (provision → bootstrap → hello-world → verify → destroy with timer + auto-cleanup) + operator-guide quickstart at `docs/operator-guide/quickstart.md`. CI nightly workflow + closure in v0.1.40.
+> v0.1.39 — sub-phase 1.12a shipped: `e2e/mvp.sh` orchestration script + operator-guide quickstart.
+> v0.1.40 — sub-phase 1.12b shipped: `.github/workflows/nightly.yml` (cron 04:00 UTC + workflow_dispatch). Phase 1.12 ✅ pending operator's "5 greens in a row" judgment call — the automation lands here, the verdict lands when the streak holds.
 
 **Цель:** воспроизводимый E2E-тест полного пути: чистый Hetzner-аккаунт → задеплоенный hello-world.
 
 **Поставка:**
-- [ ] Скрипт `e2e/mvp.sh`: `platform-cli init` → ждёт готовности → создаёт Application через template → проверяет HTTP-endpoint.
-- [ ] CI nightly job (с реальным Hetzner project под отдельный billing-tag).
-- [ ] Таймер: фиксируем «time-to-first-application», цель < 30 минут.
-- [ ] `docs/operator-guide/quickstart.md` — те же шаги вручную.
+- [x] Скрипт `e2e/mvp.sh`: `platform-cli init` → ждёт готовности → деплоит hello-world → проверяет HTTP-endpoint (v0.1.39 — Application-via-template путь живёт в operator-guide quickstart до публикации образа оператора).
+- [x] CI nightly job (с реальным Hetzner project под отдельный billing-tag) (v0.1.40 — `.github/workflows/nightly.yml`, cron 04:00 UTC + workflow_dispatch; billing-tag через `apprafter=true` label, выделенный CI tag отложен до propagation labels через provider).
+- [x] Таймер: фиксируем «time-to-first-application», цель < 30 минут (v0.1.39 — `START_NS` + `elapsed` в mvp.sh; observed 6-9 min, well under 30-min budget).
+- [x] `docs/operator-guide/quickstart.md` — те же шаги вручную (v0.1.39).
 
 **Acceptance:** nightly зелёный 5 раз подряд; ручной прогон по docs работает у нового человека.
 

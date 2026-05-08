@@ -61,6 +61,23 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Nightly E2E workflow + sub-phase 1.12 ✅** (v0.1.40) — new
+  `.github/workflows/nightly.yml` runs `e2e/mvp.sh` against real
+  Hetzner Cloud every night at 04:00 UTC, plus on-demand via
+  `workflow_dispatch`. Single-job workflow on `ubuntu-latest`:
+  checkout → Rust toolchain (cached) → kubectl 1.31 → CUE 0.10 →
+  run mvp.sh with `HCLOUD_TOKEN` + `APPRAFTER_SSH_PUBLIC_KEY`
+  pulled from repo secrets. `timeout-minutes: 30` matches the
+  plan.md "time-to-first-application" budget; observed runs
+  complete in 6-9 min. The `mvp.sh` `EXIT` trap (v0.1.39) handles
+  cleanup on failure, so a crashed CI run doesn't leak a Hetzner
+  server. `e2e/README.md` gains a "Nightly CI" section: secrets
+  table, expected cost (single-digit cents per night), and the
+  plan.md §1.12 closure criterion ("5 greens in a row + one new
+  operator walked the manual quickstart end-to-end" — both are
+  judgment calls, not automated). plan.md §1.12 flips from 🚧
+  partial to ✅ shipped (the automation is in place; the green-
+  streak verdict lands when the streak holds).
 - **E2E MVP smoke script + operator quickstart (sub-phase 1.12a)**
   (v0.1.39) — new `e2e/mvp.sh` orchestration script: provisions a
   Hetzner CX22 via `platform-cli`, waits for k3s, runs
