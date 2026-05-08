@@ -27,18 +27,28 @@ pub struct RenderedApplication {
     pub service: Option<Service>,
 }
 
-/// Render the Application's `base` block into a typed Deployment +
-/// optional Service. Per-environment overrides are not applied
-/// here — phase 1.9c folds them in via CUE unification.
+/// Render the Application's `base` block (no environment override
+/// applied). v0.1.30 entry point — keeps the simple call-site
+/// shape; new code should prefer [`render_application_for_env`]
+/// when the operator knows which environment it represents.
 pub fn render_application(app: &Application) -> RenderedApplication {
+    render_application_for_env(app, None)
+}
+
+/// Render the Application using the merged base + environment
+/// override (when `env_name` is `Some(...)` and the override exists).
+pub fn render_application_for_env(
+    app: &Application,
+    env_name: Option<&str>,
+) -> RenderedApplication {
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
     let owner = owner_reference(app);
     let labels = make_labels(&name);
-    let base = app.spec.base.clone().unwrap_or_default();
+    let effective = effective_spec(app, env_name);
 
-    let deployment = render_deployment(&name, namespace.as_deref(), &owner, &labels, &base);
-    let service = base
+    let deployment = render_deployment(&name, namespace.as_deref(), &owner, &labels, &effective);
+    let service = effective
         .expose
         .as_ref()
         .map(|expose| render_service(&name, namespace.as_deref(), &owner, &labels, expose.port));
@@ -47,6 +57,39 @@ pub fn render_application(app: &Application) -> RenderedApplication {
         deployment,
         service,
     }
+}
+
+/// Compute the effective spec — `base` unified with the named
+/// environment override (when present). Fields set in the override
+/// replace base fields; the env map merges with override-wins on
+/// conflict. v1alpha1 doesn't include CUE-only constructs, so this
+/// pure-Rust merge is functionally equivalent to CUE unification
+/// for our schema.
+pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationBaseSpec {
+    let mut effective = app.spec.base.clone().unwrap_or_default();
+    let Some(name) = env_name else {
+        return effective;
+    };
+    let Some(env_override) = app.spec.environments.as_ref().and_then(|m| m.get(name)) else {
+        return effective;
+    };
+    if env_override.image.is_some() {
+        effective.image = env_override.image.clone();
+    }
+    if env_override.replicas.is_some() {
+        effective.replicas = env_override.replicas;
+    }
+    if env_override.expose.is_some() {
+        effective.expose = env_override.expose.clone();
+    }
+    if let Some(env_env) = &env_override.env {
+        let mut merged = effective.env.unwrap_or_default();
+        for (k, v) in env_env {
+            merged.insert(k.clone(), v.clone());
+        }
+        effective.env = Some(merged);
+    }
+    effective
 }
 
 fn owner_reference(app: &Application) -> OwnerReference {
@@ -422,5 +465,192 @@ mod tests {
             Some("apprafter-operator")
         );
         assert_eq!(labels.get("apprafter").map(String::as_str), Some("true"));
+    }
+
+    fn make_app_with_envs(
+        base: ApplicationBaseSpec,
+        envs: BTreeMap<String, ApplicationBaseSpec>,
+    ) -> Application {
+        let mut app = Application::new(
+            "web",
+            ApplicationSpec {
+                base: Some(base),
+                environments: Some(envs),
+            },
+        );
+        app.metadata.namespace = Some("default".to_string());
+        app.metadata.uid = Some("uid".to_string());
+        app
+    }
+
+    #[test]
+    fn effective_spec_returns_base_when_env_name_absent() {
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("base".into()),
+                replicas: Some(2),
+                ..Default::default()
+            },
+            BTreeMap::new(),
+        );
+        let s = effective_spec(&app, None);
+        assert_eq!(s.image.as_deref(), Some("base"));
+        assert_eq!(s.replicas, Some(2));
+    }
+
+    #[test]
+    fn effective_spec_returns_base_when_env_not_in_environments_map() {
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("base".into()),
+                ..Default::default()
+            },
+            BTreeMap::new(),
+        );
+        let s = effective_spec(&app, Some("prod"));
+        assert_eq!(s.image.as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn effective_spec_env_override_replaces_image_and_replicas() {
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                image: Some("prod-image".into()),
+                replicas: Some(5),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("base-image".into()),
+                replicas: Some(1),
+                ..Default::default()
+            },
+            envs,
+        );
+        let s = effective_spec(&app, Some("prod"));
+        assert_eq!(s.image.as_deref(), Some("prod-image"));
+        assert_eq!(s.replicas, Some(5));
+    }
+
+    #[test]
+    fn effective_spec_env_override_replaces_expose_block() {
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                expose: Some(ApplicationExpose {
+                    port: 9000,
+                    public: Some(true),
+                    network: Some("public".into()),
+                }),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("base".into()),
+                expose: Some(ApplicationExpose {
+                    port: 8080,
+                    public: Some(false),
+                    network: None,
+                }),
+                ..Default::default()
+            },
+            envs,
+        );
+        let s = effective_spec(&app, Some("prod"));
+        let expose = s.expose.expect("expose decoded");
+        assert_eq!(expose.port, 9000);
+        assert_eq!(expose.public, Some(true));
+        assert_eq!(expose.network.as_deref(), Some("public"));
+    }
+
+    #[test]
+    fn effective_spec_env_override_env_merges_with_override_wins_on_conflict() {
+        let mut base_env = BTreeMap::new();
+        base_env.insert("LOG_LEVEL".to_string(), "info".to_string());
+        base_env.insert("REGION".to_string(), "eu".to_string());
+        let mut prod_env = BTreeMap::new();
+        prod_env.insert("LOG_LEVEL".to_string(), "warn".to_string());
+        prod_env.insert("PROD_FLAG".to_string(), "1".to_string());
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                env: Some(prod_env),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("x".into()),
+                env: Some(base_env),
+                ..Default::default()
+            },
+            envs,
+        );
+        let s = effective_spec(&app, Some("prod"));
+        let env = s.env.expect("env decoded");
+        // override wins:
+        assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("warn"));
+        // base survives:
+        assert_eq!(env.get("REGION").map(String::as_str), Some("eu"));
+        // override-only:
+        assert_eq!(env.get("PROD_FLAG").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn render_application_for_env_uses_env_image() {
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                image: Some("ghcr.io/acme/web:prod".into()),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("ghcr.io/acme/web:dev".into()),
+                ..Default::default()
+            },
+            envs,
+        );
+        let r = render_application_for_env(&app, Some("prod"));
+        assert_eq!(
+            r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
+                .image
+                .as_deref(),
+            Some("ghcr.io/acme/web:prod")
+        );
+    }
+
+    #[test]
+    fn render_application_no_env_falls_back_to_base() {
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                image: Some("ghcr.io/acme/web:prod".into()),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("ghcr.io/acme/web:dev".into()),
+                ..Default::default()
+            },
+            envs,
+        );
+        let r = render_application(&app); // no env → base.image wins
+        assert_eq!(
+            r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
+                .image
+                .as_deref(),
+            Some("ghcr.io/acme/web:dev")
+        );
     }
 }
