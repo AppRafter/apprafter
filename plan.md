@@ -1920,4 +1920,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-06 | 1.2 (SSH-keys ветка) — `HetznerCloudProvider.ssh_keys` + APPRAFTER_SSH_PUBLIC_KEY; v0.1.3 | initial |
 | 2026-05-06 | 1.2 (Network + Firewall ветка) — default 10.0.0.0/16 net + SSH/HTTPS firewall, server attached; v0.1.4 | initial |
 | 2026-05-06 | 1.2 (CUE Infrastructure parsing ветка) — APPRAFTER_MANIFEST overlays defaults; v0.1.5 | initial |
+| 2026-05-08 | Phase 1 patch — Hetzner `cx22` retired upstream; default flipped to `cpx22` + pre-flight validate_server_type lookup; v0.1.42 | initial |
 

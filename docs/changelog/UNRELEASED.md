@@ -11,6 +11,41 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.42 — Phase 1 patch (2026-05-08)
+
+### Fixed
+
+- **Hetzner `cx22` retirement workaround + lazy pre-flight
+  server-type validation** (v0.1.42) — Hetzner retired the entire
+  `cx*` Intel-shared series (cx11/cx21/cx22/cx32/...);
+  `platform-cli apply` against the previous default `cx22` failed
+  with `server type 104 is deprecated` AFTER creating SSH-key +
+  network + firewall, leaving partial state. Two changes:
+  (1) `DEFAULT_SERVER_TYPE` flips `cx22` → `cpx22` (same-spec
+  AMD-shared replacement: 2 vCPU / 4 GB / 80 GB / x86, orderable
+  in `nbg1`); the example manifest, the `destroy.rs` placeholder,
+  the `manifest.rs` doc-comment, and the gated real-Hetzner E2E
+  test follow. (2) New `cli-providers::hetzner_cloud::server_type::validate_server_type`
+  pure function takes the live `/v1/server_types` view, the
+  requested name, and the target region; returns
+  `CliError::ServerTypeUnavailable` with the 3 closest live
+  alternatives if the type is unknown, deprecated globally, or
+  unavailable in the region. Wired into the **top** of
+  `HetznerCloudProvider::apply()`, **gated on `needs_server_create`**:
+  the `list_server_types` round-trip is paid only when the
+  provider is about to POST a new server. No-op applies (live
+  server with our name + `apprafter=true` label already there)
+  skip the lookup entirely. Failure happens before the first
+  CREATE, so a retired type no longer leaks SSH-key / network /
+  firewall state. New client method `list_server_types()` with
+  mockito tests; 7 in-file unit tests on the validator (happy
+  path, unknown, deprecated, region-unavailable, closest-spec
+  sort, dead/other-region filtered out, no-live-alternatives
+  placeholder); 2 new integration tests in `provider_test.rs`
+  proving (a) deprecated type rejected before any POST, (b) no-op
+  apply makes zero `/server_types` calls (regression guard via
+  `mockito.expect(0)`).
+
 ## v0.1.0-mvp — Milestone M1 ✅ (released 2026-05-08)
 
 **What ships:** a complete tier-1 single-node AppRafter platform
