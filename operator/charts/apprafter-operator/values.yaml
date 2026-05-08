@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: MIT
+# Default values for the apprafter-operator chart.
+#
+# Override with:
+#   helm install apprafter-operator ./operator/charts/apprafter-operator \
+#     --namespace apprafter-system --create-namespace \
+#     --set image.repository=ghcr.io/your-org/apprafter-operator \
+#     --set image.tag=1.0.0
+
+# Operator image — operators build + push their own; no default tag.
+image:
+  repository: ghcr.io/apprafter/apprafter-operator
+  pullPolicy: IfNotPresent
+  tag: ""  # falls back to .Chart.AppVersion when empty
+
+imagePullSecrets: []
+
+# Single replica in tier-1. Multi-replica needs the leader-election
+# preemption work scheduled for a tier-2/3 HA cycle.
+replicaCount: 1
+
+# Tracing filter (RUST_LOG syntax). Pod env var.
+logLevel: info,apprafter_operator=info
+
+# HTTP port for /healthz, /readyz, /metrics.
+httpPort: 8080
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+rbac:
+  create: true
+
+# Pod-level security context.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context.
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+service:
+  type: ClusterIP
+  port: 8080

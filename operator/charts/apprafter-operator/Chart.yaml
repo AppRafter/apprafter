@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+apiVersion: v2
+name: apprafter-operator
+description: AppRafter operator — Application controller + admission webhook glue + Prometheus metrics.
+type: application
+version: 0.1.29
+appVersion: "0.1.29"
+kubeVersion: ">= 1.29.0-0"
+home: https://github.com/apprafter/apprafter
+sources:
+  - https://github.com/apprafter/apprafter
+maintainers:
+  - name: AppRafter Authors
+keywords:
+  - apprafter
+  - operator
+  - kubernetes
