@@ -61,6 +61,24 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Operator leader election (sub-phase 1.8c)** (v0.1.28) — new
+  `operator-core::leader` module exposes `LeaderElection` +
+  `LeaderConfig` for tier-1 single-replica `coordination.k8s.io/v1`
+  Lease management. The operator's `main.rs` now acquires a Lease
+  named `apprafter-operator` in `apprafter-system` before starting
+  the Application Controller; holder identity is sourced from
+  `POD_NAME` (downward API in the Helm chart, v0.1.29) and falls
+  back to `local-<pid>` for local runs. Lease duration is 30s with
+  10s renewal — three consecutive renewal failures exit the
+  process so the Deployment restart picks up. The HTTP server
+  (`/healthz`, `/readyz`, `/metrics`) runs unconditionally so the
+  pod's probes don't flap during the acquire phase. New deps:
+  `chrono` 0.4 (UTC + duration math). 4 unit tests on the pure
+  helpers (config defaults, staleness math at three time offsets).
+  Multi-replica preemption with full leader-elector semantics is
+  deferred to the tier-2/3 HA cycle. The Helm chart that wires
+  ServiceAccount + RBAC + Deployment + Service into a real cluster
+  lands in v0.1.29 (sub-phase 1.8d, closes phase 1.8).
 - **Operator binary + metrics + health endpoints (sub-phase 1.8b)**
   (v0.1.27) — new `apprafter-operator` workspace member (lib + bin).
   The binary spawns the Application Controller (`run(client,

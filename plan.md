@@ -552,7 +552,8 @@ Phase 7 запускается параллельно с 3+ как только 
 ### 1.8 Application operator — каркас на kube-rs
 
 > v0.1.26 — sub-phase 1.8a shipped: 3 library crates (`operator-core` + `operator-rendering` + `operator-controllers/application`).
-> v0.1.27 — sub-phase 1.8b shipped: `apprafter-operator` binary + 3 Prometheus signals + axum `/healthz` / `/readyz` / `/metrics`. Leader election + Helm chart + closure in v0.1.28.
+> v0.1.27 — sub-phase 1.8b shipped: `apprafter-operator` binary + 3 Prometheus signals + axum `/healthz` / `/readyz` / `/metrics`.
+> v0.1.28 — sub-phase 1.8c shipped: Lease-based leader election (`operator-core::leader`). Helm chart + closure in v0.1.29.
 
 **Цель:** Rust-операторный pod с reconcile-loop по `Application`.
 
