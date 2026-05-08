@@ -61,6 +61,26 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Admission-webhook deployment + sub-phase 1.7 ✅** (v0.1.24) —
+  the v0.1.23 webhook binary now serves HTTPS via `axum-server` +
+  `rustls` (loads `tls.crt` / `tls.key` from `/tls`, falls back to
+  HTTP when files are missing — keeps `cargo run` working in dev).
+  New module `cli-providers::k8s::admission_webhook` emits the
+  five-document install (Namespace `apprafter-system` +
+  cert-manager Certificate `admission-webhook-tls` issued by
+  `apprafter-selfsigned` + Service + Deployment +
+  ValidatingWebhookConfiguration), with the
+  `cert-manager.io/inject-ca-from` annotation keeping `caBundle`
+  rotated. CUE schema gains `spec.admissionWebhook.image` (optional);
+  Rust manifest mirror gets `AdmissionWebhookBlock`. `platform-cli
+  cluster-bootstrap` adds an 8th conditional kubectl apply at the
+  tail of the sequence — when the operator sets the image,
+  Application admission is gated by the webhook with
+  `failurePolicy: Fail`, `timeoutSeconds: 10`, and a CUE-shape
+  message ("Application is invalid: <field>: <reason>") visible in
+  `kubectl apply` output. Static rendering at
+  `manifests/tier-1/admission-webhook/example.yaml` + README.
+  Sub-phase 1.7 in plan.md flips from 🚧 partial to ✅ shipped.
 - **Admission-webhook crate (sub-phase 1.7c)** (v0.1.23) —
   new `operator/` Cargo workspace with one member crate
   `admission-webhook`. Pure validator

@@ -529,15 +529,15 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.7 Application CRD v1alpha1
+### 1.7 Application CRD v1alpha1 ✅
 
 **Цель:** зарегистрировать CRD `Application` в кластере, схема валидируется через CUE.
 
 **Поставка:**
 - [x] OpenAPI v3 схема CRD: hand-rolled YAML мирорит CUE `#ApplicationSpec` (v0.1.22 — `cli-providers::k8s::application_crd` + apply через cluster-bootstrap; `cue cmd export-crd` автогенерация откладывается до v0.2.x).
 - [x] Поля v1alpha1: `image`, `expose`, `replicas`, `env` (только литералы), `environments` map (v0.1.21 — schema + Rust parser).
-- [ ] Admission webhook (Rust, `kube-rs`) в отдельном pod с auto-rotated cert (через cert-manager).
-- [ ] Невалидный manifest реджектится с понятной ошибкой.
+- [x] Admission webhook (Rust, axum + rustls) в отдельном pod с auto-rotated cert (cert-manager Certificate в `apprafter-system`, `cert-manager.io/inject-ca-from` синхронит `caBundle` на ValidatingWebhookConfiguration; v0.1.23 — webhook crate + Dockerfile, v0.1.24 — k8s-манифесты + cluster-bootstrap wiring).
+- [x] Невалидный manifest реджектится с понятной ошибкой (v0.1.24 — webhook возвращает `Application is invalid: <field>: <reason>` через AdmissionReview, kube-apiserver включает это сообщение в ответ `kubectl apply`).
 
 **Acceptance:** `kubectl apply` валидного Application проходит; невалидного — с сообщением, указывающим поле и причину.
 
