@@ -7,16 +7,20 @@ composition layer).
 
 ## Layout
 
-This is a Cargo workspace with one crate so far:
+This is a Cargo workspace with the following crates:
 
-| Crate                | Role                                                                  |
-| -------------------- | --------------------------------------------------------------------- |
-| `admission-webhook`  | Validating admission webhook for v1alpha1 `Application` (binary).      |
+| Crate                                  | Role                                                              |
+| -------------------------------------- | ----------------------------------------------------------------- |
+| `admission-webhook`                    | Validating admission webhook for v1alpha1 `Application` (binary).  |
+| `operator-core`                        | Shared types — kube-rs `Application` CRD type (library).           |
+| `operator-rendering`                   | Pure renderer: `Application` -> Vec of k8s resources (library).    |
+| `operator-controllers/application`     | kube-rs Controller for `Application` (library).                    |
 
-The `Application` reconcile controller, `ResourceClaim` /
-`AccessGrant` / `MigrationPlan` controllers, and operator-rendering
-helper crate land in plan.md phases 1.8 / 2.x / 4.x as separate
-workspace members.
+The `apprafter-operator` binary (which wires the controllers + a
+metrics + health HTTP server) lands in v0.1.27. Leader election +
+the Helm chart land in v0.1.28 and close plan.md sub-phase 1.8.
+`ResourceClaim` / `AccessGrant` / `MigrationPlan` controllers come
+in their own subphases under phase 2.x / 4.x.
 
 ## Build
 
