@@ -126,3 +126,62 @@ out: {\n\
     assert_eq!(base.image.as_deref(), Some("ghcr.io/acme/web:1.0"));
     assert!(m.environments.is_none());
 }
+
+#[test]
+fn application_schema_vets_cleanly() {
+    use std::process::Command;
+
+    let bin = std::env::var("CUE_BIN").unwrap_or_else(|_| "cue".to_string());
+    let root = repo_root();
+
+    let output = match Command::new(&bin)
+        .current_dir(&root)
+        .args(["vet", "./schemas/v1alpha1/..."])
+        .output()
+    {
+        Ok(out) => out,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(err) => panic!("spawn cue vet: {err}"),
+    };
+    assert!(
+        output.status.success(),
+        "cue vet failed:\nstderr={}\nstdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn application_fixture_vets_against_schema() {
+    use std::process::Command;
+
+    let bin = std::env::var("CUE_BIN").unwrap_or_else(|_| "cue".to_string());
+    let root = repo_root();
+
+    let output = match Command::new(&bin)
+        .current_dir(&root)
+        .args([
+            "vet",
+            "-c",
+            "./schemas/v1alpha1/...",
+            "./examples/applications/parser.cue",
+        ])
+        .output()
+    {
+        Ok(out) => out,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(err) => panic!("spawn cue vet: {err}"),
+    };
+    assert!(
+        output.status.success(),
+        "cue vet of the parser fixture failed:\nstderr={}\nstdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
