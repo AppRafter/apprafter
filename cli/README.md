@@ -227,11 +227,29 @@ Under the hood the command:
     overrides the placeholder container image. Without the
     manifest opt-in, Backstage is skipped — the bootstrap finishes
     after step 10.
+12. **(Optional)** When the manifest declares
+    `spec.admissionWebhook.image`, applies the admission-webhook
+    stack (Namespace + cert-manager Certificate + Service +
+    Deployment + ValidatingWebhookConfiguration) to the
+    `apprafter-system` namespace. The Deployment runs the operator-
+    built image; cert-manager issues a TLS Secret named
+    `admission-webhook-tls`, the ValidatingWebhookConfiguration's
+    `cert-manager.io/inject-ca-from` annotation keeps `caBundle` in
+    sync, and the webhook validates `apprafter.io/v1alpha1`
+    Application objects on CREATE+UPDATE beyond the OpenAPI v3
+    layer. Without the manifest opt-in, the webhook is skipped —
+    Application validation falls back to the CRD's OpenAPI v3
+    schema alone.
 
 > The container image referenced by `spec.backstage.image` is
 > built outside this CLI — see
 > [`backstage-plugins/host/README.md`](../backstage-plugins/host/README.md)
 > for the scaffold + Dockerfile + push workflow.
+
+> The container image referenced by `spec.admissionWebhook.image`
+> is built from the operator workspace — see
+> [`operator/README.md`](../operator/README.md) and
+> [`manifests/tier-1/admission-webhook/README.md`](../manifests/tier-1/admission-webhook/README.md).
 
 Both shell-outs require `helm` and `kubectl` on `$PATH`.
 
