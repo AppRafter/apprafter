@@ -12,27 +12,29 @@ parser: v1alpha1.#Application & {
 		name:      "parser"
 		namespace: "demo"
 	}
-	base: {
-		image:    "ghcr.io/example/parser:latest"
-		replicas: 3
-		expose: {
-			port:   8080
-			public: false
-		}
-		env: {
-			LOG_LEVEL: "info"
-		}
-	}
-	environments: {
-		dev: {
-			replicas: 1
+	spec: {
+		base: {
+			image:    "ghcr.io/example/parser:latest"
+			replicas: 3
 			expose: {
-				port:    8080
-				network: "vpn"
+				port:   8080
+				public: false
+			}
+			env: {
+				LOG_LEVEL: "info"
 			}
 		}
-		prod: {
-			replicas: 3
+		environments: {
+			dev: {
+				replicas: 1
+				expose: {
+					port:    8080
+					network: "vpn"
+				}
+			}
+			prod: {
+				replicas: 3
+			}
 		}
 	}
 }
