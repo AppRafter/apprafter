@@ -229,6 +229,31 @@ impl Provider for HetznerCloudProvider {
     fn apply(&self) -> Result<ApplyOutcome> {
         let mut applied = 0;
 
+        // 0) Pre-flight: if we're about to POST a new server,
+        // validate the type/region combo against the live Hetzner
+        // catalog FIRST, before any other CREATE. A retired type
+        // here used to fail mid-apply at step 4, leaking SSH-key +
+        // network + firewall state. The list_server_types round-
+        // trip is ONLY paid on the create path — no-op applies
+        // (server already exists with our label) skip it.
+        let live_servers = self.refresh_servers()?;
+        let needs_server_create =
+            !self.spec.name.is_empty() && !live_servers.iter().any(|s| s.name == self.spec.name);
+        if needs_server_create {
+            info!(
+                server = %self.spec.name,
+                server_type = %self.spec.server_type,
+                location = %self.spec.location,
+                "validating server_type pre-flight"
+            );
+            let types = self.client.list_server_types()?;
+            super::server_type::validate_server_type(
+                &types.server_types,
+                &self.spec.server_type,
+                &self.spec.location,
+            )?;
+        }
+
         // 1) SSH keys.
         let live_keys = self.refresh_ssh_keys()?;
         let mut ssh_ids: Vec<u64> = Vec::new();
@@ -278,7 +303,6 @@ impl Provider for HetznerCloudProvider {
         // 4) Server (resolve id even if it already exists, so
         // floating-IP attach has somewhere to point).
         let mut server_id: Option<u64> = None;
-        let live_servers = self.refresh_servers()?;
         if let Some(existing) = live_servers.iter().find(|s| s.name == self.spec.name) {
             server_id = Some(existing.id);
         } else if !self.spec.name.is_empty() {

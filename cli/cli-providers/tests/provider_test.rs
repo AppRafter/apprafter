@@ -251,6 +251,18 @@ fn plan_creates_network_firewall_and_server_when_all_missing() {
 #[test]
 fn apply_creates_all_resources_in_order_and_attaches_to_server() {
     let mut srv = mockito::Server::new();
+    let _list_servers = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+    let _list_types = srv
+        .mock("GET", "/v1/server_types")
+        .with_status(200)
+        .with_body(
+            r#"{"server_types":[{"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4,"disk":40,"deprecation":null,"locations":[{"name":"nbg1","available":true}]}]}"#,
+        )
+        .create();
     let _list_keys = srv
         .mock("GET", "/v1/ssh_keys")
         .with_status(200)
@@ -265,11 +277,6 @@ fn apply_creates_all_resources_in_order_and_attaches_to_server() {
         .mock("GET", "/v1/firewalls")
         .with_status(200)
         .with_body(r#"{"firewalls":[]}"#)
-        .create();
-    let _list_servers = srv
-        .mock("GET", "/v1/servers")
-        .with_status(200)
-        .with_body(r#"{"servers":[]}"#)
         .create();
     let _create_key = srv
         .mock("POST", "/v1/ssh_keys")
@@ -397,6 +404,18 @@ fn destroy_removes_in_order_server_firewall_network_ssh() {
 #[test]
 fn apply_creates_floating_ip_after_server_with_server_attach() {
     let mut srv = mockito::Server::new();
+    let _list_servers = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+    let _list_types = srv
+        .mock("GET", "/v1/server_types")
+        .with_status(200)
+        .with_body(
+            r#"{"server_types":[{"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4,"disk":40,"deprecation":null,"locations":[{"name":"nbg1","available":true}]}]}"#,
+        )
+        .create();
     let _list_keys = srv
         .mock("GET", "/v1/ssh_keys")
         .with_status(200)
@@ -411,11 +430,6 @@ fn apply_creates_floating_ip_after_server_with_server_attach() {
         .mock("GET", "/v1/firewalls")
         .with_status(200)
         .with_body(r#"{"firewalls":[]}"#)
-        .create();
-    let _list_servers = srv
-        .mock("GET", "/v1/servers")
-        .with_status(200)
-        .with_body(r#"{"servers":[]}"#)
         .create();
     let _list_fips = srv
         .mock("GET", "/v1/floating_ips")
@@ -525,6 +539,20 @@ fn apply_forwards_user_data_into_the_create_server_request() {
 
     let mut server = mockito::Server::new();
     server
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+    server
+        .mock("GET", "/v1/server_types")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"server_types":[{"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4,"disk":40,"deprecation":null,"locations":[{"name":"nbg1","available":true}]}]}"#,
+        )
+        .create();
+    server
         .mock("GET", "/v1/ssh_keys")
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -541,12 +569,6 @@ fn apply_forwards_user_data_into_the_create_server_request() {
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"firewalls":[]}"#)
-        .create();
-    server
-        .mock("GET", "/v1/servers")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"servers":[]}"#)
         .create();
 
     let create = server
@@ -580,4 +602,168 @@ fn apply_forwards_user_data_into_the_create_server_request() {
     let outcome = provider.apply().expect("apply");
     assert_eq!(outcome.applied, 1);
     create.assert();
+}
+
+#[test]
+fn apply_rejects_deprecated_server_type_before_any_post() {
+    let mut server = mockito::Server::new();
+
+    // refresh_ssh_keys / refresh_networks / refresh_firewalls /
+    // refresh_servers all return empty — so the provider would
+    // try to CREATE everything. The pre-flight must reject FIRST,
+    // before any POST, so we ONLY mock the GETs and assert no
+    // POST mock was consumed.
+    let _g_keys = server
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+    let _g_nets = server
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    let _g_fws = server
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    let g_servers = server
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
+        .expect_at_least(1)
+        .create();
+    let g_types = server
+        .mock("GET", "/v1/server_types")
+        .with_status(200)
+        .with_body(
+            r#"{
+              "server_types": [
+                {
+                  "id": 109, "name": "cpx22", "architecture": "x86",
+                  "cpu_type": "shared", "cores": 2, "memory": 4, "disk": 80,
+                  "deprecation": null,
+                  "locations": [{"name": "nbg1", "available": true}]
+                },
+                {
+                  "id": 104, "name": "cx22", "architecture": "x86",
+                  "cpu_type": "shared", "cores": 2, "memory": 4, "disk": 40,
+                  "deprecation": {"announced": "2025-10-01T00:00:00Z"},
+                  "locations": [{"name": "nbg1", "available": false}]
+                }
+              ]
+            }"#,
+        )
+        .expect_at_least(1)
+        .create();
+    // NOTE: zero POST mocks. If apply calls POST, mockito returns
+    // 501 and the test would fail — but more importantly, we want
+    // it to fail BEFORE that with our typed error.
+    let no_post = server
+        .mock("POST", mockito::Matcher::Any)
+        .expect(0)
+        .create();
+
+    use cli_providers::hetzner_cloud::{
+        FirewallSpec, HetznerCloudClient, HetznerCloudProvider, NetworkSpec, ServerSpec,
+    };
+    use std::collections::BTreeMap;
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(server.url(), "test-token"),
+        spec: ServerSpec {
+            name: "platform-1".into(),
+            server_type: "cx22".into(), // ← retired upstream
+            image: "ubuntu-24.04".into(),
+            location: "nbg1".into(),
+            labels: BTreeMap::new(),
+            user_data: None,
+        },
+        ssh_keys: vec![],
+        networks: vec![NetworkSpec {
+            name: "platform-1-net".into(),
+            ip_range: "10.0.0.0/16".into(),
+            subnet_ip_range: "10.0.0.0/24".into(),
+            network_zone: "eu-central".into(),
+        }],
+        firewalls: vec![FirewallSpec {
+            name: "platform-1-fw".into(),
+            rules: vec![],
+        }],
+        floating_ips: vec![],
+    };
+
+    let err = cli_providers::Provider::apply(&provider).unwrap_err();
+    match err {
+        cli_core::CliError::ServerTypeUnavailable {
+            requested,
+            alternatives,
+            ..
+        } => {
+            assert_eq!(requested, "cx22");
+            assert!(alternatives.contains("cpx22"));
+        }
+        other => panic!("expected ServerTypeUnavailable, got {other:?}"),
+    }
+    g_servers.assert();
+    g_types.assert();
+    no_post.assert(); // proves nothing was POSTed
+}
+
+#[test]
+fn apply_skips_server_types_lookup_when_server_already_exists() {
+    let mut server = mockito::Server::new();
+
+    // SSH keys / networks / firewalls already exist — provider
+    // sees them via refresh_*, no creation needed.
+    let _g_keys = server
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+    let _g_nets = server
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    let _g_fws = server
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    // Server with our name already exists ⇒ no_op create branch.
+    let _g_servers = server
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(
+            r#"{"servers":[{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    // CRITICAL: list_server_types must NOT be called when no
+    // create is needed.
+    let no_types = server.mock("GET", "/v1/server_types").expect(0).create();
+
+    use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
+    use std::collections::BTreeMap;
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(server.url(), "test-token"),
+        spec: ServerSpec {
+            name: "platform-1".into(),
+            server_type: "cpx22".into(),
+            image: "ubuntu-24.04".into(),
+            location: "nbg1".into(),
+            labels: BTreeMap::new(),
+            user_data: None,
+        },
+        ssh_keys: vec![],
+        networks: vec![],
+        firewalls: vec![],
+        floating_ips: vec![],
+    };
+
+    let outcome = cli_providers::Provider::apply(&provider).expect("no-op apply succeeds");
+    assert_eq!(outcome.applied, 0, "no resources should be created");
+    no_types.assert(); // proves /server_types was NEVER hit
 }
