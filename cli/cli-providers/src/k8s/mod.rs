@@ -6,6 +6,7 @@
 
 pub mod argocd_gateway;
 pub mod argocd_values;
+pub mod backstage_app_config;
 pub mod backstage_manifests;
 pub mod bootstrap_app;
 pub mod cert_manager_values;
@@ -17,6 +18,7 @@ pub mod network_policy;
 
 pub use argocd_gateway::argocd_gateway_yaml;
 pub use argocd_values::{argocd_values_yaml, ARGOCD_CHART_VERSION};
+pub use backstage_app_config::backstage_app_config_yaml;
 pub use backstage_manifests::{backstage_manifests_yaml, BACKSTAGE_DEFAULT_IMAGE};
 pub use bootstrap_app::{bootstrap_application_yaml, BOOTSTRAP_APP_DEFAULT_PATH};
 pub use cert_manager_values::{cert_manager_values_yaml, CERT_MANAGER_CHART_VERSION};
