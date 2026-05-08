@@ -4,11 +4,20 @@ package v1alpha1
 
 // Application is the dev-facing unit of deployment.
 //
-// Per-environment overrides are expressed via CUE unification on the
-// `environments` map; see spec.md §3.1 and ADR 0004.
+// v1alpha1 field set (see plan.md §1.7):
+//   - image    — required-ish; the renderer fails if neither base
+//                nor any environment override sets it.
+//   - replicas — non-negative; defaults to 1 at render time.
+//   - expose   — optional Gateway-side exposure (port + visibility).
+//   - env      — string→string map. Literals only; secret/configmap
+//                refs land in 2.x with ResourceClaim and 4.x with
+//                OpenBao.
+//   - environments — per-environment overrides via CUE unification;
+//                see spec.md §3.1 and ADR 0004.
 //
-// Skeleton schema. Full field set (env sources, connects, autoscale
-// triggers, network egressIP) is filled in during phase 1.7 / 1.9.
+// Fields removed from the v1alpha1 surface: `needs`, `autoscale`,
+// `confidential`. They re-appear in their owning subphases (2.x for
+// ResourceClaim wiring, 4.x for confidential workloads).
 #Application: {
 	#TypeMeta
 	kind:     "Application"
@@ -20,24 +29,21 @@ package v1alpha1
 }
 
 #ApplicationSpec: {
-	image?:    string
+	// OCI image reference. The regex enforces non-empty; deeper
+	// digest/tag validation is left to the renderer + admission
+	// webhook (1.7c).
+	image?: string & =~"^.+$"
+
+	// Replica count. Zero is valid (scale-to-zero); negative is
+	// rejected by CUE.
 	replicas?: int & >=0
+
 	expose?: {
 		port:     int & >0 & <=65535
 		public?:  bool | *false
 		network?: "public" | "internal" | "vpn"
 	}
-	needs?: [string]: _
-	env?: [string]:   string
 
-	autoscale?: {
-		on?:  string
-		min?: int & >=0
-		max?: int & >=1
-	}
-
-	// confidential opts the workload into Tier-4 attestation +
-	// Kata-CC scheduling. See ADR 0006/0007 for secrets context and
-	// spec.md §4.1 for the substrate model.
-	confidential?: bool | *false
+	// Literal string values only — no secret refs in v1alpha1.
+	env?: [string]: string
 }
