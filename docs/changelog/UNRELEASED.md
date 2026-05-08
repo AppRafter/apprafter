@@ -61,6 +61,23 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **applications-frontend plugin scaffold (sub-phase 1.10c)**
+  (v0.1.35) — new TypeScript + Bun package at
+  `backstage-plugins/applications-frontend/`. Mirrors the v0.1.33
+  backend's layout: scaffold (package.json, tsconfig, .gitignore,
+  bun.lock), re-declared `Application` / `ApplicationSpec` /
+  `ApplicationBaseSpec` / `ApplicationExpose` /
+  `ApplicationStatus` / `ApplicationCondition` / `ObjectMeta`
+  types (hand-synced with the backend's), `ApplicationsApi
+  { listApplications, getApplication }` interface that v0.1.36's
+  React table will consume via the Backstage api-ref pattern, and
+  a pure `applicationsToRows(apps): ApplicationRow[]` data
+  transform (`name`, `namespace`, `image`, `replicas`, `phase`,
+  `endpointURL`, `ready`). 5 unit tests (full projection, list
+  order, missing-field defaults, Ready/False status, no-Ready
+  condition fallback). License is MIT (plugin tier). React + the
+  Backstage `createPlugin` glue + drilldown + per-env tabs land
+  together in v0.1.36 (sub-phase 1.10d, closes phase 1.10).
 - **applications-backend KubeApplicationStore (sub-phase 1.10b)**
   (v0.1.34) — replaces the v0.1.33 `StubApplicationStore` with a
   real `KubeApplicationStore` that proxies the kube apiserver via
