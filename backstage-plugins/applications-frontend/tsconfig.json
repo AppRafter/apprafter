@@ -10,8 +10,9 @@
     "isolatedModules": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "lib": ["es2022"],
-    "types": ["bun-types"]
+    "lib": ["es2022", "dom", "dom.iterable"],
+    "types": ["bun-types"],
+    "jsx": "react-jsx"
   },
   "include": ["src/**/*"]
 }
