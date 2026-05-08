@@ -176,6 +176,14 @@ pub struct ApplicationManifest {
     pub kind: String,
     pub metadata: Metadata,
     #[serde(default)]
+    pub spec: ApplicationOuterSpec,
+}
+
+/// `spec` block of an Application — wraps the base config and the
+/// per-environment overrides.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApplicationOuterSpec {
+    #[serde(default)]
     pub base: Option<ApplicationSpec>,
     #[serde(default)]
     pub environments: Option<BTreeMap<String, ApplicationSpec>>,
