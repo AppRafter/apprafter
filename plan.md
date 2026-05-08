@@ -534,7 +534,7 @@ Phase 7 запускается параллельно с 3+ как только 
 **Цель:** зарегистрировать CRD `Application` в кластере, схема валидируется через CUE.
 
 **Поставка:**
-- [ ] OpenAPI v3 схема CRD сгенерирована из CUE (через `cue cmd export-crd`).
+- [x] OpenAPI v3 схема CRD: hand-rolled YAML мирорит CUE `#ApplicationSpec` (v0.1.22 — `cli-providers::k8s::application_crd` + apply через cluster-bootstrap; `cue cmd export-crd` автогенерация откладывается до v0.2.x).
 - [x] Поля v1alpha1: `image`, `expose`, `replicas`, `env` (только литералы), `environments` map (v0.1.21 — schema + Rust parser).
 - [ ] Admission webhook (Rust, `kube-rs`) в отдельном pod с auto-rotated cert (через cert-manager).
 - [ ] Невалидный manifest реджектится с понятной ошибкой.

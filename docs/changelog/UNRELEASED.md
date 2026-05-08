@@ -61,6 +61,27 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Application CRD OpenAPI v3 manifest (sub-phase 1.7b)** (v0.1.22) —
+  hand-rolled `apiextensions.k8s.io/v1` CRD in
+  `cli-providers::k8s::application_crd`, mirroring the v0.1.21 CUE
+  `#ApplicationSpec` (`image` non-empty pattern, `replicas` ≥ 0,
+  `expose` with port 1..=65535 + public bool + network enum {public,
+  internal, vpn}, `env` string→string, plus the `environments` map
+  of overrides). The schema is inlined twice — once under `base`,
+  once under `environments.additionalProperties` — because k8s
+  structural-schema rules forbid `$ref`. `subresources.status: {}`
+  is declared up-front so phase 1.9 can populate it without a CRD
+  migration. `platform-cli cluster-bootstrap` now applies the CRD
+  right after the Gateway API CRDs (mandatory step, no manifest
+  opt-in). New `cargo run -p cli-providers --example
+  application_crd_example` re-renders the static
+  `manifests/tier-1/application/example-crd.yaml`; alongside it
+  ships an `example-app.yaml` minimal Application + a README. The
+  four FakeKubectl in-file tests update to expect one extra apply
+  in the sequence (Gateway-CRDs → Application-CRD → default-deny
+  NP → …). Admission-webhook (Rust + kube-rs + cert-manager
+  Certificate + ValidatingWebhookConfiguration) lands in v0.1.23
+  and closes phase 1.7.
 - **Application CRD v1alpha1 schema (sub-phase 1.7a)** (v0.1.21) —
   the v1alpha1 CUE schema for `#Application` is tightened to the
   field set declared in plan.md §1.7: `image` (non-empty),
