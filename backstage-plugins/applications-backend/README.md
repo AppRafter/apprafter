@@ -51,11 +51,50 @@ The Bun-based toolchain matches the project-wide CI pattern
 - `getApplicationHandler(store, namespace, name)` →
   `{ application: Application | null, notFound: boolean }`.
 
+## Use the kube store (v0.1.34)
+
+```ts
+import {
+  inClusterConfig,
+  KubeApplicationStore,
+  listApplicationsHandler,
+} from '@apprafter/applications-backend';
+
+const store = new KubeApplicationStore(await inClusterConfig());
+const { items } = await listApplicationsHandler(store);
+```
+
+`inClusterConfig()` reads:
+
+| Source                                                            | Field        |
+| ----------------------------------------------------------------- | ------------ |
+| `KUBERNETES_SERVICE_HOST` env var (set by k8s on every pod)       | `apiServer`  |
+| `KUBERNETES_SERVICE_PORT_HTTPS` env var (defaults to `443`)       | `apiServer`  |
+| `/var/run/secrets/kubernetes.io/serviceaccount/token`             | `token`      |
+| `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`            | `caCert`     |
+
+For local dev / tests, build the config by hand and inject a mock
+`fetchImpl`:
+
+```ts
+const store = new KubeApplicationStore({
+  apiServer: 'https://localhost:6443',
+  token: 'dev-token',
+  fetchImpl: myMockFetch,
+});
+```
+
+The store implements the `ApplicationStore` interface from v0.1.33,
+so the existing `listApplicationsHandler` / `getApplicationHandler`
+pure handlers consume it without changes.
+
 ## What's missing
 
-- Real kube proxy → v0.1.34 (sub-phase 1.10b).
 - Backstage backend plugin glue (`createBackendPlugin`,
-  `apiRouter.use(...)`, etc.) → v0.1.34 once the kube store is
-  in.
+  `apiRouter.use(...)`, etc.) → v0.1.35 (sub-phase 1.10c) along
+  with the React frontend.
 - React frontend table + drilldown → v0.1.35 (sub-phase 1.10c).
 - Per-environment tabs → v0.1.36 (sub-phase 1.10d, closes phase 1.10).
+- Watch streams for live status updates → phase 2 polish.
+- kubeconfig parsing for local dev → not planned; use env-var
+  config or a mock `fetchImpl` instead.
