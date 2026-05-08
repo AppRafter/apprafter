@@ -24,6 +24,7 @@ PATTERNS=(
   'examples/**/*.cue'
   # Scripts
   'scripts/*.sh'
+  'e2e/*.sh'
   '.devcontainer/*.sh'
   # Source code
   'cli/**/*.rs'
