@@ -61,16 +61,21 @@ jobs:
       - name: Detect Bun workspaces
         id: detect
         run: |
-          if find . -name package.json -not -path '*/node_modules/*' \
-              | head -1 | grep -q .; then
+          dirs=$(find . -maxdepth 3 -name package.json \
+              -not -path '*/node_modules/*' \
+              | xargs -r -n1 dirname | sort -u | tr '\n' ' ')
+          if [ -n "$dirs" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "::notice::no package.json yet — skipping bun lint"
           fi
-      - name: bun install
+      - name: bun install + lint
         if: steps.detect.outputs.found == 'true'
-        run: bun install --frozen-lockfile
-      - name: bun lint
-        if: steps.detect.outputs.found == 'true'
-        run: bun run lint
+        run: |
+          for dir in ${{ steps.detect.outputs.dirs }}; do
+            echo "::group::bun lint in $dir"
+            (cd "$dir" && bun install --frozen-lockfile && bun run lint)
+            echo "::endgroup::"
+          done
