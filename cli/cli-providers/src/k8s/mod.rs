@@ -4,6 +4,7 @@
 //! shell-outs, plus pure builders for the manifests / values we
 //! ship.
 
+pub mod admission_webhook;
 pub mod application_crd;
 pub mod argocd_gateway;
 pub mod argocd_values;
@@ -17,6 +18,7 @@ pub mod issuer;
 pub mod kubectl;
 pub mod network_policy;
 
+pub use admission_webhook::{admission_webhook_yaml, APPRAFTER_SYSTEM_NAMESPACE};
 pub use application_crd::{
     application_crd_yaml, APPLICATION_CRD_GROUP, APPLICATION_CRD_PLURAL, APPLICATION_CRD_VERSION,
 };
