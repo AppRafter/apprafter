@@ -109,8 +109,10 @@ The HTTP server runs unconditionally — `/healthz` and `/readyz`
 return 200 even before leadership is acquired so the pod's probes
 don't flap during the (typically sub-second) acquire phase.
 
-### What's still pending
+### Helm chart
 
-The Helm chart for in-cluster deployment (ServiceAccount + RBAC +
-Deployment + Service for `/metrics`) lands in v0.1.29 and closes
-plan.md sub-phase 1.8.
+The `charts/apprafter-operator/` Helm chart packages the operator
+binary as a `Deployment` with the RBAC + ServiceAccount + Service
+needed to run in-cluster. See
+[`charts/apprafter-operator/README.md`](charts/apprafter-operator/README.md)
+for the install + verify workflow.
