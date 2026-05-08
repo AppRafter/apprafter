@@ -1,63 +1,61 @@
-# Changelog — Unreleased
+# Changelog
 
-All notable changes to AppRafter that have not yet shipped in a
-tagged release land here. The format follows [Keep a Changelog]
-v1.1.0. Pre-1.0 development is tracked as patch increments under
-the `0.0.x` series; semver starts at 1.0.
+All notable changes to AppRafter. The format follows
+[Keep a Changelog] v1.1.0. Pre-1.0 development tracks patches as
+`MAJOR.MINOR.PATCH` where the minor matches the plan.md phase and
+the patch matches the (sub-)subphase. Milestone tags
+(`v0.1.0-mvp`, `v0.2.0-services`, etc.) point at the closing
+patch of each phase.
 
-## Phase 0 — Foundations (v0.0.1 → v0.0.8)
+## Phase 2 — Platform services (in progress)
 
-### Added
+_No entries yet — Phase 2 (M2) opens with v0.2.0._
 
-- **Repository scaffold** per `spec.md` Appendix A: `cli/`,
-  `operator/`, `schemas/`, `providers/{pg-integrated, pg-aws,
-  jetstream-integrated, clickhouse-integrated, redis-integrated,
-  s3-integrated}/`, `backstage-plugins/`, `manifests/`, `examples/`,
-  `docs/`.
-- **`plan.md`** — actionable phase-by-phase development plan
-  derived from the spec.
-- **Licensing** — `LICENSE` (FSL-1.1-MIT, canonical text from
-  fsl.software), `LICENSE-MIT`, `NOTICE` explaining the 2-year
-  FSL → MIT conversion model, plugin-level MIT `LICENSE` files in
-  `providers/` and `backstage-plugins/`, SPDX-header conventions
-  in `docs/contributing/license-headers.md`.
-- **12 ADRs** + Nygard-style template covering: FSL-1.1-MIT for
-  core, codename "AppRafter", custom Rust operator vs Crossplane,
-  CUE vs Pkl, kine+NATS vs etcd, OpenBao vs Vault, Tier-1
-  SealedSecrets vs Tier-2+ OpenBao, HTTP-first notifications,
-  platform-only templates, Dockerfile-first build, hybrid Rust SDK
-  + OpenTofu shim providers, MigrationPlan as first-class.
-- **CUE module** (`apprafter.io`) with v1alpha1 skeleton schemas
-  for all nine CRDs (`Application`, `ServiceProvider`,
-  `ResourceClaim`, `AccessGrant`, `MigrationPlan`,
-  `ExternalSurface`, `Infrastructure`, `ServiceProviderPlugin`,
-  `InfrastructureProviderPlugin`) and a vet-time fixture
-  (`examples/applications/parser.cue`).
-- **CI** — GitHub Actions workflows (`lint`, `test`,
-  `license-check`, `conventional-commits`); GitHub meta files
-  (`CODEOWNERS`, `PULL_REQUEST_TEMPLATE.md`, `ISSUE_TEMPLATE/`);
-  `lefthook.yml` for local hooks; `scripts/check-spdx-headers.sh`
-  and `scripts/check-commit-msg.sh`.
-- **Dev environment** — three install paths (Nix flake, VS Code
-  Dev Container, manual via `mise.toml`), unified `Justfile`
-  (`bootstrap`, `lint`, `fmt`, `test`, `e2e-up`, `e2e-down`,
-  `docs-serve`, `docs-build`, `stats`),
-  `docs/contributing/setup.md`.
-- **TechDocs skeleton** — mkdocs-material site with stub pages for
-  Architecture, Concepts, Operator Guide, Developer Guide,
-  Reference, plus Contributing and ADR sections; `CONTRIBUTING.md`,
-  `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1), `SECURITY.md`,
-  `GOVERNANCE.md` (lazy consensus + ADR process) at the repo root.
+## v0.1.0-mvp — Milestone M1 ✅ (released 2026-05-08)
 
-### Changed
+**What ships:** a complete tier-1 single-node AppRafter platform
+on Hetzner Cloud. From a blank Hetzner account to a hello-world
+Application reachable cluster-internally in ~6-9 minutes
+wall-clock, well under the < 30-minute target. 41 development
+cycles (v0.1.0 → v0.1.40) shipped across 13 sub-phases.
 
-- `spec.md` §6 (M0) — both remaining items flipped to `[x]`:
-  "Repository structure defined" and "License chosen". The
-  license-candidates note (MPL-2.0 / Apache-2.0) is replaced by
-  the actual decision (FSL-1.1-MIT for core, MIT for plugins;
-  see ADR 0001).
+**Stack:** Hetzner provider (Rust + ureq + mockito tests) → k3s
+single-node via cloud-init → Cilium 1.16.5 → Gateway API CRDs →
+default-deny NetworkPolicy → Argo CD 7.7.7 (GitOps via
+bootstrap-Application) → cert-manager 1.16.2 + self-signed
+ClusterIssuer → AppRafter Application CRD v1alpha1 (CUE schema +
+hand-rolled OpenAPI v3) → admission webhook (Rust + axum-server
++ rustls + cert-manager-rotated cert) → kube-rs operator with SSA
++ status subresource + per-environment expansion + Lease leader
+election + Prometheus metrics + axum /healthz/readyz/metrics +
+Helm chart → Backstage tier-1 manifests (with app-config
+ConfigMap mount + guest auth) → applications-backend +
+applications-frontend Backstage plugins (TS + Bun) → bun-http
+golden-path starter (OneBun + multi-stage distroless Dockerfile +
+Backstage Software Template) → e2e/mvp.sh smoke + nightly CI.
 
-## Phase 1 — MVP single-node (in progress)
+**Numbers:** 143 SPDX-tracked source files, ~290 Rust tests
+(cli workspace), 56 Rust tests (operator workspace), 31 TS tests
+(Bun packages), 0 clippy warnings, all under FSL-1.1-MIT (core)
+or MIT (plugins / templates) per ADR 0001.
+
+**Deliberately deferred to M2+:**
+
+- `needs.{pg,jetstream,redis}` resource claims + ServiceProvider
+  CRD + integrated providers (M2).
+- HTTPRoute for `expose.network: public` (a later phase that owns
+  Gateway domain config end-to-end).
+- Operator container image publishing (operators build their own
+  for now — `operator/charts/apprafter-operator` is ready to
+  consume an image once published).
+- Multi-replica operator HA + full Lease preemption (the v0.1.28
+  leader election is single-replica safe; HA preemption lands
+  with kine+NATS in M3).
+- ServiceMonitor / NetworkPolicy / HPA / PDB on the operator
+  chart (tier-1 single-node doesn't need them; phase 2 polish).
+- CUE FFI for per-environment unification (the v0.1.32 pure-Rust
+  merge is functionally equivalent for v1alpha1; CUE FFI lands
+  when we add CUE-only constructs).
 
 ### Added
 
@@ -729,5 +727,57 @@ the `0.0.x` series; semver starts at 1.0.
   by the `cli_smoke` and `import_test` integration suites — tarpaulin
   cannot see them but they ARE exercised. Numbers measured with
   cargo-tarpaulin 0.35.2, e2e test excluded.
+
+## v0.0.8 — Foundations (Phase 0)
+
+### Added
+
+- **Repository scaffold** per `spec.md` Appendix A: `cli/`,
+  `operator/`, `schemas/`, `providers/{pg-integrated, pg-aws,
+  jetstream-integrated, clickhouse-integrated, redis-integrated,
+  s3-integrated}/`, `backstage-plugins/`, `manifests/`, `examples/`,
+  `docs/`.
+- **`plan.md`** — actionable phase-by-phase development plan
+  derived from the spec.
+- **Licensing** — `LICENSE` (FSL-1.1-MIT, canonical text from
+  fsl.software), `LICENSE-MIT`, `NOTICE` explaining the 2-year
+  FSL → MIT conversion model, plugin-level MIT `LICENSE` files in
+  `providers/` and `backstage-plugins/`, SPDX-header conventions
+  in `docs/contributing/license-headers.md`.
+- **12 ADRs** + Nygard-style template covering: FSL-1.1-MIT for
+  core, codename "AppRafter", custom Rust operator vs Crossplane,
+  CUE vs Pkl, kine+NATS vs etcd, OpenBao vs Vault, Tier-1
+  SealedSecrets vs Tier-2+ OpenBao, HTTP-first notifications,
+  platform-only templates, Dockerfile-first build, hybrid Rust SDK
+  + OpenTofu shim providers, MigrationPlan as first-class.
+- **CUE module** (`apprafter.io`) with v1alpha1 skeleton schemas
+  for all nine CRDs (`Application`, `ServiceProvider`,
+  `ResourceClaim`, `AccessGrant`, `MigrationPlan`,
+  `ExternalSurface`, `Infrastructure`, `ServiceProviderPlugin`,
+  `InfrastructureProviderPlugin`) and a vet-time fixture
+  (`examples/applications/parser.cue`).
+- **CI** — GitHub Actions workflows (`lint`, `test`,
+  `license-check`, `conventional-commits`); GitHub meta files
+  (`CODEOWNERS`, `PULL_REQUEST_TEMPLATE.md`, `ISSUE_TEMPLATE/`);
+  `lefthook.yml` for local hooks; `scripts/check-spdx-headers.sh`
+  and `scripts/check-commit-msg.sh`.
+- **Dev environment** — three install paths (Nix flake, VS Code
+  Dev Container, manual via `mise.toml`), unified `Justfile`
+  (`bootstrap`, `lint`, `fmt`, `test`, `e2e-up`, `e2e-down`,
+  `docs-serve`, `docs-build`, `stats`),
+  `docs/contributing/setup.md`.
+- **TechDocs skeleton** — mkdocs-material site with stub pages for
+  Architecture, Concepts, Operator Guide, Developer Guide,
+  Reference, plus Contributing and ADR sections; `CONTRIBUTING.md`,
+  `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1), `SECURITY.md`,
+  `GOVERNANCE.md` (lazy consensus + ADR process) at the repo root.
+
+### Changed
+
+- `spec.md` §6 (M0) — both remaining items flipped to `[x]`:
+  "Repository structure defined" and "License chosen". The
+  license-candidates note (MPL-2.0 / Apache-2.0) is replaced by
+  the actual decision (FSL-1.1-MIT for core, MIT for plugins;
+  see ADR 0001).
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
