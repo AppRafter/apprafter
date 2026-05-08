@@ -9,12 +9,12 @@ use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    application_crd_yaml, argocd_gateway_yaml, argocd_values_yaml, backstage_manifests_yaml,
-    bootstrap_application_yaml, cert_manager_values_yaml, cilium_values_yaml,
-    default_deny_network_policy_yaml, gateway_api_crds_url, selfsigned_cluster_issuer_yaml,
-    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
-    ARGOCD_CHART_VERSION, BACKSTAGE_DEFAULT_IMAGE, BOOTSTRAP_APP_DEFAULT_PATH,
-    CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
+    admission_webhook_yaml, application_crd_yaml, argocd_gateway_yaml, argocd_values_yaml,
+    backstage_manifests_yaml, bootstrap_application_yaml, cert_manager_values_yaml,
+    cilium_values_yaml, default_deny_network_policy_yaml, gateway_api_crds_url,
+    selfsigned_cluster_issuer_yaml, HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli,
+    KubectlRunner, ManifestSource, ARGOCD_CHART_VERSION, BACKSTAGE_DEFAULT_IMAGE,
+    BOOTSTRAP_APP_DEFAULT_PATH, CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -89,6 +89,14 @@ pub fn run() -> Result<()> {
         None => None,
     };
 
+    let admission_webhook_file = match &cluster.admission_webhook_image {
+        Some(image) => Some(write_tempfile_with(
+            "apprafter-admission-webhook-",
+            &admission_webhook_yaml(image),
+        )?),
+        None => None,
+    };
+
     perform_bootstrap(
         &HelmCli,
         &KubectlCli,
@@ -102,6 +110,7 @@ pub fn run() -> Result<()> {
         argocd_gateway_file.as_ref().map(|f| f.path()),
         bootstrap_app_file.as_ref().map(|f| f.path()),
         backstage_file.as_ref().map(|f| f.path()),
+        admission_webhook_file.as_ref().map(|f| f.path()),
     )?;
 
     let mut suffix = String::new();
@@ -113,6 +122,9 @@ pub fn run() -> Result<()> {
     }
     if let Some(d) = &cluster.backstage_domain {
         suffix.push_str(&format!(" + Backstage on {d}"));
+    }
+    if cluster.admission_webhook_image.is_some() {
+        suffix.push_str(" + admission-webhook in apprafter-system");
     }
     println!(
         "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + Application CRD + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer{suffix} applied"
@@ -127,6 +139,7 @@ struct ClusterSettings {
     bootstrap_path: Option<String>,
     backstage_domain: Option<String>,
     backstage_image: Option<String>,
+    admission_webhook_image: Option<String>,
 }
 
 fn read_cluster_settings_from_manifest(cwd: &Path) -> Result<ClusterSettings> {
@@ -138,12 +151,14 @@ fn read_cluster_settings_from_manifest(cwd: &Path) -> Result<ClusterSettings> {
     let parsed: InfrastructureManifest = manifest::parse_infrastructure(cwd, Path::new(&path))?;
     let argocd = parsed.spec.argocd.unwrap_or_default();
     let backstage = parsed.spec.backstage.unwrap_or_default();
+    let admission_webhook = parsed.spec.admission_webhook.unwrap_or_default();
     Ok(ClusterSettings {
         argocd_domain: argocd.domain.filter(|d| !d.is_empty()),
         bootstrap_repo: argocd.bootstrap_repo.filter(|d| !d.is_empty()),
         bootstrap_path: argocd.bootstrap_path.filter(|d| !d.is_empty()),
         backstage_domain: backstage.domain.filter(|d| !d.is_empty()),
         backstage_image: backstage.image.filter(|d| !d.is_empty()),
+        admission_webhook_image: admission_webhook.image.filter(|d| !d.is_empty()),
     })
 }
 
@@ -174,9 +189,9 @@ fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
 /// AppRafter Application CRD + default-deny NetworkPolicy + Argo
 /// CD + cert-manager + the self-signed ClusterIssuer in that
 /// order, optionally followed by the Argo CD Gateway / HTTPRoute /
-/// Certificate manifest, the bootstrap `Application` resource, and
-/// the tier-1 Backstage manifest set. Easily driven with fake
-/// runners in tests.
+/// Certificate manifest, the bootstrap `Application` resource, the
+/// tier-1 Backstage manifest set, and the admission-webhook stack.
+/// Easily driven with fake runners in tests.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm: &H,
@@ -191,6 +206,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     argocd_gateway_path: Option<&Path>,
     bootstrap_app_path: Option<&Path>,
     backstage_manifests_path: Option<&Path>,
+    admission_webhook_path: Option<&Path>,
 ) -> Result<()> {
     helm.repo_add("cilium", "https://helm.cilium.io/")?;
     helm.upgrade_install(&HelmUpgradeArgs {
@@ -255,6 +271,13 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     if let Some(bs_path) = backstage_manifests_path {
         kubectl.apply_manifest(
             &ManifestSource::Path(bs_path.to_path_buf()),
+            kubeconfig_path,
+        )?;
+    }
+
+    if let Some(aw_path) = admission_webhook_path {
+        kubectl.apply_manifest(
+            &ManifestSource::Path(aw_path.to_path_buf()),
             kubeconfig_path,
         )?;
     }
@@ -333,6 +356,7 @@ mod tests {
             None, // Argo CD Gateway opt-in not exercised here
             None, // bootstrap Application opt-in not exercised here
             None, // Backstage opt-in not exercised here
+            None, // admission-webhook opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -420,6 +444,7 @@ mod tests {
             Some(&gateway),
             None, // bootstrap Application opt-in not exercised here
             None, // Backstage opt-in not exercised here
+            None, // admission-webhook opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -461,6 +486,7 @@ mod tests {
             Some(&gateway),
             Some(&bootstrap),
             None, // Backstage opt-in not exercised here
+            None, // admission-webhook opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -504,6 +530,7 @@ mod tests {
             Some(&gateway),
             Some(&bootstrap),
             Some(&backstage),
+            None, // admission-webhook opt-in not exercised here
         )
         .expect("bootstrap");
 
@@ -517,6 +544,54 @@ mod tests {
             other => panic!("seventh apply must be the Backstage Path, got {other:?}"),
         }
         assert_eq!(applies[6].1, kc);
+    }
+
+    #[test]
+    fn perform_bootstrap_applies_admission_webhook_when_path_provided() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let gateway = PathBuf::from("/tmp/argocd-gateway.yaml");
+        let bootstrap = PathBuf::from("/tmp/bootstrap-app.yaml");
+        let backstage = PathBuf::from("/tmp/backstage.yaml");
+        let admission_webhook = PathBuf::from("/tmp/admission-webhook.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &app_crd,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            Some(&gateway),
+            Some(&bootstrap),
+            Some(&backstage),
+            Some(&admission_webhook),
+        )
+        .expect("bootstrap");
+
+        let applies = kubectl.applies.borrow();
+        // 8 applies: Gateway CRDs URL, Application CRD Path,
+        // default-deny Path, ClusterIssuer Path, Argo CD Gateway
+        // Path, bootstrap App Path, Backstage Path, admission-webhook
+        // Path.
+        assert_eq!(applies.len(), 8);
+        match &applies[7].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &admission_webhook),
+            other => {
+                panic!("eighth apply must be the admission-webhook Path, got {other:?}")
+            }
+        }
+        assert_eq!(applies[7].1, kc);
     }
 
     #[test]
