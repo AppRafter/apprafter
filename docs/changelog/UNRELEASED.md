@@ -61,6 +61,26 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Operator binary + metrics + health endpoints (sub-phase 1.8b)**
+  (v0.1.27) — new `apprafter-operator` workspace member (lib + bin).
+  The binary spawns the Application Controller (`run(client,
+  metrics)` lives in `operator-controllers/application`) against a
+  `kube::Client` resolved via `Client::try_default()` (in-cluster
+  config or `~/.kube/config` fallback) and serves an axum HTTP
+  listener on `HTTP_PORT` (default 8080) with `/healthz` (200 ok),
+  `/readyz` (200 ready), and `/metrics` (Prometheus text format).
+  Three signals are tracked: `apprafter_reconcile_total{kind,
+  namespace, result}`, `apprafter_reconcile_duration_seconds{kind}`,
+  and `apprafter_reconcile_errors_total{kind}`. The reconcile fn
+  starts a histogram timer + increments the `ok` counter on success;
+  the error policy increments both the `error` counter and the
+  errors-only counter. New deps: `prometheus` 0.13. tokio
+  `select!` over the server task, the controller task, and
+  `signal::ctrl_c()` so any one of them exits the process. 6
+  unit tests (3 in operator-core::metrics + 3 in
+  apprafter-operator::server). Leader election + the Helm chart
+  for in-cluster deployment land in v0.1.28 (sub-phase 1.8c, closes
+  phase 1.8).
 - **Operator skeleton libraries (sub-phase 1.8a)** (v0.1.26) —
   three new Cargo workspace members under `operator/`:
   `operator-core` defines the v1alpha1 `Application` CRD type via
