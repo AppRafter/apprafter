@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# Minimal example of `kind: Application` for the v1alpha1 CRD —
+# used as a `kubectl apply` smoke-test starting point. No operator
+# reconciles this in v0.1.22; field-level validation comes from the
+# CRD's OpenAPI v3 schema. Admission-webhook validation lands in
+# v0.1.23.
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: parser
+  namespace: default
+  labels:
+    apprafter: "true"
+base:
+  image: ghcr.io/example/parser:latest
+  replicas: 1
+  expose:
+    port: 8080
+    public: false
+    network: internal
+  env:
+    LOG_LEVEL: info
+environments:
+  prod:
+    replicas: 3
