@@ -16,6 +16,7 @@ repository   = "https://github.com/apprafter/apprafter"
 [workspace.dependencies]
 axum               = "0.7"
 tokio              = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+axum-server        = { version = "0.7", features = ["tls-rustls"] }
 tower              = { version = "0.5", features = ["util"] }
 http-body-util     = "0.1"
 serde              = { version = "1", features = ["derive"] }
