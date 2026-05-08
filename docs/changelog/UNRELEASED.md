@@ -61,6 +61,24 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **E2E MVP smoke script + operator quickstart (sub-phase 1.12a)**
+  (v0.1.39) — new `e2e/mvp.sh` orchestration script: provisions a
+  Hetzner CX22 via `platform-cli`, waits for k3s, runs
+  `cluster-bootstrap`, applies a plain `Deployment` + `Service`
+  with `nginxdemos/hello:plain-text`, verifies the endpoint via an
+  in-cluster `curl` pod, and tears the cluster down. `set -euo
+  pipefail` + `EXIT` trap (auto-destroy on failure unless
+  `APPRAFTER_E2E_SKIP_DESTROY=1`) + `START_NS` timer that prints
+  elapsed wall-clock time at the end. Required env:
+  `HCLOUD_TOKEN`, `APPRAFTER_SSH_PUBLIC_KEY`. The smoke applies a
+  plain Deployment instead of an `Application` CRD because the
+  operator container image isn't published yet — full Application
+  flow lives in the new operator-guide quickstart at
+  `docs/operator-guide/quickstart.md`. The dev-guide quickstart
+  (v0.1.38) stays the developer-facing scaffold doc; the new
+  operator-guide is the cluster-operator counterpart (provision +
+  bootstrap + day-2 ops). CI nightly workflow + phase 1.12 closure
+  land in v0.1.40 (sub-phase 1.12b).
 - **bun-http Backstage Software Template + sub-phase 1.11 ✅**
   (v0.1.38) — Backstage scaffolder `template.yaml` (v1beta3)
   layered on top of the v0.1.37 starter. The
