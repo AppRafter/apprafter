@@ -25,3 +25,7 @@ export {
   listApplicationsHandler,
   getApplicationHandler,
 } from './router.ts';
+
+export type { KubeStoreConfig } from './kubeStore.ts';
+
+export { KubeApplicationStore, inClusterConfig } from './kubeStore.ts';

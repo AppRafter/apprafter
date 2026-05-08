@@ -24,10 +24,13 @@ function recordingFetch(): {
 } {
   const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
   let nextResponse: Response = jsonResponse({ items: [] });
-  const fn: typeof fetch = async (input, init) => {
-    calls.push({ url: input as string, init });
+  // Bun's `typeof fetch` carries a `preconnect` static method we
+  // never invoke here — cast through `unknown` so the mock fn's
+  // shape is accepted as a fetch impl.
+  const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
     return nextResponse;
-  };
+  }) as unknown as typeof fetch;
   return {
     fn,
     calls,
