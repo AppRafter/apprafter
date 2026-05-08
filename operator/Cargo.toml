@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+[workspace]
+resolver = "2"
+members = [
+    "admission-webhook",
+]
+
+[workspace.package]
+version      = "0.1.2"
+edition      = "2021"
+rust-version = "1.83"
+license      = "FSL-1.1-MIT"
+authors      = ["AppRafter Authors"]
+repository   = "https://github.com/apprafter/apprafter"
+
+[workspace.dependencies]
+axum               = "0.7"
+tokio              = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower              = { version = "0.5", features = ["util"] }
+http-body-util     = "0.1"
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror          = "1"
+
+[profile.release]
+lto         = "thin"
+codegen-units = 1
+strip       = "symbols"
