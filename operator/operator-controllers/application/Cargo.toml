@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+[package]
+name        = "operator-controllers-application"
+description = "kube-rs Controller for the v1alpha1 Application CRD."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+operator-core      = { path = "../../operator-core" }
+operator-rendering = { path = "../../operator-rendering" }
+
+kube      = { workspace = true }
+tracing   = { workspace = true }
+thiserror = { workspace = true }
