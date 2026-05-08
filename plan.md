@@ -535,7 +535,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 **Поставка:**
 - [ ] OpenAPI v3 схема CRD сгенерирована из CUE (через `cue cmd export-crd`).
-- [ ] Поля v1alpha1: `image`, `expose`, `replicas`, `env` (только литералы), `environments` map.
+- [x] Поля v1alpha1: `image`, `expose`, `replicas`, `env` (только литералы), `environments` map (v0.1.21 — schema + Rust parser).
 - [ ] Admission webhook (Rust, `kube-rs`) в отдельном pod с auto-rotated cert (через cert-manager).
 - [ ] Невалидный manifest реджектится с понятной ошибкой.
 

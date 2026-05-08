@@ -61,6 +61,24 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Application CRD v1alpha1 schema (sub-phase 1.7a)** (v0.1.21) —
+  the v1alpha1 CUE schema for `#Application` is tightened to the
+  field set declared in plan.md §1.7: `image` (non-empty),
+  `replicas` (≥0), `expose` (port + public + network), `env`
+  (string→string literals), and `environments` map of overrides.
+  Out-of-scope fields removed: `needs`, `autoscale`, `confidential`
+  (they re-appear in 2.x / 4.x). New Rust mirror types
+  `ApplicationManifest` / `ApplicationSpec` / `ApplicationExpose`
+  in `cli-core::manifest` plus a `parse_application(workdir, path)`
+  helper that walks the `cue export --out json` payload the same
+  way `parse_infrastructure` does. Six integration tests cover the
+  happy path against `examples/applications/parser.cue`, the
+  missing-path / wrong-kind / no-environments error branches, and
+  two `cue vet` smokes (schema vets cleanly + fixture vets against
+  the schema). No CRD installation yet — that lands in v0.1.22; the
+  admission webhook + cert-manager Certificate +
+  ValidatingWebhookConfiguration land in v0.1.23 and close
+  sub-phase 1.7.
 - **`platform-cli` workspace** — Cargo workspace under `cli/` with
   one binary crate (`platform-cli`) and three library crates
   (`cli-core`, `cli-state`, `cli-providers`).
