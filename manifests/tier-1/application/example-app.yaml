@@ -11,15 +11,16 @@ metadata:
   namespace: default
   labels:
     apprafter: "true"
-base:
-  image: ghcr.io/example/parser:latest
-  replicas: 1
-  expose:
-    port: 8080
-    public: false
-    network: internal
-  env:
-    LOG_LEVEL: info
-environments:
-  prod:
-    replicas: 3
+spec:
+  base:
+    image: ghcr.io/example/parser:latest
+    replicas: 1
+    expose:
+      port: 8080
+      public: false
+      network: internal
+    env:
+      LOG_LEVEL: info
+  environments:
+    prod:
+      replicas: 3

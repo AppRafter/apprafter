@@ -32,65 +32,68 @@ spec:
               type: string
             metadata:
               type: object
-            base:
+            spec:
               type: object
               properties:
-                image:
-                  type: string
-                  pattern: "^.+$"
-                replicas:
-                  type: integer
-                  minimum: 0
-                expose:
+                base:
                   type: object
-                  required:
-                    - port
                   properties:
-                    port:
-                      type: integer
-                      minimum: 1
-                      maximum: 65535
-                    public:
-                      type: boolean
-                    network:
+                    image:
                       type: string
-                      enum:
-                        - public
-                        - internal
-                        - vpn
-                env:
+                      pattern: "^.+$"
+                    replicas:
+                      type: integer
+                      minimum: 0
+                    expose:
+                      type: object
+                      required:
+                        - port
+                      properties:
+                        port:
+                          type: integer
+                          minimum: 1
+                          maximum: 65535
+                        public:
+                          type: boolean
+                        network:
+                          type: string
+                          enum:
+                            - public
+                            - internal
+                            - vpn
+                    env:
+                      type: object
+                      additionalProperties:
+                        type: string
+                environments:
                   type: object
                   additionalProperties:
-                    type: string
-            environments:
-              type: object
-              additionalProperties:
-                type: object
-                properties:
-                  image:
-                    type: string
-                    pattern: "^.+$"
-                  replicas:
-                    type: integer
-                    minimum: 0
-                  expose:
                     type: object
-                    required:
-                      - port
                     properties:
-                      port:
-                        type: integer
-                        minimum: 1
-                        maximum: 65535
-                      public:
-                        type: boolean
-                      network:
+                      image:
                         type: string
-                        enum:
-                          - public
-                          - internal
-                          - vpn
-                  env:
-                    type: object
-                    additionalProperties:
-                      type: string
+                        pattern: "^.+$"
+                      replicas:
+                        type: integer
+                        minimum: 0
+                      expose:
+                        type: object
+                        required:
+                          - port
+                        properties:
+                          port:
+                            type: integer
+                            minimum: 1
+                            maximum: 65535
+                          public:
+                            type: boolean
+                          network:
+                            type: string
+                            enum:
+                              - public
+                              - internal
+                              - vpn
+                      env:
+                        type: object
+                        additionalProperties:
+                          type: string
