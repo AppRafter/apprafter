@@ -226,3 +226,40 @@ out: {\n\
     assert_eq!(bs.domain.as_deref(), Some("backstage.example.com"));
     assert_eq!(bs.image.as_deref(), Some("ghcr.io/acme/backstage:1.42.0"));
 }
+
+#[test]
+fn parse_infrastructure_decodes_optional_admission_webhook_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("infra.cue");
+    std::fs::write(
+        &cue_path,
+        "package x\n\
+out: {\n\
+    apiVersion: \"apprafter.io/v1alpha1\"\n\
+    kind: \"Infrastructure\"\n\
+    metadata: name: \"p\"\n\
+    spec: {\n\
+        provider: \"hetzner-cloud\"\n\
+        admissionWebhook: image: \"ghcr.io/acme/admission-webhook:1.0.0\"\n\
+    }\n\
+}\n",
+    )
+    .unwrap();
+
+    let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
+        Ok(m) => m,
+        Err(CliError::CueNotFound) => {
+            eprintln!("skip: cue not on PATH");
+            return;
+        }
+        Err(other) => panic!("unexpected: {other}"),
+    };
+    let aw = m
+        .spec
+        .admission_webhook
+        .expect("admission_webhook block decoded");
+    assert_eq!(
+        aw.image.as_deref(),
+        Some("ghcr.io/acme/admission-webhook:1.0.0")
+    );
+}

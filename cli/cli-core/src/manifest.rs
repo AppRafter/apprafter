@@ -52,6 +52,8 @@ pub struct InfrastructureSpec {
     pub argocd: Option<ArgocdBlock>,
     #[serde(default)]
     pub backstage: Option<BackstageBlock>,
+    #[serde(default, rename = "admissionWebhook")]
+    pub admission_webhook: Option<AdmissionWebhookBlock>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -68,6 +70,12 @@ pub struct ArgocdBlock {
 pub struct BackstageBlock {
     #[serde(default)]
     pub domain: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AdmissionWebhookBlock {
     #[serde(default)]
     pub image: Option<String>,
 }

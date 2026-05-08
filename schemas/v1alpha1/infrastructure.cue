@@ -90,5 +90,17 @@ package v1alpha1
 			domain?: string
 			image?:  string
 		}
+
+		// Optional admission-webhook deploy. When `image` is set,
+		// `platform-cli cluster-bootstrap` provisions the
+		// admission-webhook stack (Namespace + cert-manager
+		// Certificate + Service + Deployment +
+		// ValidatingWebhookConfiguration) in the `apprafter-system`
+		// namespace. Without the manifest opt-in, no webhook is
+		// deployed and the Application CRD relies solely on its
+		// OpenAPI v3 schema for validation.
+		admissionWebhook?: {
+			image?: string
+		}
 	}
 }
