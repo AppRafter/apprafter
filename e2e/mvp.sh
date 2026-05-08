@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: FSL-1.1-MIT
+#
+# AppRafter E2E MVP smoke. Provisions a fresh Hetzner cluster,
+# runs `platform-cli cluster-bootstrap`, applies a hello-world
+# workload directly via kubectl (Deployment + Service — the
+# Application CRD flow lives in the manual quickstart and lands
+# in CI once an operator image is published), verifies the
+# endpoint, and tears the cluster down.
+#
+# Required env:
+#   HCLOUD_TOKEN              — Hetzner Cloud API token
+#   APPRAFTER_SSH_PUBLIC_KEY  — SSH public key inline (one line)
+#
+# Optional env:
+#   APPRAFTER_E2E_SKIP_DESTROY=1  — keep the cluster + state
+#                                   around at the end (for debug)
+#   APPRAFTER_E2E_REGION=nbg1     — Hetzner region; default nbg1
+#
+# Exit codes:
+#   0 — smoke green
+#   1 — generic failure (set -e propagates the original exit code)
+#   2 — env precondition missing (HCLOUD_TOKEN / SSH key)
+
+set -euo pipefail
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+
+START_NS=$(date +%s%N)
+
+elapsed() {
+    local end now
+    end=$(date +%s%N)
+    now=$(( (end - START_NS) / 1000000000 ))
+    printf '%dm %ds' $(( now / 60 )) $(( now % 60 ))
+}
+
+phase() {
+    printf '\n=== %s (elapsed %s) ===\n' "$1" "$(elapsed)"
+}
+
+cleanup_on_failure() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ]; then
+        printf '\n!!! E2E smoke failed at %s !!!\n' "$(elapsed)" >&2
+        if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
+            printf 'Tearing down (set APPRAFTER_E2E_SKIP_DESTROY=1 to keep the cluster).\n' >&2
+            (cd cli && cargo run --quiet --bin platform-cli -- destroy --yes) || true
+        fi
+    fi
+    exit "$exit_code"
+}
+trap cleanup_on_failure EXIT
+
+# ---------------------------------------------------------------
+# Preconditions
+# ---------------------------------------------------------------
+
+if [ -z "${HCLOUD_TOKEN:-}" ]; then
+    echo "HCLOUD_TOKEN is not set" >&2
+    exit 2
+fi
+if [ -z "${APPRAFTER_SSH_PUBLIC_KEY:-}" ]; then
+    echo "APPRAFTER_SSH_PUBLIC_KEY is not set" >&2
+    exit 2
+fi
+
+REGION="${APPRAFTER_E2E_REGION:-nbg1}"
+KUBECONFIG_FILE=$(mktemp)
+export KUBECONFIG="$KUBECONFIG_FILE"
+
+# ---------------------------------------------------------------
+# Phase 1: provision
+# ---------------------------------------------------------------
+
+phase "Phase 1: provisioning Hetzner ($REGION)"
+(cd cli && cargo run --quiet --bin platform-cli -- init \
+    --provider hetzner-cloud --tier solo --region "$REGION")
+(cd cli && cargo run --quiet --bin platform-cli -- apply)
+
+# ---------------------------------------------------------------
+# Phase 2: wait for cloud-init (k3s install)
+# ---------------------------------------------------------------
+
+phase "Phase 2: waiting for k3s (cloud-init takes ~3-5 min)"
+for attempt in $(seq 1 30); do
+    if (cd cli && cargo run --quiet --bin platform-cli -- kubeconfig) > "$KUBECONFIG_FILE" 2>/dev/null; then
+        if kubectl get nodes 2>/dev/null | grep -q ' Ready '; then
+            echo "  k3s ready on attempt $attempt"
+            break
+        fi
+    fi
+    if [ "$attempt" -eq 30 ]; then
+        echo "k3s never became ready after 30 attempts (~5 min)" >&2
+        exit 1
+    fi
+    printf '  attempt %d: not ready yet, sleeping 10s\n' "$attempt"
+    sleep 10
+done
+
+# ---------------------------------------------------------------
+# Phase 3: cluster-bootstrap
+# ---------------------------------------------------------------
+
+phase "Phase 3: cluster-bootstrap"
+(cd cli && cargo run --quiet --bin platform-cli -- cluster-bootstrap)
+
+# ---------------------------------------------------------------
+# Phase 4: apply hello-world (plain Deployment + Service)
+# ---------------------------------------------------------------
+
+phase "Phase 4: applying hello-world workload"
+kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: e2e-hello
+  namespace: default
+  labels:
+    apprafter: "true"
+    app: e2e-hello
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: e2e-hello }
+  template:
+    metadata:
+      labels: { app: e2e-hello, apprafter: "true" }
+    spec:
+      containers:
+        - name: hello
+          image: nginxdemos/hello:plain-text
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: e2e-hello
+  namespace: default
+  labels:
+    apprafter: "true"
+spec:
+  type: ClusterIP
+  selector:
+    app: e2e-hello
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+EOF
+
+# ---------------------------------------------------------------
+# Phase 5: wait for the pod to become Ready
+# ---------------------------------------------------------------
+
+phase "Phase 5: waiting for pod readiness"
+kubectl wait --for=condition=Available deployment/e2e-hello \
+    --namespace default --timeout=180s
+
+# ---------------------------------------------------------------
+# Phase 6: verify the endpoint via an in-cluster curl
+# ---------------------------------------------------------------
+
+phase "Phase 6: verifying http://e2e-hello.default.svc.cluster.local"
+output=$(kubectl run --rm -i --restart=Never \
+    --image=curlimages/curl:8 \
+    --namespace default \
+    e2e-smoke-curl -- \
+    curl -sSf --max-time 10 \
+    http://e2e-hello.default.svc.cluster.local/ 2>&1 || true)
+
+if echo "$output" | grep -q 'Server address:'; then
+    echo "  endpoint OK (nginx-hello responded)"
+else
+    echo "  endpoint check failed; curl pod output:" >&2
+    echo "$output" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------
+# Phase 7: destroy (unless opted out)
+# ---------------------------------------------------------------
+
+if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
+    phase "Phase 7: destroy"
+    (cd cli && cargo run --quiet --bin platform-cli -- destroy --yes)
+else
+    printf '\nAPPRAFTER_E2E_SKIP_DESTROY set — leaving the cluster up.\n'
+    printf 'Run `cd cli && cargo run --bin platform-cli -- destroy --yes` to clean up.\n'
+fi
+
+# ---------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------
+
+rm -f "$KUBECONFIG_FILE"
+trap - EXIT
+printf '\n✅ E2E smoke green in %s\n' "$(elapsed)"
