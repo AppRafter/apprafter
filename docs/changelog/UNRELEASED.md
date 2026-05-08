@@ -61,6 +61,26 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Operator skeleton libraries (sub-phase 1.8a)** (v0.1.26) —
+  three new Cargo workspace members under `operator/`:
+  `operator-core` defines the v1alpha1 `Application` CRD type via
+  the `kube::CustomResource` derive macro (the standard
+  `apiVersion` / `kind` / `metadata` / `spec` / `status` shape, now
+  possible thanks to the v0.1.25 spec-wrapper refactor);
+  `operator-rendering` exposes a `render_application` stub that
+  returns an empty `Vec<serde_json::Value>` (phase 1.9 fills it in);
+  `operator-controllers/application` defines `Context`,
+  `ReconcileError`, `reconcile` (logs + requeues every 60s), and
+  `error_policy` (logs + requeues every 30s). New workspace deps:
+  `kube` 0.95 (default-features = false; `client` + `runtime` +
+  `derive` + `rustls-tls`), `k8s-openapi` 0.23 (`v1_31`),
+  `schemars` 0.8, `futures` 0.3. 3 unit tests on the Application
+  type (kind/apiVersion match the CRD; serde round-trip;
+  status-subresource is optional) + 1 unit test on the rendering
+  stub. The `apprafter-operator` binary, Prometheus metrics, and
+  the axum-served `/healthz` / `/readyz` / `/metrics` endpoints
+  land in v0.1.27 (sub-phase 1.8b); leader election + the Helm
+  chart land in v0.1.28 (sub-phase 1.8c, closes phase 1.8).
 - **Application schema fixup — `spec` wrapper** (v0.1.25) —
   refactor cycle that brings the v1alpha1 `Application` shape in
   line with k8s conventions: `base` + `environments` move under a
