@@ -3,6 +3,7 @@
 resolver = "2"
 members = [
     "admission-webhook",
+    "apprafter-operator",
     "operator-controllers/application",
     "operator-core",
     "operator-rendering",
