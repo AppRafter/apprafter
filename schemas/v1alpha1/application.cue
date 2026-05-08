@@ -23,9 +23,11 @@ package v1alpha1
 	kind:     "Application"
 	metadata: #ObjectMeta
 
-	base?: #ApplicationSpec
+	spec: {
+		base?: #ApplicationSpec
 
-	environments?: [string]: #ApplicationSpec
+		environments?: [string]: #ApplicationSpec
+	}
 }
 
 #ApplicationSpec: {
