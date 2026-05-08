@@ -1,0 +1,17 @@
+{
+  "name": "@apprafter/applications-frontend",
+  "version": "0.1.35",
+  "private": true,
+  "license": "MIT",
+  "description": "Backstage frontend plugin: Application CRD table + drilldown.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "bun test",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  }
+}
