@@ -210,11 +210,16 @@ Under the hood the command:
    cluster.
 10. **(Optional)** When the manifest declares
     `spec.backstage.domain`, applies the tier-1 Backstage manifest
-    set (Namespace + Deployment + Service + HTTPRoute + Gateway +
-    cert-manager Certificate) to the `backstage` namespace.
-    `spec.backstage.image` overrides the placeholder container
-    image. Without the manifest opt-in, Backstage is skipped — the
-    bootstrap finishes after step 9.
+    set (Namespace + ConfigMap + Deployment + Service + HTTPRoute +
+    Gateway + cert-manager Certificate) to the `backstage`
+    namespace. The ConfigMap carries an `app-config.yaml` mounted
+    at `/app/app-config.yaml` (subPath, read-only) — it overrides
+    whatever the operator baked into their image and pins the
+    `guest` auth provider with `dangerouslyAllowOutsideDevelopment:
+    true` (Backstage's basic-admin stub). `spec.backstage.image`
+    overrides the placeholder container image. Without the
+    manifest opt-in, Backstage is skipped — the bootstrap finishes
+    after step 9.
 
 > The container image referenced by `spec.backstage.image` is
 > built outside this CLI — see

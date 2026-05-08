@@ -496,7 +496,7 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 1.6 Backstage минимальный деплой
 
-**Статус:** 🚧 partial — `v0.1.18` (1.6a) даёт tier-1 Kubernetes-манифесты + cluster-bootstrap wiring; `v0.1.19` (1.6b) добавит app-скаффолд через `@backstage/create-app` и Dockerfile; `v0.1.20` (1.6c) — OAuth stub + закрытие подфазы.
+**Статус:** ✅ shipped — sub-phase 1.6 закрыта серией циклов `v0.1.18`–`v0.1.20`: k8s-манифесты (1.6a) → app-скаффолд + Dockerfile (1.6b) → app-config ConfigMap + OAuth stub (1.6c).
 
 **Цель:** Backstage как pod в кластере, доступный через Gateway.
 
@@ -515,16 +515,17 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] `backstage-plugins/host/README.md` — 6-step workflow scaffold → install → build → push → manifest → cluster-bootstrap; cross-links к Dockerfile, scaffold-скрипту, rendered example manifest, Rust-builder'у.
 - [x] `cli/README.md` — blockquote-cross-link к host-app README рядом со step 10.
 
-**Поставка (OAuth stub + закрытие 1.6, v0.1.20):**
-- [ ] OAuth stub в `app-config.yaml` (basic admin).
-- [ ] `manifests/tier-1/backstage/example.yaml` обновлён ConfigMap'ом для `app-config.yaml`.
-- [ ] Sub-phase 1.6 status: ✅ shipped.
+**Поставка (app-config ConfigMap + OAuth stub, v0.1.20):**
+- [x] `cli-providers::k8s::backstage_app_config::backstage_app_config_yaml(domain)` — pure builder для tier-1 `app-config.yaml` (`app.title`, `app.baseUrl`, `backend.baseUrl` + `cors.origin` от `domain`, `backend.listen 0.0.0.0:7007`, `database better-sqlite3 :memory:`, `auth.providers.guest.dangerouslyAllowOutsideDevelopment: true`).
+- [x] `backstage_manifests_yaml` теперь эмитит 7-document YAML — добавлен `ConfigMap` `backstage-config` с `data["app-config.yaml"]: |<rendered>`, и Deployment получил `volumeMount` (subPath, readOnly) в `/app/app-config.yaml`.
+- [x] `manifests/tier-1/backstage/example.yaml` пере-рендерён.
+- [x] Sub-phase 1.6 status: ✅ shipped.
 
-**Acceptance (v0.1.18):** `perform_bootstrap` производит 6 kubectl applies в правильном порядке (Gateway CRDs → default-deny NP → ClusterIssuer → Argo CD Gateway → bootstrap App → Backstage) при полном manifest opt-in (mocked).
+**Acceptance:** `https://backstage.<domain>` открывается, виден catalog (пустой), `auth.providers.guest` пускает без логина (`dangerouslyAllowOutsideDevelopment: true`).
 
 **Зависит от:** 1.5
 
-**Размер:** M (разбит на 3 цикла: k8s-манифесты `v0.1.18` ✅, app-скаффолд `v0.1.19`, OAuth + закрытие `v0.1.20`)
+**Размер:** M (разбит на 3 цикла: k8s-манифесты `v0.1.18` ✅, app-скаффолд `v0.1.19` ✅, app-config + OAuth `v0.1.20` ✅)
 
 ---
 

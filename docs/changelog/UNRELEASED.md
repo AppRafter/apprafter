@@ -113,6 +113,21 @@ the `0.0.x` series; semver starts at 1.0.
   Setting `APPRAFTER_MANIFEST=<path>` causes `apply` to overlay
   manifest values onto the v0.1.4 defaults; without the env var
   the v0.1.4 behaviour is unchanged.
+- **Backstage app-config ConfigMap + sub-phase 1.6 ✅** (v0.1.20) —
+  the Backstage manifest set now embeds an `app-config.yaml`
+  ConfigMap mounted into the Deployment at `/app/app-config.yaml`
+  (subPath, read-only), overriding whatever's baked into the
+  operator's image. New module
+  `cli-providers::k8s::backstage_app_config` exposes
+  `backstage_app_config_yaml(domain)` — fans the domain into
+  `app.baseUrl`, `backend.baseUrl`, and `backend.cors.origin`,
+  pins the SQLite in-memory database, and turns on the `guest`
+  auth provider with `dangerouslyAllowOutsideDevelopment: true`
+  (Backstage's basic-admin stub). The rendered example at
+  `manifests/tier-1/backstage/example.yaml` grows from 6 to 7
+  documents; cluster-bootstrap still issues a single
+  `kubectl apply -f` for it. Sub-phase 1.6 in plan.md flips from
+  🚧 partial to ✅ shipped.
 - **Backstage scaffold helpers + Dockerfile** (v0.1.19) — adds
   `backstage-plugins/host/{Dockerfile,.dockerignore,scripts/
   scaffold.sh,README.md}`. The Dockerfile is the canonical
