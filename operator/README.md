@@ -94,6 +94,36 @@ curl -s http://127.0.0.1:8080/metrics
 `HTTP_PORT` (default 8080) overrides the listener port. Tracing
 filter follows `RUST_LOG` (e.g. `RUST_LOG=apprafter_operator=debug`).
 
+### Per-environment overrides
+
+`APPRAFTER_ENV` selects which key of `spec.environments` is
+unified onto `spec.base` before rendering. Empty / unset → render
+from `spec.base` only. Example:
+
+```yaml
+# Application manifest
+spec:
+  base:
+    image: ghcr.io/acme/web:1.0
+    replicas: 1
+  environments:
+    prod:
+      image: ghcr.io/acme/web:1.0  # same baseline
+      replicas: 3                  # but more replicas in prod
+```
+
+Run the operator with `APPRAFTER_ENV=prod` (or
+`spec.template.spec.containers[].env` in the Helm chart Deployment)
+and the rendered Deployment uses `replicas: 3`. Override semantics:
+
+- `image`, `replicas`, `expose` — env override replaces base when set.
+- `env` map — env override merges with base, override wins on
+  conflict.
+
+CUE-shaped unification (structural disjunctions etc.) is the same
+behaviour for our v1alpha1 schema; we may switch to a CUE FFI in
+v0.2.x once we add CUE-only constructs.
+
 ### What reconcile does
 
 Each reconcile cycle (one Application → one pass):
