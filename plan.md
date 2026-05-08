@@ -549,21 +549,22 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.8 Application operator — каркас на kube-rs
+### 1.8 Application operator — каркас на kube-rs ✅
 
 > v0.1.26 — sub-phase 1.8a shipped: 3 library crates (`operator-core` + `operator-rendering` + `operator-controllers/application`).
 > v0.1.27 — sub-phase 1.8b shipped: `apprafter-operator` binary + 3 Prometheus signals + axum `/healthz` / `/readyz` / `/metrics`.
-> v0.1.28 — sub-phase 1.8c shipped: Lease-based leader election (`operator-core::leader`). Helm chart + closure in v0.1.29.
+> v0.1.28 — sub-phase 1.8c shipped: Lease-based leader election (`operator-core::leader`).
+> v0.1.29 — sub-phase 1.8d shipped: Helm chart at `operator/charts/apprafter-operator/`. Phase 1.8 ✅.
 
 **Цель:** Rust-операторный pod с reconcile-loop по `Application`.
 
 **Поставка:**
-- [ ] `operator/` — workspace с подпакетами `operator-core`, `operator-controllers/application`, `operator-rendering`.
-- [ ] Контроллер на `kube-rs`, leader election через Lease.
-- [ ] Метрики Prometheus: `reconcile_total`, `reconcile_duration`, `reconcile_errors`.
-- [ ] Структурированный лог (tracing).
-- [ ] Health/readiness endpoints.
-- [ ] Helm chart для деплоя оператора.
+- [x] `operator/` — workspace с подпакетами `operator-core`, `operator-controllers/application`, `operator-rendering` (v0.1.26).
+- [x] Контроллер на `kube-rs`, leader election через Lease (v0.1.27 + v0.1.28).
+- [x] Метрики Prometheus: `reconcile_total`, `reconcile_duration`, `reconcile_errors` (v0.1.27).
+- [x] Структурированный лог (tracing) (v0.1.27 — `tracing-subscriber::EnvFilter` в `apprafter-operator/main.rs`).
+- [x] Health/readiness endpoints (v0.1.27 — `/healthz` + `/readyz` axum routes).
+- [x] Helm chart для деплоя оператора (v0.1.29 — `operator/charts/apprafter-operator/`).
 
 **Acceptance:** оператор запускается, видит Application-объекты, пишет «reconciled» в лог; metrics endpoint отвечает.
 

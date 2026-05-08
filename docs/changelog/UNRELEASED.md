@@ -61,6 +61,25 @@ the `0.0.x` series; semver starts at 1.0.
 
 ### Added
 
+- **Operator Helm chart + sub-phase 1.8 ✅** (v0.1.29) — new
+  Helm 3 chart at `operator/charts/apprafter-operator/` packages
+  the v0.1.27 operator binary with the v0.1.28 leader election as
+  a deployable unit. The chart provisions a `ServiceAccount`, a
+  `ClusterRole` (cluster-wide read/patch on `apprafter.io/applications`
+  + read/write on `apps/deployments`, `services`,
+  `gateway.networking.k8s.io/httproutes` for phase 1.9, plus
+  `events` create/patch), a `ClusterRoleBinding`, a `Role` +
+  `RoleBinding` in the install namespace for `coordination.k8s.io/leases`
+  (leader election), a `Deployment` (1 replica, hardened security
+  context — `runAsNonRoot: true`, `readOnlyRootFilesystem: true`,
+  `capabilities.drop: [ALL]`, `seccompProfile: RuntimeDefault` —
+  with downward-API `POD_NAME` + `POD_NAMESPACE`, `HTTP_PORT` +
+  `RUST_LOG` env vars, liveness/readiness probes on
+  `/healthz` + `/readyz`), and a ClusterIP `Service` exposing
+  `/metrics` on port 8080. The Application CRD itself is NOT in
+  the chart — `cluster-bootstrap` (v0.1.22) applies it; the chart
+  README documents the prerequisite. `helm lint` clean. Sub-phase
+  1.8 in plan.md flips from 🚧 partial to ✅ shipped.
 - **Operator leader election (sub-phase 1.8c)** (v0.1.28) — new
   `operator-core::leader` module exposes `LeaderElection` +
   `LeaderConfig` for tier-1 single-replica `coordination.k8s.io/v1`
