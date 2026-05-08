@@ -6,7 +6,8 @@ pub mod leader;
 pub mod metrics;
 
 pub use application::{
-    Application, ApplicationBaseSpec, ApplicationExpose, ApplicationSpec, ApplicationStatus,
+    Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose, ApplicationSpec,
+    ApplicationStatus,
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use metrics::Metrics;

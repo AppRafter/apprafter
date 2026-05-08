@@ -59,12 +59,33 @@ pub struct ApplicationStatus {
         rename = "observedGeneration"
     )]
     pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<ApplicationCondition>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "endpointURL"
     )]
     pub endpoint_url: Option<String>,
+}
+
+/// k8s-style condition (mirrors `meta/v1.Condition`). Operator
+/// emits `Ready` of `True` after a successful reconcile.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ApplicationCondition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status: String,
+    #[serde(rename = "lastTransitionTime")]
+    pub last_transition_time: String,
+    pub reason: String,
+    pub message: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "observedGeneration"
+    )]
+    pub observed_generation: Option<i64>,
 }
 
 #[cfg(test)]
