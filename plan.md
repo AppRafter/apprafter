@@ -1899,6 +1899,14 @@ Phase 7 запускается параллельно с 3+ как только 
 - [ ] Определить LTS-окно (рекомендация: каждый minor LTS на 1 год; 2 параллельных LTS).
 - [ ] Security-bugfixes — backport.
 
+### ∞.7 Tier-1 Hetzner stability hardening (gate to Phase 2)
+
+Открытые баги, найденные в первом полном ручном E2E (2026-05-08/09). Закрыть до старта Phase 2 (v0.2.0) — иначе Phase 2 строится на дрейфующей основе. Каждый — отдельный patch v0.1.4x.
+
+- [ ] **SSH host-key collision при destroy+apply на тот же IP.** Hetzner повторно выдаёт IP в течение секунд после destroy; новый VM имеет другой ed25519 host-key, наш `kubeconfig` шаг падает на `Host key verification failed`. Чинится переходом на per-cluster known_hosts: `.apprafter/known_hosts` + `ssh -o UserKnownHostsFile=… -o StrictHostKeyChecking=accept-new`. Прозрачно для пользователя, не трогаем `~/.ssh/known_hosts`.
+- [ ] **`HetznerCloudProvider::destroy()` race-condition.** `delete_server` возвращается мгновенно (Hetzner async-удаление); сразу следующий `delete_network` получает 409 «in use» → destroy() возвращает Err → `state.hetzner_cloud = None; state.save()` пропускается → остаются residual network/ssh-key + state неконсистентен. Воспроизводится надёжно при быстрых destroy+apply циклах. Чинится либо poll-until-404 на `GET /servers/{id}` после delete (~30 c timeout), либо exponential retry на 409 для последующих delete-вызовов.
+- [ ] **noVNC console fallback при сетевой смерти VM.** Мы передаём SSH-keys → Hetzner не ставит root-password → web-console у Hetzner выдаёт login prompt без возможности зайти. Когда сеть к VM умерла (см. ufw initcaps в v0.1.43), единственный путь — Hetzner Rescue Mode (требует power-cycle, ~5 минут). Опция: добавить опциональный `chpasswd` в cloud-config, активируемый env-переменной (`APPRAFTER_EMERGENCY_ROOT_PASSWORD`); по умолчанию выключен (key-only auth остаётся), но операторы tier-3/4 могут опт-ин. Альтернатива — задокументировать rescue-mode runbook без кода.
+
 ---
 
 ## История изменений плана
