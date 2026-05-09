@@ -253,3 +253,47 @@ fn argocd_password_without_hetzner_cloud_state_errors_with_hint() {
         .failure()
         .stderr(contains("apply"));
 }
+
+#[test]
+fn tracing_logs_go_to_stderr_not_stdout() {
+    // Regression guard: tracing-subscriber must write to stderr so
+    // commands whose stdout is consumed downstream (e.g. `kubeconfig
+    // | tee /tmp/kc`, `argocd-password | …`) produce clean
+    // machine-readable output. The `init` command logs `INFO init
+    // invoked …` and prints `would init …` to stdout — after the
+    // v0.1.44 fix, only the latter should land on stdout.
+    let dir = tempfile::tempdir().unwrap();
+    let output = cli()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ])
+        .output()
+        .expect("init runs");
+    assert!(output.status.success(), "init should succeed");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+
+    // Match on the tracing message body (`init invoked`) — it is
+    // ANSI-color-decoration agnostic. The level prefix (`INFO`)
+    // shows up wrapped in ANSI escape sequences, so a literal
+    // ` INFO ` substring check is fragile across terminal envs.
+    assert!(
+        !stdout.contains("init invoked"),
+        "stdout must not contain tracing log messages (would corrupt machine-readable command output like kubeconfig).\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("would init"),
+        "stdout still carries the human-readable program output.\nSTDOUT:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("init invoked"),
+        "tracing log messages must land on stderr.\nSTDERR:\n{stderr}"
+    );
+}
