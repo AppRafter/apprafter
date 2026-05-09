@@ -11,6 +11,27 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.44 — Phase 1 patch (2026-05-09)
+
+### Fixed
+
+- **`tracing` logs now go to stderr, not stdout** (v0.1.44) —
+  default `tracing-subscriber::fmt()` writes to stdout, which
+  mixed with our `println!` output corrupts every machine-readable
+  CLI output. `cargo run --bin platform-cli -- kubeconfig | tee
+  /tmp/kc` produced a file kubectl rejected with `yaml: control
+  characters are not allowed` because the first line of /tmp/kc
+  was `2026-…Z INFO kubeconfig invoked refresh=false` instead of
+  the YAML payload. Same class of breakage for
+  `argocd-password | …` and any programmatic consumer of
+  apply/destroy/import status output. Fix: one-line
+  `.with_writer(std::io::stderr)` on the subscriber builder in
+  `cli-core/src/logging.rs`. New regression-guard test
+  `tracing_logs_go_to_stderr_not_stdout` runs `init`, asserts the
+  `would init` program output is on stdout, the `init invoked`
+  tracing message is on stderr, and stdout has no tracing message
+  bodies. Closes ∞.7 bug #4 from `plan.md`.
+
 ## v0.1.43 — Phase 1 patch (2026-05-09)
 
 ### Fixed
