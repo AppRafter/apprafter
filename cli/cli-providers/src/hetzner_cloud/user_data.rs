@@ -27,6 +27,24 @@
 //! sidesteps the bug because its systemd unit starts after
 //! `network-online.target`, when modules are stable.
 //!
+//! The k3s install line disables five default components that
+//! `cluster-bootstrap` replaces with cluster-tier alternatives:
+//!
+//! - `--flannel-backend=none` — k3s's embedded flannel-vxlan
+//!   daemon claims the same VXLAN UDP port (8472) that Cilium's
+//!   `cilium_vxlan` device wants. Without this flag the Cilium
+//!   agent crashes on `address already in use` setting up its
+//!   datapath (root cause of the v0.1.45 fix).
+//! - `--disable-network-policy` — k3s ships `kube-router` for
+//!   `NetworkPolicy` enforcement; Cilium provides the same and
+//!   running both writes conflicting iptables/nftables rules.
+//! - `--disable-kube-proxy` — Cilium's kube-proxy replacement
+//!   (eBPF) takes over service routing.
+//! - `--disable=traefik` — Gateway API + Cilium gateway replace
+//!   it (cluster-bootstrap installs the upstream Gateway CRDs).
+//! - `--disable=servicelb` — Cilium L2 announcements replace the
+//!   k3s default LoadBalancer implementation.
+//!
 //! The function is pure and side-effect-free; the caller passes
 //! the result to `ServerSpec.user_data`.
 
@@ -45,7 +63,7 @@ packages:\n\
   - fail2ban\n\
 runcmd:\n\
   - systemctl enable --now fail2ban\n\
-  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--disable=traefik --disable=servicelb --disable-kube-proxy\" sh -'\n"
+  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--flannel-backend=none --disable-network-policy --disable-kube-proxy --disable=traefik --disable=servicelb\" sh -'\n"
         .to_string()
 }
 
@@ -97,12 +115,31 @@ mod tests {
     }
 
     #[test]
-    fn k3s_install_disables_traefik_servicelb_and_kube_proxy() {
+    fn k3s_install_disables_default_components_replaced_by_cluster_bootstrap() {
         let s = build_k3s_user_data(&K3sBootstrapOptions::default());
         assert!(s.contains("get.k3s.io"));
-        assert!(s.contains("--disable=traefik"));
-        assert!(s.contains("--disable=servicelb"));
-        assert!(s.contains("--disable-kube-proxy"));
+        // Replaced by Cilium: CNI + NetworkPolicy + kube-proxy.
+        assert!(
+            s.contains("--flannel-backend=none"),
+            "flannel must be disabled — k3s flannel-vxlan claims UDP 8472, Cilium's cilium_vxlan needs the same port; without this flag Cilium agent crashes on `address already in use` (see v0.1.45 changelog).\n{s}"
+        );
+        assert!(
+            s.contains("--disable-network-policy"),
+            "k3s NetworkPolicy (kube-router) must be disabled — Cilium provides its own enforcement and running both writes conflicting iptables rules.\n{s}"
+        );
+        assert!(
+            s.contains("--disable-kube-proxy"),
+            "kube-proxy must be disabled — Cilium's eBPF replacement takes over service routing.\n{s}"
+        );
+        // Replaced by cluster-bootstrap'd components.
+        assert!(
+            s.contains("--disable=traefik"),
+            "traefik must be disabled — Gateway API + Cilium gateway replace it.\n{s}"
+        );
+        assert!(
+            s.contains("--disable=servicelb"),
+            "servicelb must be disabled — Cilium L2 announcements replace the default LoadBalancer.\n{s}"
+        );
     }
 
     #[test]
