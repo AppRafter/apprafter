@@ -1907,6 +1907,7 @@ Phase 7 запускается параллельно с 3+ как только 
 - [ ] **`HetznerCloudProvider::destroy()` race-condition.** `delete_server` возвращается мгновенно (Hetzner async-удаление); сразу следующий `delete_network` получает 409 «in use» → destroy() возвращает Err → `state.hetzner_cloud = None; state.save()` пропускается → остаются residual network/ssh-key + state неконсистентен. Воспроизводится надёжно при быстрых destroy+apply циклах. Чинится либо poll-until-404 на `GET /servers/{id}` после delete (~30 c timeout), либо exponential retry на 409 для последующих delete-вызовов.
 - [ ] **noVNC console fallback при сетевой смерти VM.** Мы передаём SSH-keys → Hetzner не ставит root-password → web-console у Hetzner выдаёт login prompt без возможности зайти. Когда сеть к VM умерла (см. ufw initcaps в v0.1.43), единственный путь — Hetzner Rescue Mode (требует power-cycle, ~5 минут). Опция: добавить опциональный `chpasswd` в cloud-config, активируемый env-переменной (`APPRAFTER_EMERGENCY_ROOT_PASSWORD`); по умолчанию выключен (key-only auth остаётся), но операторы tier-3/4 могут опт-ин. Альтернатива — задокументировать rescue-mode runbook без кода.
 - [x] **`tracing` logs идут в stdout вместо stderr.** ✅ закрыто `v0.1.44` 2026-05-09. `with_writer(std::io::stderr)` в `cli-core/src/logging.rs` + smoke-test guard в `cli_smoke.rs`. Affected commands: `apply`, `destroy`, `import`, `kubeconfig`, `argocd-password` теперь имеют чистый stdout, диагностика на stderr.
+- [x] **k3s flannel конфликтует с Cilium VXLAN device.** ✅ закрыто `v0.1.45` 2026-05-09. k3s ships embedded flannel-vxlan daemon на UDP port 8472, тот же что нужен Cilium → `cilium_vxlan: address already in use` → cilium-agent CrashLoopBackOff → каждый `cluster-bootstrap` падал на Argo CD pre-install timeout. Fix: добавили `--flannel-backend=none --disable-network-policy` к k3s installer в `user_data.rs`; теперь 5 disabled-флагов вместо 3 (Cilium-recommended k3s recipe).
 
 ---
 
@@ -1932,4 +1933,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-08 | Phase 1 patch — Hetzner `cx22` retired upstream; default flipped to `cpx22` + pre-flight validate_server_type lookup; v0.1.42 | initial |
 | 2026-05-09 | Phase 1 patch — cloud-init drops ufw (silent initcaps fail on noble); fail2ban + Hetzner Cloud Firewall стали единственными слоями; v0.1.43 | initial |
 | 2026-05-09 | Phase 1 patch — tracing logs → stderr (фикс stdout-pollution для `kubeconfig`/`argocd-password` пайпов); ∞.7 bug #4 ✅; v0.1.44 | initial |
+| 2026-05-09 | Phase 1 patch — k3s installer передаёт `--flannel-backend=none --disable-network-policy` (фикс cilium_vxlan VXLAN-port collision, разблокирует cluster-bootstrap); ∞.7 bug #5 ✅; v0.1.45 | initial |
 

@@ -11,6 +11,47 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.45 — Phase 1 patch (2026-05-09)
+
+### Fixed
+
+- **k3s installer: disable flannel + k3s-NetworkPolicy for
+  Cilium-coexistence** (v0.1.45) — every fresh `cluster-bootstrap`
+  failed at the Argo CD step (`Error: failed pre-install: timed
+  out waiting for the condition` after 5 minutes) because
+  `cilium-agent` was in CrashLoopBackOff. cilium-agent fatal log:
+
+  ```
+  setting up vxlan device: creating vxlan device:
+  setting up device cilium_vxlan: address already in use
+  ```
+
+  k3s ships an embedded flannel-vxlan daemon (not a pod — runs
+  inside the k3s server process). Default backend `vxlan` claims
+  UDP port 8472, the same default port Cilium's `cilium_vxlan`
+  device wants. Even with `/etc/cni/net.d/05-cilium.conflist` as
+  the only CNI config, the kernel-level VXLAN socket stays held
+  by flannel, so Cilium can't take over the datapath. Cascade:
+  no Cilium → no pod IPs → `coredns Pending`, `argocd-redis-secret-init
+  Pending`, Helm `--wait` 5-min timeout. The same failure mode
+  also kills `metrics-server` and `local-path-provisioner` (they
+  came up under flannel pre-bootstrap with `10.42.0.x` IPs and
+  CrashLoop after Cilium replaces the CNI). Fix: extend the k3s
+  installer arguments in `user_data.rs` from
+  `--disable=traefik --disable=servicelb --disable-kube-proxy`
+  to `--flannel-backend=none --disable-network-policy
+  --disable-kube-proxy --disable=traefik --disable=servicelb`.
+  The recipe matches Cilium's own k3s install guide. Five
+  components disabled in total: three replaced by Cilium (CNI,
+  NetworkPolicy, kube-proxy), two by cluster-bootstrap
+  (Gateway API replaces traefik, Cilium L2 announcements replace
+  servicelb). Test `k3s_install_disables_traefik_servicelb_and_kube_proxy`
+  renamed to `k3s_install_disables_default_components_replaced_by_cluster_bootstrap`
+  and expanded to assert all five flags — each with a panic
+  message that points at the failure mode if a flag goes missing
+  in a future refactor. Closes ∞.7 bug #5 (added inline + closed
+  in the same patch).
+
 ## v0.1.44 — Phase 1 patch (2026-05-09)
 
 ### Fixed
