@@ -11,6 +11,44 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.43 — Phase 1 patch (2026-05-09)
+
+### Fixed
+
+- **cloud-init: drop ufw — silent-fail path locked out fresh VMs**
+  (v0.1.43) — every `apply` against Ubuntu 24.04 since the noble
+  release silently produced a host with `ENABLED=yes` in
+  `/etc/ufw/ufw.conf` and ZERO user-allow rules in
+  `/etc/ufw/user.rules`. Reason: `ufw allow N/proto` calls in the
+  cloud-init `runcmd` block fired before netfilter modules were
+  fully wired, so `iptables-nft` returned `ERROR: initcaps` /
+  `Could not fetch rule set generation id: Invalid argument` and
+  ufw bailed out without writing the rule. `ufw default deny`
+  (writes `/etc/default/ufw` directly) and `ufw enable` (writes
+  `/etc/ufw/ufw.conf`) didn't trigger the iptables path, so they
+  succeeded — that's how we ended up with active default-deny + no
+  allow rules. SSH (22), kube API (6443), HTTP/S (80/443) all
+  timed-out at the in-VM firewall layer despite the Hetzner Cloud
+  Firewall passing them; `kubeconfig` and any subsequent
+  `cluster-bootstrap` step was unreachable. Diagnosed via
+  Hetzner rescue mode + chroot inspection (`cat
+  /etc/ufw/user.rules` showed the empty `### RULES ### / ### END
+  RULES ###` block; `chroot ufw allow 22/tcp` reproduced the
+  initcaps error). Fix: drop ufw entirely — it was always
+  defense-in-depth duplicating the Hetzner Cloud Firewall (same
+  default-deny + same 5-port whitelist), so removing it
+  eliminates the failure mode without losing security.
+  fail2ban stays — orthogonal log-driven IP-ban (sshd today, app
+  workloads as we expose Gateway/HTTPRoute later); its systemd
+  unit starts after `network-online.target`, well past the
+  initcaps window. New `runcmd` is exactly 2 lines:
+  `systemctl enable --now fail2ban` + the k3s install curl. New
+  `user_data.rs` doc-comment captures the rationale to prevent
+  re-adding ufw on a future "defense-in-depth" pass. Tests: 4 in-
+  file unit tests, two of them new regression guards
+  (`declares_only_fail2ban_in_packages_block`,
+  `runcmd_does_not_invoke_ufw_anywhere`).
+
 ## v0.1.42 — Phase 1 patch (2026-05-08)
 
 ### Fixed
