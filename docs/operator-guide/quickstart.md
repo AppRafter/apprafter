@@ -43,7 +43,8 @@ cargo run --bin platform-cli -- apply
 `apply` provisions an SSH key, a private network with subnet, a
 firewall (default-deny inbound + the AppRafter port whitelist),
 a CX22 server attached to both, and a cloud-init `#cloud-config`
-that installs k3s + ufw + fail2ban.
+that installs fail2ban and k3s (Hetzner Cloud Firewall enforces the
+port whitelist at the network edge).
 
 The first `apply` takes ~30s on the Hetzner side; the cloud-init
 phase that brings k3s up takes another 3-5 minutes.

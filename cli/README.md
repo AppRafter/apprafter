@@ -68,12 +68,18 @@ ssh, kube API, HTTP, HTTPS, wireguard), and one CPX22 server
 attached to both. The server is provisioned with a cloud-init
 `#cloud-config` payload that:
 
-- updates apt and installs `ufw` + `fail2ban`;
-- enables UFW with the same port whitelist (default-deny inbound);
-- enables fail2ban for the SSH jail;
+- installs `fail2ban` (log-driven IP-ban, watches sshd today, workload
+  logs as we expose Gateway/HTTPRoute later);
 - runs the canonical `get.k3s.io` installer with
   `--disable=traefik --disable=servicelb` (Cilium + Gateway API
   replace them in phase 1.4).
+
+The host-level allow-list (22 + 6443 + 80 + 443 / tcp + 51820 / udp,
+default-deny everything else) is enforced by the Hetzner Cloud Firewall
+at the network edge — see `build_firewall_spec` in
+`cli/platform-cli/src/commands/apply.rs`. Earlier versions also installed
+ufw inside the VM as defense-in-depth, but it was removed in v0.1.43
+(silent failure on Ubuntu 24.04 cloud-init runcmd; see changelog).
 
 The second `apply` is a no-op (idempotent — server name + apprafter
 label match). `destroy` requires `--yes` and tears everything down
