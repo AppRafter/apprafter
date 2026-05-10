@@ -1,0 +1,13 @@
+# Build artefacts must NOT be sent to the Docker build context.
+# Without this, `COPY . .` from `context: operator` would push
+# the host's full target/ tree (multiple GBs of debug + release
+# objects + incremental caches) into the builder, triggering OOM
+# on small CI runners and stale-cache surprises across rust
+# version bumps.
+target/
+
+# Local-only state and editor noise.
+.git/
+.gitignore
+**/*.swp
+**/.DS_Store
