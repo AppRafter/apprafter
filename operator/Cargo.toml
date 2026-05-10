@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version      = "0.1.2"
 edition      = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 license      = "FSL-1.1-MIT"
 authors      = ["AppRafter Authors"]
 repository   = "https://github.com/apprafter/apprafter"
