@@ -11,6 +11,27 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.48 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **cert-manager Helm values: switch `installCRDs` → `crds.enabled`**
+  (v0.1.48) — the cert-manager Helm chart deprecated the top-level
+  `installCRDs` key in v1.15+ and emitted
+
+  ```
+  WARNING: `installCRDs` is deprecated, use `crds.enabled` instead.
+  ```
+
+  on every `cluster-bootstrap`. Functionally still worked today,
+  but the warning will become a hard failure in cert-manager v2.x
+  and was noise in the operator's first-impression UX. Switched
+  to the nested `crds: { enabled: true }` form per the chart's
+  own NOTES. New regression guard
+  `does_not_use_deprecated_top_level_install_crds` fails with a
+  descriptive message if the deprecated key sneaks back. Tier-1
+  cluster-bootstrap output is now warning-free.
+
 ## v0.1.47 — Phase 1 patch (2026-05-10)
 
 ### Fixed

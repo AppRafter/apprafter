@@ -1936,4 +1936,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-09 | Phase 1 patch — k3s installer передаёт `--flannel-backend=none --disable-network-policy` (фикс cilium_vxlan VXLAN-port collision, разблокирует cluster-bootstrap); ∞.7 bug #5 ✅; v0.1.45 | initial |
 | 2026-05-10 | Phase 1 patch — per-cluster `.apprafter/known_hosts` для SSH (фикс host-key collision на recycled Hetzner IPs); ∞.7 bug #1 ✅; v0.1.46 | initial |
 | 2026-05-10 | Phase 1 patch — `destroy()` poll-wait после delete_server (фикс async-cleanup race с 409 на delete_network); ∞.7 bug #2 ✅; v0.1.47 | initial |
+| 2026-05-10 | Phase 1 patch — cert-manager `installCRDs` → `crds.enabled` (drop deprecation warning); v0.1.48 | initial |
 
