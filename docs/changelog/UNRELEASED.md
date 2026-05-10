@@ -11,6 +11,34 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.56 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **Operator + admission-webhook Dockerfiles: drop fragile
+  dep-prebuild stage** (v0.1.56) — both images failed CI's
+  release-operator build with cargo exit 101 (stderr truncated
+  by the log writer). The v0.1.52 dep-prebuild trick — copy
+  every workspace member's Cargo.toml, stub `src/lib.rs` +
+  `main.rs`, build to populate the dep cache layer, then `rm`
+  the stubs and `COPY` real sources — turned out fragile
+  across the 5-member operator workspace + musl + alpine +
+  buildx combination. The pre-existing admission-webhook
+  variant was broken for an even simpler reason (only the
+  webhook's Cargo.toml was copied, but the workspace's
+  `members = [...]` list points at four others; cargo
+  workspace resolution fails). Both never validated because no
+  CI build ever ran against either before 2026-05-10.
+
+  Simplified both to a single `COPY . .` + `cargo build`.
+  Slower per CI run (dep layer invalidates on every source
+  change) but reliable today. New
+  `operator/.dockerignore` excludes `target/` and `.git/` so a
+  developer's local multi-GB target tree doesn't leak into the
+  builder. cargo-chef (industry-standard layered cargo cache
+  for Docker) is the right next step and will land as a
+  follow-up patch.
+
 ## v0.1.55 — Phase 1 patch (2026-05-10)
 
 ### Fixed
