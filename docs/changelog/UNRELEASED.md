@@ -11,6 +11,38 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.60 — Phase 1 patch (2026-05-11)
+
+### Fixed
+
+- **Helm template whitespace-trim ate `apiVersion:` line**
+  (v0.1.60) — `helm install apprafter-operator` failed
+  immediately with
+
+  ```
+  Error: INSTALLATION FAILED: unable to build kubernetes
+  objects from release manifest: error validating data:
+  apiVersion not set
+  ```
+
+  Because `serviceaccount.yaml` and `rbac.yaml` opened with
+  `# SPDX-License-Identifier: MIT\n{{- if X.create -}}\napiVersion:
+  …`, the trailing `-}}` stripped the newline before
+  `apiVersion:`, rendering as
+  `# SPDX-License-Identifier: MITapiVersion: v1` — YAML
+  swallowed the apiVersion into the `#` comment, doc parsed
+  with no apiVersion. Hidden through v0.1.29 → v0.1.59 because
+  `helm install` against this chart was never walked
+  end-to-end: the operator container image wasn't publishable
+  until v0.1.52, and §5 of operator-quickstart wasn't run on a
+  real cluster until today. Fix: drop the trailing `-` from
+  `{{- if X.create -}}` → `{{- if X.create }}` in both
+  affected templates. Leading-trim still eats the SPDX-comment's
+  trailing newline; the trailing newline before the body's
+  `apiVersion:` is preserved. `helm template` output now has
+  correctly-separated comment + apiVersion lines; `helm lint`
+  clean (only the cosmetic `icon is recommended` info).
+
 ## v0.1.59 — Phase 1 patch (2026-05-10)
 
 ### Fixed
