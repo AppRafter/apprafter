@@ -212,7 +212,6 @@ impl HetznerCloudClient {
             ureq::delete(&endpoint)
                 .set("Authorization", &self.auth_header())
                 .set("Accept", "application/json")
-                .call()
         })
     }
 
@@ -292,7 +291,6 @@ impl HetznerCloudClient {
             ureq::delete(&endpoint)
                 .set("Authorization", &self.auth_header())
                 .set("Accept", "application/json")
-                .call()
         })
     }
 
@@ -548,12 +546,19 @@ impl HetznerCloudClient {
 /// cap). On any other error or after the deadline expires, the
 /// last error is returned to the caller verbatim.
 ///
+/// The closure returns a fresh `ureq::Request` each iteration
+/// (since `Request::call` consumes self) and the helper does the
+/// `.call()` internally — keeping the closure return type free of
+/// `Result<_, ureq::Error>` so clippy's `result_large_err` lint
+/// (active in rust 1.95+) doesn't fire on the 272-byte
+/// `ureq::Error` variant.
+///
 /// Lives at module scope (rather than as a method on
 /// `HetznerCloudClient`) so the borrow checker is happy with the
 /// closure capturing `&self` only for the inner ureq call.
-fn delete_with_retry_on_resource_in_use<F>(endpoint: &str, mut do_call: F) -> Result<()>
+fn delete_with_retry_on_resource_in_use<F>(endpoint: &str, mut build_request: F) -> Result<()>
 where
-    F: FnMut() -> std::result::Result<ureq::Response, ureq::Error>,
+    F: FnMut() -> ureq::Request,
 {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
@@ -562,8 +567,7 @@ where
     let mut delay = Duration::from_millis(500);
 
     loop {
-        let resp = do_call();
-        match resp {
+        match build_request().call() {
             Ok(_) => return Ok(()),
             Err(ureq::Error::Status(404, _)) => return Ok(()),
             Err(ureq::Error::Status(status, response)) => {
