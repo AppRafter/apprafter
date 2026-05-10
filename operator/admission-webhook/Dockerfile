@@ -17,7 +17,7 @@
 # user (uid 65532). The musl-built binary is fully static so it
 # needs no libc / dynamic-linker support in the runtime layer.
 
-FROM rust:stable-alpine AS builder
+FROM rust:alpine AS builder
 
 RUN apk add --no-cache musl-dev
 
