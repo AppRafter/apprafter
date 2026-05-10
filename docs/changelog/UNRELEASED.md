@@ -11,6 +11,25 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.58 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **Float Dockerfile rust to `stable-alpine`, MSRV → 1.88**
+  (v0.1.58) — past the v0.1.57 fix, operator image build hit
+  the next transitive-dep MSRV bump: `home@0.5.12` (pulled in
+  by `kube` for `~/.kube/config` resolution) requires rustc
+  1.88. Each new dep MSRV bump would force another v0.1.x
+  patch on a fixed Dockerfile pin. Stop reacting: float the
+  Dockerfile builder to `rust:stable-alpine` (always latest
+  stable, refreshed on each rust release). Bit-for-bit
+  reproducibility of the builder image trades for no more
+  dep-MSRV-driven patch churn. Both Cargo.toml MSRV pins
+  bumped 1.85 → 1.88 to match the actual transitive-dep floor.
+  No downstream library consumers (both crates ship as
+  binaries via ghcr.io, not as crates on crates.io), so MSRV
+  declarations are advisory rather than a contract.
+
 ## v0.1.57 — Phase 1 patch (2026-05-10)
 
 ### Fixed
