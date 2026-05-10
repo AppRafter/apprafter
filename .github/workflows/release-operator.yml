@@ -16,15 +16,26 @@ name: release-operator
 # Security note: every dynamic value (`github.ref_name`,
 # `github.repository_owner`, `github.actor`) is consumed only as
 # an input to docker/login-action / docker/build-push-action —
-# never interpolated into a shell `run:` command — so the
-# action-injection class of risks does not apply.
+# never interpolated into a shell `run:` command. The one shell
+# step ("Compute lowercase image base") consumes
+# `github.repository_owner` via an `env:` binding rather than
+# direct expression substitution, which is the documented
+# anti-injection pattern. So the action-injection class of risks
+# does not apply.
+#
+# Why the lowercase shim: docker registry repository names MUST
+# be lowercase, but `${{ github.repository_owner }}` preserves
+# the org's display casing (e.g. `AppRafter`). GitHub Actions
+# does not provide a built-in `toLower` expression function, so
+# a shell `tr '[:upper:]' '[:lower:]'` step computes the
+# lowercase base once per job and exposes it via outputs.
 #
 # Image references after a successful run:
 #
-#   ghcr.io/<owner>/apprafter-operator:<tag>
-#   ghcr.io/<owner>/apprafter-operator:latest
-#   ghcr.io/<owner>/apprafter-admission-webhook:<tag>
-#   ghcr.io/<owner>/apprafter-admission-webhook:latest
+#   ghcr.io/<owner-lowercased>/apprafter-operator:<tag>
+#   ghcr.io/<owner-lowercased>/apprafter-operator:latest
+#   ghcr.io/<owner-lowercased>/apprafter-admission-webhook:<tag>
+#   ghcr.io/<owner-lowercased>/apprafter-admission-webhook:latest
 
 on:
   push:
@@ -46,6 +57,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Compute lowercase image base
+        id: image-base
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/apprafter-operator" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -63,8 +82,8 @@ jobs:
           file: operator/apprafter-operator/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/apprafter-operator:${{ github.ref_name }}
-            ghcr.io/${{ github.repository_owner }}/apprafter-operator:latest
+            ${{ steps.image-base.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.image-base.outputs.image }}:latest
           # Tier-1 substrate is x86 only (Hetzner CPX22).
           # Multi-arch (arm64 for Hetzner CAX*) lands when
           # Infrastructure.spec.nodes[].arch is wired through
@@ -81,6 +100,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute lowercase image base
+        id: image-base
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/apprafter-admission-webhook" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -99,8 +126,8 @@ jobs:
           file: operator/admission-webhook/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/apprafter-admission-webhook:${{ github.ref_name }}
-            ghcr.io/${{ github.repository_owner }}/apprafter-admission-webhook:latest
+            ${{ steps.image-base.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.image-base.outputs.image }}:latest
           platforms: linux/amd64
           cache-from: type=gha,scope=admission-webhook
           cache-to: type=gha,mode=max,scope=admission-webhook
