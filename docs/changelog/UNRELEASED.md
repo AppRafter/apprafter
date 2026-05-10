@@ -11,6 +11,38 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.52 — Phase 1 patch (2026-05-10)
+
+### Added
+
+- **GHCR publishing workflow + apprafter-operator Dockerfile**
+  (v0.1.52) — adds the substrate the operator-quickstart §5
+  ("install the operator + apply an Application CR") needs to
+  actually be executable: an operator container image published
+  to a registry the cluster can pull from.
+  `operator/apprafter-operator/Dockerfile` mirrors
+  admission-webhook's pattern (rust:1.83-alpine + musl,
+  distroless/static-debian12:nonroot runtime, x86_64 only
+  matching tier-1 CPX22). Path-deps (operator-core,
+  operator-rendering, operator-controllers/application) get
+  their manifests + stub sources copied up-front so the
+  dep-cache layer only invalidates on Cargo.toml changes. New
+  `.github/workflows/release-operator.yml` triggers on every
+  `v0.*` / `v1.*` tag push (plus manual `workflow_dispatch`):
+  two parallel jobs (operator + admission-webhook), auth via
+  auto-provided `GITHUB_TOKEN` (no PAT, no manually configured
+  secrets), tag-derived image refs at
+  `ghcr.io/<owner>/apprafter-operator:<tag>` and `:latest`,
+  GHA cache scoped per image. First-push UX caveat: ghcr.io
+  creates each package private; operators flip visibility to
+  public via the GitHub UI once (Packages → <package> →
+  Settings → Change visibility → Public) so `cluster-bootstrap`
+  can pull without an imagePullSecret. Subsequent tag pushes
+  update the existing public package. The "Operator container
+  image publishing (operators build their own for now)" caveat
+  in the v0.1.0-mvp release block stops applying after this
+  workflow runs against a v0.1.x tag.
+
 ## v0.1.51 — Phase 1 patch (2026-05-10)
 
 ### Fixed
