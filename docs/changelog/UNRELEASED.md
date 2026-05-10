@@ -11,6 +11,37 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.47 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **`destroy()` waits for Hetzner async server-cleanup before
+  deleting network** (v0.1.47) — `DELETE /servers/{id}` returns
+  200 immediately and processes cleanup asynchronously. The
+  immediately-following `DELETE /networks/{id}` returned 409
+  "still in use" while the server's network interface lingered,
+  so `provider.destroy()` returned Err mid-chain, `state.save()`
+  in destroy.rs was skipped, and operators ended up with
+  residual state.json (network_id + ssh_key_ids still set) +
+  orphan resources in the Hetzner project — requiring a manual
+  30-second wait + second `destroy --yes` to clean up. Bit
+  reliably during fast destroy+apply cycles (every E2E iteration
+  in v0.1.42–v0.1.46 hit it). Fix: after `delete_server`, poll
+  `GET /v1/servers` until the deleted id is no longer listed
+  before proceeding to firewall / network / ssh-key. New private
+  helper `HetznerCloudProvider::wait_for_server_gone` —
+  exponential-ish back-off (500ms → 5s cap), 60s deadline, errors
+  out with an actionable message if Hetzner is unusually slow.
+  Single sync point for the whole async-cleanup contract, rather
+  than per-call retry logic. Existing destroy tests updated to
+  use sequenced mockito mocks on `/v1/servers` (first call
+  returns server, subsequent return empty so the wait completes
+  in <1s). New regression guard
+  `destroy_waits_for_server_async_cleanup_before_deleting_network`
+  exercises the realistic case where Hetzner reports
+  `status=deleting` for one poll iteration before vanishing.
+  Closes ∞.7 bug #2.
+
 ## v0.1.46 — Phase 1 patch (2026-05-10)
 
 ### Fixed
