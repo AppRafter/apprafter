@@ -1946,4 +1946,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-10 | Phase 1 patch — closure возвращает `ureq::Request` (не `Result`), фикс CI clippy 1.95 `result_large_err`; v0.1.54 | initial |
 | 2026-05-10 | Phase 1 patch — release-operator workflow lowercase'ит `repository_owner` для ghcr.io tag (Docker registry требует lowercase); v0.1.55 | initial |
 | 2026-05-10 | Phase 1 patch — упрощены `operator-*/Dockerfile` (drop fragile dep-prebuild trick) + `operator/.dockerignore`; cargo-chef как follow-up; v0.1.56 | initial |
+| 2026-05-10 | Phase 1 patch — bump rust pin 1.83 → 1.85 (transitive dep `hashbrown-0.17.1` требует cargo `edition2024` feature, стабилизированный в 1.85); v0.1.57 | initial |
 

@@ -11,6 +11,24 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.57 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **Bump rust pin from 1.83 to 1.85 for edition2024 deps**
+  (v0.1.57) — operator + admission-webhook Dockerfile builds
+  failed with `hashbrown-0.17.1: feature \`edition2024\` is
+  required` because cargo 1.83 doesn't support it. edition2024
+  stabilized in rust 1.85. Our Dockerfile builders were on
+  `rust:1.83-alpine` and our workspace MSRVs declared
+  `rust-version = "1.83"`, both predating that release. Bumped
+  all four pins in lockstep — `cli/Cargo.toml`,
+  `operator/Cargo.toml`, `operator/apprafter-operator/Dockerfile`,
+  `operator/admission-webhook/Dockerfile`. Local builds were
+  unaffected because `rust-toolchain.toml` floats on `stable`
+  (1.95.0 today), so the discrepancy only surfaced when the
+  Dockerfile build ran in CI on the pinned 1.83 image.
+
 ## v0.1.56 — Phase 1 patch (2026-05-10)
 
 ### Fixed
