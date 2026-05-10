@@ -54,14 +54,31 @@ pub trait KubeconfigFetcher {
 
 /// Real fetcher: shells out to system `ssh` as `root@<host>`,
 /// reads the kubeconfig file, returns its contents.
+///
+/// Uses a **per-cluster** `known_hosts` file (typically
+/// `<cwd>/.apprafter/known_hosts` from
+/// `cli_state::StatePaths::known_hosts_file()`) instead of the
+/// user's `~/.ssh/known_hosts`. Two consequences:
+///
+/// 1. After `destroy --yes` clears the cluster's state directory,
+///    the per-cluster known_hosts is gone with it. Next `apply`
+///    against a fresh server (Hetzner readily reuses public IPs)
+///    starts with an empty file → `StrictHostKeyChecking=accept-new`
+///    silently writes the new host key, no `Host key verification
+///    failed` interrupt and no manual `ssh-keygen -R`.
+/// 2. The user's `~/.ssh/known_hosts` is never touched by the CLI,
+///    so it continues to defend against MITM exactly as the user
+///    configured it for their other SSH targets.
 pub struct SshKubeconfigFetcher {
     pub identity_path: PathBuf,
+    pub known_hosts_path: PathBuf,
 }
 
 impl SshKubeconfigFetcher {
-    pub fn new<P: Into<PathBuf>>(identity_path: P) -> Self {
+    pub fn new<I: Into<PathBuf>, K: Into<PathBuf>>(identity_path: I, known_hosts_path: K) -> Self {
         Self {
             identity_path: identity_path.into(),
+            known_hosts_path: known_hosts_path.into(),
         }
     }
 
@@ -69,6 +86,11 @@ impl SshKubeconfigFetcher {
         let mut cmd = Command::new("ssh");
         cmd.arg("-o")
             .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg(format!(
+                "UserKnownHostsFile={}",
+                self.known_hosts_path.display()
+            ))
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
@@ -154,7 +176,7 @@ clusters:\n\
 
     #[test]
     fn ssh_fetcher_builds_expected_argv() {
-        let f = SshKubeconfigFetcher::new("/tmp/key");
+        let f = SshKubeconfigFetcher::new("/tmp/key", "/tmp/.apprafter/known_hosts");
         let cmd = f.build_command("198.51.100.5");
         let argv: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         let argv_str: Vec<String> = argv
@@ -175,6 +197,25 @@ clusters:\n\
                 .iter()
                 .any(|a| a.contains("/etc/rancher/k3s/k3s.yaml")),
             "{argv_str:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_fetcher_uses_per_cluster_known_hosts_file() {
+        let f = SshKubeconfigFetcher::new("/tmp/key", "/tmp/.apprafter/known_hosts");
+        let cmd = f.build_command("198.51.100.5");
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.iter()
+                .any(|a| a == "UserKnownHostsFile=/tmp/.apprafter/known_hosts"),
+            "ssh must point at the per-cluster known_hosts so destroy+apply on a recycled Hetzner IP doesn't trip `Host key verification failed`.\n{argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"),
+            "accept-new + per-cluster file: silent on first contact, blocks on key change → still defends against unexpected key swap mid-cluster.\n{argv:?}"
         );
     }
 

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 const STATE_DIR: &str = ".apprafter";
 const STATE_FILE: &str = "state.json";
+const KNOWN_HOSTS_FILE: &str = "known_hosts";
 
 #[derive(Debug, Clone)]
 pub struct StatePaths {
@@ -32,6 +33,18 @@ impl StatePaths {
 
     pub fn state_file(&self) -> PathBuf {
         self.state_dir().join(STATE_FILE)
+    }
+
+    /// Per-cluster SSH `known_hosts` file. Lives next to
+    /// `state.json` so it is naturally scoped to one cluster: when
+    /// `destroy --yes` clears state, this file is removed too, and
+    /// the next `apply` against a fresh server (which Hetzner may
+    /// happily place at a recently-recycled IP) starts with a clean
+    /// slate. Avoids the "host key verification failed" annoyance
+    /// from the user's `~/.ssh/known_hosts` that would otherwise
+    /// require manual `ssh-keygen -R` after every destroy+apply.
+    pub fn known_hosts_file(&self) -> PathBuf {
+        self.state_dir().join(KNOWN_HOSTS_FILE)
     }
 }
 

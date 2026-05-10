@@ -52,7 +52,7 @@ pub fn run(refresh: bool) -> Result<()> {
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let public_ip = resolve_public_ip(&client, hetzner.server_id)?;
 
-    let fetcher = SshKubeconfigFetcher::new(default_ssh_identity_path());
+    let fetcher = SshKubeconfigFetcher::new(default_ssh_identity_path(), paths.known_hosts_file());
     let yaml = compute_kubeconfig(&fetcher, &public_ip, cached_plaintext.as_deref(), refresh)?;
 
     // Encrypt before writing back; clear the legacy plaintext slot

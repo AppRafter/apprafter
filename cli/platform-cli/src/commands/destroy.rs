@@ -75,5 +75,21 @@ pub fn run(yes: bool) -> Result<()> {
 
     state.hetzner_cloud = None;
     state.save(&paths)?;
+
+    // Drop the per-cluster known_hosts file alongside the state.
+    // The next `apply` against a fresh server (Hetzner happily
+    // recycles public IPs) starts with a clean slate; without this
+    // step the file would carry the destroyed cluster's host key
+    // and the next `kubeconfig` SSH call would fail with `Host key
+    // verification failed` until the operator manually removes the
+    // entry. Best-effort: ignore the error if the file is already
+    // gone (e.g. kubeconfig was never run for this cluster).
+    let kh = paths.known_hosts_file();
+    if kh.exists() {
+        if let Err(e) = std::fs::remove_file(&kh) {
+            info!(path = %kh.display(), error = %e, "failed to remove per-cluster known_hosts");
+        }
+    }
+
     Ok(())
 }
