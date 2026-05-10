@@ -389,6 +389,85 @@ fn delete_firewall_404_is_treated_as_already_gone() {
 }
 
 #[test]
+fn delete_firewall_retries_on_resource_in_use() {
+    // Hetzner returns 422 `resource_in_use` for ~1-15 seconds after
+    // an associated server is deleted (firewall.applied_to is
+    // reaped asynchronously). The client must retry until the
+    // attachment is dropped, otherwise destroy() falls over and
+    // leaves residual state. Sequenced mocks: first DELETE returns
+    // 422, second returns 204 — retry should succeed.
+    let mut server = mockito::Server::new();
+    let _attempt_1 = server
+        .mock("DELETE", "/v1/firewalls/21")
+        .with_status(422)
+        .with_body(
+            r#"{"error":{"code":"resource_in_use","message":"firewall with ID 21 is still in use"}}"#,
+        )
+        .expect(1)
+        .create();
+    let _attempt_2 = server
+        .mock("DELETE", "/v1/firewalls/21")
+        .with_status(204)
+        .expect(1)
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client
+        .delete_firewall(21)
+        .expect("delete_firewall retries past resource_in_use");
+}
+
+#[test]
+fn delete_network_retries_on_resource_in_use() {
+    // Same shape as the firewall retry — network.servers gets
+    // reaped on its own clock after server delete.
+    let mut server = mockito::Server::new();
+    let _attempt_1 = server
+        .mock("DELETE", "/v1/networks/11")
+        .with_status(422)
+        .with_body(
+            r#"{"error":{"code":"resource_in_use","message":"network with ID 11 has attached resources"}}"#,
+        )
+        .expect(1)
+        .create();
+    let _attempt_2 = server
+        .mock("DELETE", "/v1/networks/11")
+        .with_status(204)
+        .expect(1)
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "test-token");
+    client
+        .delete_network(11)
+        .expect("delete_network retries past resource_in_use");
+}
+
+#[test]
+fn delete_firewall_propagates_non_retriable_errors_immediately() {
+    // Non-resource_in_use errors should NOT trigger the retry loop
+    // — they are permanent failures. The test mocks a single 401
+    // and expects exactly one call.
+    let mut server = mockito::Server::new();
+    let m = server
+        .mock("DELETE", "/v1/firewalls/21")
+        .with_status(401)
+        .with_body(r#"{"error":{"code":"unauthorized","message":"bad token"}}"#)
+        .expect(1)
+        .create();
+
+    let client = HetznerCloudClient::new(server.url(), "wrong");
+    let err = client.delete_firewall(21).unwrap_err();
+    match err {
+        CliError::Hetzner { status, code, .. } => {
+            assert_eq!(status, 401);
+            assert_eq!(code, "unauthorized");
+        }
+        other => panic!("expected Hetzner error, got {other:?}"),
+    }
+    m.assert();
+}
+
+#[test]
 fn list_floating_ips_returns_filtered_list() {
     let mut server = mockito::Server::new();
     let m = server

@@ -208,34 +208,12 @@ impl HetznerCloudClient {
 
     pub fn delete_network(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/networks/{id}"));
-        let resp = ureq::delete(&endpoint)
-            .set("Authorization", &self.auth_header())
-            .set("Accept", "application/json")
-            .call();
-
-        match resp {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(404, _)) => Ok(()),
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                let envelope: ApiErrorEnvelope =
-                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
-                        error: super::types::ApiErrorDetails {
-                            code: "unknown".to_string(),
-                            message: body,
-                        },
-                    });
-                Err(CliError::Hetzner {
-                    endpoint: format!("DELETE {endpoint}"),
-                    status,
-                    code: envelope.error.code,
-                    message: envelope.error.message,
-                })
-            }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
-        }
+        delete_with_retry_on_resource_in_use(&endpoint, || {
+            ureq::delete(&endpoint)
+                .set("Authorization", &self.auth_header())
+                .set("Accept", "application/json")
+                .call()
+        })
     }
 
     pub fn list_firewalls(&self) -> Result<super::types::FirewallListResponse> {
@@ -310,34 +288,12 @@ impl HetznerCloudClient {
 
     pub fn delete_firewall(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/firewalls/{id}"));
-        let resp = ureq::delete(&endpoint)
-            .set("Authorization", &self.auth_header())
-            .set("Accept", "application/json")
-            .call();
-
-        match resp {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(404, _)) => Ok(()),
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                let envelope: ApiErrorEnvelope =
-                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
-                        error: super::types::ApiErrorDetails {
-                            code: "unknown".to_string(),
-                            message: body,
-                        },
-                    });
-                Err(CliError::Hetzner {
-                    endpoint: format!("DELETE {endpoint}"),
-                    status,
-                    code: envelope.error.code,
-                    message: envelope.error.message,
-                })
-            }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
-        }
+        delete_with_retry_on_resource_in_use(&endpoint, || {
+            ureq::delete(&endpoint)
+                .set("Authorization", &self.auth_header())
+                .set("Accept", "application/json")
+                .call()
+        })
     }
 
     pub fn delete_ssh_key(&self, id: u64) -> Result<()> {
@@ -578,6 +534,64 @@ impl HetznerCloudClient {
             Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
                 "transport error talking to {endpoint}: {t}"
             ))),
+        }
+    }
+}
+
+/// Retry a `DELETE` if Hetzner answers with `code=resource_in_use`.
+/// Used by `delete_firewall` + `delete_network` because both can
+/// hit a transient `resource_in_use` for ~1-15 seconds after the
+/// associated server is deleted (the server is gone from
+/// `GET /servers` but its references in firewall.applied_to and
+/// network.servers haven't been reaped yet by Hetzner's internal
+/// scheduler). 60s deadline, exponential back-off (500ms → 5s
+/// cap). On any other error or after the deadline expires, the
+/// last error is returned to the caller verbatim.
+///
+/// Lives at module scope (rather than as a method on
+/// `HetznerCloudClient`) so the borrow checker is happy with the
+/// closure capturing `&self` only for the inner ureq call.
+fn delete_with_retry_on_resource_in_use<F>(endpoint: &str, mut do_call: F) -> Result<()>
+where
+    F: FnMut() -> std::result::Result<ureq::Response, ureq::Error>,
+{
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut delay = Duration::from_millis(500);
+
+    loop {
+        let resp = do_call();
+        match resp {
+            Ok(_) => return Ok(()),
+            Err(ureq::Error::Status(404, _)) => return Ok(()),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                if envelope.error.code == "resource_in_use" && Instant::now() < deadline {
+                    sleep(delay);
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+                return Err(CliError::Hetzner {
+                    endpoint: format!("DELETE {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                });
+            }
+            Err(ureq::Error::Transport(t)) => {
+                return Err(CliError::Other(format!(
+                    "transport error talking to {endpoint}: {t}"
+                )))
+            }
         }
     }
 }
