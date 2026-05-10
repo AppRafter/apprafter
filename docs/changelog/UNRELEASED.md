@@ -11,6 +11,42 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.61 — Phase 1 patch (2026-05-11)
+
+### Fixed
+
+- **Operator pod CrashLoopBackOff: install rustls CryptoProvider
+  before TLS** (v0.1.61) — first ever `helm install
+  apprafter-operator` produced CrashLoopBackOff. Logs:
+
+  ```
+  thread 'main' panicked at
+    rustls-0.23.40/src/crypto/mod.rs:249:14:
+    Could not automatically determine the process-level
+    CryptoProvider from Rustls crate features.
+  ```
+
+  rustls 0.23+ removed its auto-default provider; kube 0.95's
+  `rustls-tls` feature pulls `aws-lc-rs` into the dep graph but
+  does not install it. `Client::try_default()` deep inside kube
+  panics if no provider is set at process start. Hidden through
+  v0.1.26 → v0.1.60 because nobody ran the operator binary
+  against a real cluster (in-file unit tests use no kube
+  client; axum tests use `tower::ServiceExt::oneshot`;
+  `Client::try_default` only fires when there is a real
+  apiserver to talk to). Fix: new
+  `apprafter_operator::install_rustls_crypto_provider` helper
+  — idempotent, called from `main()` BEFORE
+  `Client::try_default`. Direct rustls dep with `aws-lc-rs`
+  feature added to `apprafter-operator/Cargo.toml`. Two
+  regression-guard unit tests assert: (a) after the helper
+  runs `CryptoProvider::get_default()` returns `Some`; (b) the
+  helper is idempotent (second call is a no-op, not a panic)
+  so test processes that exercise `main()` more than once don't
+  crash. `operator/Cargo.lock` now committed (previously
+  untracked; standard practice for binaries — same as
+  `cli/Cargo.lock`).
+
 ## v0.1.60 — Phase 1 patch (2026-05-11)
 
 ### Fixed

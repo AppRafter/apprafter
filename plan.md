@@ -1950,4 +1950,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-10 | Phase 1 patch — Dockerfile-pin переехал с фиксированной версии на `rust:stable-alpine` (transitive deps непредсказуемо бампают MSRV, реактивные патчи дорого); MSRV → 1.88; v0.1.58 | initial |
 | 2026-05-10 | Phase 1 patch — `rust:stable-alpine` не существует на Docker Hub, заменено на каноничный `rust:alpine`; v0.1.59 | initial |
 | 2026-05-11 | Phase 1 patch — `helm template` whitespace-trim съедал newline между SPDX-комментом и `apiVersion:` в `serviceaccount.yaml`/`rbac.yaml` чарта operator; v0.1.60 | initial |
+| 2026-05-11 | Phase 1 patch — operator pod CrashLoopBackOff: `install_rustls_crypto_provider()` перед `Client::try_default` (rustls 0.23+ убрал auto-default); + 2 regression-guard unit-теста; v0.1.61 | initial |
 
