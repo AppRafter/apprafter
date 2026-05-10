@@ -1948,4 +1948,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-10 | Phase 1 patch — упрощены `operator-*/Dockerfile` (drop fragile dep-prebuild trick) + `operator/.dockerignore`; cargo-chef как follow-up; v0.1.56 | initial |
 | 2026-05-10 | Phase 1 patch — bump rust pin 1.83 → 1.85 (transitive dep `hashbrown-0.17.1` требует cargo `edition2024` feature, стабилизированный в 1.85); v0.1.57 | initial |
 | 2026-05-10 | Phase 1 patch — Dockerfile-pin переехал с фиксированной версии на `rust:stable-alpine` (transitive deps непредсказуемо бампают MSRV, реактивные патчи дорого); MSRV → 1.88; v0.1.58 | initial |
+| 2026-05-10 | Phase 1 patch — `rust:stable-alpine` не существует на Docker Hub, заменено на каноничный `rust:alpine`; v0.1.59 | initial |
 

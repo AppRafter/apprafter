@@ -11,6 +11,20 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.59 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **`rust:alpine`, not `rust:stable-alpine` (the latter doesn't
+  exist)** (v0.1.59) — the v0.1.58 floating Dockerfile pin was
+  wrong: Docker Hub does not publish a `rust:stable-alpine` tag.
+  Build failed with `docker.io/library/rust:stable-alpine: not
+  found`. The `stable-` prefix is a node.js convention
+  (`node:lts-alpine` etc.), not rust's. Fix: use `rust:alpine`,
+  the canonical Docker Hub tag for "latest stable on alpine".
+  Same forward-compat as v0.1.58 intended — image auto-refreshes
+  with each rust release.
+
 ## v0.1.58 — Phase 1 patch (2026-05-10)
 
 ### Fixed
