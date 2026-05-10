@@ -11,6 +11,31 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.46 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **Per-cluster `known_hosts` for SSH — no more host-key
+  collisions across destroy+apply** (v0.1.46) — Hetzner Cloud
+  freely recycles public IPs within seconds of `destroy`. With
+  the previous code passing only `-o
+  StrictHostKeyChecking=accept-new` against the operator's
+  `~/.ssh/known_hosts`, the second `kubeconfig` call after a
+  destroy/apply cycle on the same project would fail with
+  `Host key verification failed`, forcing a manual `ssh-keygen
+  -R <ip>` between every iteration of the E2E loop.
+  Fix: new `StatePaths::known_hosts_file()` returns
+  `<cwd>/.apprafter/known_hosts`. `SshKubeconfigFetcher::new`
+  now takes the path as a constructor argument and passes
+  `-o UserKnownHostsFile=<path>` alongside the existing
+  `StrictHostKeyChecking=accept-new`. `destroy --yes` removes
+  the per-cluster known_hosts alongside clearing the state file
+  (best-effort: missing-file errors are logged and ignored). The
+  user's `~/.ssh/known_hosts` is never touched. Three semantic
+  outcomes: first contact silently accepts + writes; same-cluster
+  matches silently; same-cluster key swap (real MITM risk)
+  blocks. Closes ∞.7 bug #1.
+
 ## v0.1.45 — Phase 1 patch (2026-05-09)
 
 ### Fixed
