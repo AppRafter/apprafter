@@ -151,12 +151,21 @@ fn plan_noop_when_server_already_present() {
 #[test]
 fn destroy_deletes_each_tagged_server() {
     let mut srv = mockito::Server::new();
-    let _list = srv
+    // First list call: refresh sees the server. Subsequent calls
+    // (wait_for_server_gone polling): return empty so the wait
+    // returns immediately.
+    let _list_first = srv
         .mock("GET", "/v1/servers")
         .with_status(200)
         .with_body(
             r#"{"servers":[{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}]}"#,
         )
+        .expect(1)
+        .create();
+    let _list_after = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
         .create();
     let _delete = srv
         .mock("DELETE", "/v1/servers/42")
@@ -333,12 +342,18 @@ fn apply_creates_all_resources_in_order_and_attaches_to_server() {
 #[test]
 fn destroy_removes_in_order_server_firewall_network_ssh() {
     let mut srv = mockito::Server::new();
-    let _list_servers = srv
+    let _list_servers_first = srv
         .mock("GET", "/v1/servers")
         .with_status(200)
         .with_body(
             r#"{"servers":[{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}]}"#,
         )
+        .expect(1)
+        .create();
+    let _list_servers_after = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
         .create();
     let _del_server = srv
         .mock("DELETE", "/v1/servers/42")
@@ -488,12 +503,18 @@ fn destroy_removes_floating_ip_first_then_others() {
         .with_status(204)
         .expect(1)
         .create();
-    let _list_servers = srv
+    let _list_servers_first = srv
         .mock("GET", "/v1/servers")
         .with_status(200)
         .with_body(
             r#"{"servers":[{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}]}"#,
         )
+        .expect(1)
+        .create();
+    let _list_servers_after = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
         .create();
     let _del_server = srv
         .mock("DELETE", "/v1/servers/42")
@@ -766,4 +787,96 @@ fn apply_skips_server_types_lookup_when_server_already_exists() {
     let outcome = cli_providers::Provider::apply(&provider).expect("no-op apply succeeds");
     assert_eq!(outcome.applied, 0, "no resources should be created");
     no_types.assert(); // proves /server_types was NEVER hit
+}
+
+#[test]
+fn destroy_waits_for_server_async_cleanup_before_deleting_network() {
+    // Regression guard for v0.1.47: Hetzner's `DELETE /servers/{id}`
+    // is async; the next `DELETE /networks/{id}` returns 409 "in
+    // use" while the server's network interface is still attached.
+    // Since v0.1.47 destroy() polls /v1/servers until the deleted
+    // id is gone before proceeding to firewall/network/ssh-key.
+    // Test mocks the server as "still present" once after delete
+    // (one poll iteration with the server still listed) and
+    // "gone" thereafter; asserts the second list call happens
+    // BEFORE delete_network is invoked.
+    let mut srv = mockito::Server::new();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(r#"{"floating_ips":[]}"#)
+        .create();
+
+    // Sequenced /v1/servers responses:
+    //   1st: refresh sees the server (initial destroy step).
+    //   2nd: wait_for_server_gone first poll — STILL present
+    //        (simulates Hetzner async lag).
+    //   3rd+: gone.
+    let _list_first = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(
+            r#"{"servers":[{"id":42,"name":"platform-1","status":"running","labels":{"apprafter":"true"}}]}"#,
+        )
+        .expect(1)
+        .create();
+    let _list_lag = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(
+            r#"{"servers":[{"id":42,"name":"platform-1","status":"deleting","labels":{"apprafter":"true"}}]}"#,
+        )
+        .expect(1)
+        .create();
+    let list_gone = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
+        .expect_at_least(1)
+        .create();
+
+    let _del_server = srv
+        .mock("DELETE", "/v1/servers/42")
+        .with_status(200)
+        .with_body(r#"{"action":{"id":1,"status":"success"}}"#)
+        .expect(1)
+        .create();
+    let _list_fws = srv
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    let _list_nets = srv
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    let _list_keys = srv
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+
+    use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
+    use std::collections::BTreeMap;
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(srv.url(), "tok"),
+        spec: ServerSpec {
+            name: "platform-1".into(),
+            server_type: "cpx22".into(),
+            image: "ubuntu-24.04".into(),
+            location: "nbg1".into(),
+            labels: BTreeMap::new(),
+            user_data: None,
+        },
+        ssh_keys: vec![],
+        networks: vec![],
+        firewalls: vec![],
+        floating_ips: vec![],
+    };
+
+    let outcome = cli_providers::Provider::destroy(&provider).expect("destroy succeeds");
+    assert_eq!(outcome.destroyed, 1, "exactly one server destroyed");
+    list_gone.assert(); // proves the wait-for-gone poll ran at least once
 }

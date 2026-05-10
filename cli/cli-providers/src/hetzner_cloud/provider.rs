@@ -2,8 +2,10 @@
 //! Implementation of the `Provider` trait against Hetzner Cloud.
 
 use std::collections::BTreeMap;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
-use cli_core::Result;
+use cli_core::{CliError, Result};
 use tracing::info;
 
 use crate::provider::{Action, ApplyOutcome, DestroyOutcome, Plan, Provider};
@@ -84,6 +86,33 @@ impl HetznerCloudProvider {
                 f.labels.get(APPRAFTER_LABEL).map(String::as_str) == Some(APPRAFTER_LABEL_VALUE)
             })
             .collect())
+    }
+
+    /// Poll `GET /servers` until `id` is no longer in the response.
+    /// Hetzner's `DELETE /servers/{id}` is asynchronous; this
+    /// function gives `destroy()` a synchronous boundary so the
+    /// follow-up `delete_network` doesn't 409 on a still-attached
+    /// network interface. Exponential-ish back-off (500ms → 5s
+    /// cap), 60s deadline. Returns Err only if the server is
+    /// still listed after the deadline.
+    fn wait_for_server_gone(&self, id: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut delay = Duration::from_millis(500);
+        loop {
+            let resp = self.client.list_servers()?;
+            if !resp.servers.iter().any(|s| s.id == id) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "server {id} still listed by Hetzner 60s after delete; \
+                     async-cleanup unusually slow — re-run `destroy --yes` \
+                     in a minute, or check the Hetzner Cloud Console."
+                )));
+            }
+            sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
     }
 
     fn create_request(
@@ -362,10 +391,25 @@ impl Provider for HetznerCloudProvider {
         }
 
         // 2) Servers.
+        let mut deleted_server_ids: Vec<u64> = Vec::new();
         for server in self.refresh_servers()? {
             info!(server = %server.name, id = server.id, "destroying Hetzner server");
             self.client.delete_server(server.id)?;
+            deleted_server_ids.push(server.id);
             destroyed += 1;
+        }
+
+        // 2b) Wait for each deleted server to actually be gone.
+        // Hetzner's `DELETE /servers/{id}` returns 200 immediately
+        // and processes the cleanup asynchronously; meanwhile the
+        // server's network interface still holds the network
+        // attachment, so the next step's `delete_network` returns
+        // 409 "still in use". Polling `GET /servers` until the id
+        // is no longer listed is the cleanest sync point — single
+        // place that knows about the async semantics, no per-call
+        // retry sprinkled across delete_firewall / delete_network.
+        for id in deleted_server_ids {
+            self.wait_for_server_gone(id)?;
         }
 
         // 3) Firewalls.
