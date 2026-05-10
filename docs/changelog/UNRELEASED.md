@@ -11,6 +11,33 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.50 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **Retry `delete_firewall` / `delete_network` on
+  `resource_in_use`** (v0.1.50) — the v0.1.47 `wait_for_server_gone`
+  poll closed the race where `delete_network` saw 409 while the
+  server was still in `GET /v1/servers`, but missed a subtler
+  one: even AFTER the server vanishes from the server list,
+  Hetzner's internal scheduler can take another 1-15s to drop
+  the references in `firewall.applied_to` and `network.servers`.
+  During that window `delete_firewall` returns
+  `status=422 code=resource_in_use message="firewall with ID N
+  is still in use"` — different error code than v0.1.47
+  anticipated, on a different resource, same root cause.
+  Manifested deterministically on the first post-v0.1.47 manual
+  destroy: the server-poll completed in ~700ms, then
+  `delete_firewall` 422'd. Belt-and-suspenders fix: new
+  module-level helper `delete_with_retry_on_resource_in_use`
+  wraps the inner ureq call. On `code=resource_in_use` it sleeps
+  with exponential back-off (500ms → 5s cap) and retries, up to
+  a 60s deadline. Any other error (auth, permanent 4xx,
+  transport) propagates immediately. Applied to
+  `delete_firewall` and `delete_network`. Three new mockito
+  tests cover: retry-then-succeed for firewalls, same for
+  networks, non-retriable error propagated one-shot.
+
 ## v0.1.49 — Phase 1 patch (2026-05-10)
 
 ### Added
