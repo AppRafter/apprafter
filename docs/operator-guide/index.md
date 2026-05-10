@@ -7,13 +7,19 @@
 Tasks for operators (anyone running an AppRafter cluster):
 
 - **Provisioning** — `platform-cli init` per tier (Hetzner Cloud,
-  Hetzner Robot, AWS, OpenTofu plugins).
+  Hetzner Robot, AWS, OpenTofu plugins). See
+  [`quickstart.md`](quickstart.md) for the tier-1 walkthrough.
 - **Tier upgrades** — `platform-cli upgrade-tier 1 → 2 → 3 → 4`,
   with safety semantics from `MigrationPlan`.
 - **External surface** — wiring git, registry, OIDC SSO,
   Headscale/Tailscale, synthetic monitoring, backups.
 - **Day-2** — debugging with k9s / Headlamp / Hubble; reading
   audit logs from JetStream; managing AccessGrants.
+- **Recovery from a wedged VM** — see
+  [`recovery.md`](recovery.md) for the Hetzner Rescue Mode
+  runbook (the VM is key-only and the Hetzner web console is
+  unusable for emergency access; rescue mode + chroot is the
+  documented escape hatch).
 - **Disaster recovery** — restoring from `s3://`-backups,
   cluster rebuild, `DisasterRecoveryPlan` runbooks.
 

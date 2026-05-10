@@ -11,6 +11,27 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.49 — Phase 1 patch (2026-05-10)
+
+### Added
+
+- **Operator-guide recovery runbook** (v0.1.49) — new
+  `docs/operator-guide/recovery.md` documents the Hetzner
+  Rescue Mode procedure for the case when a VM becomes
+  unreachable over SSH (cloud-init hung, kernel-level firewall
+  misconfig that survived a release, etc.). AppRafter VMs are
+  key-only — root has no password and the noVNC web console is
+  unusable for emergency access; rescue-mode + chroot is the
+  documented escape hatch. Includes commands for mounting the
+  original disk, triaging cloud-init / iptables / k3s state
+  from disk, and a "fix-in-place vs rebuild" decision table
+  (rebuild is almost always correct for tier-1). Index page
+  in operator-guide gets a cross-link. Closes ∞.7 bug #3 via
+  the docs-only path chosen during the tier-1 stability
+  hardening review on 2026-05-10 (variant C: code-level
+  optional emergency password deferred to tier-3/4 where the
+  trade-off makes sense).
+
 ## v0.1.48 — Phase 1 patch (2026-05-10)
 
 ### Fixed
