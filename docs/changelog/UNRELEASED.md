@@ -11,6 +11,28 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.54 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **CI clippy 1.95 `result_large_err` on retry helper closure**
+  (v0.1.54) — CI's lint job runs `dtolnay/rust-toolchain@stable`
+  which on the day pinned to rust 1.95.0; that release activates
+  `clippy::result_large_err` by default with a 128-byte
+  threshold. The v0.1.50 helper closure for
+  `delete_firewall`/`delete_network` had
+  `Result<ureq::Response, ureq::Error>` as its return type, and
+  `ureq::Error::Status` carries a 272-byte `Response`. Fix:
+  closure now returns a fresh `ureq::Request` each iteration and
+  the helper invokes `.call()` internally. No `Result<_,
+  ureq::Error>` in the closure signature ⇒ lint doesn't apply.
+  Behaviour identical (still a fresh Request per retry, same
+  `code=resource_in_use` gate, same back-off). Local toolchain
+  (mise + `rust-toolchain.toml` both `stable`) was on a pre-1.95
+  release at v0.1.50, hence the discrepancy. Pinning rust to a
+  specific minor across the project is a separate hygiene
+  follow-up.
+
 ## v0.1.53 — Phase 1 patch (2026-05-10)
 
 ### Fixed
