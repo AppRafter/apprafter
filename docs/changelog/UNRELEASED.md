@@ -11,6 +11,24 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.55 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **release-operator workflow: lowercase ghcr.io owner**
+  (v0.1.55) — Docker registry repository names MUST be
+  lowercase. `${{ github.repository_owner }}` preserves the
+  org's display casing (`AppRafter`), and the v0.1.52
+  workflow's first run on a v0.1.* tag failed with
+  `invalid tag "ghcr.io/AppRafter/apprafter-operator:v0.1.54":
+  repository name must be lowercase`. GitHub Actions has no
+  built-in `toLower` expression. Fix: a per-job shell shim
+  `Compute lowercase image base` reads `github.repository_owner`
+  via an `env:` binding (anti-injection pattern), pipes it
+  through `tr '[:upper:]' '[:lower:]'`, and exposes the
+  lowercase image base via step outputs that subsequent steps
+  consume.
+
 ## v0.1.54 — Phase 1 patch (2026-05-10)
 
 ### Fixed
