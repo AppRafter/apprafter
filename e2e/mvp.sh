@@ -169,8 +169,14 @@ kubectl wait --for=condition=Available deployment/e2e-hello \
 # ---------------------------------------------------------------
 
 phase "Phase 6: verifying http://e2e-hello.default.svc.cluster.local"
+# Note: `curlimages/curl:8` (bare-major tag) is NOT published —
+# only specific versions like `:8.11.0` and the floating
+# `:latest` exist. Was broken from v0.1.39 on, hidden because
+# nightly never ran (workflow secrets unset until 2026-05-10).
+# Match the docs (`docs/operator-guide/quickstart.md` §4 uses
+# bare `curlimages/curl` ⇒ `:latest`); fixed in v0.1.53.
 output=$(kubectl run --rm -i --restart=Never \
-    --image=curlimages/curl:8 \
+    --image=curlimages/curl:latest \
     --namespace default \
     e2e-smoke-curl -- \
     curl -sSf --max-time 10 \
