@@ -11,6 +11,26 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.53 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **`e2e/mvp.sh` curl image tag** (v0.1.53) — phase 6 of the
+  E2E smoke (`curl http://e2e-hello.../`) used
+  `curlimages/curl:8`, but bare-major floating tags like `:8`
+  are NOT published to Docker Hub for `curlimages/curl` —
+  only specific versions (`:8.11.0` etc.) and `:latest` exist.
+  Every smoke run since v0.1.39 would have failed at this step
+  with `Failed to pull image "curlimages/curl:8": ...
+  not found`. Hidden because nightly never ran (workflow
+  secrets unset until 2026-05-10) and manual §4 wasn't walked
+  end-to-end on a real cluster until that date. Fix: use
+  `curlimages/curl:latest`, matching what
+  `docs/operator-guide/quickstart.md` §4 and
+  `docs/dev-guide/quickstart.md` already do (both reference
+  bare `curlimages/curl` which kubelet expands to `:latest`).
+  Inline comment in `mvp.sh` captures the rationale.
+
 ## v0.1.52 — Phase 1 patch (2026-05-10)
 
 ### Added

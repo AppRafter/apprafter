@@ -1942,4 +1942,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-10 | Phase 1 patch — retry-on-`resource_in_use` для `delete_firewall`/`delete_network` (второй слой защиты от Hetzner async-cleanup лагов после v0.1.47); v0.1.50 | initial |
 | 2026-05-10 | Phase 1 patch — `default-deny` NP теперь Ingress-only с allow для same-ns + kube-system (фикс silent-breakage workloads — DNS+Service routing блокировались с v0.1.0-mvp); ∞.7 bug #6 ✅; v0.1.51 | initial |
 | 2026-05-10 | Phase 1 patch — GHCR release workflow + `apprafter-operator/Dockerfile`; разблокирует §5 (operator image теперь pullable, не «build your own»); v0.1.52 | initial |
+| 2026-05-10 | Phase 1 patch — `e2e/mvp.sh` использует `curlimages/curl:latest` вместо несуществующего `:8`; ∞.7 bug #7 ✅; v0.1.53 | initial |
 
