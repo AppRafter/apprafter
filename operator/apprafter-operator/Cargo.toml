@@ -26,6 +26,12 @@ tower              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 kube               = { workspace = true }
+# rustls 0.23+ removed its auto-default CryptoProvider; the
+# application must `install_default()` one before any TLS. We
+# pull rustls directly with `aws-lc-rs` so the `default_provider`
+# helper is in scope. Version must match what `kube` transitively
+# pulls in (0.23.x).
+rustls             = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 http-body-util = { workspace = true }

@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apprafter_operator::build_router;
+use apprafter_operator::{build_router, install_rustls_crypto_provider};
 use kube::Client;
 use operator_controllers_application as application_controller;
 use operator_core::{LeaderConfig, LeaderElection, Metrics};
@@ -34,6 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Must run BEFORE any rustls-using API (kube::Client::try_default)
+    // — rustls 0.23+ panics if no process-level CryptoProvider is
+    // installed. See `apprafter_operator::install_rustls_crypto_provider`
+    // for the full rationale + the regression-guard tests.
+    install_rustls_crypto_provider();
 
     let metrics = Arc::new(Metrics::new());
     let client = Client::try_default().await?;
