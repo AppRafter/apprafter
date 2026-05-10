@@ -11,6 +11,45 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.51 — Phase 1 patch (2026-05-10)
+
+### Fixed
+
+- **`default-deny` NetworkPolicy: allow same-ns + kube-system,
+  drop egress restriction** (v0.1.51) — every shipped version
+  from v0.1.0-mvp through v0.1.50 deployed
+  `policyTypes: [Ingress, Egress]` with zero allow rules. K8s
+  semantics: select-all-pods + no-rules + both direction-types
+  ⇒ namespace fully isolated. Workloads looked Running because
+  `readinessProbe` is host-network (exempt from NP), but
+  Service routing and DNS resolution were both blocked. Hidden
+  for ~6 weeks because: (a) `e2e/mvp.sh` (which would have
+  caught it) was wired in v0.1.39/40 but the nightly run never
+  fired — the GitHub Actions secrets weren't configured; (b)
+  manual operator-quickstart §4 (in-cluster `curl
+  http://hello.default.svc.cluster.local/`) wasn't walked
+  end-to-end against a real bootstrapped cluster until
+  2026-05-10; (c) the original code-comment claim that "the
+  operator adds explicit allow-rules per app" referred to
+  phase 2.10 (`needs` → NetworkPolicy auto-derivation), which
+  isn't shipped — so the policy was a default-deny waiting
+  forever for non-existent rules.
+
+  Fix: enforce Ingress only (Egress no longer in policyTypes —
+  egress restriction without per-app allows is what actually
+  broke things), and add two ingress allow rules:
+  same-namespace pod-to-pod (Service routing works) and
+  ingress-from-kube-system (Cilium gateway / HTTPRoute /
+  monitoring can reach default-ns pods). What stays denied:
+  ingress from any other namespace (future tier-2 multi-tenant
+  `apps-*`, attacker tunneling via another ns) — the only
+  cross-tenant threat the NP was actually mitigating before.
+
+  Three new in-file tests guard the new shape, including a
+  named `enforces_ingress_only_egress_unrestricted` whose panic
+  message points future maintainers at this commit's rationale
+  if they re-introduce Egress to `policyTypes`.
+
 ## v0.1.50 — Phase 1 patch (2026-05-10)
 
 ### Fixed
