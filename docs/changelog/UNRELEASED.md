@@ -11,6 +11,44 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.62 — Phase 1 patch (2026-05-11)
+
+### Fixed
+
+- **CRD declares `status` subschema (was empty)** (v0.1.62) —
+  operator's first reconcile against a real cluster failed on
+  every status-subresource PATCH:
+
+  ```
+  failed to create typed patch object (apprafter.io/v1alpha1,
+  Kind=Application): .status: field not declared in schema
+  ```
+
+  The CRD had `subresources.status: {}` (enables the /status
+  endpoint) but `openAPIV3Schema.properties` declared only
+  `apiVersion / kind / metadata / spec` — no `status` block at
+  all. Apiserver's structural-schema enforcement rejects any
+  `.status.*` PATCH because no schema describes what's allowed
+  there. The operator's child Deployment + Service WERE created
+  successfully (SSA on those paths doesn't traverse the CRD's
+  structural validation for the application itself), but every
+  `Application.status.phase = Ready` write died with 500.
+  Hidden through v0.1.22 → v0.1.61 because the CRD schema
+  (sub-phase 1.7b) and the operator's status-write path
+  (sub-phase 1.9b) were developed independently and never
+  exercised together end-to-end until the operator pod finally
+  reached `leader acquired — starting Application controller`
+  on 2026-05-11. Fix: add a `status` property to the
+  `openAPIV3Schema` mirroring `operator_core::ApplicationStatus`
+  (`phase` / `observedGeneration` / `endpointURL` / `conditions`
+  array of `ApplicationCondition`). Static rendering
+  `manifests/tier-1/application/example-crd.yaml` regenerated.
+  New regression-guard test
+  `status_subschema_declares_every_field_the_operator_writes`
+  fails if `operator-core` grows an ApplicationStatus field that
+  the CRD schema doesn't mirror — drift caught locally before CI
+  next time.
+
 ## v0.1.61 — Phase 1 patch (2026-05-11)
 
 ### Fixed
