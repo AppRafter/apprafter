@@ -52,6 +52,8 @@ pub struct InfrastructureSpec {
     pub argocd: Option<ArgocdBlock>,
     #[serde(default)]
     pub backstage: Option<BackstageBlock>,
+    #[serde(default)]
+    pub operator: Option<OperatorBlock>,
     #[serde(default, rename = "admissionWebhook")]
     pub admission_webhook: Option<AdmissionWebhookBlock>,
 }
@@ -77,7 +79,21 @@ pub struct BackstageBlock {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AdmissionWebhookBlock {
     #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
     pub image: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OperatorBlock {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -239,4 +255,86 @@ fn parse_application_from_value(value: &Value) -> Result<ApplicationManifest> {
     Err(CliError::Other(
         "cue export did not contain an Application document".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn operator_block_parses_all_three_fields() {
+        let v = json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "operator": {
+                    "enabled": false,
+                    "image": "ghcr.io/x/op",
+                    "tag": "v0.1.65"
+                }
+            }
+        });
+        let parsed: InfrastructureManifest = serde_json::from_value(v).unwrap();
+        let op = parsed.spec.operator.unwrap();
+        assert_eq!(op.enabled, Some(false));
+        assert_eq!(op.image.as_deref(), Some("ghcr.io/x/op"));
+        assert_eq!(op.tag.as_deref(), Some("v0.1.65"));
+    }
+
+    #[test]
+    fn operator_block_absent_yields_none() {
+        let v = json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {"provider": "hetzner-cloud"}
+        });
+        let parsed: InfrastructureManifest = serde_json::from_value(v).unwrap();
+        assert!(parsed.spec.operator.is_none());
+        assert!(parsed.spec.admission_webhook.is_none());
+    }
+
+    #[test]
+    fn admission_webhook_block_parses_all_fields() {
+        let v = json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "admissionWebhook": {
+                    "enabled": true,
+                    "image": "ghcr.io/x/aw",
+                    "tag": "v0.1.65"
+                }
+            }
+        });
+        let parsed: InfrastructureManifest = serde_json::from_value(v).unwrap();
+        let aw = parsed.spec.admission_webhook.unwrap();
+        assert_eq!(aw.enabled, Some(true));
+        assert_eq!(aw.image.as_deref(), Some("ghcr.io/x/aw"));
+        assert_eq!(aw.tag.as_deref(), Some("v0.1.65"));
+    }
+
+    #[test]
+    fn admission_webhook_block_partial_only_image() {
+        // Backward-compat shape: just `image`, no enabled / tag.
+        let v = json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "p"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "admissionWebhook": {"image": "ghcr.io/x/aw"}
+            }
+        });
+        let parsed: InfrastructureManifest = serde_json::from_value(v).unwrap();
+        let aw = parsed.spec.admission_webhook.unwrap();
+        assert_eq!(aw.image.as_deref(), Some("ghcr.io/x/aw"));
+        assert_eq!(aw.enabled, None);
+        assert_eq!(aw.tag, None);
+    }
 }
