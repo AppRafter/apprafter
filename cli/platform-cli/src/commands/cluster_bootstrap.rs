@@ -627,6 +627,151 @@ mod tests {
     }
 
     #[test]
+    fn default_manifest_installs_operator_and_webhook_in_order() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let op_chart = PathBuf::from("/tmp/operator-chart");
+        let op_values = PathBuf::from("/tmp/operator-values.yaml");
+        let aw_manifest = PathBuf::from("/tmp/admission-webhook.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &app_crd,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            Some(&op_chart),
+            Some(&op_values),
+            Some(&aw_manifest),
+            None,
+            None,
+            None,
+        )
+        .expect("bootstrap");
+
+        let installs = helm.installs.borrow();
+        assert_eq!(installs.len(), 4, "expected cilium, argocd, cert-manager, operator");
+        assert_eq!(installs[3].release, "apprafter-operator");
+        assert_eq!(installs[3].chart, op_chart.to_string_lossy());
+        assert_eq!(installs[3].namespace, "apprafter-system");
+        assert_eq!(installs[3].values_path, op_values);
+        assert!(installs[3].version.is_none(), "operator chart is local-path");
+
+        let applies = kubectl.applies.borrow();
+        // 5 applies: Gateway CRDs URL, Application CRD, default-deny,
+        // ClusterIssuer, admission-webhook.
+        assert_eq!(applies.len(), 5);
+        match &applies[4].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &aw_manifest),
+            other => panic!("fifth apply must be admission-webhook Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operator_enabled_false_skips_helm_install() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let aw_manifest = PathBuf::from("/tmp/admission-webhook.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &app_crd,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            None, // operator chart — skipped via spec.operator.enabled: false at the caller
+            None, // operator values — paired
+            Some(&aw_manifest),
+            None,
+            None,
+            None,
+        )
+        .expect("bootstrap");
+
+        let installs = helm.installs.borrow();
+        assert!(
+            !installs.iter().any(|i| i.release == "apprafter-operator"),
+            "operator should not be installed when chart path is None: {:?}",
+            installs
+        );
+        // Only the baseline 3 helm installs.
+        assert_eq!(installs.len(), 3);
+    }
+
+    #[test]
+    fn admission_webhook_enabled_false_skips_kubectl_apply() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let op_chart = PathBuf::from("/tmp/operator-chart");
+        let op_values = PathBuf::from("/tmp/operator-values.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &app_crd,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            Some(&op_chart),
+            Some(&op_values),
+            None, // admission_webhook_path — None means skip
+            None,
+            None,
+            None,
+        )
+        .expect("bootstrap");
+
+        let applies = kubectl.applies.borrow();
+        // Baseline 4 applies: Gateway CRDs URL, Application CRD,
+        // default-deny, ClusterIssuer. No admission-webhook path.
+        assert_eq!(applies.len(), 4);
+        for a in applies.iter() {
+            if let ManifestSource::Path(p) = &a.0 {
+                assert!(
+                    !p.to_string_lossy().contains("admission-webhook"),
+                    "should not apply admission-webhook when None: {p:?}",
+                );
+            }
+        }
+    }
+
+    // Tests `operator_image_override_with_colon_uses_full_ref_verbatim` and
+    // `operator_tag_override_alone_keeps_default_registry` live with Task 8,
+    // where the manifest-block → resolved-image helper is introduced.
+
+    #[test]
     fn decrypt_cached_kubeconfig_prefers_age_then_falls_back_to_plaintext() {
         let hetzner = cli_state::HetznerCloudState {
             server_id: 1,
