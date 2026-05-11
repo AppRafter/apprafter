@@ -11,6 +11,62 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.65 — Phase 1 patch — §1.15 Level C GitOps integration (2026-05-11)
+
+### Added
+
+- **`APPRAFTER_ARGOCD_REPO_TOKEN` env-var → auto-provisioned Argo
+  CD repo-credentials Secret** (§1.15) — when the env-var is set
+  alongside `spec.argocd.bootstrapRepo`, `cluster-bootstrap` creates
+  the `apprafter-bootstrap-repo-creds` Secret in the `argocd`
+  namespace with the `argocd.argoproj.io/secret-type: repository`
+  label. Argo CD discovers it automatically and scopes HTTPS basic-
+  auth to the configured `bootstrapRepo`. Closes the gap where
+  private GitHub/GitLab repos required a `kubectl apply` of a Secret
+  by hand. The companion env-var `APPRAFTER_ARGOCD_REPO_USERNAME`
+  overrides the default username (`apprafter`).
+- **`cli-providers::k8s::argocd_repo_secret` builder** — pure
+  `argocd_repo_secret_yaml(repo_url, username, token) -> String`
+  with constants `APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET` +
+  `ARGOCD_REPO_USERNAME_DEFAULT`. 4 unit tests cover label set
+  (`apprafter=true` + `argocd.argoproj.io/secret-type: repository`),
+  field propagation (url + username + password), and `type: Opaque`.
+- **`docs/operator-guide/gitops-walk.md`** — 4-quadrant manual
+  runbook (GitHub × GitLab × public × private) with prerequisites,
+  per-quadrant step-by-step instructions, DoD checklists, and
+  troubleshooting tables. Includes token-rotation + revoke sections.
+- **`cluster_bootstrap.rs::read_argocd_repo_creds`** — testable
+  helper that reads the two env-vars through an injected closure
+  (no `std::env::set_var` in tests). 4 unit tests.
+
+### Changed
+
+- **`perform_bootstrap` signature grows one parameter** —
+  `argocd_repo_secret_path: Option<&Path>` inserted between
+  `admission_webhook_path` and `argocd_gateway_path` (bootstrap-
+  order step 9.5, between webhook and Argo CD HTTPRoute). The
+  Secret is applied before the bootstrap `Application` so Argo
+  CD's first reconcile sees credentials. All 8 pre-existing
+  orchestration tests updated for the new arg position.
+- **`ClusterSettings` gains `argocd_repo_creds: Option<(String, String)>`**
+  — resolved at `cluster-bootstrap` time from env-vars. `None`
+  means public-repo path (no Secret created).
+
+### Tests
+
+- `argocd_repo_secret::tests` — 4 unit tests for the YAML builder.
+- `cluster_bootstrap::tests` — 4 new helper unit tests
+  (`read_argocd_repo_creds_*`) + 3 new orchestration tests
+  (`bootstrap_repo_with_token_creates_repo_secret_before_bootstrap_app`,
+  `bootstrap_repo_without_token_skips_secret_but_keeps_bootstrap_app`,
+  `no_bootstrap_repo_skips_both_secret_and_app`).
+
+### Docs
+
+- `quickstart.md` §3 gains the new env-var bullet pointing at the
+  walk runbook.
+- `plan.md` §1.15 entry with 10 deliverable checkboxes.
+
 ## v0.1.64 — Phase 1 patch — §1.14 Level B integration (2026-05-11)
 
 ### Added

@@ -696,6 +696,30 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
+### 1.15 Level C GitOps cycle (env-driven Argo CD repo credentials) ✅
+
+> v0.1.65 — sub-phase 1.15 shipped: `cluster-bootstrap` provisions the `apprafter-bootstrap-repo-creds` Argo CD Secret automatically when `APPRAFTER_ARGOCD_REPO_TOKEN` is set, enabling private GitHub/GitLab `spec.argocd.bootstrapRepo` without `kubectl apply` of a Secret by hand. Public-repo path unchanged. 4-quadrant manual walk documented in `docs/operator-guide/gitops-walk.md`.
+
+**Поставка (v0.1.65):**
+- [x] `cli-providers::k8s::argocd_repo_secret` — pure builder + 2 constants (4 unit tests).
+- [x] `cluster_bootstrap::read_argocd_repo_creds` testable helper over injected env-lookup closure (4 unit tests).
+- [x] `ClusterSettings` gains `argocd_repo_creds: Option<(String, String)>`; `default_cluster_settings` + `read_cluster_settings_from_manifest` populate it from env.
+- [x] `perform_bootstrap` gains `argocd_repo_secret_path: Option<&Path>` parameter at bootstrap step 9.5 (between webhook and Argo CD HTTPRoute).
+- [x] `run()` builds the tempfile when both creds + `bootstrap_repo` are `Some`, wires path through.
+- [x] Success-message suffix mentions repo-creds Secret when applied.
+- [x] 3 new orchestration tests (token+repo creates Secret before bootstrap App; token absent skips Secret but keeps App; no bootstrap repo skips both).
+- [x] 8 pre-existing orchestration tests updated for the new arg position.
+- [x] `docs/operator-guide/gitops-walk.md` — 4-quadrant runbook (GitHub × GitLab × public × private) with prereqs, DoD checklists, troubleshooting matrices, token-rotation + revoke sections.
+- [x] `docs/operator-guide/quickstart.md` §3 gains the env-var opt-in bullet.
+
+**Acceptance:** против чистого Hetzner кластера новый оператор проходит manual walk из spec §1.15 (все 4 квадранта end-to-end), каждый walk заканчивается зелёным DoD checklist (Argo CD UI: bootstrap = Synced + Healthy; child Application reconcilen оператором; для private — Secret присутствует в argocd ns).
+
+**Зависит от:** 1.14
+
+**Размер:** S (один цикл, ~2 рабочих дня кода + manual walk)
+
+---
+
 ## Фаза 2 — Платформенные сервисы (M2) ⚡
 
 **Цель фазы:** Application может декларировать `needs.{pg,jetstream,redis}` — операторы и ServiceProvider'ы выделяют ресурсы автоматически.
@@ -1978,4 +2002,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-11 | Phase 1 patch — CRD объявляет `.status` schema (раньше было только `subresources.status: {}` без `properties.status`, operator PATCH падал на `.status: field not declared in schema`); +1 regression-guard тест; v0.1.62 | initial |
 | 2026-05-11 | Phase 1 patch — hot-reconcile loop из-за `lastTransitionTime = now()` на каждом reconcile; теперь preserve when status unchanged (k8s `meta/v1.Condition` semantics); +2 regression-guard теста; v0.1.63 | initial |
 | 2026-05-11 | Phase 1 Level B integration — default-on operator + webhook (§1.14); v0.1.64 | initial |
+| 2026-05-11 | Phase 1 Level C GitOps — env-driven Argo CD repo credentials (§1.15); v0.1.65 | initial |
 
