@@ -31,6 +31,7 @@ ureq                 = { version = "2.10", features = ["json"] }
 mockito              = "1.5"
 age                  = { version = "0.10", default-features = false, features = ["armor"] }
 base64               = "0.22"
+include_dir          = "0.7"
 
 [profile.release]
 lto         = "thin"
