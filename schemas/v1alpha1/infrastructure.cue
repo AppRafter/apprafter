@@ -91,16 +91,28 @@ package v1alpha1
 			image?:  string
 		}
 
-		// Optional admission-webhook deploy. When `image` is set,
-		// `platform-cli cluster-bootstrap` provisions the
-		// admission-webhook stack (Namespace + cert-manager
+		// AppRafter operator helm release. From v0.1.64 onwards
+		// `cluster-bootstrap` installs the operator in
+		// `apprafter-system` by default using the released ghcr.io
+		// image. Set `enabled: false` to skip; override `image`
+		// and/or `tag` for fork / dev builds. See ADR / changelog
+		// for the §1.14 default-on flip.
+		operator?: {
+			enabled?: bool
+			image?:   string
+			tag?:     string
+		}
+
+		// AppRafter admission-webhook stack (Namespace + cert-manager
 		// Certificate + Service + Deployment +
-		// ValidatingWebhookConfiguration) in the `apprafter-system`
-		// namespace. Without the manifest opt-in, no webhook is
-		// deployed and the Application CRD relies solely on its
-		// OpenAPI v3 schema for validation.
+		// ValidatingWebhookConfiguration). From v0.1.64 onwards the
+		// stack installs in `apprafter-system` by default using the
+		// released ghcr.io image. Set `enabled: false` to skip;
+		// override `image` and/or `tag` for fork / dev builds.
 		admissionWebhook?: {
-			image?: string
+			enabled?: bool
+			image?:   string
+			tag?:     string
 		}
 	}
 }
