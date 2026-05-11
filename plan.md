@@ -672,6 +672,30 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
+### 1.14 Level B integration cycle (default-on operator + webhook) ✅
+
+> v0.1.64 — sub-phase 1.14 shipped: `cluster-bootstrap` installs the AppRafter operator + admission-webhook by default from ghcr.io images published by `release-operator.yml`. Default-on semantics with opt-out via `spec.{operator,admissionWebhook}.enabled: false`. Fork builds override via `image` + `tag` fields; variant-C resolution semantics (full-ref ignores `tag`).
+
+**Поставка (v0.1.64):**
+- [x] `cli-providers::k8s::image_ref` — `RELEASED_OPERATOR_VERSION` const + `resolve_image_ref` variant-C helper (6 unit tests).
+- [x] `cli-providers::k8s::operator_values` — pure values-YAML builder (3 unit tests).
+- [x] `cli-providers::k8s::operator_chart` — `include_dir!`-embedded helm chart + runtime extractor (2 tests).
+- [x] `cli-core::manifest` — `OperatorBlock` + extended `AdmissionWebhookBlock` (4 schema tests).
+- [x] `HelmUpgradeArgs.version` → `Option<String>` (allows local-path chart installs).
+- [x] `perform_bootstrap` gains operator + webhook orchestration steps in `apprafter-system` (step 8 + step 9 per spec).
+- [x] 5 new orchestration tests (default install order; operator opt-out; webhook opt-out; full-ref override; tag-only override).
+- [x] CUE schema extension: `spec.operator?:` block + extended `spec.admissionWebhook?:`.
+- [x] `e2e/mvp.sh` Phase 6.5 — apply Application CR + poll status `Ready` + assert child Deployment `Available` (60s deadline).
+- [x] `docs/operator-guide/quickstart.md` §5 rewrite (operator pod required → operator pod installed by default).
+
+**Acceptance:** против чистого Hetzner кластера новый оператор проходит manual walk из spec §1.14 (init → apply → kubeconfig → cluster-bootstrap → kubectl apply Application → `.status.phase == Ready` за 60с → child Deployment живой) без `helm install` руками и без «build your own image».
+
+**Зависит от:** 1.13
+
+**Размер:** S (один цикл, ~3 рабочих дня)
+
+---
+
 ## Фаза 2 — Платформенные сервисы (M2) ⚡
 
 **Цель фазы:** Application может декларировать `needs.{pg,jetstream,redis}` — операторы и ServiceProvider'ы выделяют ресурсы автоматически.
@@ -1953,4 +1977,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-11 | Phase 1 patch — operator pod CrashLoopBackOff: `install_rustls_crypto_provider()` перед `Client::try_default` (rustls 0.23+ убрал auto-default); + 2 regression-guard unit-теста; v0.1.61 | initial |
 | 2026-05-11 | Phase 1 patch — CRD объявляет `.status` schema (раньше было только `subresources.status: {}` без `properties.status`, operator PATCH падал на `.status: field not declared in schema`); +1 regression-guard тест; v0.1.62 | initial |
 | 2026-05-11 | Phase 1 patch — hot-reconcile loop из-за `lastTransitionTime = now()` на каждом reconcile; теперь preserve when status unchanged (k8s `meta/v1.Condition` semantics); +2 regression-guard теста; v0.1.63 | initial |
+| 2026-05-11 | v0.1.64 | 1.14 (Phase 1 Level B integration) | ✅ |
 

@@ -11,6 +11,73 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.64 — Phase 1 patch — §1.14 Level B integration (2026-05-11)
+
+### Added
+
+- **`spec.operator` block + default-on operator install** (§1.14)
+  — `platform-cli cluster-bootstrap` now installs the AppRafter
+  operator helm release in `apprafter-system` by default, using
+  the `ghcr.io/apprafter/apprafter-operator:v0.1.64` image
+  published by `release-operator.yml`. Manifest opt-out via
+  `spec.operator.enabled: false`; fork builds override via
+  `spec.operator.image` and/or `spec.operator.tag`. The
+  `RELEASED_OPERATOR_VERSION = "v0.1.64"` constant in
+  `cli-providers::k8s::image_ref` is the single source of truth
+  for both operator and admission-webhook image tags (paired
+  release from the same workflow run).
+- **`resolve_image_ref` helper** with variant-C override semantics
+  — `image` with `:` is a full ref (tag-field ignored); without
+  `:` it's a bare repo composed with the explicit-or-default tag.
+  Six unit tests cover every row of the design's override-table.
+- **Embedded operator helm chart** — the `include_dir!`-bundled
+  `operator/charts/apprafter-operator/` extracts to a tempdir at
+  `cluster-bootstrap` time, then `helm upgrade --install` runs
+  against the local-path chart. Keeps `platform-cli` installable
+  as a single binary (no out-of-repo dependency).
+- **e2e/mvp.sh Phase 6.5** — between the endpoint-verify and
+  destroy phases the harness now applies
+  `manifests/tier-1/application/example-app.yaml`, polls
+  `.status.phase` until `Ready` (60s deadline), and asserts the
+  operator-rendered child Deployment is `Available`. Nightly CI
+  thus exercises the operator reconcile path end-to-end.
+
+### Changed
+
+- **`spec.admissionWebhook` semantics flip — default-on**
+  (one-time backward-incompatible change). In v0.1.63 and earlier
+  the absence of `spec.admissionWebhook.image` meant "do not
+  install"; from v0.1.64 onwards the absence of the whole block
+  or any of its fields means "install with the released image".
+  The block gains `enabled?: bool` (opt-out) and `tag?: string`
+  (override only the tag) to mirror the `spec.operator` shape.
+  The pre-v0.1.64 `image: "..."` shape continues to parse without
+  errors. Documented in the `## v0.1.64` block above and in
+  `docs/operator-guide/quickstart.md`.
+- **`HelmUpgradeArgs.version: String` → `Option<String>`** — lets
+  the new operator install reference the embedded chart by local
+  path (version comes from `Chart.yaml`, not `--version`). Cilium
+  / Argo CD / cert-manager continue to pass `Some(<pinned>)`.
+
+### Tests
+
+- `image_ref::tests` — 6 unit tests covering every row of the
+  override-semantics table.
+- `operator_values::tests` — 3 unit tests asserting the values
+  YAML overrides only image fields (everything else stays at
+  chart defaults).
+- `operator_chart::tests::embedded_chart_contains_chart_yaml_and_templates`
+  — runtime extraction smoke test verifying the embedded chart is
+  intact.
+- `cli-core::manifest::tests` — 4 new tests covering
+  `OperatorBlock` + extended `AdmissionWebhookBlock` parsing
+  (forward + backward shapes).
+- `cluster_bootstrap::tests` — 5 new tests (3 from §1.14 task 7,
+  2 from task 8) covering default install order, opt-out
+  semantics, and image-override propagation.
+- `cli-providers::k8s::helm::tests::upgrade_install_command_omits_version_flag_when_none`
+  — regression-guard for the `Option<String>` refactor.
+
 ## v0.1.63 — Phase 1 patch (2026-05-11)
 
 ### Fixed

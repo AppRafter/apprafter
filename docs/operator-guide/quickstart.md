@@ -87,9 +87,11 @@ Optional opt-ins (set in your `Infrastructure.cue` manifest then
   syncs into the cluster).
 - `spec.backstage.domain` + `spec.backstage.image` → Backstage
   deploys with an `app-config.yaml` ConfigMap mount.
-- `spec.admissionWebhook.image` → admission-webhook stack
-  (cert-manager Certificate + Service + Deployment +
-  ValidatingWebhookConfiguration in `apprafter-system` namespace).
+- `spec.operator.enabled: false` → skip the operator helm release
+  (default: install with the released `ghcr.io/apprafter/apprafter-operator:<tag>` image).
+- `spec.admissionWebhook.enabled: false` → skip the admission-webhook stack
+  (default: install with the released image; cert-manager Certificate +
+  Service + Deployment + ValidatingWebhookConfiguration in `apprafter-system`).
 
 See [`cli/README.md`](../../cli/README.md) for the full step list
 and how each opt-in fans out.
@@ -130,20 +132,45 @@ KUBECONFIG=/tmp/kc kubectl run -it --rm curl --image=curlimages/curl --restart=N
 
 For the same flow scripted, see [`e2e/mvp.sh`](../../e2e/mvp.sh).
 
-## 5. Use the Application CRD (operator pod required)
+## 5. Use the Application CRD
 
-The cluster has the CRD installed but no operator pod by default.
-To exercise the full Application flow you need to:
+From v0.1.64 onwards the AppRafter operator and admission-webhook
+are installed by `platform-cli cluster-bootstrap` by default — no
+"build your own image" step required. Apply an Application CR and
+the operator reconciles it into a Deployment + Service via SSA,
+writes status (`phase=Ready`, `endpointURL=...`), and the
+admission-webhook gates the create/update payload against the
+in-cluster validator.
 
-1. Build the operator image (see [`operator/README.md`](../../operator/README.md)).
-2. Push it to a registry the cluster can pull from.
-3. `helm install apprafter-operator operator/charts/apprafter-operator \
-       --namespace apprafter-system --create-namespace \
-       --set image.repository=<your-registry>/apprafter-operator \
-       --set image.tag=<your-tag>`.
-4. `kubectl apply -f manifests/tier-1/application/example-app.yaml` —
-   the operator reconciles it into a Deployment + Service via SSA
-   and writes status (`phase=Ready`, `endpointURL=...`).
+```sh
+KUBECONFIG=/tmp/kc kubectl apply -f manifests/tier-1/application/example-app.yaml
+KUBECONFIG=/tmp/kc kubectl get applications.apprafter.io parser -n default \
+    -o jsonpath='{.status.phase}'   # → Ready
+KUBECONFIG=/tmp/kc kubectl get deployment parser -n default
+```
+
+To skip either component, opt out in your `Infrastructure.cue`:
+
+```cue
+spec: {
+    operator?: { enabled: false }            // skip operator helm release
+    admissionWebhook?: { enabled: false }    // skip admission-webhook
+}
+```
+
+For fork / dev builds, override the images:
+
+```cue
+spec: {
+    operator?: {
+        image: "ghcr.io/my-fork/apprafter-operator"
+        tag:   "dev"
+    }
+}
+```
+
+See [`schemas/v1alpha1/infrastructure.cue`](../../schemas/v1alpha1/infrastructure.cue)
+for the full block reference.
 
 ## 6. Day-2 ops
 
