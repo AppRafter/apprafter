@@ -92,6 +92,14 @@ Optional opt-ins (set in your `Infrastructure.cue` manifest then
 - `spec.admissionWebhook.enabled: false` → skip the admission-webhook stack
   (default: install with the released image; cert-manager Certificate +
   Service + Deployment + ValidatingWebhookConfiguration in `apprafter-system`).
+- `APPRAFTER_ARGOCD_REPO_TOKEN` env-var → creates the Argo CD
+  `apprafter-bootstrap-repo-creds` Secret in the `argocd` namespace
+  scoping HTTPS basic-auth to `spec.argocd.bootstrapRepo`. Required for
+  private GitHub/GitLab repos; ignored when `bootstrapRepo` is unset or
+  the repo is publicly cloneable. Optional companion env-var
+  `APPRAFTER_ARGOCD_REPO_USERNAME` overrides the default username
+  (`apprafter`). See
+  [`gitops-walk.md`](./gitops-walk.md) for the 4-quadrant walk.
 
 See [`cli/README.md`](../../cli/README.md) for the full step list
 and how each opt-in fans out.
