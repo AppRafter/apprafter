@@ -11,6 +11,32 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.63 — Phase 1 patch (2026-05-11)
+
+### Fixed
+
+- **Operator hot-reconcile loop: preserve `lastTransitionTime` on
+  same-status updates** (v0.1.63) — after the v0.1.62 CRD fix
+  let the operator reach `phase: Ready`, controller logs showed
+  ~10 reconciles per 100ms indefinitely. Each reconcile set
+  `last_transition_time: Utc::now()` regardless of whether the
+  Ready condition's `status` had actually changed, so the
+  status-subresource patch produced a diff on every cycle, the
+  apiserver fired a watch event on the operator's own write,
+  and the controller re-reconciled — closing the loop.
+  Per `meta/v1.Condition` semantics, `lastTransitionTime` moves
+  ONLY when `status` transitions (False ↔ True). Fix:
+  `ready_condition` now takes the previous condition slice; if
+  a Ready condition with the same `status` already exists, its
+  timestamp is reused. An idle Ready Application now produces
+  identical status objects on the 60s safety-resync → SSA patch
+  is a no-op → no watch event → no re-reconcile. Two new
+  regression-guard tests cover both directions (preserve on
+  same status, bump on actual transition). The 60s requeue at
+  reconcile-bottom stays — that is the defensive resync floor,
+  not the primary trigger; watch-event-driven reconcile remains
+  the primary path.
+
 ## v0.1.62 — Phase 1 patch (2026-05-11)
 
 ### Fixed

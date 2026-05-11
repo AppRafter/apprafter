@@ -1952,4 +1952,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-11 | Phase 1 patch — `helm template` whitespace-trim съедал newline между SPDX-комментом и `apiVersion:` в `serviceaccount.yaml`/`rbac.yaml` чарта operator; v0.1.60 | initial |
 | 2026-05-11 | Phase 1 patch — operator pod CrashLoopBackOff: `install_rustls_crypto_provider()` перед `Client::try_default` (rustls 0.23+ убрал auto-default); + 2 regression-guard unit-теста; v0.1.61 | initial |
 | 2026-05-11 | Phase 1 patch — CRD объявляет `.status` schema (раньше было только `subresources.status: {}` без `properties.status`, operator PATCH падал на `.status: field not declared in schema`); +1 regression-guard тест; v0.1.62 | initial |
+| 2026-05-11 | Phase 1 patch — hot-reconcile loop из-за `lastTransitionTime = now()` на каждом reconcile; теперь preserve when status unchanged (k8s `meta/v1.Condition` semantics); +2 regression-guard теста; v0.1.63 | initial |
 
