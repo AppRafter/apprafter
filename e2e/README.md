@@ -12,14 +12,8 @@ Provisions a fresh single-node cluster, bootstraps the in-cluster
 stack (Cilium + Gateway API CRDs + Application CRD + Argo CD +
 cert-manager + ClusterIssuer), applies a plain `Deployment` +
 `Service` running `nginxdemos/hello:plain-text`, verifies the
-endpoint via an in-cluster `curl` pod, and destroys.
-
-The script does **NOT** install the AppRafter operator pod (its
-container image isn't published yet — see the manual operator
-quickstart at `docs/operator-guide/quickstart.md` for the full
-Application-CRD flow). It tests the cluster lifecycle path end to
-end; the Application reconcile loop is exercised by hand against a
-real operator build.
+endpoint via an in-cluster `curl` pod, applies an `Application` CR
+and asserts the operator reconciles it to `Ready`, and destroys.
 
 ### Usage
 
@@ -48,7 +42,8 @@ export APPRAFTER_SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
 | 4. apply hello-world                     | <5s     | 5-8 min    |
 | 5. wait for pod ready                    | 10-30s  | 5-9 min    |
 | 6. verify endpoint                       | <10s    | 5-9 min    |
-| 7. destroy                               | ~30s    | 6-9 min    |
+| 6.5. apply Application CR + reconcile    | <60s    | 6-9 min    |
+| 7. destroy                               | ~30s    | 6-10 min   |
 
 Target time-to-first-Application: **< 30 minutes** (plan.md §1.12).
 The smoke usually lands in 6-9 minutes wall-clock; the budget is
@@ -56,12 +51,8 @@ generous.
 
 ### What's missing
 
-- The AppRafter operator pod itself isn't installed (operator
-  image isn't published yet). The full
-  `apprafter.io/v1alpha1.Application` flow lives in the manual
-  operator quickstart.
-- CI nightly job + auto-trigger — lands in v0.1.40 (sub-phase
-  1.12b, closes phase 1.12).
+- CI nightly auto-trigger lives in `.github/workflows/nightly.yml`
+  (shipped in v0.1.40 / sub-phase 1.12b).
 - Image-build + registry-push integration — out of scope for the
   smoke; operators handle this via their own CI.
 

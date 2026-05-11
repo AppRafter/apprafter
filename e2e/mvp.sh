@@ -3,10 +3,9 @@
 #
 # AppRafter E2E MVP smoke. Provisions a fresh Hetzner cluster,
 # runs `platform-cli cluster-bootstrap`, applies a hello-world
-# workload directly via kubectl (Deployment + Service — the
-# Application CRD flow lives in the manual quickstart and lands
-# in CI once an operator image is published), verifies the
-# endpoint, and tears the cluster down.
+# workload directly via kubectl (Deployment + Service), verifies the
+# endpoint, then applies an Application CR and asserts the operator
+# reconciles it to Ready, and tears the cluster down.
 #
 # Required env:
 #   HCLOUD_TOKEN              — Hetzner Cloud API token
@@ -189,6 +188,38 @@ else
     echo "$output" >&2
     exit 1
 fi
+
+# ---------------------------------------------------------------
+# Phase 6.5: Application CRD end-to-end (§1.14 integration cycle)
+# ---------------------------------------------------------------
+
+phase "Phase 6.5: Application reconcile through operator"
+kubectl apply -f manifests/tier-1/application/example-app.yaml
+
+# Poll .status.phase up to 60s. Operator's reconcile loop typically
+# resolves in <5s once the controller leader-elects, but allow
+# headroom for the helm release to finish settling.
+deadline=$(( $(date +%s) + 60 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    phase_val=$(kubectl get applications.apprafter.io parser \
+        -n default -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    if [ "$phase_val" = "Ready" ]; then
+        echo "  Application parser → phase: Ready"
+        break
+    fi
+    sleep 2
+done
+
+if [ "$phase_val" != "Ready" ]; then
+    echo "  Application parser did not reach phase: Ready within 60s" >&2
+    echo "  last seen: '$phase_val'" >&2
+    kubectl describe application.apprafter.io parser -n default >&2
+    exit 1
+fi
+
+kubectl wait --for=condition=Available deployment/parser \
+    --namespace default --timeout=60s
+echo "  child Deployment parser → Available"
 
 # ---------------------------------------------------------------
 # Phase 7: destroy (unless opted out)
