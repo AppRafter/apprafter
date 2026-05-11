@@ -113,10 +113,22 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         .and_then(|s| s.metadata.name.as_deref())
         .map(|svc_name| cluster_internal_endpoint_url(svc_name, &namespace, 80));
 
+    // Preserve lastTransitionTime if the previous Ready condition
+    // already had the same `status` value — per k8s convention the
+    // timestamp moves only when `status` transitions. Without this,
+    // each reconcile bumps the timestamp → status diff → watch
+    // event on our own write → fresh reconcile → hot loop spinning
+    // the operator's CPU.
+    let previous_conditions = app
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
     let conditions = vec![ready_condition(
         "True",
         "ReconcileSucceeded",
         "Reconcile completed; child Deployment and Service applied.",
+        previous_conditions,
     )];
     let status = build_status(&app, "Ready", conditions, endpoint_url);
     apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
@@ -239,11 +251,28 @@ fn build_status(
     }
 }
 
-fn ready_condition(status: &str, reason: &str, message: &str) -> ApplicationCondition {
+fn ready_condition(
+    status: &str,
+    reason: &str,
+    message: &str,
+    previous: &[ApplicationCondition],
+) -> ApplicationCondition {
+    // Per k8s convention, `lastTransitionTime` moves only when the
+    // condition's `status` field changes (False → True etc.). If
+    // we just observed a Ready condition with the same `status`
+    // value, reuse its timestamp. This is what stops the v0.1.61
+    // hot-reconcile loop: identical status output ⇒ SSA patch is
+    // a no-op ⇒ no watch event on our own write ⇒ no spurious
+    // re-reconcile.
+    let last_transition_time = previous
+        .iter()
+        .find(|c| c.type_ == "Ready" && c.status == status)
+        .map(|c| c.last_transition_time.clone())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
     ApplicationCondition {
         type_: "Ready".to_string(),
         status: status.to_string(),
-        last_transition_time: Utc::now().to_rfc3339(),
+        last_transition_time,
         reason: reason.to_string(),
         message: message.to_string(),
         observed_generation: None,
@@ -288,7 +317,7 @@ mod tests {
     fn build_status_carries_observed_generation_phase_and_endpoint() {
         let mut app = Application::new("web", ApplicationSpec::default());
         app.metadata.generation = Some(7);
-        let conds = vec![ready_condition("True", "Ok", "ok")];
+        let conds = vec![ready_condition("True", "Ok", "ok", &[])];
         let s = build_status(&app, "Ready", conds, Some("http://x:80".into()));
         assert_eq!(s.phase.as_deref(), Some("Ready"));
         assert_eq!(s.observed_generation, Some(7));
@@ -300,11 +329,67 @@ mod tests {
     }
 
     #[test]
+    fn ready_condition_preserves_transition_time_when_status_unchanged() {
+        // Regression guard for v0.1.63: the operator wrote status
+        // on every reconcile, and the previous `ready_condition`
+        // always set `Utc::now()` for lastTransitionTime — so each
+        // write produced a status-diff, the apiserver fired a
+        // watch event on our own update, and the controller looped
+        // hot. Per k8s convention `lastTransitionTime` moves only
+        // when the condition's `status` value changes. With the
+        // fix in place, a second `ready_condition` call carrying
+        // the previous condition slice must return the SAME
+        // timestamp string.
+        let previous = vec![ApplicationCondition {
+            type_: "Ready".to_string(),
+            status: "True".to_string(),
+            last_transition_time: "2026-05-11T00:21:18.194260724+00:00".to_string(),
+            reason: "ReconcileSucceeded".to_string(),
+            message: "first reconcile".to_string(),
+            observed_generation: None,
+        }];
+        let next = ready_condition(
+            "True",
+            "ReconcileSucceeded",
+            "Reconcile completed; child Deployment and Service applied.",
+            &previous,
+        );
+        assert_eq!(
+            next.last_transition_time, previous[0].last_transition_time,
+            "lastTransitionTime must be preserved when status is unchanged (k8s convention)"
+        );
+        assert_eq!(next.status, "True");
+    }
+
+    #[test]
+    fn ready_condition_bumps_transition_time_when_status_flips() {
+        // The other half of the invariant: when status DOES change
+        // (True ↔ False), the timestamp MUST move forward so
+        // downstream tooling (alertmanager, dashboards, audit
+        // logs) sees a real transition event.
+        let previous = vec![ApplicationCondition {
+            type_: "Ready".to_string(),
+            status: "False".to_string(),
+            last_transition_time: "2026-05-11T00:00:00+00:00".to_string(),
+            reason: "ApplyFailed".to_string(),
+            message: "old".to_string(),
+            observed_generation: None,
+        }];
+        let next = ready_condition("True", "ReconcileSucceeded", "now ok", &previous);
+        assert_ne!(
+            next.last_transition_time, previous[0].last_transition_time,
+            "lastTransitionTime must change when status flips False → True"
+        );
+        assert_eq!(next.status, "True");
+    }
+
+    #[test]
     fn ready_condition_has_rfc3339_timestamp_and_required_fields() {
         let c = ready_condition(
             "False",
             "ApplyFailed",
             "the deployment apply step returned an error",
+            &[],
         );
         assert_eq!(c.type_, "Ready");
         assert_eq!(c.status, "False");
