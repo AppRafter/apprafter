@@ -15,7 +15,11 @@ pub const CILIUM_CHART_VERSION: &str = "1.16.5";
 pub struct HelmUpgradeArgs {
     pub release: String,
     pub chart: String,
-    pub version: String,
+    /// Chart version override. `None` means "use whatever is in
+    /// the chart's `Chart.yaml`" — necessary when the chart is
+    /// referenced by local-path (e.g. an embedded helm chart
+    /// extracted to a tempdir).
+    pub version: Option<String>,
     pub namespace: String,
     pub values_path: PathBuf,
     pub kubeconfig_path: PathBuf,
@@ -45,10 +49,11 @@ impl HelmCli {
         c.arg("upgrade")
             .arg("--install")
             .arg(&args.release)
-            .arg(&args.chart)
-            .arg("--version")
-            .arg(&args.version)
-            .arg("--namespace")
+            .arg(&args.chart);
+        if let Some(v) = &args.version {
+            c.arg("--version").arg(v);
+        }
+        c.arg("--namespace")
             .arg(&args.namespace)
             .arg("--create-namespace")
             .arg("--values")
@@ -119,7 +124,7 @@ mod tests {
         let cmd = HelmCli::build_upgrade_install_command(&HelmUpgradeArgs {
             release: "cilium".into(),
             chart: "cilium/cilium".into(),
-            version: "1.16.5".into(),
+            version: Some("1.16.5".into()),
             namespace: "kube-system".into(),
             values_path: "/tmp/values.yaml".into(),
             kubeconfig_path: "/tmp/kubeconfig".into(),
@@ -145,5 +150,22 @@ mod tests {
             );
         }
         assert!(!args.iter().any(|a| a == "KUBECONFIG"), "{args:?}");
+    }
+
+    #[test]
+    fn upgrade_install_command_omits_version_flag_when_none() {
+        let cmd = HelmCli::build_upgrade_install_command(&HelmUpgradeArgs {
+            release: "apprafter-operator".into(),
+            chart: "/tmp/extracted-chart".into(),
+            version: None,
+            namespace: "apprafter-system".into(),
+            values_path: "/tmp/operator-values.yaml".into(),
+            kubeconfig_path: "/tmp/kubeconfig".into(),
+        });
+        let args = argv(&cmd);
+        assert!(!args.iter().any(|a| a == "--version"), "{args:?}");
+        // The rest of the flags must still be present.
+        assert!(args.iter().any(|a| a == "--create-namespace"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--wait"), "{args:?}");
     }
 }

@@ -212,7 +212,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm.upgrade_install(&HelmUpgradeArgs {
         release: "cilium".into(),
         chart: "cilium/cilium".into(),
-        version: CILIUM_CHART_VERSION.into(),
+        version: Some(CILIUM_CHART_VERSION.into()),
         namespace: "kube-system".into(),
         values_path: cilium_values_path.to_path_buf(),
         kubeconfig_path: kubeconfig_path.to_path_buf(),
@@ -234,7 +234,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm.upgrade_install(&HelmUpgradeArgs {
         release: "argocd".into(),
         chart: "argo/argo-cd".into(),
-        version: ARGOCD_CHART_VERSION.into(),
+        version: Some(ARGOCD_CHART_VERSION.into()),
         namespace: "argocd".into(),
         values_path: argocd_values_path.to_path_buf(),
         kubeconfig_path: kubeconfig_path.to_path_buf(),
@@ -244,7 +244,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     helm.upgrade_install(&HelmUpgradeArgs {
         release: "cert-manager".into(),
         chart: "jetstack/cert-manager".into(),
-        version: CERT_MANAGER_CHART_VERSION.into(),
+        version: Some(CERT_MANAGER_CHART_VERSION.into()),
         namespace: "cert-manager".into(),
         values_path: cert_manager_values_path.to_path_buf(),
         kubeconfig_path: kubeconfig_path.to_path_buf(),
@@ -379,14 +379,14 @@ mod tests {
         let installs = helm.installs.borrow();
         assert_eq!(installs.len(), 3);
         assert_eq!(installs[0].release, "cilium");
-        assert_eq!(installs[0].version, CILIUM_CHART_VERSION);
+        assert_eq!(installs[0].version.as_deref(), Some(CILIUM_CHART_VERSION));
 
         assert_eq!(installs[1].release, "argocd");
-        assert_eq!(installs[1].version, ARGOCD_CHART_VERSION);
+        assert_eq!(installs[1].version.as_deref(), Some(ARGOCD_CHART_VERSION));
 
         assert_eq!(installs[2].release, "cert-manager");
         assert_eq!(installs[2].chart, "jetstack/cert-manager");
-        assert_eq!(installs[2].version, CERT_MANAGER_CHART_VERSION);
+        assert_eq!(installs[2].version.as_deref(), Some(CERT_MANAGER_CHART_VERSION));
         assert_eq!(installs[2].namespace, "cert-manager");
         assert_eq!(installs[2].values_path, cm_values);
 
