@@ -92,17 +92,16 @@ pub fn run() -> Result<()> {
         None => None,
     };
 
-    let (operator_chart_tempdir, operator_values_file) = if let Some(image_ref) =
-        &cluster.operator_image
-    {
-        let (split_repo, split_tag) = split_image_ref(image_ref);
-        let values_yaml = operator_values_yaml(&split_repo, &split_tag);
-        let values_file = write_tempfile_with("apprafter-operator-values-", &values_yaml)?;
-        let (tempdir, _root) = extract_operator_chart_to_tempdir()?;
-        (Some(tempdir), Some(values_file))
-    } else {
-        (None, None)
-    };
+    let (operator_chart_tempdir, operator_values_file) =
+        if let Some(image_ref) = &cluster.operator_image {
+            let (split_repo, split_tag) = split_image_ref(image_ref);
+            let values_yaml = operator_values_yaml(&split_repo, &split_tag);
+            let values_file = write_tempfile_with("apprafter-operator-values-", &values_yaml)?;
+            let (tempdir, _root) = extract_operator_chart_to_tempdir()?;
+            (Some(tempdir), Some(values_file))
+        } else {
+            (None, None)
+        };
 
     let admission_webhook_file = if let Some(image_ref) = &cluster.admission_webhook_image {
         Some(write_tempfile_with(
@@ -113,7 +112,9 @@ pub fn run() -> Result<()> {
         None
     };
 
-    let operator_chart_path = operator_chart_tempdir.as_ref().map(|d| d.path().to_path_buf());
+    let operator_chart_path = operator_chart_tempdir
+        .as_ref()
+        .map(|d| d.path().to_path_buf());
 
     perform_bootstrap(
         &HelmCli,
@@ -263,10 +264,7 @@ fn split_image_ref(image_ref: &str) -> (String, String) {
         Some((repo, tag)) => (repo.to_string(), tag.to_string()),
         // Defensive fallback — `resolve_image_ref` guarantees a
         // colon-containing string but keep this branch typed-safe.
-        None => (
-            image_ref.to_string(),
-            RELEASED_OPERATOR_VERSION.to_string(),
-        ),
+        None => (image_ref.to_string(), RELEASED_OPERATOR_VERSION.to_string()),
     }
 }
 
@@ -490,7 +488,10 @@ mod tests {
 
         assert_eq!(installs[2].release, "cert-manager");
         assert_eq!(installs[2].chart, "jetstack/cert-manager");
-        assert_eq!(installs[2].version.as_deref(), Some(CERT_MANAGER_CHART_VERSION));
+        assert_eq!(
+            installs[2].version.as_deref(),
+            Some(CERT_MANAGER_CHART_VERSION)
+        );
         assert_eq!(installs[2].namespace, "cert-manager");
         assert_eq!(installs[2].values_path, cm_values);
 
@@ -682,8 +683,8 @@ mod tests {
             &argocd_values,
             &cm_values,
             &issuer,
-            None,                     // operator chart
-            None,                     // operator values
+            None, // operator chart
+            None, // operator values
             Some(&admission_webhook),
             Some(&gateway),
             Some(&bootstrap),
@@ -743,12 +744,19 @@ mod tests {
         .expect("bootstrap");
 
         let installs = helm.installs.borrow();
-        assert_eq!(installs.len(), 4, "expected cilium, argocd, cert-manager, operator");
+        assert_eq!(
+            installs.len(),
+            4,
+            "expected cilium, argocd, cert-manager, operator"
+        );
         assert_eq!(installs[3].release, "apprafter-operator");
         assert_eq!(installs[3].chart, op_chart.to_string_lossy());
         assert_eq!(installs[3].namespace, "apprafter-system");
         assert_eq!(installs[3].values_path, op_values);
-        assert!(installs[3].version.is_none(), "operator chart is local-path");
+        assert!(
+            installs[3].version.is_none(),
+            "operator chart is local-path"
+        );
 
         let applies = kubectl.applies.borrow();
         // 5 applies: Gateway CRDs URL, Application CRD, default-deny,
@@ -869,17 +877,14 @@ mod tests {
         assert_eq!(
             s.operator_image.as_deref(),
             Some(
-                format!("{APPRAFTER_OPERATOR_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}")
-                    .as_str()
+                format!("{APPRAFTER_OPERATOR_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}").as_str()
             )
         );
         assert_eq!(
             s.admission_webhook_image.as_deref(),
             Some(
-                format!(
-                    "{APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}"
-                )
-                .as_str()
+                format!("{APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}")
+                    .as_str()
             )
         );
     }

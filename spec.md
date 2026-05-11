@@ -2,9 +2,9 @@
 
 > **Codename:** `AppRafter`.
 > **Domain:** `apprafter.dev`.
-> **Status:** Pre-MVP design document, not yet implemented.
+> **Status:** Phase 1 (Tier 1 single-node MVP) delivered as `v0.1.0-mvp` on 2026-05-08; Phases 2–8 in active design. See `plan.md` for the phase ledger.
 > **Audience:** Architecture decisions, contributors onboarding, design rationale.
-> **Revision:** 4 (HTTP-first notifications API, platform-only templates, FSL clarification).
+> **Revision:** 5 (Phase-1 close: admission webhook split, operator Helm chart, `apprafter=true` idempotency anchor, age-encrypted state, `platform-cli import`).
 
 ---
 
@@ -371,6 +371,8 @@ This way the platform team maintains quality on the two main providers, while th
 
 `platform-cli` invokes OpenTofu under the hood for community providers; the user sees only CUE manifests and `platform-cli plan/apply`. State remains in Git.
 
+**Idempotency anchor:** built-in providers label every managed cloud object with `apprafter=true`. This single label is the canonical reference for `apply` / `destroy` / `import` — if the local state file is lost, `platform-cli import` reconstructs it by scanning live API objects for that label, without provisioning anything new. (See §4.12 for the matching CLI surface.)
+
 ### 3.8 MigrationPlan
 
 Auto-generated when a reconciler detects a destructive change (selector change for stateful claims, major version upgrades, storage class changes). Pauses execution until explicit human approval.
@@ -537,18 +539,23 @@ The operator generates the right injection mechanism based on tier (envFrom for 
 
 ### 4.5 Application Operator
 
-Custom operator written in **Rust** on **kube-rs**. Single reconcile loop, no Crossplane composition layer.
+Custom operator written in **Rust** on **kube-rs**. Distributed as a single Helm chart (`operator/charts/apprafter-operator/`) packaging two cooperating binaries — `apprafter-operator` (the reconcile loop) and `apprafter-admission-webhook` (a separate pod for cross-field validation). Image tags for both binaries are pinned by the `RELEASED_OPERATOR_VERSION` constant in `cli-providers` and built from the same git tag, so bootstrap never references a mixed pair.
 
-**Responsibilities:**
+**`apprafter-operator` — reconcile-loop responsibilities:**
 
-1. Validate `Application` manifest against CUE schema (admission webhook)
-2. Resolve per-environment overrides via CUE unification
-3. Resolve `needs` → create `ResourceClaim`s with appropriate selectors
-4. Wait for ResourceClaims to be `ready`, collect connection refs
-5. Render Deployment + Service + Gateway Route + ScaledObject (KEDA) + NetworkPolicy + EgressIP allocations from the Application
-6. Inject credentials via workload identity (SPIFFE), not mounted Secrets
-7. Configure secret injection from OpenBao (Vault Agent / CSI driver)
-8. Update `Application.status` per environment with traffic, replicas, autoscale state, recent events, current egress IP
+1. Resolve per-environment overrides (CUE unification at design time, pure-Rust override merge at runtime for v1alpha1 — switchable to CUE FFI once CUE-only constructs appear)
+2. Resolve `needs` → create `ResourceClaim`s with appropriate selectors
+3. Wait for ResourceClaims to be `ready`, collect connection refs
+4. Render Deployment + Service + Gateway Route + ScaledObject (KEDA) + NetworkPolicy + EgressIP allocations from the Application
+5. Apply children via server-side apply with field manager `apprafter-operator` (cooperates with co-owners on shared fields); cascading delete via `ownerReferences`
+6. Inject credentials via workload identity (SPIFFE), not mounted Secrets; configure secret injection from OpenBao (Vault Agent / CSI driver)
+7. Update `Application.status` per environment with `phase`, `observedGeneration`, `conditions` (`lastTransitionTime` preserved across same-status reconciles per k8s `meta/v1.Condition` semantics), traffic, replicas, autoscale state, recent events, current egress IP
+
+Leader election via Lease (10s renew / 30s expiry, holder identity from `POD_NAME`). Prometheus signals (`reconcile_total`, `reconcile_duration`, `reconcile_errors`) and axum `/healthz` / `/readyz` / `/metrics` routes.
+
+**`apprafter-admission-webhook` — validation responsibilities:**
+
+Enforces cross-field invariants the OpenAPI v3 CRD schema can't express — `image` non-empty (via `base.image` or every `environments[*].image`), env names DNS-1123, env keys `^[A-Z_][A-Z0-9_]*$`. CUE schemas stay free of half-measure regex stubs and remain the design-time view; runtime enforcement layers as **CRD OpenAPI v3 → admission webhook**. TLS cert is auto-rotated via cert-manager; `caBundle` is synced onto the `ValidatingWebhookConfiguration` via the `cert-manager.io/inject-ca-from` annotation.
 
 **Why custom over Crossplane:** see design rationale in §8.
 
@@ -734,11 +741,28 @@ Single Rust binary that manages the substrate (everything below the cluster). In
 # Initial provisioning
 platform-cli init --provider hetzner-cloud --tier solo --region nbg1
 
+# Show diff before applying
+platform-cli plan
+
 # Apply changes from Git
 platform-cli apply
 
-# Show diff before applying
-platform-cli plan
+# Tear down the cluster (idempotent; filters on apprafter=true)
+platform-cli destroy --yes
+
+# Reconstruct a lost state file by scanning live cloud resources
+platform-cli import
+
+# Retrieve the cluster kubeconfig (decrypts the age-encrypted cache, fetches via SSH on miss)
+platform-cli kubeconfig
+
+# Retrieve the Argo CD admin password (same cache semantics)
+platform-cli argocd-password
+
+# Bootstrap Cilium → Gateway API CRDs → Application CRD → default-deny NetworkPolicy →
+# Argo CD → cert-manager → self-signed ClusterIssuer (+ optional Argo CD HTTPRoute,
+# Backstage stack, operator + admission-webhook stack) on a fresh node
+platform-cli cluster-bootstrap
 
 # Tier upgrade (e.g., solo → team)
 platform-cli upgrade-tier --to team
@@ -746,6 +770,12 @@ platform-cli upgrade-tier --to team
 # User-side login after AccessGrant
 platform-cli login
 ```
+
+**State and idempotency:**
+
+- State lives at `.apprafter/state.json` (per checkout) — JSON in v0.1.x; will migrate to CUE-encoded once the state schema stabilizes.
+- Sensitive material — kubeconfig YAML, Argo CD admin password — is cached **age-encrypted** under `APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`, mode 0600, auto-created on first run). The encrypted blob lives inside `state.json`; the identity stays out of the repo.
+- All managed cloud resources are labeled `apprafter=true`. This is the canonical idempotency anchor for `apply` / `destroy` / `import`. `platform-cli import` can reconstruct a lost state file by scanning the cloud provider's API for objects with this label — no fresh provision needed.
 
 **Provider implementation strategy:**
 
@@ -798,7 +828,9 @@ platform-cli login
 
 ### Milestone M1 — MVP single-node ✅
 
-**Target:** working Tier 1 deployment on a single Hetzner CX22, deploying a hello-world Application end-to-end.
+**Delivered as `v0.1.0-mvp` on 2026-05-08.** The end-to-end path (`platform-cli init` → `apply` → `cluster-bootstrap` → Argo CD sync → operator + admission-webhook stack → Bun hello-world `Application` live) is exercised nightly by `e2e/mvp.sh` on a real Hetzner account; observed wall-clock 6–9 minutes (well under the < 30-minute solo-tier budget).
+
+**Target:** working Tier 1 deployment on a single Hetzner CX/CPX-class VDS (default `cpx22` since `v0.1.42`, after Hetzner retired `cx22` upstream), deploying a hello-world Application end-to-end.
 
 - [x] `platform-cli init` provisions k3s + NATS + Cilium + Argo CD + Backstage on fresh VDS (NATS deferred to M2; everything else lands in v0.1.2 → v0.1.20)
 - [x] Application CRD + Rust operator (basic: image, expose, no `needs` yet) (v0.1.21 → v0.1.32)
@@ -879,6 +911,11 @@ platform-cli login
 - **Build pipeline approach:** **Dockerfile-first with auto-analysis**, not magic. Buildpacks as opt-in.
 - **Infrastructure tooling — built-in vs community:** **Hetzner + AWS** as built-in (native Rust SDKs); **everything else** via `InfrastructureProviderPlugin` using OpenTofu shim under the hood. No raw Terraform/Ansible exposed to users.
 - **Migration safety:** **MigrationPlan** as a first-class concept. Destructive changes pause for explicit approval, with risk breakdown shown in Backstage.
+- **Operator deployment:** **Helm chart** at `operator/charts/apprafter-operator/`. Two binaries — `apprafter-operator` (reconcile loop) and `apprafter-admission-webhook` (cross-field validation) — ship from the same git tag, pinned by the `RELEASED_OPERATOR_VERSION` constant in `cli-providers`. Bumping the constant and tagging a release happens in the same commit/PR series; otherwise a fresh `apply` pulls a non-existent tag from GHCR and bootstrap stalls.
+- **Admission validation layering:** **CUE schemas stay design-time** and free of half-measure regex stubs. Runtime enforcement is **CRD OpenAPI v3 → admission webhook** (the webhook owns cross-field invariants like `image` non-empty, env-name DNS-1123 conformance, env-key `^[A-Z_][A-Z0-9_]*$`).
+- **Tier-1 control-plane firewall topology:** **defense in depth** via fail2ban (SSH brute-force) + the cloud-provider firewall (network-level allow-list). Evaluated and dropped (v0.1.43): ufw — silent initcaps failure on Ubuntu noble during cloud-init.
+- **Built-in cloud-provider idempotency:** every managed object is labeled `apprafter=true`; that label is the canonical anchor for `apply` / `destroy` / `import`. State at `.apprafter/state.json`; sensitive material (kubeconfig YAML, Argo CD admin password) cached **age-encrypted** under `APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`, mode 0600, auto-created on first run).
+- **k3s install profile (Tier 1):** k3s starts with five disabled subsystems — `--disable=traefik,servicelb`, `--disable-kube-proxy`, `--flannel-backend=none`, `--disable-network-policy` — so Cilium owns CNI / kube-proxy replacement / NetworkPolicy without port collisions (the embedded flannel-vxlan daemon would otherwise sit on UDP 8472 alongside Cilium's VXLAN).
 
 ### License decision
 
@@ -1067,25 +1104,48 @@ platform-cli login
 
 ---
 
-## Appendix A — Repository Structure (proposed)
+## Appendix A — Repository Structure
 
 ```
-platform/
-├── cli/                    # platform-cli (Rust)
-├── operator/               # Application/ResourceClaim/AccessGrant operator (Rust, kube-rs)
-├── schemas/                # CUE schemas for all CRDs
-├── providers/              # ServiceProvider implementations
+apprafter/
+├── cli/                            # four-crate Cargo workspace
+│   ├── platform-cli/                  # binary
+│   ├── cli-core/                      # errors, Tier, logging (tracing → stderr), CUE subprocess wrapper, secrets (age)
+│   ├── cli-state/                     # .apprafter/state.json reader/writer
+│   └── cli-providers/                 # Provider trait + Hetzner Cloud impl + k8s bootstrap renderers; owns RELEASED_OPERATOR_VERSION
+├── operator/                       # five-crate Cargo workspace + Helm chart
+│   ├── apprafter-operator/            # reconcile-loop binary
+│   ├── admission-webhook/             # cross-field validation binary (separate pod)
+│   ├── operator-core/                 # shared kube-rs types, leader election (Lease), secrets
+│   ├── operator-rendering/            # pure Application → [k8s object] function
+│   ├── operator-controllers/          # per-CRD controllers (application/…)
+│   └── charts/apprafter-operator/     # Helm chart — single source of truth for operator + webhook deployment
+├── schemas/                        # CUE schemas — design-time view of all CRDs (apprafter.io/v1alpha1)
+├── cue.mod/                        # CUE module manifest at repo root (module: "apprafter.io")
+├── providers/                      # built-in ServiceProvider implementations (statically linked into operator in M2+)
 │   ├── pg-integrated/
 │   ├── pg-aws/
 │   ├── jetstream-integrated/
 │   ├── clickhouse-integrated/
 │   ├── redis-integrated/
 │   └── s3-integrated/
-├── backstage-plugins/      # TS plugins for Backstage
-├── manifests/              # base platform manifests (per tier)
-├── docs/                   # TechDocs source
-└── examples/               # reference Applications
+├── backstage-plugins/              # TS plugins for Backstage (backends use OneBun)
+├── manifests/                      # platform manifests per tier
+│   ├── tier-1/
+│   ├── tier-2/
+│   ├── tier-3/
+│   └── tier-4/
+├── e2e/                            # end-to-end harnesses (e.g. mvp.sh — real-Hetzner smoke, ~6–9 min)
+├── docs/                           # TechDocs source + ADRs (docs/adr/) + changelog
+├── examples/                       # reference Applications + Infrastructure manifests
+└── .github/workflows/              # CI: lint, test, license-check, conventional-commits, release-operator, nightly E2E
 ```
+
+**Notes on the layout (deltas from the original sketch):**
+
+- `cue.mod/` is at the **repo root** (not under `schemas/`) so `schemas/` and `examples/` share import paths (`apprafter.io/schemas/v1alpha1`) — standard CUE monorepo practice.
+- `cli/` and `operator/` are **separate Cargo workspaces** (no top-level `Cargo.toml`); always `cd` into one before running `cargo`.
+- The OpenAPI v3 CRD shipped by `cli-providers::k8s::application_crd` and the kube-rs `Application` Rust type in `operator-core` are **hand-rolled mirrors** of `schemas/v1alpha1/Application` kept in sync by hand. There is no CUE→CRD/Rust generator yet.
 
 ---
 

@@ -56,9 +56,8 @@ fn write_dir_recursive(src: &Dir<'_>, dst: &Path) -> Result<()> {
                     .file_name()
                     .ok_or_else(|| CliError::Other("chart file without name".into()))?;
                 let path = dst.join(name);
-                std::fs::write(&path, file.contents()).map_err(|e| {
-                    CliError::Other(format!("write {}: {e}", path.display()))
-                })?;
+                std::fs::write(&path, file.contents())
+                    .map_err(|e| CliError::Other(format!("write {}: {e}", path.display())))?;
             }
         }
     }
@@ -73,7 +72,11 @@ mod tests {
     fn embedded_chart_contains_chart_yaml_and_templates() {
         let (tempdir, root) = extract_operator_chart_to_tempdir().expect("extract");
         let chart_yaml = root.join("Chart.yaml");
-        assert!(chart_yaml.exists(), "missing Chart.yaml at {}", root.display());
+        assert!(
+            chart_yaml.exists(),
+            "missing Chart.yaml at {}",
+            root.display()
+        );
         let body = std::fs::read_to_string(&chart_yaml).unwrap();
         assert!(body.contains("name: apprafter-operator"), "{body}");
 
