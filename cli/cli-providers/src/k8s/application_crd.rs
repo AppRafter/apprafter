@@ -7,9 +7,15 @@
 //! kube-apiserver's structural-schema rules forbid `$ref` /
 //! `definitions` inside CRD validation schemas.
 //!
-//! `subresources.status: {}` is declared up-front so phase 1.9 can
-//! populate `phase` / `observedGeneration` / `conditions` /
-//! `endpointURL` without a CRD-shape migration.
+//! `subresources.status: {}` enables the /status subresource —
+//! AND the schema's top-level `properties.status` block declares
+//! the field set the operator writes (`phase` / `observedGeneration`
+//! / `conditions` / `endpointURL`). Without both, the apiserver
+//! accepts the CR but rejects status-subresource PATCH with
+//! `.status: field not declared in schema` (v0.1.62 fix —
+//! previously the subresources block was present but the status
+//! schema was absent, so the operator's first reconcile against a
+//! real cluster failed on every status-write attempt).
 
 /// CRD group — `apprafter.io`. The Rust manifest mirror reads
 /// `apiVersion: apprafter.io/v1alpha1`.
@@ -132,6 +138,40 @@ spec:
                         type: object
                         additionalProperties:
                           type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                endpointURL:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
 "#
     )
 }
@@ -222,6 +262,45 @@ mod tests {
         assert!(y.contains("- public\n"), "{y}");
         assert!(y.contains("- internal\n"), "{y}");
         assert!(y.contains("- vpn\n"), "{y}");
+    }
+
+    #[test]
+    fn status_subschema_declares_every_field_the_operator_writes() {
+        // Regression guard for v0.1.62: previously the CRD enabled
+        // `subresources.status: {}` (the /status endpoint) but
+        // declared no `properties.status` block in the OpenAPIv3
+        // schema. Result: the apiserver accepted the CR on apply,
+        // and the operator's first reconcile failed with
+        // `.status: field not declared in schema` on every
+        // status-subresource PATCH. The four sub-fields must stay
+        // in lockstep with `operator-core::ApplicationStatus`.
+        let y = application_crd_yaml();
+        // The top-level status property must exist...
+        assert!(
+            y.contains("\n            status:\n              type: object"),
+            "status property must be declared at the same indent level as spec: {y}"
+        );
+        // ...and every field operator_core::ApplicationStatus
+        // writes must be in the schema.
+        for field in &[
+            "phase:",
+            "observedGeneration:",
+            "endpointURL:",
+            "conditions:",
+        ] {
+            assert!(
+                y.contains(field),
+                "ApplicationStatus.{field} must be declared in CRD properties.status; \
+                 without it `.status: field not declared in schema` from apiserver: {y}"
+            );
+        }
+        // ApplicationCondition's required fields.
+        for field in &["lastTransitionTime:", "reason:", "message:"] {
+            assert!(
+                y.contains(field),
+                "ApplicationCondition.{field} must be declared: {y}"
+            );
+        }
     }
 
     #[test]
