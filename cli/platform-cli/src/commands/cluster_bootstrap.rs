@@ -11,11 +11,13 @@ use cli_core::{CliError, Result};
 use cli_providers::k8s::{
     admission_webhook_yaml, application_crd_yaml, argocd_gateway_yaml, argocd_values_yaml,
     backstage_manifests_yaml, bootstrap_application_yaml, cert_manager_values_yaml,
-    cilium_values_yaml, default_deny_network_policy_yaml, gateway_api_crds_url,
-    selfsigned_cluster_issuer_yaml, HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli,
-    KubectlRunner, ManifestSource, APPRAFTER_OPERATOR_RELEASE_NAME, APPRAFTER_SYSTEM_NAMESPACE,
-    ARGOCD_CHART_VERSION, BACKSTAGE_DEFAULT_IMAGE, BOOTSTRAP_APP_DEFAULT_PATH,
-    CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
+    cilium_values_yaml, default_deny_network_policy_yaml, extract_operator_chart_to_tempdir,
+    gateway_api_crds_url, operator_values_yaml, resolve_image_ref, selfsigned_cluster_issuer_yaml,
+    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
+    APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE, APPRAFTER_OPERATOR_DEFAULT_IMAGE,
+    APPRAFTER_OPERATOR_RELEASE_NAME, APPRAFTER_SYSTEM_NAMESPACE, ARGOCD_CHART_VERSION,
+    BACKSTAGE_DEFAULT_IMAGE, BOOTSTRAP_APP_DEFAULT_PATH, CERT_MANAGER_CHART_VERSION,
+    CILIUM_CHART_VERSION, RELEASED_OPERATOR_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -90,13 +92,28 @@ pub fn run() -> Result<()> {
         None => None,
     };
 
-    let admission_webhook_file = match &cluster.admission_webhook_image {
-        Some(image) => Some(write_tempfile_with(
-            "apprafter-admission-webhook-",
-            &admission_webhook_yaml(image),
-        )?),
-        None => None,
+    let (operator_chart_tempdir, operator_values_file) = if let Some(image_ref) =
+        &cluster.operator_image
+    {
+        let (split_repo, split_tag) = split_image_ref(image_ref);
+        let values_yaml = operator_values_yaml(&split_repo, &split_tag);
+        let values_file = write_tempfile_with("apprafter-operator-values-", &values_yaml)?;
+        let (tempdir, _root) = extract_operator_chart_to_tempdir()?;
+        (Some(tempdir), Some(values_file))
+    } else {
+        (None, None)
     };
+
+    let admission_webhook_file = if let Some(image_ref) = &cluster.admission_webhook_image {
+        Some(write_tempfile_with(
+            "apprafter-admission-webhook-",
+            &admission_webhook_yaml(image_ref),
+        )?)
+    } else {
+        None
+    };
+
+    let operator_chart_path = operator_chart_tempdir.as_ref().map(|d| d.path().to_path_buf());
 
     perform_bootstrap(
         &HelmCli,
@@ -108,8 +125,8 @@ pub fn run() -> Result<()> {
         argocd_values_file.path(),
         cert_manager_values_file.path(),
         selfsigned_issuer_file.path(),
-        None, // operator_chart_path — wired in Task 8
-        None, // operator_values_path — wired in Task 8
+        operator_chart_path.as_deref(),
+        operator_values_file.as_ref().map(|f| f.path()),
         admission_webhook_file.as_ref().map(|f| f.path()),
         argocd_gateway_file.as_ref().map(|f| f.path()),
         bootstrap_app_file.as_ref().map(|f| f.path()),
@@ -117,6 +134,12 @@ pub fn run() -> Result<()> {
     )?;
 
     let mut suffix = String::new();
+    if cluster.operator_image.is_some() {
+        suffix.push_str(" + apprafter-operator helm release in apprafter-system");
+    }
+    if cluster.admission_webhook_image.is_some() {
+        suffix.push_str(" + admission-webhook in apprafter-system");
+    }
     if let Some(d) = &cluster.argocd_domain {
         suffix.push_str(&format!(" + Argo CD Gateway/HTTPRoute on {d}"));
     }
@@ -125,9 +148,6 @@ pub fn run() -> Result<()> {
     }
     if let Some(d) = &cluster.backstage_domain {
         suffix.push_str(&format!(" + Backstage on {d}"));
-    }
-    if cluster.admission_webhook_image.is_some() {
-        suffix.push_str(" + admission-webhook in apprafter-system");
     }
     println!(
         "cluster-bootstrap complete: cilium {CILIUM_CHART_VERSION} + Gateway API CRDs + Application CRD + default-deny NetworkPolicy + argocd {ARGOCD_CHART_VERSION} + cert-manager {CERT_MANAGER_CHART_VERSION} + self-signed ClusterIssuer{suffix} applied"
@@ -142,27 +162,72 @@ struct ClusterSettings {
     bootstrap_path: Option<String>,
     backstage_domain: Option<String>,
     backstage_image: Option<String>,
+    /// Resolved operator image reference (e.g.
+    /// `ghcr.io/apprafter/apprafter-operator:v0.1.64`). `None` only
+    /// when the user sets `spec.operator.enabled: false`.
+    operator_image: Option<String>,
+    /// Resolved admission-webhook image reference. `None` only when
+    /// the user sets `spec.admissionWebhook.enabled: false`.
     admission_webhook_image: Option<String>,
 }
 
 fn read_cluster_settings_from_manifest(cwd: &Path) -> Result<ClusterSettings> {
     let path = match std::env::var("APPRAFTER_MANIFEST") {
         Ok(p) => p,
-        Err(_) => return Ok(ClusterSettings::default()),
+        Err(_) => return Ok(default_cluster_settings()),
     };
     info!(path = %path, "reading Infrastructure manifest for cluster settings");
     let parsed: InfrastructureManifest = manifest::parse_infrastructure(cwd, Path::new(&path))?;
     let argocd = parsed.spec.argocd.unwrap_or_default();
     let backstage = parsed.spec.backstage.unwrap_or_default();
-    let admission_webhook = parsed.spec.admission_webhook.unwrap_or_default();
+    let operator_block = parsed.spec.operator.unwrap_or_default();
+    let webhook_block = parsed.spec.admission_webhook.unwrap_or_default();
+
+    let operator_image = if operator_block.enabled == Some(false) {
+        None
+    } else {
+        Some(resolve_image_ref(
+            operator_block.image.as_deref(),
+            operator_block.tag.as_deref(),
+            APPRAFTER_OPERATOR_DEFAULT_IMAGE,
+            RELEASED_OPERATOR_VERSION,
+        ))
+    };
+    let admission_webhook_image = if webhook_block.enabled == Some(false) {
+        None
+    } else {
+        Some(resolve_image_ref(
+            webhook_block.image.as_deref(),
+            webhook_block.tag.as_deref(),
+            APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE,
+            RELEASED_OPERATOR_VERSION,
+        ))
+    };
+
     Ok(ClusterSettings {
         argocd_domain: argocd.domain.filter(|d| !d.is_empty()),
         bootstrap_repo: argocd.bootstrap_repo.filter(|d| !d.is_empty()),
         bootstrap_path: argocd.bootstrap_path.filter(|d| !d.is_empty()),
         backstage_domain: backstage.domain.filter(|d| !d.is_empty()),
         backstage_image: backstage.image.filter(|d| !d.is_empty()),
-        admission_webhook_image: admission_webhook.image.filter(|d| !d.is_empty()),
+        operator_image,
+        admission_webhook_image,
     })
+}
+
+/// Default ClusterSettings used when `APPRAFTER_MANIFEST` is unset —
+/// reflects the §1.14 default-on policy (both operator + webhook
+/// install with the released tag).
+fn default_cluster_settings() -> ClusterSettings {
+    ClusterSettings {
+        operator_image: Some(format!(
+            "{APPRAFTER_OPERATOR_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}"
+        )),
+        admission_webhook_image: Some(format!(
+            "{APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}"
+        )),
+        ..ClusterSettings::default()
+    }
 }
 
 fn decrypt_cached_kubeconfig(hetzner: &cli_state::HetznerCloudState) -> Result<String> {
@@ -186,6 +251,23 @@ fn write_tempfile_with(prefix: &str, contents: &str) -> Result<NamedTempFile> {
     f.write_all(contents.as_bytes())
         .map_err(|e| CliError::Other(format!("write tempfile {prefix}: {e}")))?;
     Ok(f)
+}
+
+/// Split a fully-qualified `repo:tag` reference into `(repo, tag)`.
+/// If the input doesn't contain `:`, the entire string is treated
+/// as the repo and the default tag is appended later. This is the
+/// inverse of [`resolve_image_ref`] for callers that need to set
+/// helm `--values` keys separately.
+fn split_image_ref(image_ref: &str) -> (String, String) {
+    match image_ref.rsplit_once(':') {
+        Some((repo, tag)) => (repo.to_string(), tag.to_string()),
+        // Defensive fallback — `resolve_image_ref` guarantees a
+        // colon-containing string but keep this branch typed-safe.
+        None => (
+            image_ref.to_string(),
+            RELEASED_OPERATOR_VERSION.to_string(),
+        ),
+    }
 }
 
 /// Pure orchestration — installs Cilium + Gateway API CRDs + the
@@ -767,9 +849,76 @@ mod tests {
         }
     }
 
-    // Tests `operator_image_override_with_colon_uses_full_ref_verbatim` and
-    // `operator_tag_override_alone_keeps_default_registry` live with Task 8,
-    // where the manifest-block → resolved-image helper is introduced.
+    #[test]
+    fn split_image_ref_separates_repo_and_tag() {
+        let (r, t) = split_image_ref("ghcr.io/apprafter/apprafter-operator:v0.1.64");
+        assert_eq!(r, "ghcr.io/apprafter/apprafter-operator");
+        assert_eq!(t, "v0.1.64");
+    }
+
+    #[test]
+    fn split_image_ref_handles_registry_with_port() {
+        let (r, t) = split_image_ref("registry.local:5000/op:dev");
+        assert_eq!(r, "registry.local:5000/op");
+        assert_eq!(t, "dev");
+    }
+
+    #[test]
+    fn default_cluster_settings_installs_operator_and_webhook_with_released_tag() {
+        let s = default_cluster_settings();
+        assert_eq!(
+            s.operator_image.as_deref(),
+            Some(
+                format!("{APPRAFTER_OPERATOR_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            s.admission_webhook_image.as_deref(),
+            Some(
+                format!(
+                    "{APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}"
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn operator_image_override_with_colon_uses_full_ref_verbatim() {
+        // Simulates spec.operator.image: "ghcr.io/my-fork/apprafter-operator:dev".
+        let resolved = resolve_image_ref(
+            Some("ghcr.io/my-fork/apprafter-operator:dev"),
+            None,
+            APPRAFTER_OPERATOR_DEFAULT_IMAGE,
+            RELEASED_OPERATOR_VERSION,
+        );
+        let (repo, tag) = split_image_ref(&resolved);
+        let yaml = operator_values_yaml(&repo, &tag);
+        assert!(
+            yaml.contains("repository: ghcr.io/my-fork/apprafter-operator"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("tag: dev"), "{yaml}");
+    }
+
+    #[test]
+    fn operator_tag_override_alone_keeps_default_registry() {
+        // Simulates spec.operator.tag: "v0.1.65".
+        let resolved = resolve_image_ref(
+            None,
+            Some("v0.1.65"),
+            APPRAFTER_OPERATOR_DEFAULT_IMAGE,
+            RELEASED_OPERATOR_VERSION,
+        );
+        let (repo, tag) = split_image_ref(&resolved);
+        let yaml = operator_values_yaml(&repo, &tag);
+        assert!(
+            yaml.contains(&format!("repository: {APPRAFTER_OPERATOR_DEFAULT_IMAGE}")),
+            "{yaml}"
+        );
+        assert!(yaml.contains("tag: v0.1.65"), "{yaml}");
+    }
 
     #[test]
     fn decrypt_cached_kubeconfig_prefers_age_then_falls_back_to_plaintext() {
