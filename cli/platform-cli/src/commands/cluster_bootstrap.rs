@@ -8,16 +8,18 @@ use std::path::Path;
 use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
+#[allow(unused_imports)] // APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET is baked into argocd_repo_secret_yaml; tests use it indirectly
 use cli_providers::k8s::{
-    admission_webhook_yaml, application_crd_yaml, argocd_gateway_yaml, argocd_values_yaml,
-    backstage_manifests_yaml, bootstrap_application_yaml, cert_manager_values_yaml,
-    cilium_values_yaml, default_deny_network_policy_yaml, extract_operator_chart_to_tempdir,
-    gateway_api_crds_url, operator_values_yaml, resolve_image_ref, selfsigned_cluster_issuer_yaml,
-    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
-    APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE, APPRAFTER_OPERATOR_DEFAULT_IMAGE,
+    admission_webhook_yaml, application_crd_yaml, argocd_gateway_yaml, argocd_repo_secret_yaml,
+    argocd_values_yaml, backstage_manifests_yaml, bootstrap_application_yaml,
+    cert_manager_values_yaml, cilium_values_yaml, default_deny_network_policy_yaml,
+    extract_operator_chart_to_tempdir, gateway_api_crds_url, operator_values_yaml,
+    resolve_image_ref, selfsigned_cluster_issuer_yaml, HelmCli, HelmRunner, HelmUpgradeArgs,
+    KubectlCli, KubectlRunner, ManifestSource, APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE,
+    APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET, APPRAFTER_OPERATOR_DEFAULT_IMAGE,
     APPRAFTER_OPERATOR_RELEASE_NAME, APPRAFTER_SYSTEM_NAMESPACE, ARGOCD_CHART_VERSION,
-    BACKSTAGE_DEFAULT_IMAGE, BOOTSTRAP_APP_DEFAULT_PATH, CERT_MANAGER_CHART_VERSION,
-    CILIUM_CHART_VERSION, RELEASED_OPERATOR_VERSION,
+    ARGOCD_REPO_USERNAME_DEFAULT, BACKSTAGE_DEFAULT_IMAGE, BOOTSTRAP_APP_DEFAULT_PATH,
+    CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION, RELEASED_OPERATOR_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -112,6 +114,14 @@ pub fn run() -> Result<()> {
         None
     };
 
+    let argocd_repo_secret_file = match (&cluster.argocd_repo_creds, &cluster.bootstrap_repo) {
+        (Some((username, token)), Some(repo_url)) => Some(write_tempfile_with(
+            "apprafter-argocd-repo-secret-",
+            &argocd_repo_secret_yaml(repo_url, username, token),
+        )?),
+        _ => None,
+    };
+
     let operator_chart_path = operator_chart_tempdir
         .as_ref()
         .map(|d| d.path().to_path_buf());
@@ -129,6 +139,7 @@ pub fn run() -> Result<()> {
         operator_chart_path.as_deref(),
         operator_values_file.as_ref().map(|f| f.path()),
         admission_webhook_file.as_ref().map(|f| f.path()),
+        argocd_repo_secret_file.as_ref().map(|f| f.path()),
         argocd_gateway_file.as_ref().map(|f| f.path()),
         bootstrap_app_file.as_ref().map(|f| f.path()),
         backstage_file.as_ref().map(|f| f.path()),
@@ -140,6 +151,9 @@ pub fn run() -> Result<()> {
     }
     if cluster.admission_webhook_image.is_some() {
         suffix.push_str(" + admission-webhook in apprafter-system");
+    }
+    if argocd_repo_secret_file.is_some() {
+        suffix.push_str(" + Argo CD repo-creds Secret in argocd namespace");
     }
     if let Some(d) = &cluster.argocd_domain {
         suffix.push_str(&format!(" + Argo CD Gateway/HTTPRoute on {d}"));
@@ -156,6 +170,26 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+const ARGOCD_REPO_TOKEN_ENV: &str = "APPRAFTER_ARGOCD_REPO_TOKEN";
+const ARGOCD_REPO_USERNAME_ENV: &str = "APPRAFTER_ARGOCD_REPO_USERNAME";
+
+/// Read the Argo CD repo credentials from the supplied env-lookup
+/// closure. Returns `Some((username, token))` when the token env-var
+/// is set + non-empty. Username falls back to
+/// [`ARGOCD_REPO_USERNAME_DEFAULT`] when its env-var is unset or
+/// empty. Pure over the closure — production callsite passes
+/// `|k| std::env::var(k).ok()`; tests pass a closure over a fixed map.
+fn read_argocd_repo_creds<F>(env: F) -> Option<(String, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let token = env(ARGOCD_REPO_TOKEN_ENV).filter(|s| !s.is_empty())?;
+    let username = env(ARGOCD_REPO_USERNAME_ENV)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ARGOCD_REPO_USERNAME_DEFAULT.to_string());
+    Some((username, token))
+}
+
 #[derive(Debug, Default, Clone)]
 struct ClusterSettings {
     argocd_domain: Option<String>,
@@ -170,6 +204,11 @@ struct ClusterSettings {
     /// Resolved admission-webhook image reference. `None` only when
     /// the user sets `spec.admissionWebhook.enabled: false`.
     admission_webhook_image: Option<String>,
+    /// Resolved Argo CD repo credentials `(username, token)` from
+    /// `APPRAFTER_ARGOCD_REPO_TOKEN` (+ optional
+    /// `APPRAFTER_ARGOCD_REPO_USERNAME`). `None` when the token
+    /// env-var is unset — public-repo path.
+    argocd_repo_creds: Option<(String, String)>,
 }
 
 fn read_cluster_settings_from_manifest(cwd: &Path) -> Result<ClusterSettings> {
@@ -205,6 +244,8 @@ fn read_cluster_settings_from_manifest(cwd: &Path) -> Result<ClusterSettings> {
         ))
     };
 
+    let argocd_repo_creds = read_argocd_repo_creds(|k| std::env::var(k).ok());
+
     Ok(ClusterSettings {
         argocd_domain: argocd.domain.filter(|d| !d.is_empty()),
         bootstrap_repo: argocd.bootstrap_repo.filter(|d| !d.is_empty()),
@@ -213,6 +254,7 @@ fn read_cluster_settings_from_manifest(cwd: &Path) -> Result<ClusterSettings> {
         backstage_image: backstage.image.filter(|d| !d.is_empty()),
         operator_image,
         admission_webhook_image,
+        argocd_repo_creds,
     })
 }
 
@@ -227,6 +269,7 @@ fn default_cluster_settings() -> ClusterSettings {
         admission_webhook_image: Some(format!(
             "{APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE}:{RELEASED_OPERATOR_VERSION}"
         )),
+        argocd_repo_creds: read_argocd_repo_creds(|k| std::env::var(k).ok()),
         ..ClusterSettings::default()
     }
 }
@@ -274,6 +317,8 @@ fn split_image_ref(image_ref: &str) -> (String, String) {
 /// followed by the AppRafter operator helm release (default on,
 /// suppressed by `operator_chart_path: None`), the admission-webhook
 /// manifest (default on, suppressed by `admission_webhook_path: None`),
+/// the Argo CD repo-credentials Secret (step 9.5, applied before the
+/// bootstrap `Application` so Argo CD's first reconcile sees the creds),
 /// the Argo CD Gateway / HTTPRoute / Certificate manifest, the
 /// bootstrap `Application` resource, and the tier-1 Backstage
 /// manifest set. Easily driven with fake runners in tests.
@@ -291,6 +336,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     operator_chart_path: Option<&Path>,
     operator_values_path: Option<&Path>,
     admission_webhook_path: Option<&Path>,
+    argocd_repo_secret_path: Option<&Path>,
     argocd_gateway_path: Option<&Path>,
     bootstrap_app_path: Option<&Path>,
     backstage_manifests_path: Option<&Path>,
@@ -357,6 +403,14 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     if let Some(aw_path) = admission_webhook_path {
         kubectl.apply_manifest(
             &ManifestSource::Path(aw_path.to_path_buf()),
+            kubeconfig_path,
+        )?;
+    }
+
+    // Step 9.5 — Argo CD repo-credentials Secret (apprafter-bootstrap-repo-creds).
+    if let Some(rs_path) = argocd_repo_secret_path {
+        kubectl.apply_manifest(
+            &ManifestSource::Path(rs_path.to_path_buf()),
             kubeconfig_path,
         )?;
     }
@@ -456,6 +510,7 @@ mod tests {
             None, // operator chart
             None, // operator values
             None, // admission webhook
+            None, // argocd repo secret
             None, // argocd gateway
             None, // bootstrap app
             None, // backstage
@@ -549,6 +604,7 @@ mod tests {
             None,           // operator chart
             None,           // operator values
             None,           // admission webhook
+            None,           // argocd repo secret
             Some(&gateway), // argocd gateway
             None,           // bootstrap
             None,           // backstage
@@ -593,6 +649,7 @@ mod tests {
             None,             // operator chart
             None,             // operator values
             None,             // admission webhook
+            None,             // argocd repo secret
             Some(&gateway),   // argocd gateway
             Some(&bootstrap), // bootstrap
             None,             // backstage
@@ -639,6 +696,7 @@ mod tests {
             None,             // operator chart
             None,             // operator values
             None,             // admission webhook
+            None,             // argocd repo secret
             Some(&gateway),   // argocd gateway
             Some(&bootstrap), // bootstrap
             Some(&backstage), // backstage
@@ -683,9 +741,10 @@ mod tests {
             &argocd_values,
             &cm_values,
             &issuer,
-            None, // operator chart
-            None, // operator values
+            None,                     // operator chart
+            None,                     // operator values
             Some(&admission_webhook),
+            None,                     // argocd repo secret
             Some(&gateway),
             Some(&bootstrap),
             Some(&backstage),
@@ -737,6 +796,7 @@ mod tests {
             Some(&op_chart),
             Some(&op_values),
             Some(&aw_manifest),
+            None, // argocd repo secret
             None,
             None,
             None,
@@ -794,6 +854,7 @@ mod tests {
             None, // operator chart — skipped via spec.operator.enabled: false at the caller
             None, // operator values — paired
             Some(&aw_manifest),
+            None, // argocd repo secret
             None,
             None,
             None,
@@ -837,6 +898,7 @@ mod tests {
             Some(&op_chart),
             Some(&op_values),
             None, // admission_webhook_path — None means skip
+            None, // argocd repo secret
             None,
             None,
             None,
@@ -958,5 +1020,179 @@ mod tests {
         let err = decrypt_cached_kubeconfig(&hetzner).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("kubeconfig"), "{msg}");
+    }
+
+    #[test]
+    fn read_argocd_repo_creds_returns_none_when_token_unset() {
+        let got = read_argocd_repo_creds(|_| None);
+        assert!(got.is_none(), "{got:?}");
+    }
+
+    #[test]
+    fn read_argocd_repo_creds_returns_none_when_token_empty() {
+        let got = read_argocd_repo_creds(|k| {
+            if k == ARGOCD_REPO_TOKEN_ENV {
+                Some(String::new())
+            } else {
+                None
+            }
+        });
+        assert!(got.is_none(), "{got:?}");
+    }
+
+    #[test]
+    fn read_argocd_repo_creds_uses_default_username_when_unset() {
+        let got = read_argocd_repo_creds(|k| match k {
+            "APPRAFTER_ARGOCD_REPO_TOKEN" => Some("ghp_xxx".to_string()),
+            _ => None,
+        });
+        assert_eq!(got.as_ref().map(|(u, _)| u.as_str()), Some(ARGOCD_REPO_USERNAME_DEFAULT));
+        assert_eq!(got.map(|(_, t)| t), Some("ghp_xxx".to_string()));
+    }
+
+    #[test]
+    fn read_argocd_repo_creds_uses_supplied_username_when_set() {
+        let got = read_argocd_repo_creds(|k| match k {
+            "APPRAFTER_ARGOCD_REPO_TOKEN" => Some("ghp_xxx".to_string()),
+            "APPRAFTER_ARGOCD_REPO_USERNAME" => Some("x-access-token".to_string()),
+            _ => None,
+        });
+        assert_eq!(got, Some(("x-access-token".to_string(), "ghp_xxx".to_string())));
+    }
+
+    #[test]
+    fn bootstrap_repo_with_token_creates_repo_secret_before_bootstrap_app() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let repo_secret = PathBuf::from("/tmp/argocd-repo-secret.yaml");
+        let bootstrap = PathBuf::from("/tmp/bootstrap-app.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &app_crd,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            None,               // operator chart
+            None,               // operator values
+            None,               // admission webhook
+            Some(&repo_secret), // argocd repo secret
+            None,               // argocd gateway
+            Some(&bootstrap),   // bootstrap app
+            None,               // backstage
+        )
+        .expect("bootstrap");
+
+        let applies = kubectl.applies.borrow();
+        // 6 applies: Gateway CRDs URL, Application CRD, default-deny,
+        // ClusterIssuer, repo-secret, bootstrap App.
+        assert_eq!(applies.len(), 6);
+        match &applies[4].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &repo_secret),
+            other => panic!("fifth apply must be repo-creds Secret Path, got {other:?}"),
+        }
+        match &applies[5].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &bootstrap),
+            other => panic!("sixth apply must be bootstrap Application Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_repo_without_token_skips_secret_but_keeps_bootstrap_app() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+        let bootstrap = PathBuf::from("/tmp/bootstrap-app.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &app_crd,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            None,             // operator chart
+            None,             // operator values
+            None,             // admission webhook
+            None,             // argocd repo secret — public repo path
+            None,             // argocd gateway
+            Some(&bootstrap), // bootstrap app
+            None,             // backstage
+        )
+        .expect("bootstrap");
+
+        let applies = kubectl.applies.borrow();
+        // 5 applies: Gateway CRDs URL, Application CRD, default-deny,
+        // ClusterIssuer, bootstrap App. No repo-secret.
+        assert_eq!(applies.len(), 5);
+        for a in applies.iter() {
+            if let ManifestSource::Path(p) = &a.0 {
+                assert!(
+                    !p.to_string_lossy().contains("argocd-repo-secret"),
+                    "should not apply repo-secret when None: {p:?}",
+                );
+            }
+        }
+        match &applies[4].0 {
+            ManifestSource::Path(p) => assert_eq!(p, &bootstrap),
+            other => panic!("fifth apply must be bootstrap App Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_bootstrap_repo_skips_both_secret_and_app() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let cilium_values = PathBuf::from("/tmp/cilium-values.yaml");
+        let app_crd = PathBuf::from("/tmp/application-crd.yaml");
+        let np = PathBuf::from("/tmp/default-deny.yaml");
+        let argocd_values = PathBuf::from("/tmp/argocd-values.yaml");
+        let cm_values = PathBuf::from("/tmp/cert-manager-values.yaml");
+        let issuer = PathBuf::from("/tmp/selfsigned-issuer.yaml");
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            &kc,
+            &cilium_values,
+            &app_crd,
+            &np,
+            &argocd_values,
+            &cm_values,
+            &issuer,
+            None,
+            None,
+            None,
+            None, // argocd repo secret
+            None, // argocd gateway
+            None, // bootstrap app
+            None, // backstage
+        )
+        .expect("bootstrap");
+
+        let applies = kubectl.applies.borrow();
+        // Baseline 4 applies (no operator, no webhook, no repo-secret, no bootstrap).
+        assert_eq!(applies.len(), 4);
     }
 }
