@@ -50,6 +50,6 @@ tmp/
 *.key
 !**/age.pub.key
 
-# Encrypted state (kept in repo via age/sops, never raw)
-.apprafter/state.cue
-!.apprafter/state.cue.age
+# Local platform-cli state (.apprafter/) — never commit raw, only age-encrypted blobs
+**/.apprafter/*
+!**/.apprafter/*.age
