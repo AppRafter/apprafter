@@ -48,11 +48,7 @@ mod tests {
 
     #[test]
     fn metadata_pins_name_namespace_and_apprafter_label() {
-        let y = argocd_repo_secret_yaml(
-            "https://github.com/org/state.git",
-            "apprafter",
-            "ghp_xxx",
-        );
+        let y = argocd_repo_secret_yaml("https://github.com/org/state.git", "apprafter", "ghp_xxx");
         assert!(
             y.contains(&format!("name: {APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET}")),
             "{y}"
@@ -63,11 +59,7 @@ mod tests {
 
     #[test]
     fn metadata_carries_argocd_secret_type_repository_label() {
-        let y = argocd_repo_secret_yaml(
-            "https://github.com/org/state.git",
-            "apprafter",
-            "ghp_xxx",
-        );
+        let y = argocd_repo_secret_yaml("https://github.com/org/state.git", "apprafter", "ghp_xxx");
         assert!(
             y.contains("argocd.argoproj.io/secret-type: repository"),
             "{y}"
@@ -88,11 +80,7 @@ mod tests {
 
     #[test]
     fn secret_type_is_opaque() {
-        let y = argocd_repo_secret_yaml(
-            "https://github.com/org/state.git",
-            "apprafter",
-            "ghp_xxx",
-        );
+        let y = argocd_repo_secret_yaml("https://github.com/org/state.git", "apprafter", "ghp_xxx");
         assert!(y.contains("type: Opaque"), "{y}");
     }
 }

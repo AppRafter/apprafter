@@ -8,7 +8,8 @@ use std::path::Path;
 use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
-#[allow(unused_imports)] // APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET is baked into argocd_repo_secret_yaml; tests use it indirectly
+#[allow(unused_imports)]
+// APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET is baked into argocd_repo_secret_yaml; tests use it indirectly
 use cli_providers::k8s::{
     admission_webhook_yaml, application_crd_yaml, argocd_gateway_yaml, argocd_repo_secret_yaml,
     argocd_values_yaml, backstage_manifests_yaml, bootstrap_application_yaml,
@@ -741,10 +742,10 @@ mod tests {
             &argocd_values,
             &cm_values,
             &issuer,
-            None,                     // operator chart
-            None,                     // operator values
+            None, // operator chart
+            None, // operator values
             Some(&admission_webhook),
-            None,                     // argocd repo secret
+            None, // argocd repo secret
             Some(&gateway),
             Some(&bootstrap),
             Some(&backstage),
@@ -1046,7 +1047,10 @@ mod tests {
             "APPRAFTER_ARGOCD_REPO_TOKEN" => Some("ghp_xxx".to_string()),
             _ => None,
         });
-        assert_eq!(got.as_ref().map(|(u, _)| u.as_str()), Some(ARGOCD_REPO_USERNAME_DEFAULT));
+        assert_eq!(
+            got.as_ref().map(|(u, _)| u.as_str()),
+            Some(ARGOCD_REPO_USERNAME_DEFAULT)
+        );
         assert_eq!(got.map(|(_, t)| t), Some("ghp_xxx".to_string()));
     }
 
@@ -1057,7 +1061,10 @@ mod tests {
             "APPRAFTER_ARGOCD_REPO_USERNAME" => Some("x-access-token".to_string()),
             _ => None,
         });
-        assert_eq!(got, Some(("x-access-token".to_string(), "ghp_xxx".to_string())));
+        assert_eq!(
+            got,
+            Some(("x-access-token".to_string(), "ghp_xxx".to_string()))
+        );
     }
 
     #[test]
