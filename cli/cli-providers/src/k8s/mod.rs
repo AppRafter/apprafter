@@ -18,6 +18,7 @@ pub mod image_ref;
 pub mod issuer;
 pub mod kubectl;
 pub mod network_policy;
+pub mod operator_values;
 
 pub use admission_webhook::{admission_webhook_yaml, APPRAFTER_SYSTEM_NAMESPACE};
 pub use application_crd::{
@@ -40,3 +41,4 @@ pub use kubectl::{
     gateway_api_crds_url, KubectlCli, KubectlRunner, ManifestSource, GATEWAY_API_VERSION,
 };
 pub use network_policy::default_deny_network_policy_yaml;
+pub use operator_values::operator_values_yaml;
