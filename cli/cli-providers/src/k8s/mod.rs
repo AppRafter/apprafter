@@ -7,6 +7,7 @@
 pub mod admission_webhook;
 pub mod application_crd;
 pub mod argocd_gateway;
+pub mod argocd_repo_secret;
 pub mod argocd_values;
 pub mod backstage_app_config;
 pub mod backstage_manifests;
@@ -26,6 +27,9 @@ pub use application_crd::{
     application_crd_yaml, APPLICATION_CRD_GROUP, APPLICATION_CRD_PLURAL, APPLICATION_CRD_VERSION,
 };
 pub use argocd_gateway::argocd_gateway_yaml;
+pub use argocd_repo_secret::{
+    argocd_repo_secret_yaml, APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET, ARGOCD_REPO_USERNAME_DEFAULT,
+};
 pub use argocd_values::{argocd_values_yaml, ARGOCD_CHART_VERSION};
 pub use backstage_app_config::backstage_app_config_yaml;
 pub use backstage_manifests::{backstage_manifests_yaml, BACKSTAGE_DEFAULT_IMAGE};
