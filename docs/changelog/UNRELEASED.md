@@ -11,6 +11,45 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.67 — Phase 1 patch — §1.15 walks destroy follow-up (2026-05-13)
+
+Two follow-up bugs from v0.1.66's destroy reorder, both surfaced
+when the fix ran against production Hetzner (mockito didn't model
+the exact upstream behaviour):
+
+### Fixed
+
+- **Idempotent unassign matched the wrong error code**
+  (#fix-walk-2b). v0.1.66 treated `422 code=floating_ip_not_assigned`
+  as "already detached, proceed to DELETE". Production Hetzner
+  actually returns `422 code=service_error` + message "Floating IP
+  with ID X is not assigned to any resource" for the same condition
+  — the documented code never appears in practice. Fix:
+  `unassign_floating_ip` now ALSO accepts `status=422` + message
+  containing `is not assigned` as idempotent success. The docs-
+  consistent `floating_ip_not_assigned` code stays in the matcher
+  for forward-compat.
+
+- **`DELETE /floating_ips/{id}` raced with Hetzner's async detach**
+  (#fix-walk-2c). After `wait_for_server_gone` returns,
+  Hetzner's scheduler keeps the FIP `423 locked` for a few more
+  seconds while it tears down the server→FIP association. v0.1.66
+  did a single `DELETE` and surfaced the lock as a destroy
+  failure. Fix: generalised the existing retry helper
+  `delete_with_retry_on_resource_in_use` →
+  `delete_with_retry_on_transient_lock`, now retrying on EITHER
+  `code=resource_in_use` (firewall/network — pre-existing) OR
+  `status=423` (floating IP — new). 60 s deadline, 500 ms → 5 s
+  exponential back-off (unchanged). `delete_floating_ip` switched
+  to the helper.
+
+### Tests
+
+- `destroy_treats_service_error_is_not_assigned_as_idempotent_success`
+  — exact production unassign-422 payload.
+- `destroy_floating_ip_retries_on_423_locked_until_cleared` —
+  sequenced mockito: 423 first call, 204 second, retry kicks in.
+
 ## v0.1.66 — Phase 1 patch — §1.15 walks bug fixes (2026-05-13)
 
 Bugs surfaced during the §1.15 manual 4-quadrant walks (per

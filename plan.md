@@ -2004,4 +2004,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-11 | Phase 1 Level B integration — default-on operator + webhook (§1.14); v0.1.64 | initial |
 | 2026-05-11 | Phase 1 Level C GitOps — env-driven Argo CD repo credentials (§1.15); v0.1.65 | initial |
 | 2026-05-13 | §1.15 walks bug fixes — tier-1 firewall port 6443 + destroy floating-IP unassign order; v0.1.66 | initial |
+| 2026-05-13 | §1.15 walks follow-up — real Hetzner unassign-422 message + 423 locked retry; v0.1.67 | initial |
 
