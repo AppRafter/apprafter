@@ -2003,4 +2003,5 @@ Phase 7 запускается параллельно с 3+ как только 
 | 2026-05-11 | Phase 1 patch — hot-reconcile loop из-за `lastTransitionTime = now()` на каждом reconcile; теперь preserve when status unchanged (k8s `meta/v1.Condition` semantics); +2 regression-guard теста; v0.1.63 | initial |
 | 2026-05-11 | Phase 1 Level B integration — default-on operator + webhook (§1.14); v0.1.64 | initial |
 | 2026-05-11 | Phase 1 Level C GitOps — env-driven Argo CD repo credentials (§1.15); v0.1.65 | initial |
+| 2026-05-13 | §1.15 walks bug fixes — tier-1 firewall port 6443 + destroy floating-IP unassign order; v0.1.66 | initial |
 

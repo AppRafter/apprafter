@@ -11,6 +11,64 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.66 — Phase 1 patch — §1.15 walks bug fixes (2026-05-13)
+
+Bugs surfaced during the §1.15 manual 4-quadrant walks (per
+`feedback_phase_closure_validation` discipline — every walk-found
+bug ships as a patch with a regression-guard test before the
+next phase opens).
+
+### Fixed
+
+- **`examples/infrastructure/tier-1-hetzner.cue` — k3s apiserver
+  port 6443 was missing from `firewall.ingress`** (#fix-walk-1).
+  Hetzner Cloud Firewall default-deny dropped TCP packets from
+  the operator's workstation to `:6443`, causing the first
+  `helm upgrade --install cilium` of `cluster-bootstrap` to fail
+  with `Kubernetes cluster unreachable ... i/o timeout`. Hidden
+  during §1.14 walks because the rule was added manually in the
+  Hetzner web UI for debug and never committed. Fix: the example
+  manifest now opens `:6443` to `0.0.0.0/0` + `::/0` alongside
+  `:22` and `:443`, with an inline comment that tier-1 keeps the
+  apiserver public and higher tiers will restrict.
+- **`destroy` rejected with `422 must_be_unassigned` when a
+  Floating IP was still attached to the server** (#fix-walk-2).
+  The pre-fix destroy order deleted floating IPs FIRST, but
+  Hetzner's `DELETE /floating_ips/{id}` rejects assigned IPs —
+  so the first attached-FIP destroy aborted the whole flow,
+  leaving the cluster + firewall + network behind. Fix is
+  two-layer:
+  - **Reorder**: `destroy()` now deletes the server first
+    (auto-detaches its FIPs), waits via `wait_for_server_gone`,
+    then deletes the now-unassigned FIPs.
+  - **Defensive `unassign_floating_ip` step**: `delete_floating_ip`
+    calls a new client helper before `DELETE`, treating both
+    `422 floating_ip_not_assigned` and `404` as idempotent
+    success. Belt-and-suspenders against the race between
+    `wait_for_server_gone` returning and Hetzner's internal
+    scheduler fully detaching the FIP.
+
+### Tests
+
+- `destroy_removes_server_before_floating_ip_and_unassigns_first`
+  (renamed + rewritten — pre-fix
+  `destroy_removes_floating_ip_first_then_others` baked in the
+  buggy order and passed by coincidence: mockito's `expect(1)`
+  on each `DELETE` mock didn't enforce cross-endpoint order).
+- `destroy_treats_floating_ip_not_assigned_as_idempotent_success`
+  (new) — exercises the Hetzner `422 floating_ip_not_assigned`
+  response on `POST /actions/unassign` and asserts destroy
+  proceeds to `DELETE`.
+
+### Backlog (post-§1.15 walks)
+
+- **`apply` does not reconcile firewall rules on existing
+  firewall** (#fix-walk-3, not in v0.1.66). After editing
+  `Infrastructure.cue` to add a new ingress rule and re-running
+  `apply`, the command returns `0 actions` because state already
+  has a `firewall_id`. Workaround for §1.15: `destroy` + fresh
+  `apply` (clean-path discipline). Real fix lands separately.
+
 ## v0.1.65 — Phase 1 patch — §1.15 Level C GitOps integration (2026-05-11)
 
 ### Added
