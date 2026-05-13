@@ -379,18 +379,13 @@ impl Provider for HetznerCloudProvider {
     fn destroy(&self) -> Result<DestroyOutcome> {
         let mut destroyed = 0;
 
-        // 1) Floating IPs first (they reference the server).
-        for fip in self.refresh_floating_ips()? {
-            info!(
-                floating_ip = ?fip.name,
-                id = fip.id,
-                "destroying Hetzner floating IP"
-            );
-            self.client.delete_floating_ip(fip.id)?;
-            destroyed += 1;
-        }
-
-        // 2) Servers.
+        // 1) Servers first. Hetzner's `DELETE /servers/{id}`
+        // auto-unassigns Floating IPs attached to the server, so
+        // step 2's `delete_floating_ip` doesn't hit the API's
+        // `422 must_be_unassigned` guard. (Earlier this method
+        // tried to delete floating IPs first reasoning they
+        // "reference the server" — backwards: assigned-FIP delete
+        // is the operation Hetzner rejects, not server delete.)
         let mut deleted_server_ids: Vec<u64> = Vec::new();
         for server in self.refresh_servers()? {
             info!(server = %server.name, id = server.id, "destroying Hetzner server");
@@ -399,17 +394,34 @@ impl Provider for HetznerCloudProvider {
             destroyed += 1;
         }
 
-        // 2b) Wait for each deleted server to actually be gone.
+        // 1b) Wait for each deleted server to actually be gone.
         // Hetzner's `DELETE /servers/{id}` returns 200 immediately
         // and processes the cleanup asynchronously; meanwhile the
         // server's network interface still holds the network
-        // attachment, so the next step's `delete_network` returns
-        // 409 "still in use". Polling `GET /servers` until the id
-        // is no longer listed is the cleanest sync point — single
+        // attachment, so a later `delete_network` returns 409
+        // "still in use". Polling `GET /servers` until the id is
+        // no longer listed is the cleanest sync point — single
         // place that knows about the async semantics, no per-call
         // retry sprinkled across delete_firewall / delete_network.
         for id in deleted_server_ids {
             self.wait_for_server_gone(id)?;
+        }
+
+        // 2) Floating IPs. `delete_floating_ip` calls
+        // `unassign_floating_ip` first as a defensive belt-and-
+        // suspenders against the race between
+        // `wait_for_server_gone` returning and Hetzner's internal
+        // scheduler fully detaching the FIP from the deleted
+        // server — both `floating_ip_not_assigned` and 404 are
+        // treated as success.
+        for fip in self.refresh_floating_ips()? {
+            info!(
+                floating_ip = ?fip.name,
+                id = fip.id,
+                "destroying Hetzner floating IP"
+            );
+            self.client.delete_floating_ip(fip.id)?;
+            destroyed += 1;
         }
 
         // 3) Firewalls.

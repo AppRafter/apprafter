@@ -503,7 +503,55 @@ impl HetznerCloudClient {
         }
     }
 
+    /// Unassign a Floating IP from any server it's currently
+    /// attached to. Idempotent: 404 (gone) and 422 with code
+    /// `floating_ip_not_assigned` are both treated as success so
+    /// the caller can blindly call this before
+    /// [`Self::delete_floating_ip`] without checking state.
+    pub fn unassign_floating_ip(&self, id: u64) -> Result<()> {
+        let endpoint = self.endpoint(&format!("/floating_ips/{id}/actions/unassign"));
+        let resp = ureq::post(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                // Idempotent: already-unassigned IP is not an error.
+                if envelope.error.code == "floating_ip_not_assigned" {
+                    return Ok(());
+                }
+                Err(CliError::Hetzner {
+                    endpoint: format!("POST {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
+    /// Delete a Floating IP. Unassigns first so the deletion isn't
+    /// rejected with `must_be_unassigned` when the upstream
+    /// `delete_server` race hasn't fully reaped the attachment yet
+    /// (server is gone from `GET /servers` but the IP's
+    /// `server` field still references it for a short window).
     pub fn delete_floating_ip(&self, id: u64) -> Result<()> {
+        self.unassign_floating_ip(id)?;
+
         let endpoint = self.endpoint(&format!("/floating_ips/{id}"));
         let resp = ureq::delete(&endpoint)
             .set("Authorization", &self.auth_header())

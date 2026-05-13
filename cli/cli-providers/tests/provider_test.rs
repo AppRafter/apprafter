@@ -489,20 +489,15 @@ fn apply_creates_floating_ip_after_server_with_server_attach() {
 }
 
 #[test]
-fn destroy_removes_floating_ip_first_then_others() {
+fn destroy_removes_server_before_floating_ip_and_unassigns_first() {
+    // Regression guard for the v0.1.66 fix: when a floating IP is
+    // still assigned to a server, Hetzner rejects
+    // `DELETE /floating_ips/{id}` with `422 must_be_unassigned`.
+    // The destroy path now deletes the server first (auto-detaches
+    // the FIP) and then runs `POST /floating_ips/{id}/actions/unassign`
+    // belt-and-suspenders before `DELETE` — both 404 and
+    // `floating_ip_not_assigned` are treated as success.
     let mut srv = mockito::Server::new();
-    let _list_fips = srv
-        .mock("GET", "/v1/floating_ips")
-        .with_status(200)
-        .with_body(
-            r#"{"floating_ips":[{"id":31,"type":"ipv4","ip":"1.2.3.4","name":"egress","server":42,"home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}]}"#,
-        )
-        .create();
-    let _del_fip = srv
-        .mock("DELETE", "/v1/floating_ips/31")
-        .with_status(204)
-        .expect(1)
-        .create();
     let _list_servers_first = srv
         .mock("GET", "/v1/servers")
         .with_status(200)
@@ -520,6 +515,24 @@ fn destroy_removes_floating_ip_first_then_others() {
         .mock("DELETE", "/v1/servers/42")
         .with_status(200)
         .with_body(r#"{"action":{"id":1,"status":"success"}}"#)
+        .expect(1)
+        .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(
+            r#"{"floating_ips":[{"id":31,"type":"ipv4","ip":"1.2.3.4","name":"egress","server":42,"home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    let _unassign_fip = srv
+        .mock("POST", "/v1/floating_ips/31/actions/unassign")
+        .with_status(201)
+        .with_body(r#"{"action":{"id":2,"status":"running"}}"#)
+        .expect(1)
+        .create();
+    let _del_fip = srv
+        .mock("DELETE", "/v1/floating_ips/31")
+        .with_status(204)
         .expect(1)
         .create();
     let _list_fws = srv
@@ -548,8 +561,70 @@ fn destroy_removes_floating_ip_first_then_others() {
     };
 
     let outcome = provider.destroy().unwrap();
-    // 1 floating ip + 1 server.
+    // 1 server + 1 floating ip.
     assert_eq!(outcome.destroyed, 2);
+}
+
+#[test]
+fn destroy_treats_floating_ip_not_assigned_as_idempotent_success() {
+    // Hetzner's `POST /floating_ips/{id}/actions/unassign` returns
+    // 422 with `code=floating_ip_not_assigned` when the FIP is
+    // already detached (server delete + Hetzner's async reaper
+    // completed before our defensive unassign call). That must
+    // not abort destroy — proceed to the DELETE.
+    let mut srv = mockito::Server::new();
+    let _list_servers_first = srv
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+    let _list_fips = srv
+        .mock("GET", "/v1/floating_ips")
+        .with_status(200)
+        .with_body(
+            r#"{"floating_ips":[{"id":31,"type":"ipv4","ip":"1.2.3.4","name":"egress","server":null,"home_location":{"name":"nbg1"},"labels":{"apprafter":"true"}}]}"#,
+        )
+        .create();
+    let _unassign_fip = srv
+        .mock("POST", "/v1/floating_ips/31/actions/unassign")
+        .with_status(422)
+        .with_body(
+            r#"{"error":{"code":"floating_ip_not_assigned","message":"Floating IP is not assigned"}}"#,
+        )
+        .expect(1)
+        .create();
+    let _del_fip = srv
+        .mock("DELETE", "/v1/floating_ips/31")
+        .with_status(204)
+        .expect(1)
+        .create();
+    let _list_fws = srv
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    let _list_nets = srv
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    let _list_keys = srv
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(srv.url(), "tok"),
+        spec: spec("platform-1"),
+        ssh_keys: vec![],
+        networks: vec![],
+        firewalls: vec![],
+        floating_ips: vec![fip_spec("platform-1-egress")],
+    };
+
+    let outcome = provider.destroy().unwrap();
+    assert_eq!(outcome.destroyed, 1);
 }
 
 #[test]
