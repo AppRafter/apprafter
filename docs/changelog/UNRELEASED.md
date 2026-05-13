@@ -11,6 +11,63 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## v0.1.68 — Phase 1 patch — repo-creds Secret SSA (security) (2026-05-13)
+
+Walk-found security bug from §1.15 Q3 — exposed by manually inspecting
+`kubectl get secret apprafter-bootstrap-repo-creds -n argocd -o yaml`:
+the `kubectl apply` we used for the Secret stored the raw `stringData`
+(including the `password` PAT) in the
+`kubectl.kubernetes.io/last-applied-configuration` annotation as plain
+text. Anyone with read access to the Secret (or to etcd backups, or to
+Argo CD's "Manifest" tab in the UI) could recover the operator's GitHub
+or GitLab PAT without even base64-decoding the `data` field.
+
+### Fixed
+
+- **Repo-creds Secret apply switched to server-side apply (SSA)** —
+  new `KubectlRunner::apply_manifest_server_side(source, kubeconfig,
+  field_manager)` trait method shells out to
+  `kubectl apply --server-side --field-manager=apprafter-cli
+  --force-conflicts -f …`. SSA tracks ownership in
+  `metadata.managedFields` instead of writing the entire manifest
+  body to `last-applied-configuration`, so the PAT no longer leaks
+  into annotations. `--force-conflicts` lets the migration from
+  client-side ownership succeed cleanly on existing clusters
+  (operator re-runs `cluster-bootstrap` after upgrading).
+  `APPRAFTER_CLI_FIELD_MANAGER = "apprafter-cli"` mirrors the
+  operator's `apprafter-operator` field-manager identity so
+  cluster-side ownership is legible from `managedFields`.
+
+### Tests
+
+- `k8s::kubectl::tests::apply_server_side_command_passes_field_manager_and_force_conflicts`
+  — the build helper emits `--server-side`,
+  `--field-manager=apprafter-cli`, `--force-conflicts`, and the
+  manifest path; defensive assertion that no `--client-side` flag is
+  present.
+- `k8s::kubectl::tests::apply_server_side_command_with_url_source_still_emits_ssa_flags`
+  — URL-sourced manifests still get full SSA flag set.
+- `bootstrap_repo_with_token_creates_repo_secret_before_bootstrap_app`
+  rewritten — repo-secret now lands in `ssa_applies` (with
+  field-manager `apprafter-cli`), the bootstrap App stays in
+  client-side `applies`. Assertion structure proves the SSA call
+  ran AND the field-manager is correct.
+- `bootstrap_repo_without_token_skips_secret_but_keeps_bootstrap_app`
+  + `no_bootstrap_repo_skips_both_secret_and_app` updated — both
+  assert `ssa_applies.is_empty()` for paths where no Secret is
+  created.
+
+### Backlog (post-§1.15 walks)
+
+- **`helm upgrade --install` bumps REVISION on no-op re-bootstrap**
+  (#fix-walk-4, not in v0.1.68). Every `cluster-bootstrap` re-run
+  rev-bumps cilium / argocd / cert-manager / apprafter-operator
+  even when values are byte-identical, polluting helm history and
+  potentially triggering pod rotations on otherwise idempotent
+  re-runs. Helm 3 has no native skip-on-empty-diff; fix requires
+  either bundling the helm-diff plugin or writing our own pre-call
+  values-comparison. Deferred.
+
 ## v0.1.67 — Phase 1 patch — §1.15 walks destroy follow-up (2026-05-13)
 
 Two follow-up bugs from v0.1.66's destroy reorder, both surfaced
