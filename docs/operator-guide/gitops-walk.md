@@ -9,9 +9,11 @@ runbook the operator can follow start-to-finish without lateral reading.
 - An AppRafter cluster bootstrapped via `platform-cli` against Hetzner Cloud.
   Operator + admission-webhook install by default since v0.1.64; see the
   [operator quickstart](./quickstart.md).
-- A Git repository containing at least one Argo CD `Application` manifest at
-  the path you'll target with `bootstrapPath` (or the repo root if not set).
-  A bare empty repo will sync as a no-op — operator-facing UX is identical.
+- A Git repository containing at least one Kubernetes manifest at the path
+  you'll target with `bootstrapPath` (or the repo root if not set). Raw
+  `Deployment` / `Service` etc. work; so do nested Argo CD `Application`
+  manifests if you want a layered apps-of-apps setup. A bare empty repo
+  syncs as a no-op — operator-facing UX is identical.
 - `kubectl` configured against the cluster (run `platform-cli kubeconfig
   | tee /tmp/kc` and `export KUBECONFIG=/tmp/kc`).
 - For the **private** quadrants: ability to generate a PAT (Personal Access
@@ -21,6 +23,13 @@ The `spec.argocd.bootstrapRepo` field accepts an HTTPS URL like
 `https://github.com/org/repo.git` (works for both GitHub and GitLab). SSH
 URLs (`git@github.com:org/repo.git`) are NOT supported in this cycle —
 PAT-over-HTTPS is the only auth method.
+
+**Note on `kubectl get application ...`:** AppRafter ships its own
+`applications.apprafter.io` CRD (workload definitions consumed by the
+operator), which shadows Argo CD's `applications.argoproj.io` short name.
+`kubectl get application bootstrap -n argocd` therefore resolves to our
+CRD and returns `NotFound`. Always use the fully-qualified Argo CD form
+in this runbook: `kubectl get applications.argoproj.io bootstrap -n argocd`.
 
 ## Quadrant 1: GitHub × public
 
@@ -123,8 +132,8 @@ warning), log in as `admin` / `<password from CLI>`, and confirm:
 
 **2. kubectl sanity checks (secondary)** — same state, machine-readable:
 
-- [ ] `kubectl get application bootstrap -n argocd -o jsonpath='{.status.sync.status}'` → `Synced`.
-- [ ] `kubectl get application bootstrap -n argocd -o jsonpath='{.status.health.status}'` → `Healthy`.
+- [ ] `kubectl get applications.argoproj.io bootstrap -n argocd -o jsonpath='{.status.sync.status}'` → `Synced`.
+- [ ] `kubectl get applications.argoproj.io bootstrap -n argocd -o jsonpath='{.status.health.status}'` → `Healthy`.
 - [ ] `kubectl get applications.argoproj.io -A` lists `bootstrap` (and any child Argo CD `Application`s the repo defines).
 - [ ] `kubectl get secret apprafter-bootstrap-repo-creds -n argocd` returns `NotFound` (public repo path doesn't create a Secret).
 
@@ -137,7 +146,7 @@ warning), log in as `admin` / `<password from CLI>`, and confirm:
 | UI login rejects password                  | copy-paste added trailing whitespace       | Re-run `argocd-password` and copy the exact line.                         |
 | bootstrap App stuck `OutOfSync`            | path mismatch                              | Verify `bootstrapPath` matches the actual folder in the repo.            |
 | bootstrap App `Unknown` health             | Argo CD pod not ready yet                  | `kubectl wait --for=condition=Ready -n argocd pod -l app.kubernetes.io/name=argocd-server --timeout=120s` |
-| `Application not found` error              | Argo CD's repository scanner missed it     | `kubectl describe application bootstrap -n argocd` — check `conditions`. |
+| `Application not found` error              | Argo CD's repository scanner missed it     | `kubectl describe applications.argoproj.io bootstrap -n argocd` — check `conditions`. |
 
 ## Quadrant 2: GitLab × public
 
@@ -205,7 +214,7 @@ Open `https://localhost:8080`, log in, then on the `bootstrap` App:
 **2. kubectl sanity checks**:
 
 - [ ] `kubectl get secret apprafter-bootstrap-repo-creds -n argocd` returns the Secret.
-- [ ] `kubectl get application bootstrap -n argocd -o jsonpath='{.status.sync.status}'` → `Synced`.
+- [ ] `kubectl get applications.argoproj.io bootstrap -n argocd -o jsonpath='{.status.sync.status}'` → `Synced`.
 - [ ] `kubectl get applications.argoproj.io -A` lists `bootstrap` (and any child Argo CD `Application`s the repo defines).
 
 ### Troubleshooting
@@ -215,7 +224,7 @@ Open `https://localhost:8080`, log in, then on the `bootstrap` App:
 | `401 Unauthorized` in UI / `kubectl describe app bootstrap` | PAT expired or wrong               | Generate a new PAT, re-export `APPRAFTER_ARGOCD_REPO_TOKEN`, re-run `cluster-bootstrap`. |
 | `404 Not Found`                            | PAT lacks access to that specific repo     | In GitHub settings, edit the PAT to grant access to the bootstrap repo.   |
 | `Secret apprafter-bootstrap-repo-creds not created` | env-var was empty when `cluster-bootstrap` ran | `echo "${APPRAFTER_ARGOCD_REPO_TOKEN:0:5}…"` to verify it's set, re-run. |
-| Sync stuck > 30s after bootstrap            | Argo CD reconcile interval (~3min default) | Click `REFRESH` in the UI (or `kubectl annotate application bootstrap -n argocd argocd.argoproj.io/refresh=hard --overwrite`). |
+| Sync stuck > 30s after bootstrap            | Argo CD reconcile interval (~3min default) | Click `REFRESH` in the UI (or `kubectl annotate applications.argoproj.io bootstrap -n argocd argocd.argoproj.io/refresh=hard --overwrite`). |
 
 ## Quadrant 4: GitLab × private
 
