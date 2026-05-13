@@ -11,6 +11,12 @@ use cli_core::{CliError, Result};
 /// CRD admission work that lives in plan.md sub-phase 1.7.
 pub const GATEWAY_API_VERSION: &str = "v1.2.1";
 
+/// Field manager identity used by `platform-cli`-driven
+/// server-side `kubectl apply` calls. Mirrors the operator's
+/// `apprafter-operator` field manager so cluster-side ownership
+/// is clear from `metadata.managedFields`.
+pub const APPRAFTER_CLI_FIELD_MANAGER: &str = "apprafter-cli";
+
 /// URL of the upstream "standard install" YAML — Gateway, HTTPRoute,
 /// GRPCRoute, ReferenceGrant CRDs (the conformance baseline).
 pub fn gateway_api_crds_url() -> String {
@@ -27,6 +33,25 @@ pub enum ManifestSource {
 
 pub trait KubectlRunner {
     fn apply_manifest(&self, source: &ManifestSource, kubeconfig_path: &Path) -> Result<()>;
+
+    /// Apply a manifest using **server-side apply** with the
+    /// supplied field manager. MUST be used for manifests carrying
+    /// sensitive data (e.g. Secrets emitted via `stringData:`).
+    /// Server-side apply tracks ownership in
+    /// `metadata.managedFields` instead of the
+    /// `kubectl.kubernetes.io/last-applied-configuration`
+    /// annotation, which otherwise stores the entire applied
+    /// manifest as plaintext JSON (= raw-token leak for Secrets
+    /// with `stringData`). `--force-conflicts` is passed so
+    /// resources that pre-exist with client-side ownership migrate
+    /// cleanly to the new field manager on first SSA apply.
+    fn apply_manifest_server_side(
+        &self,
+        source: &ManifestSource,
+        kubeconfig_path: &Path,
+        field_manager: &str,
+    ) -> Result<()>;
+
     /// Read a single key from a Kubernetes Secret and return its
     /// base64-decoded contents as a UTF-8 string. Used by
     /// `platform-cli argocd-password` to retrieve the
@@ -47,6 +72,29 @@ impl KubectlCli {
     fn build_apply_command(source: &ManifestSource, kubeconfig_path: &Path) -> Command {
         let mut c = Command::new("kubectl");
         c.arg("apply").arg("-f");
+        match source {
+            ManifestSource::Url(u) => {
+                c.arg(u);
+            }
+            ManifestSource::Path(p) => {
+                c.arg(p);
+            }
+        }
+        c.env("KUBECONFIG", kubeconfig_path);
+        c
+    }
+
+    fn build_apply_server_side_command(
+        source: &ManifestSource,
+        kubeconfig_path: &Path,
+        field_manager: &str,
+    ) -> Command {
+        let mut c = Command::new("kubectl");
+        c.arg("apply")
+            .arg("--server-side")
+            .arg(format!("--field-manager={field_manager}"))
+            .arg("--force-conflicts")
+            .arg("-f");
         match source {
             ManifestSource::Url(u) => {
                 c.arg(u);
@@ -86,6 +134,25 @@ impl KubectlRunner for KubectlCli {
         if !status.success() {
             return Err(CliError::Other(format!(
                 "kubectl apply -f failed (exit {:?})",
+                status.code()
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_manifest_server_side(
+        &self,
+        source: &ManifestSource,
+        kubeconfig_path: &Path,
+        field_manager: &str,
+    ) -> Result<()> {
+        let status =
+            Self::build_apply_server_side_command(source, kubeconfig_path, field_manager)
+                .status()
+                .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
+        if !status.success() {
+            return Err(CliError::Other(format!(
+                "kubectl apply --server-side --field-manager={field_manager} -f failed (exit {:?})",
                 status.code()
             )));
         }
@@ -160,6 +227,62 @@ mod tests {
         assert!(url.contains(GATEWAY_API_VERSION), "{url}");
         assert!(url.ends_with("/standard-install.yaml"), "{url}");
         assert!(url.starts_with("https://"), "{url}");
+    }
+
+    #[test]
+    fn apply_server_side_command_passes_field_manager_and_force_conflicts() {
+        // Regression guard for v0.1.68 fix: secret-bearing manifests
+        // MUST use server-side apply so the raw stringData payload
+        // does not leak into the
+        // `kubectl.kubernetes.io/last-applied-configuration`
+        // annotation. The command must include
+        // `--server-side`, `--field-manager=apprafter-cli`, and
+        // `--force-conflicts` (so an existing client-side-applied
+        // resource can migrate ownership cleanly on first SSA run).
+        let cmd = KubectlCli::build_apply_server_side_command(
+            &ManifestSource::Path("/tmp/secret.yaml".into()),
+            Path::new("/tmp/kubeconfig"),
+            APPRAFTER_CLI_FIELD_MANAGER,
+        );
+        let args = argv(&cmd);
+        for required in [
+            "apply",
+            "--server-side",
+            "--field-manager=apprafter-cli",
+            "--force-conflicts",
+            "-f",
+            "/tmp/secret.yaml",
+        ] {
+            assert!(
+                args.iter().any(|a| a == required),
+                "missing {required}: {args:?}"
+            );
+        }
+        // Defensive: the legacy client-side path must NOT appear.
+        assert!(!args.iter().any(|a| a == "--client-side"), "{args:?}");
+    }
+
+    #[test]
+    fn apply_server_side_command_with_url_source_still_emits_ssa_flags() {
+        let cmd = KubectlCli::build_apply_server_side_command(
+            &ManifestSource::Url("https://example.com/secret.yaml".into()),
+            Path::new("/tmp/kubeconfig"),
+            "custom-fm",
+        );
+        let args = argv(&cmd);
+        for required in [
+            "apply",
+            "--server-side",
+            "--field-manager=custom-fm",
+            "--force-conflicts",
+            "-f",
+            "https://example.com/secret.yaml",
+        ] {
+            assert!(
+                args.iter().any(|a| a == required),
+                "missing {required}: {args:?}"
+            );
+        }
     }
 
     #[test]

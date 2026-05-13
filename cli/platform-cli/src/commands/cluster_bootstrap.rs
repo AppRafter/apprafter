@@ -17,10 +17,11 @@ use cli_providers::k8s::{
     extract_operator_chart_to_tempdir, gateway_api_crds_url, operator_values_yaml,
     resolve_image_ref, selfsigned_cluster_issuer_yaml, HelmCli, HelmRunner, HelmUpgradeArgs,
     KubectlCli, KubectlRunner, ManifestSource, APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE,
-    APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET, APPRAFTER_OPERATOR_DEFAULT_IMAGE,
-    APPRAFTER_OPERATOR_RELEASE_NAME, APPRAFTER_SYSTEM_NAMESPACE, ARGOCD_CHART_VERSION,
-    ARGOCD_REPO_USERNAME_DEFAULT, BACKSTAGE_DEFAULT_IMAGE, BOOTSTRAP_APP_DEFAULT_PATH,
-    CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION, RELEASED_OPERATOR_VERSION,
+    APPRAFTER_BOOTSTRAP_REPO_CREDS_SECRET, APPRAFTER_CLI_FIELD_MANAGER,
+    APPRAFTER_OPERATOR_DEFAULT_IMAGE, APPRAFTER_OPERATOR_RELEASE_NAME, APPRAFTER_SYSTEM_NAMESPACE,
+    ARGOCD_CHART_VERSION, ARGOCD_REPO_USERNAME_DEFAULT, BACKSTAGE_DEFAULT_IMAGE,
+    BOOTSTRAP_APP_DEFAULT_PATH, CERT_MANAGER_CHART_VERSION, CILIUM_CHART_VERSION,
+    RELEASED_OPERATOR_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -409,10 +410,19 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     }
 
     // Step 9.5 — Argo CD repo-credentials Secret (apprafter-bootstrap-repo-creds).
+    // MUST be server-side apply: the manifest carries the PAT in
+    // `stringData.password`, and client-side `kubectl apply` would
+    // mirror the entire body into
+    // `kubectl.kubernetes.io/last-applied-configuration` as plain
+    // text (recoverable by any read on the Secret object, scraped
+    // by etcd backups, surfaced in Argo CD's UI "Manifest" tab).
+    // SSA tracks ownership via `metadata.managedFields` and does
+    // NOT add the last-applied annotation.
     if let Some(rs_path) = argocd_repo_secret_path {
-        kubectl.apply_manifest(
+        kubectl.apply_manifest_server_side(
             &ManifestSource::Path(rs_path.to_path_buf()),
             kubeconfig_path,
+            APPRAFTER_CLI_FIELD_MANAGER,
         )?;
     }
 
@@ -466,6 +476,7 @@ mod tests {
     #[derive(Default)]
     struct FakeKubectl {
         applies: RefCell<Vec<(ManifestSource, PathBuf)>>,
+        ssa_applies: RefCell<Vec<(ManifestSource, PathBuf, String)>>,
     }
 
     impl KubectlRunner for FakeKubectl {
@@ -473,6 +484,19 @@ mod tests {
             self.applies
                 .borrow_mut()
                 .push((source.clone(), kubeconfig_path.to_path_buf()));
+            Ok(())
+        }
+        fn apply_manifest_server_side(
+            &self,
+            source: &ManifestSource,
+            kubeconfig_path: &Path,
+            field_manager: &str,
+        ) -> Result<()> {
+            self.ssa_applies.borrow_mut().push((
+                source.clone(),
+                kubeconfig_path.to_path_buf(),
+                field_manager.to_string(),
+            ));
             Ok(())
         }
         fn get_secret_value(
@@ -1101,17 +1125,33 @@ mod tests {
         )
         .expect("bootstrap");
 
+        // The repo-creds Secret goes through SERVER-SIDE apply
+        // (v0.1.68 security fix — Secret stringData would otherwise
+        // leak into the last-applied-configuration annotation), so
+        // it lands in `ssa_applies`, NOT `applies`. The bootstrap
+        // Application stays on client-side apply (no secrets).
         let applies = kubectl.applies.borrow();
-        // 6 applies: Gateway CRDs URL, Application CRD, default-deny,
-        // ClusterIssuer, repo-secret, bootstrap App.
-        assert_eq!(applies.len(), 6);
-        match &applies[4].0 {
+        let ssa_applies = kubectl.ssa_applies.borrow();
+
+        // SSA: exactly one call — the repo-creds Secret.
+        assert_eq!(ssa_applies.len(), 1, "{ssa_applies:?}");
+        match &ssa_applies[0].0 {
             ManifestSource::Path(p) => assert_eq!(p, &repo_secret),
-            other => panic!("fifth apply must be repo-creds Secret Path, got {other:?}"),
+            other => panic!("SSA apply must be repo-creds Secret Path, got {other:?}"),
         }
-        match &applies[5].0 {
+        assert_eq!(
+            ssa_applies[0].2, "apprafter-cli",
+            "field-manager must be apprafter-cli: {ssa_applies:?}"
+        );
+
+        // CSA: 5 applies — Gateway CRDs URL, Application CRD,
+        // default-deny, ClusterIssuer, bootstrap App. The bootstrap
+        // App is the LAST CSA apply (step 11) — confirms it ran
+        // AFTER the SSA Secret apply (step 9.5).
+        assert_eq!(applies.len(), 5);
+        match &applies[4].0 {
             ManifestSource::Path(p) => assert_eq!(p, &bootstrap),
-            other => panic!("sixth apply must be bootstrap Application Path, got {other:?}"),
+            other => panic!("fifth apply must be bootstrap Application Path, got {other:?}"),
         }
     }
 
@@ -1149,8 +1189,13 @@ mod tests {
         .expect("bootstrap");
 
         let applies = kubectl.applies.borrow();
-        // 5 applies: Gateway CRDs URL, Application CRD, default-deny,
-        // ClusterIssuer, bootstrap App. No repo-secret.
+        let ssa_applies = kubectl.ssa_applies.borrow();
+
+        // No SSA call when repo-secret path is None.
+        assert!(ssa_applies.is_empty(), "{ssa_applies:?}");
+
+        // 5 client-side applies: Gateway CRDs URL, Application CRD,
+        // default-deny, ClusterIssuer, bootstrap App.
         assert_eq!(applies.len(), 5);
         for a in applies.iter() {
             if let ManifestSource::Path(p) = &a.0 {
@@ -1199,7 +1244,9 @@ mod tests {
         .expect("bootstrap");
 
         let applies = kubectl.applies.borrow();
+        let ssa_applies = kubectl.ssa_applies.borrow();
         // Baseline 4 applies (no operator, no webhook, no repo-secret, no bootstrap).
         assert_eq!(applies.len(), 4);
+        assert!(ssa_applies.is_empty(), "{ssa_applies:?}");
     }
 }

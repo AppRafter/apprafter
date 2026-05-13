@@ -43,7 +43,8 @@ pub use image_ref::{
 };
 pub use issuer::{selfsigned_cluster_issuer_yaml, APPRAFTER_SELFSIGNED_ISSUER};
 pub use kubectl::{
-    gateway_api_crds_url, KubectlCli, KubectlRunner, ManifestSource, GATEWAY_API_VERSION,
+    gateway_api_crds_url, KubectlCli, KubectlRunner, ManifestSource, APPRAFTER_CLI_FIELD_MANAGER,
+    GATEWAY_API_VERSION,
 };
 pub use network_policy::default_deny_network_policy_yaml;
 pub use operator_chart::{extract_operator_chart_to_tempdir, APPRAFTER_OPERATOR_RELEASE_NAME};

@@ -122,6 +122,14 @@ mod tests {
         fn apply_manifest(&self, _: &ManifestSource, _: &Path) -> Result<()> {
             unreachable!("argocd-password never applies manifests")
         }
+        fn apply_manifest_server_side(
+            &self,
+            _: &ManifestSource,
+            _: &Path,
+            _: &str,
+        ) -> Result<()> {
+            unreachable!("argocd-password never applies manifests")
+        }
         fn get_secret_value(
             &self,
             secret: &str,

@@ -521,7 +521,14 @@ fn create_floating_ip_posts_json_with_server_and_returns_id() {
 
 #[test]
 fn delete_floating_ip_returns_unit_on_success() {
+    // Since v0.1.66 delete_floating_ip POSTs unassign first
+    // (idempotent, treats `not assigned` as success) then DELETEs.
     let mut server = mockito::Server::new();
+    let _unassign = server
+        .mock("POST", "/v1/floating_ips/31/actions/unassign")
+        .with_status(201)
+        .with_body(r#"{"action":{"id":1,"status":"success"}}"#)
+        .create();
     let m = server
         .mock("DELETE", "/v1/floating_ips/31")
         .with_status(204)
@@ -533,7 +540,13 @@ fn delete_floating_ip_returns_unit_on_success() {
 
 #[test]
 fn delete_floating_ip_404_is_treated_as_already_gone() {
+    // Both unassign and DELETE return 404 → idempotent success.
     let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/v1/floating_ips/999/actions/unassign")
+        .with_status(404)
+        .with_body(r#"{"error":{"code":"not_found","message":"x"}}"#)
+        .create();
     server
         .mock("DELETE", "/v1/floating_ips/999")
         .with_status(404)
@@ -906,6 +919,15 @@ fn delete_firewall_maps_5xx_to_hetzner() {
 #[test]
 fn delete_floating_ip_maps_5xx_to_hetzner() {
     let mut server = mockito::Server::new();
+    // Defensive unassign returns ok so we reach the DELETE step
+    // where the 5xx surfaces.
+    server
+        .mock("POST", "/v1/floating_ips/300/actions/unassign")
+        .with_status(422)
+        .with_body(
+            r#"{"error":{"code":"service_error","message":"Floating IP is not assigned"}}"#,
+        )
+        .create();
     server
         .mock("DELETE", "/v1/floating_ips/300")
         .with_status(500)
