@@ -4,7 +4,7 @@
 > **Domain:** `apprafter.dev`.
 > **Status:** Phase 1 (Tier 1 single-node MVP) delivered as `v0.1.0-mvp` on 2026-05-08; Phases 2–8 in active design. See `plan.md` for the phase ledger.
 > **Audience:** Architecture decisions, contributors onboarding, design rationale.
-> **Revision:** 5 (Phase-1 close: admission webhook split, operator Helm chart, `apprafter=true` idempotency anchor, age-encrypted state, `platform-cli import`).
+> **Revision:** 7 (Pre-Phase-2 spec refinements: tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD as declarative platform version control plane, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
 
 ---
 
@@ -24,12 +24,14 @@ The middle ground between **PaaS (Fly.io / Railway / Render)** and **vanilla Kub
 
 ### Target users
 
-| Tier | Persona | Hardware | Cost |
-|------|---------|----------|------|
-| **1. Solo** | Solo founder, side-project | 1× VDS (Hetzner CX22+) | €5–20/mo |
-| **2. Small team** | 3–10 engineers, growing product | 3× CCX or small dedicated | €50–200/mo |
-| **3. Production** | Established product, mid-size eng team | 3–5× dedicated EPYC | €500–2000/mo |
-| **4. Regulated** | Compliance/sovereignty needs | AWS C8i (TDX), confidential bare metal | $2000+/mo |
+| Tier | Persona | Substrate | Cost |
+|------|---------|-----------|------|
+| **1. Solo** | Solo founder, side-project | 1× VDS (Hetzner CPX22+) | €5–20/mo |
+| **2. Small team** | 3–10 engineers, growing product | 3+ heterogeneous nodes (CCX or small dedicated; mixed sizes allowed) | €50–200/mo |
+| **3. Production** | Established product, mid-size eng team | Bare metal (3–5× dedicated EPYC) | €500–2000/mo |
+| **4. Regulated** | Compliance/sovereignty needs | External hyperscalers (AWS / GCP / Azure) | $2000+/mo |
+
+Tier descriptions denote the **compute substrate** only. Features available at each tier (confidential containers, hard multi-tenancy, observability stack defaults) are described in §4.1 and Appendix C Feature Matrix. Tier 2 is **not** fixed at 3 nodes — it is the horizontal scaling pathway out of Tier 1, supporting heterogeneous configurations (mixed sizes, growing or shrinking node count over time).
 
 **Critical property:** dev-facing API is identical across tiers. Migration between tiers is a platform operation, not an application rewrite.
 
@@ -61,7 +63,11 @@ The `Application` manifest does not encode tier-specific assumptions. The operat
 
 ### 1.4 GitOps as the only control surface
 
-Every change to the platform is a Git commit. `kubectl apply` to production is an anti-pattern. Manual operations require explicit override and produce loud audit events.
+Every change to the platform is a declarative resource reconciled by Argo CD. `kubectl apply` to production is an anti-pattern reserved for emergency overrides. Manual operations require explicit override and produce loud audit events.
+
+The principle applies to the **platform itself** as well as user workloads. After bootstrap, the platform stack — Cilium, cert-manager, AppRafter operator, admission webhook, Backstage, and Argo CD itself — is reconciled by Argo CD from a versioned chart artifact (see §3.10 Platform stack management and §3.11 PlatformStack). The `platform-cli cluster-bootstrap` command is a minimal loader that installs Argo CD and applies a single root `Application`; further reconciliation flows through GitOps.
+
+Destructive changes — to user Applications or to the platform stack — are gated by `MigrationPlan` resources requiring explicit approval (see §3.8).
 
 ### 1.5 Decl-first
 
@@ -86,6 +92,10 @@ Concrete examples:
 - Tier 3+: Kata default
 - Tier 1: SMTP relay for notifications, no advanced routing
 - Tier 2+: full notifications service with multi-channel routing
+- Tier 1: soft multi-tenancy (Capsule policies + default-deny NetworkPolicy + workload identity); hard multi-tenancy is structurally not available on a single-node deployment
+- Tier 2+: hard multi-tenancy via Kamaji (separate Kubernetes control plane per tenant); see §3.9 Tenant CRD
+- Tier 1 / dev mode: Hubble observability opt-in (default off to minimise footprint)
+- Tier 2+: Hubble enabled by default (network observability + flow visualisation)
 
 ---
 
@@ -113,9 +123,10 @@ Concrete examples:
 ├─────────────────────────────────────────────────────────┤
 │  Compute Substrate                                       │
 │  Tier 1: single VDS (k3s)                                │
-│  Tier 2: 3× nodes (k3s/k0s HA)                           │
+│  Tier 2: 3+ heterogeneous nodes (k3s HA)                 │
 │  Tier 3: Talos + bare metal EPYC                         │
-│  Tier 4: TDX/SEV-SNP nodes for confidential workloads    │
+│  Tier 4: external hyperscalers (AWS / GCP / Azure)       │
+│  Confidential containers: orthogonal opt-in (see ADR 0015)│
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -128,97 +139,149 @@ Concrete examples:
 The unit of deployment. Encapsulates workload, exposure, configuration, dependencies, networking, and per-environment overrides — all in a single CUE document.
 
 ```cue
+apiVersion: apprafter.io/v1alpha1
 kind: Application
-name: parser
+metadata: {
+    name: "parser"
+}
+spec: {
+    // Shared base across environments
+    base: {
+        image: "ghcr.io/user/parser"
 
-// Shared base across environments
-base: {
-    image: ghcr.io/user/parser
-    expose: {port: 8080}
-    needs: {
-        pg: {size: small}
-        jetstream: {streams: ["blocks-head"]}
-        redis: {}
-    }
-    env: {
-        DATABASE_URL: from: claim.pg.uri
-        API_KEY: from: secret("third-party/tron/key")
-        JWT_SECRET: from: secret("self/jwt", rotation: 30d)
-        LOG_LEVEL: "info"
-    }
-    connects: {
-        egress: {
-            external: [
-                {host: "api.tron.network", port: 443}
-                {host: "*.binance.com", port: 443}
+        expose: {
+            port: 8080
+            public: true                              // expose externally via Gateway
+
+            // Optional — defaults to {app}.{env}.{platform-domain}
+            hostname: "parser-prod.example.com"
+
+            // Optional — defaults to ["/"]
+            paths: ["/", "/api/v1"]
+
+            // TLS via cert-manager + ClusterIssuer; default true when public: true
+            tls: true
+
+            // Optional URL rewrites (Gateway API HTTPRoute filters)
+            rewrites: [
+                {from: "/api/v1/(.*)", to: "/internal/$1"}
             ]
+
+            // WebSocket support — enables HTTP/1.1 Upgrade handling and longer idle timeouts
+            websocket: true
+
+            // Session affinity; default = websocket value (sticky when WS, non-sticky otherwise)
+            sticky: true
+
+            // IP family for ingress listeners; default inherits from Infrastructure.network.ipFamilies
+            protocols: [ipv6, ipv4]
+        }
+
+        needs: {
+            pg: {size: "small"}
+            jetstream: {streams: ["blocks-head"]}
+            redis: {}
+        }
+        env: {
+            DATABASE_URL: from: claim.pg.uri
+            API_KEY: from: secret("third-party/tron/key")
+            JWT_SECRET: from: secret("self/jwt", rotation: "30d")
+            LOG_LEVEL: "info"
+        }
+        connects: {
+            egress: {
+                external: [
+                    {host: "api.tron.network", port: 443},
+                    {host: "*.binance.com", port: 443},
+                ]
+            }
+        }
+        autoscale: {
+            on:  "jetstream_lag"
+            min: 1
+            max: 10
         }
     }
-    autoscale: {
-        on: jetstream_lag
-        min: 1
-        max: 10
-    }
-}
 
-// Per-environment overrides — CUE unification, no templating
-environments: {
-    dev: base & {
-        replicas: 1
-        expose: {public: false, network: vpn}
-        env.LOG_LEVEL: "debug"
-        needs.pg.selector: {tier: integrated}
-    }
-    staging: base & {
-        replicas: 2
-        expose: {public: false, network: vpn}
-        needs.pg.selector: {tier: integrated}
-    }
-    prod: base & {
-        replicas: 3
-        expose: {public: false}  // internal only via Gateway
-        needs.pg.selector: {tier: managed-aws}
-        confidential: true
-        network: {
-            egressIP: {static: true, pool: "third-party-egress"}
+    // Per-environment overrides — CUE unification, no templating
+    environments: {
+        dev: {
+            replicas: 1
+            expose: {public: false, network: "vpn"}
+            env: {LOG_LEVEL: "debug"}
+            needs: {pg: {selector: {tier: "integrated"}}}
+        }
+        staging: {
+            replicas: 2
+            expose: {public: false, network: "vpn"}
+            needs: {pg: {selector: {tier: "integrated"}}}
+        }
+        prod: {
+            replicas: 3
+            expose: {public: false}  // internal only via Gateway
+            needs: {pg: {selector: {tier: "managed-aws"}}}
+            confidential: true
+            network: {
+                egressIP: {
+                    static: true
+                    pool: "third-party-egress"
+                    purpose: "tron-api-integration"
+
+                    // Family for static IP allocation; default — both v4 and v6
+                    families: [ipv6, ipv4]
+                }
+            }
         }
     }
-}
 
-budget: {dev: nano, staging: small, prod: medium}
+    budget: {dev: "nano", staging: "small", prod: "medium"}
+}
 ```
 
 **Key properties:**
 
 - **Per-environment overrides via CUE unification.** No template strings, no `{{ .Values.image }}`. Just unification — type-safe, IDE-supported.
-- **Each environment** is reconciled into a separate namespace (or vCluster on Tier 2+) with its own ServiceProvider selectors, so `dev` can use integrated PG and `prod` can use AWS RDS — same manifest, different physical reality.
+- **Each environment** is reconciled into a separate namespace (within a Kamaji `TenantControlPlane` on Tier 2+, see §3.9) with its own ServiceProvider selectors, so `dev` can use integrated PG and `prod` can use AWS RDS — same manifest, different physical reality.
 - **Promotion between envs** is a platform operation (`platform-cli promote parser staging prod` or Backstage button), not a manifest rewrite.
 - **`needs` automatically generates** corresponding network policies — a dev declares `needs.pg`, the operator emits the egress rule. No duplication.
+
+**Environment isolation across tiers.** On Tier 1, each Application environment maps to a namespace in the host cluster with default-deny NetworkPolicy and Capsule policies. On Tier 2+, each environment maps to a namespace **within an AppRafter Tenant's Kamaji TenantControlPlane** — providing hard API-level isolation between environments and across applications belonging to the same tenant. The Application manifest does not change between tiers; the operator resolves environment placement based on the substrate. See §3.9 Tenant.
 
 ### 3.2 ServiceProvider
 
 A declared backend for a platform service type. Multiple providers can coexist; applications select by labels.
 
 ```cue
+apiVersion: apprafter.io/v1alpha1
 kind: ServiceProvider
-name: pg-integrated
-type: pg
-backend: cloudnative-pg
-labels: {tier: integrated, location: in-cluster}
-config: {
-    cluster: "platform-postgres"
-    nodes: 3
+metadata: {
+    name: "pg-integrated"
+    labels: {tier: "integrated", location: "in-cluster"}
 }
+spec: {
+    type:    "pg"
+    backend: "cloudnative-pg"
+    config: {
+        cluster: "platform-postgres"
+        nodes:   3
+    }
+}
+```
 
----
+```cue
+apiVersion: apprafter.io/v1alpha1
 kind: ServiceProvider
-name: pg-aws
-type: pg
-backend: aws-rds
-labels: {tier: managed, location: aws-eu-west-1, compliance: soc2}
-config: {
-    region: eu-west-1
-    instance_class: db.t4g.medium
+metadata: {
+    name: "pg-aws"
+    labels: {tier: "managed", location: "aws-eu-west-1", compliance: "soc2"}
+}
+spec: {
+    type:    "pg"
+    backend: "aws-rds"
+    config: {
+        region:         "eu-west-1"
+        instance_class: "db.t4g.medium"
+    }
 }
 ```
 
@@ -228,15 +291,21 @@ Generated by the Application operator when an Application declares a `need`. Rou
 
 ```cue
 // Generated, not authored
+apiVersion: apprafter.io/v1alpha1
 kind: ResourceClaim
-name: parser-pg
-type: pg
-selector: {tier: integrated}  // matched by app's `needs.pg.selector`
-spec: {size: small}
+metadata: {
+    name:      "parser-pg"
+    namespace: "default"
+}
+spec: {
+    type:     "pg"
+    selector: {tier: "integrated"}  // matched by app's `needs.pg.selector`
+    size:     "small"
+}
 status: {
-    provider: pg-integrated
-    connection: secret-ref://workloads/parser/pg-conn
-    ready: true
+    provider:   "pg-integrated"
+    connection: "secret-ref://workloads/parser/pg-conn"
+    ready:      true
 }
 ```
 
@@ -245,19 +314,40 @@ status: {
 Declarative access for a human or external system. Replaces ad-hoc kubeconfig + VPN-credential distribution.
 
 ```cue
+apiVersion: apprafter.io/v1alpha1
 kind: AccessGrant
-subject: alice@company.com
-scope: {
-    namespaces: ["dev", "staging"]
-    capabilities: ["read", "exec"]
-    resources: ["pods", "logs", "deployments"]
+metadata: {
+    name: "alice-grant"
 }
-network: {
-    routes: ["10.0.0.0/16"]
-    services: ["argocd", "grafana"]
+spec: {
+    subject: "alice@company.com"
+
+    // Optional — scopes the grant to a specific tenant's Kamaji control plane.
+    // When omitted, the grant applies at the host cluster level (rare;
+    // typically only for platform operators).
+    tenant: "blockchain-team"
+
+    scope: {
+        namespaces:   ["dev", "staging"]
+        capabilities: ["read", "exec"]
+        resources:    ["pods", "logs", "deployments"]
+    }
+
+    // Optional — for host cluster-admin grants, two-person rule applies:
+    // the grant becomes active only after all listed approvers sign.
+    approvers: ["bob@company.com"]
+
+    network: {
+        routes:   ["10.0.0.0/16"]
+        services: ["argocd", "grafana"]
+    }
+
+    mfa: "required"
+
+    // For host cluster-admin emergency grants, recommended ≤ 1h.
+    // For tenant-scoped read grants, longer durations (30d) acceptable.
+    expiry: "30d"
 }
-mfa: required
-expiry: "30d"
 ```
 
 **End-to-end flow when admin commits an AccessGrant:**
@@ -276,40 +366,52 @@ expiry: "30d"
 
 All auth events are written to the audit log (OpenBao audit + JetStream stream).
 
+**Tenant scoping.** When `tenant:` is specified, the AccessGrant subject receives credentials valid only for that tenant's Kamaji TenantControlPlane. The subject cannot kubectl into the host cluster or other tenants' control planes. This is the structural foundation for MSP (multi-customer) scenarios and managed-Plane A/B separation.
+
+**Two-person rule and JIT cluster-admin.** For host cluster-admin scope grants, the `approvers:` field is recommended (and required by policy for production-tier platforms). The grant enters `pending-approval` status; reconciliation produces the credential only after all approvers sign through Backstage or via API.
+
+For emergency operations, **JIT cluster-admin AccessGrants** use short TTLs (`expiry: "1h"`) with mandatory `approvers`. Backstage displays a prominent "Emergency JIT access active" banner visible to all team members for the duration of the grant. Audit logs tag the event distinctly for downstream review.
+
 ### 3.5 ExternalSurface
 
 Top-level platform manifest declaring the external contour: git host, registry, monitoring, backups, access plane.
 
 ```cue
+apiVersion: apprafter.io/v1alpha1
 kind: ExternalSurface
-git: {
-    provider: gitlab-self-hosted
-    url: "git.platform.local"
-    backups: {to: "s3://backup-bucket", schedule: daily}
+metadata: {
+    name: "default"
 }
-registry: {
-    provider: harbor
-    url: "registry.platform.local"
-    retention: "30d"
-    signing: required
-}
-access: {
-    provider: headscale
-    network: "platform-team"
-}
-syntheticMonitoring: {
-    provider: uptime-kuma
-    location: "external-vps"  // out-of-band, separate failure domain
-    endpoints: [argocd, grafana, registry, vpn]
-}
-backups: {
-    destination: "s3://platform-backup"  // external, never same failure domain
-    retention: "90d"
-    encryption: required
-}
-notifications: {
-    providers: ["smtp", "slack"]
-    smtp: {host: "smtp.example.com", from: "platform@example.com"}
+spec: {
+    git: {
+        provider: "gitlab-self-hosted"
+        url:      "git.platform.local"
+        backups: {to: "s3://backup-bucket", schedule: "daily"}
+    }
+    registry: {
+        provider:  "harbor"
+        url:       "registry.platform.local"
+        retention: "30d"
+        signing:   "required"
+    }
+    access: {
+        provider: "headscale"
+        network:  "platform-team"
+    }
+    syntheticMonitoring: {
+        provider:  "uptime-kuma"
+        location:  "external-vps"  // out-of-band, separate failure domain
+        endpoints: ["argocd", "grafana", "registry", "vpn"]
+    }
+    backups: {
+        destination: "s3://platform-backup"  // external, never same failure domain
+        retention:   "90d"
+        encryption:  "required"
+    }
+    notifications: {
+        providers: ["smtp", "slack"]
+        smtp: {host: "smtp.example.com", from: "platform@example.com"}
+    }
 }
 ```
 
@@ -322,19 +424,24 @@ notifications: {
 Extension point for community-contributed service providers. Built-in providers (Postgres, JetStream, ClickHouse, Redis, S3) ship with the platform; everything else is a plugin.
 
 ```cue
+apiVersion: apprafter.io/v1alpha1
 kind: ServiceProviderPlugin
-name: mysql-percona
-type: mysql  // new resource type, becomes available as needs.mysql
-implementation: oci://ghcr.io/community/mysql-percona-provider:v1
-config: {
-    // plugin-specific
-    cluster_size: 3
+metadata: {
+    name: "mysql-percona"
+}
+spec: {
+    type:           "mysql"  // new resource type, becomes available as needs.mysql
+    implementation: "oci://ghcr.io/community/mysql-percona-provider:v1"
+    config: {
+        // plugin-specific
+        cluster_size: 3
+    }
 }
 ```
 
 **Plugin tiers:**
 
-- **Built-in (Rust):** statically linked into operator. Curated by core team. The five canonical types.
+- **Built-in (Rust):** statically linked into operator. Curated by core team. The six canonical types (Postgres, JetStream, ClickHouse, Redis, S3, Notifications).
 - **Community (gRPC sidecar):** OCI image with gRPC server implementing the `ServiceProviderInterface` proto. Language-agnostic. Registered via `ServiceProviderPlugin`.
 - **Future (WASM):** when WASI 1.0 stabilizes. Hot-loadable, sandboxed, no per-plugin process overhead.
 
@@ -347,75 +454,93 @@ config: {
 Top-level manifest describing the substrate the platform runs on. Declarative, applied by `platform-cli`.
 
 ```cue
+apiVersion: apprafter.io/v1alpha1
 kind: Infrastructure
-provider: hetzner-cloud
-nodes: [
-    {role: control-plane, type: cx32, count: 3},
-    {role: worker, type: ccx33, count: 5}
-]
-network: {
-    privateNetwork: "platform-net"
-    floatingIPs: ["egress-tron-api", "egress-binance"]
+metadata: {
+    name: "platform-1"
 }
-osImage: talos-1.x
+spec: {
+    provider: "hetzner-cloud"
+    nodes: [
+        {role: "control-plane", type: "cpx32", count: 3},
+        {role: "worker", type: "ccx33", count: 5},
+    ]
+    network: {
+        privateNetwork: "platform-net"
+        floatingIPs: ["egress-tron-api", "egress-binance"]
+
+        // IP family strategy (see §4.3.1).
+        // Default — dual-stack (both v6 and v4).
+        ipFamilies: [ipv6, ipv4]
+
+        // When ipFamilies is single-stack and allowAppFamilyExtension is true,
+        // individual Applications may opt into dual-stack pods.
+        allowAppFamilyExtension: false
+    }
+    osImage: "talos-1.x"
+}
 ```
 
 `platform-cli plan` shows diff. `platform-cli apply` applies. State is stored in Git (encrypted via age/sops).
 
 **Provider model:**
 
-- **Built-in providers:** Hetzner Cloud, Hetzner Robot (bare metal), AWS — implemented as native Rust SDKs for tight integration.
-- **Community providers:** any other cloud (OVH, Scaleway, GCP, Azure, DO, vSphere, Proxmox, etc.) implemented as `InfrastructureProviderPlugin` — a CUE→OpenTofu translator that wraps an existing OpenTofu module.
+- **Built-in providers (v1):** Hetzner Cloud, Hetzner Robot (bare metal), AWS — implemented as native Rust SDKs for tight integration with cloud-native APIs.
+- **Additional clouds:** deferred to v2. The `Provider` trait architecture supports adding new built-in providers on demand; no external plugin contract or SDK is shipped in v1.
 
-This way the platform team maintains quality on the two main providers, while the community can add any cloud with an existing OpenTofu provider — which is most clouds.
-
-`platform-cli` invokes OpenTofu under the hood for community providers; the user sees only CUE manifests and `platform-cli plan/apply`. State remains in Git.
+If a concrete customer requirement for an additional cloud emerges before v2, support is added as a fourth native Rust implementation. See ADR 0016 for rationale and Appendix B Non-goals for the explicit scope statement.
 
 **Idempotency anchor:** built-in providers label every managed cloud object with `apprafter=true`. This single label is the canonical reference for `apply` / `destroy` / `import` — if the local state file is lost, `platform-cli import` reconstructs it by scanning live API objects for that label, without provisioning anything new. (See §4.12 for the matching CLI surface.)
 
 ### 3.8 MigrationPlan
 
-Auto-generated when a reconciler detects a destructive change (selector change for stateful claims, major version upgrades, storage class changes). Pauses execution until explicit human approval.
+A `MigrationPlan` is a declarative resource that gates destructive changes — to user Applications or to the platform stack — behind explicit approval. The same CRD covers both scopes via a discriminator field; per-scope behaviour is implemented through a Rust trait dispatch in `MigrationController`.
 
 ```cue
-// Auto-generated, not authored
+apiVersion: apprafter.io/v1alpha1
 kind: MigrationPlan
-name: parser-pg-migration-2026-05-05
-application: parser
-environment: prod
-trigger: {
-    type: selector-change
-    field: needs.pg.selector
-    from: {tier: integrated}
-    to: {tier: managed-aws}
+metadata: {
+    name:      "parser-pg-migration-2026-05-13"
+    namespace: "apprafter-system"
 }
-risks: {
-    estimatedDowntime: "5–15 minutes"
-    dataVolume: "12 GB"
-    reversible: false
-    requiresFullBackup: true
+spec: {
+    scope: {
+        type: application      // application | platform
+        application: {
+            ref: { name: "parser", namespace: "default" }
+            environment: "prod"
+        }
+    }
+    trigger: {
+        type:  "selector-change"
+        field: "needs.pg.selector"
+        from: {tier: "integrated"}
+        to:   {tier: "managed-aws"}
+    }
+    risks: {
+        classification: "data-migration"   // safe | requires-restart | data-migration | breaking
+        estimatedDowntime: "5–15 minutes"
+        dataVolume: "12 GB"
+        reversible: false
+        requiresFullBackup: true
+    }
+    plan: [
+        {step: 1, action: "Snapshot source DB to S3", estimatedDuration: "2m", reversible: true},
+        {step: 2, action: "Provision target RDS instance", estimatedDuration: "5m", reversible: true},
+        // ...
+    ]
+    approvers: ["alice@company.com"]
 }
-plan: [
-    {step: 1, action: "Snapshot source DB to S3"},
-    {step: 2, action: "Provision target RDS instance"},
-    {step: 3, action: "Restore snapshot to RDS"},
-    {step: 4, action: "Pause writes to source DB"},
-    {step: 5, action: "Sync incremental changes (WAL replication)"},
-    {step: 6, action: "Switch app to RDS"},
-    {step: 7, action: "Verify, then archive source DB"}
-]
-status: pending-approval
-approvers: ["alice@company.com"]
 ```
 
-**Workflow:**
+**Detection.** Reconcilers (the Application reconciler in the AppRafter operator, the PlatformController for platform changes) detect destructive changes during normal reconciliation. On detection, they create a `MigrationPlan` and **pause patching of dependent resources** — the source CR continues to exist with its new spec, but its child resources (Deployment, Service, HTTPRoute for Applications; Argo CD Application CRs for platform components) keep running the prior version. The source CR's `status.phase` reflects `AwaitingMigrationApproval`.
 
-1. Argo CD syncs a destructive change
-2. Reconciler creates a `MigrationPlan` instead of applying immediately
-3. Backstage shows a prominent **"Pending migration approval — production at risk"** banner with risk breakdown and step-by-step plan
-4. Approver (named in `approvers`) reviews, then **approves / rejects / edits** (e.g., adds maintenance window)
-5. On approval: dedicated migration runner executes the plan with progress reporting
-6. Every step is logged to the audit stream
+**Gate location.** The gate is implemented inside the AppRafter reconcilers, not at the Argo CD layer. Argo CD remains a transport: it synchronises whatever is in the source. AppRafter reconcilers gate the propagation from "CR in cluster" to "child resources reflect the CR's spec." This avoids fighting Argo CD's automated sync and keeps Argo CD's role simple.
+
+**Approve / reject semantics differ by scope:**
+
+- **`application` scope:** approve-only. There is no explicit reject. The application manifest lives in the user's Git repository; if the user wants to reverse a change, they revert the commit in the source repo. Argo CD synchronises the reverted manifest, the reconciler observes it as a non-destructive (or differently-destructive) change, and the original MigrationPlan is superseded.
+- **`platform` scope:** approve or reject. The platform target lives in the cluster (PlatformStack CR, see §3.11), not in a user repository. Reject means "revert `spec.pin` to the value stored in the plan's previous-spec snapshot annotation."
 
 **What's destructive (triggers MigrationPlan):**
 
@@ -423,6 +548,7 @@ approvers: ["alice@company.com"]
 - Major version upgrade of a platform service (e.g., pg 15 → 16)
 - Storage class change
 - Any change marked `destructive: true` in the ServiceProvider schema
+- Platform-stack diffs classified as `requires-restart`, `data-migration`, or `breaking` (see §3.11 PlatformStack)
 
 **What's NOT destructive (auto-applies):**
 
@@ -430,8 +556,176 @@ approvers: ["alice@company.com"]
 - Expose rule changes
 - Env var additions
 - Image updates (those are routine deployments via Argo CD)
+- Platform-stack diffs classified as `safe`
+
+**No automatic expiration.** A `MigrationPlan` in `pending-approval` state remains there indefinitely. Auto-rejection would harm solo operators on extended absences. If a user wants to dismiss a plan without acting, manual reject (platform scope) or Git revert (application scope) is the path.
+
+**Backstage UI** surfaces the queue of pending plans across both scopes, allowing approval through a unified interface. Argo CD UI also exposes an "Approve Migration" Resource Action via a Lua script for users who do not use Backstage. The CLI provides `apprafter migration list`, `apprafter migration approve <name>`, `apprafter migration reject <name>` as fallback paths.
+
+**Approvers** are listed as email addresses in `spec.approvers`. When the AccessGrant subsystem (§3.4) is fully delivered, the field will accept identity references and approval will route through the same identity layer.
 
 This turns "oops, blew up prod" into an **explicit gate** with risk visibility and human control.
+
+See ADR 0027 for the full decision record, future enhancements (skip, partial migration), and risk analysis.
+
+### 3.9 Tenant
+
+Top-level CRD describing a multi-tenancy boundary. An AppRafter Tenant wraps a Kamaji `TenantControlPlane` (providing hard API-level isolation) and a Capsule `Tenant` (providing policy enforcement layered on top).
+
+```cue
+apiVersion: apprafter.io/v1alpha1
+kind: Tenant
+metadata: {
+    name: "blockchain-team"
+}
+spec: {
+    controlPlane: {
+        // Number of Kamaji control plane pod replicas; HA recommended for T2+.
+        replicas: 2
+
+        // Datastore claim — uses standard ResourceClaim mechanism, matching
+        // pg-integrated by default. The Kamaji controller's persistence shares
+        // the same operational story as Application databases (backups, HA, observability).
+        datastore: {
+            type:     "pg"
+            selector: {tier: "integrated"}
+        }
+    }
+
+    // Tenant owners — receive cluster-admin scope inside the Tenant's TCP only.
+    // Owners come from AccessGrants referencing this tenant.
+    owners: [
+        {from: "accessGrant", subjects: ["alice@team.com", "bob@team.com"]},
+    ]
+
+    // Capsule policies enforced within the tenant's namespaces.
+    policies: {
+        quotas: {cpu: 100, memory: "200Gi", storage: "1Ti"}
+        allowedRegistries:     ["harbor.platform.local"]
+        allowedRuntimeClasses: ["kata"]
+        networkPolicies: {
+            defaultDeny:        true  // enforced regardless; setting is for clarity
+            allowSameNamespace: true  // pods in same namespace can reach each other
+        }
+    }
+
+    // Optional — limit Applications that can be deployed into this tenant
+    // by Application name or labels. Useful for MSP scenarios.
+    applicationSelector: {
+        matchLabels: {team: "blockchain"}
+    }
+}
+```
+
+**Lifecycle:**
+
+1. Apply Tenant manifest via Argo CD.
+2. AppRafter operator translates Tenant into:
+    - Kamaji `TenantControlPlane` resource in `kamaji-system` namespace, with declared datastore claim.
+    - Capsule `Tenant` resource within the TCP, with declared policies.
+3. AccessGrants referencing this tenant resolve into cluster-admin role bindings **inside the TCP only**. Subjects receive a kubeconfig via `platform-cli login --tenant blockchain-team`.
+4. Application resources targeting this tenant are deployed into namespaces inside the TCP. Each environment of an Application maps to a separate namespace.
+
+**Plane A/B separation in managed scenarios:**
+
+When AppRafter is operated as a managed offering (Managed Ops or Turnkey Cloud), the operator side runs on the host cluster (**Plane A**). Customer workloads run inside their Tenant's TCP (**Plane B**). The operator does not have automatic kubectl access into customer TCPs — accessing customer data requires an explicit AccessGrant approved by the customer.
+
+This is structural separation, not disciplinary. The Plane A operator has no credentials for Plane B unless the customer issues them.
+
+**Tier behaviour:**
+
+- **Tier 1:** Tenant CRD is accepted but produces Capsule-only enforcement (no Kamaji TCP — structurally unavailable on single-node). Soft multi-tenancy via Capsule + workload identity + default-deny NetworkPolicy.
+- **Tier 2+:** Full hard multi-tenancy with Kamaji TCP per Tenant.
+
+Granularity is at the Tenant level. A single team (one customer of an MSP) typically maps to one Tenant containing multiple Applications and environments. For strict per-environment isolation (e.g. prod isolated from dev at API level), create separate Tenants (`team-nonprod`, `team-prod`).
+
+Dev mode (DEV_MODE_SPEC §1) maps to Tier 1 footprint — Tenant CRD accepted but produces Capsule-only enforcement.
+
+**References:** see ADR 0023 for full rationale.
+
+### 3.10 Platform stack management via Argo CD
+
+The platform stack — Cilium, cert-manager, the AppRafter operator, admission webhook, default NetworkPolicies, Backstage, and Argo CD itself — is managed declaratively via Argo CD `Application` resources after the cluster bootstrap completes. `platform-cli cluster-bootstrap` is a minimal loader; subsequent reconciliation flows through GitOps.
+
+**Bootstrap loader scope.** The loader performs exactly one Helm release: Argo CD itself. After Argo CD is running, the CLI applies a single root `Application` resource that points to the platform-stack OCI chart (see §3.11 PlatformStack and ADR 0028 for distribution). All other platform components — including cert-manager, which produces certificates for Argo CD's own UI on tier deployments with a configured domain — arrive through Argo CD reconciliation.
+
+Argo CD's web UI uses a self-signed certificate on first boot, which is sufficient for port-forward access. Operators configuring a domain at bootstrap time receive a cert-manager-issued certificate within the time Argo CD takes to reconcile cert-manager and its `ClusterIssuer` (typically 2–5 minutes on Tier 1).
+
+**Self-managing Argo CD.** Argo CD itself is shipped as one of the Applications in the chart. Version bumps and configuration changes to Argo CD flow through normal reconciliation, with the safety constraint that Argo CD updates are classified as at least `requires-restart` in MigrationPlan (see §3.8) and `syncPolicy.automated.prune` is set to false for the self-managing Application. A documented manual recovery path (`apprafter platform rescue`) reinstalls Argo CD from the loader if the self-managed Argo CD becomes unable to reconcile itself.
+
+**Argo CD's role for user Applications.** User application repositories (containing `apprafter/Application.cue`) are connected to Argo CD by the user through the Argo CD UI, the CLI (`apprafter app add --repo <url>`), or Backstage Software Templates. CUE files are rendered to Kubernetes YAML by a Config Management Plugin (CMP) sidecar in Argo CD's repo-server; the sidecar is shipped as part of the platform-stack chart (see ADR 0029).
+
+**Day-2 surface.** Argo CD UI surfaces the state of both platform components and user Applications side by side. Operators investigating Cilium health use the same interface as developers checking the parser service. There is no separate diagnostic flow for "platform vs workload."
+
+Dev mode (DEV_MODE_SPEC) installs a reduced platform stack in the local k3d cluster; the same PlatformStack CRD and Argo CD-reconciled model applies, with the platform-stack chart's `tier: dev` overlay enabling minimal-footprint defaults.
+
+See ADR 0025 for the full architectural rationale, ADR 0028 for distribution mechanics, and ADR 0029 for the CMP sidecar.
+
+### 3.11 PlatformStack
+
+A `PlatformStack` CR is the declarative control plane for the platform version. Exactly one instance exists per cluster, named `default`, in the `apprafter-system` namespace. It is created by `platform-cli cluster-bootstrap` and edited thereafter through the CLI (`apprafter platform upgrade`, `apprafter platform channel`, `apprafter platform freeze`), through `kubectl edit`, or through Backstage.
+
+```yaml
+apiVersion: apprafter.io/v1alpha1
+kind: PlatformStack
+metadata:
+  name: default
+  namespace: apprafter-system
+spec:
+  # Channel selection. When pin is unset, the controller resolves to the
+  # latest version of this channel.
+  channel: stable                  # stable | beta | edge
+
+  # Optional explicit version freeze. When set, channel is ignored for
+  # resolution; channel still affects what the controller reports as
+  # availableVersion.
+  pin: "0.2.0"
+
+  # Default false. When true, the controller automatically bumps to the
+  # latest channel version, unless the diff is classified as destructive
+  # (in which case a MigrationPlan is created and the bump is gated).
+  autoUpgrade: false
+
+  # Where the chart is pulled from. Defaults to the AppRafter upstream.
+  # Forks override repoURL; tracking forks may keep upstream for
+  # availability visibility (see ADR 0028).
+  source:
+    upstream: oci://ghcr.io/apprafter/platform-stack
+    repoURL: oci://ghcr.io/apprafter/platform-stack
+    checkInterval: 6h
+
+  # Global values passed to the umbrella chart.
+  values:
+    tier: solo
+    domain: example.com
+
+  # Per-component overrides: freezes, value tweaks, enable/disable.
+  overrides:
+    cilium:
+      pin: "1.16.5"              # do not move this component even on stack bump
+    backstage:
+      enabled: false             # opt out entirely
+```
+
+**Status reports** include `currentVersion`, `availableVersion`, `lastUpstreamCheck`, a per-component status array, a `versionHistory` ring buffer of recent transitions, and standard Kubernetes conditions including `UpgradeAvailable` when a newer version of the configured channel is detected.
+
+**No explicit `spec.version` field.** Version resolution is implicit:
+- If `spec.pin` is set, that exact version is targeted.
+- Otherwise, the latest version available in `spec.channel` from `spec.source.upstream` is targeted.
+
+The OCI registry tag is the canonical source of version truth; `status.currentVersion` reports what is actually applied. `status.versionHistory` keeps the most recent N transitions for rollback and audit.
+
+**Channels.** Three channels follow the Talos and Kubernetes release-channel patterns: `stable` (tested combinations, recommended for production), `beta` (newer combinations, mostly stable), `edge` (latest, breaking changes allowed).
+
+**Safe auto-upgrade.** When `spec.autoUpgrade: true`, the controller bumps `status.currentVersion` toward `status.availableVersion` only if the diff is classified as `safe` in the chart's compatibility metadata (ADR 0028). Any other classification (`requires-restart`, `data-migration`, `breaking`) triggers a `MigrationPlan` (§3.8) instead of an automatic bump. This makes `autoUpgrade: true` safe to enable on Tier 1 single-VPS deployments.
+
+**Curated upstream combinations.** The platform-stack chart at any given version ships a tested combination of component versions. Cross-component compatibility is validated upstream during release. Users do not need to think about which Cilium pairs with which cert-manager; the curated bundle is the contract. The PlatformController does perform an environment-diff check at apply time, confirming the cluster's current Kubernetes version satisfies the chart's `minimumKubernetesVersion` before patching component Applications.
+
+**PlatformController.** A new component (delivered as part of the `apprafter-operator` binary or a sibling controller in the same workspace) reconciles PlatformStack CRs. It periodically checks the upstream OCI registry for new tags within the configured channel and updates `status.availableVersion`. On spec change, it pulls the chart at the target version, renders the umbrella chart with the merged values and overrides, computes a diff vs the currently-applied umbrella Application's values, classifies the diff, and either patches the umbrella Application (non-destructive) or creates a MigrationPlan (destructive).
+
+**CLI awareness.** `platform-cli` separately tracks its own version against upstream releases (npm-style, with a 24h TTL cache) and warns when a CLI update is available. This is unrelated to platform version; the user upgrades the CLI on their own cadence.
+
+See ADR 0026 for the full decision record, including channel semantics, override behaviour, and re-evaluation triggers.
 
 ---
 
@@ -439,15 +733,17 @@ This turns "oops, blew up prod" into an **explicit gate** with risk visibility a
 
 ### 4.1 Compute Substrate
 
-**Tier 1 (single VDS):** k3s in single-node mode with embedded NATS as kine backend. 1–2 GB RAM overhead. Cilium in CNI mode, KubeVirt disabled, Kata disabled.
+**Tier 1 (single VDS):** k3s in single-node mode with default SQLite backend during M1; kine + NATS JetStream backend introduced in M3. 1–2 GB RAM overhead. Cilium in CNI mode, kube-proxy replacement, KubeVirt disabled, Kata disabled. Dual-stack IPv4+IPv6 default. No quorum (single node). Hard multi-tenancy structurally unavailable on a single-node deployment; soft multi-tenancy via Capsule policies + default-deny NetworkPolicy + workload identity. Hubble opt-in (default off to minimise footprint).
 
-**Tier 2 (3× nodes):** k3s in HA mode, NATS JetStream cluster as kine backend (3 replicas, embedded or as a workload), Cilium with mTLS, vCluster optional for env separation.
+**Tier 2 (3+ nodes, heterogeneous allowed):** k3s in HA mode, kine + NATS JetStream cluster as control plane storage (≥3 replicas, embedded or as a workload). Cilium with mTLS, full Gateway API. Hubble enabled by default. Hard multi-tenancy via Kamaji (one TenantControlPlane per AppRafter Tenant); see §3.9. Capsule policy layer applied inside each tenant. Dual-stack IPv4+IPv6 default. Node configuration heterogeneous — mixed sizes allowed, scaling out from Tier 1 supported through `platform-cli upgrade-tier`.
 
-**Tier 3 (bare metal):** Talos Linux on dedicated EPYC, full k8s, Cilium with full Gateway API + Hubble, Kata containers as default runtime, KubeVirt enabled, LINSTOR for replicated block storage.
+**Tier 3 (bare metal):** Talos Linux on dedicated EPYC servers. Full Kubernetes (not k3s). Cilium with full Gateway API, Hubble default. Kata containers as default runtime. KubeVirt enabled for VM workloads. LINSTOR for replicated block storage. Kamaji multi-tenancy. Confidential containers opt-in (when SEV-SNP-capable hardware is provisioned). Dual-stack networking default.
 
-**Tier 4 (confidential):** Tier 3 + nodes with SEV-SNP or TDX. Kata-CC as `runtimeClass`. Apps opt-in via `confidential: true` flag.
+**Tier 4 (external hyperscalers):** AWS / GCP / Azure for regulatory or compliance-driven deployments. Talos Linux on cloud instances; same software stack as Tier 3. Kamaji multi-tenancy. Confidential containers opt-in (TDX / SEV-SNP capable instance types — AWS C8i/M8i/R8i, Azure DCadsv5/DCedsv5, GCP Tau VMs). Karpenter for node autoscaling (AWS native; see ADR 0021). Dual-stack networking default.
 
-**Open question:** at what tier does kine→NATS stop scaling? See §9.
+**Confidential containers** are an orthogonal opt-in feature available on any tier where the hardware supports it. See ADR 0015.
+
+**Open question:** at what tier does kine+NATS stop scaling? See §7.
 
 ### 4.2 Control Plane Storage — kine + NATS JetStream
 
@@ -470,7 +766,32 @@ Replace etcd with kine, configured with NATS JetStream backend. Benefits:
 - **Gateway API** as the only ingress/egress mechanism (no Service/Ingress/LoadBalancer split exposed to the dev)
 - **mTLS by default** between all workloads via Cilium service mesh or SPIRE-issued certificates
 - **NetworkPolicy: default-deny** at namespace creation; the Application's `connects` declares allowed flows
-- **IPv6 primary**, IPv4 optional
+- **Dual-stack IPv4+IPv6 by default** across all tiers (per §4.3.1); single-stack opt-in via `Infrastructure.network.ipFamilies`
+
+#### 4.3.1 IP family strategy
+
+AppRafter runs **dual-stack IPv4+IPv6 by default** across all tiers. Both Hetzner Cloud (delegated /64 IPv6 per VDS) and AWS (full dual-stack VPC) provide IPv6 at no additional cost. Cilium has been production-ready for dual-stack since v1.12.
+
+**Pod network:** every pod receives both IPv4 and IPv6 interfaces by default. Cluster CIDR uses dual notation: `--cluster-cidr=10.42.0.0/16,fd00:42::/64`. Cilium IPAM allocates from both pools.
+
+**Service network:** Services are dual-family by default with IPv6 listed first in `.spec.ipFamilies`. CoreDNS returns AAAA records before A records, so IPv6 is preferred for cluster-internal traffic. Workloads needing IPv4 (legacy databases, external services without AAAA) fall through to A record resolution transparently.
+
+**Ingress (Gateway API):** Gateway listeners accept both families simultaneously. On Tier 1 (Hetzner Cloud), the VDS public IPv4 and delegated /64 IPv6 are both forwarded to the Gateway. On Tier 4 (AWS), the native dual-stack ALB handles both families.
+
+**Egress:** Applications open outbound connections via `getaddrinfo()`, which returns address lists for both families when present. Happy Eyeballs (RFC 8305, default behaviour in glibc, modern language runtimes) attempts IPv6 first with a ~250ms timeout, falling back to IPv4 if needed. Application code is agnostic to the family choice.
+
+Static egress IPs (for third-party whitelisting via `Application.network.egressIP`) support both families per tier:
+- **Tier 1:** node IPv4 + node IPv6 prefix delivered by Hetzner.
+- **Tier 2–3:** Cilium Egress Gateway with floating IPv4 + delegated /64 IPv6 attached to dedicated egress nodes.
+- **Tier 4 AWS:** NAT Gateway with Elastic IP (IPv4) + native IPv6 egress through the VPC.
+
+**Single-stack opt-in.** Operators may set `Infrastructure.network.ipFamilies: [ipv6]` or `[ipv4]` to deploy a single-stack cluster. This is a cluster-wide decision; per-tier deviation is not enforced by the platform.
+
+**Heterogeneous mode.** When a cluster is configured single-stack but selected Applications need the other family, `Infrastructure.network.allowAppFamilyExtension: true` permits Applications to opt into dual-stack via their own `expose.protocols`. By default, `allowAppFamilyExtension: false` and Applications can only narrow (never extend) the cluster-level family list.
+
+**NAT64.** A NAT64 + DNS64 component is **not** shipped in v1. Operators choosing IPv6-only deployment accept the trade-off that IPv4-only external services become unreachable. If NAT64 capability becomes a recurring requirement, it will be added as an opt-in platform component (deferred until concrete demand emerges).
+
+**See also:** ADR 0017 for the full decision record including rationale, Happy Eyeballs mechanics, per-layer details, and re-evaluation triggers.
 
 **Connectivity model:**
 
@@ -759,10 +1080,31 @@ platform-cli kubeconfig
 # Retrieve the Argo CD admin password (same cache semantics)
 platform-cli argocd-password
 
-# Bootstrap Cilium → Gateway API CRDs → Application CRD → default-deny NetworkPolicy →
-# Argo CD → cert-manager → self-signed ClusterIssuer (+ optional Argo CD HTTPRoute,
-# Backstage stack, operator + admission-webhook stack) on a fresh node
+# Minimal bootstrap loader: installs Argo CD via Helm, creates the default
+# PlatformStack resource, and applies a root Application pointing at the
+# platform-stack OCI chart. All other platform components — Cilium,
+# cert-manager, the AppRafter operator, admission webhook, Backstage,
+# default NetworkPolicies, and self-managed Argo CD — arrive through
+# normal Argo CD reconciliation after the loader completes.
 platform-cli cluster-bootstrap
+
+# Open a UI in the browser with port-forward and auto-fetched credentials.
+# Supports argocd, backstage, grafana (when present), hubble (Tier 2+).
+platform-cli open <ui-name>
+
+# Platform stack management — operates on the PlatformStack CR in cluster.
+platform-cli platform status              # current/available versions, components
+platform-cli platform upgrade [--to <v>]  # bump spec.pin (or to latest of channel)
+platform-cli platform channel <name>      # switch channel: stable | beta | edge
+platform-cli platform freeze <component>  # pin a component version inside spec.overrides
+platform-cli platform unfreeze <component>
+platform-cli platform fork --to <oci-ref> # power-user fork bootstrap (see ADR 0028)
+platform-cli platform rescue              # emergency: reinstall Argo CD from loader
+
+# MigrationPlan management.
+platform-cli migration list
+platform-cli migration approve <name>
+platform-cli migration reject <name>      # platform-scope only; application-scope reverts via Git
 
 # Tier upgrade (e.g., solo → team)
 platform-cli upgrade-tier --to team
@@ -771,31 +1113,52 @@ platform-cli upgrade-tier --to team
 platform-cli login
 ```
 
+The CLI is a thin client over declarative resources. Most commands map directly to `kubectl patch` or `kubectl edit` on PlatformStack or MigrationPlan CRs. The same effects are achievable by editing the CRs directly; the CLI provides ergonomic wrappers. CLI version is independent of platform version (see §3.11), and the CLI separately tracks its own update availability against upstream releases, warning when a CLI update is available.
+
 **State and idempotency:**
 
 - State lives at `.apprafter/state.json` (per checkout) — JSON in v0.1.x; will migrate to CUE-encoded once the state schema stabilizes.
 - Sensitive material — kubeconfig YAML, Argo CD admin password — is cached **age-encrypted** under `APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`, mode 0600, auto-created on first run). The encrypted blob lives inside `state.json`; the identity stays out of the repo.
 - All managed cloud resources are labeled `apprafter=true`. This is the canonical idempotency anchor for `apply` / `destroy` / `import`. `platform-cli import` can reconstruct a lost state file by scanning the cloud provider's API for objects with this label — no fresh provision needed.
 
-**Provider implementation strategy:**
+**Provider implementation:**
 
-- **Built-in providers** (Hetzner Cloud, Hetzner Robot, AWS) — implemented via native Rust SDKs (`hcloud-rust`, `aws-sdk-rust`). Tight integration, no external binary.
-- **Community providers** (OVH, Scaleway, GCP, Azure, DO, vSphere, Proxmox, etc.) — implemented as `InfrastructureProviderPlugin`. The plugin contains:
-  - A CUE-to-OpenTofu translator
-  - A wrapped OpenTofu module for that provider
-  - A state-importer that reads `tofu state` back into the platform's CUE state
+- **Hetzner Cloud, Hetzner Robot, AWS** — implemented via native Rust SDKs (`hcloud-rust`, `aws-sdk-rust`). Tight integration, no external binary. These are the only infrastructure providers shipped in v1.
 
-`platform-cli` invokes OpenTofu under the hood for community providers; the user sees only CUE manifests and `platform-cli plan/apply`. State remains in Git (encrypted via age/sops). OpenTofu is OSS Linux Foundation MPL-2.0 — aligns with our license stance.
-
-**Why this hybrid:**
-
-- Native SDK gives the best UX where it matters most (the two providers we ship)
-- OpenTofu shim leverages the existing terraform-provider ecosystem for everything else (most clouds already have providers, no need to rewrite)
-- Pluggable: anyone can ship an `InfrastructureProviderPlugin` for their cloud without touching core platform code
+If additional cloud support becomes necessary before v2, it is added as a fourth native Rust provider implementation (the `cli-providers::Provider` trait is generic). No external plugin contract or OpenTofu shim is shipped. See ADR 0016 for rationale and Appendix B Non-goals.
 
 **No Ansible:** Talos is immutable, all node config goes through Talos API. Mutable Linux is not a target substrate.
 
 **Bare metal flow:** for Tier 3+, `platform-cli` orchestrates Talos `talos-bootstrap` (PXE/ISO) + `talm` for manifest generation. Same CLI, abstracted under tier-specific subcommands.
+
+### 4.13 Cluster-admin constrain
+
+AppRafter's security posture treats cluster-admin power as a risk to be minimised structurally, not merely audited after the fact. The default Kubernetes RBAC model grants cluster-admin god-mode (read any secret, exec any pod, modify any resource). This is incompatible with a security-first platform.
+
+The complete cryptographic solution is Confidential Containers (CoCo, §4.1 Tier 3+), but it is hardware-dependent and workload-opt-in. For all other workloads, defense in depth applies: a bundle of mechanisms, each reducing a different aspect of cluster-admin power.
+
+| # | Layer | What it constrains | Reference |
+|---|---|---|---|
+| 1 | Workload identity (SPIFFE) | Auth between workloads via X.509 SVID, not cluster RBAC | §4.4 |
+| 2 | Secrets via OpenBao + workload identity | Secret access via Vault Agent / CSI with SPIFFE check, not `kubectl get secret` | §4.4 |
+| 3 | Kamaji TenantControlPlane separation | Tenant-admin ≠ host-admin; host cluster-admin has no automatic kubectl access into TCPs | §3.9 |
+| 4 | Two-person rule via AccessGrant `approvers` | Host cluster-admin grants require explicit approval from a second admin | §3.4 |
+| 5 | JIT cluster-admin via short-TTL AccessGrant | Emergency host grants TTL'd at 1h; auto-revoke; loud audit | §3.4 |
+| 6 | Audit pipeline as code | All cluster-admin actions tagged and routed to immutable JetStream stream | §4.10 |
+| 7 | OpenBao audit log | All secrets access logged with SPIFFE identity | §4.4 |
+| 8 | Confidential Containers (CoCo) | Hardware-level memory encryption blocks cluster-admin read for confidential workloads | §4.1 Tier 3+ |
+
+Each layer alone has gaps:
+- Layer 1 requires SPIRE integrity.
+- Layer 2 requires SPIFFE working.
+- Layer 3 doesn't help if cluster-admin issues themselves a TCP grant (mitigated by Layer 4).
+- Layer 4 is procedural and can be socially circumvented in small teams (mitigated by Layer 5 making grants short-lived).
+- Layers 6 and 7 are forensic, not preventive.
+- Layer 8 is hardware-bound and workload-opt-in.
+
+Together, the layers reduce cluster-admin's realistic blast radius significantly while remaining operationally viable. The bundle is the structural answer to "minimize cluster-admin intervention in application workloads".
+
+See ADR 0024 for the full rationale and per-layer detail.
 
 ---
 
@@ -804,14 +1167,21 @@ platform-cli login
 | Layer | Choice | Rationale |
 |-------|--------|-----------|
 | Operator language | **Rust** + kube-rs | Performance, idiomatic for control-plane work, low memory footprint. AI-assisted development closes the productivity gap. |
-| Tooling / CLI | **Rust** (or OneBun for non-hot-path) | `platform-cli` in Rust; UI-facing services and Backstage plugins in TS/OneBun. |
+| Tooling / CLI | **Rust** (`apprafter` binary) and **Bun + project-internal opinionated TypeScript framework** (see github.com/AppRafter/onebun) for UI services and Backstage plugin backends | `apprafter` CLI in Rust; UI-facing services and Backstage plugins in TS/OneBun. |
 | Backstage plugins | **TypeScript** (Backstage native) | No choice; Backstage is React/TS. |
 | Config language | **CUE** | Typed, generic, validates schemas, importable. Pkl considered as alternative; deferred. |
-| GitOps | **Argo CD** | Mature, open source, the only k8s tool with product-grade UI. |
+| GitOps | **Argo CD** | Mature, open source, the only k8s tool with product-grade UI. The platform itself is reconciled through Argo CD (see §3.10). |
+| Platform stack distribution | **OCI Helm chart** rendered from CUE source in our monorepo; signed via cosign; published to `ghcr.io/apprafter/platform-stack` with GitHub Release `.tgz` mirror | See ADR 0028. Standard Kubernetes ecosystem pattern; fork via OCI copy, no user-side Git repository required. |
+| User app config rendering in Argo CD | **CUE Config Management Plugin (CMP) sidecar** in argocd-repo-server | See ADR 0029. Native Argo CD extension; activates only when `*.cue` files present in user repos. |
 | CI | **GitLab CI** or **Woodpecker** | Whichever pairs with Git host choice. |
-| Container runtime | **containerd** default; **Kata** Tier 3+; **Kata-CC** Tier 4 | Standard for Tier 1–2; isolation for higher tiers. |
+| Container runtime | **containerd** default; **Kata** Tier 3+; **Kata-CC** for confidential opt-in | Standard for Tier 1–2; isolation for higher tiers / confidential workloads (orthogonal opt-in, see ADR 0015). |
 | Storage | **Local-path** Tier 1; **LINSTOR** Tier 3+ | Match complexity to tier. |
 | OS | **Talos** Tier 3+; standard Linux Tier 1–2 | Talos is overkill for single-VDS; reasonable for bare metal. |
+| Workload autoscaling | **KEDA** | Mature CNCF Graduated project; ScaledObject-based, exhaustive trigger ecosystem. See ADR 0019. |
+| Node autoscaling | **Karpenter** — AWS native in Phase 6.2; Hetzner via Cluster API in Phase 5+ | Cluster-autoscaler not supported. See ADR 0021. |
+| Network observability | **Hubble** (eBPF, Cilium-native) | Default Tier 2+; opt-in Tier 1 and dev mode. See ADR 0020. |
+| Hard multi-tenancy | **Kamaji** + **Capsule** policy layer | Per-tenant separate kube-apiserver via Kamaji; Capsule for policy enforcement. Tier 2+ default; Tier 1 structurally unavailable. See ADR 0023. |
+| Infrastructure providers | **Hetzner Cloud, Hetzner Robot, AWS** (native Rust SDKs) | Additional clouds deferred to v2. See ADR 0016. |
 
 ---
 
@@ -830,6 +1200,8 @@ platform-cli login
 
 **Delivered as `v0.1.0-mvp` on 2026-05-08.** The end-to-end path (`platform-cli init` → `apply` → `cluster-bootstrap` → Argo CD sync → operator + admission-webhook stack → Bun hello-world `Application` live) is exercised nightly by `e2e/mvp.sh` on a real Hetzner account; observed wall-clock 6–9 minutes (well under the < 30-minute solo-tier budget).
 
+Subsequent to M1 delivery, ADRs 0025–0029 reframe `cluster-bootstrap` as a minimal loader (Argo CD only) with the rest of the stack delivered through Argo CD reconciliation of a versioned OCI chart. The M1.5 sub-phase (see below) performs this rework before M2 starts; existing M1 acceptance is preserved through equivalent end-to-end coverage.
+
 **Target:** working Tier 1 deployment on a single Hetzner CX/CPX-class VDS (default `cpx22` since `v0.1.42`, after Hetzner retired `cx22` upstream), deploying a hello-world Application end-to-end.
 
 - [x] `platform-cli init` provisions k3s + NATS + Cilium + Argo CD + Backstage on fresh VDS (NATS deferred to M2; everything else lands in v0.1.2 → v0.1.20)
@@ -837,6 +1209,30 @@ platform-cli login
 - [x] Argo CD configured, GitOps loop working (v0.1.13 → v0.1.17)
 - [x] Backstage with minimal Application plugin (status view) (v0.1.18 → v0.1.20 + v0.1.33 → v0.1.36)
 - [x] One golden-path template (Bun HTTP service) (v0.1.37 → v0.1.38, OneBun-based)
+
+### Milestone M1.5 — Self-managing platform rethink
+
+**Target:** the platform stack reconciles itself through Argo CD from a versioned OCI chart. `cluster-bootstrap` is a minimal loader. User app repositories sync via Argo CD with a CUE CMP plugin. PlatformStack CRD provides declarative version control. MigrationPlan unified across application and platform scopes.
+
+- [ ] `platform-stack` CUE source in monorepo with CI publishing to `ghcr.io/apprafter/platform-stack` (signed, GitHub Release mirror)
+- [ ] Minimal `cluster-bootstrap`: install Argo CD via Helm, apply root Application
+- [ ] All platform components wrapped as templated Argo CD Applications inside the umbrella chart
+- [ ] Argo CD self-management with `prune: false` and MigrationPlan-gated upgrades
+- [ ] CUE CMP sidecar (`ghcr.io/apprafter/argocd-cue-cmp`) shipped as part of the chart
+- [ ] `PlatformStack` CRD + `PlatformController` (channels, autoUpgrade, overrides, status)
+- [ ] Unified `MigrationPlan` CRD with `scope: application | platform` discriminator
+- [ ] `MigrationController` with strategy dispatch for both scopes
+- [ ] CLI thin wrappers: `apprafter platform {status,upgrade,channel,freeze,fork,rescue}`
+- [ ] CLI thin wrappers: `apprafter migration {list,approve,reject}`
+- [ ] `apprafter open <ui>` for UI access with port-forward + auto-credentials
+- [ ] `apprafter platform fork` for power-user OCI fork bootstrap
+- [ ] Backstage plugin: MigrationPlan queue view (deferred to M3 if needed for timing)
+- [ ] CLI npm-style version check (own version vs upstream releases)
+- [ ] e2e/mvp.sh updated to exercise the new path end to end
+
+**Acceptance:** `apprafter bootstrap-all` on a fresh Hetzner account produces a working Tier 1 cluster with all platform components reconciled by Argo CD. The Argo CD UI shows the umbrella platform Application plus child Applications for each component, all Healthy. `kubectl get platformstack default` shows the resolved version and current status. `apprafter open argocd` opens the UI with credentials filled. Adding a user app repo with `apprafter/Application.cue` via the Argo CD UI deploys the app end to end.
+
+**Blocks M2** because Phase 2 ServiceProviders, ResourceClaims, and Tenant logic build on the GitOps-managed platform.
 
 ### Milestone M2 — Platform Services
 
@@ -854,38 +1250,53 @@ platform-cli login
 
 **Target:** Tier 2 deployment (3 nodes), full observability stack.
 
-- [ ] HA mode bootstrap in `platform-cli`
-- [ ] kine + NATS JetStream as control plane storage (replacing default etcd in k3s)
+- [ ] HA mode bootstrap in `platform-cli` (dual-stack validated)
+- [ ] Replace k3s SQLite with kine + NATS JetStream backend; verify watch/conditional-write semantics; SQLite→NATS migration tool if data preservation needed
 - [ ] OpenTelemetry pipeline default for all workloads
 - [ ] ClickHouse provider (logs, traces, app analytics)
 - [ ] VictoriaMetrics integration
-- [ ] Hubble enabled, dashboards in Grafana
+- [ ] Hubble enabled by default at Tier 2+; Hubble UI standalone (Helm flag); Grafana network dashboards
+- [ ] Backstage flow visualizer plugin (Hubble flows on Application page, "convert flow to policy" button)
+- [ ] Kamaji controller as platform-service; first TenantControlPlane provisioned for default tenant
+- [ ] Capsule controller for policy layer
+- [ ] AppRafter `Tenant` CRD operator integration
+- [ ] Cilium Egress Gateway with family-aware static IP allocation
+- [ ] OpenBao 3-node HA with auto-unseal
+- [ ] Migration: SealedSecrets → OpenBao
 
 ### Milestone M4 — External Surface + Access
 
 **Target:** declarative external contour, AccessGrant working.
 
 - [ ] ExternalSurface CRD
+- [ ] HTTPRoute auto-generation by operator (`expose.public: true` → working route + cert + sticky/WS as needed)
 - [ ] GitLab/Forgejo deployable from manifest
 - [ ] Harbor registry deployable from manifest
 - [ ] Headscale + Tailscale Operator integration
-- [ ] AccessGrant CRD + reconciler
+- [ ] AccessGrant CRD + reconciler — tenant scoping, `approvers` for two-person rule
+- [ ] JIT cluster-admin AccessGrant flow (short-TTL, mandatory approvers, audit-tagged)
 - [ ] Backstage self-service flow for AccessGrant
+- [ ] Cilium FQDN policies for `connects.egress.external`
+- [ ] external-dns integration with `DNSZone` CRD
+- [ ] Audit pipeline cluster-admin actions tagging; separate audit stream `audit.cluster-admin`
 
 ### Milestone M5 — Tier 3 (bare metal)
 
 - [ ] Talos installation flow in `platform-cli`
 - [ ] LINSTOR provisioning automation
 - [ ] Kata containers as default runtime
-- [ ] vCluster for tenant separation
+- [ ] MSP scenarios + multi-customer Kamaji scaling (Tenant CRD already covers single-instance multi-customer from M3)
 - [ ] Migration path Tier 2 → Tier 3 (data + workloads)
+- [ ] (When CAPI bring-up complete for Turnkey foundation) Karpenter on Hetzner becomes opt-in for OSS Tier 2+ clusters
 
-### Milestone M6 — Tier 4 (confidential)
+### Milestone M6 — Tier 4 (regulated)
 
-- [ ] Kata-CC runtimeClass + nodepool selectors
-- [ ] AWS C8i / M7a integration in `platform-cli`
-- [ ] Confidential service providers (where applicable)
+- [ ] AWS provider (`platform-cli` integration; includes Karpenter standalone install as part of AWS stack)
+- [ ] Kata-CC runtimeClass + nodepool selectors for confidential workloads (opt-in via `Application.confidential: true`; available on any tier with supporting hardware)
+- [ ] Confidential service providers where applicable
 - [ ] Attestation flow integrated with workload identity
+- [ ] NAT64 component (marker — implemented on-demand when IPv6-only deployments request it)
+- [ ] Bare metal slow autoscaling research (design constraint: UX/DX must not degrade compared to faster tiers)
 
 ### Milestone M7 — 1.0
 
@@ -893,6 +1304,30 @@ platform-cli login
 - [ ] Complete docs site (TechDocs)
 - [ ] Reference deployments published
 - [ ] Public bootstrap-from-zero benchmark (target: <15 min from `platform-cli init` to first Application live)
+
+---
+
+## Known limitations of v0.1.x
+
+The following features are declared in the Application manifest schema and accepted by the operator, but are not enforced or fully implemented in the v0.1.x series. They are addressed in later phases of the roadmap (§6).
+
+- **Platform stack installed imperatively.** Sub-phases 1.5–1.18 install Cilium, cert-manager, Argo CD, the AppRafter operator, admission webhook, and Backstage via direct `helm install` and `kubectl apply` in `platform-cli cluster-bootstrap`. Drift correction does not apply to platform components, and changing platform configuration requires rebuilding the CLI. M1.5 (Self-managing rethink) replaces this with Argo CD-managed platform components from a versioned OCI chart.
+
+- **HTTPRoute auto-generation** is deferred to Phase 4 (M4). v0.1.x renders Deployment + Service per Application, but does not auto-create Gateway HTTPRoute resources. Operators must manually configure routing via `kubectl apply` on HTTPRoute manifests until Phase 4 lands. Hostname conflict detection, TLS auto-issuance, WebSocket/sticky semantics, URL rewrites — all part of Phase 4 deliverable.
+
+- **`confidential: true` flag** is deferred to Phase 6 (M6). The manifest field is accepted but does not enforce Kata-CC runtimeClass or confidential nodepool scheduling until the CoCo stack is implemented.
+
+- **`connects.egress.external` not enforced.** The field is currently advisory only — Applications declare external dependencies for documentation purposes, but Cilium FQDN policies blocking non-declared egress land in Phase 4.
+
+- **Static egress IP allocation manual.** `network.egressIP.static: true` is accepted in the manifest but not provisioned by the operator yet. Cilium Egress Gateway with family-aware static IP allocation lands in Phase 4.
+
+- **Hard multi-tenancy not enforced at Tier 2.** v0.1.x runs single-tenant by default. Kamaji + Capsule + AppRafter Tenant CRD land in Phase 3 (M3).
+
+- **AccessGrant `approvers` / JIT cluster-admin** — fields accepted but reconciliation lands in Phase 4 (M4).
+
+- **DNS automation.** External DNS records are managed manually in v0.1.x. external-dns + `DNSZone` CRD land in Phase 4 (M4).
+
+- **MigrationPlan reconciler.** The `MigrationPlan` CRD schema is defined; reconciler implementation with both application and platform scopes lands in M1.5. Until then, all changes are applied immediately by the operator without approval gating.
 
 ---
 
@@ -909,13 +1344,14 @@ platform-cli login
 - **`type:` field in `needs`:** **Removed.** Field name is the type (`needs.pg`, `needs.redis`).
 - **Selectors on `needs`:** **Yes**, symmetric with k8s nodeSelector. Default to `tier: integrated`.
 - **Build pipeline approach:** **Dockerfile-first with auto-analysis**, not magic. Buildpacks as opt-in.
-- **Infrastructure tooling — built-in vs community:** **Hetzner + AWS** as built-in (native Rust SDKs); **everything else** via `InfrastructureProviderPlugin` using OpenTofu shim under the hood. No raw Terraform/Ansible exposed to users.
+- **Infrastructure tooling — built-in vs community:** **Hetzner Cloud + Hetzner Robot + AWS** as built-in (native Rust SDKs). Additional clouds **deferred to v2**: the `cli-providers::Provider` trait is preserved as a future extension point, but no community plugin contract or OpenTofu shim is shipped in v1 (superseded ADR 0011 → ADR 0016). No raw Terraform/Ansible exposed to users.
 - **Migration safety:** **MigrationPlan** as a first-class concept. Destructive changes pause for explicit approval, with risk breakdown shown in Backstage.
 - **Operator deployment:** **Helm chart** at `operator/charts/apprafter-operator/`. Two binaries — `apprafter-operator` (reconcile loop) and `apprafter-admission-webhook` (cross-field validation) — ship from the same git tag, pinned by the `RELEASED_OPERATOR_VERSION` constant in `cli-providers`. Bumping the constant and tagging a release happens in the same commit/PR series; otherwise a fresh `apply` pulls a non-existent tag from GHCR and bootstrap stalls.
 - **Admission validation layering:** **CUE schemas stay design-time** and free of half-measure regex stubs. Runtime enforcement is **CRD OpenAPI v3 → admission webhook** (the webhook owns cross-field invariants like `image` non-empty, env-name DNS-1123 conformance, env-key `^[A-Z_][A-Z0-9_]*$`).
 - **Tier-1 control-plane firewall topology:** **defense in depth** via fail2ban (SSH brute-force) + the cloud-provider firewall (network-level allow-list). Evaluated and dropped (v0.1.43): ufw — silent initcaps failure on Ubuntu noble during cloud-init.
 - **Built-in cloud-provider idempotency:** every managed object is labeled `apprafter=true`; that label is the canonical anchor for `apply` / `destroy` / `import`. State at `.apprafter/state.json`; sensitive material (kubeconfig YAML, Argo CD admin password) cached **age-encrypted** under `APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`, mode 0600, auto-created on first run).
 - **k3s install profile (Tier 1):** k3s starts with five disabled subsystems — `--disable=traefik,servicelb`, `--disable-kube-proxy`, `--flannel-backend=none`, `--disable-network-policy` — so Cilium owns CNI / kube-proxy replacement / NetworkPolicy without port collisions (the embedded flannel-vxlan daemon would otherwise sit on UDP 8472 alongside Cilium's VXLAN).
+- **Multi-tenancy isolation choice:** **Kamaji** for hard multi-tenancy at Tier 2+ (one TenantControlPlane per AppRafter Tenant); **Capsule** as policy enforcement layer within tenant. vCluster and HNC evaluated and rejected. T1 not eligible for hard multi-tenancy (structural limitation); soft mt via Capsule + workload identity. See ADR 0023.
 
 ### License decision
 
@@ -924,7 +1360,7 @@ platform-cli login
   - 2 years after a given release date, that release auto-converts to MIT (fully OSI-approved)
   - Active development always lives in the FSL window; older releases are continuously freed
   - Bonus property: even if the project is abandoned, the most recent release is always at most 2 years from becoming MIT — a built-in safety net for the community
-- **InfrastructureProviderPlugin / ServiceProviderPlugin SDKs and community plugins:** **MIT** from day one — minimal friction for community contribution
+- **ServiceProviderPlugin SDKs and community plugins:** **MIT** from day one — minimal friction for community contribution
 - **Business model:** managed offering (à la Akuity → Argo CD), not BSL/non-compete clauses
 
 ### Still open
@@ -932,8 +1368,6 @@ platform-cli login
 1. **kine + NATS scaling ceiling.** What's the realistic upper bound? At what scale (nodes / objects / CRD churn rate) does sharding become necessary? Empirical question, answer in production.
 
 2. **CUE vs Pkl re-evaluation point.** When and how to formally re-decide. Suggested: M5 (Tier 3 milestone), with a written ADR comparing.
-
-3. **Multi-tenancy isolation choice.** vCluster vs Kamaji vs Hierarchical Namespace Controller for Tier 2+ tenant separation. Each has different cost/isolation trade-offs.
 
 4. **Migration tooling depth.** v1.0: manual MigrationPlan with operator-authored steps. v2.x: ship platform-provided automated migration plans for common cases (PG `tier: integrated → managed-aws`, ClickHouse major upgrade, etc.). Gradual increase in automation.
 
@@ -950,6 +1384,24 @@ platform-cli login
 10. **OneBun integration depth.** UI services (Backstage backends, build-report renderer, notifications service) are clear OneBun targets. `platform-cli` itself is Rust (decided). UI layer beyond Backstage — TBD.
 
 11. **Per-environment substrate (federated multi-cluster).** Should `dev` be able to live on a Tier 1 substrate while `prod` lives on Tier 3 — under one Backstage view? Compelling but requires multi-cluster control plane design. **Deferred to v2.x roadmap.**
+
+12. **kine+NATS as Kamaji datastore.** Kamaji's default datastore options are MySQL, Postgres, etcd. kine supports a NATS backend. Combining kine+NATS as a Kamaji datastore is not officially validated. Research item — if it works, single-substrate (NATS for everything) becomes possible; if not, integrated Postgres remains the path. Phase 7+ or v2.
+
+13. **Cert-manager bootstrap timing for users with domain from day one.** A user who configures `spec.argocd.domain` at bootstrap time expects HTTPS via cert-manager immediately. Current flow: bootstrap → Argo CD reconciles cert-manager → Argo CD UI eventually serves a real cert. The window between Argo CD coming up (self-signed) and cert-manager issuing the real cert (a few minutes) needs documented UX. See ADR 0025 still-open.
+
+14. **MigrationPlan future enhancements: skip and partial migration.** A "skip this update, wait for next" action lets users acknowledge an available upgrade without acting on it. Per-component approval (instead of atomic plan approval) allows partial platform updates. Both deferred to a future iteration of ADR 0027; current scope is approve/reject only, atomic per plan.
+
+15. **Cross-tier PlatformStack semantics.** When a user upgrades from Tier 1 to Tier 2, does the existing PlatformStack mutate (`spec.values.tier: solo → team`) or is a new instance created? Lean toward in-place mutation with MigrationPlan gating; will revisit in tier-upgrade design work for Phase 3. See ADR 0026 still-open.
+
+16. **Multi-cluster PlatformStack aggregation.** Managed offering (MANAGED_STRATEGY.md) requires viewing platform versions across many customer clusters. Out of scope for v1; addressed in managed-offering control-plane design.
+
+17. **Canonical filename for user app CUE.** Phase 1.11 uses `apprafter/Application.cue`. Alternatives include `apprafter.cue` at repository root or `.apprafter/app.cue`. Recommendation per ADR 0029 is to keep `apprafter/Application.cue`; settling early prevents fragmentation across user repositories.
+
+18. **Multi-app monorepo strategy.** One Argo CD Application per service, or one ApplicationSet with a Git generator discovering service paths? ApplicationSet is the standard pattern but adds indirection. Decision deferred until multi-app monorepo use cases mature in Phase 2+. See ADR 0029 still-open.
+
+19. **Compatibility metadata authoring tooling.** A future tool that analyses changelogs of upstream components (Cilium, cert-manager, etc.) and pre-fills the `compatibility.cue` classification. Out of scope for v1; CI enforces presence but classification remains a human decision. See ADR 0028 still-open.
+
+20. **Non-GitHub fork support.** `apprafter platform fork` for GitLab and other Git hosts. Phase 2+ depending on user demand.
 
 ---
 
@@ -1008,13 +1460,75 @@ platform-cli login
 - Migration path is clean: `platform-cli upgrade-tier` imports SealedSecrets into OpenBao on Tier 2+
 - This is our **principle 1.8 in action**: enterprise practices must not block solo-tier adoption
 
-### Why hybrid native-SDK + OpenTofu-shim for infrastructure providers
+### Why no multi-cloud in v1
 
-- Native SDKs give the best UX and integration depth where it matters most (Hetzner + AWS, our two main targets)
-- OpenTofu has providers for **every cloud and on-prem virtualization platform that matters**; recreating that ecosystem ourselves would burn years of engineering with no incremental value
-- Wrapping OpenTofu under our CUE manifests gives community contributors a low bar to add their cloud — write a `InfrastructureProviderPlugin`, ship the platform-CUE→Tofu translator, done
-- Users see only CUE and `platform-cli plan/apply`; OpenTofu is an implementation detail
-- OpenTofu is MPL-2.0, Linux Foundation, OSS-friendly — no vendor-lock concerns
+- Hetzner Cloud, Hetzner Robot, and AWS cover the target audience (solo founders + small business in EU, regulated workloads on AWS) for v1.
+- The earlier hybrid native-SDK + OpenTofu-shim approach (see superseded ADR 0011) introduced two state models, two error models, and two reconciliation paths — a leak of abstraction that compounds maintenance cost without proportional benefit.
+- The `cli-providers::Provider` trait is preserved as a generic extension point. Adding a fourth native cloud is straightforward when concrete demand materialises. This is **not** "we cannot add clouds", it is "we don't add them speculatively".
+- Crossplane was considered as an alternative but disqualified by its bootstrap problem (it requires an existing management cluster to provision the first VPS — incompatible with Tier 1 single-VDS bootstrap from CLI). Cluster API may be adopted at Phase 5+ for Turnkey customer hosting, but it is a Turnkey concern, not an OSS core dependency.
+- See ADR 0016 for full rationale and re-evaluation triggers.
+
+### Why dual-stack networking everywhere
+
+- Both Hetzner Cloud (delegated /64 IPv6 per VDS) and AWS (full dual-stack VPC) provide IPv6 at no additional cost.
+- Cilium is production-ready for dual-stack since v1.12+.
+- Pods with both v4 and v6 interfaces handle outbound to IPv4-only legacy services natively, avoiding NAT64 middlebox complexity.
+- Manifest portability is preserved — same Application works identically across all tiers.
+- See ADR 0017 for the full per-layer strategy and NAT64 deferral rationale.
+
+### Why Kamaji over vCluster for hard multi-tenancy
+
+- AppRafter's security-first positioning (workload identity, OpenBao, CoCo) implies hard multi-tenancy should be a structural guarantee, not a policy-based aspiration.
+- vCluster has higher insider attack surface through its syncer process, which holds permissions in both host and vcluster. Kamaji's per-tenant kube-apiserver pod is a cleaner separation.
+- Cozystack uses Kamaji in production at scale — validation of the choice for multi-customer scenarios.
+- T1 single-node cannot host hard multi-tenancy under either tool's model that aligns with bootstrap principles — T1 deliberately gets soft multi-tenancy as part of Tier 1 simplifications.
+- See ADR 0023 for full rationale.
+
+### Why defense-in-depth for cluster-admin
+
+- The default Kubernetes RBAC model grants cluster-admin god-mode powers, fundamentally incompatible with security-first positioning.
+- Confidential Containers (CoCo) provides cryptographic isolation but is hardware-dependent and workload-opt-in. It does not solve the problem for non-confidential workloads.
+- A bundle of mechanisms — workload identity, OpenBao secrets, Kamaji TCP separation, two-person rule, JIT TTL, audit pipeline, CoCo where applicable — collectively reduces cluster-admin's blast radius significantly.
+- See ADR 0024 for the full bundle and per-layer rationale.
+
+### Why Argo CD as the platform control surface
+
+- §1.4 declares GitOps as the only control surface. The Phase 1 implementation of `cluster-bootstrap` performed 9 imperative steps directly against the cluster, with platform components not reconciled by Argo CD afterward — Argo CD sat in the cluster as an optional appendix tracking at most a single user repository.
+- Reconciling the platform stack through Argo CD makes drift correction work cluster-wide, surfaces platform health in the same UI as user workloads, removes the requirement to rebuild the CLI binary to change platform configuration, and makes audit logging native.
+- The bootstrap chicken-and-egg (Argo CD must run before it can manage itself) is resolved by the standard "bootstrap loader" pattern used by Argo CD Autopilot, Flux bootstrap, and similar tools. The loader installs Argo CD only; the rest of the stack arrives through Argo CD reconciliation of a versioned OCI chart.
+- See ADR 0025 for the full architectural rationale.
+
+### Why a declarative PlatformStack CRD instead of CLI-embedded versioning
+
+- The CLI binary is updated on the user's cadence; the platform stack ships on its own release cadence. Embedding platform version in the CLI binary would couple two release cycles that should be independent.
+- A declarative CRD makes the platform version visible to Kubernetes audit logging, to Backstage, and to any external tooling reading the cluster state.
+- The PlatformController periodically checks upstream for new versions and surfaces availability through `status.availableVersion` without requiring CLI invocation. Auto-upgrade is safe by default because destructive changes route through MigrationPlan gating.
+- The version targeted by the user is implicit (`spec.pin` for explicit freeze, otherwise channel-resolved latest). Status carries the truth: `status.currentVersion` (what is applied), `status.availableVersion` (what is upstream), `status.versionHistory` (recent transitions for rollback and audit).
+- See ADR 0026 for the full decision record.
+
+### Why unified MigrationPlan with scope discriminator
+
+- The earlier MigrationPlan design in §3.8 described only Application-scope destructive changes. The PlatformStack work introduced a parallel need for platform-scope destructive changes.
+- Two separate CRDs (`MigrationPlan` + `PlatformMigrationPlan`) would duplicate schemas, controllers, webhooks, and UI surfaces. A single CRD with a scope discriminator and Rust trait dispatch keeps machinery minimal.
+- Reject semantics differ legitimately by scope. Application manifests live in user Git repositories — to revert, the user reverts the commit; an explicit "reject" action on the in-cluster MigrationPlan would be confusing because it cannot affect the source repository. Platform manifests live in the cluster (PlatformStack CR), so reject is a meaningful action: revert `spec.pin` to the previous value.
+- The gate is implemented inside AppRafter reconcilers, not at the Argo CD sync layer. Argo CD has already applied the CR to the cluster by the time our reconciler observes the destructive change; the practical gate is the propagation from "CR in cluster" to "child resources reflect the CR's spec." This keeps Argo CD's role as a simple transport.
+- See ADR 0027 for the full decision record.
+
+### Why CUE source + OCI chart distribution for the platform stack
+
+- The platform-stack repository contains only CUE source. Rendered Helm chart artifacts are produced in CI and published to OCI on tag; they are not committed back to Git. This preserves both the "CUE as configuration language" positioning and clean repository history.
+- OCI is the standard Kubernetes ecosystem distribution channel. Argo CD pulls OCI Helm charts natively. Cosign signing produces verifiable artifacts. Forking is a single `crane copy` to a different registry.
+- A secondary GitHub Release attachment ships the rendered `.tgz` for users who prefer plain Helm without involving AppRafter components — an honest fallback that does not compromise the primary distribution path.
+- The umbrella chart pattern (one template iterating over `values.components`) lets PlatformController patch a single Argo CD Application while producing N child Applications. Adding a new platform component is a CUE change in our repo, not a templates-folder change.
+- See ADR 0028 for the full decision record.
+
+### Why CUE Config Management Plugin for user app repositories
+
+- User app repositories contain CUE (the golden-path template generates `apprafter/Application.cue`). Argo CD does not understand CUE natively; without a compilation step, GitOps deployment of user apps does not work.
+- The Argo CD Config Management Plugin (CMP) extension point is a sidecar to `argocd-repo-server` and is the native mechanism for adding language/format support. It is used upstream for Kustomize variants, Jsonnet, Tanka.
+- Server-side compilation preserves user experience — users write CUE, push, and Argo CD's repo-server renders. No local render step, no pre-commit hook, no separate "rendered output" branch.
+- The CMP activates only when `*.cue` files are present. Users who prefer raw YAML are not forced into CUE.
+- See ADR 0029 for the full decision record.
 
 ### Why MigrationPlan as a first-class concept
 
@@ -1070,14 +1584,13 @@ platform-cli login
 - The platform value-add is *audit and feedback*, not hiding what's in the image.
 - Buildpacks remain available for those who want them — opt-in.
 
-### Why infrastructure tooling in Rust + CUE, not pure Terraform/Ansible
+### Why infrastructure tooling in Rust + CUE, not Terraform/Ansible
 
 - One configuration language for the user (CUE everywhere) reduces cognitive load
-- For our two main providers (Hetzner, AWS), native Rust SDKs give the tightest integration
-- For everything else, OpenTofu is the obvious choice — its provider ecosystem is unmatched, and it's MPL-2.0 OSS
+- For all v1 providers (Hetzner Cloud, Hetzner Robot, AWS), native Rust SDKs give the tightest integration and a single error / state model
 - Talos OS makes Ansible obsolete for the substrate (immutable, API-driven)
-- State in Git (encrypted via age/sops) avoids Terraform's "where does the state live" headache
-- Users never write or read Terraform/Tofu directly; it's strictly an implementation detail of community providers
+- State in Git at `.apprafter/state.json` (sensitive material age-encrypted) avoids Terraform's "where does the state live" headache
+- Additional clouds are deferred to v2 rather than carried as an OpenTofu shim — see "Why no multi-cloud in v1" above and ADR 0016
 
 ---
 
@@ -1085,13 +1598,13 @@ platform-cli login
 
 - **Tier:** the deployment scale of the platform (1–4), affecting which substrate / providers are active.
 - **Application:** the dev-facing unit of deployment, with per-environment overrides.
-- **Environment:** a named target deployment (`dev`, `staging`, `prod`) with its own namespace/vCluster, ServiceProvider selectors, and exposure rules.
+- **Environment:** a named target deployment (`dev`, `staging`, `prod`) with its own namespace (Tier 2+: within a Kamaji TenantControlPlane), ServiceProvider selectors, and exposure rules.
 - **ServiceProvider:** a backend implementation for a platform-service type (e.g., `pg-integrated`, `pg-aws`).
 - **ServiceProviderPlugin:** an OCI-distributed gRPC plugin extending the platform with new service types or backends.
-- **InfrastructureProviderPlugin:** a plugin extending `platform-cli` with support for an additional cloud or substrate, typically by wrapping an OpenTofu module.
+- **InfrastructureProviderPlugin:** the plugin extension point for additional clouds. **Deferred to v2** (see Appendix B Non-goals and ADR 0016). The `Provider` trait in `cli-providers` is preserved as the future extension point; no SDK or plugin contract ships in v1.
 - **ResourceClaim:** an internal CRD generated when an Application declares a `need`; routes to a matching ServiceProvider.
 - **AccessGrant:** declarative access for humans/external systems, replacing manual kubeconfig + VPN distribution.
-- **MigrationPlan:** auto-generated plan describing a destructive change (data migration, version upgrade) that requires explicit human approval before execution.
+- **MigrationPlan:** declarative resource gating destructive changes — to user Applications or to the platform stack — behind explicit approval. Uses a `scope: application | platform` discriminator; see §3.8 and ADR 0027.
 - **ExternalSurface:** the platform-managed external contour (git, registry, monitoring, backups, access).
 - **Infrastructure:** the substrate manifest (nodes, network, OS image) managed by `platform-cli`.
 - **Platform Service:** one of the six canonical multi-tenant services (Postgres, JetStream, ClickHouse, Redis, S3, Notifications).
@@ -1101,6 +1614,21 @@ platform-cli login
 - **Workload Identity:** a SPIFFE-issued X.509 identity that pods use to authenticate to OpenBao, ServiceProviders, and other workloads.
 - **Static Egress IP:** a fixed IP address assigned to an Application's outbound traffic, for third-party whitelisting.
 - **SealedSecrets:** Bitnami's mechanism for encrypted secrets in Git, used as the Tier 1 default before OpenBao is required.
+- **Bootstrap loader:** the minimal scope of `platform-cli cluster-bootstrap` after the M1.5 rethink — installs Argo CD via Helm and applies the root Application that points to the platform-stack chart. Everything else arrives through Argo CD reconciliation. See §3.10.
+- **Channel (platform):** one of `stable`, `beta`, `edge` — determines which set of platform-stack versions the PlatformController considers when resolving `spec.pin: unset` and when reporting `status.availableVersion`. See §3.11 and ADR 0026.
+- **CMP (Config Management Plugin):** an Argo CD extension point implemented as a sidecar in `argocd-repo-server`. AppRafter ships a CMP for CUE so user app repositories can use CUE as source and have Argo CD render it to YAML at sync time. See ADR 0029.
+- **Hard multi-tenancy:** API-level isolation through separate `kube-apiserver` per tenant. AppRafter provides this via Kamaji on Tier 2+; see §3.9 Tenant.
+- **Kamaji:** the hosted-control-plane project used by AppRafter to provide hard multi-tenancy. Each AppRafter Tenant maps to a Kamaji TenantControlPlane.
+- **MigrationController:** the reconciler for `MigrationPlan` CRs. Dispatches scope-specific logic through Rust trait implementations. See §3.8 and ADR 0027.
+- **Plane A / Plane B:** managed-offering architectural distinction. Plane A is the management plane operated by the AppRafter provider (host cluster, monitoring, Backstage). Plane B is the customer data plane (workloads inside customer Tenants' TCPs). The provider does not have automatic kubectl access to Plane B.
+- **PlatformController:** the reconciler for `PlatformStack` CRs. Tracks upstream availability, classifies diffs, patches the umbrella Argo CD Application, and creates `MigrationPlan` for destructive changes. See §3.11 and ADR 0026.
+- **PlatformStack:** the in-cluster declarative resource that controls the platform version. One instance per cluster, named `default`. See §3.11 and ADR 0026.
+- **Platform-stack chart:** the OCI Helm chart produced from CUE source in the AppRafter monorepo, signed with cosign, and published to `ghcr.io/apprafter/platform-stack`. The chart's umbrella template renders one Argo CD `Application` per platform component. See ADR 0028.
+- **Soft multi-tenancy:** isolation through namespace boundaries, RBAC, NetworkPolicies, and policy enforcement (Capsule). Cluster-admin remains a shared trust boundary. Used at Tier 1.
+- **TCP (TenantControlPlane):** a Kamaji resource representing a tenant's hosted Kubernetes control plane. AppRafter's `Tenant` CRD wraps this resource and a Capsule `Tenant` resource together.
+- **Tenant (AppRafter):** a top-level CRD wrapping Kamaji TenantControlPlane and Capsule Tenant. The unit of multi-tenancy isolation in AppRafter. See §3.9.
+- **Two-person rule:** AccessGrant policy requiring approval by one or more additional admins (the `approvers` field) before a cluster-admin scope grant becomes active. Part of the cluster-admin constrain bundle, §4.13.
+- **Umbrella chart:** the platform-stack Helm chart pattern: a single template iterates over components declared in values, producing one Argo CD `Application` per component. Lets PlatformController patch a single CR while producing N child Applications. See ADR 0028.
 
 ---
 
@@ -1138,7 +1666,20 @@ apprafter/
 ├── e2e/                            # end-to-end harnesses (e.g. mvp.sh — real-Hetzner smoke, ~6–9 min)
 ├── docs/                           # TechDocs source + ADRs (docs/adr/) + changelog
 ├── examples/                       # reference Applications + Infrastructure manifests
-└── .github/workflows/              # CI: lint, test, license-check, conventional-commits, release-operator, nightly E2E
+├── .github/workflows/              # CI: lint, test, license-check, conventional-commits, release-operator, nightly E2E
+├── platform-stack/                 # CUE source for the platform-stack Helm chart
+│   ├── cue/
+│   │   ├── platform.cue               # umbrella schema
+│   │   ├── components/                # per-component CUE: cilium, cert-manager, ...
+│   │   ├── tiers/                     # tier-specific overlays
+│   │   └── compatibility.cue          # change classification per version
+│   ├── Chart.yaml.tmpl
+│   ├── README.md
+│   └── CHANGELOG.md
+└── argocd-cue-cmp/                 # CUE CMP sidecar Dockerfile + plugin.yaml
+    ├── Dockerfile
+    ├── plugin.yaml
+    └── entrypoint.sh
 ```
 
 **Notes on the layout (deltas from the original sketch):**
@@ -1147,6 +1688,12 @@ apprafter/
 - `cli/` and `operator/` are **separate Cargo workspaces** (no top-level `Cargo.toml`); always `cd` into one before running `cargo`.
 - The OpenAPI v3 CRD shipped by `cli-providers::k8s::application_crd` and the kube-rs `Application` Rust type in `operator-core` are **hand-rolled mirrors** of `schemas/v1alpha1/Application` kept in sync by hand. There is no CUE→CRD/Rust generator yet.
 
+**CI publishes:**
+
+- `oci://ghcr.io/apprafter/platform-stack:<version>` on `platform-stack/v*` tags.
+- `oci://ghcr.io/apprafter/argocd-cue-cmp:<version>` on `argocd-cue-cmp/v*` tags.
+- GitHub Release attachment with rendered `.tgz` for users who want plain Helm.
+
 ---
 
 ## Appendix B — Non-goals
@@ -1154,8 +1701,51 @@ apprafter/
 To prevent scope creep, the platform **explicitly does not** aim to:
 
 - Be a general-purpose k8s distribution (Cozystack / Rancher's domain).
-- Support arbitrary databases as platform services. Five, not fifty.
+- Support arbitrary databases as platform services. Six, not fifty.
 - Compete with Backstage as a portal; we extend it.
 - Replace `kubectl` / `helm` / `k9s` for platform engineers — they remain the operations interface.
 - Run on Windows nodes.
 - Provide Function-as-a-Service / WASM as primary primitive (may be added later as opt-in).
+- **Multi-cloud infrastructure beyond Hetzner Cloud, Hetzner Robot, and AWS.** Community plugins for additional clouds are deferred to v2. The `Provider` trait architecture supports future addition, but no SDK or plugin contract is shipped in v1. New cloud support, if introduced before v2, is added as native Rust implementations on demand.
+
+---
+
+## Appendix C — Feature Matrix
+
+The matrix below describes default behaviours and opt-in availability of platform features across tier and mode combinations. Entries:
+- **default** — feature enabled by default at this tier
+- **opt-in** — feature available but disabled by default
+- **required** — feature is structural; cannot be disabled
+- **✗** — feature not available at this tier
+- **layered (see ref)** — behaviour described in referenced ADR or section
+
+| Feature | T1 prod | T1 dev mode | T2 prod | T3 prod | T4 prod | Managed Ops | Turnkey |
+|---|---|---|---|---|---|---|---|
+| Cilium CNI | required | required | required | required | required | required | required |
+| Dual-stack networking | default | default | default | default | default | default | default |
+| Hubble (network observability) | opt-in | opt-in | default | default | default | default | default |
+| Hubble UI standalone | opt-in | opt-in | default | default | default | default | default |
+| Backstage flow visualizer plugin | ✗ | ✗ | default | default | default | default | default |
+| OpenBao | opt-in (with KMS) | opt-in | default | default | default | default | default |
+| SealedSecrets | default | layered (DEV_MODE_SPEC §11.4) | opt-in (legacy fallback) | opt-in | opt-in | opt-in | opt-in |
+| Workload identity (SPIFFE/SPIRE) | opt-in | minimal | default | default | default | default | default |
+| KEDA (workload autoscaling) | default | opt-in | default | default | default | default | default |
+| Kata containers | ✗ | ✗ | ✗ | default (T3) | default | per-tier | per-tier |
+| Confidential containers (CoCo) | opt-in (hardware-dep, rare) | ✗ | opt-in (hardware-dep, rare) | opt-in (SEV-SNP hardware) | opt-in (TDX/SEV-SNP instances) | opt-in | opt-in |
+| Karpenter (node autoscaling) | ✗ | ✗ | opt-in (Phase 5+ via CAPI) | research (slow autoscaling design constraint) | AWS native default (Phase 6.2) | default | default |
+| Cluster-autoscaler | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Hard multi-tenancy (Kamaji) | ✗ structurally | ✗ | default (opt-out) | default | default | default | default |
+| Capsule policy layer | default (opt-out) | default | default | default | default | default | default |
+| OpenTelemetry pipeline | opt-in | minimal | default | default | default | default | default |
+| ClickHouse (logs/traces) | opt-in | ✗ | default | default | default | default | default |
+| VictoriaMetrics (metrics) | opt-in | ✗ | default | default | default | default | default |
+| Backstage portal | default | ✗ | default | default | default | default | default |
+| Argo CD | required | required | required | required | required | required | required |
+| Argo CD self-management via Argo CD | required | required | required | required | required | required | required |
+| PlatformStack CRD | required | required | required | required | required | required | required |
+| CUE CMP sidecar in Argo CD | default | default | default | default | default | default | default |
+| Headscale (AccessGrant access plane) | opt-in (Tier 1 may use external Tailscale) | ✗ | default | default | default | default | default |
+| Forgejo / GitLab self-hosted | opt-in | ✗ | opt-in | opt-in | opt-in | opt-in | opt-in |
+| Harbor registry | opt-in | ✗ | opt-in | opt-in | opt-in | opt-in | opt-in |
+
+The matrix is a living document; new features added in future phases are recorded here as defaults are established. Application-level fields (`needs.*`, `expose.*`, `confidential`, etc.) are not part of this matrix — they are described in §3 Core Concepts.

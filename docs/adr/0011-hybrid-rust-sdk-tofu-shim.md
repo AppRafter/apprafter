@@ -2,7 +2,7 @@
 
 ## Status
 
-`Accepted`. Date: 2026-05-06.
+`Superseded by ADR 0016`. Originally accepted 2026-05-06; superseded 2026-05-12.
 
 ## Context
 

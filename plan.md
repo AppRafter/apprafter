@@ -382,6 +382,34 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
+### 1.2 AUDIT — Hetzner Cloud built-in provider: IPv6 support
+
+> **AUDIT.** Подзадача-аудит закрытой 1.2 — обнаружена при работе над ADR 0017 (IPv6 + dual-stack). Может быть закрыта либо как отдельный hardening-патч до старта M1.5, либо интегрирована в M1.5 (1.71 — миграция platform-component values, где Helm-настройки переедут в платформенный chart).
+
+**Source:** ADR 0017.
+
+**Поставка:**
+- [ ] Verify, что `HetznerCloudProvider::apply` правильно handles IPv6 на server creation:
+    - Hetzner API возвращает IPv6 `/64` delegation вместе с server creation response.
+    - Текущий `cli-providers/src/hetzner_cloud.rs` хранит IPv6 в state? Если нет — добавить fields.
+- [ ] Verify, что `Network` resource (Hetzner private network) поддерживает dual-stack:
+    - В Hetzner Cloud private networks — IPv4 only (это ограничение Hetzner). Public IPv6 идёт через server's own /64.
+    - Adjust network setup так, что IPv6 routing идёт через node's public interface, IPv4 routing — через private network.
+- [ ] Verify k3s install script (`user_data.rs` или эквивалент) передаёт правильные dual-stack arguments:
+    - `--cluster-cidr=10.42.0.0/16,fd00:42::/64`
+    - `--service-cidr=10.43.0.0/16,fd00:43::/112`
+    - `--node-ip` с обоими family (host's IPv4 + IPv6).
+- [ ] Verify cloud-init и Hetzner Cloud Firewall rules не блокируют ICMPv6 (Path MTU Discovery, NDP).
+- [ ] E2E test: deploy hello-world `Application` через apply, проверить что pod получает оба IPv4 и IPv6 interfaces, и outbound к dual-stack endpoint (например, `dual-stack.example.com`) проходит через v6.
+
+**Acceptance:** Tier 1 cluster bootstrap'ится с full dual-stack; pod в hello-world Application имеет working IPv4 и IPv6 connectivity; e2e/mvp.sh продолжает зелёный.
+
+**Зависит от:** —
+
+**Размер:** M
+
+---
+
 ### 1.3 k3s bootstrap на свежем VDS
 
 **Статус:** ✅ shipped — sub-phase 1.3 закрыта серией циклов `v0.1.8`–`v0.1.10`: cloud-init bootstrap (k3s + ufw + fail2ban) → kubeconfig retrieval (SSH fetch + URL rewrite) → age-encryption кеша.
@@ -441,6 +469,38 @@ Phase 7 запускается параллельно с 3+ как только 
 **Зависит от:** 1.3
 
 **Размер:** M (разбит на 2 цикла: Cilium + Gateway API CRDs `v0.1.11` ✅, NetworkPolicy + smoke `v0.1.12` ✅)
+
+---
+
+### 1.4 AUDIT — Cilium + Gateway API установка: dual-stack Helm values
+
+> **AUDIT.** Подзадача-аудит закрытой 1.4 — обнаружена при работе над ADR 0017. Может быть закрыта либо как hardening-патч до старта M1.5, либо автоматически в составе 1.71 (миграция platform-values в chart): если CI-rendered Cilium values сразу пишутся dual-stack — audit-item закрывается без отдельной работы. Не блокирует M1.5 start.
+
+**Source:** ADR 0017.
+
+**Поставка:**
+- [ ] Locate Cilium Helm values rendering в `cli-providers` (likely `k8s/cilium.rs` или similar).
+- [ ] Current values — assess текущее state:
+    - `ipv4.enabled` set explicitly?
+    - `ipv6.enabled` set explicitly?
+    - IPAM mode (`cluster-pool` vs `kubernetes`)?
+- [ ] Update Helm values на dual-stack:
+  ```yaml
+  ipv4:
+    enabled: true
+  ipv6:
+    enabled: true
+  ipam:
+    mode: kubernetes
+  ```
+- [ ] Verify Gateway API CRDs install path не блокирует dual-stack listeners.
+- [ ] E2E test: Application с `public: true` доступен через оба IPv4 и IPv6 (curl --ipv4 и curl --ipv6 оба возвращают same content).
+
+**Acceptance:** Cilium pod logs показывают «IPv6 enabled», Gateway listeners bind на оба family, e2e curl works через оба.
+
+**Зависит от:** 1.2 AUDIT (Hetzner provider dual-stack)
+
+**Размер:** S
 
 ---
 
@@ -720,6 +780,654 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
+## Фаза 1.5 — Self-managing platform rethink (M1.5) ⚡
+
+**Цель фазы:** архитектурный rethink из ADR 0025–0029. Переход от imperative `cluster-bootstrap` к Argo CD-managed platform stack из versioned OCI chart, declarative version control через PlatformStack CRD, unified MigrationPlan для application + platform scopes, CUE compilation для user app repos через CMP sidecar.
+
+**Spec:** §3.10, §3.11 (PlatformStack), §3.8 (MigrationPlan unified). ADRs 0025–0029.
+
+**Almighty target:** «happy path» first user experience сжимается до ~30 минут end-to-end (install binary → `apprafter init` → `apprafter bootstrap-all` → `apprafter open argocd` → add app repo via UI → app deployed). Каждая подфаза landing'ится как `v0.1.66`–`v0.1.83` patch release (loose recommendation, точное mapping commit-driven). После закрытия M1.5 — tag `v0.2.0-self-managing`, после чего Phase 2 (M2) стартует с `v0.2.0-services` уже на правильном фундаменте.
+
+**Numbering:** под-фазы M1.5 используют 1.66–1.83 как continuation Phase 1 namespace, поскольку landing'ятся последовательными `v0.1.66`–`v0.1.83` releases перед `v0.2.0-services`. Major version stays `0`; minor reflects phase number (`v0.2.x` для всего между M1.5 и M3 closure, `v0.3.x` для M3 series, etc.).
+
+**Blocks Phase 2** потому что Phase 2 (ServiceProviders, ResourceClaims, Tenant logic) builds on the GitOps-managed platform. Landing Phase 2 поверх split-brain дизайна приведёт к технического долгу — все ServiceProviders придётся reframing когда M1.5 doлжен будет landить позже.
+
+### M1.5 Track positioning — CLI DX rework + Platform rethink + Dev-mode integration
+
+M1.5 содержит **три work tracks**, выполняемых **последовательно** в указанном порядке. Каждый track имеет свой authoritative spec:
+
+| Track | Order | Authoritative spec | Description |
+|---|---|---|---|
+| **A. CLI DX rework** | First | `cli-dx-task.md` §17 (12 items) | Target store, `apprafter target {add,list,use,...}`, `whoami`, `doctor`, `bootstrap-all` wrapper, miette errors, rename `platform-cli` → `apprafter`, aliases, color/NO_COLOR. **Prerequisite for Track B** потому что platform rethink relies on new CLI infrastructure (target resolution, bootstrap-all, manifest auto-discovery). |
+| **B. Platform rethink** | Second | this file, sub-phases **1.66 — 1.83** (18 items, numbered below) | Argo CD as control surface, PlatformStack CRD + Controller, MigrationPlan unification, CUE → OCI chart distribution, CMP for user app CUE. Lands after Track A is complete. |
+| **C. Dev-mode Phase 1B** | Third | `dev-mode-task.md` §20 Phase 1B | Minimum viable dev mode — `apprafter dev {cluster up, init, up, down, list, logs}` on local k3d. Lands after Track B closure (after `v0.2.0-self-managing` tag). |
+
+**Why this order**:
+
+- **Track A first**: bootstrap-all wrapper, target resolution, и miette errors are required for the minimal `cluster-bootstrap` rewrite (Track B 1.70) to provide acceptable UX. Без Track A, platform rethink landed бы на том же `cargo run --bin platform-cli` from-source workflow, который сейчас documented gap. Reverse order would create two sub-optimal user experiences during M1.5.
+- **Track B second**: platform rethink uses CLI infrastructure from Track A. Once `cluster-bootstrap` rewritten и PlatformStack CRD in place, M1.5 closes with `v0.2.0-self-managing` tag.
+- **Track C third**: dev-mode Phase 1B benefits from Track A CLI rework AND reuses Track B platform-stack chart's tier-1 overlay (with new `tiers/dev.cue` overlay). Lands after `v0.2.0-self-managing` as a follow-up patch series before M2 begins.
+
+**Dependencies between tracks (sequential)**:
+- Track A `target store` (`cli-dx-task.md` §5.1–5.6) → Track B `cluster-bootstrap` rewrite (1.70) requires target resolution instead of env vars.
+- Track A `bootstrap-all` orchestrator (`cli-dx-task.md` §5.11) → Track B 1.70 — these should be one cohesive piece of work, landed within Track A.
+- Track A `apprafter open` (referenced in Track B 1.79) → either land as part of Track A late items или Track B 1.79 — choose at implementation time when Track A is nearly done.
+- Track C dev-mode Phase 1B references Application CRD operator (already shipped в Phase 1 v0.1.7-v0.1.65), benefits from Track A CLI rework, и reuses Track B's `tiers/dev.cue` overlay.
+
+**M1.5 closure**: tag `v0.2.0-self-managing` after **both Track A and Track B** complete. Track C dev-mode Phase 1B lands as a follow-up patch series (e.g., `v0.2.1`, `v0.2.2` patch numbers depending on how it splits across commits). Phase 2B и Phase 3B из dev-mode-task.md лежат в later milestones (after M2 and M3 respectively).
+
+**Total M1.5 aggregate**: Track A (12 small-medium items per `cli-dx-task.md` §17) + Track B (18 items, 1 L + 7 M + 8 S + 2 XS) ≈ **L+ overall**, with Track C following as a separate ~M-aggregate series. The heavy work concentrates in Track B 1.73 (PlatformController — the only L item with distributed-systems penalty applied); most other items are S or M.
+
+---
+
+### 1.66 platform-stack monorepo skeleton + CUE source layout
+
+**Source:** ADR 0028.
+
+**Цель:** заложить структуру `apprafter/platform-stack/` в монорепо. CUE source-of-truth для всех Argo CD Application определений платформенных компонент.
+
+**Поставка:**
+- [ ] New subdir `apprafter/platform-stack/`:
+    - `cue/platform.cue` — umbrella schema (channels, versioning, component list type)
+    - `cue/components/cilium.cue` — Cilium Application definition с source.repoURL=https://helm.cilium.io, chart=cilium, version, default values per tier
+    - `cue/components/cert-manager.cue` — analogously для jetstack.io
+    - `cue/components/argocd.cue` — Argo CD's own Application (self-managing, prune=false)
+    - `cue/components/apprafter-operator.cue` — наш operator из ghcr.io
+    - `cue/components/admission-webhook.cue` — admission webhook
+    - `cue/components/backstage.cue` — Backstage, conditional на `values.domain`
+    - `cue/components/network-policies.cue` — default-deny NetworkPolicies
+    - `cue/components/argocd-cue-cmp.cue` — CMP sidecar configuration (см. 1.69)
+    - `cue/tiers/solo.cue` — tier 1 overlay (no Backstage если no domain, no Hubble, etc.)
+    - `cue/tiers/team.cue` — tier 2+ overlay (Hubble enabled, Kamaji, Capsule)
+    - `cue/compatibility.cue` — change classification per version (initial entry для 0.2.0)
+- [ ] `apprafter/platform-stack/Chart.yaml.tmpl` — template для umbrella chart metadata
+- [ ] `apprafter/platform-stack/README.md` — поясняет CUE-only convention, contribution model
+- [ ] `apprafter/platform-stack/CHANGELOG.md` — initial entry для 0.2.0
+
+**Acceptance:**
+- `cue eval ./apprafter/platform-stack/cue/...` exits 0; все schemas валидны.
+- Все компоненты declared в CUE (нет hardcoded values в platform-cli которые ещё не migrated в chart — это произойдёт в 1.71).
+- README ясно описывает: CUE only, rendered chart живёт в OCI, не в Git.
+
+**Зависит от:** —
+
+**Размер:** M
+
+---
+
+### 1.67 `cue cmd render` pipeline + umbrella chart generation
+
+**Source:** ADR 0028.
+
+**Цель:** CI step который рендерит CUE source в Helm umbrella chart в `dist/`.
+
+**Поставка:**
+- [ ] `apprafter/platform-stack/render.cue` (CUE command) implementing:
+    - Read all `cue/components/*.cue` files
+    - Read `cue/tiers/*.cue` overlay (parameterized via values)
+    - Emit `dist/platform-stack-<version>/Chart.yaml`
+    - Emit `dist/platform-stack-<version>/values.yaml` (rendered default values; tier-aware structure)
+    - Emit `dist/platform-stack-<version>/values.schema.json` (rendered from CUE schema; Helm native validation)
+    - Emit `dist/platform-stack-<version>/templates/applications.yaml` — единственный template, итерирующийся по `.Values.components`:
+      ```yaml
+      {{- range $name, $component := .Values.components }}
+      {{- if $component.enabled }}
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: {{ $name }}
+        namespace: argocd
+      spec:
+        source:
+          repoURL: {{ $component.source.repoURL }}
+          chart: {{ $component.source.chart }}
+          targetRevision: {{ $component.version }}
+          helm:
+            valuesObject: {{ toYaml $component.values | nindent 8 }}
+        destination: ...
+        syncPolicy: {{ toYaml $component.syncPolicy | nindent 6 }}
+      {{- end }}{{- end }}
+      ```
+    - Emit `dist/platform-stack-<version>/compatibility.yaml` — rendered change classification
+- [ ] Local `make render` target вызывает `cue cmd render` + `helm lint dist/platform-stack-<version>/`
+- [ ] `dist/` gitignored.
+
+**Acceptance:**
+- `make render` produces `dist/platform-stack-0.2.0/` content.
+- `helm lint` returns 0.
+- `helm template dist/platform-stack-0.2.0 --values examples/solo.yaml` renders correctly с tier-1 settings; produces список Argo CD Applications для cilium, cert-manager, argocd, apprafter-operator, admission-webhook (no Backstage т.к. no domain).
+- `helm template ... --values examples/team.yaml` renders с Hubble, Backstage, Kamaji, etc.
+
+**Зависит от:** 1.66
+
+**Размер:** S
+
+---
+
+### 1.68 CI OCI publish workflow + cosign signing
+
+**Source:** ADR 0028.
+
+**Цель:** GitHub Actions workflow который on tag `platform-stack/v*` builds chart + signs + publishes к OCI и GitHub Release.
+
+**Поставка:**
+- [ ] `.github/workflows/platform-stack-publish.yml`:
+    - Trigger: tag matching `platform-stack/v*`
+    - Steps:
+        1. Checkout
+        2. Install `cue` binary
+        3. Run `make render` (1.67)
+        4. `helm lint` + smoke install in `kind` cluster
+        5. `helm package dist/platform-stack-<version>` → `.tgz`
+        6. `cosign sign` artifact (with GitHub OIDC keyless signing — no managed secret keys)
+        7. `oras push ghcr.io/apprafter/platform-stack:<version>` + tag latest in channel
+        8. Attach `.tgz` and `.tgz.sig` to GitHub Release page
+- [ ] CI validation: `compatibility.cue` must update для new version tag; otherwise fail with clear error.
+- [ ] `apprafter/platform-stack/RELEASE.md` — maintainer release procedure.
+
+**Acceptance:**
+- Tag `platform-stack/v0.2.0-rc1` triggers workflow → ends green.
+- `oras pull ghcr.io/apprafter/platform-stack:0.2.0-rc1` retrieves signed chart.
+- `cosign verify ghcr.io/apprafter/platform-stack:0.2.0-rc1` succeeds.
+- GitHub Release page has both `.tgz` and `.tgz.sig` attached.
+
+**Зависит от:** 1.67
+
+**Размер:** S
+
+---
+
+### 1.69 CUE CMP sidecar Docker image + plugin.yaml
+
+**Source:** ADR 0029.
+
+**Цель:** sidecar image для `argocd-repo-server` который компилирует CUE → YAML для user app repositories.
+
+**Поставка:**
+- [ ] `apprafter/argocd-cue-cmp/` new subdir:
+    - `Dockerfile` — Alpine base + `cue` binary + plugin.yaml + entrypoint wrapper
+    - `plugin.yaml`:
+      ```yaml
+      apiVersion: argoproj.io/v1alpha1
+      kind: ConfigManagementPlugin
+      metadata:
+        name: cue
+      spec:
+        discover:
+          find:
+            glob: "**/apprafter*.cue"
+        generate:
+          command: [sh, "-c"]
+          args:
+            - /entrypoint.sh
+      ```
+    - `entrypoint.sh` — runs `cue export ./... --out yaml` + post-processing для structured error output (на ошибки CUE compile — extract first error line into single-line summary; full details в stderr).
+- [ ] `.github/workflows/argocd-cue-cmp-publish.yml` — analogous to 1.68, publishes `ghcr.io/apprafter/argocd-cue-cmp:<version>`.
+- [ ] Reference image в `apprafter/platform-stack/cue/components/argocd.cue` (argocd-repo-server `extraContainers` config).
+
+**Acceptance:**
+- `docker build apprafter/argocd-cue-cmp/` produces image.
+- Manual test: `docker run -v ./test-repo:/repo -w /repo image cue export ./... --out yaml` produces correct YAML output для sample `apprafter/Application.cue`.
+- Tag `argocd-cue-cmp/v0.2.0-rc1` publishes image.
+
+**Зависит от:** —
+
+**Размер:** S
+
+---
+
+### 1.70 Minimal `cluster-bootstrap` rewrite
+
+**Source:** ADR 0025.
+
+**Цель:** reduce `cluster-bootstrap` to a minimal loader: install Argo CD via Helm, apply root Application pointing к platform-stack OCI chart. Argo CD дальше reconciles остальное.
+
+**Поставка:**
+- [ ] Refactor `cli-providers/k8s/cluster_bootstrap.rs` (или эквивалент):
+    - Step 1: `helm install argocd` (only this; no Cilium, no cert-manager, no operator, no webhook here).
+    - Step 2: Wait для Argo CD ready (kubectl wait, ~30s).
+    - Step 3: Apply root Argo CD `Application` CR pointing на `oci://ghcr.io/apprafter/platform-stack:<resolved-version>` (resolved через PlatformStack CR — см. 1.74).
+    - Step 4: Wait для root Application reports Healthy + Synced.
+    - Step 5: Wait для child Applications (cilium, cert-manager, apprafter-operator, etc.) report Healthy. Progress UX surfaces per-component status.
+- [ ] Existing imperative install code (Cilium, cert-manager, operator, webhook, Backstage) — **deleted** from CLI. Their Helm values moved to platform-stack chart (см. 1.71).
+- [ ] `apprafter bootstrap-all` progress UX using `indicatif::MultiProgress`:
+    - Phase 1/3: substrate provisioning (Hetzner)
+    - Phase 2/3: Argo CD loader install
+    - Phase 3/3: Platform stack reconciliation (per-component sub-bars: Cilium ⏳, cert-manager ⏳, ...)
+- [ ] Idempotent resume на любом шаге (closes PRELAUNCH_CHECKLIST P1 item 3.1).
+- [ ] `apprafter cluster-bootstrap --manifest <path>` flag заменяет current `APPRAFTER_MANIFEST` env-var; auto-discovery walking upward from CWD (default).
+
+**Acceptance:**
+- `apprafter init && apprafter bootstrap-all` on fresh Hetzner account → working Tier 1 cluster with all platform components reconciled via Argo CD within ~10 minutes (vs current ~5-7 min imperative bootstrap).
+- `kubectl get applications.argoproj.io -A` shows: root, cilium, cert-manager, argocd, apprafter-operator, admission-webhook (+ network-policies, possibly Backstage), all Healthy + Synced.
+- `kubectl edit application cilium -n argocd` — change value — Argo CD reconciles → drift correction works.
+- Re-run `apprafter bootstrap-all` идемпотентен (skip-already-installed semantics).
+
+**Зависит от:** 1.66, 1.67, 1.68, 1.69 (platform-stack chart must be publishable before CLI references it)
+
+**Размер:** M
+
+---
+
+### 1.71 Migrate platform component values from CLI to chart
+
+**Source:** ADR 0025.
+
+**Цель:** все existing Helm values builders в `cli-providers::k8s::*` переезжают в `apprafter/platform-stack/cue/components/*.cue` как CUE-typed values. CLI больше не содержит platform component конфигурации.
+
+**Поставка:**
+- [ ] Audit existing CLI source:
+    - `cilium_values_yaml()` → `cue/components/cilium.cue` values block
+    - `cert_manager_values_yaml()` → `cue/components/cert-manager.cue` values
+    - `argocd_values_yaml()` → `cue/components/argocd.cue` values (включая CMP sidecar config от 1.69)
+    - `apprafter_operator_values_yaml()` → `cue/components/apprafter-operator.cue`
+    - Admission webhook manifests → `cue/components/admission-webhook.cue`
+    - Backstage values → `cue/components/backstage.cue` (conditional на values.domain)
+    - default-deny NetworkPolicy → `cue/components/network-policies.cue`
+- [ ] Self-managing Argo CD: Argo CD's own Application within chart has `syncPolicy.automated.prune: false` to prevent self-destructive upgrades.
+- [ ] Delete migrated Rust code from `cli-providers::k8s::*`.
+- [ ] Smoke: rendered chart + applied → cluster matches what previous CLI-installed setup produced (value-by-value diff).
+
+**Acceptance:**
+- `git grep -E "(cilium_values|cert_manager_values|argocd_values|backstage_values)_yaml" cli/` returns no matches in source (only possibly in tests as legacy reference).
+- Tier 1 bootstrap через new pipeline produces functionally identical cluster (Cilium config, cert-manager ClusterIssuer, Argo CD UI, admission webhook).
+- Argo CD UI shows Argo CD как один из child Applications с prune=false visible.
+
+**Зависит от:** 1.66, 1.70
+
+**Размер:** M
+
+---
+
+### 1.72 PlatformStack CRD schema + admission webhook
+
+**Source:** ADR 0026.
+
+**Цель:** CUE-typed schema для PlatformStack CR + admission webhook validation.
+
+**Поставка:**
+- [ ] `schemas/v1alpha1/platformstack.cue` — full schema per spec.md §3.11:
+    - `spec.channel` (enum stable | beta | edge)
+    - `spec.pin` (optional, semver string)
+    - `spec.autoUpgrade` (bool, default false)
+    - `spec.source.upstream` + `spec.source.repoURL` (OCI references)
+    - `spec.source.checkInterval` (duration, default 6h)
+    - `spec.values` (free-form, tier/domain/etc.)
+    - `spec.overrides` (per-component freezes)
+    - `status` with currentVersion, availableVersion, lastUpstreamCheck, components[], versionHistory (ring buffer), conditions[]
+- [ ] Generated OpenAPI v3 schema.
+- [ ] Admission webhook validation rules:
+    - Exactly one PlatformStack CR per cluster (rejected if a second is created), named `default` в namespace `apprafter-system`.
+    - `spec.channel` is one of `stable | beta | edge`.
+    - `spec.source.checkInterval` ≥ 1h (prevent rate-limit abuse).
+    - `spec.pin` is valid semver if set.
+- [ ] Bootstrap integration: 1.70 step adds creation of default `PlatformStack` CR с `spec.channel: stable`, `spec.pin: unset`, `spec.source.upstream/repoURL = oci://ghcr.io/apprafter/platform-stack`.
+
+**Acceptance:**
+- `kubectl apply` of a second PlatformStack CR rejected by admission webhook.
+- Invalid channel value rejected.
+- Default PlatformStack created during bootstrap is visible через `kubectl get platformstack default -n apprafter-system`.
+
+**Зависит от:** 1.70 (bootstrap creates the CR)
+
+**Размер:** S
+
+---
+
+### 1.73 PlatformController core: reconcile loop + OCI client + diff
+
+**Source:** ADR 0026.
+
+**Цель:** core PlatformController component — kube-rs reconcile loop, OCI registry client, helm render + diff vs current state, patches umbrella Argo CD Application.
+
+**Поставка:**
+- [ ] New crate `operator-platform-controller/` в workspace.
+- [ ] kube-rs reconcile loop watching `PlatformStack` CRs.
+- [ ] Leader election (kube standard pattern with lease в `apprafter-system` namespace).
+- [ ] OCI registry client:
+    - Pull chart by tag from `spec.source.repoURL`
+    - List available tags by channel (filter using channel marker в OCI annotations или separate index)
+- [ ] Helm render: invoke embedded helm Go library (через `cgo` или `helm-go-sdk`) или sidecar; render umbrella chart with merged `values` + `overrides` to produce target list of Applications.
+- [ ] Diff logic: compare rendered umbrella values vs currently-applied Argo CD Application's `spec.source.helm.valuesObject`. Classify diff using `compatibility.yaml` from chart (taxonomy: safe | requires-restart | data-migration | breaking).
+- [ ] On non-destructive diff (safe + requires-restart, кроме когда autoUpgrade=false): patch the single umbrella Argo CD Application; Argo CD reconciles child Applications.
+- [ ] On destructive diff (data-migration | breaking, or any change when autoUpgrade=false): defer to MigrationPlan (см. 1.78).
+- [ ] Environment check at apply time: confirm cluster's k8s version ≥ chart's `minimumKubernetesVersion`; block с clear diagnostic if not.
+- [ ] Status updates: `components[]`, `conditions[]`.
+
+**Acceptance:**
+- Edit `PlatformStack.spec.pin` from `0.2.0` to `0.2.1` (с safe-only changes в compatibility metadata) → controller pulls chart 0.2.1, computes diff classified as safe, patches umbrella Application; child Applications (Cilium etc.) reconcile to new versions within ~3 minutes.
+- Edit `spec.overrides.cilium.pin: "1.16.5"` while platform is on 0.2.1 → Cilium frozen even after stack bump to 0.2.2.
+- k8s version mismatch — clear error in `status.conditions`, no patch applied.
+
+**Зависит от:** 1.71 (umbrella chart structure), 1.72 (CRD)
+
+**Размер:** L — distributed-systems penalty applies (new distributed component, leader election, OCI client reliability)
+
+---
+
+### 1.74 PlatformController upstream check + status updates
+
+**Source:** ADR 0026.
+
+**Цель:** periodic check task, version history tracking, UpgradeAvailable condition surfacing.
+
+**Поставка:**
+- [ ] Periodic check task spawned by PlatformController (configurable interval via `spec.source.checkInterval`, default 6h):
+    - Pull OCI tag list from `spec.source.upstream` (note: upstream может differ from repoURL для fork scenarios)
+    - Filter by channel (stable/beta/edge via OCI annotation conventions)
+    - Pick latest semver tag
+    - Update `status.availableVersion`, `status.lastUpstreamCheck`
+- [ ] `status.versionHistory` ring buffer (last 10 transitions): on each successful patch of umbrella Application, push entry `{version, appliedAt, transition}`.
+- [ ] `status.conditions`:
+    - `Ready` (True если все child Applications Healthy)
+    - `UpgradeAvailable` (True если `availableVersion != currentVersion`, message describes diff classification)
+- [ ] Auto-upgrade logic: when `spec.autoUpgrade: true` AND new available version AND diff classification = `safe` → bump `spec.version` automatically (which triggers normal reconcile path → patches Applications).
+- [ ] Caching: ETag-aware OCI requests; aggressive caching of channel tag list (TTL = checkInterval).
+
+**Acceptance:**
+- Publish new platform-stack version (0.2.2 with safe changes only) → within `checkInterval` (или after manual `kubectl annotate platformstack default apprafter.io/refresh-upstream=true`), `status.availableVersion = 0.2.2`.
+- With `autoUpgrade: true` + safe classification → controller bumps spec.pin → reconcile path completes → status.currentVersion = 0.2.2.
+- With `autoUpgrade: true` + new version classified as breaking → MigrationPlan created (см. 1.78); no spec.pin bump.
+- `kubectl get platformstack default -o jsonpath='{.status.versionHistory}'` shows history entries.
+
+**Зависит от:** 1.73
+
+**Размер:** S
+
+---
+
+### 1.75 Unified MigrationPlan CRD + admission webhook
+
+**Source:** ADR 0027.
+
+**Цель:** unified MigrationPlan CRD с scope discriminator (application | platform).
+
+**Поставка:**
+- [ ] `schemas/v1alpha1/migrationplan.cue` per spec.md §3.8 rewrite:
+    - `spec.scope.type` (enum, application | platform)
+    - `spec.scope.application` (required if type=application): ref, environment
+    - `spec.scope.platform` (required if type=platform): affected components list
+    - `spec.trigger` (kind + field-specific data)
+    - `spec.risks` (classification, estimatedDowntime, dataVolume, reversible, requiresFullBackup)
+    - `spec.plan[]` (steps with action, estimatedDuration, reversible)
+    - `spec.approvers[]` (emails)
+    - `spec.previousSpecSnapshot` annotation (for platform-scope rollback)
+    - `status.phase` (pending-approval | approved | rejected | executing | completed | failed)
+    - `status.approvedBy`, `status.approvedAt`
+    - `status.executedSteps[]`
+- [ ] OpenAPI v3 schema with `oneOf` discriminator on `spec.scope.type`.
+- [ ] Admission webhook deeper validation:
+    - Required fields per scope type
+    - Approver email format validation
+    - Reject changes to `spec.scope` after CR creation (immutable)
+    - Reject `status` patches not from MigrationController (only controller can transition phase)
+
+**Acceptance:**
+- `kubectl apply` valid application-scope MigrationPlan succeeds.
+- `kubectl apply` valid platform-scope MigrationPlan succeeds.
+- Apply with missing scope-required fields → rejected.
+- Apply with invalid approver emails → rejected.
+
+**Зависит от:** —
+
+**Размер:** S
+
+---
+
+### 1.76 MigrationController + strategy dispatch
+
+**Source:** ADR 0027.
+
+**Цель:** MigrationController reconciler with Rust trait dispatch для application + platform strategies.
+
+**Поставка:**
+- [ ] Extend `apprafter-operator` workspace с `MigrationController` reconciler.
+- [ ] `MigrationStrategy` trait:
+  ```rust
+  trait MigrationStrategy {
+      fn detect_destructive(&self, ctx: &Context) -> Result<Option<DestructiveChange>>;
+      fn create_plan(&self, change: DestructiveChange) -> Result<MigrationPlan>;
+      fn execute_step(&self, step: &MigrationStep) -> Result<StepStatus>;
+      fn reject(&self, ctx: &Context) -> Result<()>;  // platform-only; application impl is no-op
+  }
+  ```
+- [ ] `ApplicationMigrationStrategy` impl: detect destructive changes in Application CR (needs.* selector changes, storage class changes, breaking image migrations).
+- [ ] `PlatformMigrationStrategy` impl: detect destructive diff between umbrella Application versions based on compatibility metadata.
+- [ ] Reconcile loop processes MigrationPlans in phase=executing, executes plan steps sequentially, updates status.
+- [ ] Approve transition: `status.phase: pending-approval → approved` (triggered by Backstage/CLI/Argo CD action). Controller transitions to `executing` and runs plan steps.
+- [ ] Reject transition (platform-only): `status.phase: pending-approval → rejected`. Controller invokes PlatformMigrationStrategy.reject() which reverts spec.pin to value from `metadata.annotations[apprafter.io/previous-spec]`.
+
+**Acceptance:**
+- MigrationPlan в pending-approval state — controller doesn't touch underlying resources.
+- Patch status.phase = approved → controller starts executing.
+- Patch status.phase = rejected on platform-scope plan → PlatformStack.spec.pin reverts to previous.
+- Patch status.phase = rejected on application-scope plan → admission webhook rejects the patch (no reject for application scope per ADR 0027).
+
+**Зависит от:** 1.75
+
+**Размер:** M
+
+---
+
+### 1.77 Application reconciler integration: gate pause/resume
+
+**Source:** ADR 0027.
+
+**Цель:** existing `Application` reconciler (delivered в Phase 1) теперь respects pending MigrationPlans — pauses child resource patching, sets status.phase=AwaitingMigrationApproval.
+
+**Поставка:**
+- [ ] Update `operator-controllers/src/application.rs`:
+    - Before patching child resources (Deployment, Service, HTTPRoute), check for existing MigrationPlan referencing this Application в namespace `apprafter-system` with phase=pending-approval.
+    - If found: skip child patching, set Application.status.phase = `AwaitingMigrationApproval`, set condition `MigrationPending`.
+    - If no pending plan: continue normal reconcile.
+    - On detect-destructive: call ApplicationMigrationStrategy to create a MigrationPlan, then enter pause mode.
+- [ ] Custom Argo CD health check (Lua script в argocd-cm ConfigMap) для Application CR: returns Degraded with message "AwaitingMigrationApproval — see MigrationPlan <name>" when Application.status.phase=AwaitingMigrationApproval. This surfaces в Argo CD UI as Degraded card.
+
+**Acceptance:**
+- User pushes destructive change в app repo (e.g., changes `needs.pg.selector`) → Argo CD syncs Application CR → reconciler creates MigrationPlan and pauses → Deployment continues running с prior version, Application UI shows Degraded with MigrationPlan reference.
+- Approve plan через `kubectl patch migrationplan <name> -p '{"status":{"phase":"approved"}}' --type=merge --subresource=status` (или CLI/Backstage) → controller resumes, executes plan steps, Application reaches Ready.
+- User revert в Git → Argo CD syncs reverted spec → reconciler observes non-destructive → existing MigrationPlan superseded.
+
+**Зависит от:** 1.76
+
+**Размер:** M
+
+---
+
+### 1.78 PlatformController MigrationPlan integration
+
+**Source:** ADR 0027.
+
+**Цель:** PlatformController detects destructive platform diffs, creates MigrationPlan instead of immediately patching umbrella Application.
+
+**Поставка:**
+- [ ] Update PlatformController reconcile path (from 1.73):
+    - After computing diff and classifying, when classification != `safe`:
+        - Save current spec.pin (or resolved version) в MigrationPlan annotation `apprafter.io/previous-spec`.
+        - Create MigrationPlan with scope.type=platform, scope.platform.components = affected component names.
+        - Skip patching umbrella Application; status updates to reflect pending.
+    - On MigrationPlan approved: PlatformController patches umbrella Application с новыми values; Argo CD reconciles.
+    - On MigrationPlan rejected: PlatformMigrationStrategy.reject() reverts PlatformStack.spec.pin via patch to value from annotation.
+
+**Acceptance:**
+- Publish platform-stack 0.3.0 (with breaking changes per compatibility metadata) → PlatformController creates MigrationPlan; PlatformStack.status.conditions[UpgradeAvailable]=True with "blocked by MigrationPlan".
+- Approve MigrationPlan → upgrade flows through.
+- Reject MigrationPlan → PlatformStack.spec.pin reverts; status reflects.
+
+**Зависит от:** 1.74, 1.76
+
+**Размер:** S
+
+---
+
+### 1.79 CLI thin wrappers + `apprafter open` commands
+
+**Source:** ADR 0025, 0026, 0027.
+
+**Цель:** CLI commands operating on declarative resources + UI access helpers + npm-style version check.
+
+**Поставка:**
+- [ ] New CLI subcommands в `apprafter` binary:
+    - `apprafter platform status` — read PlatformStack.status, format человекочитаемо (current version, available, components healthy count, recent history).
+    - `apprafter platform upgrade [--to <version>]` — patch PlatformStack.spec.pin (или channel resolution if --to not specified).
+    - `apprafter platform channel <name>` — switch channel.
+    - `apprafter platform freeze <component> [--version <v>]` — patch overrides.<component>.pin.
+    - `apprafter platform unfreeze <component>` — remove override.
+    - `apprafter platform rescue` — reinstall Argo CD from loader (emergency recovery).
+    - `apprafter migration list` — list MigrationPlans, filter by phase/scope.
+    - `apprafter migration approve <name>` — patch status.phase=approved.
+    - `apprafter migration reject <name>` — patch status.phase=rejected (rejected by webhook for application scope; works for platform).
+    - `apprafter open <ui>` — open browser to UI:
+        - `argocd` — `kubectl port-forward svc/argocd-server -n argocd 8080:443` + auto-fetch admin password from cluster secret + open https://localhost:8080
+        - `backstage` — analogously
+        - `grafana` — when present (Tier 2+)
+        - `hubble` — when present (Tier 2+)
+- [ ] npm-style CLI version check on every invocation:
+    - Cache в `~/.cache/apprafter/version-check.json` with 24h TTL.
+    - Fetch latest CLI release from `api.github.com/repos/apprafter/apprafter/releases/latest`.
+    - If newer: print warning line at start of output ("apprafter X.Y.Z available; you have ...").
+- [ ] Argo CD Resource Action Lua script (added to argocd-cm ConfigMap via platform-stack chart): "Approve Migration" button on MigrationPlan resources в Argo CD UI.
+
+**Acceptance:**
+- `apprafter platform status` outputs structured table within 2s.
+- `apprafter open argocd` opens browser with credentials filled in within 5s on second-run (cached password).
+- `apprafter migration approve <name>` succeeds; status updates within reconcile cycle.
+- CLI shows update warning when version stale.
+- Argo CD UI shows Approve button on MigrationPlan resources.
+
+**Зависит от:** 1.72, 1.75, 1.76 (CRDs must exist для thin wrappers)
+
+**Размер:** M
+
+---
+
+### 1.80 `apprafter platform fork` GitHub API automation
+
+**Source:** ADR 0028.
+
+**Цель:** one-command fork bootstrap для power users.
+
+**Поставка:**
+- [ ] `apprafter platform fork --to <oci-ref> [--private]`:
+    - Validates GitHub PAT exists (env or target credentials store).
+    - Fork `github.com/AppRafter/apprafter` to user's GitHub account/org via API.
+    - Add `.github/workflows/platform-stack-publish.yml` to the fork (copied from upstream — это same workflow что был залит в 1.68, отображённый для fork-specific OCI namespace).
+    - Trigger initial publish (push tag → CI builds → OCI publishes).
+    - Patch local PlatformStack CR: `spec.source.repoURL = <new oci ref>`, keep `spec.source.upstream` pointing to AppRafter upstream for tracking.
+- [ ] Documentation в `docs/operator-guide/fork.md`: when to fork, how to maintain, sync from upstream procedure.
+
+**Acceptance:**
+- `apprafter platform fork --to ghcr.io/myorg --private` on test account → fork created, workflow added, initial OCI publish ends green, local cluster's PlatformStack updated to pull from `ghcr.io/myorg`.
+- Edit CUE in fork → tag → next bootstrap or upgrade pulls from fork.
+- Upstream tracking: PlatformStack.status.availableVersion still reflects AppRafter upstream releases.
+
+**Зависит от:** 1.68 (workflow template), 1.79 (CLI infra)
+
+**Размер:** M
+
+---
+
+### 1.81 e2e tests update
+
+**Source:** ADR 0025, 0026, 0027, 0028, 0029.
+
+**Цель:** end-to-end coverage всех new flows.
+
+**Поставка:**
+- [ ] `e2e/mvp.sh` rewritten:
+    - Original 9-step flow → 3-step flow (init → bootstrap-all → smoke Application).
+    - Verify все platform components reconciled by Argo CD (not by CLI).
+- [ ] `e2e/gitops-walk.sh` — new script:
+    - Add app repo via Argo CD UI (scripted через Argo CD API).
+    - Push apprafter/Application.cue change → CMP renders → Argo CD syncs → operator reconciles → Deployment running.
+- [ ] `e2e/migration-app.sh` — new script:
+    - Apply Application with needs.pg.
+    - Push change to needs.pg.selector (destructive) → MigrationPlan created.
+    - Approve via CLI → migration executes → Application reaches Ready with new database.
+- [ ] `e2e/migration-platform.sh` — new script:
+    - Set PlatformStack.spec.pin = 0.2.0.
+    - Publish 0.3.0 with breaking change (test artifact).
+    - Verify MigrationPlan created with platform scope.
+    - Approve → upgrade flows; reject — PlatformStack reverts.
+- [ ] `e2e/fork.sh` — new script:
+    - Use test GitHub fixture; verify fork command on minimal repo.
+- [ ] All scripts callable from CI; runtime budget < 30 min per script на kind cluster.
+
+**Acceptance:**
+- `make e2e` runs all scripts green в CI.
+- Test coverage report shows all major code paths exercised.
+
+**Зависит от:** all 1.66–1.80
+
+**Размер:** M
+
+---
+
+### 1.82 Docs update
+
+**Source:** ADR 0025, 0026, 0027, 0028, 0029.
+
+**Цель:** rewrite outdated quickstart, add new operator/dev guides.
+
+**Поставка:**
+- [ ] `docs/operator-guide/quickstart.md` rewritten:
+    - Drop nine-step imperative narrative.
+    - Three-step flow: install binary → init → bootstrap-all.
+    - Explain Argo CD-managed platform on first read.
+    - `apprafter open argocd` instead of port-forward + cli-password dance.
+    - Update CX22 → CPX22 (closes existing factual error).
+    - Smoke test через `Application` CRD (closes existing design contradiction).
+- [ ] `docs/operator-guide/platform-management.md` (new):
+    - PlatformStack lifecycle.
+    - Channels and upgrade strategy.
+    - `apprafter platform upgrade`, `freeze`, `fork`, `rescue`.
+    - When to fork; how to maintain a fork.
+- [ ] `docs/operator-guide/migration-plans.md` (new):
+    - What's a destructive change.
+    - Approve / reject semantics by scope (application vs platform).
+    - Approving via Backstage, CLI, Argo CD UI.
+- [ ] `docs/dev-guide/application-cue.md` (new):
+    - Writing `apprafter/Application.cue` for GitOps deployment.
+    - CMP rendering, troubleshooting compile errors.
+    - Multi-environment patterns.
+- [ ] `docs/operator-guide/gitops-walk.md` updated:
+    - Workflow accounts for AppRafter Application CRs (current version tests raw Deployment+Service; new version goes through Application CRD end-to-end).
+- [ ] Update root `README.md` reference links.
+
+**Acceptance:**
+- New user reading quickstart end-to-end can get to running app in ~30 min.
+- Docs explain Argo CD's role clearly without contradictions.
+- Mental model "platform reconciles itself" передаётся on first reading.
+
+**Зависит от:** 1.81
+
+**Размер:** S
+
+---
+
+### 1.83 Tag `v0.2.0-self-managing`
+
+**Source:** all of M1.5.
+
+**Цель:** close M1.5 milestone with version tag.
+
+**Поставка:**
+- [ ] Final smoke run: full e2e suite green.
+- [ ] Update CHANGELOG.md entries for the v0.1.66 — v0.1.82 series, consolidate в M1.5 release notes.
+- [ ] Update version в Cargo.toml workspace, package metadata.
+- [ ] Tag `v0.2.0-self-managing` (signals M1.5 close before M2 starts).
+- [ ] Update root README badge.
+
+**Acceptance:**
+- Tag exists; release notes complete.
+- Gate passed для Phase 2 start.
+
+**Зависит от:** 1.82
+
+**Размер:** XS
+
+---
+
 ## Фаза 2 — Платформенные сервисы (M2) ⚡
 
 **Цель фазы:** Application может декларировать `needs.{pg,jetstream,redis}` — операторы и ServiceProvider'ы выделяют ресурсы автоматически.
@@ -814,6 +1522,36 @@ Phase 7 запускается параллельно с 3+ как только 
 **Acceptance:** Application с `needs.redis` получает рабочий DSN, два claim'а изолированы по DB-номеру.
 
 **Зависит от:** 2.3
+
+**Размер:** M
+
+---
+
+### 2.6a KEDA install + ScaledObject rendering
+
+**Source:** ADR 0019.
+
+**Цель:** KEDA как official autoscaling backend; `Application.autoscale.on:` рендерит ScaledObject.
+
+**Поставка:**
+- [ ] Install KEDA Helm chart как platform-service — post-M1.5 это означает adding KEDA как component в `apprafter/platform-stack/cue/components/keda.cue`, not direct install via CLI. KEDA arrives через Argo CD reconciliation.
+- [ ] Default enabled at Tier 1 (sufficient KEDA footprint ~50MB для opt-in autoscaling), но Application receives ScaledObject только когда `autoscale:` declared.
+- [ ] Operator renderer (`operator-rendering` crate) генерирует `ScaledObject` resource из `Application.autoscale`.
+- [ ] Supported triggers in v1: `jetstream_lag`, `cpu`, `memory`, `http_rps`.
+- [ ] Per-trigger rendering:
+    - `jetstream_lag` → KEDA `nats-jetstream` scaler with stream + consumer.
+    - `cpu` / `memory` → KEDA built-in CPU/memory scalers (HPA passthrough).
+    - `http_rps` → KEDA Prometheus scaler reading Gateway metrics.
+- [ ] Unit tests на rendering coverage для каждого trigger типа.
+- [ ] Integration test: Application с `autoscale: {on: cpu, min: 1, max: 10}` реально скейлится под cpu load на 3-node test cluster (можно re-use Tier 1 single-node для базового test'а).
+- [ ] Backstage Application view: текущий replica count + autoscaling state (Pending / Active / scale events history).
+
+**Acceptance:**
+- Application с `autoscale.on: cpu` rendered ScaledObject видим через `kubectl get scaledobject`.
+- Под load (искусственный CPU stress) replicas действительно растут от min к max.
+- Backstage показывает autoscaling activity.
+
+**Зависит от:** 2.6 needs.redis (как proxy для готовности базовых ServiceProvider'ов), 1.83 (M1.5 closure)
 
 **Размер:** M
 
@@ -997,25 +1735,56 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
+### 2.18 Known Limitations docs sync
+
+**Source:** tracker §1.1.
+
+**Цель:** перед `v0.2.0-services` tag убедиться, что `spec.md` § Known limitations of v0.1.x отражает реальное состояние закрытого Phase 2.
+
+**Поставка:**
+- [ ] Update `spec.md` Known limitations section:
+    - Remove items that landed в Phase 2 (если такие были).
+    - Remove "Platform stack installed imperatively" item (closed by M1.5).
+    - Remove "MigrationPlan reconciler not implemented" item (closed by M1.5).
+    - Add items, что **deferred** к Phase 3+ для honesty.
+- [ ] Update `docs/dev-guide/needs.md` (если такого doc нет — create) с реальным workflow для `needs.{pg,jetstream,redis}`.
+- [ ] Update `e2e/mvp.sh` — extend для проверки `needs.*` flow (apply Application с pg, verify DB provisioned, app connects).
+- [ ] Tag `v0.2.0-services` после всех Phase 2 closures.
+
+**Acceptance:** spec.md Known limitations accurate per state; e2e зелёный с pg flow.
+
+**Зависит от:** all other Phase 2 подфазы closed.
+
+**Размер:** XS
+
+---
+
 ## Фаза 3 — Multi-node + Observability (M3) ⚡
 
 **Цель фазы:** платформа поднимается в HA на 3 нодах; observability stack по умолчанию для всех workload'ов.
 
 **Spec:** §6 M3, §4.1 (Tier 2), §4.2, §4.10, §4.4 (OpenBao).
 
-### 3.1 HA-bootstrap в platform-cli
+### 3.1 HA-bootstrap в platform-cli + dual-stack validation
+
+**Source:** ADR 0017.
 
 **Поставка:**
-- [ ] `platform-cli init --tier team --nodes 3`.
+- [ ] `apprafter init --tier team --nodes 3`.
 - [ ] k3s server ×3 с `--cluster-init` + joins.
 - [ ] Embedded LB через kube-vip (или Hetzner LB).
 - [ ] Smoke: убить мастер — kubectl продолжает работать.
+- [ ] Explicit dual-stack validation на 3-nodes setup.
+- [ ] Cluster-CIDR и service-CIDR должны быть dual notation на HA bootstrap.
+- [ ] E2E: kill master node — kubectl continues working на обоих family.
 
-**Acceptance:** 3-нодовый кластер за один init; failover мастера < 30s.
+**M1.5 carry-over:** HA bootstrap теперь means provisioning multiple Hetzner nodes + running through the same Argo CD-managed platform stack pipeline. Helm values for multi-node mode live в platform-stack chart's tier-2 overlay; CLI just orchestrates substrate provisioning + platform-stack reconciliation watch.
 
-**Зависит от:** 1.13
+**Acceptance:** 3-нодовый кластер за один init; failover мастера < 30s; dual-stack connectivity sustained через node failure.
 
-**Размер:** L
+**Зависит от:** 1.83 (M1.5 closure), 1.13
+
+**Размер:** L (без изменений; dual-stack adds little work поверх HA bootstrap)
 
 ---
 
@@ -1099,62 +1868,135 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 3.7 Hubble + Grafana network dashboards
+### 3.7a Hubble enable + Hubble UI + Grafana network dashboards
+
+**Source:** ADR 0020.
 
 **Поставка:**
-- [ ] Hubble enable, относительная сборка metrics в VM.
-- [ ] Backstage plugin: Hubble flow visualizer (отдельная карточка на Application page).
-- [ ] «Наблюдаемое не разрешено политикой» → suggest-policy кнопка (создаёт Pull Request с дополнением `connects`).
+- [ ] Включить Hubble в Cilium values within platform-stack chart (per-tier overlay: tier-2 has Hubble enabled, tier-1 doesn't).
+- [ ] Hubble UI deploys via Cilium chart; expose internally через Service в `kube-system`; AccessGrant flow для external access.
+- [ ] Grafana dashboards для network metrics (имеется `cilium/cilium` upstream dashboards — import + adapt).
+- [ ] Standard dashboards: cluster-wide flows, per-namespace flows, per-Application flows (когда Application labels propagated).
 
-**Acceptance:** разработчик видит реальный трафик своего Application; нажимает кнопку — открывается PR.
+**Acceptance:**
+- Tier 2+ cluster: `kubectl -n kube-system get pods | grep hubble` показывает Hubble + UI pods running.
+- Hubble UI доступен через AccessGrant'у oriented kubeconfig.
+- Grafana dashboards показывают real-time flow metrics.
 
-**Зависит от:** 3.6, 1.10
+**Зависит от:** 3.1, 3.6 (VictoriaMetrics для metrics storage)
 
 **Размер:** M
 
 ---
 
-### 3.8 vCluster optional для env separation
+### 3.7b Backstage flow visualizer plugin
+
+**Source:** ADR 0020.
 
 **Поставка:**
-- [ ] vCluster operator установка опциональная (`platformServices.vcluster: true`).
-- [ ] `Application.environments.<env>` может указать `isolation: vcluster`.
-- [ ] platform-cli создаёт kubeconfig для vCluster при AccessGrant.
+- [ ] Backstage plugin: card на Application page показывает real-time flow data из Hubble (через Hubble Relay API).
+- [ ] «Convert observed flow to policy» button — генерирует PR в Git repository с дополнением Application's `connects.egress` (если destination not yet declared).
+- [ ] Filter UI: namespace, identity, time range, L7 protocol.
+- [ ] Drop visibility — показывает blocked flows (default-deny enforcement points).
 
-**Acceptance:** dev и prod в разных vCluster, изолированы на уровне API; ResourceClaim между ними не пересекаются.
+**Acceptance:**
+- Developer на Application page видит реальный трафик своего Application.
+- Click кнопку → PR with `connects.egress` addition открывается автоматически.
 
-**Зависит от:** 3.1
+**Зависит от:** 3.7a, 1.10 (Backstage с Application plugin)
+
+**Размер:** M
+
+---
+
+### 3.8 Kamaji + Capsule — multi-tenancy primitives (REWORK)
+
+**Source:** ADR 0023.
+
+**Цель:** установить Kamaji controller и Capsule policy controller как platform services; provision first TenantControlPlane для default tenant.
+
+**Поставка:**
+- [ ] Add Kamaji + Capsule components в `apprafter/platform-stack/cue/components/` (kamaji.cue, capsule.cue) с tier-2 overlay enabling them by default.
+- [ ] Kamaji datastore — `ResourceClaim` на `pg-integrated` provider (CNPG cluster, dedicated database для Kamaji controller).
+- [ ] Provision **default** TenantControlPlane (`apprafter-default`) для случаев, когда юзер не declared explicit Tenant — все existing Applications mapped to default tenant.
+- [ ] Capsule controller; configure default Capsule Tenant внутри default Kamaji TCP.
+- [ ] Tier 1 path: Kamaji не enabled через tier-1 overlay; Capsule installed standalone на host cluster для policy enforcement (soft mt only).
+- [ ] Backstage Tenant overview plugin (basic): list tenants, owners, status.
+
+**Acceptance:**
+- Tier 2 bootstrap: `kubectl get tcp -n kamaji-system` показывает default TenantControlPlane Active.
+- `kubectl get tenants.capsule.clastix.io -A` показывает default Capsule Tenant.
+- Kamaji datastore connects to CNPG; Kamaji state persists через controller restart.
+- Tier 1 bootstrap: только Capsule controller; no Kamaji.
+
+**Зависит от:** 2.4 (CloudNativePG), 3.1 (HA bootstrap)
 
 **Размер:** L
 
 ---
 
-### 3.9 Cilium Egress Gateway + статические egress IP
+### 3.8a AppRafter `Tenant` CRD operator integration
+
+**Source:** ADR 0023.
+
+**Цель:** AppRafter `Tenant` CRD как user-facing primitive; operator translates Tenant declarations в Kamaji TCP + Capsule Tenant.
+
+**Поставка:**
+- [ ] CUE-схема `kind: Tenant` в `schemas/v1alpha1/tenant.cue` (полная схема per spec.md §3.9).
+- [ ] Admission webhook: validation (datastore selector valid, owners non-empty, quotas reasonable).
+- [ ] Operator controller (`operator-controllers/src/tenant.rs`):
+    - Reconcile Tenant → Kamaji TenantControlPlane + Capsule Tenant внутри TCP.
+    - Watch AccessGrants referencing this Tenant → create RoleBindings cluster-admin within TCP.
+    - Status field: phase, observed TCP readiness, Capsule policy enforcement status, current owner count.
+- [ ] `apprafter login --tenant <name>` — fetches tenant-scoped kubeconfig.
+- [ ] Backstage Tenant view extended: applications inside tenant, current owners, quota usage, policy violations.
+- [ ] Cascading deletion: Tenant deletion → graceful TCP drain → Capsule Tenant cleanup → Kamaji TCP deletion.
+- [ ] Migration: existing v0.1.x Applications get auto-assigned to default tenant on Tier 2 upgrade.
+
+**Acceptance:**
+- Apply Tenant manifest → Kamaji TCP created within 60s, Capsule Tenant configured, AccessGrant references resolve to cluster-admin inside TCP only.
+- `apprafter login --tenant blockchain-team` returns kubeconfig that works only for that TCP.
+- Tenant deletion drains workloads and cleans up TCP + Capsule resources.
+
+**Зависит от:** 3.8, 4.5 (AccessGrant — for owner mapping; but reconciler can degrade gracefully if 4.5 not yet landed)
+
+**Размер:** L
+
+---
+
+### 3.9 Cilium Egress Gateway + family-aware static egress IPs
+
+**Source:** ADR 0017.
 
 **Поставка:**
 - [ ] CiliumEgressGatewayPolicy для Application с `network.egressIP.static: true`.
 - [ ] Привязка floating IP (Hetzner) к egress-нодам.
-- [ ] Backstage показывает текущий egress IP на странице Application с кнопкой copy.
+- [ ] Family-aware allocation per `Application.network.egressIP.families`. If both `[ipv6, ipv4]` — provision both floating v4 и delegated /64 v6 prefix.
+- [ ] Backstage Application view: показать current egress IPs для each family (copy button per address); смена floating IP отражается в UI.
 
-**Acceptance:** трафик от Application к `api.tron.network` идёт с фиксированного IP; смена floating IP отражается в UI.
+**Acceptance:**
+- Трафик от Application к `api.tron.network` идёт с фиксированного IP; смена floating IP отражается в UI.
+- Application с `egressIP.families: [ipv6, ipv4]` имеет working egress через оба family; third-party могут whitelist оба адреса.
 
-**Зависит от:** 1.2, 3.1
+**Зависит от:** 1.2 (Hetzner provider), 3.1 (HA bootstrap)
 
 **Размер:** M
 
 ---
 
-### 3.10 platform-cli upgrade-tier 1→2
+### 3.10 upgrade-tier 1→2
 
 **Поставка:**
-- [ ] Команда `platform-cli upgrade-tier --to team`.
-- [ ] Превращает single-node в 3-node (добавляет 2 ноды в Hetzner, joins, переключает kine на NATS HA).
+- [ ] Команда `apprafter upgrade-tier --to team`.
+- [ ] Превращает single-node в 3+ heterogeneous nodes (добавляет 2+ ноды в Hetzner, joins, переключает kine на NATS HA).
 - [ ] Бэкап перед миграцией (snapshot в S3).
 - [ ] Rollback при failure.
 
+**M1.5 carry-over:** upgrade-tier теперь means changing `PlatformStack.spec.values.tier: solo → team` + applying tier-2 overlay. PlatformController detects destructive change (significant: Kamaji + Hubble + Capsule come online), creates MigrationPlan; user approves. Underlying mechanism reuses 1.78 path.
+
 **Acceptance:** Tier 1 кластер с задеплоенным hello-world превращается в Tier 2 без downtime > 1 минуты.
 
-**Зависит от:** 3.1, 3.2
+**Зависит от:** 3.1, 3.2, 1.78 (MigrationPlan path для platform-scope diff)
 
 **Размер:** L
 
@@ -1218,6 +2060,37 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
+### 4.1a HTTPRoute auto-generation
+
+**Source:** tracker 2.6.
+
+**Цель:** operator автоматически генерирует HTTPRoute + Certificate для каждого Application с `expose.public: true`.
+
+**Поставка:**
+- [ ] CUE-схема Application расширена (per spec.md §3.1 update): `hostname`, `paths`, `tls`, `rewrites`, `websocket`, `sticky`, `protocols`.
+- [ ] Operator renderer (`operator-rendering`):
+    - HTTPRoute generation с `parentRefs` на platform Gateway (owned by ExternalSurface от 4.1), `hostnames`, `rules` с URLRewrite filters.
+    - Certificate generation через cert-manager `Certificate` resource если `tls: true`; `issuerRef` на platform ClusterIssuer.
+    - BackendLBPolicy generation для `sticky: true` (Gateway API beta feature).
+    - Annotations / EnvoyFilter для WebSocket upgrade handling и extended idle timeout если `websocket: true`.
+- [ ] Admission webhook: hostname conflict detection across namespaces (через kubectl-style list HTTPRoutes); reject Application apply с conflict error.
+- [ ] Backstage Application view: показать current hostname, TLS status, traffic statistics из Hubble (Hubble plugin already лежит в 3.7b).
+- [ ] Cascading delete: Application deletion → HTTPRoute + Certificate cleanup via ownerReferences.
+- [ ] Migration: existing Tier 1 deployments (deployed без HTTPRoute) — operator detects missing HTTPRoute on reconcile, creates с auto-generated hostname (no manual intervention required).
+- [ ] Update spec.md Known Limitations to remove «HTTPRoute auto-generation deferred to Phase 4» bullet.
+
+**Acceptance:**
+- Apply Application с `public: true` → HTTPRoute created within 30s, Certificate issued (cert-manager), Application accessible via HTTPS.
+- Hostname conflict (two Applications с same hostname): admission webhook rejects with clear error.
+- WebSocket Application: long-lived connection holds через sticky binding.
+- Cascading delete: Application removal → HTTPRoute + Certificate gone.
+
+**Зависит от:** 4.1 (ExternalSurface CRD with Gateway domain config)
+
+**Размер:** M
+
+---
+
 ### 4.2 Forgejo (или GitLab self-hosted) deployable из манифеста
 
 **Поставка:**
@@ -1265,22 +2138,93 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 4.5 AccessGrant CRD + reconciler
+### 4.4a external-dns integration + `DNSZone` CRD
+
+**Source:** tracker 2.8.
+
+**Цель:** automated DNS records для HTTPRoute / Application hostnames через external-dns operator.
+
+**Поставка:**
+- [ ] Install external-dns operator как platform-service (added to platform-stack chart components).
+- [ ] CUE-схема `kind: DNSZone` в `schemas/v1alpha1/dnszone.cue`:
+  ```cue
+  kind: DNSZone
+  name: apprafter-dev
+  zone: "apprafter.dev"
+  provider: cloudflare
+  credentialsRef: secret("platform/cloudflare-token")
+  pattern: "{app}.{env}.{tenant}.apprafter.dev"    // optional; default — let external-dns use HTTPRoute hostnames
+  ```
+- [ ] Operator translates DNSZone → external-dns DNSEndpoint resources + provider configuration.
+- [ ] Provider integrations (initial set): Cloudflare, Hetzner DNS, AWS Route53.
+- [ ] external-dns reads HTTPRoute hostnames in cluster, creates corresponding DNS records.
+- [ ] Backstage DNSZone overview: list zones, provider, record count, last sync.
+
+**Acceptance:**
+- Apply DNSZone for `apprafter.dev` with Cloudflare credentials → external-dns синхронизируется, DNS records появляются.
+- Apply Application с `hostname: "parser.apprafter.dev"` → DNS record создан в Cloudflare automatically.
+- Update spec.md Known Limitations to remove DNS-related deferral.
+
+**Зависит от:** 4.1 (ExternalSurface), 4.4 (Headscale — для credentials store integration через AccessGrant)
+
+**Размер:** M
+
+---
+
+### 4.5 AccessGrant CRD + reconciler — tenant scoping + approvers (REWORK)
+
+**Source:** ADR 0023, ADR 0024.
 
 **Поставка:**
 - [ ] CUE-схема (§3.4).
+- [ ] Add `tenant:` field — scopes grant к specific Kamaji TCP (см. spec.md §3.4 updates).
+- [ ] Add `approvers:` field — two-person rule для host cluster-admin grants.
 - [ ] Reconciler:
   - создаёт Headscale pre-auth key (одноразовый, 24h).
   - создаёт RoleBinding/ClusterRoleBinding в k8s.
   - создаёт OIDC group mapping.
   - публикует событие → notifications-сервис.
-- [ ] Status: issued / pending-activation / active / expiring / expired.
+  - Если `tenant:` set → create RoleBinding inside Kamaji TCP, not host cluster.
+  - Если `scope.cluster: host` and `scope.capabilities: ["cluster-admin"]` and `approvers` empty → admission webhook rejects (policy: host cluster-admin requires approvers).
+  - Если `approvers:` non-empty → AccessGrant status = `pending-approval`; reconciler waits for approval signals through Backstage или API endpoint.
+  - On all approvers signed → status → `active`, credentials issued (Headscale + RoleBinding + OIDC).
+  - Audit-event на каждый approval action.
+- [ ] Status: issued / pending-approval / pending-activation / active / expiring / expired.
+- [ ] Backstage AccessGrant view: pending grants requiring my approval (per user); approve/reject UI; current grants and their tenant scope.
 
-**Acceptance:** apply AccessGrant → email с magic-link приходит; click → SSO+MFA → подключение работает.
+**Acceptance:**
+- Apply AccessGrant → email с magic-link приходит; click → SSO+MFA → подключение работает.
+- AccessGrant с `tenant: blockchain-team` → subject имеет kubectl access только в TCP «blockchain-team», not host или other tenants.
+- AccessGrant `scope.cluster: host` + `scope.capabilities: cluster-admin` без `approvers` → rejected by admission.
+- AccessGrant с `approvers: ["bob@"]` + Alice как subject → grant pending until Bob approves via Backstage; only then Alice can login.
 
-**Зависит от:** 4.4, 2.13
+**Зависит от:** 4.4 (Headscale), 2.13, 3.8a (Tenant CRD для tenant scoping)
 
 **Размер:** L
+
+---
+
+### 4.5a JIT cluster-admin AccessGrant flow
+
+**Source:** ADR 0024.
+
+**Цель:** короткоживущие emergency cluster-admin grants с auto-revocation и loud audit.
+
+**Поставка:**
+- [ ] Special AccessGrant variant: `scope.cluster: host`, `scope.capabilities: ["cluster-admin"]`, `expiry: 1h` (max for JIT grants).
+- [ ] Policy enforcement: admission webhook requires `purpose:` field non-empty для JIT grants (forces operator to document why).
+- [ ] Approval flow: same `approvers` mechanism, but typically expedited (one approver minimum, can be configured).
+- [ ] Loud audit: dedicated event stream `audit.cluster-admin.jit`; immediate Backstage notification banner visible to entire team.
+- [ ] Auto-revocation на expiry: kubeconfig invalidates, RoleBinding deleted, audit closes.
+- [ ] Backstage emergency dashboard: «JIT access active» banner with grant details, time remaining, ability to view audit trail live.
+
+**Acceptance:**
+- JIT grant flow end-to-end (Alice requests с purpose, Bob approves quickly, Alice has 1h cluster-admin, banner visible all team) проходит за < 5 минут.
+- After expiry: Alice's kubectl fails with proper auth error; audit shows full trail.
+
+**Зависит от:** 4.5
+
+**Размер:** M
 
 ---
 
@@ -1345,17 +2289,28 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 4.10 Audit log в JetStream
+### 4.10 Audit log в JetStream — cluster-admin tagging (REWORK)
+
+**Source:** ADR 0024.
 
 **Поставка:**
 - [ ] Stream `audit.platform` с retention 1 год.
 - [ ] Все компоненты публикуют структурированные audit-события (кто, что, когда, на что).
-- [ ] Backstage audit-viewer plugin.
-- [ ] Экспорт в S3 для compliance.
+- [ ] Tag cluster-admin actions specifically — route to dedicated stream `audit.cluster-admin`:
+    - All k8s API server actions where user identity has cluster-admin RoleBinding.
+    - All AccessGrant lifecycle events (created, approved, active, revoked).
+    - All JIT access events (high-priority subset of cluster-admin).
+- [ ] Separate retention policy: `audit.cluster-admin` retained longer (default 3 years vs 1 year for `audit.platform`) для compliance.
+- [ ] Backstage audit-viewer plugin extended: filter by stream, search by user, time range, action type; cluster-admin actions highlighted.
+- [ ] Export to external archive (S3) for cluster-admin stream specifically — compliance-grade retention beyond cluster lifetime.
 
-**Acceptance:** все события из §3.4 (login, AccessGrant lifecycle, MigrationPlan approval) видны и неизменяемы.
+**Acceptance:**
+- Все события из §3.4 (login, AccessGrant lifecycle, MigrationPlan approval) видны и неизменяемы.
+- Cluster-admin action (например, `kubectl delete deployment` на critical workload) appears in `audit.cluster-admin` with full context (who, when, what, from where).
+- JIT grant audit trail searchable в Backstage end-to-end.
+- S3 export job succeeds, audit blob is restorable.
 
-**Зависит от:** 3.2
+**Зависит от:** 3.2 (kine + NATS), 4.5 (AccessGrant for user identity context)
 
 **Размер:** M
 
@@ -1442,24 +2397,48 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 4.16 MigrationPlan CRD + reconciler
+### 4.15a Cilium FQDN policies for `connects.egress.external`
+
+**Source:** tracker «Known limitations» elimination.
+
+**Цель:** enforce `Application.connects.egress.external` declarations через Cilium FQDN-aware NetworkPolicies; eliminate «advisory only» limitation.
 
 **Поставка:**
-- [ ] CUE-схема (§3.8).
-- [ ] Триггеры:
-  - selector change для stateful claims.
-  - major version upgrade ServiceProvider.
-  - storage class change.
-- [ ] Backstage banner «Pending migration approval» с risk breakdown.
-- [ ] Approve/reject/edit workflow (audit-logged).
-- [ ] Migration runner (на каждый известный тип миграции — отдельный runner).
-- [ ] v1.0 включает runner для PG `tier: integrated → managed-aws` и pg major upgrade.
+- [ ] Operator renderer (`operator-rendering`):
+    - For each Application с `connects.egress.external: [...]` → generate `CiliumNetworkPolicy` с FQDN matchers per declared destination.
+    - DNS-aware matching (Cilium DNS proxy integration): policy matches actual DNS resolution at runtime.
+    - Wildcard support (`*.binance.com`) per Cilium FQDN policy capabilities.
+- [ ] Backstage Application view: show declared external dependencies vs actual flows (cross-reference with Hubble drops для not-declared destinations).
+- [ ] Update spec.md Known Limitations to remove «connects.egress.external not enforced» bullet.
+- [ ] Migration: existing Applications без `connects.egress.external` declarations не affected (default-deny stays for declared destinations; undeclared traffic continues blocked by NetworkPolicy default-deny).
 
-**Acceptance:** изменение `selector: tier` для PG — не применяется, создаётся MigrationPlan; approve → шаги выполняются с прогрессом в UI.
+**Acceptance:**
+- Application с `connects.egress.external: [{host: "api.tron.network", port: 443}]` имеет working egress only к этому destination.
+- Attempt to call `api.binance.com` (not declared) → Cilium drop, Hubble logs it.
+- Backstage shows: declared destinations green, observed-but-not-declared red с «add to policy» button (similar to 3.7b).
 
-**Зависит от:** 2.4, 4.10
+**Зависит от:** 4.13 (Build pipeline — для image scan), 3.7b (Backstage Hubble plugin), 3.3 (Cilium mTLS)
 
-**Размер:** L
+**Размер:** M
+
+---
+
+### 4.16 MigrationPlan Backstage UI (REWORK — alignment with M1.5)
+
+**Source:** ADR 0027.
+
+**Цель:** после M1.5 closure, MigrationPlan CRD already exists with unified scope (application + platform). В Phase 4 остаётся Backstage UI plugin для MigrationPlan queue + notifications integration.
+
+**Поставка:**
+- [ ] Backstage MigrationPlan plugin: unified queue view (filter by scope/phase/owner), approve/reject buttons (gated by RBAC), audit trail view per plan.
+- [ ] Notifications service integration: pending-approval plan → notification to approvers via email/webhook (Phase 4 also delivers notifications service).
+- [ ] MigrationPlan template library: golden-path templates для common destructive operations (PG selector change, image major bump) — pre-populated `plan` array steps that user reviews and approves.
+
+**Acceptance:** Backstage shows MigrationPlan queue with filters; approver receives notification on pending plan; one-click approve via Backstage UI works end-to-end.
+
+**Зависит от:** 1.83 (M1.5 closure — CRD + controller already exist), 4.6 (OIDC SSO for Backstage RBAC), notifications service from Phase 4.
+
+**Размер:** M
 
 ---
 
@@ -1542,18 +2521,35 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 5.5 vCluster для tenant separation
+### 5.5 MSP scenarios + multi-customer Kamaji scaling (REWORK)
+
+**Source:** ADR 0023.
+
+**Цель:** validated MSP scenario (multiple customers одного AppRafter HQ) + scaling patterns для Kamaji когда tenants растут.
 
 **Поставка:**
-- [ ] vCluster включается по умолчанию на Tier 3+ для каждого env.
-- [ ] AccessGrant создаёт RoleBinding в vCluster, не в host.
-- [ ] Resource quotas per vCluster.
+- [ ] MSP onboarding flow:
+    - Apply customer Tenant manifest → new Kamaji TenantControlPlane provisioned.
+    - Customer admin AccessGrant scoped to TCP only.
+    - Customer Applications deployed внутри TCP.
+- [ ] Customer isolation guarantees verified end-to-end:
+    - Customer A's employee cannot kubectl into Customer B's TCP.
+    - Customer A's employee cannot kubectl into host cluster.
+    - Customer A's quota exhaustion doesn't affect Customer B.
+- [ ] Multi-customer scaling patterns:
+    - Shared Kamaji datastore (CNPG cluster) serves multiple TCPs — verify scaling characteristics.
+    - Per-TCP node selectors для tenant workload affinity (если customer wants dedicated workers).
+- [ ] Customer cluster export hooks (для customer exit / migration to self-host) — initial implementation (refines in Phase 7+).
+- [ ] Backstage MSP overview: list customers, per-customer resource usage, billing-relevant metrics.
 
-**Acceptance:** tenant'ы изолированы; failure одного vCluster не задевает другой.
+**Acceptance:**
+- 3+ customer Tenants на одном AppRafter HQ instance.
+- Customer A admin attempts to access Customer B's TCP → fails with proper auth error.
+- Customer cluster export creates portable manifest bundle.
 
-**Зависит от:** 3.8, 5.1
+**Зависит от:** 3.8a (Tenant CRD), 5.3 (LINSTOR — для customer data persistence), 4.16 (MigrationPlan UI — для customer migration scenarios)
 
-**Размер:** M
+**Размер:** L
 
 ---
 
@@ -1588,7 +2584,17 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 5.8 Закрытие чек-листа M5 spec
+### 5.8 MARKER — Karpenter на Hetzner via CAPI (opt-in для OSS Tier 2+)
+
+**Source:** ADR 0021.
+
+> When Cluster API (CAPI) infrastructure is established as part of Turnkey foundation (Phase 5+ separate work track), Karpenter on Hetzner becomes available as opt-in для OSS Tier 2+ clusters. Concrete deliverables, dependencies, and sizing are populated when CAPI is ready. Karpenter component will be added to platform-stack chart как opt-in tier-2 overlay enable.
+
+**Размер:** TBD (depends on CAPI)
+
+---
+
+### 5.9 Закрытие чек-листа M5 spec
 
 - [ ] Обновить `spec.md` §6 M5.
 - [ ] Tag `v0.5.0-bare-metal`.
@@ -1605,6 +2611,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ### 6.1 Kata-CC runtimeClass + nodepool selectors
 
+> **Wording:** confidential — opt-in feature, decoupled from T4 (per ADR 0015). Любой тир может включать confidential workloads если соответствующий nodepool доступен; T4 — это "regulated" профиль (compliance, attestation, audit), не синоним "confidential".
+
 **Поставка:**
 - [ ] kata-cc установка.
 - [ ] Nodepool labels `compute.confidential: tdx|sev-snp`.
@@ -1618,19 +2626,29 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 6.2 AWS provider (C8i / M7a)
+### 6.2 AWS provider (C8i / M7a) + Karpenter standalone (REWORK)
+
+**Source:** ADR 0021.
 
 **Поставка:**
 - [ ] AWS SDK Rust интеграция в platform-cli.
 - [ ] EC2 / VPC / EKS provisioning.
 - [ ] Mixed Hetzner+AWS deployments (через Infrastructure provider композицию).
 - [ ] AWS KMS для OpenBao auto-unseal.
+- [ ] Karpenter standalone installation as part of AWS stack (Karpenter is native first-class on AWS, no CAPI required). Karpenter component added to platform-stack chart tier-4 overlay.
+- [ ] Karpenter NodePool configurations per Application kind (default sizes, instance type preferences).
+- [ ] Cluster-autoscaler explicitly **not** installed (per ADR 0021 «cluster-autoscaler not supported»).
+- [ ] Verify Karpenter consolidation policy works well on AWS dual-stack instances.
 
-**Acceptance:** Tier 4 на AWS C8i запускается; HA между AZ.
+**Acceptance:**
+- Tier 4 на AWS C8i запускается; HA между AZ.
+- AWS Tier 4 cluster bootstraps с Karpenter active.
+- Application scaling triggers actual node provisioning (verify with Karpenter logs + EC2 instances list).
+- Karpenter consolidates when load drops.
 
 **Зависит от:** 1.2 (паттерн), 3.11 (KMS)
 
-**Размер:** L
+**Размер:** L (existing) + S (Karpenter additions) = L overall
 
 ---
 
@@ -1679,7 +2697,27 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 6.6 Закрытие чек-листа M6 spec
+### 6.6 MARKER — NAT64 opt-in component
+
+**Source:** ADR 0017.
+
+> Implemented on-demand when first IPv6-only deployment requires outbound to legacy IPv4-only services. Component: NAT64 + DNS64 platform-service (added to platform-stack chart as opt-in component). Operator declaration: `Infrastructure.network.nat64.enabled: true` when `ipFamilies: [ipv6]` is set. Concrete deliverables added when scenario materialises.
+
+**Размер:** TBD (deferred)
+
+---
+
+### 6.7 MARKER — Bare metal slow autoscaling research
+
+**Source:** ADR 0021.
+
+> Research item для Tier 3 bare metal autoscaling pattern. Design constraint: UX/DX must not degrade compared to faster tiers — Application API behavior identical, slow provisioning hidden through capacity headroom and predictive scaling. Possible paths: server auction cache + Robot API order automation. Research output: ADR + PoC; production implementation deferred until research conclusions.
+
+**Размер:** L (research, not implementation)
+
+---
+
+### 6.8 Закрытие чек-листа M6 spec
 
 - [ ] Обновить `spec.md` §6 M6.
 - [ ] Tag `v0.6.0-confidential`.
@@ -1757,36 +2795,6 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 7.5 InfrastructureProviderPlugin interface
-
-**Поставка:**
-- [ ] CUE-схема `kind: InfrastructureProviderPlugin`.
-- [ ] Plugin contract: CUE→OpenTofu translator + state-importer.
-- [ ] platform-cli host runtime (subprocess invocation OpenTofu).
-
-**Acceptance:** заглушка-plugin для OVH работает на минимальном `Infrastructure` манифесте.
-
-**Зависит от:** 1.1
-
-**Размер:** L
-
----
-
-### 7.6 Reference InfrastructureProviderPlugin: Scaleway
-
-**Поставка:**
-- [ ] Repo `apprafter-infra-scaleway`, MIT.
-- [ ] CUE→OpenTofu translator (scaleway provider).
-- [ ] Documentation.
-
-**Acceptance:** `platform-cli init --provider scaleway` поднимает Tier 1 кластер.
-
-**Зависит от:** 7.5
-
-**Размер:** L
-
----
-
 ### 7.7 WASM plugin runtime (R&D)
 
 **Поставка:**
@@ -1799,6 +2807,40 @@ Phase 7 запускается параллельно с 3+ как только 
 **Зависит от:** 7.2
 
 **Размер:** L (R&D, неблокирующее)
+
+---
+
+### 7.8 MARKER — kine+NATS как Kamaji datastore experimental
+
+**Source:** ADR 0023, tracker 2.3.
+
+> Experimental research: verify if Kamaji can use kine+NATS as datastore (kine officially supports etcd-API emulation поверх NATS; Kamaji not officially validated for this combination). If works — alternative single-substrate path для Kamaji's tenant state. If not — staying на integrated CNPG. Research output: feasibility report + (if positive) reference deployment.
+
+**Размер:** M (research, opt-in)
+
+---
+
+### 7.9 MARKER — MigrationPlan future enhancements (skip + partial migration)
+
+**Source:** ADR 0027 Still open.
+
+> Future enhancements to MigrationPlan CRD considered post-Phase-7:
+> - `skip` action: user acknowledges available upgrade without acting; PlatformStack.status.skippedVersions tracks skipped versions; only proposes next version when one becomes available. Useful for cycle skipping.
+> - Partial migration: per-component approval when a platform upgrade touches multiple components. Plan splits into sub-plans or per-component approval entries.
+>
+> Both are extensions of existing CRD schema (additive); no breaking changes.
+
+**Размер:** M (when triggered by user demand)
+
+---
+
+### 7.10 MARKER — Non-GitHub fork support
+
+**Source:** ADR 0028 Still open.
+
+> `apprafter platform fork` currently supports GitHub only (per 1.80). Extend to GitLab (and possibly Gitea/Forgejo) via vendor-specific API integration. Phase 2+ depending on user demand. Pattern: trait `GitHostForkProvider` with GitHub + GitLab implementations.
+
+**Размер:** M (when triggered)
 
 ---
 
@@ -1901,6 +2943,22 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
+## Dev-mode phases positioning (dev-mode-task.md §20)
+
+`dev-mode-task.md` defines three phased deliveries of dev mode (Phases 1B, 2B, 3B), each interleaved with platform milestones. This section maps dev-mode phases to plan milestones для visibility; sub-version numbering and acceptance criteria остаются в `dev-mode-task.md` itself.
+
+| dev-mode-task phase | Lands when | Purpose | Notes |
+|---|---|---|---|
+| **Phase 1B** — Minimum Viable Dev Mode | **After M1.5 closure** (`v0.2.x` patch series before M2 begins) | `apprafter dev cluster up/down`, `apprafter dev init`, `apprafter dev up`, `apprafter dev down`, `apprafter dev list`, `apprafter dev logs` on local k3d. Manifest layering 4 levels (base + env + dev + DevProfileLocal). No `needs.*` resolution yet — that's Phase 2B. Marked `experimental` для users. | Benefits from M1.5 Track A CLI rework (target store, miette errors); reuses M1.5 Track B platform-stack chart's tier-1 overlay (with new `tiers/dev.cue` overlay). |
+| **Phase 2B** — Dev Mode + Platform Services | After M2 closure | Dev mode supports `needs.{pg, jetstream, redis}` end-to-end on local k3d via lightweight in-cluster providers (single-node Postgres pod, embedded NATS, single Redis). Still marked `experimental`. | Depends on M2 ServiceProvider CRDs and reconcilers being in place; dev mode just runs them in a lightweight configuration. |
+| **Phase 3B** — Full Dev Experience | After M3 closure (part of MVP completion) | Production-ready local dev experience: heuristic runtime detection (Bun/Node/Rust/Go/Python), preset library (Bun HTTP, Rust async worker, etc.), `apprafter dev reset / restore` lifecycle, observability tab в Backstage equivalent для dev. Removes `experimental` tag. Completes MVP definition alongside platform Phase 3. | Per `dev-mode-task.md` §20: lands в planned pause between M3 and Phase 4 (managed offering research), so does not block Phase 4 startup. |
+
+**Sequential ordering within Phase 1B**: per `dev-mode-task.md` §20 Phase 1B internal sub-items (1B.1, 1B.2, …). Each lands as its own commit / version bump; specific patch numbers (`v0.2.1`, `v0.2.2`, ...) are commit-driven, not regulated by this plan.
+
+**Why sequential, not parallel with M1.5**: keeping the workflow linear avoids interleaving dependencies and losing track of work in flight. M1.5 closes cleanly with `v0.2.0-self-managing`, then dev-mode Phase 1B starts on top of the new platform foundation.
+
+---
+
 ## Сквозные направления (running concerns)
 
 Эти задачи не привязаны к конкретной фазе и идут параллельно.
@@ -1909,6 +2967,8 @@ Phase 7 запускается параллельно с 3+ как только 
 
 - [ ] Каждое нетривиальное архитектурное решение → ADR в `docs/adr/`.
 - [ ] Раз в квартал — ревью устаревших ADR.
+- [ ] Зафиксировать ADR'ы 0014–0029 (исключая 0018 как Unused): добавить в `docs/adr/`, обновить `docs/adr/README.md` index. ADR 0011 mark as `Status: Superseded by 0016`.
+- [ ] **M1.5 carry-over:** ADRs 0025–0029 should be committed to `docs/adr/` during M1.5 (preferably как часть 1.66 — early commit chains decision documents to the work).
 
 ### ∞.2 Dependency hygiene
 
@@ -1947,9 +3007,11 @@ Phase 7 запускается параллельно с 3+ как только 
 - [ ] Определить LTS-окно (рекомендация: каждый minor LTS на 1 год; 2 параллельных LTS).
 - [ ] Security-bugfixes — backport.
 
-### ∞.7 Tier-1 Hetzner stability hardening (gate to Phase 2)
+### ∞.7 Tier-1 Hetzner stability hardening (gate to M1.5)
 
-Открытые баги, найденные в первом полном ручном E2E (2026-05-08…10). Закрыть до старта Phase 2 (v0.2.0) — иначе Phase 2 строится на дрейфующей основе. Каждый — отдельный patch v0.1.4x.
+> **Status:** ✅ Gate passed for M1.5 start. Все items закрыты per plan.md changelog v0.1.43–v0.1.65 (см. чек-боксы ниже).
+
+Открытые баги, найденные в первом полном ручном E2E (2026-05-08…10). Закрыты до старта M1.5 (v0.1.66+) — иначе M1.5 строится на дрейфующей основе. Каждый — отдельный patch v0.1.4x–v0.1.5x.
 
 - [x] **SSH host-key collision при destroy+apply на тот же IP.** ✅ закрыто `v0.1.46` 2026-05-10. `StatePaths::known_hosts_file()` → `.apprafter/known_hosts`; `SshKubeconfigFetcher` принимает path и передаёт `-o UserKnownHostsFile=…` + `-o StrictHostKeyChecking=accept-new`. `destroy --yes` сносит файл вместе со state. `~/.ssh/known_hosts` не трогаем.
 - [x] **`HetznerCloudProvider::destroy()` race-condition.** ✅ закрыто двумя слоями: `v0.1.47` (server-level poll: `wait_for_server_gone()` ждёт исчезновения server из `GET /v1/servers`); `v0.1.50` (resource-level retry: `delete_with_retry_on_resource_in_use` для `delete_firewall` + `delete_network` — Hetzner reaps `firewall.applied_to` / `network.servers` ещё 1-15с после server-vanish, ловит на `422 resource_in_use`). Exponential back-off 500ms → 5s, 60s deadline в обоих слоях.
@@ -1957,6 +3019,20 @@ Phase 7 запускается параллельно с 3+ как только 
 - [x] **`default-deny` NetworkPolicy блокирует всё включая DNS+Service routing.** ✅ закрыто `v0.1.51` 2026-05-10. v0.1.0-mvp через v0.1.50 деплоил NP с `policyTypes: [Ingress, Egress]` и пустыми allow-rules → каждый workload в namespace в полной изоляции (только probes от kubelet работали, потому что host-network). Скрытно потому что nightly не пушился, а §4 quickstart никто не проходил end-to-end до 2026-05-10. Fix: Ingress-only с явными allow для same-ns (Service routing) и kube-system (Gateway/HTTPRoute/monitoring); egress без ограничений до phase 2.10.
 - [x] **`tracing` logs идут в stdout вместо stderr.** ✅ закрыто `v0.1.44` 2026-05-09. `with_writer(std::io::stderr)` в `cli-core/src/logging.rs` + smoke-test guard в `cli_smoke.rs`. Affected commands: `apply`, `destroy`, `import`, `kubeconfig`, `argocd-password` теперь имеют чистый stdout, диагностика на stderr.
 - [x] **k3s flannel конфликтует с Cilium VXLAN device.** ✅ закрыто `v0.1.45` 2026-05-09. k3s ships embedded flannel-vxlan daemon на UDP port 8472, тот же что нужен Cilium → `cilium_vxlan: address already in use` → cilium-agent CrashLoopBackOff → каждый `cluster-bootstrap` падал на Argo CD pre-install timeout. Fix: добавили `--flannel-backend=none --disable-network-policy` к k3s installer в `user_data.rs`; теперь 5 disabled-флагов вместо 3 (Cilium-recommended k3s recipe).
+
+### ∞.8 CRD short-name rename pre-M2
+
+**Source:** SPEC_REFINEMENTS cross-cut from ADR обсуждений.
+
+- [ ] Rename `applications.apprafter.io` CRD short-name to `apps.apprafter.io` or `workloads.apprafter.io` to avoid shadowing Argo CD's `applications.argoproj.io`. Decision and rename must happen during M1.5 (ideally early, around 1.66–1.70) before more docs reference the short name.
+
+**Размер:** XS (CRD spec change + admission alias + docs sweep). Affects existing tests minimally; mostly documentation.
+
+### ∞.9 Smoke test design fix (closes Phase 1 quickstart contradiction)
+
+**Source:** discussion of operator quickstart §4.
+
+- [ ] Rewrite `e2e/mvp.sh` and `docs/operator-guide/quickstart.md` §4 to exercise the `Application` CRD end-to-end рядом с the platform stack, not раздельно as currently. Folded into 1.81 (e2e tests update) and 1.82 (docs update) within M1.5.
 
 ---
 
