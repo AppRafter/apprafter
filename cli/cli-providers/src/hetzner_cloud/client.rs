@@ -208,7 +208,7 @@ impl HetznerCloudClient {
 
     pub fn delete_network(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/networks/{id}"));
-        delete_with_retry_on_resource_in_use(&endpoint, || {
+        delete_with_retry_on_transient_lock(&endpoint, || {
             ureq::delete(&endpoint)
                 .set("Authorization", &self.auth_header())
                 .set("Accept", "application/json")
@@ -287,7 +287,7 @@ impl HetznerCloudClient {
 
     pub fn delete_firewall(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/firewalls/{id}"));
-        delete_with_retry_on_resource_in_use(&endpoint, || {
+        delete_with_retry_on_transient_lock(&endpoint, || {
             ureq::delete(&endpoint)
                 .set("Authorization", &self.auth_header())
                 .set("Accept", "application/json")
@@ -504,10 +504,15 @@ impl HetznerCloudClient {
     }
 
     /// Unassign a Floating IP from any server it's currently
-    /// attached to. Idempotent: 404 (gone) and 422 with code
-    /// `floating_ip_not_assigned` are both treated as success so
-    /// the caller can blindly call this before
-    /// [`Self::delete_floating_ip`] without checking state.
+    /// attached to. Idempotent on these "already detached" signals:
+    ///  - 404 — FIP gone entirely.
+    ///  - 422 with `code=floating_ip_not_assigned` — Hetzner's
+    ///    documented "specific" code (kept for forward-compat).
+    ///  - 422 with `code=service_error` + message containing
+    ///    "is not assigned" — Hetzner's current production
+    ///    response when the IP is already detached. The
+    ///    `service_error` code is intentionally generic upstream,
+    ///    so the substring check is the only reliable signal.
     pub fn unassign_floating_ip(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/floating_ips/{id}/actions/unassign"));
         let resp = ureq::post(&endpoint)
@@ -527,8 +532,9 @@ impl HetznerCloudClient {
                             message: body,
                         },
                     });
-                // Idempotent: already-unassigned IP is not an error.
-                if envelope.error.code == "floating_ip_not_assigned" {
+                let already_unassigned = envelope.error.code == "floating_ip_not_assigned"
+                    || (status == 422 && envelope.error.message.contains("is not assigned"));
+                if already_unassigned {
                     return Ok(());
                 }
                 Err(CliError::Hetzner {
@@ -544,55 +550,40 @@ impl HetznerCloudClient {
         }
     }
 
-    /// Delete a Floating IP. Unassigns first so the deletion isn't
-    /// rejected with `must_be_unassigned` when the upstream
-    /// `delete_server` race hasn't fully reaped the attachment yet
-    /// (server is gone from `GET /servers` but the IP's
-    /// `server` field still references it for a short window).
+    /// Delete a Floating IP. Unassigns first so `DELETE` isn't
+    /// rejected with `must_be_unassigned`. The `DELETE` itself
+    /// uses [`delete_with_retry_on_transient_lock`] because
+    /// Hetzner briefly locks the FIP (`423 locked`) while its
+    /// async scheduler tears down the server→FIP association,
+    /// which can persist a few seconds past
+    /// `wait_for_server_gone` returning.
     pub fn delete_floating_ip(&self, id: u64) -> Result<()> {
         self.unassign_floating_ip(id)?;
 
         let endpoint = self.endpoint(&format!("/floating_ips/{id}"));
-        let resp = ureq::delete(&endpoint)
-            .set("Authorization", &self.auth_header())
-            .set("Accept", "application/json")
-            .call();
-
-        match resp {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(404, _)) => Ok(()),
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                let envelope: ApiErrorEnvelope =
-                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
-                        error: super::types::ApiErrorDetails {
-                            code: "unknown".to_string(),
-                            message: body,
-                        },
-                    });
-                Err(CliError::Hetzner {
-                    endpoint: format!("DELETE {endpoint}"),
-                    status,
-                    code: envelope.error.code,
-                    message: envelope.error.message,
-                })
-            }
-            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
-                "transport error talking to {endpoint}: {t}"
-            ))),
-        }
+        let auth = self.auth_header();
+        delete_with_retry_on_transient_lock(&endpoint, || {
+            ureq::delete(&endpoint)
+                .set("Authorization", &auth)
+                .set("Accept", "application/json")
+        })
     }
 }
 
-/// Retry a `DELETE` if Hetzner answers with `code=resource_in_use`.
-/// Used by `delete_firewall` + `delete_network` because both can
-/// hit a transient `resource_in_use` for ~1-15 seconds after the
-/// associated server is deleted (the server is gone from
-/// `GET /servers` but its references in firewall.applied_to and
-/// network.servers haven't been reaped yet by Hetzner's internal
-/// scheduler). 60s deadline, exponential back-off (500ms → 5s
-/// cap). On any other error or after the deadline expires, the
-/// last error is returned to the caller verbatim.
+/// Retry a `DELETE` while Hetzner's async cleanup scheduler is
+/// still holding on to the resource — covers two distinct
+/// transient signals:
+///
+///  - `422 resource_in_use` from `delete_firewall` /
+///    `delete_network` (firewall.applied_to and network.servers
+///    still list the deleted server for ~1–15 s after
+///    `DELETE /servers/{id}` returned).
+///  - `423 locked` from `delete_floating_ip` (Hetzner locks the
+///    FIP while it auto-unassigns from a freshly-deleted server;
+///    can persist a few seconds past `wait_for_server_gone`).
+///
+/// 60 s deadline, exponential back-off (500 ms → 5 s cap). Any
+/// other status / code is returned verbatim.
 ///
 /// The closure returns a fresh `ureq::Request` each iteration
 /// (since `Request::call` consumes self) and the helper does the
@@ -604,7 +595,7 @@ impl HetznerCloudClient {
 /// Lives at module scope (rather than as a method on
 /// `HetznerCloudClient`) so the borrow checker is happy with the
 /// closure capturing `&self` only for the inner ureq call.
-fn delete_with_retry_on_resource_in_use<F>(endpoint: &str, mut build_request: F) -> Result<()>
+fn delete_with_retry_on_transient_lock<F>(endpoint: &str, mut build_request: F) -> Result<()>
 where
     F: FnMut() -> ureq::Request,
 {
@@ -627,7 +618,8 @@ where
                             message: body,
                         },
                     });
-                if envelope.error.code == "resource_in_use" && Instant::now() < deadline {
+                let retryable = envelope.error.code == "resource_in_use" || status == 423;
+                if retryable && Instant::now() < deadline {
                     sleep(delay);
                     delay = (delay * 2).min(Duration::from_secs(5));
                     continue;
