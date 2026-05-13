@@ -35,6 +35,16 @@ infra: v1alpha1.#Infrastructure & {
 					protocol: "tcp"
 					source_ips: ["0.0.0.0/0", "::/0"]
 				},
+				{
+					// k3s apiserver — required for `kubectl` / `helm` from
+					// outside the cluster (cluster-bootstrap reads kubeconfig
+					// on the workstation and calls the apiserver directly).
+					// Tier-1 keeps this open to the internet; higher tiers
+					// will restrict to operator's IP / private network.
+					port:     "6443"
+					protocol: "tcp"
+					source_ips: ["0.0.0.0/0", "::/0"]
+				},
 			]
 		}
 		osImage: "ubuntu-24.04"
