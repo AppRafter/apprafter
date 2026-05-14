@@ -13,6 +13,116 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.90 — M1.5 Track A.12 — docs + ADR (Track A closure) (2026-05-15)
+
+Final Track A slice. After 11 sub-versions of CLI rework
+(`v0.1.69`–`v0.1.89`), the operator-facing surface is what it
+is — this slice writes it down. Four new doc pages, one new
+ADR, plus surface updates to the operator-guide and reference
+index. Code changes: zero. Version bump tracks the closure tag.
+
+### Added
+
+- **`docs/adr/0030-cli-target-store-and-credential-chain.md`** —
+  the Track A closure ADR. Codifies four design decisions
+  (target store, three-step credential resolution chain,
+  miette diagnostics, aliases + semantic colours), six
+  alternatives considered, four risks with mitigations, and
+  re-evaluation triggers (AWS provider landing, Phase 2 opening,
+  credential leak surface).
+
+- **`docs/operator-guide/quickstart.md`** — full rewrite. The
+  old flow assumed `export HCLOUD_TOKEN` + `cargo run --bin
+  apprafter -- init`; the new flow assumes `apprafter` on PATH
+  + `apprafter target add` + `apprafter bootstrap-all`. Sections:
+  prerequisites, target configuration, one-command provisioning
+  (with dry-run preview + per-phase recovery), verification via
+  `apprafter doctor` + `kubectl`, day-2 ops table, Application
+  CRD usage, troubleshooting pointer.
+
+- **`docs/operator-guide/target-store.md`** — new reference.
+  File layout (`config.yaml`, `targets/<name>/`, `auth/`,
+  `state/`), field reference for `TargetConfig`, the three-step
+  credential resolution chain explained, four common patterns
+  (single-cluster, multi-cluster, CI env-var-only, token
+  rotation), three anti-patterns.
+
+- **`docs/operator-guide/troubleshooting.md`** — new reference.
+  Diagnostic-code catalogue: every one of the 11 stable
+  `apprafter::<area>::<reason>` codes shipped through v0.1.86
+  + v0.1.87 gets a 2–3 paragraph entry with the exact
+  next-step CLI command. Plus a "walk-found common failures"
+  section and a worked example reading the layered cause
+  chain output (token_rejected wrapping hetzner_api_error).
+
+- **`docs/reference/cli.md`** — full CLI reference. Top-level
+  surface, global env vars table (11 entries:
+  `APPRAFTER_CONFIG_DIR`, `HCLOUD_TOKEN`, `APPRAFTER_SSH_*`,
+  `APPRAFTER_AGE_KEY`, `APPRAFTER_HCLOUD_BASE_URL`,
+  `APPRAFTER_MANIFEST`, `APPRAFTER_NO_PING`, `NO_COLOR`,
+  `RUST_BACKTRACE`), every subcommand with its flags, aliases
+  reference table. Cross-references quickstart + target-store
+  + troubleshooting.
+
+### Changed
+
+- **`docs/operator-guide/index.md`** — links to the new pages,
+  status note flipped from "stub" to "Track A closed", canonical
+  references list refreshed.
+
+- **`docs/reference/index.md`** — CLI reference promoted from
+  stub to first-class entry, diagnostic-code reference
+  cross-linked into troubleshooting.
+
+- **`mkdocs.yml`** nav — Operator Guide + Reference are now
+  nested entries surfacing the new pages (quickstart, target
+  store, gitops walk, troubleshooting, recovery for operator;
+  index + CLI for reference).
+
+### Tests
+
+Docs-only release. SPDX gate: 166 tracked source files pass
+(unchanged — new files are .md docs / ADR, not source code).
+`cargo fmt --check`, `cargo clippy --workspace -- -D warnings`,
+`cargo test --workspace` (564 passed): all clean. `mkdocs
+build --strict` not run locally due to a `nix shell` env quirk
+(mkdocs binary doesn't see the mkdocs-material theme through
+the ad-hoc shell); the CI workflow at `.github/workflows/docs.yml`
+remains the canonical validator.
+
+### Track A closure
+
+This is the last Track A slice. With v0.1.90 tagged, Track A
+(CLI DX rework, 12 sub-phases) is closed:
+
+| Sub-phase  | Version  | Slice                                          |
+| ---------- | -------- | ---------------------------------------------- |
+| 1.66A.1    | v0.1.69  | Rename `platform-cli` → `apprafter` + shim     |
+| 1.66A.2    | v0.1.72  | Target file structure + IO module              |
+| 1.66A.3    | v0.1.73  | `target add` non-interactive                   |
+| 1.66A.4    | v0.1.74  | Provider validator framework + Hetzner ping    |
+| 1.66A.4b   | v0.1.76  | Interactive wizard via inquire                 |
+| 1.66A.5    | v0.1.79  | Target CRUD                                    |
+| 1.66A.6    | v0.1.80  | `whoami` + `auth` stubs                        |
+| 1.66A.7    | v0.1.81  | `doctor`                                       |
+| 1.66A.8    | v0.1.82–v0.1.83 | Wire `apply`/`destroy`/`import` to chain |
+| 1.66A.9    | v0.1.84–v0.1.85 | `bootstrap-all` orchestrator             |
+| 1.66A.10   | v0.1.86–v0.1.87 | miette diagnostic refinement             |
+| 1.66A.11   | v0.1.88–v0.1.89 | Semantic colours + aliases               |
+| **1.66A.12** | **v0.1.90** | **Docs + ADR (this slice — closure)**         |
+
+Track A backlog moved to explicit follow-up (A.9c):
+
+- SSH `ConnectTimeout=5` in `SshKubeconfigFetcher` + Phase 2
+  label rename `[2/3] kubeconfig` → `[2/3] k3s-ready` (current
+  label is misleading; the ~60s isn't the fetch, it's
+  cloud-init + k3s startup).
+
+After v0.1.90 the next iteration opens **Track B (M1.5
+sub-phase 1.66 platform-stack rethink)** — the architectural
+work this M1.5 milestone was named after. Track A's CLI surface
+becomes the load-bearing user contract Track B can rely on.
+
 ## v0.1.89 — hotfix: color bootstrap-all dry-run plan (2026-05-14)
 
 Walk-found gap in v0.1.88. The Track A.11 colour pass touched

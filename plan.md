@@ -1487,9 +1487,51 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.12 (TBD, заполняется при открытии итерации)
+### 1.66A.12 Docs + ADR ✅
 
-> Track A.12 — docs + ADR. Финальная подфаза Track A: обновление операторских docs (`docs/operator/getting-started.md`, `docs/operator/cli-reference.md`) под новый flow + ADR закрывающий проектные решения Track A.
+> v0.1.90 — sub-phase 1.66A.12 shipped: финальная подфаза Track A. Документация для операторов переписана под пост-Track-A flow (`apprafter target add` + `apprafter up` вместо env-var + `cargo run`), credential resolution chain и target store layout вынесены в reference, диагностические коды каталогизированы, full CLI reference добавлен в `docs/reference/cli.md`, дизайн-решения Track A закрыты ADR 0030. mkdocs nav обновлён. Track A теперь закрыт — открывается Track B (M1.5 1.66 platform-stack rethink).
+
+**Source:** `cli-dx-task.md` §17 row 12.
+
+**Поставка:**
+- [x] `docs/adr/0030-cli-target-store-and-credential-chain.md` — новый ADR, кодифицирует 4 design decisions: D1 target store (file layout + `APPRAFTER_CONFIG_DIR` override + per-target dirs + mode 0600), D2 three-step credential resolution chain (flag → env → store, including `--target` override), D3 `miette` для user-facing diagnostics (stable `apprafter::<area>::<reason>` codes + multi-line `help` + `#[diagnostic_source]` cause chains), D4 subcommand aliases + semantic colour palette. Включает 6 alternatives considered, 4 risks с mitigations, re-evaluation triggers (AWS landing, Phase 2 opening, credential leak).
+- [x] `docs/operator-guide/quickstart.md` — полностью переписан. Old flow (`export HCLOUD_TOKEN` + `cargo run --bin apprafter -- init`) → new flow (`apprafter target add prod ...` + `apprafter bootstrap-all`). Объяснены 3-phase wrapper, dry-run preview, per-phase recovery, doctor self-check, aliases (kc/cb/up/t ls/...), миette error reading. Подробный day-2 ops table + Application CRD usage.
+- [x] `docs/operator-guide/target-store.md` — новая страница. File layout reference (`config.yaml` + per-target dirs + `auth/` + `state/`), field reference table для `TargetConfig`, credential resolution chain explained, 4 common patterns (single-cluster / multi-cluster / CI-env-only / token rotation), 3 anti-patterns.
+- [x] `docs/operator-guide/troubleshooting.md` — новая страница. Diagnostic-code catalogue: каждый из 11 кодов получает 2-3 параграфа объяснения (`env::cue_not_found`, `env::cue_export_failed`, `provider::hetzner_api_error`, `provider::server_type_unavailable`, `state::corrupt`, `target::invalid_config`, `target::not_found`, `target::token_rejected`, `target::provider_unreachable`, `io::error/json/yaml`, `cli::other`). + walk-found common failures section + worked example reading the layered cause chain.
+- [x] `docs/reference/cli.md` — новая страница. Top-level binary surface, global env vars table, every subcommand documented (target/whoami/doctor/init/apply/destroy/import/kubeconfig/cluster-bootstrap/argocd-password/bootstrap-all/status/login/upgrade-tier/auth), full aliases reference table.
+- [x] `docs/operator-guide/index.md` обновлён — links to new pages, Track A status note (closed), no more "stub" wording.
+- [x] `docs/reference/index.md` обновлён — CLI reference из stub стал first-class, диагностические коды cross-link'нуты на troubleshooting page.
+- [x] `mkdocs.yml` nav — Operator Guide + Reference раскрываются в nested entries (quickstart / target store / gitops walk / troubleshooting / recovery; reference index + CLI page).
+
+**Тесты:** docs-only changes, никаких runtime tests. SPDX gates: 166 файлов pass. fmt + clippy: clean. Workspace tests: 564 passed (unchanged). mkdocs `--strict` build не запустился локально из-за `nix shell` env quirk (mkdocs binary не видит mkdocs-material theme); CI workflow `.github/workflows/docs.yml` валидирует.
+
+**Acceptance:**
+- ✅ ADR 0030 покрывает все 4 design decisions с rationale, alternatives, risks, re-evaluation triggers.
+- ✅ Operator quickstart описывает post-Track-A flow без legacy `cargo run` / env-var-only префиксов.
+- ✅ Target store layout + credential chain документированы в одной reference page.
+- ✅ Все 11 diagnostic codes имеют next-step CLI команды в troubleshooting page.
+- ✅ Full CLI reference covers все 13 subcommand'ов + 6 aliases.
+- ✅ mkdocs nav surface'ит новые страницы.
+- ✅ SPDX clean (166 файлов).
+
+**Out-of-scope (отложено):**
+- Auto-generated CRD field reference — Phase 8.1 target per `docs/reference/index.md`.
+- Mass-rewrite of `docs/dev-guide/quickstart.md` — Track A не трогал developer flow напрямую, отдельная итерация когда developer experience станет приоритетом.
+- Translations — все docs остаются English-only.
+
+**Зависит от:** 1.66A.11 ✅ (последний код-меняющий sub-phase Track A — нужны все имплементированные фичи чтобы корректно их задокументировать).
+
+**Размер:** M (один цикл, ~1 рабочий день — 4 новых doc-файла + 1 ADR + 2 update'а + nav).
+
+---
+
+### Track A backlog (отложено в follow-up подфазы)
+
+Items surfaced during Track A walks и оставленные as concrete TODO для отдельной итерации between Track A closure и Track B opening:
+
+1. **Phase 2 polish (A.9c)** — `[2/3] kubeconfig` rename to `[2/3] k3s-ready` (label вводит в заблуждение: время — это cloud-init + k3s startup, не fetch'inг сам по себе) + short SSH `ConnectTimeout=5` (today attempt 1 блокирует ~30s на kernel TCP timeout пока cloud-init поднимает sshd). Combined fix падёт Phase 2 typical с ~60s до ~20-30s. Размер S.
+
+После закрытия Track A backlog или прямо сейчас открывается **Track B (M1.5 sub-phase 1.66 platform-stack rethink)** — главная архитектурная работа M1.5.
 
 ---
 
@@ -3776,4 +3818,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.10 walk-fix — `target add` с битым токеном выходил под generic `apprafter::cli::other` потому что `commands/target.rs::ping_provider` и `commands/target_wizard.rs::prompt_token` обёртывали типизированный `CliError::Hetzner { status: 401, .. }` в `CliError::Other(format!(...))`, теряя diagnostic code и rotation help. v0.1.87 добавил две типизированные вариации с `#[diagnostic_source]` cause chain: `apprafter::target::token_rejected` (401 — rotation hint + console URL + clipboard newline trap) и `apprafter::target::provider_unreachable` (non-401 / transport — `apprafter doctor` + status page + `--no-ping`); shared `classify_ping_error(provider, err)` helper в обоих call sites; миette теперь рендерит two-layer cascade — outer summary с rotation help + chained inner `hetzner_api_error` с full 401/403/429/5xx breakdown; +2 unit tests на новых вариантах (`provider_token_rejected_carries_rotation_hint_and_chains_cause` доказывает что `diagnostic_source()` доходит до inner code, `provider_api_unreachable_targets_outage_path_not_rotation` гарантирует что outage не предлагает rotation); 2 prior target_test integration tests перевели assertions с обёртки на diagnostic codes (rendered output line-wraps, substrings типа `(status 401)` ненадёжны, codes — да); v0.1.87 | initial |
 | 2026-05-14 | M1.5 Track A.11 — semantic colors + subcommand aliases: new `cli_core::style` модуль поверх `owo-colors` (auto-honours `NO_COLOR` через `supports-colors` feature) с 6 хелперами (ok/warn/fail/info/dim/bold); colour applied на `bootstrap-all` phase markers (`→` cyan, `✓` green, `✗` red) + `doctor` glyphs (green ✓ / yellow ⚠ / red ✗); 6 новых subcommand aliases (`kubeconfig` ↔ `kc`, `cluster-bootstrap` ↔ `cb`, `bootstrap-all` ↔ `up`, `target list/show/remove` ↔ `ls`/`info`/`rm`), сохранён prior `target` ↔ `t` для chained `apprafter t ls`; +2 unit (style ANSI-strip under non-TTY) + 7 integration (alias subprocess routing включая chained `t ls`); v0.1.88 | initial |
 | 2026-05-14 | M1.5 Track A.11 walk-fix — после walk'а v0.1.88: `apprafter up --dry-run` оставался монохромным (я подкрасил только wet path); только `INFO` лейбл от tracing-subscriber'а светился зелёным. v0.1.89 покрыл dry-run plan: `bootstrap-all` heading + `Target:` label + active target name через `style::bold`; `(active)`/`(via --target override)` tag через `style::info` cyan; `[1/3]`/`[2/3]`/`[3/3]` phase numbers cyan (echoes wet path's `→`); `Provider:/Region:/Tier:/...` labels + `<unset — ...>` placeholders + bottom hint через `style::dim` чтобы defaults не отвлекали от реальных значений; script(1)-replay confirms ANSI bytes есть в TTY и отсутствуют под `NO_COLOR=1`; v0.1.89 | initial |
+| 2026-05-15 | M1.5 Track A.12 — docs + ADR (Track A closure): new ADR 0030 кодифицирует 4 Track A design decisions (target store, credential resolution chain, miette diagnostics, aliases+color); `docs/operator-guide/quickstart.md` переписан под post-Track-A flow (`target add` + `bootstrap-all` вместо env-var + `cargo run --bin apprafter -- init`); new `docs/operator-guide/target-store.md` (file layout + chain reference); new `docs/operator-guide/troubleshooting.md` (catalogue всех 11 diagnostic codes + worked cause-chain example); new `docs/reference/cli.md` (every subcommand + global env vars table + aliases reference); `docs/operator-guide/index.md` и `docs/reference/index.md` обновлены; `mkdocs.yml` nav expanded; Track A backlog (A.9c Phase 2 polish: SSH ConnectTimeout + label rename) explicitly tracked для follow-up; v0.1.90 — закрывает Track A | initial |
 

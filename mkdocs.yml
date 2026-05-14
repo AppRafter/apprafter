@@ -69,9 +69,17 @@ nav:
   - Home: index.md
   - Architecture: architecture/index.md
   - Concepts: concepts/index.md
-  - Operator Guide: operator-guide/index.md
+  - Operator Guide:
+      - Overview: operator-guide/index.md
+      - Quickstart: operator-guide/quickstart.md
+      - Target store: operator-guide/target-store.md
+      - GitOps walk: operator-guide/gitops-walk.md
+      - Troubleshooting: operator-guide/troubleshooting.md
+      - Recovery: operator-guide/recovery.md
   - Developer Guide: dev-guide/index.md
-  - Reference: reference/index.md
+  - Reference:
+      - Overview: reference/index.md
+      - CLI: reference/cli.md
   - Contributing:
       - Setup: contributing/setup.md
       - License Headers: contributing/license-headers.md
