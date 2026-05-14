@@ -25,6 +25,14 @@ Thanks for considering a contribution.
 - The `plan.md` in the repository root is updated when a phase is
   closed — flip the checkboxes and append a row to the history
   table.
+- **CLI version bump on every release.** Each release commit that
+  bumps the patch version (`v0.1.N → v0.1.N+1`) also updates
+  `cli/Cargo.toml`'s `workspace.package.version` to match. This
+  keeps `apprafter --version` honest about what's installed.
+  The convention starts at `v0.1.77`; earlier tags between
+  `v0.1.3` and `v0.1.76` ship binaries that print `0.1.2`
+  because the field drifted (one-off historical issue, not a
+  bug worth retroactively patching).
 
 ## Pull requests
 

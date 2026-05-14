@@ -95,12 +95,15 @@ pub struct AddArgs {
 fn run_add(mut args: AddArgs) -> Result<()> {
     // Decide before validating: the wizard is allowed to fill the
     // missing inputs, so we shouldn't reject e.g. `apprafter target
-    // add` (no name) up front when the user is on a TTY.
+    // add` (no name) up front when the user is on a TTY. v0.1.77
+    // dropped the "skip when all required supplied" short-circuit —
+    // wizard now always fires on a TTY so optional fields
+    // (ssh-key, tier, region) get prompted too. Pre-supplied fields
+    // are silent through per-prompt prefill checks.
     let want_wizard = crate::commands::target_wizard::should_use_wizard(
         args.no_interactive,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
-        all_required_present_for_flow(&args),
     );
     if want_wizard {
         run_wizard_into_args(&mut args)?;
@@ -182,21 +185,6 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Decide whether all the required inputs for the current flow
-/// (add vs renew) are present on `args`. The wizard skips when
-/// they all are — that mirrors the v0.1.73 non-interactive path
-/// even on a TTY, so power users who pass full flags don't get a
-/// surprise prompt.
-fn all_required_present_for_flow(args: &AddArgs) -> bool {
-    if args.renew {
-        // Renew preserves the existing target's config — only
-        // name + token are mandatory inputs.
-        args.name.is_some() && args.token.is_some()
-    } else {
-        args.name.is_some() && args.provider.is_some() && args.token.is_some()
-    }
 }
 
 /// Fill `args` from wizard prompts for whatever fields aren't

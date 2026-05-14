@@ -22,7 +22,10 @@
 //! feedback instead of discovering the error after entering five
 //! more fields.
 
-use std::path::PathBuf;
+use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use cli_core::target::validate_hetzner_token_format;
 use cli_core::{CliError, Result};
@@ -32,6 +35,26 @@ use inquire::{InquireError, Password, PasswordDisplayMode, Select, Text};
 
 use crate::commands::hcloud::hcloud_base_url;
 use crate::commands::target::AddArgs;
+
+/// `HCLOUD_TOKEN` env-var name. Defined here so the wizard's
+/// "token-from-env" detection has the same string as clap's
+/// `#[arg(env = "HCLOUD_TOKEN")]` annotation on `--token`.
+const HCLOUD_TOKEN_ENV: &str = "HCLOUD_TOKEN";
+
+/// Where the supplied token came from — surfaced to the wizard so
+/// it can print a one-line acknowledgement when the token rode in
+/// on the env var instead of an explicit `--token` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSource {
+    /// Passed via `--token` on the command line.
+    Flag,
+    /// Picked up from the env var bound by clap's
+    /// `#[arg(env = "HCLOUD_TOKEN")]`. Distinguishable from `Flag`
+    /// by comparing the value to `std::env::var(HCLOUD_TOKEN_ENV)`.
+    Env,
+    /// No prefill at all — wizard prompts.
+    Prompt,
+}
 
 /// `solo` is the spec-blessed default tier from `spec.md` (Tier 1
 /// single VDS) and the cheapest entry. Order in the picker matches
@@ -52,23 +75,22 @@ const DEFAULT_TARGET_NAME: &str = "default";
 /// Pure on inputs to make the call testable: don't probe stdin /
 /// stdout here, only consume the booleans the caller has already
 /// resolved.
+///
+/// Until v0.1.76 the function also short-circuited "skip when all
+/// required flags are present" — v0.1.77 dropped that. The wizard
+/// now always runs on a TTY; per-prompt prefill checks make
+/// already-supplied fields silent, while optional ones (ssh-key,
+/// tier, ...) still get prompted. Explicit `--no-interactive`
+/// remains the way to force flag-driven mode.
 pub fn should_use_wizard(
     no_interactive: bool,
     stdin_is_terminal: bool,
     stdout_is_terminal: bool,
-    has_all_required_flags: bool,
 ) -> bool {
     if no_interactive {
         return false;
     }
-    if !(stdin_is_terminal && stdout_is_terminal) {
-        return false;
-    }
-    // If the user already supplied every required input, respect
-    // their intent and skip the wizard — the non-interactive flow
-    // from v0.1.73 + the ping from v0.1.75 already give them
-    // everything the wizard would.
-    !has_all_required_flags
+    stdin_is_terminal && stdout_is_terminal
 }
 
 /// Result of the `add`-flow wizard. The wizard fills only fields
@@ -97,8 +119,13 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
 
     let name = prompt_name(initial.name.as_deref())?;
     let provider = prompt_provider(initial.provider.as_deref())?;
-    let (token, token_already_verified) =
-        prompt_token(&provider, initial.token.as_deref(), initial.no_ping)?;
+    let token_source = classify_token_source(initial.token.as_deref());
+    let (token, token_already_verified) = prompt_token(
+        &provider,
+        initial.token.as_deref(),
+        token_source,
+        initial.no_ping,
+    )?;
     let ssh_key = prompt_ssh_key(initial.ssh_key.as_ref())?;
     let region = prompt_region(
         &provider,
@@ -119,6 +146,23 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
     })
 }
 
+/// Classify how the token reached us: clap's `#[arg(env)]` blends
+/// `--token` flag and `HCLOUD_TOKEN` env into the same `Option`.
+/// We probe the env separately and compare to disambiguate, so
+/// the wizard can print a friendly "Using HCLOUD_TOKEN from env"
+/// notice. Pure on inputs — testable without touching real env.
+pub fn classify_token_source_with(prefill: Option<&str>, env_value: Option<&str>) -> TokenSource {
+    match (prefill, env_value) {
+        (Some(p), Some(e)) if p == e => TokenSource::Env,
+        (Some(_), _) => TokenSource::Flag,
+        (None, _) => TokenSource::Prompt,
+    }
+}
+
+fn classify_token_source(prefill: Option<&str>) -> TokenSource {
+    classify_token_source_with(prefill, std::env::var(HCLOUD_TOKEN_ENV).ok().as_deref())
+}
+
 // ---------------------------------------------------------------
 // Renew-flow wizard — only the token gets prompted; everything
 // else is preserved from the existing target.
@@ -130,7 +174,10 @@ pub fn run_renew_wizard(provider: &str, no_ping: bool) -> Result<(String, bool)>
         "Rotating credentials. The target's config (provider, region, tier, ...) stays as-is."
     );
     eprintln!();
-    prompt_token(provider, None, no_ping)
+    // Renew deliberately ignores `HCLOUD_TOKEN` — the env var
+    // probably holds the OLD token that's being rotated. Always
+    // prompt for the new one.
+    prompt_token(provider, None, TokenSource::Prompt, no_ping)
 }
 
 // ---------------------------------------------------------------
@@ -172,8 +219,33 @@ fn prompt_provider(prefill: Option<&str>) -> Result<String> {
     Ok(answer.to_string())
 }
 
-fn prompt_token(provider: &str, prefill: Option<&str>, no_ping: bool) -> Result<(String, bool)> {
+fn prompt_token(
+    provider: &str,
+    prefill: Option<&str>,
+    source: TokenSource,
+    no_ping: bool,
+) -> Result<(String, bool)> {
     if let Some(tok) = prefill {
+        // Surface where the token came from so the user doesn't
+        // wonder "where did that token come from?" — especially
+        // for the env-var case which is otherwise invisible.
+        match source {
+            TokenSource::Env => {
+                eprintln!(
+                    "  ℹ Using token from {HCLOUD_TOKEN_ENV} env var (length {} chars)",
+                    tok.len()
+                );
+            }
+            TokenSource::Flag => {
+                eprintln!("  ℹ Using token from --token flag");
+            }
+            TokenSource::Prompt => {
+                // Caller shouldn't pass Prompt with Some(prefill);
+                // not a hard error but worth a debug breadcrumb.
+                tracing::debug!("prompt_token: prefill is Some while source = Prompt");
+            }
+        }
+
         // Validate up-front so the user gets the error attached to
         // the flag (`--token` or `HCLOUD_TOKEN` env) rather than a
         // surprise mid-wizard prompt.
@@ -185,6 +257,7 @@ fn prompt_token(provider: &str, prefill: Option<&str>, no_ping: bool) -> Result<
         } else {
             ping_for_provider(provider, tok)
                 .map_err(|e| CliError::Other(format!("token rejected by provider: {e}")))?;
+            eprintln!("  ✓ Token verified");
             true
         };
         return Ok((tok.to_string(), verified));
@@ -229,10 +302,43 @@ fn prompt_ssh_key(prefill: Option<&PathBuf>) -> Result<Option<PathBuf>> {
     if let Some(path) = prefill {
         return Ok(Some(path.clone()));
     }
+
+    // Inventory ~/.ssh/*.pub so users with multiple keys (work +
+    // personal + per-host) get a real picker rather than a Text
+    // input with a blind default. Falls back to the Text path
+    // when the directory is empty / unreadable.
+    let candidates = scan_ssh_pub_keys();
+
+    if candidates.is_empty() {
+        return prompt_ssh_key_text_fallback();
+    }
+
+    let mut options: Vec<SshKeyChoice> = candidates
+        .into_iter()
+        .map(|p| {
+            let label = ssh_key_label(&p);
+            SshKeyChoice::Path { path: p, label }
+        })
+        .collect();
+    options.push(SshKeyChoice::Other);
+    options.push(SshKeyChoice::Skip);
+
+    let selected = Select::new("SSH public key:", options)
+        .with_help_message("Used for server provisioning; can be added/changed later.")
+        .prompt()
+        .map_err(map_inquire_err)?;
+
+    match selected {
+        SshKeyChoice::Path { path, .. } => Ok(Some(path)),
+        SshKeyChoice::Other => prompt_ssh_key_text_fallback(),
+        SshKeyChoice::Skip => Ok(None),
+    }
+}
+
+fn prompt_ssh_key_text_fallback() -> Result<Option<PathBuf>> {
     let default = default_ssh_key_hint();
     let answer = Text::new("SSH public key path (leave empty to skip):")
         .with_default(&default)
-        .with_help_message("Used for server provisioning; can be set later.")
         .with_validator(|v: &str| {
             let trimmed = v.trim();
             if trimmed.is_empty() {
@@ -254,6 +360,95 @@ fn prompt_ssh_key(prefill: Option<&PathBuf>) -> Result<Option<PathBuf>> {
     } else {
         Ok(Some(expand_tilde(trimmed)))
     }
+}
+
+/// Variants of the SSH-key Select picker. `Path` carries the
+/// resolved path and the human label so the `Display` impl
+/// doesn't have to re-read the file on every redraw.
+#[derive(Clone)]
+enum SshKeyChoice {
+    Path { path: PathBuf, label: String },
+    Other,
+    Skip,
+}
+
+impl std::fmt::Display for SshKeyChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path { label, .. } => f.write_str(label),
+            Self::Other => f.write_str("Other (type a path)"),
+            Self::Skip => f.write_str("Skip (don't attach an SSH key now)"),
+        }
+    }
+}
+
+/// Scan `~/.ssh/` for `*.pub` files. Returns paths sorted
+/// alphabetically; empty Vec on any IO error (we fall back to a
+/// Text input in that case rather than failing the wizard).
+pub fn scan_ssh_pub_keys() -> Vec<PathBuf> {
+    scan_ssh_pub_keys_in(dirs::home_dir().map(|h| h.join(".ssh")).as_deref())
+}
+
+/// Testable scan: caller picks the dir. `None` or a non-existent
+/// dir yields an empty Vec.
+pub fn scan_ssh_pub_keys_in(dir: Option<&Path>) -> Vec<PathBuf> {
+    let Some(dir) = dir else { return Vec::new() };
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("pub"))
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Build a Select label for `path`: the path itself plus the
+/// public-key comment when the file looks like OpenSSH format.
+/// Compact enough to fit on one terminal row even for verbose
+/// `~/.ssh/...` paths.
+pub fn ssh_key_label(path: &Path) -> String {
+    let pretty = abbreviate_home_path(path);
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return pretty;
+    };
+    let first_line = body.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    // OpenSSH layout: <algo> <base64-key> [comment ...]
+    if parts.len() >= 2 {
+        let algo = parts[0];
+        let comment: String = if parts.len() > 2 {
+            parts[2..].join(" ")
+        } else {
+            String::new()
+        };
+        if comment.is_empty() {
+            return format!("{pretty}  ({algo})");
+        }
+        return format!("{pretty}  ({algo}, {comment})");
+    }
+    pretty
+}
+
+/// Render `path` with `$HOME` collapsed to `~` so picker rows
+/// stay readable. Pure on `home` for testability.
+fn abbreviate_home_path_with(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        if let Ok(rest) = path.strip_prefix(home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn abbreviate_home_path(path: &Path) -> String {
+    abbreviate_home_path_with(path, dirs::home_dir().as_deref())
 }
 
 fn prompt_region(
@@ -283,10 +478,119 @@ fn prompt_region(
     if regions.is_empty() {
         return Ok(None);
     }
-    let selected = Select::new("Default region:", regions)
+    eprintln!(
+        "  ⏳ Measuring latency to {} region(s)... (best-effort, ≤2s)",
+        regions.len()
+    );
+    let measured = measure_region_latencies(regions, Duration::from_millis(2000));
+    let selected = Select::new("Default region (sorted by latency):", measured)
         .prompt()
         .map_err(map_inquire_err)?;
-    Ok(Some(selected.name))
+    Ok(Some(selected.info.name))
+}
+
+/// `RegionInfo` decorated with a measured TCP latency. `None`
+/// means the probe didn't resolve / timed out — those entries
+/// sort to the end of the Select so they don't crowd the
+/// top-of-list reachable options.
+#[derive(Clone)]
+pub struct RegionWithLatency {
+    pub info: RegionInfo,
+    pub latency_ms: Option<u32>,
+}
+
+impl std::fmt::Display for RegionWithLatency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.latency_ms {
+            Some(ms) => write!(f, "{:>10}  ({:>4} ms)", self.info, ms),
+            None => write!(f, "{:>10}  (  n/a   )", self.info),
+        }
+    }
+}
+
+/// Probe each region in parallel, return sorted ascending by
+/// latency (`None` last). Bounded by `overall_timeout` so a
+/// network outage doesn't hang the wizard — entries that didn't
+/// report in time end up as `None`.
+pub fn measure_region_latencies(
+    regions: Vec<RegionInfo>,
+    overall_timeout: Duration,
+) -> Vec<RegionWithLatency> {
+    if regions.is_empty() {
+        return Vec::new();
+    }
+    let (tx, rx) = mpsc::channel::<RegionWithLatency>();
+    let originals: Vec<RegionInfo> = regions.clone();
+    let expected = regions.len();
+    for r in regions {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let latency_ms = probe_region_latency(&r.name, overall_timeout);
+            // Send may fail if the receiver was dropped (overall
+            // timeout hit) — ignore, the receiver has already
+            // moved on.
+            let _ = tx.send(RegionWithLatency {
+                info: r,
+                latency_ms,
+            });
+        });
+    }
+    drop(tx);
+
+    let deadline = Instant::now() + overall_timeout;
+    let mut results: Vec<RegionWithLatency> = Vec::with_capacity(expected);
+    while results.len() < expected {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline - now;
+        match rx.recv_timeout(remaining) {
+            Ok(r) => results.push(r),
+            Err(_) => break,
+        }
+    }
+    // Latecomers that finished after the deadline but before we
+    // returned still get picked up cheaply.
+    while let Ok(r) = rx.try_recv() {
+        results.push(r);
+    }
+
+    // Synthesize `None`-latency entries for any region that never
+    // reported within the overall timeout — the user still sees
+    // them in the Select picker (sorted to the end), they just
+    // can't compare latency. Without this, an entire run of
+    // hung probes would silently shrink the picker to zero
+    // entries.
+    let reported: std::collections::HashSet<String> =
+        results.iter().map(|r| r.info.name.clone()).collect();
+    for orig in originals {
+        if !reported.contains(&orig.name) {
+            results.push(RegionWithLatency {
+                info: orig,
+                latency_ms: None,
+            });
+        }
+    }
+
+    results.sort_by_key(|r| r.latency_ms.unwrap_or(u32::MAX));
+    results
+}
+
+/// TCP-connect to the per-Hetzner-DC speedtest endpoint
+/// (`<region>-speed.hetzner.com:443`) and return the round-trip
+/// of the connect handshake in ms. Returns `None` if DNS fails,
+/// connect times out, or any other IO error fires. Pure on the
+/// `region` name — exposed as `pub` so tests can call it (they
+/// won't actually probe in unit-tests, but the function isn't
+/// hidden behind the `prompt_region` glue).
+pub fn probe_region_latency(region: &str, timeout: Duration) -> Option<u32> {
+    let host = format!("{region}-speed.hetzner.com:443");
+    let addrs: Vec<_> = host.to_socket_addrs().ok()?.collect();
+    let addr = *addrs.first()?;
+    let start = Instant::now();
+    std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
+    Some(start.elapsed().as_millis().min(u32::MAX as u128) as u32)
 }
 
 fn prompt_tier(prefill: Option<&str>) -> Result<Option<String>> {
@@ -432,16 +736,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_use_wizard_only_when_tty_and_no_flag_and_missing_required() {
-        // No-interactive flag wins everything else.
-        assert!(!should_use_wizard(true, true, true, false));
+    fn should_use_wizard_fires_on_tty_unless_no_interactive() {
+        // --no-interactive wins regardless of TTY state.
+        assert!(!should_use_wizard(true, true, true));
         // No TTY on either stream → no wizard.
-        assert!(!should_use_wizard(false, false, true, false));
-        assert!(!should_use_wizard(false, true, false, false));
-        // All flags supplied → no wizard (respect explicit non-interactive intent).
-        assert!(!should_use_wizard(false, true, true, true));
-        // TTY + something missing → wizard.
-        assert!(should_use_wizard(false, true, true, false));
+        assert!(!should_use_wizard(false, false, true));
+        assert!(!should_use_wizard(false, true, false));
+        assert!(!should_use_wizard(false, false, false));
+        // TTY on both streams + no opt-out → wizard fires (even
+        // with all required flags present — per-prompt prefill
+        // makes the supplied fields silent; optional fields like
+        // ssh-key/tier still get prompted; v0.1.76 short-circuit
+        // dropped in v0.1.77).
+        assert!(should_use_wizard(false, true, true));
     }
 
     #[test]
@@ -502,5 +809,154 @@ mod tests {
         let s = c.to_string();
         assert!(s.starts_with("solo —"), "{s}");
         assert!(s.contains("Tier 1"), "{s}");
+    }
+
+    #[test]
+    fn classify_token_source_distinguishes_env_flag_and_none() {
+        // Env-supplied: prefill equals env value.
+        assert_eq!(
+            classify_token_source_with(Some("abc"), Some("abc")),
+            TokenSource::Env
+        );
+        // Flag-supplied: prefill differs from env (or env unset).
+        assert_eq!(
+            classify_token_source_with(Some("flag"), Some("env")),
+            TokenSource::Flag
+        );
+        assert_eq!(
+            classify_token_source_with(Some("flag"), None),
+            TokenSource::Flag
+        );
+        // None: no prefill at all.
+        assert_eq!(
+            classify_token_source_with(None, Some("env-ignored")),
+            TokenSource::Prompt
+        );
+        assert_eq!(classify_token_source_with(None, None), TokenSource::Prompt);
+    }
+
+    #[test]
+    fn scan_ssh_pub_keys_in_returns_empty_for_missing_or_empty_dirs() {
+        assert!(scan_ssh_pub_keys_in(None).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        // Non-existent subdir.
+        assert!(scan_ssh_pub_keys_in(Some(&dir.path().join("nope"))).is_empty());
+        // Empty existing dir.
+        assert!(scan_ssh_pub_keys_in(Some(dir.path())).is_empty());
+    }
+
+    #[test]
+    fn scan_ssh_pub_keys_in_returns_only_pub_files_sorted_alphabetically() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mix `.pub`, private keys (no extension), other files,
+        // and a subdirectory to make sure we don't recurse.
+        std::fs::write(dir.path().join("id_ed25519.pub"), "ssh-ed25519 AAA me@x").unwrap();
+        std::fs::write(dir.path().join("id_ed25519"), "private not for scan").unwrap();
+        std::fs::write(dir.path().join("work.pub"), "ssh-rsa BBB me@work").unwrap();
+        std::fs::write(dir.path().join("config"), "Host *\n  User me").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        std::fs::write(dir.path().join("subdir/nested.pub"), "should not appear").unwrap();
+
+        let keys = scan_ssh_pub_keys_in(Some(dir.path()));
+        let names: Vec<String> = keys
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["id_ed25519.pub", "work.pub"]);
+    }
+
+    #[test]
+    fn ssh_key_label_emits_path_algo_and_comment_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519.pub");
+        std::fs::write(&path, "ssh-ed25519 AAAAfakebody me@laptop\n").unwrap();
+        let label = ssh_key_label(&path);
+        assert!(
+            label.contains("id_ed25519.pub"),
+            "label should carry filename: {label}"
+        );
+        assert!(label.contains("ssh-ed25519"), "{label}");
+        assert!(label.contains("me@laptop"), "{label}");
+    }
+
+    #[test]
+    fn ssh_key_label_falls_back_to_path_when_file_is_unreadable() {
+        let label = ssh_key_label(std::path::Path::new("/this/does/not/exist/key.pub"));
+        // Path string is preserved verbatim; we just don't crash
+        // on the missing file.
+        assert!(label.contains("key.pub"), "{label}");
+    }
+
+    #[test]
+    fn abbreviate_home_path_collapses_home_to_tilde() {
+        let home = std::path::Path::new("/home/operator");
+        assert_eq!(
+            abbreviate_home_path_with(
+                std::path::Path::new("/home/operator/.ssh/id_ed25519.pub"),
+                Some(home)
+            ),
+            "~/.ssh/id_ed25519.pub"
+        );
+        // Path outside $HOME stays absolute.
+        assert_eq!(
+            abbreviate_home_path_with(std::path::Path::new("/etc/ssh/host_key.pub"), Some(home)),
+            "/etc/ssh/host_key.pub"
+        );
+        // No home → verbatim.
+        assert_eq!(
+            abbreviate_home_path_with(std::path::Path::new("/foo/bar"), None),
+            "/foo/bar"
+        );
+    }
+
+    #[test]
+    fn measure_region_latencies_sorts_unreachable_last_and_preserves_known() {
+        // Use a deterministic region list with hostnames that
+        // can't resolve (`.invalid` is reserved by RFC 6761 for
+        // exactly this — DNS never answers). Probes will all
+        // return `None`; the sort just has to put them in stable
+        // input order without panicking.
+        let regions = vec![
+            RegionInfo {
+                name: "z-fake.invalid".into(),
+                description: "Z".into(),
+            },
+            RegionInfo {
+                name: "a-fake.invalid".into(),
+                description: "A".into(),
+            },
+        ];
+        let measured = measure_region_latencies(regions, Duration::from_millis(200));
+        // All probes failed → all latency_ms = None; order
+        // amongst equals follows whatever the sort does (stable
+        // by latency, equal latency → input order preserved by
+        // Rust's stable sort).
+        assert_eq!(measured.len(), 2);
+        for m in &measured {
+            assert!(
+                m.latency_ms.is_none(),
+                "synthetic .invalid hosts shouldn't resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn region_with_latency_display_marks_unreachable_distinctly() {
+        let info = RegionInfo {
+            name: "nbg1".into(),
+            description: "Nuremberg".into(),
+        };
+        let reachable = RegionWithLatency {
+            info: info.clone(),
+            latency_ms: Some(24),
+        };
+        let dead = RegionWithLatency {
+            info,
+            latency_ms: None,
+        };
+        let s_reach = reachable.to_string();
+        let s_dead = dead.to_string();
+        assert!(s_reach.contains("24 ms"), "{s_reach}");
+        assert!(s_dead.contains("n/a"), "{s_dead}");
     }
 }

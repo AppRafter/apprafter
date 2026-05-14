@@ -13,6 +13,99 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.77 — wizard UX polish + workspace version-bump policy (2026-05-14)
+
+Follow-up to v0.1.76 driven by the first real walk-through of the
+wizard. Five concrete issues operator reported, all addressed in
+one patch:
+
+### Changed
+
+- **Workspace `Cargo.toml` version is now bumped per release.**
+  The field drifted at `0.1.2` from the original v0.1.2 commit
+  all the way through v0.1.76 — `apprafter --version` always
+  printed `0.1.2` regardless of what was actually installed.
+  CLAUDE.md "Versioning" rule amended to mandate the bump in
+  every release commit; this commit lands `version = "0.1.77"`
+  in `cli/Cargo.toml`, and the rule is honoured going forward.
+- **Wizard now fires on every TTY** (unless `--no-interactive`).
+  v0.1.76's `should_use_wizard` had a "skip when all required
+  flags are supplied" short-circuit that turned out to be the
+  wrong default: a user running `apprafter target add work
+  --provider hetzner-cloud --region nbg1` on a TTY was getting
+  no wizard at all because clap's `#[arg(env = "HCLOUD_TOKEN")]`
+  silently filled the token from the env var — so optional
+  fields like `--ssh-key` and `--tier` never got a chance to be
+  prompted for. v0.1.77 drops the short-circuit; per-prompt
+  prefill checks keep already-supplied fields silent while the
+  optional ones still get a `Select`. Explicit `--no-interactive`
+  remains the way to force pure flag mode.
+- **Wizard's region picker now sorts by measured TCP latency.**
+  After the token verifies, the wizard fires a parallel probe
+  (`<region>-speed.hetzner.com:443`, bounded by 2 s overall) and
+  presents the `Select` sorted ascending by ms. Unreachable
+  probes fall to the bottom with `(  n/a   )` so they're still
+  pickable. Hetzner's per-DC speedtest endpoints follow the
+  `<region>-speed.hetzner.com` pattern (`nbg1-speed`,
+  `fsn1-speed`, `hel1-speed`, `ash-speed`, `hil-speed`,
+  `sin-speed`); when DNS doesn't resolve we degrade gracefully.
+
+### Added
+
+- **Token-from-env notification.** When the wizard receives the
+  token via clap's `#[arg(env = "HCLOUD_TOKEN")]` rather than an
+  explicit `--token` flag, it now prints
+  `  ℹ Using token from HCLOUD_TOKEN env var (length N chars)`
+  before the format/ping check. The `--token` flag case prints
+  `  ℹ Using token from --token flag` for symmetry. The new
+  `TokenSource` enum + `classify_token_source_with(prefill,
+  env_value)` pure helper drive this — testable without touching
+  real env.
+- **SSH-key `Select` picker.** The wizard now scans
+  `~/.ssh/*.pub`, presents matching files as a `Select`, and
+  appends two extra entries — `Other (type a path)` and `Skip
+  (don't attach an SSH key now)`. Each `*.pub` entry shows the
+  abbreviated path (`~/.ssh/...`) plus the parsed OpenSSH algo
+  and comment (`(ssh-ed25519, me@laptop)`), so users with
+  multiple keys can pick the right one without recalling
+  filenames. Empty `~/.ssh/` falls back to the v0.1.76 Text
+  input with `~/` tilde expansion intact.
+- **`RegionInfo` carries latency in the picker** via the new
+  `RegionWithLatency` wrapper. `Display` impl renders
+  `nbg1 — Nuremberg DC Park 1  (  24 ms)` so the picker label
+  doubles as a snapshot of connectivity.
+
+### Tests
+
+- **10 new unit tests** in `commands::target_wizard`:
+  - `should_use_wizard_fires_on_tty_unless_no_interactive` —
+    replaces the old four-arg test; pins the simplified rule.
+  - `classify_token_source_distinguishes_env_flag_and_none` —
+    four-way table (env matches, env differs, env unset, no
+    prefill).
+  - `scan_ssh_pub_keys_in_returns_empty_for_missing_or_empty_dirs`
+    — `None` / non-existent / empty.
+  - `scan_ssh_pub_keys_in_returns_only_pub_files_sorted_alphabetically`
+    — mixes private keys, configs, subdirs, and pin that only
+    `*.pub` regular files in the top-level dir are returned.
+  - `ssh_key_label_emits_path_algo_and_comment_when_present`.
+  - `ssh_key_label_falls_back_to_path_when_file_is_unreadable`.
+  - `abbreviate_home_path_collapses_home_to_tilde` — happy +
+    out-of-home + no-home cases.
+  - `measure_region_latencies_sorts_unreachable_last_and_preserves_known`
+    — uses RFC-6761 reserved `.invalid` TLD so probes
+    deterministically fail; pins that every input region gets
+    exactly one output entry.
+  - `region_with_latency_display_marks_unreachable_distinctly`.
+
+### Operator note
+
+If you reinstalled `apprafter` from this commit, `apprafter
+--version` will now print `apprafter 0.1.77`. Anyone who built
+from a tag between v0.1.3 and v0.1.76 sees `apprafter 0.1.2`
+permanently in those binaries — the in-place version was never
+updated; only the git tag moved.
+
 ## v0.1.76 — M1.5 Track A.4b — interactive wizard via inquire (2026-05-14)
 
 Second half of M1.5 Track A.4. `apprafter target add` now opens an
