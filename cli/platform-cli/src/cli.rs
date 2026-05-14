@@ -173,4 +173,41 @@ pub enum TargetCommand {
         )]
         no_ping: bool,
     },
+    /// List every configured target, marking the active one. Empty
+    /// store prints an onboarding hint pointing at `target add`.
+    List,
+    /// Switch the active target. Fails when the named target does
+    /// not exist; subsequent operational commands (`apply`,
+    /// `cluster-bootstrap`, ...) act on the new active target
+    /// once Track A.8 wires the resolution chain in.
+    Use {
+        /// Name of the target to make active.
+        name: String,
+    },
+    /// Show details of a target (defaults to the active one). The
+    /// stored token is summarised as `set` / `not set` without
+    /// echoing the value; read `credentials.yaml` directly if you
+    /// need the raw bytes.
+    Show {
+        /// Target name. Defaults to the active target.
+        name: Option<String>,
+    },
+    /// Rename a target, moving its config + credentials + state
+    /// cache to the new name. Updates `active_target` when needed.
+    Rename {
+        /// Source target name (must exist).
+        from: String,
+        /// Destination target name (must not exist).
+        to: String,
+    },
+    /// Remove a target. Interactive runs prompt for confirmation
+    /// unless `--yes` is passed; non-interactive runs always
+    /// require `--yes` (no silent destruction).
+    Remove {
+        /// Target name to remove.
+        name: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }

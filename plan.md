@@ -1073,9 +1073,69 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.5 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.5 Target CRUD — `list / use / show / rename / remove` ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.4b). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → **CRUD команды `list/use/show/rename/remove` (1.66A.5)** → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.79 — sub-phase 1.66A.5 shipped: 5 новых subcommand'ов поверх target store (`tabled`-based table в `list`, kubectl-style `use/show`, `rename` с FS move + active-pointer обновлением, `remove` с `--yes` opt-in или interactive confirm). v0.1.77 + v0.1.78 wizard polish — затрагивает только `target add`; CRUD-набор полностью отдельный.
+
+**Source:** `cli-dx-task.md` §5.2–§5.6 + §6 (aliases) + §17 row 5.
+
+**Поставка:**
+- [x] Workspace dep `tabled = "0.15"` (для `target list` рендера); promoted в platform-cli как direct dep.
+- [x] `cli_core::target::rename_target(paths, from, to)` — атомарный `fs::rename` target-директории + best-effort move per-target state cache (`state/<from>/`). Refuses на missing-source (`CliError::TargetNotFound`) и existing-destination (`CliError::Other`). Re-exported через crate root. 4 unit-теста: happy path с state cache + missing source + dest collision + no-state-cache path.
+- [x] `cli/platform-cli/src/cli.rs`: новые `TargetCommand::{List, Use, Show, Rename, Remove}` варианты per spec §5.2–5.6. `Remove` имеет `--yes` flag.
+- [x] `cli/platform-cli/src/commands/target.rs`:
+    - **`run_list`** — собирает rows через `list_target_names` + `load_target` per name (skip-with-tracing-warn на unreadable, не валит вся листинг). Tabled-derive struct `TargetListRow { active, name, provider, region, tier }` с `Style::sharp()` (чистая ASCII-таблица). Empty store → onboarding hint "apprafter target add". Trailing summary `N targets configured. Active: '<name>'.`.
+    - **`run_use(name)`** — validates target exists (через `load_target`), updates `GlobalConfig.active_target` через `save_global_config`. Polite no-op message если уже active.
+    - **`run_show(name)`** — `name` Optional, default → active. Если no-active + no-name → typed error с hint'ом. Печатает Provider/Region/Default tier/Cluster name/SSH key/Hetzner token (через `token_summary(opt)` который выдаёт `"set (N chars; read credentials.yaml for the raw value)"` или `"not set"` — НЕ echo'ит токен). Trailing — на-диске пути config.yaml + credentials.yaml (mode 0600).
+    - **`run_rename(from, to)`** — validates `to` через `check_target_name`, refuses identical from==to, вызывает `cli_core::target::rename_target`, потом если `active_target == from` — обновляет global config на `to`.
+    - **`run_remove(name, yes)`** — `load_target` для existence + canonical TargetNotFound hint. Если `!yes`: на TTY показывает `inquire::Confirm` (default `false`), на non-TTY refuses ("non-interactive invocation: pass `--yes` to confirm ..."). После `remove_target`: если был active — pointer ре-assigned на alphabetically next remaining target; если targets закончились — `config.yaml` deleted (фреш-сторе-поведение возвращается).
+- [x] `token_summary` pure helper + unit-тест: НЕ leak'ит byte'ы токена даже частично.
+
+**Тесты (16 новых integration в `target_test.rs` + 4 cli-core unit + 1 platform-cli unit = 21 total):**
+- `target_list_on_empty_store_prints_onboarding_hint`
+- `target_list_renders_table_with_active_marker_and_columns`
+- `target_use_switches_active_pointer_and_reports_the_swap`
+- `target_use_on_already_active_is_a_polite_noop`
+- `target_use_on_missing_target_surfaces_available_hint`
+- `target_show_with_no_args_renders_active_target_with_masked_token` (пинит что token НЕ появляется в output)
+- `target_show_with_explicit_name_renders_named_target_without_active_marker`
+- `target_show_on_empty_store_errors_with_onboarding_hint`
+- `target_rename_moves_files_and_updates_active_pointer`
+- `target_rename_non_active_target_leaves_active_pointer_alone`
+- `target_rename_refuses_when_destination_exists`
+- `target_rename_rejects_invalid_destination_name`
+- `target_rename_refuses_identical_source_and_destination`
+- `target_remove_with_yes_flag_deletes_and_reassigns_active_alphabetically`
+- `target_remove_last_target_clears_active_pointer`
+- `target_remove_non_active_target_keeps_active_pointer_intact`
+- `target_remove_non_interactive_without_yes_refuses`
+- `target_remove_on_missing_target_surfaces_available_hint`
+- + `token_summary` unit
+- + 4 `rename_target` cli-core unit-тестов
+
+**Acceptance:**
+- ✅ `apprafter target list` рисует таблицу с `*` маркером на active, или onboarding hint на empty store.
+- ✅ `apprafter target use <name>` свитчит active; missing → friendly error c available-listом.
+- ✅ `apprafter target show [name]` показывает details; токен замаскирован как `set (N chars; ...)` без leak'а.
+- ✅ `apprafter target rename <from> <to>` атомарен (либо обе директории на месте при collision, либо ровно одна после успеха), active-pointer follows automatically.
+- ✅ `apprafter target remove <name>` требует `--yes` на non-TTY, prompt'ит на TTY; удаление active → reassign alphabetically.
+- ✅ `apprafter t list/use/show/rename/remove` alias works (через существующий `#[command(alias = "t")]` на `Target`).
+- ✅ `cargo test --workspace`: 36 target_test (16 новых CRUD + 20 prior) + 74 cli-core (+4 rename) — 0 failures. fmt + clippy + SPDX (155 files) — clean.
+
+**Out-of-scope (отложено):**
+- "Last used" / "Account" / "Cluster status" колонки в `list` + `show` — нужна telemetry-wire-up через A.8 (operational commands записывают `last_used_at`) и/или Hetzner `/v1/account`-style endpoint которого у Hetzner нет публично.
+- ADR `docs/adr/0014-cli-command-structure.md` про resource-first grouping + auth namespace — Track A.12 (docs+ADR final pass).
+- `apprafter whoami` / `apprafter auth …` (stub) — Track A.6.
+
+**Зависит от:** 1.66A.4b ✅ (wizard) — используем тот же target store API.
+
+**Размер:** M (один цикл, ~1 рабочий день кода + tests).
+
+---
+
+### 1.66A.6 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.5). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → **`whoami` + `auth` stubs (1.66A.6)** → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3351,4 +3411,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.4b — interactive wizard via `inquire`: Text/Password/Select prompts по spec §5.1, inline format+ping validation в Password, region-picker через `list_regions()`, tilde expansion для SSH-key, default-when-TTY поведение через `IsTerminal` + `should_use_wizard()`; +7 tests; v0.1.76 | initial |
 | 2026-05-14 | v0.1.76 wizard polish — workspace `Cargo.toml` version-bump policy (CLAUDE.md addendum, bumped 0.1.2 → 0.1.77); wizard fires on ANY TTY (drops "all-required" short-circuit) so optional fields get prompted; HCLOUD_TOKEN-from-env notification; SSH-key `Select` из `~/.ssh/*.pub` + algo/comment label; parallel region-latency probe (`<region>-speed.hetzner.com:443`) with sort + ms display; +10 tests; v0.1.77 | initial |
 | 2026-05-14 | v0.1.77 wizard polish #2 — `prompt_name` silent on prefill (consistency with other prompts); `ℹ <Field>: <value> (from <source>)` для всех prefilled wizard-полей (name/provider/ssh-key/region/tier — token уже имел); `run_renew` rejects identical-token with hint to generate new in Cloud Console; +3 tests; v0.1.78 | initial |
+| 2026-05-14 | M1.5 Track A.5 — target CRUD: `target list` (tabled-таблица с `*` маркером) + `target use` (свитч active) + `target show` (детали; токен masked как `set (N chars)`) + `target rename` (атомарно с auto-update active pointer) + `target remove` (`--yes` opt-in или interactive Confirm; active → reassign alphabetically); `cli_core::target::rename_target` API; +21 tests; v0.1.79 | initial |
 

@@ -18,12 +18,13 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use cli_core::target::{
-    default_config_root, load_global_config, load_target, save_global_config, save_target,
-    validate_hetzner_token_format, GlobalConfig, Target, TargetConfig, TargetCredentials,
-    TargetStorePaths,
+    default_config_root, list_target_names, load_global_config, load_target, remove_target,
+    rename_target, save_global_config, save_target, validate_hetzner_token_format, GlobalConfig,
+    Target, TargetConfig, TargetCredentials, TargetStorePaths,
 };
 use cli_core::{CliError, Result};
 use cli_providers::{HetznerCloudValidator, ProviderValidator};
+use tabled::{settings::Style, Table, Tabled};
 use tracing::info;
 
 use crate::cli::TargetCommand;
@@ -68,6 +69,11 @@ pub fn run(action: TargetCommand) -> Result<()> {
             no_interactive,
             no_ping,
         }),
+        TargetCommand::List => run_list(),
+        TargetCommand::Use { name } => run_use(&name),
+        TargetCommand::Show { name } => run_show(name.as_deref()),
+        TargetCommand::Rename { from, to } => run_rename(&from, &to),
+        TargetCommand::Remove { name, yes } => run_remove(&name, yes),
     }
 }
 
@@ -567,5 +573,294 @@ mod tests {
         let path = dir.path().join("id_ed25519.pub");
         std::fs::write(&path, "ssh-ed25519 AAAA...").unwrap();
         assert!(verify_ssh_key_readable(&path).is_ok());
+    }
+
+    #[test]
+    fn token_summary_renders_set_or_not_set_without_leaking_bytes() {
+        assert_eq!(token_summary(None), "not set");
+        let summary = token_summary(Some("aaaaaaaaaaaaaaaa"));
+        assert!(summary.contains("set"), "{summary}");
+        assert!(summary.contains("16 chars"), "{summary}");
+        // No literal token bytes in the rendered string.
+        assert!(
+            !summary.contains("aaaaaaaaaaaaaaaa"),
+            "summary must not echo the token: {summary}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------
+// CRUD subcommands (Track A.5 / v0.1.79) — `list / use / show /
+// rename / remove`. Built on top of the existing target store
+// from Track A.2; CLI surface mirrors the kubectl-style verbs.
+// ---------------------------------------------------------------
+
+/// One row of `apprafter target list`. `tabled` derives the
+/// header text from the field names + `#[tabled(rename = "...")]`
+/// attributes; the `Active` column is a single `*` for the active
+/// target and blank otherwise so the marker scans visually.
+#[derive(Tabled)]
+struct TargetListRow {
+    #[tabled(rename = "Active")]
+    active: String,
+    #[tabled(rename = "Name")]
+    name: String,
+    #[tabled(rename = "Provider")]
+    provider: String,
+    #[tabled(rename = "Region")]
+    region: String,
+    #[tabled(rename = "Tier")]
+    tier: String,
+}
+
+fn run_list() -> Result<()> {
+    info!("target list invoked");
+    let paths = TargetStorePaths::for_root(default_config_root()?);
+    let names = list_target_names(&paths)?;
+    if names.is_empty() {
+        println!(
+            "No targets configured. Run `apprafter target add` to create one — or `apprafter target add <name>` to skip the wizard's name prompt."
+        );
+        return Ok(());
+    }
+    let active = load_global_config(&paths)?
+        .map(|g| g.active_target)
+        .unwrap_or_default();
+
+    let mut rows: Vec<TargetListRow> = Vec::with_capacity(names.len());
+    for name in &names {
+        // load_target needs both config.yaml and (optionally)
+        // credentials.yaml. We only care about config here; if
+        // either file is broken we skip the row with a tracing
+        // warning rather than erroring out the whole listing.
+        let cfg = match load_target(&paths, name) {
+            Ok(t) => t.config,
+            Err(e) => {
+                tracing::warn!(target = %name, error = %e, "skipping unreadable target in list");
+                continue;
+            }
+        };
+        rows.push(TargetListRow {
+            active: if *name == active {
+                "*".into()
+            } else {
+                String::new()
+            },
+            name: name.clone(),
+            provider: cfg.provider,
+            region: cfg.region.unwrap_or_else(|| "-".into()),
+            tier: cfg.default_tier.unwrap_or_else(|| "-".into()),
+        });
+    }
+
+    let mut table = Table::new(&rows);
+    table.with(Style::sharp());
+    println!("{table}");
+    println!();
+    if active.is_empty() {
+        println!(
+            "{} targets configured. No active target — run `apprafter target use <name>` to pick one.",
+            rows.len()
+        );
+    } else {
+        println!("{} targets configured. Active: '{active}'.", rows.len());
+    }
+    Ok(())
+}
+
+fn run_use(name: &str) -> Result<()> {
+    info!(target = %name, "target use invoked");
+    let paths = TargetStorePaths::for_root(default_config_root()?);
+    // `load_target` returns TargetNotFound with an `available`
+    // hint when the name doesn't exist — we let that surface
+    // verbatim.
+    let _ = load_target(&paths, name)?;
+
+    let mut global = load_global_config(&paths)?.unwrap_or_default();
+    if global.active_target == name {
+        println!("target `{name}` was already the active target");
+        return Ok(());
+    }
+    let previous = std::mem::replace(&mut global.active_target, name.to_string());
+    save_global_config(&paths, &global)?;
+    if previous.is_empty() {
+        println!("active target set to `{name}`");
+    } else {
+        println!("active target switched: `{previous}` → `{name}`");
+    }
+    Ok(())
+}
+
+fn run_show(name: Option<&str>) -> Result<()> {
+    let paths = TargetStorePaths::for_root(default_config_root()?);
+    let active = load_global_config(&paths)?
+        .map(|g| g.active_target)
+        .unwrap_or_default();
+
+    let resolved = match name {
+        Some(n) => n.to_string(),
+        None => {
+            if active.is_empty() {
+                return Err(CliError::Other(
+                    "no active target and no name supplied. Run `apprafter target list` to see configured targets, or `apprafter target add` to create one."
+                        .to_string(),
+                ));
+            }
+            active.clone()
+        }
+    };
+    info!(target = %resolved, "target show invoked");
+    let target = load_target(&paths, &resolved)?;
+
+    let is_active = resolved == active;
+    let active_marker = if is_active { " (active)" } else { "" };
+
+    println!("Target: {resolved}{active_marker}");
+    println!("  Provider:    {}", target.config.provider);
+    println!(
+        "  Region:      {}",
+        target.config.region.as_deref().unwrap_or("not set")
+    );
+    println!(
+        "  Default tier: {}",
+        target.config.default_tier.as_deref().unwrap_or("not set")
+    );
+    println!(
+        "  Cluster name: {}",
+        target.config.cluster_name.as_deref().unwrap_or("not set")
+    );
+    println!(
+        "  SSH key:     {}",
+        target
+            .config
+            .ssh_key_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not set".to_string())
+    );
+    println!(
+        "  Hetzner token: {}",
+        token_summary(target.credentials.hetzner_token.as_deref())
+    );
+    println!();
+    println!(
+        "Config:      {}",
+        paths.target_config_file(&resolved).display()
+    );
+    println!(
+        "Credentials: {} (mode 0600)",
+        paths.target_credentials_file(&resolved).display()
+    );
+    Ok(())
+}
+
+fn run_rename(from: &str, to: &str) -> Result<()> {
+    info!(from = %from, to = %to, "target rename invoked");
+    // Validate the destination name shape here (cli_core layer
+    // stays IO-pure on names).
+    if let Err(msg) = check_target_name(to) {
+        return Err(CliError::Other(msg));
+    }
+    if from == to {
+        return Err(CliError::Other(
+            "source and destination target names are identical — nothing to rename".to_string(),
+        ));
+    }
+    let paths = TargetStorePaths::for_root(default_config_root()?);
+
+    rename_target(&paths, from, to)?;
+
+    // Keep `GlobalConfig.active_target` pointed at the right name.
+    if let Some(mut global) = load_global_config(&paths)? {
+        if global.active_target == from {
+            global.active_target = to.to_string();
+            save_global_config(&paths, &global)?;
+            println!("target renamed: `{from}` → `{to}` (active pointer updated)");
+            return Ok(());
+        }
+    }
+    println!("target renamed: `{from}` → `{to}`");
+    Ok(())
+}
+
+fn run_remove(name: &str, yes: bool) -> Result<()> {
+    info!(target = %name, yes, "target remove invoked");
+    let paths = TargetStorePaths::for_root(default_config_root()?);
+    // Load to verify existence early and surface the canonical
+    // "available targets" hint when the name is wrong.
+    let _ = load_target(&paths, name)?;
+
+    if !yes {
+        let stdin_tty = std::io::stdin().is_terminal();
+        let stdout_tty = std::io::stdout().is_terminal();
+        if !(stdin_tty && stdout_tty) {
+            return Err(CliError::Other(format!(
+                "non-interactive invocation: pass `--yes` to confirm removing target `{name}` (refusing silent destruction)"
+            )));
+        }
+        let confirmed = inquire::Confirm::new(&format!(
+            "Remove target `{name}`? This deletes config + credentials + cached state."
+        ))
+        .with_default(false)
+        .prompt()
+        .map_err(|err| match err {
+            inquire::InquireError::OperationCanceled
+            | inquire::InquireError::OperationInterrupted => {
+                CliError::Other("remove aborted by user".to_string())
+            }
+            other => CliError::Other(format!("confirmation prompt failed: {other}")),
+        })?;
+        if !confirmed {
+            println!("aborted; target `{name}` left intact");
+            return Ok(());
+        }
+    }
+
+    remove_target(&paths, name)?;
+
+    // If the removed target was active, repoint the active marker
+    // at the first remaining target alphabetically. With no
+    // targets left, clear the active pointer entirely (delete
+    // config.yaml) so the next `target add` flips back to the
+    // "first target on fresh store" greeting.
+    let mut global = load_global_config(&paths)?.unwrap_or_default();
+    if global.active_target == name {
+        let remaining = list_target_names(&paths)?;
+        match remaining.into_iter().next() {
+            Some(next) => {
+                global.active_target = next.clone();
+                save_global_config(&paths, &global)?;
+                println!(
+                    "target `{name}` removed; active switched to `{next}` (alphabetically next)"
+                );
+            }
+            None => {
+                // No targets left — drop the global config file so
+                // `load_global_config` returns None again, which
+                // `target add` interprets as "fresh store".
+                let cfg_file = paths.global_config_file();
+                if cfg_file.exists() {
+                    std::fs::remove_file(cfg_file)?;
+                }
+                println!("target `{name}` removed; no targets left, active pointer cleared");
+            }
+        }
+    } else {
+        println!("target `{name}` removed");
+    }
+    Ok(())
+}
+
+/// One-line summary of a stored token suitable for `target show`.
+/// We intentionally do NOT echo any of the token bytes — even the
+/// last 4 chars are identifying. The user reads
+/// `credentials.yaml` directly when they need the raw value.
+fn token_summary(token: Option<&str>) -> String {
+    match token {
+        None => "not set".to_string(),
+        Some(t) => format!(
+            "set ({} chars; read credentials.yaml for the raw value)",
+            t.len()
+        ),
     }
 }

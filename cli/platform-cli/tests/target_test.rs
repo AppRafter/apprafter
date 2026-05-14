@@ -622,6 +622,365 @@ fn second_target_save_keeps_first_as_active_and_reports_so() {
     );
 }
 
+// ---------------------------------------------------------------
+// CRUD commands (Track A.5 / v0.1.79) — list / use / show /
+// rename / remove. All run against a per-test tempdir + skip the
+// API ping (APPRAFTER_NO_PING=1) since they touch only the on-disk
+// store.
+// ---------------------------------------------------------------
+
+/// Seed `dir` with two targets so list/show/rename/remove have
+/// something to operate on. The first one becomes active by the
+/// `first-on-fresh-store` rule.
+fn seed_two_targets(dir: &Path) {
+    let token = synthetic_hetzner_token();
+    for (name, region) in &[("first", "nbg1"), ("second", "fsn1")] {
+        cli()
+            .env("APPRAFTER_CONFIG_DIR", dir)
+            .env("APPRAFTER_NO_PING", "1")
+            .env_remove("HCLOUD_TOKEN")
+            .args([
+                "target",
+                "add",
+                name,
+                "--provider",
+                "hetzner-cloud",
+                "--token",
+                &token,
+                "--region",
+                region,
+                "--tier",
+                "solo",
+            ])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn target_list_on_empty_store_prints_onboarding_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "list"])
+        .assert()
+        .success()
+        .stdout(contains("No targets configured"))
+        .stdout(contains("apprafter target add"));
+}
+
+#[test]
+fn target_list_renders_table_with_active_marker_and_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "list"])
+        .assert()
+        .success()
+        // Column headers from `tabled` derive.
+        .stdout(contains("Active"))
+        .stdout(contains("Name"))
+        .stdout(contains("Provider"))
+        .stdout(contains("Region"))
+        .stdout(contains("Tier"))
+        // Both targets present.
+        .stdout(contains("first"))
+        .stdout(contains("second"))
+        .stdout(contains("nbg1"))
+        .stdout(contains("fsn1"))
+        // Active is `first` (created first → auto-promoted).
+        .stdout(contains("Active: 'first'"));
+}
+
+#[test]
+fn target_use_switches_active_pointer_and_reports_the_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "use", "second"])
+        .assert()
+        .success()
+        .stdout(contains("first"))
+        .stdout(contains("second"));
+
+    // On-disk global config now points at `second`.
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: second"), "{global}");
+}
+
+#[test]
+fn target_use_on_already_active_is_a_polite_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "use", "first"])
+        .assert()
+        .success()
+        .stdout(contains("was already the active target"));
+}
+
+#[test]
+fn target_use_on_missing_target_surfaces_available_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "use", "ghost"])
+        .assert()
+        .failure()
+        // Canonical TargetNotFound message includes `available: …`.
+        .stderr(contains("target `ghost` not found"))
+        .stderr(contains("first"))
+        .stderr(contains("second"));
+}
+
+#[test]
+fn target_show_with_no_args_renders_active_target_with_masked_token() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "show"])
+        .assert()
+        .success()
+        .stdout(contains("Target: first (active)"))
+        .stdout(contains("hetzner-cloud"))
+        .stdout(contains("nbg1"))
+        .stdout(contains("Hetzner token: set"))
+        // Never echo the actual token body in show output.
+        .stdout(predicates::str::contains(synthetic_hetzner_token()).not());
+}
+
+#[test]
+fn target_show_with_explicit_name_renders_named_target_without_active_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "show", "second"])
+        .assert()
+        .success()
+        .stdout(contains("Target: second"))
+        .stdout(predicates::str::contains("(active)").not());
+}
+
+#[test]
+fn target_show_on_empty_store_errors_with_onboarding_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "show"])
+        .assert()
+        .failure()
+        .stderr(contains("no active target"))
+        .stderr(contains("apprafter target add"));
+}
+
+#[test]
+fn target_rename_moves_files_and_updates_active_pointer() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "rename", "first", "primary"])
+        .assert()
+        .success()
+        .stdout(contains("first"))
+        .stdout(contains("primary"))
+        .stdout(contains("active pointer updated"));
+
+    assert!(!dir.path().join("targets/first").exists());
+    assert!(dir.path().join("targets/primary/config.yaml").exists());
+
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: primary"), "{global}");
+}
+
+#[test]
+fn target_rename_non_active_target_leaves_active_pointer_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "rename", "second", "backup"])
+        .assert()
+        .success()
+        // No "active pointer updated" message when the renamed
+        // target wasn't active.
+        .stdout(predicates::str::contains("active pointer updated").not());
+
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: first"), "{global}");
+}
+
+#[test]
+fn target_rename_refuses_when_destination_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "rename", "first", "second"])
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+
+    // Both targets remain intact.
+    assert!(dir.path().join("targets/first/config.yaml").exists());
+    assert!(dir.path().join("targets/second/config.yaml").exists());
+}
+
+#[test]
+fn target_rename_rejects_invalid_destination_name() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "rename", "first", "with space"])
+        .assert()
+        .failure()
+        .stderr(contains("is invalid"));
+}
+
+#[test]
+fn target_rename_refuses_identical_source_and_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "rename", "first", "first"])
+        .assert()
+        .failure()
+        .stderr(contains("identical"));
+}
+
+#[test]
+fn target_remove_with_yes_flag_deletes_and_reassigns_active_alphabetically() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    // Remove the active target (`first`); active should move to
+    // the alphabetically next remaining target (`second`).
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "first", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("removed"))
+        .stdout(contains("active switched to `second`"));
+
+    assert!(!dir.path().join("targets/first").exists());
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: second"), "{global}");
+}
+
+#[test]
+fn target_remove_last_target_clears_active_pointer() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = synthetic_hetzner_token();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "only-one",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &token,
+        ])
+        .assert()
+        .success();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "only-one", "--yes"])
+        .assert()
+        .success()
+        .stdout(contains("active pointer cleared"));
+
+    // Global config file dropped; next `target add` should go
+    // through the fresh-store path again.
+    assert!(!dir.path().join("config.yaml").exists());
+}
+
+#[test]
+fn target_remove_non_active_target_keeps_active_pointer_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "second", "--yes"])
+        .assert()
+        .success();
+
+    let global = std::fs::read_to_string(dir.path().join("config.yaml")).unwrap();
+    assert!(global.contains("active_target: first"), "{global}");
+}
+
+#[test]
+fn target_remove_non_interactive_without_yes_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "second"])
+        .assert()
+        .failure()
+        .stderr(contains("non-interactive"))
+        .stderr(contains("--yes"));
+
+    // Target intact.
+    assert!(dir.path().join("targets/second/config.yaml").exists());
+}
+
+#[test]
+fn target_remove_on_missing_target_surfaces_available_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_two_targets(dir.path());
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .args(["target", "remove", "ghost", "--yes"])
+        .assert()
+        .failure()
+        .stderr(contains("target `ghost` not found"));
+}
+
 #[test]
 fn target_alias_t_subcommand_resolves_to_target() {
     // Smoke for the `apprafter t add …` alias declared in clap.

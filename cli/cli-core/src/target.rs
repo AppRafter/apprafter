@@ -402,6 +402,53 @@ pub fn list_target_names(paths: &TargetStorePaths) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Atomically rename a target directory (`from` → `to`). Refuses
+/// if `from` doesn't exist (`TargetNotFound`) or `to` already
+/// exists (typed `Other` so the caller's error message can suggest
+/// using a different name without raising the "did you mean..."
+/// surface that `TargetNotFound` carries). Best-effort: the
+/// per-target state cache (`state/<from>/`) is moved alongside
+/// when present.
+///
+/// Does **not** update `GlobalConfig.active_target` — that lives
+/// at the CLI surface where pointer-update policy is decided. The
+/// caller is expected to call `save_global_config` after `rename_target`
+/// if `active_target == from`.
+pub fn rename_target(paths: &TargetStorePaths, from: &str, to: &str) -> Result<()> {
+    let from_dir = paths.target_dir(from);
+    if !from_dir.exists() {
+        let available = list_target_names(paths).unwrap_or_default().join(", ");
+        return Err(CliError::TargetNotFound {
+            name: from.to_string(),
+            available,
+        });
+    }
+    let to_dir = paths.target_dir(to);
+    if to_dir.exists() {
+        return Err(CliError::Other(format!(
+            "target `{to}` already exists — pick a different name or remove the existing target first"
+        )));
+    }
+    fs::rename(&from_dir, &to_dir)?;
+
+    // Move the per-target state cache too, when present. This is
+    // best-effort: if state move fails halfway we leave the
+    // target rename committed because un-rolling the directory
+    // rename would itself create a window where neither path
+    // exists.
+    let from_state = paths.state_dir(from);
+    if from_state.exists() {
+        let to_state = paths.state_dir(to);
+        // Ensure parent of `state_dir` exists; fs::rename refuses
+        // when the parent of the destination is missing.
+        if let Some(parent) = to_state.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&from_state, &to_state)?;
+    }
+    Ok(())
+}
+
 /// Remove a target directory and everything under it
 /// (`config.yaml`, `credentials.yaml`, and any per-target state
 /// caches). Returns `TargetNotFound` if there's nothing to remove
@@ -746,6 +793,118 @@ mod tests {
         let (_dir, paths) = make_paths();
         let err = remove_target(&paths, "ghost").expect_err("missing target");
         assert!(matches!(err, CliError::TargetNotFound { .. }));
+    }
+
+    #[test]
+    fn rename_target_moves_dir_and_per_target_state_cache() {
+        let (_dir, paths) = make_paths();
+        let target = Target {
+            name: "old".into(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                region: Some("nbg1".into()),
+                ..Default::default()
+            },
+            credentials: TargetCredentials::default(),
+        };
+        save_target(&paths, &target).unwrap();
+        // Simulate the per-target state cache that Track A.8
+        // wires through.
+        fs::create_dir_all(paths.state_dir("old")).unwrap();
+        fs::write(paths.state_dir("old").join("state.json"), b"{}").unwrap();
+
+        rename_target(&paths, "old", "new").expect("rename ok");
+
+        assert!(!paths.target_dir("old").exists(), "old target dir gone");
+        assert!(paths.target_dir("new").exists(), "new target dir exists");
+        assert!(!paths.state_dir("old").exists(), "old state cache gone");
+        assert!(
+            paths.state_dir("new").join("state.json").exists(),
+            "per-target state moved along"
+        );
+
+        // Loading by the new name surfaces the same config that
+        // was saved under the old name.
+        let loaded = load_target(&paths, "new").expect("load by new name");
+        assert_eq!(loaded.config.region.as_deref(), Some("nbg1"));
+    }
+
+    #[test]
+    fn rename_target_returns_target_not_found_when_source_missing() {
+        let (_dir, paths) = make_paths();
+        // Have one existing target so the "available" list is
+        // non-empty and the error message is helpful.
+        save_target(
+            &paths,
+            &Target {
+                name: "existing".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        let err = rename_target(&paths, "ghost", "new").expect_err("missing source");
+        match err {
+            CliError::TargetNotFound { name, available } => {
+                assert_eq!(name, "ghost");
+                assert_eq!(available, "existing");
+            }
+            other => panic!("expected TargetNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rename_target_refuses_when_destination_exists() {
+        let (_dir, paths) = make_paths();
+        for n in ["alpha", "beta"] {
+            save_target(
+                &paths,
+                &Target {
+                    name: n.into(),
+                    config: TargetConfig {
+                        provider: "hetzner-cloud".into(),
+                        ..Default::default()
+                    },
+                    credentials: TargetCredentials::default(),
+                },
+            )
+            .unwrap();
+        }
+        let err = rename_target(&paths, "alpha", "beta").expect_err("dest collision");
+        match err {
+            CliError::Other(msg) => assert!(msg.contains("already exists"), "{msg}"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+        // Both targets remain intact — no half-rename damage.
+        assert!(paths.target_dir("alpha").exists());
+        assert!(paths.target_dir("beta").exists());
+    }
+
+    #[test]
+    fn rename_target_works_when_no_state_cache_present() {
+        // The state cache is best-effort; if it doesn't exist
+        // (i.e. operator hasn't run any commands that drop state
+        // under the target yet), rename should still succeed
+        // without trying to touch the missing dir.
+        let (_dir, paths) = make_paths();
+        save_target(
+            &paths,
+            &Target {
+                name: "fresh".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .unwrap();
+        assert!(!paths.state_dir("fresh").exists());
+        rename_target(&paths, "fresh", "minted").expect("rename ok");
+        assert!(paths.target_dir("minted").exists());
     }
 
     #[test]

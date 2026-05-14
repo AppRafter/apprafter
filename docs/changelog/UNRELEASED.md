@@ -13,6 +13,121 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.79 — M1.5 Track A.5 — target CRUD commands (2026-05-14)
+
+Fifth Track A slice. Five new subcommands on top of the existing
+target store from A.2/A.3, closing the day-to-day "manage multiple
+targets" workflow per `cli-dx-task.md` §5.2–§5.6. Each command runs
+against the same `~/.config/apprafter/` store the wizard writes to,
+so a target created via `apprafter target add` is immediately
+listable / switchable / showable / renameable / removable.
+
+### Added
+
+- **`apprafter target list`** — renders configured targets as a
+  `tabled`-derived sharp-line table with columns Active / Name /
+  Provider / Region / Tier. The `Active` column is a single `*`
+  for the active target and blank otherwise so the marker scans
+  visually. Trailing summary line: `N targets configured. Active:
+  '<name>'.`. Empty-store path prints an onboarding hint pointing
+  at `apprafter target add`. Unreadable target dirs are skipped
+  with a `tracing::warn!` rather than erroring out the whole
+  listing — bad single targets don't tank the table.
+- **`apprafter target use <name>`** — swaps
+  `GlobalConfig.active_target`. `load_target` is the existence
+  probe so the canonical `TargetNotFound { available: ... }`
+  error fires when the name is wrong. Polite no-op (`target
+  <name> was already the active target`) when the name matches
+  the current active pointer.
+- **`apprafter target show [<name>]`** — prints Provider /
+  Region / Default tier / Cluster name / SSH key / Hetzner
+  token + the on-disk paths of `config.yaml` and `credentials.
+  yaml`. Token render uses the new `token_summary` helper:
+  `set (N chars; read credentials.yaml for the raw value)` or
+  `not set`. No bytes leak into output — `target show` is safe
+  to share in bug reports. `name` defaults to the active target;
+  empty-store invocation errors with an onboarding hint.
+- **`apprafter target rename <from> <to>`** — destination name
+  validated through `check_target_name`; self-rename refused;
+  `cli_core::target::rename_target` (new) atomically moves the
+  target directory + best-effort moves the per-target state
+  cache (`state/<from>/`). When `active_target == from` the
+  global config is updated in the same operation, with the
+  message `target renamed: \`from\` → \`to\` (active pointer
+  updated)` so the operator sees what changed.
+- **`apprafter target remove <name>`** — interactive Confirm
+  prompt (default `false`) when on a TTY; non-TTY invocations
+  require `--yes` explicitly with `non-interactive invocation:
+  pass --yes to confirm removing target ...` (no silent
+  destruction). Removing the active target re-points active to
+  the alphabetically-next remaining target. Removing the last
+  target deletes `config.yaml` entirely so the next
+  `apprafter target add` greets the operator with the fresh-
+  store path again.
+
+- **`cli_core::target::rename_target(paths, from, to) ->
+  Result<()>`** — atomic `fs::rename` of `targets/<from>/` to
+  `targets/<to>/` with a best-effort move of `state/<from>/`
+  when present. Returns `TargetNotFound` (with the canonical
+  `available: ...` hint) when source is missing, typed `Other`
+  when destination already exists. Re-exported through
+  `cli_core` crate root.
+
+### Tests
+
+- 4 new `cli_core::target` unit tests covering `rename_target`:
+  happy path with state cache, missing source, destination
+  collision, no-state-cache path.
+- 16 new integration tests in `target_test.rs`:
+  - `target_list_on_empty_store_prints_onboarding_hint`
+  - `target_list_renders_table_with_active_marker_and_columns`
+  - `target_use_switches_active_pointer_and_reports_the_swap`
+  - `target_use_on_already_active_is_a_polite_noop`
+  - `target_use_on_missing_target_surfaces_available_hint`
+  - `target_show_with_no_args_renders_active_target_with_masked_token`
+    — pins that the synthetic token NEVER appears in stdout.
+  - `target_show_with_explicit_name_renders_named_target_without_active_marker`
+  - `target_show_on_empty_store_errors_with_onboarding_hint`
+  - `target_rename_moves_files_and_updates_active_pointer`
+  - `target_rename_non_active_target_leaves_active_pointer_alone`
+  - `target_rename_refuses_when_destination_exists` — pins
+    that BOTH targets survive the rejection (no half-rename
+    damage).
+  - `target_rename_rejects_invalid_destination_name`
+  - `target_rename_refuses_identical_source_and_destination`
+  - `target_remove_with_yes_flag_deletes_and_reassigns_active_alphabetically`
+  - `target_remove_last_target_clears_active_pointer` — pins
+    `config.yaml` disappears so the fresh-store path returns.
+  - `target_remove_non_active_target_keeps_active_pointer_intact`
+  - `target_remove_non_interactive_without_yes_refuses` — pins
+    the "no silent destruction" guarantee.
+  - `target_remove_on_missing_target_surfaces_available_hint`
+- 1 new unit test `token_summary_renders_set_or_not_set_without_leaking_bytes`
+  pinning that the show helper never echoes token bytes.
+- `apprafter t list/use/show/rename/remove` alias coverage is
+  inherited from the existing `target_alias_t_subcommand_resolves_to_target`
+  test which exercises `#[command(alias = "t")]` on the Target
+  group — no new alias-specific test needed.
+
+### Out of scope (deferred)
+
+- `Last used` / `Account` / `Cluster status` columns in
+  `target list` + `target show` — needs telemetry wired through
+  operational commands (A.8) and/or a Hetzner `/v1/me`-style
+  endpoint that Hetzner doesn't publicly expose. Plan-md A.5
+  closure note marks the gap.
+- ADR `docs/adr/0014-cli-command-structure.md` (resource-first
+  grouping + auth namespace) — Track A.12 (docs + ADR final pass).
+- `apprafter whoami` / `apprafter auth …` stubs — Track A.6.
+
+### Operator note
+
+Existing operational commands (`apply`, `cluster-bootstrap`,
+etc.) still read `HCLOUD_TOKEN` from the env. `target use`
+flipping the active pointer does NOT affect them yet — Track
+A.8 plumbs the resolution chain so operational commands consume
+the active target's credentials when no env var is set.
+
 ## v0.1.78 — wizard UX polish #2 (2026-05-14)
 
 Follow-up to v0.1.77 driven by the second walk-through. Three
