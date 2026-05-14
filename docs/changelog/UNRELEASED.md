@@ -13,6 +13,168 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.84 — M1.5 Track A.9 — apprafter bootstrap-all (2026-05-14)
+
+Ninth Track A slice. The "happy path" first-run experience
+collapses from three manual subcommands into one:
+
+```
+$ apprafter target add dev --provider hetzner-cloud --token "$T" \
+    --region nbg1 --tier solo
+$ apprafter bootstrap-all          # ← apply → wait → cluster-bootstrap
+```
+
+The wrapper still calls the three existing subcommands under the
+hood; nothing about their solo invocations changes. The single
+new piece is a `indicatif::MultiProgress` UX that makes the
+multi-minute Phase 2 (Hetzner cloud-init + k3s startup) visible
+instead of a black-box `ssh` retry loop.
+
+### Added
+
+- **`apprafter bootstrap-all`** (top-level command, no
+  alias yet — Track A.11 wires `.bootstrap` shorthand).
+  - **Phase 1/3 (`apply`)** — calls `commands::apply::run` with
+    the same target resolution chain (`--target` override
+    → `HCLOUD_TOKEN` env → active target). Spinner reads
+    "provisioning Hetzner Cloud resources…".
+  - **Phase 2/3 (`kubeconfig` poll)** — retry loop hitting
+    `commands::kubeconfig::fetch_and_cache(refresh=true, ...)`
+    every 10s up to a 5-minute budget (`KUBECONFIG_POLL_TIMEOUT
+    = 300s`, `KUBECONFIG_POLL_INTERVAL = 10s`). The spinner
+    message rotates with the attempt counter and the truncated
+    last error so the operator can see WHY it's still spinning
+    (typically `kex_exchange_identification` while k3s systemd
+    unit is still coming up). On timeout: typed error with a
+    hint to run `apprafter kubeconfig --refresh` once the
+    cluster reports ready.
+  - **Phase 3/3 (`cluster-bootstrap`)** — calls
+    `commands::cluster_bootstrap::run()` unchanged. Spinner
+    reads "installing Cilium + Argo CD + cert-manager +
+    operator…".
+  - **`--dry-run`** prints a 3-phase plan with the resolved
+    target label and poll budget, then exits 0. No provider /
+    cluster / kubeconfig calls. Safe to run in any directory
+    without a state file or token configured — useful for
+    inspecting what the wrapper would invoke before committing.
+  - **`--target <name>`** overrides the active target for the
+    entire run; same flag semantics as `apprafter apply
+    --target`. Threaded into Phase 2 so the kubeconfig poll
+    uses the same credentials as Phase 1.
+  - **Total elapsed time** printed at the end:
+    `bootstrap-all complete in Nm00s`. Per-phase elapsed
+    summaries on each spinner's finish line.
+
+- **`commands::kubeconfig::fetch_and_cache(refresh, target_override)`**
+  extracted from `run`. Returns the YAML string and writes the
+  encrypted state cache; never prints. `run` is now a thin
+  wrapper around it (`fetch_and_cache(…)?` → `print!`). The
+  reason it exists: Phase 2's retry loop needs to invoke the
+  kubeconfig path in-process and discard the YAML on every
+  attempt — spawning a child `apprafter kubeconfig --refresh`
+  each cycle would have to parse stdout to detect success vs
+  ssh transport error, which the in-process call gives us via
+  `Result<String>` directly.
+
+### Changed
+
+- **`commands::kubeconfig`** — replaced direct
+  `std::env::var("HCLOUD_TOKEN")` lookup with
+  `resolve_hetzner_token(None, &target_store, target_override)`.
+  `apprafter kubeconfig --refresh` now honours the same
+  credential chain as the rest of the operational commands
+  (`--target` flag → env → active target). Cold-fetch path
+  (no cached kubeconfig in state) was the only branch that
+  used HCLOUD_TOKEN, so this is the only path affected.
+
+- **`Commands::Kubeconfig`** gains a `--target <name>` flag
+  for symmetry with `apply`/`destroy`/`import`. Useful when
+  scripting against multiple targets without
+  `apprafter target use`.
+
+- **`cli/Cargo.toml`** workspace deps: `indicatif = "0.17"`.
+  `platform-cli/Cargo.toml` adds it as a direct dep.
+
+### Tests (4 unit + 4 integration)
+
+- **Unit** (`commands::bootstrap_all::tests`):
+  - `format_elapsed_uses_seconds_under_one_minute` /
+    `format_elapsed_switches_to_minutes_at_sixty_seconds` —
+    guard the `0s` → `Nm00s` boundary in the elapsed-time
+    formatter.
+  - `short_error_keeps_first_line_only` — multi-line SSH error
+    chains get trimmed to one line for the spinner.
+  - `short_error_truncates_long_first_line_with_ellipsis` —
+    80-char clamp, so the spinner glyph doesn't get shoved
+    off-screen on wide terminals.
+
+- **Integration** (`tests/bootstrap_all_test.rs`):
+  - `bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls`
+    — no state file, no HCLOUD_TOKEN, no
+    APPRAFTER_HCLOUD_BASE_URL → success + all three phase
+    labels in stdout. Pins the dry-run contract: it MUST be
+    safe in any environment.
+  - `bootstrap_all_dry_run_echoes_target_override` — `--target
+    work` round-trips into the printed plan.
+  - `bootstrap_all_help_documents_dry_run_and_target_flags` —
+    surface-level guard so `--help` doesn't accidentally drop
+    these flags during future refactors.
+  - `bootstrap_all_rejects_unknown_flag` — clap surface
+    contract.
+
+### Backwards compatibility
+
+- All three constituent subcommands (`apply`, `kubeconfig`,
+  `cluster-bootstrap`) keep their pre-v0.1.84 signatures and
+  exit behaviour. Operators who already wired
+  `kubeconfig` / `cluster-bootstrap` into scripts can keep
+  doing that; `bootstrap-all` is purely additive.
+- `apprafter kubeconfig` without `--target` keeps reading
+  `HCLOUD_TOKEN` from env first (step 2 in the resolution
+  chain). The only behavioural change is that the cold-fetch
+  path NOW also falls back to the active target's token when
+  the env var is unset — same chain as `apply`.
+
+### Out of scope (deferred)
+
+- Idempotent re-run / "skip-already-installed" semantics —
+  Argo CD already handles this for Phase 3 via `helm upgrade
+  --install`; Phase 1 dedupes through Hetzner labels; Phase 2
+  `--refresh` always re-fetches (cheap). No additional logic
+  needed for now.
+- miette-styled error rendering on Phase 2 timeout — Track
+  A.10.
+- `pb.suspend(|| println!(...))` wrapping for `apply` /
+  `cluster_bootstrap` stdout — current `println!` calls go to
+  stdout, indicatif spinner is on stderr; they don't visually
+  collide. Will revisit if the e2e walk shows interleaving
+  issues.
+
+### Operator note
+
+The e2e walk for v0.1.84 demonstrates:
+
+```
+$ apprafter target add dev --provider hetzner-cloud --token "$T" \
+    --region nbg1 --tier solo
+$ apprafter bootstrap-all
+⠋ [1/3] apply          provisioning Hetzner Cloud resources…
+✔ [1/3] apply          done in 22s
+⠋ [2/3] kubeconfig     attempt 9 — k3s not ready yet (…); next retry in 10s
+✔ [2/3] kubeconfig     ready in 1m32s
+⠋ [3/3] bootstrap      installing Cilium + Argo CD + cert-manager + operator…
+✔ [3/3] bootstrap      done in 3m12s
+bootstrap-all complete in 5m06s
+```
+
+If a phase fails, the corresponding subcommand can be re-run
+solo: `apprafter cluster-bootstrap` re-runs Phase 3 against
+the already-cached kubeconfig, etc.
+
+For a no-touch preview of what the wrapper would do without
+spending a single Hetzner cent: `apprafter bootstrap-all
+--dry-run`.
+
 ## v0.1.83 — hotfix: apply/import fall back to target config (2026-05-14)
 
 Walk-found bug in v0.1.82. The Track A.8 wiring resolved the

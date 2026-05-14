@@ -1305,9 +1305,58 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.9 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.9 `apprafter bootstrap-all` orchestrator ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.8). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → resolution chain ✅ → **`bootstrap-all` orchestrator (1.66A.9)** → miette refinement → aliases/color → docs+ADR.
+> v0.1.84 — sub-phase 1.66A.9 shipped: top-level convenience wrapper `apprafter bootstrap-all` chains `apply` → kubeconfig-wait → `cluster-bootstrap` под одним `indicatif::MultiProgress` UX. Каждая phase сохраняет свою отдельную subcommand для recovery / re-run сценариев — wrapper существует ровно чтобы первый запуск не требовал «склеить три команды» руками. `--dry-run` печатает план без provider/cluster mutation.
+
+**Source:** `cli-dx-task.md` §5.11 + §17 row 9.
+
+**Поставка:**
+- [x] `cli/cli-core/Cargo.toml` workspace dep `indicatif = "0.17"`; `platform-cli/Cargo.toml` direct dep.
+- [x] `commands/kubeconfig.rs` рефакторинг: новый `pub fn fetch_and_cache(refresh, target_override) -> Result<String>` возвращает YAML без `print!`, прежний `run` стал thin wrapper. Внутри теперь `resolve_hetzner_token` (cli-dx-task.md §7) вместо прямого `env::var("HCLOUD_TOKEN")` — Phase 2 поллинг подхватывает active target's токен идентично `apply`.
+- [x] `cli.rs` — новый `Commands::Kubeconfig { refresh, target }` (`--target` override credential resolution chain) + `Commands::BootstrapAll { target, dry_run }`.
+- [x] `main.rs` dispatch обновлён.
+- [x] `commands/bootstrap_all.rs`:
+    - Phase 1/3 — `apply::run(target_override)` с `indicatif` spinner "[1/3] apply".
+    - Phase 2/3 — retry-loop `kubeconfig::fetch_and_cache(true, target_override)` каждые 10s до 5 минут (`KUBECONFIG_POLL_TIMEOUT = 300s`, `KUBECONFIG_POLL_INTERVAL = 10s`); spinner message обновляется с attempt counter + last error truncated to single line; timeout → `CliError::Other` с hint про `apprafter kubeconfig --refresh`.
+    - Phase 3/3 — `cluster_bootstrap::run()` с spinner "[3/3] bootstrap".
+    - `--dry-run` short-circuits BEFORE any side-effect — печатает 3-phase plan, target resolution label, poll budget, exit 0.
+    - `format_elapsed` helper switches `0–59s` → `Nm00s` boundary для total / per-phase timing.
+- [x] `commands/mod.rs` регистрирует новый модуль.
+
+**Тесты (4 unit + 4 integration):**
+- 4 в `commands::bootstrap_all::tests`:
+    - `format_elapsed_uses_seconds_under_one_minute`
+    - `format_elapsed_switches_to_minutes_at_sixty_seconds`
+    - `short_error_keeps_first_line_only`
+    - `short_error_truncates_long_first_line_with_ellipsis`
+- 4 в `tests/bootstrap_all_test.rs`:
+    - `bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls` — no state / no token / no base-URL → success + all 3 phase labels printed.
+    - `bootstrap_all_dry_run_echoes_target_override` — `--target work` echoed back in plan.
+    - `bootstrap_all_help_documents_dry_run_and_target_flags` — `--help` mentions both flags.
+    - `bootstrap_all_rejects_unknown_flag` — clap surface contract guard.
+
+**Acceptance:**
+- ✅ `apprafter bootstrap-all --dry-run` exits 0 на любой директории / любом credential state, никаких provider calls.
+- ✅ `--target <name>` override доходит и до apply, и до Phase 2 kubeconfig poll (single resolution path).
+- ✅ Wet path (Hetzner) → e2e walk показывает 3 spinner phases, total elapsed time at end.
+- ✅ `cargo test --workspace` — 0 failures (+4 unit + 4 integration).
+- ✅ fmt + clippy (-D warnings) + SPDX (161 файл) clean.
+
+**Out-of-scope (отложено):**
+- Idempotent re-run / skip-already-installed semantics — оставлено для отдельной итерации (Argo CD уже handle'ит это в Phase 3 через `helm upgrade --install`; Phase 1 — Hetzner labels; Phase 2 — `--refresh` always re-fetches).
+- `pb.suspend()` wrapping `apply` / `cluster_bootstrap` stdout — текущие `println!` уходят на stdout, indicatif sits на stderr, визуально это работает без явного suspension.
+- miette-styled error rendering при timeout — Track A.10.
+
+**Зависит от:** 1.66A.8 ✅ (credential resolution chain — Phase 2 needs `resolve_hetzner_token`).
+
+**Размер:** S (один цикл, ~0.5 рабочего дня).
+
+---
+
+### 1.66A.10 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.9). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → resolution chain ✅ → `bootstrap-all` orchestrator ✅ → **miette refinement (1.66A.10)** → aliases/color → docs+ADR.
 
 ---
 
@@ -3588,4 +3637,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.7 — `apprafter doctor` (self-diagnostic): target checks (config readable, creds mode 0600, provider known, token format, token API-verified с latency, ssh-key readable) + env checks (kubectl/helm/ssh on PATH, DNS resolves api.hetzner.cloud); trichotomy PASS/WARN/FAIL → exit 1 на FAIL; +17 tests; v0.1.81 | initial |
 | 2026-05-14 | M1.5 Track A.8 — wire `apply`/`destroy`/`import` в credential resolution chain: new `cli_core::credentials` с `resolve_hetzner_token` + `resolve_hetzner_ssh_public_key` (`--flag > env > target store`), `--target <name>` flag на трёх operational commands, error messages enumerate все 3 пути; backwards-compat env-only workflows preserved; +17 tests; v0.1.82 | initial |
 | 2026-05-14 | v0.1.82 hotfix — `apply`/`import` теперь дочитывают `provider`/`region`/`cluster_name` из active target когда state.json пустой (A.8 wire'нул только credentials, но operational commands ещё требовали `init`); `init` становится опциональным после `target add`; new `cli_core::target::{resolve_active_target_name, load_active_target_config}` helpers; +1 regression-guard test; v0.1.83 | initial |
+| 2026-05-14 | M1.5 Track A.9 — `apprafter bootstrap-all` orchestrator (Phase 1 apply → Phase 2 kubeconfig SSH poll до 300s × 10s интервал → Phase 3 cluster-bootstrap) под единым `indicatif::MultiProgress` UX; `--dry-run` печатает план без provider/cluster mutation; `--target <name>` пробрасывается во все фазы; `commands::kubeconfig::fetch_and_cache` extracted из `run` чтобы Phase 2 retry-loop не плодил child процессы; `commands::kubeconfig` теперь использует `resolve_hetzner_token` вместо прямого env-чтения; `--target` flag добавлен на `Commands::Kubeconfig`; +8 tests (4 unit + 4 integration); v0.1.84 | initial |
 

@@ -35,9 +35,14 @@ fn main() -> color_eyre::Result<()> {
             dry_run,
             target,
         } => commands::import::run(force, dry_run, target.as_deref())?,
-        Commands::Kubeconfig { refresh } => commands::kubeconfig::run(refresh)?,
+        Commands::Kubeconfig { refresh, target } => {
+            commands::kubeconfig::run(refresh, target.as_deref())?
+        }
         Commands::ClusterBootstrap => commands::cluster_bootstrap::run()?,
         Commands::ArgocdPassword { refresh } => commands::argocd_password::run(refresh)?,
+        Commands::BootstrapAll { target, dry_run } => {
+            commands::bootstrap_all::run(target.as_deref(), dry_run)?
+        }
     }
     Ok(())
 }

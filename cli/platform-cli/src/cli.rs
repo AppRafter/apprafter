@@ -138,6 +138,10 @@ pub enum Commands {
         /// is already in state.
         #[arg(long, default_value_t = false)]
         refresh: bool,
+        /// Override the active target for the credential
+        /// resolution chain (see `apprafter apply --target`).
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Install Cilium (CNI + kube-proxy replacement) and apply
     /// the Gateway API standard-install CRDs into the cluster
@@ -153,6 +157,22 @@ pub enum Commands {
         /// password is already in state.
         #[arg(long, default_value_t = false)]
         refresh: bool,
+    },
+    /// One-command provisioning: runs `apply` → polls for the k3s
+    /// kubeconfig to become SSH-reachable → runs `cluster-bootstrap`
+    /// for a freshly-provisioned cluster. Convenience wrapper —
+    /// each phase still has its own subcommand for re-runs.
+    #[command(name = "bootstrap-all")]
+    BootstrapAll {
+        /// Override the active target for the credential resolution
+        /// chain (see `apprafter apply --target`).
+        #[arg(long)]
+        target: Option<String>,
+        /// Print the phase plan without touching the provider or
+        /// cluster. Useful for previewing what the wrapper would
+        /// invoke and which target it resolves against.
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
     },
 }
 

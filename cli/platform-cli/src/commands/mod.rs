@@ -4,6 +4,7 @@
 pub mod apply;
 pub mod argocd_password;
 pub mod auth;
+pub mod bootstrap_all;
 pub mod cluster_bootstrap;
 pub mod destroy;
 pub mod doctor;

@@ -5,7 +5,8 @@
 use cli_core::secrets::{
     decrypt_with_identity, default_age_key_path, encrypt_for_recipient, load_or_create_identity,
 };
-use cli_core::{CliError, Result};
+use cli_core::target::{default_config_root, TargetStorePaths};
+use cli_core::{resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{
     default_ssh_identity_path, rewrite_server_url, HetznerCloudClient, KubeconfigFetcher,
     SshKubeconfigFetcher, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
@@ -15,8 +16,18 @@ use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
 
-pub fn run(refresh: bool) -> Result<()> {
-    info!(refresh, "kubeconfig invoked");
+pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
+    info!(refresh, target_override, "kubeconfig invoked");
+    let yaml = fetch_and_cache(refresh, target_override)?;
+    print!("{yaml}");
+    Ok(())
+}
+
+/// Resolve / fetch / cache the kubeconfig, returning the YAML
+/// without printing. Split out from `run` so `bootstrap-all` (and
+/// future orchestrators) can retry the cold-fetch loop in-process
+/// without spawning a child or capturing stdout.
+pub fn fetch_and_cache(refresh: bool, target_override: Option<&str>) -> Result<String> {
     let cwd = std::env::current_dir()?;
     let paths = StatePaths::for_root(&cwd);
     let mut state = State::load_or_default(&paths)?;
@@ -38,17 +49,15 @@ pub fn run(refresh: bool) -> Result<()> {
 
     if let Some(yaml) = &cached_plaintext {
         if !refresh {
-            print!("{yaml}");
-            return Ok(());
+            return Ok(yaml.clone());
         }
     }
 
     // Cold path or --refresh: SSH-fetch from the live server.
-    let token = std::env::var("HCLOUD_TOKEN").map_err(|_| {
-        CliError::Other(
-            "HCLOUD_TOKEN env var is required to fetch kubeconfig from a live cluster".to_string(),
-        )
-    })?;
+    // Credential resolution chain (cli-dx-task.md §7) — picks up
+    // the active target's token when `HCLOUD_TOKEN` isn't set.
+    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    let token = resolve_hetzner_token(None, &target_store, target_override)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let public_ip = resolve_public_ip(&client, hetzner.server_id)?;
 
@@ -64,8 +73,7 @@ pub fn run(refresh: bool) -> Result<()> {
     updated.kubeconfig_age = Some(armored);
     state.hetzner_cloud = Some(updated);
     state.save(&paths)?;
-    print!("{yaml}");
-    Ok(())
+    Ok(yaml)
 }
 
 /// Pure orchestration: returns the kubeconfig YAML to print and
