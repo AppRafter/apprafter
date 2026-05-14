@@ -1352,6 +1352,7 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 - Capturing inner helm/kubectl output to a buffer (показывать только on failure) — feasible but invasive; пользователю всё ещё нужно видеть прогресс helm install. Доработка цвета + табличного hiding — Track A.11.
 - Idempotent re-run / skip-already-installed semantics — Argo CD handle'ит это в Phase 3 через `helm upgrade --install`; Phase 1 — Hetzner labels; Phase 2 — `--refresh` always re-fetches.
 - miette-styled error rendering при timeout — Track A.10.
+- **Phase 2 polish (отложено до отдельной итерации, ~A.9c)** — две связанные доработки, замеченные на ручном walk'е v0.1.85: (a) Phase 2 стабильно завершается за `1m00s` потому что `ssh` упирается в kernel TCP connect timeout (~30s) пока cloud-init поднимает sshd; нужен `ConnectTimeout=5` в SSH wrapper'е → attempt 1 fail'ится за 5s вместо 30s, total Phase 2 падает до ~20-30s, attempts равномернее. (b) Label `[2/3] kubeconfig` вводит в заблуждение — реально это время полного boot'а ноды (cloud-init + k3s startup), kubeconfig fetch — копеешный финальный шаг. Переименовать на `[2/3] k3s-ready` / `[2/3] cluster-up` / подобное; success-строка станет `up in Ns` вместо `ready in Ns`. dry-run phase block обновить синхронно.
 
 **Зависит от:** 1.66A.8 ✅ (credential resolution chain — Phase 2 needs `resolve_hetzner_token`).
 
