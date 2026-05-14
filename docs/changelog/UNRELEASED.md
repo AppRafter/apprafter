@@ -13,6 +13,139 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.76 — M1.5 Track A.4b — interactive wizard via inquire (2026-05-14)
+
+Second half of M1.5 Track A.4. `apprafter target add` now opens an
+interactive wizard when stdin + stdout are both TTYs and
+`--no-interactive` is not set, prompting only for the inputs the
+user didn't already supply via flags. Closes the
+"`apprafter target add` on a fresh terminal walks me through it"
+UX from `cli-dx-task.md` §5.1.
+
+### Added
+
+- **`commands::target_wizard` module** with `inquire`-driven
+  prompts following the six-step sequence from `cli-dx-task.md`
+  §5.1:
+  1. Target name (`Text`, default `default`, validates against
+     `check_target_name`).
+  2. Provider (`Select`, single entry `hetzner-cloud` today;
+     kept as a Select so adding AWS/Managed later is a one-line
+     surface change).
+  3. Provider token (`Password`, masked). The validator runs
+     inline on submit — format check via
+     `validate_hetzner_token_format`, then API ping via
+     `HetznerCloudValidator::validate_credentials()` unless
+     `--no-ping` was passed. Failure → `Validation::Invalid`
+     so the user gets to retry without re-running the entire
+     wizard.
+  4. SSH public key (`Text`, default
+     `<home>/.ssh/id_ed25519.pub` resolved via `dirs::home_dir`;
+     empty answer = skip). Validator checks the path exists.
+     Tilde expansion (`~/...`) via the new `expand_tilde`
+     helper.
+  5. Default region (`Select`, populated by
+     `validator.list_regions()`). With `--no-ping` falls back
+     to a `Text` with default `nbg1` because we can't query the
+     API.
+  6. Default tier (`Select` with one-of `solo / team / prod /
+     regulated` and human-readable labels lifted from
+     `spec.md`).
+- **`run_renew_wizard(provider, no_ping)`** — slim version
+  that only prompts for the new token; the existing target's
+  config (provider, region, tier, ...) is preserved.
+- **`should_use_wizard(no_interactive, stdin_tty, stdout_tty,
+  has_all_required_flags)`** pure decision function.  Pulled
+  out so the wizard-fire condition is unit-testable without
+  faking a PTY; the caller side resolves `stdin_tty` /
+  `stdout_tty` via `std::io::IsTerminal`. Wizard fires only
+  when both consoles are TTYs AND `--no-interactive` is unset
+  AND at least one required input is missing — power users who
+  pass full flags don't get a surprise prompt.
+- **`ProviderValidator::list_regions() -> Result<Vec<RegionInfo>>`**
+  on the trait. `RegionInfo { name, description }` with `Display`
+  rendering `<name> — <description>` so `inquire::Select` labels
+  read naturally. `HetznerCloudValidator::list_regions()` maps
+  `client.list_locations()` into a sorted-by-name list.
+- **`cli-core::target::check_target_name`** pure helper
+  exported for the wizard. Returns `Result<(), String>` so the
+  same validation message renders in both the CLI surface
+  (`CliError::Other`) and the wizard prompt
+  (`inquire::Validation::Invalid`). `validate_target_name` is
+  now a thin `CliError`-wrapping adapter.
+- **Workspace deps**: `inquire = "0.7"`; `dirs` promoted to a
+  direct dep of `platform-cli` (used for SSH-key default + tilde
+  expansion).
+- **`AddArgs.no_interactive` field** now carries the clap flag
+  value through to the orchestrator instead of being discarded
+  in the destructure — the wizard-decision function consumes it.
+
+### Changed
+
+- **`TargetCommand::Add.name`** is now `Option<String>` (was
+  `String`). The wizard prompts for it on a TTY; in non-TTY /
+  `--no-interactive` mode the existing-error path fires with
+  "target name required — pass it as a positional argument
+  (`apprafter target add <name>`) or run on a TTY to enter the
+  wizard." Backwards-compatible for all v0.1.73-style positional
+  invocations.
+- **`run_add` orchestration** restructured around the wizard
+  decision: parse flags → maybe-wizard fills gaps →
+  validate-name → save. `run_renew` takes the resolved name as
+  an explicit parameter to match.
+
+### Tests
+
+- **5 new unit tests** in `commands::target_wizard`:
+  - `should_use_wizard_only_when_tty_and_no_flag_and_missing_required`
+    — pins the four-way decision matrix.
+  - `expand_tilde_replaces_leading_tilde_slash_only` — abs path
+    untouched, `~user/foo` NOT expanded (predictable behaviour).
+  - `inline_ping_error_summarises_401_separately_from_other_http_errors`
+    — pins the wizard's one-line error renderer that feeds
+    `inquire::Validation::Invalid`.
+  - `validate_for_provider_accepts_hetzner_64_char_token_and_rejects_others`
+    — happy / wrong-length / unknown-provider.
+  - `tier_choice_display_includes_both_key_and_label` — pins
+    Display impl that drives the Select labels.
+- **2 new mockito-based tests** in `cli_providers::validators`:
+  - `list_regions_returns_sorted_region_info_from_locations_response`
+    — pins both the wire-shape mapping (Location → RegionInfo)
+    and the alphabetic sort.
+  - `region_info_display_falls_back_to_name_when_description_empty`
+    — pins the Display fallback so a stripped Hetzner response
+    doesn't render `nbg1 — ` with a trailing em-dash.
+- **22 prior integration tests** in `target_test.rs` continue
+  to pass unmodified — assert_cmd pipes stdin/stdout so
+  `IsTerminal` returns false and the wizard is correctly
+  skipped. The non-TTY path is exactly the v0.1.75 behaviour.
+
+### Out of scope (deferred)
+
+- E2E wizard test via PTY harness — overkill for the v1
+  shape; manual walks cover prompt UX. If we add a PTY harness
+  later, it would also unlock testing of progress bars in
+  `bootstrap-all` (Track A.9).
+- Hetzner account/project details in the "✓ Token verified"
+  line per `cli-dx-task.md` §5.1 — Hetzner's `/v1/locations`
+  doesn't return that info; would need an account-scoped
+  endpoint Hetzner doesn't currently expose. Current "✓ Token
+  verified" string is the achievable signal.
+- `apprafter target list / use / show / rename / remove` —
+  Track 1.66A.5.
+- `secrecy::Secret<String>` wrapper for in-memory tokens —
+  Track A.10/A.11 hardening pass.
+
+### Operator note
+
+Existing CI / script invocations are unaffected — wizard fires
+only on real terminals + when required inputs are missing.
+`HCLOUD_TOKEN=… APPRAFTER_NO_PING=1 apprafter target add work
+--provider hetzner-cloud` continues to work non-interactively
+out of the box. To force non-interactive mode in a TTY (e.g.,
+when piping prompts is too clever), pass `--no-interactive` or
+make sure every required input is on the command line.
+
 ## v0.1.75 — M1.5 Track A.4a — provider validator + Hetzner API ping (2026-05-14)
 
 First half of M1.5 Track A.4 (`cli-dx-task.md` §11 validation

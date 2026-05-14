@@ -17,19 +17,53 @@
 use crate::hetzner_cloud::HetznerCloudClient;
 use cli_core::Result;
 
+/// Provider-agnostic region descriptor. Surfaced as a `Select`
+/// picker in the interactive wizard (Track A.4b) and reused by
+/// `init` / `apply` flag-completion in Track A.8 once they
+/// resolve to the active target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionInfo {
+    /// Short ID used by the provider API (Hetzner: `nbg1`).
+    /// This is what the CLI persists in `TargetConfig.region` and
+    /// passes back to the provider on subsequent calls.
+    pub name: String,
+    /// Human-readable label (Hetzner: `Nuremberg DC Park 1`).
+    /// `Display` for `Select` uses `name — description` so the
+    /// picker is scannable without the user having to memorise IDs.
+    pub description: String,
+}
+
+impl std::fmt::Display for RegionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.description.is_empty() {
+            f.write_str(&self.name)
+        } else {
+            write!(f, "{} — {}", self.name, self.description)
+        }
+    }
+}
+
 /// Common surface every provider validator exposes to the CLI.
 ///
 /// `validate_credentials` is the read-only "does this token
-/// authenticate?" check. Track A.4b will add wizard-driving
-/// helpers (`list_regions`, etc.) — keeping the trait minimal
-/// now means each new provider gets one method to implement and
-/// no API-shape commitment we have to walk back later.
+/// authenticate?" check. `list_regions` drives the wizard's
+/// region picker (Track A.4b) and stays optional for providers
+/// where regions don't apply (returns an empty `Vec` is OK).
+/// Keeping the trait small means each new provider gets a tiny
+/// surface to implement.
 pub trait ProviderValidator {
     /// Hit a lightweight, read-only endpoint to confirm the
     /// carried credentials authenticate. Returns `Ok(())` on a
     /// 2xx response; surfaces the provider's typed error
     /// otherwise (mapped through `CliError`).
     fn validate_credentials(&self) -> Result<()>;
+
+    /// Enumerate the provider's regions for the wizard's
+    /// `Select` picker. Mirrors `validate_credentials` in surface
+    /// shape: 2xx → list, error → typed `CliError`. Hetzner's
+    /// answer is sorted by `name` so the picker is alphabetical
+    /// without each call site re-sorting.
+    fn list_regions(&self) -> Result<Vec<RegionInfo>>;
 }
 
 /// Hetzner Cloud validator. Probes `GET /v1/locations` — Hetzner's
@@ -57,9 +91,23 @@ impl ProviderValidator for HetznerCloudValidator {
     fn validate_credentials(&self) -> Result<()> {
         // The response body is intentionally discarded — we only
         // care about the 2xx vs 4xx/5xx classification at this
-        // layer. Track A.4b will surface the locations into the
-        // region picker via a separate method.
+        // layer. `list_regions` below uses the same endpoint when
+        // the caller needs the actual list.
         self.client.list_locations().map(|_| ())
+    }
+
+    fn list_regions(&self) -> Result<Vec<RegionInfo>> {
+        let resp = self.client.list_locations()?;
+        let mut regions: Vec<RegionInfo> = resp
+            .locations
+            .into_iter()
+            .map(|loc| RegionInfo {
+                name: loc.name,
+                description: loc.description,
+            })
+            .collect();
+        regions.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(regions)
     }
 }
 
@@ -127,6 +175,50 @@ mod tests {
             }
             other => panic!("expected CliError::Hetzner, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_regions_returns_sorted_region_info_from_locations_response() {
+        // Two locations on purpose, second one alphabetically
+        // before the first to pin the sort step.
+        let body = r#"{
+            "locations": [
+                {"id":1,"name":"nbg1","description":"Nuremberg DC Park 1",
+                 "country":"DE","city":"Nuremberg","network_zone":"eu-central"},
+                {"id":2,"name":"fsn1","description":"Falkenstein DC Park 1",
+                 "country":"DE","city":"Falkenstein","network_zone":"eu-central"}
+            ]
+        }"#;
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/v1/locations")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+        let v = HetznerCloudValidator::new(server.url(), "test-token");
+        let regions = v.list_regions().expect("list_regions ok");
+        assert_eq!(regions.len(), 2);
+        // Sorted alphabetically — `fsn1` before `nbg1` even though
+        // the wire payload had them flipped.
+        assert_eq!(regions[0].name, "fsn1");
+        assert_eq!(regions[0].description, "Falkenstein DC Park 1");
+        assert_eq!(regions[1].name, "nbg1");
+        // Display impl: `<name> — <description>`.
+        assert_eq!(
+            regions[0].to_string(),
+            "fsn1 — Falkenstein DC Park 1",
+            "Display impl drives inquire::Select labels"
+        );
+    }
+
+    #[test]
+    fn region_info_display_falls_back_to_name_when_description_empty() {
+        let r = RegionInfo {
+            name: "nbg1".into(),
+            description: String::new(),
+        };
+        assert_eq!(r.to_string(), "nbg1");
     }
 
     #[test]

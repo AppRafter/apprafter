@@ -98,15 +98,19 @@ pub enum Commands {
 
 #[derive(Debug, Subcommand)]
 pub enum TargetCommand {
-    /// Add (or update, with `--renew`) a deployment target. The
-    /// non-interactive form (current default — interactive wizard
-    /// arrives in v0.1.74 / Track A.4) requires `--provider` plus
-    /// any provider-specific flags such as `--token`.
+    /// Add (or update, with `--renew`) a deployment target.
+    ///
+    /// On a TTY without `--no-interactive` the command launches a
+    /// wizard that prompts for whatever flags were not provided.
+    /// On a non-TTY (CI, pipe) the command is purely flag-driven
+    /// and missing required inputs error out fast.
     Add {
         /// Target name. Must match `[A-Za-z0-9-]+`, max 64 chars.
         /// The first target created on a fresh store is auto-set
-        /// as the active target.
-        name: String,
+        /// as the active target. Optional on a TTY — the wizard
+        /// asks for it with a `default` default. Required on a
+        /// non-TTY / `--no-interactive` run.
+        name: Option<String>,
         /// Provider identifier. Only `hetzner-cloud` is wired in
         /// v0.1.73; AWS / Managed Cloud follow in later tracks.
         #[arg(long)]

@@ -14,6 +14,7 @@
 //!   5. If first target, set as active in `GlobalConfig`.
 //!   6. Print one-line confirmation.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use cli_core::target::{
@@ -52,7 +53,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
             cluster_name,
             force,
             renew,
-            no_interactive: _,
+            no_interactive,
             no_ping,
         } => run_add(AddArgs {
             name,
@@ -64,17 +65,21 @@ pub fn run(action: TargetCommand) -> Result<()> {
             cluster_name,
             force,
             renew,
+            no_interactive,
             no_ping,
         }),
     }
 }
 
 /// Plain bundle so the orchestration body below has one parameter
-/// to thread instead of ten. Field shapes mirror the clap flags
+/// to thread instead of eleven. Field shapes mirror the clap flags
 /// exactly; keep the rename pressure low by not introducing
 /// intermediate types.
 pub struct AddArgs {
-    pub name: String,
+    /// Optional because the wizard prompts for it. Mandatory at
+    /// the save step — `run_add` errors with a clear message if
+    /// we reach save with `name == None`.
+    pub name: Option<String>,
     pub provider: Option<String>,
     pub token: Option<String>,
     pub ssh_key: Option<PathBuf>,
@@ -83,17 +88,36 @@ pub struct AddArgs {
     pub cluster_name: Option<String>,
     pub force: bool,
     pub renew: bool,
+    pub no_interactive: bool,
     pub no_ping: bool,
 }
 
-fn run_add(args: AddArgs) -> Result<()> {
-    info!(target = %args.name, renew = args.renew, force = args.force, "target add invoked");
-    validate_target_name(&args.name)?;
+fn run_add(mut args: AddArgs) -> Result<()> {
+    // Decide before validating: the wizard is allowed to fill the
+    // missing inputs, so we shouldn't reject e.g. `apprafter target
+    // add` (no name) up front when the user is on a TTY.
+    let want_wizard = crate::commands::target_wizard::should_use_wizard(
+        args.no_interactive,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        all_required_present_for_flow(&args),
+    );
+    if want_wizard {
+        run_wizard_into_args(&mut args)?;
+    }
+
+    let name = args.name.clone().ok_or_else(|| {
+        CliError::Other(
+            "target name required — pass it as a positional argument (`apprafter target add <name>`) or run on a TTY to enter the wizard".to_string(),
+        )
+    })?;
+    info!(target = %name, renew = args.renew, force = args.force, "target add invoked");
+    validate_target_name(&name)?;
 
     let paths = TargetStorePaths::for_root(default_config_root()?);
 
     if args.renew {
-        return run_renew(&paths, args);
+        return run_renew(&paths, args, &name);
     }
 
     // Plain create / overwrite path.
@@ -103,12 +127,11 @@ fn run_add(args: AddArgs) -> Result<()> {
         verify_ssh_key_readable(path)?;
     }
 
-    let existing = load_target(&paths, &args.name);
+    let existing = load_target(&paths, &name);
     match existing {
         Ok(_) if !args.force => {
             return Err(CliError::Other(format!(
-                "target `{}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only",
-                args.name
+                "target `{name}` already exists — pass `--force` to overwrite or `--renew` to rotate credentials only"
             )));
         }
         Ok(_) | Err(CliError::TargetNotFound { .. }) => {}
@@ -119,13 +142,16 @@ fn run_add(args: AddArgs) -> Result<()> {
     // provider. Happens AFTER the existing-target check so a no-op
     // run with `--no-ping` against an existing target still
     // surfaces the "already exists" error immediately. `--no-ping`
-    // skips the round-trip for CI / offline setups.
+    // skips the round-trip for CI / offline setups. When the
+    // wizard already ran an inline ping the result is re-verified
+    // here on purpose — cheap (~200ms) and keeps the save-time
+    // check authoritative.
     if !args.no_ping {
         ping_provider(&provider, &token)?;
     }
 
     let target = Target {
-        name: args.name.clone(),
+        name: name.clone(),
         config: TargetConfig {
             provider,
             region: args.region,
@@ -139,7 +165,7 @@ fn run_add(args: AddArgs) -> Result<()> {
     };
     save_target(&paths, &target)?;
 
-    let became_active = ensure_active_target(&paths, &args.name)?;
+    let became_active = ensure_active_target(&paths, &name)?;
 
     let verified_suffix = if args.no_ping {
         " (token NOT verified against the API — `--no-ping` was passed)"
@@ -148,25 +174,91 @@ fn run_add(args: AddArgs) -> Result<()> {
     };
     if became_active {
         println!(
-            "target `{}` saved and set as active (first target on fresh store){verified_suffix}",
-            args.name
+            "target `{name}` saved and set as active (first target on fresh store){verified_suffix}"
         );
     } else {
         println!(
-            "target `{}` saved (active target unchanged — use `apprafter target use {}` to switch){verified_suffix}",
-            args.name, args.name
+            "target `{name}` saved (active target unchanged — use `apprafter target use {name}` to switch){verified_suffix}"
         );
     }
     Ok(())
 }
 
-fn run_renew(paths: &TargetStorePaths, args: AddArgs) -> Result<()> {
-    let mut existing = match load_target(paths, &args.name) {
+/// Decide whether all the required inputs for the current flow
+/// (add vs renew) are present on `args`. The wizard skips when
+/// they all are — that mirrors the v0.1.73 non-interactive path
+/// even on a TTY, so power users who pass full flags don't get a
+/// surprise prompt.
+fn all_required_present_for_flow(args: &AddArgs) -> bool {
+    if args.renew {
+        // Renew preserves the existing target's config — only
+        // name + token are mandatory inputs.
+        args.name.is_some() && args.token.is_some()
+    } else {
+        args.name.is_some() && args.provider.is_some() && args.token.is_some()
+    }
+}
+
+/// Fill `args` from wizard prompts for whatever fields aren't
+/// already supplied. Split out so the main `run_add` body reads
+/// linearly.
+fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
+    use crate::commands::target_wizard;
+    if args.renew {
+        // Renew wizard needs the existing target's provider, so
+        // prompt for the name first (if missing) and load the
+        // target so we know what provider's validator to wire.
+        if args.name.is_none() {
+            let n = inquire::Text::new("Target name to rotate credentials for:")
+                .with_validator(|v: &str| match check_target_name(v) {
+                    Ok(()) => Ok(inquire::validator::Validation::Valid),
+                    Err(msg) => Ok(inquire::validator::Validation::Invalid(msg.into())),
+                })
+                .prompt()
+                .map_err(|err| match err {
+                    inquire::InquireError::OperationCanceled
+                    | inquire::InquireError::OperationInterrupted => {
+                        CliError::Other("wizard aborted by user".to_string())
+                    }
+                    other => CliError::Other(format!("wizard prompt failed: {other}")),
+                })?;
+            args.name = Some(n);
+        }
+        let paths = TargetStorePaths::for_root(default_config_root()?);
+        let existing = load_target(&paths, args.name.as_deref().unwrap())?;
+        let (token, _verified) =
+            target_wizard::run_renew_wizard(&existing.config.provider, args.no_ping)?;
+        args.token = Some(token);
+    } else {
+        let out = target_wizard::run_add_wizard(args)?;
+        args.name = Some(out.name);
+        args.provider = Some(out.provider);
+        args.token = Some(out.token);
+        if args.ssh_key.is_none() {
+            args.ssh_key = out.ssh_key;
+        }
+        if args.region.is_none() {
+            args.region = out.region;
+        }
+        if args.tier.is_none() {
+            args.tier = out.tier;
+        }
+        // `out.token_already_verified` is collected but currently
+        // unused — the save-time ping below re-verifies (~200ms)
+        // to keep the on-save check authoritative. A future
+        // optimisation can short-circuit when the wizard's ping
+        // already succeeded within the same invocation.
+        let _ = out.token_already_verified;
+    }
+    Ok(())
+}
+
+fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> {
+    let mut existing = match load_target(paths, name) {
         Ok(t) => t,
         Err(CliError::TargetNotFound { .. }) => {
             return Err(CliError::Other(format!(
-                "target `{}` does not exist — drop `--renew` to create it fresh",
-                args.name
+                "target `{name}` does not exist — drop `--renew` to create it fresh"
             )));
         }
         Err(e) => return Err(e),
@@ -206,10 +298,7 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs) -> Result<()> {
     } else {
         " (token verified against Hetzner Cloud)"
     };
-    println!(
-        "target `{}` credentials rotated{verified_suffix}",
-        args.name
-    );
+    println!("target `{name}` credentials rotated{verified_suffix}");
     Ok(())
 }
 
@@ -217,30 +306,39 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs) -> Result<()> {
 // Pure validators
 // ---------------------------------------------------------------
 
-fn validate_target_name(name: &str) -> Result<()> {
+/// Pure target-name validator. Returns `Result<(), String>` so
+/// callers can pick the right error wrapping (CliError for direct
+/// CLI surface; `inquire::Validation::Invalid` for wizard
+/// prompts). The string body is reused verbatim in both paths so
+/// error UX stays consistent.
+pub(crate) fn check_target_name(name: &str) -> std::result::Result<(), String> {
     if name.is_empty() {
-        return Err(CliError::Other("target name must not be empty".to_string()));
+        return Err("target name must not be empty".to_string());
     }
     if name.len() > MAX_TARGET_NAME_LEN {
-        return Err(CliError::Other(format!(
+        return Err(format!(
             "target name must be ≤ {MAX_TARGET_NAME_LEN} chars (got {})",
             name.len()
-        )));
+        ));
     }
     // Avoid filesystem-reserved characters and any path-traversal
     // surface. The pattern matches Kubernetes resource names which
     // are already familiar to operators.
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(CliError::Other(format!(
+        return Err(format!(
             "target name `{name}` is invalid — allowed: alphanumeric + `-`"
-        )));
+        ));
     }
     if name.starts_with('-') || name.ends_with('-') {
-        return Err(CliError::Other(format!(
+        return Err(format!(
             "target name `{name}` must not start or end with `-`"
-        )));
+        ));
     }
     Ok(())
+}
+
+fn validate_target_name(name: &str) -> Result<()> {
+    check_target_name(name).map_err(CliError::Other)
 }
 
 fn require_known_provider(provider: Option<&str>) -> Result<String> {

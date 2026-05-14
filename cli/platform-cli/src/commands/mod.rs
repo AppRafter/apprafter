@@ -13,4 +13,5 @@ pub mod login;
 pub mod plan;
 pub mod status;
 pub mod target;
+pub mod target_wizard;
 pub mod upgrade_tier;

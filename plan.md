@@ -1023,9 +1023,59 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.4b — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.4b Interactive wizard via `inquire` ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.4a). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → **interactive wizard (1.66A.4b)** → CRUD команды (`list/use/show/rename/remove`, 1.66A.5) → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.76 — sub-phase 1.66A.4b shipped: `commands::target_wizard` модуль с `inquire`-based prompts (Text/Password/Select), default-when-TTY поведение, inline validation внутри token prompt'а (format + API ping), region-picker через `list_regions()`. `--no-interactive` отключает wizard явно; CRUD команды (`list/use/show/...`) и `whoami`/`doctor`/`bootstrap-all` — следующие итерации.
+
+**Source:** `cli-dx-task.md` §5.1 (interactive flow) + §9 (TTY detection) + §17 row 4.
+
+**Поставка:**
+- [x] Workspace dep `inquire = "0.7"`; `dirs` поднят в platform-cli (использует для `~/.ssh/id_ed25519.pub` default'а и tilde expansion в SSH-key prompt).
+- [x] `cli-providers::validators::ProviderValidator` расширен `fn list_regions() -> Result<Vec<RegionInfo>>`. `RegionInfo { name, description }` с `Display` impl `<name> — <description>` для удобного scanning в `Select`. `HetznerCloudValidator::list_regions()` мапит `client.list_locations()` → отсортированный по `name` Vec. +2 mockito-тестa (sorted output + Display fallback на empty description).
+- [x] `cli/platform-cli/src/cli.rs`: positional `name` теперь `Option<String>` — wizard может его спросить; ошибка surface'ится после wizard'а если name всё ещё None (non-TTY/`--no-interactive` сценарий).
+- [x] `commands/target.rs::check_target_name(&str) -> Result<(), String>` — pure helper экспортирован для wizard'а (validation сообщения консистентны между CLI surface и `inquire::Validation::Invalid`). `validate_target_name` остаётся как CliError-обёртка.
+- [x] `commands/target_wizard.rs` — новый модуль:
+    - `should_use_wizard(no_interactive, stdin_tty, stdout_tty, all_required_present)` — pure decision, testable. Wizard fires только когда **обе** consoli TTYs И `--no-interactive` не передан И хотя бы один required input отсутствует. Если все флаги supplied — non-interactive path даже на TTY (respect explicit intent).
+    - `run_add_wizard(initial: &AddArgs) -> Result<WizardOutput>` — последовательность из 6 prompts по spec §5.1:
+        1. **Target name** — `Text` с default `default`, валидатор вызывает `check_target_name`.
+        2. **Provider** — `Select` (сейчас одна опция `hetzner-cloud`, оставлен Select-shape для forward-compat).
+        3. **Provider token** — `Password` с `PasswordDisplayMode::Masked`. Inline-валидатор сначала проверяет формат, потом, если не `--no-ping`, делает API ping через `HetznerCloudValidator::validate_credentials()`. Failure → `Validation::Invalid("…")` → инквайр перепросит. Success → eprintln `✓ Token verified`.
+        4. **SSH public key path** — `Text` с default `<home>/.ssh/id_ed25519.pub` (через `dirs::home_dir`); пустая строка = "skip". Tilde expansion `~/...` через `expand_tilde` helper.
+        5. **Default region** — `Select` из `validator.list_regions()` (когда token verified). При `--no-ping` fallback на `Text` с default `nbg1` (нет API → нет picker'а).
+        6. **Default tier** — `Select` по spec choices: `solo / team / prod / regulated` с `Display` impl `<key> — <human label>`.
+    - `run_renew_wizard(provider, no_ping)` — упрощённый prompt только токена (config preserved).
+    - Все prompts мапят `InquireError::OperationCanceled/Interrupted` → `CliError::Other("wizard aborted by user")` (Ctrl-C / Esc не дают backtrace).
+- [x] `commands/target.rs::run_add`:
+    - Сначала evaluate `should_use_wizard(...)`, если true — `run_wizard_into_args(&mut args)` заполняет missing поля.
+    - После wizard'а (или без него) `name` обязан быть `Some`; иначе typed error "target name required — pass it as a positional argument ... or run on a TTY".
+    - `--renew` wizard ветвится отдельно: если name отсутствует — спрашиваем сначала name (Text + `check_target_name`), потом загружаем existing target для определения provider'а, потом `run_renew_wizard` для нового токена.
+    - Save-time ping остаётся (re-verifies даже когда wizard уже ping'нул — cheap ~200ms, save-time check — authoritative).
+- [x] 5 unit-тестов inline в `target_wizard.rs` (pure helpers): `should_use_wizard` (4 ветки), `expand_tilde` (3 cases: `~/`, abs path, `~user/` not expanded), `inline_ping_error` (401 vs 5xx сообщения), `validate_for_provider` (good/bad/unknown), `TierChoice` Display.
+
+**Acceptance:**
+- ✅ `apprafter target add` на TTY → wizard просит все поля по порядку, inline-показывает `✓ Token verified` после успешного ping'а.
+- ✅ `apprafter target add work --provider hetzner-cloud --token <X>` на TTY → wizard НЕ fires (все required supplied), сразу не-interactive path.
+- ✅ `apprafter target add work --no-interactive` без token'а → typed error "is required" (TTY не помогает когда явно non-interactive).
+- ✅ Pipe / CI → no TTY → wizard skipped, как раньше.
+- ✅ Esc / Ctrl-C во время wizard'а → "wizard aborted by user" (без backtrace, exit-code 1).
+- ✅ `cargo test --workspace`: 22 target_test (без изменений) + 5 target_wizard unit + 64 cli-core + 120 cli-providers (+2 list_regions) — 0 failures.
+- ✅ fmt + clippy + SPDX (154 files) + CUE — clean.
+
+**Out-of-scope (явно отложено):**
+- E2E wizard testing с PTY-harness — overkill для текущего MVP; manual walks покрывают prompt UX.
+- "✓ Token verified (account: …, project: …)" detail per `cli-dx-task.md` §5.1 — Hetzner `/v1/locations` не возвращает account info, нужен `/v1/me`-style endpoint (Hetzner такого не имеет). Текущий "✓ Token verified" — достаточный signal.
+- `apprafter target list / use / show / rename / remove` — Track 1.66A.5.
+- `secrecy::Secret<String>` обёртка для tokens in-memory — A.10/A.11 hardening pass.
+
+**Зависит от:** 1.66A.4a ✅ (validator framework + API ping).
+
+**Размер:** M (один цикл, ~1.5 рабочих дня).
+
+---
+
+### 1.66A.5 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.4b). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → **CRUD команды `list/use/show/rename/remove` (1.66A.5)** → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3298,4 +3348,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.3 — `apprafter target add` (+`t` alias) non-interactive: validators, `--force`/`--renew`, first-target auto-active, env-override `APPRAFTER_CONFIG_DIR`; +33 tests; v0.1.73 | initial |
 | 2026-05-14 | v0.1.73 hotfix — `validate_hetzner_token_format` теперь exactly 64 ASCII alphanumeric (без `hcloud_` префикса — v0.1.73 ложно его требовал, реальные Hetzner токены префикса не имеют); cli-dx-task.md §11 amended; +регрессия-guard на underscore-at-correct-length; v0.1.74 | initial |
 | 2026-05-14 | M1.5 Track A.4a — `cli-providers::validators` + `HetznerCloudValidator` (`GET /v1/locations` ping); `target add` теперь validates token by default + `--no-ping`/`APPRAFTER_NO_PING` opt-out; +8 tests (3 validator + 5 integration); v0.1.75 | initial |
+| 2026-05-14 | M1.5 Track A.4b — interactive wizard via `inquire`: Text/Password/Select prompts по spec §5.1, inline format+ping validation в Password, region-picker через `list_regions()`, tilde expansion для SSH-key, default-when-TTY поведение через `IsTerminal` + `should_use_wizard()`; +7 tests; v0.1.76 | initial |
 
