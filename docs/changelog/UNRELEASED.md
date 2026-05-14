@@ -13,6 +13,73 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.74 — hotfix: token validator rejected real Hetzner Cloud tokens (2026-05-14)
+
+v0.1.73's `validate_hetzner_token_format` required an `hcloud_`
+prefix on every Hetzner Cloud API token — a constraint borrowed
+from `cli-dx-task.md` §11 that turned out to be wrong. Real
+Hetzner Cloud tokens (the ones the Cloud Console → Security → API
+Tokens panel emits when you click "Create API token") are **64
+ASCII alphanumeric characters with no prefix**. The `HCLOUD_TOKEN`
+env-var name is convention, the value inside it is just the bare
+64 chars. v0.1.73 rejected every real token with the surface
+error `invalid Hetzner Cloud token: Hetzner Cloud tokens must
+start with \`hcloud_\``.
+
+### Fixed
+
+- **`validate_hetzner_token_format`** rewritten to require exactly
+  64 ASCII alphanumeric characters, no prefix:
+  ```rust
+  if token.len() != 64 { return Err(…); }
+  if !token.chars().all(|c| c.is_ascii_alphanumeric()) { return Err(…); }
+  ```
+  The previous prefix-stripping logic is gone — Hetzner doesn't
+  ship prefixed tokens, so the strict alphanumeric check matches
+  the actual format. If Hetzner ever introduces prefixed tokens
+  (secret-scanning style), we revisit the validator at that point.
+- **`cli-dx-task.md` §11** amended: the canonical Hetzner Cloud
+  token format is exactly 64 ASCII alphanumeric chars with no
+  prefix, in both the "validation steps" enumeration and the
+  per-provider validation table.
+
+### Tests
+
+Replaced the v0.1.73 prefix-centric tests with strict-format
+ones:
+
+- `validate_hetzner_token_format_accepts_canonical_64_char_token`
+  — happy path on the real shape.
+- `validate_hetzner_token_format_rejects_wrong_length` — strict
+  equality covering 5 / 63 / 65 / 200 chars in one parameterised
+  test.
+- `validate_hetzner_token_format_rejects_non_alphanumeric_at_correct_length`
+  — 64-char token with a dash; length passes, alphanumeric branch
+  fires.
+- `validate_hetzner_token_format_rejects_underscore_at_correct_length`
+  — explicit regression-guard pinning the strict alphanumeric
+  rule against any future "let's accept `hcloud_` prefix" change.
+  64 chars total (`hcloud_` + 57 `a`s) so length passes and the
+  alphanumeric check is what rejects.
+
+Tests in `commands/target.rs` and `tests/target_test.rs` updated
+to use the canonical 64-char alphanumeric synthetic shape
+(`"a".repeat(64)` instead of `format!("hcloud_{a×60}")`).
+`synthetic_hcloud_token()` helper renamed to
+`synthetic_hetzner_token()` to reflect the actual format.
+
+### Operator note
+
+Anyone who ran `apprafter target add` after upgrading to v0.1.73
+and got the cryptic "must start with `hcloud_`" error can just
+retry the same command on v0.1.74 — your real token now passes
+validation. No state migration required; v0.1.73 didn't save
+anything when it rejected the token. If you already created a
+target via the env-var-only flow before v0.1.73 (e.g., HCLOUD_TOKEN=…
+apprafter apply) nothing changed for you — that flow doesn't go
+through the validator at all and continues to work unchanged
+until Track A.8 wires the target store in.
+
 ## v0.1.73 — M1.5 Track A.3 — `apprafter target add` non-interactive (2026-05-14)
 
 Third slice of M1.5 Track A (CLI DX rework per `cli-dx-task.md`

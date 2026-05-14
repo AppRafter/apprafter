@@ -19,13 +19,13 @@ fn cli() -> Command {
     Command::cargo_bin("apprafter").unwrap()
 }
 
-/// 67-char synthetic Hetzner token (`hcloud_` + 60 `a`s) that
-/// satisfies the format validator without being a real credential.
-/// Tests stay 100 % offline — no Hetzner API ping happens until
-/// Track A.4 validator integration.
-fn synthetic_hcloud_token() -> String {
-    let body = "a".repeat(60);
-    format!("hcloud_{body}")
+/// 64-char synthetic Hetzner token (canonical alphanumeric, no
+/// prefix — matches what Hetzner Cloud Console actually issues
+/// per `cli-dx-task.md` §11 as amended in v0.1.74). Lets tests
+/// stay 100 % offline — no Hetzner API ping happens until Track
+/// A.4 validator integration.
+fn synthetic_hetzner_token() -> String {
+    "a".repeat(64)
 }
 
 /// Drop a fake SSH public key in the supplied dir and return its
@@ -40,7 +40,7 @@ fn write_fake_ssh_pubkey(dir: &Path) -> std::path::PathBuf {
 #[test]
 fn target_add_writes_config_and_credentials_and_promotes_first_target_to_active() {
     let dir = tempfile::tempdir().unwrap();
-    let token = synthetic_hcloud_token();
+    let token = synthetic_hetzner_token();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env_remove("HCLOUD_TOKEN")
@@ -97,7 +97,7 @@ fn target_add_credentials_file_is_mode_0600() {
             "--provider",
             "hetzner-cloud",
             "--token",
-            &synthetic_hcloud_token(),
+            &synthetic_hetzner_token(),
         ])
         .assert()
         .success();
@@ -116,7 +116,7 @@ fn target_add_credentials_file_is_mode_0600() {
 #[test]
 fn target_add_uses_hcloud_token_env_var_as_fallback() {
     let dir = tempfile::tempdir().unwrap();
-    let token = synthetic_hcloud_token();
+    let token = synthetic_hetzner_token();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("HCLOUD_TOKEN", &token)
@@ -158,7 +158,7 @@ fn target_add_errors_on_unknown_provider() {
             "--provider",
             "aws-bedrock",
             "--token",
-            &synthetic_hcloud_token(),
+            &synthetic_hetzner_token(),
         ])
         .assert()
         .failure()
@@ -198,7 +198,7 @@ fn target_add_errors_on_invalid_target_name() {
             "--provider",
             "hetzner-cloud",
             "--token",
-            &synthetic_hcloud_token(),
+            &synthetic_hetzner_token(),
         ])
         .assert()
         .failure()
@@ -208,7 +208,7 @@ fn target_add_errors_on_invalid_target_name() {
 #[test]
 fn target_add_refuses_to_overwrite_existing_target_without_force() {
     let dir = tempfile::tempdir().unwrap();
-    let token = synthetic_hcloud_token();
+    let token = synthetic_hetzner_token();
     for _ in 0..1 {
         cli()
             .env("APPRAFTER_CONFIG_DIR", dir.path())
@@ -248,10 +248,11 @@ fn target_add_refuses_to_overwrite_existing_target_without_force() {
 #[test]
 fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
     let dir = tempfile::tempdir().unwrap();
-    let token1 = synthetic_hcloud_token();
-    // 60 'b's to differentiate clearly from token1.
-    let body = "b".repeat(60);
-    let token2 = format!("hcloud_{body}");
+    let token1 = synthetic_hetzner_token();
+    // 64 'b's so it passes the strict alphanumeric validator and
+    // differs byte-for-byte from token1 (all 'a's) so the rotation
+    // assertion can detect either-or.
+    let token2 = "b".repeat(64);
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
@@ -304,9 +305,10 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
 #[test]
 fn target_add_renew_rotates_credentials_without_touching_config() {
     let dir = tempfile::tempdir().unwrap();
-    let token1 = synthetic_hcloud_token();
-    let body = "c".repeat(60);
-    let token2 = format!("hcloud_{body}");
+    let token1 = synthetic_hetzner_token();
+    // 64 'c's — different from token1 (all 'a's) so the rotation
+    // assertion can prove old credentials were really overwritten.
+    let token2 = "c".repeat(64);
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
@@ -354,7 +356,7 @@ fn target_add_renew_on_missing_target_errors_with_hint() {
             "add",
             "ghost",
             "--token",
-            &synthetic_hcloud_token(),
+            &synthetic_hetzner_token(),
             "--renew",
         ])
         .assert()
@@ -366,7 +368,7 @@ fn target_add_renew_on_missing_target_errors_with_hint() {
 #[test]
 fn target_add_renew_rejects_config_flags() {
     let dir = tempfile::tempdir().unwrap();
-    let token = synthetic_hcloud_token();
+    let token = synthetic_hetzner_token();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env_remove("HCLOUD_TOKEN")
@@ -407,7 +409,7 @@ fn target_add_force_and_renew_are_mutually_exclusive() {
             "--provider",
             "hetzner-cloud",
             "--token",
-            &synthetic_hcloud_token(),
+            &synthetic_hetzner_token(),
             "--force",
             "--renew",
         ])
@@ -419,7 +421,7 @@ fn target_add_force_and_renew_are_mutually_exclusive() {
 #[test]
 fn target_add_with_ssh_key_path_verifies_file_exists() {
     let dir = tempfile::tempdir().unwrap();
-    let token = synthetic_hcloud_token();
+    let token = synthetic_hetzner_token();
     let pubkey = write_fake_ssh_pubkey(dir.path());
 
     cli()
@@ -458,7 +460,7 @@ fn target_add_errors_when_ssh_key_path_missing() {
             "--provider",
             "hetzner-cloud",
             "--token",
-            &synthetic_hcloud_token(),
+            &synthetic_hetzner_token(),
             "--ssh-key",
             "/does/not/exist/key.pub",
         ])
@@ -470,7 +472,7 @@ fn target_add_errors_when_ssh_key_path_missing() {
 #[test]
 fn second_target_save_keeps_first_as_active_and_reports_so() {
     let dir = tempfile::tempdir().unwrap();
-    let token = synthetic_hcloud_token();
+    let token = synthetic_hetzner_token();
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
@@ -527,7 +529,7 @@ fn target_alias_t_subcommand_resolves_to_target() {
             "--provider",
             "hetzner-cloud",
             "--token",
-            &synthetic_hcloud_token(),
+            &synthetic_hetzner_token(),
         ])
         .assert()
         .success();

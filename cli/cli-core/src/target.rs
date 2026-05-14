@@ -89,11 +89,20 @@ pub fn default_config_root() -> Result<PathBuf> {
         })
 }
 
-/// Validate a Hetzner Cloud API token's surface format —
-/// `^hcloud_[a-zA-Z0-9]{60,}$` per `cli-dx-task.md` §11. Cheap
-/// pre-flight before the real `GET /v1/locations` ping in Track
-/// A.4; here it just catches typos and obviously-wrong values
-/// (e.g. user pasted the AWS access key by mistake).
+/// Validate a Hetzner Cloud API token's surface format. Cheap
+/// pre-flight before the real `GET /v1/locations` ping that
+/// arrives in Track A.4 — here we only catch obvious typos and
+/// wrong-credential-pasted-into-wrong-field mistakes (e.g. AWS
+/// access key landed in `--token`).
+///
+/// **Format.** Hetzner Cloud tokens copied from the Cloud Console
+/// → Security → API Tokens panel are 64 ASCII alphanumeric
+/// characters with no fixed prefix. The `HCLOUD_TOKEN` env var
+/// name is a Hetzner convention; the value inside it is just the
+/// bare 64 chars. `cli-dx-task.md` §11 originally documented an
+/// `hcloud_` prefix that doesn't exist in practice — the spec was
+/// amended in v0.1.74 to match reality, and the v0.1.73 validator
+/// that rejected real tokens has been replaced with this one.
 ///
 /// Returns `Ok(())` on success or a humane string the caller wraps
 /// into a `CliError::Other` with surrounding context. We keep the
@@ -102,18 +111,16 @@ pub fn default_config_root() -> Result<PathBuf> {
 /// best how to phrase the surrounding error ("invalid token for
 /// --token flag" vs. "invalid token in credentials.yaml").
 pub fn validate_hetzner_token_format(token: &str) -> std::result::Result<(), String> {
-    let stripped = token
-        .strip_prefix("hcloud_")
-        .ok_or_else(|| "Hetzner Cloud tokens must start with `hcloud_`".to_string())?;
-    if stripped.len() < 60 {
+    const EXPECTED_LEN: usize = 64;
+    if token.len() != EXPECTED_LEN {
         return Err(format!(
-            "Hetzner Cloud tokens have at least 64 chars total (60+ after `hcloud_`); got {} chars after the prefix",
-            stripped.len()
+            "Hetzner Cloud tokens are {EXPECTED_LEN} ASCII alphanumeric characters; got {}",
+            token.len()
         ));
     }
-    if !stripped.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if !token.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(
-            "Hetzner Cloud tokens are alphanumeric ASCII after `hcloud_` — found a non-[A-Za-z0-9] character"
+            "Hetzner Cloud tokens are ASCII alphanumeric — found a non-[A-Za-z0-9] character (whitespace? a dash? something pasted with surrounding quotes?)"
                 .to_string(),
         );
     }
@@ -801,34 +808,51 @@ mod tests {
 
     #[test]
     fn validate_hetzner_token_format_accepts_canonical_64_char_token() {
-        // 7 chars prefix + 60 chars body = 67 total (above the
-        // documented 64-char minimum, well within the typical Hetzner
-        // 64-char token shape).
-        let body = "a".repeat(60);
-        let token = format!("hcloud_{body}");
+        // Canonical Hetzner Cloud Console token shape: 64 ASCII
+        // alphanumeric, no prefix. Without this case passing the
+        // CLI rejected every real-world token (v0.1.74 regression
+        // fix — v0.1.73 had wrongly required an `hcloud_` prefix
+        // that Hetzner doesn't actually issue).
+        let token = "a".repeat(64);
         assert!(validate_hetzner_token_format(&token).is_ok(), "{token}");
     }
 
     #[test]
-    fn validate_hetzner_token_format_rejects_missing_prefix() {
-        let body = "a".repeat(60);
-        let err = validate_hetzner_token_format(&body).expect_err("missing prefix");
-        assert!(err.contains("must start with `hcloud_`"), "{err}");
+    fn validate_hetzner_token_format_rejects_wrong_length() {
+        // Strict equality on length — 63 / 65 / way-too-short /
+        // way-too-long all fail with the same canonical "are 64
+        // chars" error message.
+        for len in [5usize, 63, 65, 200] {
+            let token = "a".repeat(len);
+            let err = validate_hetzner_token_format(&token).expect_err("wrong length must fail");
+            assert!(err.contains("64"), "len={len}: {err}");
+        }
     }
 
     #[test]
-    fn validate_hetzner_token_format_rejects_too_short() {
-        let err = validate_hetzner_token_format("hcloud_short").expect_err("too short");
-        assert!(err.contains("at least 64 chars"), "{err}");
-    }
-
-    #[test]
-    fn validate_hetzner_token_format_rejects_non_ascii_alphanumeric() {
-        // Padding past the length threshold so the length check
-        // doesn't short-circuit before the alphanumeric check fires.
-        let body = "a".repeat(60);
-        let token = format!("hcloud_{body}-with-dash");
+    fn validate_hetzner_token_format_rejects_non_alphanumeric_at_correct_length() {
+        // 63 'a' + '-' = 64 chars; length check passes, alphanumeric
+        // branch fires.
+        let body = "a".repeat(63);
+        let token = format!("{body}-");
+        assert_eq!(token.len(), 64);
         let err = validate_hetzner_token_format(&token).expect_err("dash is non-alphanumeric");
+        assert!(err.contains("alphanumeric"), "{err}");
+    }
+
+    #[test]
+    fn validate_hetzner_token_format_rejects_underscore_at_correct_length() {
+        // Regression-guard for v0.1.74. v0.1.73 wrongly required an
+        // `hcloud_` prefix; this test pins the strict alphanumeric
+        // rule so that "let's accept underscores" can't sneak in
+        // silently. Hetzner's real tokens have no underscores. The
+        // string here is exactly 64 chars so the length check passes
+        // and the alphanumeric branch is what fires.
+        let body = "a".repeat(57);
+        let token = format!("hcloud_{body}");
+        assert_eq!(token.len(), 64);
+        let err =
+            validate_hetzner_token_format(&token).expect_err("underscore is non-alphanumeric");
         assert!(err.contains("alphanumeric"), "{err}");
     }
 

@@ -3247,4 +3247,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | 1.4 AUDIT (Cilium dual-stack) — explicit `ipv4.enabled: true` + `ipv6.enabled: true` в Helm values (ADR 0017); `e2e/mvp.sh` Phase 6.4 — pod-level v4+v6 podIPs assertion; v0.1.71 | initial |
 | 2026-05-14 | M1.5 Track A.2 — `cli-core::target` module: types (GlobalConfig/TargetConfig/TargetCredentials/Target/TargetStorePaths) + atomic load/save IO + 0600 enforcement + `<redacted>` Debug; +16 unit tests; v0.1.72 | initial |
 | 2026-05-14 | M1.5 Track A.3 — `apprafter target add` (+`t` alias) non-interactive: validators, `--force`/`--renew`, first-target auto-active, env-override `APPRAFTER_CONFIG_DIR`; +33 tests; v0.1.73 | initial |
+| 2026-05-14 | v0.1.73 hotfix — `validate_hetzner_token_format` теперь exactly 64 ASCII alphanumeric (без `hcloud_` префикса — v0.1.73 ложно его требовал, реальные Hetzner токены префикса не имеют); cli-dx-task.md §11 amended; +регрессия-guard на underscore-at-correct-length; v0.1.74 | initial |
 

@@ -362,10 +362,14 @@ mod tests {
 
     #[test]
     fn require_token_validates_hetzner_format() {
-        let good = "a".repeat(60);
-        let token = format!("hcloud_{good}");
+        // Canonical 64-char alphanumeric, no prefix — what Hetzner
+        // Cloud Console actually issues.
+        let token = "a".repeat(64);
         assert!(require_token("hetzner-cloud", Some(&token)).is_ok());
 
+        // Underscore is non-alphanumeric → rejected. Pinning this
+        // case to make sure the v0.1.73 regression (which required
+        // an `hcloud_` prefix) never sneaks back.
         let bad = require_token("hetzner-cloud", Some("not_a_token")).expect_err("bad token");
         match bad {
             CliError::Other(msg) => assert!(msg.contains("invalid Hetzner Cloud token"), "{msg}"),

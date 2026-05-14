@@ -215,8 +215,8 @@ In non-interactive mode: missing required flags → error with miette diagnostic
 
 **Validation steps (both modes):**
 
-1. **Token format check** — regex per provider:
-    - Hetzner: `^hcloud_[a-zA-Z0-9]{60,}$`
+1. **Token format check** — per provider:
+    - Hetzner Cloud: exactly 64 ASCII alphanumeric characters, no prefix. The token is what the Hetzner Cloud Console → Security → API Tokens panel emits when you click "Create API token"; the surrounding env var name `HCLOUD_TOKEN` is convention but does not appear inside the value. (Spec amended in v0.1.74 after v0.1.73 wrongly required an `hcloud_` prefix that Hetzner never issued.)
     - Future providers: their own patterns
 2. **SSH key existence and readability**
 3. **API ping** — verify token works against provider API:
@@ -560,7 +560,7 @@ For now, only Hetzner Cloud is implemented, but the validation framework should 
 
 | Field | Validation |
 |---|---|
-| Token | Regex `^hcloud_[a-zA-Z0-9]{60,}$`; API ping to `GET /v1/locations` |
+| Token | Exactly 64 ASCII alphanumeric chars, no prefix; API ping to `GET /v1/locations` |
 | SSH key | File exists, readable, valid OpenSSH public key format |
 | Region | Must be in `["nbg1", "fsn1", "hel1", "ash", "hil", "sin"]` (from API) |
 | Server type | Must be in API's available types list |
