@@ -3,6 +3,7 @@
 
 pub mod apply;
 pub mod argocd_password;
+pub mod auth;
 pub mod cluster_bootstrap;
 pub mod destroy;
 pub mod hcloud;
@@ -15,3 +16,4 @@ pub mod status;
 pub mod target;
 pub mod target_wizard;
 pub mod upgrade_tier;
+pub mod whoami;

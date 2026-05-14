@@ -1133,9 +1133,59 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.6 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.6 `apprafter whoami` + `auth` stubs ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.5). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → **`whoami` + `auth` stubs (1.66A.6)** → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.80 — sub-phase 1.66A.6 shipped: top-level `apprafter whoami` (identity + active target + verified status) + hidden `apprafter auth login/logout/status` stubs (per spec §3.1 reserved namespace для Managed AppRafter Cloud).
+
+**Source:** `cli-dx-task.md` §5.7 (auth stubs) + §5.8 (whoami) + §3.1 (two-layer identity/target model) + §17 row 6.
+
+**Поставка:**
+- [x] `apprafter whoami` — новая top-level команда с одним флагом `--no-ping` (+ env `APPRAFTER_NO_PING` через `BoolishValueParser`). Рендер:
+    - `Identity:     anonymous (self-hosted mode)` — placeholder до Track A.10+ когда Managed Cloud auth wires in.
+    - `Target:       <name> (active)` или onboarding hint на empty store.
+    - `Provider:     hetzner-cloud (<verification status>)` — статус: `verified ✓` / `verified ✓` skipped (если `--no-ping`) / `verification failed ✗ — token rejected (HTTP 401). Run \`apprafter target add <name> --renew\` ...` / `... HTTP <N> from provider API` / `... provider unreachable (network?)`. **Failed ping НЕ валит whoami** — операторы на flaky network'е получают остальную инфо.
+    - `Region:`, `Default tier:`, `Cluster name:`, `SSH key:` (с маркером `(loaded)` если файл существует, `(missing!)` если path в config'е есть но файла нет на диске, `not set` если не задан). `~/...` tilde-abbreviation через локальный `abbreviate_home` (3 строки, без cross-module surface).
+- [x] `apprafter auth login/logout/status` — три hidden stub'а per spec §5.7. `Commands::Auth` помечен `#[command(hide = true)]` → не появляется в `apprafter --help` (не загромождает new-user discovery surface). Под-команды реальны (`apprafter auth --help` работает): `login` и `logout` печатают friendly redirect "AppRafter Cloud is not yet available... apprafter target add"; `status` — "self-hosted mode active. Use `apprafter whoami`...". Все три имеют ссылку на `https://apprafter.dev`. `AuthCommand` enum — реальный Subcommand (не stub-string), чтобы future Managed impl заполнял ветки без CLI surface re-shape.
+- [x] `cli/platform-cli/src/commands/whoami.rs` (~150 LOC + 5 unit-тестов): pure `verified_status(target, no_ping)` + `ssh_key_status(opt)` + `abbreviate_home(p)` helpers; orchestrator `run(no_ping)`. Best-effort ping → не валит whoami.
+- [x] `cli/platform-cli/src/commands/auth.rs` (~60 LOC): три `run_X` функции через shared `print_redirect` helper.
+- [x] `cli/platform-cli/src/cli.rs`: `Commands::Whoami { no_ping }` + `Commands::Auth { #[command(hide = true)] action: AuthCommand }` + `AuthCommand { Login, Logout, Status }`.
+- [x] `cli/platform-cli/src/main.rs`: dispatch обеих новых веток.
+
+**Тесты:** 10 integration в `whoami_auth_test.rs` + 5 unit в `whoami.rs`:
+- `whoami_on_empty_store_prints_onboarding_hint`
+- `whoami_with_active_target_renders_summary_and_honours_no_ping` — пинит что синтетический токен **никогда** не появляется в stdout (regression-guard на leak).
+- `whoami_with_real_ping_reports_verified_on_mockito_200`
+- `whoami_with_real_ping_reports_failure_hint_on_mockito_401` — проверяет что 401 не валит exit code + содержит `--renew` hint.
+- `whoami_with_real_ping_reports_failure_when_provider_unreachable` — closed-port path.
+- `auth_login_prints_friendly_redirect_to_target_add`
+- `auth_logout_prints_friendly_redirect_with_nothing_to_logout_phrasing`
+- `auth_status_explains_self_hosted_mode_and_points_at_whoami`
+- `auth_group_is_hidden_from_top_level_help` — `apprafter --help` НЕ содержит `auth`.
+- `auth_subcommand_help_is_still_reachable` — `apprafter auth --help` работает (hide ≠ delete).
+- 5 unit: `verified_status` × 2 (no_ping + no_token), `ssh_key_status` × 3 (loaded / missing / not-set).
+
+**Acceptance:**
+- ✅ `apprafter whoami` на TTY/CI без active target → onboarding hint + Identity-line.
+- ✅ С active target — рендер всех полей + verified status (или skip с `--no-ping`).
+- ✅ Token никогда не leak'ится в stdout.
+- ✅ `apprafter auth login/logout/status` печатают friendly redirect + Managed-roadmap URL.
+- ✅ `apprafter --help` не показывает `auth`; `apprafter auth --help` показывает все три subcommand'а.
+- ✅ `cargo test --workspace`: 36 (target_test без изменений) + 10 (whoami_auth_test новый) + 120 (cli-providers без изменений) — 0 failures. fmt + clippy + SPDX (155 files) — clean.
+
+**Out-of-scope (отложено):**
+- "Account" / "Last used" / "Cluster: provisioned/not" в whoami — нужны (a) Hetzner endpoint которого нет публично, (b) per-target state cache wire-up через A.8, (c) telemetry on operational commands. Закроется когда A.8 land'нет state-per-target.
+- Real AppRafter Cloud auth — Managed offering, далеко за пределами M1.5.
+- ADR `docs/adr/0014-cli-command-structure.md` про резервирование `auth` namespace + resource-first grouping — Track A.12 (final docs+ADR pass).
+
+**Зависит от:** 1.66A.5 ✅ (target store + load_target).
+
+**Размер:** S (один цикл, ~0.5 рабочего дня).
+
+---
+
+### 1.66A.7 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.6). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → **`doctor` (1.66A.7)** → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3412,4 +3462,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | v0.1.76 wizard polish — workspace `Cargo.toml` version-bump policy (CLAUDE.md addendum, bumped 0.1.2 → 0.1.77); wizard fires on ANY TTY (drops "all-required" short-circuit) so optional fields get prompted; HCLOUD_TOKEN-from-env notification; SSH-key `Select` из `~/.ssh/*.pub` + algo/comment label; parallel region-latency probe (`<region>-speed.hetzner.com:443`) with sort + ms display; +10 tests; v0.1.77 | initial |
 | 2026-05-14 | v0.1.77 wizard polish #2 — `prompt_name` silent on prefill (consistency with other prompts); `ℹ <Field>: <value> (from <source>)` для всех prefilled wizard-полей (name/provider/ssh-key/region/tier — token уже имел); `run_renew` rejects identical-token with hint to generate new in Cloud Console; +3 tests; v0.1.78 | initial |
 | 2026-05-14 | M1.5 Track A.5 — target CRUD: `target list` (tabled-таблица с `*` маркером) + `target use` (свитч active) + `target show` (детали; токен masked как `set (N chars)`) + `target rename` (атомарно с auto-update active pointer) + `target remove` (`--yes` opt-in или interactive Confirm; active → reassign alphabetically); `cli_core::target::rename_target` API; +21 tests; v0.1.79 | initial |
+| 2026-05-14 | M1.5 Track A.6 — `apprafter whoami` (identity + active target + best-effort verified status; failed ping не валит exit) + hidden `apprafter auth login/logout/status` stubs (friendly redirect на `target add` + ссылка на Managed roadmap); +15 tests; v0.1.80 | initial |
 

@@ -16,6 +16,8 @@ fn main() -> color_eyre::Result<()> {
     let args = Cli::parse();
     match args.command {
         Commands::Target { action } => commands::target::run(action)?,
+        Commands::Whoami { no_ping } => commands::whoami::run(no_ping)?,
+        Commands::Auth { action } => commands::auth::run(action)?,
         Commands::Init {
             provider,
             tier,

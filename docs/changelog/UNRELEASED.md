@@ -13,6 +13,109 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.80 — M1.5 Track A.6 — whoami + auth stubs (2026-05-14)
+
+Sixth Track A slice. `apprafter whoami` is the new "what shell am
+I in?" one-shot command — identity + active target + verified
+status of the active target's token, all in seven lines of
+human-scannable output. `apprafter auth login/logout/status` are
+hidden stubs reserving the namespace for AppRafter Cloud
+(Managed) without crowding the new-user discovery surface.
+
+### Added
+
+- **`apprafter whoami`** top-level command, single flag
+  `--no-ping` (+ env `APPRAFTER_NO_PING`). Renders:
+    ```
+    Identity:     anonymous (self-hosted mode)
+    Target:       <name> (active)
+    Provider:     hetzner-cloud (verified ✓)
+    Region:       <region or "not set">
+    Default tier: <tier or "not set">
+    Cluster name: <name or "not set">
+    SSH key:      ~/.ssh/<key>.pub (loaded | missing! | not set)
+    ```
+  Verified status comes from `HetznerCloudValidator::
+  validate_credentials()` — same probe as `target add`'s ping.
+  Failure modes degrade gracefully (no exit-1 on a flaky network):
+    - 401 → `verification failed ✗ — token rejected (HTTP 401).
+      Run \`apprafter target add <name> --renew\` to rotate.`
+    - Other HTTP → `verification failed ✗ — HTTP <N> from
+      provider API`
+    - Transport → `verification failed ✗ — provider unreachable
+      (network?)`
+  Empty store path prints an onboarding hint pointing at
+  `apprafter target add`.
+
+- **`apprafter auth login / logout / status`** hidden stubs.
+  `Commands::Auth` carries `#[command(hide = true)]` so it
+  doesn't appear in `apprafter --help`, but `apprafter auth
+  --help` still works for the intentionally-curious. Each
+  subcommand prints a friendly redirect:
+    - `login` / `logout`: "AppRafter Cloud is not yet available
+      ... For self-hosted use, configure a deployment target
+      instead: `apprafter target add`. Track managed
+      availability at: https://apprafter.dev"
+    - `status`: "AppRafter Cloud authentication: not available
+      yet. Self-hosted mode active. Use `apprafter whoami`...".
+
+  `AuthCommand` is a real `Subcommand` enum (not stub strings)
+  so the future Managed implementation can fill in each handler
+  without reshaping the CLI surface.
+
+### Tests
+
+- 5 unit tests in `commands::whoami`:
+    - `verified_status_honours_no_ping_flag_without_hitting_network`
+    - `verified_status_reports_no_token_path_when_credentials_empty`
+    - `ssh_key_status_shows_loaded_for_existing_path`
+    - `ssh_key_status_flags_missing_path_loudly`
+    - `ssh_key_status_returns_not_set_for_none`
+- 10 integration tests in `whoami_auth_test.rs`:
+    - `whoami_on_empty_store_prints_onboarding_hint`
+    - `whoami_with_active_target_renders_summary_and_honours_no_ping`
+      — also pins that the synthetic token never appears in
+      stdout (regression-guard on leakage).
+    - `whoami_with_real_ping_reports_verified_on_mockito_200`
+    - `whoami_with_real_ping_reports_failure_hint_on_mockito_401`
+      — 401 path; pin that whoami exit code stays 0 + the
+      error message includes `--renew` hint.
+    - `whoami_with_real_ping_reports_failure_when_provider_unreachable`
+      — closed-port branch.
+    - `auth_login_prints_friendly_redirect_to_target_add`
+    - `auth_logout_prints_friendly_redirect_with_nothing_to_logout_phrasing`
+    - `auth_status_explains_self_hosted_mode_and_points_at_whoami`
+    - `auth_group_is_hidden_from_top_level_help` — pins
+      `apprafter --help` does NOT contain `auth`.
+    - `auth_subcommand_help_is_still_reachable` — pins
+      `apprafter auth --help` lists `login`/`logout`/`status`
+      (hide ≠ remove).
+
+### Out of scope (deferred)
+
+- "Account: name@example.com / project: default" — Hetzner
+  Cloud doesn't expose an account-info endpoint publicly. Skip
+  until upstream changes.
+- "Last used: N hours ago" — needs telemetry from operational
+  commands (apply / cluster-bootstrap / kubeconfig) writing to
+  the target's state cache. Lands with Track A.8 (resolution
+  chain plumbing).
+- "Cluster: provisioned (server_id …)" — needs the
+  per-target state cache wired into `cli-state`. Also A.8.
+- Real AppRafter Cloud auth handlers — Managed offering,
+  far beyond M1.5.
+- ADR `docs/adr/0014-cli-command-structure.md` documenting the
+  `auth` namespace reservation + resource-first grouping
+  decision — Track A.12 final docs + ADR pass.
+
+### Operator note
+
+`apprafter whoami` is a useful prompt-prefix command — drop it
+in your shell `precmd` or a script's startup banner to confirm
+which target's credentials your next command will use. The
+`--no-ping` opt-out + the `APPRAFTER_NO_PING` env var make it
+safe in tight shell loops or air-gapped contexts.
+
 ## v0.1.79 — M1.5 Track A.5 — target CRUD commands (2026-05-14)
 
 Fifth Track A slice. Five new subcommands on top of the existing

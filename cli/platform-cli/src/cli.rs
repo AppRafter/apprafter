@@ -27,6 +27,31 @@ pub enum Commands {
         #[command(subcommand)]
         action: TargetCommand,
     },
+    /// One-line summary of the operator's current shell context:
+    /// identity + active target + provider-verified status + key
+    /// config fields. Pings the provider API by default; pass
+    /// `--no-ping` to skip the network round-trip.
+    Whoami {
+        /// Skip the Hetzner Cloud API ping that confirms the
+        /// active target's token still authenticates. Honours
+        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics.
+        #[arg(
+            long = "no-ping",
+            env = "APPRAFTER_NO_PING",
+            default_value_t = false,
+            value_parser = BoolishValueParser::new(),
+        )]
+        no_ping: bool,
+    },
+    /// Reserved for AppRafter Cloud (Managed) authentication. Not
+    /// available yet — subcommands print a friendly redirect to
+    /// `apprafter target add`. Hidden from `--help` until Managed
+    /// lands so it doesn't crowd the new-user discovery surface.
+    #[command(hide = true)]
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommand,
+    },
     /// Bootstrap a fresh cluster on the given provider/tier.
     Init {
         /// Infrastructure provider identifier.
@@ -210,4 +235,22 @@ pub enum TargetCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+}
+
+/// `apprafter auth …` subcommands. All currently print the same
+/// friendly redirect to `apprafter target add` (AppRafter Cloud
+/// is not yet available). Kept as a `Subcommand` enum from day
+/// one so the future Managed implementation can fill them in
+/// without reshaping the CLI surface.
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Authenticate to AppRafter Cloud (Managed). Stub until the
+    /// Managed offering lands; today prints the self-hosted
+    /// redirect.
+    Login,
+    /// Sign out of AppRafter Cloud (Managed). Stub.
+    Logout,
+    /// Report current AppRafter Cloud (Managed) authentication
+    /// status. Stub.
+    Status,
 }
