@@ -190,16 +190,31 @@ fallback. If you still see this on v0.1.83+, your store's
 `config.yaml` for the active target is missing the `provider`
 field — fix by hand or recreate the target.
 
-### Phase 2 of `bootstrap-all` always takes ~1 minute
+### Phase 2 of `bootstrap-all` (`k3s-ready`) takes longer than expected
 
-Tracked in plan.md (Track A.9 backlog). Hetzner cloud-init takes
-90–180 s; the first SSH attempt blocks on the kernel's TCP
-connect timeout (~30 s) until sshd is up. With the current
-`KUBECONFIG_POLL_INTERVAL = 10 s`, the typical run hits
-30 + 10 + 10 ≈ 50–60 s before attempt 3 succeeds.
+The `k3s-ready` phase is **waiting for cloud-init + k3s on the
+new node**, not the kubeconfig fetch itself — that's why the
+phase was renamed from `kubeconfig` to `k3s-ready` in v0.1.91.
+Typical duration on Hetzner `cpx22` + Ubuntu 24.04 is 20–40 s,
+of which the trailing 1–2 s is the actual SCP. Pre-v0.1.91 the
+phase consistently stabilised at ~60 s because the first SSH
+attempt blocked on the kernel's default TCP connect timeout
+(~30 s) while sshd was still coming up; v0.1.91 added
+`ConnectTimeout=5` to the SSH wrapper so the retry loop's
+10-second sleep absorbs the wait instead.
 
-Not a bug; will be reduced when the SSH wrapper learns to pass
-`-o ConnectTimeout=5`.
+If you see `> 60 s` consistently on `k3s-ready`:
+
+- Re-run with `RUST_LOG=debug,kubeconfig=trace apprafter up` to
+  see each attempt's error message. The most common failure is
+  `cat: /etc/rancher/k3s/k3s.yaml: No such file` — that means
+  SSH works but k3s hasn't written the file yet; just wait.
+- Confirm the Hetzner Cloud Firewall has port 22 open
+  (`apprafter doctor` sanity-checks DNS + reachability, not
+  port-level connectivity).
+- Try `apprafter kubeconfig --refresh` once the cluster reports
+  ready in the Hetzner Cloud Console (the Web Console gives you
+  out-of-band access to the boot log).
 
 ### Token rotation accepted silently with the same value
 

@@ -95,6 +95,21 @@ impl SshKubeconfigFetcher {
             .arg("BatchMode=yes")
             .arg("-o")
             .arg("IdentitiesOnly=yes")
+            // ConnectTimeout=5: when cloud-init is still bringing
+            // sshd up, the port is closed and the kernel's default
+            // TCP connect timeout is ~30 seconds. That makes the
+            // first kubeconfig-poll attempt block for ~30 s before
+            // returning `Connection refused`, which is the
+            // dominant reason Phase 2 of `bootstrap-all` stabilises
+            // around 60 s on Hetzner cpx22 + Ubuntu 24.04. Capping
+            // ConnectTimeout at 5 s lets the retry loop's
+            // 10-second sleep do the waiting instead — typical
+            // Phase 2 drops from ~60 s to ~20–30 s, attempt
+            // counter ticks up evenly, and the operator sees the
+            // spinner make progress within the first 5 seconds
+            // instead of "frozen" for half a minute.
+            .arg("-o")
+            .arg("ConnectTimeout=5")
             .arg("-i")
             .arg(&self.identity_path)
             .arg(format!("root@{host}"))
@@ -197,6 +212,25 @@ clusters:\n\
                 .iter()
                 .any(|a| a.contains("/etc/rancher/k3s/k3s.yaml")),
             "{argv_str:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_fetcher_caps_connect_timeout_at_five_seconds() {
+        // Pins the v0.1.91 fix: without ConnectTimeout=5 the
+        // first poll attempt after `apply` blocks ~30s on the
+        // kernel's TCP connect retry while cloud-init is still
+        // bringing sshd up. 5s lets the loop's 10s sleep absorb
+        // the wait instead.
+        let f = SshKubeconfigFetcher::new("/tmp/key", "/tmp/.apprafter/known_hosts");
+        let cmd = f.build_command("198.51.100.5");
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            argv.iter().any(|a| a == "ConnectTimeout=5"),
+            "ssh must cap the TCP connect timeout at 5s so the kubeconfig poll loop doesn't block on the kernel's default ~30s retry while cloud-init is still bringing sshd up.\n{argv:?}"
         );
     }
 

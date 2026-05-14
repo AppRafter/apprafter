@@ -1525,13 +1525,15 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### Track A backlog (отложено в follow-up подфазы)
+### Track A backlog (закрыт в v0.1.91)
 
-Items surfaced during Track A walks и оставленные as concrete TODO для отдельной итерации between Track A closure и Track B opening:
+Originally items surfaced during Track A walks. Cleared:
 
-1. **Phase 2 polish (A.9c)** — `[2/3] kubeconfig` rename to `[2/3] k3s-ready` (label вводит в заблуждение: время — это cloud-init + k3s startup, не fetch'inг сам по себе) + short SSH `ConnectTimeout=5` (today attempt 1 блокирует ~30s на kernel TCP timeout пока cloud-init поднимает sshd). Combined fix падёт Phase 2 typical с ~60s до ~20-30s. Размер S.
+1. **Phase 2 polish (A.9c)** ✅ — v0.1.91 закрыл оба:
+    - SSH `ConnectTimeout=5` добавлен в `SshKubeconfigFetcher::build_command` — первая attempt fail'ится за 5s вместо ~30s на kernel TCP timeout. Typical Phase 2 на cpx22 + Ubuntu 24.04 падает с ~60s до ~20-40s.
+    - `[2/3] kubeconfig` rename → `[2/3] k3s-ready`: спиннер label, success line, failed() marker, dry-run plan, total summary breakdown — все consistent. Сообщение "waiting for cloud-init + k3s on the new node…" честно отражает что мы реально делаем. +1 regression test (`ssh_fetcher_caps_connect_timeout_at_five_seconds`); existing dry-run integration test обновлён под новый label. Docs (quickstart, troubleshooting, cli reference) тоже подтянуты.
 
-После закрытия Track A backlog или прямо сейчас открывается **Track B (M1.5 sub-phase 1.66 platform-stack rethink)** — главная архитектурная работа M1.5.
+После v0.1.91 открывается **Track B (M1.5 sub-phase 1.66 platform-stack rethink)** — главная архитектурная работа M1.5.
 
 ---
 
@@ -3819,4 +3821,5 @@ Items surfaced during Track A walks и оставленные as concrete TODO �
 | 2026-05-14 | M1.5 Track A.11 — semantic colors + subcommand aliases: new `cli_core::style` модуль поверх `owo-colors` (auto-honours `NO_COLOR` через `supports-colors` feature) с 6 хелперами (ok/warn/fail/info/dim/bold); colour applied на `bootstrap-all` phase markers (`→` cyan, `✓` green, `✗` red) + `doctor` glyphs (green ✓ / yellow ⚠ / red ✗); 6 новых subcommand aliases (`kubeconfig` ↔ `kc`, `cluster-bootstrap` ↔ `cb`, `bootstrap-all` ↔ `up`, `target list/show/remove` ↔ `ls`/`info`/`rm`), сохранён prior `target` ↔ `t` для chained `apprafter t ls`; +2 unit (style ANSI-strip under non-TTY) + 7 integration (alias subprocess routing включая chained `t ls`); v0.1.88 | initial |
 | 2026-05-14 | M1.5 Track A.11 walk-fix — после walk'а v0.1.88: `apprafter up --dry-run` оставался монохромным (я подкрасил только wet path); только `INFO` лейбл от tracing-subscriber'а светился зелёным. v0.1.89 покрыл dry-run plan: `bootstrap-all` heading + `Target:` label + active target name через `style::bold`; `(active)`/`(via --target override)` tag через `style::info` cyan; `[1/3]`/`[2/3]`/`[3/3]` phase numbers cyan (echoes wet path's `→`); `Provider:/Region:/Tier:/...` labels + `<unset — ...>` placeholders + bottom hint через `style::dim` чтобы defaults не отвлекали от реальных значений; script(1)-replay confirms ANSI bytes есть в TTY и отсутствуют под `NO_COLOR=1`; v0.1.89 | initial |
 | 2026-05-15 | M1.5 Track A.12 — docs + ADR (Track A closure): new ADR 0030 кодифицирует 4 Track A design decisions (target store, credential resolution chain, miette diagnostics, aliases+color); `docs/operator-guide/quickstart.md` переписан под post-Track-A flow (`target add` + `bootstrap-all` вместо env-var + `cargo run --bin apprafter -- init`); new `docs/operator-guide/target-store.md` (file layout + chain reference); new `docs/operator-guide/troubleshooting.md` (catalogue всех 11 diagnostic codes + worked cause-chain example); new `docs/reference/cli.md` (every subcommand + global env vars table + aliases reference); `docs/operator-guide/index.md` и `docs/reference/index.md` обновлены; `mkdocs.yml` nav expanded; Track A backlog (A.9c Phase 2 polish: SSH ConnectTimeout + label rename) explicitly tracked для follow-up; v0.1.90 — закрывает Track A | initial |
+| 2026-05-15 | M1.5 Track A.9c (Phase 2 polish backlog closure): `SshKubeconfigFetcher::build_command` добавляет `-o ConnectTimeout=5` так что первая kubeconfig-poll attempt fail'ится за 5s вместо kernel-default ~30s пока cloud-init поднимает sshd на новом cpx22; Phase 2 label rename `[2/3] kubeconfig` → `[2/3] k3s-ready` (старый label вводил в заблуждение — ~60s это cloud-init+k3s startup, не сам fetch) применён consistently: спиннер, success/failure markers, dry-run plan, total breakdown summary; spinner message теперь "waiting for cloud-init + k3s on the new node…"; docs (quickstart, troubleshooting, cli reference) обновлены synchronously; +1 regression test (`ssh_fetcher_caps_connect_timeout_at_five_seconds`); existing `bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls` integration test обновлён под `[2/3] k3s-ready`; typical Phase 2 на Hetzner cpx22 + Ubuntu 24.04 ожидаемо падает с ~60s до ~20-40s; v0.1.91 — закрывает весь Track A backlog | initial |
 

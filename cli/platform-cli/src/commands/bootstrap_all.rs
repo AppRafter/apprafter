@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 //! `apprafter bootstrap-all` — convenience wrapper that chains the
-//! three subcommands a fresh cluster needs (`apply` →
-//! kubeconfig-wait → `cluster-bootstrap`). Each phase still has
-//! its own subcommand for re-runs / partial recovery; this command
-//! exists so first-run users don't have to glue the loop themselves.
+//! three subcommands a fresh cluster needs (`apply` → wait for
+//! k3s to come up on the new node → `cluster-bootstrap`). Each
+//! phase still has its own subcommand for re-runs / partial
+//! recovery; this command exists so first-run users don't have to
+//! glue the loop themselves.
 //!
 //! UX layout (v0.1.85 rework): phases 1 and 3 invoke heavy
 //! subcommands that print verbose helm / kubectl output to
@@ -87,7 +88,7 @@ pub fn run(target_override: Option<&str>, dry_run: bool) -> Result<()> {
     );
 
     println!(
-        "bootstrap-all complete in {} (apply {} + kubeconfig {} + bootstrap {})",
+        "bootstrap-all complete in {} (apply {} + k3s-ready {} + bootstrap {})",
         format_elapsed(total_start.elapsed()),
         format_elapsed(p1),
         format_elapsed(p2),
@@ -112,18 +113,18 @@ fn failed(num: u8, name: &str, elapsed: Duration, err: CliError) -> CliError {
 fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} [2/3] kubeconfig   {wide_msg}")
+        ProgressStyle::with_template("{spinner:.cyan} [2/3] k3s-ready    {wide_msg}")
             .expect("static template"),
     );
     pb.enable_steady_tick(Duration::from_millis(120));
-    pb.set_message("waiting for k3s SSH to become reachable…");
+    pb.set_message("waiting for cloud-init + k3s on the new node…");
     let start = Instant::now();
     match wait_for_kubeconfig(target_override, &pb) {
         Ok(()) => {
             let elapsed = start.elapsed();
             pb.finish_and_clear();
             println!(
-                "{} [2/3] kubeconfig   ready in {}",
+                "{} [2/3] k3s-ready    done in {}",
                 style::ok("✓"),
                 format_elapsed(elapsed)
             );
@@ -132,7 +133,7 @@ fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
         Err(e) => {
             let elapsed = start.elapsed();
             pb.finish_and_clear();
-            Err(failed(2, "kubeconfig", elapsed, e))
+            Err(failed(2, "k3s-ready", elapsed, e))
         }
     }
 }
@@ -168,14 +169,16 @@ fn print_dry_run_plan(target_override: Option<&str>) -> Result<()> {
         style::dim("(server, network, firewall, SSH key, optional floating IPs)")
     );
     println!(
-        "  {} kubeconfig (poll)  — SSH-fetch /etc/rancher/k3s/k3s.yaml every {}s, up to {}s",
+        "  {} k3s-ready (poll)   — wait for cloud-init + k3s on the new node",
         style::info("[2/3]"),
-        KUBECONFIG_POLL_INTERVAL.as_secs(),
-        KUBECONFIG_POLL_TIMEOUT.as_secs(),
     );
     println!(
         "                              {}",
-        style::dim("(cache age-encrypted in state)")
+        style::dim(&format!(
+            "(SCP /etc/rancher/k3s/k3s.yaml every {}s, up to {}s; cache age-encrypted in state)",
+            KUBECONFIG_POLL_INTERVAL.as_secs(),
+            KUBECONFIG_POLL_TIMEOUT.as_secs(),
+        ))
     );
     println!(
         "  {} cluster-bootstrap  — install Cilium + Gateway API CRDs + Application CRD",

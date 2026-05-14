@@ -198,7 +198,7 @@ age-encrypted cache.
 ### `bootstrap-all` (alias: `up`)
 
 One-command convenience wrapper that chains `apply` →
-`kubeconfig` poll → `cluster-bootstrap` under a unified progress
+`k3s-ready` poll → `cluster-bootstrap` under a unified progress
 UX (cyan `→` phase markers, green `✓` completions, red `✗` on
 failure, per-phase elapsed timing).
 

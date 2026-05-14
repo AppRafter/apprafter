@@ -13,6 +13,134 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.91 — M1.5 Track A.9c — Phase 2 polish (backlog closure) (2026-05-15)
+
+Track A backlog cleanup. The v0.1.85 walk surfaced two related
+issues that v0.1.85's UX rework deliberately deferred to a
+follow-up: Phase 2 of `bootstrap-all` always stabilising at
+~60 s and the misleading `[2/3] kubeconfig` label. Both
+addressed here.
+
+### Changed
+
+- **`SshKubeconfigFetcher::build_command` adds
+  `-o ConnectTimeout=5`.** The first kubeconfig-poll attempt
+  after `apply` used to block ~30 s on the kernel's default TCP
+  connect retry while cloud-init was still bringing sshd up on
+  the new cpx22. Capping ConnectTimeout at 5 s lets the retry
+  loop's 10-second sleep do the waiting instead — typical
+  Phase 2 on Hetzner cpx22 + Ubuntu 24.04 drops from ~60 s to
+  ~20–40 s, the attempt counter ticks up evenly, and the
+  spinner moves within the first 5 seconds instead of "freezing"
+  for half a minute.
+
+- **Phase 2 label renamed `[2/3] kubeconfig` →
+  `[2/3] k3s-ready`** consistently across:
+  - the spinner template / prefix;
+  - the `✓` success line ("done in Ns");
+  - the `✗` failure marker ("FAILED after Ns");
+  - the dry-run plan;
+  - the final `bootstrap-all complete in T (apply X +
+    k3s-ready Y + bootstrap Z)` breakdown.
+
+  The old label suggested the wait was about fetching the
+  kubeconfig; in reality the ~60 s on a fresh cluster was
+  cloud-init + k3s startup, and the actual SCP at the tail
+  takes a second. The new label is what the operator should
+  read: "I'm waiting for k3s to be ready", with the kubeconfig
+  copy as the trailing side-effect.
+
+- **Spinner message rephrased** to "waiting for cloud-init +
+  k3s on the new node…" so even the in-progress text honestly
+  names what's happening between the attempts.
+
+- **Dry-run plan line** rewritten:
+  ```
+  [2/3] k3s-ready (poll)   — wait for cloud-init + k3s on the new node
+                              (SCP /etc/rancher/k3s/k3s.yaml every 10s, up to 300s;
+                               cache age-encrypted in state)
+  ```
+
+- **Docs** synced: `docs/operator-guide/quickstart.md` (Phase 2
+  description + duration expectation), `docs/operator-guide/troubleshooting.md`
+  (full rewrite of the "Phase 2 of bootstrap-all takes too long"
+  section — now references v0.1.91's `ConnectTimeout=5`, names
+  the new label, lists three actionable diagnostics for
+  remaining slowdowns), `docs/reference/cli.md` (`bootstrap-all`
+  blurb references `k3s-ready` instead of `kubeconfig`).
+
+### Tests
+
+- **+1 unit** in `cli_providers::hetzner_cloud::kubeconfig::tests`:
+  `ssh_fetcher_caps_connect_timeout_at_five_seconds` pins the
+  v0.1.91 SSH-arg change so a future refactor can't silently
+  drop the timeout flag.
+
+- **Existing integration test rewired**:
+  `bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls`
+  in `tests/bootstrap_all_test.rs` updated its assertion from
+  `[2/3] kubeconfig` to `[2/3] k3s-ready`.
+
+- Total: 565 (up from 564, +1 new).
+
+### Backwards compatibility
+
+- `apprafter kubeconfig` the SUBCOMMAND (and its `kc` alias) is
+  unchanged — the rename was for the bootstrap-all Phase 2
+  *label*, not the subcommand name. Operators scripting
+  `apprafter kubeconfig --refresh` keep working unchanged.
+- Diagnostic codes unchanged. The 11 stable
+  `apprafter::<area>::<reason>` codes catalogued in v0.1.86 are
+  unaffected.
+- `NO_COLOR=1` / piped output produce byte-identical output
+  modulo the literal `k3s-ready` substring replacing
+  `kubeconfig` in the affected lines.
+
+### Operator note
+
+A real-Hetzner Phase 2 trace after v0.1.91 typically looks like:
+
+```
+✓ [1/3] apply        done in 4s
+⠙ [2/3] k3s-ready    attempt 1 — fetching /etc/rancher/k3s/k3s.yaml over SSH…
+⠴ [2/3] k3s-ready    attempt 2 — k3s not ready yet (Connection refused); next retry in 10s
+⠧ [2/3] k3s-ready    attempt 3 — k3s not ready yet (No such file or directory); next retry in 10s
+✓ [2/3] k3s-ready    done in 30s
+```
+
+Three attempts at 5 + 10 + 5 + 10 + ~1 s ≈ 30 s — the attempts
+fail FAST now, the 10-second sleep is the dominant cost, and
+attempt 3 lands once `/etc/rancher/k3s/k3s.yaml` exists. Without
+v0.1.91 the same trace stretched to ~60 s because attempt 1
+alone spent ~30 s blocked on the TCP timeout.
+
+### Track A closure
+
+With v0.1.91 the entire Track A backlog is empty. Track A is
+fully closed — 13 sub-versions across 12 sub-phases plus the
+backlog cleanup:
+
+| Sub-phase  | Version  | Slice                                            |
+| ---------- | -------- | ------------------------------------------------ |
+| 1.66A.1    | v0.1.69  | Rename `platform-cli` → `apprafter` + shim       |
+| 1.66A.2    | v0.1.72  | Target file structure + IO module                |
+| 1.66A.3    | v0.1.73  | `target add` non-interactive                     |
+| 1.66A.4    | v0.1.74  | Provider validator framework + Hetzner ping      |
+| 1.66A.4b   | v0.1.76  | Interactive wizard via inquire                   |
+| 1.66A.5    | v0.1.79  | Target CRUD                                      |
+| 1.66A.6    | v0.1.80  | `whoami` + `auth` stubs                          |
+| 1.66A.7    | v0.1.81  | `doctor`                                         |
+| 1.66A.8    | v0.1.82–v0.1.83 | Wire `apply`/`destroy`/`import` to chain  |
+| 1.66A.9    | v0.1.84–v0.1.85 | `bootstrap-all` orchestrator              |
+| 1.66A.10   | v0.1.86–v0.1.87 | miette diagnostic refinement              |
+| 1.66A.11   | v0.1.88–v0.1.89 | Semantic colours + aliases                |
+| 1.66A.12   | v0.1.90  | Docs + ADR (Track A closure documentation)       |
+| **1.66A.9c** | **v0.1.91** | **Phase 2 polish — backlog cleanup**            |
+
+Next iteration opens **Track B (M1.5 sub-phase 1.66 platform-
+stack rethink)** — the architectural work this M1.5 milestone
+was named after.
+
 ## v0.1.90 — M1.5 Track A.12 — docs + ADR (Track A closure) (2026-05-15)
 
 Final Track A slice. After 11 sub-versions of CLI rework

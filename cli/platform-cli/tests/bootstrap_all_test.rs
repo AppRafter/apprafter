@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 //! Integration tests for `apprafter bootstrap-all`.
 //!
-//! The wet path (`apply` → `kubeconfig` poll → `cluster-bootstrap`)
+//! The wet path (`apply` → `k3s-ready` poll → `cluster-bootstrap`)
 //! is exercised by `e2e/mvp.sh` against a live Hetzner Cloud token;
 //! these tests cover the dry-run plan output and the clap surface
 //! contract.
@@ -33,7 +33,7 @@ fn bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls() {
         .success()
         .stdout(contains("DRY RUN"))
         .stdout(contains("[1/3] apply"))
-        .stdout(contains("[2/3] kubeconfig"))
+        .stdout(contains("[2/3] k3s-ready"))
         .stdout(contains("[3/3] cluster-bootstrap"))
         .stdout(contains("Phases:"));
 }

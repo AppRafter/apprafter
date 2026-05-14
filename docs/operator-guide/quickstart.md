@@ -89,9 +89,14 @@ This runs three phases under a unified progress UX:
    the CPX22 server, and a `#cloud-config` user-data block that
    installs fail2ban + k3s. ~30 s on the Hetzner side; cloud-init
    needs another 90–180 s after that.
-2. **`kubeconfig` (poll)** — retries `ssh root@<node> cat
-   /etc/rancher/k3s/k3s.yaml` every 10 s for up to 5 minutes, then
-   caches the result age-encrypted in `.apprafter/state.json`.
+2. **`k3s-ready` (poll)** — waits for cloud-init + k3s to finish
+   on the new node, then retrieves the kubeconfig.
+   Implementation: `ssh root@<node> cat /etc/rancher/k3s/k3s.yaml`
+   with `ConnectTimeout=5`, retried every 10 s for up to 5
+   minutes; the YAML lands age-encrypted in
+   `.apprafter/state.json`. Typical Phase-2 duration on Hetzner
+   `cpx22` + Ubuntu 24.04 is 20–40 s — most of it is the cluster
+   booting, not the kubeconfig copy.
 3. **`cluster-bootstrap`** — installs Cilium + Gateway API CRDs +
    the AppRafter Application CRD + default-deny NetworkPolicy +
    Argo CD + cert-manager + the self-signed ClusterIssuer +
