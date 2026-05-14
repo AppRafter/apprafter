@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use cli_core::manifest::{self, FirewallIngressRule, InfrastructureManifest};
-use cli_core::{CliError, Result};
+use cli_core::target::{default_config_root, TargetStorePaths};
+use cli_core::{resolve_hetzner_ssh_public_key, resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{
     build_k3s_user_data, FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient,
     HetznerCloudProvider, K3sBootstrapOptions, NetworkSpec, ServerSpec, SshKeySpec,
@@ -24,8 +25,8 @@ const DEFAULT_INGRESS_PORTS_TCP: &[&str] = &["22", "6443", "80", "443"];
 const DEFAULT_INGRESS_PORTS_UDP: &[&str] = &["51820"];
 const DEFAULT_INGRESS_SOURCES: &[&str] = &["0.0.0.0/0", "::/0"];
 
-pub fn run() -> Result<()> {
-    info!("apply invoked");
+pub fn run(target_override: Option<&str>) -> Result<()> {
+    info!(target_override, "apply invoked");
     let cwd = std::env::current_dir()?;
     let paths = StatePaths::for_root(&cwd);
     let mut state = State::load_or_default(&paths)?;
@@ -40,9 +41,14 @@ pub fn run() -> Result<()> {
         )));
     }
 
-    let token = std::env::var("HCLOUD_TOKEN").map_err(|_| {
-        CliError::Other("HCLOUD_TOKEN env var is required for hetzner-cloud apply".to_string())
-    })?;
+    // Resolution chain (cli-dx-task.md §7): --token flag (none
+    // wired on apply yet) → HCLOUD_TOKEN env → active target's
+    // credentials.yaml. `--target` (when supplied) overrides the
+    // active-pointer step. Backwards-compat is preserved — env-
+    // var-only workflows keep working without configuring a
+    // target.
+    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    let token = resolve_hetzner_token(None, &target_store, target_override)?;
 
     // Optional manifest path. If APPRAFTER_MANIFEST is set, parse
     // and overlay onto the v0.1.4 defaults; otherwise keep the
@@ -66,7 +72,7 @@ pub fn run() -> Result<()> {
         .unwrap_or_else(|| "nbg1".into());
 
     let server_spec = build_server_spec(manifest.as_ref(), &cluster, &region);
-    let ssh_keys = build_ssh_specs(manifest.as_ref(), &cluster);
+    let ssh_keys = build_ssh_specs(manifest.as_ref(), &cluster, &target_store, target_override)?;
     let networks = vec![build_network_spec(manifest.as_ref(), &cluster)];
     let firewalls = vec![build_firewall_spec(manifest.as_ref(), &cluster)];
     let floating_ips = build_floating_ip_specs(manifest.as_ref(), &cluster, &region);
@@ -110,9 +116,18 @@ fn build_server_spec(
     }
 }
 
-fn build_ssh_specs(manifest: Option<&InfrastructureManifest>, cluster: &str) -> Vec<SshKeySpec> {
+fn build_ssh_specs(
+    manifest: Option<&InfrastructureManifest>,
+    cluster: &str,
+    target_store: &TargetStorePaths,
+    target_override: Option<&str>,
+) -> Result<Vec<SshKeySpec>> {
+    // Highest priority: explicit `sshKeys` block in the
+    // Infrastructure manifest. Matches the pre-target-store
+    // behaviour — operator who hand-edited the manifest meant
+    // it.
     if let Some(blocks) = manifest.and_then(|m| m.spec.ssh_keys.as_ref()) {
-        return blocks
+        return Ok(blocks
             .iter()
             .enumerate()
             .map(|(i, b)| SshKeySpec {
@@ -122,18 +137,20 @@ fn build_ssh_specs(manifest: Option<&InfrastructureManifest>, cluster: &str) -> 
                     .unwrap_or_else(|| format!("{cluster}-key-{i}")),
                 public_key: b.public_key.clone(),
             })
-            .collect();
+            .collect());
     }
-    match std::env::var("APPRAFTER_SSH_PUBLIC_KEY") {
-        Ok(public_key) => {
-            info!(cluster = %cluster, "configuring SSH key from env");
-            vec![SshKeySpec {
-                name: format!("{cluster}-key"),
-                public_key,
-            }]
-        }
-        Err(_) => Vec::new(),
+    // Otherwise the credential resolver picks up
+    // APPRAFTER_SSH_PUBLIC_KEY env (legacy) or the active target's
+    // ssh_key_path (new). Both produce the SSH public key BODY
+    // string Hetzner expects.
+    if let Some(public_key) = resolve_hetzner_ssh_public_key(target_store, target_override)? {
+        info!(cluster = %cluster, "configuring SSH key from credentials resolver");
+        return Ok(vec![SshKeySpec {
+            name: format!("{cluster}-key"),
+            public_key,
+        }]);
     }
+    Ok(Vec::new())
 }
 
 fn build_network_spec(manifest: Option<&InfrastructureManifest>, cluster: &str) -> NetworkSpec {
@@ -343,6 +360,12 @@ mod tests {
         assert_eq!(s.location, "fsn1");
     }
 
+    fn empty_target_store() -> (tempfile::TempDir, TargetStorePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = TargetStorePaths::for_root(dir.path().to_path_buf());
+        (dir, paths)
+    }
+
     #[test]
     fn build_ssh_specs_returns_manifest_keys_with_default_names_when_unnamed() {
         let m = manifest_from(json!({
@@ -357,9 +380,11 @@ mod tests {
                 ]
             }
         }));
-        // Env override must NOT be consulted when manifest declares keys.
+        // Env override + target store must NOT be consulted when
+        // the manifest already declares keys.
         std::env::remove_var("APPRAFTER_SSH_PUBLIC_KEY");
-        let specs = build_ssh_specs(Some(&m), "cl");
+        let (_dir, paths) = empty_target_store();
+        let specs = build_ssh_specs(Some(&m), "cl", &paths, None).unwrap();
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].name, "cl-key-0");
         assert_eq!(specs[0].public_key, "ssh-ed25519 AAAA");
@@ -367,9 +392,12 @@ mod tests {
     }
 
     #[test]
-    fn build_ssh_specs_returns_empty_when_no_manifest_and_no_env() {
+    fn build_ssh_specs_returns_empty_when_no_manifest_no_env_no_target_store() {
         std::env::remove_var("APPRAFTER_SSH_PUBLIC_KEY");
-        assert!(build_ssh_specs(None, "cl").is_empty());
+        let (_dir, paths) = empty_target_store();
+        assert!(build_ssh_specs(None, "cl", &paths, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

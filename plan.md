@@ -1246,9 +1246,68 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.8 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.8 Wire `apply` / `destroy` / `import` в target resolution ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.7). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → **wire `init`/`apply`/`cluster-bootstrap` в target resolution (1.66A.8)** → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.82 — sub-phase 1.66A.8 shipped: credential resolution chain (`--flag > env > target store`) реально подключена к operational commands. После v0.1.82 — `apprafter target use prod && apprafter apply` без `HCLOUD_TOKEN=...` действительно работает.
+
+**Source:** `cli-dx-task.md` §5.10 + §7 + §17 row 8.
+
+**Поставка:**
+- [x] `cli/cli-core/src/credentials.rs` — новый модуль:
+    - `resolve_hetzner_token(cli_flag, paths, target_override) -> Result<String>` — implements 3-step chain. cli_flag (highest) > `HCLOUD_TOKEN` env > active target's credentials.yaml (или `--target <name>` override).
+    - `resolve_hetzner_ssh_public_key(paths, target_override) -> Result<Option<String>>` — analogous chain для SSH public key BODY. Env `APPRAFTER_SSH_PUBLIC_KEY` > target store path → read file.
+    - `read_ssh_public_key_body(path)` pure helper.
+    - Constants `HCLOUD_TOKEN_ENV` / `SSH_PUBLIC_KEY_ENV` для shared use.
+    - Error messages enumerate **все 3** пути (flag / env / `apprafter target add`) чтобы оператор сразу видел альтернативы.
+- [x] cli-core re-export через `pub use credentials::*`.
+- [x] `cli_core::TEST_ENV_MUTEX: pub(crate) static Mutex<()>` в `lib.rs` (cfg(test)-gated) — serialises env-touching unit tests across modules (target.rs + credentials.rs обе flip'ают HCLOUD_TOKEN / CONFIG_DIR_ENV, race без shared mutex).
+- [x] `commands/apply.rs::run(target_override: Option<&str>)` — заменил direct `env::var("HCLOUD_TOKEN")` на `resolve_hetzner_token(None, &target_store, target_override)`. `build_ssh_specs` теперь thread'ит target_store + target_override и вызывает `resolve_hetzner_ssh_public_key`; manifest `sshKeys` block по-прежнему wins (highest precedence на той ветке).
+- [x] `commands/destroy.rs::run(yes, target_override)` — analogous wiring. Empty-state early-exit моложе credential resolution чтобы `destroy --yes` в no-Hetzner-state директории не падал на missing-creds.
+- [x] `commands/import.rs::run(force, dry_run, target_override)` — analogous.
+- [x] `cli.rs` — новый `--target <name>` flag на `Apply` / `Destroy` / `Import`.
+- [x] `main.rs` dispatch обновлён.
+
+**Тесты (16 новых cli-core unit + 1 integration smoke):**
+- 16 в `cli_core::credentials::tests`:
+    - CLI flag wins over env + store
+    - env wins over store when no flag
+    - store fallback when flag + env absent
+    - `--target <name>` override picks named target not active
+    - error with 3-paths hint when nothing configured
+    - error when target exists but no token stored
+    - error with override for missing target surfaces "available" hint
+    - SSH key env wins over target path
+    - SSH key reads target path when env absent (with trim)
+    - SSH key returns None when nothing configured
+    - SSH key errors loudly on unreadable path
+- 1 в `tests/cli_smoke.rs` integration:
+    - `apply_target_flag_routes_resolution_at_named_target_and_surfaces_not_found` — seed target store с `real`, run `apply --target ghost` → typed error содержит `ghost`, `not found`, `real` (available hint).
+- 3 prior `apply_without_token_*` / `import_without_token_*` integration тесты обновлены: добавлен `APPRAFTER_CONFIG_DIR=<tempdir>` для изоляции от user's real `~/.config/apprafter/`; assertions enumerate новые "3-paths" error message tokens (`--token`, `HCLOUD_TOKEN`, `apprafter target add`).
+
+**Acceptance:**
+- ✅ `apprafter apply` без `HCLOUD_TOKEN` env читает токен из active target — главная цель Track A.
+- ✅ `--target <name>` override per-invocation, без switching active.
+- ✅ Existing CI scripts (`HCLOUD_TOKEN=... apprafter apply`) работают без изменений — backwards-compat preserved (env остаётся step 2 в chain).
+- ✅ Empty-store + no env + no flag → typed error с **всеми 3** путями выхода в сообщении.
+- ✅ Stale `--target <name>` → "did you mean..." hint via canonical TargetNotFound.
+- ✅ `cargo test --workspace`: 90 cli-core (+16 credentials) + 47 cli_smoke (+1 new integration, 3 prior updated) + 42 target_test + 10 whoami_auth_test + 6 doctor_test + ... — 0 failures.
+- ✅ fmt + clippy (-D warnings) + SPDX (160 files) clean.
+
+**Out-of-scope (отложено):**
+- `--token <X>` flag на `apply`/`destroy`/`import` (secrets в shell history — wait until A.10 miette pass решает UX).
+- Migration `<cwd>/.apprafter/state.json` → per-target `state/<name>/state.json` — отдельная iteration после bootstrap-all.
+- `kubeconfig` / `argocd-password` / `cluster-bootstrap` — не используют HCLOUD_TOKEN напрямую (работают на kubeconfig); скип.
+- `init` — не нужны creds (stub-like, write state.json only).
+
+**Зависит от:** 1.66A.5 ✅ (target store CRUD).
+
+**Размер:** M (один цикл, ~1.5 рабочих дня).
+
+---
+
+### 1.66A.9 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.8). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → resolution chain ✅ → **`bootstrap-all` orchestrator (1.66A.9)** → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3527,4 +3586,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.5 — target CRUD: `target list` (tabled-таблица с `*` маркером) + `target use` (свитч active) + `target show` (детали; токен masked как `set (N chars)`) + `target rename` (атомарно с auto-update active pointer) + `target remove` (`--yes` opt-in или interactive Confirm; active → reassign alphabetically); `cli_core::target::rename_target` API; +21 tests; v0.1.79 | initial |
 | 2026-05-14 | M1.5 Track A.6 — `apprafter whoami` (identity + active target + best-effort verified status; failed ping не валит exit) + hidden `apprafter auth login/logout/status` stubs (friendly redirect на `target add` + ссылка на Managed roadmap); +15 tests; v0.1.80 | initial |
 | 2026-05-14 | M1.5 Track A.7 — `apprafter doctor` (self-diagnostic): target checks (config readable, creds mode 0600, provider known, token format, token API-verified с latency, ssh-key readable) + env checks (kubectl/helm/ssh on PATH, DNS resolves api.hetzner.cloud); trichotomy PASS/WARN/FAIL → exit 1 на FAIL; +17 tests; v0.1.81 | initial |
+| 2026-05-14 | M1.5 Track A.8 — wire `apply`/`destroy`/`import` в credential resolution chain: new `cli_core::credentials` с `resolve_hetzner_token` + `resolve_hetzner_ssh_public_key` (`--flag > env > target store`), `--target <name>` flag на трёх operational commands, error messages enumerate все 3 пути; backwards-compat env-only workflows preserved; +17 tests; v0.1.82 | initial |
 

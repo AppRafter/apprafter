@@ -13,6 +13,137 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.82 — M1.5 Track A.8 — credential resolution chain (2026-05-14)
+
+Eighth Track A slice. The day-to-day goal of the M1.5 CLI work
+lands: `apprafter target use prod && apprafter apply` works
+without exporting `HCLOUD_TOKEN` first. Operational commands
+(`apply`, `destroy`, `import`) now thread their Hetzner Cloud
+credentials through the v0.1.73-+ target store as a fall-back
+under the existing env-var path. CI scripts that already export
+`HCLOUD_TOKEN` keep working unchanged — env stays step 2 in the
+chain.
+
+### Added
+
+- **`cli_core::credentials` module** with the
+  `cli-dx-task.md §7` resolution chain:
+    - `resolve_hetzner_token(cli_flag, paths, target_override)
+      -> Result<String>`
+        1. `cli_flag` — highest, for future `--token` flags.
+        2. `HCLOUD_TOKEN` env — pre-target-store CI flow.
+        3. Active target's `credentials.yaml` (or
+           `--target <name>` override).
+        4. Typed `CliError::Other` enumerating all three paths
+           when nothing is configured — no silent placeholder.
+    - `resolve_hetzner_ssh_public_key(paths, target_override)
+      -> Result<Option<String>>` — same shape but for the SSH
+      public key BODY (`APPRAFTER_SSH_PUBLIC_KEY` env > target
+      `ssh_key_path` → read file). Returns `Ok(None)` when no
+      key is configured anywhere; apply proceeds without one
+      (Hetzner falls back to a root password).
+    - `read_ssh_public_key_body(path)` pure helper exposed for
+      callers (e.g. `apprafter doctor`) that want the parse
+      without the full chain.
+    - Constants `HCLOUD_TOKEN_ENV` / `SSH_PUBLIC_KEY_ENV` so
+      every consumer references the same env-var name as
+      clap's `#[arg(env)]` annotations.
+
+- **`--target <name>` flag** on `apprafter apply`, `destroy`,
+  `import`. Per-invocation override of the active target —
+  useful for scripts that touch multiple targets without
+  toggling `target use`. When the override names a missing
+  target, the resolver surfaces the canonical
+  "target `X` not found (available: …)" hint.
+
+- **`cli_core::TEST_ENV_MUTEX`** (cfg(test)-gated `pub(crate)`
+  static `Mutex<()>`). Cargo runs unit tests in parallel and
+  the process-wide env-var space is a single resource — without
+  a shared lock, two tests in `target::tests` and
+  `credentials::tests` that flip `HCLOUD_TOKEN` /
+  `APPRAFTER_CONFIG_DIR` would race. The mutex serialises every
+  env-touching test in cli-core through one global gate.
+
+### Changed
+
+- **`commands::apply::run(target_override)`** drops direct
+  `env::var("HCLOUD_TOKEN")` reads in favour of the resolver.
+  `build_ssh_specs` now threads the target store + override
+  through and calls `resolve_hetzner_ssh_public_key`. The
+  manifest `sshKeys` block still wins on the precedence ladder
+  (operator hand-edited the manifest, they meant it).
+
+- **`commands::destroy::run(yes, target_override)`** —
+  analogous wiring. The empty-state early exit fires BEFORE
+  credential resolution so `destroy --yes` in a directory with
+  no Hetzner state reports "nothing to destroy" instead of a
+  credentials error.
+
+- **`commands::import::run(force, dry_run, target_override)`**
+  — analogous wiring.
+
+### Tests (17 new + 3 reworked)
+
+- 11 new unit tests in `cli_core::credentials::tests` covering
+  the full resolution matrix:
+    - flag wins / env wins / store falls back / `--target`
+      picks named-not-active / 3-paths error / no-token-stored
+      / missing-override / SSH env wins / SSH path read / SSH
+      none / SSH unreadable.
+  Each test uses the new shared `TEST_ENV_MUTEX` to keep env
+  changes serialised.
+- 1 new integration test in `tests/cli_smoke.rs`:
+  `apply_target_flag_routes_resolution_at_named_target_and_surfaces_not_found`
+  — seeds the target store, runs `apply --target ghost`, pins
+  the error message contains `ghost`, `not found`, and the
+  seeded target name as the "available" hint.
+- 3 prior `apply_without_token_*` / `import_without_token_*`
+  integration tests reworked: added `APPRAFTER_CONFIG_DIR`
+  isolation tempdir (otherwise the resolver successfully
+  falls back to the developer's real `~/.config/apprafter/`
+  target store and the test asserts the wrong thing), and
+  assertions now match the enriched error message that
+  enumerates all three credential paths.
+
+### Backwards compatibility
+
+- `HCLOUD_TOKEN=… apprafter apply` keeps working without any
+  changes (env is step 2 in the chain, above the target store).
+- `APPRAFTER_SSH_PUBLIC_KEY=…` env keeps working likewise.
+- Existing `init` + `state.json` flow is unaffected — the
+  resolution chain only intervenes at credential read time;
+  state location stays per-CWD until a future iteration
+  unifies state with the target store.
+
+### Out of scope (deferred)
+
+- `--token <X>` flag on `apply` / `destroy` / `import`. Secrets
+  on the shell command line land in history; we'll layer a
+  `--token-stdin` style alternative as part of Track A.10
+  (miette + UX hardening).
+- Migration of `<cwd>/.apprafter/state.json` into the target
+  store's `state/<name>/` tree — touched by Track A.9
+  (`bootstrap-all`) alongside the orchestration pass.
+- `kubeconfig` / `argocd-password` / `cluster-bootstrap` don't
+  consume the Hetzner token directly (they work against the
+  cluster's kubeconfig that was already cached during `apply`).
+  No resolver change needed.
+- `init` doesn't talk to any API; just writes state.json.
+
+### Operator note
+
+The new resolution lets you stop pasting `HCLOUD_TOKEN=… ` in
+front of every operational command:
+```
+apprafter target add prod --provider hetzner-cloud --token "$HCLOUD_TOKEN"
+apprafter target use prod
+apprafter init --provider hetzner-cloud --tier solo --region nbg1
+apprafter apply              # ← reads token from the target store
+apprafter destroy --yes      # ← same
+apprafter apply --target ci  # ← per-invocation override
+```
+The env var path keeps working unchanged for CI / scripts.
+
 ## v0.1.81 — M1.5 Track A.7 — apprafter doctor (2026-05-14)
 
 Seventh Track A slice. `apprafter doctor` walks the active

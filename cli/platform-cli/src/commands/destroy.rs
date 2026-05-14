@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 use std::collections::BTreeMap;
 
-use cli_core::{CliError, Result};
+use cli_core::target::{default_config_root, TargetStorePaths};
+use cli_core::{resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
 use cli_providers::Provider;
 use cli_state::{State, StatePaths};
@@ -9,8 +10,8 @@ use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
 
-pub fn run(yes: bool) -> Result<()> {
-    info!(yes, "destroy invoked");
+pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
+    info!(yes, target_override, "destroy invoked");
     let cwd = std::env::current_dir()?;
     let paths = StatePaths::for_root(&cwd);
     let mut state = State::load_or_default(&paths)?;
@@ -27,15 +28,18 @@ pub fn run(yes: bool) -> Result<()> {
         )));
     }
 
-    let Ok(token) = std::env::var("HCLOUD_TOKEN") else {
-        if yes && state.hetzner_cloud.is_none() {
-            println!("nothing to destroy: state has no Hetzner resources");
-            return Ok(());
-        }
-        return Err(CliError::Other(
-            "HCLOUD_TOKEN env var is required for hetzner-cloud destroy".to_string(),
-        ));
-    };
+    // Empty-state early exit before we even consult the resolver:
+    // an operator running `destroy --yes` in a no-Hetzner-state
+    // directory expects "nothing to do" rather than a credentials
+    // error.
+    if yes && state.hetzner_cloud.is_none() {
+        println!("nothing to destroy: state has no Hetzner resources");
+        return Ok(());
+    }
+
+    // Resolution chain (cli-dx-task.md §7).
+    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    let token = resolve_hetzner_token(None, &target_store, target_override)?;
 
     if !yes {
         return Err(CliError::Other(

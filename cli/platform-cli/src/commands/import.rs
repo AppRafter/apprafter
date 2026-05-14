@@ -2,15 +2,16 @@
 //! Read live Hetzner Cloud resources labelled `apprafter=true` and
 //! rebuild `.apprafter/state.json`. See plan.md phase 1.2 (v0.1.7).
 
-use cli_core::{CliError, Result};
+use cli_core::target::{default_config_root, TargetStorePaths};
+use cli_core::{resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
 use cli_state::{HetznerCloudState, State, StatePaths};
 use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
 
-pub fn run(force: bool, dry_run: bool) -> Result<()> {
-    info!(force, dry_run, "import invoked");
+pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<()> {
+    info!(force, dry_run, target_override, "import invoked");
     let cwd = std::env::current_dir()?;
     let paths = StatePaths::for_root(&cwd);
     let mut state = State::load_or_default(&paths)?;
@@ -24,9 +25,9 @@ pub fn run(force: bool, dry_run: bool) -> Result<()> {
         )));
     }
 
-    let token = std::env::var("HCLOUD_TOKEN").map_err(|_| {
-        CliError::Other("HCLOUD_TOKEN env var is required for hetzner-cloud import".to_string())
-    })?;
+    // Resolution chain (cli-dx-task.md §7).
+    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    let token = resolve_hetzner_token(None, &target_store, target_override)?;
 
     if state.hetzner_cloud.is_some() && !force {
         return Err(CliError::Other(

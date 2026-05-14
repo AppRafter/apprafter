@@ -74,6 +74,7 @@ fn plan_on_empty_state_says_no_changes() {
 #[test]
 fn apply_without_token_reports_missing_token() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
     // Run init first so state has provider=hetzner-cloud.
     cli()
         .current_dir(dir.path())
@@ -90,11 +91,18 @@ fn apply_without_token_reports_missing_token() {
         .success();
     cli()
         .current_dir(dir.path())
+        // Empty target store + no env → resolver fails through
+        // all three chain steps. APPRAFTER_CONFIG_DIR isolates
+        // from the developer's real ~/.config/apprafter/.
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .env_remove("HCLOUD_TOKEN")
         .arg("apply")
         .assert()
         .failure()
-        .stderr(contains("HCLOUD_TOKEN"));
+        // Error mentions every path the resolver tried.
+        .stderr(contains("--token"))
+        .stderr(contains("HCLOUD_TOKEN"))
+        .stderr(contains("apprafter target add"));
 }
 
 #[test]
@@ -134,6 +142,7 @@ fn upgrade_tier_prints_target() {
 #[test]
 fn apply_with_ssh_public_key_env_still_requires_token() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
     cli()
         .current_dir(dir.path())
         .args([
@@ -149,6 +158,7 @@ fn apply_with_ssh_public_key_env_still_requires_token() {
         .success();
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .env_remove("HCLOUD_TOKEN")
         .env("APPRAFTER_SSH_PUBLIC_KEY", "ssh-ed25519 AAAA")
         .arg("apply")
@@ -172,6 +182,7 @@ fn import_without_provider_in_state_errors_clearly() {
 #[test]
 fn import_without_token_reports_missing_token() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
     cli()
         .current_dir(dir.path())
         .args([
@@ -187,11 +198,67 @@ fn import_without_token_reports_missing_token() {
         .success();
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .env_remove("HCLOUD_TOKEN")
         .arg("import")
         .assert()
         .failure()
         .stderr(contains("HCLOUD_TOKEN"));
+}
+
+#[test]
+fn apply_target_flag_routes_resolution_at_named_target_and_surfaces_not_found() {
+    // Track A.8 plumbing smoke: `--target <name>` reaches the
+    // credential resolver and errors with the canonical
+    // "target not found, available: …" hint when the name is
+    // unknown. Verifies the clap wiring + resolver dispatch
+    // without requiring any real Hetzner endpoint.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+
+    // Seed the target store with one valid target so the
+    // resolver's "available" hint has something to recommend.
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "real",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &"a".repeat(64),
+        ])
+        .assert()
+        .success();
+
+    cli()
+        .current_dir(dir.path())
+        .args([
+            "init",
+            "--provider",
+            "hetzner-cloud",
+            "--tier",
+            "solo",
+            "--region",
+            "nbg1",
+        ])
+        .assert()
+        .success();
+    cli()
+        .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
+        .env_remove("HCLOUD_TOKEN")
+        .args(["apply", "--target", "ghost"])
+        .assert()
+        .failure()
+        .stderr(contains("ghost"))
+        .stderr(contains("not found"))
+        // The "available" hint enumerates the seeded target so
+        // the operator knows the right name to retry with.
+        .stderr(contains("real"));
 }
 
 #[test]

@@ -87,7 +87,14 @@ pub enum Commands {
     /// Show the diff between the desired state and what is live.
     Plan,
     /// Apply the desired state.
-    Apply,
+    Apply {
+        /// Inspect a target other than the active one for the
+        /// resolution chain (`--token` flag / `HCLOUD_TOKEN` env
+        /// / target store). Useful when scripting against
+        /// multiple targets without `apprafter target use`.
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Print the current cluster status.
     Status,
     /// Obtain an OIDC-backed kubeconfig.
@@ -104,6 +111,10 @@ pub enum Commands {
         /// Confirm without prompting.
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// Override the active target for the credential
+        /// resolution chain (see `apprafter apply --target`).
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Rebuild local state from live Hetzner Cloud resources tagged
     /// with `apprafter=true`. Read-only — never deletes or creates.
@@ -114,6 +125,10 @@ pub enum Commands {
         /// Print what would be imported without writing state.
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
+        /// Override the active target for the credential
+        /// resolution chain (see `apprafter apply --target`).
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Print the cached k3s kubeconfig (decrypted), fetching it
     /// over SSH on first use. Intended pipe target: `KUBECONFIG=

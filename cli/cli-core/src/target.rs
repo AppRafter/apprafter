@@ -925,11 +925,11 @@ mod tests {
 
     #[test]
     fn default_config_root_honours_apprafter_config_dir_env_override() {
-        // Save the user's real env so we don't pollute it across
-        // test threads — cargo test runs tests in parallel by
-        // default, so set + read inside a single test function and
-        // restore immediately. We use a unique tempdir so collisions
-        // between concurrent test invocations are impossible.
+        // Serialise with the crate-wide test mutex — sibling
+        // tests in `credentials::tests` flip the same env var.
+        let _guard = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let prior = std::env::var(CONFIG_DIR_ENV).ok();
         std::env::set_var(CONFIG_DIR_ENV, dir.path());
@@ -950,6 +950,9 @@ mod tests {
         // Empty string is treated as "unset" so users who do
         // `APPRAFTER_CONFIG_DIR= apprafter target list` aren't
         // accidentally pointed at the current working directory.
+        let _guard = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var(CONFIG_DIR_ENV).ok();
         std::env::set_var(CONFIG_DIR_ENV, "");
         let resolved = default_config_root().expect("dirs::config_dir is set in test env");
