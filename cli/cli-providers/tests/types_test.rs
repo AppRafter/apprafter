@@ -364,3 +364,45 @@ fn server_decodes_when_public_net_is_omitted() {
     let s: Server = serde_json::from_str(json).unwrap();
     assert!(s.public_net.is_none());
 }
+
+#[test]
+fn server_decodes_dual_stack_public_net_with_ipv6_prefix() {
+    // ADR 0017: Hetzner delegates a /64 IPv6 prefix per cloud
+    // server. The shape mirrors the public docs example:
+    // `public_net.ipv6.ip = "<prefix>::/64"`. We pin the parser so
+    // a regression in the wire-type silently dropping the v6 field
+    // would fail this test.
+    use cli_providers::hetzner_cloud::Server;
+    let json = r#"{
+        "id": 42, "name": "n", "status": "running",
+        "labels": {"apprafter": "true"},
+        "public_net": {
+            "ipv4": {"ip": "203.0.113.10"},
+            "ipv6": {"ip": "2a01:4f8:c0c:abcd::/64"}
+        }
+    }"#;
+    let s: Server = serde_json::from_str(json).unwrap();
+    let pn = s.public_net.expect("public_net should decode");
+    let v4 = pn.ipv4.expect("ipv4 should decode");
+    assert_eq!(v4.ip, "203.0.113.10");
+    let v6 = pn.ipv6.expect("ipv6 should decode (ADR 0017 dual-stack)");
+    assert_eq!(v6.ip, "2a01:4f8:c0c:abcd::/64");
+}
+
+#[test]
+fn server_decodes_public_net_with_only_ipv6_when_ipv4_absent() {
+    // Forward-compat: if Hetzner ever ships an IPv6-only server
+    // type the wire-type should tolerate the missing ipv4 field
+    // without erroring.
+    use cli_providers::hetzner_cloud::Server;
+    let json = r#"{
+        "id": 42, "name": "n", "status": "running",
+        "labels": {"apprafter": "true"},
+        "public_net": {"ipv6": {"ip": "2a01:4f8:c0c:abcd::/64"}}
+    }"#;
+    let s: Server = serde_json::from_str(json).unwrap();
+    let pn = s.public_net.expect("public_net should decode");
+    assert!(pn.ipv4.is_none(), "ipv4 absent → field stays None");
+    let v6 = pn.ipv6.expect("ipv6 should decode");
+    assert_eq!(v6.ip, "2a01:4f8:c0c:abcd::/64");
+}

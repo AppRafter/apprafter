@@ -205,6 +205,19 @@ fn default_ingress_rules() -> Vec<FirewallRuleSpec> {
         source_ips: sources.clone(),
         destination_ips: vec![],
     }));
+    // ICMP — required for Path MTU Discovery (ICMP fragmentation
+    // needed) and IPv6 NDP/RA. Hetzner Cloud Firewall does NOT
+    // distinguish ICMPv4 from ICMPv6: a single `protocol: "icmp"`
+    // rule with both v4 + v6 sources covers both families. ADR 0017
+    // §Per-tier explicitly requires this to keep dual-stack pods
+    // reachable. `port` is `None` because ICMP has no L4 port.
+    rules.push(FirewallRuleSpec {
+        direction: "in".into(),
+        port: None,
+        protocol: "icmp".into(),
+        source_ips: sources.clone(),
+        destination_ips: vec![],
+    });
     rules
 }
 
@@ -442,11 +455,13 @@ mod tests {
     }
 
     #[test]
-    fn default_ingress_rules_emits_one_rule_per_default_port() {
+    fn default_ingress_rules_emits_one_rule_per_default_port_plus_icmp() {
         let r = default_ingress_rules();
+        // TCP ports + UDP ports + 1 ICMP rule (ADR 0017 — dual-stack
+        // PMTU + NDP).
         assert_eq!(
             r.len(),
-            DEFAULT_INGRESS_PORTS_TCP.len() + DEFAULT_INGRESS_PORTS_UDP.len()
+            DEFAULT_INGRESS_PORTS_TCP.len() + DEFAULT_INGRESS_PORTS_UDP.len() + 1
         );
     }
 
@@ -465,6 +480,24 @@ mod tests {
         assert!(ports.contains(&"80/tcp".into()), "{ports:?}");
         assert!(ports.contains(&"443/tcp".into()), "{ports:?}");
         assert!(ports.contains(&"51820/udp".into()), "{ports:?}");
+    }
+
+    #[test]
+    fn default_ingress_rules_include_icmp_for_pmtu_and_ndp() {
+        // ADR 0017 requires ICMP allowance for Path MTU Discovery
+        // and IPv6 NDP/RA. Hetzner Cloud Firewall uses a single
+        // `icmp` protocol that covers both ICMPv4 and ICMPv6.
+        let r = default_ingress_rules();
+        let icmp = r
+            .iter()
+            .find(|rule| rule.protocol == "icmp")
+            .expect("default ingress must include an icmp rule for PMTU + NDP");
+        assert_eq!(icmp.direction, "in");
+        assert!(
+            icmp.port.is_none(),
+            "ICMP has no L4 port; Hetzner rejects ICMP rules that carry a port"
+        );
+        assert_eq!(icmp.source_ips, vec!["0.0.0.0/0", "::/0"]);
     }
 
     #[test]

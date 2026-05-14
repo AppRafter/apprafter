@@ -13,6 +13,78 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.70 — 1.2 AUDIT — Hetzner Cloud provider dual-stack IPv6 (2026-05-14)
+
+First slice of the Phase 1 AUDIT backlog (gap-fill items inserted
+into closed sub-phases as the project audited each layer against
+ADR 0017 "dual-stack everywhere"). 1.2 AUDIT covers the Hetzner
+provider half (this release); 1.4 AUDIT covers the Cilium values
+half in the follow-up release.
+
+### Added
+
+- **`PublicIpv6` wire-type + `PublicNet.ipv6` field** in
+  `cli-providers::hetzner_cloud::types`. Hetzner delegates a /64
+  IPv6 prefix per cloud server (free); the API returns it as
+  `public_net.ipv6.ip = "<prefix>::/64"`. The wire-type now parses
+  it instead of dropping it silently. Re-exported through
+  `cli_providers::hetzner_cloud::PublicIpv6`.
+- **`K3sBootstrapOptions.dual_stack: bool` + dual-stack CIDR
+  constants** in `cli-providers::hetzner_cloud::user_data`.
+  `build_k3s_user_data` now appends
+  `--cluster-cidr=10.42.0.0/16,fd00:42::/64
+  --service-cidr=10.43.0.0/16,fd00:43::/112` to the k3s install
+  line by default — ADR 0017 §Pod network requires both family
+  declarations to be present at install time (k3s pins single-stack
+  on first boot if the flags are absent and the conversion is
+  destructive). `dual_stack: false` opt-out is plumbed through for
+  the eventual `Infrastructure.network.ipFamilies` knob; default
+  stays `true` to honour the platform-wide dual-stack posture.
+  Constants `CLUSTER_CIDR_DUAL_STACK` / `SERVICE_CIDR_DUAL_STACK`
+  are exported for callers that need to reference them
+  (cluster-bootstrap diagnostics, manifest validators).
+- **ICMP allow-rule in default Hetzner Firewall ingress**
+  (`commands::apply::default_ingress_rules`). `direction: in,
+  protocol: "icmp", port: None, source_ips: ["0.0.0.0/0", "::/0"]`.
+  Hetzner Cloud Firewall does NOT distinguish ICMPv4 from ICMPv6 —
+  a single `icmp` protocol rule covers both. Required by ADR 0017
+  §Per-tier for Path MTU Discovery (ICMPv4 "fragmentation needed"
+  + ICMPv6 "Packet Too Big") and IPv6 Neighbour Discovery (NDP/RA);
+  without it dual-stack workloads break in subtle ways (silent
+  packet drops at the MTU boundary).
+
+### Tests
+
+- `cli_providers::hetzner_cloud::types_test::server_decodes_dual_stack_public_net_with_ipv6_prefix`
+  — pins serde shape for combined v4 + v6 `public_net`.
+- `cli_providers::hetzner_cloud::types_test::server_decodes_public_net_with_only_ipv6_when_ipv4_absent`
+  — forward-compat guard for hypothetical IPv6-only server types.
+- `cli_providers::hetzner_cloud::user_data::tests::default_options_install_dual_stack_per_adr_0017`
+  — default k3s install line carries both CIDR flags.
+- `cli_providers::hetzner_cloud::user_data::tests::single_stack_flag_drops_dual_stack_cidr_args`
+  — `dual_stack: false` opt-out drops both CIDRs while keeping the
+  five disable-flags intact.
+- `apprafter::commands::apply::tests::default_ingress_rules_emits_one_rule_per_default_port_plus_icmp`
+  — rule count = TCP ports + UDP ports + 1 ICMP.
+- `apprafter::commands::apply::tests::default_ingress_rules_include_icmp_for_pmtu_and_ndp`
+  — ICMP rule shape: `direction=in`, `port=None`,
+  `source_ips=["0.0.0.0/0", "::/0"]`.
+
+### Deferred to dependent sub-phases
+
+- **`--node-ip` dual-binding** stays out of the install line for
+  v0.1.70. Adding it requires runtime-detected host IPv4 + IPv6
+  substitution at cloud-init time (multi-line bash in `runcmd`),
+  and in Tier 1 single-node k3s auto-detects acceptably. Will land
+  alongside 3.1 (HA bootstrap) where heterogeneous-nodes
+  scenarios make explicit node-IP selection critical.
+- **Pod-level dual-stack reachability e2e** is wired to 1.4 AUDIT
+  (Cilium Helm values dual-stack). Without `ipv4.enabled` +
+  `ipv6.enabled` on Cilium, pods won't get a v6 interface even if
+  k3s has the dual-stack CIDRs. After 1.4 AUDIT we extend
+  `e2e/mvp.sh` with a `kubectl exec` curl asserting v6 outbound
+  to a dual-stack endpoint.
+
 ## v0.1.69 — M1.5 Track A.1 — rename `platform-cli` → `apprafter` + shim (2026-05-14)
 
 First slice of M1.5 Track A (CLI DX rework per `cli-dx-task.md` §17 row 1).

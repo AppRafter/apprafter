@@ -48,23 +48,54 @@
 //! The function is pure and side-effect-free; the caller passes
 //! the result to `ServerSpec.user_data`.
 
-/// Tier-1 defaults for the Hetzner cloud-init payload. Currently
-/// no fields are exposed for tweaking — `Default::default()` is
-/// the only constructor — but the struct exists so we can grow
-/// knobs later without breaking the call site.
-#[derive(Debug, Clone, Default)]
-pub struct K3sBootstrapOptions {}
+/// Tier-1 defaults for the Hetzner cloud-init payload.
+///
+/// `dual_stack` controls whether k3s is installed with the dual
+/// pod-CIDR / service-CIDR pair from ADR 0017. Default is `true`
+/// (matches the platform-wide dual-stack-everywhere posture);
+/// single-stack opt-out is plumbed through `Infrastructure.network.
+/// ipFamilies` when the manifest layer grows that knob.
+#[derive(Debug, Clone)]
+pub struct K3sBootstrapOptions {
+    pub dual_stack: bool,
+}
 
-pub fn build_k3s_user_data(_opts: &K3sBootstrapOptions) -> String {
-    "#cloud-config\n\
+impl Default for K3sBootstrapOptions {
+    fn default() -> Self {
+        Self { dual_stack: true }
+    }
+}
+
+/// Dual-stack pod and service CIDRs per ADR 0017 §"Pod network".
+/// `10.42.0.0/16` and `10.43.0.0/16` are k3s's own IPv4 defaults
+/// (we re-state them to make the `,fd00:…` continuation valid).
+/// IPv6 ranges are ULA (RFC 4193 `fd00::/8`), private to the
+/// cluster — pod-to-pod traffic stays inside the node's /64
+/// public delegation only when explicitly routed; cluster-internal
+/// is on ULA which never escapes the cluster.
+pub const CLUSTER_CIDR_DUAL_STACK: &str = "10.42.0.0/16,fd00:42::/64";
+pub const SERVICE_CIDR_DUAL_STACK: &str = "10.43.0.0/16,fd00:43::/112";
+
+pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
+    let install_exec = if opts.dual_stack {
+        format!(
+            "--flannel-backend=none --disable-network-policy --disable-kube-proxy --disable=traefik --disable=servicelb --cluster-cidr={} --service-cidr={}",
+            CLUSTER_CIDR_DUAL_STACK, SERVICE_CIDR_DUAL_STACK
+        )
+    } else {
+        "--flannel-backend=none --disable-network-policy --disable-kube-proxy --disable=traefik --disable=servicelb".to_string()
+    };
+    format!(
+        "#cloud-config\n\
 package_update: true\n\
 package_upgrade: false\n\
 packages:\n\
   - fail2ban\n\
 runcmd:\n\
   - systemctl enable --now fail2ban\n\
-  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"--flannel-backend=none --disable-network-policy --disable-kube-proxy --disable=traefik --disable=servicelb\" sh -'\n"
-        .to_string()
+  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"{}\" sh -'\n",
+        install_exec
+    )
 }
 
 #[cfg(test)]
@@ -146,5 +177,34 @@ mod tests {
     fn ends_with_newline_for_clean_yaml_concatenation() {
         let s = build_k3s_user_data(&K3sBootstrapOptions::default());
         assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn default_options_install_dual_stack_per_adr_0017() {
+        let s = build_k3s_user_data(&K3sBootstrapOptions::default());
+        assert!(
+            s.contains("--cluster-cidr=10.42.0.0/16,fd00:42::/64"),
+            "dual-stack cluster-CIDR must be in install line so pods get IPv4 + IPv6 interfaces (ADR 0017 §Pod network).\n{s}"
+        );
+        assert!(
+            s.contains("--service-cidr=10.43.0.0/16,fd00:43::/112"),
+            "dual-stack service-CIDR must be in install line so Services accept both families (ADR 0017 §Service network).\n{s}"
+        );
+    }
+
+    #[test]
+    fn single_stack_flag_drops_dual_stack_cidr_args() {
+        let s = build_k3s_user_data(&K3sBootstrapOptions { dual_stack: false });
+        assert!(
+            !s.contains("--cluster-cidr"),
+            "single-stack opt-out must NOT inject cluster-CIDR — k3s falls back to its IPv4-only default.\n{s}"
+        );
+        assert!(
+            !s.contains("--service-cidr"),
+            "single-stack opt-out must NOT inject service-CIDR.\n{s}"
+        );
+        // Other disable flags must remain regardless of stack mode.
+        assert!(s.contains("--flannel-backend=none"), "{s}");
+        assert!(s.contains("--disable-kube-proxy"), "{s}");
     }
 }

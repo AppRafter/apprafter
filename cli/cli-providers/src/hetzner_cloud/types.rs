@@ -29,9 +29,24 @@ pub struct PublicIpv4 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicIpv6 {
+    /// Hetzner returns the /64 delegation in CIDR form, e.g.
+    /// `2a01:4f8:c0c:abcd::/64`. The first usable address is
+    /// `<prefix>::1` by default; k3s + Cilium assign pod addresses
+    /// from the rest of the /64.
+    pub ip: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicNet {
     #[serde(default)]
     pub ipv4: Option<PublicIpv4>,
+    /// Hetzner delegates one /64 IPv6 prefix per server free of
+    /// charge. Always present on cloud servers in dual-stack mode;
+    /// `Option` for forward-compat if Hetzner ever ships an
+    /// IPv4-only server type (none today).
+    #[serde(default)]
+    pub ipv6: Option<PublicIpv6>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -382,31 +382,25 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.2 AUDIT — Hetzner Cloud built-in provider: IPv6 support
+### 1.2 AUDIT — Hetzner Cloud built-in provider: IPv6 support ✅
 
-> **AUDIT.** Подзадача-аудит закрытой 1.2 — обнаружена при работе над ADR 0017 (IPv6 + dual-stack). Может быть закрыта либо как отдельный hardening-патч до старта M1.5, либо интегрирована в M1.5 (1.71 — миграция platform-component values, где Helm-настройки переедут в платформенный chart).
+> v0.1.70 — 1.2 AUDIT shipped (partial): wire-type IPv6 parsing, k3s dual-stack cluster/service CIDRs, Hetzner Firewall ICMP allow-rule. `--node-ip` dual-binding и реальный pod-level dual-stack smoke прицеплены к зависимым подфазам (3.1 HA-bootstrap пересекает `--node-ip`; 1.4 AUDIT закрывает Cilium values для pod connectivity).
 
 **Source:** ADR 0017.
 
 **Поставка:**
-- [ ] Verify, что `HetznerCloudProvider::apply` правильно handles IPv6 на server creation:
-    - Hetzner API возвращает IPv6 `/64` delegation вместе с server creation response.
-    - Текущий `cli-providers/src/hetzner_cloud.rs` хранит IPv6 в state? Если нет — добавить fields.
-- [ ] Verify, что `Network` resource (Hetzner private network) поддерживает dual-stack:
-    - В Hetzner Cloud private networks — IPv4 only (это ограничение Hetzner). Public IPv6 идёт через server's own /64.
-    - Adjust network setup так, что IPv6 routing идёт через node's public interface, IPv4 routing — через private network.
-- [ ] Verify k3s install script (`user_data.rs` или эквивалент) передаёт правильные dual-stack arguments:
-    - `--cluster-cidr=10.42.0.0/16,fd00:42::/64`
-    - `--service-cidr=10.43.0.0/16,fd00:43::/112`
-    - `--node-ip` с обоими family (host's IPv4 + IPv6).
-- [ ] Verify cloud-init и Hetzner Cloud Firewall rules не блокируют ICMPv6 (Path MTU Discovery, NDP).
-- [ ] E2E test: deploy hello-world `Application` через apply, проверить что pod получает оба IPv4 и IPv6 interfaces, и outbound к dual-stack endpoint (например, `dual-stack.example.com`) проходит через v6.
+- [x] `cli-providers/src/hetzner_cloud/types.rs` — новый `PublicIpv6 { ip: String }` (хранит `<prefix>::/64` CIDR-строку как Hetzner возвращает) + `PublicNet.ipv6: Option<PublicIpv6>`. Два regression-guard теста в `tests/types_test.rs` пинят deserialize sample response (dual-stack + только-v6 forward-compat ветка). Re-export `PublicIpv6` через `cli-providers::hetzner_cloud`.
+- [x] **Hetzner private network остаётся IPv4-only** (фундаментальное ограничение Hetzner — public IPv6 идёт через server's public interface, private network — внутрикластерная IPv4). Без изменений в `NetworkSpec`; ADR 0017 это явно признаёт.
+- [x] `cli-providers/src/hetzner_cloud/user_data.rs` — `K3sBootstrapOptions { dual_stack: bool }` (`Default::default()` = `true`), `build_k3s_user_data` теперь добавляет `--cluster-cidr=10.42.0.0/16,fd00:42::/64 --service-cidr=10.43.0.0/16,fd00:43::/112` per ADR 0017. Константы `CLUSTER_CIDR_DUAL_STACK` / `SERVICE_CIDR_DUAL_STACK` экспортируются для shared-use. Два regression-guard теста — default install line содержит CIDR-пару, opt-out `dual_stack: false` дропает их без касания других disable-флагов.
+- [x] `cli/platform-cli/src/commands/apply.rs::default_ingress_rules` — новый ICMP-rule (`direction: in, protocol: icmp, port: None, source_ips: ["0.0.0.0/0", "::/0"]`) per ADR 0017 §Per-tier. Hetzner Cloud Firewall не различает ICMPv4 и ICMPv6 — один `protocol: icmp` правило покрывает обе family. Два regression-guard теста — `default_ingress_rules_emits_one_rule_per_default_port_plus_icmp` (счётчик правил) + `default_ingress_rules_include_icmp_for_pmtu_and_ndp` (shape).
+- **Отложено:** `--node-ip` dual-binding пока не передаётся — требует cloud-init substitution с runtime-detected IPv4 + IPv6 host addresses (multi-line bash в `runcmd`), что в Tier 1 single-node не блокирует connectivity (k3s auto-detects). Закроется в 3.1 (HA bootstrap), когда heterogeneous-nodes сценарий делает выбор node IP критичным.
+- **Отложено:** Full e2e dual-stack pod connectivity smoke — зависит от 1.4 AUDIT (Cilium Helm values dual-stack), pod не получит v6 интерфейс без Cilium-конфига. После 1.4 AUDIT добавим pod-level v4+v6 reachability assertion в `e2e/mvp.sh`.
 
-**Acceptance:** Tier 1 cluster bootstrap'ится с full dual-stack; pod в hello-world Application имеет working IPv4 и IPv6 connectivity; e2e/mvp.sh продолжает зелёный.
+**Acceptance:** Hetzner provider парсит IPv6 prefix из API; k3s install line содержит dual-stack CIDR-пару; ICMP allowed в Hetzner Firewall. Pod-level connectivity подтверждается после 1.4 AUDIT (Cilium).
 
 **Зависит от:** —
 
-**Размер:** M
+**Размер:** M (доставлен как single-cycle audit ~v0.1.70; реальный pod-connectivity smoke выкатим вместе с 1.4 AUDIT)
 
 ---
 
@@ -3137,4 +3131,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-13 | §1.15 walks follow-up — real Hetzner unassign-422 message + 423 locked retry; v0.1.67 | initial |
 | 2026-05-13 | §1.15 Q3 security fix — repo-creds Secret apply via SSA (no more PAT leak in last-applied-configuration annotation); v0.1.68 | initial |
 | 2026-05-14 | M1.5 Track A.1 — rename `platform-cli` → `apprafter`, add deprecated shim, sweep user-facing docs, retarget tracing filter; v0.1.69 | initial |
+| 2026-05-14 | 1.2 AUDIT (Hetzner IPv6) — wire-type `PublicIpv6` + dual-stack k3s `--cluster-cidr`/`--service-cidr` (ADR 0017) + Hetzner Firewall ICMP allow-rule; v0.1.70 | initial |
 
