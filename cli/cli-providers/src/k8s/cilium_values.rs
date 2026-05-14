@@ -7,6 +7,9 @@
 /// Helm values YAML for a single-node k3s cluster. Picks
 /// kube-proxy replacement (so k3s doesn't need kube-proxy), the
 /// Kubernetes IPAM mode (k3s exposes pod CIDR via the Node API),
+/// declares dual-stack (`ipv4.enabled: true` + `ipv6.enabled: true`
+/// per ADR 0017 §Pod network — without `ipv6.enabled` the Cilium
+/// datapath ignores k3s's v6 podCIDR even when one is allocated),
 /// disables Hubble (extra observability is over-budget for tier-1),
 /// and pins one operator replica because there is exactly one node.
 pub fn cilium_values_yaml() -> String {
@@ -14,6 +17,10 @@ pub fn cilium_values_yaml() -> String {
 kubeProxyReplacement: true
 k8sServiceHost: "127.0.0.1"
 k8sServicePort: 6443
+ipv4:
+  enabled: true
+ipv6:
+  enabled: true
 ipam:
   mode: kubernetes
 hubble:
@@ -60,5 +67,26 @@ mod tests {
         let y = cilium_values_yaml();
         assert!(y.contains("operator:"), "{y}");
         assert!(y.contains("replicas: 1"), "{y}");
+    }
+
+    #[test]
+    fn dual_stack_enabled_per_adr_0017() {
+        // ADR 0017 §Pod network — Cilium must declare BOTH ipv4 and
+        // ipv6 enabled. Default chart values for v1.16.x have
+        // `ipv4.enabled: true` but `ipv6.enabled: false`, which
+        // means pods never get a v6 interface even when k3s
+        // allocates a dual-stack podCIDR. Without these flags
+        // explicit, AppRafter pods silently drop to single-stack.
+        let y = cilium_values_yaml();
+        assert!(y.contains("ipv4:"), "ipv4 block must be declared: {y}");
+        assert!(y.contains("ipv6:"), "ipv6 block must be declared: {y}");
+        // Pin order-independent: both keys must say `enabled: true`.
+        // `enabled: false` exists for Hubble so we check the *count*
+        // of `enabled: true` occurrences (one for ipv4, one for ipv6).
+        let true_count = y.matches("enabled: true").count();
+        assert!(
+            true_count >= 2,
+            "expected at least 2 `enabled: true` (ipv4 + ipv6), found {true_count}:\n{y}"
+        );
     }
 }

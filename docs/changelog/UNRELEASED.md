@@ -13,6 +13,69 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.71 — 1.4 AUDIT — Cilium Helm values dual-stack (2026-05-14)
+
+Second slice of the Phase 1 audit backlog. v0.1.70 made the substrate
+(Hetzner provider + k3s) dual-stack-aware; v0.1.71 closes the CNI
+half — Cilium now actually allocates IPv6 addresses to pods instead
+of silently dropping the v6 podCIDR k3s offers.
+
+### Changed
+
+- **`cli-providers::k8s::cilium_values::cilium_values_yaml()`** now
+  emits explicit `ipv4: { enabled: true }` + `ipv6: { enabled: true }`
+  blocks. Cilium chart v1.16.x defaults to `ipv4.enabled: true` but
+  `ipv6.enabled: false`. Without `ipv6.enabled` declared, the Cilium
+  datapath ignores the v6 podCIDR even when k3s advertises one in
+  `node.spec.podCIDRs`. After this release, pods on Tier 1 clusters
+  receive both v4 (from `10.42.0.0/16`) and v6 (from `fd00:42::/64`)
+  IPs on creation. Doc comment on the builder updated to point at
+  ADR 0017 §Pod network.
+
+### Added
+
+- **`e2e/mvp.sh` Phase 6.4 — dual-stack podIPs assertion.** After
+  the existing Phase 6 endpoint curl passes, the script reads
+  `kubectl get pod -l app=e2e-hello -o jsonpath='{.items[0].status.
+  podIPs[*].ip}'` and asserts the pod has BOTH a v4 IP matching
+  `10.42.*` (k3s default pod CIDR) AND a v6 IP matching `fd00:42:`
+  (k3s dual-stack pod CIDR from v0.1.70). Failure mode separates
+  the two causes cleanly: missing v4 → "k3s --cluster-cidr likely
+  missing" (1.2 AUDIT regressed); missing v6 → "Cilium ipv6.enabled
+  likely false" (1.4 AUDIT regressed). Closes the 5th deferred
+  checkbox from 1.2 AUDIT (pod-level dual-stack reachability).
+
+### Tests
+
+- `cli_providers::k8s::cilium_values::tests::dual_stack_enabled_per_adr_0017`
+  — pins both `ipv4:` and `ipv6:` blocks present in the rendered
+  values; asserts at least 2 `enabled: true` lines so flipping one
+  back to `false` would fail. Doesn't pin order so values can be
+  reorganised for readability later.
+
+### Deferred to Phase 3.x
+
+- **In-pod IPv6 outbound curl** (e.g., `curl -6 https://ipv6.google.com/`
+  from a workload pod). The current Phase 6 pod image
+  `nginxdemos/hello:plain-text` doesn't include curl; standing up a
+  separate `curlimages/curl:latest --ipv6` pod just for the assertion
+  duplicates work that fits naturally inside Hubble/observability
+  work in 3.7a (network metrics with v6 visibility). The pod-IP
+  assertion in Phase 6.4 already proves Cilium allocates the v6
+  interface; outbound v6 verification reuses the same datapath.
+
+### Operator note
+
+If you're upgrading a Tier 1 cluster that was bootstrapped with
+v0.1.68 or earlier, re-running `apprafter cluster-bootstrap` will
+re-apply the Cilium Helm release with the new values. `helm` patches
+the cilium ConfigMap, agents restart, and after that fresh pods
+(deployed AFTER the agent restart) will receive dual-stack IPs.
+Existing pods keep their v4-only IPs until they're recreated — `kubectl
+rollout restart deployment <name>` triggers fresh pods with the
+dual-stack allocator. No data loss; the rollout is a normal
+pod-restart cycle.
+
 ## v0.1.70 — 1.2 AUDIT — Hetzner Cloud provider dual-stack IPv6 (2026-05-14)
 
 First slice of the Phase 1 AUDIT backlog (gap-fill items inserted

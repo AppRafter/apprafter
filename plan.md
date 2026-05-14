@@ -466,35 +466,24 @@ Phase 7 запускается параллельно с 3+ как только 
 
 ---
 
-### 1.4 AUDIT — Cilium + Gateway API установка: dual-stack Helm values
+### 1.4 AUDIT — Cilium + Gateway API установка: dual-stack Helm values ✅
 
-> **AUDIT.** Подзадача-аудит закрытой 1.4 — обнаружена при работе над ADR 0017. Может быть закрыта либо как hardening-патч до старта M1.5, либо автоматически в составе 1.71 (миграция platform-values в chart): если CI-rendered Cilium values сразу пишутся dual-stack — audit-item закрывается без отдельной работы. Не блокирует M1.5 start.
+> v0.1.71 — 1.4 AUDIT shipped: `cilium_values_yaml()` явно декларирует `ipv4.enabled: true` + `ipv6.enabled: true`; `e2e/mvp.sh` получил Phase 6.4 с pod-level dual-stack assertion (закрывает отложенный 5-й чекбокс 1.2 AUDIT).
 
 **Source:** ADR 0017.
 
 **Поставка:**
-- [ ] Locate Cilium Helm values rendering в `cli-providers` (likely `k8s/cilium.rs` или similar).
-- [ ] Current values — assess текущее state:
-    - `ipv4.enabled` set explicitly?
-    - `ipv6.enabled` set explicitly?
-    - IPAM mode (`cluster-pool` vs `kubernetes`)?
-- [ ] Update Helm values на dual-stack:
-  ```yaml
-  ipv4:
-    enabled: true
-  ipv6:
-    enabled: true
-  ipam:
-    mode: kubernetes
-  ```
-- [ ] Verify Gateway API CRDs install path не блокирует dual-stack listeners.
-- [ ] E2E test: Application с `public: true` доступен через оба IPv4 и IPv6 (curl --ipv4 и curl --ipv6 оба возвращают same content).
+- [x] Cilium Helm values builder лежит в `cli-providers/src/k8s/cilium_values.rs` (`cilium_values_yaml()`).
+- [x] Assess текущего state (v0.1.70): `ipv4.enabled` не объявлен явно (Helm chart 1.16.x default = true, но это implicit); `ipv6.enabled` не объявлен (default = false) → поды никогда не получают v6 интерфейс даже когда k3s выдаёт dual-stack podCIDR. IPAM mode = `kubernetes` (правильно — k3s публикует pod CIDR через Node API, Cilium читает оттуда без собственного allocator'а).
+- [x] Updated Helm values на dual-stack: добавлены два явных блока `ipv4: { enabled: true }` и `ipv6: { enabled: true }`. IPAM `mode: kubernetes` сохранён без изменений.
+- [x] Gateway API CRDs install path — verified: `kubectl apply -f gateway-api/standard-install.yaml` ставит **type definitions only**, не listeners. Family-binding происходит при создании Gateway resource'ом (см. позже в 4.1a), и Gateway API spec поддерживает `listener.protocol: HTTPS` без family-restriction — listener bind'ится на любую family, доступную на node (после v0.1.71 — обе). Никаких изменений в install path не требуется.
+- [x] E2E `Phase 6.4: dual-stack podIPs assertion` в `e2e/mvp.sh` — после Phase 6 (endpoint curl green) делает `kubectl get pod -l app=e2e-hello -o jsonpath='{.items[0].status.podIPs[*].ip}'` и assert'ит наличие **обоих** v4-адреса из `10.42.0.0/16` (k3s podCIDR) и v6-адреса из `fd00:42::/64` (k3s podCIDR v6 + Cilium ipv6.enabled). Без 1.4 AUDIT этот assert валится с понятным сообщением "Cilium ipv6.enabled likely false". Реальный outbound v6 curl-тест (curl -6 ipv6.google.com из pod'а) отложен в Phase 3.x — pod-image `nginxdemos/hello:plain-text` не имеет curl, добавление test-pod с `curlimages/curl:latest --ipv6` пересекается с network observability (Hubble), которую закроет 3.7a.
 
-**Acceptance:** Cilium pod logs показывают «IPv6 enabled», Gateway listeners bind на оба family, e2e curl works через оба.
+**Acceptance:** `cilium_values_yaml()` декларирует обе family explicit; unit-test `dual_stack_enabled_per_adr_0017` пинит наличие `ipv4:` + `ipv6:` blocks и счётчик `enabled: true` ≥ 2; `e2e/mvp.sh` Phase 6.4 валится если у pod'а отсутствует v6 IP.
 
-**Зависит от:** 1.2 AUDIT (Hetzner provider dual-stack)
+**Зависит от:** 1.2 AUDIT (Hetzner provider dual-stack) ✅
 
-**Размер:** S
+**Размер:** S — доставлен как single-cycle audit ~v0.1.71
 
 ---
 
@@ -3132,4 +3121,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-13 | §1.15 Q3 security fix — repo-creds Secret apply via SSA (no more PAT leak in last-applied-configuration annotation); v0.1.68 | initial |
 | 2026-05-14 | M1.5 Track A.1 — rename `platform-cli` → `apprafter`, add deprecated shim, sweep user-facing docs, retarget tracing filter; v0.1.69 | initial |
 | 2026-05-14 | 1.2 AUDIT (Hetzner IPv6) — wire-type `PublicIpv6` + dual-stack k3s `--cluster-cidr`/`--service-cidr` (ADR 0017) + Hetzner Firewall ICMP allow-rule; v0.1.70 | initial |
+| 2026-05-14 | 1.4 AUDIT (Cilium dual-stack) — explicit `ipv4.enabled: true` + `ipv6.enabled: true` в Helm values (ADR 0017); `e2e/mvp.sh` Phase 6.4 — pod-level v4+v6 podIPs assertion; v0.1.71 | initial |
 

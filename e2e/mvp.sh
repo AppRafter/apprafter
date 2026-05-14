@@ -190,6 +190,30 @@ else
 fi
 
 # ---------------------------------------------------------------
+# Phase 6.4: dual-stack pod IPs (ADR 0017 — closes 1.2 AUDIT
+# deferred 5th checkbox; only meaningful once Cilium values land
+# `ipv6.enabled: true` per 1.4 AUDIT in v0.1.71).
+# ---------------------------------------------------------------
+
+phase "Phase 6.4: dual-stack podIPs assertion"
+pod_ips=$(kubectl get pod -l app=e2e-hello -n default \
+    -o jsonpath='{.items[0].status.podIPs[*].ip}' 2>&1)
+echo "  pod ips: $pod_ips"
+# Expect a v4 from k3s default pod CIDR (10.42.0.0/16) AND a v6
+# from the dual-stack range (fd00:42::/64) per user_data k3s flags.
+# Cilium must have both `ipv4.enabled` and `ipv6.enabled` for the
+# second address to actually appear on the pod's NIC.
+if ! echo "$pod_ips" | grep -qE '(^|[[:space:]])10\.42\.'; then
+    echo "  no v4 pod IP from 10.42.0.0/16 — k3s --cluster-cidr likely missing" >&2
+    exit 1
+fi
+if ! echo "$pod_ips" | grep -qE '(^|[[:space:]])fd00:42:'; then
+    echo "  no v6 pod IP from fd00:42::/64 — Cilium ipv6.enabled likely false (closes 1.4 AUDIT)" >&2
+    exit 1
+fi
+echo "  dual-stack confirmed: both v4 and v6 pod IPs present"
+
+# ---------------------------------------------------------------
 # Phase 6.5: Application CRD end-to-end (§1.14 integration cycle)
 # ---------------------------------------------------------------
 
