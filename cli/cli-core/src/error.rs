@@ -155,6 +155,64 @@ pub enum CliError {
         available: String,
     },
 
+    /// Token validation ping during `target add` rejected the
+    /// supplied credentials. Distinct from the generic
+    /// `Hetzner { status: 401, .. }` so the operator gets a
+    /// rotation-specific help text instead of the broader Hetzner
+    /// API help. The underlying provider error is carried as the
+    /// cause chain so miette renders both layers and operators
+    /// can still see the raw API envelope.
+    #[error("provider `{provider}` rejected the supplied token")]
+    #[diagnostic(
+        code(apprafter::target::token_rejected),
+        help(
+            "The provider's read-only credential check returned 401 / unauthorized. Either the \
+             token was mistyped, never had the right scopes, or has been rotated / revoked \
+             since you copied it.\n\
+             • Verify the token at https://console.hetzner.cloud/projects → Security → API \
+               Tokens. It must say `Read & Write` next to the project.\n\
+             • Copy the token again (it's 64 ASCII chars, no prefix) — common cause: trailing \
+               newline from a clipboard manager.\n\
+             • If you're rotating, run `apprafter target add <name> --renew --token <new>` \
+               instead of re-creating the target.\n\
+             • Pass `--no-ping` to skip the check if you're seeding a target offline (CI \
+               sandbox, intermittent network)."
+        )
+    )]
+    ProviderTokenRejected {
+        provider: String,
+        #[source]
+        #[diagnostic_source]
+        cause: Box<dyn miette::Diagnostic + Send + Sync + 'static>,
+    },
+
+    /// Token validation ping during `target add` failed for a
+    /// non-auth reason — transport error, 429, 5xx, etc. We can't
+    /// rotate the user's way out of these, so the help points at
+    /// `apprafter doctor` + `--no-ping`.
+    #[error("provider `{provider}` API was unreachable during token validation")]
+    #[diagnostic(
+        code(apprafter::target::provider_unreachable),
+        help(
+            "The credential check could not complete because the provider's API was \
+             unreachable. This is NOT a credentials problem — the token may still be valid \
+             once the API recovers.\n\
+             • Run `apprafter doctor` to confirm reachability + DNS.\n\
+             • Check the provider's status page (https://status.hetzner.com/ for \
+               hetzner-cloud).\n\
+             • If you're behind a VPN / corporate proxy, ensure `https://api.hetzner.cloud/` is \
+               reachable.\n\
+             • Pass `--no-ping` to skip the round-trip and save the target offline; you can \
+               re-verify later with `apprafter doctor`."
+        )
+    )]
+    ProviderApiUnreachable {
+        provider: String,
+        #[source]
+        #[diagnostic_source]
+        cause: Box<dyn miette::Diagnostic + Send + Sync + 'static>,
+    },
+
     /// Pass-through for `std::io::Error`.
     #[error("io error: {0}")]
     #[diagnostic(
@@ -348,6 +406,77 @@ mod tests {
         // The wrapped OS message must survive into the rendered
         // `Display`, so operators can grep for the filename.
         assert!(format!("{err}").contains("perm denied"));
+    }
+
+    #[test]
+    fn provider_token_rejected_carries_rotation_hint_and_chains_cause() {
+        // Build the inner Hetzner variant first so we can chain it
+        // through the typed wrapper, then verify miette can walk
+        // the cause via the `#[diagnostic_source]` field.
+        let inner = CliError::Hetzner {
+            endpoint: "GET /v1/locations".into(),
+            status: 401,
+            code: "unauthorized".into(),
+            message: "invalid token".into(),
+        };
+        let err = CliError::ProviderTokenRejected {
+            provider: "hetzner-cloud".into(),
+            cause: Box::new(inner),
+        };
+        assert_eq!(code_of(&err), "apprafter::target::token_rejected");
+        let help = help_of(&err);
+        // Help leads with rotation guidance, not generic API blame.
+        assert!(
+            help.contains("--renew --token"),
+            "missing rotation hint: {help}"
+        );
+        assert!(
+            help.contains("--no-ping"),
+            "missing offline-fallback hint: {help}"
+        );
+        // The diagnostic source chain reaches the inner Hetzner
+        // variant — miette walks this when rendering.
+        let source = miette::Diagnostic::diagnostic_source(&err)
+            .expect("token-rejected must expose its inner cause as a diagnostic_source");
+        assert_eq!(
+            source.code().map(|c| c.to_string()),
+            Some("apprafter::provider::hetzner_api_error".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_api_unreachable_targets_outage_path_not_rotation() {
+        // Transport-error case (no HTTP status), wrapped as a
+        // generic `Other`. The classifier treats this as
+        // unreachable, not rejected.
+        let inner = CliError::Other("connection refused".into());
+        let err = CliError::ProviderApiUnreachable {
+            provider: "hetzner-cloud".into(),
+            cause: Box::new(inner),
+        };
+        assert_eq!(code_of(&err), "apprafter::target::provider_unreachable");
+        let help = help_of(&err);
+        // Help points operator at doctor + status page + --no-ping,
+        // NOT at credential rotation.
+        assert!(
+            help.contains("apprafter doctor"),
+            "missing doctor hint: {help}"
+        );
+        assert!(
+            help.contains("status.hetzner.com"),
+            "missing status-page hint: {help}"
+        );
+        assert!(
+            help.contains("--no-ping"),
+            "missing offline-fallback hint: {help}"
+        );
+        // Crucially, NOT a rotation problem — the rotation hint
+        // belongs to `token_rejected`, surfacing it here would
+        // misdirect operators.
+        assert!(
+            !help.contains("rotated / revoked"),
+            "outage help should not mention rotation: {help}"
+        );
     }
 
     #[test]

@@ -384,29 +384,21 @@ fn require_token(provider: &str, token: Option<&str>) -> Result<String> {
 /// `APPRAFTER_HCLOUD_BASE_URL` through `hcloud_base_url()` —
 /// integration tests redirect against a `mockito::Server`).
 ///
-/// Failure messages get wrapped in a CLI-shaped surface so the
-/// user sees "Hetzner Cloud rejected the token …" instead of the
-/// raw API envelope. Existing typed `CliError::Hetzner` variants
-/// from the underlying call are preserved for `--verbose` paths
-/// in future Track A.10 (miette).
+/// v0.1.87: failures classify into one of two typed CliError
+/// variants (`ProviderTokenRejected` for 401, otherwise
+/// `ProviderApiUnreachable`) and carry the original error as a
+/// `#[source]` cause chain. Miette renders both layers — operator
+/// gets the high-level rotation / reachability help PLUS the raw
+/// API envelope underneath.
 fn ping_provider(provider: &str, token: &str) -> Result<()> {
     match provider {
         "hetzner-cloud" => {
             let base = hcloud_base_url();
             tracing::debug!(provider, base = %base, "running provider validator ping");
             let validator = HetznerCloudValidator::new(base.clone(), token);
-            validator.validate_credentials().map_err(|err| match err {
-                CliError::Hetzner { status: 401, message, .. } => CliError::Other(
-                    format!("Hetzner Cloud rejected the token (HTTP 401): {message}. Double-check that the token has not been revoked and was copied complete (64 chars)."),
-                ),
-                CliError::Hetzner { status, message, .. } => CliError::Other(format!(
-                    "Hetzner Cloud API ping failed (HTTP {status}): {message}. The target was NOT saved; rerun once the API is reachable, or pass `--no-ping` to skip the check."
-                )),
-                CliError::Other(msg) => CliError::Other(format!(
-                    "could not reach Hetzner Cloud at {base}: {msg}. Pass `--no-ping` to skip the network round-trip (offline / CI setups)."
-                )),
-                other => other,
-            })
+            validator
+                .validate_credentials()
+                .map_err(|err| classify_ping_error(provider, err))
         }
         _ => {
             // Defensive: require_known_provider already gates
@@ -418,6 +410,27 @@ fn ping_provider(provider: &str, token: &str) -> Result<()> {
                 "no validator wired for provider `{provider}` — pass `--no-ping` to skip"
             )))
         }
+    }
+}
+
+/// Sort a credential-validation error into the right typed variant.
+/// 401 → `ProviderTokenRejected` (operator can rotate); everything
+/// else → `ProviderApiUnreachable` (operator can run
+/// `apprafter doctor` or wait out the outage). Both wrappers carry
+/// the original error as a `#[source]` cause chain so miette
+/// renders both the top-level summary and the underlying API
+/// envelope. Shared with the wizard's classification path so both
+/// flows emit identical diagnostic codes.
+fn classify_ping_error(provider: &str, err: CliError) -> CliError {
+    match err {
+        CliError::Hetzner { status: 401, .. } => CliError::ProviderTokenRejected {
+            provider: provider.to_string(),
+            cause: Box::new(err),
+        },
+        _ => CliError::ProviderApiUnreachable {
+            provider: provider.to_string(),
+            cause: Box::new(err),
+        },
     }
 }
 

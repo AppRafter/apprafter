@@ -13,6 +13,156 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.87 — hotfix: typed errors on target-add token validation (2026-05-14)
+
+Walk-found issue in v0.1.86. The `target add` flow with an
+invalid token surfaced as the catch-all `apprafter::cli::other`
+diagnostic, because both ping call sites (`commands/target.rs`
+non-interactive path and `commands/target_wizard.rs` interactive
+path) explicitly wrapped the typed `CliError::Hetzner { status:
+401, .. }` into `CliError::Other(format!(...))`. This dropped
+the diagnostic code AND replaced the variant-specific rotation
+help with the generic "please file an issue" help line.
+
+v0.1.87 promotes both ping outcomes to typed variants, keeps the
+original Hetzner error as a `#[diagnostic_source]` cause chain,
+and lets miette render both layers.
+
+### Added
+
+- **`CliError::ProviderTokenRejected { provider, cause }`** —
+  code `apprafter::target::token_rejected`. Triggers for 401
+  responses from the credential validation ping. Help lines
+  guide the operator through:
+  - Verifying the token at the provider's console UI.
+  - The "trailing newline from clipboard" trap (common for
+    Hetzner's 64-char tokens).
+  - Using `apprafter target add <name> --renew` for rotation
+    instead of recreating the target.
+  - Falling back to `--no-ping` for offline / CI seeding.
+
+- **`CliError::ProviderApiUnreachable { provider, cause }`** —
+  code `apprafter::target::provider_unreachable`. Triggers for
+  every non-401 ping failure (5xx, 429, transport errors). Help
+  lines target reachability checks, NOT rotation:
+  - `apprafter doctor` to confirm DNS + reachability.
+  - Provider status page link.
+  - VPN / corporate proxy check.
+  - `--no-ping` to save the target offline and verify later.
+
+  Crucially, the help does NOT mention rotation — that would
+  misdirect operators when the token is actually fine and only
+  the API is down.
+
+Both variants carry the original `CliError::Hetzner` as a
+`#[source] #[diagnostic_source] cause: Box<dyn
+miette::Diagnostic + Send + Sync + 'static>` field. Miette walks
+the chain and renders both layers:
+
+```
+Error: apprafter::target::token_rejected
+  × provider `hetzner-cloud` rejected the supplied token
+  ╰─▶ apprafter::provider::hetzner_api_error
+        × hetzner-cloud GET https://api.hetzner.cloud/v1/locations failed
+        │ (status 401): unauthorized: the token you have provided is invalid
+        help: The Hetzner Cloud API returned a non-2xx response. Common causes:
+              • 401 unauthorized — the stored API token was rotated or revoked. …
+              • 403 forbidden — …
+              • 429 rate limit — …
+              • 5xx — …
+  help: The provider's read-only credential check returned 401 / unauthorized.
+        Either the token was mistyped, never had the right scopes, or has been
+        rotated / revoked since you copied it.
+        • Verify the token at https://console.hetzner.cloud/projects → …
+        • Copy the token again (it's 64 ASCII chars, no prefix) — …
+        • If you're rotating, run `apprafter target add <name> --renew …
+        • Pass `--no-ping` to skip the check …
+```
+
+### Changed
+
+- **`commands/target.rs::ping_provider`** stops downgrading
+  typed errors. The previous `match err { CliError::Hetzner {
+  status: 401, .. } => CliError::Other(format!(…)), … }` chain
+  is replaced with a single call to
+  `classify_ping_error(provider, err)`. The helper returns the
+  new typed variants with the original error chained underneath.
+
+- **`commands/target_wizard.rs::prompt_token`** stops wrapping
+  the wizard's ping error as
+  `CliError::Other(format!("token rejected by provider: {e}"))`.
+  Same `classify_ping_error` helper, identical diagnostic codes
+  across both flows.
+
+- **`classify_ping_error(provider, err)`** lives in both
+  modules. Kept duplicated rather than pulled into cli-core
+  because the function is provider-specific (only the Hetzner
+  `status: 401` predicate today); when the second provider
+  lands, the dispatch will look different per flow. Trivial
+  duplication is cheaper than designing for hypothetical reuse.
+
+### Tests (2 new unit + 2 prior integration reworked)
+
+- **`provider_token_rejected_carries_rotation_hint_and_chains_cause`**
+  (cli_core) — pins the rotation hint substrings AND walks the
+  `Diagnostic::diagnostic_source()` chain to confirm the inner
+  `Hetzner` variant is reachable (so miette will render it).
+
+- **`provider_api_unreachable_targets_outage_path_not_rotation`**
+  (cli_core) — pins the outage hint substrings AND asserts the
+  help does NOT contain `"rotated / revoked"`, so accidental
+  copy-paste of the token_rejected help text into the outage
+  variant would fail the test.
+
+- **`target_add_surfaces_typed_error_on_hetzner_401`**
+  (target_test) — assertions migrated from the old wrap text
+  (`"Hetzner Cloud rejected the token (HTTP 401)"`) to
+  diagnostic codes (`apprafter::target::token_rejected` AND
+  `apprafter::provider::hetzner_api_error`). The chained-cause
+  rendering produces line-wrapped output where the literal
+  `(status 401)` substring may straddle a newline, but the
+  diagnostic codes themselves never wrap.
+
+- **`target_add_surfaces_helpful_error_when_api_is_unreachable`**
+  (target_test) — same migration. Pinned codes:
+  `apprafter::target::provider_unreachable`. Help substrings
+  still pinned: `--no-ping`, `apprafter doctor`.
+
+### Backwards compatibility
+
+- The shell exit code on failure is unchanged.
+- Existing log-grep workflows keyed on the original Hetzner
+  status / message text still match — the chained-cause
+  rendering preserves them inside the second layer.
+- New diagnostic codes are *additive*; consumers that grouped
+  failures by `apprafter::cli::other` will see the same
+  failures move to `apprafter::target::token_rejected` /
+  `apprafter::target::provider_unreachable` and can adjust
+  filters.
+
+### Operator note
+
+A full repro of the walk's original symptom:
+
+```
+$ apprafter target add bad --provider hetzner-cloud \
+    --token "$(python -c 'print("a"*64)')" \
+    --region nbg1 --tier solo --ssh-key ~/.ssh/id_ed25519.pub
+…
+Error: apprafter::target::token_rejected
+  × provider `hetzner-cloud` rejected the supplied token
+  ╰─▶ apprafter::provider::hetzner_api_error
+        × hetzner-cloud GET https://api.hetzner.cloud/v1/locations failed
+        │ (status 401): unauthorized: the token you have provided is invalid
+        help: …  (Hetzner-specific 401/403/429/5xx breakdown)
+  help: …  (rotation-specific: console URL, --renew, --no-ping)
+```
+
+If you previously grep'd for `apprafter::cli::other` to spot
+auth failures in CI, switch to `apprafter::target::` — both
+the rejected-token and the unreachable-provider cases now live
+under that namespace.
+
 ## v0.1.86 — M1.5 Track A.10 — miette diagnostic refinement (2026-05-14)
 
 Tenth Track A slice. Errors stop being opaque `Debug` blobs and

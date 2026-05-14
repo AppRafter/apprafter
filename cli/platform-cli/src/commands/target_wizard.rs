@@ -292,8 +292,7 @@ fn prompt_token(
         let verified = if no_ping {
             false
         } else {
-            ping_for_provider(provider, tok)
-                .map_err(|e| CliError::Other(format!("token rejected by provider: {e}")))?;
+            ping_for_provider(provider, tok).map_err(|e| classify_ping_error(provider, e))?;
             eprintln!("  ✓ Token verified");
             true
         };
@@ -686,6 +685,25 @@ fn ping_for_provider(provider: &str, token: &str) -> Result<()> {
         other => Err(CliError::Other(format!(
             "no validator for provider `{other}` — pass `--no-ping` to skip"
         ))),
+    }
+}
+
+/// Sort a credential-validation error into the right typed variant.
+/// 401 → `ProviderTokenRejected` (operator can rotate); everything
+/// else → `ProviderApiUnreachable` (operator can `doctor` or wait
+/// out the outage). Both wrappers carry the original error as a
+/// cause chain so miette renders both layers — top-level summary
+/// plus the underlying API envelope.
+fn classify_ping_error(provider: &str, err: CliError) -> CliError {
+    match err {
+        CliError::Hetzner { status: 401, .. } => CliError::ProviderTokenRejected {
+            provider: provider.to_string(),
+            cause: Box::new(err),
+        },
+        _ => CliError::ProviderApiUnreachable {
+            provider: provider.to_string(),
+            cause: Box::new(err),
+        },
     }
 }
 

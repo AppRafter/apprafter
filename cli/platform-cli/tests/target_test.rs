@@ -1091,7 +1091,21 @@ fn target_add_surfaces_typed_error_on_hetzner_401() {
         ])
         .assert()
         .failure()
-        .stderr(contains("Hetzner Cloud rejected the token (HTTP 401)"));
+        // v0.1.87 — 401 now surfaces as the typed
+        // `ProviderTokenRejected` variant. Miette renders both the
+        // top-level summary AND the underlying Hetzner API envelope
+        // via the `#[diagnostic_source]` cause chain. Pin both:
+        // diagnostic code, rotation hint from help, raw status from
+        // chained cause.
+        .stderr(contains("apprafter::target::token_rejected"))
+        .stderr(contains("rejected the supplied token"))
+        .stderr(contains("--renew"))
+        // The chained `Hetzner` cause's diagnostic code is the
+        // signal that the cause chain rendered — miette line-wraps
+        // the raw error message at 80 cols so a `(status 401)`
+        // substring isn't reliable, but the code string itself
+        // never wraps.
+        .stderr(contains("apprafter::provider::hetzner_api_error"));
 
     // Failed ping must NOT save the target. The user reruns with a
     // good token rather than getting half-state on disk.
@@ -1122,10 +1136,14 @@ fn target_add_surfaces_helpful_error_when_api_is_unreachable() {
         ])
         .assert()
         .failure()
-        .stderr(
-            contains("could not reach Hetzner Cloud").or(contains("Hetzner Cloud API ping failed")),
-        )
-        .stderr(contains("--no-ping"));
+        // v0.1.87 — non-401 transport errors surface as the typed
+        // `ProviderApiUnreachable` variant. The help block mentions
+        // `apprafter doctor` and `--no-ping` as next steps. The
+        // chained cause carries the original transport message.
+        .stderr(contains("apprafter::target::provider_unreachable"))
+        .stderr(contains("API was unreachable"))
+        .stderr(contains("--no-ping"))
+        .stderr(contains("apprafter doctor"));
 
     assert!(!dir.path().join("targets/offline").exists());
 }
