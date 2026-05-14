@@ -3,7 +3,7 @@
 `example.yaml` is the deterministic rendering of
 `cli-providers::k8s::admission_webhook::admission_webhook_yaml(
 "ghcr.io/apprafter/admission-webhook:placeholder")`. It's the same
-five-document YAML `platform-cli cluster-bootstrap` applies when
+five-document YAML `apprafter cluster-bootstrap` applies when
 `Infrastructure.spec.admissionWebhook.image` is set.
 
 The webhook validates `apprafter.io/v1alpha1` `Application` objects

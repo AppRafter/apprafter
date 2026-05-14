@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: FSL-1.1-MIT
 [package]
-name        = "platform-cli"
-description = "AppRafter platform CLI: bootstrap and lifecycle of clusters."
+name        = "apprafter"
+description = "AppRafter CLI: bootstrap and lifecycle of clusters."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -10,8 +10,15 @@ authors.workspace      = true
 repository.workspace   = true
 
 [[bin]]
-name = "platform-cli"
+name = "apprafter"
 path = "src/main.rs"
+
+# Deprecated shim that warns users about the rename and then exec's
+# the `apprafter` binary located next to itself. Slated for removal
+# in v0.2.0 alongside the M1.5 closure tag.
+[[bin]]
+name = "platform-cli"
+path = "src/bin/platform-cli.rs"
 
 [dependencies]
 age           = { workspace = true }

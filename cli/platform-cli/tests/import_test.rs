@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Integration tests for `platform-cli import` against a mockito
+//! Integration tests for `apprafter import` against a mockito
 //! Hetzner Cloud server.
 
 use assert_cmd::Command;
 use predicates::str::contains;
 
 fn cli() -> Command {
-    Command::cargo_bin("platform-cli").unwrap()
+    Command::cargo_bin("apprafter").unwrap()
 }
 
 /// Build a workspace dir with `state.json` already containing

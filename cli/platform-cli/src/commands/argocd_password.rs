@@ -25,7 +25,7 @@ pub fn run(refresh: bool) -> Result<()> {
     let mut state = State::load_or_default(&paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
-            "state has no hetzner_cloud section; run `platform-cli apply` first".to_string(),
+            "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
         )
     })?;
 
@@ -68,7 +68,7 @@ fn decrypt_kubeconfig(
         return Ok(plain.clone());
     }
     Err(CliError::Other(
-        "no cached kubeconfig in state; run `platform-cli kubeconfig` first".to_string(),
+        "no cached kubeconfig in state; run `apprafter kubeconfig` first".to_string(),
     ))
 }
 
@@ -122,12 +122,7 @@ mod tests {
         fn apply_manifest(&self, _: &ManifestSource, _: &Path) -> Result<()> {
             unreachable!("argocd-password never applies manifests")
         }
-        fn apply_manifest_server_side(
-            &self,
-            _: &ManifestSource,
-            _: &Path,
-            _: &str,
-        ) -> Result<()> {
+        fn apply_manifest_server_side(&self, _: &ManifestSource, _: &Path, _: &str) -> Result<()> {
             unreachable!("argocd-password never applies manifests")
         }
         fn get_secret_value(

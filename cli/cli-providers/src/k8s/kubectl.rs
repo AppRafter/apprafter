@@ -11,7 +11,7 @@ use cli_core::{CliError, Result};
 /// CRD admission work that lives in plan.md sub-phase 1.7.
 pub const GATEWAY_API_VERSION: &str = "v1.2.1";
 
-/// Field manager identity used by `platform-cli`-driven
+/// Field manager identity used by `apprafter`-driven
 /// server-side `kubectl apply` calls. Mirrors the operator's
 /// `apprafter-operator` field manager so cluster-side ownership
 /// is clear from `metadata.managedFields`.
@@ -54,7 +54,7 @@ pub trait KubectlRunner {
 
     /// Read a single key from a Kubernetes Secret and return its
     /// base64-decoded contents as a UTF-8 string. Used by
-    /// `platform-cli argocd-password` to retrieve the
+    /// `apprafter argocd-password` to retrieve the
     /// `argocd-initial-admin-secret` value.
     fn get_secret_value(
         &self,
@@ -146,10 +146,9 @@ impl KubectlRunner for KubectlCli {
         kubeconfig_path: &Path,
         field_manager: &str,
     ) -> Result<()> {
-        let status =
-            Self::build_apply_server_side_command(source, kubeconfig_path, field_manager)
-                .status()
-                .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
+        let status = Self::build_apply_server_side_command(source, kubeconfig_path, field_manager)
+            .status()
+            .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
         if !status.success() {
             return Err(CliError::Other(format!(
                 "kubectl apply --server-side --field-manager={field_manager} -f failed (exit {:?})",

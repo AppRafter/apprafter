@@ -16,7 +16,7 @@ report vulnerabilities privately to **security@apprafter.dev**
 
 - A description of the issue and its impact.
 - Steps to reproduce, with minimal manifests / commands.
-- The affected version (`platform-cli version` output, or the
+- The affected version (`apprafter version` output, or the
   commit SHA if running from source).
 - Any suggested mitigation.
 

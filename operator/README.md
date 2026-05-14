@@ -66,7 +66,7 @@ cd operator && docker build -t apprafter/admission-webhook:dev -f admission-webh
 
 The cert-manager `Certificate`, `Service`, `Deployment`, and
 `ValidatingWebhookConfiguration` manifests, plus
-`platform-cli cluster-bootstrap` wiring, land in v0.1.24 (closes
+`apprafter cluster-bootstrap` wiring, land in v0.1.24 (closes
 plan.md sub-phase 1.7).
 
 ## apprafter-operator

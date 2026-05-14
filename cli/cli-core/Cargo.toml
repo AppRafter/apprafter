@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: FSL-1.1-MIT
 [package]
 name        = "cli-core"
-description = "Shared types, logging, and CUE-access helpers for platform-cli."
+description = "Shared types, logging, and CUE-access helpers for apprafter."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

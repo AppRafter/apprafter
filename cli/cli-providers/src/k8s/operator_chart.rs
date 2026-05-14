@@ -4,7 +4,7 @@
 //! extractor that materialises it under a fresh tempdir so
 //! `helm upgrade --install apprafter-operator <tempdir>` can run.
 //!
-//! Using `include_dir!` keeps `platform-cli` installable as a
+//! Using `include_dir!` keeps `apprafter` installable as a
 //! standalone binary — operators don't need the AppRafter repo on
 //! disk to bootstrap a cluster.
 

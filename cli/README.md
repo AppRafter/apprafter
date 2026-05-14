@@ -1,6 +1,6 @@
 # cli/
 
-`platform-cli` — Rust binary for cluster bootstrap, lifecycle
+`apprafter` — Rust binary for cluster bootstrap, lifecycle
 management, and tier upgrades. Subcommands: `init`, `plan`,
 `apply`, `import`, `destroy`, `status`, `login`, `upgrade-tier`.
 
@@ -11,7 +11,7 @@ crates:
 
 | Crate           | Role                                                          |
 | --------------- | ------------------------------------------------------------- |
-| `platform-cli`  | Binary: clap parsing, subcommand dispatch, `color-eyre` wiring|
+| `apprafter`  | Binary: clap parsing, subcommand dispatch, `color-eyre` wiring|
 | `cli-core`      | Errors, `Tier` enum, structured logging, CUE subprocess wrapper |
 | `cli-state`     | `.apprafter/state.json` load/save                             |
 | `cli-providers` | `Provider` trait + `DryRunProvider` (real providers in 1.2)   |
@@ -56,9 +56,9 @@ export APPRAFTER_SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
 export APPRAFTER_MANIFEST=examples/infrastructure/tier-1-hetzner.cue
 
 cd cli
-cargo run --bin platform-cli -- init --provider hetzner-cloud --tier solo --region nbg1
-cargo run --bin platform-cli -- apply
-cargo run --bin platform-cli -- destroy --yes
+cargo run --bin apprafter -- init --provider hetzner-cloud --tier solo --region nbg1
+cargo run --bin apprafter -- apply
+cargo run --bin apprafter -- destroy --yes
 ```
 
 `apply` provisions one private network (10.0.0.0/16 with a
@@ -77,7 +77,7 @@ attached to both. The server is provisioned with a cloud-init
 The host-level allow-list (22 + 6443 + 80 + 443 / tcp + 51820 / udp,
 default-deny everything else) is enforced by the Hetzner Cloud Firewall
 at the network edge — see `build_firewall_spec` in
-`cli/platform-cli/src/commands/apply.rs`. Earlier versions also installed
+`cli/apprafter/src/commands/apply.rs`. Earlier versions also installed
 ufw inside the VM as defense-in-depth, but it was removed in v0.1.43
 (silent failure on Ubuntu 24.04 cloud-init runcmd; see changelog).
 
@@ -95,14 +95,14 @@ keeps `apply` idempotent across re-runs and makes them visible to
 ### Recovering state with `import`
 
 If `.apprafter/state.json` is lost (or you cloned the repo on a new
-machine), `platform-cli import` rebuilds the Hetzner section by
+machine), `apprafter import` rebuilds the Hetzner section by
 scanning the live API for resources tagged with `apprafter=true`:
 
 ```sh
 export HCLOUD_TOKEN=...
-cargo run --bin platform-cli -- import --dry-run   # preview only
-cargo run --bin platform-cli -- import             # write state
-cargo run --bin platform-cli -- import --force     # overwrite an
+cargo run --bin apprafter -- import --dry-run   # preview only
+cargo run --bin apprafter -- import             # write state
+cargo run --bin apprafter -- import --force     # overwrite an
                                                    # existing snapshot
 ```
 
@@ -123,7 +123,7 @@ export HCLOUD_TOKEN=...
 export APPRAFTER_SSH_PRIVATE_KEY="$HOME/.ssh/id_ed25519"  # optional, default
 export APPRAFTER_AGE_KEY="$HOME/.config/apprafter/age.key" # optional, default; auto-created on first run, mode 0600
 
-cargo run --bin platform-cli -- kubeconfig | KUBECONFIG=/dev/stdin kubectl get nodes
+cargo run --bin apprafter -- kubeconfig | KUBECONFIG=/dev/stdin kubectl get nodes
 ```
 
 The command shells out to `ssh root@<public-ip> cat
@@ -145,7 +145,7 @@ After `cluster-bootstrap` finishes (Argo CD pods need a moment to
 generate their initial admin secret), retrieve the password:
 
 ```sh
-cargo run --bin platform-cli -- argocd-password
+cargo run --bin apprafter -- argocd-password
 ```
 
 First call: decrypts the cached kubeconfig from state, runs
@@ -167,7 +167,7 @@ After `kubeconfig` works (so the cluster is reachable), install the
 in-cluster components:
 
 ```sh
-cargo run --bin platform-cli -- cluster-bootstrap
+cargo run --bin apprafter -- cluster-bootstrap
 ```
 
 Under the hood the command:
@@ -263,13 +263,13 @@ To verify the install end-to-end against a live cluster:
 
 ```sh
 APPRAFTER_K8S_SMOKE=1 \
-  cargo test -p platform-cli --test cluster_smoke_test smoke -- --ignored
+  cargo test -p apprafter --test cluster_smoke_test smoke -- --ignored
 ```
 
 The smoke test asserts `cilium status` is green, a minimal Gateway
 passes server-side admission, and the default-deny NetworkPolicy is
 present. It expects `KUBECONFIG` to be exported (e.g.
-`KUBECONFIG=$(platform-cli kubeconfig | tee /tmp/kc; echo /tmp/kc)`).
+`KUBECONFIG=$(apprafter kubeconfig | tee /tmp/kc; echo /tmp/kc)`).
 
 Run the real-Hetzner integration test manually:
 

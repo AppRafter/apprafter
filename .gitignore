@@ -50,6 +50,6 @@ tmp/
 *.key
 !**/age.pub.key
 
-# Local platform-cli state (.apprafter/) — never commit raw, only age-encrypted blobs
+# Local apprafter state (.apprafter/) — never commit raw, only age-encrypted blobs
 **/.apprafter/*
 !**/.apprafter/*.age

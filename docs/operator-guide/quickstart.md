@@ -35,9 +35,9 @@ Outside Nix, install them via your package manager.
 
 ```sh
 cd cli
-cargo run --bin platform-cli -- init \
+cargo run --bin apprafter -- init \
     --provider hetzner-cloud --tier solo --region nbg1
-cargo run --bin platform-cli -- apply
+cargo run --bin apprafter -- apply
 ```
 
 `apply` provisions an SSH key, a private network with subnet, a
@@ -52,7 +52,7 @@ phase that brings k3s up takes another 3-5 minutes.
 ## 2. Get kubeconfig + verify the node
 
 ```sh
-cargo run --bin platform-cli -- kubeconfig | tee /tmp/kc
+cargo run --bin apprafter -- kubeconfig | tee /tmp/kc
 KUBECONFIG=/tmp/kc kubectl get nodes
 # ↳ <hostname>   Ready   control-plane,master   <age>   v1.31.x+k3s
 ```
@@ -64,7 +64,7 @@ forces a re-fetch over SSH.
 ## 3. cluster-bootstrap
 
 ```sh
-cargo run --bin platform-cli -- cluster-bootstrap
+cargo run --bin apprafter -- cluster-bootstrap
 ```
 
 This installs (in order):
@@ -143,7 +143,7 @@ For the same flow scripted, see [`e2e/mvp.sh`](../../e2e/mvp.sh).
 ## 5. Use the Application CRD
 
 From v0.1.64 onwards the AppRafter operator and admission-webhook
-are installed by `platform-cli cluster-bootstrap` by default — no
+are installed by `apprafter cluster-bootstrap` by default — no
 "build your own image" step required. Apply an Application CR and
 the operator reconciles it into a Deployment + Service via SSA,
 writes status (`phase=Ready`, `endpointURL=...`), and the
@@ -186,16 +186,16 @@ for the full block reference.
 | ----------------------------- | -------------------------------------------------------------- |
 | List Applications             | `kubectl get applications.apprafter.io -A`                     |
 | Watch operator metrics        | `kubectl -n apprafter-system port-forward svc/apprafter-operator 8080:8080` then `curl http://127.0.0.1:8080/metrics` |
-| Get Argo CD admin password    | `cargo run --bin platform-cli -- argocd-password`              |
-| Re-fetch kubeconfig           | `cargo run --bin platform-cli -- kubeconfig --refresh`         |
-| Rebuild local state           | `cargo run --bin platform-cli -- import` (live → state.json)   |
-| Tear down                     | `cargo run --bin platform-cli -- destroy --yes`                |
+| Get Argo CD admin password    | `cargo run --bin apprafter -- argocd-password`              |
+| Re-fetch kubeconfig           | `cargo run --bin apprafter -- kubeconfig --refresh`         |
+| Rebuild local state           | `cargo run --bin apprafter -- import` (live → state.json)   |
+| Tear down                     | `cargo run --bin apprafter -- destroy --yes`                |
 
 ## Where to look next
 
 - [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md) —
   scaffold a new Application from the bun-http template.
-- [`cli/README.md`](../../cli/README.md) — every `platform-cli`
+- [`cli/README.md`](../../cli/README.md) — every `apprafter`
   subcommand + state model.
 - [`operator/README.md`](../../operator/README.md) — operator
   reconcile loop + leader-election + per-environment expansion.

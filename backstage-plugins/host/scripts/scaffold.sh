@@ -68,5 +68,5 @@ scaffold: done. Next:
   4) Plug it into your Infrastructure manifest:
        spec.backstage.image: "ghcr.io/<org>/backstage:0.1.0"
 
-  5) Run \`platform-cli cluster-bootstrap\` against your cluster.
+  5) Run \`apprafter cluster-bootstrap\` against your cluster.
 NEXT

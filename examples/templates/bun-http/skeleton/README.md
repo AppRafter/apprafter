@@ -27,7 +27,7 @@ docker push ${{ values.image }}
 `${{ values.image }}` image. Commit this whole repo into the Git
 repo Argo CD watches (set as
 `Infrastructure.spec.argocd.bootstrapRepo` when running
-`platform-cli cluster-bootstrap`); Argo CD will sync, the
+`apprafter cluster-bootstrap`); Argo CD will sync, the
 AppRafter operator will reconcile the manifest into a Deployment +
 Service, and `${{ values.name }}` becomes reachable cluster-internally
 at `http://${{ values.name }}.${{ values.namespace }}.svc.cluster.local:80`.

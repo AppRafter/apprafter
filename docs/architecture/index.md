@@ -19,7 +19,7 @@ This section will mirror `spec.md` §2 (Architecture Overview) and §4
 - Observability (OpenTelemetry → VictoriaMetrics + ClickHouse +
   Hubble).
 - UX layer (Backstage + custom plugins).
-- Infrastructure tooling (`platform-cli`).
+- Infrastructure tooling (`apprafter`).
 
 Until those pages exist, refer to `spec.md` §2 and §4 in the repo
 root, and to the [ADRs](../adr/README.md) for the rationale behind

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: FSL-1.1-MIT
 #
 # AppRafter E2E MVP smoke. Provisions a fresh Hetzner cluster,
-# runs `platform-cli cluster-bootstrap`, applies a hello-world
+# runs `apprafter cluster-bootstrap`, applies a hello-world
 # workload directly via kubectl (Deployment + Service), verifies the
 # endpoint, then applies an Application CR and asserts the operator
 # reconciles it to Ready, and tears the cluster down.
@@ -46,7 +46,7 @@ cleanup_on_failure() {
         printf '\n!!! E2E smoke failed at %s !!!\n' "$(elapsed)" >&2
         if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
             printf 'Tearing down (set APPRAFTER_E2E_SKIP_DESTROY=1 to keep the cluster).\n' >&2
-            (cd cli && cargo run --quiet --bin platform-cli -- destroy --yes) || true
+            (cd cli && cargo run --quiet --bin apprafter -- destroy --yes) || true
         fi
     fi
     exit "$exit_code"
@@ -75,9 +75,9 @@ export KUBECONFIG="$KUBECONFIG_FILE"
 # ---------------------------------------------------------------
 
 phase "Phase 1: provisioning Hetzner ($REGION)"
-(cd cli && cargo run --quiet --bin platform-cli -- init \
+(cd cli && cargo run --quiet --bin apprafter -- init \
     --provider hetzner-cloud --tier solo --region "$REGION")
-(cd cli && cargo run --quiet --bin platform-cli -- apply)
+(cd cli && cargo run --quiet --bin apprafter -- apply)
 
 # ---------------------------------------------------------------
 # Phase 2: wait for cloud-init (k3s install)
@@ -85,7 +85,7 @@ phase "Phase 1: provisioning Hetzner ($REGION)"
 
 phase "Phase 2: waiting for k3s (cloud-init takes ~3-5 min)"
 for attempt in $(seq 1 30); do
-    if (cd cli && cargo run --quiet --bin platform-cli -- kubeconfig) > "$KUBECONFIG_FILE" 2>/dev/null; then
+    if (cd cli && cargo run --quiet --bin apprafter -- kubeconfig) > "$KUBECONFIG_FILE" 2>/dev/null; then
         if kubectl get nodes 2>/dev/null | grep -q ' Ready '; then
             echo "  k3s ready on attempt $attempt"
             break
@@ -104,7 +104,7 @@ done
 # ---------------------------------------------------------------
 
 phase "Phase 3: cluster-bootstrap"
-(cd cli && cargo run --quiet --bin platform-cli -- cluster-bootstrap)
+(cd cli && cargo run --quiet --bin apprafter -- cluster-bootstrap)
 
 # ---------------------------------------------------------------
 # Phase 4: apply hello-world (plain Deployment + Service)
@@ -227,10 +227,10 @@ echo "  child Deployment parser → Available"
 
 if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
     phase "Phase 7: destroy"
-    (cd cli && cargo run --quiet --bin platform-cli -- destroy --yes)
+    (cd cli && cargo run --quiet --bin apprafter -- destroy --yes)
 else
     printf '\nAPPRAFTER_E2E_SKIP_DESTROY set — leaving the cluster up.\n'
-    printf 'Run `cd cli && cargo run --bin platform-cli -- destroy --yes` to clean up.\n'
+    printf 'Run `cd cli && cargo run --bin apprafter -- destroy --yes` to clean up.\n'
 fi
 
 # ---------------------------------------------------------------

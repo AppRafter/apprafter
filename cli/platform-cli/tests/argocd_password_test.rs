@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Integration tests for `platform-cli argocd-password`.
+//! Integration tests for `apprafter argocd-password`.
 //!
 //! The cold-fetch path goes through real `kubectl` against a live
 //! cluster — covered by manual smoke (cluster_smoke_test.rs sister
@@ -12,7 +12,7 @@ use predicates::str::contains;
 use std::io::Write;
 
 fn cli() -> Command {
-    Command::cargo_bin("platform-cli").unwrap()
+    Command::cargo_bin("apprafter").unwrap()
 }
 
 fn workspace_with_state() -> tempfile::TempDir {

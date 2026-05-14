@@ -32,7 +32,7 @@ The dev-facing API is identical across tiers. Migrating between tiers is a platf
 
 | Directory                                       | Contents                                                          |
 | ----------------------------------------------- | ----------------------------------------------------------------- |
-| [`cli/`](./cli/)                                | `platform-cli` — Rust CLI for bootstrap and lifecycle             |
+| [`cli/`](./cli/)                                | `apprafter` — Rust CLI for bootstrap and lifecycle             |
 | [`operator/`](./operator/)                      | Custom Rust operator on kube-rs                                   |
 | [`schemas/`](./schemas/)                        | CUE schemas for every CRD                                         |
 | [`providers/`](./providers/)                    | Built-in `ServiceProvider`s (pg, jetstream, clickhouse, redis, s3)|

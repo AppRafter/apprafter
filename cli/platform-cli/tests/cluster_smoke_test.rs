@@ -5,11 +5,11 @@
 //! opt in with:
 //!
 //!     APPRAFTER_K8S_SMOKE=1 KUBECONFIG=… \
-//!     cargo test -p platform-cli --test cluster_smoke_test \
+//!     cargo test -p apprafter --test cluster_smoke_test \
 //!         smoke -- --ignored
 //!
 //! Talks to the system `cilium` and `kubectl` binaries directly;
-//! does NOT exercise platform-cli (the v0.1.11 + v0.1.12 unit tests
+//! does NOT exercise apprafter (the v0.1.11 + v0.1.12 unit tests
 //! already prove the orchestration shape).
 
 use std::io::Write;

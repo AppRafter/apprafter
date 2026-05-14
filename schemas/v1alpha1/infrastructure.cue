@@ -4,7 +4,7 @@ package v1alpha1
 
 // Infrastructure describes the substrate the platform runs on
 // (provider, nodes, network, firewall, OS image). Applied by
-// `platform-cli`. See spec.md §3.7 and phase 1.2 / 5.2 / 6.2.
+// `apprafter`. See spec.md §3.7 and phase 1.2 / 5.2 / 6.2.
 //
 // Skeleton schema. Network / firewall / SSH-key / floating-IP
 // fields are optional and read by the v0.1.5+ manifest parser;
@@ -69,7 +69,7 @@ package v1alpha1
 		osImage?: string
 
 		// Optional Argo CD UI exposure + bootstrap. When `domain` is
-		// set, `platform-cli cluster-bootstrap` provisions a Gateway
+		// set, `apprafter cluster-bootstrap` provisions a Gateway
 		// + HTTPRoute + cert-manager Certificate so the UI is
 		// reachable at https://<domain>. When `bootstrapRepo` is
 		// set, an Argo CD `Application` named `bootstrap` is applied
@@ -82,7 +82,7 @@ package v1alpha1
 		}
 
 		// Optional Backstage tier-1 deploy. When `domain` is set,
-		// `platform-cli cluster-bootstrap` provisions a Namespace +
+		// `apprafter cluster-bootstrap` provisions a Namespace +
 		// Deployment + Service + HTTPRoute + cert-manager
 		// Certificate so the UI is reachable at https://<domain>.
 		// `image` defaults to a placeholder; supply your own.

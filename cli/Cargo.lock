@@ -136,6 +136,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "apprafter"
+version = "0.1.2"
+dependencies = [
+ "age",
+ "assert_cmd",
+ "clap",
+ "cli-core",
+ "cli-providers",
+ "cli-state",
+ "color-eyre",
+ "mockito",
+ "predicates",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1457,24 +1475,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "platform-cli"
-version = "0.1.2"
-dependencies = [
- "age",
- "assert_cmd",
- "clap",
- "cli-core",
- "cli-providers",
- "cli-state",
- "color-eyre",
- "mockito",
- "predicates",
- "serde_json",
- "tempfile",
- "tracing",
-]
 
 [[package]]
 name = "poly1305"

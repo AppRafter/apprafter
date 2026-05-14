@@ -10,7 +10,7 @@ once you've confirmed the basics work.
 | Tool          | Version | Purpose                                    |
 | ------------- | ------- | ------------------------------------------ |
 | Bun           | ≥ 1.x   | runs the OneBun starter; ships in the dev shell. |
-| Rust          | ≥ 1.83  | builds `platform-cli`.                     |
+| Rust          | ≥ 1.83  | builds `apprafter`.                     |
 | Cargo         | (paired with Rust) | workspace builds.                |
 | Docker        | ≥ 24    | builds the container image.                |
 | `cue`         | ≥ 0.10  | manifest validation (in the dev shell).    |
@@ -28,16 +28,16 @@ export HCLOUD_TOKEN=...                          # Hetzner Cloud API token
 export APPRAFTER_SSH_PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)"
 
 cd cli
-cargo run --bin platform-cli -- init \
+cargo run --bin apprafter -- init \
     --provider hetzner-cloud --tier solo --region nbg1
-cargo run --bin platform-cli -- apply
+cargo run --bin apprafter -- apply
 # ↳ provisions a CX22 with cloud-init k3s. ~3-5 min.
 
-cargo run --bin platform-cli -- kubeconfig | tee /tmp/kc
+cargo run --bin apprafter -- kubeconfig | tee /tmp/kc
 KUBECONFIG=/tmp/kc kubectl get nodes
 # ↳ Ready
 
-cargo run --bin platform-cli -- cluster-bootstrap
+cargo run --bin apprafter -- cluster-bootstrap
 # ↳ Cilium + Gateway API + default-deny NP + Application CRD +
 #   Argo CD + cert-manager + self-signed ClusterIssuer.
 ```

@@ -4,7 +4,7 @@
 `cli-providers::k8s::backstage_manifests::backstage_manifests_yaml(
 "backstage.example.com",
 "ghcr.io/apprafter/backstage:placeholder")`. It's the same YAML
-`platform-cli cluster-bootstrap` applies when
+`apprafter cluster-bootstrap` applies when
 `spec.backstage.domain` is set in the Infrastructure manifest.
 
 Use it as a starting point when you're populating your bootstrap

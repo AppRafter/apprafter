@@ -21,7 +21,7 @@ at `/mnt/disk`.
 
 ## When you need this
 
-- `platform-cli kubeconfig` times out on `Connection timed out`
+- `apprafter kubeconfig` times out on `Connection timed out`
   for >5 minutes after `apply`, but the Hetzner API says the
   server is `running`. Most common cause: cloud-init didn't
   finish, or finished with a misconfiguration that drops every
@@ -150,7 +150,7 @@ ssh-keygen -R <public-ip>
 ```
 
 (With v0.1.46+ AppRafter manages a per-cluster
-`.apprafter/known_hosts` for the `platform-cli kubeconfig` SSH
+`.apprafter/known_hosts` for the `apprafter kubeconfig` SSH
 step — the rescue/back-to-prod host key swap doesn't trip the
 CLI itself; the manual `ssh root@…` you used during rescue is
 where you'll see the warning.)

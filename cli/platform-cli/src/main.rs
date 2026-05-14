@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Entry point for `platform-cli`.
+//! Entry point for the `apprafter` CLI.
 
 mod cli;
 mod commands;

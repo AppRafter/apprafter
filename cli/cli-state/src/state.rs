@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Local state file for `platform-cli`.
+//! Local state file for `apprafter`.
 //!
 //! State lives in `<repo>/.apprafter/state.json` and is currently
 //! a JSON document. Encoding will switch to CUE-encoded text once
@@ -72,16 +72,16 @@ pub struct HetznerCloudState {
     pub floating_ip_ids: Vec<u64>,
     /// Plain-text k3s kubeconfig — legacy, kept for one cycle so
     /// existing state.json files still print something useful via
-    /// `platform-cli kubeconfig`. New caches go to
+    /// `apprafter kubeconfig`. New caches go to
     /// `kubeconfig_age` instead.
     #[serde(default)]
     pub kubeconfig_yaml: Option<String>,
     /// age-encrypted (ASCII-armored) k3s kubeconfig. Populated by
-    /// `platform-cli kubeconfig` on cold-fetch and re-fetch.
+    /// `apprafter kubeconfig` on cold-fetch and re-fetch.
     #[serde(default)]
     pub kubeconfig_age: Option<String>,
     /// age-encrypted (ASCII-armored) Argo CD admin password.
-    /// Populated by `platform-cli argocd-password` on first call.
+    /// Populated by `apprafter argocd-password` on first call.
     #[serde(default)]
     pub argocd_admin_password_age: Option<String>,
 }

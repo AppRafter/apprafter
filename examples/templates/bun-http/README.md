@@ -49,7 +49,7 @@ image, ~30 MB final size.
    with the tag you just pushed.
 2. Commit the file into the Git repo Argo CD watches (the one you
    set as `Infrastructure.spec.argocd.bootstrapRepo` when running
-   `platform-cli cluster-bootstrap`).
+   `apprafter cluster-bootstrap`).
 3. Argo CD picks the change up; the operator reconciles the
    Application; `/api/health` becomes reachable cluster-internally
    at `http://bun-http-starter.default.svc.cluster.local:80`.

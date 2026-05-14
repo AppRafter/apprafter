@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Shared utilities for `platform-cli` and its sister crates.
+//! Shared utilities for `apprafter` and its sister crates.
 
 pub mod cue;
 pub mod error;

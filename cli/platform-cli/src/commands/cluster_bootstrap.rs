@@ -34,7 +34,7 @@ pub fn run() -> Result<()> {
     let state = State::load_or_default(&paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
-            "state has no hetzner_cloud section; run `platform-cli apply` first".to_string(),
+            "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
         )
     })?;
 
@@ -285,7 +285,7 @@ fn decrypt_cached_kubeconfig(hetzner: &cli_state::HetznerCloudState) -> Result<S
         return Ok(plain.clone());
     }
     Err(CliError::Other(
-        "no cached kubeconfig in state; run `platform-cli kubeconfig` first".to_string(),
+        "no cached kubeconfig in state; run `apprafter kubeconfig` first".to_string(),
     ))
 }
 

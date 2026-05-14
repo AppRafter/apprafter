@@ -4,7 +4,7 @@
 //! Given the live API view of `server_types`, the requested name,
 //! and the target region, returns `Ok(())` or a structured
 //! `CliError::ServerTypeUnavailable` with the closest 3 live
-//! alternatives — letting `platform-cli apply` fail fast before
+//! alternatives — letting `apprafter apply` fail fast before
 //! provisioning SSH-key / network / firewall.
 
 use cli_core::{CliError, Result};

@@ -6,7 +6,7 @@ runbook the operator can follow start-to-finish without lateral reading.
 
 ## Prerequisites (all quadrants)
 
-- An AppRafter cluster bootstrapped via `platform-cli` against Hetzner Cloud.
+- An AppRafter cluster bootstrapped via `apprafter` against Hetzner Cloud.
   Operator + admission-webhook install by default since v0.1.64; see the
   [operator quickstart](./quickstart.md).
 - A Git repository containing at least one Kubernetes manifest at the path
@@ -14,7 +14,7 @@ runbook the operator can follow start-to-finish without lateral reading.
   `Deployment` / `Service` etc. work; so do nested Argo CD `Application`
   manifests if you want a layered apps-of-apps setup. A bare empty repo
   syncs as a no-op — operator-facing UX is identical.
-- `kubectl` configured against the cluster (run `platform-cli kubeconfig
+- `kubectl` configured against the cluster (run `apprafter kubeconfig
   | tee /tmp/kc` and `export KUBECONFIG=/tmp/kc`).
 - For the **private** quadrants: ability to generate a PAT (Personal Access
   Token) on the platform, scoped to read the bootstrap repo.
@@ -92,11 +92,11 @@ in this runbook: `kubectl get applications.argoproj.io bootstrap -n argocd`.
    ```sh
    cd cli
    export APPRAFTER_MANIFEST=../examples/infrastructure/tier-1-hetzner.cue
-   cargo run --bin platform-cli -- apply
+   cargo run --bin apprafter -- apply
    # wait ~3-5 min for cloud-init
-   cargo run --bin platform-cli -- kubeconfig | tee /tmp/kc
+   cargo run --bin apprafter -- kubeconfig | tee /tmp/kc
    export KUBECONFIG=/tmp/kc
-   cargo run --bin platform-cli -- cluster-bootstrap
+   cargo run --bin apprafter -- cluster-bootstrap
    ```
 
    The `cluster-bootstrap` summary line ends with
@@ -107,7 +107,7 @@ in this runbook: `kubectl get applications.argoproj.io bootstrap -n argocd`.
 
 The DoD must exercise the **two surfaces AppRafter ships** for this
 feature — the Argo CD web UI (`cluster-bootstrap` installs it) and the
-`platform-cli argocd-password` subcommand. `kubectl` checks are
+`apprafter argocd-password` subcommand. `kubectl` checks are
 sanity-only supplements.
 
 **1. Argo CD UI walk (primary)** — open the UI and visually verify:
@@ -117,7 +117,7 @@ sanity-only supplements.
 kubectl -n argocd port-forward svc/argocd-server 8080:443
 
 # Terminal B: get the admin password via our CLI (NOT raw kubectl).
-cd cli && cargo run --bin platform-cli -- argocd-password
+cd cli && cargo run --bin apprafter -- argocd-password
 ```
 
 Browse to `https://localhost:8080` (accept the self-signed cert
@@ -141,7 +141,7 @@ warning), log in as `admin` / `<password from CLI>`, and confirm:
 
 | Symptom                                    | Likely cause                              | Fix                                                                       |
 | ------------------------------------------ | ----------------------------------------- | ------------------------------------------------------------------------- |
-| `argocd-password` errors                   | state cache miss after fresh apply         | Re-run `cargo run --bin platform-cli -- argocd-password --refresh`.       |
+| `argocd-password` errors                   | state cache miss after fresh apply         | Re-run `cargo run --bin apprafter -- argocd-password --refresh`.       |
 | Browser can't reach `https://localhost:8080` | port-forward terminated                    | Re-run `kubectl -n argocd port-forward svc/argocd-server 8080:443`.       |
 | UI login rejects password                  | copy-paste added trailing whitespace       | Re-run `argocd-password` and copy the exact line.                         |
 | bootstrap App stuck `OutOfSync`            | path mismatch                              | Verify `bootstrapPath` matches the actual folder in the repo.            |
@@ -188,20 +188,20 @@ Identical to Quadrant 1, with one addition:
    ```
 
 5. Set `spec.argocd.bootstrapRepo` in `Infrastructure.cue` exactly as in Quadrant 1.
-6. Run `platform-cli cluster-bootstrap`. The summary line at the end includes `+ Argo CD repo-creds Secret in argocd namespace` confirming the Secret was applied.
+6. Run `apprafter cluster-bootstrap`. The summary line at the end includes `+ Argo CD repo-creds Secret in argocd namespace` confirming the Secret was applied.
 
 ### DoD checklist
 
 Same two-surface pattern as Quadrant 1, plus a Secret-presence check
 (`kubectl` only, since AppRafter doesn't ship a UI for repo creds).
 
-**1. Argo CD UI walk (primary)** — port-forward + `platform-cli argocd-password`:
+**1. Argo CD UI walk (primary)** — port-forward + `apprafter argocd-password`:
 
 ```sh
 # Terminal A
 kubectl -n argocd port-forward svc/argocd-server 8080:443
 # Terminal B
-cd cli && cargo run --bin platform-cli -- argocd-password
+cd cli && cargo run --bin apprafter -- argocd-password
 ```
 
 Open `https://localhost:8080`, log in, then on the `bootstrap` App:
@@ -258,7 +258,7 @@ When your PAT or Project Access Token expires:
 
 ```sh
 export APPRAFTER_ARGOCD_REPO_TOKEN='<new-token>'
-platform-cli cluster-bootstrap
+apprafter cluster-bootstrap
 ```
 
 `cluster-bootstrap` is idempotent — the Secret is overwritten with the new

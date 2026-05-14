@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! clap definitions for `platform-cli`.
+//! clap definitions for the `apprafter` CLI.
 
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "platform-cli",
+    name = "apprafter",
     version,
-    about = "AppRafter platform CLI: bootstrap and lifecycle of clusters.",
+    about = "AppRafter CLI: bootstrap and lifecycle of clusters.",
     long_about = None,
 )]
 pub struct Cli {

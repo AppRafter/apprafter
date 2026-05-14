@@ -23,7 +23,7 @@ pub fn run(refresh: bool) -> Result<()> {
 
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
-            "state has no hetzner_cloud section; run `platform-cli apply` first".to_string(),
+            "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),
         )
     })?;
 

@@ -31,7 +31,7 @@ pub fn run() -> Result<()> {
     let mut state = State::load_or_default(&paths)?;
 
     let provider_id = state.provider.clone().ok_or_else(|| {
-        CliError::Other("state has no provider — run `platform-cli init …` first".to_string())
+        CliError::Other("state has no provider — run `apprafter init …` first".to_string())
     })?;
 
     if provider_id != "hetzner-cloud" {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Infrastructure providers for `platform-cli`.
+//! Infrastructure providers for `apprafter`.
 
 pub mod dry_run;
 pub mod hetzner_cloud;

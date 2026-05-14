@@ -59,7 +59,7 @@ generous.
 ### Cleanup if the script crashes mid-run
 
 ```sh
-cd cli && cargo run --bin platform-cli -- destroy --yes
+cd cli && cargo run --bin apprafter -- destroy --yes
 ```
 
 `destroy` is idempotent and label-driven — it'll clean up

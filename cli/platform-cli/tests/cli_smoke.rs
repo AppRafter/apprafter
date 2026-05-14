@@ -3,7 +3,7 @@ use assert_cmd::Command;
 use predicates::str::contains;
 
 fn cli() -> Command {
-    Command::cargo_bin("platform-cli").unwrap()
+    Command::cargo_bin("apprafter").unwrap()
 }
 
 #[test]
@@ -252,6 +252,41 @@ fn argocd_password_without_hetzner_cloud_state_errors_with_hint() {
         .assert()
         .failure()
         .stderr(contains("apply"));
+}
+
+#[test]
+fn platform_cli_shim_warns_and_forwards() {
+    // v0.1.69 ships the binary rename `platform-cli` → `apprafter`
+    // with a deprecation shim. The shim must:
+    //   1. print a warning to stderr that mentions both names + the
+    //      v0.2.0 removal window,
+    //   2. forward args + exit code to the real `apprafter` binary
+    //      living next to it,
+    //   3. let the forwarded command's stdout pass through unmodified
+    //      so pipelines like `platform-cli kubeconfig | kubectl …`
+    //      keep working during the deprecation cycle.
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("platform-cli")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("plan")
+        .output()
+        .expect("shim runs");
+    assert!(output.status.success(), "shim must forward exit code");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(
+        stderr.contains("`platform-cli` has been renamed to `apprafter`"),
+        "shim must announce the rename. STDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("v0.2.0"),
+        "shim must mention the removal window. STDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("no changes"),
+        "forwarded `plan` output must reach stdout untouched. STDOUT:\n{stdout}"
+    );
 }
 
 #[test]

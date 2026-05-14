@@ -924,9 +924,7 @@ fn delete_floating_ip_maps_5xx_to_hetzner() {
     server
         .mock("POST", "/v1/floating_ips/300/actions/unassign")
         .with_status(422)
-        .with_body(
-            r#"{"error":{"code":"service_error","message":"Floating IP is not assigned"}}"#,
-        )
+        .with_body(r#"{"error":{"code":"service_error","message":"Floating IP is not assigned"}}"#)
         .create();
     server
         .mock("DELETE", "/v1/floating_ips/300")

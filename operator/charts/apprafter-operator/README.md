@@ -7,7 +7,7 @@ Helm chart that deploys the v0.1.27 AppRafter operator binary
 
 The Application CRD (`apprafter.io/v1alpha1`) must be installed
 before the operator pod starts. The simplest way is to run
-`platform-cli cluster-bootstrap` (which applies the CRD as part of
+`apprafter cluster-bootstrap` (which applies the CRD as part of
 v0.1.22), or apply it manually:
 
 ```sh

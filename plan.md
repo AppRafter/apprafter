@@ -820,6 +820,60 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
+## Фаза 1.5 / Track A — CLI DX rework (`cli-dx-task.md` §17)
+
+> 12 sub-versions, one per `cli-dx-task.md` §17 row, landed as `v0.1.69`–`v0.1.80` patch releases. Each row owns a focused slice (feature + test + docs). Track B (sub-phases 1.66 onwards) **does not start** until Track A is closed — its `cluster-bootstrap` rewrite depends on the target store + `bootstrap-all` orchestrator + miette errors landed here.
+
+### 1.66A.1 Rename `platform-cli` → `apprafter` + deprecation shim ✅
+
+> v0.1.69 — sub-phase 1.66A.1 shipped: Cargo package + binary flipped to `apprafter`; legacy `platform-cli` survives as a deprecated shim that warns + forwards; user-facing docs swept.
+
+**Source:** `cli-dx-task.md` §12 + §17 row 1.
+
+**Цель:** перевести user-facing binary с легаси-имени `platform-cli` на каноничное `apprafter` без слома существующих скриптов. Foundation для всех остальных Track A под-фаз (target store, `bootstrap-all`, `doctor`, `whoami`), которые landятся последовательно в `v0.1.70`–`v0.1.80`.
+
+**Поставка:**
+- [x] `cli/platform-cli/Cargo.toml` — package переименован в `apprafter`; `[[bin]] name = "apprafter"` (path `src/main.rs`) — каноничная точка входа; второй `[[bin]] name = "platform-cli"` (path `src/bin/platform-cli.rs`) — shim, помеченный к удалению в `v0.2.0`.
+- [x] `cli/platform-cli/src/bin/platform-cli.rs` — shim: печатает 3-строчный deprecation warning на stderr, потом `Command::new(apprafter)` + `.args(skip(1))` + forward exit code; cross-platform (`.exe` suffix на Windows).
+- [x] `cli/platform-cli/src/cli.rs` — `#[command(name = "apprafter", ...)]` для clap-help; about-line обновлён.
+- [x] `cli-core::logging::init` — дефолтный `EnvFilter` теперь `warn,apprafter=info,cli_core=info,cli_state=info,cli_providers=info`; без этого фикса INFO-логи фильтровались после переименования крейта (regression поймана `cli_smoke::tracing_logs_go_to_stderr_not_stdout`).
+- [x] User-facing error hints (`run \`platform-cli init …\` first` и т.п.) в `commands/apply.rs`, `commands/argocd_password.rs`, `commands/cluster_bootstrap.rs`, `commands/import.rs`, `commands/kubeconfig.rs` теперь ссылаются на `apprafter`.
+- [x] Internal docstrings + Cargo descriptions в `cli/cli-core`, `cli/cli-providers`, `cli/cli-state` обновлены — grep-discoverability осталась консистентной.
+- [x] Все 4 integration-теста (`cli_smoke`, `argocd_password_test`, `import_test`, `kubeconfig_test`, `cluster_smoke_test`) переключены на `Command::cargo_bin("apprafter")`.
+- [x] Новый regression-guard `cli_smoke::platform_cli_shim_warns_and_forwards` — пинит обе половины контракта shim'а (deprecation banner на stderr + forwarded `plan` output untouched на stdout + exit code).
+- [x] User-visible docs sweep: `README.md`, `cli/README.md`, `e2e/{README.md,mvp.sh}`, `operator/{README.md,charts/apprafter-operator/README.md}`, `backstage-plugins/host/{README.md,scripts/scaffold.sh}`, `manifests/**/README.md`, `examples/templates/bun-http/**`, `schemas/v1alpha1/{infrastructure,infrastructureproviderplugin}.cue`, `docs/{architecture,dev-guide,operator-guide,reference}/**/*.md`, `.github/ISSUE_TEMPLATE/bug.yml`, `SECURITY.md`, `.gitignore` — все ссылаются на `apprafter`.
+- [x] `spec.md` swept (kept `cli/platform-cli/` dir name in Appendix A repository tree with explicit comment that dir is renamed in `v0.2.x`).
+- [x] `docs/changelog/UNRELEASED.md` — new `v0.1.69` block с Changed/Added/Docs/Backwards-compatibility секциями; historic v0.1.x entries сохранены as-is (no rewriting of past system state).
+
+**Acceptance:**
+- ✅ `cargo build --workspace` зелёный — обе bin entry (`apprafter` + `platform-cli`) компилируются.
+- ✅ `cargo test --workspace` зелёный (61+ unit + 16 integration, включая новый shim-test).
+- ✅ `cargo clippy --workspace --all-targets -- -D warnings` зелёный.
+- ✅ `cargo fmt --all -- --check` зелёный.
+- ✅ Manual walk (см. ниже) — `apprafter --help` работает, shim прячет deprecation warning на stderr + forwards exit code, существующие env-var-based workflows (`HCLOUD_TOKEN=… apprafter init …`) функционируют без изменений.
+
+**Out-of-scope (отложено в следующие Track A слоты):**
+- Persistent target store (`apprafter target {add,list,use,show,rename,remove}`) — Track A.2/A.3.
+- Interactive wizard через `inquire` + miette-diagnostic errors — Track A.4.
+- `apprafter doctor`, `apprafter whoami` — Track A.6/A.7.
+- `apprafter bootstrap-all` orchestrator — Track A.9.
+- `apprafter auth` stubs — Track A.6.
+- Aliases (`apprafter t`), `--color` flag, `NO_COLOR` support — Track A.11.
+- ADR `docs/adr/0014-cli-command-structure.md` — Track A.12 (после всей Track A landed).
+- Переименование dir `cli/platform-cli/` → `cli/apprafter/` — отложено до `v0.2.0-self-managing` (M1.5 closure) одной cleanup-коммитой.
+
+**Зависит от:** 1.65 (последняя закрытая Track-B-prerequisite).
+
+**Размер:** S (один цикл, ~0.5 рабочего дня механического свипа + один новый файл shim + один regression-guard тест).
+
+---
+
+### 1.66A.2 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1). См. `cli-dx-task.md` §17 для общего трека: target store IO → `apprafter target add` non-interactive → interactive wizard → validation framework → CRUD команды → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+
+---
+
 ### 1.66 platform-stack monorepo skeleton + CUE source layout
 
 **Source:** ADR 0028.
@@ -3082,4 +3136,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-13 | §1.15 walks bug fixes — tier-1 firewall port 6443 + destroy floating-IP unassign order; v0.1.66 | initial |
 | 2026-05-13 | §1.15 walks follow-up — real Hetzner unassign-422 message + 423 locked retry; v0.1.67 | initial |
 | 2026-05-13 | §1.15 Q3 security fix — repo-creds Secret apply via SSA (no more PAT leak in last-applied-configuration annotation); v0.1.68 | initial |
+| 2026-05-14 | M1.5 Track A.1 — rename `platform-cli` → `apprafter`, add deprecated shim, sweep user-facing docs, retarget tracing filter; v0.1.69 | initial |
 

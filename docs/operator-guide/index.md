@@ -6,10 +6,10 @@
 
 Tasks for operators (anyone running an AppRafter cluster):
 
-- **Provisioning** — `platform-cli init` per tier (Hetzner Cloud,
+- **Provisioning** — `apprafter init` per tier (Hetzner Cloud,
   Hetzner Robot, AWS, OpenTofu plugins). See
   [`quickstart.md`](quickstart.md) for the tier-1 walkthrough.
-- **Tier upgrades** — `platform-cli upgrade-tier 1 → 2 → 3 → 4`,
+- **Tier upgrades** — `apprafter upgrade-tier 1 → 2 → 3 → 4`,
   with safety semantics from `MigrationPlan`.
 - **External surface** — wiring git, registry, OIDC SSO,
   Headscale/Tailscale, synthetic monitoring, backups.
@@ -26,5 +26,5 @@ Tasks for operators (anyone running an AppRafter cluster):
 Until each topic has its own page, the canonical references are:
 
 - `spec.md` §4.7 (External Surface), §4.8 (Access Plane), §4.12
-  (`platform-cli`).
+  (`apprafter`).
 - `plan.md` for the implementation order.

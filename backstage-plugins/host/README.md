@@ -3,7 +3,7 @@
 Operators of an AppRafter cluster who want a Backstage UI run a
 short scaffold-build-push loop *once*, then point
 `spec.backstage.image` in their `Infrastructure` manifest at the
-resulting image. From there `platform-cli cluster-bootstrap`
+resulting image. From there `apprafter cluster-bootstrap`
 applies the v0.1.18 manifest set
 (`manifests/tier-1/backstage/example.yaml`) into the `backstage`
 namespace and the UI shows up at `https://<spec.backstage.domain>`.
@@ -52,7 +52,7 @@ docker push ghcr.io/<your-org>/backstage:0.1.0
 # 6) Apply via cluster-bootstrap (or commit to the bootstrap repo
 #    so Argo CD picks it up):
 APPRAFTER_MANIFEST=examples/infrastructure/tier-1-hetzner.cue \
-  platform-cli cluster-bootstrap
+  apprafter cluster-bootstrap
 ```
 
 ## Where the pieces live

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Kubernetes-side install helpers used by `platform-cli
+//! Kubernetes-side install helpers used by `apprafter
 //! cluster-bootstrap`. Trait-based seams over `helm` + `kubectl`
 //! shell-outs, plus pure builders for the manifests / values we
 //! ship.

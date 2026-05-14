@@ -11,6 +11,86 @@ patch of each phase.
 
 _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
+## Phase 1.5 — Self-managing platform rethink (in progress)
+
+## v0.1.69 — M1.5 Track A.1 — rename `platform-cli` → `apprafter` + shim (2026-05-14)
+
+First slice of M1.5 Track A (CLI DX rework per `cli-dx-task.md` §17 row 1).
+Renames the user-facing CLI binary from the legacy `platform-cli` to the
+canonical `apprafter`, with a one-cycle deprecation shim so existing
+invocations don't break overnight. Foundation for the upcoming target
+store + `bootstrap-all` orchestrator in subsequent Track A slices.
+
+### Changed
+
+- **Cargo package + binary renamed** —
+  `cli/platform-cli/Cargo.toml` now declares package `apprafter` with
+  `[[bin]] name = "apprafter"` as the canonical entry point. Workspace
+  layout, dir names, and existing `cli-core` / `cli-providers` /
+  `cli-state` crates are untouched — only the user-facing binary name
+  flips. `cargo install --path cli/platform-cli` installs `apprafter`
+  on `$PATH` instead of `platform-cli`.
+- **clap App name flipped** — `apprafter --help` now shows `apprafter`
+  in the usage line instead of `platform-cli`, matching the new binary
+  name. Subcommands and flags are unchanged.
+- **Default `tracing` filter retargeted** — `cli-core::logging::init`
+  default `EnvFilter` now lists `apprafter=info` instead of
+  `platform_cli=info`. Crate-renamed log levels keep firing at
+  `INFO` without users needing to set `RUST_LOG`.
+- **User-facing error hints retargeted** — strings like
+  `state has no provider — run \`platform-cli init …\` first` now
+  reference `apprafter init …`. Internal `cli-core` / `cli-providers`
+  / `cli-state` doc-comments also retargeted to the new binary name
+  to keep grep-discoverability consistent.
+
+### Added
+
+- **`platform-cli` deprecation shim** —
+  `cli/platform-cli/src/bin/platform-cli.rs` is a second binary
+  built from the same package. It prints a 3-line warning to stderr
+  ("`platform-cli` has been renamed to `apprafter`. Run `apprafter
+  <command>` instead. This shim will be removed in v0.2.0.") and
+  then spawns the `apprafter` binary located in the same directory
+  with the same argv, forwarding stdin/stdout/stderr and the exit
+  code. Cross-platform (Unix + Windows `.exe` resolution).
+- **Shim regression-guard test** —
+  `cli_smoke::platform_cli_shim_warns_and_forwards` runs the shim
+  via `assert_cmd::cargo_bin("platform-cli")`, asserts the deprecation
+  banner reaches stderr, the forwarded `plan` output reaches stdout
+  untouched, and the shim's exit code matches `apprafter plan`. Pins
+  both halves of the deprecation contract.
+
+### Docs
+
+- **User-visible CLI references swept** across `README.md`,
+  `cli/README.md`, `e2e/README.md`, `e2e/mvp.sh`,
+  `operator/README.md`, `operator/charts/apprafter-operator/README.md`,
+  `backstage-plugins/host/{README.md,scripts/scaffold.sh}`,
+  `manifests/README.md`, `manifests/tier-1/{admission-webhook,application,backstage}/README.md`,
+  `examples/templates/bun-http/{README.md,skeleton/README.md,skeleton/apprafter/Application.cue}`,
+  `schemas/v1alpha1/{infrastructure,infrastructureproviderplugin}.cue`,
+  `docs/architecture/`, `docs/dev-guide/`, `docs/operator-guide/`,
+  `docs/reference/`, `.github/ISSUE_TEMPLATE/bug.yml`, `SECURITY.md`,
+  `.gitignore`, `plan.md`, `spec.md`. The deprecated `platform-cli`
+  string survives only in (1) `cli/platform-cli/Cargo.toml`'s second
+  `[[bin]]` entry, (2) the shim source + its test, (3) ADRs (`docs/adr/`),
+  (4) historical TDD plans (`docs/superpowers/plans/`), and (5) past
+  changelog entries (v0.1.x ≤ 68) — each describing system state at
+  the time of the decision.
+- **`cli-dx-task.md` §17 row 1 marked actionable**; subsequent rows
+  unlock Track A.2 (`target` file structure) onward.
+
+### Backwards compatibility
+
+- Existing scripts that invoke `platform-cli <command>` continue to
+  work via the shim. The shim prints a deprecation warning on every
+  call. Removal is scheduled for `v0.2.0-self-managing` (M1.5
+  closure) — script owners have the full Track A + Track B cycle
+  to migrate.
+- `HCLOUD_TOKEN` + `APPRAFTER_SSH_PUBLIC_KEY` env-var workflow
+  unchanged; Track A.2+ adds the persistent target store as an
+  additive layer (resolution chain stays env-friendly).
+
 ## v0.1.68 — Phase 1 patch — repo-creds Secret SSA (security) (2026-05-13)
 
 Walk-found security bug from §1.15 Q3 — exposed by manually inspecting

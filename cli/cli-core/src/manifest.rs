@@ -5,7 +5,7 @@
 //! The parser shells out to `cue export` (via [`crate::cue::export_in`])
 //! and deserialises the resulting JSON into [`InfrastructureManifest`].
 //! Defaults are intentionally **not** applied here: callers
-//! (currently `platform-cli::commands::apply`) compose manifest
+//! (currently `apprafter::commands::apply`) compose manifest
 //! values with their own constants so the parser stays a pure
 //! shape-translator.
 

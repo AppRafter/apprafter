@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Integration tests for `platform-cli kubeconfig`.
+//! Integration tests for `apprafter kubeconfig`.
 //!
 //! The cold-fetch path exercises `ssh` against the live server and
 //! is covered in-process by the FakeFetcher unit tests in
@@ -11,7 +11,7 @@ use assert_cmd::Command;
 use predicates::str::contains;
 
 fn cli() -> Command {
-    Command::cargo_bin("platform-cli").unwrap()
+    Command::cargo_bin("apprafter").unwrap()
 }
 
 fn workspace_with_state() -> tempfile::TempDir {

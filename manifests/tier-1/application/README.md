@@ -2,7 +2,7 @@
 
 `example-crd.yaml` is the deterministic rendering of
 `cli-providers::k8s::application_crd::application_crd_yaml()`. It's
-the same YAML `platform-cli cluster-bootstrap` applies during the
+the same YAML `apprafter cluster-bootstrap` applies during the
 v0.1.22 step — no opt-in required.
 
 `example-app.yaml` is a minimal `kind: Application` manifest. Use it

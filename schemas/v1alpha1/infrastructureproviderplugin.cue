@@ -2,7 +2,7 @@
 
 package v1alpha1
 
-// InfrastructureProviderPlugin extends `platform-cli` with support
+// InfrastructureProviderPlugin extends `apprafter` with support
 // for an additional cloud or substrate, typically by wrapping an
 // OpenTofu module. See ADR 0011 and spec.md §3.7 / §4.12.
 #InfrastructureProviderPlugin: {

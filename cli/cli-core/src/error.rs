@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
-//! Error type used throughout `platform-cli` and its libraries.
+//! Error type used throughout `apprafter` and its libraries.
 //!
 //! `CliError` carries variants for every recoverable failure mode
 //! the CLI surfaces. Anything we cannot recover from (programmer

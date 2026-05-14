@@ -15,7 +15,7 @@ to AppRafter):
   generated credentials through workload identity.
 - **Build pipeline** — Dockerfile + auto-analysis (CVE scan, SBOM,
   layer report) surfaced in Backstage.
-- **Promotion** — `dev → staging → prod` via `platform-cli promote`.
+- **Promotion** — `dev → staging → prod` via `apprafter promote`.
 - **Notifications** — sending via the platform HTTP API with
   channel routing and DLQ.
 
