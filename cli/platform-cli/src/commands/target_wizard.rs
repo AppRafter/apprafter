@@ -117,8 +117,8 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
     eprintln!("Welcome to AppRafter. Let's set up a deployment target.");
     eprintln!();
 
-    let name = prompt_name(initial.name.as_deref())?;
-    let provider = prompt_provider(initial.provider.as_deref())?;
+    let name = prompt_name(initial.name.as_deref(), "positional argument")?;
+    let provider = prompt_provider(initial.provider.as_deref(), "--provider flag")?;
     let token_source = classify_token_source(initial.token.as_deref());
     let (token, token_already_verified) = prompt_token(
         &provider,
@@ -126,14 +126,16 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
         token_source,
         initial.no_ping,
     )?;
-    let ssh_key = prompt_ssh_key(initial.ssh_key.as_ref())?;
+    let ssh_key_source = classify_ssh_key_source(initial.ssh_key.as_deref());
+    let ssh_key = prompt_ssh_key(initial.ssh_key.as_ref(), ssh_key_source)?;
     let region = prompt_region(
         &provider,
         &token,
         initial.region.as_deref(),
+        "--region flag",
         initial.no_ping,
     )?;
-    let tier = prompt_tier(initial.tier.as_deref())?;
+    let tier = prompt_tier(initial.tier.as_deref(), "--tier flag")?;
 
     Ok(WizardOutput {
         name,
@@ -144,6 +146,33 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
         tier,
         token_already_verified,
     })
+}
+
+/// Whether the SSH-key prefill came in via the `--ssh-key` flag or
+/// the `APPRAFTER_SSH_PUBLIC_KEY_PATH` env var (clap's
+/// `#[arg(env)]` blends both into the same `Option<PathBuf>`).
+/// Returns the user-facing source label for the prefill
+/// announcement. The default `"--ssh-key flag"` is what most
+/// people will see; `"APPRAFTER_SSH_PUBLIC_KEY_PATH env var"`
+/// fires only when the path on disk matches the env value byte
+/// for byte.
+pub fn classify_ssh_key_source_with(
+    prefill: Option<&Path>,
+    env_value: Option<&str>,
+) -> &'static str {
+    match (prefill, env_value) {
+        (Some(p), Some(e)) if p.to_string_lossy() == e => "APPRAFTER_SSH_PUBLIC_KEY_PATH env var",
+        _ => "--ssh-key flag",
+    }
+}
+
+fn classify_ssh_key_source(prefill: Option<&Path>) -> &'static str {
+    classify_ssh_key_source_with(
+        prefill,
+        std::env::var("APPRAFTER_SSH_PUBLIC_KEY_PATH")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Classify how the token reached us: clap's `#[arg(env)]` blends
@@ -184,10 +213,17 @@ pub fn run_renew_wizard(provider: &str, no_ping: bool) -> Result<(String, bool)>
 // Individual prompts
 // ---------------------------------------------------------------
 
-fn prompt_name(prefill: Option<&str>) -> Result<String> {
-    let default = prefill.unwrap_or(DEFAULT_TARGET_NAME).to_string();
+fn prompt_name(prefill: Option<&str>, source: &str) -> Result<String> {
+    if let Some(name) = prefill {
+        // Don't re-prompt for a pre-supplied name — the v0.1.76
+        // behaviour of asking with `<name>` as the default was
+        // mostly noise. Announce + accept, mirroring the silent
+        // path the other prefilled fields already take.
+        eprintln!("  ℹ Target name: {name} (from {source})");
+        return Ok(name.to_string());
+    }
     let answer = Text::new("Target name:")
-        .with_default(&default)
+        .with_default(DEFAULT_TARGET_NAME)
         .with_validator(|v: &str| match super::target::check_target_name(v) {
             Ok(()) => Ok(Validation::Valid),
             Err(msg) => Ok(Validation::Invalid(msg.into())),
@@ -197,7 +233,7 @@ fn prompt_name(prefill: Option<&str>) -> Result<String> {
     Ok(answer)
 }
 
-fn prompt_provider(prefill: Option<&str>) -> Result<String> {
+fn prompt_provider(prefill: Option<&str>, source: &str) -> Result<String> {
     // Single-entry Select today — kept as a Select so adding a
     // provider in the future doesn't reshape the wizard surface.
     if let Some(p) = prefill {
@@ -206,6 +242,7 @@ fn prompt_provider(prefill: Option<&str>) -> Result<String> {
         // prompt entirely matches the "wizard only fills missing
         // bits" contract.
         if PROVIDER_CHOICES.contains(&p) {
+            eprintln!("  ℹ Provider: {p} (from {source})");
             return Ok(p.to_string());
         }
         return Err(CliError::Other(format!(
@@ -298,8 +335,10 @@ fn prompt_token(
     Ok((answer, !no_ping))
 }
 
-fn prompt_ssh_key(prefill: Option<&PathBuf>) -> Result<Option<PathBuf>> {
+fn prompt_ssh_key(prefill: Option<&PathBuf>, source: &str) -> Result<Option<PathBuf>> {
     if let Some(path) = prefill {
+        let abbrev = abbreviate_home_path(path);
+        eprintln!("  ℹ SSH public key: {abbrev} (from {source})");
         return Ok(Some(path.clone()));
     }
 
@@ -455,9 +494,11 @@ fn prompt_region(
     provider: &str,
     token: &str,
     prefill: Option<&str>,
+    source: &str,
     no_ping: bool,
 ) -> Result<Option<String>> {
     if let Some(r) = prefill {
+        eprintln!("  ℹ Default region: {r} (from {source})");
         return Ok(Some(r.to_string()));
     }
     if no_ping {
@@ -593,8 +634,9 @@ pub fn probe_region_latency(region: &str, timeout: Duration) -> Option<u32> {
     Some(start.elapsed().as_millis().min(u32::MAX as u128) as u32)
 }
 
-fn prompt_tier(prefill: Option<&str>) -> Result<Option<String>> {
+fn prompt_tier(prefill: Option<&str>, source: &str) -> Result<Option<String>> {
     if let Some(t) = prefill {
+        eprintln!("  ℹ Default tier: {t} (from {source})");
         return Ok(Some(t.to_string()));
     }
     let options: Vec<TierChoice> = TIER_CHOICES
@@ -938,6 +980,32 @@ mod tests {
                 "synthetic .invalid hosts shouldn't resolve"
             );
         }
+    }
+
+    #[test]
+    fn classify_ssh_key_source_prefers_env_label_when_path_matches_env_value() {
+        let p = PathBuf::from("/home/me/.ssh/id_ed25519.pub");
+        // Path matches env-var value byte-for-byte → labelled
+        // as the env source so the user can find where it came
+        // from.
+        assert_eq!(
+            classify_ssh_key_source_with(Some(&p), Some("/home/me/.ssh/id_ed25519.pub")),
+            "APPRAFTER_SSH_PUBLIC_KEY_PATH env var"
+        );
+        // Path differs → flag source.
+        assert_eq!(
+            classify_ssh_key_source_with(Some(&p), Some("/somewhere/else.pub")),
+            "--ssh-key flag"
+        );
+        // No env at all → flag source.
+        assert_eq!(
+            classify_ssh_key_source_with(Some(&p), None),
+            "--ssh-key flag"
+        );
+        // No prefill — the function isn't called in practice but
+        // the fallback is still "--ssh-key flag" (callers gate
+        // the call on prefill.is_some() anyway).
+        assert_eq!(classify_ssh_key_source_with(None, None), "--ssh-key flag");
     }
 
     #[test]

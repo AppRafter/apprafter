@@ -381,6 +381,91 @@ fn target_add_renew_on_missing_target_errors_with_hint() {
 }
 
 #[test]
+fn target_add_renew_rejects_identical_token_with_rotation_hint() {
+    // The v0.1.77 walk surfaced that `--renew` happily "rotated"
+    // a target to the exact same token bytes — green checkmark,
+    // zero actual change in Hetzner. v0.1.78 makes that case
+    // fail loudly so the operator hits the Hetzner Cloud Console
+    // and generates a fresh token instead of having a silent
+    // no-op.
+    let dir = tempfile::tempdir().unwrap();
+    let token = synthetic_hetzner_token();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "rotate-me",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &token,
+        ])
+        .assert()
+        .success();
+
+    // Same token supplied to --renew → reject.
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args(["target", "add", "rotate-me", "--token", &token, "--renew"])
+        .assert()
+        .failure()
+        .stderr(contains("requires a NEW token"))
+        .stderr(contains("Hetzner Cloud Console"));
+
+    // On-disk credentials must still reflect the original token,
+    // not be wiped or corrupted by the failed renew attempt.
+    let creds =
+        std::fs::read_to_string(dir.path().join("targets/rotate-me/credentials.yaml")).unwrap();
+    assert!(
+        creds.contains(&token),
+        "original token must remain on disk after a rejected renew, got:\n{creds}"
+    );
+}
+
+#[test]
+fn target_add_renew_accepts_genuinely_new_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = synthetic_hetzner_token();
+    let new = "b".repeat(64);
+    assert_ne!(old, new, "test fixtures must differ");
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "rotate-me",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &old,
+        ])
+        .assert()
+        .success();
+
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args(["target", "add", "rotate-me", "--token", &new, "--renew"])
+        .assert()
+        .success()
+        .stdout(contains("credentials rotated"));
+
+    let creds =
+        std::fs::read_to_string(dir.path().join("targets/rotate-me/credentials.yaml")).unwrap();
+    assert!(creds.contains(&new), "new token must land on disk");
+    assert!(!creds.contains(&old), "old token must be replaced");
+}
+
+#[test]
 fn target_add_renew_rejects_config_flags() {
     let dir = tempfile::tempdir().unwrap();
     let token = synthetic_hetzner_token();

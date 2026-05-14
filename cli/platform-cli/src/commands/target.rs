@@ -268,6 +268,20 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> 
     // Token is required for renew (whole point of the flag);
     // ssh-key path is optional (user may renew only the token).
     let token = require_token(&existing.config.provider, args.token.as_deref())?;
+
+    // Reject identical-token "rotations" loudly. The wizard happily
+    // accepts whatever the user types, the CLI happily accepts the
+    // env var — and an operator who pastes the OLD token by
+    // muscle-memory gets a green "credentials rotated" message
+    // without anything actually changing in Hetzner. That's the
+    // exact opposite of what `--renew` advertises. Match a token
+    // by raw bytes so even a single-char drift counts as "new".
+    if existing.credentials.hetzner_token.as_deref() == Some(token.as_str()) {
+        return Err(CliError::Other(format!(
+            "`--renew` requires a NEW token, but the value provided is identical to the one already saved for target `{name}`. Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then re-run `apprafter target add {name} --renew` with the new value."
+        )));
+    }
+
     if let Some(path) = args.ssh_key.as_ref() {
         verify_ssh_key_readable(path)?;
         existing.config.ssh_key_path = Some(path.clone());

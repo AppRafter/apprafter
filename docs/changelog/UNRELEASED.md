@@ -13,6 +13,83 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.78 — wizard UX polish #2 (2026-05-14)
+
+Follow-up to v0.1.77 driven by the second walk-through. Three
+behaviour fixes:
+
+### Changed
+
+- **`prompt_name` skips silently on prefill.** v0.1.76 always
+  asked, with the supplied name as the default — minor friction
+  but inconsistent with how the other prefilled fields behave.
+  Now the prefilled `name` flows through silently with the same
+  `ℹ Target name: <name> (from <source>)` announcement other
+  fields use.
+
+- **Origin labels for every prefilled wizard field.** v0.1.77
+  already printed `ℹ Using token from HCLOUD_TOKEN env var ...`
+  but the other prefilled fields just disappeared into "wizard
+  didn't ask". Now each prefilled field prints
+  `  ℹ <Field>: <value> (from <source>)` so the user can audit
+  what's coming from where without re-reading the command line.
+  Sources:
+  - Name: `positional argument` (`apprafter target add <name>`).
+  - Provider: `--provider flag`.
+  - SSH key: `--ssh-key flag` or
+    `APPRAFTER_SSH_PUBLIC_KEY_PATH env var` (clap's
+    `#[arg(env)]` blends both into one `Option<PathBuf>`; the
+    new `classify_ssh_key_source_with(prefill, env_value)` pure
+    helper disambiguates the same way `classify_token_source`
+    does for the token field).
+  - Region: `--region flag`.
+  - Default tier: `--tier flag`.
+
+- **`run_renew` rejects identical-token "rotations".** The
+  second walk surfaced that the renew flow silently accepted
+  whatever the wizard or CLI handed it, including the existing
+  token re-pasted by muscle memory — green "credentials
+  rotated" message, zero actual change in Hetzner. v0.1.78
+  compares the new token to `existing.credentials.hetzner_token`
+  byte-for-byte after `require_token` validates it; on match
+  the command fails with:
+  ```
+  `--renew` requires a NEW token, but the value provided is
+  identical to the one already saved for target `<name>`.
+  Generate a fresh token in the Hetzner Cloud Console →
+  Security → API Tokens, then re-run `apprafter target add
+  <name> --renew` with the new value.
+  ```
+  No `--force` override — re-saving the same token under the
+  banner of "rotation" is always the wrong outcome; an operator
+  who really wants to overwrite the credentials half can pass
+  `apprafter target add <name> --force --token <X>` instead
+  (deletes the renew safety net by going through the create
+  path).
+
+### Tests
+
+- `classify_ssh_key_source_prefers_env_label_when_path_matches_env_value`
+  — four-way table (env match / env diff / no env / no
+  prefill) pinning the source resolution.
+- `target_add_renew_rejects_identical_token_with_rotation_hint`
+  — integration test: create target with token A, attempt
+  `--renew` with same token A → command fails, error mentions
+  "requires a NEW token" + "Hetzner Cloud Console", and the
+  on-disk credentials file still contains the original token
+  (no corruption from the failed renew).
+- `target_add_renew_accepts_genuinely_new_token` — regression
+  guard that the identical-token check only fires on identity,
+  not on the happy rotation path.
+
+### Operator note
+
+The renew check is purely defensive — flagging an outcome the
+operator clearly didn't intend. If you legitimately want to
+overwrite a target's config without rotating credentials, use
+`apprafter target add <name> --force --token <same>` (the
+create flow, not renew).
+
 ## v0.1.77 — wizard UX polish + workspace version-bump policy (2026-05-14)
 
 Follow-up to v0.1.76 driven by the first real walk-through of the
