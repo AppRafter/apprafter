@@ -151,27 +151,44 @@ fn print_dry_run_plan(target_override: Option<&str>) -> Result<()> {
         .as_ref()
         .and_then(|s| load_active_target_config(s, target_override));
 
-    println!("bootstrap-all — DRY RUN (no provider or cluster mutation)");
+    println!(
+        "{} — DRY RUN (no provider or cluster mutation)",
+        style::bold("bootstrap-all")
+    );
     println!();
     print_target_block(target_override, name.as_deref(), config.as_ref());
     println!();
-    println!("Phases:");
-    println!("  [1/3] apply              — provision Hetzner Cloud resources");
+    println!("{}", style::bold("Phases:"));
     println!(
-        "                              (server, network, firewall, SSH key, optional floating IPs)"
+        "  {} apply              — provision Hetzner Cloud resources",
+        style::info("[1/3]")
     );
     println!(
-        "  [2/3] kubeconfig (poll)  — SSH-fetch /etc/rancher/k3s/k3s.yaml every {}s, up to {}s",
+        "                              {}",
+        style::dim("(server, network, firewall, SSH key, optional floating IPs)")
+    );
+    println!(
+        "  {} kubeconfig (poll)  — SSH-fetch /etc/rancher/k3s/k3s.yaml every {}s, up to {}s",
+        style::info("[2/3]"),
         KUBECONFIG_POLL_INTERVAL.as_secs(),
         KUBECONFIG_POLL_TIMEOUT.as_secs(),
     );
-    println!("                              (cache age-encrypted in state)");
-    println!("  [3/3] cluster-bootstrap  — install Cilium + Gateway API CRDs + Application CRD");
+    println!(
+        "                              {}",
+        style::dim("(cache age-encrypted in state)")
+    );
+    println!(
+        "  {} cluster-bootstrap  — install Cilium + Gateway API CRDs + Application CRD",
+        style::info("[3/3]")
+    );
     println!("                              + default-deny NetworkPolicy + Argo CD + cert-manager");
     println!("                              + self-signed ClusterIssuer + apprafter-operator");
     println!("                              + admission-webhook");
     println!();
-    println!("Run `apprafter bootstrap-all` (without --dry-run) to execute.");
+    println!(
+        "{}",
+        style::dim("Run `apprafter bootstrap-all` (without --dry-run) to execute.")
+    );
     Ok(())
 }
 
@@ -180,43 +197,71 @@ fn print_target_block(
     resolved_name: Option<&str>,
     config: Option<&TargetConfig>,
 ) {
+    let label = style::bold("Target:");
     match (target_override, resolved_name) {
-        (Some(t), _) => println!("Target: {t} (via --target override)"),
-        (None, Some(n)) => println!("Target: {n} (active)"),
+        (Some(t), _) => println!(
+            "{label} {} {}",
+            style::bold(t),
+            style::info("(via --target override)")
+        ),
+        (None, Some(n)) => println!("{label} {} {}", style::bold(n), style::info("(active)")),
         (None, None) => {
-            println!("Target: <none — no active target in store>");
-            println!("  Run `apprafter target add <name> --provider hetzner-cloud …` first.");
+            println!(
+                "{label} {}",
+                style::dim("<none — no active target in store>")
+            );
+            println!(
+                "  {}",
+                style::dim("Run `apprafter target add <name> --provider hetzner-cloud …` first.")
+            );
             return;
         }
     }
     match config {
         Some(c) => {
-            println!("  Provider:    {}", c.provider);
+            let placeholder_region = style::dim("<unset — apply uses nbg1>");
+            let placeholder_tier = style::dim("<unset — apply uses solo>");
+            let placeholder_cluster = style::dim("<unset — apply uses platform-1>");
+            let placeholder_ssh = style::dim("<unset>");
+            let label_provider = style::dim("Provider:   ");
+            let label_region = style::dim("Region:     ");
+            let label_tier = style::dim("Tier:       ");
+            let label_cluster = style::dim("Cluster:    ");
+            let label_ssh = style::dim("SSH key:    ");
+            println!("  {label_provider} {}", c.provider);
             println!(
-                "  Region:      {}",
-                c.region.as_deref().unwrap_or("<unset — apply uses nbg1>")
+                "  {label_region} {}",
+                c.region
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| placeholder_region.clone()),
             );
             println!(
-                "  Tier:        {}",
+                "  {label_tier} {}",
                 c.default_tier
                     .as_deref()
-                    .unwrap_or("<unset — apply uses solo>")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| placeholder_tier.clone()),
             );
             println!(
-                "  Cluster:     {}",
+                "  {label_cluster} {}",
                 c.cluster_name
                     .as_deref()
-                    .unwrap_or("<unset — apply uses platform-1>")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| placeholder_cluster.clone()),
             );
             println!(
-                "  SSH key:     {}",
+                "  {label_ssh} {}",
                 c.ssh_key_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<unset>".to_string())
+                    .unwrap_or_else(|| placeholder_ssh.clone()),
             );
         }
-        None => println!("  (config unreadable — target file missing or malformed)"),
+        None => println!(
+            "  {}",
+            style::dim("(config unreadable — target file missing or malformed)")
+        ),
     }
 }
 

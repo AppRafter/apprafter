@@ -13,6 +13,74 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.89 — hotfix: color bootstrap-all dry-run plan (2026-05-14)
+
+Walk-found gap in v0.1.88. The Track A.11 colour pass touched
+the wet path (`→`, `✓`, `✗` phase markers) and `doctor`
+glyphs, but the much more common `apprafter up --dry-run`
+output stayed monochrome — the only green visible was the
+`INFO` label from `tracing-subscriber`, which is unrelated
+to the new `style` module.
+
+v0.1.89 closes the gap with subtle, semantically-meaningful
+colouring of the dry-run plan, designed so the structurally
+important parts (target name, phase numbers, real config
+values) read at full brightness while the supporting labels
+and `<unset — apply uses …>` defaults fade into `style::dim`.
+
+### Changed
+
+- **`bootstrap-all — DRY RUN`** heading: `style::bold` on the
+  command name.
+- **`Target:` label** + **active target name**: `style::bold`.
+  Reads as the answer to "which cluster am I about to touch?",
+  which is the single most important line in the plan.
+- **`(active)` / `(via --target override)`**: `style::info`
+  cyan. Tag, not content — quick visual confirmation that the
+  resolution chain worked.
+- **`Phases:` heading**: `style::bold`.
+- **`[1/3]` / `[2/3]` / `[3/3]` phase numbers**: `style::info`
+  cyan. Echoes the cyan `→` marker the wet path uses; the
+  parallel visual cue helps operators map dry-run phases to
+  the runtime spinner output.
+- **Field labels `Provider:` / `Region:` / `Tier:` /
+  `Cluster:` / `SSH key:`**: `style::dim`. The label is
+  scaffolding; the operator's eye should land on the value to
+  its right.
+- **`<unset — apply uses …>` placeholders**: `style::dim`.
+  Stays readable, but fades against real values.
+- **`(server, network, firewall, …)`** sub-line under each
+  phase: `style::dim`. Supplementary detail, not the headline.
+- **Bottom hint** `Run \`apprafter bootstrap-all\` …`:
+  `style::dim`.
+
+The `→` / `✓` / `✗` markers + spinner colour in the wet path
+keep the v0.1.88 styling; only the dry-run side of the file
+changes here.
+
+### Backwards compatibility
+
+- `NO_COLOR=1` and non-TTY pipes still produce byte-identical
+  output to v0.1.85 (zero ANSI sequences). Verified by
+  `cargo test`'s existing `cli_core::style::tests` running
+  under captured-stdout.
+- All `bootstrap_all` integration tests stay green; assertions
+  match the substring content of the `style::*` helpers'
+  output, which under non-TTY equals the original text.
+
+### Operator note
+
+Running in a real terminal you now see:
+- the target name bold (so you can't miss which cluster);
+- `(active)` cyan (resolution-chain confirmation);
+- phase numbers `[1/3]` … cyan (mapping to the cyan `→` in
+  the wet path);
+- everything else either full-brightness real value or
+  dimmed scaffolding.
+
+In CI / piped output the file is byte-for-byte the same as
+v0.1.88.
+
 ## v0.1.88 — M1.5 Track A.11 — semantic colors + subcommand aliases (2026-05-14)
 
 Eleventh Track A slice. Two ergonomic additions: semantic colour
