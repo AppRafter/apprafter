@@ -57,17 +57,67 @@ const TARGET_CONFIG_FILE: &str = "config.yaml";
 const TARGET_CREDENTIALS_FILE: &str = "credentials.yaml";
 const AUTH_KEEP_FILE: &str = ".keep";
 
-/// Resolve `$XDG_CONFIG_HOME/apprafter/` (or the platform
-/// equivalent on non-Linux). Errors when neither
-/// `dirs::config_dir()` nor a usable `$HOME` are available, which
-/// shouldn't happen on any sane install — `Result` is the safe
-/// surface.
+/// Env-var that overrides `default_config_root()`. Primary use is
+/// integration tests pointing the store at a `tempfile::TempDir`
+/// without touching the developer's real `~/.config/apprafter/`;
+/// power users can also redirect their store for compartmentalised
+/// experimentation. Honoured ahead of `dirs::config_dir()` so the
+/// override is reliable even on macOS where `dirs::config_dir()`
+/// returns `~/Library/Application Support/` instead of `~/.config/`.
+pub const CONFIG_DIR_ENV: &str = "APPRAFTER_CONFIG_DIR";
+
+/// Resolve the target-store root. Order:
+///
+/// 1. `$APPRAFTER_CONFIG_DIR` (used verbatim — no `apprafter/`
+///    suffix appended, so tests can point straight at their tempdir).
+/// 2. `dirs::config_dir().join("apprafter")` (XDG on Linux, native
+///    on macOS/Windows).
+///
+/// Errors when neither path resolves (no `HOME`, no
+/// `XDG_CONFIG_HOME`, no env override) — should never happen on a
+/// sane install, but `Result` is the safe surface.
 pub fn default_config_root() -> Result<PathBuf> {
+    if let Ok(custom) = std::env::var(CONFIG_DIR_ENV) {
+        if !custom.is_empty() {
+            return Ok(PathBuf::from(custom));
+        }
+    }
     dirs::config_dir()
         .map(|p| p.join("apprafter"))
         .ok_or_else(|| {
             CliError::Other("cannot resolve config dir (HOME / XDG_CONFIG_HOME both unset?)".into())
         })
+}
+
+/// Validate a Hetzner Cloud API token's surface format —
+/// `^hcloud_[a-zA-Z0-9]{60,}$` per `cli-dx-task.md` §11. Cheap
+/// pre-flight before the real `GET /v1/locations` ping in Track
+/// A.4; here it just catches typos and obviously-wrong values
+/// (e.g. user pasted the AWS access key by mistake).
+///
+/// Returns `Ok(())` on success or a humane string the caller wraps
+/// into a `CliError::Other` with surrounding context. We keep the
+/// return shape `Result<_, String>` rather than `Result<_, CliError>`
+/// because validators are pure: no IO, no errno; the caller knows
+/// best how to phrase the surrounding error ("invalid token for
+/// --token flag" vs. "invalid token in credentials.yaml").
+pub fn validate_hetzner_token_format(token: &str) -> std::result::Result<(), String> {
+    let stripped = token
+        .strip_prefix("hcloud_")
+        .ok_or_else(|| "Hetzner Cloud tokens must start with `hcloud_`".to_string())?;
+    if stripped.len() < 60 {
+        return Err(format!(
+            "Hetzner Cloud tokens have at least 64 chars total (60+ after `hcloud_`); got {} chars after the prefix",
+            stripped.len()
+        ));
+    }
+    if !stripped.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(
+            "Hetzner Cloud tokens are alphanumeric ASCII after `hcloud_` — found a non-[A-Za-z0-9] character"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Locator for every path inside the target store. Carries a
@@ -705,6 +755,81 @@ mod tests {
             dbg.contains("<redacted>"),
             "Debug must show the <redacted> marker so a stray println! is visible in logs: {dbg}"
         );
+    }
+
+    #[test]
+    fn default_config_root_honours_apprafter_config_dir_env_override() {
+        // Save the user's real env so we don't pollute it across
+        // test threads — cargo test runs tests in parallel by
+        // default, so set + read inside a single test function and
+        // restore immediately. We use a unique tempdir so collisions
+        // between concurrent test invocations are impossible.
+        let dir = tempdir().unwrap();
+        let prior = std::env::var(CONFIG_DIR_ENV).ok();
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        let resolved = default_config_root().expect("env override should resolve");
+        match prior {
+            Some(v) => std::env::set_var(CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(CONFIG_DIR_ENV),
+        }
+        assert_eq!(
+            resolved,
+            dir.path(),
+            "env override must be used verbatim, no `apprafter/` suffix appended"
+        );
+    }
+
+    #[test]
+    fn default_config_root_ignores_empty_env_override() {
+        // Empty string is treated as "unset" so users who do
+        // `APPRAFTER_CONFIG_DIR= apprafter target list` aren't
+        // accidentally pointed at the current working directory.
+        let prior = std::env::var(CONFIG_DIR_ENV).ok();
+        std::env::set_var(CONFIG_DIR_ENV, "");
+        let resolved = default_config_root().expect("dirs::config_dir is set in test env");
+        match prior {
+            Some(v) => std::env::set_var(CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(CONFIG_DIR_ENV),
+        }
+        assert_eq!(
+            resolved.file_name().and_then(|s| s.to_str()),
+            Some("apprafter"),
+            "empty env override must fall through to dirs::config_dir().join(apprafter), got {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn validate_hetzner_token_format_accepts_canonical_64_char_token() {
+        // 7 chars prefix + 60 chars body = 67 total (above the
+        // documented 64-char minimum, well within the typical Hetzner
+        // 64-char token shape).
+        let body = "a".repeat(60);
+        let token = format!("hcloud_{body}");
+        assert!(validate_hetzner_token_format(&token).is_ok(), "{token}");
+    }
+
+    #[test]
+    fn validate_hetzner_token_format_rejects_missing_prefix() {
+        let body = "a".repeat(60);
+        let err = validate_hetzner_token_format(&body).expect_err("missing prefix");
+        assert!(err.contains("must start with `hcloud_`"), "{err}");
+    }
+
+    #[test]
+    fn validate_hetzner_token_format_rejects_too_short() {
+        let err = validate_hetzner_token_format("hcloud_short").expect_err("too short");
+        assert!(err.contains("at least 64 chars"), "{err}");
+    }
+
+    #[test]
+    fn validate_hetzner_token_format_rejects_non_ascii_alphanumeric() {
+        // Padding past the length threshold so the length check
+        // doesn't short-circuit before the alphanumeric check fires.
+        let body = "a".repeat(60);
+        let token = format!("hcloud_{body}-with-dash");
+        let err = validate_hetzner_token_format(&token).expect_err("dash is non-alphanumeric");
+        assert!(err.contains("alphanumeric"), "{err}");
     }
 
     #[test]

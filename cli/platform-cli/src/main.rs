@@ -14,22 +14,23 @@ fn main() -> color_eyre::Result<()> {
     logging::init();
 
     let args = Cli::parse();
-    match &args.command {
+    match args.command {
+        Commands::Target { action } => commands::target::run(action)?,
         Commands::Init {
             provider,
             tier,
             region,
-        } => commands::init::run(provider, tier, region)?,
+        } => commands::init::run(&provider, &tier, &region)?,
         Commands::Plan => commands::plan::run()?,
         Commands::Apply => commands::apply::run()?,
         Commands::Status => commands::status::run()?,
         Commands::Login => commands::login::run()?,
-        Commands::UpgradeTier { to } => commands::upgrade_tier::run(to)?,
-        Commands::Destroy { yes } => commands::destroy::run(*yes)?,
-        Commands::Import { force, dry_run } => commands::import::run(*force, *dry_run)?,
-        Commands::Kubeconfig { refresh } => commands::kubeconfig::run(*refresh)?,
+        Commands::UpgradeTier { to } => commands::upgrade_tier::run(&to)?,
+        Commands::Destroy { yes } => commands::destroy::run(yes)?,
+        Commands::Import { force, dry_run } => commands::import::run(force, dry_run)?,
+        Commands::Kubeconfig { refresh } => commands::kubeconfig::run(refresh)?,
         Commands::ClusterBootstrap => commands::cluster_bootstrap::run()?,
-        Commands::ArgocdPassword { refresh } => commands::argocd_password::run(*refresh)?,
+        Commands::ArgocdPassword { refresh } => commands::argocd_password::run(refresh)?,
     }
     Ok(())
 }

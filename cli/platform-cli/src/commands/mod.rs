@@ -12,4 +12,5 @@ pub mod kubeconfig;
 pub mod login;
 pub mod plan;
 pub mod status;
+pub mod target;
 pub mod upgrade_tier;

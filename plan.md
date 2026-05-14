@@ -910,9 +910,73 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.3 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.3 `apprafter target add` non-interactive ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1, 1.66A.2). См. `cli-dx-task.md` §17 для общего трека: target store IO ✅ → `apprafter target add` non-interactive → interactive wizard → validation framework → CRUD команды → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.73 — sub-phase 1.66A.3 shipped: clap subcommand `apprafter target add <name>` (+ alias `apprafter t add`) с pure flag-driven flow, валидация (name shape, provider whitelist, token format, ssh-key readable), `--force` / `--renew` семантика, первый target auto-promotes в active. Interactive wizard via `inquire` — отложен в A.4.
+
+**Source:** `cli-dx-task.md` §5.1 (non-interactive flow), §10 (error patterns), §11 (validation rules), §17 row 3.
+
+**Поставка:**
+- [x] `cli/platform-cli/src/cli.rs` — новый `Commands::Target { action }` варинт + `TargetCommand::Add { name, provider, token, ssh_key, region, tier, cluster_name, force, renew, no_interactive }` enum-вариант. `#[command(alias = "t")]` на `Target` группе → `apprafter t add …` работает идентично `apprafter target add …`. `--token` читает `HCLOUD_TOKEN` env var через `#[arg(env)]`, `--ssh-key` — `APPRAFTER_SSH_PUBLIC_KEY_PATH`. `--force` и `--renew` помечены `conflicts_with` для clap-уровневого reject комбинации.
+- [x] `cli/platform-cli/src/commands/target.rs` — handler-модуль:
+    - `run(action) → match → run_add(args)`.
+    - `validate_target_name(name)` — non-empty, ≤64 chars, `[A-Za-z0-9-]+`, без leading/trailing `-`.
+    - `require_known_provider(opt)` — non-None + whitelist (`["hetzner-cloud"]` пока).
+    - `require_token(provider, opt)` — non-None + per-provider format check. Для hetzner-cloud зовёт `cli_core::target::validate_hetzner_token_format`.
+    - `verify_ssh_key_readable(path)` — `path.exists()` + `read_to_string` success.
+    - `run_renew(paths, args)` — error если target отсутствует; refuses конфиг-флаги (только credentials); зовёт `save_target(existing.with(new creds))`.
+    - `ensure_active_target(paths, name)` — `save_global_config({active_target: name})` только если `load_global_config` возвращает None (first-run case); subsequent saves не трогают active pointer.
+- [x] `cli/platform-cli/src/main.rs` — `match args.command` (move) + dispatch `Commands::Target { action } => commands::target::run(action)?`. Существующие command::run сигнатуры (`&str` / `bool`) совместимы через `&owned` / Copy.
+- [x] `cli-core::target` extensions:
+    - `CONFIG_DIR_ENV = "APPRAFTER_CONFIG_DIR"` — env override для `default_config_root()` (testing ergonomics + power-user redirect). Используется verbatim, без `.join("apprafter")` суффикса.
+    - `validate_hetzner_token_format(token)` — `^hcloud_[a-zA-Z0-9]{60,}$` без `regex` crate (string-методы достаточно для такой простой проверки). Возвращает `Result<(), String>` — caller-level wrap в `CliError::Other` с context'ом.
+- [x] 17 integration-тестов (`tests/target_test.rs`):
+    - happy path (`writes_config_and_credentials_and_promotes_first_target_to_active`) — пинит на-disk layout, active pointer, token landed.
+    - mode 0600 (`credentials_file_is_mode_0600`, Unix-only).
+    - env-var fallback (`uses_hcloud_token_env_var_as_fallback`) — clap `#[arg(env)]` works.
+    - missing token (`errors_when_token_missing_entirely`).
+    - unknown provider (`errors_on_unknown_provider`).
+    - malformed token (`errors_on_malformed_hetzner_token`).
+    - invalid name (`errors_on_invalid_target_name`).
+    - no-force overwrite reject (`refuses_to_overwrite_existing_target_without_force`) — error message включает оба `--force` и `--renew` hint'а.
+    - force overwrite (`force_overwrites_existing_target_and_keeps_active_pointer`) — active pointer **не** меняется на second-save.
+    - renew rotate (`renew_rotates_credentials_without_touching_config`).
+    - renew on missing (`renew_on_missing_target_errors_with_hint`).
+    - renew refuses config flags (`renew_rejects_config_flags`).
+    - clap-level conflict (`force_and_renew_are_mutually_exclusive`).
+    - ssh-key path verified (`with_ssh_key_path_verifies_file_exists`).
+    - ssh-key missing (`errors_when_ssh_key_path_missing`).
+    - second save preserves active (`second_target_save_keeps_first_as_active_and_reports_so`).
+    - alias `t` works (`target_alias_t_subcommand_resolves_to_target`).
+- [x] 10 unit-тестов inline в `commands/target.rs` (pure validators): `validate_target_name` × 5 cases, `require_known_provider` × 2, `require_token` happy + bad, `verify_ssh_key_readable` × 2.
+- [x] 6 unit-тестов в `cli_core::target` (валидатор + env override): `default_config_root_honours_apprafter_config_dir_env_override`, `_ignores_empty_env_override`, `validate_hetzner_token_format` × 4.
+
+**Acceptance:**
+- ✅ `apprafter target add default --provider hetzner-cloud --token hcloud_…` создаёт целый target + ставит active.
+- ✅ Subsequent `target add another --provider … --token …` создаёт, **не** трогает active.
+- ✅ `target add existing` без `--force` → error с hint'ом на оба `--force` и `--renew`.
+- ✅ `target add existing --force` → overwrites; `target add existing --renew --token …` → только credentials, config preserved.
+- ✅ `apprafter t add … ` — alias работает.
+- ✅ `--force --renew` одновременно — clap reject (`conflicts_with`).
+- ✅ Malformed token / unknown provider / invalid name — typed error на stderr.
+- ✅ `cargo test --workspace`: 0 failures (17 new integration + 10 unit + 6 cli-core validator = +33 vs v0.1.72). fmt + clippy + SPDX (151 files) — clean.
+
+**Out-of-scope (отложено):**
+- Interactive wizard через `inquire` — Track A.4 (v0.1.74).
+- `apprafter target list / use / show / rename / remove` — Track A.5.
+- `apprafter target add` real API ping (`GET /v1/locations` against Hetzner) — Track A.4 validator framework.
+- `apprafter whoami` aggregator (показать active target + provider verified status) — Track A.6.
+- Resolution chain в существующие `init / apply / cluster-bootstrap` — Track A.8.
+
+**Зависит от:** 1.66A.2 ✅ (target store IO).
+
+**Размер:** S (один цикл, ~1 рабочий день).
+
+---
+
+### 1.66A.4 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1, 1.66A.2, 1.66A.3). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → interactive wizard → validation framework → CRUD команды → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3182,4 +3246,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | 1.2 AUDIT (Hetzner IPv6) — wire-type `PublicIpv6` + dual-stack k3s `--cluster-cidr`/`--service-cidr` (ADR 0017) + Hetzner Firewall ICMP allow-rule; v0.1.70 | initial |
 | 2026-05-14 | 1.4 AUDIT (Cilium dual-stack) — explicit `ipv4.enabled: true` + `ipv6.enabled: true` в Helm values (ADR 0017); `e2e/mvp.sh` Phase 6.4 — pod-level v4+v6 podIPs assertion; v0.1.71 | initial |
 | 2026-05-14 | M1.5 Track A.2 — `cli-core::target` module: types (GlobalConfig/TargetConfig/TargetCredentials/Target/TargetStorePaths) + atomic load/save IO + 0600 enforcement + `<redacted>` Debug; +16 unit tests; v0.1.72 | initial |
+| 2026-05-14 | M1.5 Track A.3 — `apprafter target add` (+`t` alias) non-interactive: validators, `--force`/`--renew`, first-target auto-active, env-override `APPRAFTER_CONFIG_DIR`; +33 tests; v0.1.73 | initial |
 

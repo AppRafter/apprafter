@@ -12,7 +12,7 @@ pub mod tier;
 pub use error::{CliError, Result};
 pub use target::{
     default_config_root, list_target_names, load_global_config, load_target, remove_target,
-    save_global_config, save_target, GlobalConfig, Target, TargetConfig, TargetCredentials,
-    TargetStorePaths, TARGET_STORE_VERSION,
+    save_global_config, save_target, validate_hetzner_token_format, GlobalConfig, Target,
+    TargetConfig, TargetCredentials, TargetStorePaths, CONFIG_DIR_ENV, TARGET_STORE_VERSION,
 };
 pub use tier::Tier;

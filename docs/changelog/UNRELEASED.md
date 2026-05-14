@@ -13,6 +13,147 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.73 — M1.5 Track A.3 — `apprafter target add` non-interactive (2026-05-14)
+
+Third slice of M1.5 Track A (CLI DX rework per `cli-dx-task.md`
+§5.1, §11, §17 row 3). First user-visible piece of the target
+store — `apprafter target add <name>` saves a deployment target
+to the on-disk store from v0.1.72 with pure flag-driven UX.
+**No interactive wizard yet** — Track A.4 (v0.1.74) layers
+`inquire`-based prompts on top of this exact handler.
+
+### Added
+
+- **`apprafter target` subcommand group** in `cli/platform-cli/
+  src/cli.rs` with `#[command(alias = "t")]`, so `apprafter t add
+  …` works identically to `apprafter target add …`. Subcommand
+  enum `TargetCommand` is room-to-grow (Track A.5 adds `List`,
+  `Use`, `Show`, `Rename`, `Remove`).
+- **`apprafter target add <name>`** with flags per `cli-dx-task.md`
+  §5.1:
+  - `--provider hetzner-cloud` (only provider in v0.1.73; AWS /
+    Managed arrive later).
+  - `--token <hcloud_…>` — Hetzner Cloud API token. Reads
+    `HCLOUD_TOKEN` env var via clap's `#[arg(env)]` for CI
+    ergonomics so existing scripts work without retyping the
+    flag.
+  - `--ssh-key <path>` — optional SSH public key path. Reads
+    `APPRAFTER_SSH_PUBLIC_KEY_PATH` env. Stored as a path
+    (not the key body) so the user's `~/.ssh/` remains the
+    source of truth.
+  - `--region nbg1 / --tier solo / --cluster-name platform-1`
+    — defaults for downstream commands.
+  - `--force` — overwrite an existing target. Without it, the
+    command refuses (error message mentions both `--force` and
+    `--renew` so the user picks the right path).
+  - `--renew` — rotate only credentials of an existing target.
+    Errors when target doesn't exist; refuses config flags
+    (provider/region/tier/cluster-name); accepts new
+    `--token` and optionally new `--ssh-key`. Mutually
+    exclusive with `--force` (clap-level `conflicts_with`).
+  - `--no-interactive` — placeholder for Track A.4. v0.1.73 is
+    already non-interactive regardless; accepting the flag now
+    keeps shell aliases stable across the upgrade.
+- **`commands::target` handler module** orchestrating create /
+  overwrite / renew semantics:
+  - `validate_target_name(name)` — non-empty, ≤ 64 chars,
+    `[A-Za-z0-9-]+`, no leading/trailing `-`. Filesystem safety
+    + kubectl-style legibility.
+  - `require_known_provider(opt)` — non-None + whitelist
+    (`["hetzner-cloud"]`). Surfaces a typed error so users
+    don't save a half-working config for a provider that's
+    not wired.
+  - `require_token(provider, opt)` — non-None + per-provider
+    format validation. For hetzner-cloud invokes
+    `cli_core::target::validate_hetzner_token_format`.
+  - `verify_ssh_key_readable(path)` — `path.exists()` +
+    `read_to_string` success (catches unreadable/typo paths).
+  - `run_renew(paths, args)` — loads existing target, swaps
+    credentials, preserves config.
+  - `ensure_active_target(paths, name)` — promotes the
+    just-saved target to active **only** when no `GlobalConfig`
+    exists yet (first-run case). Subsequent target saves leave
+    the active pointer alone; users switch explicitly via
+    `apprafter target use <name>` (Track A.5).
+- **`cli_core::target::CONFIG_DIR_ENV = "APPRAFTER_CONFIG_DIR"`**
+  — env override that points `default_config_root()` at an
+  alternate root. Primary use is integration tests (every test
+  in `target_test.rs` runs against a fresh `tempfile::TempDir`),
+  but power users get the same redirect for compartmentalised
+  experiments. Used verbatim — no `apprafter/` suffix appended,
+  so tests can point straight at their tempdir. Empty string is
+  treated as unset to avoid `APPRAFTER_CONFIG_DIR= apprafter
+  target list` accidentally pointing at the CWD.
+- **`cli_core::target::validate_hetzner_token_format(token) ->
+  Result<(), String>`** — pre-flight check for the
+  `^hcloud_[a-zA-Z0-9]{60,}$` shape per `cli-dx-task.md` §11.
+  Implemented with `str` methods instead of pulling in the
+  `regex` crate — the pattern is simple enough that the manual
+  check is clearer and dep-lighter. Real `GET /v1/locations`
+  API ping lives in Track A.4 (validator framework).
+
+### Tests
+
+- **17 integration tests** in `cli/platform-cli/tests/
+  target_test.rs`:
+  - Happy path (saves both files, sets active, creates
+    `auth/.keep` placeholder).
+  - Mode 0600 on `credentials.yaml` (Unix-only `#[cfg(unix)]`).
+  - `HCLOUD_TOKEN` env-var fallback works (clap `#[arg(env)]`).
+  - Missing `--token` errors with hint about both flag + env.
+  - Unknown provider, malformed token, invalid name all error
+    with typed messages.
+  - Existing target without `--force` → refuses; error mentions
+    both `--force` and `--renew` paths.
+  - `--force` overwrites; second-save does NOT change active
+    pointer.
+  - `--renew` rotates credentials; preserves region/cluster_name
+    in the on-disk config.
+  - `--renew` on missing target → error hinting "drop --renew".
+  - `--renew` + config flag (`--region`) → error refusing the
+    combination.
+  - `--force --renew` together → clap-level conflict reject.
+  - `--ssh-key` happy path saves the path verbatim into config.
+  - `--ssh-key` pointing at non-existent file → error.
+  - Second target save keeps the first as active (deferred
+    switching to Track A.5).
+  - `apprafter t add …` alias resolves identically.
+- **10 unit tests** inline in `commands/target.rs` covering the
+  pure validators (`validate_target_name` × 5,
+  `require_known_provider` × 2, `require_token` × 2,
+  `verify_ssh_key_readable` × 2).
+- **6 unit tests** in `cli_core::target` covering the env
+  override + format validator
+  (`default_config_root_honours_apprafter_config_dir_env_override`,
+  `_ignores_empty_env_override`,
+  `validate_hetzner_token_format` × 4 — happy / missing prefix /
+  too short / non-alphanumeric).
+
+### Out of scope (deferred to subsequent Track A slots)
+
+- Interactive wizard via `inquire` (default flow when TTY
+  detected, no `--no-interactive`) — Track A.4 / v0.1.74.
+- `apprafter target list / use / show / rename / remove` — Track
+  A.5.
+- Real Hetzner API ping (`GET /v1/locations`) as part of
+  `target add` validation — Track A.4 validator framework.
+- `apprafter whoami` aggregator (active target + verified
+  status) — Track A.6.
+- Resolution chain plumbed into `init / apply /
+  cluster-bootstrap` (active target's token used when no env
+  var or `--token` flag) — Track A.8.
+
+### Operator note
+
+The new command does **not** affect existing workflows.
+`HCLOUD_TOKEN` + `APPRAFTER_SSH_PUBLIC_KEY` env-var-based
+`apprafter apply` keeps working unchanged — Track A.8 wires the
+target store into operational commands as a *fallback* below the
+env-var override, per the resolution chain documented in
+`cli-dx-task.md` §7. Until A.8 lands, `apprafter target add` is
+informational only (saves config + credentials, but
+`apply / cluster-bootstrap` still read env vars).
+
 ## v0.1.72 — M1.5 Track A.2 — target file structure + IO module (2026-05-14)
 
 Second slice of M1.5 Track A (CLI DX rework per `cli-dx-task.md` §17
