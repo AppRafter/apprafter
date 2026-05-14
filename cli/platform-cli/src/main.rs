@@ -1,19 +1,52 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 //! Entry point for the `apprafter` CLI.
+//!
+//! v0.1.86 — error rendering migrated from `color-eyre` to
+//! `miette`'s `fancy` reporter. `CliError` (defined in cli-core)
+//! derives `miette::Diagnostic`, so unhandled errors render with
+//! the rustc-style `error:` / `help:` / `code:` block instead of
+//! `Debug` output.
 
 mod cli;
 mod commands;
 
 use clap::Parser;
 use cli_core::logging;
+use miette::{IntoDiagnostic, Result};
 
 use crate::cli::{Cli, Commands};
 
-fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
+fn main() -> Result<()> {
+    // Configure miette's `fancy` reporter as the global panic /
+    // error formatter. Disable backtraces in the rendered output
+    // — they're loud and almost never relevant for end users; the
+    // diagnostic `help:` line is more actionable. Backtraces are
+    // still available via `RUST_BACKTRACE=1` for development.
+    miette::set_hook(Box::new(|_| {
+        Box::new(
+            miette::MietteHandlerOpts::new()
+                .terminal_links(true)
+                .unicode(true)
+                .context_lines(2)
+                .with_cause_chain()
+                .build(),
+        )
+    }))
+    .into_diagnostic()?;
+
     logging::init();
 
     let args = Cli::parse();
+    dispatch(args).map_err(miette::Report::new)
+}
+
+/// Pure dispatch over the parsed CLI. Returns `cli_core::Result`
+/// so the typed `CliError -> miette::Report` conversion happens
+/// exactly once at the binary boundary (`main` above) and the
+/// inner code keeps using the original `?` ergonomics over
+/// `cli_core::Result<T>`. Easier to test in isolation if we ever
+/// want to, too.
+fn dispatch(args: Cli) -> cli_core::Result<()> {
     match args.command {
         Commands::Target { action } => commands::target::run(action)?,
         Commands::Whoami { no_ping } => commands::whoami::run(no_ping)?,

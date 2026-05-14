@@ -13,6 +13,181 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.86 — M1.5 Track A.10 — miette diagnostic refinement (2026-05-14)
+
+Tenth Track A slice. Errors stop being opaque `Debug` blobs and
+start carrying a stable code + multi-line help text. The binary
+switches from `color-eyre` to `miette`'s `fancy` reporter, so
+unhandled `CliError`s render with the rustc-style three-line
+block:
+
+```
+Error: apprafter::target::not_found
+
+  × target `ghost` not found (available: )
+  help: Either the `--target` flag was given a name that's not in the store,
+        or no target has been created yet. List existing targets with
+        `apprafter target list`; create a new one with `apprafter target add
+        <name> --provider hetzner-cloud …`. If the store is empty (`available:
+        ` shows nothing), this is your first run — start with `apprafter
+        target add`.
+```
+
+The same `CliError` value used to render as
+`Error: TargetNotFound { name: "ghost", available: "" }`, which
+is fine for grepping in CI logs and useless for operators.
+
+### Added
+
+- **`cli_core::CliError` now derives `miette::Diagnostic`.** Every
+  user-facing variant ships:
+  - A stable `code(apprafter::*)` matching `^apprafter::[a-z_:]+$`.
+    Codes are part of the public surface — log-analytics
+    pipelines can group by them across releases.
+  - A multi-line `help(...)` line describing root causes and the
+    next-step CLI command to fix it.
+
+  Codes added in this slice:
+  - `apprafter::env::cue_not_found` — `nix develop` hint.
+  - `apprafter::env::cue_export_failed` — `cue vet` reproduce
+    hint.
+  - `apprafter::provider::hetzner_api_error` — enumerates 401 /
+    403 / 429 / 5xx common causes, points at `apprafter target
+    add --renew` for the 401 path and `apprafter doctor` for the
+    rest.
+  - `apprafter::provider::server_type_unavailable` — explains
+    the cx22 → cpx22 retirement story and points at the
+    Infrastructure manifest's `nodes[0].kind` field.
+  - `apprafter::state::corrupt` — recommends `apprafter import`
+    as a safe recovery path (rebuilds state from live Hetzner
+    labels).
+  - `apprafter::target::invalid_config` — walks the operator
+    through both hand-fix and per-target re-creation paths
+    under `$XDG_CONFIG_HOME/apprafter/targets/<name>/`.
+  - `apprafter::target::not_found` — lists `target list` +
+    `target add` next steps, calls out the empty-store
+    first-run case.
+  - `apprafter::io::error` / `apprafter::io::json` /
+    `apprafter::io::yaml` — variant-specific guidance for each
+    decode flavour.
+  - `apprafter::cli::other` — the catch-all. Kept stable so
+    grepping logs for recurring messages produces useful
+    candidates for promotion to a typed variant.
+
+- **`miette::set_hook` installed in `main`** with the `fancy`
+  handler (terminal links, Unicode glyphs, 2 lines of context,
+  cause-chain rendering). Backtraces stay opt-in via
+  `RUST_BACKTRACE=1`; the default render is help-line first,
+  not stack-trace first.
+
+- **Pure `dispatch(args: Cli) -> cli_core::Result<()>` helper**
+  in `main.rs`. Subcommand handlers keep their original
+  `cli_core::Result` ergonomics; the typed-error →
+  `miette::Report` conversion happens exactly once at the
+  binary boundary. Easy to drive from tests if needed.
+
+### Changed
+
+- **`color-eyre` dropped** from the workspace and platform-cli
+  `Cargo.toml`. Nothing else in the workspace used it; one fewer
+  TUI-error crate to track.
+
+- **`cli-core` adds `miette` as a direct dep** because
+  `CliError` lives there. Workspace dep added as
+  `miette = { version = "7", features = ["fancy"] }`.
+
+- **File-scope `#![allow(unused_assignments)]`** in
+  `cli_core/src/error.rs`. `miette-derive` 7.6.0 generates
+  diagnostic-plumbing helper bindings that reassign named-field
+  values; the lint fires on generated code that isn't ours to
+  fix. A local enum-level `#[allow]` doesn't propagate through
+  the derive macro, so the suppression has to live at file
+  scope. Documented at the top of the file with the rationale.
+
+### Tests (8 unit + 3 integration)
+
+- **Unit** (`cli_core::error::tests`) — 8 tests pin every
+  user-facing variant's `.code()` and `.help()` text against the
+  documented strings. Catches accidental code renames and help
+  drift across future edits. Examples:
+  - `hetzner_diagnostic_help_enumerates_401_403_429_5xx` —
+    asserts each of the four error families is mentioned
+    explicitly so operators don't have to guess which case
+    applies.
+  - `server_type_unavailable_diagnostic_explains_retirement_path`
+    — both `cx22` and `cpx22` substrings must appear so the
+    most common cause is self-explained.
+
+- **Integration** (`tests/miette_render_test.rs`) — 3
+  subprocess-based tests verifying the END-TO-END render:
+  - `unhandled_error_renders_with_miette_help_line` — `apply`
+    with no creds → stderr contains `help:` + a real
+    `apprafter::…` code (proof we're going through the fancy
+    reporter, not `eyre` or `Debug`).
+  - `typed_target_not_found_renders_with_dedicated_code_and_help`
+    — `target show ghost` → stderr contains the dedicated
+    `apprafter::target::not_found` code AND the help-text
+    substrings (`apprafter target list`, `apprafter target
+    add`). Pins the rendering contract for typed variants.
+  - `no_color_env_yields_ansi_free_stderr` — `NO_COLOR=1` →
+    no `\x1b` bytes in stderr, but the same `help:` + code
+    substrings stay present. Pipe-friendliness contract.
+
+### Backwards compatibility
+
+- All existing stderr-substring assertions in
+  `cli_smoke.rs` / `target_test.rs` / `doctor_test.rs` /
+  `kubeconfig_test.rs` / `import_test.rs` continue to pass —
+  miette's render preserves the original `Display` text inside
+  the boxed error message, and the help-text substrings only
+  add to stderr (never remove).
+- The shell-level exit code on error is unchanged. The binary
+  returns `Err(miette::Report)` from `main`, miette renders to
+  stderr, the process exits with code 1.
+- Existing log-grep workflows keyed on the `Display` text keep
+  working. The diagnostic codes are *additional* signal; they
+  don't replace the human-readable message.
+
+### Out of scope (deferred)
+
+- `#[source_code]` + `#[label]` span highlighting per variant
+  (e.g. highlighting the offending Hetzner token prefix). The
+  miette feature exists; it requires threading source text
+  through the error chain, which is more useful once CUE
+  manifest parse errors also feed through this surface. Will
+  revisit when those get the same treatment.
+- Mass-promoting `CliError::Other(format!(...))` call sites
+  into typed variants. `Other` stays the catch-all with a
+  stable code; recurring messages get promoted when they
+  become recurring. Today's catch-all-with-code is the
+  signalling for future promotions.
+- The Phase 2 SSH `ConnectTimeout` + `[2/3] kubeconfig` rename
+  backlog (Track A.9 follow-up) is still untouched here.
+
+### Operator note
+
+The most operator-visible change is the help line. Two examples
+from a fresh checkout:
+
+```
+$ apprafter target show ghost
+…
+Error: apprafter::target::not_found
+  × target `ghost` not found (available: )
+  help: …
+```
+
+```
+$ apprafter apply
+…
+Error: apprafter::cli::other
+  × no provider configured. Run `apprafter target add <name> --provider
+  │ hetzner-cloud …` (recommended) or the legacy `apprafter init …`.
+  help: …
+```
+
+Set `NO_COLOR=1` for ANSI-free output (CI / pipe).
+
 ## v0.1.85 — hotfix: bootstrap-all UX rework after walk feedback (2026-05-14)
 
 Walk-found issues in v0.1.84. Three problems made the new

@@ -1360,9 +1360,72 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.10 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.10 miette diagnostic refinement ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.9). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → resolution chain ✅ → `bootstrap-all` orchestrator ✅ → **miette refinement (1.66A.10)** → aliases/color → docs+ADR.
+> v0.1.86 — sub-phase 1.66A.10 shipped: каждый user-facing вариант `CliError` теперь несёт стабильный `code(apprafter::*)` + многострочный `help(...)` через `miette::Diagnostic` derive, а binary entry point рендерит через `miette::MietteHandlerOpts` (`fancy` reporter) вместо `color-eyre`. Результат — rustc-quality error UX: `error:` + код, бокс-обёрнутое сообщение, многострочный `help:` с конкретными next-step командами. Зависимость `color-eyre` удалена.
+
+**Source:** `cli-dx-task.md` §10 + §17 row 10.
+
+**Поставка:**
+- [x] `cli/Cargo.toml` workspace deps: `miette = { version = "7", features = ["fancy"] }`; удалена `color-eyre` (больше не используется).
+- [x] `cli/cli-core/Cargo.toml` — `miette` direct dep (поскольку `CliError` derives `Diagnostic` в cli-core).
+- [x] `cli/platform-cli/Cargo.toml` — `miette` direct dep, удалена `color-eyre`.
+- [x] `cli/cli-core/src/error.rs`:
+    - `CliError` теперь derives `miette::Diagnostic` рядом с `thiserror::Error`.
+    - 9 вариантов получили `#[diagnostic(code(...), help(...))]`:
+        - `CueNotFound` — `apprafter::env::cue_not_found` + nix-develop hint.
+        - `CueExport` — `apprafter::env::cue_export_failed` + `cue vet` reproduce hint.
+        - `Hetzner` — `apprafter::provider::hetzner_api_error` + enumerate 401/403/429/5xx common causes + `apprafter doctor` next-step.
+        - `ServerTypeUnavailable` — `apprafter::provider::server_type_unavailable` + cx22→cpx22 retirement story.
+        - `InvalidState` — `apprafter::state::corrupt` + `apprafter import` recovery hint.
+        - `InvalidTargetConfig` — `apprafter::target::invalid_config` + per-target dir recovery path.
+        - `TargetNotFound` — `apprafter::target::not_found` + `target list` + `target add` hints.
+        - `Io` / `Json` / `Yaml` — каждая получает `apprafter::io::*` code + variant-specific help.
+        - `Other` (catch-all) — `apprafter::cli::other` со стабильным code чтобы log-analytics могла find'ить recurring messages кандидатами на promotion в typed variant.
+    - File-level `#![allow(unused_assignments)]` для подавления `miette-derive` 7.6.0's generated reassignments (lint fires на generated code за нашим контролем; локальное `#[allow]` на enum не пропускается через derive macro).
+- [x] `cli/platform-cli/src/main.rs`:
+    - Return type `color_eyre::Result<()>` → `miette::Result<()>`.
+    - `color_eyre::install()` заменён на `miette::set_hook(...)` с `MietteHandlerOpts::new().terminal_links(true).unicode(true).context_lines(2).with_cause_chain().build()`.
+    - Вынесен `fn dispatch(args: Cli) -> cli_core::Result<()>` — типизированный CliError→miette::Report happens exactly once на binary boundary, inner code keeps original `?` ergonomics over `cli_core::Result<T>`.
+- [x] doc-comment на `cli-core::error` объясняет policy: новые call-sites должны добавлять typed variants с кодами вместо `Other(format!(...))`.
+
+**Тесты (8 unit + 3 integration):**
+- 8 в `cli_core::error::tests`:
+    - `target_not_found_diagnostic_carries_stable_code_and_helpful_hint` — code = `apprafter::target::not_found`, help содержит `target list` + `target add`.
+    - `invalid_target_config_diagnostic_points_at_target_directory` — code = `apprafter::target::invalid_config`, help содержит `$XDG_CONFIG_HOME/apprafter/targets/` + `target add`.
+    - `hetzner_diagnostic_help_enumerates_401_403_429_5xx` — help раскрывает все 4 типа failures + `target add` + `doctor`.
+    - `server_type_unavailable_diagnostic_explains_retirement_path` — help упоминает cx22 + cpx22 retirement.
+    - `cue_not_found_diagnostic_recommends_nix_develop` — help содержит `nix develop` + `docs/contributing/setup.md`.
+    - `invalid_state_diagnostic_recommends_import_for_recovery` — help содержит `apprafter import`.
+    - `io_error_passes_through_with_dedicated_code` — code = `apprafter::io::error`, wrapped OS message survives в Display.
+    - `other_keeps_catch_all_code_so_recurring_variants_can_be_filtered` — code = `apprafter::cli::other` (stable для log analytics).
+- 3 в `tests/miette_render_test.rs` (полноценный subprocess-based render contract):
+    - `unhandled_error_renders_with_miette_help_line` — `apply` без creds → stderr содержит `help:` + `apprafter::cli::other` code (catch-all variant goes through fancy renderer).
+    - `typed_target_not_found_renders_with_dedicated_code_and_help` — `target show ghost` → stderr содержит `apprafter::target::not_found` + `help:` + `apprafter target list` + `apprafter target add` substrings из help text.
+    - `no_color_env_yields_ansi_free_stderr` — `NO_COLOR=1` → no `\x1b` bytes в stderr но `help:` + diagnostic code still present (pipe-friendly).
+
+**Acceptance:**
+- ✅ Любой `CliError` reaching `main` рендерится с `Error: apprafter::<...>` + box-wrapped message + `help:` block (NOT с `Debug` stringification).
+- ✅ Stable diagnostic codes per variant для log-analytics + future error catalogue.
+- ✅ `NO_COLOR=1` респектится (no ANSI sequences в stderr).
+- ✅ `cargo test --workspace` — 553 tests, 0 failures (+11 over v0.1.85's 542).
+- ✅ fmt + clippy (-D warnings) + SPDX (163 файла) clean.
+- ✅ `color-eyre` workspace + platform-cli deps удалены.
+
+**Out-of-scope (отложено):**
+- `#[source_code]` + `#[label]` span highlighting per variant (например, `InvalidHetznerTokenFormat` с подсветкой именно префикса) — feature exists в miette, но требует carrying source text через error chain. Promote later when CUE manifest parsing errors get the same treatment.
+- Promotion массовых `CliError::Other(format!(...))` call sites в типизированные варианты — `Other` остаётся catch-all со стабильным code; конвертация — отдельная работа, по мере того как specific shapes повторяются.
+- Cause-chain rendering refinements (multi-level nested errors) — `with_cause_chain()` уже включён в hook builder, но AppRafter ещё не порождает глубоких цепочек. Полировка — when needed.
+
+**Зависит от:** 1.66A.9 ✅ (нужен `bootstrap-all` рабочий путь для smoke tests миette-рендера).
+
+**Размер:** S (один цикл, ~0.5 рабочего дня).
+
+---
+
+### 1.66A.11 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.10). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → resolution chain ✅ → `bootstrap-all` orchestrator ✅ → miette refinement ✅ → **aliases / color / NO_COLOR (1.66A.11)** → docs+ADR.
 
 ---
 
@@ -3645,4 +3708,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | v0.1.82 hotfix — `apply`/`import` теперь дочитывают `provider`/`region`/`cluster_name` из active target когда state.json пустой (A.8 wire'нул только credentials, но operational commands ещё требовали `init`); `init` становится опциональным после `target add`; new `cli_core::target::{resolve_active_target_name, load_active_target_config}` helpers; +1 regression-guard test; v0.1.83 | initial |
 | 2026-05-14 | M1.5 Track A.9 — `apprafter bootstrap-all` orchestrator (Phase 1 apply → Phase 2 kubeconfig SSH poll до 300s × 10s интервал → Phase 3 cluster-bootstrap) под единым `indicatif::MultiProgress` UX; `--dry-run` печатает план без provider/cluster mutation; `--target <name>` пробрасывается во все фазы; `commands::kubeconfig::fetch_and_cache` extracted из `run` чтобы Phase 2 retry-loop не плодил child процессы; `commands::kubeconfig` теперь использует `resolve_hetzner_token` вместо прямого env-чтения; `--target` flag добавлен на `Commands::Kubeconfig`; +8 tests (4 unit + 4 integration); v0.1.84 | initial |
 | 2026-05-14 | M1.5 Track A.9 hotfix UX — после ручного walk'а v0.1.84: `MultiProgress` дублировал spinner-строки на каждый helm/kubectl `println` (Phase 1 + Phase 3 spinner fought с tracing-логами apply/cluster-bootstrap за тот же row); dry-run печатал `<active target>` placeholder вместо имени активного target'а и не раскрывал что делает каждая фаза. v0.1.85 пересобрал bootstrap_all: Phase 1+3 без spinner (`→ start / inner output / ✓ end`), Phase 2 keeps spinner (retry loop owns all output), `finish_and_clear()` + static success line; dry-run теперь load'ит `default_config_root` + `resolve_active_target_name` + `load_active_target_config` и печатает реальное имя active target + Provider/Region/Tier/Cluster/SSH-key из `config.yaml` + human-readable описание каждой фазы; +2 integration tests (empty store hint + active target resolved name); v0.1.85 | initial |
+| 2026-05-14 | M1.5 Track A.10 — miette diagnostic refinement: `CliError` derives `miette::Diagnostic` с stable `code(apprafter::*)` + multi-line `help(...)` на 9 user-facing вариантах (cue_not_found, hetzner_api_error, server_type_unavailable, state::corrupt, target::invalid_config, target::not_found, io/json/yaml, cli::other); binary entry point switched с `color-eyre` на `miette::set_hook` с `fancy` reporter; `NO_COLOR` respected; `color-eyre` workspace + platform-cli deps удалены; +11 tests (8 unit на `.code()`/`.help()` accessor surface + 3 subprocess-based integration на rendered stderr — `help:` block, diagnostic code substrings, ANSI-free под `NO_COLOR`); v0.1.86 | initial |
 
