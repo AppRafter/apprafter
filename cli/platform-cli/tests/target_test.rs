@@ -12,6 +12,7 @@
 //! out of scope here — Track A.3 ships pure flag-driven mode only.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::Path;
 
@@ -43,6 +44,7 @@ fn target_add_writes_config_and_credentials_and_promotes_first_target_to_active(
     let token = synthetic_hetzner_token();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -89,6 +91,7 @@ fn target_add_credentials_file_is_mode_0600() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -119,6 +122,7 @@ fn target_add_uses_hcloud_token_env_var_as_fallback() {
     let token = synthetic_hetzner_token();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env("HCLOUD_TOKEN", &token)
         .args([
             "target",
@@ -138,6 +142,7 @@ fn target_add_errors_when_token_missing_entirely() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args(["target", "add", "ci", "--provider", "hetzner-cloud"])
         .assert()
@@ -150,6 +155,7 @@ fn target_add_errors_on_unknown_provider() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -170,6 +176,7 @@ fn target_add_errors_on_malformed_hetzner_token() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -190,6 +197,7 @@ fn target_add_errors_on_invalid_target_name() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -212,6 +220,7 @@ fn target_add_refuses_to_overwrite_existing_target_without_force() {
     for _ in 0..1 {
         cli()
             .env("APPRAFTER_CONFIG_DIR", dir.path())
+            .env("APPRAFTER_NO_PING", "1")
             .env_remove("HCLOUD_TOKEN")
             .args([
                 "target",
@@ -228,6 +237,7 @@ fn target_add_refuses_to_overwrite_existing_target_without_force() {
     // Second invocation: must refuse.
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -256,6 +266,7 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -273,6 +284,7 @@ fn target_add_force_overwrites_existing_target_and_keeps_active_pointer() {
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -312,6 +324,7 @@ fn target_add_renew_rotates_credentials_without_touching_config() {
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -331,6 +344,7 @@ fn target_add_renew_rotates_credentials_without_touching_config() {
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args(["target", "add", "prod", "--token", &token2, "--renew"])
         .assert()
@@ -350,6 +364,7 @@ fn target_add_renew_on_missing_target_errors_with_hint() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -371,6 +386,7 @@ fn target_add_renew_rejects_config_flags() {
     let token = synthetic_hetzner_token();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -385,6 +401,7 @@ fn target_add_renew_rejects_config_flags() {
         .success();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target", "add", "live", "--token", &token, "--region", "hel1", "--renew",
@@ -401,6 +418,7 @@ fn target_add_force_and_renew_are_mutually_exclusive() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -426,6 +444,7 @@ fn target_add_with_ssh_key_path_verifies_file_exists() {
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .env_remove("APPRAFTER_SSH_PUBLIC_KEY_PATH")
         .args([
@@ -451,6 +470,7 @@ fn target_add_errors_when_ssh_key_path_missing() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .env_remove("APPRAFTER_SSH_PUBLIC_KEY_PATH")
         .args([
@@ -476,6 +496,7 @@ fn second_target_save_keeps_first_as_active_and_reports_so() {
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -492,6 +513,7 @@ fn second_target_save_keeps_first_as_active_and_reports_so() {
 
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "target",
@@ -521,6 +543,7 @@ fn target_alias_t_subcommand_resolves_to_target() {
     let dir = tempfile::tempdir().unwrap();
     cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_NO_PING", "1")
         .env_remove("HCLOUD_TOKEN")
         .args([
             "t",
@@ -534,4 +557,181 @@ fn target_alias_t_subcommand_resolves_to_target() {
         .assert()
         .success();
     assert!(dir.path().join("targets/via-alias/config.yaml").exists());
+}
+
+// ---------------------------------------------------------------
+// Provider API ping (Track A.4a / v0.1.75)
+//
+// These tests redirect the Hetzner client at a `mockito::Server`
+// via APPRAFTER_HCLOUD_BASE_URL (honoured by hcloud_base_url()).
+// They MUST NOT set APPRAFTER_NO_PING — the whole point is to
+// exercise the ping path end-to-end.
+// ---------------------------------------------------------------
+
+const LOCATIONS_OK: &str = r#"{
+    "locations": [
+        {
+            "id": 1,
+            "name": "fsn1",
+            "description": "Falkenstein DC Park 1",
+            "country": "DE",
+            "city": "Falkenstein",
+            "network_zone": "eu-central"
+        }
+    ]
+}"#;
+
+#[test]
+fn target_add_pings_provider_by_default_and_announces_verified_status() {
+    let mut server = mockito::Server::new();
+    let _m = server
+        .mock("GET", "/v1/locations")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(LOCATIONS_OK)
+        .expect(1)
+        .create();
+
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
+        .env_remove("HCLOUD_TOKEN")
+        .env_remove("APPRAFTER_NO_PING")
+        .args([
+            "target",
+            "add",
+            "primary",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &synthetic_hetzner_token(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("verified against Hetzner Cloud"));
+
+    // Mock expectation is asserted on Drop via `expect(1)` — the
+    // ping must have been called exactly once.
+    drop(_m);
+    drop(server);
+
+    assert!(dir.path().join("targets/primary/config.yaml").exists());
+}
+
+#[test]
+fn target_add_surfaces_typed_error_on_hetzner_401() {
+    let mut server = mockito::Server::new();
+    let _m = server
+        .mock("GET", "/v1/locations")
+        .with_status(401)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"unauthorized","message":"unable to authenticate"}}"#)
+        .expect(1)
+        .create();
+
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_HCLOUD_BASE_URL", server.url())
+        .env_remove("HCLOUD_TOKEN")
+        .env_remove("APPRAFTER_NO_PING")
+        .args([
+            "target",
+            "add",
+            "bad-token",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &synthetic_hetzner_token(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("Hetzner Cloud rejected the token (HTTP 401)"));
+
+    // Failed ping must NOT save the target. The user reruns with a
+    // good token rather than getting half-state on disk.
+    assert!(
+        !dir.path().join("targets/bad-token").exists(),
+        "target dir must not exist after a failed ping"
+    );
+}
+
+#[test]
+fn target_add_surfaces_helpful_error_when_api_is_unreachable() {
+    // No mockito server — point at a known-closed port so ureq
+    // returns a transport-class error.
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("HCLOUD_TOKEN")
+        .env_remove("APPRAFTER_NO_PING")
+        .args([
+            "target",
+            "add",
+            "offline",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &synthetic_hetzner_token(),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("could not reach Hetzner Cloud").or(contains("Hetzner Cloud API ping failed")),
+        )
+        .stderr(contains("--no-ping"));
+
+    assert!(!dir.path().join("targets/offline").exists());
+}
+
+#[test]
+fn target_add_no_ping_flag_skips_validator_and_announces_unverified() {
+    // No mockito server set up — would fail any actual ping. The
+    // --no-ping flag must short-circuit before that.
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env_remove("HCLOUD_TOKEN")
+        .env_remove("APPRAFTER_NO_PING")
+        .args([
+            "target",
+            "add",
+            "ci",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &synthetic_hetzner_token(),
+            "--no-ping",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("token NOT verified"));
+
+    assert!(dir.path().join("targets/ci/config.yaml").exists());
+}
+
+#[test]
+fn target_add_no_ping_env_var_also_skips_validator() {
+    // Equivalent to the --no-ping flag via env-var binding.
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", dir.path())
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "ci-env",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &synthetic_hetzner_token(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("token NOT verified"));
 }

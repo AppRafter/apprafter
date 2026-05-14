@@ -974,9 +974,58 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.4 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.4 Provider validator framework + Hetzner API ping ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1, 1.66A.2, 1.66A.3). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → interactive wizard → validation framework → CRUD команды → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.75 — sub-phase 1.66A.4 (split as A.4a) shipped: `cli-providers::validators` module с `ProviderValidator` trait + `HetznerCloudValidator` (`GET /v1/locations`); `target add` теперь делает real API ping по умолчанию + flag `--no-ping` / env `APPRAFTER_NO_PING` для CI/offline. Interactive wizard через `inquire` — отложен в **1.66A.4b** (v0.1.76).
+
+**Source:** `cli-dx-task.md` §5.1 (token verified step) + §11 (validation framework), §17 row 4.
+
+**Поставка:**
+- [x] `cli/cli-providers/src/hetzner_cloud/types.rs` — новые wire-types `Location { id, name, description, country, city, network_zone }` + `LocationListResponse`. Re-exported через crate root.
+- [x] `cli/cli-providers/src/hetzner_cloud/client.rs::list_locations()` — `GET /v1/locations` с тем же error-mapping шаблоном как остальные list_X методы (на 2xx parse, на 4xx/5xx → `CliError::Hetzner`, на transport-fail → `CliError::Other`). Reused validator-ом и (будущим в A.4b) wizard-region-picker'ом.
+- [x] `cli/cli-providers/src/validators.rs` — новый модуль:
+    - `pub trait ProviderValidator { fn validate_credentials(&self) -> Result<()>; }` — минимальная поверхность (region/type lookups придут с wizard'ом в A.4b).
+    - `pub struct HetznerCloudValidator { client: HetznerCloudClient }` + `new(base_url, token)` + impl `ProviderValidator` через `self.client.list_locations().map(|_| ())`.
+    - 3 unit-теста с mockito: 200 OK (валид) / 401 → typed `CliError::Hetzner` / closed-port → `CliError::Other` transport.
+- [x] `cli-providers::lib.rs` — re-export `HetznerCloudValidator` + `ProviderValidator`.
+- [x] `cli/platform-cli/src/cli.rs::TargetCommand::Add` — новый флаг `--no-ping` с env-binding `APPRAFTER_NO_PING` через `BoolishValueParser` (принимает `1/0/yes/no/true/false/on/off` — не только canonical `true`/`false`, чтобы shell-сcripty `APPRAFTER_NO_PING=1 apprafter target add ...` работал).
+- [x] `cli/platform-cli/src/commands/target.rs::ping_provider(provider, token)` — orchestrator: знает per-provider маршруты, для hetzner-cloud зовёт `HetznerCloudValidator::new(hcloud_base_url(), token).validate_credentials()`. Error-mapping расширен с human-readable hint'ами:
+    - 401 → "Hetzner Cloud rejected the token (HTTP 401)..."
+    - non-401 HTTP error → "Hetzner Cloud API ping failed (HTTP {status})..." + reassurance что target NOT saved.
+    - transport-fail → "could not reach Hetzner Cloud at {base}..." + `--no-ping` hint.
+- [x] `run_add` теперь делает ping после format/ssh-key checks но ДО save (так, чтобы failed ping не оставлял half-state на диске). `run_renew` — analogous, ping после `require_token`.
+- [x] Success-message в `target add` теперь упоминает статус: `... (token verified against Hetzner Cloud)` или `... (token NOT verified — \`--no-ping\` was passed)`. Closes the cli-dx-task.md §5.1 "✓ Token verified" UX promise on the non-interactive flow (interactive wizard will reuse the same string in A.4b).
+- [x] 5 новых integration-тестов (`tests/target_test.rs`):
+    - `target_add_pings_provider_by_default_and_announces_verified_status` — mockito 200, target saved + UI says "verified". `mockito::Mock::expect(1)` пинит, что ping реально был сделан.
+    - `target_add_surfaces_typed_error_on_hetzner_401` — mockito 401 + assertion что target dir на диске **не** создан (нет half-state).
+    - `target_add_surfaces_helpful_error_when_api_is_unreachable` — closed port 1 → error message содержит либо "could not reach" либо "API ping failed" (зависит от платформы) + `--no-ping` hint.
+    - `target_add_no_ping_flag_skips_validator_and_announces_unverified` — `--no-ping` короткозамыкает на нereachable base URL.
+    - `target_add_no_ping_env_var_also_skips_validator` — `APPRAFTER_NO_PING=1` равноценен флагу.
+- [x] 17 prior integration-тестов получили `APPRAFTER_NO_PING=1` через sed-инжект (focus тех тестов — file IO / clap parsing, не API; новые ping-тесты эту поверхность покрывают отдельно).
+
+**Acceptance:**
+- ✅ `apprafter target add <name> --token <valid>` ходит в Hetzner, success-message содержит "(token verified against Hetzner Cloud)".
+- ✅ С невалидным токеном — typed error "(HTTP 401)" + target **не** сохранён.
+- ✅ С недоступным API — typed error + `--no-ping` hint.
+- ✅ `--no-ping` / `APPRAFTER_NO_PING=1` — short-circuit, success-message "(token NOT verified)".
+- ✅ Existing env-var-based `apply` / `cluster-bootstrap` flow не затронут — ping живёт только в `target add`.
+- ✅ `cargo test --workspace`: 22 target_test (17 prior +5 new) + 118 cli-providers (115 +3 validator) — 0 failures. fmt + clippy + SPDX (153 files) — clean.
+
+**Out-of-scope (отложено):**
+- Interactive wizard через `inquire` — Track 1.66A.4b (v0.1.76).
+- Region validator + region-picker (использует уже готовый `list_locations`) — пойдёт в A.4b вместе с wizard'ом.
+- `secrecy::Secret<String>` обёртка для in-memory tokens — A.10/A.11 (miette + secret hardening pass).
+- Resolution chain в operational `init/apply/cluster-bootstrap` — A.8.
+
+**Зависит от:** 1.66A.3 ✅ (target add non-interactive).
+
+**Размер:** S (один цикл, ~1 рабочий день).
+
+---
+
+### 1.66A.4b — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.4a). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → **interactive wizard (1.66A.4b)** → CRUD команды (`list/use/show/rename/remove`, 1.66A.5) → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3248,4 +3297,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.2 — `cli-core::target` module: types (GlobalConfig/TargetConfig/TargetCredentials/Target/TargetStorePaths) + atomic load/save IO + 0600 enforcement + `<redacted>` Debug; +16 unit tests; v0.1.72 | initial |
 | 2026-05-14 | M1.5 Track A.3 — `apprafter target add` (+`t` alias) non-interactive: validators, `--force`/`--renew`, first-target auto-active, env-override `APPRAFTER_CONFIG_DIR`; +33 tests; v0.1.73 | initial |
 | 2026-05-14 | v0.1.73 hotfix — `validate_hetzner_token_format` теперь exactly 64 ASCII alphanumeric (без `hcloud_` префикса — v0.1.73 ложно его требовал, реальные Hetzner токены префикса не имеют); cli-dx-task.md §11 amended; +регрессия-guard на underscore-at-correct-length; v0.1.74 | initial |
+| 2026-05-14 | M1.5 Track A.4a — `cli-providers::validators` + `HetznerCloudValidator` (`GET /v1/locations` ping); `target add` теперь validates token by default + `--no-ping`/`APPRAFTER_NO_PING` opt-out; +8 tests (3 validator + 5 integration); v0.1.75 | initial |
 

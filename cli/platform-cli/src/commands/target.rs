@@ -22,9 +22,12 @@ use cli_core::target::{
     TargetStorePaths,
 };
 use cli_core::{CliError, Result};
+use cli_providers::{HetznerCloudValidator, ProviderValidator};
 use tracing::info;
 
 use crate::cli::TargetCommand;
+
+use crate::commands::hcloud::hcloud_base_url;
 
 /// Maximum length for a target name. Matches the spec
 /// (`cli-dx-task.md` §5.1 validation rules). A short cap keeps
@@ -50,6 +53,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
             force,
             renew,
             no_interactive: _,
+            no_ping,
         } => run_add(AddArgs {
             name,
             provider,
@@ -60,12 +64,13 @@ pub fn run(action: TargetCommand) -> Result<()> {
             cluster_name,
             force,
             renew,
+            no_ping,
         }),
     }
 }
 
 /// Plain bundle so the orchestration body below has one parameter
-/// to thread instead of nine. Field shapes mirror the clap flags
+/// to thread instead of ten. Field shapes mirror the clap flags
 /// exactly; keep the rename pressure low by not introducing
 /// intermediate types.
 pub struct AddArgs {
@@ -78,6 +83,7 @@ pub struct AddArgs {
     pub cluster_name: Option<String>,
     pub force: bool,
     pub renew: bool,
+    pub no_ping: bool,
 }
 
 fn run_add(args: AddArgs) -> Result<()> {
@@ -109,6 +115,15 @@ fn run_add(args: AddArgs) -> Result<()> {
         Err(e) => return Err(e),
     }
 
+    // API ping confirms the token actually authenticates with the
+    // provider. Happens AFTER the existing-target check so a no-op
+    // run with `--no-ping` against an existing target still
+    // surfaces the "already exists" error immediately. `--no-ping`
+    // skips the round-trip for CI / offline setups.
+    if !args.no_ping {
+        ping_provider(&provider, &token)?;
+    }
+
     let target = Target {
         name: args.name.clone(),
         config: TargetConfig {
@@ -126,14 +141,19 @@ fn run_add(args: AddArgs) -> Result<()> {
 
     let became_active = ensure_active_target(&paths, &args.name)?;
 
+    let verified_suffix = if args.no_ping {
+        " (token NOT verified against the API — `--no-ping` was passed)"
+    } else {
+        " (token verified against Hetzner Cloud)"
+    };
     if became_active {
         println!(
-            "target `{}` saved and set as active (first target on fresh store)",
+            "target `{}` saved and set as active (first target on fresh store){verified_suffix}",
             args.name
         );
     } else {
         println!(
-            "target `{}` saved (active target unchanged — use `apprafter target use {}` to switch)",
+            "target `{}` saved (active target unchanged — use `apprafter target use {}` to switch){verified_suffix}",
             args.name, args.name
         );
     }
@@ -172,13 +192,24 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs) -> Result<()> {
         verify_ssh_key_readable(path)?;
         existing.config.ssh_key_path = Some(path.clone());
     }
+    if !args.no_ping {
+        ping_provider(&existing.config.provider, &token)?;
+    }
 
     existing.credentials = TargetCredentials {
         hetzner_token: Some(token),
     };
     save_target(paths, &existing)?;
 
-    println!("target `{}` credentials rotated", args.name);
+    let verified_suffix = if args.no_ping {
+        " (token NOT verified — `--no-ping` was passed)"
+    } else {
+        " (token verified against Hetzner Cloud)"
+    };
+    println!(
+        "target `{}` credentials rotated{verified_suffix}",
+        args.name
+    );
     Ok(())
 }
 
@@ -239,6 +270,49 @@ fn require_token(provider: &str, token: Option<&str>) -> Result<String> {
             .map_err(|reason| CliError::Other(format!("invalid Hetzner Cloud token: {reason}")))?;
     }
     Ok(token.to_string())
+}
+
+/// Run the read-only `validate_credentials()` ping for the
+/// provider. For Hetzner Cloud this is `GET /v1/locations`
+/// against the production base URL (overridable via
+/// `APPRAFTER_HCLOUD_BASE_URL` through `hcloud_base_url()` —
+/// integration tests redirect against a `mockito::Server`).
+///
+/// Failure messages get wrapped in a CLI-shaped surface so the
+/// user sees "Hetzner Cloud rejected the token …" instead of the
+/// raw API envelope. Existing typed `CliError::Hetzner` variants
+/// from the underlying call are preserved for `--verbose` paths
+/// in future Track A.10 (miette).
+fn ping_provider(provider: &str, token: &str) -> Result<()> {
+    match provider {
+        "hetzner-cloud" => {
+            let base = hcloud_base_url();
+            tracing::debug!(provider, base = %base, "running provider validator ping");
+            let validator = HetznerCloudValidator::new(base.clone(), token);
+            validator.validate_credentials().map_err(|err| match err {
+                CliError::Hetzner { status: 401, message, .. } => CliError::Other(
+                    format!("Hetzner Cloud rejected the token (HTTP 401): {message}. Double-check that the token has not been revoked and was copied complete (64 chars)."),
+                ),
+                CliError::Hetzner { status, message, .. } => CliError::Other(format!(
+                    "Hetzner Cloud API ping failed (HTTP {status}): {message}. The target was NOT saved; rerun once the API is reachable, or pass `--no-ping` to skip the check."
+                )),
+                CliError::Other(msg) => CliError::Other(format!(
+                    "could not reach Hetzner Cloud at {base}: {msg}. Pass `--no-ping` to skip the network round-trip (offline / CI setups)."
+                )),
+                other => other,
+            })
+        }
+        _ => {
+            // Defensive: require_known_provider already gates
+            // on the whitelist, so this arm should be
+            // unreachable. Surface a typed error rather than
+            // panic so a future regression in the whitelist
+            // doesn't blow up the user's shell.
+            Err(CliError::Other(format!(
+                "no validator wired for provider `{provider}` — pass `--no-ping` to skip"
+            )))
+        }
+    }
 }
 
 fn verify_ssh_key_readable(path: &Path) -> Result<()> {

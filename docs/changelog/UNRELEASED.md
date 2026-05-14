@@ -13,6 +13,130 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.75 — M1.5 Track A.4a — provider validator + Hetzner API ping (2026-05-14)
+
+First half of M1.5 Track A.4 (`cli-dx-task.md` §11 validation
+framework + §5.1 "token verified" UX). `apprafter target add` now
+actually confirms the token authenticates with Hetzner Cloud
+before saving — no more half-state on disk after a bad-token
+accident. The interactive wizard half of A.4 follows as A.4b
+(v0.1.76); splitting into two iterations keeps each set of tests
+focused.
+
+### Added
+
+- **`cli_providers::validators` module** with a minimal
+  `ProviderValidator` trait:
+  ```rust
+  pub trait ProviderValidator {
+      fn validate_credentials(&self) -> Result<()>;
+  }
+  ```
+  Region / type lookups intentionally **not** in the trait yet —
+  they're wizard-side concerns and arrive with A.4b so the trait
+  doesn't grow speculative surface.
+- **`HetznerCloudValidator`** implementation. Owns a
+  `HetznerCloudClient`; `validate_credentials()` calls
+  `client.list_locations()` and discards the payload.
+  `GET /v1/locations` is Hetzner's own recommendation for cheap
+  auth probes — any valid token can read it, no quota spent, no
+  resources touched. Mockito-based unit tests cover 200 OK,
+  401 typed-error, and transport-error (closed port).
+- **`cli_providers::hetzner_cloud::types::{Location,
+  LocationListResponse}`** wire-types — re-exported through the
+  crate root. Wizard's region picker in A.4b consumes the same
+  shape.
+- **`cli_providers::hetzner_cloud::client::list_locations()`** —
+  drop-in alongside the other `list_X` methods; same error
+  mapping as the rest (2xx → parse, 4xx/5xx → `CliError::Hetzner`,
+  transport-fail → `CliError::Other`).
+- **`apprafter target add --no-ping`** flag (clap) plus
+  **`APPRAFTER_NO_PING`** env-var binding through
+  `BoolishValueParser`. The parser accepts `1 / 0 / yes / no /
+  true / false / on / off` so shell scripts can write the
+  natural `APPRAFTER_NO_PING=1` without clap's strict
+  `true`/`false` rejecting it. Skips the round-trip for CI sand­
+  boxes and offline pre-seeding flows.
+- **`ping_provider(provider, token)` orchestrator** in
+  `commands::target`. For hetzner-cloud it instantiates the
+  validator against `hcloud_base_url()` (honours
+  `APPRAFTER_HCLOUD_BASE_URL` for mockito-driven integration
+  tests, falls back to the upstream URL otherwise) and maps the
+  raw error into a human-readable surface:
+  - 401 → "Hetzner Cloud rejected the token (HTTP 401):
+    {message}. Double-check that the token has not been revoked
+    and was copied complete (64 chars)."
+  - Other HTTP → "Hetzner Cloud API ping failed (HTTP {status}):
+    {message}. The target was NOT saved; rerun once the API is
+    reachable, or pass `--no-ping` to skip the check."
+  - Transport → "could not reach Hetzner Cloud at {base}: {msg}.
+    Pass `--no-ping` to skip the network round-trip (offline /
+    CI setups)."
+- **Success-message extension** announces verification status:
+  `… (token verified against Hetzner Cloud)` when the ping ran
+  and `… (token NOT verified — \`--no-ping\` was passed)` when
+  it didn't. Closes the "✓ Token verified" promise from
+  `cli-dx-task.md` §5.1 on the non-interactive flow; the
+  interactive wizard in A.4b will reuse the same string for
+  consistency.
+
+### Changed
+
+- **`run_add`** now does the API ping after format / ssh-key
+  checks but **before** `save_target`, so a 401 leaves no
+  half-state on disk. Same ordering applied to `run_renew` for
+  the credential-rotation path.
+
+### Tests
+
+- **3 mockito-based unit tests** in `cli_providers::validators`:
+  200 OK happy path, 401 typed `CliError::Hetzner` surface,
+  closed-port transport error.
+- **5 new integration tests** in `tests/target_test.rs`:
+  - `target_add_pings_provider_by_default_and_announces_verified_status`
+    — `mockito::Mock::expect(1)` pins that the ping really
+    happened; success message shows "verified".
+  - `target_add_surfaces_typed_error_on_hetzner_401` — 401 path;
+    assertion that the target dir does NOT exist after the
+    failure (no half-state).
+  - `target_add_surfaces_helpful_error_when_api_is_unreachable`
+    — closed port; the error message must include either
+    "could not reach" (Unix transport) or "API ping failed"
+    (some sandboxes synthesise a 5xx), plus the `--no-ping`
+    hint regardless.
+  - `target_add_no_ping_flag_skips_validator_and_announces_unverified`
+    — `--no-ping` short-circuits even when the base URL points
+    at a closed port.
+  - `target_add_no_ping_env_var_also_skips_validator` —
+    `APPRAFTER_NO_PING=1` env binding equivalent to the flag.
+- **17 pre-existing target_test cases updated** with
+  `APPRAFTER_NO_PING=1` injected next to `APPRAFTER_CONFIG_DIR`
+  in their `.env()` setup. Those tests are about file-store /
+  flag parsing, not the API — the new ping-specific tests cover
+  the validation path exclusively, so the focus split is clean.
+
+### Out of scope (deferred to A.4b and beyond)
+
+- Interactive wizard via `inquire` (default flow when TTY
+  detected + no `--no-interactive`) — Track 1.66A.4b /
+  v0.1.76.
+- Region validator + region-picker (`list_regions()` on the
+  trait, autocomplete in the wizard) — A.4b ships these
+  together since the picker is the consumer.
+- `secrecy::Secret<String>` wrapper for in-memory tokens — A.10
+  / A.11 hardening pass.
+- Resolution chain plumbing into `init` / `apply` /
+  `cluster-bootstrap` so they consume the active target's
+  credentials — A.8.
+
+### Operator note
+
+If you previously got into the habit of running `apprafter
+target add` without internet access (e.g. air-gapped lab), pass
+`--no-ping` or set `APPRAFTER_NO_PING=1` once in your shell
+profile. The flag is documented in `apprafter target add
+--help`; the env var name is stable contract.
+
 ## v0.1.74 — hotfix: token validator rejected real Hetzner Cloud tokens (2026-05-14)
 
 v0.1.73's `validate_hetzner_token_format` required an `hcloud_`

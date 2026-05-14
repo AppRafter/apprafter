@@ -68,6 +68,45 @@ impl HetznerCloudClient {
         }
     }
 
+    /// `GET /v1/locations` — list every Hetzner Cloud datacenter the
+    /// account can target. Reading it requires nothing beyond a
+    /// valid `Authorization` token (no quota, no resources touched,
+    /// no rate-limit weight worth mentioning), which makes it the
+    /// canonical pre-flight "is this token valid?" probe per
+    /// `cli-dx-task.md` §11.
+    pub fn list_locations(&self) -> Result<super::types::LocationListResponse> {
+        let endpoint = self.endpoint("/locations");
+        let resp = ureq::get(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Accept", "application/json")
+            .call();
+
+        match resp {
+            Ok(r) => r
+                .into_json::<super::types::LocationListResponse>()
+                .map_err(|e| CliError::Other(format!("parse list_locations response: {e}"))),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("GET {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
     pub fn list_server_types(&self) -> Result<super::types::ServerTypeListResponse> {
         // Pagination defaults to 25 results; the full list is typically small
         // enough that a single page suffices for pre-flight validation.

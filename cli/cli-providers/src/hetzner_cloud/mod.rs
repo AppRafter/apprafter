@@ -23,10 +23,11 @@ pub use types::{
     ApiErrorDetails, ApiErrorEnvelope, Deprecation, Firewall, FirewallCreateRequest,
     FirewallCreateResponse, FirewallListResponse, FirewallReference, FirewallRule, FloatingIp,
     FloatingIpCreateRequest, FloatingIpCreateResponse, FloatingIpListResponse, HomeLocation,
-    Network, NetworkCreateRequest, NetworkCreateResponse, NetworkListResponse, PublicIpv4,
-    PublicIpv6, PublicNet, Server, ServerCreateRequest, ServerCreateResponse, ServerListResponse,
-    ServerStatus, ServerType, ServerTypeListResponse, ServerTypeLocation, SshKey,
-    SshKeyCreateRequest, SshKeyCreateResponse, SshKeyListResponse, Subnet,
+    Location, LocationListResponse, Network, NetworkCreateRequest, NetworkCreateResponse,
+    NetworkListResponse, PublicIpv4, PublicIpv6, PublicNet, Server, ServerCreateRequest,
+    ServerCreateResponse, ServerListResponse, ServerStatus, ServerType, ServerTypeListResponse,
+    ServerTypeLocation, SshKey, SshKeyCreateRequest, SshKeyCreateResponse, SshKeyListResponse,
+    Subnet,
 };
 pub use user_data::{
     build_k3s_user_data, K3sBootstrapOptions, CLUSTER_CIDR_DUAL_STACK, SERVICE_CIDR_DUAL_STACK,

@@ -306,3 +306,24 @@ pub struct ServerTypeLocation {
 pub struct ServerTypeListResponse {
     pub server_types: Vec<ServerType>,
 }
+
+/// One row of `GET /v1/locations`. Hetzner cloud locations are
+/// the physical datacenters servers boot into (e.g. `nbg1` =
+/// Nuremberg). We use the list endpoint mainly as a lightweight
+/// `Authorization` probe (any valid token can read it, no API
+/// quota is spent), and the wizard / region-picker in Track A.4b
+/// will surface the same response to drive an autocomplete picker.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Location {
+    pub id: u64,
+    pub name: String,
+    pub description: String,
+    pub country: String,
+    pub city: String,
+    pub network_zone: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocationListResponse {
+    pub locations: Vec<Location>,
+}

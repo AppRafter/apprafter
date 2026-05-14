@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 //! clap definitions for the `apprafter` CLI.
 
+use clap::builder::BoolishValueParser;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -152,5 +153,20 @@ pub enum TargetCommand {
         /// non-interactive regardless of TTY.
         #[arg(long = "no-interactive", default_value_t = false)]
         no_interactive: bool,
+        /// Skip the Hetzner Cloud API ping that confirms the token
+        /// authenticates (`GET /v1/locations`). Useful in CI when
+        /// the network sandbox blocks outbound calls, or when
+        /// pre-seeding a target store offline. v0.1.75 wired the
+        /// ping in by default; this opt-out keeps the previous
+        /// (format-only) behaviour available. Also honours
+        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics —
+        /// any non-empty value flips the flag.
+        #[arg(
+            long = "no-ping",
+            env = "APPRAFTER_NO_PING",
+            default_value_t = false,
+            value_parser = BoolishValueParser::new(),
+        )]
+        no_ping: bool,
     },
 }
