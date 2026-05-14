@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 fn cli() -> Command {
@@ -169,14 +170,23 @@ fn apply_with_ssh_public_key_env_still_requires_token() {
 
 #[test]
 fn import_without_provider_in_state_errors_clearly() {
+    // Isolate from the developer's real ~/.config/apprafter/
+    // target store — otherwise v0.1.83's "fall back to target
+    // store config" wiring kicks in and the test asserts the
+    // wrong error.
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .env_remove("HCLOUD_TOKEN")
         .arg("import")
         .assert()
         .failure()
-        .stderr(contains("provider"));
+        // Error now mentions both the recommended new path
+        // (`apprafter target add`) and the legacy `init`.
+        .stderr(contains("provider"))
+        .stderr(contains("apprafter target add").or(contains("apprafter init")));
 }
 
 #[test]
@@ -204,6 +214,76 @@ fn import_without_token_reports_missing_token() {
         .assert()
         .failure()
         .stderr(contains("HCLOUD_TOKEN"));
+}
+
+#[test]
+fn apply_without_init_uses_active_target_config_for_provider() {
+    // Regression-guard for the v0.1.83 fix: after `target add`
+    // the operator should be able to run `apprafter apply`
+    // directly without first running `apprafter init`. v0.1.82
+    // wired credential resolution but provider/region still
+    // required state.json, so the user hit "state has no
+    // provider — run init first" even when target had it all.
+    let cwd = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+
+    // Seed target store with full config but NO `init` in cwd.
+    // Use an obviously-invalid token so apply fails fast on the
+    // first API call — we don't want to actually hit Hetzner;
+    // we just need to verify that apply got PAST the
+    // "no provider" gate.
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
+        .env("APPRAFTER_NO_PING", "1")
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "active",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &"a".repeat(64),
+            "--region",
+            "nbg1",
+            "--tier",
+            "solo",
+            "--cluster-name",
+            "from-target",
+        ])
+        .assert()
+        .success();
+
+    // Apply with NO `init`. Should NOT fail with "state has no
+    // provider"; should fail (or proceed to API call) after
+    // pulling provider/region/cluster_name from the target.
+    let output = cli()
+        .current_dir(cwd.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
+        .env_remove("HCLOUD_TOKEN")
+        .env_remove("APPRAFTER_NO_PING")
+        // Point Hetzner at a closed port so apply fails on the
+        // FIRST network attempt instead of hanging or actually
+        // creating resources. The point of the test is that
+        // apply got past provider resolution.
+        .env("APPRAFTER_HCLOUD_BASE_URL", "http://127.0.0.1:1")
+        .arg("apply")
+        .output()
+        .expect("apply runs");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Failure is expected (closed-port transport). What MUST
+    // NOT appear is the "state has no provider" / "run init"
+    // gate.
+    assert!(
+        !stderr.contains("state has no provider"),
+        "apply should fall back to active target's provider, not require init.\nSTDERR:\n{stderr}\nSTDOUT:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("run `apprafter init"),
+        "init must be optional when an active target is configured.\nSTDERR:\n{stderr}"
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! Read live Hetzner Cloud resources labelled `apprafter=true` and
 //! rebuild `.apprafter/state.json`. See plan.md phase 1.2 (v0.1.7).
 
-use cli_core::target::{default_config_root, TargetStorePaths};
+use cli_core::target::{default_config_root, load_active_target_config, TargetStorePaths};
 use cli_core::{resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
 use cli_state::{HetznerCloudState, State, StatePaths};
@@ -16,17 +16,30 @@ pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<
     let paths = StatePaths::for_root(&cwd);
     let mut state = State::load_or_default(&paths)?;
 
-    let provider_id = state.provider.clone().ok_or_else(|| {
-        CliError::Other("state has no provider — run `apprafter init …` first".to_string())
-    })?;
+    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    let target_config = load_active_target_config(&target_store, target_override);
+
+    // Provider resolves from state.json → active target's
+    // `config.yaml.provider` (v0.1.83 wiring). Makes `import`
+    // usable directly after `apprafter target add` without an
+    // intervening `init`.
+    let provider_id = state
+        .provider
+        .clone()
+        .or_else(|| target_config.as_ref().map(|c| c.provider.clone()))
+        .ok_or_else(|| {
+            CliError::Other(
+                "no provider configured. Run `apprafter target add <name> --provider hetzner-cloud …` (recommended) or `apprafter init --provider hetzner-cloud …`."
+                    .to_string(),
+            )
+        })?;
     if provider_id != "hetzner-cloud" {
         return Err(CliError::Other(format!(
             "provider `{provider_id}` is not yet implemented in this skeleton"
         )));
     }
 
-    // Resolution chain (cli-dx-task.md §7).
-    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    // Credential resolution chain (cli-dx-task.md §7).
     let token = resolve_hetzner_token(None, &target_store, target_override)?;
 
     if state.hetzner_cloud.is_some() && !force {
@@ -35,10 +48,25 @@ pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<
         ));
     }
 
+    // cluster_name precedence: state.json → target_config →
+    // default. Same as apply.
     let cluster = state
         .cluster_name
         .clone()
+        .or_else(|| target_config.as_ref().and_then(|c| c.cluster_name.clone()))
         .unwrap_or_else(|| "platform-1".into());
+
+    // Seed missing state fields so subsequent destroy/apply/import
+    // round-trips in this directory short-circuit via state.json.
+    if state.provider.is_none() {
+        state.provider = Some(provider_id.clone());
+    }
+    if state.cluster_name.is_none() {
+        state.cluster_name = Some(cluster.clone());
+    }
+    if state.region.is_none() {
+        state.region = target_config.as_ref().and_then(|c| c.region.clone());
+    }
 
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let snapshot = match build_snapshot(&client, &cluster)? {

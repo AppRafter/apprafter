@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use cli_core::manifest::{self, FirewallIngressRule, InfrastructureManifest};
-use cli_core::target::{default_config_root, TargetStorePaths};
+use cli_core::target::{default_config_root, load_active_target_config, TargetStorePaths};
 use cli_core::{resolve_hetzner_ssh_public_key, resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{
     build_k3s_user_data, FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient,
@@ -31,9 +31,26 @@ pub fn run(target_override: Option<&str>) -> Result<()> {
     let paths = StatePaths::for_root(&cwd);
     let mut state = State::load_or_default(&paths)?;
 
-    let provider_id = state.provider.clone().ok_or_else(|| {
-        CliError::Other("state has no provider — run `apprafter init …` first".to_string())
-    })?;
+    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    let target_config = load_active_target_config(&target_store, target_override);
+
+    // Provider resolves from state.json first (legacy `init`
+    // path) and falls back to the active target's
+    // `config.yaml.provider` — that's the v0.1.83 wiring that
+    // makes `apprafter target add → apply` work without an
+    // explicit `init`. `init` stays a command for operators who
+    // prefer the explicit two-step setup; it just isn't
+    // mandatory anymore.
+    let provider_id = state
+        .provider
+        .clone()
+        .or_else(|| target_config.as_ref().map(|c| c.provider.clone()))
+        .ok_or_else(|| {
+            CliError::Other(
+                "no provider configured. Run `apprafter target add <name> --provider hetzner-cloud …` (recommended) or the legacy `apprafter init --provider hetzner-cloud --tier solo --region nbg1`."
+                    .to_string(),
+            )
+        })?;
 
     if provider_id != "hetzner-cloud" {
         return Err(CliError::Other(format!(
@@ -41,13 +58,11 @@ pub fn run(target_override: Option<&str>) -> Result<()> {
         )));
     }
 
-    // Resolution chain (cli-dx-task.md §7): --token flag (none
-    // wired on apply yet) → HCLOUD_TOKEN env → active target's
-    // credentials.yaml. `--target` (when supplied) overrides the
-    // active-pointer step. Backwards-compat is preserved — env-
-    // var-only workflows keep working without configuring a
-    // target.
-    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    // Credential resolution chain (cli-dx-task.md §7): --token
+    // flag (none wired on apply yet) → HCLOUD_TOKEN env → active
+    // target's credentials.yaml. `--target` (when supplied)
+    // overrides the active-pointer step. Backwards-compat
+    // preserved — env-var-only workflows keep working.
     let token = resolve_hetzner_token(None, &target_store, target_override)?;
 
     // Optional manifest path. If APPRAFTER_MANIFEST is set, parse
@@ -61,15 +76,38 @@ pub fn run(target_override: Option<&str>) -> Result<()> {
         Err(_) => None,
     };
 
+    // cluster_name precedence: state.json (filled after first
+    // successful apply) → target_config.cluster_name → default
+    // "platform-1".
     let cluster = state
         .cluster_name
         .clone()
+        .or_else(|| target_config.as_ref().and_then(|c| c.cluster_name.clone()))
         .unwrap_or_else(|| "platform-1".into());
+    // region precedence: manifest → state.json → target_config →
+    // default "nbg1". Manifest still wins because operators who
+    // hand-edited it meant it.
     let region = manifest
         .as_ref()
         .and_then(|m| m.spec.region.clone())
         .or_else(|| state.region.clone())
+        .or_else(|| target_config.as_ref().and_then(|c| c.region.clone()))
         .unwrap_or_else(|| "nbg1".into());
+
+    // First-run convenience: seed state.json with the resolved
+    // provider so future `destroy` / `import` / next-`apply`
+    // calls in this directory short-circuit through state
+    // without re-reading the target store. Doesn't write to
+    // disk yet — `persist_state` at the end of run() flushes.
+    if state.provider.is_none() {
+        state.provider = Some(provider_id.clone());
+    }
+    if state.cluster_name.is_none() {
+        state.cluster_name = Some(cluster.clone());
+    }
+    if state.region.is_none() {
+        state.region = Some(region.clone());
+    }
 
     let server_spec = build_server_spec(manifest.as_ref(), &cluster, &region);
     let ssh_keys = build_ssh_specs(manifest.as_ref(), &cluster, &target_store, target_override)?;

@@ -13,6 +13,114 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.83 — hotfix: apply/import fall back to target config (2026-05-14)
+
+Walk-found bug in v0.1.82. The Track A.8 wiring resolved the
+Hetzner *token* from the active target — but `provider` /
+`region` / `cluster_name` still lived only in the legacy
+`<cwd>/.apprafter/state.json`, written by `apprafter init`. So
+the operator's natural flow
+
+```
+$ apprafter target show
+Target: dev (active)
+  Provider: hetzner-cloud
+  Region:   nbg1
+  Default tier: solo
+...
+$ apprafter apply
+Error: state has no provider — run `apprafter init …` first
+```
+
+surfaced as a confusing mismatch — target store says everything
+is configured, apply demands `init` anyway.
+
+v0.1.83 finishes the wiring: `apply` and `import` now read
+`provider`, `region`, and `cluster_name` from the active target
+as fallback when `state.json` is empty. `init` stays as a
+command for operators who prefer the explicit setup, but is no
+longer mandatory after `target add`.
+
+### Changed
+
+- **`cli_core::target` gains two helpers** (`pub fn`,
+  re-exported through the crate root):
+  - `resolve_active_target_name(paths, target_override)
+    -> Result<Option<String>>` — mirrors the precedence the
+    credential resolver uses (override → active pointer →
+    None). Used by both apply/import to look at the *same*
+    target for both config and credentials within one
+    invocation.
+  - `load_active_target_config(paths, target_override)
+    -> Option<TargetConfig>` — best-effort: returns `None`
+    on any IO / parse failure rather than `Err`. Operational
+    commands treat the target store strictly as a fallback;
+    a broken target file shouldn't take them down when they
+    could otherwise resolve from env or state.json. Real
+    errors stay with the credential resolver.
+
+- **`commands::apply`** now resolves the provider chain
+  `state.provider → target_config.provider → typed error`.
+  Same for `cluster_name` (`state → target_config → "platform-1"`)
+  and `region` (`manifest → state → target_config → "nbg1"`).
+  First-run convenience: after the resolved values are in
+  hand, missing `state.json` fields are seeded so subsequent
+  destroy/import/apply round-trips in this directory
+  short-circuit through state.
+
+- **`commands::import`** gets the same fallback wiring for
+  `provider` and `cluster_name`. `region` is seeded from the
+  target when state was empty.
+
+- **Error message refresh** on the "no provider" gate now
+  enumerates both paths:
+  > no provider configured. Run `apprafter target add <name>
+  > --provider hetzner-cloud …` (recommended) or the legacy
+  > `apprafter init --provider hetzner-cloud --tier solo
+  > --region nbg1`.
+
+### Tests
+
+- **New regression-guard** in `tests/cli_smoke.rs`:
+  `apply_without_init_uses_active_target_config_for_provider`
+  — seeds a target with full config in an isolated
+  `APPRAFTER_CONFIG_DIR`, then runs `apply` from a CWD that
+  has no `state.json`. Points the Hetzner client at a closed
+  port so apply fails fast (transport error) rather than
+  hitting the real API; the assertion is that apply got PAST
+  the provider gate (stderr must NOT contain "state has no
+  provider" / "run init first"). Pins the v0.1.83 wiring
+  against the exact failure mode the walk surfaced.
+- **Reworked** `import_without_provider_in_state_errors_clearly`:
+  added `APPRAFTER_CONFIG_DIR` isolation so the test doesn't
+  accidentally fall back to the developer's real
+  `~/.config/apprafter/` target store. Updated assertion to
+  match the enriched two-path error message.
+
+### Backwards compatibility
+
+- `apprafter init` continues to work unchanged for operators
+  who prefer the explicit two-step setup.
+- `HCLOUD_TOKEN=… apprafter apply` still works without a
+  target store configured — v0.1.82 chain still terminates
+  on the env var.
+- Existing `state.json` files keep being authoritative when
+  populated. The target-store fallback only fills GAPS.
+
+### Operator note (the walk that surfaced this)
+
+```
+$ apprafter target add dev --provider hetzner-cloud --token "$T" \
+    --region nbg1 --tier solo
+$ apprafter target use dev    # automatic on first add
+$ apprafter apply             # ← v0.1.83 makes this work; v0.1.82 errored
+```
+
+If you previously ran `apprafter init` to work around the
+v0.1.82 gate, that's now redundant but harmless — `init` just
+writes the same values to `state.json` that the resolver would
+have pulled from the target.
+
 ## v0.1.82 — M1.5 Track A.8 — credential resolution chain (2026-05-14)
 
 Eighth Track A slice. The day-to-day goal of the M1.5 CLI work

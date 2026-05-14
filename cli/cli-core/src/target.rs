@@ -303,6 +303,48 @@ pub fn save_global_config(paths: &TargetStorePaths, cfg: &GlobalConfig) -> Resul
     atomic_write(&paths.global_config_file(), yaml.as_bytes(), false)
 }
 
+/// Best-effort: which target should non-credential code paths
+/// (apply / destroy / import) consult for fallback config like
+/// provider / region / cluster_name?
+///
+/// Returns `Some(name)` when:
+///  1. `target_override` is supplied (the `--target` flag), OR
+///  2. `GlobalConfig.active_target` exists and is non-empty.
+///
+/// Returns `None` for a fresh store with no targets — callers
+/// then fall through to defaults / errors.
+///
+/// Mirrors the same precedence the credential resolver uses, so
+/// operational commands look at the *same* target for both
+/// config and credentials within one invocation.
+pub fn resolve_active_target_name(
+    paths: &TargetStorePaths,
+    target_override: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(n) = target_override {
+        return Ok(Some(n.to_string()));
+    }
+    Ok(load_global_config(paths)?
+        .map(|g| g.active_target)
+        .filter(|s| !s.is_empty()))
+}
+
+/// Convenience helper used by `apply`/`destroy`/`import` to load
+/// the active target's non-secret config when state.json is empty.
+/// Returns `None` (not Err) for any failure — these consumers
+/// treat the target store strictly as a fallback, so a broken
+/// target file shouldn't take down operational commands that
+/// could otherwise succeed from env or state.json. Real errors
+/// surface through the credential resolver which IS allowed to
+/// fail.
+pub fn load_active_target_config(
+    paths: &TargetStorePaths,
+    target_override: Option<&str>,
+) -> Option<TargetConfig> {
+    let name = resolve_active_target_name(paths, target_override).ok()??;
+    load_target(paths, &name).ok().map(|t| t.config)
+}
+
 // ---------------------------------------------------------------
 // Per-target IO
 // ---------------------------------------------------------------
