@@ -18,6 +18,7 @@ fn main() -> color_eyre::Result<()> {
         Commands::Target { action } => commands::target::run(action)?,
         Commands::Whoami { no_ping } => commands::whoami::run(no_ping)?,
         Commands::Auth { action } => commands::auth::run(action)?,
+        Commands::Doctor { target, no_ping } => commands::doctor::run(target.as_deref(), no_ping)?,
         Commands::Init {
             provider,
             tier,

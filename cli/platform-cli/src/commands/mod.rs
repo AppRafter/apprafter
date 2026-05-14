@@ -6,6 +6,7 @@ pub mod argocd_password;
 pub mod auth;
 pub mod cluster_bootstrap;
 pub mod destroy;
+pub mod doctor;
 pub mod hcloud;
 pub mod import;
 pub mod init;

@@ -52,6 +52,26 @@ pub enum Commands {
         #[command(subcommand)]
         action: AuthCommand,
     },
+    /// Self-diagnostic. Walks the active target's stored config,
+    /// credentials, and reachability checks plus the surrounding
+    /// shell environment (kubectl, helm, ssh, DNS). Prints PASS /
+    /// WARN / FAIL per check; exits 1 if any FAIL fires so CI
+    /// gates can wire `apprafter doctor` in directly.
+    Doctor {
+        /// Inspect a target other than the active one. Defaults
+        /// to the active target.
+        #[arg(long)]
+        target: Option<String>,
+        /// Skip the Hetzner Cloud API ping. Honours
+        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics.
+        #[arg(
+            long = "no-ping",
+            env = "APPRAFTER_NO_PING",
+            default_value_t = false,
+            value_parser = BoolishValueParser::new(),
+        )]
+        no_ping: bool,
+    },
     /// Bootstrap a fresh cluster on the given provider/tier.
     Init {
         /// Infrastructure provider identifier.

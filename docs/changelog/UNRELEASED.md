@@ -13,6 +13,133 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.81 — M1.5 Track A.7 — apprafter doctor (2026-05-14)
+
+Seventh Track A slice. `apprafter doctor` walks the active
+target's stored state + reachability + the surrounding shell
+environment and prints a PASS / WARN / FAIL line per check.
+Three audiences per `cli-dx-task.md` §5.9: new-user
+troubleshooting, CI smoke gates wiring `doctor` in as a
+quality precondition, and bug-report templates that paste
+the output verbatim.
+
+### Added
+
+- **`apprafter doctor`** top-level command with two flags:
+  `--target <name>` to inspect a non-active target, and
+  `--no-ping` (+ `APPRAFTER_NO_PING` env binding) to skip the
+  Hetzner API round-trip. Output layout per spec:
+  ```
+  Checking target `default`...
+    ✓ Config file readable (.../config.yaml)
+    ✓ Credentials file present (mode 0600) (.../credentials.yaml)
+    ✓ Provider `hetzner-cloud` supported
+    ✓ Token format valid (64 chars, alphanumeric)
+    ✓ Token verified against provider API (Hetzner Cloud /v1/locations, 142 ms)
+    ✓ SSH key readable (~/.ssh/id_ed25519.pub (ssh-ed25519))
+
+  Checking environment...
+    ✓ `kubectl` on PATH (Client Version: ...)
+    ✓ `helm` on PATH (v3.16.0+gXXXX)
+    ✓ `ssh` on PATH (OpenSSH_9.6p1, ...)
+    ✓ DNS resolves `api.hetzner.cloud` (443/tcp)
+
+  10 checks for target `default`: 10 passed. All good — ready
+  for `apprafter init` / `apprafter apply`.
+  ```
+  Failed checks land their hint on a second indented line so
+  the operator gets the specific next step without having to
+  copy-paste into a search engine. Exit code is 0 on
+  PASS-only or WARN-only runs, 1 on any FAIL — wires straight
+  into CI gates.
+
+- **`Check { name, status, detail, hint }` + `DoctorReport`
+  data layer**, kept separate from the side-effecting
+  collection functions so rendering can be unit-tested
+  without invoking real APIs. `CheckStatus::{Pass, Warn, Fail}`
+  with corresponding glyphs `✓ / ⚠ / ✗`.
+
+- **Target checks** (when a target is resolved):
+  - Config file readable — exercised by `load_target`, fails
+    fast with an "available targets: ..." hint when the name
+    doesn't exist.
+  - Credentials file present (mode 0600 on Unix; existence
+    only on Windows) — WARN if mode drifted from 0600 with a
+    `chmod 600` hint.
+  - Provider `X` supported — whitelist match (`hetzner-cloud`
+    today).
+  - Token format valid — through `validate_hetzner_token_format`.
+  - Token verified against provider API — runs
+    `HetznerCloudValidator::validate_credentials()` with
+    `Instant::now()` timing. 401 → FAIL with a `--renew`
+    hint; other HTTP / transport → FAIL with a status-page /
+    network hint; `--no-ping` or missing token → WARN.
+  - SSH key readable — reads + parses the OpenSSH first
+    line; surfaces the algo (`ssh-ed25519`, `ssh-rsa`, ...);
+    FAIL when the configured path is missing on disk (stale
+    target config); WARN when no path is set at all.
+
+- **Env checks** (always):
+  - `kubectl` / `helm` / `ssh` on PATH — runs the tool's
+    `--version`-style invocation, captures stdout AND stderr
+    (ssh writes to stderr), reports the first non-empty line
+    as detail. Missing tool downgrades to WARN with an
+    install hint — doctor is a diagnostic, not an installer.
+  - DNS resolves `api.hetzner.cloud` — via
+    `ToSocketAddrs::to_socket_addrs("api.hetzner.cloud:443")`.
+    PASS with `443/tcp` detail; FAIL with resolver-error
+    hint on the rare unreachable-DNS case.
+
+### Tests (17 new)
+
+- 11 unit in `commands::doctor::tests` covering pure helpers:
+  - Glyph rendering.
+  - `DoctorReport::{passed, warned, failed, has_failures}`.
+  - `check_dns_resolves` happy + `.invalid` TLD (RFC 6761
+    reserved as never-resolvable).
+  - `check_tool` WARN branch on missing binary.
+  - `check_provider_known` known/unknown.
+  - `check_token_format` valid/missing.
+  - `check_token_ping` `--no-ping` branch.
+- 6 integration tests in `tests/doctor_test.rs`:
+  - `doctor_on_empty_store_errors_with_onboarding_hint`
+  - `doctor_renders_target_and_env_checks_with_summary` —
+    pins the section structure + summary phrasing + that the
+    `--no-ping` WARN doesn't fail the run.
+  - `doctor_target_flag_inspects_non_active_target` — pins
+    the `--target <name>` override.
+  - `doctor_ssh_key_missing_path_fails_the_run_with_exit_1`
+    — stale-config detection (path stored, file deleted).
+  - `doctor_target_not_found_fails_with_available_hint` —
+    "did you mean..." surface from the canonical
+    TargetNotFound shape.
+  - `doctor_summary_line_phrases_outcomes_clearly` — pins
+    the "warning(s)" verbiage when WARN-only.
+
+### Out of scope (deferred)
+
+- "Region in known list" check — would need a hardcoded list
+  (brittle as Hetzner adds DCs) or an API call (already part
+  of the token ping). Implicit pass: if the ping succeeds with
+  this region configured, the region is valid for the provider.
+- "No active cluster" check — needs a per-target state cache
+  to query (`state/<name>/state.json`). Lands with Track A.8
+  (resolution chain plumbing).
+- Color output for PASS/WARN/FAIL — Track A.11
+  (color / NO_COLOR / --color flag pass).
+- miette-style diagnostics — Track A.10 (error UX refinement).
+
+### Operator note
+
+`apprafter doctor` is wire-it-in-CI friendly:
+```yaml
+- run: apprafter doctor --target ci --no-ping
+```
+A non-zero exit means a FAIL fired; the report itself goes to
+stdout so the CI log shows exactly which check tripped. For
+shell-prompt or banner use the `--no-ping` flag (or the
+`APPRAFTER_NO_PING=1` env var) to keep the run offline.
+
 ## v0.1.80 — M1.5 Track A.6 — whoami + auth stubs (2026-05-14)
 
 Sixth Track A slice. `apprafter whoami` is the new "what shell am

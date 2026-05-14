@@ -1183,9 +1183,72 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.7 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.7 `apprafter doctor` ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.6). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → **`doctor` (1.66A.7)** → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.81 — sub-phase 1.66A.7 shipped: self-diagnostic команда (target checks + env checks + DNS probe; trichotomy PASS/WARN/FAIL; FAIL → exit 1 для CI gates).
+
+**Source:** `cli-dx-task.md` §5.9 + §17 row 7.
+
+**Поставка:**
+- [x] `apprafter doctor [--target <name>] [--no-ping]` — новая top-level команда.
+- [x] `cli/platform-cli/src/commands/doctor.rs` (~520 LOC + 11 unit-тестов): pure `Check { name, status, detail, hint }` + `DoctorReport { target_name, target_checks, env_checks }` data layer, отдельные `build_target_checks` / `build_env_checks` / `print_report` функции; orchestrator `run` зовёт всё + exit-1 на FAIL.
+- [x] **Target checks** (когда target resolved):
+    - `Config file readable` — через `load_target`; on `TargetNotFound` сразу FAIL с available-hint'ом.
+    - `Credentials file present (mode 0600)` — на Unix проверяет permissions, WARN если drift'нул от 0600; на других OS просто existence-check.
+    - `Provider \`X\` supported` — whitelist (`hetzner-cloud`).
+    - `Token format valid` — `validate_hetzner_token_format`; FAIL с `--renew` hint'ом если сломан.
+    - `Token verified against provider API` — `HetznerCloudValidator::validate_credentials()` с timing (`{ms} ms`); WARN если `--no-ping` / нет токена; FAIL с разделением 401 (token rejected → `--renew` hint) / non-401 HTTP / transport.
+    - `SSH key readable` — exists + read_to_string + parse algo из OpenSSH-первой строки; FAIL если path в config'е есть но файла нет на диске (stale config); WARN если path не задан.
+- [x] **Env checks** (всегда):
+    - `\`kubectl\` on PATH` / `\`helm\` on PATH` / `\`ssh\` on PATH` — `Command::new(tool).args(...).output()`, PASS с первой непустой строкой (stdout ИЛИ stderr — `ssh -V` пишет в stderr), WARN с hint'ом если binary не найден. Лояльно — отсутствие optional-tool не валит doctor.
+    - `DNS resolves \`api.hetzner.cloud\`` — `ToSocketAddrs::to_socket_addrs("host:443")`; PASS с `443/tcp` detail или FAIL с resolver-error hint'ом.
+- [x] **Rendering**: `  ✓ name (detail)` / `  ⚠ name (detail)` / `  ✗ name (detail)` + `      hint: <hint>` на отдельной indented строке. Trailing summary с разными формулировками для clean / warning-only / FAIL'ed runs.
+- [x] **Exit policy**: FAIL anywhere → `std::process::exit(1)`; WARN-only → exit 0 + "Ready to go; review warnings".
+
+**Тесты (17 новых):**
+- 11 unit в `commands::doctor::tests`:
+    - `check_status_glyph_renders_distinctly`
+    - `report_counters_split_by_status`
+    - `report_has_failures_returns_false_when_only_warns`
+    - `check_dns_resolves_localhost_passes` (RFC reserved 127.0.0.1)
+    - `check_dns_resolves_invalid_tld_fails` (RFC 6761 `.invalid`)
+    - `check_tool_warns_on_missing_binary` (no `apprafter-doctor-no-such-binary` on $PATH)
+    - `check_provider_known_fails_for_unknown_provider` / `_passes_for_hetzner`
+    - `check_token_format_passes_canonical_token` / `_fails_on_missing_token`
+    - `check_token_ping_warns_when_no_ping_flag_set`
+- 6 integration в `tests/doctor_test.rs`:
+    - `doctor_on_empty_store_errors_with_onboarding_hint`
+    - `doctor_renders_target_and_env_checks_with_summary` (Target/Env разделы, --no-ping → WARN на ping, summary mentions target name)
+    - `doctor_target_flag_inspects_non_active_target` (`--target secondary`)
+    - `doctor_ssh_key_missing_path_fails_the_run_with_exit_1` (configure ssh-key path → удалить файл → FAIL + exit 1)
+    - `doctor_target_not_found_fails_with_available_hint` (`--target ghost`)
+    - `doctor_summary_line_phrases_outcomes_clearly` (warning-only run → "warning(s)", no FAIL в выводе)
+
+**Acceptance:**
+- ✅ `apprafter doctor` на empty store → typed error + onboarding hint.
+- ✅ С active target — все 10 (~6 target + ~4 env) checks отрисованы; summary с count'ом PASS/WARN/FAIL.
+- ✅ `--target <name>` инспектирует non-active target.
+- ✅ `--no-ping` → token-ping check как WARN с "skipped — --no-ping".
+- ✅ Любая FAIL → exit 1 (для CI gates).
+- ✅ Никаких token leaks в output.
+- ✅ `cargo test --workspace`: 36 target_test + 10 whoami_auth_test + 6 doctor_test + 120 cli-providers + ... — 0 failures.
+- ✅ fmt + clippy (-D warnings) + SPDX (158 files) clean.
+
+**Out-of-scope (отложено):**
+- "Region in known list" check — нужен hardcoded list (brittle) или API call (уже есть в ping). Implicit: если ping проходит с этим region'ом, он валиден.
+- "No active cluster" check — нужен cli-state cross-ref per target. Track A.8.
+- Color output для PASS/WARN/FAIL — Track A.11 (color/NO_COLOR).
+- miette-стиль diagnostics — Track A.10.
+
+**Зависит от:** 1.66A.4a ✅ (validator), 1.66A.5 ✅ (CRUD load_target).
+
+**Размер:** M (один цикл, ~1 рабочий день).
+
+---
+
+### 1.66A.8 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.7). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → **wire `init`/`apply`/`cluster-bootstrap` в target resolution (1.66A.8)** → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3463,4 +3526,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | v0.1.77 wizard polish #2 — `prompt_name` silent on prefill (consistency with other prompts); `ℹ <Field>: <value> (from <source>)` для всех prefilled wizard-полей (name/provider/ssh-key/region/tier — token уже имел); `run_renew` rejects identical-token with hint to generate new in Cloud Console; +3 tests; v0.1.78 | initial |
 | 2026-05-14 | M1.5 Track A.5 — target CRUD: `target list` (tabled-таблица с `*` маркером) + `target use` (свитч active) + `target show` (детали; токен masked как `set (N chars)`) + `target rename` (атомарно с auto-update active pointer) + `target remove` (`--yes` opt-in или interactive Confirm; active → reassign alphabetically); `cli_core::target::rename_target` API; +21 tests; v0.1.79 | initial |
 | 2026-05-14 | M1.5 Track A.6 — `apprafter whoami` (identity + active target + best-effort verified status; failed ping не валит exit) + hidden `apprafter auth login/logout/status` stubs (friendly redirect на `target add` + ссылка на Managed roadmap); +15 tests; v0.1.80 | initial |
+| 2026-05-14 | M1.5 Track A.7 — `apprafter doctor` (self-diagnostic): target checks (config readable, creds mode 0600, provider known, token format, token API-verified с latency, ssh-key readable) + env checks (kubectl/helm/ssh on PATH, DNS resolves api.hetzner.cloud); trichotomy PASS/WARN/FAIL → exit 1 на FAIL; +17 tests; v0.1.81 | initial |
 
