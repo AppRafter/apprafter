@@ -49,6 +49,19 @@ impl CheckStatus {
             Self::Fail => "✗",
         }
     }
+
+    /// Glyph wrapped in the matching semantic colour helper.
+    /// `owo-colors` strips ANSI when stdout isn't a TTY, so under
+    /// `cargo test` / `NO_COLOR=1` / piped output the result is
+    /// identical to `glyph()`. Real terminals see green ✓ / yellow
+    /// ⚠ / red ✗.
+    fn coloured_glyph(&self) -> String {
+        match self {
+            Self::Pass => cli_core::style::ok(self.glyph()),
+            Self::Warn => cli_core::style::warn(self.glyph()),
+            Self::Fail => cli_core::style::fail(self.glyph()),
+        }
+    }
 }
 
 /// One row of the doctor report. `detail` lands on the same line
@@ -470,9 +483,10 @@ pub fn print_report(report: &DoctorReport) {
 }
 
 fn print_check_line(c: &Check) {
+    let glyph = c.status.coloured_glyph();
     match &c.detail {
-        Some(d) => println!("  {} {} ({})", c.status.glyph(), c.name, d),
-        None => println!("  {} {}", c.status.glyph(), c.name),
+        Some(d) => println!("  {glyph} {} ({})", c.name, d),
+        None => println!("  {glyph} {}", c.name),
     }
     if let Some(h) = &c.hint {
         println!("      hint: {h}");

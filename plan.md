@@ -1423,9 +1423,73 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.11 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.11 Aliases + semantic colors + NO_COLOR ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1–1.66A.10). См. `cli-dx-task.md` §17: target store IO ✅ → `target add` non-interactive ✅ → validator framework ✅ → interactive wizard ✅ → CRUD ✅ → `whoami`+`auth` ✅ → `doctor` ✅ → resolution chain ✅ → `bootstrap-all` orchestrator ✅ → miette refinement ✅ → **aliases / color / NO_COLOR (1.66A.11)** → docs+ADR.
+> v0.1.88 — sub-phase 1.66A.11 shipped: новый `cli_core::style` модуль с семантическими хелперами поверх `owo-colors` (auto-honours `NO_COLOR` через `supports-colors` feature); цвет applied на `bootstrap-all` markers (`→` cyan, `✓` green, `✗` red) + `doctor` PASS/WARN/FAIL glyphs (green/yellow/red); subcommand aliases — `target list/show/remove` ↔ `ls`/`info`/`rm`, `kubeconfig` ↔ `kc`, `cluster-bootstrap` ↔ `cb`, `bootstrap-all` ↔ `up`. Уже существовавший `target` ↔ `t` сохраняется, новые aliases прицепляются к нему (`apprafter t ls`).
+
+**Source:** `cli-dx-task.md` §17 row 11.
+
+**Поставка:**
+- [x] `cli/Cargo.toml` workspace dep `owo-colors = { version = "4", features = ["supports-colors"] }`; `cli-core/Cargo.toml` direct dep.
+- [x] `cli/cli-core/src/style.rs` — новый модуль:
+    - `ok(t)` — green (PASS / `✓` / verified). `Stream::Stdout` для авто-NO_COLOR.
+    - `warn(t)` — yellow (WARN / soft failures).
+    - `fail(t)` — red. `Stream::Stderr` — callsites that consume `fail()` write to stderr.
+    - `info(t)` — cyan (phase markers `→`, column headers, `(active)` tags).
+    - `dim(t)` — dimmed (tertiary annotations типа `(unset — apply uses platform-1)`).
+    - `bold(t)` — bold emphasis (target names, cluster names). Combine: `info(&bold("dev"))`.
+    - Все возвращают `String` (упрощено — `if_supports_color` возвращает hard-to-name generic type; форматирование в строку pragmatic и pollutes только небольшие call sites).
+- [x] `cli-core/src/lib.rs` — `pub mod style;`.
+- [x] `commands/bootstrap_all.rs`:
+    - Phase markers `→`/`✓`/`✗` через `style::info/ok/fail`.
+    - Phase 2 spinner success line использует `style::ok`.
+    - Phase failure marker через `style::fail`.
+- [x] `commands/doctor.rs`:
+    - Новый `CheckStatus::coloured_glyph(&self) -> String` — green ✓ / yellow ⚠ / red ✗.
+    - `print_check_line` использует coloured glyph.
+- [x] `cli/platform-cli/src/cli.rs` — aliases:
+    - `Kubeconfig` — `alias = "kc"`.
+    - `ClusterBootstrap` — `alias = "cb"`.
+    - `BootstrapAll` — `alias = "up"`.
+    - `TargetCommand::List` — `alias = "ls"`.
+    - `TargetCommand::Show` — `alias = "info"`.
+    - `TargetCommand::Remove` — `alias = "rm"`.
+
+**Тесты (2 unit + 7 integration):**
+- 2 в `cli_core::style::tests`:
+    - `ok_returns_ansi_free_text_when_stream_is_not_a_tty` — под `cargo test` stdout не TTY → no ANSI bytes, literal text survives.
+    - `warn_fail_info_dim_bold_all_round_trip_text_under_no_tty` — same contract для всех 5 helpers.
+- 7 в `tests/aliases_test.rs`:
+    - `target_ls_alias_routes_to_target_list` — sub-process сравнение stdout/exit между `target list` и `target ls` (identical bytes).
+    - `target_rm_alias_routes_to_target_remove` — `rm ghost --yes` → typed `apprafter::target::not_found`.
+    - `target_info_alias_routes_to_target_show` — same not-found surface.
+    - `kc_alias_routes_to_kubeconfig` — surfaces "no hetzner_cloud state" hint identically.
+    - `cb_alias_routes_to_cluster_bootstrap` — same.
+    - `up_alias_routes_to_bootstrap_all_dry_run` — `up --dry-run` exits 0 + prints `DRY RUN` plan identical to `bootstrap-all --dry-run`.
+    - `t_alias_for_target_still_works_alongside_new_alias_chain` — `apprafter t ls` chains `t` (target) ↔ `ls` (list) → empty-store onboarding hint surfaces. Pins muscle-memory kubectl-style path.
+
+**Acceptance:**
+- ✅ `bootstrap-all` real run в TTY показывает coloured phase markers (green ✓ / cyan →).
+- ✅ `doctor` PASS rows green, WARN rows yellow, FAIL rows red.
+- ✅ `NO_COLOR=1` или non-TTY pipe → output identical to monochrome v0.1.87 (zero ANSI bytes).
+- ✅ Все 6 новых aliases работают через subprocess: `apprafter ls`/`info`/`rm`/`kc`/`cb`/`up` + chained `t ls`/`t info`/`t rm`.
+- ✅ `cargo test --workspace` — 564 tests, 0 failures.
+- ✅ fmt + clippy (-D warnings) + SPDX (165 файлов) clean.
+
+**Out-of-scope (отложено):**
+- Цвет на `target list` table (через `tabled` cell styling) — feasible but требует custom cell renderer; на стандартных терминалах current monospace table читается хорошо. Promote позже если walk feedback потребует.
+- Цветная identity-строка в `whoami` (target name + cluster bold-cyan) — следующее iterative refinement; foundation готов через `style::bold` + `style::info`.
+- `style::ok_strong` / `style::fail_strong` background variants — добавим если нужно различать "ready" vs "ready + critical path".
+
+**Зависит от:** 1.66A.10 ✅ (miette уже использует свой палитру; `style` модуль координирует семантику чтобы наш output совпадал с miette's по тонам — green/yellow/red).
+
+**Размер:** S (один цикл, ~0.5 рабочего дня).
+
+---
+
+### 1.66A.12 (TBD, заполняется при открытии итерации)
+
+> Track A.12 — docs + ADR. Финальная подфаза Track A: обновление операторских docs (`docs/operator/getting-started.md`, `docs/operator/cli-reference.md`) под новый flow + ADR закрывающий проектные решения Track A.
 
 ---
 
@@ -3710,4 +3774,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.9 hotfix UX — после ручного walk'а v0.1.84: `MultiProgress` дублировал spinner-строки на каждый helm/kubectl `println` (Phase 1 + Phase 3 spinner fought с tracing-логами apply/cluster-bootstrap за тот же row); dry-run печатал `<active target>` placeholder вместо имени активного target'а и не раскрывал что делает каждая фаза. v0.1.85 пересобрал bootstrap_all: Phase 1+3 без spinner (`→ start / inner output / ✓ end`), Phase 2 keeps spinner (retry loop owns all output), `finish_and_clear()` + static success line; dry-run теперь load'ит `default_config_root` + `resolve_active_target_name` + `load_active_target_config` и печатает реальное имя active target + Provider/Region/Tier/Cluster/SSH-key из `config.yaml` + human-readable описание каждой фазы; +2 integration tests (empty store hint + active target resolved name); v0.1.85 | initial |
 | 2026-05-14 | M1.5 Track A.10 — miette diagnostic refinement: `CliError` derives `miette::Diagnostic` с stable `code(apprafter::*)` + multi-line `help(...)` на 9 user-facing вариантах (cue_not_found, hetzner_api_error, server_type_unavailable, state::corrupt, target::invalid_config, target::not_found, io/json/yaml, cli::other); binary entry point switched с `color-eyre` на `miette::set_hook` с `fancy` reporter; `NO_COLOR` respected; `color-eyre` workspace + platform-cli deps удалены; +11 tests (8 unit на `.code()`/`.help()` accessor surface + 3 subprocess-based integration на rendered stderr — `help:` block, diagnostic code substrings, ANSI-free под `NO_COLOR`); v0.1.86 | initial |
 | 2026-05-14 | M1.5 Track A.10 walk-fix — `target add` с битым токеном выходил под generic `apprafter::cli::other` потому что `commands/target.rs::ping_provider` и `commands/target_wizard.rs::prompt_token` обёртывали типизированный `CliError::Hetzner { status: 401, .. }` в `CliError::Other(format!(...))`, теряя diagnostic code и rotation help. v0.1.87 добавил две типизированные вариации с `#[diagnostic_source]` cause chain: `apprafter::target::token_rejected` (401 — rotation hint + console URL + clipboard newline trap) и `apprafter::target::provider_unreachable` (non-401 / transport — `apprafter doctor` + status page + `--no-ping`); shared `classify_ping_error(provider, err)` helper в обоих call sites; миette теперь рендерит two-layer cascade — outer summary с rotation help + chained inner `hetzner_api_error` с full 401/403/429/5xx breakdown; +2 unit tests на новых вариантах (`provider_token_rejected_carries_rotation_hint_and_chains_cause` доказывает что `diagnostic_source()` доходит до inner code, `provider_api_unreachable_targets_outage_path_not_rotation` гарантирует что outage не предлагает rotation); 2 prior target_test integration tests перевели assertions с обёртки на diagnostic codes (rendered output line-wraps, substrings типа `(status 401)` ненадёжны, codes — да); v0.1.87 | initial |
+| 2026-05-14 | M1.5 Track A.11 — semantic colors + subcommand aliases: new `cli_core::style` модуль поверх `owo-colors` (auto-honours `NO_COLOR` через `supports-colors` feature) с 6 хелперами (ok/warn/fail/info/dim/bold); colour applied на `bootstrap-all` phase markers (`→` cyan, `✓` green, `✗` red) + `doctor` glyphs (green ✓ / yellow ⚠ / red ✗); 6 новых subcommand aliases (`kubeconfig` ↔ `kc`, `cluster-bootstrap` ↔ `cb`, `bootstrap-all` ↔ `up`, `target list/show/remove` ↔ `ls`/`info`/`rm`), сохранён prior `target` ↔ `t` для chained `apprafter t ls`; +2 unit (style ANSI-strip under non-TTY) + 7 integration (alias subprocess routing включая chained `t ls`); v0.1.88 | initial |
 

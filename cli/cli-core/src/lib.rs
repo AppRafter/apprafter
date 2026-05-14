@@ -7,6 +7,7 @@ pub mod error;
 pub mod logging;
 pub mod manifest;
 pub mod secrets;
+pub mod style;
 pub mod target;
 pub mod tier;
 

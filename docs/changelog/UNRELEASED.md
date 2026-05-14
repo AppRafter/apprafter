@@ -13,6 +13,130 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.88 — M1.5 Track A.11 — semantic colors + subcommand aliases (2026-05-14)
+
+Eleventh Track A slice. Two ergonomic additions: semantic colour
+on result lines (so success-vs-warning-vs-failure parses
+visually, not character-by-character), and short aliases for the
+most-typed subcommands (`apprafter ls`, `apprafter up`, etc.).
+Both honour the standard `NO_COLOR` / non-TTY contracts so
+nothing changes for CI / piped output.
+
+### Added
+
+- **`cli_core::style` module** — semantic colour helpers wrapping
+  `owo-colors` 4.x with the `supports-colors` feature. Each
+  helper checks the relevant stream (stdout / stderr) for TTY +
+  `NO_COLOR` lazily on every format call and returns plain text
+  when colour isn't supported:
+  - `ok(t)` — green, for `✓` markers, PASS rows, verified labels.
+  - `warn(t)` — yellow, for WARN rows and soft failures.
+  - `fail(t)` — red (uses stderr stream — callsites that consume
+    `fail()` write to stderr).
+  - `info(t)` — cyan, for neutral phase markers (`→`), column
+    headers, and `(active)` tags.
+  - `dim(t)` — dimmed, for tertiary annotations like
+    `(unset — apply uses platform-1)` in dry-run plans.
+  - `bold(t)` — bold emphasis; combine with the others by
+    nesting: `info(&bold("dev"))`.
+
+  All helpers return `String` (not the `owo-colors` reference-
+  flavoured wrapper) — the generic type returned by
+  `if_supports_color` is hard to name in a function signature,
+  and `format!()` overhead is negligible against the cost of
+  emitting the line at all.
+
+- **6 new subcommand aliases**:
+  - `apprafter kc` → `apprafter kubeconfig`
+  - `apprafter cb` → `apprafter cluster-bootstrap`
+  - `apprafter up` → `apprafter bootstrap-all`
+  - `apprafter t ls` → `apprafter target list` (chains with the
+    pre-existing `t` → `target` alias)
+  - `apprafter t info` → `apprafter target show`
+  - `apprafter t rm` → `apprafter target remove`
+
+  All clap aliases — `clap` shows them inline in `--help`. The
+  canonical names stay primary; aliases exist for speed.
+
+### Changed
+
+- **`commands/bootstrap_all.rs`** wraps the `→`, `✓`, `✗`
+  glyphs with `style::info`, `style::ok`, `style::fail`. Spinner
+  finish-success line also uses `style::ok` for its `✓`.
+- **`commands/doctor.rs`** gains a `CheckStatus::coloured_glyph`
+  helper alongside the existing `glyph()`. PASS rows render
+  green ✓, WARN rows yellow ⚠, FAIL rows red ✗. The non-glyph
+  text (check name, detail, hint) stays uncoloured so the
+  attention is on the verdict.
+
+### Tests (2 unit + 7 integration)
+
+- **Unit** (`cli_core::style::tests`):
+  - `ok_returns_ansi_free_text_when_stream_is_not_a_tty` — pins
+    the no-TTY contract (cargo test's captured stdout): each
+    helper returns the literal input with zero ANSI bytes.
+  - `warn_fail_info_dim_bold_all_round_trip_text_under_no_tty`
+    — same contract across all 5 remaining helpers.
+
+- **Integration** (`tests/aliases_test.rs`):
+  - `target_ls_alias_routes_to_target_list` — subprocess `target
+    list` and `target ls` produce byte-identical stdout. The
+    strongest possible "same handler" assertion.
+  - `target_rm_alias_routes_to_target_remove` — alias surfaces
+    the same `apprafter::target::not_found` diagnostic on a
+    missing target.
+  - `target_info_alias_routes_to_target_show` — same.
+  - `kc_alias_routes_to_kubeconfig` — surfaces the "no
+    hetzner_cloud state" hint identically.
+  - `cb_alias_routes_to_cluster_bootstrap` — same.
+  - `up_alias_routes_to_bootstrap_all_dry_run` — `up --dry-run`
+    prints the same `DRY RUN` plan as `bootstrap-all --dry-run`.
+  - `t_alias_for_target_still_works_alongside_new_alias_chain`
+    — `apprafter t ls` chains the pre-existing `t` alias with
+    the new `ls` alias. Pins muscle-memory kubectl-style.
+
+### Backwards compatibility
+
+- All canonical command names still work. Aliases are purely
+  additive.
+- `NO_COLOR=1` / piped output produce byte-identical output to
+  v0.1.87 (zero ANSI sequences).
+- The `style` module is `pub mod` in `cli-core`, available to
+  any future workspace member that wants to follow the same
+  semantic palette.
+- Miette's own renderer keeps using its own palette (already
+  honours `NO_COLOR`); the new module is for our `println!`-
+  based output, not miette diagnostics.
+
+### Out of scope (deferred)
+
+- Coloured cells in `apprafter target list` (active row
+  highlighting via `tabled`). Feasible via custom cell renderer;
+  current monospace table reads well enough that this can wait
+  for walk feedback.
+- Coloured identity / cluster names in `whoami` (bold-cyan
+  emphasis). Foundation is there via `style::bold` +
+  `style::info`; next iterative refinement.
+- Background-colour `style::ok_strong` / `style::fail_strong`
+  variants for critical-path emphasis. Add when needed.
+
+### Operator note
+
+Type-saving tour for the new shortcuts:
+
+```
+$ apprafter t ls          # → target list
+$ apprafter t info dev    # → target show dev
+$ apprafter t rm bad      # → target remove bad
+$ apprafter kc            # → kubeconfig
+$ apprafter cb            # → cluster-bootstrap
+$ apprafter up            # → bootstrap-all
+$ apprafter up --dry-run  # → bootstrap-all --dry-run
+```
+
+For CI / scripts where colour interferes, set `NO_COLOR=1` (or
+pipe stdout into a file — the helpers auto-detect both).
+
 ## v0.1.87 — hotfix: typed errors on target-add token validation (2026-05-14)
 
 Walk-found issue in v0.1.86. The `target add` flow with an

@@ -133,6 +133,7 @@ pub enum Commands {
     /// Print the cached k3s kubeconfig (decrypted), fetching it
     /// over SSH on first use. Intended pipe target: `KUBECONFIG=
     /// /dev/stdin kubectl ...`.
+    #[command(alias = "kc")]
     Kubeconfig {
         /// Force a re-fetch over SSH even if a cached kubeconfig
         /// is already in state.
@@ -146,7 +147,7 @@ pub enum Commands {
     /// Install Cilium (CNI + kube-proxy replacement) and apply
     /// the Gateway API standard-install CRDs into the cluster
     /// pointed to by the cached kubeconfig.
-    #[command(name = "cluster-bootstrap")]
+    #[command(name = "cluster-bootstrap", alias = "cb")]
     ClusterBootstrap,
     /// Print the Argo CD admin password (decrypted), fetching it
     /// from the cluster on first use. The plaintext is cached
@@ -162,7 +163,7 @@ pub enum Commands {
     /// kubeconfig to become SSH-reachable → runs `cluster-bootstrap`
     /// for a freshly-provisioned cluster. Convenience wrapper —
     /// each phase still has its own subcommand for re-runs.
-    #[command(name = "bootstrap-all")]
+    #[command(name = "bootstrap-all", alias = "up")]
     BootstrapAll {
         /// Override the active target for the credential resolution
         /// chain (see `apprafter apply --target`).
@@ -255,6 +256,7 @@ pub enum TargetCommand {
     },
     /// List every configured target, marking the active one. Empty
     /// store prints an onboarding hint pointing at `target add`.
+    #[command(alias = "ls")]
     List,
     /// Switch the active target. Fails when the named target does
     /// not exist; subsequent operational commands (`apply`,
@@ -268,6 +270,7 @@ pub enum TargetCommand {
     /// stored token is summarised as `set` / `not set` without
     /// echoing the value; read `credentials.yaml` directly if you
     /// need the raw bytes.
+    #[command(alias = "info")]
     Show {
         /// Target name. Defaults to the active target.
         name: Option<String>,
@@ -283,6 +286,7 @@ pub enum TargetCommand {
     /// Remove a target. Interactive runs prompt for confirmation
     /// unless `--yes` is passed; non-interactive runs always
     /// require `--yes` (no silent destruction).
+    #[command(alias = "rm")]
     Remove {
         /// Target name to remove.
         name: String,

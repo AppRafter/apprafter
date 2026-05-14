@@ -19,6 +19,7 @@
 
 use std::time::{Duration, Instant};
 
+use cli_core::style;
 use cli_core::target::{
     default_config_root, load_active_target_config, resolve_active_target_name, TargetConfig,
     TargetStorePaths,
@@ -52,11 +53,18 @@ pub fn run(target_override: Option<&str>, dry_run: bool) -> Result<()> {
     // its time inside `provider.apply()` calling the Hetzner REST
     // API, which logs through `tracing` to stderr; a spinner here
     // would just fight those tracing lines for the same row.
-    println!("→ [1/3] apply        provisioning Hetzner Cloud resources…");
+    println!(
+        "{} [1/3] apply        provisioning Hetzner Cloud resources…",
+        style::info("→")
+    );
     let p1_start = Instant::now();
     apply::run(target_override).map_err(|e| failed(1, "apply", p1_start.elapsed(), e))?;
     let p1 = p1_start.elapsed();
-    println!("✓ [1/3] apply        done in {}", format_elapsed(p1));
+    println!(
+        "{} [1/3] apply        done in {}",
+        style::ok("✓"),
+        format_elapsed(p1)
+    );
 
     // Phase 2/3 — kubeconfig poll. Our retry loop, no inner
     // subcommand output, so we get a clean indicatif spinner with
@@ -65,11 +73,18 @@ pub fn run(target_override: Option<&str>, dry_run: bool) -> Result<()> {
 
     // Phase 3/3 — cluster-bootstrap. Same rationale as phase 1:
     // helm/kubectl print release notes, would clobber a spinner.
-    println!("→ [3/3] bootstrap    installing Cilium + Argo CD + cert-manager + operator…");
+    println!(
+        "{} [3/3] bootstrap    installing Cilium + Argo CD + cert-manager + operator…",
+        style::info("→")
+    );
     let p3_start = Instant::now();
     cluster_bootstrap::run().map_err(|e| failed(3, "bootstrap", p3_start.elapsed(), e))?;
     let p3 = p3_start.elapsed();
-    println!("✓ [3/3] bootstrap    done in {}", format_elapsed(p3));
+    println!(
+        "{} [3/3] bootstrap    done in {}",
+        style::ok("✓"),
+        format_elapsed(p3)
+    );
 
     println!(
         "bootstrap-all complete in {} (apply {} + kubeconfig {} + bootstrap {})",
@@ -87,7 +102,8 @@ pub fn run(target_override: Option<&str>, dry_run: bool) -> Result<()> {
 /// error chain.
 fn failed(num: u8, name: &str, elapsed: Duration, err: CliError) -> CliError {
     eprintln!(
-        "✗ [{num}/3] {name:<10} FAILED after {}",
+        "{} [{num}/3] {name:<10} FAILED after {}",
+        style::fail("✗"),
         format_elapsed(elapsed)
     );
     err
@@ -106,7 +122,11 @@ fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
         Ok(()) => {
             let elapsed = start.elapsed();
             pb.finish_and_clear();
-            println!("✓ [2/3] kubeconfig   ready in {}", format_elapsed(elapsed));
+            println!(
+                "{} [2/3] kubeconfig   ready in {}",
+                style::ok("✓"),
+                format_elapsed(elapsed)
+            );
             Ok(elapsed)
         }
         Err(e) => {
