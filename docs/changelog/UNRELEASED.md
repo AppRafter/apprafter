@@ -13,6 +13,128 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.72 — M1.5 Track A.2 — target file structure + IO module (2026-05-14)
+
+Second slice of M1.5 Track A (CLI DX rework per `cli-dx-task.md` §17
+row 2). Foundation for the persistent target store that lets users
+configure multiple deployment targets, pick one active at a time,
+and drop the per-shell `HCLOUD_TOKEN=… APPRAFTER_SSH_PUBLIC_KEY=…`
+incantation. **No CLI commands wired in this release** — pure IO
+layer that subsequent Track A iterations build on (A.3 non-interactive
+`target add`, A.4 interactive wizard, A.5 `list/use/show/rename/remove`,
+A.8 plumb resolution chain into existing operational commands).
+
+### Added
+
+- **`cli-core::target` module** implementing the file layout from
+  `cli-dx-task.md` §4 (`$XDG_CONFIG_HOME/apprafter/{config.yaml,
+  targets/<name>/{config,credentials}.yaml, auth/.keep, state/<name>/}`):
+  - `default_config_root() -> Result<PathBuf>` — cross-platform XDG
+    resolution via `dirs::config_dir()`.
+  - `TargetStorePaths` — testable locator (carries `root`) with
+    methods for every file/dir in the spec.
+  - `GlobalConfig { active_target, version }` + `TARGET_STORE_VERSION
+    = 1` forward-compat marker.
+  - `TargetConfig { provider, region, default_tier, cluster_name,
+    ssh_key_path }` non-secret half.
+  - `TargetCredentials { hetzner_token: Option<String> }` secret
+    half with **manual `Debug` impl** that emits `<redacted>` —
+    deriving `Debug` would leak the token in any `println!("{:?}", …)`
+    or `tracing::debug!(creds = ?creds, …)` call. Catches stray
+    log statements at compile time of the call site, not after a
+    secrets leak in the wild.
+  - `Target { name, config, credentials }` — in-memory composition
+    of both halves.
+  - `load_global_config / save_global_config / load_target /
+    save_target / list_target_names / remove_target` IO surface.
+  - Internal `atomic_write(path, bytes, secret)`: tempfile in the
+    target dir → `write_all` + `sync_all` → `set_permissions` (0600
+    for `secret = true`, 0644 otherwise) → `persist()` atomic rename
+    over the final path. No window where the credentials file is
+    briefly world-readable; no half-written file readable by an
+    interrupted load.
+- **`auth/.keep` placeholder** auto-created on first save so the
+  reserved `apprafter auth` namespace directory exists from the
+  beginning. Track A.6 fills it when Managed AppRafter Cloud login
+  lands.
+- **New `CliError` variants**:
+  - `InvalidTargetConfig { path, message }` — surface for corrupt
+    YAML so error UX can suggest `apprafter target add <name>
+    --renew` instead of `apprafter init`.
+  - `TargetNotFound { name, available }` — `available` is the
+    comma-joined list of configured names so error messages can
+    show "did you mean..." without an extra round-trip.
+  - `Yaml(serde_yaml::Error)` via `#[from]` for ergonomic `?`
+    propagation.
+- **Workspace dependencies**:
+  - `serde_yaml = "0.9"` — wire format (more human-friendly than
+    JSON for hand-edited config; cli-dx-task.md §8 mandates it).
+  - `dirs = "5"` — cross-platform XDG path resolution.
+  - `tempfile` promoted from `dev-dependencies` to regular
+    `dependencies` of `cli-core` since `atomic_write` uses it in
+    prod code, not just tests.
+
+### Tests
+
+16 new regression-guards (inline in `target.rs`) covering every
+contract worth pinning:
+
+- `default_config_root_points_at_user_config_dir_under_apprafter`
+  — leaf path is `apprafter/` regardless of host XDG.
+- `paths_compose_per_spec_directory_layout` — pins each
+  `TargetStorePaths` method against the spec layout so renaming
+  a constant fails loudly.
+- `load_global_config_returns_none_on_fresh_store` — first-run
+  doesn't surface as an error.
+- `save_then_load_global_round_trips_active_target` — global YAML
+  round-trip.
+- `save_global_creates_auth_placeholder_directory` — `auth/.keep`
+  invariant.
+- `load_global_config_returns_invalid_target_config_on_corrupt_yaml`
+  — typed error with file path.
+- `save_then_load_target_round_trips_both_halves` — per-target
+  config + credentials round-trip including the Hetzner token.
+- `load_target_returns_target_not_found_with_available_list` —
+  error message contains comma-joined available names.
+- `load_target_tolerates_missing_credentials_file` — dotfiles-only
+  scenario (user pulled config.yaml from git, hasn't run `target
+  add --renew` yet).
+- `credentials_file_lands_at_mode_0600` (Unix-only) — credentials
+  YAML is 0600; sibling `config.yaml` is 0644 (mode pin per spec).
+- `list_target_names_returns_empty_on_fresh_store` +
+  `list_target_names_returns_sorted_names_skipping_dot_dirs` —
+  lexicographic sort, dot-prefixed dirs hidden (so the atomic-write
+  tempfile leftover prefix `.apprafter-tgt-*` never leaks into
+  user-facing `target list` output).
+- `remove_target_deletes_both_files_and_state_dir` — cascading
+  delete also clears `state/<name>/`.
+- `remove_target_returns_target_not_found_when_missing` — caller
+  pattern-matches for idempotent delete.
+- `credentials_debug_redacts_token` — `<redacted>` marker present
+  in Debug format; raw token absent.
+- `atomic_write_leaves_no_temp_files_on_success` — no
+  `.apprafter-tgt-*.tmp` files in `<root>/` after a clean save.
+
+### Out of scope (deferred to subsequent Track A slots)
+
+- CLI commands — `apprafter target add/list/use/show/rename/remove`
+  arrive in Track A.3 (non-interactive flag-driven) → A.4
+  (interactive wizard via `inquire`) → A.5 (the read/rename/remove
+  set).
+- Provider validator framework (token regex + API ping) — Track
+  A.4.
+- Resolution chain (CLI flag > env var > target store) plumbed
+  into existing `init / apply / cluster-bootstrap` commands —
+  Track A.8.
+- Migration of `<cwd>/.apprafter/state.json` to per-target
+  `<root>/state/<name>/` — Track A.8 (gradual; env-var flow stays
+  the highest-priority override per `cli-dx-task.md` §7 so the
+  migration is purely additive).
+- `secrecy::Secret<String>` in-memory wrapper — defer to Track A.3
+  where credentials hit hot in-memory paths (CLI flag parsing →
+  YAML write). The manual `Debug` redact + 0600 mode already cover
+  the dominant risk vector (accidental logging).
+
 ## v0.1.71 — 1.4 AUDIT — Cilium Helm values dual-stack (2026-05-14)
 
 Second slice of the Phase 1 audit backlog. v0.1.70 made the substrate
@@ -69,12 +191,32 @@ of silently dropping the v6 podCIDR k3s offers.
 If you're upgrading a Tier 1 cluster that was bootstrapped with
 v0.1.68 or earlier, re-running `apprafter cluster-bootstrap` will
 re-apply the Cilium Helm release with the new values. `helm` patches
-the cilium ConfigMap, agents restart, and after that fresh pods
-(deployed AFTER the agent restart) will receive dual-stack IPs.
-Existing pods keep their v4-only IPs until they're recreated — `kubectl
-rollout restart deployment <name>` triggers fresh pods with the
-dual-stack allocator. No data loss; the rollout is a normal
-pod-restart cycle.
+the `cilium-config` ConfigMap, but **the cilium DaemonSet pod
+template does not change** (Cilium chart v1.16.x has no
+`checksum/config` annotation that would tie ConfigMap changes to a
+pod rotation). Result: cilium-agent pods keep running with the old
+v4-only IPAM until explicitly rolled. Two-step manual fix:
+
+```
+kubectl rollout restart daemonset cilium -n kube-system
+# wait for new agents to be Ready, then recreate any existing pods:
+kubectl rollout restart deployment <name> -n <ns>
+# or for plain pods: kubectl delete pod <name> && kubectl run <name> ...
+```
+
+Fresh installs are unaffected — agents come up with `ipv6.enabled:
+true` from the start, and the first pod scheduled receives both
+v4 and v6.
+
+**Why we ship it manual for now:** the cleanest fix is to add
+`kubectl rollout restart daemonset cilium` inside `cluster-bootstrap`
+after `helm upgrade cilium`, but that adds ~30s of overhead to every
+re-bootstrap run. M1.5 Track B 1.70 (`cluster-bootstrap` rewrite to
+Argo CD-managed platform stack) replaces the imperative helm flow
+entirely — Argo CD's resource hooks handle ConfigMap-triggered
+restarts natively, so the wart self-resolves at that point without
+us shipping disposable code. Tracked in plan.md 1.4 AUDIT closure
+section under "Known wart".
 
 ## v0.1.70 — 1.2 AUDIT — Hetzner Cloud provider dual-stack IPv6 (2026-05-14)
 

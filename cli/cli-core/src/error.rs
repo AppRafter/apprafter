@@ -51,6 +51,25 @@ pub enum CliError {
     #[error("state file at {path}: {message}")]
     InvalidState { path: PathBuf, message: String },
 
+    /// Target config / credentials / global-config file present but
+    /// unparseable. Distinct from `InvalidState` so error messages
+    /// can point users at `apprafter target add <name> --renew`
+    /// instead of `apprafter init`.
+    #[error("target config at {path}: {message}")]
+    InvalidTargetConfig { path: PathBuf, message: String },
+
+    /// A subcommand asked for target `name`, but the target store
+    /// has no such target. `available` lists what *is* configured
+    /// (may be empty, signalling first-run + `apprafter target add`
+    /// is the right next step).
+    #[error("target `{name}` not found (available: {available})")]
+    TargetNotFound {
+        name: String,
+        /// Comma-separated list of configured target names; the
+        /// empty string `""` means "no targets configured yet".
+        available: String,
+    },
+
     /// Pass-through for `std::io::Error`.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -58,6 +77,10 @@ pub enum CliError {
     /// JSON encode/decode error.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// YAML encode/decode error (target store files use YAML).
+    #[error("yaml error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
 
     /// Catch-all, free-form message.
     #[error("{0}")]

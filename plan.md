@@ -483,7 +483,9 @@ Phase 7 запускается параллельно с 3+ как только 
 
 **Зависит от:** 1.2 AUDIT (Hetzner provider dual-stack) ✅
 
-**Размер:** S — доставлен как single-cycle audit ~v0.1.71
+**Размер:** S — доставлен как single-cycle audit ~v0.1.71.
+
+**Known wart (deferred to Track B 1.70):** `helm upgrade cilium` патчит `cilium-config` ConfigMap, но **не** триггерит rotation cilium DaemonSet pods (chart v1.16.x не имеет `checksum/config` аннотации в template'е). На свежий install это не влияет (агенты сразу стартуют с новыми values), но на upgrade существующего кластера оператору приходится вручную `kubectl rollout restart daemonset cilium -n kube-system` + пересоздать pod'ы, чтобы они получили v6 IP. Quick-fix в `cluster-bootstrap` (один `kubectl rollout restart`) добавил бы ~30с к каждому re-run; вместо этого ждём 1.70 (`cluster-bootstrap` rewrite в Argo CD-managed flow), где Argo CD resource hooks решают это нативно — disposable код мы тогда не пишем.
 
 ---
 
@@ -851,9 +853,66 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 
 ---
 
-### 1.66A.2 — 1.66A.12 (TBD, заполняются по мере landings)
+### 1.66A.2 Target file structure + IO module ✅
 
-> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1). См. `cli-dx-task.md` §17 для общего трека: target store IO → `apprafter target add` non-interactive → interactive wizard → validation framework → CRUD команды → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
+> v0.1.72 — sub-phase 1.66A.2 shipped: `cli-core::target` module — types (`GlobalConfig`, `TargetConfig`, `TargetCredentials`, `Target`, `TargetStorePaths`) + atomic load/save IO + 0600 enforcement on credentials. No CLI commands wired yet — pure foundation for A.3+ wizards.
+
+**Source:** `cli-dx-task.md` §4 (file layout), §8 (deps), §17 row 2.
+
+**Поставка:**
+- [x] Новые workspace deps: `serde_yaml = "0.9"` + `dirs = "5"`; `tempfile` промотан из dev-dependencies cli-core в обычные (atomic-write использует его в prod-коде).
+- [x] `cli-core/src/target.rs` (~570 строк):
+    - `default_config_root()` → `dirs::config_dir().join("apprafter")` — cross-platform XDG.
+    - `TargetStorePaths { root }` testable locator с методами `global_config_file`/`targets_dir`/`target_dir`/`target_config_file`/`target_credentials_file`/`auth_dir`/`auth_keep_file`/`state_dir` — миррорит spec §4 на тип-уровне.
+    - `GlobalConfig { active_target, version }` с `TARGET_STORE_VERSION = 1` форвард-compat кодом.
+    - `TargetConfig { provider, region, default_tier, cluster_name, ssh_key_path }` (`#[serde(default)]`).
+    - `TargetCredentials { hetzner_token: Option<String> }` — **manual `Debug` impl** с `<redacted>` маркером (никогда не derive — лекит токен в любом `println!("{:?}", ...)`).
+    - `load_global_config`/`save_global_config`/`load_target`/`save_target`/`list_target_names`/`remove_target`.
+    - `atomic_write(path, bytes, secret)` — tempfile-in-same-dir + fsync + chmod (0600 для secret, 0644 для public) + `persist()` rename (POSIX-atomic, ReplaceFileW на Windows).
+    - `ensure_auth_placeholder()` — создаёт `auth/.keep` на любом первом write, чтобы reserved namespace existed для будущего Managed.
+- [x] `cli-core/src/error.rs`: новые варианты `InvalidTargetConfig { path, message }`, `TargetNotFound { name, available }`, `Yaml(serde_yaml::Error)` через `#[from]`.
+- [x] `cli-core/src/lib.rs`: pub use re-export всех target-типов и функций; модуль `target` зарегистрирован.
+- [x] 16 regression-guard unit-tests (inline в `target.rs`):
+    - `default_config_root_points_at_user_config_dir_under_apprafter` — leaf path sanity guard.
+    - `paths_compose_per_spec_directory_layout` — пин on-disk shape против spec §4 (если кто-то ренеймит `TARGETS_DIR` константу, тест отлетит).
+    - `load_global_config_returns_none_on_fresh_store` — first-run case ОК.
+    - `save_then_load_global_round_trips_active_target` — round-trip global.
+    - `save_global_creates_auth_placeholder_directory` — auth/.keep всегда создаётся.
+    - `load_global_config_returns_invalid_target_config_on_corrupt_yaml` — corrupt YAML → typed error.
+    - `save_then_load_target_round_trips_both_halves` — round-trip per-target config + creds.
+    - `load_target_returns_target_not_found_with_available_list` — error message включает comma-separated список существующих имён.
+    - `load_target_tolerates_missing_credentials_file` — dotfiles-only сценарий (config есть, credentials нет — возвращает empty creds, не ошибку).
+    - `credentials_file_lands_at_mode_0600` (Unix-only `#[cfg(unix)]`) — пин разрешений: credentials.yaml = 0600, config.yaml = 0644.
+    - `list_target_names_returns_empty_on_fresh_store` + `list_target_names_returns_sorted_names_skipping_dot_dirs` — список target'ов сортирован, hidden dirs (`.scratch` от atomic-write tempfiles) скрыты.
+    - `remove_target_deletes_both_files_and_state_dir` — удаление каскадно сносит `state/<name>/`.
+    - `remove_target_returns_target_not_found_when_missing` — idempotency помощник.
+    - `credentials_debug_redacts_token` — пинит `<redacted>` маркер в Debug формате (защита от случайного println).
+    - `atomic_write_leaves_no_temp_files_on_success` — после успешного save в корне нет `.apprafter-tgt-*.tmp` файлов.
+
+**Acceptance:**
+- ✅ `cargo build --workspace` зелёный (новые `serde_yaml`, `dirs`, `tempfile` deps скомпилированы).
+- ✅ `cargo test --workspace`: 26 cli-core тестов (16 новых target + 10 pre-existing), 0 failures across весь workspace.
+- ✅ `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- ✅ `cargo fmt --all -- --check` — clean.
+- ✅ `scripts/check-spdx-headers.sh` (150 файлов) + `scripts/lint-cue.sh` — green.
+- ✅ Module re-exports проверены: `use cli_core::{TargetStorePaths, GlobalConfig, Target, TargetConfig, TargetCredentials, save_target, load_target, list_target_names, remove_target}` компилируется в чистом downstream crate'е (semantics test through smoke tests in Track A.3).
+
+**Out-of-scope (отложено в зависимые слоты):**
+- Никаких CLI команд — `apprafter target add/list/use/...` приходят в Track A.3 (non-interactive) → A.4 (interactive wizard) → A.5 (CRUD-набор).
+- Provider validator framework (`token format regex`, API ping) — Track A.4.
+- Resolution chain plumbed в existing commands (`init/apply/cluster-bootstrap` берут токен из active target) — Track A.8.
+- Migration существующего `<cwd>/.apprafter/state.json` в per-target `<root>/state/<name>/` — Track A.8.
+- `secrecy::Secret<String>` wrapper для in-memory защиты — добавится в Track A.3/A.4 когда credentials handling попадает в hot path. Сейчас защита через manual Debug-redact + mode 0600 на файле.
+
+**Зависит от:** 1.66A.1 ✅
+
+**Размер:** S (один цикл, ~1 рабочий день кода + тестов).
+
+---
+
+### 1.66A.3 — 1.66A.12 (TBD, заполняются по мере landings)
+
+> Каждая следующая Track A под-фаза получает собственный заголовок и `Поставка/Acceptance/Размер` блок ровно перед тем, как открывается её итерация. Шаблон — выше (1.66A.1, 1.66A.2). См. `cli-dx-task.md` §17 для общего трека: target store IO ✅ → `apprafter target add` non-interactive → interactive wizard → validation framework → CRUD команды → `whoami`+`auth` stubs → `doctor` → wire `init/apply/cluster-bootstrap` → `bootstrap-all` → miette refinement → aliases/color → docs+ADR.
 
 ---
 
@@ -3122,4 +3181,5 @@ M1.5 содержит **три work tracks**, выполняемых **посл�
 | 2026-05-14 | M1.5 Track A.1 — rename `platform-cli` → `apprafter`, add deprecated shim, sweep user-facing docs, retarget tracing filter; v0.1.69 | initial |
 | 2026-05-14 | 1.2 AUDIT (Hetzner IPv6) — wire-type `PublicIpv6` + dual-stack k3s `--cluster-cidr`/`--service-cidr` (ADR 0017) + Hetzner Firewall ICMP allow-rule; v0.1.70 | initial |
 | 2026-05-14 | 1.4 AUDIT (Cilium dual-stack) — explicit `ipv4.enabled: true` + `ipv6.enabled: true` в Helm values (ADR 0017); `e2e/mvp.sh` Phase 6.4 — pod-level v4+v6 podIPs assertion; v0.1.71 | initial |
+| 2026-05-14 | M1.5 Track A.2 — `cli-core::target` module: types (GlobalConfig/TargetConfig/TargetCredentials/Target/TargetStorePaths) + atomic load/save IO + 0600 enforcement + `<redacted>` Debug; +16 unit tests; v0.1.72 | initial |
 
