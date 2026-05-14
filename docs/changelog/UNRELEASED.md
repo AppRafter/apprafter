@@ -13,6 +13,144 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.85 — hotfix: bootstrap-all UX rework after walk feedback (2026-05-14)
+
+Walk-found issues in v0.1.84. Three problems made the new
+wrapper feel noisier than it should:
+
+1. **Duplicated spinner lines**: `MultiProgress` keeps every
+   bar (finished or not) in its render set. On every helm /
+   kubectl write — and there are MANY — the bars re-rendered,
+   producing a cascade of stale `[1/3] apply  done in 4s` /
+   `[2/3] kubeconfig  ready in 1m00s` lines scrolling past
+   the actual phase 3 output. Easy to miss the real work in
+   the noise.
+
+2. **`dry-run` was opaque**: showed the literal subcommand
+   names but the `<active target>` placeholder was never
+   resolved to a real name, so operators couldn't tell which
+   target the wrapper would actually use. And the phase
+   descriptions were just CLI lines, not "what this phase
+   does".
+
+3. **Spinner fought with `tracing` logs**: the steady tick
+   redraws on every 120ms, the apply/cluster-bootstrap
+   tracing-on-stderr writes interleaved with it, the row got
+   visually torn.
+
+v0.1.85 reworks the UX:
+
+### Changed
+
+- **Phases 1 and 3 stop using spinners.** Replaced with
+  static start / end markers:
+  ```
+  → [1/3] apply        provisioning Hetzner Cloud resources…
+  …helm / kubectl / tracing output flows normally here…
+  ✓ [1/3] apply        done in 4s
+  ```
+  No animation to fight the inner subcommand's stderr writes;
+  no `MultiProgress` to redraw stale frames; no duplicate
+  spinner lines.
+
+- **Phase 2 keeps its spinner** (and uses a single
+  `ProgressBar`, not `MultiProgress`). The kubeconfig poll
+  loop owns all output between Phase 1's end and Phase 3's
+  start, so the spinner has nothing to compete with. On
+  success: `finish_and_clear()` + static `✓ [2/3]
+  kubeconfig   ready in Ns` line. On failure: same `✗`
+  marker + bubbled error.
+
+- **Failure marker added** for all phases:
+  `✗ [N/3] phase   FAILED after Ns` on stderr, then the
+  original `CliError` is propagated unchanged so the
+  shell-level exit code + error chain still work.
+
+- **Final summary now breaks down per phase**:
+  ```
+  bootstrap-all complete in 3m21s (apply 4s + kubeconfig 1m00s + bootstrap 2m16s)
+  ```
+  Quick visual sanity check on which phase ate the most
+  time.
+
+- **`--dry-run` rebuilt** as a real plan, not a subcommand
+  listing:
+  ```
+  bootstrap-all — DRY RUN (no provider or cluster mutation)
+
+  Target: dev2 (active)
+    Provider:    hetzner-cloud
+    Region:      nbg1
+    Tier:        solo
+    Cluster:     <unset — apply uses platform-1>
+    SSH key:     /home/rem/.ssh/id_ed25519_gmail.pub
+
+  Phases:
+    [1/3] apply              — provision Hetzner Cloud resources
+                                (server, network, firewall, SSH key, optional floating IPs)
+    [2/3] kubeconfig (poll)  — SSH-fetch /etc/rancher/k3s/k3s.yaml every 10s, up to 300s
+                                (cache age-encrypted in state)
+    [3/3] cluster-bootstrap  — install Cilium + Gateway API CRDs + Application CRD
+                                + default-deny NetworkPolicy + Argo CD + cert-manager
+                                + self-signed ClusterIssuer + apprafter-operator
+                                + admission-webhook
+
+  Run `apprafter bootstrap-all` (without --dry-run) to execute.
+  ```
+  The target block resolves the *real* active target name
+  (or echoes the `--target` override) and reads `config.yaml`
+  so operators can see exactly which provider / region /
+  tier the wrapper would use before committing. Each phase
+  line describes what it does, not the CLI string it would
+  call.
+
+### Tests (2 new integration)
+
+- `bootstrap_all_dry_run_with_empty_store_prints_onboarding_hint`
+  — empty `APPRAFTER_CONFIG_DIR` → `no active target` +
+  `apprafter target add` hint surfaces in stdout. Pins the
+  onboarding UX so the empty-store path doesn't silently
+  print a half-empty plan.
+
+- `bootstrap_all_dry_run_with_active_target_resolves_name_and_config`
+  — seeds a real target via `apprafter target add` with
+  provider + region + tier, then runs `bootstrap-all
+  --dry-run` against the same `APPRAFTER_CONFIG_DIR` and
+  asserts the plan reads `Target: myprod (active)` with
+  provider/region/tier echoed back. Locks down the resolution
+  + display path so future refactors can't accidentally drop
+  it back to a placeholder.
+
+Existing 4 unit + 4 integration tests from v0.1.84 untouched
+and still pass.
+
+### Color theming
+
+Not in scope here. Plan Track A.11 owns CLI colour /
+`NO_COLOR` support along with alias support
+(`.bootstrap`, `.k`, etc.). v0.1.85 keeps everything
+monochrome.
+
+### Operator note
+
+The v0.1.84 walk surfaced this in two real-Hetzner runs.
+The fresh-cluster trace now reads (1 main spinner active at
+a time, no cascade):
+
+```
+→ [1/3] apply        provisioning Hetzner Cloud resources…
+…
+apply complete: 4 action(s)
+✓ [1/3] apply        done in 4s
+⠋ [2/3] kubeconfig   attempt 3 — k3s not ready yet (cat: …); next retry in 10s
+✓ [2/3] kubeconfig   ready in 1m00s
+→ [3/3] bootstrap    installing Cilium + Argo CD + cert-manager + operator…
+…
+cluster-bootstrap complete: cilium 1.16.5 + …
+✓ [3/3] bootstrap    done in 2m16s
+bootstrap-all complete in 3m21s (apply 4s + kubeconfig 1m00s + bootstrap 2m16s)
+```
+
 ## v0.1.84 — M1.5 Track A.9 — apprafter bootstrap-all (2026-05-14)
 
 Ninth Track A slice. The "happy path" first-run experience

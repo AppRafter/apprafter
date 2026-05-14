@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: FSL-1.1-MIT
 //! `apprafter bootstrap-all` — convenience wrapper that chains the
 //! three subcommands a fresh cluster needs (`apply` →
-//! kubeconfig-wait → `cluster-bootstrap`) under a single
-//! `indicatif`-driven progress UX. Each phase still has its own
-//! subcommand for re-runs / partial recovery; this command exists
-//! so first-run users don't have to glue the loop themselves.
+//! kubeconfig-wait → `cluster-bootstrap`). Each phase still has
+//! its own subcommand for re-runs / partial recovery; this command
+//! exists so first-run users don't have to glue the loop themselves.
+//!
+//! UX layout (v0.1.85 rework): phases 1 and 3 invoke heavy
+//! subcommands that print verbose helm / kubectl output to
+//! stdout, so we don't run a spinner around them — its frames
+//! would interleave with the subcommand chatter and persist
+//! stale lines. Instead we print one `→ [N/3] phase  msg` line
+//! before the work, let the subcommand stream normally, then
+//! print one `✓ [N/3] phase  done in Ns` line after. Phase 2
+//! (`kubeconfig` poll) is OUR retry loop with no inner
+//! subcommand output, so it gets a real `indicatif` spinner —
+//! the spinner finishes cleanly via `finish_and_clear()` and is
+//! replaced with the static success line on success.
 
 use std::time::{Duration, Instant};
 
+use cli_core::target::{
+    default_config_root, load_active_target_config, resolve_active_target_name, TargetConfig,
+    TargetStorePaths,
+};
 use cli_core::{CliError, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
 use crate::commands::{apply, cluster_bootstrap, kubeconfig};
@@ -29,64 +44,160 @@ pub fn run(target_override: Option<&str>, dry_run: bool) -> Result<()> {
     let total_start = Instant::now();
 
     if dry_run {
-        print_dry_run_plan(target_override);
+        print_dry_run_plan(target_override)?;
         return Ok(());
     }
 
-    let mp = MultiProgress::new();
-    let style = ProgressStyle::with_template("{spinner:.cyan} {prefix:<14.bold} {wide_msg}")
-        .expect("static template");
-
-    // ── Phase 1/3: apply ────────────────────────────────────────
-    let pb1 = mp.add(ProgressBar::new_spinner());
-    pb1.set_style(style.clone());
-    pb1.set_prefix("[1/3] apply");
-    pb1.enable_steady_tick(Duration::from_millis(120));
-    pb1.set_message("provisioning Hetzner Cloud resources…");
+    // Phase 1/3 — apply. No spinner: apply itself spends most of
+    // its time inside `provider.apply()` calling the Hetzner REST
+    // API, which logs through `tracing` to stderr; a spinner here
+    // would just fight those tracing lines for the same row.
+    println!("→ [1/3] apply        provisioning Hetzner Cloud resources…");
     let p1_start = Instant::now();
-    apply::run(target_override)?;
-    pb1.finish_with_message(format!("done in {}", format_elapsed(p1_start.elapsed())));
+    apply::run(target_override).map_err(|e| failed(1, "apply", p1_start.elapsed(), e))?;
+    let p1 = p1_start.elapsed();
+    println!("✓ [1/3] apply        done in {}", format_elapsed(p1));
 
-    // ── Phase 2/3: wait for kubeconfig (k3s + SSH readiness) ──
-    let pb2 = mp.add(ProgressBar::new_spinner());
-    pb2.set_style(style.clone());
-    pb2.set_prefix("[2/3] kubeconfig");
-    pb2.enable_steady_tick(Duration::from_millis(120));
-    pb2.set_message("waiting for k3s SSH to become reachable…");
-    let p2_start = Instant::now();
-    wait_for_kubeconfig(target_override, &pb2)?;
-    pb2.finish_with_message(format!("ready in {}", format_elapsed(p2_start.elapsed())));
+    // Phase 2/3 — kubeconfig poll. Our retry loop, no inner
+    // subcommand output, so we get a clean indicatif spinner with
+    // a live attempt counter + truncated last error.
+    let p2 = run_kubeconfig_phase(target_override)?;
 
-    // ── Phase 3/3: cluster-bootstrap ───────────────────────────
-    let pb3 = mp.add(ProgressBar::new_spinner());
-    pb3.set_style(style);
-    pb3.set_prefix("[3/3] bootstrap");
-    pb3.enable_steady_tick(Duration::from_millis(120));
-    pb3.set_message("installing Cilium + Argo CD + cert-manager + operator…");
+    // Phase 3/3 — cluster-bootstrap. Same rationale as phase 1:
+    // helm/kubectl print release notes, would clobber a spinner.
+    println!("→ [3/3] bootstrap    installing Cilium + Argo CD + cert-manager + operator…");
     let p3_start = Instant::now();
-    cluster_bootstrap::run()?;
-    pb3.finish_with_message(format!("done in {}", format_elapsed(p3_start.elapsed())));
+    cluster_bootstrap::run().map_err(|e| failed(3, "bootstrap", p3_start.elapsed(), e))?;
+    let p3 = p3_start.elapsed();
+    println!("✓ [3/3] bootstrap    done in {}", format_elapsed(p3));
 
     println!(
-        "bootstrap-all complete in {}",
-        format_elapsed(total_start.elapsed())
+        "bootstrap-all complete in {} (apply {} + kubeconfig {} + bootstrap {})",
+        format_elapsed(total_start.elapsed()),
+        format_elapsed(p1),
+        format_elapsed(p2),
+        format_elapsed(p3),
     );
     Ok(())
 }
 
-fn print_dry_run_plan(target_override: Option<&str>) {
-    let target_label = target_override
-        .map(|t| format!("--target {t}"))
-        .unwrap_or_else(|| "<active target>".to_string());
-    println!("bootstrap-all — DRY RUN (no provider or cluster mutation)");
-    println!("  target resolution: {target_label}");
-    println!("  [1/3] apply              — apprafter apply {target_label}");
-    println!(
-        "  [2/3] kubeconfig (poll)  — apprafter kubeconfig --refresh {target_label} (≤{}s timeout, {}s interval)",
-        KUBECONFIG_POLL_TIMEOUT.as_secs(),
-        KUBECONFIG_POLL_INTERVAL.as_secs(),
+/// Map an inner-subcommand error into a structured one with the
+/// phase prefix prepended and the elapsed time annotated. Keeps the
+/// timing accountable in failure mode without losing the original
+/// error chain.
+fn failed(num: u8, name: &str, elapsed: Duration, err: CliError) -> CliError {
+    eprintln!(
+        "✗ [{num}/3] {name:<10} FAILED after {}",
+        format_elapsed(elapsed)
     );
-    println!("  [3/3] cluster-bootstrap  — apprafter cluster-bootstrap");
+    err
+}
+
+fn run_kubeconfig_phase(target_override: Option<&str>) -> Result<Duration> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} [2/3] kubeconfig   {wide_msg}")
+            .expect("static template"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(120));
+    pb.set_message("waiting for k3s SSH to become reachable…");
+    let start = Instant::now();
+    match wait_for_kubeconfig(target_override, &pb) {
+        Ok(()) => {
+            let elapsed = start.elapsed();
+            pb.finish_and_clear();
+            println!("✓ [2/3] kubeconfig   ready in {}", format_elapsed(elapsed));
+            Ok(elapsed)
+        }
+        Err(e) => {
+            let elapsed = start.elapsed();
+            pb.finish_and_clear();
+            Err(failed(2, "kubeconfig", elapsed, e))
+        }
+    }
+}
+
+fn print_dry_run_plan(target_override: Option<&str>) -> Result<()> {
+    let store_root = default_config_root().ok();
+    let store = store_root
+        .as_ref()
+        .map(|p| TargetStorePaths::for_root(p.clone()));
+    let name = store.as_ref().and_then(|s| {
+        resolve_active_target_name(s, target_override)
+            .ok()
+            .flatten()
+    });
+    let config = store
+        .as_ref()
+        .and_then(|s| load_active_target_config(s, target_override));
+
+    println!("bootstrap-all — DRY RUN (no provider or cluster mutation)");
+    println!();
+    print_target_block(target_override, name.as_deref(), config.as_ref());
+    println!();
+    println!("Phases:");
+    println!("  [1/3] apply              — provision Hetzner Cloud resources");
+    println!(
+        "                              (server, network, firewall, SSH key, optional floating IPs)"
+    );
+    println!(
+        "  [2/3] kubeconfig (poll)  — SSH-fetch /etc/rancher/k3s/k3s.yaml every {}s, up to {}s",
+        KUBECONFIG_POLL_INTERVAL.as_secs(),
+        KUBECONFIG_POLL_TIMEOUT.as_secs(),
+    );
+    println!("                              (cache age-encrypted in state)");
+    println!("  [3/3] cluster-bootstrap  — install Cilium + Gateway API CRDs + Application CRD");
+    println!("                              + default-deny NetworkPolicy + Argo CD + cert-manager");
+    println!("                              + self-signed ClusterIssuer + apprafter-operator");
+    println!("                              + admission-webhook");
+    println!();
+    println!("Run `apprafter bootstrap-all` (without --dry-run) to execute.");
+    Ok(())
+}
+
+fn print_target_block(
+    target_override: Option<&str>,
+    resolved_name: Option<&str>,
+    config: Option<&TargetConfig>,
+) {
+    match (target_override, resolved_name) {
+        (Some(t), _) => println!("Target: {t} (via --target override)"),
+        (None, Some(n)) => println!("Target: {n} (active)"),
+        (None, None) => {
+            println!("Target: <none — no active target in store>");
+            println!("  Run `apprafter target add <name> --provider hetzner-cloud …` first.");
+            return;
+        }
+    }
+    match config {
+        Some(c) => {
+            println!("  Provider:    {}", c.provider);
+            println!(
+                "  Region:      {}",
+                c.region.as_deref().unwrap_or("<unset — apply uses nbg1>")
+            );
+            println!(
+                "  Tier:        {}",
+                c.default_tier
+                    .as_deref()
+                    .unwrap_or("<unset — apply uses solo>")
+            );
+            println!(
+                "  Cluster:     {}",
+                c.cluster_name
+                    .as_deref()
+                    .unwrap_or("<unset — apply uses platform-1>")
+            );
+            println!(
+                "  SSH key:     {}",
+                c.ssh_key_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unset>".to_string())
+            );
+        }
+        None => println!("  (config unreadable — target file missing or malformed)"),
+    }
 }
 
 /// Poll the SSH-backed kubeconfig fetcher until it succeeds or the
@@ -184,7 +295,7 @@ mod tests {
         let long = "x".repeat(200);
         let out = short_error(&long);
         assert!(out.ends_with('…'));
-        // 79 'x' chars + the ellipsis byte sequence (3 bytes in UTF-8).
+        // 79 'x' chars + the ellipsis = 80 chars total
         assert_eq!(out.chars().count(), 80);
     }
 }
