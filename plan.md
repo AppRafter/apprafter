@@ -1540,87 +1540,108 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
-### 1.66 platform-stack monorepo skeleton + CUE source layout
+### 1.66 platform-stack monorepo skeleton + CUE source layout ✅
+
+> v0.1.92 — sub-phase 1.66 shipped: top-level `platform-stack/` со всем CUE-only source per ADR 0028. **Layout flat** — `platform-stack/cue/` единая директория с filename prefixes (`component_<name>.cue`, `tier_<name>.cue`) вместо subdirectory groupings. Subdirs пробовали — CUE считает их отдельными package instances even when `package` declaration matches, что ломает cross-file `_components` merging. Дополнительные design-walk gotchas (autobinding-strip + typed `_components` strip + `vet -c` rejecting defaults) задокументированы в `platform-stack/README.md` + комментах в `platform.cue`.
 
 **Source:** ADR 0028.
 
-**Цель:** заложить структуру `apprafter/platform-stack/` в монорепо. CUE source-of-truth для всех Argo CD Application определений платформенных компонент.
+**Цель:** заложить структуру `platform-stack/` в монорепо. CUE source-of-truth для всех Argo CD Application определений платформенных компонент.
 
 **Поставка:**
-- [ ] New subdir `apprafter/platform-stack/`:
-    - `cue/platform.cue` — umbrella schema (channels, versioning, component list type)
-    - `cue/components/cilium.cue` — Cilium Application definition с source.repoURL=https://helm.cilium.io, chart=cilium, version, default values per tier
-    - `cue/components/cert-manager.cue` — analogously для jetstack.io
-    - `cue/components/argocd.cue` — Argo CD's own Application (self-managing, prune=false)
-    - `cue/components/apprafter-operator.cue` — наш operator из ghcr.io
-    - `cue/components/admission-webhook.cue` — admission webhook
-    - `cue/components/backstage.cue` — Backstage, conditional на `values.domain`
-    - `cue/components/network-policies.cue` — default-deny NetworkPolicies
-    - `cue/components/argocd-cue-cmp.cue` — CMP sidecar configuration (см. 1.69)
-    - `cue/tiers/solo.cue` — tier 1 overlay (no Backstage если no domain, no Hubble, etc.)
-    - `cue/tiers/team.cue` — tier 2+ overlay (Hubble enabled, Kamaji, Capsule)
-    - `cue/compatibility.cue` — change classification per version (initial entry для 0.2.0)
-- [ ] `apprafter/platform-stack/Chart.yaml.tmpl` — template для umbrella chart metadata
-- [ ] `apprafter/platform-stack/README.md` — поясняет CUE-only convention, contribution model
-- [ ] `apprafter/platform-stack/CHANGELOG.md` — initial entry для 0.2.0
+- [x] New top-level subdir `platform-stack/` (path указан с префиксом `apprafter/` в исходном тексте — это GitHub URL convention `apprafter/apprafter` org+repo; в clonированном дереве это просто `platform-stack/` на root уровне рядом с `cli/`, `operator/`, `schemas/`).
+    - [x] `cue/platform.cue` — umbrella schema (`#Version` / `#Channel` / `#Tier` / `#ComponentSource` / `#Component` / `#ComponentSet` / `#PlatformValues` / `_components: {}` package-level base).
+    - [x] `cue/component_cilium.cue` — Cilium 1.16.5, kube-proxy replacement, IPAM kubernetes, Hubble off by default.
+    - [x] `cue/component_cert-manager.cue` — jetstack v1.16.2 + CRDs enabled.
+    - [x] `cue/component_argocd.cue` — Argo CD 7.7.7 self-managing (`prune: false`), Dex off.
+    - [x] `cue/component_apprafter-operator.cue` — pinned to v0.1.91 (Track A closing tag) from `oci://ghcr.io/apprafter/apprafter-operator`.
+    - [x] `cue/component_admission-webhook.cue` — pinned to v0.1.91, 2 replicas default.
+    - [x] `cue/component_backstage.cue` — Git-source manifests, conditional on `values.backstage.domain`, default-off в tier-1 overlay.
+    - [x] `cue/component_network-policies.cue` — default-deny + DNS + Argo-CD egress allowance bundle.
+    - [x] `cue/component_argocd-cue-cmp.cue` — declared but `enabled: false` by default до sidecar wiring step в 1.69.
+    - [x] `cue/tier_solo.cue` — tier 1 overlay (single cpx22, Hubble off, Backstage off, argocd-cue-cmp off, single-replica everything).
+    - [x] `cue/tier_team.cue` — tier 2 overlay (Hubble on relay+UI, Backstage on, admission-webhook + cert-manager + operator at 2 replicas).
+    - [x] `cue/compatibility.cue` — `#ChangeClass` + `#VersionRecord` schema + initial 0.2.0 entry classified `safe` (no behaviour change vs in-tree v0.1.x bootstrap).
+- [x] `platform-stack/Chart.yaml.tmpl` — template для umbrella chart metadata (рендерится в `dist/<version>/Chart.yaml` через `cue cmd render` в 1.67).
+- [x] `platform-stack/README.md` — full layout + contribution model + distribution + forking story + design-walk decision rationale.
+- [x] `platform-stack/CHANGELOG.md` — initial planned 0.2.0 entry.
+- [x] `scripts/lint-cue.sh` расширен: `cue fmt --check` + `cue vet` теперь покрывают `./platform-stack/cue/...`.
+- [x] `scripts/check-spdx-headers.sh` patterns добавлены: `platform-stack/cue/**/*.cue` + `platform-stack/Chart.yaml.tmpl`. SPDX gate теперь 167 файлов.
+
+**Тесты:** scaffold-only release — никаких runtime tests, валидируем CUE-слой:
+- [x] `bash scripts/lint-cue.sh` — `cue fmt --check` + `cue vet` clean.
+- [x] `nix run nixpkgs#cue -- vet -c ./platform-stack/cue/...` — strict concreteness check passes (exit 0).
+- [x] `nix run nixpkgs#cue -- eval ./platform-stack/cue/... -e tier1` / `-e tier2` — рендерят fully-concrete components map.
 
 **Acceptance:**
-- `cue eval ./apprafter/platform-stack/cue/...` exits 0; все schemas валидны.
-- Все компоненты declared в CUE (нет hardcoded values в platform-cli которые ещё не migrated в chart — это произойдёт в 1.71).
-- README ясно описывает: CUE only, rendered chart живёт в OCI, не в Git.
+- ✅ `cue vet -c ./platform-stack/cue/...` exits 0; все schemas валидны + полностью concrete на обоих tiers.
+- ✅ Все 8 компонентов declared в CUE. Hardcoded values в `cli-providers::k8s::*` остаются на месте до migration в 1.71 — `platform-stack/` сейчас параллельная source-of-truth, не replacement.
+- ✅ README ясно описывает: CUE only в Git, rendered chart живёт в OCI (`oci://ghcr.io/apprafter/platform-stack:<version>`), GitHub Release `.tgz` secondary.
+
+**Design-walk gotchas** (зафиксированы в README + komments в `platform.cue` чтобы будущие contributors не переоткрывали):
+- Subdirectory split → CUE считает sibling dirs отдельными package instances, `_components` не мерджились. **Fix:** flat `cue/` с filename prefixes.
+- `#ComponentSet` autobinding `[NAME=string]: #Component & { name: NAME }` re-применяет `#Component` на каждом overlay unification и стрипит concrete fields. **Fix:** plain `[string]: #Component` + explicit `name:` per component.
+- Typed `_components: #ComponentSet` — та же проблема. **Fix:** plain `_components: {}` с локальной type-conformance на declaration site.
+- CUE 0.10+ `vet -c` flags `bool | *false` как incomplete даже когда default applies. **Fix:** explicit pin per tier (`tier_team.cue`'s `argocd-cue-cmp.enabled: false`).
+
+**Out-of-scope (отложено):**
+- `dist/` renderer + `templates/applications.yaml` template + `make render` — sub-phase 1.67.
+- Publish workflow (`.github/workflows/platform-stack-publish.yml`) — 1.68.
+- Argo CD CMP sidecar wiring — 1.69.
+- Migration `cli-providers::k8s` hardcoded values → CUE — 1.71.
 
 **Зависит от:** —
 
-**Размер:** M
+**Размер:** M (один цикл, ~0.5-1 рабочий день; основное время — design-walk на CUE gotchas).
 
 ---
 
-### 1.67 `cue cmd render` pipeline + umbrella chart generation
+### 1.67 `cue cmd render` pipeline + umbrella chart generation ✅
+
+> v0.1.93 — sub-phase 1.67 shipped: CUE-tools-based renderer + Makefile + per-tier examples + Helm-native values schema. `make -C platform-stack render` produces a fully-lintable umbrella chart in `dist/platform-stack-<version>/` purely from CUE source, with no hand-edited intermediate YAML. Helm lint clean (only INFO about an icon recommendation, no errors / warnings). `helm template --set tier=99` rejects out-of-range tier values at the schema gate before any Argo CD reconcile sees them.
 
 **Source:** ADR 0028.
 
 **Цель:** CI step который рендерит CUE source в Helm umbrella chart в `dist/`.
 
 **Поставка:**
-- [ ] `apprafter/platform-stack/render.cue` (CUE command) implementing:
-    - Read all `cue/components/*.cue` files
-    - Read `cue/tiers/*.cue` overlay (parameterized via values)
-    - Emit `dist/platform-stack-<version>/Chart.yaml`
-    - Emit `dist/platform-stack-<version>/values.yaml` (rendered default values; tier-aware structure)
-    - Emit `dist/platform-stack-<version>/values.schema.json` (rendered from CUE schema; Helm native validation)
-    - Emit `dist/platform-stack-<version>/templates/applications.yaml` — единственный template, итерирующийся по `.Values.components`:
-      ```yaml
-      {{- range $name, $component := .Values.components }}
-      {{- if $component.enabled }}
-      apiVersion: argoproj.io/v1alpha1
-      kind: Application
-      metadata:
-        name: {{ $name }}
-        namespace: argocd
-      spec:
-        source:
-          repoURL: {{ $component.source.repoURL }}
-          chart: {{ $component.source.chart }}
-          targetRevision: {{ $component.version }}
-          helm:
-            valuesObject: {{ toYaml $component.values | nindent 8 }}
-        destination: ...
-        syncPolicy: {{ toYaml $component.syncPolicy | nindent 6 }}
-      {{- end }}{{- end }}
-      ```
-    - Emit `dist/platform-stack-<version>/compatibility.yaml` — rendered change classification
-- [ ] Local `make render` target вызывает `cue cmd render` + `helm lint dist/platform-stack-<version>/`
-- [ ] `dist/` gitignored.
+- [x] `platform-stack/cue/render_tool.cue` — CUE `command: render: { ... }` using `tool/file` package. Tasks:
+    - `mkdist` / `mktemplates` / `mkexamples` — `file.Mkdir` создают `dist/platform-stack-<version>/templates/` + `examples/` (с `$dep` chain, чтобы `file.Create` shaped tasks выполнялись после dirs).
+    - `chartYaml` — Chart.yaml v2 (apiVersion + name + description + version + appVersion + maintainers + keywords + annotations с `apprafter.io/change-class` + `apprafter.io/operator-version` из `compatibility.cue`).
+    - `valuesYaml` — defaults to `tier1` (solo), emit via `yaml.Marshal`. Operators running `helm install platform-stack` без `--values` получают tier-1 baseline (совпадает с v0.1.x cluster-bootstrap).
+    - `valuesSchemaJson` — Helm-native JSON-schema-2020-12 (handrolled to match `#PlatformValues` shape — CUE's auto-export targets draft-07 which Helm не понимает). Required: version + tier + channel + components; tier enum `[1,2,3,4]`; channel enum `["stable","edge"]`; per-component required: name/enabled/namespace/source/version. `additionalProperties: false`.
+    - `appsTemplate` — `templates/applications.yaml`: единственный Go template. `{{- range $name, $component := .Values.components }}` → один Argo CD `Application` per enabled entry. Conditional `helm.valuesObject` only когда `source.chart` set (Git-source components skip it). Labels `apprafter.io/{component,tier,channel}`. SSA + auto-create-namespace via `syncPolicy.syncOptions` из CUE base.
+    - `compatibilityYaml` — `compatibility.yaml` rendered from `compatibility.cue`'s `compatibility: [string]: #VersionRecord`.
+    - `soloExample` / `teamExample` — `examples/values.solo.yaml` + `examples/values.team.yaml` (concrete tier renders for `helm install -f`).
+    - `readme` — `README.md` inside the rendered chart pointing back at the CUE source (so users pulling the OCI artifact see a redirect to canonical docs).
+- [x] `platform-stack/Makefile` — `make render` / `render-only` / `lint` / `clean` / `help`. Auto-detects `cue` and `helm` binaries from PATH, falls back to `nix run nixpkgs#cue --` / `nix run nixpkgs#kubernetes-helm --` so anyone in the project's nix shell или с nix available picks them up. Version резолвится из `tier1.version` через `cue export` — никогда не хардкодится в Makefile.
+- [x] `dist/` уже gitignored (project-wide rule в `.gitignore` line 17 — `dist/` without leading slash matches at any depth).
+- [x] `Justfile` — `just platform-stack-render` + `just platform-stack-check` wrappers вокруг `make -C platform-stack ...` для project-level convenience.
+- [x] `platform-stack/README.md` Local-development section обновлён с реальными командами + per-tier helm template примером + schema-gate sanity check (`--set tier=99` → error).
+
+**Тесты:** scaffold-only — никакого Rust unit/integration кода не меняется (565 passed). Валидация через render-and-lint:
+- [x] `cue cmd render` (через `make render-only` или direct) emit'ит 8 файлов в `dist/platform-stack-0.2.0/` (Chart.yaml + values.yaml + values.schema.json + compatibility.yaml + README.md + templates/applications.yaml + examples/values.solo.yaml + examples/values.team.yaml).
+- [x] `helm lint dist/platform-stack-0.2.0` exits 0 (single INFO about chart icon, no warnings / errors).
+- [x] `helm template platform dist/platform-stack-0.2.0` (default tier-1) → 6 Argo CD Applications: admission-webhook + apprafter-operator + argocd + cert-manager + cilium + network-policies. Backstage + argocd-cue-cmp ожидаемо disabled.
+- [x] `helm template platform dist/platform-stack-0.2.0 --values dist/platform-stack-0.2.0/examples/values.team.yaml` → 7 Applications (добавляется Backstage; argocd-cue-cmp всё ещё off до 1.69 wiring).
+- [x] `helm template platform dist/platform-stack-0.2.0 --set tier=99` → schema rejects `value must be one of 1, 2, 3, 4`. Validates the values.schema.json gate.
 
 **Acceptance:**
-- `make render` produces `dist/platform-stack-0.2.0/` content.
-- `helm lint` returns 0.
-- `helm template dist/platform-stack-0.2.0 --values examples/solo.yaml` renders correctly с tier-1 settings; produces список Argo CD Applications для cilium, cert-manager, argocd, apprafter-operator, admission-webhook (no Backstage т.к. no domain).
-- `helm template ... --values examples/team.yaml` renders с Hubble, Backstage, Kamaji, etc.
+- ✅ `make render` produces `dist/platform-stack-0.2.0/` content.
+- ✅ `helm lint` returns 0.
+- ✅ `helm template ... --values examples/values.solo.yaml` renders tier-1 correctly (6 enabled Applications, no Backstage / no argocd-cue-cmp).
+- ✅ `helm template ... --values examples/values.team.yaml` renders tier-2 correctly (7 Applications с Backstage enabled, Hubble relay+UI in cilium values).
+- ✅ Schema gate rejects invalid tier values at `helm template` time before reaching Argo CD.
 
-**Зависит от:** 1.66
+**Out-of-scope (отложено):**
+- Kamaji / Capsule / Hubble dashboard для tier-2+ — отдельные components, landing в sub-phase 1.71+ alongside the in-tree manifest migration.
+- Smoke install в kind cluster — это CI-side acceptance в sub-phase 1.68 publish workflow.
+- `helm push` к OCI registry + `cosign sign` — sub-phase 1.68.
+- `text/template` engine для `Chart.yaml.tmpl` (сейчас chart metadata — CUE string literal с interpolation). Перевод на template engine — when chart metadata вырастает; пока линейная string interpolation покрывает все substitutions.
 
-**Размер:** S
+**Зависит от:** 1.66 ✅
+
+**Размер:** S (один цикл, ~0.5 рабочий день — основное время на отладку CUE `tool/file` task DAG semantics + Helm template indent/quoting).
 
 ---
 
@@ -3841,3 +3862,4 @@ Originally items surfaced during Track A walks. Cleared:
 | 2026-05-15 | M1.5 Track A.12 — docs + ADR (Track A closure): new ADR 0030 кодифицирует 4 Track A design decisions (target store, credential resolution chain, miette diagnostics, aliases+color); `docs/operator-guide/quickstart.md` переписан под post-Track-A flow (`target add` + `bootstrap-all` вместо env-var + `cargo run --bin apprafter -- init`); new `docs/operator-guide/target-store.md` (file layout + chain reference); new `docs/operator-guide/troubleshooting.md` (catalogue всех 11 diagnostic codes + worked cause-chain example); new `docs/reference/cli.md` (every subcommand + global env vars table + aliases reference); `docs/operator-guide/index.md` и `docs/reference/index.md` обновлены; `mkdocs.yml` nav expanded; Track A backlog (A.9c Phase 2 polish: SSH ConnectTimeout + label rename) explicitly tracked для follow-up; v0.1.90 — закрывает Track A | initial |
 | 2026-05-15 | M1.5 Track A.9c (Phase 2 polish backlog closure): `SshKubeconfigFetcher::build_command` добавляет `-o ConnectTimeout=5` так что первая kubeconfig-poll attempt fail'ится за 5s вместо kernel-default ~30s пока cloud-init поднимает sshd на новом cpx22; Phase 2 label rename `[2/3] kubeconfig` → `[2/3] k3s-ready` (старый label вводил в заблуждение — ~60s это cloud-init+k3s startup, не сам fetch) применён consistently: спиннер, success/failure markers, dry-run plan, total breakdown summary; spinner message теперь "waiting for cloud-init + k3s on the new node…"; docs (quickstart, troubleshooting, cli reference) обновлены synchronously; +1 regression test (`ssh_fetcher_caps_connect_timeout_at_five_seconds`); existing `bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls` integration test обновлён под `[2/3] k3s-ready`; typical Phase 2 на Hetzner cpx22 + Ubuntu 24.04 ожидаемо падает с ~60s до ~20-40s; v0.1.91 — закрывает весь Track A backlog | initial |
 | 2026-05-15 | M1.5 Track B.1.66 — platform-stack scaffold: new top-level `platform-stack/cue/` (flat layout — CUE treats subdirs как отдельные package instances even when `package` declaration matches, что ломало cross-file `_components` merging; обнаружено на design walk через `cue export -e direct_cilium`). 12 CUE файлов: `platform.cue` (umbrella schema — `#Version`/`#Channel`/`#Tier`/`#ComponentSource`/`#Component`/`#ComponentSet`/`#PlatformValues`/`_components`), 8 component declarations (`component_cilium.cue`, `component_cert-manager.cue`, `component_argocd.cue`, `component_apprafter-operator.cue`, `component_admission-webhook.cue`, `component_backstage.cue`, `component_network-policies.cue`, `component_argocd-cue-cmp.cue` — последний declared but disabled by default до wiring step в 1.69), 2 tier overlays (`tier_solo.cue` tier 1 + `tier_team.cue` tier 2 со своими `enabled`/replicas/Hubble настройками), `compatibility.cue` со схемой `#ChangeClass`+`#VersionRecord` и initial 0.2.0 entry; на design walk вскрылся gotcha: `[NAME=string]: #Component & { name: NAME }` autobinding в `#ComponentSet` re-применяет `#Component` на каждом overlay-unification и стрипит concrete `namespace`/`version` — заменён на plain `[string]: #Component` + explicit `name:` per component; `_components: #ComponentSet` тоже типизировать нельзя (та же проблема), оставлен plain `{}` с локальной type-conformance на declaration site; `Chart.yaml.tmpl` template + `README.md` (full layout + contribution model + distribution + forking + design-walk decision rationale) + `CHANGELOG.md` (0.2.0 planned entry); `scripts/lint-cue.sh` + `scripts/check-spdx-headers.sh` расширены под `platform-stack/cue/...` + `platform-stack/Chart.yaml.tmpl`; `cue vet -c` passes, lint clean, все 565 Rust tests остаются зелёными; v0.1.92 — открывает Track B | initial |
+| 2026-05-15 | M1.5 Track B.1.67 — `cue cmd render` pipeline + umbrella chart generation: `platform-stack/cue/render_tool.cue` declares `command: render: { ... }` с 9 tasks (3 `file.Mkdir` + 6 `file.Create`) и `$dep` chain для DAG ordering; emit Chart.yaml v2 (с annotation'ами apprafter.io/change-class+apprafter.io/operator-version из compatibility.cue), values.yaml (defaults to tier1), values.schema.json (handrolled Helm-native draft-2020-12 — CUE's auto-export targets draft-07 который Helm не понимает), templates/applications.yaml (единственный Go template итерирующий .Values.components → один Argo CD Application per enabled entry, conditional helm.valuesObject only когда source.chart set, labels apprafter.io/{component,tier,channel}), compatibility.yaml, examples/values.{solo,team}.yaml, README.md внутри rendered chart; `platform-stack/Makefile` с targets `render`/`render-only`/`lint`/`clean`/`help`, auto-detect cue+helm с nix fallback, version резолвится из tier1.version через `cue export` без хардкода; `Justfile` получил `platform-stack-render` + `platform-stack-check` wrappers; `dist/` уже gitignored project-wide; README local-dev section updated с реальными командами + schema-gate sanity check; verified — `helm lint` clean (single INFO про chart icon), `helm template` default → 6 tier-1 Apps, with team values → 7 Apps (Backstage on), `--set tier=99` → schema rejects "value must be one of 1, 2, 3, 4"; v0.1.93 | initial |

@@ -102,6 +102,33 @@ docs-build:
         nix shell nixpkgs#python3Packages.mkdocs-material -c mkdocs build --strict
     fi
 
+# Render the platform-stack umbrella chart from CUE source into
+# `platform-stack/dist/platform-stack-<version>/`. Wrapper over
+# `make -C platform-stack render`. Used by the publish workflow
+# (`.github/workflows/platform-stack-publish.yml`) and by
+# contributors editing `platform-stack/cue/`. `dist/` is gitignored.
+platform-stack-render:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v make >/dev/null 2>&1; then
+        make -C platform-stack render-only
+    else
+        nix shell nixpkgs#gnumake -c make -C platform-stack render-only
+    fi
+
+# Render + helm lint + per-tier helm template sanity check. The
+# `make render` target inside `platform-stack/` already invokes
+# helm lint; this just bundles the typical developer round-trip
+# under one project-level entry point.
+platform-stack-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v make >/dev/null 2>&1 && command -v helm >/dev/null 2>&1; then
+        make -C platform-stack render
+    else
+        nix shell nixpkgs#gnumake nixpkgs#kubernetes-helm -c make -C platform-stack render
+    fi
+
 # Quick repo statistics — lines of code per language.
 stats:
     @echo "Lines of code (tracked source files):"

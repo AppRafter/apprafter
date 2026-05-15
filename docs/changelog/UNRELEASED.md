@@ -13,6 +13,130 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.93 — M1.5 Track B.1.67 — chart renderer pipeline (2026-05-15)
+
+Second Track B slice. The 1.66 scaffold provided the CUE
+source; this slice turns it into a fully-lintable Helm umbrella
+chart on disk. End-to-end loop:
+
+```sh
+cd platform-stack && make render
+# ⇒ dist/platform-stack-0.2.0/
+#   Chart.yaml + values.yaml + values.schema.json
+#   templates/applications.yaml
+#   compatibility.yaml + README.md
+#   examples/values.solo.yaml + examples/values.team.yaml
+helm lint dist/platform-stack-0.2.0          # → 0 errors, 1 INFO
+helm template platform dist/platform-stack-0.2.0
+#   → 6 Argo CD Applications (tier-1 default)
+```
+
+No CUE source ever leaves `platform-stack/cue/`; the rendered
+chart is purely a CI / publish artifact, gitignored.
+
+### Added
+
+- **`platform-stack/cue/render_tool.cue`** — CUE `command:
+  render: { ... }` declared using the `tool/file` package.
+  Nine tasks chained via `$dep`:
+  - `mkdist` / `mktemplates` / `mkexamples` — `file.Mkdir` with
+    `createParents`.
+  - `chartYaml` — Chart.yaml v2 with `apprafter.io/change-class`
+    and `apprafter.io/operator-version` annotations pulled from
+    `compatibility.cue`.
+  - `valuesYaml` — defaults to `tier1` (solo). Operators who
+    `helm install platform-stack` without `--values` get the
+    same baseline the in-tree v0.1.x cluster-bootstrap installs.
+  - `valuesSchemaJson` — hand-rolled Helm-native JSON Schema
+    (draft-2020-12). CUE's auto-export targets draft-07, which
+    Helm refuses. Required: `version` / `tier` / `channel` /
+    `components`; `tier` enum `[1, 2, 3, 4]`; `channel` enum
+    `["stable", "edge"]`; per-component pattern constraint on
+    the map keys; `additionalProperties: false`.
+  - `appsTemplate` — the umbrella chart's **single** Go
+    template iterating over `.Values.components`. Emits one
+    Argo CD `Application` per enabled entry. Labels
+    `apprafter.io/{component,tier,channel}`. Conditional
+    `helm.valuesObject` block only when `source.chart` is set
+    (Git-source components like `network-policies` and
+    `backstage` skip it). SSA + auto-create-namespace flow
+    through from CUE base.
+  - `compatibilityYaml` / `soloExample` / `teamExample` /
+    `readme` — per-tier example values + an in-chart README
+    pointing back at the canonical AppRafter monorepo CUE
+    source.
+
+- **`platform-stack/Makefile`** — `make render` /
+  `render-only` / `lint` / `clean` / `help`. Auto-detects
+  `cue` and `helm` on `PATH`, falls back to
+  `nix run nixpkgs#cue --` / `nix run nixpkgs#kubernetes-helm --`
+  so anyone with Nix available picks them up automatically
+  even outside the dev shell. The chart version reads from
+  the CUE source itself via `cue export ... -e tier1.version`,
+  so the Makefile never hard-codes a version path.
+
+- **`Justfile`** — `just platform-stack-render` and
+  `just platform-stack-check` wrappers around the Makefile
+  for project-level convenience.
+
+- **`platform-stack/README.md`** Local-development section
+  rewritten with the real `make render` / `helm template` /
+  `--set tier=99` schema-gate examples, replacing the
+  scaffold-era "lands in 1.67" placeholders.
+
+### Changed
+
+- Nothing in the existing CUE production package files
+  (`platform.cue`, `component_*.cue`, `tier_*.cue`,
+  `compatibility.cue`). The renderer reads them via the
+  `package platformstack` import; they don't depend on
+  `tool/*` and remain `cue vet`-clean without it.
+
+### Verified
+
+- `make -C platform-stack render-only` emits 8 files in
+  `dist/platform-stack-0.2.0/`.
+- `helm lint dist/platform-stack-0.2.0` → 0 errors, 0
+  warnings, 1 INFO (chart icon recommendation — cosmetic).
+- `helm template platform dist/platform-stack-0.2.0` (default
+  / tier-1 values) → 6 Argo CD Applications:
+  `admission-webhook` + `apprafter-operator` + `argocd` +
+  `cert-manager` + `cilium` + `network-policies`. Backstage
+  + argocd-cue-cmp correctly disabled.
+- `helm template platform dist/platform-stack-0.2.0 --values
+  dist/platform-stack-0.2.0/examples/values.team.yaml` → 7
+  Applications (Backstage enabled, Hubble relay+UI in cilium
+  values). argocd-cue-cmp still disabled until the 1.69
+  sidecar wiring.
+- `helm template platform dist/platform-stack-0.2.0 --set
+  tier=99` → schema rejects: `value must be one of 1, 2, 3,
+  4`. Validates the `values.schema.json` gate before Argo CD
+  ever sees the input.
+- `bash scripts/lint-cue.sh` clean; SPDX gate covers the
+  new files (167 → 169 tracked source files after staging).
+- `cargo test --workspace` stays at 565 passed (no Rust
+  changes).
+
+### Design notes
+
+- **No `helm push` here.** Publishing to OCI + cosign
+  signing is sub-phase 1.68's territory.
+- **No in-tree manifest migration here.** The v0.1.x
+  `cli-providers::k8s::cilium_values_yaml` etc. continue to
+  produce the chart values they always did; `platform-stack/`
+  is a parallel source of truth until 1.71 cuts the CLI
+  over to consuming the rendered chart.
+- **Single template by design.** Adding a component =
+  adding a CUE declaration. Editing the template would mean
+  the chart is no longer "data-driven", which trades the
+  ADR 0028 contribution model for ad-hoc plumbing. Resist
+  the urge.
+- **JSON Schema is hand-rolled.** Auto-deriving from
+  `#PlatformValues` via `cue def --out=jsonschema` was
+  considered but rejected — output is draft-07, Helm
+  requires draft-2020-12, and the manual schema is only
+  ~35 lines that change once a year.
+
 ## v0.1.92 — M1.5 Track B.1.66 — platform-stack scaffold (2026-05-15)
 
 First Track B slice. Lays down the CUE-only source tree the

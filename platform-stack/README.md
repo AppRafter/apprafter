@@ -105,16 +105,30 @@ workflow (lands in 1.68). Maintainer release procedure: see
 ## Local development
 
 ```sh
-# Validate CUE source (already wired into the project lint).
-just lint                     # under the hood: cue vet ./platform-stack/cue/...
+# Validate CUE source (wired into the project lint).
+just lint                     # ⇒ cue fmt --check + cue vet ./platform-stack/cue/...
 
-# Render to dist/ (lands in 1.67):
-make render                   # → dist/platform-stack-<version>/
+# Render the chart to dist/ (the CUE `render` command emits
+# Chart.yaml, values.yaml, values.schema.json, the single
+# templates/applications.yaml template, per-tier examples, and
+# a compatibility.yaml snapshot).
+cd platform-stack && make render-only
 
-# Local sanity install (lands in 1.67):
-helm template dist/platform-stack-<version>
-helm lint dist/platform-stack-<version>
+# Render + helm lint + helm template sanity check.
+cd platform-stack && make render
+
+# Render a specific tier on top:
+helm template platform dist/platform-stack-<version>                     # tier-1 (default values.yaml)
+helm template platform dist/platform-stack-<version> \
+    --values dist/platform-stack-<version>/examples/values.team.yaml     # tier-2
+
+# Schema gate (rejects bad input before Argo CD ever sees it):
+helm template platform dist/platform-stack-<version> --set tier=99       # → "value must be one of 1, 2, 3, 4"
 ```
+
+`make render` is the single source of truth — both the local
+loop above and the publish workflow (`.github/workflows/platform-stack-publish.yml`,
+lands in 1.68) call it. `dist/` is gitignored.
 
 ## Forking the stack
 
