@@ -13,6 +13,159 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.92 — M1.5 Track B.1.66 — platform-stack scaffold (2026-05-15)
+
+First Track B slice. Lays down the CUE-only source tree the
+upcoming chart renderer (1.67) and publish workflow (1.68) will
+consume. No runtime code changes; only new files under
+`platform-stack/` plus lint-config touch-ups.
+
+The deliverable matches ADR 0028's distribution model:
+**CUE source in this repository; rendered Helm chart in OCI on
+tag.** This commit lands the CUE side.
+
+### Added
+
+- **`platform-stack/`** new top-level subdirectory, flat
+  `cue/` tree (no subdirs — CUE treats subdirectories as
+  separate package instances even when `package` declaration
+  matches; that broke cross-file `_components` merging on the
+  design walk).
+
+  - **`cue/platform.cue`** — umbrella schema. Types:
+    `#Version` (semver regex), `#Channel` (`stable | edge`),
+    `#Tier` (1..4), `#ComponentSource`, `#Component`,
+    `#ComponentSet`, `#PlatformValues`. Plus the hidden
+    package-level `_components: {}` base.
+
+  - **8 component declarations** (one file each — filename
+    prefix `component_`):
+    `cilium` (1.16.5, kube-proxy replacement + IPAM kubernetes
+    + Hubble off by default), `cert-manager` (v1.16.2 +
+    `crds.enabled`), `argocd` (7.7.7, self-managing with
+    `prune: false`), `apprafter-operator` (v0.1.91 from
+    `oci://ghcr.io/apprafter`), `admission-webhook` (same image
+    family), `backstage` (Git source, default off), `network-
+    policies` (default-deny + DNS + Argo-CD egress allowance),
+    `argocd-cue-cmp` (declared but disabled until 1.69 wiring).
+
+  - **2 tier overlays** (filename prefix `tier_`):
+    - `solo.cue` — tier 1, Hubble off, Backstage off,
+      argocd-cue-cmp off, single-replica everything (cpx22
+      RAM budget).
+    - `team.cue` — tier 2, Hubble on (relay + UI), Backstage
+      on, admission-webhook + cert-manager + operator at 2
+      replicas.
+
+  - **`compatibility.cue`** — `#ChangeClass`
+    (`safe | caution | breaking`) + `#VersionRecord` schema +
+    initial `0.2.0` entry classifying the first published
+    version as `safe` (no operator-facing behaviour change vs
+    the in-tree v0.1.x bootstrap).
+
+- **`platform-stack/Chart.yaml.tmpl`** — template the
+  upcoming `cue cmd render` (lands 1.67) substitutes
+  `{{ .Version }}` into. Operators never see this file
+  directly; it lives here as the source of truth for chart
+  metadata while everything else (rendered values, schema,
+  templates) is generated from CUE.
+
+- **`platform-stack/README.md`** — full layout reference,
+  contribution model (adding a component / tightening a
+  default / major version bump / adding a tier), local
+  development workflow (`just lint` / future `make render`),
+  forking story (`apprafter platform fork` lands in 1.74),
+  design-walk decision rationale (why flat layout, why
+  `[string]: #Component` without autobinding).
+
+- **`platform-stack/CHANGELOG.md`** — operator-facing release
+  notes for the platform-stack chart itself, distinct from
+  the AppRafter monorepo's `docs/changelog/UNRELEASED.md`.
+  Initial entry placeholder for the planned 0.2.0 publish.
+
+### Changed
+
+- **`scripts/lint-cue.sh`** — `cue fmt --check` and
+  `cue vet` now cover `./platform-stack/cue/...` alongside
+  `schemas/` and `examples/`.
+
+- **`scripts/check-spdx-headers.sh`** — patterns extended to
+  cover `platform-stack/cue/**/*.cue` and
+  `platform-stack/Chart.yaml.tmpl`. The new files all carry
+  the SPDX-License-Identifier in the first 5 lines, so the
+  hook continues to pass (166 tracked source files).
+
+### Design-walk gotchas (recorded so future contributors don't re-discover)
+
+1. **Subdirectory split.** Even with identical `package
+   platformstack` declarations, CUE treats `cue/components/`
+   and `cue/tiers/` as separate package instances. `_components`
+   defined in `cue/components/cilium.cue` does **not** flow
+   into `cue/tiers/solo.cue`. Fix: single flat `cue/` directory
+   with filename prefixes (`component_`, `tier_`) replacing
+   the would-be subdirectory groupings.
+
+2. **`#ComponentSet` autobinding.** The natural-looking
+   `#ComponentSet: [NAME=string]: #Component & { name: NAME }`
+   form (which auto-fills `name` from the map key) re-applies
+   `#Component` to every map entry on each unification —
+   including the per-tier `components: _components & {
+   overlay }`. That re-application strips concrete fields
+   contributed by `_components` (`namespace`, `version`, …)
+   and `cue vet -c` reports them as incomplete on each tier
+   instance. Fix: drop the autobinding, set `name:` explicitly
+   in each component declaration, keep `#ComponentSet` as
+   plain `[string]: #Component`.
+
+3. **Typed `_components`.** Same problem as #2:
+   `_components: #ComponentSet` forces #Component
+   re-application on every per-tier overlay unification.
+   Solution: declare `_components: {}` (untyped) at package
+   level; each component's `#Component & { … }` conformance
+   is enforced locally at its declaration site, which is
+   strictly stronger than a package-level type pin.
+
+4. **Default-marked values are not concrete to `vet -c`.**
+   CUE 0.10+'s `vet -c` flags `bool | *false` as incomplete
+   even though the default applies. Pin the value explicitly
+   in any tier that doesn't override it (current case:
+   `argocd-cue-cmp.enabled` in `tier_team.cue`).
+
+### Tests
+
+Pure scaffold release. Two layers verified locally:
+
+- `bash scripts/lint-cue.sh` — `cue fmt --check` + `cue vet`
+  pass for all three trees (`schemas`, `platform-stack/cue`,
+  `examples`).
+- `cue vet -c ./platform-stack/cue/...` — strict concreteness
+  check passes. Every tier instance produces a fully-concrete
+  components map with no leftover regex constraints / typed
+  placeholders.
+- `cue eval -e tier1 ./platform-stack/cue/...` — renders the
+  tier-1 values document the renderer will hand off to
+  `cue cmd render` in the next sub-phase.
+
+Rust tests stay green (565 passed, unchanged from v0.1.91).
+SPDX gate: 166 tracked files (now including
+`platform-stack/cue/*.cue` + `platform-stack/Chart.yaml.tmpl`).
+fmt + clippy clean.
+
+### What's next
+
+- **1.67** — `cue cmd render` command + `templates/applications.yaml`
+  template + `make render` target. Produces the
+  `dist/platform-stack-<version>/` tree from CUE.
+- **1.68** — `.github/workflows/platform-stack-publish.yml`:
+  on `platform-stack/v*` tags, render → helm lint → cosign
+  sign → `oras push ghcr.io/apprafter/platform-stack:<v>` +
+  GitHub Release `.tgz` attachment.
+- **1.69** — Argo CD CMP sidecar wiring per ADR 0029.
+- **1.70** — `apprafter cluster-bootstrap` rewrite to consume
+  the published OCI artifact instead of direct
+  `helm upgrade --install` (the work this whole Track B was
+  named after).
+
 ## v0.1.91 — M1.5 Track A.9c — Phase 2 polish (backlog closure) (2026-05-15)
 
 Track A backlog cleanup. The v0.1.85 walk surfaced two related

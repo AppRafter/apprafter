@@ -22,6 +22,9 @@ PATTERNS=(
   'cue.mod/module.cue'
   'schemas/**/*.cue'
   'examples/**/*.cue'
+  # platform-stack (CUE source + Helm Chart template)
+  'platform-stack/cue/**/*.cue'
+  'platform-stack/Chart.yaml.tmpl'
   # Scripts
   'scripts/*.sh'
   'e2e/*.sh'

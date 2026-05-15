@@ -23,10 +23,13 @@ else
 fi
 
 echo "==> cue fmt --check"
-"${CUE_CMD[@]}" fmt --check ./schemas/... ./examples/...
+"${CUE_CMD[@]}" fmt --check ./schemas/... ./examples/... ./platform-stack/cue/...
 
 echo "==> cue vet ./schemas/..."
 "${CUE_CMD[@]}" vet ./schemas/...
+
+echo "==> cue vet ./platform-stack/cue/..."
+"${CUE_CMD[@]}" vet ./platform-stack/cue/...
 
 echo "==> cue vet ./examples/..."
 # Skip Backstage scaffolder skeletons — they contain template placeholders

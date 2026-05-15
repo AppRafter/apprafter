@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+#
+# Template for the umbrella chart's `Chart.yaml`. The renderer
+# (lands in plan.md sub-phase 1.67) substitutes `{{ .Version }}`
+# at `cue cmd render` time, producing
+# `dist/platform-stack-<version>/Chart.yaml`.
+#
+# Operators do not see this file — they consume the rendered
+# `Chart.yaml` shipped inside the OCI artifact. The template
+# lives here as the operator's source of truth for chart
+# metadata; everything else (rendered values, schema,
+# templates) is derived from CUE.
+
+apiVersion: v2
+name: platform-stack
+description: |
+  AppRafter platform-stack: a curated bundle of Cilium,
+  cert-manager, Argo CD, apprafter-operator, admission-webhook,
+  and (optionally) Backstage, rendered as Argo CD Applications
+  from CUE source. Single source of truth for the platform
+  layer of an AppRafter cluster.
+
+  Distributed via OCI (`oci://ghcr.io/apprafter/platform-stack:<version>`)
+  and as a GitHub Release `.tgz`. CUE source lives in the
+  AppRafter monorepo at `platform-stack/cue/` — see
+  `platform-stack/README.md`.
+type: application
+version: "{{ .Version }}"
+appVersion: "{{ .Version }}"
+home: https://apprafter.io
+sources:
+  - https://github.com/apprafter/apprafter/tree/main/platform-stack
+maintainers:
+  - name: AppRafter Authors
+    url: https://apprafter.io
+keywords:
+  - apprafter
+  - platform
+  - argocd
+  - cilium
+  - cert-manager
+  - kubernetes
+annotations:
+  apprafter.io/change-class: "{{ .ChangeClass }}"
+  apprafter.io/operator-version: "{{ .OperatorVersion }}"

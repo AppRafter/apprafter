@@ -32,8 +32,11 @@
 |------|----------|-------------------|--------|------------|
 | 0 | Основания и подготовка | M0 finalization | M | — |
 | 1 | MVP single-node | M1 | L | 0 |
+| 1.9 | Dev Mode MVP (1B) | dev-mode-task.md §20 Phase 1B | M+ | 1.5 |
 | 2 | Платформенные сервисы | M2 | L | 1 |
+| 2.9 | Dev Mode + Services (2B) | dev-mode-task.md §20 Phase 2B | M | 1.9, 2 |
 | 3 | Multi-node + observability | M3 | L | 2 |
+| 3.9 | Dev Mode Full (3B) | dev-mode-task.md §20 Phase 3B | M | 2.9, 3 |
 | 4 | External Surface + Access | M4 | L | 3 |
 | 5 | Tier 3 — bare metal | M5 | L | 4 |
 | 6 | Tier 4 — confidential | M6 | M | 5 |
@@ -2122,26 +2125,21 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
-### 1.83 Tag `v0.2.0-self-managing`
+## Фаза 1.9 — Dev Mode MVP (Phase 1B из dev-mode-task.md)
 
-**Source:** all of M1.5.
+**Цель фазы:** ship minimum viable dev mode для локальной разработки на k3d. CLI команды: `apprafter dev cluster up/down/status/wipe`, `apprafter dev init`, `apprafter dev up`, `apprafter dev down`, `apprafter dev list`, `apprafter dev logs`. Manifest layering 4 уровня (Application.base + environments.dev + DevProfile + DevProfileLocal). `needs.*` resolution в эту фазу **не входит** — лендится в Фазе 2.9. Помечается `experimental` для users.
 
-**Цель:** close M1.5 milestone with version tag.
+**Source of truth:** `dev-mode-task.md` §20 Phase 1B (sub-items 1B.1 – 1B.12).
 
-**Поставка:**
-- [ ] Final smoke run: full e2e suite green.
-- [ ] Update CHANGELOG.md entries for the v0.1.66 — v0.1.82 series, consolidate в M1.5 release notes.
-- [ ] Update version в Cargo.toml workspace, package metadata.
-- [ ] Tag `v0.2.0-self-managing` (signals M1.5 close before M2 starts).
-- [ ] Update root README badge.
+**Spec:** `spec.md` §3.10, §3.11.
 
-**Acceptance:**
-- Tag exists; release notes complete.
-- Gate passed для Phase 2 start.
+**Зависит от:** Phase 1.5 closed. Нужны: PlatformStack CRD (1.72), MigrationPlan CRD (1.75), `tiers/dev.cue` overlay в platform-stack chart (опт-ин/опт-аут defaults per dev-mode-task.md §12.2), Application reconciler dev-awareness hooks.
 
-**Зависит от:** 1.82
+**Поставка:** items 1B.1 – 1B.12 из `dev-mode-task.md` §20 перетаскиваются сюда AI-агентом по мере реализации (как 1.6.1, 1.6.2, …), с реальными размерами и acceptance criteria для каждого. Тот же паттерн, что Track A из Phase 1.5 (где cli-dx items живут в `cli-dx-task.md` §17 и lend'ятся в plan.md по факту).
 
-**Размер:** XS
+**Версии:** `v0.1.x` patch series (без closing tag — M2 стартует следующим коммитом с bump на `v0.2.0`).
+
+**Размер (aggregate):** M+ (~1.5–2 недели FT по dev-mode-task.md §20). Корректируется по факту перетаскивания items.
 
 ---
 
@@ -2476,6 +2474,24 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
+## Фаза 2.9 — Dev Mode + Services (Phase 2B из dev-mode-task.md)
+
+**Цель фазы:** dev mode поддерживает `needs.{pg, jetstream, redis}` end-to-end локально через lightweight in-cluster providers (single-node Postgres pod, embedded NATS, single Redis). Дев-кластер на `dev cluster up` поднимает все ServiceProviders по умолчанию с `--without` opt-out флагом. Helper команда `dev claim status <app>` для диагностики ResourceClaim. Помечается `experimental` (полный DX в Фазе 3.9).
+
+**Source of truth:** `dev-mode-task.md` §20 Phase 2B.
+
+**Spec:** `spec.md` §3.10, §3.2 (ServiceProvider/ResourceClaim).
+
+**Зависит от:** Phase 1.9 closed + Phase 2 closed (ServiceProvider CRD 2.1, ResourceClaim CRD 2.2, scheduler 2.3, реализации `needs.pg` 2.4 / `needs.jetstream` 2.5 / `needs.redis` 2.6).
+
+**Поставка:** items из `dev-mode-task.md` §20 Phase 2B перетаскиваются сюда AI-агентом по мере реализации.
+
+**Версии:** `v0.2.x` patch series.
+
+**Размер (aggregate):** M (~1 неделя FT). Корректируется по факту.
+
+---
+
 ## Фаза 3 — Multi-node + Observability (M3) ⚡
 
 **Цель фазы:** платформа поднимается в HA на 3 нодах; observability stack по умолчанию для всех workload'ов.
@@ -2757,6 +2773,24 @@ Originally items surfaced during Track A walks. Cleared:
 - [ ] Tag `v0.3.0-multinode`.
 
 **Размер:** XS
+
+---
+
+## Фаза 3.9 — Dev Mode Full (Phase 3B из dev-mode-task.md)
+
+**Цель фазы:** production-ready local dev experience. Heuristic runtime detection (Bun / Node / Rust / Go / Python), preset library (Bun HTTP service, Rust async worker, и т.д.), полный `dev reset / restore` lifecycle с backups, observability tab в Backstage equivalent для dev. Снимается `experimental` tag — dev mode становится официальной частью MVP completion.
+
+**Source of truth:** `dev-mode-task.md` §20 Phase 3B.
+
+**Spec:** `spec.md` §3.10, §3.11.
+
+**Зависит от:** Phase 2.9 closed + Phase 3 closed (observability stack, Backstage flow visualizer).
+
+**Поставка:** items из `dev-mode-task.md` §20 Phase 3B перетаскиваются сюда AI-агентом по мере реализации. По завершении — снимается `experimental` маркер в user-facing docs и CLI help.
+
+**Версии:** `v0.3.x` patch series. По dev-mode-task.md §20 эта фаза лендится в planned pause между M3 и Phase 4 (managed offering research), не блокирует старт Phase 4.
+
+**Размер (aggregate):** M (~1 неделя FT). Корректируется по факту.
 
 ---
 
@@ -3162,7 +3196,7 @@ Originally items surfaced during Track A walks. Cleared:
 ### 4.17 Закрытие чек-листа M4 spec
 
 - [ ] Обновить `spec.md` §6 M4.
-- [ ] Tag `v0.4.0-external-access`.
+- [ ] Tag `v0.4-mvp`.
 
 **Размер:** XS
 
@@ -3660,22 +3694,6 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
-## Dev-mode phases positioning (dev-mode-task.md §20)
-
-`dev-mode-task.md` defines three phased deliveries of dev mode (Phases 1B, 2B, 3B), each interleaved with platform milestones. This section maps dev-mode phases to plan milestones для visibility; sub-version numbering and acceptance criteria остаются в `dev-mode-task.md` itself.
-
-| dev-mode-task phase | Lands when | Purpose | Notes |
-|---|---|---|---|
-| **Phase 1B** — Minimum Viable Dev Mode | **After M1.5 closure** (`v0.2.x` patch series before M2 begins) | `apprafter dev cluster up/down`, `apprafter dev init`, `apprafter dev up`, `apprafter dev down`, `apprafter dev list`, `apprafter dev logs` on local k3d. Manifest layering 4 levels (base + env + dev + DevProfileLocal). No `needs.*` resolution yet — that's Phase 2B. Marked `experimental` для users. | Benefits from M1.5 Track A CLI rework (target store, miette errors); reuses M1.5 Track B platform-stack chart's tier-1 overlay (with new `tiers/dev.cue` overlay). |
-| **Phase 2B** — Dev Mode + Platform Services | After M2 closure | Dev mode supports `needs.{pg, jetstream, redis}` end-to-end on local k3d via lightweight in-cluster providers (single-node Postgres pod, embedded NATS, single Redis). Still marked `experimental`. | Depends on M2 ServiceProvider CRDs and reconcilers being in place; dev mode just runs them in a lightweight configuration. |
-| **Phase 3B** — Full Dev Experience | After M3 closure (part of MVP completion) | Production-ready local dev experience: heuristic runtime detection (Bun/Node/Rust/Go/Python), preset library (Bun HTTP, Rust async worker, etc.), `apprafter dev reset / restore` lifecycle, observability tab в Backstage equivalent для dev. Removes `experimental` tag. Completes MVP definition alongside platform Phase 3. | Per `dev-mode-task.md` §20: lands в planned pause between M3 and Phase 4 (managed offering research), so does not block Phase 4 startup. |
-
-**Sequential ordering within Phase 1B**: per `dev-mode-task.md` §20 Phase 1B internal sub-items (1B.1, 1B.2, …). Each lands as its own commit / version bump; specific patch numbers (`v0.2.1`, `v0.2.2`, ...) are commit-driven, not regulated by this plan.
-
-**Why sequential, not parallel with M1.5**: keeping the workflow linear avoids interleaving dependencies and losing track of work in flight. M1.5 closes cleanly with `v0.2.0-self-managing`, then dev-mode Phase 1B starts on top of the new platform foundation.
-
----
-
 ## Сквозные направления (running concerns)
 
 Эти задачи не привязаны к конкретной фазе и идут параллельно.
@@ -3822,4 +3840,4 @@ Originally items surfaced during Track A walks. Cleared:
 | 2026-05-14 | M1.5 Track A.11 walk-fix — после walk'а v0.1.88: `apprafter up --dry-run` оставался монохромным (я подкрасил только wet path); только `INFO` лейбл от tracing-subscriber'а светился зелёным. v0.1.89 покрыл dry-run plan: `bootstrap-all` heading + `Target:` label + active target name через `style::bold`; `(active)`/`(via --target override)` tag через `style::info` cyan; `[1/3]`/`[2/3]`/`[3/3]` phase numbers cyan (echoes wet path's `→`); `Provider:/Region:/Tier:/...` labels + `<unset — ...>` placeholders + bottom hint через `style::dim` чтобы defaults не отвлекали от реальных значений; script(1)-replay confirms ANSI bytes есть в TTY и отсутствуют под `NO_COLOR=1`; v0.1.89 | initial |
 | 2026-05-15 | M1.5 Track A.12 — docs + ADR (Track A closure): new ADR 0030 кодифицирует 4 Track A design decisions (target store, credential resolution chain, miette diagnostics, aliases+color); `docs/operator-guide/quickstart.md` переписан под post-Track-A flow (`target add` + `bootstrap-all` вместо env-var + `cargo run --bin apprafter -- init`); new `docs/operator-guide/target-store.md` (file layout + chain reference); new `docs/operator-guide/troubleshooting.md` (catalogue всех 11 diagnostic codes + worked cause-chain example); new `docs/reference/cli.md` (every subcommand + global env vars table + aliases reference); `docs/operator-guide/index.md` и `docs/reference/index.md` обновлены; `mkdocs.yml` nav expanded; Track A backlog (A.9c Phase 2 polish: SSH ConnectTimeout + label rename) explicitly tracked для follow-up; v0.1.90 — закрывает Track A | initial |
 | 2026-05-15 | M1.5 Track A.9c (Phase 2 polish backlog closure): `SshKubeconfigFetcher::build_command` добавляет `-o ConnectTimeout=5` так что первая kubeconfig-poll attempt fail'ится за 5s вместо kernel-default ~30s пока cloud-init поднимает sshd на новом cpx22; Phase 2 label rename `[2/3] kubeconfig` → `[2/3] k3s-ready` (старый label вводил в заблуждение — ~60s это cloud-init+k3s startup, не сам fetch) применён consistently: спиннер, success/failure markers, dry-run plan, total breakdown summary; spinner message теперь "waiting for cloud-init + k3s on the new node…"; docs (quickstart, troubleshooting, cli reference) обновлены synchronously; +1 regression test (`ssh_fetcher_caps_connect_timeout_at_five_seconds`); existing `bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls` integration test обновлён под `[2/3] k3s-ready`; typical Phase 2 на Hetzner cpx22 + Ubuntu 24.04 ожидаемо падает с ~60s до ~20-40s; v0.1.91 — закрывает весь Track A backlog | initial |
-
+| 2026-05-15 | M1.5 Track B.1.66 — platform-stack scaffold: new top-level `platform-stack/cue/` (flat layout — CUE treats subdirs как отдельные package instances even when `package` declaration matches, что ломало cross-file `_components` merging; обнаружено на design walk через `cue export -e direct_cilium`). 12 CUE файлов: `platform.cue` (umbrella schema — `#Version`/`#Channel`/`#Tier`/`#ComponentSource`/`#Component`/`#ComponentSet`/`#PlatformValues`/`_components`), 8 component declarations (`component_cilium.cue`, `component_cert-manager.cue`, `component_argocd.cue`, `component_apprafter-operator.cue`, `component_admission-webhook.cue`, `component_backstage.cue`, `component_network-policies.cue`, `component_argocd-cue-cmp.cue` — последний declared but disabled by default до wiring step в 1.69), 2 tier overlays (`tier_solo.cue` tier 1 + `tier_team.cue` tier 2 со своими `enabled`/replicas/Hubble настройками), `compatibility.cue` со схемой `#ChangeClass`+`#VersionRecord` и initial 0.2.0 entry; на design walk вскрылся gotcha: `[NAME=string]: #Component & { name: NAME }` autobinding в `#ComponentSet` re-применяет `#Component` на каждом overlay-unification и стрипит concrete `namespace`/`version` — заменён на plain `[string]: #Component` + explicit `name:` per component; `_components: #ComponentSet` тоже типизировать нельзя (та же проблема), оставлен plain `{}` с локальной type-conformance на declaration site; `Chart.yaml.tmpl` template + `README.md` (full layout + contribution model + distribution + forking + design-walk decision rationale) + `CHANGELOG.md` (0.2.0 planned entry); `scripts/lint-cue.sh` + `scripts/check-spdx-headers.sh` расширены под `platform-stack/cue/...` + `platform-stack/Chart.yaml.tmpl`; `cue vet -c` passes, lint clean, все 565 Rust tests остаются зелёными; v0.1.92 — открывает Track B | initial |
