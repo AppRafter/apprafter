@@ -13,6 +13,45 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.95 — hotfix: workflow syntax error after v0.1.94 push (2026-05-15)
+
+GitHub Actions rejected `platform-stack-publish.yml` on push
+with `(Line: 232, Col: 14): Unexpected symbol: '…'`. Root cause:
+one comment line inside a `run: |` block contained the literal
+sequence `${{ … }}` (with a Unicode ellipsis between the
+expression braces). GHA evaluates `${{ }}` expressions in `run:`
+scalar bodies BEFORE the shell sees the script, including in
+shell comments — the parser tried to evaluate `…` as an
+expression and bailed.
+
+### Changed
+
+- **`.github/workflows/platform-stack-publish.yml`** — rewrote
+  the offending comment without the `${{ }}` symbol. Net
+  effect on functionality: zero (it was a security-rationale
+  comment). Net effect on YAML validity: workflow now parses
+  cleanly.
+
+### Why this slipped past local validation
+
+`yamllint` validates YAML structure (indentation, quoting, key
+ordering) but doesn't run the GitHub Actions expression
+evaluator. The only way to catch this kind of issue without
+the real runner is `actionlint` (or `act` for local
+simulation). Adding `actionlint` to the pre-commit chain is a
+candidate for a future hardening pass; today the cost is the
+~3-minute round trip via real GitHub Actions on push.
+
+### Workflow-author rule of thumb
+
+Inside any `run: |` block, never use `${{ }}` even in a
+comment — neither bash nor GHA expression evaluator treats
+`#` as a comment marker for THEIR parsing pass. Use plain
+text descriptions referencing the syntax by name.
+
+`bash scripts/lint-cue.sh` clean. `cargo test --workspace`
+stays at 565 passed (no Rust changes).
+
 ## v0.1.94 — M1.5 Track B.1.68 — publish workflow + cosign signing (2026-05-15)
 
 Third Track B slice. 1.66 landed CUE source, 1.67 turned it into

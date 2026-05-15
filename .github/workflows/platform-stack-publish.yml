@@ -230,11 +230,11 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
           IS_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
         run: |
-          # Heredoc is double-quoted by default so $VARS expand,
-          # but `${{ … }}` would have been substituted by the
-          # runner BEFORE the shell sees the script. All inputs
-          # come from `env:` above, so no untrusted value reaches
-          # the heredoc literal.
+          # Heredoc is double-quoted by default so $VARS expand.
+          # GitHub Actions expression syntax (the dollar +
+          # double-brace form) is NOT used inside this run body
+          # — all dynamic inputs come from the `env:` block
+          # above, so no untrusted value reaches the heredoc.
           notes_file=$(mktemp)
           cat > "$notes_file" <<EOF
           ## platform-stack ${VERSION}
