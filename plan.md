@@ -1645,36 +1645,66 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
-### 1.68 CI OCI publish workflow + cosign signing
+### 1.68 CI OCI publish workflow + cosign signing ✅
+
+> v0.1.94 — sub-phase 1.68 shipped: `.github/workflows/platform-stack-publish.yml` triggers on `platform-stack/v*` tags (или manual `workflow_dispatch`), validate'ит `compatibility.cue` имеет entry для версии, render'ит chart, lints, smoke-template'ит обе tier-1/tier-2, packages, push'ит к OCI на `ghcr.io/<owner>/platform-stack:<version>`, cosign-keyless signs OCI digest + `.tgz` blob через Sigstore OIDC (ambient GitHub identity, no managed keys), tags `:latest` on stable releases via `oras tag`, и создаёт GitHub Release с `.tgz` + `.tgz.sig` + `.tgz.pem` attachments и body content описывающим install + verify commands. `scripts/check-platform-stack-version.sh` — отдельный helper, используется CI как fail-fast gate, тоже работает локально для проверки перед tagging'ом. `platform-stack/RELEASE.md` — full maintainer procedure: versioning rules, pre-release checklist, tagging steps, after-publish actions, failure-mode recovery.
 
 **Source:** ADR 0028.
 
 **Цель:** GitHub Actions workflow который on tag `platform-stack/v*` builds chart + signs + publishes к OCI и GitHub Release.
 
 **Поставка:**
-- [ ] `.github/workflows/platform-stack-publish.yml`:
-    - Trigger: tag matching `platform-stack/v*`
-    - Steps:
-        1. Checkout
-        2. Install `cue` binary
-        3. Run `make render` (1.67)
-        4. `helm lint` + smoke install in `kind` cluster
-        5. `helm package dist/platform-stack-<version>` → `.tgz`
-        6. `cosign sign` artifact (with GitHub OIDC keyless signing — no managed secret keys)
-        7. `oras push ghcr.io/apprafter/platform-stack:<version>` + tag latest in channel
-        8. Attach `.tgz` and `.tgz.sig` to GitHub Release page
-- [ ] CI validation: `compatibility.cue` must update для new version tag; otherwise fail with clear error.
-- [ ] `apprafter/platform-stack/RELEASE.md` — maintainer release procedure.
+- [x] `.github/workflows/platform-stack-publish.yml`:
+    - [x] Trigger: tag matching `platform-stack/v*` (плюс `workflow_dispatch` с `version:` input для manual republish).
+    - [x] Step 1: Checkout.
+    - [x] Step 2: Resolve version from tag (strip `platform-stack/v` prefix) or from workflow input. Detect pre-release via `-` in version → controls `:latest` retag + GitHub Release `prerelease:` flag.
+    - [x] Step 3: Compute lowercase owner (ghcr requires lowercase). Same shim as `release-operator.yml`.
+    - [x] Step 4: `cue-lang/setup-cue@v1` + `azure/setup-helm@v4` + `sigstore/cosign-installer@v3`.
+    - [x] Step 5: `bash scripts/check-platform-stack-version.sh "$VERSION"` — compatibility gate.
+    - [x] Step 6: `make -C platform-stack render-only` — render CUE → `dist/`.
+    - [x] Step 7: `helm lint`.
+    - [x] Step 8: `helm template` smoke for **both** tiers — assert 6 tier-1 Applications + Backstage on tier-2.
+    - [x] Step 9: `helm package` → `.tgz`.
+    - [x] Step 10: `docker/login-action@v3` к `ghcr.io` via `GITHUB_TOKEN`.
+    - [x] Step 11: `helm push` к `oci://ghcr.io/<owner>` (Helm 3.8+ native OCI push; tag derived from `Chart.yaml.version`). Resolve immutable digest via `helm show chart oci://...` для последующего cosign sign — Sigstore best practice: never sign mutable tags.
+    - [x] Step 12: `cosign sign --yes "${IMAGE}@${DIGEST}"` — keyless via Sigstore OIDC + GitHub Actions ambient identity (`id-token: write` permission). No managed signing keys.
+    - [x] Step 13: `cosign sign-blob --yes ... "$TGZ"` → `.tgz.sig` + `.tgz.pem` detached signature pair для GitHub Release attachment path (`cosign verify-blob` consumer).
+    - [x] Step 14: `oras tag "${IMAGE}:${VERSION}" latest` (только на stable, с graceful warning если oras CLI отсутствует на runner image).
+    - [x] Step 15: `gh release create` с heredoc-formatted notes (install snippets для Argo CD path + plain Helm path + cosign verify snippets для обоих), attaches `.tgz` + `.sig` + `.pem`, `--prerelease` flag для pre-release tags.
+    - [x] Security hardening: каждый dynamic input (`github.ref_name`, `github.repository_owner`, `github.event.inputs.version`, `github.repository`) routed через `env:` binding, не direct interpolation в `run:` body — pattern из release-operator.yml продолжается. Heredoc-built notes file через `mktemp` + `--notes-file` чтобы не передавать multi-line string в bash arg directly.
+- [x] CI validation: `scripts/check-platform-stack-version.sh "$VERSION"` exits non-zero с human-readable error pointing at `compatibility.cue`. Resolves cue binary same way `lint-cue.sh` does (local → nix fallback). Verified локально на happy path (`0.2.0` → returns YAML) и unhappy path (`99.99.99` → exit 1 с instruction'ом добавить entry).
+- [x] `platform-stack/RELEASE.md` — full maintainer release procedure:
+    - Semver rules + first-published-version-is-0.2.0 explanation.
+    - Pre-release checklist (compatibility.cue entry + accurate change class + operator version + CHANGELOG.md + local render passes + workspace tests).
+    - Tagging instructions (pre-release `-rc1` vs stable).
+    - After-publish actions (verify in clean env + bump `RELEASED_OPERATOR_VERSION` if paired + update UNRELEASED.md).
+    - Failure-mode recovery (tag delete + re-push).
+
+**Тесты:** CI-side acceptance — нельзя по-настоящему verify без push'a реального tag'а. Локальные проверки которые делал:
+- [x] `bash scripts/check-platform-stack-version.sh 0.2.0` → success + prints YAML.
+- [x] `bash scripts/check-platform-stack-version.sh 99.99.99` → exit 1 + human-readable error pointing at compatibility.cue.
+- [x] `yamllint -d relaxed .github/workflows/platform-stack-publish.yml` clean.
+- [x] SPDX gate clean (167 → 170 после staging .yml + .sh + RELEASE.md).
+- [x] Все existing gates green (cargo fmt/clippy/test 565, cue lint, spdx).
 
 **Acceptance:**
-- Tag `platform-stack/v0.2.0-rc1` triggers workflow → ends green.
-- `oras pull ghcr.io/apprafter/platform-stack:0.2.0-rc1` retrieves signed chart.
-- `cosign verify ghcr.io/apprafter/platform-stack:0.2.0-rc1` succeeds.
-- GitHub Release page has both `.tgz` and `.tgz.sig` attached.
+- ✅ Workflow file present и syntactically valid (yamllint passes).
+- ✅ Compatibility-gate скрипт работает on happy and unhappy paths.
+- ✅ Security pattern from `release-operator.yml` (env-binding for all dynamic inputs) consistent.
+- ✅ Release procedure documented в `platform-stack/RELEASE.md`.
+- ⏳ Tag `platform-stack/v0.2.0-rc1` triggers workflow → ends green. **Verified only after first real push** (CI-side acceptance). Local validation steps above approximate the pre-push checklist.
+- ⏳ `oras pull ghcr.io/apprafter/platform-stack:0.2.0-rc1` retrieves signed chart. **Verified after first real push.**
+- ⏳ `cosign verify ghcr.io/apprafter/platform-stack@<digest> --certificate-identity-regexp ... --certificate-oidc-issuer ...` succeeds. **Verified after first real push.**
+- ⏳ GitHub Release page has `.tgz` + `.tgz.sig` + `.tgz.pem` attached. **Verified after first real push.**
 
-**Зависит от:** 1.67
+**Out-of-scope (отложено):**
+- Smoke install in `kind` cluster within the workflow — current `helm template` smoke + `helm lint` cover chart shape and template-time errors. Adding kind would extend workflow runtime ~3 minutes for marginal new coverage. Promote when first real-world chart bug slips past template-time validation.
+- SLSA Level 3 build provenance attestation. cosign already provides keyless artifact provenance; SLSA Level 3 demands hermetic builds in `slsa-github-generator` reusable workflow. Defer until M3 compliance pass.
+- Multi-architecture OCI manifest list. The chart is a Helm artifact — architecture-neutral by definition. Sub-charts (Cilium, cert-manager, Argo CD) are pulled by Argo CD at install time and select arch on the user's cluster.
 
-**Размер:** S
+**Зависит от:** 1.67 ✅ (renderer + Makefile — workflow shells out to `make -C platform-stack render-only`).
+
+**Размер:** S (один цикл, ~0.5 рабочий день — основное время на отладку cosign keyless flow + проверку workflow-injection security pattern).
 
 ---
 
@@ -3863,3 +3893,4 @@ Originally items surfaced during Track A walks. Cleared:
 | 2026-05-15 | M1.5 Track A.9c (Phase 2 polish backlog closure): `SshKubeconfigFetcher::build_command` добавляет `-o ConnectTimeout=5` так что первая kubeconfig-poll attempt fail'ится за 5s вместо kernel-default ~30s пока cloud-init поднимает sshd на новом cpx22; Phase 2 label rename `[2/3] kubeconfig` → `[2/3] k3s-ready` (старый label вводил в заблуждение — ~60s это cloud-init+k3s startup, не сам fetch) применён consistently: спиннер, success/failure markers, dry-run plan, total breakdown summary; spinner message теперь "waiting for cloud-init + k3s on the new node…"; docs (quickstart, troubleshooting, cli reference) обновлены synchronously; +1 regression test (`ssh_fetcher_caps_connect_timeout_at_five_seconds`); existing `bootstrap_all_dry_run_prints_three_phase_plan_without_provider_calls` integration test обновлён под `[2/3] k3s-ready`; typical Phase 2 на Hetzner cpx22 + Ubuntu 24.04 ожидаемо падает с ~60s до ~20-40s; v0.1.91 — закрывает весь Track A backlog | initial |
 | 2026-05-15 | M1.5 Track B.1.66 — platform-stack scaffold: new top-level `platform-stack/cue/` (flat layout — CUE treats subdirs как отдельные package instances even when `package` declaration matches, что ломало cross-file `_components` merging; обнаружено на design walk через `cue export -e direct_cilium`). 12 CUE файлов: `platform.cue` (umbrella schema — `#Version`/`#Channel`/`#Tier`/`#ComponentSource`/`#Component`/`#ComponentSet`/`#PlatformValues`/`_components`), 8 component declarations (`component_cilium.cue`, `component_cert-manager.cue`, `component_argocd.cue`, `component_apprafter-operator.cue`, `component_admission-webhook.cue`, `component_backstage.cue`, `component_network-policies.cue`, `component_argocd-cue-cmp.cue` — последний declared but disabled by default до wiring step в 1.69), 2 tier overlays (`tier_solo.cue` tier 1 + `tier_team.cue` tier 2 со своими `enabled`/replicas/Hubble настройками), `compatibility.cue` со схемой `#ChangeClass`+`#VersionRecord` и initial 0.2.0 entry; на design walk вскрылся gotcha: `[NAME=string]: #Component & { name: NAME }` autobinding в `#ComponentSet` re-применяет `#Component` на каждом overlay-unification и стрипит concrete `namespace`/`version` — заменён на plain `[string]: #Component` + explicit `name:` per component; `_components: #ComponentSet` тоже типизировать нельзя (та же проблема), оставлен plain `{}` с локальной type-conformance на declaration site; `Chart.yaml.tmpl` template + `README.md` (full layout + contribution model + distribution + forking + design-walk decision rationale) + `CHANGELOG.md` (0.2.0 planned entry); `scripts/lint-cue.sh` + `scripts/check-spdx-headers.sh` расширены под `platform-stack/cue/...` + `platform-stack/Chart.yaml.tmpl`; `cue vet -c` passes, lint clean, все 565 Rust tests остаются зелёными; v0.1.92 — открывает Track B | initial |
 | 2026-05-15 | M1.5 Track B.1.67 — `cue cmd render` pipeline + umbrella chart generation: `platform-stack/cue/render_tool.cue` declares `command: render: { ... }` с 9 tasks (3 `file.Mkdir` + 6 `file.Create`) и `$dep` chain для DAG ordering; emit Chart.yaml v2 (с annotation'ами apprafter.io/change-class+apprafter.io/operator-version из compatibility.cue), values.yaml (defaults to tier1), values.schema.json (handrolled Helm-native draft-2020-12 — CUE's auto-export targets draft-07 который Helm не понимает), templates/applications.yaml (единственный Go template итерирующий .Values.components → один Argo CD Application per enabled entry, conditional helm.valuesObject only когда source.chart set, labels apprafter.io/{component,tier,channel}), compatibility.yaml, examples/values.{solo,team}.yaml, README.md внутри rendered chart; `platform-stack/Makefile` с targets `render`/`render-only`/`lint`/`clean`/`help`, auto-detect cue+helm с nix fallback, version резолвится из tier1.version через `cue export` без хардкода; `Justfile` получил `platform-stack-render` + `platform-stack-check` wrappers; `dist/` уже gitignored project-wide; README local-dev section updated с реальными командами + schema-gate sanity check; verified — `helm lint` clean (single INFO про chart icon), `helm template` default → 6 tier-1 Apps, with team values → 7 Apps (Backstage on), `--set tier=99` → schema rejects "value must be one of 1, 2, 3, 4"; v0.1.93 | initial |
+| 2026-05-15 | M1.5 Track B.1.68 — CI OCI publish workflow + cosign signing: `.github/workflows/platform-stack-publish.yml` triggers на `platform-stack/v*` tag (+ `workflow_dispatch` с `version:` input); validate'ит `compatibility.cue` через `scripts/check-platform-stack-version.sh` (cue export -e compatibility[<v>], exits 1 с pointer-to-fix если entry missing); рендерит chart (`make -C platform-stack render-only`); `helm lint` + tier-1/tier-2 smoke template assertions (6 / 7 enabled Apps); `helm package` → `.tgz`; `docker login` к ghcr.io через GITHUB_TOKEN; `helm push` к `oci://ghcr.io/<owner>` (Helm 3.8+ native OCI); resolve immutable digest через `helm show chart --version`; cosign keyless sign по digest (Sigstore OIDC + `id-token: write` permission, no managed keys); cosign sign-blob на `.tgz` → `.tgz.sig` + `.tgz.pem` для GitHub Release attachment path; `oras tag :latest` на stable releases с graceful warning если CLI отсутствует; `gh release create` с heredoc-built notes via mktemp+`--notes-file` (install snippets Argo CD + plain Helm + cosign verify для обоих) + `.tgz` / `.sig` / `.pem` attachments + `--prerelease` flag на pre-release; security hardening — все dynamic inputs (github.ref_name, github.repository_owner, github.event.inputs.version, github.repository) routed через env: binding (та же anti-injection pattern что release-operator.yml); `platform-stack/RELEASE.md` — full maintainer procedure (semver rules, pre-release checklist, tagging, after-publish actions, failure-mode recovery); local validation: yamllint clean, scripts/check-platform-stack-version.sh tested на happy (0.2.0 → YAML) + unhappy (99.99.99 → exit 1) paths; final acceptance ⏳ verifies after first real `platform-stack/v0.2.0-rc1` push (CI-side, не локально воспроизводимо); v0.1.94 | initial |

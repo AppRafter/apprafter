@@ -13,6 +13,138 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.94 — M1.5 Track B.1.68 — publish workflow + cosign signing (2026-05-15)
+
+Third Track B slice. 1.66 landed CUE source, 1.67 turned it into
+a rendered chart, this slice publishes that chart on tag with a
+cosign signature attached. Maintainer flow after this lands:
+
+```sh
+# 1. Add compatibility entry for the new version.
+# 2. Tag and push.
+git tag platform-stack/v0.2.0-rc1
+git push origin platform-stack/v0.2.0-rc1
+# 3. Workflow runs end-to-end: render → lint → sign → push.
+# 4. Verify the published artifact.
+cosign verify ghcr.io/<owner>/platform-stack@<digest> \
+    --certificate-identity-regexp 'https://github.com/<owner>/<repo>/' \
+    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+```
+
+### Added
+
+- **`.github/workflows/platform-stack-publish.yml`** — single
+  job, 15 steps:
+  1. Checkout.
+  2. Resolve version from tag (strips `platform-stack/v`
+     prefix) or workflow-dispatch input. Detects pre-release
+     via `-` in version (controls `:latest` retag + GitHub
+     Release `prerelease:` flag).
+  3. Compute lowercase owner (ghcr requires lowercase) — same
+     shim pattern as `release-operator.yml`.
+  4. Install tooling: `cue-lang/setup-cue@v1` + `azure/setup-helm@v4`
+     + `sigstore/cosign-installer@v3`.
+  5. **Compatibility gate** — `bash scripts/check-platform-stack-version.sh "$VERSION"`
+     fails fast with a pointer-to-fix when `compatibility.cue`
+     has no entry for the tagged version. This is the contract
+     `PlatformController` (Phase 2+) relies on; a missing entry
+     would surface as a stuck reconcile in production.
+  6. `make -C platform-stack render-only` (the 1.67 path).
+  7. `helm lint`.
+  8. `helm template` smoke for **both** tiers: assert 6 tier-1
+     Applications present + Backstage on tier-2.
+  9. `helm package` → `.tgz`.
+  10. Log in to ghcr.io via the auto-provided `GITHUB_TOKEN`.
+  11. `helm push` to `oci://ghcr.io/<owner>` (Helm 3.8+ native
+      OCI). Resolve the immutable digest via `helm show chart`
+      — cosign signs digests, not mutable tags (Sigstore best
+      practice).
+  12. `cosign sign --yes "${IMAGE}@${DIGEST}"` — keyless via
+      Sigstore OIDC + GitHub Actions ambient identity
+      (`id-token: write` permission, no managed keys).
+  13. `cosign sign-blob` for the `.tgz` → `.tgz.sig` +
+      `.tgz.pem` detached signature pair, for users who consume
+      the GitHub Release attachment via plain Helm.
+  14. `oras tag :latest` on stable releases (graceful warning
+      if the runner image drops the `oras` CLI).
+  15. `gh release create` with heredoc-built install/verify
+      notes (written to a temp file and consumed via
+      `--notes-file` — never passed as a multi-line bash arg),
+      attaching `.tgz` + `.sig` + `.pem`, `--prerelease` flag
+      on pre-release tags.
+
+- **`scripts/check-platform-stack-version.sh`** — standalone
+  helper, callable both from CI and from a maintainer's local
+  shell as the pre-tag sanity check. Resolves the `cue` binary
+  the same way `lint-cue.sh` does (local install →
+  `nix run nixpkgs#cue --` fallback). Tested on:
+  - `0.2.0` → success, prints the matching YAML record.
+  - `99.99.99` → exit 1 with a human-readable instruction
+    block telling the maintainer exactly what to add to
+    `compatibility.cue`.
+
+- **`platform-stack/RELEASE.md`** — full maintainer procedure:
+  semver rules + the "0.2.0 is the first published version"
+  explanation, pre-release checklist (compatibility entry +
+  accurate change class + operator version + CHANGELOG entry +
+  local render passes), tagging instructions for both
+  pre-release and stable paths, after-publish actions
+  (verification in a clean env, `RELEASED_OPERATOR_VERSION`
+  bump if paired, `UNRELEASED.md` pointer), and failure-mode
+  recovery (tag delete + re-push).
+
+### Security hardening
+
+- Every dynamic value (`github.ref_name`,
+  `github.repository_owner`, `github.event.inputs.version`,
+  `github.repository`) is routed through an `env:` binding
+  rather than direct `${{ }}` interpolation into `run:`
+  bodies. This is the documented anti-workflow-injection
+  pattern, the same one `release-operator.yml` already
+  follows.
+- The cosign signature targets the **digest**, never the
+  mutable tag — a follow-up push that overwrote the tag would
+  not invalidate the signed digest, so consumers can pin to
+  a known-good digest regardless of how the tag drifts.
+- `gh release create` consumes the notes body via a temp
+  file (`mktemp` + `--notes-file`), not as a multi-line shell
+  arg, so heredoc content never reaches command-substitution
+  parsing.
+
+### Tests
+
+CI-side acceptance — the workflow's end-to-end behaviour can
+only be verified by pushing a real `platform-stack/v0.2.0-rc1`
+tag, which is a one-shot maintainer action outside the scope
+of this commit. Locally I validated:
+
+- `bash scripts/check-platform-stack-version.sh 0.2.0` →
+  exit 0, prints the YAML record.
+- `bash scripts/check-platform-stack-version.sh 99.99.99` →
+  exit 1, prints the fix-it-up instruction block.
+- `yamllint -d relaxed .github/workflows/platform-stack-publish.yml`
+  → clean.
+- `bash scripts/lint-cue.sh` → clean.
+- SPDX gate: 167 tracked source files → 170 after staging
+  (`+ .yml + .sh + RELEASE.md`).
+- `cargo test --workspace` → 565 passed (no Rust changes).
+
+### Out of scope
+
+- Smoke install into a real `kind` cluster within the
+  workflow. `helm template` smoke + `helm lint` cover chart
+  shape and template-time errors; kind install would extend
+  workflow runtime ~3 minutes for marginal coverage. Promote
+  when the first real-world bug slips past template-time
+  validation.
+- SLSA Level 3 build provenance attestation. cosign already
+  provides keyless artifact provenance; SLSA Level 3 demands
+  hermetic builds via `slsa-github-generator`. Defer to the
+  M3 compliance pass.
+- Multi-architecture OCI manifest list. The chart is a Helm
+  artifact (architecture-neutral); sub-charts pulled at
+  install time select arch on the user's cluster.
+
 ## v0.1.93 — M1.5 Track B.1.67 — chart renderer pipeline (2026-05-15)
 
 Second Track B slice. The 1.66 scaffold provided the CUE

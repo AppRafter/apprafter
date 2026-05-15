@@ -1,0 +1,298 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+name: platform-stack-publish
+
+# Builds, signs, and publishes the AppRafter platform-stack
+# umbrella Helm chart on every `platform-stack/v*` tag, plus on
+# demand via `workflow_dispatch`. The chart is pushed to two
+# channels in parallel (ADR 0028):
+#
+#   1. OCI registry — `oci://ghcr.io/<owner>/platform-stack:<version>`.
+#      Primary distribution; Argo CD pulls from here on every
+#      `PlatformStack` reconcile.
+#   2. GitHub Release attachment — the rendered `.tgz` plus its
+#      cosign signature, for users who want to consume the chart
+#      via plain Helm without involving AppRafter components.
+#
+# Signing is cosign keyless (Sigstore OIDC + GitHub Actions
+# ambient identity). No long-lived signing keys to manage.
+#
+# Compatibility gate: before publishing, the workflow asserts
+# that `platform-stack/cue/compatibility.cue` contains an entry
+# for the tagged version. Missing entry → workflow fails fast
+# with a clear pointer at the file to edit. This is the contract
+# `PlatformController` (Phase 2+) relies on to gate automated
+# upgrades.
+#
+# Security note (per the workflow-injection guide): every
+# dynamic value (`github.ref_name`, `github.repository_owner`,
+# `github.event.inputs.*`) is consumed via an `env:` binding
+# rather than direct `${{ }}` interpolation into `run:` bodies.
+# `github.repository` is the workflow-file's own OWNER/REPO so
+# it isn't user-controlled, but is still routed through env
+# for consistency.
+
+on:
+  push:
+    tags:
+      - 'platform-stack/v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without `platform-stack/v` prefix), e.g. 0.2.0-rc1'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # create GitHub Release + attach .tgz
+  packages: write   # push to ghcr.io
+  id-token: write   # cosign keyless OIDC
+
+jobs:
+  publish:
+    name: render, sign, and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag or input
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          WORKFLOW_INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          # Tag form: `platform-stack/v0.2.0` → version `0.2.0`.
+          # Workflow-dispatch input is already stripped.
+          if [[ -n "${WORKFLOW_INPUT_VERSION:-}" ]]; then
+            version="${WORKFLOW_INPUT_VERSION}"
+          else
+            version="${REF_NAME#platform-stack/v}"
+          fi
+          # Pre-release (`0.2.0-rc1`) → push only `:<version>`.
+          # Stable (`0.2.0`) → also tag `:latest`.
+          if [[ "$version" == *-* ]]; then
+            is_prerelease=true
+          else
+            is_prerelease=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+          echo "tag=platform-stack/v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Compute lowercase owner
+        id: owner
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "lowercase=$owner_lc" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner_lc}/platform-stack" >> "$GITHUB_OUTPUT"
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: Verify compatibility.cue has an entry for the version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: bash scripts/check-platform-stack-version.sh "$VERSION"
+
+      - name: Render umbrella chart from CUE
+        run: make -C platform-stack render-only
+
+      - name: helm lint
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: helm lint "platform-stack/dist/platform-stack-${VERSION}"
+
+      - name: helm template smoke (tier-1 + tier-2)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          helm template platform "platform-stack/dist/platform-stack-${VERSION}" \
+            > /tmp/rendered-tier1.yaml
+          # Default render must contain the six tier-1 Apps.
+          # Backstage + argocd-cue-cmp are intentionally absent.
+          for app in admission-webhook apprafter-operator argocd cert-manager cilium network-policies; do
+            if ! grep -q "name: \"${app}\"" /tmp/rendered-tier1.yaml; then
+              echo "::error::tier-1 render missing expected Argo CD Application: ${app}"
+              exit 1
+            fi
+          done
+          helm template platform "platform-stack/dist/platform-stack-${VERSION}" \
+            --values "platform-stack/dist/platform-stack-${VERSION}/examples/values.team.yaml" \
+            > /tmp/rendered-tier2.yaml
+          grep -q 'name: "backstage"' /tmp/rendered-tier2.yaml || {
+            echo "::error::tier-2 render did not enable backstage"
+            exit 1
+          }
+
+      - name: helm package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          helm package "platform-stack/dist/platform-stack-${VERSION}" \
+            --destination platform-stack/dist
+          echo "tgz=platform-stack/dist/platform-stack-${VERSION}.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: helm push to OCI
+        id: push
+        env:
+          IMAGE: ${{ steps.owner.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          OWNER_LC: ${{ steps.owner.outputs.lowercase }}
+          TGZ: ${{ steps.package.outputs.tgz }}
+        run: |
+          # `helm push` of an OCI artifact derives the registry
+          # tag from Chart.yaml's `version` — exactly what we
+          # want for the primary push.
+          helm push "$TGZ" "oci://ghcr.io/${OWNER_LC}"
+          # cosign signs immutable digests, not mutable tags
+          # (Sigstore best practice). Resolve the digest now.
+          digest=$(helm show chart "oci://${IMAGE}" --version "$VERSION" \
+            | awk '/^digest:/ {print $2; exit}')
+          if [[ -z "$digest" ]]; then
+            echo "::error::failed to resolve OCI digest for ${IMAGE}:${VERSION}"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: cosign sign (keyless via OIDC)
+        env:
+          IMAGE: ${{ steps.owner.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          # Sign the immutable digest, not the mutable tag —
+          # protects against tag-overwrite attacks.
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: cosign sign-blob for the `.tgz` attachment
+        env:
+          TGZ: ${{ steps.package.outputs.tgz }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          # Detached signature for users who consume the GitHub
+          # Release `.tgz` directly without OCI. Outputs
+          # <tgz>.sig + <tgz>.pem; verify with
+          # `cosign verify-blob --signature <sig> --certificate <pem>`.
+          cosign sign-blob --yes \
+            --output-signature "${TGZ}.sig" \
+            --output-certificate "${TGZ}.pem" \
+            "$TGZ"
+
+      - name: Tag `:latest` on stable releases
+        if: steps.version.outputs.is_prerelease == 'false'
+        env:
+          IMAGE: ${{ steps.owner.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Helm OCI push doesn't natively re-tag. The
+          # `oras` CLI ships on `ubuntu-latest` since the
+          # November 2024 runner image; the guard below
+          # surfaces a clear warning if a future runner image
+          # rolls it back.
+          if command -v oras >/dev/null 2>&1; then
+            oras tag "${IMAGE}:${VERSION}" latest
+          else
+            echo "::warning::oras not available on this runner; :latest tag not updated. Add `uses: oras-project/setup-oras@v1` in a follow-up."
+          fi
+
+      - name: Create / update GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TGZ: ${{ steps.package.outputs.tgz }}
+          IMAGE: ${{ steps.owner.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IS_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
+        run: |
+          # Heredoc is double-quoted by default so $VARS expand,
+          # but `${{ … }}` would have been substituted by the
+          # runner BEFORE the shell sees the script. All inputs
+          # come from `env:` above, so no untrusted value reaches
+          # the heredoc literal.
+          notes_file=$(mktemp)
+          cat > "$notes_file" <<EOF
+          ## platform-stack ${VERSION}
+
+          AppRafter platform-stack umbrella Helm chart. CUE source
+          in [platform-stack/cue/](https://github.com/${REPO}/tree/${TAG}/platform-stack/cue).
+
+          ### Install via Argo CD (recommended)
+
+          \`\`\`yaml
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: platform
+            namespace: argocd
+          spec:
+            source:
+              repoURL: oci://${IMAGE}
+              chart: platform-stack
+              targetRevision: ${VERSION}
+            destination: { server: https://kubernetes.default.svc, namespace: argocd }
+          \`\`\`
+
+          ### Install via plain Helm
+
+          \`\`\`sh
+          helm install platform oci://${IMAGE} --version ${VERSION}
+          \`\`\`
+
+          ### Verify the signature
+
+          \`\`\`sh
+          # OCI artifact (Argo CD path):
+          cosign verify ${IMAGE}@${DIGEST} \\
+              --certificate-identity-regexp "https://github.com/${REPO}/" \\
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+          # .tgz attachment (plain Helm path):
+          cosign verify-blob \\
+              --certificate platform-stack-${VERSION}.tgz.pem \\
+              --signature platform-stack-${VERSION}.tgz.sig \\
+              --certificate-identity-regexp "https://github.com/${REPO}/" \\
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\
+              platform-stack-${VERSION}.tgz
+          \`\`\`
+
+          Compatibility class + operator pairing in
+          [\`platform-stack/cue/compatibility.cue\`](https://github.com/${REPO}/blob/${TAG}/platform-stack/cue/compatibility.cue).
+          EOF
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            gh release create "$TAG" \
+              "$TGZ" "$TGZ.sig" "$TGZ.pem" \
+              --title "platform-stack ${VERSION}" \
+              --notes-file "$notes_file" \
+              --prerelease
+          else
+            gh release create "$TAG" \
+              "$TGZ" "$TGZ.sig" "$TGZ.pem" \
+              --title "platform-stack ${VERSION}" \
+              --notes-file "$notes_file"
+          fi
