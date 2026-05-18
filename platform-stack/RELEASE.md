@@ -23,10 +23,12 @@ monorepo's `v0.1.x` patch stream:
 - **PATCH** — bug fixes / dependency version bumps within
   the same chart shape.
 
-The first published version is **0.2.0**, aligned with the
-upcoming `v0.2.0-services` AppRafter milestone. Earlier
-`0.1.x` versions don't exist — they would have implied the
-chart existed in v0.1.x, which it didn't.
+The first published version is **0.1.0**. Chart MINOR tracks
+the AppRafter monorepo **phase** (Phase 1.5 → chart 0.1.x;
+chart MINOR will bump to 0.2.0 alongside the `v0.2.0-services`
+milestone when Phase 2 services land). Chart patch versions are
+independent of the monorepo's `v0.1.x` patch stream — the two
+share only MINOR/MAJOR semantics.
 
 ## Pre-release checklist
 
@@ -70,13 +72,13 @@ the operator + webhook publish workflow, not this one.
 ```sh
 # Pre-release (-rc1, -rc2, ...) — pushes :<version> only,
 # no :latest alias, GitHub Release marked `prerelease: true`.
-git tag platform-stack/v0.2.0-rc1
-git push origin platform-stack/v0.2.0-rc1
+git tag platform-stack/v0.1.0-rc1
+git push origin platform-stack/v0.1.0-rc1
 
 # Stable release — pushes :<version> AND retags :latest,
 # GitHub Release marked stable.
-git tag platform-stack/v0.2.0
-git push origin platform-stack/v0.2.0
+git tag platform-stack/v0.1.0
+git push origin platform-stack/v0.1.0
 ```
 
 The push triggers `.github/workflows/platform-stack-publish.yml`.

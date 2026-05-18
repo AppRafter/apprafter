@@ -4,7 +4,7 @@ package platformstack
 
 // Cilium CNI + kube-proxy replacement. Pinned to the version
 // the v0.1.x `cluster-bootstrap` installs today (1.16.5) so
-// platform-stack 0.2.0 is bit-for-bit compatible with the
+// platform-stack 0.1.0 is bit-for-bit compatible with the
 // existing single-node tier-1 install.
 //
 // Values are the same baseline as

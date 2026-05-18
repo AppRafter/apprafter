@@ -10,7 +10,7 @@ package platformstack
 // `RELEASED_OPERATOR_VERSION` constant that drives the default
 // tag).
 //
-// platform-stack 0.2.0 pins the operator at v0.1.91 (the
+// platform-stack 0.1.0 pins the operator at v0.1.91 (the
 // closing tag of Track A). Future platform-stack versions bump
 // this together with their own `version` field — the
 // compatibility metadata in `cue/compatibility.cue` records the

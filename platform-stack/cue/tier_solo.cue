@@ -31,7 +31,7 @@ package platformstack
 // declaration rather than shadowing it.
 
 tier1: #PlatformValues & {
-	version: "0.2.0"
+	version: "0.1.0"
 	tier:    1
 	channel: "stable"
 	components: _components & {

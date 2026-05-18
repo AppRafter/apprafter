@@ -13,8 +13,12 @@
 package platformstack
 
 // #Version is the public version of the platform-stack umbrella
-// chart. The first published version is 0.2.0 (aligned with the
-// `v0.2.0-services` milestone that follows M1.5 closure).
+// chart. The first published version is 0.1.0 — minor tracks
+// the AppRafter monorepo phase (Phase 1.5 → chart 0.1.x;
+// chart MINOR bumps to 0.2.0 alongside the `v0.2.0-services`
+// milestone when Phase 2 services land). Chart patch versions
+// are independent of the monorepo patch stream (`v0.1.x`); the
+// two share only MINOR/MAJOR semantics.
 //
 // Semver semantics:
 //

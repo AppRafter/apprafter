@@ -19,13 +19,18 @@
 
 ## Unreleased
 
-_Scaffold under construction — published versions start at 0.2.0
-once the renderer (plan.md 1.67) and publish workflow (1.68)
-land._
+_Scaffold under construction — first publish is 0.1.0 once the
+publish workflow (plan.md 1.68) runs end-to-end on a real tag._
 
-## 0.2.0 (planned — aligned with `v0.2.0-services` milestone)
+## 0.1.0 (planned — first published chart release)
 
-First published platform-stack version. Bundles the v0.1.x
+First published platform-stack version. Minor tracks the
+AppRafter monorepo **phase** (Phase 1.5 → chart 0.1.x; chart
+MINOR will bump to 0.2.0 alongside the `v0.2.0-services`
+milestone when Phase 2 services land). Chart patch versions
+are independent of the monorepo's `v0.1.x` patch stream.
+
+Bundles the v0.1.x
 cluster-bootstrap component set unchanged, sourced via Argo CD
 instead of direct `helm upgrade --install`:
 

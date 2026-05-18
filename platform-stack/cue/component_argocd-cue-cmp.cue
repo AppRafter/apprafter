@@ -6,7 +6,7 @@ package platformstack
 // Argo CD to render CUE source repositories. See ADR 0029 for
 // the design rationale.
 //
-// platform-stack 0.2.0 ships the CMP scaffold but doesn't yet
+// platform-stack 0.1.0 ships the CMP scaffold but doesn't yet
 // wire it as an Application of its own — the CMP container
 // runs as a sidecar of `argocd-repo-server`, configured via
 // values merged into the Argo CD release. This component

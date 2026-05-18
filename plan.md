@@ -1907,6 +1907,50 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
+### 1.74a Yanking support для опубликованных platform-stack версий
+
+**Source:** ADR 0028 (extension, motivated by "published-with-bug" scenario).
+
+**Цель:** возможность retroactively пометить конкретную опубликованную версию platform-stack как yanked. Controller перестаёт предлагать её новым пользователям через `availableVersion`, существующие кластеры на этой версии получают warning, но не форсятся автоапгрейдом. Аналог `cargo yank` / `npm deprecate` / PyPI yank для OCI-distributed chart.
+
+**Зачем:** OCI tag immutable per (repo, version) → если опубликовал версию с регрессией, единственный путь — publish next patch, но нет механизма мягко увести с битой версии тех кто на ней. Yanking даёт «soft recall» без принудительного апгрейда (всё ещё уважает MigrationPlan семантику).
+
+**Поставка:**
+
+- [ ] Extend `compatibility.cue` schema в `apprafter/platform-stack/`:
+    ```cue
+    versions: [_]: {
+        classification: "safe" | "breaking"
+        // новые поля:
+        yanked: bool | *false
+        yankedReason?: string  // required when yanked=true
+    }
+    ```
+- [ ] CI guard в `platform-stack-publish.yml` (расширение 1.68 валидации compatibility.cue): PR ставящий `yanked: true` без непустого `yankedReason` → fail с понятным сообщением. Это `compatibility.cue`-only PR (без bump version) — публикация не триггерится, только метаданные обновляются.
+- [ ] PlatformController (расширение 1.74) изменения:
+    - `availableVersion` resolution через channel skip'ает entries с `yanked: true`. Кластер с `spec.channel: stable` видит только non-yanked stable версии.
+    - Если `status.currentVersion` matches yanked entry → push condition `YankedVersion=True` с `Message: <yankedReason>`, surfaces в `kubectl describe platformstack`. Условие — informational/warning, не Ready=False (платформа функциональна, просто на не рекомендованной версии).
+    - Upgrade flow **не модифицируется** — yanked это метаданные про версию, не override на user policy. Если `spec.autoUpgrade: true` и доступна safe non-yanked версия → обычный safe-upgrade path сработает (выведет с yanked версии естественным образом). Если `autoUpgrade: false` — остаётся manual, warning подсвечивает «настоятельно рекомендуется применить доступный апгрейд», но controller никаких действий не предпринимает.
+    - Если `spec.pin` точно указывает на yanked версию → condition `YankedVersion=True`, pin остаётся в силе. Пользователь явно прибил себя к этой версии — наше дело только предупредить.
+- [ ] Surface yank warning в UI'ях с framing «update strongly recommended»:
+    - `apprafter platform status` CLI — warning баннер с reason + указание availableVersion (если есть non-yanked доступная).
+    - Backstage platform plugin (если уже landed к этому моменту) — UI banner на странице PlatformStack с такой же информацией.
+
+**Acceptance:**
+
+- Publish `platform-stack/v0.2.5` нормальный → fresh кластер с `channel: stable` резолвит `availableVersion=0.2.5`.
+- Update `compatibility.cue` (PR без bump): для `0.2.5` поставить `yanked: true, yankedReason: "regression в X"`, publish `0.2.6` → fresh кластер резолвит `availableVersion=0.2.6` (skip 0.2.5).
+- Кластер уже на `0.2.5`, `spec.autoUpgrade: false`: `status.conditions` содержит `YankedVersion=True` с reason, `apprafter platform status` показывает warning «update strongly recommended → 0.2.6», `spec.version` без изменений (manual policy уважена).
+- Кластер уже на `0.2.5`, `spec.autoUpgrade: true`, `0.2.6` classification=safe: normal safe-upgrade path срабатывает → controller бампает на `0.2.6` (yank ничего не меняет в policy, просто получилось что естественный апгрейд уводит с битой версии).
+- `spec.pin: "0.2.5"` (explicit) на yanked версии → warning есть, но pin не меняется (явный user choice уважён).
+- CI guard fail на PR ставящем `yanked: true` без `yankedReason`.
+
+**Зависит от:** 1.74 (PlatformController + status fields)
+
+**Размер:** S
+
+---
+
 ### 1.75 Unified MigrationPlan CRD + admission webhook
 
 **Source:** ADR 0027.
@@ -3895,3 +3939,4 @@ Originally items surfaced during Track A walks. Cleared:
 | 2026-05-15 | M1.5 Track B.1.67 — `cue cmd render` pipeline + umbrella chart generation: `platform-stack/cue/render_tool.cue` declares `command: render: { ... }` с 9 tasks (3 `file.Mkdir` + 6 `file.Create`) и `$dep` chain для DAG ordering; emit Chart.yaml v2 (с annotation'ами apprafter.io/change-class+apprafter.io/operator-version из compatibility.cue), values.yaml (defaults to tier1), values.schema.json (handrolled Helm-native draft-2020-12 — CUE's auto-export targets draft-07 который Helm не понимает), templates/applications.yaml (единственный Go template итерирующий .Values.components → один Argo CD Application per enabled entry, conditional helm.valuesObject only когда source.chart set, labels apprafter.io/{component,tier,channel}), compatibility.yaml, examples/values.{solo,team}.yaml, README.md внутри rendered chart; `platform-stack/Makefile` с targets `render`/`render-only`/`lint`/`clean`/`help`, auto-detect cue+helm с nix fallback, version резолвится из tier1.version через `cue export` без хардкода; `Justfile` получил `platform-stack-render` + `platform-stack-check` wrappers; `dist/` уже gitignored project-wide; README local-dev section updated с реальными командами + schema-gate sanity check; verified — `helm lint` clean (single INFO про chart icon), `helm template` default → 6 tier-1 Apps, with team values → 7 Apps (Backstage on), `--set tier=99` → schema rejects "value must be one of 1, 2, 3, 4"; v0.1.93 | initial |
 | 2026-05-15 | M1.5 Track B.1.68 — CI OCI publish workflow + cosign signing: `.github/workflows/platform-stack-publish.yml` triggers на `platform-stack/v*` tag (+ `workflow_dispatch` с `version:` input); validate'ит `compatibility.cue` через `scripts/check-platform-stack-version.sh` (cue export -e compatibility[<v>], exits 1 с pointer-to-fix если entry missing); рендерит chart (`make -C platform-stack render-only`); `helm lint` + tier-1/tier-2 smoke template assertions (6 / 7 enabled Apps); `helm package` → `.tgz`; `docker login` к ghcr.io через GITHUB_TOKEN; `helm push` к `oci://ghcr.io/<owner>` (Helm 3.8+ native OCI); resolve immutable digest через `helm show chart --version`; cosign keyless sign по digest (Sigstore OIDC + `id-token: write` permission, no managed keys); cosign sign-blob на `.tgz` → `.tgz.sig` + `.tgz.pem` для GitHub Release attachment path; `oras tag :latest` на stable releases с graceful warning если CLI отсутствует; `gh release create` с heredoc-built notes via mktemp+`--notes-file` (install snippets Argo CD + plain Helm + cosign verify для обоих) + `.tgz` / `.sig` / `.pem` attachments + `--prerelease` flag на pre-release; security hardening — все dynamic inputs (github.ref_name, github.repository_owner, github.event.inputs.version, github.repository) routed через env: binding (та же anti-injection pattern что release-operator.yml); `platform-stack/RELEASE.md` — full maintainer procedure (semver rules, pre-release checklist, tagging, after-publish actions, failure-mode recovery); local validation: yamllint clean, scripts/check-platform-stack-version.sh tested на happy (0.2.0 → YAML) + unhappy (99.99.99 → exit 1) paths; final acceptance ⏳ verifies after first real `platform-stack/v0.2.0-rc1` push (CI-side, не локально воспроизводимо); v0.1.94 | initial |
 | 2026-05-15 | M1.5 Track B.1.68 walk-fix — GitHub Actions reject'ил workflow на push с ошибкой "Line: 232, Col: 14: Unexpected symbol: '…'" потому что один из комментариев внутри `run: |` блока содержал `${{ … }}` (буквальный ellipsis Unicode внутри expression-syntax скобок) — GHA парсит `${{ }}` в run-body scalar'ах до того как shell видит script. v0.1.95 переписал тот комментарий без `${{ }}` syntax, проверил grep'ом что больше нигде в run-bod'ах нет expression-style braces (header comments вне scalar'ов yamllint discard'ит — там line 29 безвреден); yamllint clean, остальные gates green; workflow теперь syntactically valid для GitHub Actions parser'а; v0.1.95 | initial |
+| 2026-05-15 | M1.5 chart-versioning policy decision — first published platform-stack version = **0.1.0** вместо ранее запланированного 0.2.0. Rationale: chart MINOR трекает phase number AppRafter monorepo (Phase 1.5 → chart 0.1.x), не milestone target. Когда Phase 2 services landings → chart MINOR bump'нется на 0.2.0 alongside `v0.2.0-services`. Patch versions chart и monorepo независимы (share only MINOR/MAJOR semantics). v0.1.96 flip'нул: `tier_solo.cue` + `tier_team.cue` `version: "0.1.0"`, `compatibility.cue` entry rename, `platform.cue` doc-comment, 4 component doc-comments (cilium/cert-manager/argocd-cue-cmp/operator/webhook упоминающих "platform-stack X.Y.Z"), `CHANGELOG.md` section + version notes, `RELEASE.md` versioning rules + tagging examples; re-render produces `dist/platform-stack-0.1.0/`, helm lint clean, `check-platform-stack-version.sh 0.1.0` → success, `0.2.0` → exit 1; v0.1.96 | initial |

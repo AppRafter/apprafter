@@ -8,7 +8,7 @@ package platformstack
 // binary from the operator; same image registry, same release
 // cadence.
 //
-// platform-stack 0.2.0 pins the webhook at v0.1.91 alongside
+// platform-stack 0.1.0 pins the webhook at v0.1.91 alongside
 // the operator. Cert-manager handles the TLS Certificate
 // (`apprafter-system/admission-webhook-tls`) and rotates it
 // automatically; the chart values surface only the image refs.

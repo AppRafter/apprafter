@@ -54,10 +54,14 @@ compatibility: [VERSION=string]: #VersionRecord & {
 	version: VERSION
 }
 
-// Initial entry — platform-stack 0.2.0 is the first published
-// version (aligned with the upcoming `v0.2.0-services`
-// milestone tag).
-compatibility: "0.2.0": {
+// Initial entry — platform-stack 0.1.0 is the first published
+// version. Minor tracks the AppRafter monorepo phase (we're
+// in Phase 1.5; chart MINOR bumps to 0.2.0 alongside the
+// `v0.2.0-services` milestone when Phase 2 services land).
+// Chart patch versions are independent of the monorepo
+// patch stream (`v0.1.x`); the two share only MINOR/MAJOR
+// semantics.
+compatibility: "0.1.0": {
 	change:          "safe"
 	operatorVersion: "v0.1.91"
 	notes: """

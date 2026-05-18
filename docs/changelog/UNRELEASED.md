@@ -13,6 +13,77 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.96 — chart-versioning policy: first published is 0.1.0 (2026-05-15)
+
+Policy fix discovered before pushing the first chart release.
+Previous plan was to ship `platform-stack/v0.2.0` aligned with
+the upcoming `v0.2.0-services` AppRafter milestone. Walk
+revealed a cleaner mental model: **chart MINOR tracks the
+monorepo's PHASE number**, not the milestone target. We're in
+Phase 1.5 → chart 0.1.x. Phase 2 services land → chart MINOR
+bumps to 0.2.0 alongside `v0.2.0-services`. Chart patch
+versions and monorepo patch versions remain independent;
+the two share only MINOR/MAJOR semantics.
+
+### Changed
+
+- **`platform-stack/cue/tier_solo.cue`** + **`tier_team.cue`** —
+  `version: "0.2.0"` → `"0.1.0"`.
+- **`platform-stack/cue/compatibility.cue`** — entry key
+  renamed `"0.2.0"` → `"0.1.0"`; the surrounding doc-comment
+  now explains the phase-tracking rule instead of the
+  milestone-alignment one.
+- **`platform-stack/cue/platform.cue`** — `#Version` doc-block
+  updated.
+- **4 component doc-comments** (cilium / cert-manager /
+  argocd-cue-cmp / apprafter-operator / admission-webhook)
+  flipped their `// platform-stack 0.2.0 …` references to
+  `// platform-stack 0.1.0 …`.
+- **`platform-stack/CHANGELOG.md`** — `0.2.0 (planned)` →
+  `0.1.0 (planned — first published chart release)` with the
+  phase-tracking rationale.
+- **`platform-stack/RELEASE.md`** — versioning rules section
+  rewritten; tagging examples now show `platform-stack/v0.1.0`
+  / `v0.1.0-rc1` instead of `v0.2.0` / `v0.2.0-rc1`.
+
+### Verified
+
+- `make -C platform-stack render-only` produces
+  `dist/platform-stack-0.1.0/` (no `-0.2.0/` artifact left
+  behind — the renderer keys off `tier1.version`).
+- `helm lint` clean.
+- `bash scripts/check-platform-stack-version.sh 0.1.0` →
+  success, prints the YAML record.
+- `bash scripts/check-platform-stack-version.sh 0.2.0` →
+  exit 1 (no longer a recognised version — exactly the
+  fail-fast behaviour the workflow's compatibility gate
+  needs).
+- `bash scripts/lint-cue.sh` clean.
+- SPDX gate stays at 169 (no new files).
+- `cargo test --workspace` stays at 565 passed (no Rust
+  changes).
+
+### What this unblocks
+
+- Push `platform-stack/v0.1.0-rc1` as the first real-tag
+  smoke test of the publish workflow (after the next
+  `git push origin master`). The workflow's compatibility
+  gate now accepts the version, the chart renders to a
+  sensibly-named path, and the first OCI artifact lands at
+  `ghcr.io/<owner>/platform-stack:0.1.0-rc1` instead of the
+  semantically-confused `0.2.0-rc1` ("we shipped 0.2.0 before
+  the M2 services milestone? what?").
+
+### Note on ADR 0028
+
+ADR 0028 is marked **Draft** and contains examples using
+`0.2.0`. The ADR captures the design decisions
+(OCI distribution, CUE source, dual-channel publishing) —
+specific version numbers in its examples are illustrative,
+not normative. No ADR rewrite needed; the version policy
+lives in `RELEASE.md` and `compatibility.cue` (the
+authoritative places).
+
 ## v0.1.95 — hotfix: workflow syntax error after v0.1.94 push (2026-05-15)
 
 GitHub Actions rejected `platform-stack-publish.yml` on push
