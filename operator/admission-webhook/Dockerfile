@@ -24,9 +24,16 @@
 # user (uid 65532). The musl-built binary is fully static so it
 # needs no libc / dynamic-linker support in the runtime layer.
 
-FROM rust:alpine AS chef
-RUN apk add --no-cache musl-dev \
- && cargo install cargo-chef --locked
+# Base image pinned + cargo-chef installed as pre-built binary
+# — see `operator/apprafter-operator/Dockerfile` for full
+# rationale.
+FROM rust:1.88-alpine3.21 AS chef
+ARG CARGO_CHEF_VERSION=0.1.71
+RUN apk add --no-cache musl-dev curl tar \
+ && curl --proto '=https' --tlsv1.2 -fsSL \
+      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xz -C /usr/local/bin/ cargo-chef \
+ && chmod +x /usr/local/bin/cargo-chef
 WORKDIR /workspace
 
 FROM chef AS planner
