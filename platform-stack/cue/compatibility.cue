@@ -99,3 +99,32 @@ compatibility: "0.1.0": {
 		"docs/changelog/UNRELEASED.md#v0192",
 	]
 }
+
+// 0.1.1 — license-only re-release per ADR 0032. SPDX header
+// migrated FSL-1.1-MIT → FSL-1.1-Apache-2.0 across the chart
+// source. Identical component versions, identical rendered
+// Argo CD Applications, identical Helm values — the only
+// byte-level difference vs the 0.1.0 OCI artifact is the
+// SPDX comment line in every CUE source file, which doesn't
+// reach the rendered chart in any operator-visible form.
+compatibility: "0.1.1": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		License-only re-release. SPDX header migration from
+		FSL-1.1-MIT to FSL-1.1-Apache-2.0 across
+		`platform-stack/cue/*.cue` and `Chart.yaml.tmpl` per
+		ADR 0032. No behavioural delta — same Cilium 1.16.5,
+		cert-manager v1.16.2, Argo CD 7.7.7, apprafter-operator
+		+ admission-webhook v0.1.91; same Argo CD Application
+		set per tier; same default values.
+
+		Operators on 0.1.0 may upgrade by changing
+		`spec.source.targetRevision: "0.1.1"` on their
+		platform Application. No manifest changes required
+		downstream.
+		"""
+	references: [
+		"docs/adr/0032-license-fsl-1-1-apache-2-0.md",
+	]
+}
