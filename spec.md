@@ -1194,7 +1194,7 @@ See ADR 0024 for the full rationale and per-layer detail.
 - [x] Initial CUE schemas drafted
 - [x] Codename chosen
 - [x] Repository structure defined
-- [x] License chosen (FSL-1.1-MIT for core, MIT for plugins; see ADR 0001)
+- [x] License chosen (FSL-1.1-Apache-2.0 for core, MIT for plugins; see ADR 0001 + ADR 0032)
 
 ### Milestone M1 — MVP single-node ✅
 
@@ -1355,11 +1355,12 @@ The following features are declared in the Application manifest schema and accep
 
 ### License decision
 
-- **Core platform:** **FSL-1.1-MIT** (Functional Source License → MIT after 2 years), modeled on Sentry's approach.
+- **Core platform:** **FSL-1.1-Apache-2.0** (Functional Source License → Apache 2.0 after 2 years), modeled on Sentry's approach (Sentry also uses FSL-1.1-Apache-2.0).
   - Each release carries a 2-year window of commercial-use protection (cloud-vendor SaaS rebranding restricted)
-  - 2 years after a given release date, that release auto-converts to MIT (fully OSI-approved)
+  - 2 years after a given release date, that release auto-converts to Apache 2.0 (fully OSI-approved)
   - Active development always lives in the FSL window; older releases are continuously freed
-  - Bonus property: even if the project is abandoned, the most recent release is always at most 2 years from becoming MIT — a built-in safety net for the community
+  - Bonus property: even if the project is abandoned, the most recent release is always at most 2 years from becoming Apache 2.0 — a built-in safety net for the community
+  - Pre-ADR-0032 releases (v0.0.1–v0.1.96) were published under FSL-1.1-MIT and continue converting to MIT per their own anniversaries; see ADR 0032 and NOTICE
 - **ServiceProviderPlugin SDKs and community plugins:** **MIT** from day one — minimal friction for community contribution
 - **Business model:** managed offering (à la Akuity → Argo CD), not BSL/non-compete clauses
 
@@ -1538,18 +1539,19 @@ The following features are declared in the Application manifest schema and accep
 - MigrationPlan turns the implicit "this might blow up" into an explicit "this **will** require approval, here's the risk breakdown" — same model that Terraform `plan/apply` proved successful
 - Approval is human-in-the-loop **by design**, not by accident
 
-### Why FSL-1.1-MIT for the core (Sentry's model)
+### Why FSL-1.1-Apache-2.0 for the core (Sentry's model)
 
 - BSL has non-compete clauses that scare some enterprise users and are not OSI-approved
-- Pure Apache-2.0 lets cloud vendors paraderaiderbrand the platform as their managed offering with zero contribution back (the Cozystack-style risk we've been trying to avoid)
+- Pure Apache 2.0 (without the FSL wrap) lets cloud vendors rebrand the platform as their managed offering with zero contribution back (the Cozystack-style risk we've been trying to avoid)
 - AGPL on portal + MPL on core split is workable but creates licensing complexity and split governance
-- FSL-1.1-MIT (Functional Source License) provides a clean middle ground:
+- FSL-1.1-Apache-2.0 (Functional Source License) provides a clean middle ground:
   - 2-year commercial use restriction (cloud vendors cannot offer it as their primary managed product)
-  - Auto-converts to MIT after 2 years (every release becomes fully OSI open)
+  - Auto-converts to Apache 2.0 after 2 years (every release becomes fully OSI open)
   - Used in production by Sentry (since 2023), proven model
   - Single license to communicate, easier than tier-split licensing
+- Apache 2.0 was chosen over MIT as the conversion target (ADR 0032): explicit patent grant + retaliation clause matter for a project that orchestrates Cilium/eBPF, SPIFFE, OpenBao, Kamaji and confidential-computing primitives (Kata-CC on Intel TDX, AMD SEV-SNP, ARM CCA); also aligns with the Kubernetes / CNCF ecosystem convention and provides an explicit trademark disclaimer
 - The 2-year window is enough for us to establish a managed offering as the canonical commercial deployment, after which the protection naturally relaxes
-- **Built-in safety net:** even if the project is abandoned, the most recent release is at most 2 years away from being MIT — community can always continue without us
+- **Built-in safety net:** even if the project is abandoned, the most recent release is at most 2 years away from being Apache 2.0 — community can always continue without us
 - Plugins under MIT from day one keeps the contribution bar minimal
 
 ### Why HTTP API for notifications (not direct NATS exposure)
