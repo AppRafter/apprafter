@@ -140,6 +140,14 @@ compatibility: "0.1.1": {
 // --out yaml` at sync time. User apps that stick with raw
 // YAML continue to work unchanged; the CMP `discover.find.glob`
 // rule skips repositories without `apprafter*.cue`.
+//
+// **Known issue (fixed in 0.1.3):** this version inherits
+// the upstream `argo-cd` 7.7.7 default `redis-ha.enabled:
+// true`, which on single-node clusters causes the Argo CD
+// install to time out at the pre-install hook (3 redis pods
+// can't schedule across 3 nodes when there's only one). 0.1.3
+// disables redis-ha in tier-1 defaults; bump to 0.1.3 if
+// installing on tier-1.
 compatibility: "0.1.2": {
 	change:          "safe"
 	operatorVersion: "v0.1.91"
@@ -164,5 +172,47 @@ compatibility: "0.1.2": {
 	references: [
 		"docs/adr/0029-cue-cmp.md",
 		"argocd-cue-cmp/README.md",
+	]
+}
+
+// 0.1.3 — tier-1 single-node hotfix on top of 0.1.2. Disables
+// `redis-ha.enabled` (defaults `true` upstream, schedules 3
+// anti-affinity-bound pods that can't coexist on one node),
+// flips `notifications.enabled: false` (saves the deployment
+// on tier-1 cpx22 RAM budget), and pins
+// `server.service.type: ClusterIP` until the chart's own
+// Gateway/HTTPRoute exposure lands. No new components, no
+// version pins changed — pure tier-1 default refinement
+// matching the v0.1.x in-tree baseline.
+compatibility: "0.1.3": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		Tier-1 single-node hotfix. The chart at 0.1.2 inherited
+		the upstream `argo-cd` 7.7.7 default
+		`redis-ha.enabled: true`, which schedules 3 redis-ha
+		pods with `requiredDuringSchedulingIgnoredDuringExecution`
+		`podAntiAffinity`. On single-node k3s those pods never
+		become Ready, the chart's pre-install hook waits on
+		them, and `helm install` times out with
+		`failed pre-install: timed out waiting for the
+		condition`.
+
+		0.1.3 sets `redis-ha.enabled: false` in the tier-1
+		default values for `argocd` (matches the v0.1.x
+		in-tree imperative baseline). Also flips
+		`notifications.enabled: false` and pins
+		`server.service.type: ClusterIP` for consistency with
+		the CLI's loader values.
+
+		Operators on 0.1.0–0.1.2 who hit the timeout: upgrade
+		to 0.1.3 (or to the matching CLI v0.1.98+ which pins
+		this chart version). The same `redis-ha: false`
+		override could also be added to the operator's
+		platform Application `helm.valuesObject` as a one-off
+		workaround.
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v0198",
 	]
 }

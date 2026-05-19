@@ -24,10 +24,22 @@ _components: argocd: #Component & {
 		// Single replicas on tier-1 (cpx22 RAM budget). Tier
 		// 2+ overlays scale these up; Dex stays off until
 		// OIDC SSO lands in Phase 3.
-		controller: replicas:         int | *1
-		server: replicas:             int | *1
+		//
+		// `redis-ha.enabled: false` is critical on single-node
+		// k3s — the upstream chart's redis-ha StatefulSet sets
+		// `requiredDuringSchedulingIgnoredDuringExecution`
+		// podAntiAffinity across 3 redis pods, which never
+		// schedule on one node. The loader install
+		// (`commands/cluster_bootstrap.rs::argocd_loader_values_yaml`)
+		// disables it too; this overlay keeps them aligned so
+		// the chart's self-reconcile doesn't re-enable it on
+		// adoption.
+		controller: replicas: int | *1
+		"redis-ha": enabled:  bool | *false
+		server: replicas:     int | *1
+		server: service: type: string | *"ClusterIP"
 		applicationSet: replicaCount: int | *1
-		notifications: replicas:      int | *1
+		notifications: enabled:       bool | *false
 		dex: enabled:                 bool | *false
 
 		// argocd-repo-server runs the cue-cmp sidecar that

@@ -13,6 +13,95 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.98 — walk-fix: redis-ha pre-install timeout on single-node (2026-05-19)
+
+Real-Hetzner walk of v0.1.97 surfaced a regression. The new
+GitOps loader's `helm install argocd argo/argo-cd 7.7.7`
+failed on single-node k3s with:
+
+```
+Error: failed pre-install: 1 error occurred:
+        * timed out waiting for the condition
+```
+
+Root cause: the upstream `argo-cd` 7.7.7 chart defaults
+`redis-ha.enabled: true`, which schedules **3 redis-ha pods**
+plus an haproxy with `requiredDuringSchedulingIgnoredDuringExecution`
+`podAntiAffinity`. On a single-node cluster those pods can
+never become Ready. The chart's pre-install hook waits on them
+and times out.
+
+v0.1.x's in-tree imperative install explicitly disabled
+redis-ha (`cli-providers::k8s::argocd_values_yaml`). The
+v0.1.97 GitOps rewrite shrunk the loader values and
+accidentally dropped that flag.
+
+### Changed
+
+- **`commands/cluster_bootstrap.rs::argocd_loader_values_yaml`**
+  restores three values from the v0.1.x baseline:
+  - `redis-ha.enabled: false` — primary fix for the timeout.
+  - `notifications.enabled: false` — saves one more
+    deployment on tier-1 cpx22 RAM (was `replicas: 1`).
+  - `server.service.type: ClusterIP` — keeps the loader from
+    exposing anything before the chart's
+    `component_argocd.cue` wires Gateway/HTTPRoute.
+
+- **`platform-stack/cue/component_argocd.cue`** mirrors the
+  same tier-1 defaults so the chart's self-reconcile doesn't
+  re-enable redis-ha when it adopts the loader's release.
+  Without this mirror the loader installs fine, but the first
+  Argo CD reconcile of its own Application would flip redis-ha
+  back on and break.
+
+- **Chart `currentVersion: 0.1.2 → 0.1.3`** plus the matching
+  `compatibility.cue` entry. Change class `safe` — pure tier-1
+  default refinement, no new components.
+
+- **CLI `RELEASED_PLATFORM_STACK_VERSION`: `"0.1.2" → "0.1.3"`**
+  so `apprafter bootstrap-all` pulls the fixed chart.
+
+### Tests (2 new)
+
+- `argocd_loader_values_disables_redis_ha_for_single_node_k3s`
+  pins the `redis-ha.enabled: false` flag in the loader
+  values so future refactors can't silently drop it again.
+- `argocd_loader_values_keep_server_at_cluster_ip_until_chart_exposes_it`
+  pins the `server.service.type: ClusterIP` value for the
+  loader. Total: 551 passed.
+
+- The pre-existing `argocd_loader_values_keeps_replicas_at_one_for_initial_install`
+  test was tightened to assert `notifications.enabled: false`
+  instead of `replicas: 1`.
+
+### Recovery for operators stuck mid-install
+
+If you ran `apprafter bootstrap-all` on v0.1.97 and saw the
+timeout, the cluster has:
+
+- A working VM + k3s.
+- A failed (`pending-install`) Argo CD helm release.
+
+`helm upgrade --install` against the fixed values usually
+adopts the failed release cleanly. If it doesn't:
+
+```sh
+KUBECONFIG=$(apprafter kubeconfig --refresh) \
+  helm delete argocd -n argocd || true
+KUBECONFIG=$(apprafter kubeconfig) kubectl delete ns argocd || true
+apprafter bootstrap-all
+```
+
+The `apply` + `k3s-ready` phases stay idempotent — they'll
+no-op on the existing VM. The `bootstrap` phase reruns clean.
+
+### Note on chart 0.1.2
+
+0.1.2's `compatibility.cue` entry now carries a "known issue"
+note pointing operators at 0.1.3. The 0.1.2 OCI artifact stays
+on the registry as a historical record; future installs default
+to 0.1.3 via the CLI's `RELEASED_PLATFORM_STACK_VERSION` bump.
+
 ## v0.1.97 — M1.5 Track B.1.70 — minimal cluster-bootstrap rewrite (2026-05-19)
 
 ADR 0025 lands. The CLI's `cluster-bootstrap` step shrinks

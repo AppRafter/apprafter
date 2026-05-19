@@ -30,7 +30,7 @@ pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.64";
 /// (`oci://ghcr.io/<owner>/platform-stack:<version>`) before a
 /// bumped CLI ships, otherwise `apprafter cluster-bootstrap`'s
 /// root Application reconcile fails with "pull failed: not found".
-pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.2";
+pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.3";
 
 /// Default OCI registry path the chart is published to. The
 /// `apprafter` owner is overridable via `--platform-stack-repo`

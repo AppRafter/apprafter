@@ -219,23 +219,42 @@ spec:
 /// extraContainers (cue-cmp sidecar) + tier-2 replica counts
 /// when it reconciles; we only need to get Argo CD up enough
 /// to read its own next-step manifest.
+///
+/// Walk-found bug (v0.1.97 → v0.1.98 fix): the upstream
+/// `argo-cd` chart 7.7.7 defaults `redis-ha.enabled: true`,
+/// which tries to schedule 3 redis-ha pods + 1 haproxy with
+/// `podAntiAffinity` `requiredDuringSchedulingIgnoredDuringExecution`
+/// — on a single-node k3s those pods never become Ready, the
+/// chart's pre-install Job hook waits on them, and `helm
+/// install` times out with `failed pre-install: timed out
+/// waiting for the condition`. The v0.1.x imperative install
+/// explicitly set `redis-ha.enabled: false`; the v0.1.97
+/// rewrite dropped that flag by accident. Restored, plus
+/// `notifications.enabled: false` (saves one more replica on
+/// tier-1 cpx22 RAM) and `server.service.type: ClusterIP`
+/// (Gateway/HTTPRoute exposure lands via the platform-stack
+/// chart's argocd component, not the loader).
 fn argocd_loader_values_yaml() -> String {
     r#"# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Loader values for the initial Argo CD install. The
 # platform-stack chart's component_argocd.cue overlays this
 # release with the cue-cmp sidecar and per-tier replicas on
 # its first reconcile.
+dex:
+  enabled: false
+redis-ha:
+  enabled: false
 controller:
   replicas: 1
 server:
   replicas: 1
+  service:
+    type: ClusterIP
 repoServer:
   replicas: 1
 applicationSet:
   replicaCount: 1
 notifications:
-  replicas: 1
-dex:
   enabled: false
 "#
     .to_string()
@@ -445,9 +464,42 @@ mod tests {
         // Argo CD's first reconcile, not the loader install.
         let v = argocd_loader_values_yaml();
         assert!(v.contains("dex:\n  enabled: false"));
-        for k in ["controller", "server", "repoServer", "notifications"] {
+        for k in ["controller", "server", "repoServer"] {
             assert!(v.contains(&format!("{k}:\n  replicas: 1")), "{v}");
         }
+        // notifications was bumped to `enabled: false` instead
+        // of `replicas: 1` — the latter still allocated one
+        // notifications pod, the former skips the deployment
+        // entirely (tier-1 cpx22 RAM budget).
+        assert!(v.contains("notifications:\n  enabled: false"), "{v}");
+    }
+
+    #[test]
+    fn argocd_loader_values_disables_redis_ha_for_single_node_k3s() {
+        // The v0.1.97 → v0.1.98 walk-found bug: the upstream
+        // argo-cd chart 7.7.7 defaults redis-ha.enabled: true,
+        // which schedules 3 redis pods with
+        // requiredDuringSchedulingIgnoredDuringExecution
+        // podAntiAffinity. On single-node k3s those pods never
+        // become Ready; the chart's pre-install hook times
+        // out. Disabling redis-ha here matches the v0.1.x
+        // baseline and unblocks the install.
+        let v = argocd_loader_values_yaml();
+        assert!(v.contains("redis-ha:\n  enabled: false"), "{v}");
+    }
+
+    #[test]
+    fn argocd_loader_values_keep_server_at_cluster_ip_until_chart_exposes_it() {
+        // Loader install runs before the platform-stack chart
+        // reconciles; the chart's component_argocd.cue is what
+        // wires Gateway / HTTPRoute exposure. Loader keeps the
+        // server at ClusterIP so the loader doesn't expose
+        // anything that's not yet hardened.
+        let v = argocd_loader_values_yaml();
+        assert!(
+            v.contains("server:\n  replicas: 1\n  service:\n    type: ClusterIP"),
+            "{v}"
+        );
     }
 
     #[test]
