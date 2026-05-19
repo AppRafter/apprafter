@@ -20,7 +20,25 @@
 ## Unreleased
 
 _Scaffold under construction — first publish is 0.1.0 once the
-publish workflow (plan.md 1.68) runs end-to-end on a real tag._
+publish workflow (plan.md 1.68) runs end-to-end._
+
+**Build-tooling notes (not part of any chart release):**
+
+- The chart version is the **only** field a maintainer needs to
+  bump: `platform-stack/cue/platform.cue` →
+  `currentVersion: #Version & "<new>"`, then add the matching
+  `compatibility.cue` entry. `tier_solo.cue` / `tier_team.cue` /
+  the renderer / the workflow all derive from `currentVersion`
+  via CUE references — no string-literal drift possible.
+- The publish workflow is `workflow_dispatch` only; it **writes
+  the `platform-stack/v<version>` tag itself** as the final step
+  via `gh release create`. Tag pushes do NOT trigger it. This
+  inverts the older "tag → publish" model so an accident tag
+  push can't ship a half-baked chart.
+- `cue vet -c ./platform-stack/cue/...` enforces
+  `compatibility: (currentVersion): #VersionRecord` — i.e. the
+  current version MUST have a compatibility entry, caught at
+  edit time before any CI runs.
 
 ## 0.1.0 (planned — first published chart release)
 

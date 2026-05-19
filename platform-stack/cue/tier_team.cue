@@ -27,7 +27,7 @@ package platformstack
 // actually wires those components in.
 
 tier2: #PlatformValues & {
-	version: "0.1.0"
+	version: currentVersion
 	tier:    2
 	channel: "stable"
 	components: _components & {

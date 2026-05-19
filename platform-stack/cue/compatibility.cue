@@ -54,6 +54,22 @@ compatibility: [VERSION=string]: #VersionRecord & {
 	version: VERSION
 }
 
+// The current chart version MUST have a matching compatibility
+// record — otherwise `PlatformController` (Phase 2+) has no
+// classification to gate automated upgrades on, and the publish
+// workflow's pre-flight script would fail at runtime. Surfacing
+// the invariant in CUE turns a missing-entry bump into a `cue
+// vet -c` failure at edit time, not a CI failure on push.
+//
+// The pattern `(currentVersion): #VersionRecord` uses CUE's
+// dynamic-field syntax — the key is computed from
+// `currentVersion` declared in `platform.cue`. The unification
+// passes when the explicit `compatibility: "0.1.0": { … }`
+// entry below provides all required #VersionRecord fields;
+// fails with an "incomplete value" diagnostic that points at
+// the offending field if the entry is missing or partial.
+compatibility: (currentVersion): #VersionRecord
+
 // Initial entry — platform-stack 0.1.0 is the first published
 // version. Minor tracks the AppRafter monorepo phase (we're
 // in Phase 1.5; chart MINOR bumps to 0.2.0 alongside the

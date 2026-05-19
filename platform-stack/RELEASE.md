@@ -30,14 +30,46 @@ milestone when Phase 2 services land). Chart patch versions are
 independent of the monorepo's `v0.1.x` patch stream — the two
 share only MINOR/MAJOR semantics.
 
+## Source of truth
+
+The chart version lives in exactly **one** place:
+
+- `platform-stack/cue/platform.cue` →
+  `currentVersion: #Version & "<version>"`
+
+Everything downstream derives from there:
+- `tier_solo.cue` + `tier_team.cue` reference it via
+  `version: currentVersion`.
+- `compatibility.cue` enforces a CUE-level invariant
+  `compatibility: (currentVersion): #VersionRecord` so the
+  current version MUST have a matching entry.
+- The renderer (`make -C platform-stack render-only`) reads
+  `tier1.version` (which equals `currentVersion`) for the
+  `dist/<chart>-<version>/` path.
+- The publish workflow reads `currentVersion` directly via
+  `cue export ./platform-stack/cue/... -e currentVersion`.
+
+A version bump is a **two-line edit**:
+
+1. `platform-stack/cue/platform.cue` — bump
+   `currentVersion: #Version & "0.1.0"` → `"0.1.1"`
+   (or `"0.2.0"`, etc).
+2. `platform-stack/cue/compatibility.cue` — add the matching
+   entry `compatibility: "0.1.1": { change: …, … }`.
+
+If you skip step 2, `cue vet -c ./platform-stack/cue/...`
+fails at edit time with `compatibility."0.1.1".change:
+incomplete value …`, before you can even commit. CI then
+runs the same check on push as a belt-and-suspenders.
+
 ## Pre-release checklist
 
-Before tagging a release, confirm:
+Before running the publish workflow, confirm:
 
-- [ ] `platform-stack/cue/compatibility.cue` has an entry for
-      the new version. The publish workflow's first step calls
-      `scripts/check-platform-stack-version.sh <version>` and
-      fails fast if the entry is missing.
+- [ ] `currentVersion` in `platform-stack/cue/platform.cue`
+      reflects the version you want to publish.
+- [ ] `platform-stack/cue/compatibility.cue` has the matching
+      entry. (`cue vet -c` will yell at you if it doesn't.)
 - [ ] The entry's `change:` field accurately classifies the
       delta vs the previous version. Be conservative —
       misclassifying `breaking` as `safe` lets
@@ -58,46 +90,64 @@ Before tagging a release, confirm:
           --values dist/platform-stack-<version>/examples/values.team.yaml
       ```
 - [ ] `bash scripts/lint-cue.sh` clean.
-- [ ] `cargo test --workspace` clean (paranoia — platform-stack
-      doesn't depend on Rust, but the workspace cross-impact
-      catches accidental linting fallout).
+- [ ] `bash scripts/check-platform-stack-version.sh` (no args
+      — auto-reads `currentVersion`) → success.
+- [ ] Changes committed and pushed to the branch you want to
+      release from.
 
-## Tagging
+## Publishing
 
-Release tags are **prefixed**: `platform-stack/v<version>`.
-The prefix scopes the publish workflow to chart releases only
-— AppRafter monorepo releases (`v0.x.y` / `v1.x.y`) trigger
-the operator + webhook publish workflow, not this one.
+Releases are triggered by **running the workflow**, not by
+pushing a tag. The workflow itself writes the
+`platform-stack/v<version>` tag at the end of a successful
+publish, so a half-baked chart never lands.
 
 ```sh
-# Pre-release (-rc1, -rc2, ...) — pushes :<version> only,
-# no :latest alias, GitHub Release marked `prerelease: true`.
-git tag platform-stack/v0.1.0-rc1
-git push origin platform-stack/v0.1.0-rc1
+# Normal flow — workflow reads currentVersion from CUE source.
+gh workflow run platform-stack-publish.yml --ref <branch-or-sha>
 
-# Stable release — pushes :<version> AND retags :latest,
-# GitHub Release marked stable.
-git tag platform-stack/v0.1.0
-git push origin platform-stack/v0.1.0
+# Watch the run.
+gh run watch
 ```
 
-The push triggers `.github/workflows/platform-stack-publish.yml`.
-Watch the run in the Actions tab; on success the workflow:
+Or via the GitHub UI: `Actions → platform-stack-publish → Run
+workflow → branch: <branch> → Run`.
 
-1. Validates `compatibility.cue` has the entry.
-2. Renders the chart from CUE (`make -C platform-stack render-only`).
-3. Runs `helm lint` + tier-1 / tier-2 smoke templates.
-4. Packages → `platform-stack-<version>.tgz`.
-5. `helm push` to `oci://ghcr.io/<owner>/platform-stack:<version>`.
-6. `cosign sign` the immutable OCI digest (keyless via Sigstore
-   OIDC + the workflow's ambient GitHub identity).
-7. `cosign sign-blob` the `.tgz` → `.tgz.sig` + `.tgz.pem`.
-8. On stable: `oras tag` the artifact as `:latest`.
-9. Creates a GitHub Release with the three files attached and
-   a body containing the install + verify snippets.
+The optional `version_override:` input is for emergency /
+debug re-publishes against a specific commit (the value MUST
+still have a `compatibility.cue` entry). Normal flow leaves
+it empty.
 
-The `id-token: write` permission is what makes keyless signing
-work — never remove it from `permissions:` block.
+On success the workflow runs:
+
+1. Reads `currentVersion` from CUE source (or uses the
+   `version_override` input).
+2. Refuses to proceed if `platform-stack/v<version>` already
+   exists on `origin`.
+3. Validates `compatibility.cue` has a matching entry via
+   `scripts/check-platform-stack-version.sh`.
+4. Renders the chart from CUE
+   (`make -C platform-stack render-only`).
+5. Runs `helm lint` + tier-1 / tier-2 smoke templates.
+6. Packages → `platform-stack-<version>.tgz`.
+7. `helm push` to
+   `oci://ghcr.io/<owner>/platform-stack:<version>`.
+8. `cosign sign` the immutable OCI digest (keyless via
+   Sigstore OIDC + the workflow's ambient GitHub identity).
+9. `cosign sign-blob` the `.tgz` → `.tgz.sig` + `.tgz.pem`.
+10. On stable (`<version>` without a `-`-suffix): `oras tag`
+    the artifact as `:latest`.
+11. `gh release create platform-stack/v<version>` — this
+    creates BOTH the GitHub Release AND the underlying git
+    tag in one shot, pointing at the workflow's checkout
+    SHA. `--prerelease` is set when the version contains
+    `-` (e.g. `0.1.0-rc1`).
+
+The `id-token: write` permission is what makes keyless
+signing work — never remove it from `permissions:` block.
+
+The `contents: write` permission is what lets `gh release
+create` write the tag back to the repo.
 
 ## After publish
 
@@ -125,22 +175,33 @@ work — never remove it from `permissions:` block.
 
 ## Failure modes
 
-If the workflow fails partway through (e.g. `helm push` after
-`helm package`), GitHub keeps the tag but no Release is
-created and no OCI artifact lands. Recovery:
+Tag-creation happens only as the workflow's final step
+(`gh release create`), so a failure partway through leaves
+neither tag nor release on `origin`. Recovery:
 
 1. Inspect the workflow logs to find the failing step.
 2. Fix the underlying issue (most often: missing
-   `compatibility.cue` entry → add and commit before
-   re-tagging).
-3. Delete the broken tag both locally and on the remote:
+   `compatibility.cue` entry — but `cue vet -c` already
+   catches that at edit time; if it slipped past, fix and
+   commit).
+3. Re-run the workflow against the fixed commit:
    ```sh
-   git tag -d platform-stack/v<version>
-   git push origin --delete platform-stack/v<version>
+   gh workflow run platform-stack-publish.yml --ref <branch>
    ```
-4. Re-tag and re-push.
 
-The CI workflow is idempotent on a clean run: the second
-attempt will skip steps that already completed (helm push
-overwrites by tag), so partial states don't leak into the
-registry as long as the tag is replayed cleanly.
+The OCI registry may have a partial artifact if `helm push`
+succeeded but `cosign sign` failed. Re-running pushes the
+same tag again (Helm OCI is overwrite-by-tag), then signs
+fresh. The pre-flight "tag does not exist on origin" guard
+only checks the git side — so a partial-OCI / no-git-tag
+state is recoverable by another workflow run.
+
+If the failure happened AFTER `gh release create` (very
+unlikely — it's the last step), you'll have a tag + release
+without a signature attachment. To clean up:
+
+```sh
+gh release delete platform-stack/v<version> --yes --cleanup-tag
+```
+
+Then re-run the workflow.

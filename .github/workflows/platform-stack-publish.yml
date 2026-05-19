@@ -2,9 +2,8 @@
 name: platform-stack-publish
 
 # Builds, signs, and publishes the AppRafter platform-stack
-# umbrella Helm chart on every `platform-stack/v*` tag, plus on
-# demand via `workflow_dispatch`. The chart is pushed to two
-# channels in parallel (ADR 0028):
+# umbrella Helm chart. The chart is pushed to two channels in
+# parallel (ADR 0028):
 #
 #   1. OCI registry — `oci://ghcr.io/<owner>/platform-stack:<version>`.
 #      Primary distribution; Argo CD pulls from here on every
@@ -16,34 +15,57 @@ name: platform-stack-publish
 # Signing is cosign keyless (Sigstore OIDC + GitHub Actions
 # ambient identity). No long-lived signing keys to manage.
 #
+# Version resolution: the canonical chart version lives in
+# `platform-stack/cue/platform.cue` as `currentVersion`. The
+# workflow reads it via `cue export ./platform-stack/cue/... -e
+# currentVersion` — `tier1.version`, `tier2.version`, and the
+# `compatibility.cue` key invariant all flow from that single
+# definition. The optional `version_override` workflow input
+# is for emergency / debugging re-publishes against a specific
+# commit; normal release flow leaves it empty.
+#
+# Trigger model (workflow_dispatch ONLY):
+#
+# - The workflow CREATES the git tag `platform-stack/v<version>`
+#   as the LAST step, after a successful publish — not the
+#   trigger that started the run. This reverses the older
+#   "tag → publish" model so an accidental tag push can't
+#   publish a half-baked chart.
+# - To release, run the workflow from the Actions tab (or
+#   `gh workflow run platform-stack-publish.yml`) against the
+#   commit you want to release from. The workflow validates
+#   compatibility, renders, lints, publishes, signs, and only
+#   then writes the tag back.
+#
 # Compatibility gate: before publishing, the workflow asserts
-# that `platform-stack/cue/compatibility.cue` contains an entry
-# for the tagged version. Missing entry → workflow fails fast
-# with a clear pointer at the file to edit. This is the contract
-# `PlatformController` (Phase 2+) relies on to gate automated
-# upgrades.
+# that `compatibility.cue` contains an entry for the resolved
+# version. Combined with the CUE-level invariant
+# `compatibility: (currentVersion): #VersionRecord`, missing
+# entries are caught both at edit time (`cue vet -c`) and at
+# CI time.
 #
 # Security note (per the workflow-injection guide): every
-# dynamic value (`github.ref_name`, `github.repository_owner`,
-# `github.event.inputs.*`) is consumed via an `env:` binding
-# rather than direct `${{ }}` interpolation into `run:` bodies.
-# `github.repository` is the workflow-file's own OWNER/REPO so
-# it isn't user-controlled, but is still routed through env
-# for consistency.
+# dynamic value (`github.repository_owner`,
+# `github.event.inputs.*`, `github.repository`) is consumed via
+# an `env:` binding rather than direct `${{ }}` interpolation
+# into `run:` bodies. The pattern matches `release-operator.yml`.
 
 on:
-  push:
-    tags:
-      - 'platform-stack/v*'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to publish (without `platform-stack/v` prefix), e.g. 0.2.0-rc1'
-        required: true
+      version_override:
+        description: |
+          Optional. Publish a specific version regardless of
+          what `currentVersion` says in `platform.cue`. Leave
+          empty for the normal flow (workflow reads
+          `currentVersion` from the CUE source). Use only for
+          emergency re-publishes; the value MUST still have a
+          matching `compatibility.cue` entry.
+        required: false
         type: string
 
 permissions:
-  contents: write   # create GitHub Release + attach .tgz
+  contents: write   # create GitHub Release, push tag
   packages: write   # push to ghcr.io
   id-token: write   # cosign keyless OIDC
 
@@ -56,21 +78,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version from tag or input
+      - name: Install CUE (needed for currentVersion resolution)
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Resolve version from CUE or override
         id: version
         env:
-          REF_NAME: ${{ github.ref_name }}
-          WORKFLOW_INPUT_VERSION: ${{ github.event.inputs.version }}
+          OVERRIDE: ${{ github.event.inputs.version_override }}
         run: |
-          # Tag form: `platform-stack/v0.2.0` → version `0.2.0`.
-          # Workflow-dispatch input is already stripped.
-          if [[ -n "${WORKFLOW_INPUT_VERSION:-}" ]]; then
-            version="${WORKFLOW_INPUT_VERSION}"
+          # Normal flow: read `currentVersion` from the CUE
+          # source — the single source of truth declared in
+          # `platform-stack/cue/platform.cue`. The override
+          # input is for emergency re-publishes only.
+          if [[ -n "${OVERRIDE:-}" ]]; then
+            version="${OVERRIDE}"
+            echo "::notice::Using version_override='${version}' (skipping currentVersion lookup)"
           else
-            version="${REF_NAME#platform-stack/v}"
+            version=$(cue export ./platform-stack/cue/... \
+              -e currentVersion --out text)
+            if [[ -z "${version:-}" ]]; then
+              echo "::error::failed to resolve currentVersion from CUE source"
+              exit 1
+            fi
+            echo "Resolved currentVersion=${version} from platform.cue"
           fi
-          # Pre-release (`0.2.0-rc1`) → push only `:<version>`.
-          # Stable (`0.2.0`) → also tag `:latest`.
+          # Pre-release (`0.1.0-rc1`) → push only `:<version>`.
+          # Stable (`0.1.0`) → also tag `:latest`.
           if [[ "$version" == *-* ]]; then
             is_prerelease=true
           else
@@ -80,6 +115,19 @@ jobs:
           echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
           echo "tag=platform-stack/v$version" >> "$GITHUB_OUTPUT"
 
+      - name: Fail if the tag we would create already exists
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # Tag is created by this workflow as the LAST step.
+          # If the tag already exists on the remote, either the
+          # previous run succeeded (no-op republish) or someone
+          # manually tagged. Either way, surface it and stop.
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::tag ${TAG} already exists on origin. Bump currentVersion in platform.cue (and add the matching compatibility entry) before re-running."
+            exit 1
+          fi
+
       - name: Compute lowercase owner
         id: owner
         env:
@@ -88,11 +136,6 @@ jobs:
           owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
           echo "lowercase=$owner_lc" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${owner_lc}/platform-stack" >> "$GITHUB_OUTPUT"
-
-      - name: Install CUE
-        uses: cue-lang/setup-cue@v1.0.1
-        with:
-          version: v0.10.0
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -218,8 +261,7 @@ jobs:
             echo "::warning::oras not available on this runner; :latest tag not updated. Add `uses: oras-project/setup-oras@v1` in a follow-up."
           fi
 
-      - name: Create / update GitHub Release
-        if: github.event_name == 'push'
+      - name: Create GitHub Release + tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -229,7 +271,15 @@ jobs:
           IMAGE: ${{ steps.owner.outputs.image }}
           DIGEST: ${{ steps.push.outputs.digest }}
           IS_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
+          SHA: ${{ github.sha }}
         run: |
+          # `gh release create <tag>` creates the tag implicitly
+          # when it doesn't exist — pointing it at the workflow's
+          # checkout SHA via `--target`. This is the LAST step;
+          # if anything earlier failed, no tag and no release
+          # land. The pre-flight "tag does not exist" guard at
+          # the top of the job ensures we never overwrite a tag
+          # silently.
           # Heredoc is double-quoted by default so $VARS expand.
           # GitHub Actions expression syntax (the dollar +
           # double-brace form) is NOT used inside this run body

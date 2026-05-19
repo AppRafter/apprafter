@@ -153,6 +153,26 @@ package platformstack
 	components: #ComponentSet
 }
 
+// `currentVersion` is THE single source of truth for the chart
+// version being built. Every other place that needs to mention
+// the version must reference this:
+//
+//   - `tier_solo.cue` + `tier_team.cue` use `version:
+//     currentVersion` instead of a string literal.
+//   - The renderer (`render_tool.cue`) computes its `dist/`
+//     subdir from `currentVersion`.
+//   - The `platform-stack-publish` workflow reads the value
+//     via `cue export -e currentVersion`.
+//
+// Bumping the chart version is a one-line edit here PLUS adding
+// the matching `compatibility[currentVersion]` entry below.
+// CUE enforces the pairing (see the `compatibility:
+// (currentVersion): #VersionRecord` line in `compatibility.cue`)
+// — a bump that forgets the compatibility entry fails `cue vet
+// -c` with an "incomplete value" error pointing at the missing
+// fields, before the publish workflow ever runs.
+currentVersion: #Version & "0.1.0"
+
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring
 // `_components: <name>: #Component & { … }`. The leading
