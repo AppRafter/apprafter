@@ -1,32 +1,44 @@
 # SPDX-License-Identifier: MIT
-# Multi-stage build for the AppRafter admission-webhook binary.
+# Multi-stage build for the AppRafter admission-webhook binary,
+# using `cargo-chef` so the dependency-build layer stays
+# cacheable independently of source changes. See
+# `operator/apprafter-operator/Dockerfile` for the full
+# rationale — the strategy is identical, only the `--bin`
+# target differs.
 #
-# Build context is `operator/` (set by the
-# release-operator.yml workflow's `context: operator`). The
-# pre-existing single-member dep-prebuild trick was broken
-# (workspace member resolution failed because only the webhook's
-# Cargo.toml was copied, not the other workspace members') and
-# never validated since no nightly / CI build ever ran against
-# it before 2026-05-10. Simplified here to a single COPY +
-# build — slower per CI run because the dep layer invalidates
-# on every source change, but reliable. cargo-chef
-# (the industry-standard layered cache for cargo in Docker) is
-# the right next step and lands as a separate v0.1.x patch.
+# Layer plan:
+#
+#   1. `chef`    — Rust + musl toolchain + cargo-chef.
+#   2. `planner` — `cargo chef prepare` emits `recipe.json`,
+#                  source-free dep description.
+#   3. `builder` — `cargo chef cook --bin admission-webhook`
+#                  builds dependencies as a separate cacheable
+#                  layer; then full-source `cargo build`
+#                  re-compiles only the changed crates.
+#
+# With the workflow's `cache-from / cache-to: type=gha,
+# scope=admission-webhook`, a typical source-only push drops
+# this job from ~6 min to ~1-2 min.
 #
 # Runtime image: distroless/static-debian12 with the `nonroot`
 # user (uid 65532). The musl-built binary is fully static so it
 # needs no libc / dynamic-linker support in the runtime layer.
 
-FROM rust:alpine AS builder
-
-RUN apk add --no-cache musl-dev
-
+FROM rust:alpine AS chef
+RUN apk add --no-cache musl-dev \
+ && cargo install cargo-chef --locked
 WORKDIR /workspace
 
-# Whole workspace. .dockerignore (sibling file) keeps target/
-# and .git/ out of the build context.
+FROM chef AS planner
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
+FROM chef AS builder
+COPY --from=planner /workspace/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json \
+        --target x86_64-unknown-linux-musl \
+        --bin admission-webhook
+COPY . .
 RUN cargo build --release --bin admission-webhook \
         --target x86_64-unknown-linux-musl
 
