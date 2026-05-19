@@ -548,8 +548,74 @@ compatibility: "0.1.7": {
 		`cilium-cni: unable to connect to Cilium agent`
 		failures on every other pod schedule): upgrade to
 		0.1.7 (or to the matching CLI v0.1.103+).
+
+		Known issue carried into 0.1.7 (fixed in 0.1.8):
+
+		* On a fresh cluster the root `platform` Application
+		  fails with `Application referencing project default
+		  which does not exist`. Chart 7.7.7 does not
+		  auto-create the `default` AppProject and Argo CD
+		  2.13.1's server does not recreate it on startup.
+		  Previous walks may have hit this lazily; v0.1.103
+		  ran into it deterministically.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01103",
+	]
+}
+
+// 0.1.8 — default AppProject hotfix on top of 0.1.7. Argo CD
+// chart 7.7.7 ships `configs.projects: {}` by default and
+// the upstream argocd-server 2.13.1 does not re-create the
+// `default` AppProject on startup, so every Application
+// rendered with `spec.project: default` (incl. the root
+// `platform` Application the CLI loader applies) fails with
+// `Application referencing project default which does not
+// exist`. Walk #7 surfaced this — earlier walks hit it
+// lazily and Argo CD's reconciler appeared to handle it.
+//
+// Fix: `component_argocd.cue` gains a `configs.projects.default`
+// values block mirroring Argo CD's historical implicit
+// default (`sourceRepos: ["*"]`, `destinations: [{namespace: "*",
+// server: "*"}]`, all-kinds whitelists). The same block is
+// added to `cli-providers::k8s::argocd_loader_values_yaml`
+// so the loader install creates the AppProject before the
+// root Application apply, and the chart's self-reconcile
+// keeps it alive after adoption.
+//
+// Future: an admin who wants to restrict the default project
+// (per-tenant `sourceRepos`, namespace lockdown, RBAC) edits
+// the same block in their fork's `component_argocd.cue`
+// overlay.
+compatibility: "0.1.8": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		Default AppProject hotfix.
+
+		Chart 7.7.7 ships `configs.projects: {}`; Argo CD
+		2.13.1's server does not auto-create `default` on
+		startup. Every Application with `spec.project:
+		default` (incl. the root `platform` Application the
+		CLI loader applies) fails with `Application
+		referencing project default which does not exist`.
+
+		0.1.8 adds an unrestricted `default` AppProject to
+		`configs.projects` in both the chart's
+		`component_argocd.cue` values overlay and the CLI
+		loader's `argocd_loader_values_yaml`. The loader
+		creates it on initial `helm install`; the chart's
+		self-reconcile keeps it alive on adopt. Operators
+		who want to restrict the default project edit the
+		overlay in their fork.
+
+		Operators on 0.1.7 stuck with `Application
+		referencing project default which does not exist`:
+		upgrade to 0.1.8 (or to the matching CLI v0.1.104+).
+		Manual one-time recovery: `kubectl apply -f -` an
+		AppProject named `default` in namespace `argocd`.
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01104",
 	]
 }

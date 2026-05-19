@@ -55,10 +55,39 @@ _components: argocd: #Component & {
 		// `cli-providers::k8s::argocd_loader_values_yaml` so
 		// the chart's self-reconcile keeps the repo registered
 		// when it adopts the loader Argo CD release.
-		configs: repositories: apprafter: {
-			url:       "ghcr.io/apprafter"
-			type:      "helm"
-			enableOCI: "true"
+		configs: {
+			repositories: apprafter: {
+				url:       "ghcr.io/apprafter"
+				type:      "helm"
+				enableOCI: "true"
+			}
+
+			// Argo CD chart 7.7.7 does NOT auto-create the
+			// `default` AppProject, and Argo CD 2.13.1 server
+			// does NOT recreate it on startup either. Without
+			// this block, every Application with `project:
+			// default` (incl. the root `platform` Application
+			// the CLI loader applies) fails with `Application
+			// referencing project default which does not
+			// exist`. Walk-found bug v0.1.103 → v0.1.104.
+			// Mirrored in the CLI loader (`argocd_loader_values_yaml`)
+			// so adoption is a no-op.
+			projects: default: {
+				description: "Default project — Argo CD baseline, unrestricted."
+				sourceRepos: ["*"]
+				destinations: [{
+					namespace: "*"
+					server:    "*"
+				}]
+				clusterResourceWhitelist: [{
+					group: "*"
+					kind:  "*"
+				}]
+				namespaceResourceWhitelist: [{
+					group: "*"
+					kind:  "*"
+				}]
+			}
 		}
 
 		// argocd-repo-server runs the cue-cmp sidecar that

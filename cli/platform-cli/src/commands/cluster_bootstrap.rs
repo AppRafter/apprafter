@@ -335,12 +335,35 @@ notifications:
 # rewrites into the correct `helm pull oci://<repo>/<chart>`.
 # Mirrored in platform-stack/cue/component_argocd.cue so the
 # chart's self-reconcile keeps the registration alive on adopt.
+#
+# `configs.projects.default` is required because chart 7.7.7
+# does NOT auto-create the `default` AppProject, and Argo CD
+# 2.13.1 does NOT recreate it on server startup (walk-found
+# bug, v0.1.103 → v0.1.104: root `platform` Application
+# stuck with `Application referencing project default which
+# does not exist`). The spec mirrors Argo CD's historical
+# implicit default: unrestricted source repos, destinations,
+# and resource kinds.
 configs:
   repositories:
     apprafter:
       url: ghcr.io/apprafter
       type: helm
       enableOCI: "true"
+  projects:
+    default:
+      description: Default project — Argo CD baseline, unrestricted.
+      sourceRepos:
+        - "*"
+      destinations:
+        - namespace: "*"
+          server: "*"
+      clusterResourceWhitelist:
+        - group: "*"
+          kind: "*"
+      namespaceResourceWhitelist:
+        - group: "*"
+          kind: "*"
 "#
     .to_string()
 }
@@ -542,6 +565,27 @@ mod tests {
             "jsonpath={.status.health.status}=Healthy"
         );
         assert_eq!(waits[3].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn argocd_loader_values_create_default_app_project() {
+        // Walk-found bug v0.1.103 → v0.1.104. Argo CD chart
+        // 7.7.7 does not auto-create the `default` AppProject;
+        // Argo CD 2.13.1 server does not recreate it on
+        // startup. Without this block, every Application with
+        // `project: default` (incl. the root `platform`
+        // Application) fails with `Application referencing
+        // project default which does not exist`.
+        let v = argocd_loader_values_yaml();
+        assert!(v.contains("projects:"), "{v}");
+        assert!(v.contains("default:"), "{v}");
+        // The unrestricted-default spec mirrors Argo CD's
+        // historical implicit default project — any source
+        // repo, any destination, any resource kind.
+        assert!(v.contains("sourceRepos:"), "{v}");
+        assert!(v.contains("destinations:"), "{v}");
+        assert!(v.contains("clusterResourceWhitelist:"), "{v}");
+        assert!(v.contains("namespaceResourceWhitelist:"), "{v}");
     }
 
     #[test]

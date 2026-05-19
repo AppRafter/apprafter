@@ -13,6 +13,103 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.104 — walk-fix: default AppProject missing (2026-05-20)
+
+Seventh walk on chart 0.1.7 / CLI v0.1.103. Bootstrap hung
+on `kubectl wait application/platform Synced` (10-min
+timeout). Diagnostics on the cluster:
+
+```
+$ kubectl describe application platform -n argocd
+Status:
+  Conditions:
+    Type:    InvalidSpecError
+    Message: Application referencing project default which
+             does not exist
+  Sync:    Unknown
+  Health:  Unknown
+
+$ kubectl get appproject -n argocd
+No resources found in argocd namespace.
+```
+
+Chart 0.1.7 was published (`gh release list` confirmed), so
+the OCI pull path worked. The blocker was that **no
+`default` AppProject existed on the cluster** — and Argo CD
+chart 7.7.7 ships `configs.projects: {}` by default, with
+argocd-server 2.13.1 NOT recreating `default` on startup.
+
+Earlier walks plausibly hit this lazily (Argo CD's reconciler
+appeared to handle it on retry), but v0.1.103's run was
+deterministic.
+
+### Fix
+
+`configs.projects.default` block added to **both** sides:
+
+- `cli-providers::k8s::argocd_loader_values_yaml` — the
+  loader's `helm install argocd` now renders an AppProject
+  named `default` immediately, before the root Application
+  is applied.
+- `platform-stack/cue/component_argocd.cue` — chart's
+  self-reconcile keeps the same AppProject alive on adopt.
+
+Spec mirrors Argo CD's historical implicit default —
+unrestricted source repos, destinations, and resource kinds:
+
+```yaml
+projects:
+  default:
+    description: Default project — Argo CD baseline, unrestricted.
+    sourceRepos: ["*"]
+    destinations:
+      - { namespace: "*", server: "*" }
+    clusterResourceWhitelist:
+      - { group: "*", kind: "*" }
+    namespaceResourceWhitelist:
+      - { group: "*", kind: "*" }
+```
+
+Operators wanting a restricted default project (per-tenant
+`sourceRepos`, namespace lockdown, RBAC) edit the overlay
+in their fork.
+
+### Chart + CLI versions
+
+- Chart `currentVersion 0.1.7 → 0.1.8` with full compat
+  entry; 0.1.7 entry gets a known-issue note.
+- CLI `RELEASED_PLATFORM_STACK_VERSION → "0.1.8"`.
+- CLI `0.1.103 → 0.1.104`.
+
+### Tests
+
+- `argocd_loader_values_create_default_app_project` —
+  regression guard pinning `projects.default` + the four
+  required whitelist keys in the loader values YAML.
+- Total: 557 passed (was 556).
+
+### Recovery for clusters stuck on 0.1.7
+
+```sh
+kubectl apply -n argocd -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: argocd
+spec:
+  description: Default project — Argo CD baseline.
+  sourceRepos: ["*"]
+  destinations: [{namespace: "*", server: "*"}]
+  clusterResourceWhitelist: [{group: "*", kind: "*"}]
+  namespaceResourceWhitelist: [{group: "*", kind: "*"}]
+EOF
+kubectl annotate application platform -n argocd \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+Then `apprafter bootstrap-all`'s `kubectl wait Synced` clears.
+
 ## v0.1.103 — walk-fix: Cilium chart-overlay drift (2026-05-19)
 
 Sixth walk on chart 0.1.6 / CLI v0.1.102. Two of three
