@@ -3,6 +3,7 @@
 ## Status
 
 `Accepted`. Date: 2026-05-06.
+`Superseded` by ADR 0032 (for the core base license choice; plugin MIT carve-out and FSL wrap rationale preserved). Date: 2026-05-19.
 
 ## Context
 
