@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 package examples
 
 import v1alpha1 "apprafter.io/schemas/v1alpha1"

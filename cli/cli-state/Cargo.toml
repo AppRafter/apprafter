@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 [package]
 name        = "cli-state"
 description = "Local state file (.apprafter/state.json) load/save for apprafter."

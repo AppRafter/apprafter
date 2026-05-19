@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # AppRafter E2E MVP smoke. Provisions a fresh Hetzner cluster,
 # runs `apprafter cluster-bootstrap`, applies a hello-world

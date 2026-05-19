@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Generator for the Argo CD repository-credentials `Secret`.
 //!
 //! Pure string composition. `cluster-bootstrap` writes the result

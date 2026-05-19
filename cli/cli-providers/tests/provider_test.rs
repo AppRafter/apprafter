@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Provider-level tests: plan/apply/destroy diff state vs reality.
 
 use std::collections::BTreeMap;

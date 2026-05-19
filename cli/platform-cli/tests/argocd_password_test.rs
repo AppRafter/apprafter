@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for `apprafter argocd-password`.
 //!
 //! The cold-fetch path goes through real `kubectl` against a live

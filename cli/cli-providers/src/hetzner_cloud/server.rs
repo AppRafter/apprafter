@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Higher-level resource specs for the Hetzner Cloud provider.
 //! Each spec is the desired shape; the provider diffs it against
 //! the API view and emits Actions.

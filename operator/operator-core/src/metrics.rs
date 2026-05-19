@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Prometheus metrics for the AppRafter operator.
 //!
 //! Three signal-grade metrics:

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Local state file for `apprafter`.
 //!
 //! State lives in `<repo>/.apprafter/state.json` and is currently

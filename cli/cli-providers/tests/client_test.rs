@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! HTTP-level tests for HetznerCloudClient using mockito.
 
 use cli_core::CliError;

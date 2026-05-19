@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Renders the tier-1 Backstage manifest set with placeholder
 //! values, used to refresh manifests/tier-1/backstage/example.yaml.
 

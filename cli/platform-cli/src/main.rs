@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Entry point for the `apprafter` CLI.
 //!
 //! v0.1.86 — error rendering migrated from `color-eyre` to

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter doctor` — self-diagnostic. Walks the active
 //! target's stored state + reachability + the surrounding shell
 //! environment and prints a PASS / WARN / FAIL line per check.

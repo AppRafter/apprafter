@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Renders the tier-1 Application CRD with the v1alpha1 schema,
 //! used to refresh manifests/tier-1/application/example-crd.yaml.
 

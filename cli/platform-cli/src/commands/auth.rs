@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter auth …` — reserved namespace for AppRafter Cloud
 //! (Managed) authentication, per `cli-dx-task.md` §3.1 + §5.7 +
 //! §3.4. Today all three subcommands (login / logout / status)

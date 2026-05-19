@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Embeds `operator/charts/apprafter-operator/` into the
 //! `cli-providers` crate at compile time and exposes a runtime
 //! extractor that materialises it under a fresh tempdir so

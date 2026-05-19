@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter whoami` — one-line summary of the operator's
 //! current shell context: identity, active target, verified
 //! status, and the config fields most operational commands care

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Round-trip tests for the Hetzner Cloud wire types.
 
 use cli_providers::hetzner_cloud::types::{

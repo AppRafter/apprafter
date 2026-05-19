@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Trait that every infrastructure provider implements.
 //!
 //! Built-in providers (Hetzner Cloud, Hetzner Robot, AWS) and

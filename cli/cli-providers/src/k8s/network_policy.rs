@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Generators for cluster-side `NetworkPolicy` manifests.
 //!
 //! Tier-1 baseline: deny ingress from **other** namespaces while

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Thin wrapper around the `age` crate for AppRafter's at-rest
 //! secret encryption.
 //!

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Blocking HTTP wrapper around the Hetzner Cloud REST API.
 //!
 //! Pure I/O — no business logic. The provider in

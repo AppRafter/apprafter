@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Shared helpers for Hetzner-touching commands (apply / destroy /
 //! import). Currently just `hcloud_base_url()`.
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for `apprafter kubeconfig`.
 //!
 //! The cold-fetch path exercises `ssh` against the live server and

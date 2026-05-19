@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Pure builder for the cloud-init `#cloud-config` user-data
 //! attached to AppRafter-managed Hetzner Cloud servers.
 //!

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # Provision tools that are not installed by the dev-container features.
 # Idempotent — safe to re-run.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # Verify that `platform-stack/cue/compatibility.cue` has an
 # entry for a given chart version. Used both:

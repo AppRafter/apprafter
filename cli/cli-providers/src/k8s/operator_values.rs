@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Tier-1 Helm values for `operator/charts/apprafter-operator/`.
 //!
 //! Pure string composition. `cluster-bootstrap` writes the result

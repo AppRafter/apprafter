@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 use std::collections::BTreeMap;
 
 use cli_core::target::{default_config_root, TargetStorePaths};

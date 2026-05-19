@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # Verify that every tracked source file under known code paths
 # declares an SPDX-License-Identifier in its first 5 lines (to allow

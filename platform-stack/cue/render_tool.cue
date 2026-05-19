@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
 // platform-stack chart renderer. Run with:
 //
@@ -54,7 +54,7 @@ _distDir: "dist/\(_chartName)-\(tier1.version)"
 // for a file whose content is small and stable.
 _chartYaml: """
 	# Rendered by `cue cmd render`. Do not edit.
-	# SPDX-License-Identifier: FSL-1.1-MIT
+	# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 	apiVersion: v2
 	name: \(_chartName)
 	description: |
@@ -104,7 +104,7 @@ _chartYaml: """
 // the `{{ }}` literal. CUE happily ships this verbatim.
 _applicationsTemplate: """
 	{{/*
-	  SPDX-License-Identifier: FSL-1.1-MIT
+	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
 	  Rendered by `cue cmd render`. Do not edit.
 	  Iterates over .Values.components, emitting one Argo CD
 	  Application per enabled entry.

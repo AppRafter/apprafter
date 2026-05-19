@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Pure resolution of `(image, tag)` override pairs from
 //! `Infrastructure.spec.operator` / `Infrastructure.spec.admissionWebhook`
 //! into the effective `repo:tag` reference helm + kubectl manifests

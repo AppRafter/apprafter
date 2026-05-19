@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Tier-1 Backstage manifest set.
 //!
 //! Emits a 6-document YAML — Namespace, Deployment, Service,

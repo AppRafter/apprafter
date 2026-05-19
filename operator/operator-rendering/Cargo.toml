@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 [package]
 name        = "operator-rendering"
 description = "Pure renderer: Application -> Vec of k8s resources."

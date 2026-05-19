@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Pure renderer: `Application` -> typed k8s resources.
 //!
 //! v0.1.30 (sub-phase 1.9a) emits a `Deployment` always and a

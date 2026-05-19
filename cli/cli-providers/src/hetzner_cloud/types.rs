@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Wire types for the Hetzner Cloud REST API.
 //!
 //! Covers the subset needed by server CRUD and SSH-key CRUD.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for `apprafter bootstrap-all`.
 //!
 //! The wet path (`apply` → `k3s-ready` poll → `cluster-bootstrap`)

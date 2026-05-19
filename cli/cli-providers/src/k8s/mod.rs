@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Kubernetes-side install helpers used by `apprafter
 //! cluster-bootstrap`. Trait-based seams over `helm` + `kubectl`
 //! shell-outs, plus pure builders for the manifests / values we

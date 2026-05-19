@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Persistent target store for the `apprafter` CLI.
 //!
 //! A **Target** is a named bundle of `(provider, region,

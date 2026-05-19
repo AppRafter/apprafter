@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Semantic color helpers for `apprafter` CLI output.
 //!
 //! Wraps `owo-colors` so the rest of the codebase emits intent

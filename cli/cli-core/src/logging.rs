@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Structured logging for `apprafter`.
 //!
 //! Honours `RUST_LOG`. Default level is `info` for the CLI crates

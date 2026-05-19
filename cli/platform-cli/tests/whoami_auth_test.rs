@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for `apprafter whoami` + `apprafter auth …`
 //! stubs (Track A.6 / v0.1.80).
 //!

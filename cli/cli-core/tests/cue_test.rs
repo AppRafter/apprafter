@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for the CUE subprocess wrapper.
 //!
 //! The two cases (happy path + CueNotFound) live in a single test

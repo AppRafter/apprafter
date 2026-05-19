@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Deprecated `platform-cli` shim.
 //!
 //! The canonical binary is now `apprafter`. This shim exists for one

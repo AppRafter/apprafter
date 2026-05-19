@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Credential resolution chain (cli-dx-task.md §7).
 //!
 //! Operational commands (`apprafter apply` / `destroy` / `import`

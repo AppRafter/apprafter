@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 site_name: AppRafter
 site_description: Opinionated, vertically-integrated PaaS on Kubernetes
 site_url: https://apprafter.dev/docs

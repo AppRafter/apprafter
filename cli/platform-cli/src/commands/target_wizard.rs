@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Interactive wizard for `apprafter target add` (Track A.4b /
 //! v0.1.76). Triggers when stdin + stdout are both TTYs and
 //! `--no-interactive` is not set; fills only the fields the user

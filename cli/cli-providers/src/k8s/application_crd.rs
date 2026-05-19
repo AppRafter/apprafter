@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Generator for the v1alpha1 `Application` CustomResourceDefinition.
 //!
 //! Hand-rolled OpenAPI v3 mirroring `schemas/v1alpha1/application.cue`.

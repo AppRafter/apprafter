@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Install Cilium + Gateway API CRDs into the cluster pointed to
 //! by the cached kubeconfig. See plan.md phase 1.4 (v0.1.11).
 

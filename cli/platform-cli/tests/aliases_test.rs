@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for the subcommand aliases shipped in
 //! v0.1.88 (Track A.11). Each test verifies that the alias
 //! routes to the same handler as the canonical name — same

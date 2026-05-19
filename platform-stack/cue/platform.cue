@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
 // Package platformstack is the CUE source of truth for the
 // AppRafter platform-stack umbrella Helm chart.

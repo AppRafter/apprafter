@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 [workspace]
 resolver = "2"
 members = [
@@ -13,7 +13,7 @@ members = [
 version      = "0.1.2"
 edition      = "2021"
 rust-version = "1.88"
-license      = "FSL-1.1-MIT"
+license      = "FSL-1.1-Apache-2.0"
 authors      = ["AppRafter Authors"]
 repository   = "https://github.com/apprafter/apprafter"
 

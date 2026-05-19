@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! kube-rs Controller for the v1alpha1 `Application` CRD.
 //!
 //! v0.1.31 (sub-phase 1.9b) wires the v0.1.30 renderer into

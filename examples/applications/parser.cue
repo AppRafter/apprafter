@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
 // Example Application manifest used as a vet-time fixture. Mirrors
 // the parser example from spec.md §3.1 in skeleton form; the full

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
 // Package v1alpha1 contains the AppRafter platform CRD schemas.
 // This is a skeleton: full per-CRD field sets are filled in during

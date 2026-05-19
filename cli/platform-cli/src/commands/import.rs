@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Read live Hetzner Cloud resources labelled `apprafter=true` and
 //! rebuild `.apprafter/state.json`. See plan.md phase 1.2 (v0.1.7).
 

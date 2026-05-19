@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Lease-based leader election for the AppRafter operator.
 //!
 //! Tier-1 single-replica scope: the operator creates (or takes over

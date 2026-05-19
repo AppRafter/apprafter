@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! End-to-end test against a real Hetzner Cloud project.
 //!
 //! Skipped by default (`#[ignore]`). Run with:

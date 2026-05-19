@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Subprocess wrapper around the `cue` binary.
 //!
 //! The wrapper is intentionally minimal: it shells out to

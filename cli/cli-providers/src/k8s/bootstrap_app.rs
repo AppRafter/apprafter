@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Generator for the Argo CD bootstrap `Application` manifest.
 //!
 //! Pure string composition. The CLI writes the result to a tempfile

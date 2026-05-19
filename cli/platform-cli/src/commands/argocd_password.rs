@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Print the Argo CD admin password from the cluster, caching the
 //! result age-encrypted in state. See plan.md phase 1.5 (v0.1.14).
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 // `miette-derive` 7.6.0's generated diagnostic plumbing reassigns
 // named-field bindings as part of its `Debug` / `Diagnostic` impl
 // scaffolding; the initial bindings never get read and trip

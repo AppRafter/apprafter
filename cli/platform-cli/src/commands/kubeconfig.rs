@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Print the k3s kubeconfig for the current cluster, fetching it
 //! over SSH on first use and caching the result in state.
 

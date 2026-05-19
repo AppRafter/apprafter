@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Pure validator for the v1alpha1 Application spec.
 //!
 //! Enforces v1alpha1 invariants the OpenAPI v3 CRD layer can't

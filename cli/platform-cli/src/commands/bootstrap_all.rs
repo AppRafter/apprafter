@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter bootstrap-all` — convenience wrapper that chains the
 //! three subcommands a fresh cluster needs (`apply` → wait for
 //! k3s to come up on the new node → `cluster-bootstrap`). Each

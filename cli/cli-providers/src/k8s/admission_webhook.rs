@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Tier-1 admission-webhook deployment.
 //!
 //! Emits a 5-document YAML — Namespace, cert-manager Certificate,

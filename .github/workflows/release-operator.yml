@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 name: release-operator
 
 # Builds and pushes the AppRafter operator + admission-webhook

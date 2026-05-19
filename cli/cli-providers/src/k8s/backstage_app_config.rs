@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Tier-1 `app-config.yaml` for the Backstage host app.
 //!
 //! Pure string composition. The result is embedded as the

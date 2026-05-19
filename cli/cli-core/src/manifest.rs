@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Typed Rust mirror of the CUE `Infrastructure` document, plus a
 //! `parse_infrastructure(workdir, path)` helper.
 //!

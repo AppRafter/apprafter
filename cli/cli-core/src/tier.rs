@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The four AppRafter deployment tiers (see spec.md §0 and §4.1).
 
 use std::fmt;

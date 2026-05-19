@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Kubeconfig retrieval helpers for the Hetzner provider.
 //!
 //! Two concerns live here:

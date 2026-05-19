@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # Lint CUE schemas and examples. Used both locally and in CI
 # (CI wiring lands in phase 0.5).

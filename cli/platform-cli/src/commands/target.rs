@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter target …` subcommand handlers.
 //!
 //! v0.1.73 (Track A.3) ships **`target add`** in pure non-interactive

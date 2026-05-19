@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for the miette-based error renderer wired
 //! into `main.rs` in v0.1.86 (Track A.10). These tests focus on
 //! the END-TO-END contract — that a `CliError` reaching `main`

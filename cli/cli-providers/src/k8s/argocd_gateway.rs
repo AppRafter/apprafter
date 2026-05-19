@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Generators for the Argo CD UI exposure manifests:
 //! - Gateway (HTTPS listener with hostname + TLS terminate).
 //! - HTTPRoute (routes / to argocd-server).

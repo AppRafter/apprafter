@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Generators for cert-manager `ClusterIssuer` manifests.
 //!
 //! Tier-1 baseline: a single self-signed `ClusterIssuer` named

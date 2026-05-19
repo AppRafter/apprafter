@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! kube-rs CRD types for v1alpha1 `Application`.
 //!
 //! Mirrors the OpenAPI v3 CRD shipped in `cli-providers::k8s::application_crd`
