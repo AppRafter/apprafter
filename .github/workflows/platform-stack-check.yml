@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+name: platform-stack-check
+
+# PR + push-to-master gate for everything under
+# `platform-stack/**`. Three layers:
+#
+#   1. CUE source validity: `cue fmt --check` + `cue vet -c`
+#      (strict concreteness). Catches the same surface as
+#      `scripts/lint-cue.sh` but scoped tightly.
+#   2. Render integrity: `make -C platform-stack render-only`
+#      + `helm lint` + per-tier `helm template` smoke.
+#   3. **Drift detection:** if `currentVersion` matches a tag
+#      already on origin (i.e. that version has been
+#      published), and any chart-source file changed vs that
+#      tag, FAIL the workflow. Forces the maintainer to
+#      either bump `currentVersion` (and add the matching
+#      compatibility entry) or revert the source change.
+#
+# The publish workflow (`platform-stack-publish.yml`) runs on
+# push to master with the same path filter; its `should_publish`
+# gate silently no-ops if currentVersion is already published.
+# The drift check here is what turns that silent no-op into a
+# loud red CI status, so a "chart content changed without a
+# bump" mistake can't slip past unnoticed.
+#
+# Security note: every dynamic value comes from `env:`
+# bindings, matching the convention in
+# `platform-stack-publish.yml` and `release-operator.yml`.
+
+on:
+  pull_request:
+    paths:
+      - 'platform-stack/**'
+      - 'scripts/check-platform-stack-version.sh'
+      - '.github/workflows/platform-stack-check.yml'
+      - '.github/workflows/platform-stack-publish.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'platform-stack/**'
+      - 'scripts/check-platform-stack-version.sh'
+      - '.github/workflows/platform-stack-check.yml'
+      - '.github/workflows/platform-stack-publish.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: cue vet + render + helm lint + drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so the drift check can diff
+          # HEAD against `platform-stack/v<currentVersion>`
+          # when that tag exists on origin.
+          fetch-depth: 0
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: cue fmt --check
+        run: cue fmt --check ./platform-stack/cue/...
+
+      - name: cue vet -c (concrete)
+        # The CUE-level invariant
+        # `compatibility: (currentVersion): #VersionRecord`
+        # fails this step if currentVersion was bumped without
+        # a matching compatibility entry — catching the most
+        # common version-bump mistake before render time.
+        run: cue vet -c ./platform-stack/cue/...
+
+      - name: Resolve currentVersion
+        id: version
+        run: |
+          version=$(cue export ./platform-stack/cue/... \
+            -e currentVersion --out text)
+          if [[ -z "${version:-}" ]]; then
+            echo "::error::failed to resolve currentVersion from CUE source"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=platform-stack/v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Compatibility-gate sanity check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: bash scripts/check-platform-stack-version.sh "$VERSION"
+
+      - name: Render chart from CUE
+        run: make -C platform-stack render-only
+
+      - name: helm lint
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: helm lint "platform-stack/dist/platform-stack-${VERSION}"
+
+      - name: helm template smoke (tier-1 + tier-2)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          helm template platform "platform-stack/dist/platform-stack-${VERSION}" \
+            > /tmp/rendered-tier1.yaml
+          for app in admission-webhook apprafter-operator argocd cert-manager cilium network-policies; do
+            if ! grep -q "name: \"${app}\"" /tmp/rendered-tier1.yaml; then
+              echo "::error::tier-1 render missing expected Argo CD Application: ${app}"
+              exit 1
+            fi
+          done
+          helm template platform "platform-stack/dist/platform-stack-${VERSION}" \
+            --values "platform-stack/dist/platform-stack-${VERSION}/examples/values.team.yaml" \
+            > /tmp/rendered-tier2.yaml
+          grep -q 'name: "backstage"' /tmp/rendered-tier2.yaml || {
+            echo "::error::tier-2 render did not enable backstage"
+            exit 1
+          }
+
+      - name: Drift detection (chart content changed without version bump)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # If platform-stack/v<currentVersion> does NOT exist
+          # on origin yet, currentVersion is "in-flight" — the
+          # next publish workflow run will tag it. Source
+          # changes here are part of preparing the bump. No
+          # drift to check.
+          if ! git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::${TAG} not on origin yet — currentVersion is in-flight, drift check no-op."
+            exit 0
+          fi
+          # Tag exists on origin → currentVersion is already
+          # published. Any change to chart-source files vs the
+          # published tag is drift.
+          #
+          # Pathspec covers everything that affects the
+          # rendered chart: CUE sources (data, types, render
+          # logic) + the Chart.yaml template reference. The
+          # Makefile and lint script are tooling — changes
+          # there don't drift the artifact.
+          if git diff --quiet "${TAG}" HEAD -- \
+              'platform-stack/cue/*.cue' \
+              'platform-stack/Chart.yaml.tmpl'; then
+            echo "::notice::No drift vs ${TAG} — chart content unchanged."
+            exit 0
+          fi
+          echo "::error::Chart source under platform-stack/cue/ or Chart.yaml.tmpl changed since ${TAG} was published, but currentVersion is still ${VERSION}."
+          echo "::error::Either bump currentVersion in platform-stack/cue/platform.cue (and add the matching compatibility.cue entry), or revert the source changes."
+          echo ""
+          echo "--- Diff vs ${TAG} (truncated to 80 lines) ---"
+          git diff "${TAG}" HEAD -- \
+            'platform-stack/cue/*.cue' \
+            'platform-stack/Chart.yaml.tmpl' \
+            | head -80 || true
+          exit 1

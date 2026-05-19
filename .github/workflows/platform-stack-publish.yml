@@ -24,33 +24,49 @@ name: platform-stack-publish
 # is for emergency / debugging re-publishes against a specific
 # commit; normal release flow leaves it empty.
 #
-# Trigger model (workflow_dispatch ONLY):
+# Trigger model (auto-publish on currentVersion bump):
 #
-# - The workflow CREATES the git tag `platform-stack/v<version>`
-#   as the LAST step, after a successful publish — not the
-#   trigger that started the run. This reverses the older
-#   "tag → publish" model so an accidental tag push can't
-#   publish a half-baked chart.
-# - To release, run the workflow from the Actions tab (or
-#   `gh workflow run platform-stack-publish.yml`) against the
-#   commit you want to release from. The workflow validates
-#   compatibility, renders, lints, publishes, signs, and only
-#   then writes the tag back.
+# - Workflow runs on every push to master that touches
+#   `platform-stack/**` plus the workflow file itself.
+#   `workflow_dispatch` stays as the manual / emergency
+#   override path.
+# - The `detect` job reads `currentVersion` from CUE and
+#   checks whether `platform-stack/v<version>` is already a
+#   tag on origin. If yes, the publish job is skipped — the
+#   commit was a non-bump edit (typo / refactor / drift). If
+#   no, the publish job runs.
+# - The `publish` job CREATES the git tag `platform-stack/v<version>`
+#   as its LAST step via `gh release create --target $GITHUB_SHA`.
+#   The pre-publish state is "branch master is ahead of the
+#   latest published tag"; the post-publish state is "tag
+#   exists on origin, future master pushes at the same
+#   currentVersion no-op".
+# - Drift between commits-and-publishes is enforced by the
+#   sibling `platform-stack-check.yml` workflow at PR time:
+#   chart source changes without a currentVersion bump fail
+#   that workflow before merge.
 #
 # Compatibility gate: before publishing, the workflow asserts
 # that `compatibility.cue` contains an entry for the resolved
 # version. Combined with the CUE-level invariant
 # `compatibility: (currentVersion): #VersionRecord`, missing
-# entries are caught both at edit time (`cue vet -c`) and at
-# CI time.
+# entries are caught at edit time (`cue vet -c`), at PR time
+# (`platform-stack-check.yml`), and at publish time (here).
 #
 # Security note (per the workflow-injection guide): every
 # dynamic value (`github.repository_owner`,
 # `github.event.inputs.*`, `github.repository`) is consumed via
-# an `env:` binding rather than direct `${{ }}` interpolation
-# into `run:` bodies. The pattern matches `release-operator.yml`.
+# an `env:` binding rather than direct expression
+# interpolation into `run:` bodies. Pattern matches
+# `release-operator.yml`.
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - 'platform-stack/**'
+      - 'scripts/check-platform-stack-version.sh'
+      - '.github/workflows/platform-stack-publish.yml'
   workflow_dispatch:
     inputs:
       version_override:
@@ -70,10 +86,15 @@ permissions:
   id-token: write   # cosign keyless OIDC
 
 jobs:
-  publish:
-    name: render, sign, and publish
+  detect:
+    name: resolve currentVersion + check if publish needed
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_publish: ${{ steps.gate.outputs.should_publish }}
 
     steps:
       - uses: actions/checkout@v4
@@ -115,18 +136,49 @@ jobs:
           echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
           echo "tag=platform-stack/v$version" >> "$GITHUB_OUTPUT"
 
-      - name: Fail if the tag we would create already exists
+      - name: Check whether currentVersion is already published
+        id: gate
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          # Tag is created by this workflow as the LAST step.
-          # If the tag already exists on the remote, either the
-          # previous run succeeded (no-op republish) or someone
-          # manually tagged. Either way, surface it and stop.
+          # Tag is created by the publish job as its LAST step.
+          # If it already exists on origin, this push touched
+          # platform-stack/** without bumping currentVersion —
+          # i.e. a refactor, docs fix, or (caught by
+          # platform-stack-check.yml at PR time) a drift bug.
+          # Either way, publishing again would be wrong.
           if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::error::tag ${TAG} already exists on origin. Bump currentVersion in platform.cue (and add the matching compatibility entry) before re-running."
-            exit 1
+            echo "::notice::Tag ${TAG} already exists on origin — currentVersion has not been bumped. Skipping publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Tag ${TAG} not yet on origin — proceeding to publish."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
+
+  publish:
+    name: render, sign, and publish
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Re-expose detect outputs as a single step source
+        id: version
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          IS_PRERELEASE: ${{ needs.detect.outputs.is_prerelease }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          # Mirroring detect.outputs onto this job's step
+          # outputs keeps the rest of the file readable —
+          # all later steps reference `steps.version.outputs.*`
+          # the same way they did before the job split.
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Compute lowercase owner
         id: owner
