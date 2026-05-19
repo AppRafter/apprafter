@@ -25,6 +25,10 @@ PATTERNS=(
   # platform-stack (CUE source + Helm Chart template)
   'platform-stack/cue/**/*.cue'
   'platform-stack/Chart.yaml.tmpl'
+  # argocd-cue-cmp (Argo CD CMP sidecar image source — ADR 0029)
+  'argocd-cue-cmp/Dockerfile'
+  'argocd-cue-cmp/plugin.yaml'
+  'argocd-cue-cmp/entrypoint.sh'
   # Scripts
   'scripts/*.sh'
   'e2e/*.sh'

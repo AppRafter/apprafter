@@ -6,38 +6,48 @@ package platformstack
 // Argo CD to render CUE source repositories. See ADR 0029 for
 // the design rationale.
 //
-// platform-stack 0.1.0 ships the CMP scaffold but doesn't yet
-// wire it as an Application of its own — the CMP container
-// runs as a sidecar of `argocd-repo-server`, configured via
-// values merged into the Argo CD release. This component
-// exists so the operator's view of "which CMP version do we
-// ship" is centralised here, not duplicated in
-// `cue/component_argocd.cue`.
+// The CMP container runs as a sidecar of `argocd-repo-server`,
+// NOT as a standalone Argo CD Application. This file therefore
+// declares the component with `enabled: false` so the umbrella
+// chart's `templates/applications.yaml` skips it — the sidecar
+// wiring lives in `cue/component_argocd.cue` via
+// `values.repoServer.extraContainers`, which reads `image.*`
+// from this file via the `_components` map for traceability.
 //
-// Wiring step (`templates/applications.yaml` reading this
-// component) lands in plan.md sub-phase 1.69 alongside the
-// repo-server sidecar values; today the component carries the
-// definition without producing an Argo CD Application.
+// The image is built and published independently of the
+// platform-stack chart, on its own `argocd-cue-cmp/v*` tag
+// series. Bumping the chart's choice of cue-cmp version is
+// a one-line edit to `version:` + `values.image.tag:` here.
 _components: "argocd-cue-cmp": #Component & {
 	name: "argocd-cue-cmp"
-	// Default OFF until the sidecar plumbing lands in 1.69.
-	// Tier overlays may turn it on once they're ready to feed
-	// user CUE repositories through Argo CD.
+	// Default OFF — this component is a sidecar, not a
+	// standalone Application. `component_argocd.cue` reads
+	// `values.image.*` to inject the sidecar into
+	// `repoServer.extraContainers`.
 	enabled:   bool | *false
 	namespace: "argocd"
 	source: {
-		repoURL: "oci://ghcr.io/apprafter"
-		chart:   "apprafter-argocd-cue-cmp"
+		// Source URL is informational — the sidecar is not
+		// pulled as a Helm chart, it's a container image
+		// the chart's argocd values reference directly. The
+		// repoURL points operators at the source of the
+		// image so `cue/compatibility.cue` retrospect is
+		// possible.
+		repoURL: "https://github.com/apprafter/apprafter/tree/main/argocd-cue-cmp"
+		path:    "argocd-cue-cmp"
 	}
-	version: "v0.1.91"
+	// Pinned cue-cmp image tag. Bump this in lockstep with
+	// the chart's own `currentVersion` bump when a new
+	// argocd-cue-cmp release ships.
+	version: "v0.1.0"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/argocd-cue-cmp"
-			tag:        string | *"v0.1.91"
+			tag:        string | *"v0.1.0"
 		}
-		// CUE evaluation timeout per repo render. Default 60s
-		// matches Argo CD's repo-server hard timeout less the
-		// 2-3s overhead of sidecar plumbing.
+		// CUE evaluation timeout per repo render. Default
+		// 57s matches Argo CD's repo-server hard timeout
+		// (60s) less the 2-3s overhead of sidecar plumbing.
 		cueTimeoutSeconds: int | *57
 	}
 }

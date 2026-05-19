@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: argocd-cue-cmp-check
+
+# PR + push-to-master gate for `argocd-cue-cmp/**`. Three
+# layers, mirroring the platform-stack-check pattern:
+#
+#   1. VERSION file sanity: single non-empty line, no
+#      whitespace, semver-ish.
+#   2. Image smoke build: `docker build` succeeds against
+#      the Dockerfile.
+#   3. Drift detection: if `argocd-cue-cmp/v<VERSION>` is
+#      already a tag on origin and any file under
+#      `argocd-cue-cmp/` differs from that tag, fail.
+#      Forces the maintainer to bump VERSION or revert.
+#
+# The publish workflow's `should_publish` gate silently
+# no-ops on non-bump pushes; this check turns that into a
+# loud red CI status so accidental drift can't slip past.
+
+on:
+  pull_request:
+    paths:
+      - 'argocd-cue-cmp/**'
+      - '.github/workflows/argocd-cue-cmp-check.yml'
+      - '.github/workflows/argocd-cue-cmp-publish.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'argocd-cue-cmp/**'
+      - '.github/workflows/argocd-cue-cmp-check.yml'
+      - '.github/workflows/argocd-cue-cmp-publish.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: VERSION + dockerfile smoke + drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: VERSION file sanity
+        id: version
+        run: |
+          version=$(tr -d '[:space:]' < argocd-cue-cmp/VERSION)
+          if [[ -z "${version:-}" ]]; then
+            echo "::error::argocd-cue-cmp/VERSION is empty"
+            exit 1
+          fi
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::argocd-cue-cmp/VERSION '${version}' is not semver"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=argocd-cue-cmp/v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Image smoke build (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: argocd-cue-cmp
+          file: argocd-cue-cmp/Dockerfile
+          push: false
+          load: true
+          tags: argocd-cue-cmp:check
+          build-args: |
+            IMAGE_VERSION=${{ steps.version.outputs.version }}
+            IMAGE_REVISION=${{ github.sha }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=argocd-cue-cmp
+          cache-to: type=gha,mode=max,scope=argocd-cue-cmp
+
+      - name: Entrypoint smoke (cue export of a tiny fixture)
+        run: |
+          mkdir -p /tmp/cue-smoke/apprafter
+          cat > /tmp/cue-smoke/apprafter/Application.cue <<'EOF'
+          package app
+          apiVersion: "apprafter.io/v1alpha1"
+          kind:       "Application"
+          metadata: {
+              name:      "hello"
+              namespace: "default"
+          }
+          spec: image: "nginxdemos/hello:plain-text"
+          EOF
+          out=$(docker run --rm \
+              -v /tmp/cue-smoke:/repo \
+              -w /repo \
+              --entrypoint /usr/local/bin/entrypoint.sh \
+              argocd-cue-cmp:check)
+          if ! echo "$out" | grep -q "kind: Application"; then
+            echo "::error::entrypoint did not render Application kind"
+            echo "--- captured output ---"
+            echo "$out"
+            exit 1
+          fi
+          echo "::notice::entrypoint smoke: rendered Application correctly"
+
+      - name: Drift detection (image source changed without VERSION bump)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if ! git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::${TAG} not on origin yet — VERSION is in-flight, drift check no-op."
+            exit 0
+          fi
+          # Pathspec covers everything that affects the
+          # built image. README is documentation, so
+          # changes there don't drift the artifact.
+          if git diff --quiet "${TAG}" HEAD -- \
+              'argocd-cue-cmp/Dockerfile' \
+              'argocd-cue-cmp/plugin.yaml' \
+              'argocd-cue-cmp/entrypoint.sh' \
+              'argocd-cue-cmp/VERSION'; then
+            echo "::notice::No drift vs ${TAG} — image source unchanged."
+            exit 0
+          fi
+          echo "::error::Image source under argocd-cue-cmp/ changed since ${TAG} was published, but VERSION is still ${VERSION}."
+          echo "::error::Either bump argocd-cue-cmp/VERSION, or revert the source changes."
+          echo ""
+          echo "--- Diff vs ${TAG} (truncated to 80 lines) ---"
+          git diff "${TAG}" HEAD -- \
+            'argocd-cue-cmp/Dockerfile' \
+            'argocd-cue-cmp/plugin.yaml' \
+            'argocd-cue-cmp/entrypoint.sh' \
+            'argocd-cue-cmp/VERSION' \
+            | head -80 || true
+          exit 1

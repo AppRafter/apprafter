@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: argocd-cue-cmp-publish
+
+# Builds, signs, and publishes the argocd-cue-cmp Docker image
+# (ADR 0029). Mirrors the architecture of
+# `platform-stack-publish.yml`:
+#
+#   - Auto-trigger on push to master that touches
+#     `argocd-cue-cmp/**` plus the workflow file.
+#   - `detect` job reads `argocd-cue-cmp/VERSION`, checks
+#     whether `argocd-cue-cmp/v<version>` already exists on
+#     origin. If yes → silent no-op. If no → publish.
+#   - `publish` job builds + pushes to ghcr.io, cosign-signs
+#     the immutable digest, then `gh release create` writes
+#     the tag and release in one shot.
+#
+# Image version is independent of platform-stack chart
+# version, CLI version, and operator version. The chart's
+# `platform-stack/cue/component_argocd-cue-cmp.cue` pins
+# which cue-cmp tag to mount.
+#
+# Security: every dynamic input goes through `env:` bindings,
+# matching the pattern in sibling workflows.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'argocd-cue-cmp/**'
+      - '.github/workflows/argocd-cue-cmp-publish.yml'
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: |
+          Optional. Publish a specific version regardless of
+          what `argocd-cue-cmp/VERSION` says. Leave empty for
+          the normal flow. Use only for emergency re-publishes.
+        required: false
+        type: string
+
+permissions:
+  contents: write   # create GitHub Release, push tag
+  packages: write   # push to ghcr.io
+  id-token: write   # cosign keyless OIDC
+
+jobs:
+  detect:
+    name: resolve version + check if publish needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from VERSION file or override
+        id: version
+        env:
+          OVERRIDE: ${{ github.event.inputs.version_override }}
+        run: |
+          if [[ -n "${OVERRIDE:-}" ]]; then
+            version="${OVERRIDE}"
+            echo "::notice::Using version_override=${version}"
+          else
+            version=$(tr -d '[:space:]' < argocd-cue-cmp/VERSION)
+            if [[ -z "${version:-}" ]]; then
+              echo "::error::failed to read argocd-cue-cmp/VERSION (empty)"
+              exit 1
+            fi
+            echo "Resolved version=${version} from VERSION file"
+          fi
+          if [[ "$version" == *-* ]]; then
+            is_prerelease=true
+          else
+            is_prerelease=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+          echo "tag=argocd-cue-cmp/v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether version is already published
+        id: gate
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::Tag ${TAG} already exists on origin. Skipping publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Tag ${TAG} not yet on origin. Proceeding to publish."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: build, sign, and publish
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Re-expose detect outputs as a single step source
+        id: version
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          IS_PRERELEASE: ${{ needs.detect.outputs.is_prerelease }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Compute lowercase owner
+        id: owner
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "lowercase=$owner_lc" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner_lc}/argocd-cue-cmp" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: argocd-cue-cmp
+          file: argocd-cue-cmp/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.owner.outputs.image }}:${{ steps.version.outputs.version }}
+          build-args: |
+            IMAGE_VERSION=${{ steps.version.outputs.version }}
+            IMAGE_REVISION=${{ github.sha }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=argocd-cue-cmp
+          cache-to: type=gha,mode=max,scope=argocd-cue-cmp
+
+      - name: cosign sign (keyless via OIDC)
+        env:
+          IMAGE: ${{ steps.owner.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          # docker/build-push-action exposes the immutable
+          # manifest digest as a step output. Sigstore best
+          # practice is to sign the digest, not the mutable
+          # tag.
+          if [[ -z "$DIGEST" ]]; then
+            echo "::error::digest output missing from build step"
+            exit 1
+          fi
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Tag :latest on stable releases
+        if: steps.version.outputs.is_prerelease == 'false'
+        env:
+          IMAGE: ${{ steps.owner.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # buildx imagetools create with --tag preserves the
+          # digest and updates only the tag reference.
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION}"
+
+      - name: Create GitHub Release + tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.owner.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IS_PRERELEASE: ${{ steps.version.outputs.is_prerelease }}
+          SHA: ${{ github.sha }}
+        run: |
+          notes_file=$(mktemp)
+          cat > "$notes_file" <<EOF
+          ## argocd-cue-cmp ${VERSION}
+
+          Argo CD Config Management Plugin sidecar for CUE
+          compilation of user application repositories
+          (ADR 0029). Mounted into argocd-repo-server via
+          [\`platform-stack\`](https://github.com/${REPO}/tree/main/platform-stack)'s
+          chart values.
+
+          ### Pull
+
+          \`\`\`sh
+          docker pull ${IMAGE}:${VERSION}
+          # or via digest (immutable):
+          docker pull ${IMAGE}@${DIGEST}
+          \`\`\`
+
+          ### Verify the signature
+
+          \`\`\`sh
+          cosign verify ${IMAGE}@${DIGEST} \\
+              --certificate-identity-regexp "https://github.com/${REPO}/" \\
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+          \`\`\`
+
+          Source: [\`argocd-cue-cmp/\`](https://github.com/${REPO}/tree/${TAG}/argocd-cue-cmp).
+          EOF
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --title "argocd-cue-cmp ${VERSION}" \
+              --notes-file "$notes_file" \
+              --prerelease
+          else
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --title "argocd-cue-cmp ${VERSION}" \
+              --notes-file "$notes_file"
+          fi

@@ -25,14 +25,58 @@ _components: argocd: #Component & {
 		// 2+ overlays scale these up; Dex stays off until
 		// OIDC SSO lands in Phase 3.
 		controller: replicas:         int | *1
-		repoServer: replicas:         int | *1
 		server: replicas:             int | *1
 		applicationSet: replicaCount: int | *1
 		notifications: replicas:      int | *1
 		dex: enabled:                 bool | *false
-		// CMP sidecar configuration lives in
-		// argocd-cue-cmp.cue and is merged into the same
-		// values object via overlay.
+
+		// argocd-repo-server runs the cue-cmp sidecar that
+		// renders user app repositories' `apprafter*.cue`
+		// files into Kubernetes YAML at sync time (ADR 0029).
+		// Image tag is pulled from `_components.argocd-cue-cmp`
+		// so a chart-level bump of the cue-cmp version is a
+		// one-line edit in that file alone.
+		//
+		// Volumes layout matches Argo CD's CMP sidecar
+		// contract: `var-files` is the shared sandbox where
+		// repo-server mounts the user repo for the sidecar
+		// to read, `cmp-tmp` is per-render scratch. The
+		// sidecar runs as UID 999 (same as the upstream
+		// argocd-repo-server image) so file ownership lines
+		// up across containers.
+		repoServer: {
+			replicas: int | *1
+			extraContainers: [{
+				name:  "cue-cmp"
+				image: "\(_components."argocd-cue-cmp".values.image.repository):\(_components."argocd-cue-cmp".values.image.tag)"
+				command: ["/var/run/argocd/argocd-cmp-server"]
+				securityContext: {
+					runAsNonRoot: true
+					runAsUser:    999
+				}
+				volumeMounts: [{
+					mountPath: "/var/run/argocd"
+					name:      "var-files"
+				}, {
+					mountPath: "/home/argocd/cmp-server/plugins"
+					name:      "plugins"
+				}, {
+					mountPath: "/tmp"
+					name:      "cmp-tmp"
+				}, {
+					mountPath: "/home/argocd/cmp-server/config/plugin.yaml"
+					subPath:   "plugin.yaml"
+					name:      "cue-cmp-config"
+				}]
+			}]
+			volumes: [{
+				name: "cue-cmp-config"
+				configMap: name: "cue-cmp-plugin-config"
+			}, {
+				name: "cmp-tmp"
+				emptyDir: {}
+			}]
+		}
 	}
 	syncPolicy: {
 		automated: {

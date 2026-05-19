@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+#
+# Argo CD Config Management Plugin manifest for CUE
+# compilation of user application repositories. ADR 0029.
+#
+# The plugin activates only when an Argo CD Application's
+# source repository contains a file matching `**/apprafter*.cue`.
+# When it does, Argo CD's repo-server hands control to this
+# sidecar, which runs `cue export ./... --out yaml` via
+# `entrypoint.sh` and pipes the rendered manifests back into
+# Argo CD's standard sync pipeline.
+#
+# Users who prefer raw YAML are unaffected — without
+# `apprafter*.cue` in the repo, the CMP discover step skips
+# the repository.
+apiVersion: argoproj.io/v1alpha1
+kind: ConfigManagementPlugin
+metadata:
+  name: cue
+spec:
+  # Detection rule. Globs are evaluated relative to the
+  # repo-server's checkout of the user repository. The
+  # `apprafter*.cue` pattern is the canonical user-app
+  # filename per Phase 1.11 + ADR 0029 §"Still open" —
+  # subject to future migration to `.apprafter/app.cue` if
+  # that resolves.
+  discover:
+    find:
+      glob: "**/apprafter*.cue"
+  # Render command. `entrypoint.sh` lives in the sidecar
+  # image and wraps `cue export` so CUE compile errors
+  # surface as structured single-line summaries in the
+  # Argo CD UI (full stderr remains available in the sync
+  # log). Sync details: see ADR 0029 §Rationale.
+  generate:
+    command: [sh, "-c"]
+    args:
+      - /usr/local/bin/entrypoint.sh

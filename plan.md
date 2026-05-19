@@ -1708,42 +1708,55 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
-### 1.69 CUE CMP sidecar Docker image + plugin.yaml
+### 1.69 CUE CMP sidecar Docker image + plugin.yaml ✅
+
+> 2026-05-19 — sub-phase 1.69 shipped: `argocd-cue-cmp/` flat directory at repo root + publish/check workflow pair following the same trigger-inversion + drift-detection model as `platform-stack-*.yml`. Chart bumped to 0.1.2 to wire the sidecar into `argocd-repo-server.extraContainers`. Image's own version track `argocd-cue-cmp/v*` — independent semver, started at 0.1.0.
 
 **Source:** ADR 0029.
 
 **Цель:** sidecar image для `argocd-repo-server` который компилирует CUE → YAML для user app repositories.
 
 **Поставка:**
-- [ ] `apprafter/argocd-cue-cmp/` new subdir:
-    - `Dockerfile` — Alpine base + `cue` binary + plugin.yaml + entrypoint wrapper
-    - `plugin.yaml`:
-      ```yaml
-      apiVersion: argoproj.io/v1alpha1
-      kind: ConfigManagementPlugin
-      metadata:
-        name: cue
-      spec:
-        discover:
-          find:
-            glob: "**/apprafter*.cue"
-        generate:
-          command: [sh, "-c"]
-          args:
-            - /entrypoint.sh
-      ```
-    - `entrypoint.sh` — runs `cue export ./... --out yaml` + post-processing для structured error output (на ошибки CUE compile — extract first error line into single-line summary; full details в stderr).
-- [ ] `.github/workflows/argocd-cue-cmp-publish.yml` — analogous to 1.68, publishes `ghcr.io/apprafter/argocd-cue-cmp:<version>`.
-- [ ] Reference image в `apprafter/platform-stack/cue/components/argocd.cue` (argocd-repo-server `extraContainers` config).
+- [x] New top-level `argocd-cue-cmp/`:
+    - [x] `Dockerfile` — Alpine 3.20 multi-stage; fetcher stage pulls cue v0.10.0 tarball from GitHub Releases; runtime stage drops cue binary on PATH, copies plugin.yaml + entrypoint.sh, sets UID/GID 999 to match argocd-repo-server CMP sidecar contract (Alpine 3.20's ping group on gid 999 deleted first to free the slot). OCI labels populated from build args (IMAGE_VERSION, IMAGE_REVISION) which CI fills.
+    - [x] `plugin.yaml` — ConfigManagementPlugin manifest. `discover.find.glob: "**/apprafter*.cue"` (matches phase 1.11 user app convention). `generate.command: [sh, "-c"]` invokes `/usr/local/bin/entrypoint.sh`.
+    - [x] `entrypoint.sh` — runs `cue export ./... --out yaml`; on success prints YAML to stdout; on failure extracts first non-empty error line as `::cue-cmp:: CUE compile failed: <summary>` to stderr + full cue stderr block below. Smoke-tested locally: happy-path → exit 0 + YAML; conflict-path (`apiVersion: "v1"` vs `"v2"`) → exit 1 + summary line.
+    - [x] `VERSION` — plain-text single source of truth for image semver. Read by publish workflow via `tr -d '[:space:]' < VERSION`. Initial value `0.1.0`.
+    - [x] `README.md` — purpose + local build instructions + smoke test script + release flow.
+- [x] `.github/workflows/argocd-cue-cmp-publish.yml` — split into `detect` + `publish` jobs (same pattern as `platform-stack-publish.yml`). Trigger: push to master on `argocd-cue-cmp/**` paths + `workflow_dispatch` with optional `version_override:`. `detect` resolves VERSION, checks if tag exists on origin → `should_publish`. `publish` (gated): docker buildx build + push to `ghcr.io/<owner>/argocd-cue-cmp:<version>` + cosign keyless sign (immutable digest from `docker/build-push-action` outputs, not the mutable tag) + `:latest` retag via `docker buildx imagetools create` on stable + `gh release create argocd-cue-cmp/v<version>` создаёт tag.
+- [x] `.github/workflows/argocd-cue-cmp-check.yml` — PR + push gate. VERSION semver validation, docker smoke build (no push), entrypoint fixture render (tiny `apprafter/Application.cue` → assert `kind: Application` in output), **drift detection** identical to platform-stack-check: if `argocd-cue-cmp/v<VERSION>` exists on origin AND any file under `argocd-cue-cmp/{Dockerfile,plugin.yaml,entrypoint.sh,VERSION}` differs → fail с 80-line diff.
+- [x] `platform-stack/cue/component_argocd-cue-cmp.cue` обновлён: image tag `v0.1.91` → `v0.1.0` (cue-cmp's own semver track), repoURL переключён на GitHub source path (image не Helm chart, sidecar pulled directly via repoServer.extraContainers), `version` field тоже `v0.1.0`. Doc-comment объясняет sidecar-not-Application semantics.
+- [x] `platform-stack/cue/component_argocd.cue` обновлён: добавлен `repoServer.extraContainers` блок с `cue-cmp` sidecar. `image` поле читает `_components."argocd-cue-cmp".values.image.repository:tag` через CUE interpolation — bump cue-cmp version становится one-line edit в одном файле. UID 999 / runAsNonRoot. Volume mounts соответствуют Argo CD CMP sidecar contract (var-files, plugins, cmp-tmp, cue-cmp-config configmap subPath).
+- [x] `platform-stack/cue/platform.cue` — `currentVersion` 0.1.1 → 0.1.2.
+- [x] `platform-stack/cue/compatibility.cue` — добавлена запись 0.1.2 (change: safe, references ADR 0029 + argocd-cue-cmp/README.md, упоминает ~50 MiB sidecar memory overhead из ADR 0029, single repo-server pod restart impact).
+- [x] `scripts/check-spdx-headers.sh` — добавил patterns `argocd-cue-cmp/{Dockerfile,plugin.yaml,entrypoint.sh}`. SPDX gate cover'ит 175 файлов.
+
+**Тесты:**
+- [x] `docker build` локально — pass. Multi-stage build → runtime image с UID 999, cue v0.10.0 binary, plugin.yaml и entrypoint.sh на правильных path'ах per Argo CD CMP sidecar contract.
+- [x] Entrypoint happy-path smoke: tiny `apprafter/Application.cue` → renders YAML, exit 0.
+- [x] Entrypoint error-path smoke: conflict-cue (`apiVersion` two-values) → `::cue-cmp:: CUE compile failed: apiVersion: conflicting values...` summary on stderr + full block, exit 1.
+- [x] `cue vet -c ./platform-stack/cue/...` clean (invariant catches future bump-without-compat).
+- [x] `bash scripts/lint-cue.sh` clean.
+- [x] Render chart 0.1.2: `helm lint` clean, `helm template` rendered output показывает `extraContainers` блок с `cue-cmp` sidecar в argocd-repo-server и `ghcr.io/apprafter/argocd-cue-cmp:v0.1.0` image ref.
+- [x] yamllint оба новых workflow'а clean.
+- [x] SPDX gate (170 → 175 после staging).
+- [x] CLI / cargo тесты untouched (565 passed, не Rust changes).
 
 **Acceptance:**
-- `docker build apprafter/argocd-cue-cmp/` produces image.
-- Manual test: `docker run -v ./test-repo:/repo -w /repo image cue export ./... --out yaml` produces correct YAML output для sample `apprafter/Application.cue`.
-- Tag `argocd-cue-cmp/v0.2.0-rc1` publishes image.
+- ✅ `docker build argocd-cue-cmp/` produces image (verified locally).
+- ✅ Manual test: `docker run --rm -v ./test-repo:/repo -w /repo --entrypoint /usr/local/bin/entrypoint.sh image` produces correct YAML output для sample `apprafter/Application.cue`.
+- ⏳ Tag `argocd-cue-cmp/v0.1.0-rc1` publishes image (CI-side, не локально воспроизводимо — verified at first push of `argocd-cue-cmp/VERSION` to master).
 
-**Зависит от:** —
+**Out-of-scope (отложено):**
+- ApplicationSet pattern для multi-app monorepos — Phase 2+ per ADR 0029 §"Still open".
+- Canonical filename migration `apprafter/Application.cue` → `.apprafter/app.cue` — deferred per ADR 0029.
+- Backstage plugin surfacing CUE compile errors — out of scope per ADR 0029.
+- End-to-end Argo CD sync test (steps 4-5 из ADR 0029 implementation outline) — manual integration test, plan.md M3 territory.
+- Multi-arch arm64 — same reasoning as release-operator.yml: Hetzner cpx22 is amd64, arm64 lands когда `Infrastructure.spec.nodes[].arch` wires through apply.rs.
 
-**Размер:** S
+**Зависит от:** 1.68 ✅ (publish-workflow pattern reused), 1.67 ✅ (chart renderer для wiring step).
+
+**Размер:** S (одна итерация, ~3 часа — основное время на Argo CD CMP sidecar contract research + Alpine ping-group conflict).
 
 ---
 
@@ -3942,3 +3955,4 @@ Originally items surfaced during Track A walks. Cleared:
 | 2026-05-15 | M1.5 chart-versioning policy decision — first published platform-stack version = **0.1.0** вместо ранее запланированного 0.2.0. Rationale: chart MINOR трекает phase number AppRafter monorepo (Phase 1.5 → chart 0.1.x), не milestone target. Когда Phase 2 services landings → chart MINOR bump'нется на 0.2.0 alongside `v0.2.0-services`. Patch versions chart и monorepo независимы (share only MINOR/MAJOR semantics). v0.1.96 flip'нул: `tier_solo.cue` + `tier_team.cue` `version: "0.1.0"`, `compatibility.cue` entry rename, `platform.cue` doc-comment, 4 component doc-comments (cilium/cert-manager/argocd-cue-cmp/operator/webhook упоминающих "platform-stack X.Y.Z"), `CHANGELOG.md` section + version notes, `RELEASE.md` versioning rules + tagging examples; re-render produces `dist/platform-stack-0.1.0/`, helm lint clean, `check-platform-stack-version.sh 0.1.0` → success, `0.2.0` → exit 1; v0.1.96 | initial |
 | 2026-05-19 | M1.5 Track B.1.68 refactor — chart-version single-source-of-truth + workflow inverts tag↔publish ordering. Walk-found: tier_solo/tier_team/compatibility-key все хардкодили "0.1.0" литералом → potential drift. Также workflow триггерился на push:tags, что позволяло "accident tag push → unconditional publish"; user попросил поменять направление — workflow создаёт tag после успешного publish, не наоборот. v0.1.97-equiv (без monorepo bump — CLI не менялся): добавил `currentVersion: #Version & "0.1.0"` в platform.cue как canonical source; `tier_solo`/`tier_team` теперь `version: currentVersion`; compatibility.cue получил CUE-level invariant `compatibility: (currentVersion): #VersionRecord` — bump currentVersion без matching entry падает на `cue vet -c` с диагностикой incomplete-fields; workflow trigger переключён на `workflow_dispatch` ONLY (no push:tags), optional `version_override:` input для emergency re-publish; workflow читает `currentVersion` через `cue export -e currentVersion`, проверяет что tag не существует на origin, прогоняет compat-gate + render + lint + push + sign, и в самом конце `gh release create` создаёт tag + release одним вызовом (через `--target $GITHUB_SHA`); `scripts/check-platform-stack-version.sh` без аргументов auto-reads currentVersion; RELEASE.md полностью переписан под новую модель — "две-строчный version bump в platform.cue+compatibility.cue", `gh workflow run` вместо `git tag && git push`, failure-mode recovery упрощена; cli/Cargo.toml откатан на 0.1.96 (CLI не менялся, monorepo tag не создаётся) | n/a |
 | 2026-05-19 | M1.5 Track B.1.68 auto-trigger + drift detection — `platform-stack-publish.yml` теперь триггерится на `push: branches: [master], paths: ['platform-stack/**', …]` (плюс `workflow_dispatch` стайл-овеr); job разбит на `detect` + `publish`: detect resolve'ит currentVersion и проверяет что `platform-stack/v<version>` не существует на origin, если уже есть → `should_publish=false` и publish job skipped (commit был не bump, а refactor / docs / drift). Новый workflow `platform-stack-check.yml` триггерится на PR + push к master с теми же paths и enforce'ит: cue fmt --check + cue vet -c (invariant catches bump-without-compat) + render + helm lint + tier-1/tier-2 smoke + **drift detection** — если currentVersion матчится тэгу на origin И files в `platform-stack/cue/*.cue` или `Chart.yaml.tmpl` отличаются от того commit'а → fail с 80-line diff и hint про currentVersion в platform.cue. Это делает "chart source changed без version bump" blocking CI error на PR time; на master тот же check работает как post-merge safety net. `actions/checkout` с `fetch-depth: 0` чтобы drift check имел доступ к remote tags. RELEASE.md обновлён под auto-trigger model — "Normal flow: bump + PR → check workflow + merge → publish workflow auto-detects bump"; добавлен PR-time guards section. yamllint clean, все cue/spdx/cargo gates green. CLI не менялся → monorepo tag не создаётся, версии в Cargo.toml не трогаются | n/a |
+| 2026-05-19 | M1.5 Track B.1.69 — CUE CMP sidecar (ADR 0029): new top-level `argocd-cue-cmp/` flat directory (Dockerfile, plugin.yaml, entrypoint.sh, VERSION='0.1.0', README.md). Alpine 3.20 multi-stage build pulls cue v0.10.0 tarball, runtime image runs as UID/GID 999 (matches argocd-repo-server CMP contract; pre-existing Alpine ping group at gid 999 deleted to free slot). entrypoint.sh wraps `cue export ./... --out yaml` со structured error output — first error line as `::cue-cmp:: CUE compile failed: <summary>` к stderr, full block ниже, exit 0/1 correctly. New paired workflows `argocd-cue-cmp-publish.yml` + `argocd-cue-cmp-check.yml` — same detect/publish split + drift detection pattern as platform-stack-*; image's own semver track `argocd-cue-cmp/v*` independent of monorepo/chart/operator versions. Chart bumped 0.1.1 → 0.1.2: `component_argocd-cue-cmp.cue` обновлён под new image registry + version pin, `component_argocd.cue` получает `repoServer.extraContainers` блок с cue-cmp sidecar (image pull через CUE interpolation `_components."argocd-cue-cmp".values.image.{repository,tag}` — one-line bump cue-cmp version), compatibility.cue entry для 0.1.2 (change: safe, references ADR 0029). SPDX gate расширен под `argocd-cue-cmp/{Dockerfile,plugin.yaml,entrypoint.sh}` (170 → 175). Local verified: docker build clean, entrypoint happy + error paths exit-code/output correct, helm template 0.1.2 показывает extraContainers + cue-cmp:v0.1.0 image. CI-side acceptance ⏳ verified at first push (cue-cmp publish workflow + chart publish workflow оба триггерятся параллельно) | n/a |

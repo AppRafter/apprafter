@@ -128,3 +128,41 @@ compatibility: "0.1.1": {
 		"docs/adr/0032-license-fsl-1-1-apache-2-0.md",
 	]
 }
+
+// 0.1.2 — wires the cue-cmp sidecar (ADR 0029) into
+// argocd-repo-server's `extraContainers`. Pulls the
+// `ghcr.io/<owner>/argocd-cue-cmp:v0.1.0` image which has
+// its own publish track (`argocd-cue-cmp/v*` tag series,
+// `.github/workflows/argocd-cue-cmp-publish.yml`).
+//
+// User apps that contain `apprafter*.cue` are now renderable
+// by Argo CD directly — the sidecar runs `cue export ./...
+// --out yaml` at sync time. User apps that stick with raw
+// YAML continue to work unchanged; the CMP `discover.find.glob`
+// rule skips repositories without `apprafter*.cue`.
+compatibility: "0.1.2": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		Wires the argocd-cue-cmp sidecar (ADR 0029) into
+		`argocd-repo-server.extraContainers`. The sidecar
+		image is pinned to v0.1.0 of the
+		`argocd-cue-cmp/v*` track. Apprafter-operator and
+		admission-webhook are unchanged.
+
+		Upgrade impact: a single argocd-repo-server pod
+		restart adds the cue-cmp sidecar. The sidecar adds
+		~50 MiB to the pod's memory footprint per ADR
+		0029's estimate. CMP activates only when a user
+		repository contains `apprafter*.cue`; raw-YAML user
+		apps are unaffected.
+
+		Operators on 0.1.0 or 0.1.1 may upgrade by
+		changing `spec.source.targetRevision: "0.1.2"` on
+		their platform Application.
+		"""
+	references: [
+		"docs/adr/0029-cue-cmp.md",
+		"argocd-cue-cmp/README.md",
+	]
+}
