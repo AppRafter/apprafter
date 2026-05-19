@@ -33,9 +33,9 @@ Cozystack's deployment baseline is bare metal. AppRafter Tier 1 is a single VDS 
 
 ### License model
 
-Cozystack uses Apache 2.0. AppRafter uses FSL-1.1-MIT (auto-converts to MIT 2 years after each release).
+Cozystack uses Apache 2.0. AppRafter uses FSL-1.1-Apache-2.0 (auto-converts to Apache 2.0 2 years after each release; see ADR 0032 for the post-M1 base-license migration from FSL-1.1-MIT to FSL-1.1-Apache-2.0).
 
-Apache 2.0 alone exposes the project to traction-without-revenue risk — cloud vendors can rebrand and offer the platform as their managed product with no contribution back. FSL-1.1-MIT provides a 2-year commercial-use protection window per release while preserving full OSS access for individuals and on-prem deployments.
+Plain Apache 2.0 (without the FSL wrap) exposes the project to traction-without-revenue risk — cloud vendors can rebrand and offer the platform as their managed product with no contribution back. The FSL wrap provides a 2-year commercial-use protection window per release while preserving full OSS access for individuals and on-prem deployments; after that window each release converts to vanilla Apache 2.0.
 
 ### API surface
 
@@ -89,5 +89,6 @@ Core platform team.
 ## References
 
 - Cozystack project page.
-- ADR 0001 (License decision — FSL-1.1-MIT rationale).
+- ADR 0001 (License decision — FSL wrap rationale; superseded for base license choice by ADR 0032).
+- ADR 0032 (Migration of core base license to FSL-1.1-Apache-2.0).
 - ADR 0023 (Multi-tenancy via Kamaji — pattern borrowed from Cozystack).

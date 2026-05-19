@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: FSL-1.1-MIT -->
+<!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
 
 # Contributing to AppRafter
 
@@ -48,13 +48,14 @@ Thanks for considering a contribution.
 By contributing, you agree your contribution is licensed under the
 same terms as the project:
 
-- **FSL-1.1-MIT** — for the platform core (`cli/`, `operator/`,
+- **FSL-1.1-Apache-2.0** — for the platform core (`cli/`, `operator/`,
   `schemas/`, `manifests/`, and platform-internal services).
 - **MIT** — for plugins (`providers/`, `backstage-plugins/`, and
   community SDKs).
 
-See [`LICENSE`](LICENSE), [`LICENSE-MIT`](LICENSE-MIT),
-and [`NOTICE`](NOTICE) for the full text and rationale.
+See [`LICENSE`](LICENSE), [`LICENSE-APACHE`](LICENSE-APACHE),
+[`LICENSE-MIT`](LICENSE-MIT), and [`NOTICE`](NOTICE) for the full
+text and rationale.
 
 ## Code of Conduct
 

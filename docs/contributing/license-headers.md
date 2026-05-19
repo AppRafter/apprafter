@@ -5,20 +5,23 @@ Every source file in this repository must declare its license via an
 
 Two identifiers are in use across the monorepo:
 
-| Path                                            | SPDX identifier |
-| ----------------------------------------------- | --------------- |
-| `cli/`, `operator/`, `schemas/`, `manifests/`   | `FSL-1.1-MIT`   |
-| `providers/`, `backstage-plugins/`              | `MIT`           |
+| Path                                            | SPDX identifier        |
+| ----------------------------------------------- | ---------------------- |
+| `cli/`, `operator/`, `schemas/`, `manifests/`   | `FSL-1.1-Apache-2.0`   |
+| `providers/`, `backstage-plugins/`              | `MIT`                  |
 
 Plugins and SDKs are MIT from day one to keep contribution friction
-minimal; the platform core uses FSL-1.1-MIT (see `NOTICE` for the rationale).
+minimal; the platform core uses FSL-1.1-Apache-2.0 (see `NOTICE` and
+ADR 0032 for the rationale). Releases v0.0.1 through v0.1.96 were
+published under the previous FSL-1.1-MIT base — see ADR 0032 for the
+migration history.
 
 ## Per-language syntax
 
 Rust:
 
 ```rust
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 ```
 
 TypeScript / JavaScript / OneBun:
@@ -30,19 +33,19 @@ TypeScript / JavaScript / OneBun:
 CUE:
 
 ```cue
-// SPDX-License-Identifier: FSL-1.1-MIT
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
 ```
 
 YAML / Bash / Dockerfile (hash comments):
 
 ```yaml
-# SPDX-License-Identifier: FSL-1.1-MIT
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 ```
 
 HTML / Markdown (HTML comment, optional):
 
 ```html
-<!-- SPDX-License-Identifier: FSL-1.1-MIT -->
+<!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
 ```
 
 ## Generated files

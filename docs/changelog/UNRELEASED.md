@@ -4066,7 +4066,9 @@ Backstage Software Template) → e2e/mvp.sh smoke + nightly CI.
 **Numbers:** 143 SPDX-tracked source files, ~290 Rust tests
 (cli workspace), 56 Rust tests (operator workspace), 31 TS tests
 (Bun packages), 0 clippy warnings, all under FSL-1.1-MIT (core)
-or MIT (plugins / templates) per ADR 0001.
+or MIT (plugins / templates) per ADR 0001. (M1 shipped before
+the ADR 0032 base-license migration; subsequent releases use
+FSL-1.1-Apache-2.0 — see ADR 0032.)
 
 **Deliberately deferred to M2+:**
 
@@ -4768,13 +4770,16 @@ or MIT (plugins / templates) per ADR 0001.
   `docs/`.
 - **`plan.md`** — actionable phase-by-phase development plan
   derived from the spec.
-- **Licensing** — `LICENSE` (FSL-1.1-MIT, canonical text from
-  fsl.software), `LICENSE-MIT`, `NOTICE` explaining the 2-year
-  FSL → MIT conversion model, plugin-level MIT `LICENSE` files in
-  `providers/` and `backstage-plugins/`, SPDX-header conventions
-  in `docs/contributing/license-headers.md`.
+- **Licensing** — `LICENSE` (FSL-1.1-MIT at M0; canonical text from
+  fsl.software; later migrated to FSL-1.1-Apache-2.0 per ADR 0032),
+  `LICENSE-MIT`, `NOTICE` explaining the 2-year FSL conversion model,
+  plugin-level MIT `LICENSE` files in `providers/` and
+  `backstage-plugins/`, SPDX-header conventions in
+  `docs/contributing/license-headers.md`.
 - **12 ADRs** + Nygard-style template covering: FSL-1.1-MIT for
-  core, codename "AppRafter", custom Rust operator vs Crossplane,
+  core (the base-license choice was later migrated to
+  FSL-1.1-Apache-2.0 via ADR 0032), codename "AppRafter", custom
+  Rust operator vs Crossplane,
   CUE vs Pkl, kine+NATS vs etcd, OpenBao vs Vault, Tier-1
   SealedSecrets vs Tier-2+ OpenBao, HTTP-first notifications,
   platform-only templates, Dockerfile-first build, hybrid Rust SDK
@@ -4807,6 +4812,7 @@ or MIT (plugins / templates) per ADR 0001.
   "Repository structure defined" and "License chosen". The
   license-candidates note (MPL-2.0 / Apache-2.0) is replaced by
   the actual decision (FSL-1.1-MIT for core, MIT for plugins;
-  see ADR 0001).
+  see ADR 0001 — subsequently migrated to FSL-1.1-Apache-2.0 base
+  via ADR 0032).
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
