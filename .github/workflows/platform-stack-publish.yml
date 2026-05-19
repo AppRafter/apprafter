@@ -271,16 +271,23 @@ jobs:
           # `helm push` of an OCI artifact derives the registry
           # tag from Chart.yaml's `version` — exactly what we
           # want for the primary push.
-          helm push "$TGZ" "oci://ghcr.io/${OWNER_LC}"
-          # cosign signs immutable digests, not mutable tags
-          # (Sigstore best practice). Resolve the digest now.
-          digest=$(helm show chart "oci://${IMAGE}" --version "$VERSION" \
-            | awk '/^digest:/ {print $2; exit}')
+          #
+          # Capture the push stdout so we can extract the
+          # `Digest: sha256:…` line — that's the immutable
+          # digest cosign signs against (Sigstore best
+          # practice: never sign a mutable tag). `helm show
+          # chart` prints the Chart.yaml metadata, which has
+          # NO `digest:` field, so we can't fall back to that.
+          push_output=$(mktemp)
+          helm push "$TGZ" "oci://ghcr.io/${OWNER_LC}" \
+            2>&1 | tee "$push_output"
+          digest=$(awk '/^Digest:/ {print $2; exit}' "$push_output")
           if [[ -z "$digest" ]]; then
-            echo "::error::failed to resolve OCI digest for ${IMAGE}:${VERSION}"
+            echo "::error::failed to resolve OCI digest for ${IMAGE}:${VERSION} from helm push output"
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "::notice::Resolved OCI digest: ${digest}"
 
       - name: cosign sign (keyless via OIDC)
         env:
