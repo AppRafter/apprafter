@@ -13,6 +13,103 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.105 — walk-fix: broken operator image + missing ClusterIssuer (2026-05-20)
+
+Eighth walk on chart 0.1.8 / CLI v0.1.104. After the manual
+default-AppProject patch from v0.1.104, four of six children
+went green, but operator + admission-webhook stayed broken.
+
+### Bug M — operator image v0.1.91 is broken
+
+```
+$ kubectl describe pod -n apprafter-system -l app.kubernetes.io/name=apprafter-operator
+  State:   Waiting
+    Reason:  CreateContainerError
+
+$ kubectl run --rm -i test-pull \
+    --image=ghcr.io/apprafter/apprafter-operator:v0.1.91 \
+    --command -- /apprafter-operator --help
+  failed to create containerd task: ... unable to start container
+  process: error during container init: exec: "/apprafter-operator":
+  stat /apprafter-operator: no such file or directory
+```
+
+Not an ENTRYPOINT issue — the **binary itself is missing
+from the image manifest**. The v0.1.91 image was published
+months ago when Track A closed, likely from a partial /
+stale Dockerfile that didn't complete the COPY step. The
+image has been broken ever since but never exercised
+because v0.1.x cluster-bootstrap installed the operator
+chart from a local path (`operator/charts/apprafter-operator/`),
+not from OCI.
+
+Fix:
+- Both `operator/charts/apprafter-operator/Chart.yaml` and
+  `operator/charts/apprafter-admission-webhook/Chart.yaml`
+  bumped to `version: v0.1.92` with `appVersion: "v0.1.105"`
+  (today's monorepo tag). The
+  release-operator.yml workflow rebuilds container images
+  on every `v0.*` tag push using the cargo-chef Dockerfile
+  that reliably produces a working binary.
+- Both chart deployment templates gain an explicit
+  `command: ["/<binary>"]` field. Defence in depth —
+  containers no longer rely on the image manifest's
+  ENTRYPOINT field, so a future image-build accident can't
+  reproduce this class of failure silently.
+
+### Bug L — `apprafter-selfsigned` ClusterIssuer missing
+
+```
+$ kubectl get certificate -n apprafter-system
+NAME                    READY   SECRET                  AGE
+admission-webhook-tls   False   admission-webhook-tls   7m
+
+$ kubectl get clusterissuer
+No resources found
+```
+
+The webhook chart's `Certificate` template references
+`kind: ClusterIssuer, name: apprafter-selfsigned`. cert-manager
+chart 1.16.2 does not ship default issuers (it's a per-cluster
+policy decision); v0.1.x cluster-bootstrap created the
+`apprafter-selfsigned` ClusterIssuer via
+`cli-providers::k8s::issuer.rs`. After the v0.1.97
+imperative-to-GitOps rewrite, that step migrated out of the
+CLI but **the ClusterIssuer was never moved into a chart
+template**. Webhook Certificate hung in `Issuing` forever.
+
+Fix:
+- New `operator/charts/apprafter-admission-webhook/templates/clusterissuer.yaml`
+  ships the `apprafter-selfsigned` ClusterIssuer (`selfSigned: {}`
+  spec — matches the v0.1.x baseline) alongside the
+  Certificate it serves. Single chart owns both halves of
+  the TLS pair.
+
+### Decorative — `RELEASED_OPERATOR_VERSION` drift fixed
+
+`cli-providers::k8s::image_ref::RELEASED_OPERATOR_VERSION`
+was `"v0.1.64"` — three months stale per CLAUDE.md's
+"bump in lockstep" rule. Bumped to `"v0.1.105"`. Now
+matches chart `appVersion`.
+
+### Chart + CLI versions
+
+- Chart `currentVersion 0.1.8 → 0.1.9` with full compat
+  entry; 0.1.8 entry lists the two known issues fixed in
+  0.1.9.
+- Operator chart `v0.1.91 → v0.1.92`, appVersion
+  `v0.1.91 → v0.1.105`.
+- Admission-webhook chart `v0.1.91 → v0.1.92`, appVersion
+  `v0.1.91 → v0.1.105`.
+- CLI `RELEASED_PLATFORM_STACK_VERSION → "0.1.9"`.
+- CLI `RELEASED_OPERATOR_VERSION → "v0.1.105"`.
+- CLI `0.1.104 → 0.1.105`.
+
+### Tests
+
+No new CLI tests — defects are chart-domain. 557 CLI tests
+still pass; fmt + clippy + SPDX + cue vet all clean.
+
 ## v0.1.104 — walk-fix: default AppProject missing (2026-05-20)
 
 Seventh walk on chart 0.1.7 / CLI v0.1.103. Bootstrap hung

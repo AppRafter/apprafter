@@ -23,11 +23,17 @@ _components: "admission-webhook": #Component & {
 		repoURL: "ghcr.io/apprafter"
 		chart:   "apprafter-admission-webhook"
 	}
-	version: "v0.1.91"
+	version: "v0.1.92"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-admission-webhook"
-			tag:        string | *"v0.1.91"
+			// Same v0.1.91-image-broken-ENTRYPOINT fix as the
+			// operator chart; new chart v0.1.92 also adds an
+			// explicit `command:` to the deployment template
+			// and ships the `apprafter-selfsigned`
+			// ClusterIssuer that this chart's Certificate
+			// references.
+			tag: string | *"v0.1.105"
 		}
 		// Two replicas by default so a single pod restart
 		// doesn't gap the validating webhook. Tier overlays

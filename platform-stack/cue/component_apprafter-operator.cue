@@ -28,13 +28,19 @@ _components: "apprafter-operator": #Component & {
 		repoURL: "ghcr.io/apprafter"
 		chart:   "apprafter-operator"
 	}
-	version: "v0.1.91"
+	version: "v0.1.92"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-operator"
-			// Defaults to the chart version unless explicitly
-			// overridden (fork / dev builds).
-			tag: string | *"v0.1.91"
+			// Image tag pinned to the monorepo tag that ships
+			// the fresh build with explicit-command Dockerfile.
+			// v0.1.91 image lacked usable ENTRYPOINT in its
+			// manifest on k3s v1.35 containerd (walk-found bug
+			// v0.1.104 → v0.1.105: pods failed with
+			// `failed to generate spec: no command specified`).
+			// Chart 0.1.92 also hard-wires the command in the
+			// deployment template as defence in depth.
+			tag: string | *"v0.1.105"
 		}
 		// Leader-election guards (10s renew / 30s expiry) match
 		// the in-tree settings; tier overlays may bump replicas.

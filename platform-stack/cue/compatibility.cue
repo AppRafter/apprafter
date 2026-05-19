@@ -614,8 +614,93 @@ compatibility: "0.1.8": {
 		upgrade to 0.1.8 (or to the matching CLI v0.1.104+).
 		Manual one-time recovery: `kubectl apply -f -` an
 		AppProject named `default` in namespace `argocd`.
+
+		Known issues carried into 0.1.8 (fixed in 0.1.9):
+
+		* `apprafter-operator` pods failed
+		  `CreateContainerError` with `failed to generate
+		  spec: no command specified`. The
+		  `ghcr.io/apprafter/apprafter-operator:v0.1.91`
+		  container image was broken — `kubectl run` against
+		  the image showed `stat /apprafter-operator: no such
+		  file or directory`. The binary never made it into
+		  the image when v0.1.91 was tagged.
+		* `admission-webhook` pods stuck with `MountVolume.SetUp
+		  failed: secret "admission-webhook-tls" not found`.
+		  cert-manager Certificate was issuing but the
+		  referenced `apprafter-selfsigned` ClusterIssuer
+		  didn't exist on the cluster — the chart never
+		  shipped it.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01104",
+	]
+}
+
+// 0.1.9 — operator + webhook chart hardening on top of
+// 0.1.8. Walk #8 surfaced two defects tied to chart-side
+// blind spots:
+//
+//   1. `ghcr.io/apprafter/apprafter-operator:v0.1.91`
+//      container image was broken — `kubectl run` showed
+//      `stat /apprafter-operator: no such file or directory`.
+//      The binary was missing from the image manifest at
+//      that tag (likely a stale or partially-built artefact
+//      from when v0.1.91 was first published). Fix: bump
+//      both `operator/charts/apprafter-operator` and
+//      `operator/charts/apprafter-admission-webhook` to
+//      chart version `v0.1.92` with `appVersion: v0.1.105`
+//      (the fresh monorepo tag whose
+//      release-operator.yml workflow rebuilds the images
+//      with the cargo-chef Dockerfile that
+//      reliably produces working binaries). Both chart
+//      templates also gain an explicit
+//      `command: [...]` field that does NOT rely on the
+//      image manifest's ENTRYPOINT field, as defence in
+//      depth against future image-build edge cases.
+//   2. The `apprafter-selfsigned` ClusterIssuer that
+//      `apprafter-admission-webhook`'s `Certificate`
+//      template references didn't exist on a fresh
+//      cluster — cert-manager never received an Issuer
+//      definition and the Certificate stayed in `Issuing`
+//      forever. Fix: ship a `clusterissuer.yaml` template
+//      in the webhook chart that creates the ClusterIssuer
+//      alongside the Certificate it serves. The
+//      `selfSigned: {}` spec matches Argo CD's historical
+//      v0.1.x baseline.
+//
+// Also: `cli-providers::k8s::RELEASED_OPERATOR_VERSION`
+// bumped from `v0.1.64` to `v0.1.105` (was three months
+// stale per CLAUDE.md sync rule).
+compatibility: "0.1.9": {
+	change:          "safe"
+	operatorVersion: "v0.1.105"
+	notes: """
+		Operator + admission-webhook chart hardening.
+
+		* Operator + webhook charts bumped to v0.1.92 with
+		  appVersion v0.1.105 — fresh monorepo tag whose
+		  workflow rebuilds the container images with the
+		  cargo-chef Dockerfile that reliably produces a
+		  working binary at /apprafter-operator and
+		  /admission-webhook. The v0.1.91 image was broken
+		  (binary missing).
+		* Both chart templates gain explicit
+		  `command: [...]` field — defence in depth against
+		  future image-manifest edge cases.
+		* New `clusterissuer.yaml` template in the webhook
+		  chart ships the `apprafter-selfsigned` ClusterIssuer
+		  that this chart's Certificate references. Without
+		  it cert-manager could not issue the TLS Secret and
+		  the webhook pod stayed `MountVolume.SetUp failed`.
+
+		Operators on 0.1.8 stuck with `no command specified`
+		(operator pods) or `MountVolume.SetUp failed`
+		(webhook pods): upgrade to 0.1.9 (or to the matching
+		CLI v0.1.105+). No manual cluster surgery needed —
+		the chart's self-reconcile applies both fixes.
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01105",
 	]
 }

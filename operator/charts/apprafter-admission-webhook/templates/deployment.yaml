@@ -26,6 +26,10 @@ spec:
         - name: {{ include "apprafter-admission-webhook.name" . }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # See operator chart's deployment.yaml for rationale
+          # — explicit command, no reliance on image
+          # manifest's ENTRYPOINT.
+          command: ["/admission-webhook"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           ports:

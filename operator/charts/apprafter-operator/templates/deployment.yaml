@@ -27,6 +27,15 @@ spec:
         - name: operator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Explicit command — does not rely on the image
+          # manifest's ENTRYPOINT field. containerd on k3s
+          # v1.35 rejects pods with `failed to generate spec:
+          # no command specified` if the image manifest lacks
+          # ENTRYPOINT for any reason (walk-found bug v0.1.104
+          # → v0.1.105). Hard-wiring `command` here keeps the
+          # chart bullet-proof against image-manifest edge
+          # cases.
+          command: ["/apprafter-operator"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:

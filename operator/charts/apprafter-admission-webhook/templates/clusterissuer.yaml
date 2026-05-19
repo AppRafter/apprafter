@@ -1,0 +1,21 @@
+{{/* SPDX-License-Identifier: MIT */}}
+{{/*
+  cert-manager `apprafter-selfsigned` ClusterIssuer. The webhook
+  chart's Certificate references this by name, so the two must
+  ship together. cert-manager chart itself does NOT create a
+  default ClusterIssuer (per-cluster policy decision), so we
+  declare ours here.
+
+  ClusterIssuer is cluster-scoped — only one named
+  `apprafter-selfsigned` can exist. Multiple chart releases of
+  this chart on the same cluster would conflict; that's
+  acceptable for the tier-1 single-release contract.
+*/}}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: apprafter-selfsigned
+  labels:
+    {{- include "apprafter-admission-webhook.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
