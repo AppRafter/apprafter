@@ -471,8 +471,85 @@ compatibility: "0.1.6": {
 		match template labels` or `app path does not exist`:
 		upgrade to 0.1.6 (or to the matching CLI v0.1.102+
 		which pins this chart version).
+
+		Known issues carried into 0.1.6 (all fixed in 0.1.7):
+
+		* `cilium-operator` CrashLoopBackOff with
+		  `KUBERNETES_SERVICE_HOST=auto` env var — chart's
+		  `component_cilium.cue` values diverged from the
+		  CLI loader's (`k8sServiceHost: "auto"` vs
+		  `"127.0.0.1"`, missing `ipv4`/`ipv6` flags). Argo
+		  CD applied chart-overlay manifests on top of the
+		  loader Deployment, breaking Cilium agent.
+		* `cert-manager` reported `terminatingReplicas:
+		  field not declared in schema` — same field skew as
+		  the other components but `component_cert-manager.cue`
+		  lacked `ignoreDifferences` in 0.1.5 / 0.1.6.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01102",
+	]
+}
+
+// 0.1.7 — Cilium chart-overlay alignment hotfix on top of
+// 0.1.6. Walk #6 surfaced that Argo CD applies
+// `component_cilium.cue` values as a plain-manifest overlay
+// on top of the loader-installed Cilium release, NOT as a
+// helm upgrade of the existing release. The two value sets
+// MUST therefore be byte-identical for tier-1 — any drift
+// reconfigures the live Cilium operator + agent and the
+// operator crashes with `unable to load in-cluster
+// configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT
+// must be defined` (because the chart was setting
+// `k8sServiceHost: "auto"` which gets emitted as a literal
+// env-var string).
+//
+//   1. `component_cilium.cue` values rewrite to mirror
+//      `cli-providers::k8s::cilium_values_yaml` byte-by-byte:
+//      `kubeProxyReplacement: true` (bool, not string),
+//      `k8sServiceHost: "127.0.0.1"` (not `"auto"`),
+//      `k8sServicePort: 6443` (added, was missing),
+//      `ipv4.enabled: true` + `ipv6.enabled: true` (added,
+//      were missing — drove the ConfigMap's
+//      `enable-ipv6: "false"` divergence).
+//   2. `component_cert-manager.cue` gains `ignoreDifferences`
+//      for `Deployment.status.terminatingReplicas` (oversight
+//      in 0.1.5 / 0.1.6).
+//
+// Note for B.1.71: the duplication between
+// `cli-providers::k8s::cilium_values_yaml` and
+// `component_cilium.cue` is exactly what B.1.71's
+// "migration of values from CLI to chart" eliminates. Until
+// then, every edit to either side MUST be paired (commented
+// banner in `component_cilium.cue` reminds the next reader).
+compatibility: "0.1.7": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		Cilium chart-overlay alignment hotfix.
+
+		* `component_cilium.cue` now mirrors the CLI loader's
+		  `cilium_values_yaml` byte-by-byte. The chart's
+		  former `k8sServiceHost: "auto"` was reaching live
+		  pods as literal env-var
+		  `KUBERNETES_SERVICE_HOST=auto`, crashing
+		  cilium-operator with `unable to load in-cluster
+		  configuration`. Fixed by setting `k8sServiceHost:
+		  "127.0.0.1"`, `k8sServicePort: 6443`, restoring
+		  `ipv4.enabled: true` + `ipv6.enabled: true`, and
+		  flipping `kubeProxyReplacement` from string back to
+		  bool.
+		* `component_cert-manager.cue` gains
+		  `ignoreDifferences` for
+		  `Deployment.status.terminatingReplicas`.
+
+		Operators on 0.1.6 stuck with cilium-operator
+		CrashLoopBackOff (and the cascade of
+		`cilium-cni: unable to connect to Cilium agent`
+		failures on every other pod schedule): upgrade to
+		0.1.7 (or to the matching CLI v0.1.103+).
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01103",
 	]
 }

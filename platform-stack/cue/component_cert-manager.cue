@@ -36,4 +36,14 @@ _components: "cert-manager": #Component & {
 	// cert-manager-webhook` and Argo CD retries with backoff
 	// for minutes before convergence.
 	syncWave: -10
+
+	// cert-manager ships three Deployments (controller,
+	// webhook, cainjector); each surfaces
+	// `status.terminatingReplicas` on k3s v1.35. Same skew as
+	// every other component with a Deployment.
+	ignoreDifferences: [{
+		group: "apps"
+		kind:  "Deployment"
+		jsonPointers: ["/status/terminatingReplicas"]
+	}]
 }

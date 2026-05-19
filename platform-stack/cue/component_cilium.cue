@@ -22,15 +22,32 @@ _components: cilium: #Component & {
 		chart:   "cilium"
 	}
 	version: "1.16.5"
+	// Values MUST mirror `cli-providers::k8s::cilium_values_yaml`
+	// byte-by-byte for tier-1. The CLI's cluster-bootstrap
+	// loader installs Cilium with those values; when the chart
+	// adopts the loader release on first reconcile, helm
+	// upgrade applies whatever this overlay produces. ANY drift
+	// — `k8sServiceHost: "auto"` instead of `"127.0.0.1"`,
+	// missing `ipv4`/`ipv6` enabled flags, `kubeProxyReplacement`
+	// as string instead of bool — reconfigures the live Cilium
+	// agent + operator and on cpx22 k3s reliably crashes
+	// cilium-operator with `CrashLoopBackOff` (every new pod
+	// then fails with `cilium-cni: unable to connect to Cilium
+	// agent`). Walk-found bug v0.1.102 → v0.1.103.
+	//
+	// Once B.1.71 lands and these values are owned by ONE side
+	// (chart values yaml, regenerated into the CLI loader via
+	// `cue cmd`), the drift becomes impossible. Until then, any
+	// edit here MUST be paired with the same edit in
+	// `cli-providers::k8s::cilium_values_yaml`.
 	values: {
-		kubeProxyReplacement: "true"
-		k8sServiceHost:       "auto"
-		ipam: mode: "kubernetes"
-		hubble: {
-			enabled: bool | *false
-			relay: enabled: bool | *false
-			ui: enabled:    bool | *false
-		}
+		kubeProxyReplacement: bool | *true
+		k8sServiceHost:       string | *"127.0.0.1"
+		k8sServicePort:       int | *6443
+		ipv4: enabled:      bool | *true
+		ipv6: enabled:      bool | *true
+		ipam: mode:         string | *"kubernetes"
+		hubble: enabled:    bool | *false
 		operator: replicas: int | *1
 	}
 

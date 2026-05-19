@@ -13,6 +13,77 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.103 — walk-fix: Cilium chart-overlay drift (2026-05-19)
+
+Sixth walk on chart 0.1.6 / CLI v0.1.102. Two of three
+remaining defects fixed; the third (`argocd redis-secret-init`)
+plausibly cleared as a side-effect.
+
+### Bug J — cilium-operator CrashLoopBackOff
+
+```
+unable to load in-cluster configuration,
+KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT
+must be defined
+```
+
+`kubectl describe` showed env `KUBERNETES_SERVICE_HOST: auto`
+on the cilium-operator pod — literal string `"auto"`, not a
+hostname. Source: `component_cilium.cue` was carrying
+`k8sServiceHost: "auto"` (and `kubeProxyReplacement: "true"`
+as string, missing `ipv4`/`ipv6` flags, missing
+`k8sServicePort`), all of which diverged from the CLI
+loader's `cilium_values_yaml`.
+
+The mechanic: Argo CD doesn't `helm upgrade` the
+loader-installed release. It renders chart templates with
+its OWN values and applies them as plain manifests. Two
+owners for the same Deployment + ConfigMap. The
+chart-rendered manifest wins; `helm get values cilium`
+still showed the loader's values (the in-storage helm
+release record), but the live ConfigMap had `enable-ipv6:
+"false"` (chart default) and the live Deployment had
+`KUBERNETES_SERVICE_HOST=auto` (chart's literal value).
+
+Fix: `component_cilium.cue` values now mirror
+`cli-providers::k8s::cilium_values_yaml` byte-by-byte —
+`kubeProxyReplacement: true` (bool), `k8sServiceHost:
+"127.0.0.1"`, `k8sServicePort: 6443`, `ipv4.enabled: true`,
+`ipv6.enabled: true`. A banner comment in the cue file
+reminds the next reader that any edit MUST be paired with
+the same edit in the CLI loader until B.1.71's central
+values source eliminates the duplication.
+
+### Bug I — cert-manager `terminatingReplicas`
+
+`component_cert-manager.cue` was missed in the `ignoreDifferences`
+pass — chart 0.1.5 added the field to `#Component` schema +
+cilium + argocd, 0.1.6 extended to operator + webhook, but
+cert-manager kept slipping through.
+
+Fix: same one-element block as the others.
+
+### Cascade — argocd `redis-secret-init` Job
+
+Walk #5 logs left this hook hanging. Walk #6 same — but
+plausibly because cilium-agent was down (no networking → no
+pod schedule → Job never executes). With Bug J fixed,
+cilium-agent stays Ready, and the hook should complete
+within image-pull time. **To verify on the next walk.**
+
+### Chart + CLI versions
+
+- Chart `currentVersion 0.1.6 → 0.1.7` with full compat
+  entry; 0.1.6 entry lists the two known issues fixed in
+  0.1.7.
+- CLI `RELEASED_PLATFORM_STACK_VERSION → "0.1.7"`.
+- CLI `0.1.102 → 0.1.103`.
+
+### Tests
+
+No new CLI tests — both defects are chart-domain. 556 CLI
+tests pass; fmt + clippy + SPDX + cue vet all clean.
+
 ## v0.1.102 — walk-fix: chart-template hygiene + sync ordering (2026-05-19)
 
 Fifth walk on the GitOps loader, against chart 0.1.5. Bootstrap
