@@ -2,24 +2,38 @@ AppRafter — Licensing Notice
 ============================
 
 The AppRafter platform core is licensed under the Functional Source License
-v1.1 with MIT Future License (SPDX: FSL-1.1-MIT). See LICENSE for the full
-text.
+v1.1 with Apache 2.0 Future License (SPDX: FSL-1.1-Apache-2.0). See LICENSE
+for the full text and LICENSE-APACHE for the Apache 2.0 conversion target.
 
 How the Future License conversion works
 ---------------------------------------
 
-Each release of the platform core is published under FSL-1.1-MIT. On the
-second anniversary of the date a given release is made available, that
-release converts to the MIT License. The MIT text used by the conversion is
-reproduced verbatim in LICENSE-MIT for transparency.
+Each release of the platform core is published under FSL-1.1-Apache-2.0. On
+the second anniversary of the date a given release is made available, that
+release converts to the Apache License, Version 2.0. The Apache 2.0 text
+used by the conversion is reproduced verbatim in LICENSE-APACHE for
+transparency.
 
 In practice this means:
 
-  - Active development always lives under FSL-1.1-MIT.
-  - Each release has a fixed expiry: two years to MIT.
+  - Active development always lives under FSL-1.1-Apache-2.0.
+  - Each release has a fixed expiry: two years to Apache 2.0.
   - The most recent release is always at most two years away from being
-    plain MIT — even if upstream development stops, the codebase eventually
-    becomes fully OSI-open.
+    plain Apache 2.0 — even if upstream development stops, the codebase
+    eventually becomes fully OSI-open.
+
+Two-license landscape during the FSL window
+-------------------------------------------
+
+Pre-existing releases v0.0.1 through v0.1.96 (plus the v0.1.0-mvp milestone
+tag) were published under FSL-1.1-MIT, the previous base license choice
+recorded in ADR 0001. Per ADR 0032, those releases retain their original
+terms — their 2-year conversion clock continues running independently and
+they convert to the MIT License (not Apache 2.0) on their own anniversaries.
+LICENSE-MIT in the repository root preserves the MIT text for that purpose.
+
+Only versions published from the ADR 0032 migration commit forward convert
+to Apache 2.0.
 
 Plugins
 -------
@@ -29,14 +43,23 @@ the InfrastructureProviderPlugin / ServiceProviderPlugin SDKs are licensed
 under the MIT License from day one (no FSL window). Each such directory
 carries its own LICENSE file.
 
-Why FSL-1.1-MIT?
-----------------
+Why FSL-1.1-Apache-2.0?
+-----------------------
 
 The FSL Permitted-Purpose clause restricts other parties from offering the
 platform as a competing managed service while it is under active
 development. After two years, that protection naturally relaxes as the
-release converts to MIT. This approach follows the model adopted by Sentry
-in 2023 and provides a single, well-understood license to communicate.
+release converts to Apache 2.0. This approach follows the model adopted
+by Sentry in 2023 (which also uses FSL-1.1-Apache-2.0).
+
+The Apache 2.0 conversion target was chosen over MIT for the platform core
+because the project orchestrates Cilium (eBPF/CNI), SPIFFE/SPIRE, OpenBao,
+Kamaji, and confidential-computing primitives (Kata/CoCo on Intel TDX,
+AMD SEV-SNP, ARM CCA) — a domain with real patent footprint where Apache's
+explicit patent grant (§3) and patent-retaliation clause are more than
+ceremony. Apache 2.0 also aligns with the Kubernetes / CNCF ecosystem
+convention and provides an explicit trademark disclaimer (§6). See ADR 0032
+for the full rationale.
 
 Third-party components
 ----------------------
@@ -48,5 +71,6 @@ licensing.
 Trademarks
 ----------
 
-"AppRafter" is a project codename. No trademark rights are granted by
-either the FSL or the MIT license. See the Trademarks clause in LICENSE.
+"AppRafter" is a project codename. No trademark rights are granted by the
+FSL, Apache 2.0, or MIT license. See the Trademarks clause in LICENSE and
+Apache 2.0 §6 in LICENSE-APACHE.
