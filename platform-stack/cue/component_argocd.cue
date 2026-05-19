@@ -120,6 +120,12 @@ _components: argocd: #Component & {
 		syncOptions: [...string] | *["CreateNamespace=true", "ServerSideApply=true"]
 	}
 
+	// Self-adopt early — before cert-manager and the operator
+	// charts try to reconcile, so the OCI repo registration
+	// (above) is in place by the time those charts pull from
+	// `ghcr.io/apprafter`.
+	syncWave: -15
+
 	// Same Kubernetes 1.31+ field skew as
 	// `component_cilium.cue`. Argo CD's own Deployments
 	// (server, repo-server, applicationset, controller,

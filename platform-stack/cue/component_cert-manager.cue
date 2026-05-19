@@ -29,4 +29,11 @@ _components: "cert-manager": #Component & {
 		// Tier 2+ overlays bump this to 2+.
 		replicaCount: int | *1
 	}
+
+	// cert-manager must be Synced before the admission-webhook
+	// chart applies its `Certificate` resource — otherwise the
+	// request fails with `no endpoints available for service
+	// cert-manager-webhook` and Argo CD retries with backoff
+	// for minutes before convergence.
+	syncWave: -10
 }

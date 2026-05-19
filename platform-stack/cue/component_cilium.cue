@@ -34,6 +34,10 @@ _components: cilium: #Component & {
 		operator: replicas: int | *1
 	}
 
+	// CNI is the prerequisite for every other component to
+	// schedule pods. Sync first.
+	syncWave: -20
+
 	// Argo CD 2.13.1 (shipped by argo-cd chart 7.7.7) doesn't
 	// know about `Deployment.status.terminatingReplicas` /
 	// `DaemonSet.status.terminatingReplicas` — Kubernetes

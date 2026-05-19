@@ -117,6 +117,8 @@ _applicationsTemplate: """
 	metadata:
 	  name: {{ $name | quote }}
 	  namespace: argocd
+	  annotations:
+	    argocd.argoproj.io/sync-wave: {{ $component.syncWave | quote }}
 	  labels:
 	    apprafter.io/component: {{ $name | quote }}
 	    apprafter.io/tier: {{ $.Values.tier | quote }}
@@ -197,6 +199,7 @@ _valuesSchema: {
 						version: {type: "string"}
 						values: {type: "object"}
 						syncPolicy: {type: "object"}
+						syncWave: {type: "integer"}
 						ignoreDifferences: {
 							type: "array"
 							items: {type: "object"}

@@ -35,4 +35,13 @@ _components: "admission-webhook": #Component & {
 		// the gap is tolerable.
 		replicas: int | *2
 	}
+
+	// Same Kubernetes 1.31+ field skew. The webhook
+	// Deployment also surfaces `status.terminatingReplicas`
+	// on k3s v1.35.
+	ignoreDifferences: [{
+		group: "apps"
+		kind:  "Deployment"
+		jsonPointers: ["/status/terminatingReplicas"]
+	}]
 }

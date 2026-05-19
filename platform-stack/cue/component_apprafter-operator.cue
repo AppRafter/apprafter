@@ -40,4 +40,17 @@ _components: "apprafter-operator": #Component & {
 		// the in-tree settings; tier overlays may bump replicas.
 		replicas: int | *1
 	}
+
+	// Same Kubernetes 1.31+ field skew as `component_cilium.cue`
+	// and `component_argocd.cue`. The operator Deployment
+	// surfaces `status.terminatingReplicas` on k3s v1.35; Argo
+	// CD 2.13.1 doesn't know the field and reports
+	// `ComparisonError: field not declared in schema`. The
+	// sync itself succeeds (it's a diff-side error, not an
+	// apply-side error), but the noise prevents Healthy.
+	ignoreDifferences: [{
+		group: "apps"
+		kind:  "Deployment"
+		jsonPointers: ["/status/terminatingReplicas"]
+	}]
 }

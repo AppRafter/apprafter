@@ -116,6 +116,27 @@ package platformstack
 		syncOptions: [...string] | *["CreateNamespace=true", "ServerSideApply=true"]
 	}
 
+	// Argo CD sync-wave for the rendered Application. Argo CD
+	// sorts Applications by `argocd.argoproj.io/sync-wave`
+	// annotation ascending; a wave starts only after the
+	// previous wave's Applications report `Sync=Synced`.
+	// Practical use today:
+	//
+	//   - cilium    → -20  (CNI, prerequisite for everything)
+	//   - argocd    → -15  (self-management adopt)
+	//   - cert-manager → -10  (CRDs + webhook live before
+	//                          any cert-manager.io/v1 resource
+	//                          is applied)
+	//   - default    → 0    (operator, admission-webhook,
+	//                        network-policies, backstage)
+	//
+	// Without this, the admission-webhook chart's `Certificate`
+	// resource is applied before cert-manager's validating
+	// webhook service has endpoints, and the request fails
+	// with `failed calling webhook "webhook.cert-manager.io":
+	// no endpoints available`.
+	syncWave: int | *0
+
 	// Optional `spec.ignoreDifferences` — list of fields Argo CD
 	// should exclude from drift comparison. Practical use today
 	// is muting Kubernetes-version-skew fields the Argo CD
@@ -192,7 +213,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.1.5"
+currentVersion: #Version & "0.1.6"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

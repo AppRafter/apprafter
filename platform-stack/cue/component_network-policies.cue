@@ -28,7 +28,14 @@ _components: "network-policies": #Component & {
 		repoURL: "https://github.com/apprafter/apprafter.git"
 		path:    "manifests/tier-1/network-policies"
 	}
-	version: "v0.1.91"
+	// Pinned to the monorepo tag that first ships
+	// `manifests/tier-1/network-policies/` (created in v0.1.101
+	// for chart 0.1.5). The v0.1.91 tag — the operator chart's
+	// AppVersion anchor — predates that directory and Argo CD
+	// fails sync with `app path does not exist`. Bump in
+	// lockstep with any monorepo tag that changes
+	// `manifests/tier-1/network-policies/**`.
+	version: "v0.1.102"
 	values: {
 		// No values today; the manifests are static. Kept as
 		// an empty object so the chart template's

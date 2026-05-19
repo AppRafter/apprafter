@@ -13,6 +13,119 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.102 — walk-fix: chart-template hygiene + sync ordering (2026-05-19)
+
+Fifth walk on the GitOps loader, against chart 0.1.5. Bootstrap
+completed cleanly, but five children stayed in degraded states.
+
+### Bug D — admission-webhook `selector does not match template labels`
+
+```
+spec.template.metadata.labels: Invalid value: {...}: `selector`
+does not match template `labels`
+```
+
+The new webhook chart's `_helpers.tpl` defined `labels`
+without including `selectorLabels`. The Deployment's
+`spec.selector.matchLabels` (`app.kubernetes.io/name` +
+`app.kubernetes.io/instance` after the 0.1.6 sync below) had
+nothing to match in `spec.template.metadata.labels`. The
+operator chart already had the right shape — I copied the
+overall layout but missed the cross-include.
+
+Fix: webhook `_helpers.tpl` mirrors the operator chart's
+pattern (`labels` definition pulls `selectorLabels` in via
+`include`). Also standardised webhook's selector on the
+`app.kubernetes.io/{name,instance}` convention to match the
+operator chart and the rest of the ecosystem.
+
+### Bug E — operator + webhook still hit `terminatingReplicas`
+
+```
+Failed to compare desired state to live state: ...
+.status.terminatingReplicas: field not declared in schema
+```
+
+v0.1.101's chart 0.1.5 added `ignoreDifferences` to cilium +
+argocd but missed operator + admission-webhook. Same
+Kubernetes 1.31+ field, same fix.
+
+Fix: `component_apprafter-operator.cue` +
+`component_admission-webhook.cue` get
+`ignoreDifferences: [{ group: apps, kind: Deployment,
+jsonPointers: [/status/terminatingReplicas] }]`.
+
+### Bug F — network-policies `app path does not exist`
+
+`component_network-policies.cue` pinned `version: v0.1.91` —
+the operator chart's AppVersion anchor — but that monorepo
+tag predates the `manifests/tier-1/network-policies/`
+directory (created in v0.1.101). Argo CD checked out the
+v0.1.91 tree, found no such path, and failed.
+
+Fix: bump to `version: v0.1.102` — the tag that ships
+chart 0.1.6 and (since v0.1.101) the missing directory.
+
+### Bug G — admission-webhook Certificate beats cert-manager webhook
+
+```
+Internal error occurred: failed calling webhook
+"webhook.cert-manager.io": ... no endpoints available for
+service "cert-manager-webhook"
+```
+
+Argo CD synced child Applications in parallel. The
+admission-webhook chart applies a `Certificate` resource;
+that resource is validated by cert-manager's mutating
+webhook; cert-manager's webhook hadn't started yet on a
+fresh cluster.
+
+Fix: introduce sync ordering via
+`argocd.argoproj.io/sync-wave` annotations on the rendered
+Application metadata.
+
+- `#Component` schema in `platform.cue` gains optional
+  `syncWave: int | *0` field.
+- `render_tool.cue` template emits it as
+  `metadata.annotations."argocd.argoproj.io/sync-wave"` on
+  every rendered Application.
+- `component_cilium.cue` → `-20` (CNI, prerequisite for
+  every pod schedule).
+- `component_argocd.cue` → `-15` (self-adopt before
+  cert-manager and the OCI-consumers).
+- `component_cert-manager.cue` → `-10` (webhook + CRDs live
+  before any cert-manager.io/v1 resource is applied).
+- Everyone else → `0` (default).
+
+Argo CD waits for a wave's Applications to report
+`Sync=Synced` before starting the next wave. The race goes
+away.
+
+### Bug H — argocd adopt `redis-secret-init` hook hang
+
+`Job/argocd-redis-secret-init` is `pre-install,pre-upgrade`,
+so it re-runs on chart adoption. Pulling
+`quay.io/argoproj/argocd:v2.13.1` on cpx22 takes minutes.
+Bug B and G already mitigate the surrounding noise; H is
+plausibly just timing. **Not fixed in 0.1.6 — left to
+verify on the next walk.** If it persists, the next patch
+will add an `argocd-cm` knob to disable the hook on adopt
+(the secret it initialises already exists post-loader).
+
+### Chart + CLI versions
+
+- Chart `currentVersion 0.1.5 → 0.1.6` with full compat
+  entry; 0.1.5 entry lists the five known issues fixed in
+  0.1.6.
+- CLI `RELEASED_PLATFORM_STACK_VERSION "0.1.5" → "0.1.6"`.
+- CLI `0.1.101 → 0.1.102`.
+
+### Tests
+
+No new CLI tests — every defect is chart-domain. 556 CLI
+tests still pass; cargo fmt + clippy + SPDX + cue vet all
+clean.
+
 ## v0.1.101 — walk-fix: child-Application syncability (2026-05-19)
 
 Fourth walk on the GitOps loader (chart 0.1.4, CLI v0.1.100).

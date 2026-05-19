@@ -369,8 +369,110 @@ compatibility: "0.1.5": {
 		Operators on 0.1.4 stuck with `ComparisonError`:
 		upgrade to 0.1.5 (or to the matching CLI v0.1.101+
 		which pins this chart version).
+
+		Known issues carried into 0.1.5 (all fixed in 0.1.6):
+
+		* `admission-webhook` Deployment failed validation
+		  with `selector does not match template labels` —
+		  the chart's `_helpers.tpl` defined `labels` without
+		  including `selectorLabels`.
+		* `apprafter-operator` + `admission-webhook` still
+		  reported `terminatingReplicas: field not declared
+		  in schema` — `ignoreDifferences` was only added to
+		  cilium + argocd in 0.1.5.
+		* `network-policies` failed `app path does not exist`
+		  because the git pin (`version: v0.1.91`) predates
+		  the directory `manifests/tier-1/network-policies/`,
+		  which was created only in v0.1.101.
+		* `admission-webhook` `Certificate` resource hit
+		  `no endpoints available for service
+		  cert-manager-webhook` — chart did not order
+		  cert-manager before dependents.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01101",
+	]
+}
+
+// 0.1.6 — chart-template hygiene + sync ordering hotfix on
+// top of 0.1.5. Five independent defects all surfaced on the
+// fresh walk against 0.1.5:
+//
+//   1. `apprafter-admission-webhook` chart's `_helpers.tpl`
+//      defined `labels` without including `selectorLabels`,
+//      so `Deployment.spec.template.metadata.labels` did not
+//      contain `app.kubernetes.io/name` / `app.kubernetes.io/instance`
+//      that the selector matched on. Kubernetes API rejected
+//      the Deployment with `selector does not match template
+//      labels`. Fixed by mirroring the operator chart's
+//      `labels` definition that already pulled
+//      `selectorLabels` in via `include`.
+//   2. `component_apprafter-operator.cue` +
+//      `component_admission-webhook.cue` lacked
+//      `ignoreDifferences` for
+//      `Deployment.status.terminatingReplicas` (added to
+//      cilium + argocd in 0.1.5, missed for these two).
+//      Same Kubernetes 1.31+ field skew, same fix.
+//   3. `component_network-policies.cue` pinned `version:
+//      v0.1.91` — the operator chart's AppVersion anchor —
+//      but that monorepo tag predates the
+//      `manifests/tier-1/network-policies/` directory
+//      (created in v0.1.101 for chart 0.1.5). Bumped to
+//      `v0.1.102`, the tag that ships 0.1.6.
+//   4. `admission-webhook` `Certificate` resource failed
+//      with `no endpoints available for service
+//      cert-manager-webhook` because Argo CD applied it
+//      before cert-manager's webhook had endpoints. Fixed
+//      by adding `argocd.argoproj.io/sync-wave` ordering:
+//      cilium = -20, argocd = -15, cert-manager = -10,
+//      everyone else = 0 (default). `#Component` schema in
+//      `platform.cue` gains an optional `syncWave: int |
+//      *0` field; `render_tool.cue` emits it as a metadata
+//      annotation on the rendered Application.
+//   5. Side benefit of (4): cilium reconciles before
+//      cert-manager / operator / webhook even when their
+//      Argo CD adopt happens first, eliminating a class of
+//      `not-ready taint` races on slow image-pull paths.
+//
+// No new components; no API breaks for existing
+// `_components` entries that don't set `syncWave` /
+// `ignoreDifferences` (both default to safe values).
+compatibility: "0.1.6": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		Chart-template hygiene + sync ordering hotfix.
+
+		* `apprafter-admission-webhook` chart's `_helpers.tpl`
+		  now includes `selectorLabels` inside `labels` (same
+		  shape as the operator chart). Fixes the
+		  `selector does not match template labels` failure.
+		* `component_apprafter-operator` +
+		  `component_admission-webhook` gain
+		  `ignoreDifferences` for
+		  `Deployment.status.terminatingReplicas` (Kubernetes
+		  1.31+ field, k3s v1.35).
+		* `component_network-policies` git pin bumped from
+		  `v0.1.91` to `v0.1.102` (the monorepo tag that
+		  ships chart 0.1.6 and the
+		  `manifests/tier-1/network-policies/` directory).
+		* `#Component` grows an optional `syncWave: int | *0`
+		  field; cilium = -20, argocd = -15, cert-manager =
+		  -10. The admission-webhook `Certificate` no longer
+		  applies before cert-manager's webhook has
+		  endpoints.
+
+		Schema: existing `_components` entries that don't set
+		`syncWave` or `ignoreDifferences` continue to work
+		unchanged (both default to safe values: 0 and `[]`
+		respectively).
+
+		Operators on 0.1.5 stuck with `selector does not
+		match template labels` or `app path does not exist`:
+		upgrade to 0.1.6 (or to the matching CLI v0.1.102+
+		which pins this chart version).
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01102",
 	]
 }
