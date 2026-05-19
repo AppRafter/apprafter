@@ -13,6 +13,122 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.97 — M1.5 Track B.1.70 — minimal cluster-bootstrap rewrite (2026-05-19)
+
+ADR 0025 lands. The CLI's `cluster-bootstrap` step shrinks
+from ~1250 lines of imperative `helm install` / `kubectl
+apply` of seven components into a four-step GitOps loader
+that hands the platform layer off to Argo CD. The
+platform-stack chart published in 1.66–1.69 is now the actual
+installer; this CLI just bootstraps Argo CD enough to reach
+the chart.
+
+### Changed
+
+- **`commands/cluster_bootstrap.rs` rewritten end to end.**
+  Four steps:
+  1. `helm upgrade --install argocd argo/argo-cd` with
+     loader-only values (single replicas, dex off). The
+     platform-stack chart's `component_argocd.cue` overlay
+     adopts this release on first reconcile.
+  2. `kubectl wait --for=condition=Available
+     deployment/argocd-server` — gates the next step (root
+     Application apply fails with "no matches for kind"
+     before the CRD is installed).
+  3. `kubectl apply -f <root-application.yaml>`. The root
+     Application points at `oci://ghcr.io/<owner>/platform-stack`
+     chart `platform-stack` at the
+     `RELEASED_PLATFORM_STACK_VERSION` pinned in the CLI
+     binary (currently `0.1.2`).
+  4. `kubectl wait
+     --for=jsonpath='{.status.health.status}'=Healthy
+     application/platform` — once Healthy, child Applications
+     (cilium, cert-manager, argocd self-managing,
+     apprafter-operator, admission-webhook, network-policies,
+     conditionally Backstage) are reconciling under Argo CD.
+
+- **Imperative install code deleted.** Cilium, cert-manager,
+  Application CRD, default-deny NetworkPolicy, ClusterIssuer,
+  the operator Helm release, the admission-webhook manifest,
+  the bootstrap Application, the Argo CD repo-creds Secret,
+  the Argo CD Gateway+HTTPRoute+Certificate triad, and the
+  Backstage manifest set no longer appear in the CLI. Their
+  renderers in `cli-providers::k8s::*_yaml()` stay around as
+  the chart's parallel source of truth until sub-phase 1.71
+  cuts the duplication.
+
+- **`KubectlRunner` trait gained `wait_for_condition`.**
+  Supports both `--for=condition=<X>` (deployment readiness)
+  and `--for=jsonpath=...=<value>` (Argo CD Application
+  health). Resource refs that need a label selector split on
+  whitespace inside the wrapper so `Command::args` doesn't
+  pass them as one quoted token.
+
+- **Three new constants in `cli-providers::k8s`**:
+  `RELEASED_PLATFORM_STACK_VERSION = "0.1.2"`,
+  `APPRAFTER_PLATFORM_STACK_DEFAULT_REPO = "oci://ghcr.io/apprafter"`,
+  `APPRAFTER_PLATFORM_STACK_CHART_NAME = "platform-stack"`.
+  Bump `RELEASED_PLATFORM_STACK_VERSION` in lockstep with
+  each `platform-stack/v*` publish.
+
+### Tests
+
+The 13 tests that pinned the old `perform_bootstrap` shape
+(component install ordering, optional component handling,
+SSA secret apply, etc.) are deleted along with the code they
+pinned. Five new tests cover the GitOps loader:
+
+- `perform_bootstrap_installs_argocd_then_applies_root_then_waits_for_healthy`
+  pins the full call sequence: 1 helm repo_add, 1 helm
+  install (argocd only), 1 client-side apply (root
+  Application), 0 server-side applies, 2 waits in the right
+  order.
+- `render_root_application_includes_repo_url_and_chart_version`
+  + `render_root_application_uses_argocd_namespace_destination`
+  pin the rendered YAML structure.
+- `argocd_loader_values_keeps_replicas_at_one_for_initial_install`
+  pins the loader-only values shape.
+- Existing two `decrypt_cached_kubeconfig_*` helper tests
+  preserved (unchanged behaviour).
+
+Test totals: 549 passed (down from 565 — net of −13 + 5).
+fmt + clippy + spdx clean.
+
+### Acceptance (real-cluster verification deferred)
+
+The functional acceptance — fresh Hetzner →
+`apprafter init && apprafter bootstrap-all` → tier-1 cluster
+with 6+ child Applications all Healthy + Synced — can only
+be verified against a live cluster. Pending:
+
+- First real-Hetzner walk after `platform-stack/v0.1.2` lands
+  in OCI.
+- `kubectl get applications.argoproj.io -A` should list
+  `platform` + 6 children.
+- `kubectl edit application cilium -n argocd` should
+  reconcile back.
+- Re-run idempotency.
+
+### Out of scope (deferred)
+
+- Per-component progress sub-bars in `bootstrap-all` Phase 3.
+- `apprafter cluster-bootstrap --manifest <path>` flag — the
+  `APPRAFTER_MANIFEST` env var still works.
+- Partial-state recovery on wait timeout.
+- `e2e/mvp.sh` rewrite — drives the imperative install today.
+
+### Migration note for operators
+
+An existing v0.1.x cluster bootstrapped via the imperative
+path: this CLI does not touch your existing Argo CD release
+(`helm upgrade --install` adopts it). But applying the root
+Application will replace the imperative Cilium / cert-manager
+/ etc. helm releases with Argo CD-managed Applications.
+Expect a single reconcile cycle where existing resources
+transition from "client-side managed fields" to "Argo CD
+field manager". Plan a maintenance window for the first
+upgrade.
+
 ## v0.1.96 — chart-versioning policy: first published is 0.1.0 (2026-05-15)
 
 Policy fix discovered before pushing the first chart release.

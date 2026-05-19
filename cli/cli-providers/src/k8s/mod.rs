@@ -39,7 +39,8 @@ pub use cilium_values::cilium_values_yaml;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs, CILIUM_CHART_VERSION};
 pub use image_ref::{
     resolve_image_ref, APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE, APPRAFTER_OPERATOR_DEFAULT_IMAGE,
-    RELEASED_OPERATOR_VERSION,
+    APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
+    RELEASED_OPERATOR_VERSION, RELEASED_PLATFORM_STACK_VERSION,
 };
 pub use issuer::{selfsigned_cluster_issuer_yaml, APPRAFTER_SELFSIGNED_ISSUER};
 pub use kubectl::{

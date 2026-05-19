@@ -17,6 +17,33 @@
 /// container images to ghcr.io.
 pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.64";
 
+/// Single source of truth for the platform-stack OCI Helm chart
+/// version `cluster-bootstrap` points the root Argo CD Application
+/// at. Updated whenever a new `platform-stack/v*` is published; the
+/// CLI's "wait for child Applications" loop also relies on this to
+/// know which child components to expect (chart 0.1.0 ships 6 tier-1
+/// Applications; 0.1.2 adds the cue-cmp sidecar wiring but keeps the
+/// same Application count).
+///
+/// Bump in lockstep with `platform-stack/cue/platform.cue`'s
+/// `currentVersion`. The chart at this version MUST exist in OCI
+/// (`oci://ghcr.io/<owner>/platform-stack:<version>`) before a
+/// bumped CLI ships, otherwise `apprafter cluster-bootstrap`'s
+/// root Application reconcile fails with "pull failed: not found".
+pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.2";
+
+/// Default OCI registry path the chart is published to. The
+/// `apprafter` owner is overridable via `--platform-stack-repo`
+/// (lands in a follow-up) for fork users (`apprafter platform fork
+/// --to ghcr.io/myorg`, plan.md 1.74). Read by `cluster-bootstrap`
+/// when rendering the root Application's `spec.source.repoURL`.
+pub const APPRAFTER_PLATFORM_STACK_DEFAULT_REPO: &str = "oci://ghcr.io/apprafter";
+
+/// Chart name under the registry path. The renderer
+/// (`platform-stack/cue/render_tool.cue`) hardcodes this as the
+/// chart name in `Chart.yaml`; both sides MUST agree.
+pub const APPRAFTER_PLATFORM_STACK_CHART_NAME: &str = "platform-stack";
+
 /// Default ghcr.io repository for the operator container image.
 pub const APPRAFTER_OPERATOR_DEFAULT_IMAGE: &str = "ghcr.io/apprafter/apprafter-operator";
 

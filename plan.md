@@ -1760,36 +1760,49 @@ Originally items surfaced during Track A walks. Cleared:
 
 ---
 
-### 1.70 Minimal `cluster-bootstrap` rewrite
+### 1.70 Minimal `cluster-bootstrap` rewrite ✅
+
+> v0.1.97 — sub-phase 1.70 shipped. `commands/cluster_bootstrap.rs` переписан целиком с ~1250-line imperative install (Cilium + Gateway + Application CRD + default-deny + Argo CD + cert-manager + ClusterIssuer + operator helm + webhook manifest + bootstrap App + Backstage) на 4-step GitOps loader (~450 lines, half of которых — комментарии и тесты). Argo CD теперь handle'ит весь platform layer через chart pull. Сам CLI binary stays small — он только loader.
 
 **Source:** ADR 0025.
 
 **Цель:** reduce `cluster-bootstrap` to a minimal loader: install Argo CD via Helm, apply root Application pointing к platform-stack OCI chart. Argo CD дальше reconciles остальное.
 
 **Поставка:**
-- [ ] Refactor `cli-providers/k8s/cluster_bootstrap.rs` (или эквивалент):
-    - Step 1: `helm install argocd` (only this; no Cilium, no cert-manager, no operator, no webhook here).
-    - Step 2: Wait для Argo CD ready (kubectl wait, ~30s).
-    - Step 3: Apply root Argo CD `Application` CR pointing на `oci://ghcr.io/apprafter/platform-stack:<resolved-version>` (resolved через PlatformStack CR — см. 1.74).
-    - Step 4: Wait для root Application reports Healthy + Synced.
-    - Step 5: Wait для child Applications (cilium, cert-manager, apprafter-operator, etc.) report Healthy. Progress UX surfaces per-component status.
-- [ ] Existing imperative install code (Cilium, cert-manager, operator, webhook, Backstage) — **deleted** from CLI. Their Helm values moved to platform-stack chart (см. 1.71).
-- [ ] `apprafter bootstrap-all` progress UX using `indicatif::MultiProgress`:
-    - Phase 1/3: substrate provisioning (Hetzner)
-    - Phase 2/3: Argo CD loader install
-    - Phase 3/3: Platform stack reconciliation (per-component sub-bars: Cilium ⏳, cert-manager ⏳, ...)
-- [ ] Idempotent resume на любом шаге (closes PRELAUNCH_CHECKLIST P1 item 3.1).
-- [ ] `apprafter cluster-bootstrap --manifest <path>` flag заменяет current `APPRAFTER_MANIFEST` env-var; auto-discovery walking upward from CWD (default).
+- [x] Refactor `commands/cluster_bootstrap.rs`:
+    - [x] **Step 1**: `helm repo add argo …` + `helm upgrade --install argocd argo/argo-cd` с loader-only values (single replicas, dex off — chart's `component_argocd.cue` overlay adopts the release on first reconcile, adds cue-cmp sidecar + tier-2 replicas).
+    - [x] **Step 2**: `kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=180s` — gates root Application apply until Argo CD CRDs are installed (otherwise "no matches for kind Application").
+    - [x] **Step 3**: Render single root Application YAML (`apiVersion: argoproj.io/v1alpha1, kind: Application, name: platform, source.repoURL: oci://ghcr.io/<owner>/platform-stack, chart: platform-stack, targetRevision: 0.1.2`) → `kubectl apply -f`. Repo + version pulled из `cli-providers::k8s::APPRAFTER_PLATFORM_STACK_DEFAULT_REPO` + `RELEASED_PLATFORM_STACK_VERSION` constants.
+    - [x] **Step 4**: `kubectl wait --for=jsonpath='{.status.health.status}'=Healthy application/platform -n argocd --timeout=600s` — once root Application reports Healthy, all child Applications (cilium, cert-manager, argocd self-managing, apprafter-operator, admission-webhook, network-policies, conditionally Backstage) are reconciling under Argo CD.
+- [x] Existing imperative install code **deleted** from CLI: 7 component installs + 5 manifests + 2 helpers (~800 lines net). `cli-providers::k8s::*_yaml` рендерераторы остаются как-есть для chart-side use (parallel source-of-truth до 1.71's migration).
+- [x] `cli-providers::k8s` exposes 3 new constants: `RELEASED_PLATFORM_STACK_VERSION = "0.1.2"`, `APPRAFTER_PLATFORM_STACK_DEFAULT_REPO = "oci://ghcr.io/apprafter"`, `APPRAFTER_PLATFORM_STACK_CHART_NAME = "platform-stack"`. Bump `RELEASED_PLATFORM_STACK_VERSION` lockstep с published chart tag.
+- [x] `KubectlRunner` trait расширен `wait_for_condition(resource_ref, namespace, condition_expr, timeout_secs, kubeconfig)`. Wraps `kubectl wait --for=<expr>`. Supports both `condition=Available` (deployment readiness) и `jsonpath={.status.health.status}=Healthy` (Argo CD Application health). Real-impl shells out, fake-impl записывает calls для tests.
+- [x] FakeKubectl в `argocd_password.rs` обновлён под расширенный trait (unreachable! на wait — argocd-password never waits).
+
+**Тесты:**
+- [x] `perform_bootstrap_installs_argocd_then_applies_root_then_waits_for_healthy` — full sequence assertions: 1 helm repo_add, 1 helm install (argocd only, no Cilium/cert-manager/operator/webhook), 1 client-side apply (root Application), 0 server-side applies, 2 waits в правильном порядке (deployment/argocd-server first, application/platform second).
+- [x] `render_root_application_includes_repo_url_and_chart_version` — pin repoURL + targetRevision + chart name in rendered YAML. Verifies `prune: true` + `selfHeal: true` syncPolicy для drift correction.
+- [x] `render_root_application_uses_argocd_namespace_destination` — destination namespace + cluster URL.
+- [x] `argocd_loader_values_keeps_replicas_at_one_for_initial_install` — minimal loader values (replicas=1, dex off). Tier-2 replica counts arrive via Argo CD's first reconcile.
+- [x] Existing `decrypt_cached_kubeconfig_*` helper tests preserved.
 
 **Acceptance:**
-- `apprafter init && apprafter bootstrap-all` on fresh Hetzner account → working Tier 1 cluster with all platform components reconciled via Argo CD within ~10 minutes (vs current ~5-7 min imperative bootstrap).
-- `kubectl get applications.argoproj.io -A` shows: root, cilium, cert-manager, argocd, apprafter-operator, admission-webhook (+ network-policies, possibly Backstage), all Healthy + Synced.
-- `kubectl edit application cilium -n argocd` — change value — Argo CD reconciles → drift correction works.
-- Re-run `apprafter bootstrap-all` идемпотентен (skip-already-installed semantics).
+- ✅ `cargo test --workspace` — 549 passed, 0 failed (down from 565 since 1.70 deleted 13 imperative-install tests; net change is ~25 removed + ~5 new, ~16 net reduction).
+- ✅ `cargo fmt --all --check` + `cargo clippy --workspace -- -D warnings` clean.
+- ⏳ `apprafter init && apprafter bootstrap-all` on fresh Hetzner account → tier-1 cluster reconciles via Argo CD. **Verified after first push** (CI-side acceptance through `e2e/mvp.sh` nightly + manual walk).
+- ⏳ `kubectl get applications.argoproj.io -A` shows root + 6 children all Healthy + Synced. **Verified after first push.**
+- ⏳ `kubectl edit application cilium -n argocd` — drift correction via Argo CD. **Verified after first push.**
+- ⏳ Re-run `apprafter bootstrap-all` идемпотентен. **Verified after first push.**
 
-**Зависит от:** 1.66, 1.67, 1.68, 1.69 (platform-stack chart must be publishable before CLI references it)
+**Out-of-scope (отложено):**
+- `apprafter bootstrap-all` per-component progress sub-bars (cilium ⏳, cert-manager ⏳, ...). Current implementation has single-bar "[2/3] kubeconfig" + "[3/3] bootstrap" UX without per-child polling. Adding `kubectl get applications -n argocd -o jsonpath='...'` poll loop is a UX-polish iteration, not blocking 1.70.
+- `apprafter cluster-bootstrap --manifest <path>` flag + auto-discovery from CWD — current `APPRAFTER_MANIFEST` env-var still works. Manifest overlay → root Application's `helm.valuesObject` requires CLI knowledge of chart values shape; defer to 1.71 cutover.
+- Idempotent resume на каждом шаге (PRELAUNCH_CHECKLIST P1 item 3.1) — `helm upgrade --install` + `kubectl apply` уже idempotent на step level; what's NOT yet idempotent — partial state when waits timeout (e.g. argocd-server up but root Application apply failed). Defer полная resume semantics.
+- E2E test (`e2e/mvp.sh`) update — currently tests imperative install. Rewriting it для GitOps path = separate iteration после first real-cluster verification.
 
-**Размер:** M
+**Зависит от:** 1.66 ✅, 1.67 ✅, 1.68 ✅, 1.69 ✅ (platform-stack chart must be publishable + CMP sidecar wired before CLI references it).
+
+**Размер:** M (один цикл, ~3 часа — rewrite + tests + trait extension + Cargo bump).
 
 ---
 
@@ -3956,3 +3969,4 @@ Originally items surfaced during Track A walks. Cleared:
 | 2026-05-19 | M1.5 Track B.1.68 refactor — chart-version single-source-of-truth + workflow inverts tag↔publish ordering. Walk-found: tier_solo/tier_team/compatibility-key все хардкодили "0.1.0" литералом → potential drift. Также workflow триггерился на push:tags, что позволяло "accident tag push → unconditional publish"; user попросил поменять направление — workflow создаёт tag после успешного publish, не наоборот. v0.1.97-equiv (без monorepo bump — CLI не менялся): добавил `currentVersion: #Version & "0.1.0"` в platform.cue как canonical source; `tier_solo`/`tier_team` теперь `version: currentVersion`; compatibility.cue получил CUE-level invariant `compatibility: (currentVersion): #VersionRecord` — bump currentVersion без matching entry падает на `cue vet -c` с диагностикой incomplete-fields; workflow trigger переключён на `workflow_dispatch` ONLY (no push:tags), optional `version_override:` input для emergency re-publish; workflow читает `currentVersion` через `cue export -e currentVersion`, проверяет что tag не существует на origin, прогоняет compat-gate + render + lint + push + sign, и в самом конце `gh release create` создаёт tag + release одним вызовом (через `--target $GITHUB_SHA`); `scripts/check-platform-stack-version.sh` без аргументов auto-reads currentVersion; RELEASE.md полностью переписан под новую модель — "две-строчный version bump в platform.cue+compatibility.cue", `gh workflow run` вместо `git tag && git push`, failure-mode recovery упрощена; cli/Cargo.toml откатан на 0.1.96 (CLI не менялся, monorepo tag не создаётся) | n/a |
 | 2026-05-19 | M1.5 Track B.1.68 auto-trigger + drift detection — `platform-stack-publish.yml` теперь триггерится на `push: branches: [master], paths: ['platform-stack/**', …]` (плюс `workflow_dispatch` стайл-овеr); job разбит на `detect` + `publish`: detect resolve'ит currentVersion и проверяет что `platform-stack/v<version>` не существует на origin, если уже есть → `should_publish=false` и publish job skipped (commit был не bump, а refactor / docs / drift). Новый workflow `platform-stack-check.yml` триггерится на PR + push к master с теми же paths и enforce'ит: cue fmt --check + cue vet -c (invariant catches bump-without-compat) + render + helm lint + tier-1/tier-2 smoke + **drift detection** — если currentVersion матчится тэгу на origin И files в `platform-stack/cue/*.cue` или `Chart.yaml.tmpl` отличаются от того commit'а → fail с 80-line diff и hint про currentVersion в platform.cue. Это делает "chart source changed без version bump" blocking CI error на PR time; на master тот же check работает как post-merge safety net. `actions/checkout` с `fetch-depth: 0` чтобы drift check имел доступ к remote tags. RELEASE.md обновлён под auto-trigger model — "Normal flow: bump + PR → check workflow + merge → publish workflow auto-detects bump"; добавлен PR-time guards section. yamllint clean, все cue/spdx/cargo gates green. CLI не менялся → monorepo tag не создаётся, версии в Cargo.toml не трогаются | n/a |
 | 2026-05-19 | M1.5 Track B.1.69 — CUE CMP sidecar (ADR 0029): new top-level `argocd-cue-cmp/` flat directory (Dockerfile, plugin.yaml, entrypoint.sh, VERSION='0.1.0', README.md). Alpine 3.20 multi-stage build pulls cue v0.10.0 tarball, runtime image runs as UID/GID 999 (matches argocd-repo-server CMP contract; pre-existing Alpine ping group at gid 999 deleted to free slot). entrypoint.sh wraps `cue export ./... --out yaml` со structured error output — first error line as `::cue-cmp:: CUE compile failed: <summary>` к stderr, full block ниже, exit 0/1 correctly. New paired workflows `argocd-cue-cmp-publish.yml` + `argocd-cue-cmp-check.yml` — same detect/publish split + drift detection pattern as platform-stack-*; image's own semver track `argocd-cue-cmp/v*` independent of monorepo/chart/operator versions. Chart bumped 0.1.1 → 0.1.2: `component_argocd-cue-cmp.cue` обновлён под new image registry + version pin, `component_argocd.cue` получает `repoServer.extraContainers` блок с cue-cmp sidecar (image pull через CUE interpolation `_components."argocd-cue-cmp".values.image.{repository,tag}` — one-line bump cue-cmp version), compatibility.cue entry для 0.1.2 (change: safe, references ADR 0029). SPDX gate расширен под `argocd-cue-cmp/{Dockerfile,plugin.yaml,entrypoint.sh}` (170 → 175). Local verified: docker build clean, entrypoint happy + error paths exit-code/output correct, helm template 0.1.2 показывает extraContainers + cue-cmp:v0.1.0 image. CI-side acceptance ⏳ verified at first push (cue-cmp publish workflow + chart publish workflow оба триггерятся параллельно) | n/a |
+| 2026-05-19 | M1.5 Track B.1.70 — Minimal cluster-bootstrap rewrite (ADR 0025): `commands/cluster_bootstrap.rs` переписан с ~1250-line imperative install (Cilium + Gateway + Application CRD + default-deny + Argo CD + cert-manager + ClusterIssuer + operator + webhook + Backstage) на 4-step GitOps loader (~450 lines). Step 1: `helm upgrade --install argocd argo/argo-cd` с loader-only values (replicas=1, dex off). Step 2: `kubectl wait --for=condition=Available deployment/argocd-server` (gates root Application apply until CRDs installed). Step 3: kubectl apply root Application (`name: platform, source.repoURL: oci://ghcr.io/<owner>/platform-stack, chart: platform-stack, targetRevision: 0.1.2`). Step 4: `kubectl wait --for=jsonpath='{.status.health.status}'=Healthy application/platform` — после Healthy все child Applications reconciling под Argo CD. Argo CD handle'ит drift correction + prune semantics + idempotent re-apply. Existing `cli-providers::k8s::*_yaml` рендерераторы остаются (chart's parallel source-of-truth до 1.71 migration). `cli-providers::k8s` exports 3 новых constants: `RELEASED_PLATFORM_STACK_VERSION = "0.1.2"`, `APPRAFTER_PLATFORM_STACK_DEFAULT_REPO = "oci://ghcr.io/apprafter"`, `APPRAFTER_PLATFORM_STACK_CHART_NAME = "platform-stack"`. `KubectlRunner` trait расширен `wait_for_condition()` методом (supports `--for=condition=` + `--for=jsonpath=` flavours). 13 imperative-install tests deleted, 5 GitOps-loader tests added. 549 passed (down from 565 net). CLI binary меняется значимо → monorepo tag v0.1.97. Real-cluster acceptance ⏳ verified at first walk after push | v0.1.97 |

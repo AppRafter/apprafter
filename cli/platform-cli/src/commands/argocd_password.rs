@@ -137,6 +137,9 @@ mod tests {
                 .push((secret.into(), namespace.into(), key.into()));
             Ok(self.body.clone())
         }
+        fn wait_for_condition(&self, _: &str, _: &str, _: &str, _: u64, _: &Path) -> Result<()> {
+            unreachable!("argocd-password never waits on resources")
+        }
     }
 
     #[test]

@@ -63,6 +63,35 @@ pub trait KubectlRunner {
         key: &str,
         kubeconfig_path: &Path,
     ) -> Result<String>;
+
+    /// Block until a resource matches a `--for=<condition>`
+    /// predicate. Wraps `kubectl wait`. Used by the post-1.70
+    /// `cluster-bootstrap` to:
+    ///
+    ///   1. Wait for the Argo CD server Deployment to become
+    ///      Available after the loader Helm install
+    ///      (`--for=condition=Available deployment/argocd-server`).
+    ///   2. Wait for the root `Application platform` to report
+    ///      `status.health.status: Healthy` after the chart
+    ///      pull begins (`--for=jsonpath='{.status.health.status}'=Healthy
+    ///      application/platform`).
+    ///
+    /// `resource_ref` is a kubectl-style reference: either
+    /// `<kind>/<name>` (e.g. `deployment/argocd-server`) or
+    /// `<kind> -l <selector>` patterns — pass the whole string
+    /// verbatim and the wrapper splits on whitespace for
+    /// `Command::args`. `condition_expr` is the value passed to
+    /// `--for=` (e.g. `condition=Available` or
+    /// `jsonpath={.status.health.status}=Healthy`). Timeout is
+    /// applied as `--timeout=<n>s`.
+    fn wait_for_condition(
+        &self,
+        resource_ref: &str,
+        namespace: &str,
+        condition_expr: &str,
+        timeout_seconds: u64,
+        kubeconfig_path: &Path,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +133,31 @@ impl KubectlCli {
             }
         }
         c.env("KUBECONFIG", kubeconfig_path);
+        c
+    }
+
+    fn build_wait_command(
+        resource_ref: &str,
+        namespace: &str,
+        condition_expr: &str,
+        timeout_seconds: u64,
+        kubeconfig_path: &Path,
+    ) -> Command {
+        // `resource_ref` may contain spaces (e.g.
+        // `pod -l app.kubernetes.io/name=argocd-server`); split
+        // on whitespace and feed each token as a separate arg
+        // so `Command` doesn't quote the whole thing as one
+        // positional argument.
+        let mut c = Command::new("kubectl");
+        c.arg("wait");
+        for tok in resource_ref.split_whitespace() {
+            c.arg(tok);
+        }
+        c.arg("-n")
+            .arg(namespace)
+            .arg(format!("--for={condition_expr}"))
+            .arg(format!("--timeout={timeout_seconds}s"))
+            .env("KUBECONFIG", kubeconfig_path);
         c
     }
 
@@ -187,6 +241,34 @@ impl KubectlRunner for KubectlCli {
             })?;
         String::from_utf8(decoded)
             .map_err(|e| CliError::Other(format!("secret {secret_name}/{key} is not utf-8: {e}")))
+    }
+
+    fn wait_for_condition(
+        &self,
+        resource_ref: &str,
+        namespace: &str,
+        condition_expr: &str,
+        timeout_seconds: u64,
+        kubeconfig_path: &Path,
+    ) -> Result<()> {
+        let output = Self::build_wait_command(
+            resource_ref,
+            namespace,
+            condition_expr,
+            timeout_seconds,
+            kubeconfig_path,
+        )
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl wait: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(CliError::Other(format!(
+                "kubectl wait {resource_ref} -n {namespace} --for={condition_expr} \
+                 --timeout={timeout_seconds}s failed (exit {:?}): {stderr}",
+                output.status.code()
+            )));
+        }
+        Ok(())
     }
 }
 
