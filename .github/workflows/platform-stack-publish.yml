@@ -189,6 +189,16 @@ jobs:
           echo "lowercase=$owner_lc" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${owner_lc}/platform-stack" >> "$GITHUB_OUTPUT"
 
+      - name: Install CUE
+        # `detect` ran in its own job and installed CUE in
+        # that runner — the `publish` job starts on a fresh
+        # runner, so we install CUE here too. The
+        # compatibility-gate script + `make render-only`
+        # below both shell out to `cue`.
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
