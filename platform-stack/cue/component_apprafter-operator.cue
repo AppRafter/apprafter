@@ -20,7 +20,12 @@ _components: "apprafter-operator": #Component & {
 	enabled:   bool | *true
 	namespace: "apprafter-system"
 	source: {
-		repoURL: "oci://ghcr.io/apprafter"
+		// OCI registry — without the `oci://` scheme prefix.
+		// Argo CD identifies OCI vs HTTPS chart repos from the
+		// `Secret(argocd.argoproj.io/secret-type: repository)`
+		// + `enableOCI: "true"` registration in
+		// `component_argocd.cue`, not from the URL scheme.
+		repoURL: "ghcr.io/apprafter"
 		chart:   "apprafter-operator"
 	}
 	version: "v0.1.91"

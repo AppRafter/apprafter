@@ -17,7 +17,10 @@ _components: "admission-webhook": #Component & {
 	enabled:   bool | *true
 	namespace: "apprafter-system"
 	source: {
-		repoURL: "oci://ghcr.io/apprafter"
+		// OCI registry — without the `oci://` scheme prefix.
+		// Argo CD reads the OCI flag from the repository
+		// Secret registered by `component_argocd.cue`.
+		repoURL: "ghcr.io/apprafter"
 		chart:   "apprafter-admission-webhook"
 	}
 	version: "v0.1.91"

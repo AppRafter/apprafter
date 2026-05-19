@@ -184,6 +184,15 @@ compatibility: "0.1.2": {
 // Gateway/HTTPRoute exposure lands. No new components, no
 // version pins changed — pure tier-1 default refinement
 // matching the v0.1.x in-tree baseline.
+//
+// **Known issue (fixed in 0.1.4):** Argo CD generates a
+// malformed `helm pull --repo oci://ghcr.io/apprafter <chart>`
+// for `repoURL: oci://ghcr.io/apprafter` and the root
+// Application reports `ComparisonError: object required`. The
+// fix in 0.1.4 registers the repo via
+// `configs.repositories.apprafter` (bare URL + `enableOCI:
+// "true"`) and drops the `oci://` scheme prefix in all chart
+// `repoURL` fields. Bump to 0.1.4 if you hit `object required`.
 compatibility: "0.1.3": {
 	change:          "safe"
 	operatorVersion: "v0.1.91"
@@ -214,5 +223,65 @@ compatibility: "0.1.3": {
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v0198",
+	]
+}
+
+// 0.1.4 — OCI repo registration hotfix. Argo CD's
+// `argocd-repo-server` does not infer the OCI Helm protocol
+// from a `oci://...` `repoURL` scheme — it shells out to
+// `helm pull --repo <url> <chart>` which is malformed for
+// OCI. The fix:
+//
+//   1. Register `ghcr.io/apprafter` as a Helm OCI repository
+//      via `configs.repositories.apprafter` (bare URL +
+//      `enableOCI: "true"`) — added to `component_argocd.cue`
+//      and mirrored in `cli-providers::k8s::argocd_loader_values_yaml`
+//      so the chart's self-reconcile keeps the registration
+//      alive when it adopts the loader Argo CD release.
+//   2. All chart `repoURL` fields pointing at `ghcr.io/apprafter`
+//      drop the `oci://` prefix (`component_apprafter-operator.cue`,
+//      `component_admission-webhook.cue`).
+//   3. CLI constant `APPRAFTER_PLATFORM_STACK_DEFAULT_REPO`
+//      drops the prefix correspondingly; `helm push` workflows
+//      prepend `oci://` independently when invoking
+//      `helm push`.
+//   4. `cluster-bootstrap` now waits for `Sync=Synced` before
+//      `Health=Healthy` — a freshly-created root Application
+//      reports `Healthy` trivially (zero children) while
+//      `Sync=Unknown` on chart-pull failure, which was
+//      catching the 0.1.3 failure as a false-positive.
+compatibility: "0.1.4": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		OCI repo registration hotfix. The chart at 0.1.3 carried
+		`repoURL: oci://ghcr.io/apprafter` on
+		`component_apprafter-operator` and
+		`component_admission-webhook`, plus the root Application
+		(rendered by the CLI loader) carried the same. Argo CD
+		does not auto-detect OCI from the URL scheme — it runs
+		`helm pull --repo oci://ghcr.io/apprafter <chart>` which
+		`helm` rejects with `object required`. The Application
+		reports `ComparisonError: object required` and
+		`Sync=Unknown / Health=Healthy` (trivially Healthy
+		because no children rendered).
+
+		0.1.4 registers `ghcr.io/apprafter` via the Argo CD
+		Helm repositories config (bare URL + `enableOCI:
+		"true"`) and drops `oci://` from every chart `repoURL`.
+		Argo CD's `argocd-repo-server` then runs the correct
+		`helm pull oci://ghcr.io/apprafter/<chart>` form.
+
+		Operators on 0.1.3 who hit `object required`: upgrade
+		to 0.1.4 (or to the matching CLI v0.1.100+ which pins
+		this chart version). Manual recovery is a one-time
+		`kubectl apply` of a Secret(label=repository) +
+		patching the root Application's `repoURL` to
+		`ghcr.io/apprafter`; the chart's self-reconcile then
+		owns it. CLI v0.1.100's bootstrap-all does all this on
+		a fresh cluster.
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01100",
 	]
 }

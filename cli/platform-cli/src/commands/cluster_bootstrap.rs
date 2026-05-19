@@ -211,10 +211,25 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         kubeconfig_path,
     )?;
 
-    // 4. Wait for the root Application to report Healthy. Argo
-    //    CD's repo-server has to pull the OCI chart, render N
-    //    child Applications, each child has to pull its own
-    //    upstream chart, etc. — generous timeout.
+    // 4a. Wait for the root Application to report Synced. The
+    //     Synced flag is what tells us Argo CD actually pulled
+    //     the chart and produced child Applications. Health is
+    //     not enough on its own — a freshly-created root
+    //     Application with **zero rendered children** reports
+    //     `Healthy` (trivially, no resources to fail) while
+    //     `Sync=Unknown` (chart pull errored). Walk-found bug
+    //     v0.1.99 → v0.1.100 was this exact false-positive.
+    kubectl.wait_for_condition(
+        "application/platform",
+        Some("argocd"),
+        "jsonpath={.status.sync.status}=Synced",
+        PLATFORM_RECONCILE_TIMEOUT_SECS,
+        kubeconfig_path,
+    )?;
+
+    // 4b. Then wait for Healthy. After Synced, the child
+    //     Applications exist; Healthy means their workloads
+    //     reached the chart's health-check thresholds.
     kubectl.wait_for_condition(
         "application/platform",
         Some("argocd"),
@@ -312,6 +327,20 @@ applicationSet:
   replicaCount: 1
 notifications:
   enabled: false
+# OCI Helm repository registration. Without this Argo CD
+# generates a malformed `helm pull --repo oci://<repo> <chart>`
+# for OCI charts and the root Application fails with
+# `object required` (walk-found bug, v0.1.99 → v0.1.100). The
+# bare URL + `enableOCI: "true"` form is what argocd-repo-server
+# rewrites into the correct `helm pull oci://<repo>/<chart>`.
+# Mirrored in platform-stack/cue/component_argocd.cue so the
+# chart's self-reconcile keeps the registration alive on adopt.
+configs:
+  repositories:
+    apprafter:
+      url: ghcr.io/apprafter
+      type: helm
+      enableOCI: "true"
 "#
     .to_string()
 }
@@ -481,11 +510,13 @@ mod tests {
 
         // Waits: node Ready first (so step 1 can schedule),
         // argocd-server Available second, root Application
-        // Healthy third. Ordering matters — applying the
-        // Application before the CRD is installed would fail
-        // with "no matches".
+        // Synced third, root Application Healthy fourth.
+        // Synced-before-Healthy is critical — a freshly-created
+        // root Application reports Healthy trivially (zero
+        // children) while Sync=Unknown on chart-pull failure.
+        // Walk-found false-positive v0.1.99 → v0.1.100.
         let waits = kubectl.waits.borrow();
-        assert_eq!(waits.len(), 3);
+        assert_eq!(waits.len(), 4, "{waits:?}");
         assert_eq!(waits[0].resource_ref, "node --all");
         assert_eq!(waits[0].namespace, None);
         assert_eq!(waits[0].condition_expr, "condition=Ready");
@@ -500,9 +531,65 @@ mod tests {
         assert_eq!(waits[2].namespace, Some("argocd".to_string()));
         assert_eq!(
             waits[2].condition_expr,
-            "jsonpath={.status.health.status}=Healthy"
+            "jsonpath={.status.sync.status}=Synced"
         );
         assert_eq!(waits[2].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
+
+        assert_eq!(waits[3].resource_ref, "application/platform");
+        assert_eq!(waits[3].namespace, Some("argocd".to_string()));
+        assert_eq!(
+            waits[3].condition_expr,
+            "jsonpath={.status.health.status}=Healthy"
+        );
+        assert_eq!(waits[3].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn argocd_loader_values_register_apprafter_oci_repo() {
+        // Walk-found bug v0.1.99 → v0.1.100. Without this
+        // registration argocd-repo-server runs
+        //   helm pull --repo oci://ghcr.io/apprafter platform-stack
+        // which Helm rejects with `object required`. The
+        // registration tells Argo CD to use the OCI form of
+        // `helm pull oci://<repo>/<chart>` instead.
+        let v = argocd_loader_values_yaml();
+        // `configs.repositories.apprafter` block with three
+        // required keys: bare URL (no `oci://`), `type: helm`,
+        // `enableOCI: "true"`. We pin all three so a typo can't
+        // regress to the malformed pull command.
+        assert!(v.contains("configs:"), "{v}");
+        assert!(v.contains("repositories:"), "{v}");
+        assert!(v.contains("apprafter:"), "{v}");
+        assert!(v.contains("url: ghcr.io/apprafter"), "{v}");
+        assert!(v.contains("type: helm"), "{v}");
+        assert!(v.contains("enableOCI: \"true\""), "{v}");
+        // Negative guard — the `oci://` form must NOT appear
+        // in any non-comment line. Argo CD identifies OCI vs
+        // HTTPS via `enableOCI`, not via URL scheme.
+        for line in v.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !line.contains("oci://"),
+                "loader values non-comment line must not carry oci:// prefix: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_application_repourl_is_bare_without_oci_scheme() {
+        // Companion to argocd_loader_values_register_apprafter_oci_repo.
+        // The root Application's repoURL MUST match the
+        // registration URL byte-for-byte (`ghcr.io/apprafter`)
+        // — Argo CD does not normalise `oci://x` to `x`.
+        let yaml = render_root_application(APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, "0.1.4");
+        assert!(yaml.contains("repoURL: \"ghcr.io/apprafter\""), "{yaml}");
+        assert!(
+            !yaml.contains("oci://"),
+            "root Application repoURL must be bare: {yaml}"
+        );
     }
 
     #[test]

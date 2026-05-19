@@ -42,6 +42,25 @@ _components: argocd: #Component & {
 		notifications: enabled:       bool | *false
 		dex: enabled:                 bool | *false
 
+		// OCI Helm repository registration. Without this the
+		// `argocd-repo-server` shells out to
+		// `helm pull --repo oci://ghcr.io/apprafter <chart>`,
+		// which is malformed for OCI registries — `helm pull`
+		// for OCI requires `helm pull oci://<repo>/<chart>` form.
+		// Argo CD bridges that by reading `enableOCI: "true"`
+		// off this registration and rewriting the pull
+		// command. URL is BARE (no `oci://` scheme); Argo CD
+		// adds the scheme based on `enableOCI`. Matches the
+		// loader-side block in
+		// `cli-providers::k8s::argocd_loader_values_yaml` so
+		// the chart's self-reconcile keeps the repo registered
+		// when it adopts the loader Argo CD release.
+		configs: repositories: apprafter: {
+			url:       "ghcr.io/apprafter"
+			type:      "helm"
+			enableOCI: "true"
+		}
+
 		// argocd-repo-server runs the cue-cmp sidecar that
 		// renders user app repositories' `apprafter*.cue`
 		// files into Kubernetes YAML at sync time (ADR 0029).

@@ -13,6 +13,143 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.100 — walk-fix: Argo CD OCI repo must be registered (2026-05-19)
+
+Third real-Hetzner walk on the GitOps loader (chart 0.1.3,
+CLI v0.1.99). Cilium + Argo CD installed cleanly, root
+`platform` Application reached `Sync=Synced, Health=Healthy`
+— but `kubectl get applications -A` showed **only the root**,
+no child Applications.
+
+Diagnosis from the cluster:
+
+```
+kubectl describe application platform -n argocd
+
+Status:
+  Conditions:
+    Type:    ComparisonError
+    Message: Failed to load target state: failed to generate
+             manifest: rpc error: ... `helm pull --destination
+             /tmp/... --version 0.1.3 --repo oci://ghcr.io/apprafter
+             platform-stack` failed exit status 1:
+             Error: looks like "oci://ghcr.io/apprafter" is not
+             a valid chart repository or cannot be reached:
+             object required
+```
+
+Two distinct bugs surfaced together.
+
+### Bug 1 — Argo CD does not infer OCI from URL scheme
+
+`argocd-repo-server` runs `helm pull --repo <repoURL> <chart>`,
+which is the **HTTPS-style** form. For OCI registries
+`helm pull` requires `helm pull oci://<repo>/<chart>` form —
+note the chart name is part of the URL, not a separate
+positional. Helm rejects the `--repo oci://...` form with
+`object required`.
+
+Argo CD bridges this **only if** the registry is registered
+via a `Secret(label argocd.argoproj.io/secret-type=repository)`
+carrying `enableOCI: "true"`. Without that registration the
+URL scheme is irrelevant — `helm pull` is invoked the same
+malformed way.
+
+### Bug 2 — `kubectl wait Healthy` is a false-positive
+
+A freshly-created root Application with **zero rendered
+children** reports `Health=Healthy` (trivially, no resources
+to fail) while `Sync=Unknown` (chart pull errored). Our
+v0.1.99 loader's final wait was `--for=jsonpath={.status.health.status}=Healthy`,
+which matched the empty-Healthy and returned 0. The CLI
+reported "bootstrap complete" while reconcile had never
+actually started.
+
+### Fix
+
+**Bug 1:**
+
+- `cli-providers::k8s::APPRAFTER_PLATFORM_STACK_DEFAULT_REPO`:
+  `"oci://ghcr.io/apprafter"` → `"ghcr.io/apprafter"` (bare).
+- `argocd_loader_values_yaml`: new `configs.repositories.apprafter`
+  block (`url: ghcr.io/apprafter`, `type: helm`, `enableOCI: "true"`).
+- Chart `component_argocd.cue`: same block mirrored in
+  `values.configs.repositories.apprafter` so the chart's
+  self-reconcile keeps the registration alive when adopting
+  the loader Argo CD release.
+- Chart `component_apprafter-operator.cue`, `component_admission-webhook.cue`:
+  drop `oci://` prefix in `repoURL`.
+- Chart `currentVersion 0.1.3 → 0.1.4` + matching
+  `compatibility.cue` entry. 0.1.3 entry gets a "known issue"
+  note pointing operators at 0.1.4.
+
+**Bug 2:**
+
+- `perform_bootstrap` step 4: split into 4a (wait Synced)
+  and 4b (wait Healthy). Synced is what tells us the chart
+  pulled and rendered children; Healthy is meaningful only
+  after Synced.
+
+### Changed
+
+- `cli-providers::k8s::APPRAFTER_PLATFORM_STACK_DEFAULT_REPO`,
+  `RELEASED_PLATFORM_STACK_VERSION` (→ `"0.1.4"`).
+- `commands/cluster_bootstrap.rs`: loader values + 2-step
+  final wait + 3 new regression-guard tests, 1 existing
+  test extended with the Synced step + per-line `oci://`
+  guard.
+- `platform-stack/cue/`: `platform.cue` `currentVersion`,
+  `compatibility.cue` entry, `component_argocd.cue`
+  (`configs.repositories.apprafter` block),
+  `component_apprafter-operator.cue` + `component_admission-webhook.cue`
+  (`oci://` prefix dropped from `repoURL`).
+
+### Tests
+
+- `argocd_loader_values_register_apprafter_oci_repo` — pins
+  the `configs.repositories.apprafter` block in loader values
+  (`url`, `type`, `enableOCI`); negative guard runs per-line
+  so `oci://` is forbidden in non-comment lines only.
+- `root_application_repourl_is_bare_without_oci_scheme` —
+  pins the root Application's `repoURL` byte-form so a future
+  refactor can't reintroduce the malformed prefix.
+- Main bootstrap test extended: 4 kubectl waits now (node
+  Ready, argocd-server Available, Application Synced,
+  Application Healthy) in that order.
+
+Total: 556 passed (was 554 in v0.1.99).
+
+### Recovery for clusters stuck on v0.1.99 / chart 0.1.3
+
+Manual one-time bridge (CLI v0.1.100 + chart 0.1.4 does it
+automatically):
+
+```sh
+kubectl apply -n argocd -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-apprafter
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  name: apprafter
+  url: ghcr.io/apprafter
+  type: helm
+  enableOCI: "true"
+EOF
+kubectl -n argocd patch application platform --type merge \
+  -p '{"spec":{"source":{"repoURL":"ghcr.io/apprafter"}}}'
+kubectl -n argocd patch application platform --type merge \
+  -p '{"operation":{"sync":{}}}'
+```
+
+After the chart 0.1.4 reconcile owns these (the
+`configs.repositories.apprafter` block reapplies the Secret
+contents, and the chart's own `repoURL` fields are bare),
+manual steps drop away.
+
 ## v0.1.99 — walk-fix: CNI must install before Argo CD (2026-05-19)
 
 Second walk on the v0.1.98 GitOps loader surfaced the

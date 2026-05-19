@@ -19,25 +19,36 @@ pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.64";
 
 /// Single source of truth for the platform-stack OCI Helm chart
 /// version `cluster-bootstrap` points the root Argo CD Application
-/// at. Updated whenever a new `platform-stack/v*` is published; the
-/// CLI's "wait for child Applications" loop also relies on this to
-/// know which child components to expect (chart 0.1.0 ships 6 tier-1
-/// Applications; 0.1.2 adds the cue-cmp sidecar wiring but keeps the
-/// same Application count).
+/// at. Updated whenever a new `platform-stack/v*` is published.
 ///
 /// Bump in lockstep with `platform-stack/cue/platform.cue`'s
 /// `currentVersion`. The chart at this version MUST exist in OCI
-/// (`oci://ghcr.io/<owner>/platform-stack:<version>`) before a
-/// bumped CLI ships, otherwise `apprafter cluster-bootstrap`'s
-/// root Application reconcile fails with "pull failed: not found".
-pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.3";
+/// (`oci://<owner>/platform-stack:<version>`) before a bumped CLI
+/// ships, otherwise `apprafter cluster-bootstrap`'s root
+/// Application reconcile fails with "pull failed: not found".
+pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.4";
 
-/// Default OCI registry path the chart is published to. The
-/// `apprafter` owner is overridable via `--platform-stack-repo`
-/// (lands in a follow-up) for fork users (`apprafter platform fork
-/// --to ghcr.io/myorg`, plan.md 1.74). Read by `cluster-bootstrap`
-/// when rendering the root Application's `spec.source.repoURL`.
-pub const APPRAFTER_PLATFORM_STACK_DEFAULT_REPO: &str = "oci://ghcr.io/apprafter";
+/// Default OCI registry path the chart is published to.
+///
+/// Stored **without** the `oci://` scheme prefix. Two reasons:
+///
+///   - Argo CD repository registrations carry a bare URL +
+///     `enableOCI: "true"` flag; the scheme is implicit. Both
+///     the loader values in
+///     `cli-providers::k8s::argocd_loader_values_yaml` and the
+///     chart's `component_argocd.cue` register this URL
+///     verbatim under `configs.repositories.apprafter.url`.
+///   - The root Application's `spec.source.repoURL` MUST match
+///     the registration URL byte-for-byte for Argo CD to
+///     resolve it. Passing `oci://ghcr.io/apprafter` would
+///     trigger a malformed `helm pull --repo oci://... chart`
+///     command (walk-found bug, v0.1.99 → v0.1.100).
+///
+/// Fork users (`apprafter platform fork --to ghcr.io/myorg`,
+/// plan.md 1.74) override by passing `ghcr.io/myorg` here.
+/// `helm push` workflows independently prepend `oci://` when
+/// invoking `helm push`.
+pub const APPRAFTER_PLATFORM_STACK_DEFAULT_REPO: &str = "ghcr.io/apprafter";
 
 /// Chart name under the registry path. The renderer
 /// (`platform-stack/cue/render_tool.cue`) hardcodes this as the
