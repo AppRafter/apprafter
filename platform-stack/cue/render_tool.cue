@@ -142,6 +142,10 @@ _applicationsTemplate: """
 	    namespace: {{ $component.namespace | quote }}
 	  syncPolicy:
 	{{ toYaml $component.syncPolicy | indent 4 }}
+	  {{- with $component.ignoreDifferences }}
+	  ignoreDifferences:
+	{{ toYaml . | indent 4 }}
+	  {{- end }}
 	{{- end }}
 	{{- end }}
 
@@ -193,6 +197,10 @@ _valuesSchema: {
 						version: {type: "string"}
 						values: {type: "object"}
 						syncPolicy: {type: "object"}
+						ignoreDifferences: {
+							type: "array"
+							items: {type: "object"}
+						}
 					}
 				}
 			}

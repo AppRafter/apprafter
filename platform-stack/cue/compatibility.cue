@@ -185,14 +185,16 @@ compatibility: "0.1.2": {
 // version pins changed — pure tier-1 default refinement
 // matching the v0.1.x in-tree baseline.
 //
-// **Known issue (fixed in 0.1.4):** Argo CD generates a
+// **Known issue (fixed in 0.1.4 / 0.1.5):** Argo CD generates a
 // malformed `helm pull --repo oci://ghcr.io/apprafter <chart>`
 // for `repoURL: oci://ghcr.io/apprafter` and the root
 // Application reports `ComparisonError: object required`. The
 // fix in 0.1.4 registers the repo via
 // `configs.repositories.apprafter` (bare URL + `enableOCI:
 // "true"`) and drops the `oci://` scheme prefix in all chart
-// `repoURL` fields. Bump to 0.1.4 if you hit `object required`.
+// `repoURL` fields. 0.1.5 layers further child-Application
+// fixes on top — see 0.1.5 notes. Bump straight to 0.1.5 if
+// installing fresh.
 compatibility: "0.1.3": {
 	change:          "safe"
 	operatorVersion: "v0.1.91"
@@ -280,8 +282,95 @@ compatibility: "0.1.4": {
 		`ghcr.io/apprafter`; the chart's self-reconcile then
 		owns it. CLI v0.1.100's bootstrap-all does all this on
 		a fresh cluster.
+
+		Known issue carried into 0.1.4: child Applications
+		(`cilium`, `argocd`, `apprafter-operator`,
+		`admission-webhook`, `network-policies`) reported
+		`Sync=Unknown` after the OCI fix. Three independent
+		causes — see 0.1.5 notes. Bump straight to 0.1.5 for
+		a clean fresh install.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01100",
+	]
+}
+
+// 0.1.5 — child-Application syncability hotfix on top of
+// 0.1.4. Three independent walk-found defects:
+//
+//   1. `apprafter-operator` and `apprafter-admission-webhook`
+//      helm charts were never published to OCI — only the
+//      container images were. Argo CD failed `helm pull
+//      oci://ghcr.io/apprafter/apprafter-operator` with
+//      `not found`. Fixed by adding a `helm-charts` job to
+//      `release-operator.yml` that packages + pushes both
+//      charts via `helm push oci://ghcr.io/<owner>`. The
+//      existing `apprafter-operator` chart is bumped to
+//      `v0.1.91` to match the platform-stack pin; a new
+//      `apprafter-admission-webhook` chart is created from
+//      scratch (templates derived from the v0.1.x in-tree
+//      `cli-providers::k8s::admission_webhook_yaml` renderer
+//      — Namespace dropped because Argo CD creates it via
+//      `CreateNamespace=true`; Certificate, Service,
+//      Deployment, ValidatingWebhookConfiguration templated).
+//   2. `cilium` + `argocd` child Applications failed
+//      structured-merge diff with `terminatingReplicas: field
+//      not declared in schema` — k3s v1.35 surfaces the
+//      Kubernetes 1.31+ field on Deployment/DaemonSet/StatefulSet
+//      `.status`, Argo CD 2.13.1 doesn't yet know it. Fixed
+//      by adding `ignoreDifferences` blocks in the affected
+//      components; `#Component` schema in `platform.cue`
+//      grows an optional `ignoreDifferences` field, and
+//      `render_tool.cue` renders it into the Argo CD
+//      Application spec.
+//   3. `network-policies` Application failed with `app path
+//      does not exist` — `component_network-policies.cue`
+//      pointed at `manifests/tier-1/network-policies/`
+//      which had never been created when the v0.1.97
+//      imperative-to-GitOps rewrite migrated inline manifests
+//      out of the CLI. Fixed by creating
+//      `manifests/tier-1/network-policies/default-deny.yaml`
+//      (content lifted from
+//      `cli-providers::k8s::network_policy::default_deny_network_policy_yaml`).
+compatibility: "0.1.5": {
+	change:          "safe"
+	operatorVersion: "v0.1.91"
+	notes: """
+		Child-Application syncability hotfix. Without 0.1.5 a
+		fresh install on Kubernetes 1.31+ ends with the root
+		`platform` Application Synced but five of six children
+		stuck on `ComparisonError` or `Unknown`:
+
+		* `apprafter-operator` + `admission-webhook` —
+		  Helm chart never published to OCI; only the
+		  container image existed. 0.1.5 adds a `helm-charts`
+		  job to `release-operator.yml` that packages + pushes
+		  both charts; the existing `apprafter-operator` chart
+		  is bumped to `v0.1.91` and a new
+		  `apprafter-admission-webhook` chart is created.
+		* `cilium` + `argocd` —
+		  `Deployment.status.terminatingReplicas` (Kubernetes
+		  1.31+, surfaced by k3s v1.35) wasn't in the Argo CD
+		  2.13.1 schema. 0.1.5 adds `ignoreDifferences` blocks
+		  to both components covering Deployment / DaemonSet /
+		  StatefulSet `/status/terminatingReplicas`.
+		* `network-policies` —
+		  `manifests/tier-1/network-policies/` didn't exist
+		  in the monorepo. 0.1.5 creates
+		  `default-deny.yaml` mirroring the v0.1.x in-tree
+		  `default_deny_network_policy_yaml` baseline.
+
+		Schema impact: `#Component` grows an optional
+		`ignoreDifferences: [...{group, kind, jsonPointers?,
+		jqPathExpressions?}]` field. Empty list (the
+		default) is a no-op; existing components are
+		unaffected.
+
+		Operators on 0.1.4 stuck with `ComparisonError`:
+		upgrade to 0.1.5 (or to the matching CLI v0.1.101+
+		which pins this chart version).
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01101",
 	]
 }

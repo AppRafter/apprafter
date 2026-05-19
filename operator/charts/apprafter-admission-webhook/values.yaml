@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT
+# Default values for the apprafter-admission-webhook chart.
+
+image:
+  repository: ghcr.io/apprafter/apprafter-admission-webhook
+  pullPolicy: IfNotPresent
+  tag: ""  # falls back to .Chart.AppVersion when empty
+
+imagePullSecrets: []
+
+replicas: 1
+
+# cert-manager ClusterIssuer that signs the webhook TLS cert.
+# The platform-stack chart installs `apprafter-selfsigned`
+# alongside cert-manager.
+certIssuer:
+  kind: ClusterIssuer
+  name: apprafter-selfsigned
+
+# Per-pod and container security contexts. Tightened to match
+# the operator chart's contract — non-root, read-only rootfs.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# ValidatingWebhookConfiguration knobs. `failurePolicy: Fail`
+# is the safe default — admission requests that can't reach
+# the webhook are REJECTED rather than silently allowed.
+# Cluster-builders who deliberately want the webhook off
+# during incident response can set this to `Ignore`.
+webhook:
+  failurePolicy: Fail
+  timeoutSeconds: 10

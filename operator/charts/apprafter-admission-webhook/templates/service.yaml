@@ -1,0 +1,16 @@
+{{/* SPDX-License-Identifier: MIT */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "apprafter-admission-webhook.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "apprafter-admission-webhook.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "apprafter-admission-webhook.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443

@@ -1,0 +1,33 @@
+{{/* SPDX-License-Identifier: MIT */}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: admission-webhook.apprafter.io
+  labels:
+    {{- include "apprafter-admission-webhook.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ printf "%s/%s" .Release.Namespace (include "apprafter-admission-webhook.tlsSecretName" .) }}
+webhooks:
+  - name: applications.apprafter.io
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    admissionReviewVersions:
+      - v1
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    clientConfig:
+      service:
+        name: {{ include "apprafter-admission-webhook.fullname" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate
+        port: 443
+    rules:
+      - apiGroups:
+          - apprafter.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - applications
+        scope: Namespaced

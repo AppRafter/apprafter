@@ -33,4 +33,26 @@ _components: cilium: #Component & {
 		}
 		operator: replicas: int | *1
 	}
+
+	// Argo CD 2.13.1 (shipped by argo-cd chart 7.7.7) doesn't
+	// know about `Deployment.status.terminatingReplicas` /
+	// `DaemonSet.status.terminatingReplicas` — Kubernetes
+	// 1.31+ fields surfaced by k3s v1.35. Without an explicit
+	// ignore, structured-merge diff fails with
+	// `field not declared in schema` and the Application
+	// reports `ComparisonError`. The chart's adopt of Argo CD
+	// itself fixes the schema as a side-effect of a future
+	// upgrade, but until then we mute the field per-component.
+	ignoreDifferences: [
+		{
+			group: "apps"
+			kind:  "Deployment"
+			jsonPointers: ["/status/terminatingReplicas"]
+		},
+		{
+			group: "apps"
+			kind:  "DaemonSet"
+			jsonPointers: ["/status/terminatingReplicas"]
+		},
+	]
 }

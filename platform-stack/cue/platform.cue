@@ -115,6 +115,27 @@ package platformstack
 		}
 		syncOptions: [...string] | *["CreateNamespace=true", "ServerSideApply=true"]
 	}
+
+	// Optional `spec.ignoreDifferences` — list of fields Argo CD
+	// should exclude from drift comparison. Practical use today
+	// is muting Kubernetes-version-skew fields the Argo CD
+	// `2.13.1` schema does not yet know about (e.g.
+	// `Deployment.status.terminatingReplicas` added in
+	// Kubernetes 1.31 and surfaced by k3s v1.35; Argo CD
+	// reports `field not declared in schema` when the live
+	// object carries it but the structured-merge differ doesn't
+	// recognise it). Per-component because the noisy fields
+	// differ by component shape — operator's Deployment doesn't
+	// expose the same fields as Cilium's DaemonSet.
+	//
+	// Empty list = no ignored differences (the common case;
+	// most components don't need this).
+	ignoreDifferences: [...{
+		group: string
+		kind:  string
+		jsonPointers?: [...string]
+		jqPathExpressions?: [...string]
+	}] | *[]
 }
 
 // #ComponentSet is the umbrella chart's `values.components`
@@ -171,7 +192,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.1.4"
+currentVersion: #Version & "0.1.5"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

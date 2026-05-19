@@ -13,6 +13,108 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.101 — walk-fix: child-Application syncability (2026-05-19)
+
+Fourth walk on the GitOps loader (chart 0.1.4, CLI v0.1.100).
+Root `platform` Application reached `Synced/Healthy` and six
+children appeared. **Only `cert-manager` Synced**; the other
+five failed in three independent ways.
+
+### Bug A — operator + admission-webhook helm charts not published
+
+```
+Failed to load target state: ... error pulling OCI chart:
+  helm pull oci://ghcr.io/apprafter/apprafter-operator
+    --version v0.1.91 ...
+  Error: ghcr.io/apprafter/apprafter-operator:v0.1.91:
+  not found
+```
+
+`release-operator.yml` builds and pushes the operator +
+admission-webhook **container images** but never publishes
+their **Helm charts**. `operator/charts/apprafter-operator/`
+existed at `0.1.29` (drift from `v0.1.91`);
+`operator/charts/apprafter-admission-webhook/` didn't exist
+at all. The platform-stack chart's
+`component_apprafter-operator.cue` / `component_admission-webhook.cue`
+references therefore pointed at OCI artefacts that had never
+been uploaded.
+
+Fix:
+- New `apprafter-admission-webhook` Helm chart created from
+  scratch — `Chart.yaml`, `values.yaml`, `_helpers.tpl`,
+  `certificate.yaml`, `service.yaml`, `deployment.yaml`,
+  `validatingwebhookconfiguration.yaml`. Templates derived
+  from the v0.1.x in-tree `cli-providers::k8s::admission_webhook_yaml`
+  renderer; Namespace dropped because Argo CD's
+  `syncOptions: CreateNamespace=true` handles it.
+- `apprafter-operator` Chart.yaml `version / appVersion`
+  bumped from `0.1.29` → `v0.1.91` to match the platform-
+  stack pin.
+- New `helm-charts` job in `release-operator.yml` runs after
+  the image jobs, packages both charts, and pushes them via
+  `helm push oci://ghcr.io/<owner>`. Chart version comes
+  from `Chart.yaml` (NOT `github.ref_name`) so the
+  platform-stack pin stays the source of truth.
+
+### Bug B — `terminatingReplicas: field not declared in schema`
+
+`cilium` + `argocd` Applications failed structured-merge
+diff with `field not declared in schema`. k3s v1.35 surfaces
+`Deployment.status.terminatingReplicas` /
+`DaemonSet.status.terminatingReplicas` /
+`StatefulSet.status.terminatingReplicas` (Kubernetes 1.31+
+addition); Argo CD 2.13.1 doesn't have the field in its
+structured-merge schema and refuses to diff.
+
+Fix:
+- `#Component` schema in `platform.cue` grows an optional
+  `ignoreDifferences: [...{group, kind, jsonPointers?,
+  jqPathExpressions?}]` field, defaulting to `[]`.
+- `render_tool.cue` template emits the block into the Argo
+  CD Application spec when non-empty.
+- `component_cilium.cue` ignores Deployment + DaemonSet
+  `/status/terminatingReplicas`; `component_argocd.cue`
+  ignores Deployment + StatefulSet.
+
+### Bug C — `network-policies: app path does not exist`
+
+`component_network-policies.cue` references the git path
+`manifests/tier-1/network-policies/`, which had never been
+created when the v0.1.97 imperative-to-GitOps rewrite moved
+inline manifests out of the CLI. The directory was simply
+missing.
+
+Fix:
+- `manifests/tier-1/network-policies/default-deny.yaml`
+  created. Content lifted from
+  `cli-providers::k8s::network_policy::default_deny_network_policy_yaml`:
+  ingress allow from same namespace + kube-system, no egress
+  block (matches the v0.1.x baseline; per-app egress allows
+  land in phase 2.10).
+
+### Chart + CLI versions
+
+- Chart `currentVersion 0.1.4 → 0.1.5` with full compat
+  entry; 0.1.4 entry gets a "known issue carried into 0.1.4"
+  note pointing operators at 0.1.5.
+- CLI `RELEASED_PLATFORM_STACK_VERSION "0.1.4" → "0.1.5"`.
+- CLI `0.1.100 → 0.1.101`.
+
+### Tests
+
+No new CLI tests — all three bugs are chart-domain. Existing
+556 tests still pass; `cargo fmt` / `clippy` / SPDX (now 184
+files, +9 from admission-webhook chart + network-policies
+manifest) / `cue vet` all clean.
+
+### Recovery for clusters stuck on chart 0.1.4
+
+`apprafter destroy --yes && cargo install --path platform-cli
+--force --bins && apprafter bootstrap-all` after CLI v0.1.101
++ chart 0.1.5 + operator charts are published. No manual
+intermediate steps required.
+
 ## v0.1.100 — walk-fix: Argo CD OCI repo must be registered (2026-05-19)
 
 Third real-Hetzner walk on the GitOps loader (chart 0.1.3,

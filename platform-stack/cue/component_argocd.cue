@@ -119,4 +119,22 @@ _components: argocd: #Component & {
 		}
 		syncOptions: [...string] | *["CreateNamespace=true", "ServerSideApply=true"]
 	}
+
+	// Same Kubernetes 1.31+ field skew as
+	// `component_cilium.cue`. Argo CD's own Deployments
+	// (server, repo-server, applicationset, controller,
+	// notifications) ALL surface
+	// `status.terminatingReplicas` on k3s v1.35.
+	ignoreDifferences: [
+		{
+			group: "apps"
+			kind:  "Deployment"
+			jsonPointers: ["/status/terminatingReplicas"]
+		},
+		{
+			group: "apps"
+			kind:  "StatefulSet"
+			jsonPointers: ["/status/terminatingReplicas"]
+		},
+	]
 }

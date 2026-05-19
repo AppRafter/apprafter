@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
+# Tier-1 baseline NetworkPolicy. Mirrors what the v0.1.x
+# imperative cluster-bootstrap installed inline. Argo CD's
+# `network-policies` Application now reconciles this directory
+# (see `platform-stack/cue/component_network-policies.cue`).
+#
+# Rationale lives in
+# `cli-providers/src/k8s/network_policy.rs` — same shape as
+# `default_deny_network_policy_yaml("default")`. Once the chart
+# fully owns this layer (post-B.1.71 migration), the CLI
+# renderer becomes dead code and can be deleted; for now the
+# two are kept in sync by hand.
+#
+# Why no Egress block: tier-1 is single-tenant and the operator
+# doesn't yet auto-derive per-app egress allows from
+# `ServiceProvider` / `ResourceClaim` (lands in phase 2.10).
+# Restricting egress without those allows would silently break
+# DNS + Service routing (the v0.1.50 → v0.1.51 fix).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: default
+  labels:
+    apprafter: "true"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Same-namespace pod-to-pod (Service routing, intra-app
+    # backend calls, etc.).
+    - from:
+        - podSelector: {}
+    # kube-system (Cilium gateway pods forwarding HTTPRoute
+    # traffic, future-tier-2 monitoring scrapes, controllers
+    # reaching workloads).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
