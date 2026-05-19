@@ -3,6 +3,15 @@
 //! 0025). Replaces the v0.1.x imperative install path with a
 //! GitOps loader:
 //!
+//!   0. `helm install cilium cilium/cilium` — CNI first.
+//!      Without it the k3s node carries
+//!      `node.kubernetes.io/not-ready:NoSchedule` (k3s starts
+//!      with `--flannel-backend=none`) and the Argo CD
+//!      pre-install hook Job is `Pending` forever, failing
+//!      the loader install with `failed pre-install: timed out
+//!      waiting for the condition`.
+//!      0b. `kubectl wait --for=condition=Ready node --all`
+//!      so step 1 starts on a Ready node.
 //!   1. `helm install argocd argo/argo-cd` — bare Argo CD,
 //!      nothing else.
 //!   2. `kubectl wait` for the `argocd-server` Deployment to
@@ -13,23 +22,33 @@
 //!   4. `kubectl wait` for that root Application to report
 //!      `status.health.status: Healthy` and
 //!      `status.sync.status: Synced`. Once Healthy, the chart's
-//!      child Applications (cilium, cert-manager,
-//!      apprafter-operator, admission-webhook, network-policies,
-//!      conditionally Backstage) are reconciling under Argo CD.
+//!      child Applications (cilium adopts the loader release,
+//!      cert-manager, apprafter-operator, admission-webhook,
+//!      network-policies, conditionally Backstage) are
+//!      reconciling under Argo CD.
 //!
 //! Drift correction, prune semantics, and re-apply idempotency
 //! all flow from Argo CD instead of the CLI. Re-running
 //! `cluster-bootstrap` against an already-bootstrapped cluster
-//! is a no-op: `helm upgrade --install` keeps Argo CD on the
-//! same revision, `kubectl apply` is idempotent on the root
-//! Application, the waits succeed instantly because the
+//! is a no-op: `helm upgrade --install` keeps Cilium + Argo CD
+//! on the same revision, `kubectl apply` is idempotent on the
+//! root Application, the waits succeed instantly because the
 //! conditions are already met.
 //!
+//! Why Cilium is in the CLI loader and not the chart: k3s
+//! comes up without a CNI, so nothing schedules until Cilium
+//! is installed — including the Argo CD pre-install hook the
+//! chart would need to bring Cilium in. Loader = "minimum to
+//! make the node schedulable and Argo CD reach Available".
+//! Once Argo CD is up, `component_cilium.cue` adopts the
+//! loader release (same name/namespace, `prune: false`) and
+//! takes over upgrades and value overlays.
+//!
 //! What deliberately went away vs. v0.1.x:
-//!   - Direct `helm install` of Cilium, cert-manager, the
-//!     operator, the admission-webhook, the bootstrap
-//!     Application, Backstage. All now reconciled BY Argo CD
-//!     via the platform-stack chart.
+//!   - Direct `helm install` of cert-manager, the operator,
+//!     the admission-webhook, the bootstrap Application,
+//!     Backstage. All now reconciled BY Argo CD via the
+//!     platform-stack chart.
 //!   - Inline Gateway API + Application CRD + default-deny
 //!     NetworkPolicy + self-signed ClusterIssuer manifests.
 //!     Shipped as components inside the chart.
@@ -43,9 +62,9 @@ use std::path::Path;
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
-    APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
-    ARGOCD_CHART_VERSION, RELEASED_PLATFORM_STACK_VERSION,
+    cilium_values_yaml, HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner,
+    ManifestSource, APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
+    ARGOCD_CHART_VERSION, CILIUM_CHART_VERSION, RELEASED_PLATFORM_STACK_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -55,6 +74,13 @@ use tracing::info;
 /// slow cpx22 cold start (cloud-init + image pulls + helm pod
 /// schedule), tight enough that genuine breakage fails fast.
 ///
+/// `NODE_READY_TIMEOUT_SECS` covers Cilium DaemonSet image
+/// pull → Cilium agent ready → node `Ready=True`. Cilium pods
+/// tolerate `node.kubernetes.io/not-ready:NoSchedule` so they
+/// schedule on the not-ready node immediately; the wall-clock
+/// dominator is the ~140 MB image pull. 180s on cpx22.
+const NODE_READY_TIMEOUT_SECS: u64 = 180;
+
 /// `ARGOCD_DEPLOYMENT_TIMEOUT_SECS` covers the helm-install
 /// chart deploy → Argo CD pods scheduled → Available condition.
 /// Empirically ~90s on cpx22, 180s leaves headroom.
@@ -63,9 +89,10 @@ const ARGOCD_DEPLOYMENT_TIMEOUT_SECS: u64 = 180;
 /// `PLATFORM_RECONCILE_TIMEOUT_SECS` covers Argo CD pulling the
 /// OCI chart → rendering N child Applications → each child
 /// pulling its own upstream chart → component pods scheduled
-/// → reconciler reports Healthy. Cilium + cert-manager + ArgoCD
-/// (self-manage) + operator + webhook + network-policies =
-/// 6-7 chart pulls in sequence. 10 minutes on cpx22.
+/// → reconciler reports Healthy. Roughly six to seven sequential
+/// chart pulls on tier-1: Cilium adopt, cert-manager, ArgoCD
+/// self-manage, operator, webhook, netpolicies. 10 minutes on
+/// cpx22.
 const PLATFORM_RECONCILE_TIMEOUT_SECS: u64 = 600;
 
 pub fn run() -> Result<()> {
@@ -96,8 +123,8 @@ pub fn run() -> Result<()> {
     )?;
 
     println!(
-        "cluster-bootstrap complete: Argo CD installed, platform-stack {platform_version} \
-         reconciling from {platform_repo}/{chart}",
+        "cluster-bootstrap complete: Cilium installed, node Ready, Argo CD installed, \
+         platform-stack {platform_version} reconciling from {platform_repo}/{chart}",
         chart = APPRAFTER_PLATFORM_STACK_CHART_NAME,
     );
     Ok(())
@@ -112,6 +139,35 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     kubeconfig_path: &Path,
     root_application_path: &Path,
 ) -> Result<()> {
+    // 0. Cilium first — see module doc. k3s starts without a
+    //    CNI, the single node carries
+    //    `node.kubernetes.io/not-ready:NoSchedule`, and the
+    //    Argo CD pre-install hook Job is `Pending` forever
+    //    until a CNI installs. Cilium DaemonSet tolerates the
+    //    not-ready taint so it schedules on the not-ready
+    //    node and flips it to Ready.
+    helm.repo_add("cilium", "https://helm.cilium.io/")?;
+    let cilium_values_file =
+        write_tempfile_with("apprafter-cilium-loader-values-", &cilium_values_yaml())?;
+    helm.upgrade_install(&HelmUpgradeArgs {
+        release: "cilium".into(),
+        chart: "cilium/cilium".into(),
+        version: Some(CILIUM_CHART_VERSION.into()),
+        namespace: "kube-system".into(),
+        values_path: cilium_values_file.path().to_path_buf(),
+        kubeconfig_path: kubeconfig_path.to_path_buf(),
+    })?;
+
+    // 0b. Node MUST reach Ready before step 1 — otherwise the
+    //     Argo CD pre-install hook would still be Pending.
+    kubectl.wait_for_condition(
+        "node --all",
+        None,
+        "condition=Ready",
+        NODE_READY_TIMEOUT_SECS,
+        kubeconfig_path,
+    )?;
+
     // 1. Argo CD loader install. `helm upgrade --install` is
     //    idempotent — re-running cluster-bootstrap on a
     //    healthy cluster is a no-op.
@@ -142,7 +198,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //    apply` fails with "no matches for kind".
     kubectl.wait_for_condition(
         "deployment/argocd-server",
-        "argocd",
+        Some("argocd"),
         "condition=Available",
         ARGOCD_DEPLOYMENT_TIMEOUT_SECS,
         kubeconfig_path,
@@ -161,7 +217,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //    upstream chart, etc. — generous timeout.
     kubectl.wait_for_condition(
         "application/platform",
-        "argocd",
+        Some("argocd"),
         "jsonpath={.status.health.status}=Healthy",
         PLATFORM_RECONCILE_TIMEOUT_SECS,
         kubeconfig_path,
@@ -327,7 +383,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct WaitCall {
         resource_ref: String,
-        namespace: String,
+        namespace: Option<String>,
         condition_expr: String,
         timeout_seconds: u64,
         kubeconfig_path: PathBuf,
@@ -359,14 +415,14 @@ mod tests {
         fn wait_for_condition(
             &self,
             resource_ref: &str,
-            namespace: &str,
+            namespace: Option<&str>,
             condition_expr: &str,
             timeout_seconds: u64,
             kubeconfig_path: &Path,
         ) -> Result<()> {
             self.waits.borrow_mut().push(WaitCall {
                 resource_ref: resource_ref.to_string(),
-                namespace: namespace.to_string(),
+                namespace: namespace.map(|s| s.to_string()),
                 condition_expr: condition_expr.to_string(),
                 timeout_seconds,
                 kubeconfig_path: kubeconfig_path.to_path_buf(),
@@ -376,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn perform_bootstrap_installs_argocd_then_applies_root_then_waits_for_healthy() {
+    fn perform_bootstrap_installs_cilium_then_argocd_then_applies_root_then_waits_for_healthy() {
         let helm = FakeHelm::default();
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
@@ -384,23 +440,31 @@ mod tests {
 
         perform_bootstrap(&helm, &kubectl, &kc, &root_app).expect("bootstrap");
 
-        // Helm: exactly one repo_add (`argo`) and one install
-        // (the loader Argo CD release). No Cilium, no cert-
-        // manager, no operator — those reconcile via the chart.
+        // Helm: two repo_adds (cilium, argo) and two installs
+        // (cilium first, then the loader Argo CD release).
+        // cert-manager, operator, webhook reconcile via the
+        // chart.
         let repos = helm.repos.borrow();
         assert_eq!(
             repos.as_slice(),
-            &[(
-                "argo".to_string(),
-                "https://argoproj.github.io/argo-helm".to_string()
-            )]
+            &[
+                ("cilium".to_string(), "https://helm.cilium.io/".to_string()),
+                (
+                    "argo".to_string(),
+                    "https://argoproj.github.io/argo-helm".to_string()
+                ),
+            ]
         );
         let installs = helm.installs.borrow();
-        assert_eq!(installs.len(), 1, "{installs:?}");
-        assert_eq!(installs[0].release, "argocd");
-        assert_eq!(installs[0].chart, "argo/argo-cd");
-        assert_eq!(installs[0].namespace, "argocd");
-        assert_eq!(installs[0].version.as_deref(), Some(ARGOCD_CHART_VERSION));
+        assert_eq!(installs.len(), 2, "{installs:?}");
+        assert_eq!(installs[0].release, "cilium");
+        assert_eq!(installs[0].chart, "cilium/cilium");
+        assert_eq!(installs[0].namespace, "kube-system");
+        assert_eq!(installs[0].version.as_deref(), Some(CILIUM_CHART_VERSION));
+        assert_eq!(installs[1].release, "argocd");
+        assert_eq!(installs[1].chart, "argo/argo-cd");
+        assert_eq!(installs[1].namespace, "argocd");
+        assert_eq!(installs[1].version.as_deref(), Some(ARGOCD_CHART_VERSION));
 
         // kubectl: exactly one client-side apply (the root
         // Application), no SSA applies.
@@ -415,23 +479,70 @@ mod tests {
             "loader path should not use server-side apply"
         );
 
-        // Waits: argocd-server first, root Application second.
-        // Ordering matters — applying the Application before
-        // the CRD is installed would fail with "no matches".
+        // Waits: node Ready first (so step 1 can schedule),
+        // argocd-server Available second, root Application
+        // Healthy third. Ordering matters — applying the
+        // Application before the CRD is installed would fail
+        // with "no matches".
         let waits = kubectl.waits.borrow();
-        assert_eq!(waits.len(), 2);
-        assert_eq!(waits[0].resource_ref, "deployment/argocd-server");
-        assert_eq!(waits[0].namespace, "argocd");
-        assert_eq!(waits[0].condition_expr, "condition=Available");
-        assert_eq!(waits[0].timeout_seconds, ARGOCD_DEPLOYMENT_TIMEOUT_SECS);
+        assert_eq!(waits.len(), 3);
+        assert_eq!(waits[0].resource_ref, "node --all");
+        assert_eq!(waits[0].namespace, None);
+        assert_eq!(waits[0].condition_expr, "condition=Ready");
+        assert_eq!(waits[0].timeout_seconds, NODE_READY_TIMEOUT_SECS);
 
-        assert_eq!(waits[1].resource_ref, "application/platform");
-        assert_eq!(waits[1].namespace, "argocd");
+        assert_eq!(waits[1].resource_ref, "deployment/argocd-server");
+        assert_eq!(waits[1].namespace, Some("argocd".to_string()));
+        assert_eq!(waits[1].condition_expr, "condition=Available");
+        assert_eq!(waits[1].timeout_seconds, ARGOCD_DEPLOYMENT_TIMEOUT_SECS);
+
+        assert_eq!(waits[2].resource_ref, "application/platform");
+        assert_eq!(waits[2].namespace, Some("argocd".to_string()));
         assert_eq!(
-            waits[1].condition_expr,
+            waits[2].condition_expr,
             "jsonpath={.status.health.status}=Healthy"
         );
-        assert_eq!(waits[1].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
+        assert_eq!(waits[2].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn cilium_installs_before_argocd_so_node_can_become_ready() {
+        // Regression guard for the v0.1.97 → v0.1.99 catch-22:
+        // k3s starts without a CNI; the node carries
+        // `node.kubernetes.io/not-ready:NoSchedule` until
+        // Cilium installs. Argo CD's pre-install hook Job pod
+        // doesn't tolerate it and stays Pending forever, helm
+        // install times out with `failed pre-install`. Cilium
+        // pods DO tolerate the taint, so they schedule and
+        // flip the node to Ready. This test pins the ordering
+        // so a future refactor can't put argocd back first.
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let root_app = PathBuf::from("/tmp/root-app.yaml");
+
+        perform_bootstrap(&helm, &kubectl, &kc, &root_app).expect("bootstrap");
+
+        let installs = helm.installs.borrow();
+        let cilium_idx = installs.iter().position(|i| i.release == "cilium");
+        let argocd_idx = installs.iter().position(|i| i.release == "argocd");
+        assert!(cilium_idx.is_some(), "cilium install missing");
+        assert!(argocd_idx.is_some(), "argocd install missing");
+        assert!(
+            cilium_idx < argocd_idx,
+            "cilium must install before argocd: cilium={cilium_idx:?} argocd={argocd_idx:?}"
+        );
+
+        // Node-Ready wait must come between cilium install
+        // (otherwise CNI isn't installed yet) and argocd
+        // install (otherwise the pre-install hook is stuck).
+        let waits = kubectl.waits.borrow();
+        let node_wait_idx = waits.iter().position(|w| w.resource_ref == "node --all");
+        assert_eq!(
+            node_wait_idx,
+            Some(0),
+            "node Ready wait must be the FIRST kubectl call: {waits:?}"
+        );
     }
 
     #[test]

@@ -13,6 +13,127 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.99 — walk-fix: CNI must install before Argo CD (2026-05-19)
+
+Second walk on the v0.1.98 GitOps loader surfaced the
+**catch-22 the rewrite created**. Real-Hetzner output:
+
+```
+Error: failed pre-install: 1 error occurred:
+        * timed out waiting for the condition
+```
+
+This time the redis-ha fix from v0.1.98 was applied (chart
+0.1.3, `redis-ha.enabled: false`), but the pre-install
+`Job/argocd-redis-secret-init` pod stayed `Pending` with:
+
+```
+Warning  FailedScheduling  …  0/1 nodes are available:
+  1 node(s) had untolerated taint(s).
+```
+
+Diagnosis:
+
+```sh
+kubectl describe node | grep Taints
+# Taints: node.kubernetes.io/not-ready:NoSchedule
+
+kubectl get nodes
+# platform-1   NotReady   control-plane
+```
+
+k3s comes up with **no CNI** (it's installed with
+`--flannel-backend=none` so Cilium can replace it). Without a
+CNI the node sits at `Ready=False` and carries
+`node.kubernetes.io/not-ready:NoSchedule`. The Argo CD
+pre-install Job pod doesn't tolerate that taint → stays
+`Pending` → helm install times out.
+
+The v0.1.x imperative install resolved this by installing
+**Cilium first**. The v0.1.97 GitOps rewrite moved Cilium
+into the chart, which Argo CD reconciles — but Argo CD
+itself can't start without a CNI. Catch-22.
+
+### Fix
+
+Cilium goes back into the CLI loader as **Step 0**, before
+Argo CD. The chart's `component_cilium.cue` still owns
+upgrades and value overlays via Argo CD's
+adoption-of-existing-release behaviour (same release name +
+namespace, `prune: false` so the self-reconcile is
+non-destructive).
+
+The loader now does:
+
+1. `helm install cilium cilium/cilium` (kube-system).
+2. `kubectl wait --for=condition=Ready node --all`.
+3. `helm install argocd argo/argo-cd` (argocd).
+4. `kubectl wait deployment/argocd-server` Available.
+5. `kubectl apply` root `Application platform`.
+6. `kubectl wait application/platform` Healthy.
+
+### Changed
+
+- **`commands/cluster_bootstrap.rs`**: added Step 0 (Cilium
+  install via existing `cli-providers::k8s::cilium_values_yaml`
+  + `CILIUM_CHART_VERSION`) and Step 0b (node-Ready wait,
+  180s — image pull dominates the wall-clock).
+
+- **`cli-providers::k8s::KubectlRunner::wait_for_condition`**
+  signature changed: `namespace: &str → namespace: Option<&str>`.
+  The CLI emits `-n <ns>` only when `Some`, so cluster-scoped
+  resources (Node, CRD) can be waited on cleanly. All three
+  call sites updated; FakeKubectl in `cluster_bootstrap` and
+  `argocd_password` mirrors the new signature.
+
+- **Module doc-comment** in `cluster_bootstrap.rs` rewritten
+  to document the new ordering and the reason Cilium lives
+  in the CLI loader and not the chart.
+
+### Tests (3 new)
+
+- `wait_command_emits_namespace_flag_when_some` and
+  `wait_command_omits_namespace_flag_when_none` in
+  `cli-providers/src/k8s/kubectl.rs` — pin the new
+  `Option<&str>` contract at the command-builder layer.
+- `cilium_installs_before_argocd_so_node_can_become_ready`
+  in `cluster_bootstrap.rs` — regression guard pinning the
+  Cilium → Argo CD ordering at the orchestration layer, so a
+  future loader refactor can't reintroduce the catch-22.
+- `perform_bootstrap_installs_argocd_then_applies_root_then_waits_for_healthy`
+  renamed to `..._installs_cilium_then_argocd_then_applies_...`,
+  asserts two helm installs (cilium first, argocd second),
+  three kubectl waits (node Ready, argocd-server Available,
+  Application Healthy), and the exact ordering.
+
+Total: 554 passed (was 551 in v0.1.98).
+
+### Chart impact
+
+None. Chart stays on **0.1.3** — the CUE definition of
+`component_cilium.cue` is unchanged, and Argo CD's adopt of
+the loader Cilium release is automatic by name + namespace.
+`RELEASED_PLATFORM_STACK_VERSION` stays `"0.1.3"`.
+
+### Recovery for clusters stuck on v0.1.98
+
+If you ran `apprafter bootstrap-all` on v0.1.98 and saw the
+timeout, the cluster has:
+
+- A working VM + k3s + a `NotReady` node.
+- A failed (`pending-install` or `failed`) Argo CD helm
+  release with a stuck pre-install Job.
+
+```sh
+KUBECONFIG=$(apprafter kubeconfig --refresh) \
+  helm delete argocd -n argocd || true
+KUBECONFIG=$(apprafter kubeconfig) kubectl delete ns argocd || true
+apprafter bootstrap-all
+```
+
+`apply` + `k3s-ready` no-op against the existing VM;
+`bootstrap` now runs the new ordered loader.
+
 ## v0.1.98 — walk-fix: redis-ha pre-install timeout on single-node (2026-05-19)
 
 Real-Hetzner walk of v0.1.97 surfaced a regression. The new

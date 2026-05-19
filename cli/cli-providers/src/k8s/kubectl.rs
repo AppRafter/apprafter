@@ -80,14 +80,18 @@ pub trait KubectlRunner {
     /// `<kind>/<name>` (e.g. `deployment/argocd-server`) or
     /// `<kind> -l <selector>` patterns — pass the whole string
     /// verbatim and the wrapper splits on whitespace for
-    /// `Command::args`. `condition_expr` is the value passed to
-    /// `--for=` (e.g. `condition=Available` or
+    /// `Command::args`. `namespace` is `Some(ns)` for
+    /// namespaced resources (Deployment, Application), `None`
+    /// for cluster-scoped (Node, CustomResourceDefinition);
+    /// the wrapper emits `-n <ns>` only when `Some`.
+    /// `condition_expr` is the value passed to `--for=` (e.g.
+    /// `condition=Available` or
     /// `jsonpath={.status.health.status}=Healthy`). Timeout is
     /// applied as `--timeout=<n>s`.
     fn wait_for_condition(
         &self,
         resource_ref: &str,
-        namespace: &str,
+        namespace: Option<&str>,
         condition_expr: &str,
         timeout_seconds: u64,
         kubeconfig_path: &Path,
@@ -138,7 +142,7 @@ impl KubectlCli {
 
     fn build_wait_command(
         resource_ref: &str,
-        namespace: &str,
+        namespace: Option<&str>,
         condition_expr: &str,
         timeout_seconds: u64,
         kubeconfig_path: &Path,
@@ -153,9 +157,10 @@ impl KubectlCli {
         for tok in resource_ref.split_whitespace() {
             c.arg(tok);
         }
-        c.arg("-n")
-            .arg(namespace)
-            .arg(format!("--for={condition_expr}"))
+        if let Some(ns) = namespace {
+            c.arg("-n").arg(ns);
+        }
+        c.arg(format!("--for={condition_expr}"))
             .arg(format!("--timeout={timeout_seconds}s"))
             .env("KUBECONFIG", kubeconfig_path);
         c
@@ -246,7 +251,7 @@ impl KubectlRunner for KubectlCli {
     fn wait_for_condition(
         &self,
         resource_ref: &str,
-        namespace: &str,
+        namespace: Option<&str>,
         condition_expr: &str,
         timeout_seconds: u64,
         kubeconfig_path: &Path,
@@ -262,8 +267,9 @@ impl KubectlRunner for KubectlCli {
         .map_err(|e| CliError::Other(format!("spawn kubectl wait: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let ns_disp = namespace.map(|n| format!("-n {n} ")).unwrap_or_default();
             return Err(CliError::Other(format!(
-                "kubectl wait {resource_ref} -n {namespace} --for={condition_expr} \
+                "kubectl wait {resource_ref} {ns_disp}--for={condition_expr} \
                  --timeout={timeout_seconds}s failed (exit {:?}): {stderr}",
                 output.status.code()
             )));
@@ -364,6 +370,60 @@ mod tests {
                 "missing {required}: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn wait_command_emits_namespace_flag_when_some() {
+        // Regression guard for v0.1.99: `wait_for_condition`'s
+        // `namespace: Option<&str>` API must still emit `-n
+        // <ns>` for namespaced resources (Deployments,
+        // Applications). Splits on whitespace so multi-token
+        // refs (`pod -l label=value`) lay out as separate args.
+        let cmd = KubectlCli::build_wait_command(
+            "deployment/argocd-server",
+            Some("argocd"),
+            "condition=Available",
+            180,
+            Path::new("/tmp/kubeconfig"),
+        );
+        let args = argv(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "wait",
+                "deployment/argocd-server",
+                "-n",
+                "argocd",
+                "--for=condition=Available",
+                "--timeout=180s",
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_command_omits_namespace_flag_when_none() {
+        // Cluster-scoped resources (Node, CRD) must NOT carry
+        // `-n` — kubectl tolerates it for Nodes but rejects it
+        // for some other cluster-scoped kinds. `None` is the
+        // contract for "this resource has no namespace".
+        let cmd = KubectlCli::build_wait_command(
+            "node --all",
+            None,
+            "condition=Ready",
+            180,
+            Path::new("/tmp/kubeconfig"),
+        );
+        let args = argv(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "wait",
+                "node",
+                "--all",
+                "--for=condition=Ready",
+                "--timeout=180s",
+            ]
+        );
     }
 
     #[test]
