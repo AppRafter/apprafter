@@ -17,17 +17,6 @@
 /// container images to ghcr.io.
 pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.106";
 
-/// Single source of truth for the platform-stack OCI Helm chart
-/// version `cluster-bootstrap` points the root Argo CD Application
-/// at. Updated whenever a new `platform-stack/v*` is published.
-///
-/// Bump in lockstep with `platform-stack/cue/platform.cue`'s
-/// `currentVersion`. The chart at this version MUST exist in OCI
-/// (`oci://<owner>/platform-stack:<version>`) before a bumped CLI
-/// ships, otherwise `apprafter cluster-bootstrap`'s root
-/// Application reconcile fails with "pull failed: not found".
-pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.12";
-
 /// Default OCI registry path the chart is published to.
 ///
 /// Stored **without** the `oci://` scheme prefix. Two reasons:

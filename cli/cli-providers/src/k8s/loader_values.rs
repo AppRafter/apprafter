@@ -65,4 +65,27 @@ mod tests {
             "missing default AppProject (walk-fix #7):\n{ARGOCD_LOADER_VALUES_YAML}"
         );
     }
+
+    #[test]
+    fn released_platform_stack_version_matches_semver_shape() {
+        // CUE schema in `platform-stack/cue/platform.cue` already
+        // pins `currentVersion: #Version`, so this is belt-and-
+        // braces: build.rs panics on malformed CUE, this test
+        // panics on malformed Rust string.
+        assert!(
+            RELEASED_PLATFORM_STACK_VERSION
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false),
+            "RELEASED_PLATFORM_STACK_VERSION should start with a digit \
+             (no `v` prefix per platform-stack/cue/platform.cue#Version): \
+             got {RELEASED_PLATFORM_STACK_VERSION:?}"
+        );
+        assert!(
+            RELEASED_PLATFORM_STACK_VERSION.matches('.').count() >= 2,
+            "RELEASED_PLATFORM_STACK_VERSION should be at least major.minor.patch: \
+             got {RELEASED_PLATFORM_STACK_VERSION:?}"
+        );
+    }
 }
