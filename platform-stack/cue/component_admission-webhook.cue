@@ -23,17 +23,18 @@ _components: "admission-webhook": #Component & {
 		repoURL: "ghcr.io/apprafter"
 		chart:   "apprafter-admission-webhook"
 	}
-	version: "v0.1.92"
+	version: "v0.1.93"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-admission-webhook"
-			// Same v0.1.91-image-broken-ENTRYPOINT fix as the
-			// operator chart; new chart v0.1.92 also adds an
-			// explicit `command:` to the deployment template
-			// and ships the `apprafter-selfsigned`
-			// ClusterIssuer that this chart's Certificate
-			// references.
-			tag: string | *"v0.1.105"
+			// Image tag v0.1.106: bumped because the v0.1.105
+			// webhook binary panicked at TLS init with
+			// `Could not automatically determine the
+			// process-level CryptoProvider`. v0.1.106 calls
+			// `install_rustls_crypto_provider()` (mirroring
+			// the operator's v0.1.61 fix) before the rustls-
+			// using axum-server initialises.
+			tag: string | *"v0.1.106"
 		}
 		// Two replicas by default so a single pod restart
 		// doesn't gap the validating webhook. Tier overlays

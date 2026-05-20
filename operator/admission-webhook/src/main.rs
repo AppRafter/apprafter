@@ -11,13 +11,19 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use admission_webhook::build_router;
+use admission_webhook::{build_router, install_rustls_crypto_provider};
 use axum_server::tls_rustls::RustlsConfig;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Must come before any rustls-using API (axum-server's
+    // bind_rustls / RustlsConfig::from_pem_file). rustls 0.23+
+    // requires an explicit CryptoProvider when multiple
+    // backends are linked.
+    install_rustls_crypto_provider();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

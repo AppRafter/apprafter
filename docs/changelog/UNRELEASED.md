@@ -13,6 +13,71 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.106 — walk-fix: webhook rustls CryptoProvider panic (2026-05-20)
+
+Ninth walk on chart 0.1.9 / CLI v0.1.105. Five of six children
+green; admission-webhook panics at TLS init:
+
+```
+admission-webhook listening with TLS addr=0.0.0.0:8443
+thread 'main' panicked at rustls-0.23.40/src/crypto/mod.rs:249:
+  Could not automatically determine the process-level
+  CryptoProvider from Rustls crate features.
+  Call CryptoProvider::install_default() before this point
+```
+
+### Bug N — webhook never installed a rustls CryptoProvider
+
+rustls 0.23+ removed the auto-default. The **operator** binary
+had this fix in `apprafter_operator::install_rustls_crypto_provider`
+since v0.1.61, but the **webhook** crate was missed — its
+`main.rs` jumped straight to `RustlsConfig::from_pem_file`.
+
+The bug had been there since the webhook gained TLS support
+**months ago**, but was masked by walk-fix #8's discovery: the
+`v0.1.91` webhook image was broken (binary missing), so the
+webhook code never actually executed. Walk-fix #8 published a
+working v0.1.105 image; walk #9 was the first run that
+actually executed the webhook binary, surfacing the latent
+rustls panic immediately.
+
+### Fix
+
+- `operator/admission-webhook/src/lib.rs` gains
+  `install_rustls_crypto_provider()` — same shape as the
+  operator's. Idempotent on re-call (the operator's
+  regression-guard tests mirrored here).
+- `operator/admission-webhook/src/main.rs` calls it as the
+  first line of `async fn main()`, before the TLS server init.
+- `operator/admission-webhook/Cargo.toml` adds a direct
+  `rustls = { version = "0.23", features = ["aws-lc-rs"] }`
+  dep so the `default_provider` function resolves.
+- Two new regression-guard tests in the webhook crate mirror
+  the operator's: one asserting `install_default()` sets a
+  provider, one asserting it's idempotent.
+
+### Chart + CLI versions
+
+- Operator + webhook charts both bump in lockstep:
+  `version v0.1.92 → v0.1.93`, `appVersion v0.1.105 → v0.1.106`.
+  The operator chart bumps even though only the webhook
+  binary changed — keeping appVersion sync prevents a future
+  drift class.
+- Chart `currentVersion 0.1.9 → 0.1.10` with full compat
+  entry; 0.1.9 entry gets a known-issue note.
+- CLI `RELEASED_PLATFORM_STACK_VERSION → "0.1.10"`.
+- CLI `RELEASED_OPERATOR_VERSION → "v0.1.106"`.
+- CLI `0.1.105 → 0.1.106`.
+
+### Tests
+
++2 regression-guard tests in `operator/admission-webhook/src/lib.rs`:
+- `install_rustls_crypto_provider_sets_a_process_level_default`
+- `install_rustls_crypto_provider_is_idempotent`
+
+Total: 557 cli passed (unchanged), 62 operator passed.
+fmt + clippy + SPDX + cue vet all clean.
+
 ## v0.1.105 — walk-fix: broken operator image + missing ClusterIssuer (2026-05-20)
 
 Eighth walk on chart 0.1.8 / CLI v0.1.104. After the manual

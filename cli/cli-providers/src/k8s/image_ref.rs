@@ -15,7 +15,7 @@
 /// with the `release-operator.yml` workflow run that publishes the
 /// matching `apprafter-operator` / `apprafter-admission-webhook`
 /// container images to ghcr.io.
-pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.105";
+pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.106";
 
 /// Single source of truth for the platform-stack OCI Helm chart
 /// version `cluster-bootstrap` points the root Argo CD Application
@@ -26,7 +26,7 @@ pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.105";
 /// (`oci://<owner>/platform-stack:<version>`) before a bumped CLI
 /// ships, otherwise `apprafter cluster-bootstrap`'s root
 /// Application reconcile fails with "pull failed: not found".
-pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.9";
+pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.10";
 
 /// Default OCI registry path the chart is published to.
 ///

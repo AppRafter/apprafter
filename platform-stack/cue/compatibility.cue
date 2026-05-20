@@ -699,8 +699,66 @@ compatibility: "0.1.9": {
 		(webhook pods): upgrade to 0.1.9 (or to the matching
 		CLI v0.1.105+). No manual cluster surgery needed —
 		the chart's self-reconcile applies both fixes.
+
+		Known issue carried into 0.1.9 (fixed in 0.1.10):
+
+		* `admission-webhook` v0.1.105 image panics at TLS
+		  init with `Could not automatically determine the
+		  process-level CryptoProvider`. The webhook's
+		  `main.rs` was never updated for the rustls 0.23
+		  API (the operator's v0.1.61 fix only touched its
+		  own crate). Never surfaced before because the
+		  v0.1.91 image was broken and the webhook code
+		  never executed. 0.1.10 mirrors the operator's
+		  fix into the webhook crate.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01105",
+	]
+}
+
+// 0.1.10 — webhook rustls CryptoProvider fix on top of
+// 0.1.9. The walk #8 v0.1.105 image finally ran the
+// webhook code (after months of broken v0.1.91 image
+// shielding the bug) and surfaced a rustls 0.23 panic
+// the operator binary fixed in v0.1.61 but the webhook
+// binary never got. Fix: mirror the operator's
+// `install_rustls_crypto_provider()` helper into the
+// `admission-webhook` crate and call it in `main` before
+// any rustls-using API. New direct dependency on
+// `rustls = { version = "0.23", features = ["aws-lc-rs"] }`
+// in `operator/admission-webhook/Cargo.toml`.
+//
+// Chart-side: operator + webhook charts both bump to
+// `version: v0.1.93` with `appVersion: "v0.1.106"`
+// (lockstep with the new monorepo tag). Operator chart
+// bumps even though only the webhook binary changed —
+// keeps the two appVersions in sync so a future bug in
+// either binary lands at the same monorepo tag.
+compatibility: "0.1.10": {
+	change:          "safe"
+	operatorVersion: "v0.1.106"
+	notes: """
+		Webhook rustls CryptoProvider fix.
+
+		The v0.1.105 webhook image panicked at TLS init:
+		`Could not automatically determine the process-level
+		CryptoProvider from Rustls crate features`. The
+		operator binary already had the fix since v0.1.61
+		but the webhook crate didn't — never surfaced
+		earlier because the v0.1.91 webhook image was
+		broken and the binary never executed.
+
+		0.1.10's webhook image (v0.1.106) calls
+		`install_rustls_crypto_provider()` in `main` before
+		any rustls-using API. Both operator + webhook charts
+		bump to v0.1.93 / appVersion v0.1.106 in lockstep.
+
+		Operators on 0.1.9 with `admission-webhook` panic at
+		startup: upgrade to 0.1.10 (or to the matching CLI
+		v0.1.106+).
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01106",
 	]
 }

@@ -28,19 +28,20 @@ _components: "apprafter-operator": #Component & {
 		repoURL: "ghcr.io/apprafter"
 		chart:   "apprafter-operator"
 	}
-	version: "v0.1.92"
+	version: "v0.1.93"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-operator"
-			// Image tag pinned to the monorepo tag that ships
-			// the fresh build with explicit-command Dockerfile.
-			// v0.1.91 image lacked usable ENTRYPOINT in its
-			// manifest on k3s v1.35 containerd (walk-found bug
-			// v0.1.104 → v0.1.105: pods failed with
-			// `failed to generate spec: no command specified`).
-			// Chart 0.1.92 also hard-wires the command in the
-			// deployment template as defence in depth.
-			tag: string | *"v0.1.105"
+			// Image tag pinned to v0.1.106: the operator chart
+			// itself is unchanged from v0.1.92 (deployment
+			// template gained explicit `command:` then), but
+			// the admission-webhook crate at v0.1.105 panicked
+			// at runtime on rustls 0.23+'s missing default
+			// CryptoProvider; v0.1.106 adds the same fix the
+			// operator binary already had since v0.1.61.
+			// Bumping operator chart version too (v0.1.92 →
+			// v0.1.93) keeps the lockstep with webhook chart.
+			tag: string | *"v0.1.106"
 		}
 		// Leader-election guards (10s renew / 30s expiry) match
 		// the in-tree settings; tier overlays may bump replicas.

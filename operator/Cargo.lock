@@ -9,6 +9,7 @@ dependencies = [
  "axum",
  "axum-server",
  "http-body-util",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror",
