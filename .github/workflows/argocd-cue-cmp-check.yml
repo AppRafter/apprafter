@@ -115,14 +115,22 @@ jobs:
             echo "::notice::${TAG} not on origin yet — version.cue is in-flight, drift check no-op."
             exit 0
           fi
-          # Pathspec covers everything that affects the
-          # built image. README is documentation, so
-          # changes there don't drift the artifact.
+          # Pathspec covers ONLY files that affect the built
+          # image — Dockerfile + entrypoint.sh + plugin.yaml.
+          # `version.cue` is metadata (the version itself, not
+          # image source); editing it IS the version bump, so
+          # the detect job's `cue export -e version` + tag-
+          # exists check handles bump-detection separately.
+          # README is documentation. Including version.cue here
+          # produced a false positive after the B.1.71b refactor
+          # that replaced plain-text `VERSION` with `version.cue`
+          # (v0.1.1 tag's snapshot didn't have version.cue, so
+          # the diff registered it as "added file" and incorrectly
+          # demanded a version bump).
           if git diff --quiet "${TAG}" HEAD -- \
               'argocd-cue-cmp/Dockerfile' \
               'argocd-cue-cmp/plugin.yaml' \
-              'argocd-cue-cmp/entrypoint.sh' \
-              'argocd-cue-cmp/version.cue'; then
+              'argocd-cue-cmp/entrypoint.sh'; then
             echo "::notice::No drift vs ${TAG} — image source unchanged."
             exit 0
           fi
@@ -134,6 +142,5 @@ jobs:
             'argocd-cue-cmp/Dockerfile' \
             'argocd-cue-cmp/plugin.yaml' \
             'argocd-cue-cmp/entrypoint.sh' \
-            'argocd-cue-cmp/version.cue' \
             | head -80 || true
           exit 1
