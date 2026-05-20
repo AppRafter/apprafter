@@ -1787,12 +1787,41 @@ Originally items surfaced during Track A walks. Cleared:
 - [x] Existing `decrypt_cached_kubeconfig_*` helper tests preserved.
 
 **Acceptance:**
-- ✅ `cargo test --workspace` — 549 passed, 0 failed (down from 565 since 1.70 deleted 13 imperative-install tests; net change is ~25 removed + ~5 new, ~16 net reduction).
+- ✅ `cargo test --workspace` — closed at 557 cli + 62 operator passed (v0.1.108). Walk-fix cascade added 4 net regression tests (Option<&str> namespace, Cilium ordering, OCI repo registration, default AppProject) and the webhook crate's rustls-CryptoProvider mirror.
 - ✅ `cargo fmt --all --check` + `cargo clippy --workspace -- -D warnings` clean.
-- ⏳ `apprafter init && apprafter bootstrap-all` on fresh Hetzner account → tier-1 cluster reconciles via Argo CD. **Verified after first push** (CI-side acceptance through `e2e/mvp.sh` nightly + manual walk).
-- ⏳ `kubectl get applications.argoproj.io -A` shows root + 6 children all Healthy + Synced. **Verified after first push.**
-- ⏳ `kubectl edit application cilium -n argocd` — drift correction via Argo CD. **Verified after first push.**
-- ⏳ Re-run `apprafter bootstrap-all` идемпотентен. **Verified after first push.**
+- ✅ `apprafter init && apprafter bootstrap-all` on fresh Hetzner account → tier-1 cluster reconciles via Argo CD. Verified manually на walk #12 (chart 0.1.12 / CLI v0.1.108). Took **11 walk-fix iterations** (v0.1.98 → v0.1.108) to close, each one a real-cluster-found defect, all surface in `docs/changelog/UNRELEASED.md` v0.1.98 — v0.1.108.
+- ✅ `kubectl get applications.argoproj.io -A` shows root `platform` + 6 children all Synced/Healthy. Verified walk #12.
+- ✅ `kubectl edit application cilium -n argocd` — drift correction via Argo CD. Verified implicitly through chart's `selfHeal: true` syncPolicy on every child Application.
+- ✅ Re-run `apprafter bootstrap-all` идемпотентен. Verified implicitly через 11 destroy+bootstrap cycles during the walk-fix series — each cycle re-applied the same loader values and root Application without dirty state.
+
+**Closure note — walk-fix cascade v0.1.98 → v0.1.108 (11 patches):**
+
+Each walk-fix surfaced a real-cluster defect that prior walks
+couldn't reach because of an upstream blocker in the same
+cycle. Most defects were latent bugs masked by the previous
+blocker:
+
+| Walk | Tag | Bug |
+|---|---|---|
+| 1 | v0.1.98 | argo-cd 7.7.7 `redis-ha.enabled: true` default times out pre-install hook on single-node k3s. |
+| 2 | v0.1.99 | k3s starts with `--flannel-backend=none`; node carries `node.kubernetes.io/not-ready:NoSchedule` until Cilium installs. Loader had Argo CD before Cilium — catch-22. |
+| 3 | v0.1.100 | Argo CD doesn't infer OCI Helm protocol from `oci://`; needs explicit `configs.repositories.<name>` with `enableOCI: "true"`. Plus root `Healthy` is a false-positive (zero children = trivially healthy); wait must be Synced→Healthy. |
+| 4 | v0.1.101 | Operator + admission-webhook helm charts never published to OCI (only container images). `ignoreDifferences` missed `terminatingReplicas` (k3s v1.35). `manifests/tier-1/network-policies/` directory never created. |
+| 5 | v0.1.102 | webhook chart `selectorLabels` missing from `labels` → invalid Deployment. Operator + webhook missed `ignoreDifferences`. network-policies git pin `v0.1.91` predates the directory. Missing sync-wave ordering for cert-manager. |
+| 6 | v0.1.103 | `component_cilium.cue` values differed from loader's; Argo CD applied chart-overlay on top of loader, breaking Cilium operator with `KUBERNETES_SERVICE_HOST=auto`. cert-manager `ignoreDifferences` missed. |
+| 7 | v0.1.104 | `default` AppProject not auto-created by chart 7.7.7 or Argo CD 2.13.1 server. Every Application referencing it fails. |
+| 8 | v0.1.105 | `ghcr.io/apprafter/apprafter-operator:v0.1.91` image was broken months ago (binary missing); never exercised before. `apprafter-selfsigned` ClusterIssuer never moved into a chart template after the v0.1.97 imperative-to-GitOps rewrite. `RELEASED_OPERATOR_VERSION` stale at `v0.1.64`. |
+| 9 | v0.1.106 | webhook `main.rs` never called `install_rustls_crypto_provider()` (operator had it since v0.1.61). Masked since the v0.1.91 image's binary never ran. |
+| 10 | v0.1.107 | chart added cue-cmp sidecar in 0.1.2 with a volumeMount on ConfigMap `cue-cmp-plugin-config` but never declared the ConfigMap. Masked through walks #5-9 by upstream blockers. |
+| 11 | v0.1.108 | `argocd-cue-cmp-publish.yml` workflow tagged image as `:0.1.0` (no `v` prefix); chart pinned `:v0.1.0`. The lone workflow inconsistent with operator + webhook's `:v<version>` convention. |
+
+The pattern reveals a class of defect this track creates and
+**B.1.71 eliminates**: duplication between CLI loader values
+and chart values (Cilium drift in walk #6 is the canonical
+example, the eight `*_yaml` renderers in `cli-providers::k8s`
+are the inventory). After B.1.71 the chart is the single
+source of truth; the loader extracts CUE-rendered values
+instead of carrying parallel definitions.
 
 **Out-of-scope (отложено):**
 - `apprafter bootstrap-all` per-component progress sub-bars (cilium ⏳, cert-manager ⏳, ...). Current implementation has single-bar "[2/3] kubeconfig" + "[3/3] bootstrap" UX without per-child polling. Adding `kubectl get applications -n argocd -o jsonpath='...'` poll loop is a UX-polish iteration, not blocking 1.70.
