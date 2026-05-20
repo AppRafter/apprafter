@@ -26,6 +26,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # cli/cli-providers/build.rs shells out to `cue export`
+      # at compile time (Track B.1.71 — chart values are the
+      # single source of truth, CLI loader values are derived
+      # via cue export -e _loaderValues.<comp>). Without cue
+      # on PATH the build script panics on the runner.
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

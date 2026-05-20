@@ -15,6 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # cli/cli-providers/build.rs shells out to `cue export`
+      # at compile time (Track B.1.71). Without cue on PATH
+      # the build script panics with NotFound.
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
       - uses: dtolnay/rust-toolchain@stable
       - id: detect
         run: |
