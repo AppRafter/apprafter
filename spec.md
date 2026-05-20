@@ -707,7 +707,7 @@ spec:
       enabled: false             # opt out entirely
 ```
 
-**Status reports** include `currentVersion`, `availableVersion`, `lastUpstreamCheck`, a per-component status array, a `versionHistory` ring buffer of recent transitions, and standard Kubernetes conditions including `UpgradeAvailable` when a newer version of the configured channel is detected.
+**Status reports** include `currentVersion`, `targetVersion`, `availableVersion`, `lastUpstreamCheck`, a per-component status array, a `versionHistory` ring buffer of recent transitions, and standard Kubernetes conditions including `UpgradeAvailable` when a newer version of the configured channel is detected.
 
 **No explicit `spec.version` field.** Version resolution is implicit:
 - If `spec.pin` is set, that exact version is targeted.
