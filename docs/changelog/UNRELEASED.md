@@ -13,6 +13,56 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.112 — M1.5 Track B.1.72 walk-fix #1 — explicit CRD-Established wait (2026-05-20)
+
+First post-v0.1.111 walk on Hetzner: `apprafter bootstrap-all`
+flow reached step 5 (SSA-apply of the default PlatformStack
+singleton) and failed with `error: resource mapping not found
+... no matches for kind "PlatformStack" in version
+"apprafter.io/v1alpha1"; ensure CRDs are installed first`. The
+preceding `kubectl wait application/platform Healthy` had
+already returned successfully — meaning either:
+
+- Argo CD reported the root Application Healthy slightly
+  before the operator chart's child Application's CRDs reached
+  `Established=True` (apiserver discovery aggregation lag), or
+- The kubectl client's on-disk discovery cache pre-dated the
+  CRD registration, so the subsequent `kubectl apply -f
+  platformstack.yaml` invocation resolved the type mapping
+  against a stale cache and never hit the apiserver.
+
+### Fix
+
+`cluster_bootstrap.rs` step 4c now explicitly waits for both
+CRDs (`applications.apprafter.io` + `platformstacks.apprafter.io`)
+to report `condition=Established` before step 5 fires. The
+wait both blocks until the CRD truly serves traffic AND forces
+a fresh discovery lookup on the next kubectl invocation
+(closing the stale-cache angle).
+
+New constant `CRD_ESTABLISHED_TIMEOUT_SECS = 120` covers the
+gap; in practice the wait returns in sub-second to a few
+seconds once the operator chart's child Application has
+applied the CRD manifests (sync-wave -5).
+
+### Regression guards
+
+- Existing `perform_bootstrap_installs_cilium_...` test now
+  asserts `waits.len() == 6` (was 4), with `waits[4]` and
+  `waits[5]` pinned to the two CRD waits with
+  `condition=Established` + the new timeout constant.
+- New test
+  `crd_established_waits_run_after_root_healthy_and_before_platformstack_apply`
+  explicitly asserts ordering: both CRD waits sit after the
+  Healthy wait and before the SSA apply.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01111` (Track B.1.72 closure
+  that introduced step 5)
+- `cli/platform-cli/src/commands/cluster_bootstrap.rs`
+  module doc — step 4c rationale
+
 ## v0.1.111 — M1.5 Track B.1.72 closure — PlatformStack CRD + Application CRD restoration (2026-05-19)
 
 PlatformStack CRD per spec §3.11 + ADR 0026 + restored

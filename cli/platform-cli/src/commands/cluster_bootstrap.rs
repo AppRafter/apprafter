@@ -98,6 +98,28 @@ const ARGOCD_DEPLOYMENT_TIMEOUT_SECS: u64 = 180;
 /// cpx22.
 const PLATFORM_RECONCILE_TIMEOUT_SECS: u64 = 600;
 
+/// `CRD_ESTABLISHED_TIMEOUT_SECS` covers the gap between
+/// "root Application reports Healthy" and "the operator chart's
+/// CRDs (`applications.apprafter.io` + `platformstacks.apprafter.io`)
+/// are visible through the kube-apiserver's discovery endpoint."
+///
+/// Walk-found bug v0.1.111 → v0.1.112: step 4b on root App
+/// passed (Healthy), but step 5 SSA-apply of the default
+/// PlatformStack CR failed with `no matches for kind
+/// "PlatformStack"`. Either Argo CD reported the root Healthy
+/// before the operator child Application's CRDs were
+/// Established, or the kubectl client's on-disk discovery cache
+/// pre-dated the CRD registration. Explicit
+/// `kubectl wait --for=condition=Established crd/...` fixes
+/// both: it blocks until the CRD truly serves traffic AND
+/// forces the kubectl invocation to re-resolve discovery for
+/// the subsequent SSA apply.
+///
+/// 120s is comfortably more than the gap between operator chart
+/// child-App Synced and CRDs Established (sub-second to a few
+/// seconds in practice).
+const CRD_ESTABLISHED_TIMEOUT_SECS: u64 = 120;
+
 pub fn run() -> Result<()> {
     info!("cluster-bootstrap invoked (GitOps loader)");
     let cwd = std::env::current_dir()?;
@@ -260,6 +282,43 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         Some("argocd"),
         "jsonpath={.status.health.status}=Healthy",
         PLATFORM_RECONCILE_TIMEOUT_SECS,
+        kubeconfig_path,
+    )?;
+
+    // 4c. Explicitly wait for the two CRDs the operator chart
+    //     ships (sync-wave -5) to report `Established=True`. In
+    //     theory step 4b's Healthy on the root Application
+    //     implies the operator child Application is Healthy,
+    //     which implies its CRDs are applied. In practice
+    //     (walk-found bug v0.1.111 → v0.1.112) step 4b passed
+    //     but step 5's SSA-apply of the default PlatformStack CR
+    //     failed with `no matches for kind "PlatformStack"`.
+    //     Two plausible causes — both fixed by an explicit
+    //     `kubectl wait crd/X --for=condition=Established`:
+    //
+    //     (a) Argo CD reports the root Healthy slightly before
+    //         the operator child's CRDs reach Established (the
+    //         apiserver's discovery aggregation lags creation by
+    //         a few hundred ms to a few seconds).
+    //     (b) The kubectl client's on-disk discovery cache pre-
+    //         dates the CRD registration; subsequent `kubectl
+    //         apply -f <PlatformStack>.yaml` reads the stale
+    //         cache and fails the mapping lookup before ever
+    //         hitting the apiserver. The wait both blocks until
+    //         the CRD truly serves traffic AND forces kubectl to
+    //         re-resolve discovery for the subsequent SSA apply.
+    kubectl.wait_for_condition(
+        "crd/applications.apprafter.io",
+        None,
+        "condition=Established",
+        CRD_ESTABLISHED_TIMEOUT_SECS,
+        kubeconfig_path,
+    )?;
+    kubectl.wait_for_condition(
+        "crd/platformstacks.apprafter.io",
+        None,
+        "condition=Established",
+        CRD_ESTABLISHED_TIMEOUT_SECS,
         kubeconfig_path,
     )?;
 
@@ -529,13 +588,18 @@ mod tests {
 
         // Waits: node Ready first (so step 1 can schedule),
         // argocd-server Available second, root Application
-        // Synced third, root Application Healthy fourth.
+        // Synced third, root Application Healthy fourth, then
+        // both CRDs Established before the PlatformStack SSA
+        // apply at step 5. The CRD waits close the v0.1.111 →
+        // v0.1.112 walk-fix gap where step 4b passed but step 5
+        // failed with `no matches for kind "PlatformStack"` —
+        // see the rationale comment on `CRD_ESTABLISHED_TIMEOUT_SECS`.
         // Synced-before-Healthy is critical — a freshly-created
         // root Application reports Healthy trivially (zero
         // children) while Sync=Unknown on chart-pull failure.
         // Walk-found false-positive v0.1.99 → v0.1.100.
         let waits = kubectl.waits.borrow();
-        assert_eq!(waits.len(), 4, "{waits:?}");
+        assert_eq!(waits.len(), 6, "{waits:?}");
         assert_eq!(waits[0].resource_ref, "node --all");
         assert_eq!(waits[0].namespace, None);
         assert_eq!(waits[0].condition_expr, "condition=Ready");
@@ -561,6 +625,58 @@ mod tests {
             "jsonpath={.status.health.status}=Healthy"
         );
         assert_eq!(waits[3].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
+
+        assert_eq!(waits[4].resource_ref, "crd/applications.apprafter.io");
+        assert_eq!(waits[4].namespace, None);
+        assert_eq!(waits[4].condition_expr, "condition=Established");
+        assert_eq!(waits[4].timeout_seconds, CRD_ESTABLISHED_TIMEOUT_SECS);
+
+        assert_eq!(waits[5].resource_ref, "crd/platformstacks.apprafter.io");
+        assert_eq!(waits[5].namespace, None);
+        assert_eq!(waits[5].condition_expr, "condition=Established");
+        assert_eq!(waits[5].timeout_seconds, CRD_ESTABLISHED_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn crd_established_waits_run_after_root_healthy_and_before_platformstack_apply() {
+        // Regression guard for walk-fix v0.1.111 → v0.1.112.
+        // The two CRD waits MUST sit between the root App
+        // Healthy wait (waits[3]) and the SSA apply (recorded
+        // in `ssa_applies`). Reordering would re-introduce the
+        // race: applying the PlatformStack before its CRD is
+        // Established + discoverable produces the `no matches
+        // for kind` error operators saw on the v0.1.111 walk.
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let root_app = PathBuf::from("/tmp/root-app.yaml");
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
+
+        perform_bootstrap(&helm, &kubectl, &kc, &root_app, platformstack.path())
+            .expect("bootstrap");
+
+        let waits = kubectl.waits.borrow();
+        let crd_wait_positions: Vec<usize> = waits
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.resource_ref.starts_with("crd/"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            crd_wait_positions.len(),
+            2,
+            "expected exactly two CRD waits, got {crd_wait_positions:?}"
+        );
+        // Both CRD waits must come AFTER the App Healthy wait.
+        assert!(
+            crd_wait_positions[0] > 3,
+            "first CRD wait must follow waits[3] (Healthy); positions: {crd_wait_positions:?}"
+        );
+        // And the SSA apply happens after the waits return; the
+        // FakeKubectl records it in `ssa_applies` so its mere
+        // presence after a successful perform_bootstrap proves
+        // the ordering held.
+        assert_eq!(kubectl.ssa_applies.borrow().len(), 1);
     }
 
     #[test]
