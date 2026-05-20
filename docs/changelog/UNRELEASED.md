@@ -13,6 +13,71 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.108 — walk-fix: cue-cmp image tag missing `v` prefix (2026-05-20)
+
+Eleventh walk on chart 0.1.11 / CLI v0.1.107. ConfigMap from
+walk-fix #10 deployed correctly; new `argocd-repo-server` pod
+now stuck on image pull instead of mount:
+
+```
+Back-off pulling image "ghcr.io/apprafter/argocd-cue-cmp:v0.1.0":
+ErrImagePull: ... MANIFEST_UNKNOWN: manifest unknown
+```
+
+### Bug P — image tag form inconsistency
+
+`crane ls ghcr.io/apprafter/argocd-cue-cmp` shows the image
+**exists** but the tag is `:0.1.0` (no `v` prefix), while the
+chart pins `:v0.1.0`.
+
+Workflow line (`argocd-cue-cmp-publish.yml`):
+
+```yaml
+tags: |
+  ${{ steps.owner.outputs.image }}:${{ steps.version.outputs.version }}
+```
+
+`steps.version.outputs.version` comes from
+`argocd-cue-cmp/VERSION` which contains `0.1.0` (no `v`). The
+git tag is created as `argocd-cue-cmp/v<version>` (with `v`),
+but the image tag was the plain version. Operator + webhook
+images use `:${{ github.ref_name }}` = `:v0.1.x`, so the chart
++ CLI conventions all expected `:v<version>`. The argocd-cue-cmp
+workflow was inconsistent.
+
+Latent since chart 0.1.2 (Track B.1.69), masked through walks
+#5-10 by upstream blockers (broken cue-cmp ConfigMap never
+let the pull happen).
+
+### Fix
+
+- `.github/workflows/argocd-cue-cmp-publish.yml`:
+  - Build/push `tags:` line gains `v` prefix:
+    `${{ steps.owner.outputs.image }}:v${{ steps.version.outputs.version }}`.
+  - `Tag :latest` step source updated to match.
+  - Release notes `docker pull` example updated.
+- `argocd-cue-cmp/VERSION`: `0.1.0` → `0.1.1`. The
+  workflow's `detect` job gates on existing git tag
+  `argocd-cue-cmp/v<version>`; without a version bump
+  `should_publish=false` and the workflow would skip.
+  v0.1.1 is a re-publish of v0.1.0's source under the
+  corrected tag form. The v0.1.0 image stays on the
+  registry as a historical artefact.
+- `component_argocd-cue-cmp.cue` pin bumped `v0.1.0` →
+  `v0.1.1`.
+
+### Chart + CLI versions
+
+- Chart `currentVersion 0.1.11 → 0.1.12` with full compat
+  entry; 0.1.11 entry gets a known-issue note.
+- CLI `RELEASED_PLATFORM_STACK_VERSION → "0.1.12"`.
+- CLI `0.1.107 → 0.1.108`.
+
+### Tests
+
+No new CLI tests — defect is workflow + chart pin. 557 cli
+tests still pass; fmt + clippy + SPDX + cue vet all clean.
+
 ## v0.1.107 — walk-fix: cue-cmp ConfigMap never shipped (2026-05-20)
 
 Tenth walk on chart 0.1.10 / CLI v0.1.106. Five of six children

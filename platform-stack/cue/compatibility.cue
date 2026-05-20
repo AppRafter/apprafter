@@ -814,8 +814,71 @@ compatibility: "0.1.11": {
 		pod (Init:0/1) and `Synced/Degraded` argocd
 		Application: upgrade to 0.1.11 (or to the matching
 		CLI v0.1.107+).
+
+		Known issue carried into 0.1.11 (fixed in 0.1.12):
+
+		* `argocd-repo-server` cue-cmp sidecar fails image
+		  pull with `MANIFEST_UNKNOWN` for
+		  `ghcr.io/apprafter/argocd-cue-cmp:v0.1.0`. The
+		  v0.1.0 publish workflow tagged the image as
+		  `:0.1.0` (no `v` prefix); chart pinned `:v0.1.0`.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01107",
+	]
+}
+
+// 0.1.12 — cue-cmp image tag form correction on top of
+// 0.1.11. The `argocd-cue-cmp-publish.yml` workflow tagged
+// the v0.1.0 image as `:0.1.0` (no `v` prefix) while the
+// git tag form was `argocd-cue-cmp/v0.1.0` and every other
+// AppRafter container image uses the `v<version>` form
+// (operator + admission-webhook from
+// `release-operator.yml`). Chart 0.1.2-0.1.11 pinned
+// `:v0.1.0` and the cue-cmp sidecar failed `helm pull` with
+// `MANIFEST_UNKNOWN`. Latent since chart 0.1.2 (Track
+// B.1.69) but masked through walks #5-10 by upstream
+// blockers in the same repo-server pod (broken
+// ConfigMap mount in 0.1.10).
+//
+// Fix:
+//   1. `argocd-cue-cmp-publish.yml` tag pattern changed from
+//      `${IMAGE}:${VERSION}` to `${IMAGE}:v${VERSION}`. The
+//      v0.1.0 image stays as a historical artefact; v0.1.1
+//      onward uses the consistent `:v<version>` form.
+//   2. `argocd-cue-cmp/VERSION` bumped `0.1.0` → `0.1.1` so
+//      the workflow's `detect` job actually triggers a fresh
+//      publish (would otherwise see `argocd-cue-cmp/v0.1.0`
+//      git tag exists and skip).
+//   3. `component_argocd-cue-cmp.cue` pin bumped `v0.1.0` →
+//      `v0.1.1` to consume the v-prefixed image.
+//
+// Image source code didn't change — v0.1.1 is a re-publish
+// of v0.1.0's source with the corrected tag form.
+compatibility: "0.1.12": {
+	change:          "safe"
+	operatorVersion: "v0.1.106"
+	notes: """
+		cue-cmp image tag form correction.
+
+		The `argocd-cue-cmp-publish.yml` workflow tagged the
+		v0.1.0 image as `:0.1.0` (no `v` prefix); chart
+		pinned `:v0.1.0`. `helm pull` failed with
+		`MANIFEST_UNKNOWN` because the manifest at the
+		v-prefixed tag never existed.
+
+		0.1.12 ships chart pin `v0.1.1` consuming a
+		freshly-published `ghcr.io/apprafter/argocd-cue-cmp:v0.1.1`
+		image. The workflow now tags new images with the
+		`v<version>` form matching the operator + webhook
+		convention. v0.1.0 image stays as a historical
+		artefact for traceability.
+
+		Operators on 0.1.11 with `argocd-repo-server` pod
+		stuck on `Init:0/1` and image-pull `MANIFEST_UNKNOWN`:
+		upgrade to 0.1.12 (or to the matching CLI v0.1.108+).
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01108",
 	]
 }

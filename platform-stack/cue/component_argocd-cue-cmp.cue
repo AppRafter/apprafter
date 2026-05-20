@@ -39,11 +39,18 @@ _components: "argocd-cue-cmp": #Component & {
 	// Pinned cue-cmp image tag. Bump this in lockstep with
 	// the chart's own `currentVersion` bump when a new
 	// argocd-cue-cmp release ships.
-	version: "v0.1.0"
+	//
+	// v0.1.0 image existed on ghcr.io but was tagged
+	// `:0.1.0` (no `v` prefix) due to a workflow bug —
+	// chart's `:v0.1.0` pin produced MANIFEST_UNKNOWN at
+	// pull time. v0.1.1 onward uses the corrected
+	// `:v<version>` tag form (walk-found bug v0.1.107 →
+	// v0.1.108).
+	version: "v0.1.1"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/argocd-cue-cmp"
-			tag:        string | *"v0.1.0"
+			tag:        string | *"v0.1.1"
 		}
 		// CUE evaluation timeout per repo render. Default
 		// 57s matches Argo CD's repo-server hard timeout

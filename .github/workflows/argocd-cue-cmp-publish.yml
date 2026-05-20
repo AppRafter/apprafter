@@ -147,8 +147,17 @@ jobs:
           context: argocd-cue-cmp
           file: argocd-cue-cmp/Dockerfile
           push: true
+          # Image tag carries the `v` prefix to match the git
+          # tag (`argocd-cue-cmp/v<version>`) and the convention
+          # used by `release-operator.yml`'s operator + webhook
+          # images. Walk-found bug v0.1.107 → v0.1.108: the
+          # initial v0.1.0 publish tagged the image as `:0.1.0`
+          # (no v); chart pin `:v0.1.0` made Argo CD's
+          # argocd-repo-server fail with `MANIFEST_UNKNOWN`. The
+          # v0.1.0 image stays as a historical artefact;
+          # v0.1.1 onward uses `:v<version>`.
           tags: |
-            ${{ steps.owner.outputs.image }}:${{ steps.version.outputs.version }}
+            ${{ steps.owner.outputs.image }}:v${{ steps.version.outputs.version }}
           build-args: |
             IMAGE_VERSION=${{ steps.version.outputs.version }}
             IMAGE_REVISION=${{ github.sha }}
@@ -179,10 +188,13 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           # buildx imagetools create with --tag preserves the
-          # digest and updates only the tag reference.
+          # digest and updates only the tag reference. Source
+          # tag uses the v-prefixed form to match the actual
+          # pushed manifest (see "Image tag carries the v
+          # prefix" comment on the build step above).
           docker buildx imagetools create \
             --tag "${IMAGE}:latest" \
-            "${IMAGE}:${VERSION}"
+            "${IMAGE}:v${VERSION}"
 
       - name: Create GitHub Release + tag
         env:
@@ -208,7 +220,7 @@ jobs:
           ### Pull
 
           \`\`\`sh
-          docker pull ${IMAGE}:${VERSION}
+          docker pull ${IMAGE}:v${VERSION}
           # or via digest (immutable):
           docker pull ${IMAGE}@${DIGEST}
           \`\`\`
