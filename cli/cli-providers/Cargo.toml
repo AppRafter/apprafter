@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 [package]
 name        = "cli-providers"
+build       = "build.rs"
 description = "Infrastructure-provider abstractions and stubs for apprafter."
 version.workspace      = true
 edition.workspace      = true

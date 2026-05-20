@@ -10,6 +10,7 @@ pub mod cilium_values;
 pub mod helm;
 pub mod image_ref;
 pub mod kubectl;
+pub mod loader_values;
 
 pub use argocd_values::ARGOCD_CHART_VERSION;
 pub use cilium_values::cilium_values_yaml;
@@ -23,3 +24,4 @@ pub use kubectl::{
     gateway_api_crds_url, KubectlCli, KubectlRunner, ManifestSource, APPRAFTER_CLI_FIELD_MANAGER,
     GATEWAY_API_VERSION,
 };
+pub use loader_values::CILIUM_VALUES_YAML;
