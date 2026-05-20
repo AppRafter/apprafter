@@ -52,9 +52,10 @@
 //!   - Inline Gateway API + Application CRD + default-deny
 //!     NetworkPolicy + self-signed ClusterIssuer manifests.
 //!     Shipped as components inside the chart.
-//!   - The `cli-providers::k8s::*_yaml` value renderers stay
-//!     around as the chart's parallel source of truth until
-//!     sub-phase 1.71 removes the duplication.
+//!   - The `cli-providers::k8s::*_yaml` inline value renderers.
+//!     Values are now owned by the chart (`_loaderValues.*` in
+//!     CUE) and extracted into compile-time constants by
+//!     `build.rs` — one source of truth, no duplication.
 
 use std::io::Write;
 use std::path::Path;

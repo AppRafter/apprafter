@@ -67,6 +67,26 @@ mod tests {
     }
 
     #[test]
+    fn loader_values_are_non_empty_yaml() {
+        // Sanity guard — build.rs must have produced non-empty
+        // output. An empty / whitespace-only constant would mean
+        // `cue export` returned nothing (e.g. the field name
+        // changed and build.rs swallowed it). We'd rather catch
+        // that here than at runtime when `helm install` rejects
+        // an empty values file.
+        assert!(
+            CILIUM_VALUES_YAML.trim().len() > 50,
+            "CILIUM_VALUES_YAML suspiciously short ({} chars): {CILIUM_VALUES_YAML}",
+            CILIUM_VALUES_YAML.len(),
+        );
+        assert!(
+            ARGOCD_LOADER_VALUES_YAML.trim().len() > 100,
+            "ARGOCD_LOADER_VALUES_YAML suspiciously short ({} chars): {ARGOCD_LOADER_VALUES_YAML}",
+            ARGOCD_LOADER_VALUES_YAML.len(),
+        );
+    }
+
+    #[test]
     fn released_platform_stack_version_matches_semver_shape() {
         // CUE schema in `platform-stack/cue/platform.cue` already
         // pins `currentVersion: #Version`, so this is belt-and-
