@@ -64,7 +64,7 @@ use cli_core::{CliError, Result};
 use cli_providers::k8s::{
     HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
     APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
-    ARGOCD_CHART_VERSION, CILIUM_CHART_VERSION, CILIUM_VALUES_YAML,
+    ARGOCD_CHART_VERSION, ARGOCD_LOADER_VALUES_YAML, CILIUM_CHART_VERSION, CILIUM_VALUES_YAML,
     RELEASED_PLATFORM_STACK_VERSION,
 };
 use cli_state::{State, StatePaths};
@@ -180,10 +180,8 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     // platform-stack chart's own `component_argocd.cue`
     // overlay will adopt this release and add the cue-cmp
     // sidecar + tier-2 replica counts when it reconciles.
-    let argocd_values_file = write_tempfile_with(
-        "apprafter-argocd-loader-values-",
-        &argocd_loader_values_yaml(),
-    )?;
+    let argocd_values_file =
+        write_tempfile_with("apprafter-argocd-loader-values-", ARGOCD_LOADER_VALUES_YAML)?;
     helm.upgrade_install(&HelmUpgradeArgs {
         release: "argocd".into(),
         chart: "argo/argo-cd".into(),
@@ -284,89 +282,6 @@ spec:
 "#,
         chart_name = APPRAFTER_PLATFORM_STACK_CHART_NAME,
     )
-}
-
-/// Minimal values for the Argo CD loader install. The
-/// platform-stack chart's `component_argocd.cue` will overlay
-/// extraContainers (cue-cmp sidecar) + tier-2 replica counts
-/// when it reconciles; we only need to get Argo CD up enough
-/// to read its own next-step manifest.
-///
-/// Walk-found bug (v0.1.97 → v0.1.98 fix): the upstream
-/// `argo-cd` chart 7.7.7 defaults `redis-ha.enabled: true`,
-/// which tries to schedule 3 redis-ha pods + 1 haproxy with
-/// `podAntiAffinity` `requiredDuringSchedulingIgnoredDuringExecution`
-/// — on a single-node k3s those pods never become Ready, the
-/// chart's pre-install Job hook waits on them, and `helm
-/// install` times out with `failed pre-install: timed out
-/// waiting for the condition`. The v0.1.x imperative install
-/// explicitly set `redis-ha.enabled: false`; the v0.1.97
-/// rewrite dropped that flag by accident. Restored, plus
-/// `notifications.enabled: false` (saves one more replica on
-/// tier-1 cpx22 RAM) and `server.service.type: ClusterIP`
-/// (Gateway/HTTPRoute exposure lands via the platform-stack
-/// chart's argocd component, not the loader).
-fn argocd_loader_values_yaml() -> String {
-    r#"# SPDX-License-Identifier: FSL-1.1-Apache-2.0
-# Loader values for the initial Argo CD install. The
-# platform-stack chart's component_argocd.cue overlays this
-# release with the cue-cmp sidecar and per-tier replicas on
-# its first reconcile.
-dex:
-  enabled: false
-redis-ha:
-  enabled: false
-controller:
-  replicas: 1
-server:
-  replicas: 1
-  service:
-    type: ClusterIP
-repoServer:
-  replicas: 1
-applicationSet:
-  replicaCount: 1
-notifications:
-  enabled: false
-# OCI Helm repository registration. Without this Argo CD
-# generates a malformed `helm pull --repo oci://<repo> <chart>`
-# for OCI charts and the root Application fails with
-# `object required` (walk-found bug, v0.1.99 → v0.1.100). The
-# bare URL + `enableOCI: "true"` form is what argocd-repo-server
-# rewrites into the correct `helm pull oci://<repo>/<chart>`.
-# Mirrored in platform-stack/cue/component_argocd.cue so the
-# chart's self-reconcile keeps the registration alive on adopt.
-#
-# `configs.projects.default` is required because chart 7.7.7
-# does NOT auto-create the `default` AppProject, and Argo CD
-# 2.13.1 does NOT recreate it on server startup (walk-found
-# bug, v0.1.103 → v0.1.104: root `platform` Application
-# stuck with `Application referencing project default which
-# does not exist`). The spec mirrors Argo CD's historical
-# implicit default: unrestricted source repos, destinations,
-# and resource kinds.
-configs:
-  repositories:
-    apprafter:
-      url: ghcr.io/apprafter
-      type: helm
-      enableOCI: "true"
-  projects:
-    default:
-      description: Default project — Argo CD baseline, unrestricted.
-      sourceRepos:
-        - "*"
-      destinations:
-        - namespace: "*"
-          server: "*"
-      clusterResourceWhitelist:
-        - group: "*"
-          kind: "*"
-      namespaceResourceWhitelist:
-        - group: "*"
-          kind: "*"
-"#
-    .to_string()
 }
 
 fn platform_stack_repo() -> String {
@@ -569,61 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn argocd_loader_values_create_default_app_project() {
-        // Walk-found bug v0.1.103 → v0.1.104. Argo CD chart
-        // 7.7.7 does not auto-create the `default` AppProject;
-        // Argo CD 2.13.1 server does not recreate it on
-        // startup. Without this block, every Application with
-        // `project: default` (incl. the root `platform`
-        // Application) fails with `Application referencing
-        // project default which does not exist`.
-        let v = argocd_loader_values_yaml();
-        assert!(v.contains("projects:"), "{v}");
-        assert!(v.contains("default:"), "{v}");
-        // The unrestricted-default spec mirrors Argo CD's
-        // historical implicit default project — any source
-        // repo, any destination, any resource kind.
-        assert!(v.contains("sourceRepos:"), "{v}");
-        assert!(v.contains("destinations:"), "{v}");
-        assert!(v.contains("clusterResourceWhitelist:"), "{v}");
-        assert!(v.contains("namespaceResourceWhitelist:"), "{v}");
-    }
-
-    #[test]
-    fn argocd_loader_values_register_apprafter_oci_repo() {
-        // Walk-found bug v0.1.99 → v0.1.100. Without this
-        // registration argocd-repo-server runs
-        //   helm pull --repo oci://ghcr.io/apprafter platform-stack
-        // which Helm rejects with `object required`. The
-        // registration tells Argo CD to use the OCI form of
-        // `helm pull oci://<repo>/<chart>` instead.
-        let v = argocd_loader_values_yaml();
-        // `configs.repositories.apprafter` block with three
-        // required keys: bare URL (no `oci://`), `type: helm`,
-        // `enableOCI: "true"`. We pin all three so a typo can't
-        // regress to the malformed pull command.
-        assert!(v.contains("configs:"), "{v}");
-        assert!(v.contains("repositories:"), "{v}");
-        assert!(v.contains("apprafter:"), "{v}");
-        assert!(v.contains("url: ghcr.io/apprafter"), "{v}");
-        assert!(v.contains("type: helm"), "{v}");
-        assert!(v.contains("enableOCI: \"true\""), "{v}");
-        // Negative guard — the `oci://` form must NOT appear
-        // in any non-comment line. Argo CD identifies OCI vs
-        // HTTPS via `enableOCI`, not via URL scheme.
-        for line in v.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            assert!(
-                !line.contains("oci://"),
-                "loader values non-comment line must not carry oci:// prefix: {line}"
-            );
-        }
-    }
-
-    #[test]
     fn root_application_repourl_is_bare_without_oci_scheme() {
         // Companion to argocd_loader_values_register_apprafter_oci_repo.
         // The root Application's repoURL MUST match the
@@ -697,52 +557,6 @@ mod tests {
         // Sub-charts target the cluster (kubernetes.default.svc).
         assert!(yaml.contains("namespace: argocd"));
         assert!(yaml.contains("server: https://kubernetes.default.svc"));
-    }
-
-    #[test]
-    fn argocd_loader_values_keeps_replicas_at_one_for_initial_install() {
-        // The loader install minimises memory while we wait
-        // for the chart's own Argo CD component overlay to
-        // adopt the release. Tier-2 replica counts arrive via
-        // Argo CD's first reconcile, not the loader install.
-        let v = argocd_loader_values_yaml();
-        assert!(v.contains("dex:\n  enabled: false"));
-        for k in ["controller", "server", "repoServer"] {
-            assert!(v.contains(&format!("{k}:\n  replicas: 1")), "{v}");
-        }
-        // notifications was bumped to `enabled: false` instead
-        // of `replicas: 1` — the latter still allocated one
-        // notifications pod, the former skips the deployment
-        // entirely (tier-1 cpx22 RAM budget).
-        assert!(v.contains("notifications:\n  enabled: false"), "{v}");
-    }
-
-    #[test]
-    fn argocd_loader_values_disables_redis_ha_for_single_node_k3s() {
-        // The v0.1.97 → v0.1.98 walk-found bug: the upstream
-        // argo-cd chart 7.7.7 defaults redis-ha.enabled: true,
-        // which schedules 3 redis pods with
-        // requiredDuringSchedulingIgnoredDuringExecution
-        // podAntiAffinity. On single-node k3s those pods never
-        // become Ready; the chart's pre-install hook times
-        // out. Disabling redis-ha here matches the v0.1.x
-        // baseline and unblocks the install.
-        let v = argocd_loader_values_yaml();
-        assert!(v.contains("redis-ha:\n  enabled: false"), "{v}");
-    }
-
-    #[test]
-    fn argocd_loader_values_keep_server_at_cluster_ip_until_chart_exposes_it() {
-        // Loader install runs before the platform-stack chart
-        // reconciles; the chart's component_argocd.cue is what
-        // wires Gateway / HTTPRoute exposure. Loader keeps the
-        // server at ClusterIP so the loader doesn't expose
-        // anything that's not yet hardened.
-        let v = argocd_loader_values_yaml();
-        assert!(
-            v.contains("server:\n  replicas: 1\n  service:\n    type: ClusterIP"),
-            "{v}"
-        );
     }
 
     #[test]

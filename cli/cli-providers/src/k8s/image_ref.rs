@@ -35,7 +35,7 @@ pub const RELEASED_PLATFORM_STACK_VERSION: &str = "0.1.12";
 ///   - Argo CD repository registrations carry a bare URL +
 ///     `enableOCI: "true"` flag; the scheme is implicit. Both
 ///     the loader values in
-///     `cli-providers::k8s::argocd_loader_values_yaml` and the
+///     `cli-providers::k8s::ARGOCD_LOADER_VALUES_YAML` and the
 ///     chart's `component_argocd.cue` register this URL
 ///     verbatim under `configs.repositories.apprafter.url`.
 ///   - The root Application's `spec.source.repoURL` MUST match

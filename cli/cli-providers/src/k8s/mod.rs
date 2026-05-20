@@ -22,4 +22,4 @@ pub use kubectl::{
     gateway_api_crds_url, KubectlCli, KubectlRunner, ManifestSource, APPRAFTER_CLI_FIELD_MANAGER,
     GATEWAY_API_VERSION,
 };
-pub use loader_values::CILIUM_VALUES_YAML;
+pub use loader_values::{ARGOCD_LOADER_VALUES_YAML, CILIUM_VALUES_YAML};

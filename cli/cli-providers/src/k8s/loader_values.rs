@@ -40,4 +40,29 @@ mod tests {
             "missing ipv6 block: {CILIUM_VALUES_YAML}"
         );
     }
+
+    #[test]
+    fn argocd_loader_values_yaml_contains_critical_fields() {
+        // Walk-fix #1 (redis-ha), #3 (OCI repo registration),
+        // #5 (sync-wave order), #7 (default AppProject), and #11
+        // (image tag form) all touched these fields. Pin them
+        // here so a future chart edit that drops any of them
+        // fails this test in CI rather than silently break
+        // bootstrap.
+        assert!(
+            ARGOCD_LOADER_VALUES_YAML.contains("redis-ha:")
+                && ARGOCD_LOADER_VALUES_YAML.contains("enabled: false"),
+            "missing redis-ha: enabled: false (walk-fix #1):\n{ARGOCD_LOADER_VALUES_YAML}"
+        );
+        assert!(
+            ARGOCD_LOADER_VALUES_YAML.contains("apprafter:")
+                && ARGOCD_LOADER_VALUES_YAML.contains("enableOCI:"),
+            "missing apprafter OCI repo registration (walk-fix #3):\n{ARGOCD_LOADER_VALUES_YAML}"
+        );
+        assert!(
+            ARGOCD_LOADER_VALUES_YAML.contains("default:")
+                && ARGOCD_LOADER_VALUES_YAML.contains("sourceRepos:"),
+            "missing default AppProject (walk-fix #7):\n{ARGOCD_LOADER_VALUES_YAML}"
+        );
+    }
 }
