@@ -7,10 +7,6 @@ use std::process::Command;
 
 use cli_core::{CliError, Result};
 
-/// Pinned Cilium chart version. Bumped intentionally — bump in
-/// lockstep with NetworkPolicy + smoke work in v0.1.12.
-pub const CILIUM_CHART_VERSION: &str = "1.16.5";
-
 #[derive(Debug, Clone)]
 pub struct HelmUpgradeArgs {
     pub release: String,

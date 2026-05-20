@@ -10,6 +10,12 @@ package platformstack
 // and emits Rust `const &str` constants the loader uses
 // verbatim.
 //
+// Schema: each component carries
+//   - `chartVersion`: upstream Helm chart version (`--version`
+//     arg to `helm install`)
+//   - `values`: subset of Helm values the loader install
+//     passes via `helm install -f`
+//
 // Why hidden (`_` prefix): operators don't override these. The
 // loader is an internal CLI implementation detail; chart
 // users interact through `_components.*.values` overlays
@@ -30,57 +36,76 @@ package platformstack
 // need on first install — Argo CD has to be running first
 // before it can pull the chart that defines them. So the
 // chart's `component_argocd.cue` derives its `values:` as
-// `_loaderValues.argocd & { ...sidecar extras... }` —
+// `_loaderValues.argocd.values & { ...sidecar extras... }` —
 // unification, not equality. There is no invariant assertion
 // for Argo CD; the `& {…}` pattern at the call site already
 // encodes the subset relationship.
 _loaderValues: {
-	// Cilium values — byte-identical to `_components.cilium.values`.
-	cilium: _components.cilium.values
+	cilium: {
+		// Upstream Cilium chart version. Bumped in lockstep
+		// with Cilium support work (single source per
+		// CLAUDE.md "one way to do things").
+		chartVersion: "1.16.5"
+		// Cilium values — byte-identical to the chart's
+		// component values (B.1.71 invariant below).
+		values: _components.cilium.values
+	}
 
-	// Argo CD values — strict subset of `_components.argocd.values`.
-	// The chart adds the cue-cmp sidecar + its ConfigMap on
-	// top via `& { ... }`; loader doesn't ship those.
-	//
-	// Field order matches the pre-refactor `component_argocd.cue`
-	// `values:` block so YAML export round-trips byte-equivalent
-	// (CUE preserves declaration order on export).
 	argocd: {
-		controller: replicas: 1
-		"redis-ha": enabled:  false
-		server: replicas:     1
-		server: service: type: "ClusterIP"
-		applicationSet: replicaCount: 1
-		notifications: enabled:       false
-		dex: enabled:                 false
-		configs: {
-			repositories: apprafter: {
-				url:       "ghcr.io/apprafter"
-				type:      "helm"
-				enableOCI: "true"
+		// Upstream Argo CD chart version (argo/argo-cd
+		// from https://argoproj.github.io/argo-helm).
+		chartVersion: "7.7.7"
+		// Argo CD values — strict subset of `_components.argocd.values`.
+		// The chart adds the cue-cmp sidecar + its ConfigMap on
+		// top via `& { ... }`; loader doesn't ship those.
+		//
+		// Field order matches the pre-refactor `component_argocd.cue`
+		// `values:` block so YAML export round-trips byte-equivalent
+		// (CUE preserves declaration order on export).
+		values: {
+			controller: replicas: 1
+			"redis-ha": enabled:  false
+			server: replicas:     1
+			server: service: type: "ClusterIP"
+			applicationSet: replicaCount: 1
+			notifications: enabled:       false
+			dex: enabled:                 false
+			configs: {
+				repositories: apprafter: {
+					url:       "ghcr.io/apprafter"
+					type:      "helm"
+					enableOCI: "true"
+				}
+				projects: default: {
+					description: "Default project — Argo CD baseline, unrestricted."
+					sourceRepos: ["*"]
+					destinations: [{
+						namespace: "*"
+						server:    "*"
+					}]
+					clusterResourceWhitelist: [{
+						group: "*"
+						kind:  "*"
+					}]
+					namespaceResourceWhitelist: [{
+						group: "*"
+						kind:  "*"
+					}]
+				}
 			}
-			projects: default: {
-				description: "Default project — Argo CD baseline, unrestricted."
-				sourceRepos: ["*"]
-				destinations: [{
-					namespace: "*"
-					server:    "*"
-				}]
-				clusterResourceWhitelist: [{
-					group: "*"
-					kind:  "*"
-				}]
-				namespaceResourceWhitelist: [{
-					group: "*"
-					kind:  "*"
-				}]
-			}
+			repoServer: replicas: 1
 		}
-		repoServer: replicas: 1
 	}
 }
 
-// Invariant: chart's cilium values ARE the loader values. CUE
-// unifies left + right; if any future edit makes them
+// B.1.71 invariant: chart's cilium values ARE the loader values.
+// CUE unifies left + right; if any future edit makes them
 // diverge, `cue vet` fails with `incompatible values`.
-_components: cilium: values: _loaderValues.cilium
+_components: cilium: values: _loaderValues.cilium.values
+
+// B.1.71b invariant: chart's Argo CD upstream chart version IS
+// the loader's chart version. Single source of truth.
+// (Cilium's version is declared inline in component_cilium.cue
+// as `version: _loaderValues.cilium.chartVersion` to preserve
+// YAML export field order.)
+_components: argocd: version: _loaderValues.argocd.chartVersion

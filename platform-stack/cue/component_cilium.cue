@@ -21,7 +21,10 @@ _components: cilium: #Component & {
 		repoURL: "https://helm.cilium.io/"
 		chart:   "cilium"
 	}
-	version: "1.16.5"
+	// B.1.71b: single source via _loaderValues.cilium.chartVersion.
+	// The literal lives in loader_values.cue; this field just
+	// references it to preserve export field order.
+	version: _loaderValues.cilium.chartVersion
 	// Values are the single source of truth for the Cilium
 	// loader install. `build.rs` in `cli-providers` extracts
 	// `_loaderValues.cilium` via `cue export`, so any edit here

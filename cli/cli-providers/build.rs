@@ -29,8 +29,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", chart_root.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    let cilium_yaml = cue_export(&chart_root, "_loaderValues.cilium");
-    let argocd_yaml = cue_export(&chart_root, "_loaderValues.argocd");
+    let cilium_yaml = cue_export(&chart_root, "_loaderValues.cilium.values");
+    let argocd_yaml = cue_export(&chart_root, "_loaderValues.argocd.values");
+    let cilium_chart_version = cue_export_string(&chart_root, "_loaderValues.cilium.chartVersion");
+    let argocd_chart_version = cue_export_string(&chart_root, "_loaderValues.argocd.chartVersion");
     let platform_stack_version = cue_export_string(&chart_root, "currentVersion");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -41,9 +43,13 @@ fn main() {
          // Do not edit. Modify `platform-stack/cue/` instead.\n\
          pub const CILIUM_VALUES_YAML: &str = {cilium_yaml:?};\n\
          pub const ARGOCD_LOADER_VALUES_YAML: &str = {argocd_yaml:?};\n\
+         pub const CILIUM_CHART_VERSION: &str = {cilium_chart_version:?};\n\
+         pub const ARGOCD_CHART_VERSION: &str = {argocd_chart_version:?};\n\
          pub const RELEASED_PLATFORM_STACK_VERSION: &str = {platform_stack_version:?};\n",
         cilium_yaml = cilium_yaml,
         argocd_yaml = argocd_yaml,
+        cilium_chart_version = cilium_chart_version,
+        argocd_chart_version = argocd_chart_version,
         platform_stack_version = platform_stack_version,
     );
 

@@ -87,6 +87,21 @@ mod tests {
     }
 
     #[test]
+    fn cilium_chart_version_matches_expected_pin() {
+        // B.1.71b: chart's `_loaderValues.cilium.chartVersion` is
+        // the SoT. Pinning the actual string here lets a future
+        // chart-side bump that forgot to update this expectation
+        // fail in CI rather than silently change what the loader
+        // installs.
+        assert_eq!(CILIUM_CHART_VERSION, "1.16.5");
+    }
+
+    #[test]
+    fn argocd_chart_version_matches_expected_pin() {
+        assert_eq!(ARGOCD_CHART_VERSION, "7.7.7");
+    }
+
+    #[test]
     fn released_platform_stack_version_matches_semver_shape() {
         // CUE schema in `platform-stack/cue/platform.cue` already
         // pins `currentVersion: #Version`, so this is belt-and-

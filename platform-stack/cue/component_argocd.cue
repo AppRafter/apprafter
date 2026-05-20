@@ -19,9 +19,10 @@ _components: argocd: #Component & {
 		repoURL: "https://argoproj.github.io/argo-helm"
 		chart:   "argo-cd"
 	}
-	version: "7.7.7"
+	// version: set by B.1.71b invariant in loader_values.cue
+	// (`_components.argocd.version: _loaderValues.argocd.chartVersion`)
 
-	// `values:` is `_loaderValues.argocd` unified with the
+	// `values:` is `_loaderValues.argocd.values` unified with the
 	// chart-only adopt-time extras below. The loader-side
 	// subset (replicas, dex/redis-ha/notifications off, OCI
 	// repo registration, default AppProject) lives in
@@ -57,7 +58,7 @@ _components: argocd: #Component & {
 	// the root `platform` Application the CLI loader applies)
 	// fails with `Application referencing project default
 	// which does not exist`. Walk-found bug v0.1.103 → v0.1.104.
-	values: _loaderValues.argocd & {
+	values: _loaderValues.argocd.values & {
 		// argocd-repo-server runs the cue-cmp sidecar that
 		// renders user app repositories' `apprafter*.cue`
 		// files into Kubernetes YAML at sync time (ADR 0029).
