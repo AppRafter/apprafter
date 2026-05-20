@@ -20,76 +20,44 @@ _components: argocd: #Component & {
 		chart:   "argo-cd"
 	}
 	version: "7.7.7"
-	values: {
-		// Single replicas on tier-1 (cpx22 RAM budget). Tier
-		// 2+ overlays scale these up; Dex stays off until
-		// OIDC SSO lands in Phase 3.
-		//
-		// `redis-ha.enabled: false` is critical on single-node
-		// k3s — the upstream chart's redis-ha StatefulSet sets
-		// `requiredDuringSchedulingIgnoredDuringExecution`
-		// podAntiAffinity across 3 redis pods, which never
-		// schedule on one node. The loader install
-		// (`commands/cluster_bootstrap.rs::argocd_loader_values_yaml`)
-		// disables it too; this overlay keeps them aligned so
-		// the chart's self-reconcile doesn't re-enable it on
-		// adoption.
-		controller: replicas: int | *1
-		"redis-ha": enabled:  bool | *false
-		server: replicas:     int | *1
-		server: service: type: string | *"ClusterIP"
-		applicationSet: replicaCount: int | *1
-		notifications: enabled:       bool | *false
-		dex: enabled:                 bool | *false
 
-		// OCI Helm repository registration. Without this the
-		// `argocd-repo-server` shells out to
-		// `helm pull --repo oci://ghcr.io/apprafter <chart>`,
-		// which is malformed for OCI registries — `helm pull`
-		// for OCI requires `helm pull oci://<repo>/<chart>` form.
-		// Argo CD bridges that by reading `enableOCI: "true"`
-		// off this registration and rewriting the pull
-		// command. URL is BARE (no `oci://` scheme); Argo CD
-		// adds the scheme based on `enableOCI`. Matches the
-		// loader-side block in
-		// `cli-providers::k8s::argocd_loader_values_yaml` so
-		// the chart's self-reconcile keeps the repo registered
-		// when it adopts the loader Argo CD release.
-		configs: {
-			repositories: apprafter: {
-				url:       "ghcr.io/apprafter"
-				type:      "helm"
-				enableOCI: "true"
-			}
-
-			// Argo CD chart 7.7.7 does NOT auto-create the
-			// `default` AppProject, and Argo CD 2.13.1 server
-			// does NOT recreate it on startup either. Without
-			// this block, every Application with `project:
-			// default` (incl. the root `platform` Application
-			// the CLI loader applies) fails with `Application
-			// referencing project default which does not
-			// exist`. Walk-found bug v0.1.103 → v0.1.104.
-			// Mirrored in the CLI loader (`argocd_loader_values_yaml`)
-			// so adoption is a no-op.
-			projects: default: {
-				description: "Default project — Argo CD baseline, unrestricted."
-				sourceRepos: ["*"]
-				destinations: [{
-					namespace: "*"
-					server:    "*"
-				}]
-				clusterResourceWhitelist: [{
-					group: "*"
-					kind:  "*"
-				}]
-				namespaceResourceWhitelist: [{
-					group: "*"
-					kind:  "*"
-				}]
-			}
-		}
-
+	// `values:` is `_loaderValues.argocd` unified with the
+	// chart-only adopt-time extras below. The loader-side
+	// subset (replicas, dex/redis-ha/notifications off, OCI
+	// repo registration, default AppProject) lives in
+	// `loader_values.cue` so the CLI's `build.rs` can lift it
+	// out as a `const &str` for `cluster-bootstrap`. The
+	// extras (cue-cmp sidecar + its ConfigMap) only matter
+	// once Argo CD is up, so they're chart-only.
+	//
+	// Single replicas on tier-1 (cpx22 RAM budget). Tier 2+
+	// overlays scale these up; Dex stays off until OIDC SSO
+	// lands in Phase 3.
+	//
+	// `redis-ha.enabled: false` is critical on single-node
+	// k3s — the upstream chart's redis-ha StatefulSet sets
+	// `requiredDuringSchedulingIgnoredDuringExecution`
+	// podAntiAffinity across 3 redis pods, which never
+	// schedule on one node.
+	//
+	// OCI Helm repository registration: without this the
+	// `argocd-repo-server` shells out to
+	// `helm pull --repo oci://ghcr.io/apprafter <chart>`,
+	// which is malformed for OCI registries — `helm pull`
+	// for OCI requires `helm pull oci://<repo>/<chart>` form.
+	// Argo CD bridges that by reading `enableOCI: "true"`
+	// off this registration and rewriting the pull command.
+	// URL is BARE (no `oci://` scheme); Argo CD adds the
+	// scheme based on `enableOCI`.
+	//
+	// Argo CD chart 7.7.7 does NOT auto-create the `default`
+	// AppProject, and Argo CD 2.13.1 server does NOT recreate
+	// it on startup either. Without the `configs.projects.default`
+	// block, every Application with `project: default` (incl.
+	// the root `platform` Application the CLI loader applies)
+	// fails with `Application referencing project default
+	// which does not exist`. Walk-found bug v0.1.103 → v0.1.104.
+	values: _loaderValues.argocd & {
 		// argocd-repo-server runs the cue-cmp sidecar that
 		// renders user app repositories' `apprafter*.cue`
 		// files into Kubernetes YAML at sync time (ADR 0029).
@@ -104,8 +72,11 @@ _components: argocd: #Component & {
 		// sidecar runs as UID 999 (same as the upstream
 		// argocd-repo-server image) so file ownership lines
 		// up across containers.
+		//
+		// `repoServer.replicas` already comes from
+		// `_loaderValues.argocd` above; only the chart-only
+		// extras live here.
 		repoServer: {
-			replicas: int | *1
 			extraContainers: [{
 				name:  "cue-cmp"
 				image: "\(_components."argocd-cue-cmp".values.image.repository):\(_components."argocd-cue-cmp".values.image.tag)"

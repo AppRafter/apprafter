@@ -22,9 +22,62 @@ package platformstack
 // Deployment and cilium-operator crashed with `KUBERNETES_SERVICE_HOST=auto`.
 // The invariant below makes that crash impossible by
 // construction — chart values ≡ loader values for Cilium.
+//
+// Argo CD differs: the chart adds adopt-time extras on top
+// of the loader subset (cue-cmp sidecar in
+// `repoServer.extraContainers`, the `cue-cmp-plugin-config`
+// ConfigMap in `extraObjects`) that the CLI loader does NOT
+// need on first install — Argo CD has to be running first
+// before it can pull the chart that defines them. So the
+// chart's `component_argocd.cue` derives its `values:` as
+// `_loaderValues.argocd & { ...sidecar extras... }` —
+// unification, not equality. There is no invariant assertion
+// for Argo CD; the `& {…}` pattern at the call site already
+// encodes the subset relationship.
 _loaderValues: {
 	// Cilium values — byte-identical to `_components.cilium.values`.
 	cilium: _components.cilium.values
+
+	// Argo CD values — strict subset of `_components.argocd.values`.
+	// The chart adds the cue-cmp sidecar + its ConfigMap on
+	// top via `& { ... }`; loader doesn't ship those.
+	//
+	// Field order matches the pre-refactor `component_argocd.cue`
+	// `values:` block so YAML export round-trips byte-equivalent
+	// (CUE preserves declaration order on export).
+	argocd: {
+		controller: replicas: 1
+		"redis-ha": enabled:  false
+		server: replicas:     1
+		server: service: type: "ClusterIP"
+		applicationSet: replicaCount: 1
+		notifications: enabled:       false
+		dex: enabled:                 false
+		configs: {
+			repositories: apprafter: {
+				url:       "ghcr.io/apprafter"
+				type:      "helm"
+				enableOCI: "true"
+			}
+			projects: default: {
+				description: "Default project — Argo CD baseline, unrestricted."
+				sourceRepos: ["*"]
+				destinations: [{
+					namespace: "*"
+					server:    "*"
+				}]
+				clusterResourceWhitelist: [{
+					group: "*"
+					kind:  "*"
+				}]
+				namespaceResourceWhitelist: [{
+					group: "*"
+					kind:  "*"
+				}]
+			}
+		}
+		repoServer: replicas: 1
+	}
 }
 
 // Invariant: chart's cilium values ARE the loader values. CUE
