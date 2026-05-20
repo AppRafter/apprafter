@@ -81,27 +81,43 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    if kind != "Application" {
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "apiVersion": api_version,
-                "kind": "AdmissionReview",
-                "response": {
-                    "uid": uid,
-                    "allowed": true,
-                }
-            })),
-        );
-    }
-
-    let spec = request
+    let object = request
         .get("object")
-        .and_then(|o| o.get("spec"))
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
 
-    let errors = validate_application_spec(&spec);
+    let errors = match kind {
+        "Application" => {
+            let spec = object
+                .get("spec")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+            validate_application_spec(&spec)
+        }
+        "PlatformStack" => {
+            crate::validator_platformstack::validate_platformstack(&object)
+        }
+        _ => {
+            // Webhook registered for an unrecognised kind — allow,
+            // log once for operator visibility. The
+            // ValidatingWebhookConfiguration's rules list is the
+            // source of truth for which kinds reach this handler;
+            // unknown kinds should not surface in production.
+            warn!(target: "admission_webhook", "AdmissionReview for unrecognised kind {kind:?}; allowing");
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "apiVersion": api_version,
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": uid,
+                        "allowed": true,
+                    }
+                })),
+            );
+        }
+    };
+
     if errors.is_empty() {
         return (
             StatusCode::OK,
@@ -116,7 +132,7 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         );
     }
 
-    let message = render_error_message(&errors);
+    let message = render_error_message(kind, &errors);
     (
         StatusCode::OK,
         Json(json!({
@@ -134,8 +150,8 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
     )
 }
 
-fn render_error_message(errors: &[ValidationError]) -> String {
-    let mut out = String::from("Application is invalid: ");
+fn render_error_message(kind: &str, errors: &[ValidationError]) -> String {
+    let mut out = format!("{kind} is invalid: ");
     for (i, e) in errors.iter().enumerate() {
         if i > 0 {
             out.push_str("; ");
@@ -150,20 +166,152 @@ fn render_error_message(errors: &[ValidationError]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::json;
+    use tower::ServiceExt;
 
     #[test]
     fn renders_single_error() {
-        let msg = render_error_message(&[ValidationError::new("spec.base.image", "is required")]);
+        let msg = render_error_message(
+            "Application",
+            &[ValidationError::new("spec.base.image", "is required")],
+        );
         assert!(msg.starts_with("Application is invalid: "));
         assert!(msg.contains("spec.base.image: is required"));
     }
 
     #[test]
     fn renders_multiple_errors_with_separator() {
-        let msg = render_error_message(&[
-            ValidationError::new("a", "x"),
-            ValidationError::new("b", "y"),
-        ]);
+        let msg = render_error_message(
+            "Application",
+            &[
+                ValidationError::new("a", "x"),
+                ValidationError::new("b", "y"),
+            ],
+        );
         assert!(msg.contains("a: x; b: y"));
+    }
+
+    #[test]
+    fn renders_platformstack_kind_in_message() {
+        let msg = render_error_message(
+            "PlatformStack",
+            &[ValidationError::new("metadata.name", "must be default")],
+        );
+        assert!(msg.starts_with("PlatformStack is invalid: "));
+        assert!(msg.contains("metadata.name: must be default"));
+    }
+
+    fn admission_review_for_kind(kind: &str, object: serde_json::Value) -> serde_json::Value {
+        json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "deadbeef",
+                "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": kind },
+                "object": object,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn rejects_platformstack_with_wrong_name() {
+        let router = build_router();
+        let body = admission_review_for_kind(
+            "PlatformStack",
+            json!({
+                "metadata": { "name": "other", "namespace": "apprafter-system" },
+                "spec": {
+                    "source": {
+                        "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                        "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                        "checkInterval": "6h"
+                    },
+                    "values": { "tier": 1 }
+                }
+            }),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(false));
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("PlatformStack is invalid"));
+        assert!(msg.contains("metadata.name"));
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_platformstack() {
+        let router = build_router();
+        let body = admission_review_for_kind(
+            "PlatformStack",
+            json!({
+                "metadata": { "name": "default", "namespace": "apprafter-system" },
+                "spec": {
+                    "source": {
+                        "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                        "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                        "checkInterval": "6h"
+                    },
+                    "values": { "tier": 1 }
+                }
+            }),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn allows_unrecognised_kind() {
+        let router = build_router();
+        let body = admission_review_for_kind("SomethingElse", json!({}));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(true));
     }
 }
