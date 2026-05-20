@@ -13,6 +13,45 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.111 — M1.5 Track B.1.72 closure — PlatformStack CRD + Application CRD restoration (2026-05-19)
+
+PlatformStack CRD per spec §3.11 + ADR 0026 + restored
+Application CRD (B.1.71 dropped the imperative shipper without a
+chart-side replacement). Both CRDs ship from the operator Helm
+chart at sync-wave -5; admission webhook validates PlatformStack
+singleton (name=default, namespace=apprafter-system), channel
+enum, pin semver shape, source.checkInterval >= 1h.
+
+`cluster-bootstrap` gains step 5: apply the default PlatformStack
+singleton (channel=stable, autoUpgrade=false, tier from active
+target) via SSA with field manager `apprafter-cli` once the
+platform Application reports Healthy. PlatformController
+reconciliation lands in B.1.73; until then the CR exists with
+empty status and serves as the schema anchor.
+
+### Version chain
+
+- CLI v0.1.110 → v0.1.111.
+- operator + admission-webhook chart v0.1.93 → v0.1.94.
+- operator + admission-webhook appVersion v0.1.106 → v0.1.111 (matches
+  the release-operator workflow tag).
+- platform-stack chart 0.1.14 → 0.1.15 via the operator-chart pin
+  chain (`component_apprafter-operator.cue` + `component_admission-webhook.cue`
+  pins + `platform.cue#currentVersion` bump triggering the
+  compatibility invariant).
+
+### Spec.md doc edit
+
+§3.11 prose: `targetVersion` added to the
+`Status reports include` list (additive status field, no
+revision bump).
+
+### References
+
+- `docs/superpowers/plans/2026-05-19-track-b-1-72-platformstack-crd.md`
+- `docs/adr/0026-platformstack-crd-and-platformcontroller.md`
+- spec.md §3.11
+
 ## v0.1.110 — M1.5 Track B.1.71b closure — remaining version drift closed (2026-05-20)
 
 B.1.71 left six version-duplication classes in the "Deferred

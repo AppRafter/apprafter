@@ -94,9 +94,7 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
                 .unwrap_or(Value::Object(Default::default()));
             validate_application_spec(&spec)
         }
-        "PlatformStack" => {
-            crate::validator_platformstack::validate_platformstack(&object)
-        }
+        "PlatformStack" => crate::validator_platformstack::validate_platformstack(&object),
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The

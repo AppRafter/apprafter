@@ -130,9 +130,9 @@ fn is_semver(s: &str) -> bool {
     if core_segments.len() != 3 {
         return false;
     }
-    core_segments.iter().all(|seg| {
-        !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit())
-    })
+    core_segments
+        .iter()
+        .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Parse a Go-style duration with a single unit suffix
@@ -242,7 +242,9 @@ mod tests {
         let mut obj = valid_object();
         obj["spec"]["source"]["checkInterval"] = json!("30m");
         let errors = validate_platformstack(&obj);
-        assert!(errors.iter().any(|e| e.field == "spec.source.checkInterval"));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.source.checkInterval"));
     }
 
     #[test]
@@ -250,7 +252,9 @@ mod tests {
         let mut obj = valid_object();
         obj["spec"]["source"]["checkInterval"] = json!("3599s");
         let errors = validate_platformstack(&obj);
-        assert!(errors.iter().any(|e| e.field == "spec.source.checkInterval"));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.source.checkInterval"));
     }
 
     #[test]
@@ -272,7 +276,9 @@ mod tests {
         let mut obj = valid_object();
         obj["spec"]["source"]["checkInterval"] = json!("forever");
         let errors = validate_platformstack(&obj);
-        assert!(errors.iter().any(|e| e.field == "spec.source.checkInterval"));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.source.checkInterval"));
     }
 
     #[test]
