@@ -757,8 +757,65 @@ compatibility: "0.1.10": {
 		Operators on 0.1.9 with `admission-webhook` panic at
 		startup: upgrade to 0.1.10 (or to the matching CLI
 		v0.1.106+).
+
+		Known issue carried into 0.1.10 (fixed in 0.1.11):
+
+		* `argocd` Application reports `Synced/Degraded`
+		  because the new `argocd-repo-server` pod (with
+		  cue-cmp sidecar) is stuck in `Init:0/1`. kubelet
+		  events show `MountVolume.SetUp failed for volume
+		  "cue-cmp-config": configmap
+		  "cue-cmp-plugin-config" not found`. The
+		  `component_argocd.cue` chart references the
+		  ConfigMap but never created it. 0.1.11 ships it
+		  via `extraObjects`.
 		"""
 	references: [
 		"docs/changelog/UNRELEASED.md#v01106",
+	]
+}
+
+// 0.1.11 — cue-cmp ConfigMap ship hotfix on top of 0.1.10.
+// The `component_argocd.cue` overlay added a cue-cmp
+// sidecar to `argocd-repo-server` in 0.1.2 with a
+// volumeMount pointing at ConfigMap `cue-cmp-plugin-config`,
+// but the ConfigMap was never declared anywhere — the
+// repo-server Deployment couldn't start because kubelet
+// failed to mount a non-existent ConfigMap. The bug was
+// masked through walks #5-9 because earlier blockers
+// (broken images, missing ClusterIssuer, rustls panic)
+// halted reconciliation before the new repo-server pod
+// got a chance to schedule.
+//
+// Fix: chart's `extraObjects` value now ships a ConfigMap
+// `cue-cmp-plugin-config` with the verbatim
+// `argocd-cue-cmp/plugin.yaml` content. ConfigMap lives in
+// the same release as the Deployment that mounts it.
+compatibility: "0.1.11": {
+	change:          "safe"
+	operatorVersion: "v0.1.106"
+	notes: """
+		cue-cmp ConfigMap ship hotfix.
+
+		The chart's argocd component carried a `cue-cmp`
+		sidecar with a volumeMount on ConfigMap
+		`cue-cmp-plugin-config` since chart 0.1.2 (Track
+		B.1.69), but the ConfigMap was never created. The
+		repo-server pod failed `MountVolume.SetUp` and the
+		Argo CD Application stuck on `Synced/Degraded`.
+
+		0.1.11 ships the ConfigMap via the upstream chart's
+		`extraObjects` value. Content is verbatim from
+		`argocd-cue-cmp/plugin.yaml`; an edit there must be
+		mirrored here until a `cue cmd` step in the chart
+		renderer reads it directly.
+
+		Operators on 0.1.10 with stuck `argocd-repo-server`
+		pod (Init:0/1) and `Synced/Degraded` argocd
+		Application: upgrade to 0.1.11 (or to the matching
+		CLI v0.1.107+).
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md#v01107",
 	]
 }

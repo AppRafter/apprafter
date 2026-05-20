@@ -13,6 +13,91 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.107 — walk-fix: cue-cmp ConfigMap never shipped (2026-05-20)
+
+Tenth walk on chart 0.1.10 / CLI v0.1.106. Five of six children
+fully green; argocd Application reports `Synced/Degraded`.
+Diagnosis:
+
+```
+$ kubectl get pods -n argocd
+argocd-repo-server-7c7cd4b9b8-4fdd8                 1/1     Running     (old, loader)
+argocd-repo-server-9bd8976c8-5d8p7                  0/2     Init:0/1    (new, chart adopt)
+
+$ kubectl describe pod -n argocd argocd-repo-server-9bd8976c8-5d8p7
+Events:
+  FailedMount  MountVolume.SetUp failed for volume "cue-cmp-config":
+               configmap "cue-cmp-plugin-config" not found
+```
+
+### Bug O — chart references ConfigMap that doesn't exist
+
+`component_argocd.cue` added a `cue-cmp` sidecar to
+`argocd-repo-server` in chart 0.1.2 (Track B.1.69) with a
+`volumeMount` on ConfigMap `cue-cmp-plugin-config` — but the
+ConfigMap **itself was never declared anywhere**. The Argo CD
+CMP contract requires `plugin.yaml` to be mounted at
+`/home/argocd/cmp-server/config/plugin.yaml`; we wired the
+mount but never created the source ConfigMap.
+
+The bug had been there since chart 0.1.2 (six chart versions
+back), masked through walks #5-9 because earlier blockers
+(broken operator image, missing ClusterIssuer, webhook
+rustls panic) halted reconciliation before the new
+repo-server pod got a chance to schedule.
+
+### Fix
+
+`component_argocd.cue` adds an `extraObjects` value with a
+ConfigMap named `cue-cmp-plugin-config` carrying the
+verbatim `argocd-cue-cmp/plugin.yaml` content. The upstream
+argo-cd chart's `extraObjects` value renders extra raw
+manifests in the same release as the rest of the chart, so
+the ConfigMap lives next to the Deployment that mounts it
+— the chart's hooks delete + recreate them as a unit.
+
+```yaml
+extraObjects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: cue-cmp-plugin-config
+      namespace: argocd
+    data:
+      plugin.yaml: |
+        apiVersion: argoproj.io/v1alpha1
+        kind: ConfigManagementPlugin
+        metadata:
+          name: cue
+        spec:
+          discover:
+            find:
+              glob: "**/apprafter*.cue"
+          generate:
+            command: [sh, "-c"]
+            args:
+              - /usr/local/bin/entrypoint.sh
+```
+
+Content is verbatim from `argocd-cue-cmp/plugin.yaml`. If
+the source plugin manifest evolves (e.g. `discover.find.glob`
+flips from `**/apprafter*.cue` to `.apprafter/app.cue`),
+both sides need a paired edit — comment in the chart cue
+file marks this until a future `cue cmd` step in the chart
+renderer reads the source file directly.
+
+### Chart + CLI versions
+
+- Chart `currentVersion 0.1.10 → 0.1.11` with full compat
+  entry; 0.1.10 entry gets a known-issue note.
+- CLI `RELEASED_PLATFORM_STACK_VERSION → "0.1.11"`.
+- CLI `0.1.106 → 0.1.107`.
+
+### Tests
+
+No new CLI tests — defect is chart-domain. 557 CLI tests
+still pass; fmt + clippy + SPDX + cue vet all clean.
+
 ## v0.1.106 — walk-fix: webhook rustls CryptoProvider panic (2026-05-20)
 
 Ninth walk on chart 0.1.9 / CLI v0.1.105. Five of six children

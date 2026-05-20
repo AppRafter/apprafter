@@ -137,6 +137,49 @@ _components: argocd: #Component & {
 				emptyDir: {}
 			}]
 		}
+
+		// The cue-cmp sidecar above mounts a ConfigMap named
+		// `cue-cmp-plugin-config` at
+		// `/home/argocd/cmp-server/config/plugin.yaml`. The
+		// ConfigMap itself was MISSING in chart 0.1.10 —
+		// `kubelet` reported `MountVolume.SetUp failed for
+		// volume "cue-cmp-config": configmap
+		// "cue-cmp-plugin-config" not found`, the new
+		// repo-server pod stuck in `Init:0/1`, and the Argo
+		// CD self-adopt Application reported `Synced/Degraded`
+		// (walk-found bug v0.1.106 → v0.1.107).
+		//
+		// Shipping the ConfigMap via the upstream chart's
+		// `extraObjects` value puts it in the same release
+		// as the repo-server Deployment. Content is verbatim
+		// from `argocd-cue-cmp/plugin.yaml`; if that file
+		// evolves (e.g. `discover.find.glob` flips), this
+		// block MUST be edited in lockstep until a future
+		// `cue cmd` step in the chart renderer reads
+		// argocd-cue-cmp/plugin.yaml directly.
+		extraObjects: [{
+			apiVersion: "v1"
+			kind:       "ConfigMap"
+			metadata: {
+				name:      "cue-cmp-plugin-config"
+				namespace: "argocd"
+			}
+			data: "plugin.yaml": """
+				# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+				apiVersion: argoproj.io/v1alpha1
+				kind: ConfigManagementPlugin
+				metadata:
+				  name: cue
+				spec:
+				  discover:
+				    find:
+				      glob: "**/apprafter*.cue"
+				  generate:
+				    command: [sh, "-c"]
+				    args:
+				      - /usr/local/bin/entrypoint.sh
+				"""
+		}]
 	}
 	syncPolicy: {
 		automated: {
