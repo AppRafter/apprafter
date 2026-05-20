@@ -62,9 +62,10 @@ use std::path::Path;
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    cilium_values_yaml, HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner,
-    ManifestSource, APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
-    ARGOCD_CHART_VERSION, CILIUM_CHART_VERSION, RELEASED_PLATFORM_STACK_VERSION,
+    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
+    APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
+    ARGOCD_CHART_VERSION, CILIUM_CHART_VERSION, CILIUM_VALUES_YAML,
+    RELEASED_PLATFORM_STACK_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -148,7 +149,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //    node and flips it to Ready.
     helm.repo_add("cilium", "https://helm.cilium.io/")?;
     let cilium_values_file =
-        write_tempfile_with("apprafter-cilium-loader-values-", &cilium_values_yaml())?;
+        write_tempfile_with("apprafter-cilium-loader-values-", CILIUM_VALUES_YAML)?;
     helm.upgrade_install(&HelmUpgradeArgs {
         release: "cilium".into(),
         chart: "cilium/cilium".into(),

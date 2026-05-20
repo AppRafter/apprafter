@@ -6,14 +6,12 @@
 //! `image_ref`, and the surviving values modules remain.
 
 pub mod argocd_values;
-pub mod cilium_values;
 pub mod helm;
 pub mod image_ref;
 pub mod kubectl;
 pub mod loader_values;
 
 pub use argocd_values::ARGOCD_CHART_VERSION;
-pub use cilium_values::cilium_values_yaml;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs, CILIUM_CHART_VERSION};
 pub use image_ref::{
     resolve_image_ref, APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE, APPRAFTER_OPERATOR_DEFAULT_IMAGE,
