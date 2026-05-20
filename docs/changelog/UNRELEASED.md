@@ -13,6 +13,71 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.110 — M1.5 Track B.1.71b closure — remaining version drift closed (2026-05-20)
+
+B.1.71 left six version-duplication classes in the "Deferred
+to follow-up" section of its closure notes. B.1.71b closes
+all of them.
+
+### Eliminated drift classes
+
+- **Cilium + Argo CD upstream chart versions** — now declared
+  in `_loaderValues.{cilium,argocd}.chartVersion` (CUE single
+  source). CUE invariants pin `_components.<comp>.version` to
+  the same field. `cli/cli-providers/build.rs` emits
+  `CILIUM_CHART_VERSION` + `ARGOCD_CHART_VERSION` as
+  generated constants. Hand-maintained
+  `helm.rs#CILIUM_CHART_VERSION` and `argocd_values.rs`
+  (the whole file) deleted.
+
+- **Operator + admission-webhook image tags** — now declared
+  in `operator/charts/<chart>/Chart.yaml#appVersion` (Helm
+  chart standard). Both chart's `values.image.tag` dropped
+  from `component_apprafter-operator.cue` +
+  `component_admission-webhook.cue`; the Helm template's
+  `.Chart.AppVersion` fallback drives the deployed image
+  tag. `build.rs` reads both `Chart.yaml` files via a small
+  line-prefix grep, asserts they agree on `appVersion`, and
+  emits `RELEASED_OPERATOR_VERSION` as a generated const.
+  Hand-maintained const in `image_ref.rs` deleted.
+
+- **cue-cmp image version** — `argocd-cue-cmp/VERSION`
+  plain-text file replaced by `argocd-cue-cmp/version.cue`
+  (package `argocdcuecmp` at `apprafter.io/argocd-cue-cmp`).
+  Three consumers (chart's
+  `component_argocd-cue-cmp.cue` via CUE import;
+  `argocd-cue-cmp-publish.yml`'s `detect` job via
+  `cue export -e version`; `argocd-cue-cmp-check.yml`'s
+  drift check the same way) all read from this single file.
+
+### Tests
+
+- `cilium_chart_version_matches_expected_pin` — pins generated
+  `CILIUM_CHART_VERSION == "1.16.5"`.
+- `argocd_chart_version_matches_expected_pin` — pins
+  `ARGOCD_CHART_VERSION == "7.7.7"`.
+- `released_operator_version_matches_v_prefixed_semver` —
+  pins `RELEASED_OPERATOR_VERSION` to a `v<major>.<minor>.<patch>`
+  shape (the actual value is whatever both Chart.yaml files
+  agree on; the test pins the format, not the literal).
+
+### Versions
+
+- Chart `currentVersion 0.1.13 → 0.1.14` (refactor only, no
+  rendered output change).
+- CLI `0.1.109 → 0.1.110`.
+
+### Nothing deferred
+
+B.1.71's "Deferred to follow-up" section is now empty. The
+two policy-pins that B.1.71 explicitly carved out of scope
+(operator helm chart version `Chart.yaml#version` vs
+`component_apprafter-operator.cue#version`, ditto webhook)
+remain conscious lockstep pins, not drift bugs — they encode
+"this platform-stack pins THAT operator chart version", and
+diverging them is a deliberate operator-chart-bump decision,
+not an automation gap.
+
 ## v0.1.109 — M1.5 Track B.1.71 closure — chart as single source of truth (2026-05-20)
 
 Track B.1.71 closure. The CLI's loader values are now

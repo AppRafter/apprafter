@@ -943,3 +943,58 @@ compatibility: "0.1.13": {
 		"docs/changelog/UNRELEASED.md#v01109",
 	]
 }
+
+// 0.1.14 — Track B.1.71b closure: remaining version drift
+// classes from B.1.71's "deferred follow-ups" all closed.
+// Cilium + Argo CD upstream chart versions now live in
+// `_loaderValues.{cilium,argocd}.chartVersion` (CUE single
+// source, build.rs-derived in CLI). Operator + admission-
+// webhook container image tags now live in
+// `operator/charts/<chart>/Chart.yaml#appVersion` (Helm
+// chart standard, build.rs-derived in CLI; chart's
+// `values.image.tag` field dropped so the chart template's
+// `.Chart.AppVersion` fallback drives the deployed image).
+// cue-cmp image version now lives in
+// `argocd-cue-cmp/version.cue` (single SoT for chart +
+// publish workflow + check workflow). No rendered chart
+// YAML change vs 0.1.13.
+compatibility: "0.1.14": {
+	change:          "safe"
+	operatorVersion: "v0.1.106"
+	notes: """
+		Track B.1.71b closure: closed the remaining 6 version-
+		duplication classes that B.1.71's structural refactor
+		had deferred. Single source of truth now established
+		for:
+
+		* Cilium + Argo CD upstream chart versions
+		  (`_loaderValues.{cilium,argocd}.chartVersion` in
+		  CUE; build.rs-derived in CLI).
+		* Operator + admission-webhook container image tags
+		  (operator chart's `Chart.yaml#appVersion`;
+		  build.rs-derived in CLI; chart `values.image.tag`
+		  dropped so the Helm template's `.Chart.AppVersion`
+		  fallback wins).
+		* cue-cmp image version
+		  (`argocd-cue-cmp/version.cue`; CUE-imported by
+		  chart, `cue export`-read by both publish and
+		  check workflows).
+
+		Drift between any of these places now fails at:
+		* `cue vet` (chart-side invariants for
+		  Cilium / Argo CD).
+		* `build.rs` assertion (operator + webhook
+		  Chart.yaml `appVersion` must agree).
+		* CI workflow setup (cue-cmp version invocations
+		  resolve from a single CUE file).
+
+		Rendered chart YAML byte-equivalent to 0.1.13
+		(verified by `cue export -e _components.<comp>`
+		diff). Operators on 0.1.13 upgrade without any
+		cluster-side action.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-71b-close-remaining-version-drift.md",
+		"docs/changelog/UNRELEASED.md#v01110",
+	]
+}
