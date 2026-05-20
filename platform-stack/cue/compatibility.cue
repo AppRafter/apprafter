@@ -882,3 +882,64 @@ compatibility: "0.1.12": {
 		"docs/changelog/UNRELEASED.md#v01108",
 	]
 }
+
+// 0.1.13 — Track B.1.71 closure: chart values become the
+// single source of truth. The chart's existing component
+// values are unchanged; the CLI loader now reads them via
+// `cli/cli-providers/build.rs` (cue export at compile time)
+// instead of carrying a parallel copy. No rendered chart
+// YAML changes; no operator / webhook image bump; no
+// runtime behavioural change.
+//
+// Drift classes eliminated:
+//   - Cilium chart-overlay drift (walk-fix #6, v0.1.103) —
+//     `_components.cilium.values ≡ _loaderValues.cilium`
+//     invariant + reference unification.
+//   - Argo CD loader-subset drift (walk-fixes #1, #3, #5,
+//     #7) — chart's `component_argocd.cue` derives
+//     `values:` as `_loaderValues.argocd & { ...extras... }`.
+//   - `RELEASED_PLATFORM_STACK_VERSION` manual lockstep
+//     rule — now derived from chart's `currentVersion`.
+compatibility: "0.1.13": {
+	change:          "safe"
+	operatorVersion: "v0.1.106"
+	notes: """
+		Track B.1.71 closure: chart-as-single-source-of-truth.
+
+		The platform-stack chart's CUE source becomes the
+		only place platform component values are defined.
+		The CLI loader (`apprafter cluster-bootstrap`) used
+		to carry hand-maintained copies of the same Cilium +
+		Argo CD values in `cli-providers/src/k8s/*_yaml.rs`
+		— 12 dead renderer files surfaced after the v0.1.97
+		GitOps refactor and survived the 11-walk-fix
+		cascade only because most weren't actually called.
+		B.1.71 removes them entirely.
+
+		Cilium + Argo CD loader values now derive from new
+		`_loaderValues.{cilium,argocd}` fields in
+		`platform-stack/cue/loader_values.cue` via
+		`cli/cli-providers/build.rs` running `cue export -e
+		_loaderValues.<comp> --out yaml` at compile time.
+		The chart's `component_cilium.cue` and
+		`component_argocd.cue` reference the same
+		`_loaderValues` source — chart and loader can no
+		longer diverge.
+
+		`RELEASED_PLATFORM_STACK_VERSION` is also
+		chart-derived now (extracted from `currentVersion`
+		field). Bumping the chart's `currentVersion`
+		automatically bumps the CLI's pin at next compile —
+		no more CLAUDE.md "Bump in lockstep" hand-discipline.
+
+		Rendered chart YAML is byte-equivalent to 0.1.12
+		(verified by `cue export -e _components.argocd.values
+		--out yaml` diff on either side of Task 5's refactor
+		— empty). Operators on 0.1.12 can upgrade without
+		any cluster-side action.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-71-chart-as-sot.md",
+		"docs/changelog/UNRELEASED.md#v01109",
+	]
+}

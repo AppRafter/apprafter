@@ -13,6 +13,67 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.109 — M1.5 Track B.1.71 closure — chart as single source of truth (2026-05-20)
+
+Track B.1.71 closure. The CLI's loader values are now
+extracted from the platform-stack chart's CUE source at
+compile time via `cli-providers/build.rs`. 12 dead `*_yaml`
+renderers deleted; the surviving loader path
+(`cluster_bootstrap.rs`) consumes generated `const &str`
+constants instead of hand-maintained YAML strings.
+
+### Eliminated drift classes
+
+- **Cilium chart-overlay drift** (walk-fix #6, v0.1.103) —
+  invariant in `platform-stack/cue/loader_values.cue` pins
+  `_components.cilium.values ≡ _loaderValues.cilium`. Any
+  future edit that desyncs the two fails `cue vet`.
+- **Argo CD loader-subset drift** (walks #1, #3, #5, #7) —
+  chart's `component_argocd.cue` derives `values:` as
+  `_loaderValues.argocd & { ...extras... }`. Loader fields
+  are the same CUE values the chart ships.
+- **`RELEASED_PLATFORM_STACK_VERSION` lockstep** — derived
+  from chart's `currentVersion` field; bumping the chart
+  bumps the CLI pin automatically.
+
+### Deletions
+
+12 files removed from `cli-providers/src/k8s/`:
+admission_webhook, application_crd, argocd_gateway,
+argocd_repo_secret, backstage_app_config, backstage_manifests,
+bootstrap_app, cert_manager_values, cilium_values, issuer,
+network_policy, operator_chart, operator_values. Plus three
+`examples/*.rs` files (backstage_example,
+admission_webhook_example, application_crd_example).
+
+### Test impact
+
+- ~80 unit tests retired alongside their files.
+- 4 new tests in `cli-providers/src/k8s/loader_values.rs`
+  pin walk-fix-critical fields:
+  - `cilium_values_yaml_contains_loader_critical_fields`
+  - `argocd_loader_values_yaml_contains_critical_fields`
+  - `released_platform_stack_version_matches_semver_shape`
+  - `loader_values_are_non_empty_yaml`
+- Total: 479 cli tests pass (was 557 before B.1.71).
+
+### Versions
+
+- Chart `currentVersion 0.1.12 → 0.1.13` (no rendered-output
+  change; refactor only).
+- CLI `0.1.108 → 0.1.109`.
+
+### Deferred to follow-up
+
+- `RELEASED_OPERATOR_VERSION` (the operator + webhook
+  chart's appVersion) stays a hand-maintained constant in
+  `image_ref.rs`. Same build.rs mechanism can derive it from
+  `operator/charts/apprafter-operator/Chart.yaml#appVersion`
+  but that crosses workspace boundaries — separate sub-task.
+- `argocd-cue-cmp/plugin.yaml` embedded in
+  `component_argocd.cue` as a string literal — same SoT
+  shape as Cilium values but smaller surface. Defer.
+
 ## v0.1.108 — walk-fix: cue-cmp image tag missing `v` prefix (2026-05-20)
 
 Eleventh walk on chart 0.1.11 / CLI v0.1.107. ConfigMap from

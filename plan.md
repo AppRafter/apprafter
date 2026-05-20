@@ -1835,14 +1835,16 @@ instead of carrying parallel definitions.
 
 ---
 
-### 1.71 Migrate platform component values from CLI to chart
+### 1.71 Migrate platform component values from CLI to chart ✅
+
+> v0.1.109 — sub-phase 1.71 shipped. `cli/cli-providers/build.rs` extracts `_loaderValues.{cilium,argocd}` + `currentVersion` from `platform-stack/cue/` at compile time. 12 dead `*_yaml` renderer files deleted; `cluster_bootstrap.rs` consumes generated constants. CUE invariants enforce chart↔loader agreement structurally.
 
 **Source:** ADR 0025.
 
 **Цель:** все existing Helm values builders в `cli-providers::k8s::*` переезжают в `apprafter/platform-stack/cue/components/*.cue` как CUE-typed values. CLI больше не содержит platform component конфигурации.
 
 **Поставка:**
-- [ ] Audit existing CLI source:
+- [x] Audit existing CLI source:
     - `cilium_values_yaml()` → `cue/components/cilium.cue` values block
     - `cert_manager_values_yaml()` → `cue/components/cert-manager.cue` values
     - `argocd_values_yaml()` → `cue/components/argocd.cue` values (включая CMP sidecar config от 1.69)
@@ -1850,9 +1852,9 @@ instead of carrying parallel definitions.
     - Admission webhook manifests → `cue/components/admission-webhook.cue`
     - Backstage values → `cue/components/backstage.cue` (conditional на values.domain)
     - default-deny NetworkPolicy → `cue/components/network-policies.cue`
-- [ ] Self-managing Argo CD: Argo CD's own Application within chart has `syncPolicy.automated.prune: false` to prevent self-destructive upgrades.
-- [ ] Delete migrated Rust code from `cli-providers::k8s::*`.
-- [ ] Smoke: rendered chart + applied → cluster matches what previous CLI-installed setup produced (value-by-value diff).
+- [x] Self-managing Argo CD: Argo CD's own Application within chart has `syncPolicy.automated.prune: false` to prevent self-destructive upgrades.
+- [x] Delete migrated Rust code from `cli-providers::k8s::*`.
+- [x] Smoke: rendered chart + applied → cluster matches what previous CLI-installed setup produced (value-by-value diff).
 
 **Acceptance:**
 - `git grep -E "(cilium_values|cert_manager_values|argocd_values|backstage_values)_yaml" cli/` returns no matches in source (only possibly in tests as legacy reference).
@@ -2166,6 +2168,129 @@ instead of carrying parallel definitions.
 - Argo CD UI shows Approve button on MigrationPlan resources.
 
 **Зависит от:** 1.72, 1.75, 1.76 (CRDs must exist для thin wrappers)
+
+**Размер:** M
+
+---
+
+### 1.79a CLI app/repo subcommands + AppProjects + `open` polish
+
+**Source:** ADR 0025, 0026 (Argo CD projects model); продолжение 1.79.
+
+**Цель:** убрать необходимость заходить в Argo CD UI для повседневных операций (добавление repo, deploy status, rollback) и разделить платформенные приложения от пользовательских визуально и через RBAC.
+
+#### Поставка — AppProjects в platform-stack chart
+
+- [ ] Добавить три `AppProject` ресурса в umbrella chart (`platform-stack/cue/projects/`):
+    - `platform` — для core platform components. `sourceRepos: ["oci://ghcr.io/apprafter/*", "*"]` (через `*` пока разрешено пока нет fork-сценариев), `destinations: [{namespace: "*", server: "*"}]`, `clusterResourceWhitelist: [{group: "*", kind: "*"}]`.
+    - `platform-providers` — для ServiceProvider operators (CNPG, Dragonfly, NATS, Kamaji). Те же permissions что и `platform`, разделение чисто визуальное + lifecycle-категория.
+    - `apps` — для user applications. `sourceRepos: ["*"]` (пока не введён RBAC через AccessGrant Phase 4), `destinations: [{namespace: "*", server: "https://kubernetes.default.svc"}]`, `clusterResourceWhitelist: []` (юзеры не создают cluster-scoped ресурсы), `namespaceResourceWhitelist: [{group: "apprafter.io", kind: "Application"}, {group: "", kind: "ConfigMap"}, {group: "", kind: "Secret"}, {group: "gateway.networking.k8s.io", kind: "HTTPRoute"}]`.
+- [ ] Update umbrella Helm templates — все platform Applications получают `spec.project: platform`, ServiceProvider Applications получают `spec.project: platform-providers`.
+- [ ] CMP plugin (`argocd-cue-cmp`) рендерит user Application CRs с `spec.project: apps` по умолчанию.
+
+#### Поставка — `apprafter open` polish
+
+- [ ] `apprafter open argocd` URL → `/applications?proj=apps` по умолчанию.
+- [ ] Флаги `--project <name>` (default `apps`) и `--all-projects` (убирает фильтр).
+- [ ] Output формат при открытии:
+    ```
+    $ apprafter open argocd
+
+    Opening Argo CD UI...
+      URL:       https://localhost:8080/applications?proj=apps
+      Username:  admin
+      Password:  H7x4kP9aB3...
+                 (copied to clipboard)
+
+    ✓ Browser opened
+    ℹ Press Ctrl+C to stop port-forward
+    ```
+- [ ] Password copy to clipboard через `arboard` crate (cross-platform).
+- [ ] Password также печатается в terminal в plaintext — юзер может подсмотреть если clipboard засрался другим контентом.
+- [ ] Попытка pre-fill username через URL `?username=admin` — если Argo CD это поддерживает (проверить empirically, не блокирующее на acceptance). Если нет — оставить только display + clipboard.
+- [ ] Аналогичная обработка для `apprafter open backstage` (когда появится).
+
+#### Поставка — `apprafter app` подкоманды
+
+- [ ] `apprafter app add [<git-url>]`:
+    - Без аргумента: детектит git origin из cwd через `git remote get-url origin`, нормализует (SSH→HTTPS, убирает `.git`).
+    - Флаги: `--name <name>` (default = repo name), `--branch <branch>` (default = current branch для cwd-режима, `main` для explicit URL), `--path <path>` (default `/`), `--project <name>` (default `apps`), `--remote <name>` (default `origin`).
+    - Interactive: спрашивает name/branch/path с дефолтами; non-interactive: использует defaults или fails если `--git-url` не задан.
+    - Проверка доступности репо — `git ls-remote` через subprocess (поддерживает HTTPS auth check без token, для private — детект unauthorized).
+    - Если репо private и не зарегистрирован cred — inline prompt: "Use existing PAT / Add new PAT / Skip". "Add new PAT" вызывает тот же flow что `apprafter repo creds add`.
+    - Пишет Argo CD `Application` CR в `argocd` namespace с label `apprafter.io/managed-by: apprafter` и annotation `apprafter.io/source: cli`. CR указывает на пользовательский repo, CMP plugin рендерит `apprafter/Application.cue` оттуда.
+- [ ] `apprafter app list [--project <name>] [--all-projects]`:
+    - Default filter `--project apps`.
+    - Таблица: name, repo, branch, sync state, health, last sync time.
+- [ ] `apprafter app status <name>`:
+    - Detail view: Argo CD Application sync/health + AppRafter Application CR conditions (если CMP уже отрендерил) + перечень child resources.
+    - Если есть pending MigrationPlan для этого app — выводит в верхней секции с approve-командой (зеркальная логика к `dev cluster status`).
+- [ ] `apprafter app logs <name> [--follow] [--tail <N>] [--container <c>]`:
+    - Wrapper над `kubectl logs` с label selector по AppRafter Application.
+    - Multi-pod: aggregate by default, `--pod <name>` для конкретного.
+- [ ] `apprafter app rollback <name> [--to <revision>]`:
+    - Без `--to`: rollback к предыдущей Git revision (читает `status.history` из Argo CD Application).
+    - С `--to <sha>`: rollback к указанному коммиту.
+    - Внутри — patch `spec.source.targetRevision`, Argo CD ресинкает.
+    - Confirmation prompt в interactive, `--yes` для non-interactive.
+- [ ] `apprafter app remove <name>`:
+    - Confirmation prompt с listing того что удалится (deployment, claims, потерянные данные).
+    - Удаляет Argo CD Application, в каскаде — AppRafter Application CR и child resources.
+    - `--keep-data` опция — удаляет workload, оставляет PVC/ResourceClaims.
+
+**Alias:** `apprafter a` → `apprafter app` (если не конфликтует с `apply` — проверить; если конфликтует, без alias).
+
+#### Поставка — `apprafter repo creds` подкоманды
+
+- [ ] `apprafter repo creds add [<name>]`:
+    - Interactive wizard: name, URL prefix (default детектится по последнему `app add`-у с private репо), type (PAT/SSH/basic-auth), token/key input (через `inquire::Password`).
+    - Token validation:
+        - GitHub: `github_pat_*` (fine-grained) или `ghp_*` (classic), regex check + API ping `GET https://api.github.com/user`.
+        - GitLab: `glpat-*`, API ping `GET https://gitlab.com/api/v4/user`.
+        - Generic: формат не валидируется, только URL prefix reachability.
+    - Создаёт k8s Secret в namespace `argocd` с labels:
+        - `argocd.argoproj.io/secret-type: repo-creds`
+        - `apprafter.io/managed-by: apprafter`
+        - `apprafter.io/cred-name: <name>`
+        - Stringdata: `url`, `username` (для PAT — обычно git provider user или token holder), `password` (token).
+- [ ] `apprafter repo creds list`:
+    - Таблица: name, URL prefix, type, last used (если есть annotation), expires (если можем определить — для GitHub fine-grained есть `X-GitHub-Request-Id` headers но не exp; для classic — никак; оставить N/A).
+- [ ] `apprafter repo creds show <name>`:
+    - Detail view, token замаскирован (`****`).
+- [ ] `apprafter repo creds rotate <name>`:
+    - Prompt только для нового token, остальные поля сохраняются.
+    - Patch existing Secret (не пересоздаёт — иначе Argo CD может потерять reference кратковременно).
+    - Re-validation token'а перед patch.
+- [ ] `apprafter repo creds remove <name>`:
+    - Confirmation с warning если есть Applications зависящие от этого prefix.
+    - `--yes` для skip confirmation.
+
+#### Поставка — context-aware error hints
+
+- [ ] При `apprafter app add` без `.git` в cwd: hint "Run from a git repository, or use `apprafter app add <git-url>` explicitly".
+- [ ] При попытке `app add` для private репо без creds в non-interactive: error "Repository requires authentication. Configure with `apprafter repo creds add` first" + exit code 2.
+- [ ] При попытке `app add` с конфликтным именем (Application с таким name уже есть): error "Application '<name>' already exists. Use `apprafter app status <name>` or pick a different `--name`".
+
+#### Acceptance
+
+- [ ] `apprafter open argocd` открывает UI с фильтром `apps`, username отображается в выводе, password в clipboard.
+- [ ] В Argo CD UI верхний project selector показывает три проекта; `apps` пустой при свежем bootstrap, `platform` и `platform-providers` содержат соответствующие Applications.
+- [ ] `cd <git-repo> && apprafter app add` без аргументов корректно детектит origin и регистрирует app.
+- [ ] `apprafter app add` для private репо без creds → interactive prompt предлагает добавить PAT inline.
+- [ ] `apprafter repo creds add` с невалидным GitHub PAT → fail с regex error до API call.
+- [ ] `apprafter repo creds add` с валидным форматом но revoked token → fail с API ping error и hint про token rotation.
+- [ ] `apprafter app rollback <name>` без `--to` откатывает к предыдущей revision; Argo CD синкает в течение reconcile cycle.
+- [ ] `apprafter app remove` удаляет Application каскадно, `--keep-data` сохраняет PVC.
+- [ ] `apprafter repo creds rotate` обновляет token, existing apps продолжают синкаться без даунтайма Argo CD repo reconcile.
+
+#### Не входит в этот item
+
+- AccessGrant / RBAC enforcement через AppProject (Phase 4 целиком).
+- Reverse proxy для `apprafter open` (отдельный item, после M2, когда понадобится Backstage с теми же проблемами).
+- `apprafter app scale`, `apprafter app env set` — высокоуровневые ops-команды (M2+, после ServiceProvider/ResourceClaim).
+- Backstage Application plugin — отдельный item в Phase 3.
+
+**Зависит от:** 1.79 (CLI thin wrappers infrastructure + `open` для argocd базовый).
 
 **Размер:** M
 
@@ -4010,3 +4135,4 @@ instead of carrying parallel definitions.
 | 2026-05-20 | M1.5 Track B.1.70 walk-fix #9 — на v0.1.105 image впервые реально запустился webhook code (v0.1.91 image был broken, binary missing, webhook code не выполнялся 8 walks). Surfaced **Bug N** — `thread 'main' panicked at rustls-0.23.40/src/crypto/mod.rs:249: Could not automatically determine the process-level CryptoProvider`. rustls 0.23+ removed auto-default; operator binary имел fix `install_rustls_crypto_provider()` с v0.1.61, но webhook crate missed (jump straight to `RustlsConfig::from_pem_file` без install). Long-standing latent bug, был masked broken v0.1.91 image months. Fix: `operator/admission-webhook/src/lib.rs` получил `install_rustls_crypto_provider()` (same shape as operator's — `aws_lc_rs::default_provider().install_default()` идемпотентный); `src/main.rs` вызывает первой строкой `async fn main()`, до TLS server init; `Cargo.toml` direct `rustls = { version = "0.23", features = ["aws-lc-rs"] }` dep для `default_provider` resolution; +2 regression tests (`install_rustls_crypto_provider_sets_a_process_level_default`, `_is_idempotent`) mirror operator's. Chart-side: operator + webhook charts оба bump к `version v0.1.93 / appVersion v0.1.106` в lockstep (operator chart bump'ит даже хоть его code не менялся — sync appVersion предотвращает future drift). Chart bumped 0.1.9 → 0.1.10 с compat entry + known-issue note в 0.1.9; CLI bumped 0.1.105 → 0.1.106, RELEASED_PLATFORM_STACK_VERSION → "0.1.10", RELEASED_OPERATOR_VERSION → "v0.1.106". 557 cli + 62 operator tests passed; все гейты clean | v0.1.106 |
 | 2026-05-20 | M1.5 Track B.1.70 walk-fix #10 — argocd Application Synced/Degraded; новый argocd-repo-server pod (с cue-cmp sidecar) stuck Init:0/1 с `MountVolume.SetUp failed for volume "cue-cmp-config": configmap "cue-cmp-plugin-config" not found`. **Bug O** — `component_argocd.cue` добавлял cue-cmp sidecar с volumeMount на ConfigMap `cue-cmp-plugin-config` в chart 0.1.2 (Track B.1.69), но **сам ConfigMap никогда не создавался**. Bug latent через 6 chart versions (0.1.2 → 0.1.10), masked предыдущими blockers (broken image, missing ClusterIssuer, rustls panic) — repo-server pod не получал шанс schedule. Walk #10 был первым clean run где cue-cmp sidecar реально attached + mount evaluated. Fix: `component_argocd.cue` получает `extraObjects` block с ConfigMap `cue-cmp-plugin-config` содержащим verbatim plugin.yaml content (Argo CD CMP contract — `apiVersion: argoproj.io/v1alpha1, kind: ConfigManagementPlugin, name: cue, discover.find.glob: "**/apprafter*.cue", generate.command: sh -c /usr/local/bin/entrypoint.sh`). Источник истины пока остаётся `argocd-cue-cmp/plugin.yaml`, embedding это duplication до future `cue cmd` step в chart renderer прочитает source файл напрямую — комментарий marks lockstep edit requirement. Chart bumped 0.1.10 → 0.1.11 с full compat entry + known-issue note в 0.1.10; CLI bumped 0.1.106 → 0.1.107, RELEASED_PLATFORM_STACK_VERSION → "0.1.11". 557 cli tests passed; все гейты clean | v0.1.107 |
 | 2026-05-20 | M1.5 Track B.1.70 walk-fix #11 — walk-fix #10 ConfigMap зашёл OK, новый argocd-repo-server pod теперь stuck на image pull instead of mount: `Back-off pulling image "ghcr.io/apprafter/argocd-cue-cmp:v0.1.0": ErrImagePull MANIFEST_UNKNOWN`. **Bug P** — `crane ls` показал image **существует**, но tag = `:0.1.0` (без `v`), а chart pin = `:v0.1.0`. `argocd-cue-cmp-publish.yml` workflow tag line was `${IMAGE}:${VERSION}` где VERSION = `0.1.0` (без v) из VERSION file. Git tag создавался как `argocd-cue-cmp/v<version>` (с `v`), но image tag — без. Inconsistency с operator + webhook workflows (там `image:${github.ref_name}` = `:v0.1.x`). Latent с chart 0.1.2 (Track B.1.69), masked walks #5-10 upstream blockers (broken ConfigMap не давал pull happen). Fix: (1) workflow `tags:` line gets `v` prefix: `${IMAGE}:v${VERSION}`; (2) `Tag :latest` source + release notes example updated; (3) `argocd-cue-cmp/VERSION` 0.1.0 → 0.1.1 (workflow detect gates на git tag existence, без bump skipnет publish); (4) `component_argocd-cue-cmp.cue` pin к `v0.1.1`. v0.1.1 image — re-publish source v0.1.0 с corrected tag form. v0.1.0 image stays на registry как historical artefact. Chart bumped 0.1.11 → 0.1.12 с full compat entry + known-issue note в 0.1.11; CLI bumped 0.1.107 → 0.1.108, RELEASED_PLATFORM_STACK_VERSION → "0.1.12". 557 cli tests passed; все гейты clean | v0.1.108 |
+| 2026-05-20 | M1.5 Track B.1.71 closure — chart as single source of truth. `cli/cli-providers/build.rs` extracts `_loaderValues.{cilium,argocd}` + `currentVersion` from `platform-stack/cue/` at compile time, emits `CILIUM_VALUES_YAML`, `ARGOCD_LOADER_VALUES_YAML`, `RELEASED_PLATFORM_STACK_VERSION` as generated Rust constants. `cluster_bootstrap.rs` swaps hand-rolled YAML for these. 12 dead `*_yaml` renderers deleted (admission_webhook, application_crd, argocd_gateway, argocd_repo_secret, backstage_app_config, backstage_manifests, bootstrap_app, cert_manager_values, cilium_values, issuer, network_policy, operator_chart, operator_values) plus 3 dead examples. CUE invariant `_components.cilium.values ≡ _loaderValues.cilium` makes walk-fix #6's drift class structurally impossible; Argo CD chart's `values:` derives from `_loaderValues.argocd & { ...extras... }` so loader stays a strict subset by construction. `RELEASED_PLATFORM_STACK_VERSION` drift class also gone. Chart bumped 0.1.12 → 0.1.13 (refactor, no rendered-output change); CLI bumped 0.1.108 → 0.1.109. Test count 557 → 479 (~80 deleted renderer tests, 4 new loader_values regression guards). Deferred: `RELEASED_OPERATOR_VERSION` from operator chart's Chart.yaml (cross-workspace path), `argocd-cue-cmp/plugin.yaml` embedded in component_argocd as string literal | v0.1.109 |
