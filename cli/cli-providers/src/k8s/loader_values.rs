@@ -102,6 +102,22 @@ mod tests {
     }
 
     #[test]
+    fn released_operator_version_matches_v_prefixed_semver() {
+        // Pinned via build.rs reading both operator + webhook
+        // Chart.yaml#appVersion (asserted equal). The `v` prefix
+        // is convention for operator + webhook image tags (see
+        // release-operator.yml's tag inputs).
+        assert!(
+            RELEASED_OPERATOR_VERSION.starts_with('v'),
+            "expected `v` prefix, got {RELEASED_OPERATOR_VERSION:?}"
+        );
+        assert!(
+            RELEASED_OPERATOR_VERSION.matches('.').count() >= 2,
+            "expected major.minor.patch, got {RELEASED_OPERATOR_VERSION:?}"
+        );
+    }
+
+    #[test]
     fn released_platform_stack_version_matches_semver_shape() {
         // CUE schema in `platform-stack/cue/platform.cue` already
         // pins `currentVersion: #Version`, so this is belt-and-

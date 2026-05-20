@@ -10,13 +10,6 @@
 //!   `format!("{image}:{tag}")` using the supplied or default tag.
 //! - Both arguments default when `None`.
 
-/// Single source of truth for the operator + admission-webhook image
-/// tag installed by `cluster-bootstrap` by default. Bump in lockstep
-/// with the `release-operator.yml` workflow run that publishes the
-/// matching `apprafter-operator` / `apprafter-admission-webhook`
-/// container images to ghcr.io.
-pub const RELEASED_OPERATOR_VERSION: &str = "v0.1.106";
-
 /// Default OCI registry path the chart is published to.
 ///
 /// Stored **without** the `oci://` scheme prefix. Two reasons:
@@ -71,6 +64,7 @@ pub fn resolve_image_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::k8s::loader_values::RELEASED_OPERATOR_VERSION;
 
     #[test]
     fn defaults_compose_repo_and_tag() {

@@ -19,21 +19,40 @@
 //! behaviour.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let chart_root = manifest_dir.join("../../platform-stack/cue");
 
+    let operator_chart_yaml =
+        manifest_dir.join("../../operator/charts/apprafter-operator/Chart.yaml");
+    let webhook_chart_yaml =
+        manifest_dir.join("../../operator/charts/apprafter-admission-webhook/Chart.yaml");
+
     println!("cargo:rerun-if-changed={}", chart_root.display());
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", operator_chart_yaml.display());
+    println!("cargo:rerun-if-changed={}", webhook_chart_yaml.display());
 
     let cilium_yaml = cue_export(&chart_root, "_loaderValues.cilium.values");
     let argocd_yaml = cue_export(&chart_root, "_loaderValues.argocd.values");
     let cilium_chart_version = cue_export_string(&chart_root, "_loaderValues.cilium.chartVersion");
     let argocd_chart_version = cue_export_string(&chart_root, "_loaderValues.argocd.chartVersion");
     let platform_stack_version = cue_export_string(&chart_root, "currentVersion");
+
+    let operator_app_version = read_chart_field(&operator_chart_yaml, "appVersion");
+    let webhook_app_version = read_chart_field(&webhook_chart_yaml, "appVersion");
+
+    assert_eq!(
+        operator_app_version, webhook_app_version,
+        "operator + admission-webhook charts must ship the same appVersion \
+         (operator: {operator_app_version}, webhook: {webhook_app_version}) — \
+         they're built together by release-operator.yml"
+    );
+
+    let released_operator_version = operator_app_version;
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let out_file = out_dir.join("loader_values.rs");
@@ -45,12 +64,14 @@ fn main() {
          pub const ARGOCD_LOADER_VALUES_YAML: &str = {argocd_yaml:?};\n\
          pub const CILIUM_CHART_VERSION: &str = {cilium_chart_version:?};\n\
          pub const ARGOCD_CHART_VERSION: &str = {argocd_chart_version:?};\n\
-         pub const RELEASED_PLATFORM_STACK_VERSION: &str = {platform_stack_version:?};\n",
+         pub const RELEASED_PLATFORM_STACK_VERSION: &str = {platform_stack_version:?};\n\
+         pub const RELEASED_OPERATOR_VERSION: &str = {released_operator_version:?};\n",
         cilium_yaml = cilium_yaml,
         argocd_yaml = argocd_yaml,
         cilium_chart_version = cilium_chart_version,
         argocd_chart_version = argocd_chart_version,
         platform_stack_version = platform_stack_version,
+        released_operator_version = released_operator_version,
     );
 
     std::fs::write(&out_file, contents)
@@ -111,4 +132,28 @@ fn cue_export(chart_root: &PathBuf, expr: &str) -> String {
 fn cue_export_string(chart_root: &PathBuf, expr: &str) -> String {
     let raw = cue_export(chart_root, expr);
     raw.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
+/// Read a top-level scalar string field from a Helm Chart.yaml
+/// file via a minimal line-prefix grep. Helm chart manifests
+/// keep `version:` and `appVersion:` as top-level keys in
+/// flat YAML, so this avoids the cost of a full serde_yaml
+/// dependency at build time. Trims surrounding whitespace +
+/// optional `"..."` quoting.
+fn read_chart_field(chart_yaml: &Path, field: &str) -> String {
+    let content = std::fs::read_to_string(chart_yaml).unwrap_or_else(|e| {
+        panic!(
+            "cli-providers/build.rs: read {chart_yaml:?}: {e}. \
+             Track B.1.71b moved the SoT for operator + webhook \
+             image tags into these Chart.yaml files."
+        );
+    });
+    let prefix = format!("{field}:");
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            return rest.trim().trim_matches('"').trim_matches('\'').to_string();
+        }
+    }
+    panic!("cli-providers/build.rs: field {field:?} not found in {chart_yaml:?}");
 }

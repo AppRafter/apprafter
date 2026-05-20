@@ -27,14 +27,9 @@ _components: "admission-webhook": #Component & {
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-admission-webhook"
-			// Image tag v0.1.106: bumped because the v0.1.105
-			// webhook binary panicked at TLS init with
-			// `Could not automatically determine the
-			// process-level CryptoProvider`. v0.1.106 calls
-			// `install_rustls_crypto_provider()` (mirroring
-			// the operator's v0.1.61 fix) before the rustls-
-			// using axum-server initialises.
-			tag: string | *"v0.1.106"
+			// `tag:` omitted — falls back to `.Chart.AppVersion`
+			// (same pattern as component_apprafter-operator.cue;
+			// see that file's comment for the full rationale).
 		}
 		// Two replicas by default so a single pod restart
 		// doesn't gap the validating webhook. Tier overlays

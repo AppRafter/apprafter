@@ -32,16 +32,14 @@ _components: "apprafter-operator": #Component & {
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-operator"
-			// Image tag pinned to v0.1.106: the operator chart
-			// itself is unchanged from v0.1.92 (deployment
-			// template gained explicit `command:` then), but
-			// the admission-webhook crate at v0.1.105 panicked
-			// at runtime on rustls 0.23+'s missing default
-			// CryptoProvider; v0.1.106 adds the same fix the
-			// operator binary already had since v0.1.61.
-			// Bumping operator chart version too (v0.1.92 →
-			// v0.1.93) keeps the lockstep with webhook chart.
-			tag: string | *"v0.1.106"
+			// `tag:` omitted — the operator chart's deployment
+			// template falls back to `.Chart.AppVersion` when
+			// `image.tag` is empty, so the SoT for the deployed
+			// image tag is the operator chart's
+			// `Chart.yaml#appVersion`. CLI's
+			// `RELEASED_OPERATOR_VERSION` is derived from the
+			// same Chart.yaml via `cli/cli-providers/build.rs`
+			// (B.1.71b drift-class closure).
 		}
 		// Leader-election guards (10s renew / 30s expiry) match
 		// the in-tree settings; tier overlays may bump replicas.
