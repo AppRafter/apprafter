@@ -61,12 +61,13 @@ use std::io::Write;
 use std::path::Path;
 
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
+use cli_core::target::{default_config_root, load_active_target_config, TargetStorePaths};
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
     HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
-    APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
-    ARGOCD_CHART_VERSION, ARGOCD_LOADER_VALUES_YAML, CILIUM_CHART_VERSION, CILIUM_VALUES_YAML,
-    RELEASED_PLATFORM_STACK_VERSION,
+    APPRAFTER_CLI_FIELD_MANAGER, APPRAFTER_PLATFORM_STACK_CHART_NAME,
+    APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, ARGOCD_CHART_VERSION, ARGOCD_LOADER_VALUES_YAML,
+    CILIUM_CHART_VERSION, CILIUM_VALUES_YAML, RELEASED_PLATFORM_STACK_VERSION,
 };
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
@@ -111,22 +112,45 @@ pub fn run() -> Result<()> {
     let plaintext = decrypt_cached_kubeconfig(&hetzner)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
 
+    let store_root = default_config_root().ok();
+    let target_store = store_root
+        .as_ref()
+        .map(|p| TargetStorePaths::for_root(p.clone()));
+    let target_config = target_store
+        .as_ref()
+        .and_then(|s| load_active_target_config(s, None));
+
+    let active_tier: u8 = target_config
+        .as_ref()
+        .and_then(|c| c.default_tier.as_deref())
+        .and_then(|s| s.parse::<cli_core::Tier>().ok())
+        .map(|t| t.level())
+        .unwrap_or(1);
+
+    let active_domain: Option<&str> = None;
+
     let platform_repo = platform_stack_repo();
     let platform_version = platform_stack_version();
 
     let root_app_yaml = render_root_application(&platform_repo, &platform_version);
     let root_app_file = write_tempfile_with("apprafter-root-application-", &root_app_yaml)?;
 
+    let platformstack_yaml = render_platformstack_default(active_tier, active_domain);
+    let platformstack_file =
+        write_tempfile_with("apprafter-platformstack-default-", &platformstack_yaml)?;
+
     perform_bootstrap(
         &HelmCli,
         &KubectlCli,
         kubeconfig_file.path(),
         root_app_file.path(),
+        platformstack_file.path(),
     )?;
 
     println!(
         "cluster-bootstrap complete: Cilium installed, node Ready, Argo CD installed, \
-         platform-stack {platform_version} reconciling from {platform_repo}/{chart}",
+         platform-stack {platform_version} reconciling from {platform_repo}/{chart}; \
+         PlatformStack/default created in apprafter-system (tier={active_tier})",
         chart = APPRAFTER_PLATFORM_STACK_CHART_NAME,
     );
     Ok(())
@@ -140,6 +164,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     kubectl: &K,
     kubeconfig_path: &Path,
     root_application_path: &Path,
+    platformstack_default_path: &Path,
 ) -> Result<()> {
     // 0. Cilium first — see module doc. k3s starts without a
     //    CNI, the single node carries
@@ -238,6 +263,20 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         kubeconfig_path,
     )?;
 
+    // 5. Apply the default PlatformStack singleton. The
+    //    operator chart's CRD reconciliation under Argo CD has
+    //    by now registered platformstacks.apprafter.io (sync-wave
+    //    -5 ensured this before the operator Deployment came up),
+    //    so the apply lands on a defined schema. SSA with field
+    //    manager `apprafter-cli` means a re-bootstrap is idempotent
+    //    (managed fields stay with the loader; PlatformController
+    //    in B.1.73 will own status under its own field manager).
+    kubectl.apply_manifest_server_side(
+        &ManifestSource::Path(platformstack_default_path.to_path_buf()),
+        kubeconfig_path,
+        APPRAFTER_CLI_FIELD_MANAGER,
+    )?;
+
     Ok(())
 }
 
@@ -282,6 +321,48 @@ spec:
       - ServerSideApply=true
 "#,
         chart_name = APPRAFTER_PLATFORM_STACK_CHART_NAME,
+    )
+}
+
+/// Render the default `PlatformStack` CR YAML the loader applies
+/// once the platform Application reports Healthy. Singleton —
+/// name=default, namespace=apprafter-system. Webhook enforces
+/// both fields plus the rest of the contract.
+///
+/// `tier` is the active CLI target's tier (1..=4). `domain`
+/// is optional — tier 1 deployments without a public domain
+/// omit the field entirely and rely on the chart's defaults.
+pub(crate) fn render_platformstack_default(tier: u8, domain: Option<&str>) -> String {
+    let domain_line = match domain {
+        Some(d) => format!("    domain: \"{d}\"\n"),
+        None => String::new(),
+    };
+    format!(
+        r#"# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Rendered by `apprafter cluster-bootstrap` (Track B.1.72).
+# The PlatformStack singleton is the declarative control plane
+# for the platform version. PlatformController (B.1.73) will
+# reconcile spec changes; in 1.72 the CR exists with empty
+# status until then.
+apiVersion: apprafter.io/v1alpha1
+kind: PlatformStack
+metadata:
+  name: default
+  namespace: apprafter-system
+spec:
+  channel: stable
+  autoUpgrade: false
+  source:
+    upstream: "oci://{repo}/{chart}"
+    repoURL: "oci://{repo}/{chart}"
+    checkInterval: 6h
+  values:
+    tier: {tier}
+{domain_line}"#,
+        repo = APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
+        chart = APPRAFTER_PLATFORM_STACK_CHART_NAME,
+        tier = tier,
+        domain_line = domain_line,
     )
 }
 
@@ -406,8 +487,10 @@ mod tests {
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
         let root_app = PathBuf::from("/tmp/root-app.yaml");
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
 
-        perform_bootstrap(&helm, &kubectl, &kc, &root_app).expect("bootstrap");
+        perform_bootstrap(&helm, &kubectl, &kc, &root_app, platformstack.path())
+            .expect("bootstrap");
 
         // Helm: two repo_adds (cilium, argo) and two installs
         // (cilium first, then the loader Argo CD release).
@@ -436,17 +519,13 @@ mod tests {
         assert_eq!(installs[1].version.as_deref(), Some(ARGOCD_CHART_VERSION));
 
         // kubectl: exactly one client-side apply (the root
-        // Application), no SSA applies.
+        // Application), one SSA apply (the PlatformStack singleton).
         let applies = kubectl.applies.borrow();
         assert_eq!(applies.len(), 1);
         match &applies[0].0 {
             ManifestSource::Path(p) => assert_eq!(p, &root_app),
             other => panic!("expected Path root-app, got {other:?}"),
         }
-        assert!(
-            kubectl.ssa_applies.borrow().is_empty(),
-            "loader path should not use server-side apply"
-        );
 
         // Waits: node Ready first (so step 1 can schedule),
         // argocd-server Available second, root Application
@@ -513,8 +592,10 @@ mod tests {
         let kubectl = FakeKubectl::default();
         let kc = PathBuf::from("/tmp/kubeconfig");
         let root_app = PathBuf::from("/tmp/root-app.yaml");
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
 
-        perform_bootstrap(&helm, &kubectl, &kc, &root_app).expect("bootstrap");
+        perform_bootstrap(&helm, &kubectl, &kc, &root_app, platformstack.path())
+            .expect("bootstrap");
 
         let installs = helm.installs.borrow();
         let cilium_idx = installs.iter().position(|i| i.release == "cilium");
@@ -593,5 +674,55 @@ mod tests {
         let err = decrypt_cached_kubeconfig(&hetzner).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("kubeconfig"), "{msg}");
+    }
+
+    #[test]
+    fn step_5_ssa_applies_platformstack_with_loader_field_manager() {
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kubeconfig = tempfile::NamedTempFile::new().unwrap();
+        let root_app = tempfile::NamedTempFile::new().unwrap();
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            kubeconfig.path(),
+            root_app.path(),
+            platformstack.path(),
+        )
+        .unwrap();
+
+        let ssa = kubectl.ssa_applies.borrow();
+        assert_eq!(ssa.len(), 1);
+        match &ssa[0].0 {
+            ManifestSource::Path(p) => assert_eq!(p, platformstack.path()),
+            other => panic!("expected Path SSA source, got {other:?}"),
+        }
+        assert_eq!(ssa[0].2, "apprafter-cli");
+    }
+
+    #[test]
+    fn render_platformstack_default_includes_tier_and_domain() {
+        let yaml = render_platformstack_default(2, Some("example.com"));
+        assert!(yaml.contains("name: default"));
+        assert!(yaml.contains("namespace: apprafter-system"));
+        assert!(yaml.contains("channel: stable"));
+        assert!(yaml.contains("tier: 2"));
+        assert!(yaml.contains("domain: \"example.com\""));
+        assert!(yaml.contains("checkInterval: 6h"));
+    }
+
+    #[test]
+    fn render_platformstack_default_omits_domain_when_unset() {
+        let yaml = render_platformstack_default(1, None);
+        assert!(yaml.contains("tier: 1"));
+        assert!(!yaml.contains("domain:"));
+    }
+
+    #[test]
+    fn render_platformstack_default_uses_apprafter_oci_repo() {
+        let yaml = render_platformstack_default(1, None);
+        assert!(yaml.contains("oci://ghcr.io/apprafter/platform-stack"));
     }
 }
