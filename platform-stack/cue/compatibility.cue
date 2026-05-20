@@ -998,3 +998,47 @@ compatibility: "0.1.14": {
 		"docs/changelog/UNRELEASED.md#v01110",
 	]
 }
+
+// 0.1.15 — Track B.1.72 closure: PlatformStack CRD + Application
+// CRD restoration + admission-webhook PlatformStack validator +
+// loader default CR. Operator + admission-webhook images bump to
+// v0.1.111 (the new operator chart appVersion). Chart shape
+// changes vs 0.1.14: operator chart now ships two CRD templates
+// (applications.apprafter.io + platformstacks.apprafter.io); the
+// admission-webhook ValidatingWebhookConfiguration now declares
+// two webhook entries. No user-facing values schema change.
+compatibility: "0.1.15": {
+	change:          "safe"
+	operatorVersion: "v0.1.111"
+	notes: """
+		Track B.1.72 closure: ship the PlatformStack CRD per
+		spec §3.11 + restore the Application CRD that B.1.71
+		dropped (no shipper after the imperative kubectl-apply
+		path was removed). Both CRDs ship from the operator
+		Helm chart at sync-wave -5 so cert-manager (-10) is
+		up first and the operator + admission-webhook
+		Deployments (default 0) see the schemas registered.
+
+		Admission webhook gains PlatformStack validation:
+		singleton (name=default, namespace=apprafter-system),
+		channel enum, pin semver shape, source.checkInterval
+		>= 1h. Webhook dispatch routes by kind. The
+		ValidatingWebhookConfiguration template carries a
+		second webhook entry pointing at the same /validate
+		endpoint.
+
+		Loader (cluster_bootstrap.rs) gains step 5: apply the
+		default PlatformStack CR via SSA with field manager
+		`apprafter-cli` after the platform Application reports
+		Healthy. PlatformController reconciliation logic lands
+		in B.1.73; until then the CR sits with empty status.
+
+		No rendered chart values change vs 0.1.14 for any
+		existing component — every diff is additive (new CRD
+		templates + new webhook entry).
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-19-track-b-1-72-platformstack-crd.md",
+		"docs/changelog/UNRELEASED.md#v01111",
+	]
+}
