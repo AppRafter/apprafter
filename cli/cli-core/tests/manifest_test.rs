@@ -49,10 +49,19 @@ fn parse_full_infrastructure_fixture() {
 
     let fw = parsed.spec.firewall.as_ref().expect("firewall present");
     let ingress = fw.ingress.as_ref().expect("ingress present");
-    assert_eq!(ingress.len(), 2);
+    // The fixture exposes three ports on the tier-1 firewall:
+    // 22 (SSH bootstrap), 443 (HTTPS for HTTPRoute backends),
+    // and 6443 (k3s apiserver for kubectl + helm from the
+    // workstation — added in commit b9b204b). The assertion
+    // was originally `== 2` and only surfaced as wrong once
+    // the B.1.71 CI fix put cue on PATH so this test stopped
+    // silent-skipping on Err(CueNotFound).
+    assert_eq!(ingress.len(), 3);
     assert_eq!(ingress[0].port, "22");
     assert_eq!(ingress[0].protocol.as_deref(), Some("tcp"));
     assert_eq!(ingress[1].port, "443");
+    assert_eq!(ingress[2].port, "6443");
+    assert_eq!(ingress[2].protocol.as_deref(), Some("tcp"));
 }
 
 #[test]
