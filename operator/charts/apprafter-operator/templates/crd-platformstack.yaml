@@ -65,12 +65,15 @@ spec:
                     upstream:
                       type: string
                       pattern: "^oci://.+$"
+                      default: "oci://ghcr.io/apprafter/platform-stack"
                     repoURL:
                       type: string
                       pattern: "^oci://.+$"
+                      default: "oci://ghcr.io/apprafter/platform-stack"
                     checkInterval:
                       type: string
                       pattern: "^[0-9]+(h|m|s)$"
+                      default: "6h"
                 values:
                   type: object
                   required: [tier]
