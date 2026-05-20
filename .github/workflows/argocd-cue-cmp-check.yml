@@ -4,14 +4,14 @@ name: argocd-cue-cmp-check
 # PR + push-to-master gate for `argocd-cue-cmp/**`. Three
 # layers, mirroring the platform-stack-check pattern:
 #
-#   1. VERSION file sanity: single non-empty line, no
-#      whitespace, semver-ish.
+#   1. version.cue sanity: reads bare semver via
+#      `cue export -e version --out text`, validates format.
 #   2. Image smoke build: `docker build` succeeds against
 #      the Dockerfile.
-#   3. Drift detection: if `argocd-cue-cmp/v<VERSION>` is
+#   3. Drift detection: if `argocd-cue-cmp/v<version>` is
 #      already a tag on origin and any file under
 #      `argocd-cue-cmp/` differs from that tag, fail.
-#      Forces the maintainer to bump VERSION or revert.
+#      Forces the maintainer to bump version.cue or revert.
 #
 # The publish workflow's `should_publish` gate silently
 # no-ops on non-bump pushes; this check turns that into a
@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   check:
-    name: VERSION + dockerfile smoke + drift
+    name: version.cue + dockerfile smoke + drift
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -43,20 +43,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: VERSION file sanity
+      - name: version.cue sanity
         id: version
         run: |
-          version=$(tr -d '[:space:]' < argocd-cue-cmp/VERSION)
+          version=$(cue export -e version --out text ./argocd-cue-cmp/...)
           if [[ -z "${version:-}" ]]; then
-            echo "::error::argocd-cue-cmp/VERSION is empty"
+            echo "::error::failed to extract version from argocd-cue-cmp/version.cue"
             exit 1
           fi
           if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::error::argocd-cue-cmp/VERSION '${version}' is not semver"
+            echo "::error::argocd-cue-cmp/version.cue '${version}' is not semver"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -103,13 +106,13 @@ jobs:
           fi
           echo "::notice::entrypoint smoke: rendered Application correctly"
 
-      - name: Drift detection (image source changed without VERSION bump)
+      - name: Drift detection (image source changed without version.cue bump)
         env:
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           if ! git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::notice::${TAG} not on origin yet — VERSION is in-flight, drift check no-op."
+            echo "::notice::${TAG} not on origin yet — version.cue is in-flight, drift check no-op."
             exit 0
           fi
           # Pathspec covers everything that affects the
@@ -119,18 +122,18 @@ jobs:
               'argocd-cue-cmp/Dockerfile' \
               'argocd-cue-cmp/plugin.yaml' \
               'argocd-cue-cmp/entrypoint.sh' \
-              'argocd-cue-cmp/VERSION'; then
+              'argocd-cue-cmp/version.cue'; then
             echo "::notice::No drift vs ${TAG} — image source unchanged."
             exit 0
           fi
-          echo "::error::Image source under argocd-cue-cmp/ changed since ${TAG} was published, but VERSION is still ${VERSION}."
-          echo "::error::Either bump argocd-cue-cmp/VERSION, or revert the source changes."
+          echo "::error::Image source under argocd-cue-cmp/ changed since ${TAG} was published, but version.cue is still ${VERSION}."
+          echo "::error::Either bump argocd-cue-cmp/version.cue, or revert the source changes."
           echo ""
           echo "--- Diff vs ${TAG} (truncated to 80 lines) ---"
           git diff "${TAG}" HEAD -- \
             'argocd-cue-cmp/Dockerfile' \
             'argocd-cue-cmp/plugin.yaml' \
             'argocd-cue-cmp/entrypoint.sh' \
-            'argocd-cue-cmp/VERSION' \
+            'argocd-cue-cmp/version.cue' \
             | head -80 || true
           exit 1

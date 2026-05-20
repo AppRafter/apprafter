@@ -2,6 +2,8 @@
 
 package platformstack
 
+import "apprafter.io/argocd-cue-cmp:argocdcuecmp"
+
 // Argo CD Config Management Plugin (CMP) sidecar that teaches
 // Argo CD to render CUE source repositories. See ADR 0029 for
 // the design rationale.
@@ -16,8 +18,9 @@ package platformstack
 //
 // The image is built and published independently of the
 // platform-stack chart, on its own `argocd-cue-cmp/v*` tag
-// series. Bumping the chart's choice of cue-cmp version is
-// a one-line edit to `version:` + `values.image.tag:` here.
+// series. Bumping the cue-cmp image version is a one-line
+// edit to `argocd-cue-cmp/version.cue`; this file and the
+// publish workflow both derive from that single CUE source.
 _components: "argocd-cue-cmp": #Component & {
 	name: "argocd-cue-cmp"
 	// Default OFF — this component is a sidecar, not a
@@ -36,21 +39,24 @@ _components: "argocd-cue-cmp": #Component & {
 		repoURL: "https://github.com/apprafter/apprafter/tree/main/argocd-cue-cmp"
 		path:    "argocd-cue-cmp"
 	}
-	// Pinned cue-cmp image tag. Bump this in lockstep with
-	// the chart's own `currentVersion` bump when a new
-	// argocd-cue-cmp release ships.
-	//
-	// v0.1.0 image existed on ghcr.io but was tagged
-	// `:0.1.0` (no `v` prefix) due to a workflow bug —
-	// chart's `:v0.1.0` pin produced MANIFEST_UNKNOWN at
-	// pull time. v0.1.1 onward uses the corrected
-	// `:v<version>` tag form (walk-found bug v0.1.107 →
-	// v0.1.108).
-	version: "v0.1.1"
+	// The `v` prefix is added here; the SoT version in
+	// `argocd-cue-cmp/version.cue` is bare semver (e.g.
+	// "0.1.1"). v0.1.0 image existed on ghcr.io but was
+	// tagged `:0.1.0` (no `v` prefix) due to a workflow
+	// bug — chart's `:v0.1.0` pin produced
+	// MANIFEST_UNKNOWN at pull time. v0.1.1 onward uses
+	// the corrected `:v<version>` tag form (walk-found
+	// bug v0.1.107 → v0.1.108).
+	version: "v\(argocdcuecmp.version)"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/argocd-cue-cmp"
-			tag:        string | *"v0.1.1"
+			// Tag is `v` + the SoT version from
+			// `argocd-cue-cmp/version.cue`. A single bump
+			// there propagates here and into the publish
+			// workflow's `detect` step (B.1.71b
+			// drift-class closure).
+			tag: string | *"v\(argocdcuecmp.version)"
 		}
 		// CUE evaluation timeout per repo render. Default
 		// 57s matches Argo CD's repo-server hard timeout

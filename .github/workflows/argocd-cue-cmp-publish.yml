@@ -7,9 +7,10 @@ name: argocd-cue-cmp-publish
 #
 #   - Auto-trigger on push to master that touches
 #     `argocd-cue-cmp/**` plus the workflow file.
-#   - `detect` job reads `argocd-cue-cmp/VERSION`, checks
-#     whether `argocd-cue-cmp/v<version>` already exists on
-#     origin. If yes → silent no-op. If no → publish.
+#   - `detect` job reads `argocd-cue-cmp/version.cue` via
+#     `cue export`, checks whether `argocd-cue-cmp/v<version>`
+#     already exists on origin. If yes → silent no-op. If no →
+#     publish.
 #   - `publish` job builds + pushes to ghcr.io, cosign-signs
 #     the immutable digest, then `gh release create` writes
 #     the tag and release in one shot.
@@ -33,8 +34,9 @@ on:
       version_override:
         description: |
           Optional. Publish a specific version regardless of
-          what `argocd-cue-cmp/VERSION` says. Leave empty for
-          the normal flow. Use only for emergency re-publishes.
+          what `argocd-cue-cmp/version.cue` says. Leave empty
+          for the normal flow. Use only for emergency
+          re-publishes.
         required: false
         type: string
 
@@ -56,8 +58,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
 
-      - name: Resolve version from VERSION file or override
+      - name: Resolve version from version.cue or override
         id: version
         env:
           OVERRIDE: ${{ github.event.inputs.version_override }}
@@ -66,12 +71,12 @@ jobs:
             version="${OVERRIDE}"
             echo "::notice::Using version_override=${version}"
           else
-            version=$(tr -d '[:space:]' < argocd-cue-cmp/VERSION)
+            version=$(cue export -e version --out text ./argocd-cue-cmp/...)
             if [[ -z "${version:-}" ]]; then
-              echo "::error::failed to read argocd-cue-cmp/VERSION (empty)"
+              echo "::error::failed to extract version from argocd-cue-cmp/version.cue"
               exit 1
             fi
-            echo "Resolved version=${version} from VERSION file"
+            echo "Resolved version=${version} from argocd-cue-cmp/version.cue"
           fi
           if [[ "$version" == *-* ]]; then
             is_prerelease=true
