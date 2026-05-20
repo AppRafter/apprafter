@@ -18,8 +18,9 @@ fn export_smoke() {
         .to_path_buf();
     // Path 1: happy path. cue is invoked from the repo root
     // (which contains cue.mod/) with a path relative to it.
-    // Skip cleanly if cue is absent so CI without the dev shell
-    // still runs.
+    // We REQUIRE `cue` on PATH — the v0.1.109 CI incident
+    // (silent-skipped fixture/assertion mismatch sat for 5+
+    // commits) burned the previous "skip if missing" pattern.
     let target = Path::new("./examples/applications");
     match cue::export_in(&repo_root, target) {
         Ok(value) => assert!(
@@ -27,7 +28,10 @@ fn export_smoke() {
             "cue export should yield a JSON object, got {value:?}"
         ),
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected error from cue::export_in: {other}"),
     }

@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Integration tests for `cli_core::manifest::parse_application`.
 //!
-//! Skips at runtime when `cue` is absent from PATH (mirrors the
-//! `manifest_test` / `cue_test` pattern).
+//! Panics with a clear "install cue / run from `nix develop`"
+//! message if the `cue` binary is missing from PATH. The earlier
+//! pattern of silent-skipping on `CueNotFound` was changed after
+//! a v0.1.109 incident where a fixture / assertion mismatch sat
+//! undetected for 5+ commits because every local `cargo test`
+//! silently skipped without cue.
 
 use std::path::{Path, PathBuf};
 
@@ -25,8 +29,10 @@ fn parse_full_application_fixture() {
     let parsed: ApplicationManifest = match manifest::parse_application(&root, path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
@@ -63,9 +69,12 @@ fn parse_application_returns_error_on_missing_path() {
     match manifest::parse_application(&root, path) {
         Err(CliError::CueExport { .. }) => {}
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
-        Err(other) => panic!("expected CueExport or CueNotFound, got {other}"),
+        Err(other) => panic!("expected CueExport, got {other}"),
         Ok(_) => panic!("missing path should not parse successfully"),
     }
 }
@@ -83,12 +92,15 @@ fn parse_application_errors_when_no_application_document() {
     let err = manifest::parse_application(dir.path(), &cue_path).unwrap_err();
     match err {
         CliError::CueNotFound => {
-            eprintln!("skip: cue not on PATH");
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         CliError::Other(msg) => {
             assert!(msg.contains("Application"), "{msg}");
         }
-        other => panic!("expected Other or CueNotFound, got {other:?}"),
+        other => panic!("expected Other, got {other:?}"),
     }
 }
 
@@ -118,8 +130,10 @@ out: {\n\
     let m = match manifest::parse_application(dir.path(), &cue_path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
@@ -143,8 +157,10 @@ fn application_schema_vets_cleanly() {
     {
         Ok(out) => out,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(err) => panic!("spawn cue vet: {err}"),
     };
@@ -175,8 +191,10 @@ fn application_fixture_vets_against_schema() {
     {
         Ok(out) => out,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(err) => panic!("spawn cue vet: {err}"),
     };

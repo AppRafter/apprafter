@@ -25,8 +25,10 @@ fn parse_full_infrastructure_fixture() {
     let parsed: InfrastructureManifest = match manifest::parse_infrastructure(&root, path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
@@ -73,9 +75,12 @@ fn parse_returns_error_on_missing_path() {
             // Expected: cue export prints an error and exits non-zero.
         }
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
-        Err(other) => panic!("expected CueExport or CueNotFound, got {other}"),
+        Err(other) => panic!("expected CueExport, got {other}"),
         Ok(_) => panic!("missing path should not parse successfully"),
     }
 }
@@ -94,12 +99,15 @@ fn parse_infrastructure_errors_when_no_infrastructure_document() {
     let err = cli_core::manifest::parse_infrastructure(dir.path(), &cue_path).unwrap_err();
     match err {
         CliError::CueNotFound => {
-            eprintln!("skip: cue not on PATH");
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         CliError::Other(msg) => {
             assert!(msg.contains("Infrastructure"), "{msg}");
         }
-        other => panic!("expected Other or CueNotFound, got {other:?}"),
+        other => panic!("expected Other, got {other:?}"),
     }
 }
 
@@ -125,8 +133,10 @@ out: {\n\
     let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
@@ -153,8 +163,10 @@ out: {\n\
     let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
@@ -187,8 +199,10 @@ out: {\n\
     let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
@@ -226,8 +240,10 @@ out: {\n\
     let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
@@ -258,8 +274,10 @@ out: {\n\
     let m = match cli_core::manifest::parse_infrastructure(dir.path(), &cue_path) {
         Ok(m) => m,
         Err(CliError::CueNotFound) => {
-            eprintln!("skip: cue not on PATH");
-            return;
+            panic!(
+                "cue must be on PATH for this test — run from \
+                 `nix develop` or install cue v0.10+"
+            );
         }
         Err(other) => panic!("unexpected: {other}"),
     };
