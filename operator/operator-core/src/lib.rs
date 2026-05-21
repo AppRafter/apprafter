@@ -4,6 +4,7 @@
 pub mod application;
 pub mod leader;
 pub mod metrics;
+pub mod platform_stack;
 
 pub use application::{
     Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose, ApplicationSpec,
@@ -11,3 +12,8 @@ pub use application::{
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use metrics::Metrics;
+pub use platform_stack::{
+    PlatformStack, PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,
+    PlatformStackSource, PlatformStackSpec, PlatformStackStatus, PlatformStackValues,
+    PlatformStackVersionHistoryEntry,
+};
