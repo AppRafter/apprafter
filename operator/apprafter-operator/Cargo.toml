@@ -17,8 +17,9 @@ name = "apprafter-operator"
 path = "src/main.rs"
 
 [dependencies]
-operator-core                      = { path = "../operator-core" }
-operator-controllers-application   = { path = "../operator-controllers/application" }
+operator-core                          = { path = "../operator-core" }
+operator-controllers-application       = { path = "../operator-controllers/application" }
+operator-controllers-platform-stack    = { path = "../operator-controllers/platform-stack" }
 
 axum               = { workspace = true }
 tokio              = { workspace = true }

@@ -98,9 +98,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // PlatformController — peer to the Application controller in
+    // the same binary per Track B.1.73 design. Both run after the
+    // single Lease is held, so a lease loss tears the process
+    // down and both controllers go with it.
+    let platform_controller_handle = tokio::spawn({
+        let client = client.clone();
+        let metrics = metrics.clone();
+        async move {
+            if let Err(err) =
+                operator_controllers_platform_stack::run(client, metrics).await
+            {
+                error!(%err, "PlatformController error");
+            }
+        }
+    });
+
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
+        _ = platform_controller_handle => warn!("PlatformController exited"),
         _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }
