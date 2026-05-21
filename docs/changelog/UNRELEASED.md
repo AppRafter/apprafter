@@ -13,6 +13,89 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.113 — M1.5 Track B.1.72 walk-fix #2 — two-stage CRD wait (create + Established) (2026-05-20)
+
+Second post-v0.1.111 walk: v0.1.112's CRD wait (`kubectl wait
+--for=condition=Established crd/...`) failed **immediately**
+with `Error from server (NotFound): customresourcedefinitions
+"applications.apprafter.io" not found`. The wait didn't time
+out — it errored on the missing resource at request time.
+
+### Root cause
+
+`kubectl wait` errors out instantly when the named resource
+does not exist; it does **not** poll for the resource to
+appear. So v0.1.112's single-stage Established wait racing the
+operator chart's CRD apply was guaranteed to fail whenever
+step 4b's root-Application Healthy fired as a false-positive
+(Argo CD aggregating child health in a brief window where
+children's `.status` is still empty / Progressing).
+
+### Fix
+
+`cluster_bootstrap.rs` step 4c now does a **two-stage wait per
+CRD**:
+
+1. `kubectl wait crd/X --for=create --timeout=600s` — blocks
+   until the CRD object exists (kubectl 1.27+ feature; we
+   require k8s 1.29+ per operator chart).
+2. `kubectl wait crd/X --for=condition=Established --timeout=60s`
+   — blocks until the apiserver registered it in discovery.
+
+Both stages × two CRDs = 4 CRD waits total, ordered:
+`crd/applications.apprafter.io` create → Established →
+`crd/platformstacks.apprafter.io` create → Established.
+
+New constants:
+- `CRD_CREATE_TIMEOUT_SECS = 600` (covers chart pull + apply
+  through cert-manager wave -10 + operator wave 0 under load).
+- `CRD_ESTABLISHED_TIMEOUT_SECS = 60` (down from 120; once the
+  CRD exists, establishment is sub-second to a few seconds).
+
+The two-stage wait also forces a fresh kubectl discovery
+resolution for the subsequent SSA apply at step 5 — closing
+the on-disk discovery-cache angle mentioned in v0.1.111 →
+v0.1.112 notes.
+
+### Regression guards
+
+- Existing `perform_bootstrap_installs_cilium_...` test:
+  `waits.len() == 8` (was 6 in v0.1.112, was 4 in v0.1.111).
+  Positions [4]-[7] pinned to create/Established/create/Established
+  alternating between the two CRD names.
+- Existing `crd_established_waits_run_after_root_healthy_and_before_platformstack_apply`
+  test updated: now expects 4 CRD-prefixed waits and asserts
+  that each `--for=create` comes BEFORE its matching
+  `--for=condition=Established`.
+
+### Open question (deferred)
+
+Why does step 4b's `kubectl wait
+application/platform jsonpath={.status.health.status}=Healthy`
+return success well before the operator chart's child
+Application has reached Healthy itself? Two hypotheses:
+
+1. Argo CD's app-controller writes an interim
+   `.status.health.status = "Healthy"` for the root before
+   walking children, then later transitions to Progressing
+   while children reconcile. `kubectl wait` polls during the
+   brief Healthy window and returns.
+2. Argo CD's health aggregation for app-of-apps treats
+   children whose `.status` is empty as "no signal" rather
+   than "Progressing".
+
+Either way, the explicit CRD wait (step 4c) makes the root
+Healthy check non-load-bearing for the CRD-readiness
+assertion. We can investigate the underlying Argo CD
+behaviour later if it bites a different invariant; in the
+meantime step 4c is the durable shield.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01112` (walk-fix #1)
+- `cli/platform-cli/src/commands/cluster_bootstrap.rs`
+  step 4c rationale comment
+
 ## v0.1.112 — M1.5 Track B.1.72 walk-fix #1 — explicit CRD-Established wait (2026-05-20)
 
 First post-v0.1.111 walk on Hetzner: `apprafter bootstrap-all`
