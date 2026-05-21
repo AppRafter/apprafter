@@ -1205,3 +1205,76 @@ compatibility: "0.1.18": {
 		"docs/changelog/UNRELEASED.md#v01116",
 	]
 }
+
+// 0.1.19 — Track B.1.73 walk-fix #3: third post-closure walk
+// (with RBAC + SSA TypeMeta from previous walk-fixes)
+// surfaced two semantic bugs in the reconcile loop:
+//
+//   1. `UpgradeAvailable=True` fired for first-reconcile even
+//      when `currentVersion == availableVersion`. Root cause:
+//      old logic used `values_differ()` as the "is bump needed"
+//      gate, but loader-created parent App lacks
+//      `helm.valuesObject` (null vs `{tier: 1}` looks like a
+//      diff). Fix: `UpgradeAvailable` is now a STRICT semver
+//      comparison `channel_latest > target_for_patch`,
+//      independent of values diffs.
+//   2. PlatformController never patched the parent Application
+//      when `pin==None && autoUpgrade==false`, so
+//      `helm.valuesObject` stayed unset and
+//      `platform-controller` never registered as a field manager
+//      (visible in `managedFields[*].manager`). Fix: SSA patch
+//      ALWAYS owns both `targetRevision` (kept at current when
+//      policy forbids bump) AND `helm.valuesObject`. Values are
+//      runtime config, not a version bump — they are not gated
+//      by pin/autoUpgrade.
+//
+// Side effect: `MigrationPending` now also has an explicit
+// `False/Clean` representation (was previously absent when no
+// migration was pending). `Synced.reason` switches between
+// `Patched` and `Reconciled` depending on whether the cycle
+// actually issued an SSA patch.
+compatibility: "0.1.19": {
+	change:          "safe"
+	operatorVersion: "v0.1.117"
+	notes: """
+		Track B.1.73 walk-fix #3. Reconcile-loop semantic
+		refactor:
+
+		* `UpgradeAvailable` condition is now a strict semver
+		  comparison (`channel_latest > target_for_patch`).
+		  Walk-found bug v0.1.116 → v0.1.117 where condition
+		  fired True on first reconcile even when
+		  current==available. Fail-safe on unparseable
+		  versions — `semver_gt` returns false rather than
+		  flapping the condition.
+
+		* SSA ALWAYS owns `targetRevision` and
+		  `helm.valuesObject`. `targetRevision` in the patch
+		  body is kept at current value when policy
+		  (pin/autoUpgrade) forbids bump; values are unconditional.
+		  This guarantees `platform-controller` registers as
+		  field manager on first reconcile so subsequent
+		  foreign writes get caught by outside-writer
+		  detection.
+
+		* `MigrationPending` has an explicit `False/Clean`
+		  branch. `Synced.reason` distinguishes `Patched` (we
+		  issued an SSA patch this cycle) from `Reconciled`
+		  (parent already matched desired state).
+
+		8 new regression tests pin the new semantics:
+		`semver_gt_*` (5 tests) + `platform_controller_owns_source_*`
+		(3 tests). Total unit tests 32 → 40.
+
+		Rendered chart vs 0.1.18: byte-equivalent — no chart-
+		shape change. Operators on 0.1.18 upgrade in place;
+		operator pod restarts on new image and the next
+		reconcile correctly populates status.conditions and
+		registers `platform-controller` as field manager on
+		the parent platform Application.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01117",
+	]
+}

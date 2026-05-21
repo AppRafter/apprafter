@@ -19,6 +19,7 @@ use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
+use semver::Version;
 use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -109,17 +110,31 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
 
-    // 1. Resolve desired version (pin OR channel-latest).
-    let desired_version = match &spec.pin {
+    // 1. Always query channel-latest from upstream. Two reasons:
+    //    (a) it's `status.availableVersion` regardless of whether
+    //        pin is set;
+    //    (b) the `UpgradeAvailable` condition is a semver
+    //        comparison of channel-latest against the actual
+    //        deployed target, NOT against the operator's desired
+    //        intent. Walk-found bug v0.1.116 → v0.1.117: the
+    //        old logic conflated "values_differ" with "newer
+    //        version exists" and fired UpgradeAvailable=True on
+    //        first reconcile because the loader created the
+    //        parent App without `helm.valuesObject` (null vs
+    //        `{tier: 1}` looked like a diff).
+    let channel = Channel::parse(&spec.channel).unwrap_or(Channel::Stable);
+    let channel_latest = latest_in_channel(&spec.source.upstream, channel).await?;
+    let channel_latest_str = channel_latest.to_string();
+
+    // 2. Policy target — what PlatformController wants the
+    //    parent's `spec.source.targetRevision` to be. Pin wins
+    //    over channel-latest.
+    let policy_target = match &spec.pin {
         Some(p) => p.clone(),
-        None => {
-            let channel = Channel::parse(&spec.channel).unwrap_or(Channel::Stable);
-            let v = latest_in_channel(&spec.source.upstream, channel).await?;
-            v.to_string()
-        }
+        None => channel_latest_str.clone(),
     };
 
-    // 2. Read parent Application state via dynamic API.
+    // 3. Read parent Application state via dynamic API.
     let apps: Api<DynamicObject> = Api::namespaced_with(
         ctx.client.clone(),
         PARENT_APPLICATION_NAMESPACE,
@@ -134,127 +149,230 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         .to_string();
     let in_flight = is_in_flight(&parent_json);
 
-    // 3. Desired source payload.
-    let desired = build_desired(spec, &desired_version);
+    // 4. Desired SSA payload.
+    let desired = build_desired(spec, &policy_target);
 
-    // 4. Decide action.
+    let target_changed = current_target != desired.target_revision;
+    let values_changed = values_differ(&parent_json, &desired.helm_values);
+
+    // 5. Pre-build a status skeleton; conditions filled in below.
     let mut new_status: PlatformStackStatus = stack.status.clone().unwrap_or_default();
-    new_status.target_version = Some(desired_version.clone());
-    new_status.current_version = Some(current_target.clone());
     new_status.last_upstream_check = Some(Utc::now().to_rfc3339());
-    new_status.available_version = Some(desired_version.clone());
+    new_status.available_version = Some(channel_latest_str.clone());
 
-    let needs_patch = current_target != desired.target_revision
-        || values_differ(&parent_json, &desired.helm_values);
-
-    if needs_patch && in_flight {
+    // 6. In-flight gating. We do NOT fight an in-progress sync —
+    //    Argo CD's app-controller is mid-apply; another patch
+    //    from us would race with that.
+    if (target_changed || values_changed) && in_flight {
         info!(
             "parent Application in flight; requeuing reconcile in {:?}",
             IN_FLIGHT_REQUEUE
         );
+        new_status.target_version = Some(current_target.clone());
+        new_status.current_version = Some(current_target.clone());
         write_status(&stack, &ctx, new_status).await?;
         return Ok(Action::requeue(IN_FLIGHT_REQUEUE));
     }
 
-    if needs_patch {
-        // Policy gate: pin set → always allowed.
-        // pin unset + autoUpgrade false → status-only update.
-        let pin_set = spec.pin.is_some();
-        if !pin_set && !spec.auto_upgrade {
-            // Surface availability without bumping.
-            let cond = condition(
-                COND_UPGRADE_AVAILABLE,
-                "True",
-                "ManualApprovalRequired",
-                &format!(
-                    "upstream has {desired_version} (channel {ch}) but autoUpgrade=false",
-                    ch = spec.channel
-                ),
-                &prior_conds,
-            );
-            upsert_condition(&mut new_status, cond);
-            write_status(&stack, &ctx, new_status).await?;
-            return Ok(Action::requeue(parse_check_interval(
-                &spec.source.check_interval,
-            )));
-        }
+    // 7. Decide what target_revision to put into the SSA patch.
+    //
+    //    `helm.valuesObject` is ALWAYS owned by PlatformController
+    //    once it touches the resource — values are runtime config,
+    //    not a version bump, and the pin/autoUpgrade policy does
+    //    not gate them. `targetRevision` IS gated by policy.
+    //
+    //    If policy forbids the target change, the SSA patch still
+    //    includes `targetRevision = current_target` so
+    //    PlatformController takes ownership of the field without
+    //    actually changing it. This lets `detect_outside_writer`
+    //    catch any subsequent foreign write reliably.
+    let pin_set = spec.pin.is_some();
+    let allow_target_bump = pin_set || spec.auto_upgrade;
 
-        // Pin OR autoUpgrade=true → classify diff.
+    let mut migration_pending: Option<ChangeClass> = None;
+    let target_for_patch = if target_changed && allow_target_bump {
+        // Pin OR autoUpgrade=true → classify diff. Safe /
+        // requires-restart bump; breaking / data-migration stays
+        // on current_target and surfaces MigrationPending=True.
         let class = fetch_change_class(&spec.source.upstream, &desired.target_revision).await?;
         if matches!(class, ChangeClass::Breaking | ChangeClass::DataMigration) {
-            // Defer to MigrationPlan (1.74). 1.73: push condition, no auto-bump.
             ctx.hooks
                 .request_migration_plan(&current_target, &desired.target_revision, class)
                 .await?;
-            let cond = condition(
-                COND_MIGRATION_PENDING,
-                "True",
-                format!("{class:?}").as_str(),
-                &format!(
-                    "change from {current_target} → {desired_version} classified as {class:?}; manual approval required (1.74 MigrationPlan)"
-                ),
-                &prior_conds,
-            );
-            upsert_condition(&mut new_status, cond);
-            write_status(&stack, &ctx, new_status).await?;
-            return Ok(Action::requeue(parse_check_interval(
-                &spec.source.check_interval,
-            )));
+            migration_pending = Some(class);
+            current_target.clone()
+        } else {
+            desired.target_revision.clone()
         }
+    } else {
+        // Either no change needed OR policy forbids bump
+        // (pin unset + autoUpgrade=false). Keep current; the
+        // UpgradeAvailable condition will reflect whether a
+        // newer version exists upstream.
+        current_target.clone()
+    };
 
-        // Safe / requires-restart → SSA patch parent.
-        patch_application(&apps, &desired, false).await?;
-        let cond = condition(
+    // 8. SSA patch parent App. Always run when ANY field changes
+    //    (values OR target). On steady state (no diff) we skip the
+    //    patch to avoid unnecessary churn through Argo CD.
+    let patch_payload = DesiredSource {
+        target_revision: target_for_patch.clone(),
+        helm_values: desired.helm_values.clone(),
+    };
+    let patched_this_cycle =
+        target_changed || values_changed || !platform_controller_owns_source(&parent_json);
+    if patched_this_cycle {
+        patch_application(&apps, &patch_payload, false).await?;
+    }
+
+    // 9. Outside-writer detection — any non-`platform-controller` +
+    //    non-`argocd-application-controller` field manager owning
+    //    `f:spec.f:source.f:targetRevision` (or f:helm) is treated
+    //    as an unauthorized modification and force-reverted.
+    let foreign_writer = detect_outside_writer(&parent_json);
+    if let Some(foreign) = &foreign_writer {
+        warn!(manager = %foreign, "foreign field manager detected; force-reverting parent App");
+        patch_application(&apps, &patch_payload, true).await?;
+    }
+
+    // 10. Conditions. `Synced` reflects whether PlatformController
+    //     achieved its desired state on the parent.
+    //     `UpgradeAvailable` is the semver comparison of
+    //     channel-latest against the deployed target —
+    //     independent of values diffs and policy gates.
+    let upgrade_available = semver_gt(&channel_latest_str, &target_for_patch);
+    let cond_upgrade = if upgrade_available {
+        condition(
+            COND_UPGRADE_AVAILABLE,
+            "True",
+            "ManualApprovalRequired",
+            &format!(
+                "channel {ch} latest is {channel_latest_str}; deployed target is {target}; \
+                 set spec.autoUpgrade=true or spec.pin to advance",
+                ch = spec.channel,
+                target = target_for_patch
+            ),
+            &prior_conds,
+        )
+    } else {
+        condition(
+            COND_UPGRADE_AVAILABLE,
+            "False",
+            "UpToDate",
+            &format!(
+                "deployed target {target} is the latest in channel {ch}",
+                ch = spec.channel,
+                target = target_for_patch
+            ),
+            &prior_conds,
+        )
+    };
+    upsert_condition(&mut new_status, cond_upgrade);
+
+    let cond_migration = match migration_pending {
+        Some(class) => condition(
+            COND_MIGRATION_PENDING,
+            "True",
+            &format!("{class:?}"),
+            &format!(
+                "change from {current_target} → {desired_target} classified as {class:?}; \
+                 manual approval required (1.74 MigrationPlan)",
+                desired_target = desired.target_revision
+            ),
+            &prior_conds,
+        ),
+        None => condition(
+            COND_MIGRATION_PENDING,
+            "False",
+            "Clean",
+            "no destructive diff pending",
+            &prior_conds,
+        ),
+    };
+    upsert_condition(&mut new_status, cond_migration);
+
+    let cond_synced = if patched_this_cycle {
+        condition(
             COND_SYNCED,
             "True",
             "Patched",
-            &format!("targetRevision → {desired_version}"),
+            &format!(
+                "PlatformController patched parent Application (target={target_for_patch}); \
+                 values_changed={values_changed}, target_changed={target_changed}"
+            ),
             &prior_conds,
-        );
-        upsert_condition(&mut new_status, cond);
+        )
     } else {
-        // No diff to apply.
-        let cond = condition(
+        condition(
             COND_SYNCED,
             "True",
             "Reconciled",
-            "Application.spec.source matches PlatformStack",
+            "parent Application matches PlatformStack desired state",
             &prior_conds,
-        );
-        upsert_condition(&mut new_status, cond);
-    }
+        )
+    };
+    upsert_condition(&mut new_status, cond_synced);
 
-    // 5. Outside-writer detection: any non-platform-controller
-    //    + non-argocd field manager owning
-    //    `f:spec.f:source.f:targetRevision` (or f:helm) on the
-    //    parent is a violation.
-    if let Some(foreign) = detect_outside_writer(&parent_json) {
-        // Force-revert with our field manager.
-        patch_application(&apps, &desired, true).await?;
-        let cond = condition(
+    let cond_unauthorized = match &foreign_writer {
+        Some(foreign) => condition(
             COND_UNAUTHORIZED_SOURCE_MODIFICATION,
             "True",
             "ForeignFieldManager",
-            &format!("detected external write by field manager {foreign:?}; reverted"),
+            &format!(
+                "detected external write to spec.source by field manager {foreign:?}; \
+                 PlatformController force-reverted"
+            ),
             &prior_conds,
-        );
-        upsert_condition(&mut new_status, cond);
-    } else {
-        let cond = condition(
+        ),
+        None => condition(
             COND_UNAUTHORIZED_SOURCE_MODIFICATION,
             "False",
             "Clean",
             "no foreign writer detected on spec.source",
             &prior_conds,
-        );
-        upsert_condition(&mut new_status, cond);
-    }
+        ),
+    };
+    upsert_condition(&mut new_status, cond_unauthorized);
 
-    // 6. Status write + requeue on cadence.
+    new_status.current_version = Some(target_for_patch.clone());
+    new_status.target_version = Some(target_for_patch);
     write_status(&stack, &ctx, new_status).await?;
     Ok(Action::requeue(parse_check_interval(
         &spec.source.check_interval,
     )))
+}
+
+/// Strict semver comparison: returns true iff `a > b`. Falls back
+/// to `false` when either side is unparseable — fail-safe (better
+/// to not fire `UpgradeAvailable` than to flap on garbage).
+fn semver_gt(a: &str, b: &str) -> bool {
+    match (Version::parse(a), Version::parse(b)) {
+        (Ok(av), Ok(bv)) => av > bv,
+        _ => false,
+    }
+}
+
+/// Has PlatformController already taken SSA ownership of any
+/// `spec.source` field? Used to decide whether to send a no-op
+/// SSA patch on the first reconcile (so future foreign writes
+/// get caught by `detect_outside_writer`). Without this the
+/// initial reconcile would skip the patch entirely whenever
+/// `target_changed==false && values_changed==false` and never
+/// register the field manager.
+fn platform_controller_owns_source(parent: &Value) -> bool {
+    let Some(entries) = parent
+        .pointer("/metadata/managedFields")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    entries.iter().any(|e| {
+        e.get("manager").and_then(Value::as_str) == Some(FIELD_MANAGER)
+            && e.get("fieldsV1")
+                .and_then(|v| v.get("f:spec"))
+                .and_then(|s| s.get("f:source"))
+                .is_some()
+    })
 }
 
 fn is_in_flight(parent: &Value) -> bool {
@@ -557,6 +675,84 @@ mod tests {
                 .and_then(Value::as_str),
             Some("0.1.17")
         );
+    }
+
+    #[test]
+    fn semver_gt_compares_strictly_greater() {
+        assert!(semver_gt("0.1.19", "0.1.18"));
+        assert!(semver_gt("0.2.0", "0.1.99"));
+        assert!(semver_gt("1.0.0", "0.99.99"));
+    }
+
+    #[test]
+    fn semver_gt_returns_false_for_equal() {
+        // Critical regression guard: v0.1.116 wrongly fired
+        // UpgradeAvailable=True for equal versions (because the
+        // old logic used values_differ instead of semver
+        // comparison).
+        assert!(!semver_gt("0.1.18", "0.1.18"));
+    }
+
+    #[test]
+    fn semver_gt_returns_false_for_lesser() {
+        assert!(!semver_gt("0.1.17", "0.1.18"));
+        assert!(!semver_gt("0.1.0", "1.0.0"));
+    }
+
+    #[test]
+    fn semver_gt_handles_prereleases() {
+        // 0.2.0-rc.1 < 0.2.0 per semver precedence.
+        assert!(semver_gt("0.2.0", "0.2.0-rc.1"));
+        assert!(!semver_gt("0.2.0-rc.1", "0.2.0"));
+    }
+
+    #[test]
+    fn semver_gt_returns_false_on_unparseable_input() {
+        // Fail-safe — bogus version strings must NOT trigger
+        // UpgradeAvailable=True. Prefer quiet "no upgrade" to a
+        // flapping condition on garbage input.
+        assert!(!semver_gt("not-a-version", "0.1.18"));
+        assert!(!semver_gt("0.1.18", "garbage"));
+        assert!(!semver_gt("", "0.1.18"));
+    }
+
+    #[test]
+    fn platform_controller_owns_source_finds_own_manager() {
+        let parent = json!({
+            "metadata": {
+                "managedFields": [
+                    {
+                        "manager": "platform-controller",
+                        "fieldsV1": {"f:spec": {"f:source": {"f:targetRevision": {}}}}
+                    }
+                ]
+            }
+        });
+        assert!(platform_controller_owns_source(&parent));
+    }
+
+    #[test]
+    fn platform_controller_owns_source_false_when_only_argocd_present() {
+        let parent = json!({
+            "metadata": {
+                "managedFields": [
+                    {
+                        "manager": "argocd-application-controller",
+                        "fieldsV1": {"f:status": {}}
+                    },
+                    {
+                        "manager": "kubectl-client-side-apply",
+                        "fieldsV1": {"f:spec": {"f:source": {"f:targetRevision": {}}}}
+                    }
+                ]
+            }
+        });
+        assert!(!platform_controller_owns_source(&parent));
+    }
+
+    #[test]
+    fn platform_controller_owns_source_false_when_metadata_missing() {
+        assert!(!platform_controller_owns_source(&json!({})));
     }
 
     #[test]

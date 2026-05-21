@@ -13,6 +13,125 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.117 — M1.5 Track B.1.73 walk-fix #3 — UpgradeAvailable semver + values ownership (2026-05-21)
+
+Third post-v0.1.114 walk. PlatformController status now
+populated (RBAC fix from v0.1.115, TypeMeta fix from v0.1.116
+both effective). But two semantic bugs surfaced:
+
+```yaml
+status:
+  currentVersion: 0.1.18
+  availableVersion: 0.1.18
+  targetVersion: 0.1.18
+  conditions:
+  - type: UpgradeAvailable
+    status: "True"            # WRONG — current == available
+    reason: ManualApprovalRequired
+    message: "upstream has 0.1.18 but autoUpgrade=false"
+```
+
+And `managedFields[*].manager` on the parent App contained
+`kubectl-client-side-apply argocd-application-controller` —
+NO `platform-controller`. The controller never SSA-patched the
+parent because policy (pin=None + autoUpgrade=false) refused.
+
+### Root causes
+
+1. **`UpgradeAvailable` conflated values diff with version
+   diff.** The old gate was `current_target != desired_target
+   || values_differ(parent, desired_values)`. Loader-created
+   parent App lacks `helm.valuesObject`, so on first reconcile
+   `values_differ` returns true even when versions match. The
+   "no bump allowed" branch then fired `UpgradeAvailable=True`
+   with a misleading message.
+2. **PlatformController never owned `helm.valuesObject`.** The
+   pin/autoUpgrade policy gate was wrapped around BOTH target
+   and values, but values are runtime config — not a version
+   bump — and should be PlatformController-owned regardless.
+
+### Fix
+
+`reconcile()` refactored end-to-end:
+
+- New `semver_gt(a, b)` helper. `UpgradeAvailable` condition
+  is a STRICT semver comparison `channel_latest > target_for_patch`,
+  independent of values diffs. Fail-safe on unparseable
+  versions (returns false).
+- `channel_latest` is queried on every reconcile (powers
+  `status.availableVersion` regardless of pin).
+- `target_for_patch` = `desired.target_revision` if
+  `target_changed && (pin || autoUpgrade) && safe class`;
+  otherwise `current_target`.
+- SSA patch ALWAYS includes both `targetRevision` and
+  `helm.valuesObject`. PlatformController registers as field
+  manager on first reconcile via no-op SSA when the parent App
+  already matches desired state.
+- New `platform_controller_owns_source(parent)` helper —
+  triggers a one-time SSA patch on first reconcile when the
+  manager hasn't taken ownership yet (so future foreign writes
+  get caught reliably).
+- `MigrationPending` now has explicit `False/Clean`
+  representation when no destructive diff is pending.
+- `Synced.reason` switches between `Patched` (issued a patch
+  this cycle) and `Reconciled` (parent already matched).
+
+### Regression guards (+8 tests, 32 → 40 total)
+
+- `semver_gt_compares_strictly_greater`
+- `semver_gt_returns_false_for_equal`
+- `semver_gt_returns_false_for_lesser`
+- `semver_gt_handles_prereleases`
+- `semver_gt_returns_false_on_unparseable_input` (fail-safe)
+- `platform_controller_owns_source_finds_own_manager`
+- `platform_controller_owns_source_false_when_only_argocd_present`
+- `platform_controller_owns_source_false_when_metadata_missing`
+
+### Expected post-fix walk
+
+```yaml
+status:
+  currentVersion: 0.1.19
+  availableVersion: 0.1.19
+  targetVersion: 0.1.19
+  conditions:
+  - type: UpgradeAvailable
+    status: "False"
+    reason: UpToDate
+    message: "deployed target 0.1.19 is the latest in channel stable"
+  - type: Synced
+    status: "True"
+    reason: Patched
+  - type: UnauthorizedSourceModification
+    status: "False"
+    reason: Clean
+  - type: MigrationPending
+    status: "False"
+    reason: Clean
+```
+
+And:
+```
+kubectl get application.argoproj.io platform -n argocd -o jsonpath='{.metadata.managedFields[*].manager}'
+# now contains: ... platform-controller
+```
+
+### Version chain
+
+- CLI 0.1.116 → 0.1.117.
+- operator + admission-webhook chart v0.1.97 → v0.1.98.
+- operator + admission-webhook `appVersion` v0.1.116 →
+  v0.1.117.
+- platform-stack chart 0.1.18 → 0.1.19.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01116` (TypeMeta fix that
+  made this bug observable — status populated for the first
+  time, exposing the wrong condition logic)
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  reconcile() body + `semver_gt` + `platform_controller_owns_source`
+
 ## v0.1.116 — M1.5 Track B.1.73 walk-fix #2 — SSA TypeMeta in status patch (2026-05-21)
 
 Second post-v0.1.114 walk (with RBAC fix from v0.1.115):
