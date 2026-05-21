@@ -1102,3 +1102,57 @@ compatibility: "0.1.16": {
 		"docs/changelog/UNRELEASED.md#v01114",
 	]
 }
+
+// 0.1.17 — Track B.1.73 walk-fix #1: first post-closure walk
+// surfaced PlatformController's `.status` empty even hours after
+// CR creation. Root cause: operator chart's ClusterRole granted
+// permissions only for `apprafter.io/applications` (B.1.71-era
+// scope); PlatformController's watcher on
+// `apprafter.io/platformstacks` failed silently on its first
+// list/watch call (Forbidden), so the reconciler never ran.
+// Same chart also lacked `argoproj.io/applications` get/patch
+// needed for the SSA patch on the parent `platform` Application.
+//
+// Fix: ClusterRole gains two new rule blocks (platformstacks +
+// argoproj.io/applications). Same chart bump also lowers
+// liveness/readiness initialDelaySeconds on both operator and
+// admission-webhook Deployments (10s/5s → 2s/1s) and introduces
+// a startupProbe (1s period, 30s failureThreshold) to give cold
+// boots a grace window without taxing every restart. Workspace-
+// wide release profile sets `panic = "abort"` to shave a few MB
+// off the musl-static images.
+compatibility: "0.1.17": {
+	change:          "safe"
+	operatorVersion: "v0.1.115"
+	notes: """
+		Track B.1.73 walk-fix #1. Three changes, all in the
+		operator chart + operator workspace:
+
+		1. Operator ClusterRole gains rules for
+		   `apprafter.io/platformstacks` (+ /status) and
+		   `argoproj.io/applications` — without these
+		   PlatformController fails silently on first watch
+		   and `.status` never populates.
+		2. Operator + webhook Deployments lose the 5-10s
+		   readiness/liveness initial-delay padding; new
+		   startupProbe (1s period × 30s failureThreshold)
+		   keeps cold-boot tolerance without paying the
+		   cost on every restart.
+		3. Operator workspace `[profile.release]` sets
+		   `panic = "abort"` — smaller binary, faster
+		   image pull, panic-on-abort matches the
+		   pod-restart contract.
+
+		Rendered chart vs 0.1.16: existing children
+		byte-equivalent (no per-component values change).
+		Operators on 0.1.16 upgrade in place — chart sync
+		applies the new ClusterRole rules + Deployment probe
+		blocks; the operator pod restarts once when the new
+		image arrives and starts reconciling PlatformStack
+		correctly.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01115",
+	]
+}

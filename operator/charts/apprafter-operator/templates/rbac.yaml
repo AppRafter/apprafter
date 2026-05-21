@@ -19,6 +19,38 @@ rules:
       - watch
       - patch
       - update
+  # PlatformStack CRD — watched by the PlatformController in the
+  # same operator binary (B.1.73). Without these the controller
+  # fails silently on its first list/watch call and the
+  # PlatformStack's `.status` never populates. Walk-found bug
+  # v0.1.114 → v0.1.115.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - platformstacks
+      - platformstacks/status
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  # Argo CD's `Application` CRD lives under argoproj.io. The
+  # PlatformController SSA-patches the parent `platform`
+  # Application in the `argocd` namespace with field manager
+  # `platform-controller`; cluster-scoped get/patch is the
+  # narrowest viable shape since the resource lives outside the
+  # operator's own namespace.
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - applications
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
   # Owned children — phase 1.9 will create + manage these.
   - apiGroups:
       - apps

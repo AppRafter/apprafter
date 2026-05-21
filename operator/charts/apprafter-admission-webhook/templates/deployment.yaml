@@ -43,19 +43,32 @@ spec:
               value: /tls/tls.crt
             - name: TLS_KEY_PATH
               value: /tls/tls.key
+          # The webhook binary is a pure-Rust musl-static image
+          # that boots in ms; the previous 10s/5s initial delays
+          # added pointless wait to every cold start. The
+          # startupProbe gives a generous grace window for the
+          # genuinely-slow first boot while keeping
+          # liveness/readiness tight afterwards.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 1
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /readyz
               port: https
               scheme: HTTPS
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
               port: https
               scheme: HTTPS
-            initialDelaySeconds: 10
+            initialDelaySeconds: 2
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

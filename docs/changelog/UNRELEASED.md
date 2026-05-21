@@ -13,6 +13,81 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.115 — M1.5 Track B.1.73 walk-fix #1 — RBAC + startup speed (2026-05-21)
+
+First post-v0.1.114 walk: `apprafter bootstrap-all` completed,
+all Argo CD children Healthy, default `PlatformStack` CR
+applied in `apprafter-system`. But:
+
+```sh
+$ kubectl get platformstack default -n apprafter-system -o jsonpath='{.status}'
+# empty
+```
+
+PlatformController had not reconciled even hours after CR
+creation. Root cause: the operator chart's ClusterRole granted
+permissions only for `apprafter.io/applications` (B.1.71-era
+scope). PlatformController's watcher on
+`apprafter.io/platformstacks` errored with Forbidden on its
+first list/watch, the controller's stream closed, no reconcile
+ran. Same chart also lacked `argoproj.io/applications`
+get/patch — even if the watcher had worked, the SSA patch on
+the parent `platform` Application would have been rejected.
+
+### A. RBAC additions
+
+Operator chart's ClusterRole gains two rule blocks:
+
+```yaml
+- apiGroups: [apprafter.io]
+  resources: [platformstacks, platformstacks/status]
+  verbs: [get, list, watch, patch, update]
+- apiGroups: [argoproj.io]
+  resources: [applications]
+  verbs: [get, list, watch, patch, update]
+```
+
+Cluster-scoped (rather than RoleBinding into `argocd`) since
+the parent Application lives outside the operator's own
+namespace and we'd otherwise need a second binding.
+
+### B. Probe delays + startupProbe
+
+Both operator and admission-webhook Deployments dropped the
+5-10s `initialDelaySeconds` padding on liveness/readiness
+probes (the Rust musl-static binaries boot in ms; the wait
+was pointless). New `startupProbe` (1s period × 30s
+failureThreshold) gives cold-boot grace without paying it on
+every restart.
+
+Net per-pod cold-start saving: ~5-10s on the operator and
+~5-10s on the webhook. Image pull (~1-2 min on cpx22) remains
+the dominant factor.
+
+### C. `panic = "abort"` in operator workspace
+
+`operator/Cargo.toml` `[profile.release]` adds `panic =
+"abort"`. Drops unwinding machinery from the musl-static
+images (~5-10% size reduction), which trims image-pull time
+on cold starts. Matches the pod-restart contract — on a
+panic we want the kubelet to restart the pod, not catch and
+keep limping.
+
+### Version chain
+
+- CLI 0.1.114 → 0.1.115.
+- operator + admission-webhook chart v0.1.95 → v0.1.96.
+- operator + admission-webhook `appVersion` v0.1.114 →
+  v0.1.115.
+- platform-stack chart 0.1.16 → 0.1.17 via the CUE invariant
+  chain.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01114` (Track B.1.73 closure
+  that shipped the controller missing these RBAC rules)
+- `operator/charts/apprafter-operator/templates/rbac.yaml`
+
 ## v0.1.114 — M1.5 Track B.1.73 closure — PlatformController core (2026-05-20)
 
 PlatformController landed in the `apprafter-operator` binary
