@@ -5,6 +5,7 @@ members = [
     "admission-webhook",
     "apprafter-operator",
     "operator-controllers/application",
+    "operator-controllers/platform-stack",
     "operator-core",
     "operator-rendering",
 ]
@@ -34,6 +35,12 @@ schemars           = "0.8"
 futures            = "0.3"
 prometheus         = { version = "0.13", default-features = false }
 chrono             = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+oci-distribution   = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+semver             = { version = "1", features = ["serde"] }
+serde_yaml         = "0.9"
+async-trait        = "0.1"
+flate2             = "1.0"
+tar                = "0.4"
 
 [profile.release]
 lto         = "thin"

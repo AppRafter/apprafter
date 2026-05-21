@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "operator-controllers-platform-stack"
+description = "kube-rs Controller for the v1alpha1 PlatformStack CRD."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+operator-core = { path = "../../operator-core" }
+
+kube             = { workspace = true }
+k8s-openapi      = { workspace = true }
+tracing          = { workspace = true }
+thiserror        = { workspace = true }
+futures          = { workspace = true }
+tokio            = { workspace = true }
+chrono           = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+serde_yaml       = { workspace = true }
+oci-distribution = { workspace = true }
+semver           = { workspace = true }
+async-trait      = { workspace = true }
+flate2           = { workspace = true }
+tar              = { workspace = true }
