@@ -13,6 +13,53 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.116 — M1.5 Track B.1.73 walk-fix #2 — SSA TypeMeta in status patch (2026-05-21)
+
+Second post-v0.1.114 walk (with RBAC fix from v0.1.115):
+PlatformController failing every reconcile with the SAME error
+every minute:
+
+```
+ApiError: invalid object type: /, Kind=: BadRequest
+```
+
+Root cause: `write_status` SSA-patch body was
+`{"status": {...}}` only — missing `apiVersion` + `kind` +
+`metadata.name` (the SSA TypeMeta contract). The apiserver
+can't resolve the target resource's schema without those
+three fields and rejects with `invalid object type: /, Kind=`
+(empty GroupVersion, empty Kind). The Application reconciler's
+`apply_status` has always emitted them correctly; we dropped
+the contract in B.1.73's new `write_status`.
+
+### Fix
+
+Extracted `build_status_patch(name, status)` and
+`build_application_patch(desired)` helpers in
+`operator-controllers/platform-stack/src/reconcile.rs`. Both
+emit full SSA-compliant bodies with apiVersion + kind +
+metadata.name + the resource-specific fields. `write_status`
+and `patch_application` now route through these helpers.
+
+Two regression-guard tests pin the contract:
+
+- `build_status_patch_includes_apiversion_kind_and_name`
+- `build_application_patch_includes_apiversion_kind_name_and_source`
+
+### Version chain
+
+- CLI 0.1.115 → 0.1.116.
+- operator + admission-webhook chart v0.1.96 → v0.1.97.
+- operator + admission-webhook `appVersion` v0.1.115 →
+  v0.1.116.
+- platform-stack chart 0.1.17 → 0.1.18.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01115` (walk-fix #1 RBAC)
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  `build_status_patch` / `build_application_patch`
+
 ## v0.1.115 — M1.5 Track B.1.73 walk-fix #1 — RBAC + startup speed (2026-05-21)
 
 First post-v0.1.114 walk: `apprafter bootstrap-all` completed,

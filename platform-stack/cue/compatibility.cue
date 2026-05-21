@@ -1156,3 +1156,52 @@ compatibility: "0.1.17": {
 		"docs/changelog/UNRELEASED.md#v01115",
 	]
 }
+
+// 0.1.18 — Track B.1.73 walk-fix #2: second post-closure walk
+// (now with RBAC + faster probes from v0.1.115) surfaced
+// PlatformController failing every reconcile with
+// `ApiError: invalid object type: /, Kind=` (BadRequest 400)
+// from the apiserver. Root cause: `write_status` SSA-patch body
+// was `{"status": {...}}` only — missing apiVersion + kind +
+// metadata.name. SSA REQUIRES these three TypeMeta fields in
+// every patch body so the apiserver can resolve the resource's
+// schema before merging. The Application reconciler's
+// `apply_status` had carried this correctly since v0.1.31; we
+// dropped it in B.1.73's new `write_status`.
+//
+// Fix: extracted `build_status_patch(name, status)` and
+// `build_application_patch(desired)` helpers that always emit
+// the full TypeMeta + metadata.name block. Two regression-guard
+// tests pin the contract (`build_status_patch_includes_apiversion_kind_and_name`,
+// `build_application_patch_includes_apiversion_kind_name_and_source`).
+compatibility: "0.1.18": {
+	change:          "safe"
+	operatorVersion: "v0.1.116"
+	notes: """
+		Track B.1.73 walk-fix #2. PlatformController's
+		`write_status` SSA patch missed the
+		apiVersion + kind + metadata.name TypeMeta block —
+		apiserver rejected every reconcile with
+		`invalid object type: /, Kind=` BadRequest 400.
+
+		Fix landed entirely operator-side: `write_status`
+		now uses a `build_status_patch` helper that emits
+		the full SSA-compliant body. `patch_application`
+		got the same treatment (its TypeMeta was already
+		correct but now sits behind the same helper
+		convention). Two regression tests pin both helpers'
+		output shape so future refactors can't strip
+		TypeMeta silently.
+
+		Rendered chart vs 0.1.17: existing children
+		byte-equivalent (no chart-shape change). Operators
+		on 0.1.17 upgrade in place — the operator pod
+		restarts on new image and PlatformController starts
+		populating `.status` correctly within the first
+		reconcile cycle (seconds).
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01116",
+	]
+}

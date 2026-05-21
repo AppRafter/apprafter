@@ -303,17 +303,7 @@ async fn patch_application(
     desired: &DesiredSource,
     force: bool,
 ) -> Result<(), Error> {
-    let payload = json!({
-        "apiVersion": "argoproj.io/v1alpha1",
-        "kind": "Application",
-        "metadata": { "name": PARENT_APPLICATION_NAME },
-        "spec": {
-            "source": {
-                "targetRevision": desired.target_revision,
-                "helm": { "valuesObject": desired.helm_values },
-            }
-        }
-    });
+    let payload = build_application_patch(desired);
     let mut params = PatchParams::apply(FIELD_MANAGER);
     if force {
         params = params.force();
@@ -323,20 +313,57 @@ async fn patch_application(
     Ok(())
 }
 
+fn build_application_patch(desired: &DesiredSource) -> Value {
+    // apiVersion + kind + metadata.name are REQUIRED in every SSA
+    // patch body — the apiserver uses them to resolve the target
+    // resource's schema. Same TypeMeta contract that
+    // `build_status_patch` enforces for PlatformStack writes.
+    json!({
+        "apiVersion": "argoproj.io/v1alpha1",
+        "kind": "Application",
+        "metadata": { "name": PARENT_APPLICATION_NAME },
+        "spec": {
+            "source": {
+                "targetRevision": desired.target_revision,
+                "helm": { "valuesObject": desired.helm_values },
+            }
+        }
+    })
+}
+
 async fn write_status(
     stack: &PlatformStack,
     ctx: &Context,
     new_status: PlatformStackStatus,
 ) -> Result<(), Error> {
     let api: Api<PlatformStack> = Api::namespaced(ctx.client.clone(), SINGLETON_NAMESPACE);
-    let patch = json!({ "status": new_status });
+    let name = stack.name_any();
+    // SSA REQUIRES apiVersion + kind + metadata.name in the patch
+    // body — the apiserver uses them to look up the resource's
+    // OpenAPI schema before merging. Walk-found bug v0.1.115 →
+    // v0.1.116: a `{"status": {...}}` patch alone hits the
+    // apiserver with `invalid object type: /, Kind=` (empty
+    // GroupVersion, empty Kind) and every reconcile retry loops
+    // on that error. Mirror'ed from
+    // `operator_controllers_application::apply_status` which has
+    // always carried the TypeMeta.
+    let patch = build_status_patch(&name, &new_status);
     api.patch_status(
-        &stack.name_any(),
+        &name,
         &PatchParams::apply(FIELD_MANAGER),
         &Patch::Apply(&patch),
     )
     .await?;
     Ok(())
+}
+
+fn build_status_patch(name: &str, new_status: &PlatformStackStatus) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "PlatformStack",
+        "metadata": { "name": name },
+        "status": new_status,
+    })
 }
 
 fn parse_check_interval(s: &str) -> Duration {
@@ -496,5 +523,77 @@ mod tests {
             }
         });
         assert!(detect_outside_writer(&parent).is_none());
+    }
+
+    #[test]
+    fn build_status_patch_includes_apiversion_kind_and_name() {
+        // Regression guard for walk-fix v0.1.115 → v0.1.116. SSA
+        // requires the patch body to carry apiVersion + kind +
+        // metadata.name; a bare `{"status": {...}}` body fails
+        // with `invalid object type: /, Kind=` from the apiserver
+        // (empty GroupVersion, empty Kind) and loops every
+        // reconcile retry on the same error.
+        let status = PlatformStackStatus {
+            current_version: Some("0.1.17".into()),
+            ..Default::default()
+        };
+        let patch = build_status_patch("default", &status);
+        let map = patch.as_object().expect("patch is JSON object");
+        assert_eq!(
+            map.get("apiVersion").and_then(Value::as_str),
+            Some("apprafter.io/v1alpha1")
+        );
+        assert_eq!(
+            map.get("kind").and_then(Value::as_str),
+            Some("PlatformStack")
+        );
+        assert_eq!(
+            patch.pointer("/metadata/name").and_then(Value::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            patch
+                .pointer("/status/currentVersion")
+                .and_then(Value::as_str),
+            Some("0.1.17")
+        );
+    }
+
+    #[test]
+    fn build_application_patch_includes_apiversion_kind_name_and_source() {
+        // SSA TypeMeta contract for the parent Application
+        // patch — same shape requirement as status patch. Carried
+        // forward from the v0.1.114 closure (TypeMeta was correct
+        // here; this test pins the contract so future refactors
+        // can't silently strip it the way write_status did).
+        let desired = DesiredSource {
+            target_revision: "0.1.17".into(),
+            helm_values: json!({"tier": 1}),
+        };
+        let patch = build_application_patch(&desired);
+        assert_eq!(
+            patch.get("apiVersion").and_then(Value::as_str),
+            Some("argoproj.io/v1alpha1")
+        );
+        assert_eq!(
+            patch.get("kind").and_then(Value::as_str),
+            Some("Application")
+        );
+        assert_eq!(
+            patch.pointer("/metadata/name").and_then(Value::as_str),
+            Some(PARENT_APPLICATION_NAME)
+        );
+        assert_eq!(
+            patch
+                .pointer("/spec/source/targetRevision")
+                .and_then(Value::as_str),
+            Some("0.1.17")
+        );
+        assert_eq!(
+            patch
+                .pointer("/spec/source/helm/valuesObject/tier")
+                .and_then(Value::as_i64),
+            Some(1)
+        );
     }
 }
