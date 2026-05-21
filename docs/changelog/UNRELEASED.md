@@ -13,6 +13,122 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.114 — M1.5 Track B.1.73 closure — PlatformController core (2026-05-20)
+
+PlatformController landed in the `apprafter-operator` binary
+(per the session 2026-05-20 design adapting plan.md's "new crate"
+to "second controller in the existing operator"). Reconciles
+`PlatformStack/default` by SSA-patching the parent `platform`
+Argo CD Application's `spec.source.{targetRevision,
+helm.valuesObject}` with field manager `platform-controller`.
+Three-version status model (`currentVersion` / `targetVersion` /
+`availableVersion`) populated; conditions `Synced`,
+`UpgradeAvailable`, `MigrationPending`,
+`UnauthorizedSourceModification` maintained per k8s convention.
+
+### Reconcile cycle
+
+1. Resolve desired version (pin or channel-latest from OCI via
+   `oci-distribution`).
+2. Read parent Application state (in-flight detection via
+   `status.sync.status == "OutOfSync"` or
+   `operationState.phase == "Running"`).
+3. Compute desired source payload via `desired::build`.
+4. Decide action:
+   - In-flight ⇒ requeue 30s.
+   - No diff ⇒ status-only update with `Synced=True`.
+   - Diff + pin/autoUpgrade=false ⇒ status-only update with
+     `UpgradeAvailable=True`.
+   - Diff + safe/requires-restart class ⇒ SSA patch parent.
+   - Diff + breaking/data-migration ⇒ push `MigrationPending=True`,
+     defer to 1.74's MigrationPlan.
+5. Outside-writer detection via `metadata.managedFields`; foreign
+   writer (anything other than `platform-controller` or
+   `argocd-application-controller`) ⇒ force-revert +
+   `UnauthorizedSourceModification=True`.
+6. Status write + cadence requeue from
+   `spec.source.checkInterval`.
+
+### Chart-side override pattern (extending platform-stack 0.1.15
+→ 0.1.16)
+
+The umbrella chart's `_applicationsTemplate` now consumes
+`.Values.overrides.<component>.{pin, values, enabled}`:
+
+- `pin` REPLACES the component's curated `targetRevision`.
+- `values` DEEP-MERGES (`mergeOverwrite`) onto the component's
+  `values`; override wins on collisions.
+- `enabled` REPLACES the component's `enabled` flag (gating
+  emission entirely).
+
+PlatformController writes this block onto the parent
+Application's `helm.valuesObject` from
+`PlatformStack.spec.overrides`. Chart `values.schema.json`
+declares `overrides` as optional with the same key shape as
+`components`. Rendered chart vs 0.1.15 byte-equivalent when
+`.Values.overrides` is empty (default).
+
+### New OCI dep
+
+`oci-distribution = 0.11` (rustls-tls features) for anonymous
+chart tarball pulls. Chart-side `compatibility.yaml` extracted
+from the chart's single tarball layer via `flate2` + `tar`.
+
+### Hooks for 1.74 / 1.74a (stubs in place, concrete impls
+deferred)
+
+`PolicyHooks` trait with `is_yanked(upstream, version)` and
+`request_migration_plan(from, to, change_class)` — concrete
+implementations land in B.1.74 (MigrationPlan CR creation) and
+B.1.74a (yanking field + skip-yanked logic). `NoOpHooks`
+(default in 1.73) returns "not yanked" / "no migration plan
+requested" for every call.
+
+### Out of scope (explicit)
+
+- Yanking field + skip-yanked logic → 1.74a.
+- MigrationPlan auto-create → 1.74. 1.73 only pushes the
+  `MigrationPending=True` condition on breaking diff.
+- Multi-stack support — singleton enforced by webhook (1.72).
+- Rollback flow (downgrade via lower pin) — needs dedicated
+  design for stateful components.
+- `minimumKubernetesVersion` environment check — not in
+  `compatibility.yaml` shape yet; future iteration.
+
+### Version chain
+
+- CLI 0.1.113 → 0.1.114.
+- operator + admission-webhook chart v0.1.94 → v0.1.95.
+- operator + admission-webhook `appVersion` v0.1.111 → v0.1.114
+  (matches new monorepo tag; both `Chart.yaml` files bumped in
+  lockstep per the `build.rs` equality assertion).
+- platform-stack chart 0.1.15 → 0.1.16 via CUE invariant chain
+  (component pin bumps + currentVersion + compatibility entry).
+
+### Test coverage
+
+30 unit tests in `operator-controllers-platform-stack`:
+- 5 `oci::tests` — channel resolution + scheme strip.
+- 4 `compatibility::tests` — change class parsing + tarball
+  extract.
+- 4 `desired::tests` — minimal spec, domain, extras, overrides
+  serialization.
+- 2 `policy::tests` — NoOpHooks default behavior.
+- 4 `status::tests` — condition transition-time preservation +
+  upsert.
+- 11 `reconcile::tests` — check interval parsing, in-flight
+  detection, values diff, outside-writer detection (positive +
+  negative cases).
+
+Plus 1 ignored smoke test scaffold (`reconcile_smoke_test.rs`)
+gated by `APPRAFTER_K8S_SMOKE=1`.
+
+### References
+
+- `docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md`
+- `docs/adr/0026-platformstack-crd-and-platformcontroller.md`
+- spec.md §3.11
+
 ## v0.1.113 — M1.5 Track B.1.72 walk-fix #2 — two-stage CRD wait (create + Established) (2026-05-20)
 
 Second post-v0.1.111 walk: v0.1.112's CRD wait (`kubectl wait

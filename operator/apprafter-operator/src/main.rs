@@ -106,9 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = client.clone();
         let metrics = metrics.clone();
         async move {
-            if let Err(err) =
-                operator_controllers_platform_stack::run(client, metrics).await
-            {
+            if let Err(err) = operator_controllers_platform_stack::run(client, metrics).await {
                 error!(%err, "PlatformController error");
             }
         }

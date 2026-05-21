@@ -70,6 +70,7 @@ dependencies = [
  "http-body-util",
  "kube",
  "operator-controllers-application",
+ "operator-controllers-platform-stack",
  "operator-core",
  "rustls",
  "tokio",

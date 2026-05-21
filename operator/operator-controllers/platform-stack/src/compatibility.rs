@@ -64,8 +64,9 @@ pub async fn fetch_change_class(
 ) -> Result<ChangeClass, CompatError> {
     let bare = upstream_url.strip_prefix("oci://").unwrap_or(upstream_url);
     let with_tag = format!("{bare}:{version}");
-    let reference: Reference =
-        with_tag.parse().map_err(|e: oci_distribution::ParseError| {
+    let reference: Reference = with_tag
+        .parse()
+        .map_err(|e: oci_distribution::ParseError| {
             CompatError::InvalidReference(with_tag.clone(), e.to_string())
         })?;
 
@@ -192,7 +193,9 @@ mod tests {
             let mut builder = Builder::new(enc);
             let content = b"compatibility:\n  \"0.1.15\":\n    change: safe\n";
             let mut header = tar::Header::new_gnu();
-            header.set_path("platform-stack/compatibility.yaml").unwrap();
+            header
+                .set_path("platform-stack/compatibility.yaml")
+                .unwrap();
             header.set_size(content.len() as u64);
             header.set_cksum();
             builder.append(&header, &content[..]).unwrap();

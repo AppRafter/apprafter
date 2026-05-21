@@ -180,8 +180,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         }
 
         // Pin OR autoUpgrade=true → classify diff.
-        let class =
-            fetch_change_class(&spec.source.upstream, &desired.target_revision).await?;
+        let class = fetch_change_class(&spec.source.upstream, &desired.target_revision).await?;
         if matches!(class, ChangeClass::Breaking | ChangeClass::DataMigration) {
             // Defer to MigrationPlan (1.74). 1.73: push condition, no auto-bump.
             ctx.hooks
@@ -291,9 +290,8 @@ fn detect_outside_writer(parent: &Value) -> Option<String> {
             .get("fieldsV1")
             .and_then(|v| v.get("f:spec"))
             .and_then(|s| s.get("f:source"));
-        if fields.is_some_and(|s| {
-            s.get("f:targetRevision").is_some() || s.get("f:helm").is_some()
-        }) {
+        if fields.is_some_and(|s| s.get("f:targetRevision").is_some() || s.get("f:helm").is_some())
+        {
             return Some(manager.to_string());
         }
     }

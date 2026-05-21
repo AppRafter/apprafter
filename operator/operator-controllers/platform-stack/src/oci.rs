@@ -69,16 +69,11 @@ pub fn channel_matches(version: &Version, channel: Channel) -> bool {
 /// semver in the requested channel. `upstream_url` examples:
 /// `oci://ghcr.io/apprafter/platform-stack` or
 /// `ghcr.io/apprafter/platform-stack`.
-pub async fn latest_in_channel(
-    upstream_url: &str,
-    channel: Channel,
-) -> Result<Version, OciError> {
+pub async fn latest_in_channel(upstream_url: &str, channel: Channel) -> Result<Version, OciError> {
     let bare = strip_oci_scheme(upstream_url);
-    let reference: Reference = bare
-        .parse()
-        .map_err(|e: oci_distribution::ParseError| {
-            OciError::InvalidReference(bare.to_string(), e.to_string())
-        })?;
+    let reference: Reference = bare.parse().map_err(|e: oci_distribution::ParseError| {
+        OciError::InvalidReference(bare.to_string(), e.to_string())
+    })?;
 
     let client = Client::new(ClientConfig::default());
     let tag_response = client
