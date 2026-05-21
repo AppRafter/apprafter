@@ -99,6 +99,26 @@ _chartYaml: """
 // / cert-manager chart); the alternative `helm.parameters`
 // would force key/value flattening.
 //
+// Override merge (B.1.73): when `.Values.overrides.<name>` is
+// set, the template overlays it onto the chart's per-component
+// declaration:
+//
+//   - `overrides.<name>.enabled` REPLACES `component.enabled`
+//     (deciding whether the child Application is emitted at
+//     all).
+//   - `overrides.<name>.pin` REPLACES `component.version` for
+//     the rendered `spec.source.targetRevision`.
+//   - `overrides.<name>.values` DEEP-MERGES onto
+//     `component.values` (override wins on collisions). Helm's
+//     `mergeOverwrite` does a recursive merge in that direction.
+//
+// Override writes go through PlatformController's SSA patch
+// on the parent platform Application — the CR
+// `PlatformStack.spec.overrides` is its source. Operators
+// editing values directly through `kubectl edit application`
+// trigger `UnauthorizedSourceModification=True` on the
+// PlatformStack.
+//
 // Note the double-curly braces: this string is itself a Go
 // template that Helm will execute at install time, so we keep
 // the `{{ }}` literal. CUE happily ships this verbatim.
@@ -106,11 +126,25 @@ _applicationsTemplate: """
 	{{/*
 	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
 	  Rendered by `cue cmd render`. Do not edit.
-	  Iterates over .Values.components, emitting one Argo CD
-	  Application per enabled entry.
+	  Iterates over .Values.components, applying any
+	  per-component override from .Values.overrides, and emits
+	  one Argo CD Application per enabled entry.
 	*/}}
+	{{- $overrides := default (dict) $.Values.overrides }}
 	{{- range $name, $component := .Values.components }}
-	{{- if $component.enabled }}
+	{{- $override := default (dict) (index $overrides $name) }}
+	{{- $enabled := $component.enabled }}
+	{{- if hasKey $override "enabled" }}
+	{{- $enabled = $override.enabled }}
+	{{- end }}
+	{{- if $enabled }}
+	{{- $version := $component.version }}
+	{{- if hasKey $override "pin" }}
+	{{- $version = $override.pin }}
+	{{- end }}
+	{{- $componentValues := default (dict) $component.values }}
+	{{- $overrideValues := default (dict) $override.values }}
+	{{- $values := mergeOverwrite (deepCopy $componentValues) $overrideValues }}
 	---
 	apiVersion: argoproj.io/v1alpha1
 	kind: Application
@@ -133,11 +167,11 @@ _applicationsTemplate: """
 	    {{- with $component.source.path }}
 	    path: {{ . | quote }}
 	    {{- end }}
-	    targetRevision: {{ $component.version | quote }}
+	    targetRevision: {{ $version | quote }}
 	    {{- if $component.source.chart }}
 	    helm:
 	      valuesObject:
-	{{ toYaml $component.values | indent 8 }}
+	{{ toYaml $values | indent 8 }}
 	    {{- end }}
 	  destination:
 	    server: https://kubernetes.default.svc
@@ -205,6 +239,21 @@ _valuesSchema: {
 							items: {type: "object"}
 						}
 					}
+				}
+			}
+			additionalProperties: false
+		}
+		overrides: {
+			type: "object"
+			patternProperties: {
+				"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$": {
+					type: "object"
+					properties: {
+						pin: {type: "string"}
+						values: {type: "object"}
+						enabled: {type: "boolean"}
+					}
+					additionalProperties: false
 				}
 			}
 			additionalProperties: false

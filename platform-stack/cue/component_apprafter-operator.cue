@@ -28,7 +28,7 @@ _components: "apprafter-operator": #Component & {
 		repoURL: "ghcr.io/apprafter"
 		chart:   "apprafter-operator"
 	}
-	version: "v0.1.94"
+	version: "v0.1.95"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-operator"

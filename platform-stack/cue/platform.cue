@@ -172,6 +172,36 @@ package platformstack
 	[string]: #Component
 }
 
+// #ComponentOverride is one entry in the umbrella chart's
+// optional `values.overrides` map. PlatformController writes
+// this block onto the parent platform Application's
+// `helm.valuesObject` per the B.1.73 design — at chart render
+// time the Helm template merges these onto the per-component
+// `_components` projection (override wins on `pin`, deep-merges
+// on `values`, replaces on `enabled`).
+//
+// The chart's per-component pin (`_components.<name>.version`)
+// is the "curated bundle" version; an operator wanting a
+// component to differ from the bundle declares the override
+// here via PlatformStack.spec.overrides.<name>.
+#ComponentOverride: {
+	// Force this component to a specific upstream chart version,
+	// bypassing the umbrella chart's curated pin. Used for
+	// security backports out-of-band of the umbrella release.
+	pin?: string
+
+	// Component-specific values merged onto `_components.<name>.values`
+	// at template-render time (override wins on collisions). Free-
+	// form per component; the chart does not validate the shape
+	// (mirror'ed from the upstream component chart's own values).
+	values?: {...}
+
+	// Disable a component entirely. Per-component `enabled`
+	// inside `_components` is the chart-side default; the
+	// PlatformStack-side override here wins when set.
+	enabled?: bool
+}
+
 // #PlatformValues is the full shape of the umbrella chart's
 // rendered `values.yaml`. Tier overlays project into this
 // shape; the chart template iterates `components`.
@@ -193,6 +223,17 @@ package platformstack
 	// individual components off (`enabled: false`) but cannot
 	// remove the declaration — that's a chart-shape change.
 	components: #ComponentSet
+
+	// Optional per-component overrides — PlatformController
+	// writes this block at runtime via SSA on the parent
+	// platform Application. The chart's `_applicationsTemplate`
+	// reads `(index .Values.overrides $name)` at install time
+	// and threads `pin` / `values` / `enabled` into the rendered
+	// child Application.
+	//
+	// Empty by default — the chart's curated bundle stands on
+	// its own without any override block.
+	overrides?: [string]: #ComponentOverride
 }
 
 // `currentVersion` is THE single source of truth for the chart
@@ -213,7 +254,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.1.15"
+currentVersion: #Version & "0.1.16"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

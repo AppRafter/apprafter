@@ -1042,3 +1042,63 @@ compatibility: "0.1.15": {
 		"docs/changelog/UNRELEASED.md#v01111",
 	]
 }
+
+// 0.1.16 — Track B.1.73 closure: PlatformController landed in
+// the apprafter-operator binary. Reconciles `PlatformStack/default`
+// by SSA-patching the parent `platform` Argo CD Application's
+// `spec.source.{targetRevision, helm.valuesObject}` with field
+// manager `platform-controller`. Three-version status model
+// (currentVersion / targetVersion / availableVersion) populated;
+// conditions `Synced`, `UpgradeAvailable`, `MigrationPending`,
+// `UnauthorizedSourceModification` maintained per k8s convention.
+// Chart-shape change vs 0.1.15: `_applicationsTemplate` reads
+// `.Values.overrides.<component>.{pin, values, enabled}` and
+// projects each onto the rendered child Application (pin
+// replaces targetRevision, values mergeOverwrite onto component
+// values, enabled gates emission). Operator + admission-webhook
+// image bump to v0.1.114 (matches the new monorepo tag).
+compatibility: "0.1.16": {
+	change:          "safe"
+	operatorVersion: "v0.1.114"
+	notes: """
+		Track B.1.73 closure — PlatformController core. Watches
+		PlatformStack/default in apprafter-system; SSA-patches
+		parent platform Application's spec.source with field
+		manager `platform-controller`; populates three-version
+		status (current/target/available) + conditions
+		(Synced, UpgradeAvailable, MigrationPending,
+		UnauthorizedSourceModification).
+
+		Chart-shape change vs 0.1.15: `_applicationsTemplate`
+		consumes `.Values.overrides` so PlatformController can
+		patch per-component pin/values/enabled through the
+		parent Application's helm.valuesObject. Schema
+		(`values.schema.json`) declares `overrides` as an
+		optional top-level object with the same key shape as
+		`components`.
+
+		Out of scope for 1.73 (deferred):
+		  * Yanking field + skip-yanked logic → 1.74a.
+		    `NoOpHooks::is_yanked` always returns false here.
+		  * MigrationPlan auto-create → 1.74.
+		    `NoOpHooks::request_migration_plan` is a no-op;
+		    breaking-diff signal lives in MigrationPending=True
+		    condition.
+		  * Multi-stack support — singleton enforced by
+		    webhook.
+		  * Rollback flow (downgrade via lower pin) — needs
+		    dedicated design for stateful components.
+
+		Rendered chart vs 0.1.15: existing children unchanged
+		when `.Values.overrides` is empty; the new template
+		degrades cleanly with `default (dict)` so omitted
+		overrides ⇒ original component values. Operators on
+		0.1.15 upgrade without any cluster-side action; the
+		PlatformController takes ownership of
+		`spec.source.targetRevision` on first reconcile.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01114",
+	]
+}
