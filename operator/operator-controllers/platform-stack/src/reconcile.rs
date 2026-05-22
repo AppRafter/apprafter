@@ -17,6 +17,7 @@ use futures::StreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
 use semver::Version;
@@ -78,6 +79,17 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         version: "v1alpha1".into(),
         kind: "Application".into(),
     });
+    // Dynamic Api for the parent platform Application — used both
+    // for the read in reconcile() and for the watch mapping that
+    // bridges Application change events to PlatformStack
+    // reconciles (so a foreign kubectl-patch on the parent App's
+    // spec.source triggers immediate revert instead of waiting
+    // for the next checkInterval).
+    let apps: Api<DynamicObject> = Api::namespaced_with(
+        client.clone(),
+        PARENT_APPLICATION_NAMESPACE,
+        &app_api_resource,
+    );
     let ctx = Arc::new(Context {
         client,
         metrics,
@@ -85,11 +97,44 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         app_api_resource,
     });
 
+    info!(
+        parent_app = format!("{PARENT_APPLICATION_NAMESPACE}/{PARENT_APPLICATION_NAME}").as_str(),
+        "PlatformController Controller::run() entering watch loop"
+    );
     Controller::new(stacks, watcher::Config::default())
+        .watches_with(
+            apps,
+            ctx.app_api_resource.clone(),
+            watcher::Config::default(),
+            |app: DynamicObject| {
+                // Bridge: any change to the parent platform App
+                // triggers a reconcile of the singleton
+                // PlatformStack. Reconcile filters non-singleton
+                // names internally.
+                if app.metadata.namespace.as_deref() == Some(PARENT_APPLICATION_NAMESPACE)
+                    && app.metadata.name.as_deref() == Some(PARENT_APPLICATION_NAME)
+                {
+                    Some(
+                        ObjectRef::<PlatformStack>::new(SINGLETON_NAME).within(SINGLETON_NAMESPACE),
+                    )
+                } else {
+                    None
+                }
+            },
+        )
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
-            if let Err(e) = res {
-                warn!(error = %e, "PlatformController reconcile error");
+            match res {
+                Ok((obj, action)) => {
+                    info!(
+                        object = %obj,
+                        ?action,
+                        "PlatformController reconcile completed"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "PlatformController reconcile error");
+                }
             }
         })
         .await;
@@ -102,6 +147,11 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         warn!(name = %stack.name_any(), "ignoring non-singleton PlatformStack");
         return Ok(Action::await_change());
     }
+    info!(
+        name = %stack.name_any(),
+        generation = stack.metadata.generation.unwrap_or(0),
+        "PlatformController reconcile fired"
+    );
 
     let spec = &stack.spec;
     let prior_conds = stack
@@ -219,20 +269,29 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         target_revision: target_for_patch.clone(),
         helm_values: desired.helm_values.clone(),
     };
+
+    // Detect foreign writer BEFORE patching — so we know whether
+    // we need force=true on the SSA patch. Walk-found bug
+    // v0.1.117 → v0.1.118: the old order (patch without force,
+    // then detect-and-revert) deadlocked when the loader's
+    // `kubectl-client-side-apply` already owned
+    // `f:spec.f:source.f:targetRevision`. The non-force patch
+    // 409'd and reconcile errored before reaching the revert
+    // path.
+    //
+    // Now PlatformController IS the single writer for
+    // `spec.source.{targetRevision, helm.valuesObject}` — every
+    // SSA patch uses force=true. Foreign-writer detection only
+    // surfaces the audit condition; the patch itself is
+    // unconditional and always wins.
+    let foreign_writer = detect_outside_writer(&parent_json);
     let patched_this_cycle =
         target_changed || values_changed || !platform_controller_owns_source(&parent_json);
-    if patched_this_cycle {
-        patch_application(&apps, &patch_payload, false).await?;
-    }
-
-    // 9. Outside-writer detection — any non-`platform-controller` +
-    //    non-`argocd-application-controller` field manager owning
-    //    `f:spec.f:source.f:targetRevision` (or f:helm) is treated
-    //    as an unauthorized modification and force-reverted.
-    let foreign_writer = detect_outside_writer(&parent_json);
-    if let Some(foreign) = &foreign_writer {
-        warn!(manager = %foreign, "foreign field manager detected; force-reverting parent App");
-        patch_application(&apps, &patch_payload, true).await?;
+    if patched_this_cycle || foreign_writer.is_some() {
+        if let Some(foreign) = &foreign_writer {
+            warn!(manager = %foreign, "foreign field manager on parent spec.source; force-reverting");
+        }
+        patch_application(&apps, &patch_payload).await?;
     }
 
     // 10. Conditions. `Synced` reflects whether PlatformController
@@ -395,13 +454,34 @@ fn values_differ(parent: &Value, desired: &Value) -> bool {
     &current != desired
 }
 
+/// Field managers whose write to parent App `spec.source` is
+/// considered legitimate and does NOT trip the
+/// `UnauthorizedSourceModification` condition.
+///
+/// * `platform-controller` — this controller. Obviously OK.
+/// * `argocd-application-controller` — Argo CD writes status,
+///   never spec.source, but its entry shows up in `managedFields`
+///   so we whitelist defensively.
+/// * `apprafter-cli` — the loader's initial SSA apply of the
+///   root Application during bootstrap (walk-fix v0.1.117 →
+///   v0.1.118 switched the loader from client-side to SSA with
+///   this field manager). PlatformController takes ownership on
+///   first reconcile via force=true patch; whitelisting prevents
+///   the bootstrap state from looping
+///   `UnauthorizedSourceModification=True`.
+const WHITELISTED_FIELD_MANAGERS: &[&str] = &[
+    FIELD_MANAGER,
+    "argocd-application-controller",
+    "apprafter-cli",
+];
+
 fn detect_outside_writer(parent: &Value) -> Option<String> {
     let entries = parent
         .pointer("/metadata/managedFields")
         .and_then(Value::as_array)?;
     for entry in entries {
         let manager = entry.get("manager").and_then(Value::as_str)?;
-        if manager == FIELD_MANAGER || manager == "argocd-application-controller" {
+        if WHITELISTED_FIELD_MANAGERS.contains(&manager) {
             continue;
         }
         let fields = entry
@@ -419,13 +499,22 @@ fn detect_outside_writer(parent: &Value) -> Option<String> {
 async fn patch_application(
     apps: &Api<DynamicObject>,
     desired: &DesiredSource,
-    force: bool,
 ) -> Result<(), Error> {
+    // PlatformController is the single writer for parent
+    // Application's `spec.source.{targetRevision, helm.valuesObject}`
+    // per the B.1.73 design. Always SSA with `force=true` —
+    // negotiating ownership against `kubectl-patch`,
+    // `kubectl-edit`, or the loader's `apprafter-cli` would
+    // produce unrecoverable 409 deadlocks when reconciles fire
+    // before the foreign writer has been displaced. Foreign
+    // writes get surfaced via the `UnauthorizedSourceModification`
+    // condition; the patch itself is unconditional.
+    info!(
+        target = %desired.target_revision,
+        "SSA-patching parent platform Application (force=true)"
+    );
     let payload = build_application_patch(desired);
-    let mut params = PatchParams::apply(FIELD_MANAGER);
-    if force {
-        params = params.force();
-    }
+    let params = PatchParams::apply(FIELD_MANAGER).force();
     apps.patch(PARENT_APPLICATION_NAME, &params, &Patch::Apply(&payload))
         .await?;
     Ok(())

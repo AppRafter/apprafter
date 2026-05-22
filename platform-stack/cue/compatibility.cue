@@ -1278,3 +1278,105 @@ compatibility: "0.1.19": {
 		"docs/changelog/UNRELEASED.md#v01117",
 	]
 }
+
+// 0.1.20 — Track B.1.73 walk-fix #4: fourth post-closure walk
+// finally produced PlatformController logs that pinpointed the
+// remaining issue — `compatibility.yaml` parsing was failing on
+// every reconcile that reached the change-class classifier
+// (target_changed && allow_target_bump). Five fixes land
+// together so the same walk doesn't surface them iteratively.
+//
+// 1. **compatibility.yaml parser** — the rendered shape is a
+//    top-level map keyed by version string, NOT wrapped in a
+//    `compatibility:` object as the old `CompatibilityDoc`
+//    struct expected. Direct `BTreeMap<String, VersionRecord>`
+//    type alias replaces the wrapper.
+//
+// 2. **Observability** — info!() logs at PlatformController
+//    spawn (lib.rs::run), Controller::run start, every
+//    reconcile fire/finish, every SSA patch. Previously a
+//    silent reconcile (RBAC failure, parse error, etc.) left
+//    operators staring at a static status with no logs;
+//    walk-fix #4 surfaces every reconcile attempt at info
+//    level.
+//
+// 3. **Loader uses SSA + apprafter-cli whitelist** — step 3
+//    (root Application) switches from client-side `kubectl
+//    apply -f` to `apply_manifest_server_side` with field
+//    manager `apprafter-cli` (same convention as step 5's
+//    PlatformStack apply). PlatformController's
+//    `detect_outside_writer` now whitelists `apprafter-cli`
+//    alongside `platform-controller` and
+//    `argocd-application-controller`. Closes the false-
+//    positive `UnauthorizedSourceModification=True` that
+//    every fresh bootstrap was emitting.
+//
+// 4. **Controller watches parent Application** — Argo CD
+//    Application changes (manual kubectl-patch, foreign
+//    writes, sync events) now trigger PlatformController
+//    reconciles immediately via the `watches_with` clause.
+//    Was: 6h checkInterval wait before detecting any
+//    parent-App tampering. Now: ms-latency.
+//
+// 5. **Single-writer SSA pattern** — `patch_application`
+//    always uses `force=true`. The old "patch without force,
+//    then force-revert if foreign detected" two-step
+//    deadlocked when the loader's `kubectl-client-side-apply`
+//    already owned spec.source.targetRevision (409 Conflict
+//    before reaching the revert path). PlatformController
+//    is now THE single writer for
+//    `spec.source.{targetRevision, helm.valuesObject}`;
+//    foreign detection only surfaces the audit condition,
+//    not the patch decision.
+compatibility: "0.1.20": {
+	change:          "safe"
+	operatorVersion: "v0.1.118"
+	notes: """
+		Track B.1.73 walk-fix #4. Five fixes:
+
+		1. compatibility.yaml parser accepts the actual
+		   top-level-version-map shape the chart renders
+		   (was looking for a `compatibility:` wrapper key
+		   that doesn't exist).
+		2. info!() observability throughout PlatformController
+		   so silent reconciles can be diagnosed from logs.
+		3. Loader SSA's the root Application with field
+		   manager `apprafter-cli`; the operator
+		   whitelists it. No more false-positive
+		   `UnauthorizedSourceModification` on bootstrap.
+		4. Controller watches the parent platform
+		   Application — foreign writes (kubectl-patch /
+		   kubectl-edit) trigger immediate reconcile +
+		   revert instead of waiting for
+		   spec.source.checkInterval.
+		5. `patch_application` always uses force=true.
+		   PlatformController is the single writer for the
+		   parent App's spec.source. SSA conflict
+		   negotiation removed.
+
+		Known limitation: if an operator manually
+		`kubectl-patch`-es the parent platform
+		Application to an OLD platform-stack chart version
+		that doesn't ship the PlatformStack RBAC
+		(pre-0.1.17), Argo CD will overwrite the
+		ClusterRole, PlatformController loses watch
+		permissions, and the controller can no longer
+		auto-revert. Recovery: manually `kubectl-patch`
+		the parent target back to a known-good chart
+		version. This is a degenerate case (operator
+		actively downgrading past PlatformController-
+		aware versions) and accepted as documented
+		behaviour rather than engineered around.
+
+		Rendered chart vs 0.1.19: byte-equivalent (no
+		chart-shape change beyond version bumps).
+		Operators on 0.1.19 upgrade in place; the
+		operator pod restarts on new image and
+		PlatformController begins reconciling correctly
+		within the first cycle.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01118",
+	]
+}

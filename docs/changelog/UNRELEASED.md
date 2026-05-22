@@ -13,6 +13,133 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.118 — M1.5 Track B.1.73 walk-fix #4 — compatibility parser + observability + single-writer SSA (2026-05-22)
+
+Fourth post-v0.1.114 walk. With RBAC + TypeMeta + UpgradeAvailable semver
+all landed (walk-fixes #1-3), PlatformController finally logged from
+inside its reconcile loop and exposed the next layer of bugs:
+
+```
+WARN PlatformController reconcile failed
+error=compatibility fetch error: parse compatibility.yaml: missing field `compatibility`
+```
+
+### Five fixes in one walk-fix
+
+**1. `compatibility.yaml` parser** (load-bearing)
+
+The rendered shape from `platform-stack/cue/render_tool.cue` is a
+TOP-LEVEL map keyed by semver string:
+
+```yaml
+"0.1.19":
+  version: "0.1.19"
+  change: safe
+  operatorVersion: v0.1.117
+```
+
+But the parser's `struct CompatibilityDoc { compatibility: BTreeMap<..> }`
+expected an outer `compatibility:` wrapper that doesn't exist. Every
+reconcile that hit `fetch_change_class` (whenever
+`target_changed && allow_target_bump`) errored. Fix: type alias
+`type CompatibilityDoc = BTreeMap<String, VersionRecord>` — direct
+map, no wrapper.
+
+**2. Observability — `info!()` logs throughout PlatformController**
+
+Previously a silent reconcile (RBAC failure, parser error, watcher
+disconnect) left operators staring at a static `.status` with zero log
+breadcrumbs to diagnose. New logs:
+
+- `PlatformController starting` (at spawn).
+- `Controller::run() entering watch loop` (after Controller::new).
+- `PlatformController reconcile fired` (at reconcile entry).
+- `PlatformController reconcile completed` (after each cycle).
+- `SSA-patching parent platform Application (force=true)` (per patch).
+- `foreign field manager on parent spec.source` (per outside-writer detection).
+
+**3. Loader uses SSA + `apprafter-cli` whitelist**
+
+Walk-fix surfaced `UnauthorizedSourceModification=True / ForeignFieldManager: kubectl-client-side-apply`
+on every fresh bootstrap because the loader used client-side `kubectl
+apply -f` for the root Application. Switching to
+`apply_manifest_server_side` with field manager `apprafter-cli` —
+same convention as step 5's PlatformStack apply — plus whitelisting
+`apprafter-cli` in `WHITELISTED_FIELD_MANAGERS` closes the
+false-positive.
+
+**4. Controller watches parent Application**
+
+`Controller::new(stacks, ...).watches_with(apps, app_api_resource, ..., mapper)`
+bridges parent-App change events to PlatformStack reconciles. Foreign
+writes (`kubectl-patch`, `kubectl-edit`, anything not whitelisted) now
+trigger immediate reconcile + revert. Was: 6h `checkInterval` wait
+before detection.
+
+**5. Single-writer SSA pattern**
+
+`patch_application` always uses `force=true` and dropped the `force:
+bool` parameter. The old "patch without force, then force-revert if
+detect_outside_writer flagged" two-step deadlocked when the loader's
+`kubectl-client-side-apply` already owned `spec.source.targetRevision`:
+SSA without force returned 409 Conflict, reconcile errored, never
+reached the revert path. PlatformController is now THE single writer
+for `spec.source.{targetRevision, helm.valuesObject}`. Foreign-writer
+detection still runs (for the audit condition + force-revert flag),
+but the patch decision is unconditional.
+
+### Known limitation (documented, not engineered around)
+
+If an operator manually `kubectl-patch`-es the parent platform
+Application to a chart version that PRE-DATES the PlatformStack RBAC
+(anything before chart 0.1.17), Argo CD will overwrite the ClusterRole
+with the old version's RBAC template. PlatformController loses
+`platformstacks` watch permissions, becomes silent, and the
+auto-revert no longer fires. **Recovery**: manually `kubectl-patch`
+the parent target back to a chart version that ships the new RBAC
+(0.1.17+):
+
+```sh
+kubectl patch application.argoproj.io platform -n argocd --type=merge \
+  -p '{"spec":{"source":{"targetRevision":"0.1.20"}}}'
+```
+
+This is a degenerate case (operator actively downgrading past the
+PlatformController-aware era) and accepted behaviour rather than
+engineered around.
+
+### Regression guards
+
+- `compatibility_doc_parses_top_level_version_map` — pins the shape
+  parser accepts.
+- `compatibility_doc_tolerates_extra_fields_per_record` — future
+  schema additions (yanked field per 1.74a, etc.) don't break the
+  parser.
+- `step_3_ssa_applies_root_application_with_loader_field_manager`
+  — pins loader's SSA convention.
+- Updated existing tests:
+  `perform_bootstrap_installs_..._waits_for_healthy` — now asserts 2
+  SSA applies (root App + PlatformStack), 0 client-side applies.
+  `crd_established_waits_run_after_root_healthy_and_before_platformstack_apply`
+  — same SSA count update.
+
+Total tests: 42 unit (operator) + ~487 cli + 1 ignored smoke.
+
+### Version chain
+
+- CLI 0.1.117 → 0.1.118.
+- operator + admission-webhook chart v0.1.98 → v0.1.99.
+- operator + admission-webhook `appVersion` v0.1.117 → v0.1.118.
+- platform-stack chart 0.1.19 → 0.1.20.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01117` (UpgradeAvailable semver
+  fix — surfaced the compatibility-parser bug because the
+  semver-correct path actually hit `fetch_change_class` instead of
+  bypassing it).
+- `operator/operator-controllers/platform-stack/src/{lib,reconcile,compatibility}.rs`.
+
 ## v0.1.117 — M1.5 Track B.1.73 walk-fix #3 — UpgradeAvailable semver + values ownership (2026-05-21)
 
 Third post-v0.1.114 walk. PlatformController status now

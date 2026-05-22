@@ -43,10 +43,15 @@ pub enum CompatError {
     UnknownVersion(String),
 }
 
-#[derive(Debug, Deserialize)]
-struct CompatibilityDoc {
-    compatibility: BTreeMap<String, VersionRecord>,
-}
+/// The rendered `compatibility.yaml` shape that
+/// `platform-stack/cue/render_tool.cue` produces is a
+/// top-level map keyed by version string (NOT wrapped in a
+/// `compatibility:` field). Walk-found bug v0.1.117 → v0.1.118:
+/// the old `CompatibilityDoc { compatibility: BTreeMap<..> }`
+/// expected an outer wrapper that doesn't exist, so every
+/// reconcile that hit `fetch_change_class` errored on
+/// `missing field "compatibility"`. Switch to a direct map.
+type CompatibilityDoc = BTreeMap<String, VersionRecord>;
 
 #[derive(Debug, Deserialize)]
 struct VersionRecord {
@@ -100,7 +105,6 @@ pub async fn fetch_change_class(
             let doc: CompatibilityDoc = serde_yaml::from_slice(&yaml_bytes)
                 .map_err(|e| CompatError::Parse(e.to_string()))?;
             let record = doc
-                .compatibility
                 .get(version)
                 .ok_or_else(|| CompatError::UnknownVersion(version.to_string()))?;
             return Ok(parse_change_class(record.change.as_deref()));
@@ -191,7 +195,11 @@ mod tests {
         {
             let enc = GzEncoder::new(&mut tar_bytes, Compression::default());
             let mut builder = Builder::new(enc);
-            let content = b"compatibility:\n  \"0.1.15\":\n    change: safe\n";
+            // Matches the shape `platform-stack/cue/render_tool.cue`
+            // emits: top-level map keyed by version string. NO
+            // wrapping `compatibility:` field — walk-found bug
+            // v0.1.117 → v0.1.118.
+            let content = b"\"0.1.19\":\n  version: \"0.1.19\"\n  change: safe\n  operatorVersion: v0.1.118\n";
             let mut header = tar::Header::new_gnu();
             header
                 .set_path("platform-stack/compatibility.yaml")
@@ -204,8 +212,73 @@ mod tests {
 
         let extracted = extract_compatibility_yaml(&tar_bytes).unwrap();
         let s = std::str::from_utf8(&extracted).unwrap();
-        assert!(s.contains("0.1.15"));
+        assert!(s.contains("0.1.19"));
         assert!(s.contains("change: safe"));
+    }
+
+    #[test]
+    fn compatibility_doc_parses_top_level_version_map() {
+        // Regression guard for walk-fix v0.1.117 → v0.1.118. The
+        // chart renderer emits compatibility.yaml as a
+        // top-level map keyed by semver string — NOT wrapped in
+        // a `compatibility:` object. Parser must accept this
+        // shape directly.
+        //
+        // Raw byte literal (`br#"..."#`) — escape-free so the
+        // YAML indentation survives literal newlines. The naive
+        // `b"...\n  ...\n"` form with `\<newline>` line
+        // continuations eats the leading whitespace of the next
+        // line and corrupts indentation.
+        let yaml: &[u8] = br#""0.1.18":
+  version: "0.1.18"
+  change: safe
+  operatorVersion: v0.1.116
+"0.1.19":
+  version: "0.1.19"
+  change: safe
+  operatorVersion: v0.1.117
+"0.2.0":
+  version: "0.2.0"
+  change: breaking
+  operatorVersion: v0.2.0
+"#;
+        let doc: CompatibilityDoc =
+            serde_yaml::from_slice(yaml).expect("top-level version map parses");
+        assert_eq!(doc.len(), 3);
+        assert_eq!(
+            doc.get("0.1.19").and_then(|r| r.change.as_deref()),
+            Some("safe")
+        );
+        assert_eq!(
+            doc.get("0.2.0").and_then(|r| r.change.as_deref()),
+            Some("breaking")
+        );
+    }
+
+    #[test]
+    fn compatibility_doc_tolerates_extra_fields_per_record() {
+        // The rendered version record carries `version`,
+        // `change`, `operatorVersion`, `notes`, `references[]`;
+        // we only read `change`. serde_yaml's deserializer
+        // ignores unknown fields by default. Pin this so a
+        // future field bump on the chart side doesn't break
+        // PlatformController.
+        let yaml: &[u8] = br#""0.1.19":
+  version: "0.1.19"
+  change: safe
+  operatorVersion: v0.1.117
+  notes: "multi-line notes here"
+  references:
+    - docs/...
+    - another
+  yanked: true
+  futureField: 42
+"#;
+        let doc: CompatibilityDoc = serde_yaml::from_slice(yaml).expect("extra fields tolerated");
+        assert_eq!(
+            doc.get("0.1.19").and_then(|r| r.change.as_deref()),
+            Some("safe")
+        );
     }
 
     #[test]

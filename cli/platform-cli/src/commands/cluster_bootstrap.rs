@@ -266,11 +266,21 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         kubeconfig_path,
     )?;
 
-    // 3. Apply the root Application. Single handoff point —
-    //    everything downstream is Argo CD's responsibility.
-    kubectl.apply_manifest(
+    // 3. Apply the root Application via server-side apply with
+    //    field manager `apprafter-cli`. Same SSA convention as
+    //    step 5's PlatformStack apply. Walk-found bug v0.1.117
+    //    → v0.1.118: a plain `kubectl apply -f` left field
+    //    manager `kubectl-client-side-apply` owning
+    //    `spec.source.targetRevision`, which PlatformController
+    //    then flagged as a foreign writer
+    //    (`UnauthorizedSourceModification=True`). SSA + the
+    //    `apprafter-cli` whitelist in
+    //    `operator-controllers/platform-stack`'s
+    //    `WHITELISTED_FIELD_MANAGERS` keep the bootstrap clean.
+    kubectl.apply_manifest_server_side(
         &ManifestSource::Path(root_application_path.to_path_buf()),
         kubeconfig_path,
+        APPRAFTER_CLI_FIELD_MANAGER,
     )?;
 
     // 4a. Wait for the root Application to report Synced. The
@@ -597,14 +607,23 @@ mod tests {
         assert_eq!(installs[1].namespace, "argocd");
         assert_eq!(installs[1].version.as_deref(), Some(ARGOCD_CHART_VERSION));
 
-        // kubectl: exactly one client-side apply (the root
-        // Application), one SSA apply (the PlatformStack singleton).
+        // kubectl: zero client-side applies (B.1.73 walk-fix #4
+        // moved the root Application apply onto SSA with field
+        // manager `apprafter-cli` — same convention as the
+        // PlatformStack singleton), two SSA applies in order
+        // (root Application THEN PlatformStack default).
         let applies = kubectl.applies.borrow();
-        assert_eq!(applies.len(), 1);
-        match &applies[0].0 {
+        assert!(
+            applies.is_empty(),
+            "no client-side applies expected, got {applies:?}"
+        );
+        let ssa = kubectl.ssa_applies.borrow();
+        assert_eq!(ssa.len(), 2, "expected 2 SSA applies, got {ssa:?}");
+        match &ssa[0].0 {
             ManifestSource::Path(p) => assert_eq!(p, &root_app),
-            other => panic!("expected Path root-app, got {other:?}"),
+            other => panic!("expected Path root-app at SSA[0], got {other:?}"),
         }
+        assert_eq!(ssa[0].2, "apprafter-cli");
 
         // Waits: node Ready first (so step 1 can schedule),
         // argocd-server Available second, root Application
@@ -722,11 +741,13 @@ mod tests {
             waits[crd_wait_positions[3]].condition_expr,
             "condition=Established"
         );
-        // And the SSA apply happens after the waits return; the
-        // FakeKubectl records it in `ssa_applies` so its mere
-        // presence after a successful perform_bootstrap proves
-        // the ordering held.
-        assert_eq!(kubectl.ssa_applies.borrow().len(), 1);
+        // And the SSA applies happen after the waits return; the
+        // FakeKubectl records them in `ssa_applies` so the post-
+        // perform_bootstrap snapshot pins the ordering. After
+        // B.1.73 walk-fix #4 the root Application is also SSA-
+        // applied, so the count is 2 (root App then PlatformStack
+        // default).
+        assert_eq!(kubectl.ssa_applies.borrow().len(), 2);
     }
 
     #[test]
@@ -859,13 +880,55 @@ mod tests {
         )
         .unwrap();
 
+        // Step 3 (root App) + step 5 (PlatformStack) BOTH SSA
+        // after walk-fix #4. Step 5 is the SECOND ssa entry.
         let ssa = kubectl.ssa_applies.borrow();
-        assert_eq!(ssa.len(), 1);
-        match &ssa[0].0 {
+        assert_eq!(ssa.len(), 2);
+        match &ssa[1].0 {
             ManifestSource::Path(p) => assert_eq!(p, platformstack.path()),
-            other => panic!("expected Path SSA source, got {other:?}"),
+            other => panic!("expected Path SSA source at [1], got {other:?}"),
+        }
+        assert_eq!(ssa[1].2, "apprafter-cli");
+    }
+
+    #[test]
+    fn step_3_ssa_applies_root_application_with_loader_field_manager() {
+        // Walk-fix #4 v0.1.118: the root Application is SSA-
+        // applied (was client-side `kubectl apply` in prior
+        // versions). Field manager is `apprafter-cli` — the
+        // same one the PlatformStack singleton uses — and
+        // PlatformController's `WHITELISTED_FIELD_MANAGERS`
+        // includes it so the bootstrap state doesn't trip
+        // `UnauthorizedSourceModification=True`.
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kubeconfig = tempfile::NamedTempFile::new().unwrap();
+        let root_app = tempfile::NamedTempFile::new().unwrap();
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
+
+        perform_bootstrap(
+            &helm,
+            &kubectl,
+            kubeconfig.path(),
+            root_app.path(),
+            platformstack.path(),
+        )
+        .unwrap();
+
+        let ssa = kubectl.ssa_applies.borrow();
+        assert_eq!(ssa.len(), 2);
+        // First SSA = root Application (step 3).
+        match &ssa[0].0 {
+            ManifestSource::Path(p) => assert_eq!(p, root_app.path()),
+            other => panic!("expected Path root-app at SSA[0], got {other:?}"),
         }
         assert_eq!(ssa[0].2, "apprafter-cli");
+        // The historical client-side apply path must be empty.
+        assert!(
+            kubectl.applies.borrow().is_empty(),
+            "no client-side apply expected, got {:?}",
+            kubectl.applies.borrow()
+        );
     }
 
     #[test]

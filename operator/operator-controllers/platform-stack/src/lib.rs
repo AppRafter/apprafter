@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use kube::Client;
 use operator_core::Metrics;
+use tracing::info;
 
 pub mod compatibility;
 pub mod desired;
@@ -42,5 +43,13 @@ pub const SINGLETON_NAMESPACE: &str = "apprafter-system";
 /// underlying kube-rs Controller stream ends (which happens on
 /// API-server disconnect or process shutdown).
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), reconcile::Error> {
-    reconcile::run(client, metrics).await
+    info!(
+        ns = SINGLETON_NAMESPACE,
+        name = SINGLETON_NAME,
+        field_manager = FIELD_MANAGER,
+        "PlatformController starting"
+    );
+    let result = reconcile::run(client, metrics).await;
+    info!("PlatformController stream ended");
+    result
 }
