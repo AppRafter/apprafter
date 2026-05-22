@@ -1,0 +1,180 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Five structural-advantage blocks. The fifth (KFM #3 — Agentic
+// operations with structural safety) is `featured` and spans the
+// full grid width as a closer card. Content from sections.jsx
+// :671-741 (BRIEF v2.2 §4.7).
+
+import Container from '../primitives/Container.astro';
+import SectionHead from '../primitives/SectionHead.astro';
+
+type Block = {
+  title: string;
+  /** HTML — may contain <strong> and inline <code class="mono">. */
+  leadHtml: string;
+  detail: string;
+  phase: string;
+  featured?: boolean;
+};
+
+const blocks: Block[] = [
+  {
+    title: 'Manifest portability across tiers.',
+    leadHtml:
+      '<strong>The same Application manifest is designed to run from local dev (k3d) through a single VDS, multi-node clusters, bare metal, and hyperscalers — without rewrites.</strong> Not “we tested in a few environments” — a structural property: one CUE schema, one operator, one ResourceClaim contract. Only the backing changes.',
+    detail:
+      'Today it works on local dev, Tier 1 (single VDS), and Tier 2 (multi-node). Tier 3 is in Phase 5+, Tier 4 in Phase 6+.',
+    phase: 'Today: Tier 1 + Tier 2',
+  },
+  {
+    title: 'Replayable audit log out of the box.',
+    leadHtml:
+      '<strong>The control plane runs on kine + NATS JetStream, which means every platform operation can be replayed from the event log.</strong> Not a separate audit pipeline, not an add-on to etcd. Compliance-friendly <strong>architecturally</strong>, not by promise. A competitor would have to swap out their control plane storage layer to match — a major architectural commitment.',
+    detail:
+      'Works today on Tier 2 and above. On Tier 1 the control plane uses kine + SQLite for simplicity; replayable log is available as an opt-in upgrade.',
+    phase: 'Today: Tier 2+',
+  },
+  {
+    title: 'Managed → self-host: trivial exit.',
+    leadHtml:
+      '<strong>An architectural consequence of how we run Managed: only the UI and operations layer is hosted by us. Your cluster always stays with you.</strong> Other managed platforms keep workloads on their infrastructure — replicating our model would conflict with their incentive structure. Workloads-live-with-us is how the dominant model monetizes; we monetize differently.',
+    detail: 'Full CLI in Phase 4. Principle in place from Phase 1.',
+    phase: 'Principle: Phase 1 · Full CLI: Phase 4',
+  },
+  {
+    title: 'Six platform services through one typed primitive.',
+    leadHtml:
+      '<strong>Not a Helm wrapper over Postgres.</strong> A standardized CRD contract via ResourceClaim and ServiceProvider, which means a drop-in replacement (Postgres → AlloyDB, Redis → Valkey, S3 → Garage) is a container-level swap of the ServiceProvider — not an application rewrite. Competitors who expose services through Helm values would have to change their resource model from the ground up.',
+    detail:
+      'Works today: Postgres, JetStream, Redis (Phase 2). Coming: ClickHouse, S3, Notifications (Phase 3).',
+    phase: 'Today: Postgres · JetStream · Redis',
+  },
+  {
+    title: 'Agentic operations with structural safety.',
+    leadHtml:
+      '<strong>An AI agent can deploy, scale, restart, or migrate your apps through the MCP server — every destructive operation is gated by a MigrationPlan CRD with explicit human approval.</strong> Not a soft API check that an agent can bypass. The classifier runs in the operator: <code class="mono">delete_app prod</code> creates a MigrationPlan in your cluster, pauses, waits for <code class="mono">apprafter migration approve</code>. A competitor without a CRD-based primitive would have to bolt safety on as a side-channel, which agents can route around.',
+    detail:
+      'Works today via CLI approvals. Backstage MigrationPlan plugin coming Phase 4+ (post-launch first bundle).',
+    phase: 'Today: CLI approval flow',
+    featured: true,
+  },
+];
+---
+
+<section aria-label="Structural advantages" id="architecture" data-screen-label="architecture">
+  <Container>
+    <SectionHead
+      eyebrow="Structural advantages"
+      title="What the architecture gives you."
+      lede="Each claim is supported by the shape of the system, not by maintenance promises."
+    />
+    <div class="advantages">
+      {
+        blocks.map((b) => (
+          <div class={`advantage${b.featured ? ' advantage-featured' : ''}`}>
+            <h3>{b.title}</h3>
+            <p set:html={b.leadHtml} />
+            <p class="faint italic" style="font-size: 14px;">
+              {b.detail}
+            </p>
+            <span class="phase-tag">{b.phase}</span>
+          </div>
+        ))
+      }
+    </div>
+  </Container>
+</section>
+
+<style>
+  .advantages {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: stretch;
+    gap: 0;
+    margin-top: 56px;
+    border-top: 1px solid var(--border);
+    border-left: 1px solid var(--border);
+  }
+  .advantage {
+    padding: 36px 40px 40px;
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-self: stretch;
+  }
+  .advantage h3 {
+    font-size: 21px;
+    margin-bottom: 14px;
+    max-width: 90%;
+    text-wrap: balance;
+  }
+  .advantage h3 strong {
+    font-weight: 700;
+  }
+  .advantage p {
+    font-size: 15px;
+    color: var(--fg-muted);
+    line-height: 1.6;
+  }
+  .advantage p + p {
+    margin-top: 12px;
+  }
+  .advantage > p:nth-of-type(2) {
+    margin-top: auto;
+    padding-top: 12px;
+  }
+  .advantage .phase-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 22px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    padding: 5px 9px;
+    border: 1px solid var(--border-strong);
+    align-self: flex-start;
+  }
+  .advantage .italic {
+    font-style: italic;
+  }
+  .advantage p :global(strong) {
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .advantage p :global(code.mono) {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    padding: 1px 4px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--accent);
+  }
+
+  .advantage-featured {
+    grid-column: 1 / -1;
+    background: color-mix(in srgb, var(--accent) 4%, var(--surface));
+  }
+  .advantage-featured h3 {
+    max-width: 60%;
+  }
+  .advantage-featured > p:first-of-type {
+    max-width: 78%;
+  }
+
+  @media (max-width: 1080px) {
+    .advantages {
+      grid-template-columns: 1fr;
+    }
+    .advantage-featured h3,
+    .advantage-featured > p:first-of-type {
+      max-width: 100%;
+    }
+  }
+</style>

@@ -83,6 +83,54 @@ describe('hero section pieces', () => {
   });
 });
 
+describe('content sections (Phase F)', () => {
+  test('all eight section source files exist', () => {
+    for (const f of [
+      'src/components/sections/ValueProps.astro',
+      'src/components/sections/ScalingJourney.astro',
+      'src/components/sections/TierLadder.astro',
+      'src/components/sections/Comparison.astro',
+      'src/components/sections/BoringTech.astro',
+      'src/components/sections/Advantages.astro',
+      'src/components/sections/Roadmap.astro',
+      'src/components/sections/BootstrapStrip.astro',
+    ]) {
+      expect(existsSync(join(ROOT, f))).toBe(true);
+    }
+  });
+
+  test('roadmap phase ids are stable anchors for comparison cross-links', () => {
+    const rm = readFileSync(join(ROOT, 'src/components/sections/Roadmap.astro'), 'utf8');
+    const cmp = readFileSync(join(ROOT, 'src/components/sections/Comparison.astro'), 'utf8');
+    // Comparison links to #roadmap-phase-phase-8 in the Turnkey
+    // exit row — Roadmap must build the same slug from "Phase 8+".
+    expect(cmp).toContain('#roadmap-phase-phase-8');
+    expect(rm).toContain('Phase 8+');
+  });
+
+  test('all section eyebrows are unique (no copy-paste collisions)', () => {
+    const sectionFiles = [
+      'ValueProps',
+      'ScalingJourney',
+      'TierLadder',
+      'Comparison',
+      'BoringTech',
+      'Advantages',
+      'Roadmap',
+    ];
+    const eyebrows = new Set<string>();
+    for (const name of sectionFiles) {
+      const src = readFileSync(join(ROOT, `src/components/sections/${name}.astro`), 'utf8');
+      const m = src.match(/eyebrow="([^"]+)"/);
+      expect(m).not.toBeNull();
+      const eb = m?.[1] ?? '';
+      expect(eyebrows.has(eb)).toBe(false);
+      eyebrows.add(eb);
+    }
+    expect(eyebrows.size).toBe(sectionFiles.length);
+  });
+});
+
 describe('cue-highlight build-time tokenizer', () => {
   test('keyword + string + number + comment classes attach', () => {
     // The tokenizer matches sections.jsx (renderCue) behaviour:

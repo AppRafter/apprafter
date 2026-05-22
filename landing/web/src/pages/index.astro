@@ -2,15 +2,21 @@
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //
-// Bootstrap stub — replaced by the real composition in Phase G.
-// For Phase E it wires the Hero (with CUE snippet + waitlist) into
-// the existing Header + Footer chain so a single build verifies
-// the whole top-of-page surface end-to-end.
+// Full page composition — Phase F. The final SEO + JSON-LD pass
+// + BaseLayout extraction lands in Phase G.
 
 import '../styles/index.css';
 import Footer from '../components/layout/Footer.astro';
 import Header from '../components/layout/Header.astro';
 import Hero from '../components/hero/Hero.astro';
+import ValueProps from '../components/sections/ValueProps.astro';
+import ScalingJourney from '../components/sections/ScalingJourney.astro';
+import TierLadder from '../components/sections/TierLadder.astro';
+import Comparison from '../components/sections/Comparison.astro';
+import BoringTech from '../components/sections/BoringTech.astro';
+import Advantages from '../components/sections/Advantages.astro';
+import Roadmap from '../components/sections/Roadmap.astro';
+import BootstrapStrip from '../components/sections/BootstrapStrip.astro';
 import { THEME_INIT_SCRIPT } from '../lib/theme-init';
 ---
 
@@ -40,6 +46,14 @@ import { THEME_INIT_SCRIPT } from '../lib/theme-init';
 
     <main id="main">
       <Hero />
+      <ValueProps />
+      <ScalingJourney />
+      <TierLadder />
+      <Comparison />
+      <BoringTech />
+      <Advantages />
+      <Roadmap />
+      <BootstrapStrip />
     </main>
 
     <Footer />

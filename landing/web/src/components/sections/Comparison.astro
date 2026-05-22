@@ -1,0 +1,327 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Self-host vs Managed vs Turnkey comparison table + three
+// transparency cards underneath. Content from sections.jsx
+// :428-525 (BRIEF v2.2 §4.5). Cell values are HTML strings so
+// the price-cell composition and inline strong/code render
+// without an extra renderer layer in Phase F; Phase H replaces
+// them with Lexical richText from Payload.
+
+import Container from '../primitives/Container.astro';
+import SectionHead from '../primitives/SectionHead.astro';
+import StatusPill from '../primitives/StatusPill.astro';
+
+type Row = {
+  label: string;
+  /** HTML — supports <span class="price-cell">, <strong>, etc. */
+  selfHtml: string;
+  managedHtml: string;
+  turnkeyHtml: string;
+};
+
+const rows: Row[] = [
+  {
+    label: 'Price',
+    selfHtml:
+      '<span class="price-cell">Free<sup>†</sup><span class="price-sub">FSL-1.1-Apache-2.0</span></span>',
+    managedHtml:
+      '<span class="price-cell">€10/mo per cluster<span class="price-sub">Hosted Services (launch)<br />+ €10/mo Operations add-on (Phase 4.5+)</span></span>',
+    turnkeyHtml:
+      '<span class="price-cell">From €30/mo (Tier 1)<span class="price-sub">Server cost + reseller markup<br />+ €20/mo per cluster</span></span>',
+  },
+  {
+    label: 'Who runs the infra',
+    selfHtml: 'You',
+    managedHtml: 'You (your Hetzner account)',
+    turnkeyHtml: 'We do',
+  },
+  {
+    label: 'Who runs the UI',
+    selfHtml: 'You (optional)',
+    managedHtml: 'We do',
+    turnkeyHtml: 'We do',
+  },
+  {
+    label: 'Where your data lives',
+    selfHtml: 'With you',
+    managedHtml: 'With you — your cluster, your control plane, your databases',
+    turnkeyHtml: 'With us, in our Hetzner account',
+  },
+  {
+    label: 'What we have visibility into',
+    selfHtml: 'Nothing',
+    managedHtml: 'Only metadata — architectural guarantee from cluster ownership',
+    turnkeyHtml:
+      'Metadata by design (Minimal Data Exposure architecture), but the account is ours — so the guarantee is policy-level rather than structural',
+  },
+  {
+    label: 'Exit when you stop paying',
+    selfHtml: '<span class="faint">n/a</span>',
+    managedHtml:
+      'Your cluster keeps running. OSS takes over management. UI/Backstage you can self-host (we ship the tooling). You only lose the thin cloud-native premium layer — AI insights, cross-cluster aggregator, smart bill analysis.',
+    turnkeyHtml:
+      'Cross-cluster MigrationPlan tooling (<a href="#roadmap-phase-phase-8">Phase 8+</a>) for orchestrated migration.',
+  },
+];
+
+type TransparencyBlock = {
+  kicker: string;
+  title: string;
+  /** HTML — supports <strong> and inline <code>. */
+  bodyHtml: string;
+};
+
+const transparency: TransparencyBlock[] = [
+  {
+    kicker: '4.5.1 / Pricing',
+    title: 'Everything you pay for is in this table.',
+    bodyHtml:
+      '<p>No hidden tiers, no per-seat upsells, no “free tier that ends once you outgrow it”. Prepaid model — what you see is what you pay, no metered surprises. Annual billing optional, with a <strong>save two months</strong> discount.</p><p>14-day trial without a card, once per account.</p>',
+  },
+  {
+    kicker: '4.5.2 / Anti-lock',
+    title: 'Architectural, not promised.',
+    bodyHtml:
+      '<p>In <strong>Managed</strong>, your cluster physically lives on your infrastructure. Cancel — the cluster keeps running, you lose the premium layer (which you can mostly self-host; we ship the tooling). An <strong>architectural fact</strong>, not a service-level promise.</p><p>For <strong>Turnkey</strong>, we invest engineering cycles into your <strong>exit path</strong>. Cross-cluster MigrationPlan is <strong>planned as shipped tooling</strong> (Phase 8+) — <code>apprafter migration plan</code> — for moving to self-host or another provider.</p>',
+  },
+  {
+    kicker: '4.5.3 / Alignment',
+    title: 'Our model grows with you.',
+    bodyHtml:
+      '<p>Per-cluster billing means our revenue grows when your deployments grow. We don’t make more by locking you in or up-selling seats. We make more when you scale — more clusters, more workloads, more compute.</p><p>When you stay small, we stay small with you. An <strong>incentive structure</strong>, encoded in how we charge.</p>',
+  },
+];
+---
+
+<section aria-label="Self-host vs Managed vs Turnkey" id="offerings" data-screen-label="offerings">
+  <Container>
+    <SectionHead eyebrow="How to run AppRafter" title="Three ways to run AppRafter." />
+
+    <table class="compare-table">
+      <thead>
+        <tr>
+          <th scope="col"></th>
+          <th scope="col">Self-host</th>
+          <th scope="col" class="featured">
+            Managed <span class="mono faint" style="font-size: 11px; margin-left: 6px;">(waitlist)</span>
+          </th>
+          <th scope="col">
+            Turnkey <span class="mono faint" style="font-size: 11px; margin-left: 6px;">(roadmap)</span>
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        {
+          rows.map((r) => (
+            <tr>
+              <td>{r.label}</td>
+              <td set:html={r.selfHtml} />
+              <td set:html={r.managedHtml} />
+              <td set:html={r.turnkeyHtml} />
+            </tr>
+          ))
+        }
+        <tr class="status-row">
+          <td>Status</td>
+          <td><StatusPill kind="live" label="Available now" /></td>
+          <td><StatusPill kind="waitlist" label="Waitlist" /></td>
+          <td><StatusPill kind="roadmap" label="Roadmap" /></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p class="footnote">
+      <sup>†</sup> FSL-1.1-Apache-2.0 allows any use — personal, internal business,
+      commercial workloads — except offering AppRafter itself as a managed service
+      to third parties. After two years, the license auto-converts to plain Apache
+      2.0 and that restriction lifts.
+    </p>
+
+    <div class="transparency-grid">
+      {
+        transparency.map((b) => (
+          <div class="transparency-card">
+            <h4>
+              <span class="kicker">{b.kicker}</span>
+              {b.title}
+            </h4>
+            <div set:html={b.bodyHtml} />
+          </div>
+        ))
+      }
+    </div>
+  </Container>
+</section>
+
+<style>
+  .compare-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+    font-size: 14.5px;
+  }
+  .compare-table th,
+  .compare-table td {
+    text-align: left;
+    vertical-align: top;
+    padding: 18px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .compare-table thead th {
+    font-weight: 700;
+    font-size: 16px;
+    border-bottom: 1px solid var(--border-strong);
+    padding-bottom: 24px;
+    padding-top: 24px;
+    position: relative;
+  }
+  .compare-table thead th.featured {
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+    border-bottom-color: var(--accent);
+  }
+  .compare-table tbody tr:hover td {
+    background: color-mix(in srgb, var(--fg) 2%, transparent);
+  }
+  .compare-table tbody td:first-child {
+    color: var(--fg-faint);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    width: 200px;
+    padding-top: 22px;
+  }
+
+  .compare-table :global(.price-cell) {
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .compare-table :global(.price-cell .price-sub) {
+    display: block;
+    font-size: 13px;
+    color: var(--fg-muted);
+    font-weight: 400;
+    margin-top: 4px;
+  }
+
+  .compare-table .status-row td:first-child {
+    color: transparent;
+    padding-top: 18px;
+  }
+  .compare-table .status-row td:not(:first-child) {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  .footnote {
+    margin-top: 18px;
+    font-size: 13px;
+    color: var(--fg-faint);
+    font-style: italic;
+    max-width: 880px;
+    line-height: 1.55;
+  }
+  .footnote sup {
+    color: var(--accent);
+    font-style: normal;
+    font-weight: 500;
+  }
+
+  .transparency-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    align-items: stretch;
+    gap: 24px;
+    margin-top: 56px;
+  }
+  .transparency-card {
+    padding: 28px 28px 32px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 320px;
+  }
+  .transparency-card h4 {
+    font-size: 16px;
+    font-weight: 700;
+    margin: 0 0 14px;
+    letter-spacing: -0.005em;
+    min-height: 64px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+  .transparency-card h4 .kicker {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 500;
+    margin-bottom: 6px;
+  }
+  .transparency-card :global(p) {
+    font-size: 14.5px;
+    color: var(--fg-muted);
+    line-height: 1.6;
+  }
+  .transparency-card :global(p + p) {
+    margin-top: 12px;
+  }
+  .transparency-card :global(strong) {
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .transparency-card :global(code) {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    padding: 1px 6px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--accent);
+  }
+
+  @media (max-width: 1080px) {
+    .compare-table tbody td:first-child {
+      width: 150px;
+    }
+  }
+  @media (max-width: 720px) {
+    .transparency-grid {
+      grid-template-columns: 1fr;
+    }
+    .transparency-card {
+      min-height: 0;
+    }
+    .compare-table thead {
+      display: none;
+    }
+    .compare-table,
+    .compare-table tbody,
+    .compare-table tr,
+    .compare-table td {
+      display: block;
+      width: 100%;
+    }
+    .compare-table tr {
+      border: 1px solid var(--border);
+      margin-bottom: 16px;
+      padding: 12px;
+    }
+    .compare-table td {
+      padding: 8px 0;
+      border-bottom: 1px dashed var(--border);
+    }
+    .compare-table tbody td:first-child {
+      width: auto;
+      padding-top: 8px;
+    }
+  }
+</style>

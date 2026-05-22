@@ -1,0 +1,172 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Two-column tech list — Under the hood (upstream components) and
+// What we wrote ourselves (AppRafter-original code). Content ported
+// from sections.jsx :530-592 (BRIEF v2.2 §4.6).
+
+import Container from '../primitives/Container.astro';
+import SectionHead from '../primitives/SectionHead.astro';
+
+type Item = readonly [name: string, desc: string];
+
+const underHood: Item[] = [
+  ['Talos Linux', 'Immutable OS, API-driven. Fewer snowflakes than a regular Linux node.'],
+  [
+    'k3s / Cilium',
+    'k8s core + eBPF networking. Network policies, observability via Hubble, egress gateway.',
+  ],
+  [
+    'NATS JetStream',
+    'Event/messaging backbone and control plane storage (via the community kine-nats adapter).',
+  ],
+  ['CloudNativePG', 'Postgres operator with replication, backups, point-in-time recovery.'],
+  ['Dragonfly', 'Redis-compatible, scales better on a single node.'],
+  ['ClickHouse', 'Logs, traces, application analytics.'],
+  ['OpenBao', 'Secrets management (HashiCorp Vault fork, BSL-free).'],
+  ['Backstage', 'Developer portal with TypeScript plugins.'],
+  ['Kamaji + Capsule', 'Hard multi-tenancy (Phase 5+).'],
+  ['cert-manager · external-dns · KEDA', 'Standard k8s add-ons.'],
+];
+
+const ourCode: Item[] = [
+  [
+    'Rust operator on kube-rs',
+    'Reconciles Application, ResourceClaim, ServiceProvider, MigrationPlan, Tenant, AccessGrant.',
+  ],
+  ['CUE-based admission webhook', 'Type-safe validation with line-level errors before apply.'],
+  ['apprafter CLI', 'Bootstrap, manifest workflow, dev mode, migration tooling.'],
+  [
+    'MCP server with agentic safety gate',
+    'Hosted MCP endpoint proxying through customer agent. Operations classified by risk taxonomy — safe / reversible / bounded write / destructive — with automatic MigrationPlan creation for destructive operations.',
+  ],
+  [
+    'NATS-based audit log layer on top of kine',
+    "Turning the control plane's NATS backing store into a replayable platform event log (Tier 2+; opt-in upgrade on Tier 1).",
+  ],
+  ['MigrationPlan reconciler', 'Destructive-change gating with explicit approval.'],
+  ['ResourceClaim / ServiceProvider primitives', 'Typed contract for platform services.'],
+];
+---
+
+<section aria-label="Boring tech" id="stack" data-screen-label="stack">
+  <Container>
+    <SectionHead
+      eyebrow="The stack"
+      title="Boring tech, opinionated glue."
+      lede="We don't reinvent the Kubernetes control plane. Under the hood — well-known, proven components. The real work is opinionated composition and a thin layer of code where no ready solution exists."
+    />
+    <div class="boring-grid">
+      <div class="boring-col">
+        <h3>Under the hood</h3>
+        <ul class="tech-list">
+          {
+            underHood.map(([name, desc]) => (
+              <li>
+                <span class="name">{name}</span>
+                <span class="desc">{desc}</span>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+      <div class="boring-col">
+        <h3>What we wrote ourselves</h3>
+        <ul class="tech-list">
+          {
+            ourCode.map(([name, desc]) => (
+              <li>
+                <span class="name">
+                  <span class="ours">{name}</span>
+                </span>
+                <span class="desc">{desc}</span>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+    </div>
+    <p class="closing">
+      This is a thin layer <strong>on top of</strong> proven components — only where
+      no ready solution exists. Boring, and that's intentional.
+      <strong>Boring tech</strong> is easier to debug, easier to hire for, easier to
+      keep running.
+    </p>
+  </Container>
+</section>
+
+<style>
+  .boring-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 56px;
+    margin-top: 56px;
+  }
+  .boring-col h3 {
+    font-size: 14px;
+    font-family: var(--font-mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    font-weight: 500;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+  }
+  .tech-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .tech-list li {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 16px;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 14.5px;
+  }
+  .tech-list li:last-child {
+    border-bottom: 0;
+  }
+  .tech-list .name {
+    font-weight: 500;
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    letter-spacing: -0.005em;
+    color: var(--fg);
+  }
+  .tech-list .name .ours {
+    color: var(--accent);
+  }
+  .tech-list .desc {
+    color: var(--fg-muted);
+    line-height: 1.55;
+  }
+
+  .closing {
+    font-size: 17px;
+    color: var(--fg-muted);
+    max-width: 760px;
+    line-height: 1.6;
+    margin-top: 56px;
+  }
+  .closing strong {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  @media (max-width: 1080px) {
+    .boring-grid {
+      grid-template-columns: 1fr;
+      gap: 40px;
+    }
+  }
+  @media (max-width: 720px) {
+    .tech-list li {
+      grid-template-columns: 1fr;
+      gap: 4px;
+    }
+  }
+</style>

@@ -1,0 +1,168 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Phases (not quarters) — content ported from sections.jsx
+// :746-814 (BRIEF v2.2 §4.8). Each phase block gets a stable
+// anchor id so the Comparison section can link directly to e.g.
+// #roadmap-phase-phase-8 for the cross-cluster migration item.
+
+import Container from '../primitives/Container.astro';
+import SectionHead from '../primitives/SectionHead.astro';
+
+type Phase = {
+  num: string;
+  title: string;
+  items: string[];
+};
+
+const phases: Phase[] = [
+  {
+    num: 'Phase 4',
+    title: 'Managed offering launch',
+    items: [
+      'Export-to-self-host CLI (fully functional)',
+      'MCP-native managed (full integration)',
+      'Minimal Data Exposure ADR + audit',
+      'Hosted Services + Managed Operations tiers shipped',
+    ],
+  },
+  {
+    num: 'Phase 5+',
+    title: 'Production Tier 3 + multi-tenancy',
+    items: [
+      'Tier 3 (Talos + LINSTOR on bare metal)',
+      'Hard multi-tenancy via Kamaji + Capsule',
+      'Turnkey Cloud launches (Tier 1–3)',
+      'Live platform demo via self-hosted AccessGrant',
+      'One-time migration toolkit (Product 1: cloud-foreign → AppRafter)',
+    ],
+  },
+  {
+    num: 'Phase 6+',
+    title: 'Confidential workloads',
+    items: [
+      'Tier 4 confidential containers (Kata-CC) in opinionated wrapper',
+      'Full T1 → T4 manifest portability complete',
+    ],
+  },
+  {
+    num: 'Phase 8+',
+    title: 'Cross-cluster federation',
+    items: [
+      'Cross-cluster MigrationPlan (Product 2): sub-second cutover between clusters',
+      'DR failover as an orchestrated operation',
+      'Region migration within Turnkey — invisible to the customer',
+    ],
+  },
+];
+
+const slug = (num: string) =>
+  `roadmap-phase-${num.toLowerCase().replace(/\W+/g, '-').replace(/^-|-$/g, '')}`;
+---
+
+<section aria-label="Roadmap" id="roadmap" data-screen-label="roadmap">
+  <Container>
+    <SectionHead
+      eyebrow="Roadmap"
+      title="Roadmap."
+      lede={'Phases, not quarters. Each one a finished product on its own, not “an MVP we’ll polish later”.'}
+    />
+    <div class="roadmap">
+      {
+        phases.map((p) => (
+          <div class="roadmap-phase" id={slug(p.num)}>
+            <div class="phase-meta">
+              <div class="phase-num">{p.num}</div>
+              <h3>{p.title}</h3>
+            </div>
+            <ul>
+              {p.items.map((item) => (
+                <li>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+    </div>
+    <p class="roadmap-closing">
+      Roadmap is driven by shipped features, not PR dates. Each phase is a
+      finished product on its own, not “an MVP we'll polish later”.
+    </p>
+  </Container>
+</section>
+
+<style>
+  .roadmap {
+    margin-top: 48px;
+    position: relative;
+  }
+  .roadmap-phase {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 56px;
+    padding: 36px 0;
+    border-top: 1px solid var(--border);
+    position: relative;
+  }
+  .roadmap-phase:last-child {
+    border-bottom: 1px solid var(--border);
+  }
+  .roadmap-phase .phase-meta {
+    position: sticky;
+    top: 88px;
+    align-self: start;
+  }
+  .roadmap-phase .phase-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .roadmap-phase h3 {
+    font-size: 24px;
+    margin-top: 8px;
+    text-wrap: balance;
+  }
+  .roadmap-phase ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 14px;
+  }
+  .roadmap-phase li {
+    font-size: 16px;
+    color: var(--fg-muted);
+    padding-left: 22px;
+    position: relative;
+    line-height: 1.5;
+  }
+  .roadmap-phase li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0.6em;
+    width: 10px;
+    height: 1px;
+    background: var(--accent);
+  }
+  .roadmap-closing {
+    margin-top: 56px;
+    font-size: 17px;
+    color: var(--fg-muted);
+    max-width: 720px;
+    line-height: 1.6;
+  }
+
+  @media (max-width: 1080px) {
+    .roadmap-phase {
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .roadmap-phase .phase-meta {
+      position: static;
+    }
+  }
+</style>

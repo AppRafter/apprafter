@@ -1,0 +1,275 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Central thesis visual — Tier 1 single VPS → arrow → Tier 2 HA
+// cluster — both built from the same Application.cue. Ported from
+// sections.jsx :597-666 (BRIEF v2.2 §4 introduction).
+
+import Container from '../primitives/Container.astro';
+import SectionHead from '../primitives/SectionHead.astro';
+---
+
+<section
+  aria-label="Scaling journey"
+  id="scaling-journey"
+  data-screen-label="scaling-journey"
+>
+  <Container>
+    <SectionHead
+      eyebrow="How scaling works"
+      title="One file. From single node to HA cluster."
+      lede={'Most PaaS platforms cap at vertical scaling — when you grow, you migrate. Most Kubernetes distros assume you’re starting big. AppRafter is the same platform from a €5 VPS to a multi-node HA cluster, and the same <code class="mono">Application.cue</code> deploys to both.'}
+    />
+
+    <div class="journey">
+      <!-- Left: Tier 1 — single node -->
+      <div class="journey-side">
+        <div class="journey-eyebrow">Tier 1 · €5 VPS</div>
+        <div class="journey-stage">
+          <div class="journey-node solo">
+            <span class="node-label">node-1</span>
+          </div>
+          <div class="journey-file">
+            <span class="file-name">Application.cue</span>
+            <span class="file-meta">23 LOC</span>
+          </div>
+        </div>
+        <div class="journey-caption">
+          A single VDS. Single-node Postgres. SealedSecrets. Sane defaults.
+        </div>
+      </div>
+
+      <!-- Middle: arrow -->
+      <div class="journey-arrow">
+        <div class="arrow-bar">
+          <span class="arrow-label">Tier upgrade</span>
+        </div>
+        <svg viewBox="0 0 80 28" aria-hidden="true" class="arrow-head">
+          <path
+            d="M0 14 H72 M60 4 L72 14 L60 24"
+            stroke="currentColor"
+            stroke-width="2"
+            fill="none"
+            stroke-linecap="square"></path>
+        </svg>
+      </div>
+
+      <!-- Right: Tier 2 — HA cluster -->
+      <div class="journey-side">
+        <div class="journey-eyebrow">Tier 2 · HA cluster</div>
+        <div class="journey-stage">
+          <div class="journey-cluster">
+            <div class="journey-node"><span class="node-label">cp-1</span></div>
+            <div class="journey-node"><span class="node-label">cp-2</span></div>
+            <div class="journey-node"><span class="node-label">cp-3</span></div>
+            <div class="journey-node small"><span class="node-label">w-1</span></div>
+            <div class="journey-node small"><span class="node-label">w-2</span></div>
+            <div class="journey-node small"><span class="node-label">w-N</span></div>
+          </div>
+          <div class="journey-file">
+            <span class="file-name">Application.cue</span>
+            <span class="file-meta">identical · 23 LOC</span>
+          </div>
+        </div>
+        <div class="journey-caption">
+          3+ nodes. CloudNativePG. Replayable audit log. OpenBao for secrets.
+        </div>
+      </div>
+    </div>
+
+    <div class="journey-footer">
+      <span class="footer-kicker">No rewrite.</span>
+      <span class="footer-kicker">No migration tool.</span>
+      <span class="footer-kicker">One CUE manifest.</span>
+    </div>
+
+    <div class="journey-caveat">
+      <strong>Today:</strong> Tier 1 and Tier 2 ready at signup. T1→T2 migration
+      tool ships in the first post-launch bundle (~2–4 weeks after release).
+    </div>
+  </Container>
+</section>
+
+<style>
+  .journey {
+    margin-top: 24px;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: stretch;
+    gap: 32px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    padding: 40px;
+  }
+  .journey-side {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    min-height: 320px;
+  }
+  .journey-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .journey-stage {
+    flex-grow: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 28px 24px;
+    border: 1px dashed var(--border-strong);
+    background: var(--bg);
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .journey-node {
+    width: 88px;
+    height: 64px;
+    border: 1px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+    position: relative;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-start;
+    padding: 8px 10px;
+  }
+  .journey-node.solo {
+    width: 124px;
+    height: 88px;
+  }
+  .journey-node .node-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+  .journey-cluster {
+    display: grid;
+    grid-template-columns: repeat(3, 64px);
+    gap: 10px;
+  }
+  .journey-cluster .journey-node {
+    width: 64px;
+    height: 48px;
+  }
+  .journey-cluster .journey-node.small {
+    border-color: var(--border-strong);
+    background: var(--surface);
+    border-style: solid;
+  }
+  .journey-cluster .journey-node.small .node-label {
+    color: var(--fg-muted);
+  }
+  .journey-file {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    align-self: stretch;
+  }
+  .journey-file .file-name {
+    color: var(--fg);
+    flex-grow: 1;
+  }
+  .journey-file .file-name::before {
+    content: '▸ ';
+    color: var(--accent);
+  }
+  .journey-file .file-meta {
+    color: var(--fg-faint);
+  }
+  .journey-caption {
+    font-size: 14px;
+    color: var(--fg-muted);
+    line-height: 1.5;
+    text-wrap: pretty;
+  }
+
+  .journey-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    color: var(--accent);
+    align-self: center;
+  }
+  .journey-arrow .arrow-bar {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+    text-align: center;
+    max-width: 180px;
+    line-height: 1.4;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    white-space: nowrap;
+  }
+  .journey-arrow .arrow-head {
+    width: 80px;
+    height: 28px;
+  }
+
+  .journey-footer {
+    margin-top: 28px;
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .journey-footer .footer-kicker {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    color: var(--fg);
+    position: relative;
+    padding-left: 18px;
+  }
+  .journey-footer .footer-kicker::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 10px;
+    height: 1px;
+    background: var(--accent);
+  }
+  .journey-caveat {
+    margin-top: 24px;
+    padding: 16px 20px;
+    border-left: 2px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+    font-size: 14px;
+    color: var(--fg-muted);
+    line-height: 1.55;
+  }
+  .journey-caveat strong {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  @media (max-width: 1080px) {
+    .journey {
+      grid-template-columns: 1fr;
+      padding: 28px;
+    }
+    .journey-arrow {
+      transform: rotate(90deg);
+      margin: 8px 0;
+    }
+    .journey-arrow .arrow-bar {
+      transform: rotate(-90deg);
+    }
+  }
+</style>

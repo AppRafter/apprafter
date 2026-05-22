@@ -1,0 +1,231 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Four-tier ladder: cards + stair-step visual + orthogonal note.
+// Content from sections.jsx :350-423 (BRIEF v2.2 §4.4).
+
+import Container from '../primitives/Container.astro';
+import SectionHead from '../primitives/SectionHead.astro';
+
+type Tier = {
+  num: string;
+  title: string;
+  price: string;
+  desc: string;
+  status: 'live' | 'roadmap';
+  statusText: string;
+};
+
+const tiers: Tier[] = [
+  {
+    num: 'Tier 1',
+    title: 'Single VDS',
+    price: 'From €5/mo',
+    desc: 'A single VDS with sane simplifications (no HA quorum, single-node database, no multi-tenancy). For side-projects and solo founders. Hetzner Cloud at launch.',
+    status: 'live',
+    statusText: 'Available now',
+  },
+  {
+    num: 'Tier 2',
+    title: 'Production cluster',
+    price: '3+ nodes',
+    desc: 'Production. 3 or more nodes of any size and any count — grows with your project. Hetzner Cloud at launch.',
+    status: 'live',
+    statusText: 'Available now',
+  },
+  {
+    num: 'Tier 3',
+    title: 'Bare metal',
+    price: 'Dedicated EPYC',
+    desc: 'Bare metal. Dedicated EPYC servers. For when you need a performance ceiling above VPS.',
+    status: 'roadmap',
+    statusText: 'Roadmap · Phase 5+',
+  },
+  {
+    num: 'Tier 4',
+    title: 'Hyperscalers',
+    price: 'AWS · GCP · Azure',
+    desc: 'Hyperscalers. Primarily for cases where regulation requires these specific providers.',
+    status: 'roadmap',
+    statusText: 'Roadmap · Phase 6+',
+  },
+];
+---
+
+<section aria-label="Tier ladder" id="tiers" data-screen-label="tiers">
+  <Container>
+    <SectionHead
+      eyebrow="Tier ladder"
+      title="One Application manifest. The backing changes — not your app."
+    />
+    <div class="ladder-wrap">
+      <div class="stair" aria-hidden="true">
+        {
+          [1, 2, 3, 4].map((n) => (
+            <div class={`step${n <= 2 ? ' live' : ''}`} style={`height: ${20 + n * 16}px`}>
+              <span class="label">T{n}</span>
+            </div>
+          ))
+        }
+      </div>
+      <div class="tier-cards">
+        {
+          tiers.map((t) => (
+            <div class="tier-card">
+              <span class="tier-num">{t.num}</span>
+              <h3>{t.title}</h3>
+              <div class="price">{t.price}</div>
+              <p>{t.desc}</p>
+              <span class={`status ${t.status}`}>{t.statusText}</span>
+            </div>
+          ))
+        }
+      </div>
+      <div class="orthogonal-note">
+        <strong>Confidential containers</strong> — orthogonal capability, not a tier.
+        Available on any hardware that supports TDX or SEV-SNP. Shipping Phase
+        6+.
+      </div>
+    </div>
+  </Container>
+</section>
+
+<style>
+  .ladder-wrap {
+    position: relative;
+    margin-top: 8px;
+  }
+  .tier-cards {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-top: 56px;
+  }
+  .tier-card {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 24px 22px 26px;
+    display: flex;
+    flex-direction: column;
+    min-height: 280px;
+  }
+  .tier-card .tier-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    color: var(--fg-faint);
+    text-transform: uppercase;
+  }
+  .tier-card h3 {
+    margin-top: 10px;
+    font-size: 20px;
+    font-weight: 700;
+  }
+  .tier-card .price {
+    margin-top: 6px;
+    font-size: 14px;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-weight: 500;
+  }
+  .tier-card p {
+    margin-top: 14px;
+    font-size: 14.5px;
+    color: var(--fg-muted);
+    line-height: 1.55;
+    flex-grow: 1;
+  }
+  .tier-card .status {
+    margin-top: 18px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    align-self: flex-start;
+    padding: 6px 9px;
+    border: 1px solid var(--border-strong);
+    color: var(--fg-muted);
+  }
+  .tier-card .status.live {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .tier-card .status.live::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    display: inline-block;
+  }
+  .tier-card .status.roadmap::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border: 1px solid var(--fg-faint);
+    display: inline-block;
+  }
+
+  .stair {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    height: 88px;
+    align-items: end;
+    margin-top: 48px;
+    gap: 16px;
+    position: relative;
+  }
+  .stair .step {
+    position: relative;
+    border: 1px solid var(--border-strong);
+    background: var(--surface-2);
+  }
+  .stair .step.live {
+    background: var(--surface);
+    border-color: var(--accent);
+  }
+  .stair .step .label {
+    position: absolute;
+    bottom: 8px;
+    left: 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-faint);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .stair .step.live .label {
+    color: var(--accent);
+  }
+
+  .orthogonal-note {
+    margin-top: 32px;
+    padding: 18px 22px;
+    border-left: 2px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+    font-size: 15px;
+    color: var(--fg-muted);
+  }
+  .orthogonal-note strong {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  @media (max-width: 1080px) {
+    .tier-cards {
+      grid-template-columns: repeat(2, 1fr);
+    }
+    .stair {
+      display: none;
+    }
+  }
+  @media (max-width: 720px) {
+    .tier-cards {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
