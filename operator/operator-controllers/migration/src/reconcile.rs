@@ -267,9 +267,23 @@ async fn write_status(
         "metadata": { "name": name },
         "status": new_status,
     });
+    // `force=true` is load-bearing here. External actors
+    // (Backstage UI, `apprafter migration approve|reject`,
+    // `kubectl patch --subresource=status`) write `status.phase`
+    // and register their own SSA field manager
+    // (`kubectl-patch` / `backstage` / etc.) as the owner of
+    // that field. MigrationController's own SSA patch carrying
+    // `phase=executing` (or `completed` / `failed`) without
+    // `.force()` 409s with a managedFields conflict, the
+    // reconcile error_policy retries forever on the same
+    // conflict, and the plan freezes at `approved`.
+    //
+    // Walk-found bug v0.1.126 → v0.1.127. Application
+    // controller's `apply_status` already uses `.force()` for
+    // exactly this reason (operator-controllers/application).
     api.patch_status(
         name,
-        &PatchParams::apply(FIELD_MANAGER),
+        &PatchParams::apply(FIELD_MANAGER).force(),
         &Patch::Apply(&body),
     )
     .await?;

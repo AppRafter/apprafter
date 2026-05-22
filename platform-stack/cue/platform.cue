@@ -254,7 +254,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.1.28"
+currentVersion: #Version & "0.1.29"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

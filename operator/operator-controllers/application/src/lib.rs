@@ -22,7 +22,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use operator_core::{
-    Application, ApplicationCondition, ApplicationStatus, MigrationPlan, Metrics,
+    Application, ApplicationCondition, ApplicationStatus, Metrics, MigrationPlan,
     COND_MIGRATION_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
@@ -334,7 +334,12 @@ async fn find_blocking_migration_plan(
 ) -> Result<Option<MigrationPlan>, ReconcileError> {
     let api: Api<MigrationPlan> = Api::namespaced(client.clone(), MIGRATION_PLAN_NAMESPACE);
     let list = api.list(&Default::default()).await?;
-    Ok(pick_blocking_plan(list.items, app_name, app_namespace, environment))
+    Ok(pick_blocking_plan(
+        list.items,
+        app_name,
+        app_namespace,
+        environment,
+    ))
 }
 
 /// Pure scope-matching logic for `find_blocking_migration_plan`.
@@ -390,10 +395,7 @@ fn build_paused_status(app: &Application, plan_name: &str) -> ApplicationStatus 
         .as_ref()
         .and_then(|s| s.conditions.as_deref())
         .unwrap_or(&[]);
-    let previous_endpoint = app
-        .status
-        .as_ref()
-        .and_then(|s| s.endpoint_url.clone());
+    let previous_endpoint = app.status.as_ref().and_then(|s| s.endpoint_url.clone());
 
     let ready = ready_condition(
         "False",
@@ -428,7 +430,9 @@ fn migration_pending_condition(
         status: "True".to_string(),
         last_transition_time,
         reason: "MigrationPlanPending".to_string(),
-        message: format!("MigrationPlan {MIGRATION_PLAN_NAMESPACE}/{plan_name} is awaiting approval"),
+        message: format!(
+            "MigrationPlan {MIGRATION_PLAN_NAMESPACE}/{plan_name} is awaiting approval"
+        ),
         observed_generation: None,
     }
 }

@@ -1649,6 +1649,71 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #1 post-B.1.76 — MigrationController status SSA
+// missing `.force()`. External actors (Backstage, CLI,
+// `kubectl patch --subresource=status`) own `status.phase`
+// after writing it; controller's own SSA patch carrying the
+// next phase value 409s with a managedFields conflict;
+// error_policy retries forever; plan freezes at `approved`.
+// Fix: add `.force()` to MigrationController's write_status
+// + preventively to PlatformController's write_status (which
+// hasn't surfaced the bug but is structurally identical).
+// Operator-binary change only → image v0.1.126 → v0.1.127
+// via the standard chart appVersion lockstep.
+compatibility: "0.1.29": {
+	change:          "safe"
+	operatorVersion: "v0.1.127"
+	notes: """
+		Walk-fix #1 post-B.1.76 — SSA `.force()` on
+		MigrationController + PlatformController status
+		writes.
+
+		Symptom (walk-found, 2026-05-22 acceptance walk
+		of B.1.74→B.1.77): after `kubectl patch
+		migrationplan ... --subresource=status --type=merge
+		-p '{"status":{"phase":"approved"}}'`, the plan
+		stayed at phase=`approved` forever. Controller
+		logs showed `migration reconcile completed` on
+		the watch-fired UPDATE event, but no subsequent
+		transition to `executing` or `completed`.
+
+		Root cause: kubectl's merge-patch registers the
+		field manager `kubectl-patch` as the owner of
+		`status.phase`. MigrationController's own SSA
+		patch (under `migration-controller` field manager)
+		carrying `phase=executing` 409s against that
+		ownership without `.force()`. The error propagates
+		through `reconcile`, error_policy requeues 15s,
+		next reconcile hits the same conflict — infinite
+		loop.
+
+		Fix:
+
+		* `operator-controllers/migration::write_status`:
+		  add `.force()` to `PatchParams::apply(FIELD_MANAGER)`.
+		* `operator-controllers/platform-stack::write_status`:
+		  same. Preventive — PlatformController has been
+		  the sole writer of `PlatformStack.status` in
+		  every walk so far, but the conflict shape is
+		  structurally identical and a single manual
+		  `kubectl patch --subresource=status` would
+		  freeze the loop.
+
+		Application controller's `apply_status` already
+		uses `.force()` for exactly this reason — the
+		walk-fix brings the migration + platform paths
+		in line.
+
+		Rendered chart vs 0.1.28: byte-equivalent
+		templates. Operator-binary change only; chart
+		appVersion bump propagates the new image.
+		"""
+	references: [
+		"plan.md",
+		"docs/changelog/UNRELEASED.md#v01127",
+	]
+}
+
 // Track B.1.77 closure — Application reconciler gate
 // (pause/resume) + Argo CD UI surfacing of pending
 // MigrationPlans. ApplicationController now checks for

@@ -32,8 +32,8 @@ use tracing::{info, warn};
 
 use operator_core::{
     Application, ApplicationSpec, DestructiveChange, MigrationApplicationRef,
-    MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope, MigrationPlanSpec,
-    MigrationStep, MigrationStrategy, MigrationTrigger, StepOutcome,
+    MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope,
+    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, StepOutcome,
 };
 
 /// SSA field manager used by the strategies' reject path when

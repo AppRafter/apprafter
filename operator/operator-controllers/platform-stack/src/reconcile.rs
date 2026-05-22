@@ -852,9 +852,24 @@ async fn write_status(
     // `operator_controllers_application::apply_status` which has
     // always carried the TypeMeta.
     let patch = build_status_patch(&name, &new_status, include_version_history);
+    // `force=true` for the same reason MigrationController's
+    // status write uses it (walk-found bug v0.1.126 →
+    // v0.1.127 on the migration side): a manual `kubectl
+    // patch --subresource=status` registers a foreign field
+    // manager as the owner of the status field we just
+    // overwrote, and the next reconcile SSA-applies the
+    // controller's desired status under
+    // `platform-controller` — without `.force()` that 409s
+    // with a managedFields conflict and freezes the loop.
+    //
+    // PlatformController has historically been the SOLE
+    // writer of `PlatformStack.status`, so the bug never
+    // surfaced in walks — but defensive coverage is cheap
+    // and prevents a future operator support session from
+    // chasing the same conflict.
     api.patch_status(
         &name,
-        &PatchParams::apply(FIELD_MANAGER),
+        &PatchParams::apply(FIELD_MANAGER).force(),
         &Patch::Apply(&patch),
     )
     .await?;

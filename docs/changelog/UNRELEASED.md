@@ -13,6 +13,103 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.127 — M1.5 walk-fix #1 post-B.1.76 — SSA `.force()` on status writes (2026-05-22)
+
+Walk-found bug на acceptance walk B.1.74→B.1.77 на v0.1.126.
+
+### Symptom
+
+Phase 3.2 of the walk: `kubectl patch migrationplan walk-app-1
+-n apprafter-system --subresource=status --type=merge -p
+'{"status":{"phase":"approved"}}'` returned success, plan
+status flipped к `approved` — but the MigrationController
+never transitioned the plan to `executing` / `completed`.
+Phase stayed at `approved` indefinitely; controller logs
+showed `migration reconcile completed plan=walk-app-1` on
+the watch-fired UPDATE event but no observable status
+change.
+
+### Root cause
+
+`kubectl patch --subresource=status --type=merge` registers
+the field manager **`kubectl-patch`** as the owner of
+`status.phase` in the resource's `managedFields`.
+MigrationController's own SSA patch carrying
+`phase=executing` (or `completed` / `failed`) under field
+manager **`migration-controller`** **without** `.force()`
+409s with a managedFields conflict from the apiserver:
+"another field manager owns this field, refusing to
+overwrite". The reconcile's `?` propagator surfaces the
+error to `error_policy`, which requeues 15s; the next
+reconcile hits the same conflict; loop forever.
+
+### Fix
+
+Add `.force()` to two call sites:
+
+1. **`operator-controllers/migration::reconcile::write_status`**
+   — the actual offender. MigrationController has external
+   writers (kubectl, Backstage UI, CLI) by design, so
+   `.force()` is load-bearing.
+2. **`operator-controllers/platform-stack::reconcile::write_status`**
+   — preventive. PlatformController has historically been
+   the sole writer of `PlatformStack.status` in every walk
+   so far, so the bug never surfaced; but the conflict
+   shape is structurally identical (any operator who
+   `kubectl patch --subresource=status` PlatformStack
+   manually would freeze the loop). Defensive coverage is
+   cheap.
+
+`operator-controllers/application::apply_status` already
+uses `.force()` (built into the B.1.7-era reconciler for
+exactly this reason). The walk-fix brings the migration +
+platform paths in line.
+
+### Why not add a regression test?
+
+The bug only manifests at the apiserver / managedFields
+layer — `cargo test` against an in-memory mock doesn't
+exercise SSA conflict resolution. The next acceptance walk
+re-runs phase 3.2 of the runbook (kubectl patch status.phase
+without `--field-manager` workaround); if the plan
+transitions to `completed`, the fix held. Unit-level
+coverage would require either a real apiserver in tests
+(e3-up smoke against k3d) or a non-trivial mock —
+disproportionate cost for a single-line force flag fix.
+
+### Walk workaround (no rebuild)
+
+For operators completing a walk on v0.1.126 without
+rebuilding the operator:
+
+```bash
+kubectl patch migrationplan <name> -n apprafter-system \
+  --subresource=status --type=merge \
+  --field-manager=migration-controller \
+  -p '{"status":{"phase":"approved"}}'
+```
+
+Pretending to be the controller's field manager bypasses
+the conflict for that single patch; the controller's next
+SSA write reuses the same manager name and overwrites
+freely.
+
+### Files
+
+- `operator/operator-controllers/migration/src/reconcile.rs`
+  — `.force()` on `write_status` PatchParams.
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  — `.force()` on `write_status` PatchParams (preventive).
+
+### Versions
+
+- CLI: 0.1.126 → 0.1.127.
+- Operator chart: v0.1.107 → v0.1.108.
+- Admission-webhook chart: v0.1.107 → v0.1.108 (lockstep).
+- platform-stack chart: 0.1.28 → 0.1.29, with the matching
+  `compatibility: "0.1.29"` entry (byte-equivalent
+  templates — operator-binary change only).
+
 ## v0.1.126 — M1.5 Track B.1.77 closure — Application reconciler gate (2026-05-22)
 
 The Application reconciler now respects pending MigrationPlans
