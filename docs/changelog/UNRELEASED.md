@@ -13,6 +13,107 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.121 — M1.5 Track B.1.74 closure — versionHistory + Ready condition (2026-05-22)
+
+Track B.1.74 ("PlatformController upstream check + status updates")
+per plan.md. Most of the sub-phase's scope was already covered by
+B.1.73's reconcile machinery (periodic check, OCI tag list, channel
+filter, availableVersion / lastUpstreamCheck, UpgradeAvailable
+condition, safe-class auto-upgrade). B.1.74 closes the two
+remaining gaps:
+
+### 1. `status.versionHistory` ring buffer
+
+New `append_version_history(status, entry)` helper in
+`operator-controllers/platform-stack/src/status.rs`. On each
+successful SSA patch that ACTUALLY changes `targetRevision`
+(not status-only / values-only patches), reconcile appends:
+
+```yaml
+version: "0.1.21"
+appliedAt: "2026-05-22T13:42:00+00:00"
+outcome: "succeeded"
+```
+
+Capped at `VERSION_HISTORY_CAP = 10` entries. Oldest drops
+from the FRONT when the cap is exceeded (FIFO queue
+semantics).
+
+Visible via:
+```sh
+kubectl get platformstack default -n apprafter-system \
+  -o jsonpath='{.status.versionHistory}'
+```
+
+Empty until the first version bump (e.g., user sets
+`spec.pin`, or `autoUpgrade=true` + new safe upstream).
+
+### 2. `Ready` condition
+
+New `COND_READY` constant. Mirrors parent's aggregate health:
+
+- **True / Healthy** when `parent.status.health.status == "Healthy"`
+  (Argo CD's aggregation from all child Applications +
+  their workloads).
+- **False / ParentNotHealthy** during sync or Degraded
+  states, with message naming the actual health value.
+
+Joins the four pre-existing conditions in
+`kubectl describe platformstack default` — total 5 conditions:
+
+```
+Synced / UpgradeAvailable / MigrationPending /
+UnauthorizedSourceModification / Ready
+```
+
+### Skipped (documented intent, not bugs)
+
+- **ETag-aware OCI requests** — the existing throttle
+  (`MIN_OCI_POLL_INTERVAL_SECS=60`) + cached `availableVersion`
+  reuse already saturate the bandwidth concern. An ETag
+  pathway would shave bytes-per-poll without changing the
+  cadence. YAGNI per CLAUDE.md.
+- **Breaking-class MigrationPlan auto-create** — covered by
+  B.1.75 (MigrationPlan CRD + admission). B.1.74 keeps the
+  existing `MigrationPending=True` condition placeholder.
+
+### Regression guards
+
+- `append_version_history_grows_to_cap` — fills to cap exactly,
+  asserts newest at the back / oldest at the front.
+- `append_version_history_caps_at_max_and_drops_oldest` —
+  overflows by 3, asserts oldest 3 dropped (FIFO).
+- `append_version_history_starts_from_empty_status` — Option::None
+  initialization works.
+
+Total tests: 48 (was 45).
+
+### Live verification
+
+Push v0.1.121 + observe versionHistory grow on the next
+test 1 (`kubectl patch platformstack default pin=<lower-version>`).
+Ready condition visible immediately on next reconcile
+post-bootstrap.
+
+### Version chain
+
+- CLI 0.1.120 → 0.1.121.
+- operator + admission-webhook chart v0.1.101 → v0.1.102.
+- operator + admission-webhook `appVersion` v0.1.120 → v0.1.121.
+- platform-stack chart 0.1.22 → 0.1.23.
+
+### References
+
+- plan.md §1.74 (PlatformController upstream check +
+  status updates).
+- spec.md §3.11 ("Status reports include `currentVersion`,
+  `targetVersion`, `availableVersion`, `lastUpstreamCheck`,
+  a per-component status array, a `versionHistory` ring buffer...").
+- `operator/operator-controllers/platform-stack/src/status.rs`
+  `append_version_history` + `COND_READY`.
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  `Ready` condition emission + history append site.
+
 ## v0.1.120 — M1.5 Track B.1.73 walk-fix #6 — Kubernetes Events on foreign-writer detection (2026-05-22)
 
 Post-v0.1.119 walk reached steady state cleanly (~2 reconciles/min,

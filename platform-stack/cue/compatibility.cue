@@ -1522,3 +1522,82 @@ compatibility: "0.1.22": {
 		"docs/changelog/UNRELEASED.md#v01120",
 	]
 }
+
+// 0.1.23 — Track B.1.74 closure: PlatformController status
+// observability polish. Two surface additions on top of the
+// already-shipping B.1.73 reconcile machinery (which already
+// covers periodic check, OCI tag list, channel filter,
+// availableVersion / lastUpstreamCheck updates, UpgradeAvailable
+// condition, and safe-class auto-upgrade):
+//
+//   1. `status.versionHistory` ring buffer (capped at 10
+//      entries). On each successful SSA patch that ACTUALLY
+//      changes `targetRevision`, append
+//      `{version, appliedAt, outcome: "succeeded"}`. Oldest
+//      entries drop from the front when the cap is exceeded.
+//      Feeds rollback decisions + audit. Empty until the first
+//      version bump.
+//
+//   2. `Ready` condition mirroring parent's aggregate health.
+//      True iff `parent.status.health.status == "Healthy"`
+//      (Argo CD's own aggregation from child Applications +
+//      their workloads). Surfaces alongside the other four
+//      conditions in `kubectl describe platformstack default`.
+//
+// Skipped (per plan.md "Размер: S" + YAGNI per CLAUDE.md):
+//   * ETag-aware OCI requests — the existing throttle
+//     (`MIN_OCI_POLL_INTERVAL_SECS=60`) + cached availableVersion
+//     reuse already saturate the bandwidth concern; an ETag
+//     pathway would shave bytes-per-poll without changing the
+//     poll cadence. Deferred to a future perf pass.
+//   * Breaking-class MigrationPlan auto-create — covered by
+//     B.1.75 (MigrationPlan CRD + admission). B.1.74 keeps the
+//     existing behaviour of pushing `MigrationPending=True`
+//     condition + the `Normal/SourceReverted`-style audit
+//     events from walk-fix #6.
+//
+// Rendered chart vs 0.1.22: byte-equivalent (no chart-shape
+// change). Operator-binary change only; image v0.1.120 → v0.1.121
+// via the standard chart appVersion lockstep.
+compatibility: "0.1.23": {
+	change:          "safe"
+	operatorVersion: "v0.1.121"
+	notes: """
+		Track B.1.74 closure. PlatformController gains
+		two status surface additions:
+
+		* `status.versionHistory` ring buffer (cap 10).
+		  Appended on each successful targetRevision
+		  bump. Visible via:
+		      kubectl get platformstack default \\
+		          -n apprafter-system \\
+		          -o jsonpath='{.status.versionHistory}'
+		* `Ready` condition. True iff parent platform
+		  Application reports Healthy; False with
+		  `ParentNotHealthy` reason during sync /
+		  Degraded states. Joins the four pre-existing
+		  conditions (Synced / UpgradeAvailable /
+		  MigrationPending / UnauthorizedSourceModification).
+
+		Skipped: ETag-aware OCI requests (existing throttle
+		+ cached availableVersion saturate the bandwidth
+		concern; deferred). Breaking-class MigrationPlan
+		auto-create still routes through the
+		`MigrationPending=True` condition placeholder —
+		B.1.75 lands the actual MigrationPlan CRD +
+		controller logic.
+
+		Acceptance walk piggybacks on B.1.73 walk-fix #6
+		Event audit-trail verification (per user's
+		earlier "test as regression during 1.74 walk"
+		request).
+
+		Rendered chart vs 0.1.22: byte-equivalent.
+		Operator-binary change only; chart appVersion
+		bump propagates the new image.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01121",
+	]
+}

@@ -13,6 +13,19 @@ pub const COND_SYNCED: &str = "Synced";
 pub const COND_UPGRADE_AVAILABLE: &str = "UpgradeAvailable";
 pub const COND_MIGRATION_PENDING: &str = "MigrationPending";
 pub const COND_UNAUTHORIZED_SOURCE_MODIFICATION: &str = "UnauthorizedSourceModification";
+/// `Ready` mirrors `parent.status.health.status`. True iff the
+/// parent platform Application reports Healthy (all child
+/// Applications synced + their workloads at their chart-defined
+/// health threshold). Surfaces alongside the other conditions
+/// in `kubectl describe platformstack default`. Walk-fix B.1.74.
+pub const COND_READY: &str = "Ready";
+
+/// Maximum entries kept in `PlatformStack.status.versionHistory`.
+/// Ring-buffer behaviour: oldest entry drops when this cap is
+/// exceeded. Per spec.md §3.11 ("recent N transitions"); 10 is
+/// enough for audit + rollback decisions without bloating the
+/// CR.
+pub const VERSION_HISTORY_CAP: usize = 10;
 
 /// Build a fresh condition or carry the prior transition time
 /// forward if the status value has not changed. Use this for
@@ -51,6 +64,29 @@ pub fn upsert_condition(status: &mut PlatformStackStatus, c: PlatformStackCondit
         conds.push(c);
     }
     status.conditions = Some(conds);
+}
+
+/// Append a version-history entry as a ring buffer capped at
+/// `VERSION_HISTORY_CAP`. The newest entry lives at the END of
+/// the vector (chronological order); oldest entries drop from
+/// the FRONT when the cap is exceeded.
+///
+/// Walk-fix B.1.74: tracks "what versions did PlatformController
+/// successfully bring online, in what order?" — feeds rollback +
+/// audit. Caller invokes only on a successful SSA patch that
+/// actually changes `targetRevision`; status-only or values-only
+/// patches don't constitute a version transition.
+pub fn append_version_history(
+    status: &mut PlatformStackStatus,
+    entry: operator_core::PlatformStackVersionHistoryEntry,
+) {
+    let mut history = status.version_history.clone().unwrap_or_default();
+    history.push(entry);
+    if history.len() > VERSION_HISTORY_CAP {
+        let drop = history.len() - VERSION_HISTORY_CAP;
+        history.drain(0..drop);
+    }
+    status.version_history = Some(history);
 }
 
 #[cfg(test)]
@@ -140,5 +176,70 @@ mod tests {
             },
         );
         assert_eq!(status.conditions.as_ref().unwrap().len(), 1);
+    }
+
+    fn entry(version: &str, applied_at: &str) -> operator_core::PlatformStackVersionHistoryEntry {
+        operator_core::PlatformStackVersionHistoryEntry {
+            version: version.into(),
+            applied_at: applied_at.into(),
+            outcome: "succeeded".into(),
+        }
+    }
+
+    #[test]
+    fn append_version_history_grows_to_cap() {
+        let mut status = PlatformStackStatus::default();
+        for i in 0..VERSION_HISTORY_CAP {
+            append_version_history(
+                &mut status,
+                entry(
+                    &format!("0.1.{i}"),
+                    &format!("2026-05-22T00:0{i:01}:00+00:00"),
+                ),
+            );
+        }
+        let history = status.version_history.as_ref().expect("history populated");
+        assert_eq!(history.len(), VERSION_HISTORY_CAP);
+        // Newest entry is at the END of the vector.
+        assert_eq!(
+            history.last().unwrap().version,
+            format!("0.1.{}", VERSION_HISTORY_CAP - 1)
+        );
+        assert_eq!(history.first().unwrap().version, "0.1.0");
+    }
+
+    #[test]
+    fn append_version_history_caps_at_max_and_drops_oldest() {
+        let mut status = PlatformStackStatus::default();
+        // Push 13 entries — the first 3 must be dropped.
+        for i in 0..(VERSION_HISTORY_CAP + 3) {
+            append_version_history(
+                &mut status,
+                entry(
+                    &format!("0.1.{i}"),
+                    &format!("2026-05-22T00:00:{i:02}+00:00"),
+                ),
+            );
+        }
+        let history = status.version_history.as_ref().unwrap();
+        assert_eq!(history.len(), VERSION_HISTORY_CAP);
+        // Oldest survivor is at index 0; oldest 3 dropped.
+        assert_eq!(history.first().unwrap().version, "0.1.3");
+        // Newest entry at the back.
+        assert_eq!(
+            history.last().unwrap().version,
+            format!("0.1.{}", VERSION_HISTORY_CAP + 2)
+        );
+    }
+
+    #[test]
+    fn append_version_history_starts_from_empty_status() {
+        // Regression guard: even when `status.version_history`
+        // is None (first reconcile), append() must initialize
+        // it to `Some(vec![entry])`.
+        let mut status = PlatformStackStatus::default();
+        assert!(status.version_history.is_none());
+        append_version_history(&mut status, entry("0.1.20", "2026-05-22T00:00:00+00:00"));
+        assert_eq!(status.version_history.as_ref().unwrap().len(), 1);
     }
 }

@@ -27,15 +27,17 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use operator_core::{Metrics, PlatformStack, PlatformStackStatus};
+use operator_core::{
+    Metrics, PlatformStack, PlatformStackStatus, PlatformStackVersionHistoryEntry,
+};
 
 use crate::compatibility::{fetch_change_class, ChangeClass};
 use crate::desired::{build as build_desired, DesiredSource};
 use crate::oci::{latest_in_channel, Channel};
 use crate::policy::{NoOpHooks, PolicyHooks};
 use crate::status::{
-    condition, upsert_condition, COND_MIGRATION_PENDING, COND_SYNCED,
-    COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
+    append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING, COND_READY,
+    COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
 };
 use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
@@ -535,6 +537,60 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         ),
     };
     upsert_condition(&mut new_status, cond_unauthorized);
+
+    // `Ready` mirrors parent's aggregate health — True iff
+    // Argo CD reports the parent platform Application Healthy
+    // (which in turn requires all child Applications +
+    // their workloads at their chart-defined health threshold).
+    // Walk-fix B.1.74. Sourcing from parent status saves us
+    // walking each child individually; Argo CD's app-controller
+    // does the aggregation work already.
+    let parent_health = parent_json
+        .pointer("/status/health/status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let cond_ready = if parent_health == "Healthy" {
+        condition(
+            COND_READY,
+            "True",
+            "Healthy",
+            "parent platform Application reports Healthy",
+            &prior_conds,
+        )
+    } else {
+        condition(
+            COND_READY,
+            "False",
+            "ParentNotHealthy",
+            &format!(
+                "parent platform Application health is {h:?} (target {target}); \
+                 platform reconciling or degraded",
+                h = parent_health,
+                target = target_for_patch
+            ),
+            &prior_conds,
+        )
+    };
+    upsert_condition(&mut new_status, cond_ready);
+
+    // versionHistory ring buffer (B.1.74). Only record on a
+    // SUCCESSFUL bump of `targetRevision` — values-only patches
+    // and no-op reconciles don't constitute a version
+    // transition. `target_changed` captures pre-patch state
+    // (current_target != desired) and the patch must have
+    // actually included a new target (so we exclude the policy-
+    // refused / MigrationPending branches where target_for_patch
+    // == current_target).
+    if target_changed && target_for_patch != current_target {
+        append_version_history(
+            &mut new_status,
+            PlatformStackVersionHistoryEntry {
+                version: target_for_patch.clone(),
+                applied_at: now.to_rfc3339(),
+                outcome: "succeeded".into(),
+            },
+        );
+    }
 
     new_status.current_version = Some(target_for_patch.clone());
     new_status.target_version = Some(target_for_patch);
