@@ -3,17 +3,16 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //
 // Bootstrap stub — replaced by the real composition in Phase G.
-// For Phase C we exercise the new primitives so a single build verifies
-// the LogoMark / Wordmark / Brand / Container / SectionHead / StatusPill
-// chain plus the ThemeToggle Svelte island.
+// For Phase D it exercises Header + Footer + primitives so a single
+// build verifies the whole layout-level chain.
 
 import { THEME_INIT_SCRIPT } from '../lib/theme-init';
 import '../styles/index.css';
-import Brand from '../components/brand/Brand.astro';
+import Header from '../components/layout/Header.astro';
+import Footer from '../components/layout/Footer.astro';
 import Container from '../components/primitives/Container.astro';
 import SectionHead from '../components/primitives/SectionHead.astro';
 import StatusPill from '../components/primitives/StatusPill.astro';
-import ThemeToggle from '../components/layout/ThemeToggle.svelte';
 ---
 
 <!doctype html>
@@ -21,7 +20,7 @@ import ThemeToggle from '../components/layout/ThemeToggle.svelte';
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AppRafter — primitives preview</title>
+    <title>AppRafter — layout preview</title>
     <link
       rel="preload"
       href="/fonts/roboto-400.woff2"
@@ -34,49 +33,37 @@ import ThemeToggle from '../components/layout/ThemeToggle.svelte';
   <body>
     <a href="#main" class="skip-to-content">Skip to content</a>
 
-    <Container as="header" class="bootstrap-header">
-      <Brand variant="twoTone" size={26} />
-      <ThemeToggle client:load />
-    </Container>
+    <Header />
 
     <main id="main">
-      <Container as="section" class="bootstrap-section">
+      <Container as="section">
         <SectionHead
-          eyebrow="Phase C preview"
-          title="Primitives wired."
-          lede="LogoMark + Wordmark + Brand link, Container, SectionHead, three StatusPill kinds, and the ThemeToggle Svelte island."
+          eyebrow="Phase D preview"
+          title="Layout chain wired."
+          lede="Sticky Header with scroll-driven bottom border, theme toggle, and Brand + nav. Footer with three columns, copyright, and FSL license note. Phase E hero arrives next."
         />
 
-        <div class="pill-row">
+        <div class="pill-row" style="display: flex; gap: 12px; flex-wrap: wrap;">
           <StatusPill kind="live" label="Available now" />
           <StatusPill kind="waitlist" label="Waitlist" />
           <StatusPill kind="roadmap" label="Roadmap" />
         </div>
+      </Container>
 
-        <p class="muted" style="margin-top: 32px; max-width: 36rem;">
-          Click the sun / moon icon in the header to verify theme switching
-          persists across reloads. The real hero, sections, and footer arrive
-          in Phase D through G.
-        </p>
+      <Container as="section">
+        <SectionHead
+          eyebrow="Filler"
+          title="Scroll to see the header border appear."
+        />
+        <div style="height: 120vh; opacity: 0.4; line-height: 2;">
+          Scroll down a few hundred pixels and the sticky header gains its 1 px
+          border-bottom (color-mix backdrop kicks in immediately on first paint).
+          Theme toggle in the top-right flips dark ↔ light and persists across
+          reloads via localStorage[apprafter-theme].
+        </div>
       </Container>
     </main>
 
-    <style>
-      .bootstrap-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        height: 64px;
-        border-bottom: 1px solid var(--border);
-      }
-      .bootstrap-section {
-        padding-top: var(--section-pad-y);
-      }
-      .pill-row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 12px;
-      }
-    </style>
+    <Footer />
   </body>
 </html>

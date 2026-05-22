@@ -1,0 +1,164 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Site footer. Brand-with-blurb column + three link columns
+// (Project / Legal / Author) + bottom row with copyright, license
+// note, founder line. Copy hardcoded here for Phase D, wired to
+// Payload FooterContent global in Phase H.
+
+import Brand from '../brand/Brand.astro';
+import Container from '../primitives/Container.astro';
+
+const year = new Date().getFullYear();
+
+const columns = [
+  {
+    heading: 'Project',
+    links: [
+      {
+        label: 'Spec',
+        href: 'https://github.com/AppRafter/apprafter/blob/main/spec.md',
+        external: true,
+      },
+      { label: 'GitHub', href: 'https://github.com/AppRafter/apprafter', external: true },
+      { label: 'Roadmap', href: '#roadmap', external: false },
+      {
+        label: 'Docs',
+        href: 'https://github.com/AppRafter/apprafter#readme',
+        external: true,
+        soon: true,
+      },
+    ],
+  },
+  {
+    heading: 'Legal',
+    links: [
+      {
+        label: 'License — FSL-1.1-Apache-2.0',
+        href: 'https://github.com/AppRafter/apprafter/blob/main/LICENSE',
+        external: true,
+      },
+      { label: 'Privacy', href: '/privacy', external: false },
+      { label: 'Terms', href: '/terms', external: false },
+    ],
+  },
+  {
+    heading: 'Author',
+    links: [
+      { label: 'Founder’s site', href: '#author', external: false },
+      { label: 'GitHub org', href: 'https://github.com/AppRafter', external: true },
+    ],
+  },
+];
+---
+
+<footer class="site-footer">
+  <Container>
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <Brand variant="twoTone" size={22} />
+        <p class="desc">
+          An opinionated PaaS on Kubernetes. Open source, bootstrap-funded,
+          scaling with you instead of around you.
+        </p>
+      </div>
+      {
+        columns.map((col) => (
+          <div>
+            <h4>{col.heading}</h4>
+            <ul>
+              {col.links.map((link) => (
+                <li>
+                  <a
+                    href={link.href}
+                    {...(link.external
+                      ? { target: '_blank', rel: 'noreferrer' }
+                      : {})}
+                  >
+                    {link.label}
+                    {link.soon && (
+                      <span class="faint mono" style="font-size: 10px; margin-left: 6px;">
+                        SOON
+                      </span>
+                    )}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+    </div>
+    <div class="footer-bottom">
+      <span>© {year} AppRafter · <a href="https://apprafter.dev" class="muted">apprafter.dev</a></span>
+      <span class="mono" style="font-size: 12px;">
+        FSL-1.1-Apache-2.0 · auto-converts to Apache 2.0 after 2 years
+      </span>
+      <span>Bootstrap-funded. Built solo.</span>
+    </div>
+  </Container>
+</footer>
+
+<style>
+  .site-footer {
+    padding: 72px 0 36px;
+    font-size: 14px;
+  }
+  .footer-grid {
+    display: grid;
+    grid-template-columns: 1.6fr repeat(3, 1fr);
+    gap: 48px;
+    margin-bottom: 48px;
+  }
+  .footer-grid h4 {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    font-weight: 500;
+    margin-bottom: 16px;
+  }
+  .footer-grid ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 10px;
+  }
+  .footer-grid a {
+    color: var(--fg-muted);
+  }
+  .footer-grid a:hover {
+    color: var(--fg);
+  }
+  .footer-brand .desc {
+    color: var(--fg-muted);
+    margin-top: 12px;
+    max-width: 280px;
+    line-height: 1.55;
+  }
+  .footer-bottom {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 24px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-faint);
+    font-size: 13px;
+    flex-wrap: wrap;
+  }
+
+  @media (max-width: 1080px) {
+    .footer-grid {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  @media (max-width: 720px) {
+    .footer-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

@@ -1,0 +1,107 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Sticky site header. Logo on the left, nav + theme toggle on the right.
+// Background uses color-mix to fade the page background so the header
+// reads through scrolling content; a 1px border-bottom appears once
+// the user has scrolled past 8 px (a small vanilla script below
+// toggles the `.scrolled` class — no Svelte island needed).
+//
+// Links (Docs / Spec / GitHub) are hardcoded here for Phase D; they
+// migrate to Payload SiteSettings in Phase H without further structural
+// change.
+
+import Brand from '../brand/Brand.astro';
+import Container from '../primitives/Container.astro';
+import ThemeToggle from './ThemeToggle.svelte';
+
+const links = {
+  docs: 'https://github.com/AppRafter/apprafter#readme',
+  spec: 'https://github.com/AppRafter/apprafter/blob/main/spec.md',
+  github: 'https://github.com/AppRafter/apprafter',
+};
+---
+
+<header class="site-header" id="top">
+  <Container class="row">
+    <Brand variant="twoTone" size={26} />
+    <nav class="nav" aria-label="Primary">
+      <a href={links.docs} target="_blank" rel="noreferrer" class="soon">Docs</a>
+      <a href={links.spec} target="_blank" rel="noreferrer">Spec</a>
+      <a href={links.github} target="_blank" rel="noreferrer" aria-label="GitHub">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path
+            d="M12 .5A12 12 0 0 0 0 12.5a12 12 0 0 0 8.2 11.4c.6.1.8-.3.8-.6v-2.1c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.9 1.3 1.9 1.3 1.1 1.9 2.9 1.4 3.7 1 .1-.8.4-1.4.8-1.7-2.6-.3-5.4-1.3-5.4-6 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.6.1-3.3 0 0 1-.3 3.3 1.2a11.4 11.4 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.6 1.7.2 3 .1 3.3.8.8 1.2 1.9 1.2 3.2 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.3v3.3c0 .3.2.7.8.6A12 12 0 0 0 24 12.5 12 12 0 0 0 12 .5z"
+          ></path>
+        </svg>
+      </a>
+      <ThemeToggle client:load />
+    </nav>
+  </Container>
+</header>
+
+<script>
+  const header = document.querySelector('.site-header');
+  if (header) {
+    const onScroll = () => header.classList.toggle('scrolled', window.scrollY > 8);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+  }
+</script>
+
+<style>
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: saturate(140%) blur(10px);
+    -webkit-backdrop-filter: saturate(140%) blur(10px);
+    border-bottom: 1px solid transparent;
+    transition: border-color 200ms ease;
+  }
+  .site-header.scrolled {
+    border-bottom-color: var(--border);
+  }
+  .site-header :global(.row) {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+    gap: 24px;
+  }
+
+  .nav {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+  }
+  .nav a {
+    color: var(--fg-muted);
+    font-size: 14px;
+    font-weight: 500;
+    transition: color 150ms ease;
+  }
+  .nav a:hover {
+    color: var(--fg);
+  }
+  .nav .soon::after {
+    content: 'Soon';
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    margin-left: 6px;
+    padding: 2px 5px;
+    border: 1px solid var(--border-strong);
+    color: var(--fg-faint);
+    text-transform: uppercase;
+    vertical-align: 2px;
+  }
+
+  @media (max-width: 720px) {
+    .nav a:not([aria-label='GitHub']) {
+      display: none;
+    }
+  }
+</style>
