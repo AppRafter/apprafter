@@ -1,61 +1,72 @@
 ---
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// Full page composition — Phase F. The final SEO + JSON-LD pass
-// + BaseLayout extraction lands in Phase G.
 
-import '../styles/index.css';
+import BaseLayout from '../components/layout/BaseLayout.astro';
 import Footer from '../components/layout/Footer.astro';
 import Header from '../components/layout/Header.astro';
 import Hero from '../components/hero/Hero.astro';
-import ValueProps from '../components/sections/ValueProps.astro';
+import Advantages from '../components/sections/Advantages.astro';
+import BootstrapStrip from '../components/sections/BootstrapStrip.astro';
+import BoringTech from '../components/sections/BoringTech.astro';
+import Comparison from '../components/sections/Comparison.astro';
+import Roadmap from '../components/sections/Roadmap.astro';
 import ScalingJourney from '../components/sections/ScalingJourney.astro';
 import TierLadder from '../components/sections/TierLadder.astro';
-import Comparison from '../components/sections/Comparison.astro';
-import BoringTech from '../components/sections/BoringTech.astro';
-import Advantages from '../components/sections/Advantages.astro';
-import Roadmap from '../components/sections/Roadmap.astro';
-import BootstrapStrip from '../components/sections/BootstrapStrip.astro';
-import { THEME_INIT_SCRIPT } from '../lib/theme-init';
+import ValueProps from '../components/sections/ValueProps.astro';
+
+const title =
+  'AppRafter — One manifest. From a €5 VPS to production. Open source.';
+const description =
+  'AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — the same one runs from a single VDS to a multi-node production cluster. Open source (FSL-1.1-Apache-2.0).';
+
+const organizationLd = {
+  '@context': 'https://schema.org',
+  '@type': 'Organization',
+  name: 'AppRafter',
+  url: 'https://apprafter.dev',
+  logo: 'https://apprafter.dev/favicon.svg',
+  sameAs: ['https://github.com/AppRafter/apprafter'],
+};
+
+const softwareLd = {
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: 'AppRafter',
+  description,
+  applicationCategory: 'DeveloperApplication',
+  operatingSystem: 'Linux',
+  url: 'https://apprafter.dev',
+  license: 'https://github.com/AppRafter/apprafter/blob/main/LICENSE',
+  offers: { '@type': 'Offer', price: '0', priceCurrency: 'EUR' },
+};
 ---
 
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AppRafter — One manifest. From a €5 VPS to production. Open source.</title>
-    <meta
-      name="description"
-      content="AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — the same one runs from a single VDS to a multi-node production cluster. Open source (FSL-1.1-Apache-2.0)."
+<BaseLayout title={title} description={description}>
+  <Fragment slot="head">
+    <script
+      type="application/ld+json"
+      is:inline
+      set:html={JSON.stringify(organizationLd)}
     />
-    <link
-      rel="preload"
-      href="/fonts/roboto-400.woff2"
-      as="font"
-      type="font/woff2"
-      crossorigin
+    <script
+      type="application/ld+json"
+      is:inline
+      set:html={JSON.stringify(softwareLd)}
     />
-    <script is:inline set:html={THEME_INIT_SCRIPT} />
-  </head>
-  <body>
-    <a href="#main" class="skip-to-content">Skip to content</a>
+  </Fragment>
 
-    <Header />
-
-    <main id="main">
-      <Hero />
-      <ValueProps />
-      <ScalingJourney />
-      <TierLadder />
-      <Comparison />
-      <BoringTech />
-      <Advantages />
-      <Roadmap />
-      <BootstrapStrip />
-    </main>
-
-    <Footer />
-  </body>
-</html>
+  <Header />
+  <main id="main">
+    <Hero />
+    <ValueProps />
+    <ScalingJourney />
+    <TierLadder />
+    <Comparison />
+    <BoringTech />
+    <Advantages />
+    <Roadmap />
+    <BootstrapStrip />
+  </main>
+  <Footer />
+</BaseLayout>

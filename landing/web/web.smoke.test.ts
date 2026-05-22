@@ -83,6 +83,32 @@ describe('hero section pieces', () => {
   });
 });
 
+describe('page shell (Phase G)', () => {
+  test('BaseLayout owns <head>, og:*, twitter:*, JSON-LD slot', () => {
+    const layoutPath = join(ROOT, 'src/components/layout/BaseLayout.astro');
+    expect(existsSync(layoutPath)).toBe(true);
+    const layout = readFileSync(layoutPath, 'utf8');
+    // Required <head> surface.
+    expect(layout).toContain('<title>');
+    expect(layout).toContain('og:site_name');
+    expect(layout).toContain('og:image');
+    expect(layout).toContain('twitter:card');
+    expect(layout).toContain('rel="canonical"');
+    expect(layout).toContain('rel="preload"');
+    // Allows page-specific head injection (JSON-LD).
+    expect(layout).toContain('<slot name="head" />');
+  });
+
+  test('index.astro emits Organization + SoftwareApplication JSON-LD', () => {
+    const idx = readFileSync(join(ROOT, 'src/pages/index.astro'), 'utf8');
+    // Quote style follows Biome's single-quote formatting; assert
+    // the type values rather than the exact quoting.
+    expect(idx).toMatch(/'@type':\s*'Organization'/);
+    expect(idx).toMatch(/'@type':\s*'SoftwareApplication'/);
+    expect(idx).toContain('application/ld+json');
+  });
+});
+
 describe('content sections (Phase F)', () => {
   test('all eight section source files exist', () => {
     for (const f of [
