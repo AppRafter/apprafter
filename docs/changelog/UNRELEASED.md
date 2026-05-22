@@ -13,6 +13,112 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.120 — M1.5 Track B.1.73 walk-fix #6 — Kubernetes Events on foreign-writer detection (2026-05-22)
+
+Post-v0.1.119 walk reached steady state cleanly (~2 reconciles/min,
+no loop, all conditions UpToDate/Clean). Test 2 (manual
+`kubectl patch parent target=0.1.19`) showed PlatformController
+DID force-revert the parent — visible in Argo CD UI by eye —
+but **no durable trace** appeared in either logs or status:
+
+- `UnauthorizedSourceModification=True` condition flipped back
+  to `False/Clean` within the next reconcile cycle (sub-second)
+  after the SSA force-revert took effect. The condition is
+  point-in-time, not historical.
+- `WARN foreign field manager...` log line was potentially lost
+  during the operator pod's restart cascade (the kubectl-patch
+  triggered Argo CD to start syncing chart 0.1.19, which had a
+  different operator image pin, kicking off a pod replacement
+  mid-revert).
+- `--tail=20 -f` log streams couldn't reliably capture it.
+
+### Fix — Kubernetes Events on detection + revert
+
+PlatformController now emits two Events per detected violation
+via `kube::runtime::events::Recorder`:
+
+1. **`Warning/ForeignFieldManager`** at detection, naming the
+   offending field manager and the desired target the
+   controller is restoring.
+2. **`Normal/SourceReverted`** after the force-revert SSA patch
+   succeeds, naming the restored target.
+
+Both target the PlatformStack singleton with the parent Argo
+CD Application as `secondary` (`related` per Kubernetes
+events.k8s.io/v1) so operators can correlate from either side:
+
+```sh
+kubectl describe platformstack default -n apprafter-system
+# Events:
+#   Type     Reason                Action          Message
+#   ----     ------                ------          -------
+#   Warning  ForeignFieldManager   ForceRevert     reverted external write...
+#   Normal   SourceReverted        Reconciled      parent Application spec.source restored...
+
+kubectl get events -n apprafter-system --sort-by='.lastTimestamp'
+```
+
+Events survive the `UnauthorizedSourceModification` condition
+flip-back, AND survive operator pod restarts (Kubernetes event
+TTL default 1h).
+
+### Operator chart RBAC
+
+ClusterRole gains a second events rule for the `events.k8s.io`
+apiGroup. kube-rs's `Recorder::publish` uses the v1 events API
+(which lives in `events.k8s.io`, NOT the legacy `""` core
+group). The legacy `""` group rule stays for the Application
+controller's older emission path.
+
+```yaml
+- apiGroups: [events.k8s.io]
+  resources: [events]
+  verbs: [create, patch]
+```
+
+### Best-effort publish
+
+Event publish failures are logged at `warn!` level but do NOT
+fail the reconcile. The force-revert SSA patch is the
+load-bearing action; events are audit polish.
+
+### Regression guards
+
+- `parent_object_reference_points_at_argocd_application` —
+  pins the shape of the `related` ObjectReference (group +
+  version + kind + name + namespace). Accidentally pointing
+  events at the wrong kind would silently break the audit
+  trail.
+
+Total tests: 45 (was 44).
+
+### Live verification (deferred to B.1.74 walk)
+
+Per user request, the next live test of the Event audit trail
+piggybacks on B.1.74 acceptance — when MigrationPlan auto-
+create lands, the same manual-kubectl-patch scenario also
+exercises the Event emission. Walk-fix #6 ships unverified on
+live cluster; regression test above pins the wire shape so the
+event payload can't silently regress.
+
+### Version chain
+
+- CLI 0.1.119 → 0.1.120.
+- operator + admission-webhook chart v0.1.100 → v0.1.101.
+- operator + admission-webhook `appVersion` v0.1.119 → v0.1.120.
+- platform-stack chart 0.1.21 → 0.1.22.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01119` (reconcile-loop fix
+  that made steady-state observation possible, which is what
+  revealed the audit-trail gap).
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  `build_recorder` + `parent_object_reference` + Event emission
+  in foreign-writer branch.
+- `operator/charts/apprafter-operator/templates/rbac.yaml`
+  events.k8s.io rule.
+
 ## v0.1.119 — M1.5 Track B.1.73 walk-fix #5 — break reconcile loop (2026-05-22)
 
 Fifth post-v0.1.114 walk: Phase 1-3 acceptance finally clean

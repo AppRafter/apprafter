@@ -14,12 +14,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::ObjectReference;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use semver::Version;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -39,6 +41,47 @@ use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
 const PARENT_APPLICATION_NAME: &str = "platform";
 const PARENT_APPLICATION_NAMESPACE: &str = "argocd";
+
+/// Reporter identity stamped onto every Kubernetes Event this
+/// controller publishes. Shows up in `kubectl describe
+/// platformstack default` under the event's `Reporter` field
+/// (and in `kubectl get events -o wide` under `REPORTING
+/// INSTANCE`). Walk-fix #6 v0.1.119 → v0.1.120.
+const EVENT_REPORTER_CONTROLLER: &str = "platform-controller";
+
+/// Build a per-reconcile `Recorder` targeting the singleton
+/// PlatformStack. Each event lands in the same namespace as
+/// the resource (`apprafter-system`); the `reference` carries
+/// the typed identity so `kubectl describe platformstack
+/// default` surfaces it in the Events section.
+///
+/// `Recorder::new` is cheap — internally just wires an Api +
+/// reference + reporter. Constructing per-event keeps the
+/// reconcile function pure and avoids stashing mutable state
+/// in `Context`.
+fn build_recorder(ctx: &Context, stack: &PlatformStack) -> Recorder {
+    let reporter = Reporter {
+        controller: EVENT_REPORTER_CONTROLLER.into(),
+        instance: std::env::var("POD_NAME").ok(),
+    };
+    let reference = stack.object_ref(&());
+    Recorder::new(ctx.client.clone(), reporter, reference)
+}
+
+/// Static ObjectReference for the parent platform Application.
+/// Used as the `secondary` (Kubernetes `related`) field on
+/// events so operators can correlate `kubectl describe
+/// application platform -n argocd` ↔ `kubectl describe
+/// platformstack default -n apprafter-system`.
+fn parent_object_reference() -> ObjectReference {
+    ObjectReference {
+        api_version: Some("argoproj.io/v1alpha1".into()),
+        kind: Some("Application".into()),
+        name: Some(PARENT_APPLICATION_NAME.into()),
+        namespace: Some(PARENT_APPLICATION_NAMESPACE.into()),
+        ..ObjectReference::default()
+    }
+}
 
 /// Backoff when the parent Application is mid-sync; the loop
 /// re-evaluates after this delay rather than cancelling the
@@ -339,8 +382,59 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     if patched_this_cycle || foreign_writer.is_some() {
         if let Some(foreign) = &foreign_writer {
             warn!(manager = %foreign, "foreign field manager on parent spec.source; force-reverting");
+            // Walk-fix #6 v0.1.119 → v0.1.120: emit a
+            // Kubernetes Event so the foreign-write +
+            // revert pair leaves a durable audit trace
+            // visible via `kubectl describe platformstack
+            // default` (and `kubectl get events`). Without
+            // this, a transient revert vanishes from the
+            // `UnauthorizedSourceModification` condition
+            // within one reconcile cycle and operators
+            // staring at `kubectl get platformstack` see
+            // only the post-recovery `False/Clean` state —
+            // no record that a foreign write happened.
+            //
+            // Best-effort: failures to publish the event
+            // are logged but don't fail the reconcile. The
+            // force-revert SSA patch (below) is the actual
+            // load-bearing action.
+            let recorder = build_recorder(&ctx, &stack);
+            let ev = KubeEvent {
+                type_: EventType::Warning,
+                reason: "ForeignFieldManager".into(),
+                note: Some(format!(
+                    "reverted external write to spec.source on parent Application \
+                     {PARENT_APPLICATION_NAMESPACE}/{PARENT_APPLICATION_NAME} by field manager \
+                     {foreign:?}; PlatformController force-reapplied desired state \
+                     (target={target_for_patch})"
+                )),
+                action: "ForceRevert".into(),
+                secondary: Some(parent_object_reference()),
+            };
+            if let Err(e) = recorder.publish(ev).await {
+                warn!(error = %e, "failed to publish ForeignFieldManager event (continuing)");
+            }
         }
         patch_application(&apps, &patch_payload).await?;
+        if foreign_writer.is_some() {
+            // Companion Normal event so the audit trail
+            // records the recovery action, not just the
+            // violation.
+            let recorder = build_recorder(&ctx, &stack);
+            let ev = KubeEvent {
+                type_: EventType::Normal,
+                reason: "SourceReverted".into(),
+                note: Some(format!(
+                    "parent Application spec.source restored to PlatformController \
+                     desired state (target={target_for_patch})"
+                )),
+                action: "Reconciled".into(),
+                secondary: Some(parent_object_reference()),
+            };
+            if let Err(e) = recorder.publish(ev).await {
+                warn!(error = %e, "failed to publish SourceReverted event (continuing)");
+            }
+        }
     }
 
     // 10. Conditions. `Synced` reflects whether PlatformController
@@ -918,6 +1012,21 @@ mod tests {
     #[test]
     fn platform_controller_owns_source_false_when_metadata_missing() {
         assert!(!platform_controller_owns_source(&json!({})));
+    }
+
+    #[test]
+    fn parent_object_reference_points_at_argocd_application() {
+        // Walk-fix #6 v0.1.119 → v0.1.120: events publish the
+        // parent Application as `secondary` so operators can
+        // correlate `kubectl describe platformstack default`
+        // ↔ `kubectl describe application platform -n argocd`.
+        // Pin the shape — accidentally pointing at the wrong
+        // kind would break the audit trail.
+        let r = parent_object_reference();
+        assert_eq!(r.api_version.as_deref(), Some("argoproj.io/v1alpha1"));
+        assert_eq!(r.kind.as_deref(), Some("Application"));
+        assert_eq!(r.name.as_deref(), Some("platform"));
+        assert_eq!(r.namespace.as_deref(), Some("argocd"));
     }
 
     #[test]

@@ -1447,3 +1447,78 @@ compatibility: "0.1.21": {
 		"docs/changelog/UNRELEASED.md#v01119",
 	]
 }
+
+// 0.1.22 — Track B.1.73 walk-fix #6: observability polish for
+// foreign-writer detection. After walk-fix #5 closed the
+// reconcile loop and the cluster reached steady state, a real-
+// world test (manual `kubectl patch parent target=0.1.19`)
+// showed PlatformController DID force-revert the parent
+// Application — visible by eye in the Argo CD UI — but the
+// `UnauthorizedSourceModification=True` condition was already
+// cleared back to `False/Clean` by the next reconcile cycle
+// (sub-second), and the WARN log line emitted at detection
+// time was potentially lost during the operator pod's
+// restart cascade. Net effect: zero durable audit trace for
+// the violation.
+//
+// Fix: emit two Kubernetes Events per detected violation:
+//
+//   1. `Warning/ForeignFieldManager` — at detection, naming
+//      the offending field manager + the parent target it
+//      tried to set.
+//   2. `Normal/SourceReverted` — after force-revert SSA
+//      succeeds, naming the desired target the controller
+//      restored.
+//
+// Events publish through `kube::runtime::events::Recorder`
+// (kube-rs canonical helper), targeting the PlatformStack
+// singleton with the parent Argo CD Application as
+// `secondary` (Kubernetes `related`) so operators can
+// correlate `kubectl describe platformstack default` ↔
+// `kubectl describe application platform -n argocd`.
+//
+// Operator chart's ClusterRole gains a second `events`
+// rule for the `events.k8s.io` apiGroup (kube-rs Recorder
+// uses the v1 events API, which lives in `events.k8s.io`,
+// not the legacy `""` core group).
+compatibility: "0.1.22": {
+	change:          "safe"
+	operatorVersion: "v0.1.120"
+	notes: """
+		Track B.1.73 walk-fix #6 — observability polish.
+
+		PlatformController now emits two Kubernetes Events
+		per foreign-writer detection:
+
+		* `Warning/ForeignFieldManager` at detection
+		  (naming the offending manager).
+		* `Normal/SourceReverted` after the force-revert
+		  SSA patch succeeds.
+
+		Both events target the PlatformStack singleton
+		with the parent Argo CD Application as
+		`secondary` (`related`). Visible via:
+
+		    kubectl describe platformstack default -n apprafter-system
+		    kubectl get events -n apprafter-system
+
+		Events survive the brief `UnauthorizedSourceModification`
+		condition flip-back-to-False that the next
+		reconcile cycle does after the revert, and
+		survive operator pod restarts (per Kubernetes
+		event TTL, default 1h on most clusters).
+
+		Operator chart's ClusterRole gains
+		`events.k8s.io/events` create+patch rules
+		(kube-rs `Recorder::publish` uses the v1 events
+		API).
+
+		Rendered chart vs 0.1.21: byte-equivalent
+		operator+webhook component values; only RBAC
+		ClusterRole grew by one apiGroup block.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01120",
+	]
+}

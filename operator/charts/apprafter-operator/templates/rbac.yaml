@@ -88,9 +88,22 @@ rules:
       - update
       - patch
       - delete
-  # Events — operators emit events on Application status changes.
+  # Events — operators emit events on Application status changes
+  # (legacy core/v1) AND PlatformController emits foreign-writer /
+  # source-reverted audit events on PlatformStack
+  # (events.k8s.io/v1, walk-fix #6 v0.1.119 → v0.1.120). kube-rs's
+  # `Recorder::publish` uses the v1 events API; the legacy ""
+  # group is kept for the older Application-controller emission
+  # path.
   - apiGroups:
       - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - events.k8s.io
     resources:
       - events
     verbs:
