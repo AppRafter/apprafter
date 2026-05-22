@@ -448,10 +448,10 @@ Booking {
 
 ## 4. Progress checklist (high-level)
 
-- [ ] Phase A — Bootstrap (A1–A6)
-- [ ] Phase B — Style foundation (B1–B7)
-- [ ] Phase C — Primitives (C1–C5)
-- [ ] Phase D — Header & Footer (D1–D4)
+- [x] Phase A — Bootstrap (A1–A6) — commits 667a807, f2e062b, fe31c5b
+- [x] Phase B — Style foundation (B1–B7) — commit be484af
+- [x] Phase C — Primitives (C1–C5) — commit 1f21a68
+- [x] Phase D — Header & Footer (D1–D2) — commit 0076b3c
 - [ ] Phase E — Hero (E1–E6)
 - [ ] Phase F — Sections (F1–F8)
 - [ ] Phase G — Composition (G1–G4)
@@ -2329,4 +2329,11 @@ git commit -am "feat(landing): CI workflow + README + DEPLOY"
 
 | Дата/Время | Task | Описание | Commit |
 |---|---|---|---|
-| 2026-05-22 | — | Plan created | — |
+| 2026-05-22 03:30 | — | Plan created | — |
+| 2026-05-22 03:43 | A1 | Archive v1 briefs, copy v2.2 design-source | 667a807 |
+| 2026-05-22 03:48 | A2+A3 | Workspace root + SPDX helpers | f2e062b |
+| 2026-05-22 03:57 | A4+A5+A6 | Astro + Payload scaffolds, both typecheck clean, web build green | fe31c5b |
+| 2026-05-22 04:03 | B1–B7 | tokens/reset/fonts/global/index CSS + theme-init script | be484af |
+| 2026-05-22 04:03 | — | `src/content/fallback` renamed → `src/data/fallback` (Astro auto-collection avoidance) | (rolled into fe31c5b) |
+| 2026-05-22 04:06 | C1–C5 | LogoMark/Wordmark/Brand/Container/Eyebrow/SectionHead/StatusPill + ThemeToggle island | 1f21a68 |
+| 2026-05-22 04:10 | D1–D2 | Header (sticky, scroll-border, nav) + Footer (3 cols, FSL note) | 0076b3c |
