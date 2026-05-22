@@ -1,0 +1,16 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Small uppercase mono kicker used above section titles.
+// Renders the leading slash automatically — pass the label only,
+// e.g. <Eyebrow text="Why AppRafter" /> renders "/ WHY APPRAFTER".
+
+type Props = {
+  text: string;
+};
+
+const { text } = Astro.props;
+---
+
+<div class="eyebrow">/ {text}</div>

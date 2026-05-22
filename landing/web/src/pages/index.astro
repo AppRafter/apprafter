@@ -3,11 +3,17 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //
 // Bootstrap stub — replaced by the real composition in Phase G.
-// For Phase B we wire the style foundation + no-FOUC theme init
-// to verify everything parses and theme switching round-trips.
+// For Phase C we exercise the new primitives so a single build verifies
+// the LogoMark / Wordmark / Brand / Container / SectionHead / StatusPill
+// chain plus the ThemeToggle Svelte island.
 
 import { THEME_INIT_SCRIPT } from '../lib/theme-init';
 import '../styles/index.css';
+import Brand from '../components/brand/Brand.astro';
+import Container from '../components/primitives/Container.astro';
+import SectionHead from '../components/primitives/SectionHead.astro';
+import StatusPill from '../components/primitives/StatusPill.astro';
+import ThemeToggle from '../components/layout/ThemeToggle.svelte';
 ---
 
 <!doctype html>
@@ -15,7 +21,7 @@ import '../styles/index.css';
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AppRafter — bootstrapping</title>
+    <title>AppRafter — primitives preview</title>
     <link
       rel="preload"
       href="/fonts/roboto-400.woff2"
@@ -27,22 +33,50 @@ import '../styles/index.css';
   </head>
   <body>
     <a href="#main" class="skip-to-content">Skip to content</a>
-    <main id="main" class="container" style="padding-top: var(--section-pad-y);">
-      <p class="eyebrow">/ Bootstrapping</p>
-      <h1>App<span style="color: var(--accent);">Rafter</span> landing</h1>
-      <p class="muted" style="margin-top: 1.5rem; font-size: 19px; max-width: 36rem;">
-        Style foundation wired. Tokens, Roboto self-hosted, dark/light theme
-        switching via <code class="mono">data-theme</code> on <code class="mono"
-          >&lt;html&gt;</code
-        >.
-      </p>
-      <p class="faint" style="margin-top: 1rem; font-size: 14px;">
-        Toggle the attribute in DevTools to verify both themes render before
-        the real components arrive in Phase C–G.
-      </p>
-      <p class="mono" style="margin-top: 2rem; font-size: 14px; color: var(--accent);">
-        See landing/docs/2026-05-22-landing-implementation-plan.md
-      </p>
+
+    <Container as="header" class="bootstrap-header">
+      <Brand variant="twoTone" size={26} />
+      <ThemeToggle client:load />
+    </Container>
+
+    <main id="main">
+      <Container as="section" class="bootstrap-section">
+        <SectionHead
+          eyebrow="Phase C preview"
+          title="Primitives wired."
+          lede="LogoMark + Wordmark + Brand link, Container, SectionHead, three StatusPill kinds, and the ThemeToggle Svelte island."
+        />
+
+        <div class="pill-row">
+          <StatusPill kind="live" label="Available now" />
+          <StatusPill kind="waitlist" label="Waitlist" />
+          <StatusPill kind="roadmap" label="Roadmap" />
+        </div>
+
+        <p class="muted" style="margin-top: 32px; max-width: 36rem;">
+          Click the sun / moon icon in the header to verify theme switching
+          persists across reloads. The real hero, sections, and footer arrive
+          in Phase D through G.
+        </p>
+      </Container>
     </main>
+
+    <style>
+      .bootstrap-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 64px;
+        border-bottom: 1px solid var(--border);
+      }
+      .bootstrap-section {
+        padding-top: var(--section-pad-y);
+      }
+      .pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+    </style>
   </body>
 </html>

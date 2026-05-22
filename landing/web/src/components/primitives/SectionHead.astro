@@ -1,0 +1,48 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Standard section header: eyebrow + h2 + optional lede paragraph.
+// Used by every content section in src/components/sections/.
+
+import Eyebrow from './Eyebrow.astro';
+
+type Props = {
+  eyebrow: string;
+  /** Plain text — no HTML. */
+  title: string;
+  /** Optional lede. May contain inline HTML (passed through set:html). */
+  lede?: string;
+};
+
+const { eyebrow, title, lede } = Astro.props;
+---
+
+<div class="section-head">
+  <Eyebrow text={eyebrow} />
+  <h2>{title}</h2>
+  {lede && <p class="lede" set:html={lede} />}
+</div>
+
+<style>
+  .section-head {
+    max-width: 720px;
+    margin-bottom: 56px;
+  }
+  .section-head h2 {
+    margin-top: 12px;
+    text-wrap: balance;
+  }
+  .section-head .lede {
+    color: var(--fg-muted);
+    font-size: 18px;
+    margin-top: 14px;
+    max-width: 640px;
+    text-wrap: pretty;
+  }
+  .section-head .lede :global(code.mono),
+  .section-head .lede :global(.mono) {
+    font-family: var(--font-mono);
+    font-size: 0.95em;
+  }
+</style>

@@ -1,0 +1,22 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Page container — clamps width to --container-w, pads sides with
+// --container-pad-x. The .container class is defined globally in
+// styles/global.css; this component just lets sections compose
+// without repeating the class everywhere and supports an extra
+// className via `class`.
+
+type Props = {
+  class?: string;
+  as?: 'div' | 'header' | 'footer' | 'section' | 'nav' | 'main';
+};
+
+const { class: className, as: Tag = 'div' }: Props = Astro.props;
+const cls = ['container', className].filter(Boolean).join(' ');
+---
+
+<Tag class={cls}>
+  <slot />
+</Tag>

@@ -1,0 +1,30 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+
+type Props = {
+  variant?: 'twoTone' | 'mono';
+};
+
+const { variant = 'twoTone' } = Astro.props;
+---
+
+{
+  variant === 'mono' ? (
+    <span class="wordmark">AppRafter</span>
+  ) : (
+    <span class="wordmark">
+      App<span class="accented">Rafter</span>
+    </span>
+  )
+}
+
+<style>
+  .wordmark {
+    display: inline-flex;
+    gap: 0;
+  }
+  .wordmark .accented {
+    color: var(--accent);
+  }
+</style>

@@ -1,0 +1,70 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Three-state status pill used in the comparison table and tier cards.
+// Visual treatment ported from design-source/styles.css :510-599.
+
+type Props = {
+  kind: 'live' | 'waitlist' | 'roadmap';
+  label: string;
+};
+
+const { kind, label } = Astro.props;
+const cls = kind === 'live' ? 'live' : kind === 'waitlist' ? 'is-waitlist' : 'is-roadmap';
+---
+
+<span class={`status-pill ${cls}`}>{label}</span>
+
+<style>
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 6px 12px;
+    min-width: 140px;
+    height: 28px;
+    white-space: nowrap;
+    border: 1px solid var(--border-strong);
+    color: var(--fg-muted);
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .status-pill.live {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+  }
+  .status-pill.live::before {
+    content: '';
+    width: 5px;
+    height: 5px;
+    background: var(--accent-fg);
+  }
+  .status-pill.is-waitlist {
+    background: transparent;
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .status-pill.is-waitlist::before {
+    content: '';
+    width: 5px;
+    height: 5px;
+    background: var(--accent);
+  }
+  .status-pill.is-roadmap {
+    background: transparent;
+    color: var(--fg-faint);
+    border: 1px dashed var(--border-strong);
+  }
+  .status-pill.is-roadmap::before {
+    content: '';
+    width: 5px;
+    height: 5px;
+    border: 1px solid var(--fg-faint);
+  }
+</style>
