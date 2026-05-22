@@ -452,10 +452,10 @@ Booking {
 - [x] Phase B — Style foundation (B1–B7) — commit be484af
 - [x] Phase C — Primitives (C1–C5) — commit 1f21a68
 - [x] Phase D — Header & Footer (D1–D2) — commit 0076b3c
-- [ ] Phase E — Hero (E1–E6)
-- [ ] Phase F — Sections (F1–F8)
-- [ ] Phase G — Composition (G1–G4)
-- [ ] Phase H — CMS (H1–H10)
+- [x] Phase E — Hero (E1–E6) — commit a63c09e
+- [x] Phase F — Sections (F1–F8) — commit ceb5ce9
+- [x] Phase G — Composition (G1–G4) — commit e2ee391
+- [~] Phase H — CMS — part 1 (WaitlistSignups + Booking + hook) commit b544b7a; part 2 (12 content globals + cms.ts client + lexical-to-html + section refactor + seed) pending
 - [ ] Phase I — Polish (I1–I8)
 - [ ] Phase J — Docs/CI (J1–J5)
 
@@ -2337,3 +2337,10 @@ git commit -am "feat(landing): CI workflow + README + DEPLOY"
 | 2026-05-22 04:03 | — | `src/content/fallback` renamed → `src/data/fallback` (Astro auto-collection avoidance) | (rolled into fe31c5b) |
 | 2026-05-22 04:06 | C1–C5 | LogoMark/Wordmark/Brand/Container/Eyebrow/SectionHead/StatusPill + ThemeToggle island | 1f21a68 |
 | 2026-05-22 04:10 | D1–D2 | Header (sticky, scroll-border, nav) + Footer (3 cols, FSL note) | 0076b3c |
+| 2026-05-22 — | — | docs: progress checkboxes ticked A-D | 14a9e56 |
+| 2026-05-22 — | CI | per-workspace lint scripts + smoke tests; workflow ignores Bun workspace children | 45f3bce, dca51b5 |
+| 2026-05-22 — | — | env-driven ports for web + cms (LANDING_*_PORT, LANDING_CMS_URL, LANDING_CMS_CORS_ORIGINS) | 2e488e8 |
+| 2026-05-22 — | E1–E6 | cue-highlight build-time tokenizer + HeroCodeBlock + CodeCopyButton + WaitlistForm + Hero composition | a63c09e |
+| 2026-05-22 — | F1–F8 | All eight content sections ported from design 1:1 | ceb5ce9 |
+| 2026-05-22 — | G1–G4 | BaseLayout extracted; index uses named head slot; JSON-LD Organization + SoftwareApplication; full SEO surface | e2ee391 |
+| 2026-05-22 — | H part 1 | WaitlistSignups collection + Booking global + sendDiscoveryEmail hook + mailer.ts; live POST verified end-to-end through Vite proxy | b544b7a |
