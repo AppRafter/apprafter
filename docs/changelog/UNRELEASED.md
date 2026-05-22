@@ -13,6 +13,96 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.119 — M1.5 Track B.1.73 walk-fix #5 — break reconcile loop (2026-05-22)
+
+Fifth post-v0.1.114 walk: Phase 1-3 acceptance finally clean
+(status correctly populated, all conditions sensible, no
+false-positive `UnauthorizedSourceModification`, managedFields
+includes `platform-controller`). But operator logs show the
+controller burning hundreds of reconciles per second in a tight
+loop — `reconcile fired generation=2` + `reconcile completed`
+repeating every ~350ms continuously.
+
+### Root cause
+
+Every reconcile unconditionally:
+1. Queried OCI for channel-latest (`latest_in_channel`).
+2. Stamped `status.lastUpstreamCheck = Utc::now()`.
+3. SSA-patched status with that new timestamp.
+
+The status patch bumped the resource version, the watcher fired
+a fresh event, the next reconcile repeated the cycle. Tight
+self-feedback loop. CPU pegged.
+
+This also broke test 2 (manual `kubectl patch` parent target):
+the foreign-writer revert race got lost in the noise — by the
+time PlatformController's force-revert landed, Argo CD had
+already pulled the downgraded chart, replaced operator's
+ClusterRole with the old version (no `platformstacks` rules),
+and the controller could no longer reconcile.
+
+### Fix
+
+Two-pronged:
+
+**1. OCI poll throttle (`MIN_OCI_POLL_INTERVAL_SECS = 60`)**
+
+`reconcile()` reads prior `status.lastUpstreamCheck` and only
+re-queries OCI when ≥60s have elapsed since the last poll.
+Intermediate reconciles preserve prior `availableVersion` and
+don't touch `lastUpstreamCheck`.
+
+**2. `write_status_if_changed` skip predicate**
+
+New wrapper around `write_status` that compares the computed
+`new_status` against `stack.status` (PartialEq derived). If
+byte-equal — short-circuits and returns Ok without sending the
+SSA patch. Combined with (1) + `condition()`'s transition-time
+preservation, a no-op reconcile produces identical status, the
+patch never fires, no watch event, the loop is dead.
+
+### Steady-state behaviour after fix
+
+- Initial reconcile on CR create: OCI poll, status populated,
+  SSA patch fires.
+- Subsequent watch events (from our own status writes): reconcile
+  fires, OCI poll skipped (throttled), status unchanged, patch
+  skipped, no further watch events.
+- Once `MIN_OCI_POLL_INTERVAL_SECS` elapses: next watch event
+  (or `Action::requeue` timer) triggers a real OCI poll +
+  timestamp update + patch.
+
+Result: ~0.017 Hz steady-state reconcile rate (1 per minute)
+vs. 100+ Hz tight loop pre-fix.
+
+### Regression guards
+
+- `status_equality_treats_identical_payloads_as_noop` —
+  asserts `PartialEq` on `PlatformStackStatus` works for the
+  skip predicate.
+- `status_equality_distinguishes_timestamp_changes` — flip
+  side: confirms a real `lastUpstreamCheck` advance OR
+  `availableVersion` bump produces not-equal so the patch
+  actually fires.
+
+Total tests: 44 (was 42).
+
+### Version chain
+
+- CLI 0.1.118 → 0.1.119.
+- operator + admission-webhook chart v0.1.99 → v0.1.100.
+- operator + admission-webhook `appVersion` v0.1.118 → v0.1.119.
+- platform-stack chart 0.1.20 → 0.1.21.
+
+### References
+
+- `docs/changelog/UNRELEASED.md#v01118` (compatibility parser
+  fix — surfaced this loop because the parser-failure path
+  prevented status updates from happening at all, masking the
+  tight-loop behaviour).
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  `MIN_OCI_POLL_INTERVAL_SECS` + `write_status_if_changed`.
+
 ## v0.1.118 — M1.5 Track B.1.73 walk-fix #4 — compatibility parser + observability + single-writer SSA (2026-05-22)
 
 Fourth post-v0.1.114 walk. With RBAC + TypeMeta + UpgradeAvailable semver

@@ -1380,3 +1380,70 @@ compatibility: "0.1.20": {
 		"docs/changelog/UNRELEASED.md#v01118",
 	]
 }
+
+// 0.1.21 — Track B.1.73 walk-fix #5: fifth post-closure walk
+// finally showed clean Phase 1-3 status (RBAC + TypeMeta +
+// semver + compatibility parser + observability all working),
+// but the controller was burning hundreds of reconciles per
+// second in a tight loop visible in the logs (`reconcile fired`
+// + `reconcile completed` lines repeating ~3 per second).
+//
+// Root cause: every reconcile unconditionally queried OCI for
+// channel-latest AND stamped `status.lastUpstreamCheck =
+// Utc::now()`. The status SSA patch bumped the resource
+// version, the watcher fired a fresh event, the next reconcile
+// did the same — tight self-feedback loop.
+//
+// Two-pronged fix:
+//   1. **OCI poll throttle** — `MIN_OCI_POLL_INTERVAL_SECS=60`
+//      floor between actual OCI queries. Intermediate
+//      reconciles re-use the cached `status.availableVersion`
+//      and skip the lastUpstreamCheck timestamp update.
+//   2. **Skip status write when unchanged** — new
+//      `write_status_if_changed` short-circuits when the
+//      computed `new_status` is byte-equal to the stored
+//      `stack.status`. Combined with (1) + `condition()`'s
+//      transition-time preservation, a no-op reconcile produces
+//      an identical status, the patch never fires, no watch
+//      event, loop dies.
+//
+// Side-benefit: foreign-writer revert (kubectl-patch on parent
+// App) is no longer races against hundreds of in-flight
+// reconciles competing for SSA ownership. The watch event
+// fires a single reconcile, force-revert lands cleanly.
+compatibility: "0.1.21": {
+	change:          "safe"
+	operatorVersion: "v0.1.119"
+	notes: """
+		Track B.1.73 walk-fix #5 — break the
+		hundred-reconciles-per-second loop.
+
+		Reconcile body now:
+		* Throttles OCI poll to once per 60s
+		  (MIN_OCI_POLL_INTERVAL_SECS). Intermediate
+		  reconciles re-use the cached availableVersion
+		  and don't touch lastUpstreamCheck.
+		* Skips the status SSA patch when the computed
+		  new_status is byte-equal to the stored status
+		  (`write_status_if_changed`).
+
+		Net behaviour: in steady state PlatformController
+		emits ONE reconcile per minute (driven by the
+		60s OCI poll throttle) instead of hundreds per
+		second. Spec edits / parent App events still
+		fire reconciles immediately as before, but the
+		status write that follows is now idempotent —
+		no self-triggering watch event.
+
+		Rendered chart vs 0.1.20: byte-equivalent
+		(no chart-shape change beyond version bumps).
+		Operators on 0.1.20 upgrade in place; pod
+		restarts on new image, reconcile loop drops
+		from 100+ Hz to steady-state ~0.017 Hz
+		(1/60s).
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01119",
+	]
+}

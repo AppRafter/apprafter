@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
@@ -47,6 +47,24 @@ const IN_FLIGHT_REQUEUE: Duration = Duration::from_secs(30);
 
 /// Default cadence when `spec.source.checkInterval` parsing fails.
 const DEFAULT_REQUEUE: Duration = Duration::from_secs(3600);
+
+/// Floor for how often PlatformController actually queries the
+/// OCI registry for channel-latest. Walk-found bug v0.1.118 →
+/// v0.1.119: every reconcile was unconditionally calling
+/// `latest_in_channel` and stamping `status.lastUpstreamCheck =
+/// Utc::now()`. The status write bumped the resource version,
+/// the watcher fired a fresh event, the next reconcile bumped
+/// the version again — controller burned hundreds of reconciles
+/// per second in a tight loop.
+///
+/// 60s is generous enough to absorb watch-event bursts (Argo CD
+/// reconcile patches on parent App, our own SSA patches when
+/// values genuinely change, user kubectl-edits) without making
+/// the cadence feel sluggish. The chart's webhook minimum for
+/// `checkInterval` is 1h; this is only the throttle for
+/// "the user hasn't asked for a poll yet but a watch event
+/// woke us up".
+const MIN_OCI_POLL_INTERVAL_SECS: i64 = 60;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -160,21 +178,46 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
 
-    // 1. Always query channel-latest from upstream. Two reasons:
-    //    (a) it's `status.availableVersion` regardless of whether
-    //        pin is set;
-    //    (b) the `UpgradeAvailable` condition is a semver
-    //        comparison of channel-latest against the actual
-    //        deployed target, NOT against the operator's desired
-    //        intent. Walk-found bug v0.1.116 → v0.1.117: the
-    //        old logic conflated "values_differ" with "newer
-    //        version exists" and fired UpgradeAvailable=True on
-    //        first reconcile because the loader created the
-    //        parent App without `helm.valuesObject` (null vs
-    //        `{tier: 1}` looked like a diff).
+    // 1. Channel-latest from upstream, throttled to MIN_OCI_POLL_INTERVAL_SECS.
+    //
+    // The query feeds two consumers:
+    //   (a) `status.availableVersion` (regardless of pin);
+    //   (b) the `UpgradeAvailable` semver comparison.
+    //
+    // Walk-found bug v0.1.116 → v0.1.117 fixed (a) — old code
+    // used values_differ instead of semver. Walk-found bug
+    // v0.1.118 → v0.1.119 fixes the cadence: an unconditional
+    // OCI poll + `lastUpstreamCheck = Utc::now()` on every
+    // reconcile bumped the resource version, fired a watch
+    // event, and looped the controller hundreds of times per
+    // second. Throttle to 60s (MIN_OCI_POLL_INTERVAL_SECS);
+    // intermediate reconciles re-use the cached
+    // `status.availableVersion` and skip writing
+    // lastUpstreamCheck.
     let channel = Channel::parse(&spec.channel).unwrap_or(Channel::Stable);
-    let channel_latest = latest_in_channel(&spec.source.upstream, channel).await?;
-    let channel_latest_str = channel_latest.to_string();
+    let now = Utc::now();
+    let prior_last_check = stack
+        .status
+        .as_ref()
+        .and_then(|s| s.last_upstream_check.as_deref())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc));
+    let prior_available = stack
+        .status
+        .as_ref()
+        .and_then(|s| s.available_version.clone());
+    let should_poll_oci = match (prior_last_check, &prior_available) {
+        (Some(t), Some(_)) => (now - t).num_seconds() >= MIN_OCI_POLL_INTERVAL_SECS,
+        _ => true,
+    };
+    let (channel_latest_str, did_poll_oci) = if should_poll_oci {
+        let v = latest_in_channel(&spec.source.upstream, channel).await?;
+        (v.to_string(), true)
+    } else {
+        // SAFETY: when `should_poll_oci` is false we've already
+        // confirmed `prior_available` is Some(_) above.
+        (prior_available.clone().unwrap(), false)
+    };
 
     // 2. Policy target — what PlatformController wants the
     //    parent's `spec.source.targetRevision` to be. Pin wins
@@ -206,9 +249,15 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     let values_changed = values_differ(&parent_json, &desired.helm_values);
 
     // 5. Pre-build a status skeleton; conditions filled in below.
+    // Only stamp lastUpstreamCheck / availableVersion when we
+    // actually polled OCI this cycle — preserving prior values
+    // otherwise so byte-equal status diffs don't bump the
+    // resource version and trigger another watch event.
     let mut new_status: PlatformStackStatus = stack.status.clone().unwrap_or_default();
-    new_status.last_upstream_check = Some(Utc::now().to_rfc3339());
-    new_status.available_version = Some(channel_latest_str.clone());
+    if did_poll_oci {
+        new_status.last_upstream_check = Some(now.to_rfc3339());
+        new_status.available_version = Some(channel_latest_str.clone());
+    }
 
     // 6. In-flight gating. We do NOT fight an in-progress sync —
     //    Argo CD's app-controller is mid-apply; another patch
@@ -220,7 +269,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         );
         new_status.target_version = Some(current_target.clone());
         new_status.current_version = Some(current_target.clone());
-        write_status(&stack, &ctx, new_status).await?;
+        write_status_if_changed(&stack, &ctx, new_status).await?;
         return Ok(Action::requeue(IN_FLIGHT_REQUEUE));
     }
 
@@ -395,7 +444,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
 
     new_status.current_version = Some(target_for_patch.clone());
     new_status.target_version = Some(target_for_patch);
-    write_status(&stack, &ctx, new_status).await?;
+    write_status_if_changed(&stack, &ctx, new_status).await?;
     Ok(Action::requeue(parse_check_interval(
         &spec.source.check_interval,
     )))
@@ -562,6 +611,33 @@ async fn write_status(
     )
     .await?;
     Ok(())
+}
+
+/// Skip the SSA status patch when the computed status is
+/// byte-equal to what's already on the resource. Walk-found
+/// bug v0.1.118 → v0.1.119: every reconcile bumped
+/// `lastUpstreamCheck` and other timestamps unconditionally,
+/// which made every SSA patch a real change, which fired a
+/// watch event, which kicked off another reconcile. Result:
+/// hundreds of reconciles per second in a tight loop.
+///
+/// The skip predicate combines with the OCI-poll throttle
+/// (`MIN_OCI_POLL_INTERVAL_SECS`): on intermediate reconciles
+/// the throttle preserves prior `lastUpstreamCheck` +
+/// `availableVersion`, and `condition()` preserves
+/// `lastTransitionTime` when status is unchanged. So a
+/// no-op reconcile produces a byte-equal `new_status` and
+/// this function short-circuits, breaking the loop.
+async fn write_status_if_changed(
+    stack: &PlatformStack,
+    ctx: &Context,
+    new_status: PlatformStackStatus,
+) -> Result<(), Error> {
+    let prior = stack.status.clone().unwrap_or_default();
+    if prior == new_status {
+        return Ok(());
+    }
+    write_status(stack, ctx, new_status).await
 }
 
 fn build_status_patch(name: &str, new_status: &PlatformStackStatus) -> Value {
@@ -842,6 +918,46 @@ mod tests {
     #[test]
     fn platform_controller_owns_source_false_when_metadata_missing() {
         assert!(!platform_controller_owns_source(&json!({})));
+    }
+
+    #[test]
+    fn status_equality_treats_identical_payloads_as_noop() {
+        // Regression guard for walk-fix v0.1.118 → v0.1.119:
+        // `write_status_if_changed` must short-circuit when the
+        // computed status matches what's stored. Without this,
+        // every reconcile's SSA patch fires a watch event,
+        // kicking off another reconcile, looping the controller
+        // at hundreds of cycles per second.
+        let a = PlatformStackStatus {
+            current_version: Some("0.1.20".into()),
+            target_version: Some("0.1.20".into()),
+            available_version: Some("0.1.20".into()),
+            last_upstream_check: Some("2026-05-22T00:54:45+00:00".into()),
+            ..PlatformStackStatus::default()
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn status_equality_distinguishes_timestamp_changes() {
+        // The flip side of the no-op skip: if lastUpstreamCheck
+        // genuinely advances (because we polled OCI), the
+        // statuses must compare not-equal so the SSA patch
+        // actually fires.
+        let mut a = PlatformStackStatus {
+            current_version: Some("0.1.20".into()),
+            last_upstream_check: Some("2026-05-22T00:54:45+00:00".into()),
+            ..PlatformStackStatus::default()
+        };
+        let mut b = a.clone();
+        b.last_upstream_check = Some("2026-05-22T00:55:45+00:00".into());
+        assert_ne!(a, b);
+        // And same idea for availableVersion bumps.
+        a.available_version = Some("0.1.20".into());
+        b.available_version = Some("0.1.21".into());
+        b.last_upstream_check = a.last_upstream_check.clone();
+        assert_ne!(a, b);
     }
 
     #[test]
