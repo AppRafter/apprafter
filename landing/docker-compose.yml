@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 AppRafter contributors
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+#
+# Local Postgres for landing/cms development. Production runs a
+# separate, standalone Postgres on the same Hetzner VPS as the rest
+# of the AppRafter community/dev infra (see DEPLOY.md).
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: apprafter-landing-cms-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: apprafter_cms
+      POSTGRES_USER: apprafter
+      POSTGRES_PASSWORD: apprafter_dev
+    ports:
+      - '5432:5432'
+    volumes:
+      - cms-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U apprafter -d apprafter_cms']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  cms-pg-data:

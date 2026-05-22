@@ -11,7 +11,7 @@
 **Architecture (TL;DR):**
 
 - `landing/` — самостоятельный Bun-workspace внутри монорепо AppRafter, отдельно от Rust workspaces (`cli/`, `operator/`). Внутри две npm-package'и: `landing/web` (Astro-сайт, статическая сборка) и `landing/cms` (Payload 3, headless self-hosted).
-- Контент почти весь редактируется через Payload (collections + globals); локальные JSON-фолбэки (`landing/web/src/content/fallback/*.json`) с точным текстом из `LANDING_BRIEF v2.2` используются (а) когда Payload недоступен в dev и (б) как seed для первого `payload migrate` в проде.
+- Контент почти весь редактируется через Payload (collections + globals); локальные JSON-фолбэки (`landing/web/src/data/fallback/*.json`) с точным текстом из `LANDING_BRIEF v2.2` используются (а) когда Payload недоступен в dev и (б) как seed для первого `payload migrate` в проде.
 - Только три Svelte-острова: `ThemeToggle`, `HeroCodeBlock` (copy-кнопка), `WaitlistForm` (inline-форма с email + opt-in на discovery call). CUE-подсветка делается build-time в Astro компоненте — никакой JS-tokenizer в рантайме.
 - Ноль React, ноль Tailwind, ноль сторонних UI-китов. Vanilla CSS на custom properties, ровно как в `styles.css` из бандла.
 
@@ -217,7 +217,7 @@ landing/
 │   │   ├── lib/
 │   │   │   └── mailer.ts               # nodemailer / Resend SDK обёртка
 │   │   └── seed/
-│   │       └── seed.ts                 # CLI: `bun run seed` — заливает дефолты из ../web/src/content/fallback/
+│   │       └── seed.ts                 # CLI: `bun run seed` — заливает дефолты из ../web/src/data/fallback/
 │   └── public/                         # admin assets если нужно
 ```
 
@@ -1669,7 +1669,7 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/ValueProps.astro`
-- Create: `landing/web/src/content/fallback/valueProps.json`
+- Create: `landing/web/src/data/fallback/valueProps.json`
 
 **Source:** `design-source/sections.jsx:277-345`.
 
@@ -1682,7 +1682,7 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/ScalingJourney.astro`
-- Create: `landing/web/src/content/fallback/scalingJourney.json`
+- Create: `landing/web/src/data/fallback/scalingJourney.json`
 
 **Source:** `sections.jsx:597-666` + стили строки 749-905.
 
@@ -1723,7 +1723,7 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/TierLadder.astro`
-- Create: `landing/web/src/content/fallback/tierLadder.json`
+- Create: `landing/web/src/data/fallback/tierLadder.json`
 
 **Source:** `sections.jsx:350-423` + стили 392-504.
 
@@ -1735,8 +1735,8 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/Comparison.astro`
-- Create: `landing/web/src/content/fallback/comparison.json`
-- Create: `landing/web/src/content/fallback/transparency.json`
+- Create: `landing/web/src/data/fallback/comparison.json`
+- Create: `landing/web/src/data/fallback/transparency.json`
 
 **Source:** `sections.jsx:428-525` + стили 510-662.
 
@@ -1750,7 +1750,7 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/BoringTech.astro`
-- Create: `landing/web/src/content/fallback/boringTech.json`
+- Create: `landing/web/src/data/fallback/boringTech.json`
 
 **Source:** `sections.jsx:530-592` + стили 668-713.
 
@@ -1762,7 +1762,7 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/Advantages.astro`
-- Create: `landing/web/src/content/fallback/advantages.json`
+- Create: `landing/web/src/data/fallback/advantages.json`
 
 **Source:** `sections.jsx:671-741` + стили 717-746 и 906-941.
 
@@ -1774,7 +1774,7 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/Roadmap.astro`
-- Create: `landing/web/src/content/fallback/roadmap.json`
+- Create: `landing/web/src/data/fallback/roadmap.json`
 
 **Source:** `sections.jsx:746-814` + стили 947-1004.
 
@@ -1787,7 +1787,7 @@ $effect(() => {
 
 **Files:**
 - Create: `landing/web/src/components/sections/BootstrapStrip.astro`
-- Create: `landing/web/src/content/fallback/bootstrapStrip.json`
+- Create: `landing/web/src/data/fallback/bootstrapStrip.json`
 
 **Source:** `sections.jsx:819-825` + стили 1078-1085.
 
@@ -1993,7 +1993,7 @@ async function fetchOrFallback<T>(path: string, fallbackName: string): Promise<T
   } catch (err) {
     if (import.meta.env.PROD) throw err;
     // dev fallback
-    const mod = await import(`../content/fallback/${fallbackName}.json`);
+    const mod = await import(`../data/fallback/${fallbackName}.json`);
     return mod.default as T;
   }
 }

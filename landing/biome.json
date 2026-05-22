@@ -1,7 +1,15 @@
 {
   "$schema": "https://biomejs.dev/schemas/1.9.0/schema.json",
   "files": {
-    "include": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.mjs", "**/*.jsx", "**/*.json", "**/*.svelte"],
+    "include": [
+      "**/*.ts",
+      "**/*.tsx",
+      "**/*.js",
+      "**/*.mjs",
+      "**/*.jsx",
+      "**/*.json",
+      "**/*.svelte"
+    ],
     "ignore": [
       "**/dist",
       "**/.astro",

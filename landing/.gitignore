@@ -8,7 +8,11 @@ dist/
 .env.*.local
 *.log
 .DS_Store
+
+# Bun 1.3+ uses text bun.lock (committed). Older binary bun.lockb is
+# never produced; ignore the .bak just in case.
 bun.lockb.bak
+bun.lockb
 
 # Payload generated types — regenerated on build, but we DO commit
 # the file so landing/web can typecheck without running the cms.

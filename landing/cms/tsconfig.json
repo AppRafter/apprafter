@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "preserve",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": {
+      "@payload-config": ["./src/payload.config.ts"],
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*", "next-env.d.ts", ".next/types/**/*.ts", "next.config.mjs"],
+  "exclude": ["node_modules", ".next", "dist"]
+}
