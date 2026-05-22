@@ -19,7 +19,8 @@
       "docs/design-source",
       "docs/archive",
       "**/*.lock",
-      "**/bun.lockb"
+      "**/bun.lockb",
+      "cms/payload-types.ts"
     ]
   },
   "linter": {
@@ -52,5 +53,17 @@
     "formatter": {
       "indentWidth": 2
     }
-  }
+  },
+  "overrides": [
+    {
+      "include": ["**/*.svelte"],
+      "linter": {
+        "rules": {
+          "style": {
+            "useConst": "off"
+          }
+        }
+      }
+    }
+  ]
 }

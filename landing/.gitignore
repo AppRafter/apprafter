@@ -14,6 +14,10 @@ dist/
 bun.lockb.bak
 bun.lockb
 
+# Next.js auto-regenerates this on every `next dev` / `next build` —
+# never edited by hand, never useful to track.
+cms/next-env.d.ts
+
 # Payload generated types — regenerated on build, but we DO commit
 # the file so landing/web can typecheck without running the cms.
 # (so the file is intentionally NOT ignored — keep this comment to

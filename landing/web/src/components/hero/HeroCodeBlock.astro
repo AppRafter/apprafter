@@ -1,0 +1,101 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Hero CUE snippet. Server-rendered through cueTokenize() so the
+// browser receives pre-highlighted HTML and only a tiny Svelte
+// island for the copy button. Styling 1:1 with
+// design-source/styles.css :: .codeblock + .codeblock-header
+// + .tok-* palette.
+
+import { cueTokenize } from '../../lib/cue-highlight';
+import CodeCopyButton from './CodeCopyButton.svelte';
+
+type Props = {
+  filename: string;
+  snippet: string;
+};
+
+const { filename, snippet }: Props = Astro.props;
+const html = cueTokenize(snippet);
+---
+
+<div class="codeblock" aria-label="Application manifest example">
+  <div class="codeblock-header">
+    <span class="filename">{filename}</span>
+    <CodeCopyButton client:idle snippet={snippet} />
+  </div>
+  <pre set:html={html} />
+</div>
+
+<style>
+  .codeblock {
+    position: relative;
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 4px;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .codeblock-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--code-border);
+    background: #07101f;
+  }
+  :global([data-theme='light']) .codeblock-header {
+    background: #060d1a;
+  }
+  .codeblock-header .filename {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: #94a3b8;
+    letter-spacing: 0.02em;
+  }
+  .codeblock-header .filename::before {
+    content: '';
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    background: var(--accent);
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  pre {
+    margin: 0;
+    padding: 18px 20px;
+    overflow-x: auto;
+    color: #e2e8f0;
+    font-size: 13px;
+    line-height: 1.65;
+  }
+  /* Token palette — kept slate-heavy with a single teal accent
+     channel + warm amber for numerics. Matches BRIEF §3.5 and
+     design-fix-1 instructions on code block restraint. */
+  pre :global(.tok-key) {
+    color: #94a3b8;
+  }
+  pre :global(.tok-str) {
+    color: #5eead4;
+  }
+  pre :global(.tok-num) {
+    color: #fbbf24;
+  }
+  pre :global(.tok-kw) {
+    color: #f472b6;
+  }
+  pre :global(.tok-cmt) {
+    color: #475569;
+    font-style: italic;
+  }
+  pre :global(.tok-ident) {
+    color: #e2e8f0;
+  }
+  pre :global(.tok-acc) {
+    color: var(--accent);
+  }
+</style>

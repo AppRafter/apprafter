@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //
 // Bootstrap stub — replaced by the real composition in Phase G.
-// For Phase D it exercises Header + Footer + primitives so a single
-// build verifies the whole layout-level chain.
+// For Phase E it wires the Hero (with CUE snippet + waitlist) into
+// the existing Header + Footer chain so a single build verifies
+// the whole top-of-page surface end-to-end.
 
-import { THEME_INIT_SCRIPT } from '../lib/theme-init';
 import '../styles/index.css';
-import Header from '../components/layout/Header.astro';
 import Footer from '../components/layout/Footer.astro';
-import Container from '../components/primitives/Container.astro';
-import SectionHead from '../components/primitives/SectionHead.astro';
-import StatusPill from '../components/primitives/StatusPill.astro';
+import Header from '../components/layout/Header.astro';
+import Hero from '../components/hero/Hero.astro';
+import { THEME_INIT_SCRIPT } from '../lib/theme-init';
 ---
 
 <!doctype html>
@@ -20,7 +19,11 @@ import StatusPill from '../components/primitives/StatusPill.astro';
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AppRafter — layout preview</title>
+    <title>AppRafter — One manifest. From a €5 VPS to production. Open source.</title>
+    <meta
+      name="description"
+      content="AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — the same one runs from a single VDS to a multi-node production cluster. Open source (FSL-1.1-Apache-2.0)."
+    />
     <link
       rel="preload"
       href="/fonts/roboto-400.woff2"
@@ -36,32 +39,7 @@ import StatusPill from '../components/primitives/StatusPill.astro';
     <Header />
 
     <main id="main">
-      <Container as="section">
-        <SectionHead
-          eyebrow="Phase D preview"
-          title="Layout chain wired."
-          lede="Sticky Header with scroll-driven bottom border, theme toggle, and Brand + nav. Footer with three columns, copyright, and FSL license note. Phase E hero arrives next."
-        />
-
-        <div class="pill-row" style="display: flex; gap: 12px; flex-wrap: wrap;">
-          <StatusPill kind="live" label="Available now" />
-          <StatusPill kind="waitlist" label="Waitlist" />
-          <StatusPill kind="roadmap" label="Roadmap" />
-        </div>
-      </Container>
-
-      <Container as="section">
-        <SectionHead
-          eyebrow="Filler"
-          title="Scroll to see the header border appear."
-        />
-        <div style="height: 120vh; opacity: 0.4; line-height: 2;">
-          Scroll down a few hundred pixels and the sticky header gains its 1 px
-          border-bottom (color-mix backdrop kicks in immediately on first paint).
-          Theme toggle in the top-right flips dark ↔ light and persists across
-          reloads via localStorage[apprafter-theme].
-        </div>
-      </Container>
+      <Hero />
     </main>
 
     <Footer />
