@@ -153,6 +153,24 @@ pub struct MigrationPlanStatus {
         rename = "executedSteps"
     )]
     pub executed_steps: Option<Vec<ExecutedStep>>,
+    /// RFC3339 timestamp recording when MigrationController
+    /// successfully applied `strategy.reject()` to a
+    /// `phase=rejected` plan. Walk-fix #3 post-B.1.77 marker:
+    /// rejected plans are otherwise re-reconciled on every
+    /// operator pod restart (cache replay → watcher fires on
+    /// existing rejected plans), each replay re-invoking
+    /// `strategy.reject()` which patches
+    /// `PlatformStack.spec.pin` back to the snapshot value —
+    /// overriding any operator action taken since the
+    /// original reject. Once `rejectedAt` is set,
+    /// MigrationController treats the plan as sealed and
+    /// skips `strategy.reject()` on subsequent reconciles.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "rejectedAt"
+    )]
+    pub rejected_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]

@@ -654,6 +654,33 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // refused / MigrationPending branches where target_for_patch
     // == current_target).
     let appended_history = target_changed && target_for_patch != current_target;
+    // Walk-fix #4 post-B.1.77: explicit logging of the bump
+    // decision + history snapshot so future walks diagnose
+    // missing versionHistory entries without source-level
+    // tracing rebuilds. Each value here governs whether the
+    // SSA patch carries the `versionHistory` field claim:
+    //
+    //   * `appended_history=true` ⇒ build_status_patch sends
+    //     the new vector and `platform-controller` claims
+    //     ownership of `f:status.f:versionHistory`.
+    //   * `appended_history=false` ⇒ field stripped from the
+    //     patch body; server preserves the existing value.
+    //
+    // If the field never appears in `managedFields[*].fieldsV1
+    // .f:status` after a series of bumps, this log line is
+    // the first place to look.
+    info!(
+        target_changed,
+        appended_history,
+        target_for_patch = %target_for_patch,
+        current_target = %current_target,
+        prior_history_len = stack
+            .status
+            .as_ref()
+            .and_then(|s| s.version_history.as_ref())
+            .map_or(0, |v| v.len()),
+        "PlatformController bump decision"
+    );
     if appended_history {
         append_version_history(
             &mut new_status,
@@ -667,6 +694,11 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
 
     new_status.current_version = Some(target_for_patch.clone());
     new_status.target_version = Some(target_for_patch);
+    info!(
+        include_version_history = appended_history,
+        new_history_len = new_status.version_history.as_ref().map_or(0, |v| v.len()),
+        "PlatformController writing status"
+    );
     write_status_if_changed(&stack, &ctx, new_status, appended_history).await?;
     Ok(Action::requeue(parse_check_interval(
         &spec.source.check_interval,

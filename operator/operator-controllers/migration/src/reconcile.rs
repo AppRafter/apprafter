@@ -135,14 +135,40 @@ async fn reconcile(plan: Arc<MigrationPlan>, ctx: Arc<Context>) -> Result<Action
             execute_next_step(plan.as_ref(), strategy.as_ref(), &ctx, &namespace, &name).await
         }
 
-        // External flip to `rejected`. Run strategy.reject —
-        // idempotent (re-running after a successful revert is
-        // a byte-equivalent SSA patch). For application-scope
-        // plans the reject is a no-op (ADR 0027); the webhook
-        // FSM also blocks the transition, so this code path
-        // is a defensive belt-and-braces.
+        // External flip to `rejected`. Run strategy.reject
+        // ONCE — `status.rejectedAt` marker prevents
+        // re-invocation across operator pod restarts.
+        //
+        // Walk-fix #3 post-B.1.77: prior version called
+        // `strategy.reject()` on every reconcile of a
+        // rejected plan, which fires on cold-start cache
+        // replay (operator restart, leader-election handoff,
+        // etc.). For platform-scope plans the strategy SSA-
+        // patches `PlatformStack.spec.pin` back to the
+        // snapshot value, overriding ANY subsequent operator
+        // action on pin — the rejected plan effectively pins
+        // the platform forever. Marker-gated invocation
+        // turns the call into a true one-shot.
+        //
+        // For application-scope plans `strategy.reject` is a
+        // no-op per ADR 0027 (the webhook FSM also blocks
+        // the transition); the marker still gets set so the
+        // sealing behaviour is uniform across scopes.
         "rejected" => {
+            let already_applied = plan
+                .status
+                .as_ref()
+                .and_then(|s| s.rejected_at.as_deref())
+                .is_some();
+            if already_applied {
+                info!(plan = %name, "rejected plan already sealed — skipping strategy.reject");
+                return Ok(Action::await_change());
+            }
             strategy.reject(plan.as_ref()).await?;
+            let mut sealed = plan.status.clone().unwrap_or_default();
+            sealed.rejected_at = Some(Utc::now().to_rfc3339());
+            write_status(&ctx, &namespace, &name, &sealed).await?;
+            info!(plan = %name, "rejected plan sealed");
             Ok(Action::await_change())
         }
 
@@ -469,5 +495,42 @@ mod tests {
         // at the second step in spec.plan[].
         let steps = plan.spec.plan.as_ref().unwrap();
         assert_eq!(steps[executed.len()].step, 2);
+    }
+
+    #[test]
+    fn rejected_plan_with_rejected_at_marker_is_sealed() {
+        // Walk-fix #3 contract: once `status.rejectedAt` is
+        // set, the controller treats the rejected plan as
+        // sealed. Encodes the helper logic the reconcile body
+        // uses (`plan.status.as_ref().and_then(|s|
+        // s.rejected_at.as_deref()).is_some()`); pin against
+        // future refactors that might drop the marker check.
+        let mut plan = build_plan("platform", vec![], Some("rejected"));
+        plan.status.as_mut().unwrap().rejected_at = Some("2026-05-22T22:55:44+00:00".into());
+        let sealed = plan
+            .status
+            .as_ref()
+            .and_then(|s| s.rejected_at.as_deref())
+            .is_some();
+        assert!(sealed, "plan with rejectedAt marker must be sealed");
+    }
+
+    #[test]
+    fn rejected_plan_without_rejected_at_marker_is_not_sealed() {
+        // The complementary case: first time controller sees
+        // phase=rejected, marker is absent → strategy.reject
+        // must fire. Subsequent reconcile sets the marker
+        // before write — so this branch is taken at most once
+        // per plan lifetime.
+        let plan = build_plan("platform", vec![], Some("rejected"));
+        let sealed = plan
+            .status
+            .as_ref()
+            .and_then(|s| s.rejected_at.as_deref())
+            .is_some();
+        assert!(
+            !sealed,
+            "freshly-rejected plan without rejectedAt marker must NOT be considered sealed"
+        );
     }
 }

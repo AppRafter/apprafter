@@ -146,6 +146,9 @@ spec:
                   format: date-time
                 approvedBy:
                   type: string
+                rejectedAt:
+                  type: string
+                  format: date-time
                 executedSteps:
                   type: array
                   items:

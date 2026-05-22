@@ -13,6 +13,137 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.129 — M1.5 walk-fix #3 + #4 post-B.1.77 (2026-05-23)
+
+Two bundled walk-fixes from acceptance walk
+B.1.74→B.1.77 on v0.1.127.
+
+### Walk-fix #3 — MigrationController seals rejected plans
+
+**Symptom.** Walk Phase 3.3 created a platform-scope
+MigrationPlan, patched its status.phase to `rejected`;
+PlatformMigrationStrategy.reject reverted
+`PlatformStack.spec.pin` к the plan's snapshot value
+(`"0.1.25"`). Then walk's cleanup `kubectl patch
+platformstack default --type=merge -p '{"spec":{"pin":null}}'`
+was supposed к restore the cluster k channel-following,
+but PlatformStack stayed locked at `pin="0.1.25"`,
+PlatformController errored on `fetch_change_class("0.1.25")`
+(version unpublished in OCI registry), and the cluster
+froze in an error loop.
+
+**Root cause.** MigrationController's `phase=rejected`
+branch called `strategy.reject()` on EVERY reconcile:
+
+```rust
+"rejected" => {
+    strategy.reject(plan.as_ref()).await?;
+    Ok(Action::await_change())
+}
+```
+
+Operator pod restarts (chart auto-upgrade replacing the
+Deployment image; each pin patch in the walk bumped the
+appVersion) trigger kube-rs Controller cold-start cache
+replay → watcher fires on every existing MigrationPlan
+→ rejected plans get re-reconciled → strategy.reject
+re-applied → SSA-patch `PlatformStack.spec.pin` back to
+snapshot value. The user's subsequent `pin=null` patches
+got immediately overridden.
+
+**Fix.** Persistent marker on the plan itself:
+`status.rejectedAt: Option<String>` (RFC3339 timestamp).
+Reconcile's `rejected` branch:
+
+```rust
+"rejected" => {
+    let already_applied = plan.status.as_ref()
+        .and_then(|s| s.rejected_at.as_deref())
+        .is_some();
+    if already_applied {
+        info!(plan = %name, "rejected plan already sealed — skipping strategy.reject");
+        return Ok(Action::await_change());
+    }
+    strategy.reject(plan.as_ref()).await?;
+    let mut sealed = plan.status.clone().unwrap_or_default();
+    sealed.rejected_at = Some(Utc::now().to_rfc3339());
+    write_status(&ctx, &namespace, &name, &sealed).await?;
+    info!(plan = %name, "rejected plan sealed");
+    Ok(Action::await_change())
+}
+```
+
+First reconcile that sees `phase=rejected` AND no
+`rejectedAt` set: invokes strategy + writes the marker.
+Subsequent reconciles (cold-start replays, related
+events) see the marker and no-op.
+
+For application-scope plans, `strategy.reject` is a
+no-op per ADR 0027 anyway; the marker still gets set so
+the sealing behaviour is uniform.
+
+### Walk-fix #4 — PlatformController bump-cycle observability
+
+Walk Phase 6 (artificial pin downgrade + upgrade test)
+revealed that `PlatformStack.status.versionHistory`
+stays `null` across multiple successful targetRevision
+bumps, despite the reconcile flow being designed to
+append an entry on every flip. Diagnosis from existing
+logs was inconclusive — only generic `reconcile fired`
+/ `reconcile completed` lines were emitted.
+
+Two new `info!()` logs in `operator-controllers/platform-stack`:
+
+1. **Before append decision** —
+   `PlatformController bump decision`:
+   surfaces `target_changed`, `appended_history`,
+   `target_for_patch`, `current_target`,
+   `prior_history_len`.
+2. **Before status write** —
+   `PlatformController writing status`:
+   surfaces `include_version_history`,
+   `new_history_len`.
+
+Production-useful (not debug). Future walk-fix lands
+the actual `versionHistory` write fix once these logs
+reveal which decision branch is the offender.
+
+### Schema changes
+
+`MigrationPlanStatus` (both CRD schema in operator chart
++ CUE schema in `schemas/v1alpha1/migrationplan.cue`)
+gains optional `rejectedAt: string format=date-time`.
+Rust type `operator_core::MigrationPlanStatus` gains
+`rejected_at: Option<String>` field.
+
+### Tests
+
++2 regression tests in `operator-controllers/migration`:
+
+- `rejected_plan_with_rejected_at_marker_is_sealed`
+- `rejected_plan_without_rejected_at_marker_is_not_sealed`
+
+Total in migration crate: 12 → 14.
+
+### Files
+
+- `operator/operator-core/src/migration_plan.rs` — `rejected_at` field.
+- `operator/operator-controllers/migration/src/reconcile.rs` —
+  marker-gated reject + 2 tests.
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  — observability logs.
+- `operator/charts/apprafter-operator/templates/crd-migrationplan.yaml`
+  — `rejectedAt` schema.
+- `schemas/v1alpha1/migrationplan.cue` — `rejectedAt` schema.
+
+### Versions
+
+- CLI: 0.1.128 → 0.1.129.
+- Operator chart: v0.1.109 → v0.1.110.
+- Admission-webhook chart: v0.1.109 → v0.1.110 (lockstep).
+- platform-stack chart: 0.1.30 → 0.1.31, with the matching
+  `compatibility: "0.1.31"` entry.
+
 ## v0.1.128 — M1.5 walk-fix #2 post-B.1.77 — webhook ADR 0027 bypass (2026-05-22)
 
 Walk-found bug on acceptance walk B.1.74→B.1.77 на v0.1.127.

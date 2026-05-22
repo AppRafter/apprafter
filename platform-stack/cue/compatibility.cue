@@ -1649,6 +1649,102 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #3 + #4 post-B.1.77. #3: MigrationController seals
+// rejected plans via `status.rejectedAt` marker — prior code
+// re-invoked `strategy.reject()` on every reconcile (cold-
+// start cache replay → reject re-applied → PlatformStack.spec.pin
+// re-patched к snapshot value, overriding any subsequent
+// operator pin patches). #4: PlatformController bump-cycle
+// observability logs (`target_changed`, `appended_history`,
+// `target_for_patch`, `current_target`, history lengths) к
+// help diagnose missing versionHistory entries в future walks.
+// MigrationPlan CRD schema + CUE schema extended с optional
+// `status.rejectedAt: string format=date-time`. Operator-binary
+// change только; image v0.1.128 → v0.1.129 via standard chart
+// appVersion lockstep.
+compatibility: "0.1.31": {
+	change:          "safe"
+	operatorVersion: "v0.1.129"
+	notes: """
+		Walk-fix #3 + #4 post-B.1.77.
+
+		**#3: MigrationController rejected-plan seal.**
+
+		Symptom (walk-found, 2026-05-22 acceptance walk
+		of B.1.74→B.1.77): user's `kubectl patch
+		platformstack default --type=merge -p
+		'{"spec":{"pin":null}}'` was silently overridden
+		— PlatformController kept landing на
+		`spec.pin="0.1.25"` (the snapshot value of a
+		previously-rejected platform-scope plan). Logs
+		showed `PlatformMigrationStrategy.reject —
+		reverted PlatformStack.spec.pin pin_value="0.1.25"`
+		on EVERY reconcile of the rejected plan.
+
+		Root cause: MigrationController's "rejected"
+		branch unconditionally called `strategy.reject()`
+		on each reconcile. Operator pod restarts (chart
+		auto-upgrade replacing the Deployment image)
+		trigger cold-start cache replay → watcher fires
+		on every existing MigrationPlan → rejected plans
+		get re-rejected. For platform scope this means
+		`spec.pin` reverts к the plan's snapshot pin
+		value every restart, locking the cluster on that
+		version.
+
+		Fix: persistent `status.rejectedAt` marker. First
+		reconcile that sees `phase=rejected` AND no
+		`rejectedAt` set: calls `strategy.reject()`,
+		then writes `status.rejectedAt=now`. Subsequent
+		reconciles see the marker, skip the strategy
+		call, await_change.
+
+		CRD schema (operator chart + CUE source): adds
+		`status.rejectedAt: string format=date-time` к
+		MigrationPlanStatus. Rust type
+		(`operator_core::MigrationPlanStatus`) gains
+		corresponding `rejected_at: Option<String>`.
+
+		+2 regression unit tests pin the marker logic:
+		`rejected_plan_with_rejected_at_marker_is_sealed`,
+		`rejected_plan_without_rejected_at_marker_is_not_sealed`.
+
+		**#4: PlatformController bump-cycle observability.**
+
+		Walk Phase 6 (artificial pin downgrade + upgrade)
+		uncovered that `status.versionHistory` stays empty
+		across multiple successful targetRevision bumps —
+		expected к have entries для every flip. Diagnosis
+		from logs alone was inconclusive (logs showed only
+		generic "reconcile fired"/"reconcile completed").
+
+		To help future walks diagnose: two `info!()` logs
+		around the bump decision and the status write:
+
+		* Before append: `PlatformController bump decision`
+		  — surfaces `target_changed`, `appended_history`,
+		  `target_for_patch`, `current_target`,
+		  `prior_history_len`.
+		* After conditions + assignments, before write:
+		  `PlatformController writing status` — surfaces
+		  `include_version_history`, `new_history_len`.
+
+		Production-useful logs (not debug). Future
+		walk-fix may follow with the actual versionHistory
+		write fix once these logs reveal the offending
+		branch.
+
+		Rendered chart vs 0.1.30: byte-equivalent
+		templates (except CRD's MigrationPlanStatus
+		schema addition). Operator-binary change
+		propagates new image.
+		"""
+	references: [
+		"plan.md",
+		"docs/changelog/UNRELEASED.md#v01129",
+	]
+}
+
 // Walk-fix #2 post-B.1.77 — webhook FSM permitted app-scope
 // rejected via first-write fast-path, bypassing ADR 0027.
 // On a fresh MigrationPlan CR без status, `kubectl patch

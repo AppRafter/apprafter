@@ -178,6 +178,17 @@ package v1alpha1
 	// Step-by-step audit trail. One entry per executed
 	// step; appended in order.
 	executedSteps?: [...#ExecutedStep]
+
+	// RFC3339 timestamp recording when MigrationController
+	// successfully applied `strategy.reject()` for a
+	// `phase=rejected` plan. Walk-fix #3 post-B.1.77 marker:
+	// without it, operator pod restarts re-invoke
+	// `strategy.reject()` on every cold-start cache replay
+	// of existing rejected plans, overriding subsequent
+	// operator actions on PlatformStack.spec.pin. With the
+	// marker set, MigrationController skips reject
+	// invocation — plan is sealed.
+	rejectedAt?: string
 }
 
 #ExecutedStep: {
