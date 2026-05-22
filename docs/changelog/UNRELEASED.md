@@ -13,6 +13,165 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.124 — M1.5 Track B.1.75 closure — unified MigrationPlan CRD + admission webhook (2026-05-22)
+
+The third AppRafter CRD lands. `MigrationPlan` covers both
+application-scope and platform-scope destructive changes
+through a single discriminator field (`spec.scope.type`),
+gated by explicit approval. Implements spec.md §3.8 and
+ADR 0027.
+
+B.1.75 ships schema + CRD + admission validation only —
+**no MigrationController** (lands in B.1.76). The CRD is
+applied during cluster bootstrap; clusters can author
+MigrationPlan CRs by hand or via tooling, but nothing
+reconciles them yet. PlatformController behaviour is
+unchanged in this release.
+
+### CUE schema rewrite
+
+`schemas/v1alpha1/migrationplan.cue` is fully rewritten:
+
+- `spec.scope.type: "application" | "platform"` — the
+  discriminator.
+- `spec.scope.application: { ref: { name, namespace },
+  environment }` — required when type=application.
+- `spec.scope.platform: { components: [...] }` — required
+  when type=platform; webhook rejects empty `components`.
+- `spec.trigger: { type, field, from?, to? }` — what
+  caused the plan; per-type payload (`selector-change`,
+  `major-version-upgrade`, `platform-classification`, ...).
+  `from`/`to` are free-form JSON because triggers cover
+  heterogeneous field types.
+- `spec.risks: { classification, estimatedDowntime?,
+  dataVolume?, reversible?, requiresFullBackup? }` —
+  classification mirrors the platform-stack change-class
+  vocabulary (safe | requires-restart | data-migration |
+  breaking).
+- `spec.plan[]: { step, action, estimatedDuration?,
+  reversible? }`.
+- `spec.approvers[]: string` — emails.
+- `spec.previousSpecSnapshot?: {...}` — free-form JSON
+  carried by PlatformController on platform-scope plans
+  for reject-flow rollback (lands in B.1.78).
+- `status.phase` enum + `approvedAt/By` + `executedSteps[]`.
+
+Per the project's CUE schema validation philosophy
+(CLAUDE.md), this file declares structural invariants only.
+Cross-field invariants live in the admission webhook.
+
+Two example fixtures under `examples/migrationplans/`
+(`parser-pg-selector.cue` for application scope,
+`platform-0-2-0-bump.cue` for platform scope) round-trip
+both arms of the discriminator through `cue vet`.
+
+### CRD template
+
+`operator/charts/apprafter-operator/templates/crd-migrationplan.yaml`
+ships at sync-wave -5 alongside the existing two CRDs. The
+OpenAPI v3 schema mirrors the CUE shape, with one
+deviation: **no `oneOf` discriminator**. The apiserver's
+structural-schema requirement rejects most `oneOf` shapes
+inside a CRD; instead, both `scope.application` and
+`scope.platform` are optional at the CRD layer and the
+webhook enforces the conditional invariant. Trade-off
+favours simplicity — the webhook is already in the path.
+
+`additionalPrinterColumns` surface Scope + Classification +
+Phase in `kubectl get migrationplan`.
+
+### Admission webhook
+
+New `operator/admission-webhook/src/validator_migrationplan.rs`
+module + a dispatch branch in `server.rs`:
+
+- **Scope discriminator.** type=application MUST have
+  `scope.application` with non-empty `ref.{name,namespace}`
+  + `environment`; type=platform MUST have
+  `scope.platform.components` non-empty. The mismatched
+  sub-object (a `platform:` block on an application-scope
+  plan, etc.) is rejected — keeps trait dispatch in B.1.76
+  clean.
+- **Approver emails.** `is_emailish` — single `@`, non-empty
+  local + domain, dot in domain. Catches obvious typos;
+  doesn't try to mirror every RFC corner case (admission
+  webhook isn't the right surface).
+- **`spec.scope` immutability on UPDATE.** The dispatch
+  passes `request.oldObject` through to the validator;
+  on UPDATE, the validator rejects any change to
+  `spec.scope`. Other spec fields stay mutable in 1.75;
+  B.1.76 tightens those rules around `plan` / `risks`
+  execution-order semantics.
+
+`ValidatingWebhookConfiguration` extends with a third
+webhook entry for `migrationplans` (CREATE + UPDATE),
+sharing the existing cert-manager TLS Certificate.
+
+### Rust types
+
+`operator/operator-core/src/migration_plan.rs` declares the
+kube-rs `MigrationPlan` type (CustomResource derive) plus
+the nested specs. Unused by reconcile code in 1.75 — the
+webhook works on `serde_json::Value` like the other
+validators. The type exists for B.1.76's MigrationController
+to consume directly.
+
+### Architecture note: status protection deferred
+
+Plan.md's 1.75 deliverable list called for "reject status
+patches not from MigrationController" as part of the
+webhook validation. This is deferred to B.1.76 because the
+controller doesn't exist yet — there's no field-manager
+identity to compare against, and `Unable to find auth
+principal` would be the only signal. B.1.76 lands the
+MigrationController with `migration-controller` SSA field
+manager + the corresponding status-write guard.
+
+### Tests
+
+- 24 new unit tests in `validator_migrationplan` covering
+  scope discriminator (happy paths + every required-field
+  failure + mismatched sub-object), approver email
+  validation, scope immutability on UPDATE.
+- 3 new integration tests in `tests/server_test.rs`:
+  accept application-scope MigrationPlan, reject
+  platform-scope with empty components, reject UPDATE
+  scope mutation.
+- 2 CUE example manifests doubling as `cue vet` fixtures.
+
+Total: +27 tests on the webhook crate (39 → 63 lib tests;
+7 → 10 integration tests).
+
+### Files
+
+- `schemas/v1alpha1/migrationplan.cue` — full rewrite.
+- `examples/migrationplans/parser-pg-selector.cue` — new.
+- `examples/migrationplans/platform-0-2-0-bump.cue` — new.
+- `operator/charts/apprafter-operator/templates/crd-migrationplan.yaml` — new.
+- `operator/charts/apprafter-admission-webhook/templates/validatingwebhookconfiguration.yaml` — third webhook entry.
+- `operator/operator-core/src/migration_plan.rs` — new.
+- `operator/operator-core/src/lib.rs` — re-exports.
+- `operator/admission-webhook/src/validator_migrationplan.rs` — new.
+- `operator/admission-webhook/src/lib.rs` — module declaration.
+- `operator/admission-webhook/src/server.rs` — kind dispatch + `oldObject` plumbing.
+- `operator/admission-webhook/tests/server_test.rs` — three new integration tests.
+
+### Versions
+
+- CLI: 0.1.123 → 0.1.124.
+- Operator chart: v0.1.104 → v0.1.105.
+- Admission-webhook chart: v0.1.104 → v0.1.105 (lockstep).
+- platform-stack chart: 0.1.25 → 0.1.26, with the matching
+  `compatibility: "0.1.26"` entry.
+
+### Walk
+
+Manual walk deferred to the natural next break point —
+the MigrationController in B.1.76 will need full
+end-to-end verification of the application + platform
+flows, and exercising B.1.75's CRD + webhook there as the
+authoring path covers both releases in one walk.
+
 ## v0.1.123 — M1.5 Track B.1.74a closure — yanking support (2026-05-22)
 
 Soft-recall mechanism for published platform-stack versions.

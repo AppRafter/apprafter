@@ -85,6 +85,10 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         .get("object")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
+    // `oldObject` is only present on UPDATE operations. The
+    // MigrationPlan validator uses it for spec.scope
+    // immutability; other validators ignore it.
+    let old_object = request.get("oldObject").cloned();
 
     let errors = match kind {
         "Application" => {
@@ -95,6 +99,9 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
             validate_application_spec(&spec)
         }
         "PlatformStack" => crate::validator_platformstack::validate_platformstack(&object),
+        "MigrationPlan" => {
+            crate::validator_migrationplan::validate_migrationplan(&object, old_object.as_ref())
+        }
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The

@@ -325,8 +325,7 @@ mod tests {
   change: safe
   operatorVersion: v0.1.91
 "#;
-        let doc: CompatibilityDoc =
-            serde_yaml::from_slice(yaml).expect("missing yanked tolerated");
+        let doc: CompatibilityDoc = serde_yaml::from_slice(yaml).expect("missing yanked tolerated");
         let rec = doc.get("0.1.10").expect("entry present");
         assert!(!rec.yanked);
         assert!(rec.yanked_reason.is_none());

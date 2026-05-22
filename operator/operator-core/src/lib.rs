@@ -4,6 +4,7 @@
 pub mod application;
 pub mod leader;
 pub mod metrics;
+pub mod migration_plan;
 pub mod platform_stack;
 
 pub use application::{
@@ -12,6 +13,11 @@ pub use application::{
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use metrics::Metrics;
+pub use migration_plan::{
+    ExecutedStep, MigrationApplicationRef, MigrationApplicationScope, MigrationPlan,
+    MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus, MigrationPlatformScope,
+    MigrationRisks, MigrationStep, MigrationTrigger,
+};
 pub use platform_stack::{
     PlatformStack, PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,
     PlatformStackSource, PlatformStackSpec, PlatformStackStatus, PlatformStackValues,

@@ -1649,6 +1649,67 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Track B.1.75 closure — unified MigrationPlan CRD +
+// admission webhook validation. New CRD shipped by the
+// operator chart (sync-wave -5 alongside Application +
+// PlatformStack). Admission webhook gains a third dispatch
+// branch enforcing the scope discriminator, approver-email
+// format, and `spec.scope` immutability across UPDATE.
+// PlatformStack reconcile behaviour unchanged; this is a
+// schema + webhook landing only — MigrationController logic
+// lands in B.1.76. Operator-binary change (webhook +
+// operator-core types) → image v0.1.123 → v0.1.124 via
+// the standard chart appVersion lockstep.
+compatibility: "0.1.26": {
+	change:          "safe"
+	operatorVersion: "v0.1.124"
+	notes: """
+		Track B.1.75 closure — unified MigrationPlan CRD +
+		admission webhook validation.
+
+		Adds the third AppRafter CRD shipped via the
+		operator chart: `migrationplans.apprafter.io`
+		(short names `mp`, `migplan`), with OpenAPI v3
+		schema mirroring `schemas/v1alpha1/migrationplan.cue`.
+		Scope discriminator `spec.scope.type`:
+		`application` | `platform`. CRD applied at
+		sync-wave -5 alongside the two existing CRDs.
+
+		Admission webhook (`apprafter-admission-webhook`)
+		extends the `ValidatingWebhookConfiguration` with
+		a third entry covering `migrationplans` CREATE +
+		UPDATE. Validation:
+
+		* Scope discriminator: `type: application`
+		  requires a populated `scope.application` block
+		  (with `ref.{name,namespace}` + `environment`);
+		  `type: platform` requires `scope.platform.components`
+		  non-empty. The mismatched sub-object is rejected.
+		* Approver emails: light RFC5322 — single `@`,
+		  non-empty local + domain, dot in domain.
+		* `spec.scope` immutability on UPDATE — comparing
+		  `request.object` vs `request.oldObject` from the
+		  AdmissionReview. Other spec fields stay mutable
+		  in 1.75; 1.76 tightens those once the controller
+		  exists.
+
+		MigrationController logic + status writes ship in
+		B.1.76. PlatformController behaviour unchanged in
+		this release.
+
+		Rendered chart vs 0.1.25: byte-equivalent
+		templates. Operator + webhook binary change
+		(+ new validator module + dispatch wiring +
+		operator-core MigrationPlan types); chart appVersion
+		bump propagates the new images.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md#175-unified-migrationplan-crd-admission-webhook",
+		"docs/changelog/UNRELEASED.md#v01124",
+	]
+}
+
 // Track B.1.74a — yanking support. Schema extension: every
 // #VersionRecord gains an optional `yanked: bool | *false` plus
 // `yankedReason?: string`. The CUE constraint is "optional

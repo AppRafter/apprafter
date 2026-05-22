@@ -3,6 +3,7 @@
 
 pub mod server;
 pub mod validator;
+pub mod validator_migrationplan;
 pub mod validator_platformstack;
 
 pub use server::build_router;

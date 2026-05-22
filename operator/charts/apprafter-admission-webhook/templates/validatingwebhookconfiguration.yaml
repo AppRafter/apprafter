@@ -54,3 +54,26 @@ webhooks:
         resources:
           - platformstacks
         scope: Namespaced
+  - name: migrationplans.apprafter.io
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    admissionReviewVersions:
+      - v1
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    clientConfig:
+      service:
+        name: {{ include "apprafter-admission-webhook.fullname" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate
+        port: 443
+    rules:
+      - apiGroups:
+          - apprafter.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - migrationplans
+        scope: Namespaced

@@ -162,3 +162,128 @@ async fn validate_echoes_apiversion_back() {
     let (_status, body) = post_validate(payload).await;
     assert_eq!(body["apiVersion"], "admission.k8s.io/v1beta1");
 }
+
+// ---------------- MigrationPlan dispatch (B.1.75) ----------------
+//
+// These tests pin the router's third-kind dispatch path. The
+// validator_migrationplan unit tests already cover the
+// validation logic itself; here we just confirm
+// kind="MigrationPlan" reaches the validator at all + that
+// `oldObject` on UPDATE flows through into the immutability
+// check.
+
+#[tokio::test]
+async fn validate_allows_valid_application_scope_migrationplan() {
+    let payload = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "mp-1",
+            "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "MigrationPlan" },
+            "operation": "CREATE",
+            "object": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "parser-pg-2026", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": {
+                        "type": "application",
+                        "application": {
+                            "ref": { "name": "parser", "namespace": "demo" },
+                            "environment": "prod"
+                        }
+                    },
+                    "trigger": { "type": "selector-change", "field": "needs.pg.selector" },
+                    "approvers": ["alice@company.com"]
+                }
+            }
+        }
+    });
+    let (status, body) = post_validate(payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["response"]["uid"], "mp-1");
+    assert_eq!(body["response"]["allowed"], true);
+}
+
+#[tokio::test]
+async fn validate_rejects_platform_migrationplan_without_components() {
+    let payload = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "mp-2",
+            "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "MigrationPlan" },
+            "operation": "CREATE",
+            "object": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "p-empty", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": { "type": "platform", "platform": { "components": [] } },
+                    "trigger": { "type": "platform-classification", "field": "spec.pin" }
+                }
+            }
+        }
+    });
+    let (status, body) = post_validate(payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["response"]["allowed"], false);
+    let message = body["response"]["status"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("spec.scope.platform.components"),
+        "{message}"
+    );
+    assert!(message.contains("MigrationPlan is invalid"), "{message}");
+}
+
+#[tokio::test]
+async fn validate_rejects_migrationplan_scope_mutation_on_update() {
+    // Server-level guard for `oldObject` flow: UPDATE request
+    // with a different `spec.scope` shape must reach
+    // `validate_migrationplan` with the old value and be
+    // rejected.
+    let app_scope = json!({
+        "type": "application",
+        "application": {
+            "ref": { "name": "parser", "namespace": "demo" },
+            "environment": "prod"
+        }
+    });
+    let platform_scope = json!({
+        "type": "platform",
+        "platform": { "components": ["apprafter-operator"] }
+    });
+    let payload = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "mp-3",
+            "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "MigrationPlan" },
+            "operation": "UPDATE",
+            "object": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "scope-flip", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": platform_scope,
+                    "trigger": { "type": "t", "field": "f" }
+                }
+            },
+            "oldObject": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "scope-flip", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": app_scope,
+                    "trigger": { "type": "t", "field": "f" }
+                }
+            }
+        }
+    });
+    let (status, body) = post_validate(payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["response"]["allowed"], false);
+    let message = body["response"]["status"]["message"].as_str().unwrap();
+    assert!(message.contains("spec.scope"), "{message}");
+    assert!(message.contains("immutable"), "{message}");
+}
