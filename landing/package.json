@@ -1,0 +1,26 @@
+{
+  "name": "@apprafter/landing",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AppRafter landing — Astro 5 (web) + Payload 3 (cms) monorepo. See docs/2026-05-22-landing-implementation-plan.md.",
+  "workspaces": ["web", "cms"],
+  "scripts": {
+    "dev:web": "bun --filter '@apprafter/landing-web' dev",
+    "dev:cms": "bun --filter '@apprafter/landing-cms' dev",
+    "build:web": "bun --filter '@apprafter/landing-web' build",
+    "build:cms": "bun --filter '@apprafter/landing-cms' build",
+    "build": "bun run build:cms && bun run build:web",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "bun --filter '*' run typecheck",
+    "check:spdx": "bash scripts/check-spdx.sh"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}

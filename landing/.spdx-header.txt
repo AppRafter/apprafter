@@ -1,0 +1,25 @@
+# SPDX header reference for landing/
+#
+# Apply to every source file you create under landing/web/src, landing/cms/src,
+# landing/scripts. Choose the comment style matching the file's syntax.
+# License is FSL-1.1-Apache-2.0 per ADR 0032 (docs/adr/0032-license-fsl-1-1-apache-2-0.md).
+
+--- // (TS/JS/Svelte <script> / Astro front-matter) -----------------------------
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+
+--- /* */ (CSS) ---------------------------------------------------------------
+/* SPDX-FileCopyrightText: 2026 AppRafter contributors */
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0          */
+
+--- # (shell / YAML / TOML) ----------------------------------------------------
+# SPDX-FileCopyrightText: 2026 AppRafter contributors
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+
+--- Astro / Svelte (top-of-file) ----------------------------------------------
+Inside Astro front-matter (---) use the // form.
+Inside Svelte <script> use the // form.
+For pure markup/style files use the /* */ form.
+
+--- JSON / lockfiles / generated ------------------------------------------------
+Skipped (cannot host comments).
