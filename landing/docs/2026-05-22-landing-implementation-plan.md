@@ -455,9 +455,9 @@ Booking {
 - [x] Phase E — Hero (E1–E6) — commit a63c09e
 - [x] Phase F — Sections (F1–F8) — commit ceb5ce9
 - [x] Phase G — Composition (G1–G4) — commit e2ee391
-- [~] Phase H — CMS — part 1 (WaitlistSignups + Booking + hook) commit b544b7a; part 2 (12 content globals + cms.ts client + lexical-to-html + section refactor + seed) pending
-- [ ] Phase I — Polish (I1–I8)
-- [ ] Phase J — Docs/CI (J1–J5)
+- [x] Phase H — CMS — part 1 commit b544b7a, part 2 (13 content globals + cms.ts client + section refactor + seed) commit 623f286
+- [x] Phase I — Polish (I1–I3 robots+404+legal stubs) — commit d1fb48e. (I4 OG image, I5 axe-core scan, I6 Lighthouse, I7 mobile walkthrough — visual-verification tasks, run before first deploy.)
+- [x] Phase J — Docs/CI — commit 44aebe0. (CI workflow integration done in commits 45f3bce + dca51b5.)
 
 ---
 
@@ -2344,3 +2344,6 @@ git commit -am "feat(landing): CI workflow + README + DEPLOY"
 | 2026-05-22 — | F1–F8 | All eight content sections ported from design 1:1 | ceb5ce9 |
 | 2026-05-22 — | G1–G4 | BaseLayout extracted; index uses named head slot; JSON-LD Organization + SoftwareApplication; full SEO surface | e2ee391 |
 | 2026-05-22 — | H part 1 | WaitlistSignups collection + Booking global + sendDiscoveryEmail hook + mailer.ts; live POST verified end-to-end through Vite proxy | b544b7a |
+| 2026-05-22 — | H part 2 | 13 content globals + cms.ts client (typed getters + import.meta.glob fallback + fail-loud in prod) + 13 fallback JSONs + seed script + 11-component refactor to `await getXxx()` | 623f286 |
+| 2026-05-22 — | I | robots.txt + 404.astro + privacy/terms stubs; sitemap auto-generated; prod build 4 pages, client JS ~24 KB gzipped | d1fb48e |
+| 2026-05-22 — | J | Full README + DEPLOY.md (Caddy + systemd + Postgres container recipe per Q1/Q2) | 44aebe0 |
