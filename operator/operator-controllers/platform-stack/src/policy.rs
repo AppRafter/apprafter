@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Future-version policy hooks. PlatformController calls these
-//! during reconcile so 1.74 (MigrationPlan) and 1.74a (yanking)
-//! can drop in concrete implementations without touching the
+//! during reconcile so 1.74 (MigrationPlan auto-create) can
+//! drop in a concrete implementation without touching the
 //! reconcile loop.
 //!
-//! In 1.73 we ship a `NoOpHooks` default impl: every version is
-//! considered non-yanked; MigrationPlan creation is a no-op
-//! returning success (the breaking-diff condition is still
-//! pushed onto the PlatformStack status from
-//! `reconcile::reconcile`).
+//! Yank handling (B.1.74a) is NOT a hook — the reconcile loop
+//! pulls `compatibility.yaml` once per OCI poll cycle and
+//! consumes it inline for two purposes: filtering yanked
+//! versions out of channel-latest resolution
+//! (`resolve_non_yanked_latest`) and surfacing the
+//! `YankedVersion` condition. Adding a hook on top would
+//! either duplicate work (N tarball pulls per resolve) or
+//! force the hook to take a `&CompatibilityDoc` argument that
+//! is a thin wrapper over the standard `BTreeMap` lookup —
+//! neither shape adds value.
+//!
+//! `NoOpHooks` remains as the default test fixture: it
+//! returns success on every MigrationPlan request without
+//! creating any resource. 1.74 lands the real impl.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -24,12 +33,6 @@ pub enum PolicyError {
 /// Hooks the reconciler calls into.
 #[async_trait]
 pub trait PolicyHooks: Send + Sync {
-    /// Should the reconciler skip `version` when picking the
-    /// channel-latest? Concrete impl in 1.74a reads
-    /// `compatibility.yaml#<version>.yanked` (the yanked field
-    /// does not yet exist in 1.73 — schema bump in 1.74a).
-    async fn is_yanked(&self, upstream_url: &str, version: &str) -> Result<bool, PolicyError>;
-
     /// Request a MigrationPlan be created for the breaking
     /// transition from `from_version` to `to_version`. 1.73's
     /// stub returns Ok(()) without creating any resource — the
@@ -49,10 +52,6 @@ pub struct NoOpHooks;
 
 #[async_trait]
 impl PolicyHooks for NoOpHooks {
-    async fn is_yanked(&self, _: &str, _: &str) -> Result<bool, PolicyError> {
-        Ok(false)
-    }
-
     async fn request_migration_plan(
         &self,
         _: &str,
@@ -66,12 +65,6 @@ impl PolicyHooks for NoOpHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn no_op_hooks_report_not_yanked() {
-        let hooks = NoOpHooks;
-        assert!(!hooks.is_yanked("oci://example", "0.1.0").await.unwrap());
-    }
 
     #[tokio::test]
     async fn no_op_hooks_succeed_on_migration_plan_request() {

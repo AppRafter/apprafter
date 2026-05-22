@@ -13,6 +13,160 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.123 — M1.5 Track B.1.74a closure — yanking support (2026-05-22)
+
+Soft-recall mechanism for published platform-stack versions.
+Chart-author marks a version as `yanked: true` in
+`compatibility.cue`; PlatformController then steers fresh
+clusters away from that version and surfaces a
+`YankedVersion=True` condition on clusters that already
+deployed it. Analogous to `cargo yank` / `npm deprecate` /
+PyPI yank for the OCI-distributed chart.
+
+### Schema extension
+
+`platform-stack/cue/compatibility.cue#VersionRecord` gains:
+
+- `yanked: bool | *false` — chart-author opt-in flag. Older
+  `compatibility.yaml` tarballs without the field are
+  tolerated; the Rust deserializer defaults to `false`.
+- `yankedReason?: string` — verbatim string surfaced in the
+  `YankedVersion` condition message and (future) CLI /
+  Backstage warnings. CUE cannot express "required iff
+  yanked=true" with a single field constraint, so the
+  conditional invariant is enforced by CI guards.
+
+### CI guards (both PR + publish time)
+
+A new step in `platform-stack-check.yml` (PR) and
+`platform-stack-publish.yml` (publish) renders the
+compatibility map to JSON via `cue export ./platform-stack/cue/... -e compatibility --out json`
+and uses `jq` to find any entry with `yanked == true` and
+empty / missing `yankedReason`. Either present → workflow
+fails with a clear `::error::` annotation pointing at the
+offending version keys.
+
+### PlatformController surfaces
+
+Three behaviour changes in `operator-controllers/platform-stack`:
+
+1. **`resolve_non_yanked_latest`** — new helper consumed by the
+   reconcile's channel-latest resolution. The flow:
+   - `oci::tags_in_channel(url, channel)` returns all
+     channel-matching tags, sorted descending (newest first).
+     New API; the prior `oci::latest_in_channel` stays as a
+     yank-unaware wrapper.
+   - `compatibility::fetch_compatibility_doc(url, top_tag)`
+     pulls the chart tarball at the top tag once per OCI
+     poll cycle and parses the full version map.
+   - The helper walks candidates newest-first and returns
+     the version of the first entry whose record is not
+     `yanked: true`. Fresh clusters never resolve
+     `availableVersion` to a yanked version. Missing
+     entries count as not yanked (older versions outside
+     the compat doc's history window stay resolvable).
+
+2. **`YankedVersion` condition** — new `COND_YANKED_VERSION`
+   constant in `status.rs`. Pushed each OCI poll cycle:
+   - `True` with reason `Yanked` and message
+     `"currentVersion <X> is yanked: <yankedReason>"` when
+     the deployed `target_for_patch` matches a yanked
+     entry.
+   - `False` with reason `NotYanked` otherwise.
+   - Skipped (prior condition value preserved) on
+     throttled / no-poll reconciles when the compat doc
+     isn't fetched.
+
+3. **Refactored compatibility access** —
+   `fetch_compatibility_doc(url, version_tag)` is the new
+   public entry point. The reconcile pulls the doc once,
+   reuses it for the yank filter and the `YankedVersion`
+   condition. `fetch_change_class` stays as a backwards-
+   compatible wrapper around the new fn for the
+   target-classification call site.
+
+### Architecture: yank handling stays inline (not a hook)
+
+`PolicyHooks::is_yanked` was a stub method in 1.73,
+positioned for "fill in actual logic" in 1.74a. On
+implementation it became clear the work is a pure lookup
+over an already-pulled `CompatibilityDoc` — not an
+extensibility seam. Dispatching through a trait would either
+re-pull the doc per candidate (N tarball pulls per resolve)
+or force the hook to take `&CompatibilityDoc`, which
+collapses to a one-line `is_some_and(|r| r.yanked)` call.
+
+Decision: removed the stub `is_yanked` from the trait
+entirely. `NoOpHooks` keeps `request_migration_plan` for
+1.74 (MigrationPlan auto-create). The reconcile loop
+performs yank lookups inline on the doc it just pulled.
+
+### Deferred (out of scope for 1.74a)
+
+- `apprafter platform status` CLI subcommand banner —
+  surfacing the `YankedVersion` condition in CLI output.
+  Lands when the `apprafter platform` CLI surface itself
+  lands (later sub-phase).
+- Backstage platform plugin UI banner — lands when the
+  Backstage plugin lands in Phase 2.
+- `compatibility.cue`-only PR / publish-without-bump flow
+  hinted at in the plan. The current drift-detection logic
+  in `platform-stack-check.yml` forces a chart bump on any
+  CUE source change; revisit when there's a concrete yank
+  scenario to validate the flow against.
+
+### Regression guards
+
++9 new tests in `operator-controllers/platform-stack`:
+
+- `compatibility.rs`: `version_record_yanked_defaults_to_false_when_field_absent`,
+  `version_record_yanked_true_with_camelcase_reason_parses`.
+- `oci.rs`: `sort_tags_descending_orders_newest_first_and_strips_v_prefix`,
+  `sort_tags_descending_returns_empty_when_channel_rejects_all`.
+- `reconcile.rs`: `resolve_non_yanked_latest_picks_top_when_none_yanked`,
+  `resolve_non_yanked_latest_skips_top_when_yanked`,
+  `resolve_non_yanked_latest_skips_consecutive_yanked`,
+  `resolve_non_yanked_latest_treats_missing_entry_as_not_yanked`,
+  `resolve_non_yanked_latest_falls_back_to_top_when_all_yanked`.
+
+One test removed: `no_op_hooks_report_not_yanked` (the
+stub it pinned is gone). Net 50 → 58 tests.
+
+### Files
+
+- `platform-stack/cue/compatibility.cue` — schema +
+  compat 0.1.25 entry.
+- `.github/workflows/platform-stack-check.yml` — PR-time
+  guard.
+- `.github/workflows/platform-stack-publish.yml` —
+  publish-time guard.
+- `operator/operator-controllers/platform-stack/src/compatibility.rs`
+  — `VersionRecord` extension, `fetch_compatibility_doc`,
+  `fetch_change_class` wrapper.
+- `operator/operator-controllers/platform-stack/src/oci.rs`
+  — `tags_in_channel`, `sort_tags_descending` helper.
+- `operator/operator-controllers/platform-stack/src/status.rs`
+  — `COND_YANKED_VERSION` constant.
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  — `resolve_non_yanked_latest`, condition emission, doc
+  reuse.
+- `operator/operator-controllers/platform-stack/src/policy.rs`
+  — trait shrink (deleted stub `is_yanked`).
+
+### Versions
+
+- CLI: 0.1.122 → 0.1.123.
+- Operator chart: v0.1.103 → v0.1.104.
+- Admission-webhook chart: v0.1.103 → v0.1.104 (lockstep).
+- platform-stack chart: 0.1.24 → 0.1.25, with the
+  matching `compatibility: "0.1.25"` entry.
+
+### Walk
+
+Deferred per user direction: B.1.74a closes as code +
+guards landing; next walk opportunity exercises yanking
+end-to-end as a regression.
+
 ## v0.1.122 — M1.5 Track B.1.74 walk-fix #7 — versionHistory race fix (2026-05-22)
 
 The B.1.74 acceptance walk surfaced a controller-cache race

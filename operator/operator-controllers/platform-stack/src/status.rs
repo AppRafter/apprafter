@@ -20,6 +20,17 @@ pub const COND_UNAUTHORIZED_SOURCE_MODIFICATION: &str = "UnauthorizedSourceModif
 /// in `kubectl describe platformstack default`. Walk-fix B.1.74.
 pub const COND_READY: &str = "Ready";
 
+/// `YankedVersion=True` when the cluster's `currentVersion`
+/// is marked `yanked: true` in the published compatibility
+/// metadata. Informational (NOT `Ready=False`) — the platform
+/// keeps running fine, the yank is a chart-author hint that
+/// the operator should upgrade soon. `condition.message`
+/// carries the verbatim `yankedReason` from
+/// `compatibility.yaml`. Surfaces in `kubectl describe
+/// platformstack default` + `apprafter platform status`.
+/// Track B.1.74a.
+pub const COND_YANKED_VERSION: &str = "YankedVersion";
+
 /// Maximum entries kept in `PlatformStack.status.versionHistory`.
 /// Ring-buffer behaviour: oldest entry drops when this cap is
 /// exceeded. Per spec.md §3.11 ("recent N transitions"); 10 is

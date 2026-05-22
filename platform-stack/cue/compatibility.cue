@@ -45,6 +45,41 @@ package platformstack
 	// References to ADRs / changelog entries that justify
 	// this version's design decisions.
 	references: [...string]
+
+	// Yank marker. Defaults to false. Set to true via a
+	// `compatibility.cue`-only PR (no `currentVersion` bump)
+	// to soft-recall a published version. PlatformController
+	// then:
+	//
+	//   * skips this version in `availableVersion`
+	//     channel-latest resolution — fresh clusters never
+	//     resolve to a yanked version.
+	//   * raises `YankedVersion=True` (informational, not
+	//     `Ready=False`) on clusters whose
+	//     `status.currentVersion` matches this entry.
+	//   * does NOT force-upgrade existing clusters — yanked
+	//     is metadata, never a policy override.
+	//
+	// Analogous to `cargo yank` / `npm deprecate` / PyPI
+	// yank. The OCI tag itself stays published (tags are
+	// immutable in OCI distribution); yank is purely a
+	// chart-author hint surfaced via the compatibility
+	// metadata.
+	yanked: bool | *false
+
+	// Mandatory when `yanked: true`. Free-form one-line
+	// reason shown verbatim in the `YankedVersion` condition
+	// message, in `apprafter platform status`, and in the
+	// Backstage UI banner.
+	//
+	// The CUE constraint here is "optional string", because
+	// CUE cannot express "required iff yanked=true" with a
+	// single field constraint. The publish workflow's CI
+	// guard enforces the conditional invariant by failing
+	// any `yanked: true` entry whose `yankedReason` is
+	// missing or empty (see
+	// `.github/workflows/platform-stack-publish.yml`).
+	yankedReason?: string
 }
 
 // `compatibility` is the indexed history. Keys are versions
@@ -1614,6 +1649,73 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Track B.1.74a — yanking support. Schema extension: every
+// #VersionRecord gains an optional `yanked: bool | *false` plus
+// `yankedReason?: string`. The CUE constraint is "optional
+// string"; the conditional invariant "yankedReason required
+// when yanked: true" is enforced at PR + publish time by the
+// `platform-stack-{check,publish}.yml` workflows
+// (`cue export ./platform-stack/cue/... -e compatibility | jq`
+// over the rendered map). PlatformController consumes the
+// fields: `resolve_non_yanked_latest` filters yanked versions
+// out of channel-latest resolution; the `YankedVersion`
+// condition surfaces a verbatim `yankedReason` when
+// `status.currentVersion` matches a yanked entry. Operator-
+// binary change only; image v0.1.122 → v0.1.123 via the
+// standard chart appVersion lockstep.
+compatibility: "0.1.25": {
+	change:          "safe"
+	operatorVersion: "v0.1.123"
+	notes: """
+		Track B.1.74a closure — yanking support.
+
+		Schema extension (#VersionRecord):
+
+		* `yanked: bool | *false` — chart-author hint that a
+		  published version should not be resolved by fresh
+		  installs. Default false; older compatibility.yaml
+		  tarballs without the field are tolerated.
+		* `yankedReason?: string` — verbatim text surfaced
+		  in the `YankedVersion` condition message + CLI /
+		  Backstage UI banners.
+
+		PlatformController behaviour:
+
+		* `availableVersion` resolution walks
+		  channel-matching tags newest-first, skips entries
+		  with `yanked: true`. Fresh clusters never land on
+		  a yanked version.
+		* `YankedVersion` condition (informational, NOT
+		  `Ready=False`): True iff `status.currentVersion`
+		  matches a yanked entry; the condition `message`
+		  carries `yankedReason` verbatim.
+		* Upgrade flow unchanged — yank is metadata, not a
+		  policy override. Pin to a yanked version stays
+		  honoured; warning surfaces, controller takes no
+		  action.
+
+		CI guard: PR-time + publish-time workflow step
+		fails when any `yanked: true` entry has missing or
+		empty `yankedReason`. Mirrors the rationale of the
+		compatibility-gate sanity check.
+
+		Architecture note: yank handling moved INLINE in
+		the reconcile loop, not behind `PolicyHooks::is_yanked`.
+		The trait gained no method; the prior stub method
+		was deleted. Rationale: yank is a pure-lookup on
+		an already-pulled `CompatibilityDoc`, not an
+		extensibility seam.
+
+		Rendered chart vs 0.1.24: byte-equivalent.
+		Operator-binary change only; chart appVersion
+		bump propagates the new image.
+		"""
+	references: [
+		"plan.md#1.74a-yanking-support",
+		"docs/changelog/UNRELEASED.md#v01123",
+	]
+}
+
 compatibility: "0.1.24": {
 	change:          "safe"
 	operatorVersion: "v0.1.122"

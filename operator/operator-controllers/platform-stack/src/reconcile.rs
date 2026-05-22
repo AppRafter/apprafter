@@ -31,13 +31,16 @@ use operator_core::{
     Metrics, PlatformStack, PlatformStackStatus, PlatformStackVersionHistoryEntry,
 };
 
-use crate::compatibility::{fetch_change_class, ChangeClass};
+use crate::compatibility::{
+    fetch_change_class, fetch_compatibility_doc, ChangeClass, CompatibilityDoc,
+};
 use crate::desired::{build as build_desired, DesiredSource};
-use crate::oci::{latest_in_channel, Channel};
+use crate::oci::{tags_in_channel, Channel};
 use crate::policy::{NoOpHooks, PolicyHooks};
 use crate::status::{
     append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING, COND_READY,
     COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
+    COND_YANKED_VERSION,
 };
 use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
@@ -255,13 +258,42 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         (Some(t), Some(_)) => (now - t).num_seconds() >= MIN_OCI_POLL_INTERVAL_SECS,
         _ => true,
     };
-    let (channel_latest_str, did_poll_oci) = if should_poll_oci {
-        let v = latest_in_channel(&spec.source.upstream, channel).await?;
-        (v.to_string(), true)
+    // Pull tags + compatibility.yaml in a single throttled OCI
+    // poll cycle. The compat doc is needed twice:
+    //
+    //   1. `resolve_non_yanked_latest`: walk candidates
+    //      newest-first, skip entries with `yanked: true`. Track
+    //      B.1.74a — yanking support.
+    //   2. The `YankedVersion` condition below — look up the
+    //      eventually-deployed target's yank status by version
+    //      key in the same doc.
+    //
+    // One additional manifest+blob pull per poll cycle on top
+    // of B.1.73's `fetch_change_class` lookup. Bounded by the
+    // 60s throttle (`MIN_OCI_POLL_INTERVAL_SECS`).
+    let (channel_latest_str, did_poll_oci, compat_doc) = if should_poll_oci {
+        let candidates = tags_in_channel(&spec.source.upstream, channel).await?;
+        let top_tag = candidates[0].to_string();
+        let doc = match fetch_compatibility_doc(&spec.source.upstream, &top_tag).await {
+            Ok(d) => Some(d),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "failed to pull compatibility doc from top tag {top_tag}; \
+                     yank filter inactive this cycle"
+                );
+                None
+            }
+        };
+        let resolved = match &doc {
+            Some(d) => resolve_non_yanked_latest(&candidates, d),
+            None => top_tag,
+        };
+        (resolved, true, doc)
     } else {
         // SAFETY: when `should_poll_oci` is false we've already
         // confirmed `prior_available` is Some(_) above.
-        (prior_available.clone().unwrap(), false)
+        (prior_available.clone().unwrap(), false, None)
     };
 
     // 2. Policy target — what PlatformController wants the
@@ -576,6 +608,43 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     };
     upsert_condition(&mut new_status, cond_ready);
 
+    // `YankedVersion` condition (B.1.74a). True iff the
+    // currently-deployed target is annotated `yanked: true` in
+    // the compatibility metadata; informational only (does NOT
+    // flip `Ready=False`, does NOT force an upgrade — yanked is
+    // chart-author hint, not a policy override).
+    //
+    // We only re-evaluate when we pulled the compat doc this
+    // cycle. On throttled (no-poll) reconciles the prior
+    // condition value carries forward via `new_status =
+    // stack.status.clone()`.
+    if let Some(doc) = &compat_doc {
+        let yanked_entry = doc.get(&target_for_patch).filter(|r| r.yanked);
+        let cond_yanked = match yanked_entry {
+            Some(rec) => condition(
+                COND_YANKED_VERSION,
+                "True",
+                "Yanked",
+                &format!(
+                    "currentVersion {target_for_patch} is yanked: {reason}",
+                    reason = rec
+                        .yanked_reason
+                        .as_deref()
+                        .unwrap_or("(no reason supplied — see compatibility.yaml)")
+                ),
+                &prior_conds,
+            ),
+            None => condition(
+                COND_YANKED_VERSION,
+                "False",
+                "NotYanked",
+                "currentVersion is not marked yanked in compatibility metadata",
+                &prior_conds,
+            ),
+        };
+        upsert_condition(&mut new_status, cond_yanked);
+    }
+
     // versionHistory ring buffer (B.1.74). Only record on a
     // SUCCESSFUL bump of `targetRevision` — values-only patches
     // and no-op reconciles don't constitute a version
@@ -612,6 +681,30 @@ fn semver_gt(a: &str, b: &str) -> bool {
         (Ok(av), Ok(bv)) => av > bv,
         _ => false,
     }
+}
+
+/// Walk `candidates_desc` (newest first) and return the version
+/// string of the first entry whose compatibility record is NOT
+/// `yanked: true`. Candidates missing from the doc are treated
+/// as not yanked (older versions outside the doc's history
+/// window — surfaced to fresh clusters without warning so we
+/// don't break installations of long-lived earlier versions).
+///
+/// All candidates yanked is a chart-author error condition;
+/// for safety we return the top tag anyway so the cluster
+/// stays on a defined version. The yanked status separately
+/// surfaces via the `YankedVersion` condition.
+///
+/// Track B.1.74a.
+fn resolve_non_yanked_latest(candidates_desc: &[Version], doc: &CompatibilityDoc) -> String {
+    for v in candidates_desc {
+        let key = v.to_string();
+        let yanked = doc.get(&key).is_some_and(|r| r.yanked);
+        if !yanked {
+            return key;
+        }
+    }
+    candidates_desc[0].to_string()
 }
 
 /// Has PlatformController already taken SSA ownership of any
@@ -1128,6 +1221,100 @@ mod tests {
         assert!(!semver_gt("not-a-version", "0.1.18"));
         assert!(!semver_gt("0.1.18", "garbage"));
         assert!(!semver_gt("", "0.1.18"));
+    }
+
+    fn rec(yanked: bool) -> crate::compatibility::VersionRecord {
+        // Helper builds a VersionRecord without going through
+        // serde — the `change`/`yanked_reason` fields aren't
+        // load-bearing for the `resolve_non_yanked_latest`
+        // tests, only `yanked`.
+        serde_yaml::from_str(&format!(
+            "change: safe\nyanked: {yanked}\nyankedReason: \"sample reason\"\n",
+        ))
+        .expect("compat record YAML")
+    }
+
+    #[test]
+    fn resolve_non_yanked_latest_picks_top_when_none_yanked() {
+        // Baseline: every candidate has yanked=false → return
+        // the top version unchanged. Pins B.1.74a no-op behavior
+        // when the chart-author hasn't yanked anything.
+        let candidates: Vec<Version> = ["0.1.22", "0.1.21", "0.1.20"]
+            .iter()
+            .map(|s| Version::parse(s).unwrap())
+            .collect();
+        let mut doc = std::collections::BTreeMap::new();
+        doc.insert("0.1.22".to_string(), rec(false));
+        doc.insert("0.1.21".to_string(), rec(false));
+        doc.insert("0.1.20".to_string(), rec(false));
+        assert_eq!(resolve_non_yanked_latest(&candidates, &doc), "0.1.22");
+    }
+
+    #[test]
+    fn resolve_non_yanked_latest_skips_top_when_yanked() {
+        // Core B.1.74a behavior. Top tag is yanked → walk to
+        // the next candidate and return that. Fresh clusters
+        // resolving channel-latest never land on a yanked
+        // version (the design goal of yanking support).
+        let candidates: Vec<Version> = ["0.1.22", "0.1.21", "0.1.20"]
+            .iter()
+            .map(|s| Version::parse(s).unwrap())
+            .collect();
+        let mut doc = std::collections::BTreeMap::new();
+        doc.insert("0.1.22".to_string(), rec(true));
+        doc.insert("0.1.21".to_string(), rec(false));
+        doc.insert("0.1.20".to_string(), rec(false));
+        assert_eq!(resolve_non_yanked_latest(&candidates, &doc), "0.1.21");
+    }
+
+    #[test]
+    fn resolve_non_yanked_latest_skips_consecutive_yanked() {
+        // Multiple consecutive yanks at the top — keep walking
+        // until the first non-yanked. Real chart-author
+        // scenario: ship 0.1.22 → yank it → ship 0.1.23 → yank
+        // it too → fresh clusters fall back to 0.1.21.
+        let candidates: Vec<Version> = ["0.1.23", "0.1.22", "0.1.21"]
+            .iter()
+            .map(|s| Version::parse(s).unwrap())
+            .collect();
+        let mut doc = std::collections::BTreeMap::new();
+        doc.insert("0.1.23".to_string(), rec(true));
+        doc.insert("0.1.22".to_string(), rec(true));
+        doc.insert("0.1.21".to_string(), rec(false));
+        assert_eq!(resolve_non_yanked_latest(&candidates, &doc), "0.1.21");
+    }
+
+    #[test]
+    fn resolve_non_yanked_latest_treats_missing_entry_as_not_yanked() {
+        // Older versions outside the doc's history window are
+        // resolvable. The yank marker is purely an opt-in
+        // signal; absence == ok. Prevents accidentally blocking
+        // resolution on a published version that pre-dates the
+        // chart-author's compatibility.cue starting point.
+        let candidates: Vec<Version> = ["0.1.22", "0.1.5"]
+            .iter()
+            .map(|s| Version::parse(s).unwrap())
+            .collect();
+        let mut doc = std::collections::BTreeMap::new();
+        doc.insert("0.1.22".to_string(), rec(true));
+        // 0.1.5 is absent from the doc → counts as not yanked.
+        assert_eq!(resolve_non_yanked_latest(&candidates, &doc), "0.1.5");
+    }
+
+    #[test]
+    fn resolve_non_yanked_latest_falls_back_to_top_when_all_yanked() {
+        // Pathological case: chart-author yanks everything in
+        // the doc. Returning top keeps the cluster on a defined
+        // version; the YankedVersion condition will surface the
+        // problem separately.
+        let candidates: Vec<Version> = ["0.1.22", "0.1.21"]
+            .iter()
+            .map(|s| Version::parse(s).unwrap())
+            .collect();
+        let mut doc = std::collections::BTreeMap::new();
+        doc.insert("0.1.22".to_string(), rec(true));
+        doc.insert("0.1.21".to_string(), rec(true));
+        assert_eq!(resolve_non_yanked_latest(&candidates, &doc), "0.1.22");
     }
 
     #[test]

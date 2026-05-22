@@ -51,24 +51,46 @@ pub enum CompatError {
 /// expected an outer wrapper that doesn't exist, so every
 /// reconcile that hit `fetch_change_class` errored on
 /// `missing field "compatibility"`. Switch to a direct map.
-type CompatibilityDoc = BTreeMap<String, VersionRecord>;
+pub type CompatibilityDoc = BTreeMap<String, VersionRecord>;
 
-#[derive(Debug, Deserialize)]
-struct VersionRecord {
+#[derive(Debug, Clone, Deserialize)]
+pub struct VersionRecord {
     #[serde(default)]
-    change: Option<String>,
+    pub change: Option<String>,
+    /// Yank marker added in B.1.74a. Defaults to `false` when
+    /// the field is absent (older `compatibility.yaml` tarballs
+    /// published before the schema bump).
+    #[serde(default)]
+    pub yanked: bool,
+    /// Free-form yank reason; mandatory when `yanked == true`,
+    /// surfaced verbatim in the `YankedVersion` condition
+    /// message. CI guards the conditional requirement at chart
+    /// publish time (see
+    /// `.github/workflows/platform-stack-publish.yml`).
+    #[serde(default, rename = "yankedReason")]
+    pub yanked_reason: Option<String>,
 }
 
-/// Pull the chart tarball at `<repo>:<version>` from `upstream_url`
-/// and return the change class for `version`. The upstream URL
-/// follows the same `oci://...` shape passed to
-/// `oci::latest_in_channel`.
-pub async fn fetch_change_class(
+/// Pull the chart tarball at `<repo>:<version_tag>` from
+/// `upstream_url` and return the full parsed compatibility
+/// document. The `version_tag` is the OCI tag to query (not
+/// the version-being-classified); typically the
+/// channel-latest tag, whose `compatibility.yaml` contains
+/// records for itself and every prior published version.
+///
+/// Callers reuse the returned map for: change-class lookup
+/// (target version's `change` field), yank filtering (walk
+/// candidates desc, skip entries with `yanked == true`), and
+/// `YankedVersion` condition messaging (read
+/// `yanked_reason`).
+///
+/// One OCI manifest pull + one blob pull per call.
+pub async fn fetch_compatibility_doc(
     upstream_url: &str,
-    version: &str,
-) -> Result<ChangeClass, CompatError> {
+    version_tag: &str,
+) -> Result<CompatibilityDoc, CompatError> {
     let bare = upstream_url.strip_prefix("oci://").unwrap_or(upstream_url);
-    let with_tag = format!("{bare}:{version}");
+    let with_tag = format!("{bare}:{version_tag}");
     let reference: Reference = with_tag
         .parse()
         .map_err(|e: oci_distribution::ParseError| {
@@ -104,13 +126,25 @@ pub async fn fetch_change_class(
         if let Ok(yaml_bytes) = extract_compatibility_yaml(&blob) {
             let doc: CompatibilityDoc = serde_yaml::from_slice(&yaml_bytes)
                 .map_err(|e| CompatError::Parse(e.to_string()))?;
-            let record = doc
-                .get(version)
-                .ok_or_else(|| CompatError::UnknownVersion(version.to_string()))?;
-            return Ok(parse_change_class(record.change.as_deref()));
+            return Ok(doc);
         }
     }
     Err(CompatError::MissingFile)
+}
+
+/// Convenience wrapper kept for callers that still need just
+/// the change class. Internally fetches the full
+/// `compatibility.yaml` map then extracts the requested
+/// version's `change` field.
+pub async fn fetch_change_class(
+    upstream_url: &str,
+    version: &str,
+) -> Result<ChangeClass, CompatError> {
+    let doc = fetch_compatibility_doc(upstream_url, version).await?;
+    let record = doc
+        .get(version)
+        .ok_or_else(|| CompatError::UnknownVersion(version.to_string()))?;
+    Ok(parse_change_class(record.change.as_deref()))
 }
 
 /// Walk a gzipped chart tarball blob and return the contents of
@@ -258,11 +292,11 @@ mod tests {
     #[test]
     fn compatibility_doc_tolerates_extra_fields_per_record() {
         // The rendered version record carries `version`,
-        // `change`, `operatorVersion`, `notes`, `references[]`;
-        // we only read `change`. serde_yaml's deserializer
-        // ignores unknown fields by default. Pin this so a
-        // future field bump on the chart side doesn't break
-        // PlatformController.
+        // `change`, `operatorVersion`, `notes`, `references[]`,
+        // plus the B.1.74a `yanked` + `yankedReason` fields.
+        // serde_yaml's deserializer ignores unknown fields by
+        // default. Pin this so a future field bump on the chart
+        // side doesn't break PlatformController.
         let yaml: &[u8] = br#""0.1.19":
   version: "0.1.19"
   change: safe
@@ -271,13 +305,56 @@ mod tests {
   references:
     - docs/...
     - another
-  yanked: true
   futureField: 42
 "#;
         let doc: CompatibilityDoc = serde_yaml::from_slice(yaml).expect("extra fields tolerated");
         assert_eq!(
             doc.get("0.1.19").and_then(|r| r.change.as_deref()),
             Some("safe")
+        );
+    }
+
+    #[test]
+    fn version_record_yanked_defaults_to_false_when_field_absent() {
+        // B.1.74a contract: older `compatibility.yaml` tarballs
+        // published before the schema bump have no `yanked`
+        // field. PlatformController must treat the absence as
+        // "not yanked" — never panic, never error.
+        let yaml: &[u8] = br#""0.1.10":
+  version: "0.1.10"
+  change: safe
+  operatorVersion: v0.1.91
+"#;
+        let doc: CompatibilityDoc =
+            serde_yaml::from_slice(yaml).expect("missing yanked tolerated");
+        let rec = doc.get("0.1.10").expect("entry present");
+        assert!(!rec.yanked);
+        assert!(rec.yanked_reason.is_none());
+    }
+
+    #[test]
+    fn version_record_yanked_true_with_camelcase_reason_parses() {
+        // Regression guard for B.1.74a. The CUE schema emits
+        // `yankedReason` (camelCase, matching the rest of the
+        // chart's value names); the Rust deserializer maps via
+        // `#[serde(rename = "yankedReason")]` onto the
+        // `yanked_reason` field. Forgetting the rename would
+        // silently drop the reason and leave the
+        // `YankedVersion` condition message empty in the
+        // cluster.
+        let yaml: &[u8] = br#""0.1.21":
+  version: "0.1.21"
+  change: safe
+  operatorVersion: v0.1.118
+  yanked: true
+  yankedReason: "regression in PlatformController OCI poll"
+"#;
+        let doc: CompatibilityDoc = serde_yaml::from_slice(yaml).expect("yanked entry parses");
+        let rec = doc.get("0.1.21").expect("entry present");
+        assert!(rec.yanked);
+        assert_eq!(
+            rec.yanked_reason.as_deref(),
+            Some("regression in PlatformController OCI poll")
         );
     }
 

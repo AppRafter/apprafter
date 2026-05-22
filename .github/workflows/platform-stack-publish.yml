@@ -214,6 +214,32 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: bash scripts/check-platform-stack-version.sh "$VERSION"
 
+      - name: Verify every yanked entry carries a non-empty yankedReason
+        # B.1.74a CI guard. The CUE schema cannot express the
+        # conditional invariant "yankedReason required when
+        # yanked: true" as a single field constraint, so we
+        # enforce it here at publish time. A yanked entry
+        # without a reason is a chart-author error — fresh
+        # clusters would see a YankedVersion=True condition with
+        # an empty message, which defeats the purpose of the
+        # soft-recall flow.
+        run: |
+          set -euo pipefail
+          json=$(cue export ./platform-stack/cue/... -e compatibility --out json)
+          missing=$(jq -r '
+            to_entries[]
+            | select(.value.yanked == true)
+            | select((.value.yankedReason // "") == "")
+            | .key
+          ' <<<"$json")
+          if [[ -n "$missing" ]]; then
+            echo "::error::compatibility.cue has yanked entries without a yankedReason:"
+            echo "$missing"
+            echo "::error::Set a non-empty yankedReason on every yanked: true entry before publish."
+            exit 1
+          fi
+          echo "::notice::All yanked entries (if any) carry a non-empty yankedReason."
+
       - name: Render umbrella chart from CUE
         run: make -C platform-stack render-only
 
