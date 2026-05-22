@@ -13,6 +13,145 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.122 — M1.5 Track B.1.74 walk-fix #7 — versionHistory race fix (2026-05-22)
+
+The B.1.74 acceptance walk surfaced a controller-cache race
+that quietly truncates `status.versionHistory` over successive
+successful reconciles. Symptom: after PlatformController bumps
+the parent Application from `v0.1.19` → `v0.1.20`, a kubectl
+inspect briefly shows the new entry, then on the next watcher
+tick the field drops back to its pre-bump value.
+
+### Root cause
+
+PlatformController's reconcile writes `PlatformStack.status` via
+server-side apply with `force=true` and field manager
+`platform-controller`. Each successful write generates an
+`UPDATED` event on the kube-rs watcher stream — which the
+`Controller` framework correctly debounces, but cannot prevent
+from firing AT LEAST once per write. The follow-up reconcile
+reads the `PlatformStack` from the watcher cache; the cache
+lags the apiserver by a few hundred milliseconds in the
+single-node walk-cluster.
+
+Concretely:
+
+1. **Reconcile #N**: appends a 3rd entry to `versionHistory`,
+   writes the full status (3 entries) to the apiserver.
+2. **Apiserver**: persists 3 entries.
+3. **Watcher cache**: still returns the pre-write snapshot
+   (2 entries) — eventual consistency.
+4. **Reconcile #N+1** (fired by our own write): observes
+   stale 2-entry vector, no append happens (no
+   `targetRevision` flip), but `write_status_if_changed`
+   detects a `conditions[*].reason` delta vs the prior status
+   (Synced cycle messaging is fresh) and writes a NEW SSA
+   patch carrying the stale 2-entry `versionHistory`.
+5. **Apiserver**: SSA payload becomes the new truth for the
+   `versionHistory` field — third entry is gone.
+
+The pattern is classic SSA + cached-read footgun: SSA replaces
+the entire array atomically (no list-merge directive for
+`versionHistory` because it has no `x-kubernetes-list-map-keys`),
+so any read-modify-write that reads stale data clobbers
+concurrent writes.
+
+### Fix — Option A: omit `versionHistory` from SSA patch when
+controller did not append this cycle
+
+The decisive observation: server-side apply PRESERVES field
+values that are ABSENT from the patch body. Field managers
+only own fields they explicitly set. So the canonical fix is
+to omit `versionHistory` from the SSA patch whenever the
+current reconcile cycle did not append a new entry. The
+apiserver's existing value stays authoritative, the watcher
+cache catches up on the next refresh, and the next genuine
+append (driven by a real `targetRevision` flip) ships the
+full new vector — including all earlier entries, because they
+were already on the apiserver.
+
+Three internal helpers grew an `include_version_history: bool`
+parameter:
+
+- `build_status_patch(name, status, include_version_history)`
+  — when false, serializes the status to JSON then strips the
+  `versionHistory` map key before wrapping in the SSA body.
+- `write_status(..., include_version_history)`
+- `write_status_if_changed(..., include_version_history)`
+
+The reconcile body tracks an `appended_history` flag:
+
+```rust
+let appended_history = target_changed && target_for_patch != current_target;
+if appended_history {
+    append_version_history(&mut new_status, …);
+}
+…
+write_status_if_changed(&stack, &ctx, new_status, appended_history).await?;
+```
+
+The in-flight early-return at the top of the reconcile always
+passes `false` — no append ever happens before that branch
+fires.
+
+### Why Option A and not B (read-from-apiserver)
+
+Considered alternative: bypass the watcher cache, read the
+`PlatformStack` directly from the apiserver via `Api::get`
+before building the SSA payload. Rejected because
+
+- Adds a per-reconcile apiserver round-trip on the hottest
+  path of the controller.
+- Doesn't actually close the race — `Api::get` is still
+  subject to the apiserver's read-your-write timing on a
+  multi-master setup.
+- Leaks the cache-vs-apiserver split into application logic,
+  whereas the SSA-omit-fix uses the platform's existing
+  guarantees.
+
+Option A is also strictly local — no protocol contract changes,
+no impact on observers (`kubectl get platformstack -w`
+continues to see the same vector after each successful
+reconcile).
+
+### Regression guards
+
+Two new unit tests pin the new behaviour:
+
+- `build_status_patch_omits_version_history_when_not_appended`
+  — passing `include_version_history: false` strips the field;
+  other status fields flow through unchanged.
+- `build_status_patch_includes_version_history_when_appended`
+  — passing `true` keeps the vector intact (so a genuine
+  append still persists).
+
+The pre-existing `build_status_patch_includes_apiversion_kind_and_name`
+test was updated for the new 3-arg signature.
+
+### Files
+
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  — three helper signatures + new tests + reconcile-body
+  flag.
+
+### Versions
+
+- CLI: 0.1.121 → 0.1.122 (per the `cli/Cargo.toml` lockstep
+  rule; the controller is the binary touched).
+- Operator chart: v0.1.102 → v0.1.103.
+- Admission-webhook chart: v0.1.102 → v0.1.103 (lockstep —
+  same release pipeline publishes both, even when only one
+  binary changed; otherwise `RELEASED_OPERATOR_VERSION` and
+  the chart appVersion drift).
+- platform-stack chart: 0.1.23 → 0.1.24, `compatibility:
+  "0.1.24"` records the safe-class change.
+
+### Walk
+
+User invocation 2026-05-22: "Давай А без ре-волка и сразу к
+1.74а перейдём" — Option A landed without re-walk; B.1.74a
+(yanking) follows in the next patch.
+
 ## v0.1.121 — M1.5 Track B.1.74 closure — versionHistory + Ready condition (2026-05-22)
 
 Track B.1.74 ("PlatformController upstream check + status updates")

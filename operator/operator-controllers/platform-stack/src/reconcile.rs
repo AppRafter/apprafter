@@ -314,7 +314,10 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         );
         new_status.target_version = Some(current_target.clone());
         new_status.current_version = Some(current_target.clone());
-        write_status_if_changed(&stack, &ctx, new_status).await?;
+        // In-flight branch: we DID NOT append history this cycle,
+        // so omit `versionHistory` from the SSA patch to preserve
+        // server-side state.
+        write_status_if_changed(&stack, &ctx, new_status, false).await?;
         return Ok(Action::requeue(IN_FLIGHT_REQUEUE));
     }
 
@@ -581,7 +584,8 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // actually included a new target (so we exclude the policy-
     // refused / MigrationPending branches where target_for_patch
     // == current_target).
-    if target_changed && target_for_patch != current_target {
+    let appended_history = target_changed && target_for_patch != current_target;
+    if appended_history {
         append_version_history(
             &mut new_status,
             PlatformStackVersionHistoryEntry {
@@ -594,7 +598,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
 
     new_status.current_version = Some(target_for_patch.clone());
     new_status.target_version = Some(target_for_patch);
-    write_status_if_changed(&stack, &ctx, new_status).await?;
+    write_status_if_changed(&stack, &ctx, new_status, appended_history).await?;
     Ok(Action::requeue(parse_check_interval(
         &spec.source.check_interval,
     )))
@@ -741,6 +745,7 @@ async fn write_status(
     stack: &PlatformStack,
     ctx: &Context,
     new_status: PlatformStackStatus,
+    include_version_history: bool,
 ) -> Result<(), Error> {
     let api: Api<PlatformStack> = Api::namespaced(ctx.client.clone(), SINGLETON_NAMESPACE);
     let name = stack.name_any();
@@ -753,7 +758,7 @@ async fn write_status(
     // on that error. Mirror'ed from
     // `operator_controllers_application::apply_status` which has
     // always carried the TypeMeta.
-    let patch = build_status_patch(&name, &new_status);
+    let patch = build_status_patch(&name, &new_status, include_version_history);
     api.patch_status(
         &name,
         &PatchParams::apply(FIELD_MANAGER),
@@ -778,24 +783,53 @@ async fn write_status(
 /// `lastTransitionTime` when status is unchanged. So a
 /// no-op reconcile produces a byte-equal `new_status` and
 /// this function short-circuits, breaking the loop.
+///
+/// `include_version_history` — when false, the SSA patch body
+/// OMITS the `versionHistory` field entirely so server-side
+/// state on that field is preserved. Walk-fix #7 v0.1.121 →
+/// v0.1.122: previously the reconcile loop always serialized
+/// `version_history` from `new_status` (which started as a
+/// clone of the stale-cache `stack.status`), so a
+/// race-fired second reconcile could overwrite a freshly-
+/// appended entry from the first reconcile with an older
+/// cached list. Including the field only when this cycle
+/// actually appended makes the write idempotent w.r.t. that
+/// race.
 async fn write_status_if_changed(
     stack: &PlatformStack,
     ctx: &Context,
     new_status: PlatformStackStatus,
+    include_version_history: bool,
 ) -> Result<(), Error> {
     let prior = stack.status.clone().unwrap_or_default();
     if prior == new_status {
         return Ok(());
     }
-    write_status(stack, ctx, new_status).await
+    write_status(stack, ctx, new_status, include_version_history).await
 }
 
-fn build_status_patch(name: &str, new_status: &PlatformStackStatus) -> Value {
+fn build_status_patch(
+    name: &str,
+    new_status: &PlatformStackStatus,
+    include_version_history: bool,
+) -> Value {
+    // Serialize the status as JSON Value, then conditionally
+    // strip `versionHistory` so server-side state on that
+    // append-only field is preserved across racy reconciles.
+    // Walk-fix #7 v0.1.121 → v0.1.122. See
+    // `write_status_if_changed` docstring for the rationale.
+    let mut status_value = serde_json::to_value(new_status)
+        .expect("PlatformStackStatus is always serializable to JSON");
+    if !include_version_history {
+        if let Value::Object(map) = &mut status_value {
+            map.remove("versionHistory");
+        }
+    }
     json!({
         "apiVersion": "apprafter.io/v1alpha1",
         "kind": "PlatformStack",
         "metadata": { "name": name },
-        "status": new_status,
+        "status": status_value,
     })
 }
 
@@ -970,7 +1004,7 @@ mod tests {
             current_version: Some("0.1.17".into()),
             ..Default::default()
         };
-        let patch = build_status_patch("default", &status);
+        let patch = build_status_patch("default", &status, true);
         let map = patch.as_object().expect("patch is JSON object");
         assert_eq!(
             map.get("apiVersion").and_then(Value::as_str),
@@ -989,6 +1023,71 @@ mod tests {
                 .pointer("/status/currentVersion")
                 .and_then(Value::as_str),
             Some("0.1.17")
+        );
+    }
+
+    #[test]
+    fn build_status_patch_omits_version_history_when_not_appended() {
+        // Regression guard for walk-fix v0.1.121 → v0.1.122.
+        // Without this guard the controller's own status writes
+        // can clobber `versionHistory` on the apiserver: a
+        // cache-stale `PlatformStack` snapshot becomes the new
+        // SSA body, dropping entries the previous reconcile had
+        // already persisted. SSA preserves field values that are
+        // ABSENT from the patch body, so skipping
+        // `versionHistory` whenever this reconcile cycle did not
+        // append is the canonical fix.
+        let status = PlatformStackStatus {
+            current_version: Some("0.1.20".into()),
+            version_history: Some(vec![operator_core::PlatformStackVersionHistoryEntry {
+                version: "0.1.19".into(),
+                applied_at: "t".into(),
+                outcome: "succeeded".into(),
+            }]),
+            ..Default::default()
+        };
+        let patch = build_status_patch("default", &status, false);
+        // The `versionHistory` field must NOT appear in the SSA
+        // patch body — the apiserver keeps the field at its
+        // existing value when omitted under server-side apply.
+        assert!(
+            patch.pointer("/status/versionHistory").is_none(),
+            "versionHistory must be absent when include_version_history=false; got {patch:#?}"
+        );
+        // Other status fields still flow through.
+        assert_eq!(
+            patch
+                .pointer("/status/currentVersion")
+                .and_then(Value::as_str),
+            Some("0.1.20")
+        );
+    }
+
+    #[test]
+    fn build_status_patch_includes_version_history_when_appended() {
+        // Counterpart guard: when the reconcile DID append a
+        // history entry this cycle, the SSA body MUST ship the
+        // new vector — otherwise the append silently never
+        // persists. Pairs with
+        // `build_status_patch_omits_version_history_when_not_appended`.
+        let status = PlatformStackStatus {
+            current_version: Some("0.1.20".into()),
+            version_history: Some(vec![operator_core::PlatformStackVersionHistoryEntry {
+                version: "0.1.20".into(),
+                applied_at: "2026-05-22T12:00:00+00:00".into(),
+                outcome: "succeeded".into(),
+            }]),
+            ..Default::default()
+        };
+        let patch = build_status_patch("default", &status, true);
+        let history = patch
+            .pointer("/status/versionHistory")
+            .and_then(Value::as_array)
+            .expect("versionHistory present when include_version_history=true");
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].get("version").and_then(Value::as_str),
+            Some("0.1.20")
         );
     }
 

@@ -1601,3 +1601,51 @@ compatibility: "0.1.23": {
 		"docs/changelog/UNRELEASED.md#v01121",
 	]
 }
+
+// Walk-fix #7 follow-up to B.1.74. The versionHistory ring
+// buffer surfaced a controller-cache race: a follow-up
+// reconcile fires from our own status write, reads a STALE
+// `PlatformStack` snapshot from the watcher cache (missing
+// the entry the prior reconcile just persisted), and the
+// subsequent SSA patch clobbers `versionHistory` with the
+// stale vector. The fix omits `versionHistory` from the SSA
+// patch body whenever the current reconcile cycle did NOT
+// append a new entry — SSA preserves field values not
+// present in the patch. Operator-binary change only; image
+// v0.1.121 → v0.1.122 via the standard chart appVersion
+// lockstep.
+compatibility: "0.1.24": {
+	change:          "safe"
+	operatorVersion: "v0.1.122"
+	notes: """
+		Walk-fix #7 v0.1.122 — versionHistory race fix.
+
+		B.1.74 acceptance walk surfaced a controller-cache
+		race: PlatformController's own status write triggers
+		a follow-up reconcile via the watcher cache (kube-rs
+		`Controller`). The follow-up reconcile reads the
+		cached `PlatformStack` which lags the apiserver,
+		then writes back the stale `versionHistory` vector
+		— the just-persisted entry vanishes.
+
+		Fix (Option A): the SSA patch body now OMITS the
+		`versionHistory` field when the current reconcile
+		cycle did not append a new entry. Server-side apply
+		preserves field values that are ABSENT from the
+		patch, so the prior reconcile's entry stays
+		authoritative on the apiserver.
+
+		Two regression tests guard the new behaviour:
+
+		* `build_status_patch_omits_version_history_when_not_appended`
+		* `build_status_patch_includes_version_history_when_appended`
+
+		Rendered chart vs 0.1.23: byte-equivalent.
+		Operator-binary change only; chart appVersion
+		bump propagates the new image.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-05-20-track-b-1-73-platform-controller.md",
+		"docs/changelog/UNRELEASED.md#v01122",
+	]
+}

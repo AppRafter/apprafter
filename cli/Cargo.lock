@@ -137,7 +137,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "apprafter"
-version = "0.1.121"
+version = "0.1.122"
 dependencies = [
  "age",
  "assert_cmd",
@@ -403,7 +403,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli-core"
-version = "0.1.121"
+version = "0.1.122"
 dependencies = [
  "age",
  "dirs",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "cli-providers"
-version = "0.1.121"
+version = "0.1.122"
 dependencies = [
  "base64 0.22.1",
  "cli-core",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "cli-state"
-version = "0.1.121"
+version = "0.1.122"
 dependencies = [
  "cli-core",
  "serde",
