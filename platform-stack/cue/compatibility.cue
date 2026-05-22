@@ -1649,6 +1649,85 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #2 post-B.1.77 — webhook FSM permitted app-scope
+// rejected via first-write fast-path, bypassing ADR 0027.
+// On a fresh MigrationPlan CR без status, `kubectl patch
+// --subresource=status -p '{"status":{"phase":"rejected"}}'`
+// slipped through the FSM's permissive `old_phase.is_empty()`
+// branch — webhook accepted, controller silently no-op'нул
+// reject (ApplicationMigrationStrategy::reject returns Ok per
+// design), but the ADR 0027 intent ("application-scope plans
+// cannot be rejected") was violated в audit terms. Fix: scope
+// guard `new_phase=="rejected" && scope=="application" → false`
+// applied BEFORE the empty-old-phase fast-path. +3 regression
+// tests (first-write to rejected on app-scope blocked; same
+// allowed on platform-scope; approved→rejected on app-scope
+// blocked). Operator-binary change only → image v0.1.127 →
+// v0.1.128 via the standard chart appVersion lockstep.
+compatibility: "0.1.30": {
+	change:          "safe"
+	operatorVersion: "v0.1.128"
+	notes: """
+		Walk-fix #2 post-B.1.77 — webhook FSM closes
+		ADR 0027 bypass on first-write to status.phase.
+
+		Symptom (walk-found, 2026-05-22 acceptance walk
+		of B.1.74→B.1.77 on v0.1.127): Phase 3.4 of the
+		runbook applied a fresh app-scope MigrationPlan
+		then immediately patched `status.phase=rejected`
+		via `kubectl patch --subresource=status`. The
+		webhook accepted the patch — should have denied
+		per ADR 0027.
+
+		Root cause: `is_allowed_phase_transition`'s
+		first-write branch (matched когда
+		`oldObject.status.phase == ""` — fresh CR без
+		status) returned `true` for any plausible target
+		phase including `rejected`, REGARDLESS of scope.
+		The ADR 0027 scope check applied only in the
+		`pending-approval → rejected` match arm later in
+		the function, so the first-write path bypassed it.
+
+		Fix: ADR 0027 guard now runs FIRST, before the
+		first-write fast-path. `new_phase=="rejected" &&
+		scope_type=="application" → false` covers any
+		path to `rejected` on app-scope:
+
+		* fresh CR + patch к rejected — blocked.
+		* pending-approval → rejected — blocked.
+		* approved → rejected (defensive) — blocked.
+		* executing → rejected (defensive) — blocked.
+
+		Error message extended to reference ADR 0027 for
+		any new_phase=rejected на app-scope (was only the
+		`pending-approval → rejected` case).
+
+		+3 regression unit tests:
+		`rejects_application_scope_first_write_to_rejected_per_adr_0027`,
+		`allows_platform_scope_first_write_to_rejected`,
+		`rejects_application_scope_approved_to_rejected_per_adr_0027`.
+
+		Total in admission-webhook lib: 75 → 78.
+
+		No code damage from the slipped reject — the
+		controller's `ApplicationMigrationStrategy.reject`
+		is Ok-no-op per ADR 0027 design (defensive belt-
+		and-braces от B.1.76). User who walked through 3.4
+		of the runbook saw the plan transition to phase=
+		rejected без any side-effect; semantically just
+		an audit-trail violation.
+
+		Rendered chart vs 0.1.29: byte-equivalent
+		templates. Operator + webhook binary change;
+		chart appVersion bump propagates new images.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md",
+		"docs/changelog/UNRELEASED.md#v01128",
+	]
+}
+
 // Walk-fix #1 post-B.1.76 — MigrationController status SSA
 // missing `.force()`. External actors (Backstage, CLI,
 // `kubectl patch --subresource=status`) own `status.phase`

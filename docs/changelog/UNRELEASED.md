@@ -13,6 +13,122 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.128 — M1.5 walk-fix #2 post-B.1.77 — webhook ADR 0027 bypass (2026-05-22)
+
+Walk-found bug on acceptance walk B.1.74→B.1.77 на v0.1.127.
+
+### Symptom
+
+Phase 3.4 of the walk runbook: apply a fresh app-scope
+MigrationPlan, then `kubectl patch <plan>
+--subresource=status -p '{"status":{"phase":"rejected"}}'`.
+The webhook was supposed to deny with the ADR 0027 error
+message ("application-scope MigrationPlans cannot be
+rejected; revert the Git commit ..."). Instead the patch
+succeeded, the plan transitioned к `phase=rejected`, and
+the audit trail recorded a phase that ADR 0027 explicitly
+forbids for application scope.
+
+### Root cause
+
+`is_allowed_phase_transition` (in `validator_migrationplan`)
+had two layers:
+
+1. **First-write fast-path** — when `oldObject.status.phase`
+   is empty (fresh CR без status), allow any plausible
+   target phase. Intended for tooling that pre-populates
+   status on CREATE (admin shortcut).
+2. **FSM match arms** — for non-empty old_phase, walk a
+   table of explicit transitions. The ADR 0027 scope check
+   lived only here, on the `("pending-approval", "rejected")`
+   arm.
+
+When the user `kubectl apply`'d a fresh CR, its `status.phase`
+defaulted к empty. Subsequent `kubectl patch --subresource=
+status` fired an UPDATE event with `oldObject.status.phase
+== ""` (the pre-patch state) — first-write fast-path
+matched, returned `true`, ADR 0027 scope check bypassed.
+
+### Fix
+
+Apply the ADR 0027 scope rule BEFORE the first-write
+fast-path. Any path к `rejected` on application scope is
+blocked:
+
+```rust
+fn is_allowed_phase_transition(old_phase, new_phase, scope_type) -> bool {
+    // ADR 0027 — application-scope plans cannot be rejected.
+    // Must run BEFORE the empty-old-phase first-write
+    // fast-path so a fresh CR + patch к rejected can't slip
+    // through.
+    if new_phase == "rejected" && scope_type == "application" {
+        return false;
+    }
+    // ... rest of FSM unchanged
+}
+```
+
+Error message extended too — was only triggered on
+`pending-approval → rejected`. Now any path that lands on
+`rejected` for app-scope surfaces the ADR 0027 reference.
+
+### Why no code damage from the slipped reject
+
+`ApplicationMigrationStrategy.reject` (operator-controllers/
+migration/strategy.rs) is `Ok-no-op` by design per ADR 0027
+— defensive belt-and-braces from B.1.76 для exactly this
+"webhook misconfigures and lets app-scope reject through"
+scenario. The controller observed phase=rejected, called
+strategy.reject (no-op), sealed the plan. No PlatformStack
+mutation, no child resource fiddling. Just the audit-trail
+violation: an app-scope plan in `phase=rejected` state when
+the spec says that state is unreachable.
+
+### Regression coverage
+
++3 new unit tests pin the corner cases:
+
+- `rejects_application_scope_first_write_to_rejected_per_adr_0027`
+  — the load-bearing guard. Fresh CR без status, patch к
+  rejected, expect ADR 0027 error.
+- `allows_platform_scope_first_write_to_rejected` — the
+  counterpart. Platform-scope plans CAN be rejected from any
+  state (operator shortcut), so the new guard must not
+  over-block.
+- `rejects_application_scope_approved_to_rejected_per_adr_0027`
+  — defensive. Even if some external actor flips app-scope
+  to `approved` first, the next flip to `rejected` is
+  blocked. The existing FSM `_ => false` fallthrough
+  already covered this; the test pins the behaviour against
+  a future refactor that might accidentally permit it.
+
+Total admission-webhook lib: 75 → 78.
+
+### Files
+
+- `operator/admission-webhook/src/validator_migrationplan.rs`
+  — fix + 3 regression tests + extended error message.
+
+### Versions
+
+- CLI: 0.1.127 → 0.1.128.
+- Operator chart: v0.1.108 → v0.1.109.
+- Admission-webhook chart: v0.1.108 → v0.1.109 (lockstep).
+- platform-stack chart: 0.1.29 → 0.1.30, with the matching
+  `compatibility: "0.1.30"` entry (byte-equivalent
+  templates — operator + webhook binary change).
+
+### Walk continuation
+
+User's frozen `walk-app-1` plan на v0.1.126 auto-unfroze
+when v0.1.127 deployed (SSA `.force()` fix landed). Same
+auto-recovery applies here: the `walk-app-reject-test` plan
+that slipped к `phase=rejected` on v0.1.127 stays in its
+sealed state (no operator action gets re-run). After
+v0.1.128 deploys, future fresh CRs + reject patches will
+be properly denied; the walk Phase 3.4 acceptance test
+should produce the ADR 0027 error message.
+
 ## v0.1.127 — M1.5 walk-fix #1 post-B.1.76 — SSA `.force()` on status writes (2026-05-22)
 
 Walk-found bug на acceptance walk B.1.74→B.1.77 на v0.1.126.

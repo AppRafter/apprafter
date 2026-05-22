@@ -162,13 +162,19 @@ fn validate_phase_transition(
         .unwrap_or("");
 
     if !is_allowed_phase_transition(old_phase, new_phase, scope_type) {
-        let reason = if scope_type == "application"
-            && old_phase == "pending-approval"
-            && new_phase == "rejected"
-        {
-            // ADR 0027: application-scope plans cannot be
-            // rejected. Surface the specific reason so users
-            // hitting this know to `git revert` instead.
+        // ADR 0027: application-scope plans cannot reach the
+        // `rejected` phase by ANY path — direct CREATE-with-
+        // status, kubectl patch from pending-approval, or
+        // anywhere else. Surface the specific reason so users
+        // hitting this know to `git revert` instead.
+        //
+        // Walk-fix #2 post-B.1.77: prior version only matched
+        // the explicit `pending-approval → rejected` transition.
+        // First-write to status.phase=rejected on a fresh CR
+        // (oldObject.status.phase=="") slipped through the
+        // FSM's first-write allow-everything branch and the
+        // generic error message was less useful for that case.
+        let reason = if scope_type == "application" && new_phase == "rejected" {
             "application-scope MigrationPlans cannot be rejected; \
              revert the Git commit in your application repo and let \
              the Application reconciler supersede this plan (ADR 0027)"
@@ -191,7 +197,8 @@ fn validate_phase_transition(
 ///
 /// ```text
 ///   ""               → pending-approval                  (CREATE; status.phase unset on object)
-///   ""               → approved | rejected | executing  (CREATE-with-status; allow for tooling)
+///   ""               → approved | executing | completed | failed   (CREATE-with-status; allow for tooling)
+///   ""               → rejected                          (platform scope only; ADR 0027)
 ///   pending-approval → approved                          (any scope; external)
 ///   pending-approval → rejected                          (platform scope only; external)
 ///   approved         → executing                         (controller)
@@ -200,10 +207,21 @@ fn validate_phase_transition(
 ///   sealed (completed/failed/rejected) → *               (forbidden — immutable)
 /// ```
 fn is_allowed_phase_transition(old_phase: &str, new_phase: &str, scope_type: &str) -> bool {
+    // ADR 0027: application-scope plans cannot be rejected by
+    // any path. This rule MUST apply BEFORE the empty-
+    // old-phase first-write fast-path — otherwise a fresh CR
+    // (CR without status; oldObject.status.phase = "")
+    // patched with `phase=rejected` slips through with the
+    // permissive "allow anything on first write" rule.
+    // Walk-fix #2 post-B.1.77.
+    if new_phase == "rejected" && scope_type == "application" {
+        return false;
+    }
+
     // First-write to status.phase from an empty / absent
     // value: accept anything legal for the FSM's downstream
     // transitions. Tooling that creates a plan already in
-    // `approved` is rare but not malformed.
+    // `approved` (admin shortcut) is rare but not malformed.
     if old_phase.is_empty() {
         return matches!(
             new_phase,
@@ -726,5 +744,76 @@ mod tests {
         let new = with_phase(application_scope_object(), "executing");
         let old = with_phase(application_scope_object(), "executing");
         assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn rejects_application_scope_first_write_to_rejected_per_adr_0027() {
+        // Walk-found bug v0.1.127 → v0.1.128: a fresh
+        // MigrationPlan CR has empty `status.phase`. The
+        // FSM's "first-write allow-everything" branch let
+        // `kubectl patch --subresource=status -p
+        // '{"status":{"phase":"rejected"}}'` through even for
+        // application-scope plans, bypassing the ADR 0027
+        // rule that only platform-scope can be rejected.
+        //
+        // Regression guard: webhook MUST reject `"" →
+        // rejected` on application scope, with the same
+        // ADR 0027 error message as the
+        // `pending-approval → rejected` case.
+        let mut new = application_scope_object();
+        new["status"] = json!({ "phase": "rejected" });
+        // oldObject has no status — simulates a fresh CR
+        // that just got created (status.phase absent / empty).
+        let old = application_scope_object();
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(
+            errors.iter().any(|e| e.field == "status.phase"),
+            "first-write to rejected on app-scope must trip the FSM guard; got {errors:?}"
+        );
+        let msg = &errors
+            .iter()
+            .find(|e| e.field == "status.phase")
+            .unwrap()
+            .message;
+        assert!(
+            msg.contains("application-scope") && msg.contains("ADR 0027"),
+            "error message must reference ADR 0027; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn allows_platform_scope_first_write_to_rejected() {
+        // Platform-scope plans CAN be rejected from any state
+        // including direct first-write. Tooling that
+        // pre-rejects a platform-scope plan (e.g. operator
+        // who already approved the bump out-of-band but wants
+        // an audit-trail entry) goes through.
+        let mut new = platform_scope_object();
+        new["status"] = json!({ "phase": "rejected" });
+        let old = platform_scope_object();
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(
+            errors.is_empty(),
+            "platform-scope first-write to rejected must be allowed; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_application_scope_approved_to_rejected_per_adr_0027() {
+        // Defensive guard: even if some external actor
+        // somehow patches phase=approved on an app-scope
+        // plan, a subsequent flip to `rejected` must STILL
+        // be blocked. The FSM's existing match arm doesn't
+        // cover `("approved", "rejected")` so this falls
+        // through to `_ => false` regardless of the new
+        // walk-fix #2 early guard — testing here pins the
+        // behaviour against a future refactor that might
+        // accidentally permit the transition.
+        let mut new = application_scope_object();
+        new["status"] = json!({ "phase": "rejected" });
+        let mut old = application_scope_object();
+        old["status"] = json!({ "phase": "approved" });
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(errors.iter().any(|e| e.field == "status.phase"));
     }
 }
