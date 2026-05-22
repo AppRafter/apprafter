@@ -1,0 +1,63 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+
+import BaseLayout from '../components/layout/BaseLayout.astro';
+import Brand from '../components/brand/Brand.astro';
+import Container from '../components/primitives/Container.astro';
+---
+
+<BaseLayout
+  title="404 — AppRafter"
+  description="The page you were looking for does not exist on apprafter.dev."
+>
+  <Fragment slot="head">
+    <meta name="robots" content="noindex" />
+  </Fragment>
+
+  <main id="main">
+    <Container>
+      <div class="wrap">
+        <Brand variant="twoTone" size={28} />
+        <p class="eyebrow" style="margin-top: 48px;">/ 404</p>
+        <h1>Page not found.</h1>
+        <p class="lede">
+          The page you were looking for does not exist on
+          <a href="/">apprafter.dev</a>. The
+          <a href="https://github.com/AppRafter/apprafter/blob/main/spec.md">spec</a>
+          and the
+          <a href="https://github.com/AppRafter/apprafter">GitHub repo</a>
+          are probably what you wanted.
+        </p>
+      </div>
+    </Container>
+  </main>
+</BaseLayout>
+
+<style>
+  .wrap {
+    padding-top: 96px;
+    padding-bottom: 160px;
+    max-width: 680px;
+  }
+  h1 {
+    font-size: 48px;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    margin-top: 16px;
+  }
+  .lede {
+    margin-top: 24px;
+    color: var(--fg-muted);
+    font-size: 18px;
+    line-height: 1.55;
+    max-width: 560px;
+  }
+  .lede a {
+    color: var(--accent);
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  .lede a:hover {
+    border-bottom-color: var(--accent);
+  }
+</style>

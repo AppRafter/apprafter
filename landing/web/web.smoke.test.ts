@@ -110,6 +110,39 @@ describe('page shell (Phase G)', () => {
   });
 });
 
+describe('polish — sitemap, robots, 404, legal stubs (Phase I)', () => {
+  test('robots.txt allows everything + advertises sitemap', () => {
+    const r = readFileSync(join(ROOT, 'public/robots.txt'), 'utf8');
+    expect(r).toContain('User-agent: *');
+    expect(r).toContain('Allow: /');
+    expect(r).toContain('Sitemap: https://apprafter.dev/sitemap-index.xml');
+  });
+
+  test('Astro sitemap integration registered in astro.config.ts', () => {
+    const cfg = readFileSync(join(ROOT, 'astro.config.ts'), 'utf8');
+    expect(cfg).toContain('@astrojs/sitemap');
+    expect(cfg).toContain('sitemap()');
+  });
+
+  test('404 + privacy + terms pages present + carry noindex robots meta', () => {
+    for (const page of ['404.astro', 'privacy.astro', 'terms.astro']) {
+      const p = join(ROOT, 'src/pages', page);
+      expect(existsSync(p)).toBe(true);
+      const src = readFileSync(p, 'utf8');
+      expect(src).toContain('noindex');
+    }
+  });
+
+  test('Privacy + Terms reference ADR 0032 / FSL-1.1-Apache-2.0 instead of MIT', () => {
+    for (const page of ['privacy.astro', 'terms.astro']) {
+      const src = readFileSync(join(ROOT, 'src/pages', page), 'utf8');
+      expect(src).not.toContain('FSL-1.1-MIT');
+    }
+    const terms = readFileSync(join(ROOT, 'src/pages/terms.astro'), 'utf8');
+    expect(terms).toContain('FSL-1.1-Apache-2.0');
+  });
+});
+
 describe('content sections (Phase F)', () => {
   test('all eight section source files exist', () => {
     for (const f of [
