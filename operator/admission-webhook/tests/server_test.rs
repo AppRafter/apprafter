@@ -237,6 +237,99 @@ async fn validate_rejects_platform_migrationplan_without_components() {
 }
 
 #[tokio::test]
+async fn validate_rejects_application_scope_phase_transition_to_rejected() {
+    // Acceptance test #4 for B.1.76: application-scope plans
+    // cannot transition to phase=rejected. The admission
+    // webhook is the load-bearing guard (no controller-side
+    // enforcement needed, since the controller never sees
+    // the request).
+    let app_scope = json!({
+        "type": "application",
+        "application": {
+            "ref": { "name": "parser", "namespace": "demo" },
+            "environment": "prod"
+        }
+    });
+    let payload = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "mp-reject-app",
+            "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "MigrationPlan" },
+            "operation": "UPDATE",
+            "object": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "app-reject", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": app_scope.clone(),
+                    "trigger": { "type": "t", "field": "f" }
+                },
+                "status": { "phase": "rejected" }
+            },
+            "oldObject": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "app-reject", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": app_scope,
+                    "trigger": { "type": "t", "field": "f" }
+                },
+                "status": { "phase": "pending-approval" }
+            }
+        }
+    });
+    let (status, body) = post_validate(payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["response"]["allowed"], false);
+    let message = body["response"]["status"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("application-scope") && message.contains("ADR 0027"),
+        "rejection message must explain ADR 0027 rationale; got {message}"
+    );
+}
+
+#[tokio::test]
+async fn validate_allows_platform_scope_phase_transition_to_rejected() {
+    let platform_scope = json!({
+        "type": "platform",
+        "platform": { "components": ["apprafter-operator"] }
+    });
+    let payload = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "mp-reject-plat",
+            "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "MigrationPlan" },
+            "operation": "UPDATE",
+            "object": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "platform-reject", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": platform_scope.clone(),
+                    "trigger": { "type": "t", "field": "f" }
+                },
+                "status": { "phase": "rejected" }
+            },
+            "oldObject": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": { "name": "platform-reject", "namespace": "apprafter-system" },
+                "spec": {
+                    "scope": platform_scope,
+                    "trigger": { "type": "t", "field": "f" }
+                },
+                "status": { "phase": "pending-approval" }
+            }
+        }
+    });
+    let (status, body) = post_validate(payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["response"]["allowed"], true);
+}
+
+#[tokio::test]
 async fn validate_rejects_migrationplan_scope_mutation_on_update() {
     // Server-level guard for `oldObject` flow: UPDATE request
     // with a different `spec.scope` shape must reach

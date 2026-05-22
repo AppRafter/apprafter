@@ -112,10 +112,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // MigrationController — third controller (Track B.1.76).
+    // Owns `MigrationPlan.status.*` writes under field manager
+    // `migration-controller`. Currently does not consume the
+    // shared `metrics` handle — strategy actions are no-ops in
+    // 1.76, no counters to surface yet. Wires in when 1.77 +
+    // 1.78 ship real action runners.
+    let migration_controller_handle = tokio::spawn({
+        let client = client.clone();
+        async move {
+            if let Err(err) = operator_controllers_migration::run(client).await {
+                error!(%err, "MigrationController error");
+            }
+        }
+    });
+
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
         _ = platform_controller_handle => warn!("PlatformController exited"),
+        _ = migration_controller_handle => warn!("MigrationController exited"),
         _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }

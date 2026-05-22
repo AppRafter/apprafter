@@ -112,9 +112,122 @@ pub fn validate_migrationplan(object: &Value, old_object: Option<&Value>) -> Vec
                  create a new MigrationPlan instead of mutating an existing one",
             ));
         }
+
+        // ---- status.phase FSM (UPDATE only) — B.1.76 ----
+        //
+        // External actors are allowed to transition
+        // `pending-approval → approved` (any scope) and
+        // `pending-approval → rejected` (platform scope only).
+        // Controller-side transitions (`approved → executing`,
+        // `executing → completed/failed`, etc.) are allowed too
+        // — the webhook does not gate them on identity (trust
+        // RBAC for that). Sealed states (`completed`, `failed`,
+        // `rejected`) are immutable.
+        validate_phase_transition(object, old, &mut errors);
     }
 
     errors
+}
+
+/// Phase transition FSM (B.1.76). Reads `oldObject.status.phase`
+/// and `object.status.phase`, accepts the legal transitions,
+/// rejects everything else.
+///
+/// Application-scope `pending-approval → rejected` is the
+/// acceptance test #4 case — ADR 0027 explicitly forbids reject
+/// for application-scope plans (the user reverts the Git commit
+/// instead). The webhook is the load-bearing guard.
+fn validate_phase_transition(
+    object: &Value,
+    old_object: &Value,
+    errors: &mut Vec<ValidationError>,
+) {
+    let old_phase = old_object
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let new_phase = object
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    // No phase change → nothing to validate.
+    if old_phase == new_phase {
+        return;
+    }
+
+    let scope_type = object
+        .pointer("/spec/scope/type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    if !is_allowed_phase_transition(old_phase, new_phase, scope_type) {
+        let reason = if scope_type == "application"
+            && old_phase == "pending-approval"
+            && new_phase == "rejected"
+        {
+            // ADR 0027: application-scope plans cannot be
+            // rejected. Surface the specific reason so users
+            // hitting this know to `git revert` instead.
+            "application-scope MigrationPlans cannot be rejected; \
+             revert the Git commit in your application repo and let \
+             the Application reconciler supersede this plan (ADR 0027)"
+                .to_string()
+        } else {
+            format!(
+                "illegal status.phase transition {old_phase:?} → {new_phase:?} \
+                 for scope.type={scope_type:?}; \
+                 see spec.md §3.8 for the legal FSM"
+            )
+        };
+        errors.push(ValidationError::new("status.phase", reason));
+    }
+}
+
+/// Is `old_phase → new_phase` a legal transition for the
+/// given scope type?
+///
+/// The FSM:
+///
+/// ```text
+///   ""               → pending-approval                  (CREATE; status.phase unset on object)
+///   ""               → approved | rejected | executing  (CREATE-with-status; allow for tooling)
+///   pending-approval → approved                          (any scope; external)
+///   pending-approval → rejected                          (platform scope only; external)
+///   approved         → executing                         (controller)
+///   executing        → executing                         (same phase, no-op; covered by guard above)
+///   executing        → completed | failed                (controller)
+///   sealed (completed/failed/rejected) → *               (forbidden — immutable)
+/// ```
+fn is_allowed_phase_transition(old_phase: &str, new_phase: &str, scope_type: &str) -> bool {
+    // First-write to status.phase from an empty / absent
+    // value: accept anything legal for the FSM's downstream
+    // transitions. Tooling that creates a plan already in
+    // `approved` is rare but not malformed.
+    if old_phase.is_empty() {
+        return matches!(
+            new_phase,
+            "pending-approval" | "approved" | "executing" | "completed" | "failed" | "rejected"
+        );
+    }
+
+    // Sealed states never transition. The CR can be deleted +
+    // recreated under a new name if a fresh attempt is needed.
+    if matches!(old_phase, "completed" | "failed" | "rejected") {
+        return false;
+    }
+
+    match (old_phase, new_phase) {
+        ("pending-approval", "approved") => true,
+        ("pending-approval", "rejected") => scope_type == "platform",
+        ("approved", "executing") => true,
+        ("executing", "completed") => true,
+        ("executing", "failed") => true,
+        // Controller may stay on `executing` while running
+        // step-by-step — the equality guard above prevents this
+        // function from being called in that case.
+        _ => false,
+    }
 }
 
 fn validate_application_scope(
@@ -500,5 +613,118 @@ mod tests {
         let obj = json!({ "metadata": { "name": "x", "namespace": "apprafter-system" } });
         let errors = validate_migrationplan(&obj, None);
         assert!(errors.iter().any(|e| e.field == "spec"));
+    }
+
+    // ---------- phase FSM (B.1.76) ----------
+
+    fn with_phase(mut obj: Value, phase: &str) -> Value {
+        obj["status"] = json!({ "phase": phase });
+        obj
+    }
+
+    #[test]
+    fn allows_application_scope_pending_to_approved() {
+        let new = with_phase(application_scope_object(), "approved");
+        let old = with_phase(application_scope_object(), "pending-approval");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn allows_platform_scope_pending_to_approved() {
+        let new = with_phase(platform_scope_object(), "approved");
+        let old = with_phase(platform_scope_object(), "pending-approval");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn allows_platform_scope_pending_to_rejected() {
+        let new = with_phase(platform_scope_object(), "rejected");
+        let old = with_phase(platform_scope_object(), "pending-approval");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn rejects_application_scope_pending_to_rejected_per_adr_0027() {
+        // Acceptance test #4 for B.1.76. Application-scope
+        // plans cannot be rejected per ADR 0027; the user
+        // reverts the Git commit instead.
+        let new = with_phase(application_scope_object(), "rejected");
+        let old = with_phase(application_scope_object(), "pending-approval");
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(errors.iter().any(|e| e.field == "status.phase"));
+        let msg = &errors
+            .iter()
+            .find(|e| e.field == "status.phase")
+            .unwrap()
+            .message;
+        assert!(
+            msg.contains("application-scope") && msg.contains("ADR 0027"),
+            "error message should explain why application reject is blocked; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn allows_controller_approved_to_executing() {
+        let new = with_phase(application_scope_object(), "executing");
+        let old = with_phase(application_scope_object(), "approved");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn allows_controller_executing_to_completed() {
+        let new = with_phase(application_scope_object(), "completed");
+        let old = with_phase(application_scope_object(), "executing");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn allows_controller_executing_to_failed() {
+        let new = with_phase(application_scope_object(), "failed");
+        let old = with_phase(application_scope_object(), "executing");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn rejects_completed_sealed_to_anything() {
+        let new = with_phase(application_scope_object(), "executing");
+        let old = with_phase(application_scope_object(), "completed");
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(errors.iter().any(|e| e.field == "status.phase"));
+    }
+
+    #[test]
+    fn rejects_failed_sealed_to_anything() {
+        let new = with_phase(application_scope_object(), "executing");
+        let old = with_phase(application_scope_object(), "failed");
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(errors.iter().any(|e| e.field == "status.phase"));
+    }
+
+    #[test]
+    fn rejects_rejected_sealed_to_anything() {
+        let new = with_phase(platform_scope_object(), "approved");
+        let old = with_phase(platform_scope_object(), "rejected");
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(errors.iter().any(|e| e.field == "status.phase"));
+    }
+
+    #[test]
+    fn rejects_skipping_approved_step() {
+        // pending-approval → executing (skipping approved) is
+        // not in the FSM. External tooling tempted to fast-
+        // forward must hit `approved` first.
+        let new = with_phase(application_scope_object(), "executing");
+        let old = with_phase(application_scope_object(), "pending-approval");
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(errors.iter().any(|e| e.field == "status.phase"));
+    }
+
+    #[test]
+    fn allows_no_phase_change_on_update() {
+        // Updates that don't touch status.phase (e.g. tweaks
+        // to `approvers`) must not trip the FSM guard.
+        let new = with_phase(application_scope_object(), "executing");
+        let old = with_phase(application_scope_object(), "executing");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
     }
 }

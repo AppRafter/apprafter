@@ -1649,6 +1649,96 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Track B.1.76 closure — MigrationController + strategy
+// dispatch. Third reconciler in the apprafter-operator
+// binary owns the MigrationPlan phase FSM: external actors
+// flip `pending-approval → approved | rejected`, controller
+// drives `approved → executing → completed/failed` and runs
+// `PlatformMigrationStrategy.reject` on platform-scope
+// rejects (SSA-patches PlatformStack.spec.pin back to the
+// snapshot). Webhook FSM extension blocks application-scope
+// rejects (ADR 0027) + sealed-state mutations. RBAC
+// extends with migrationplans + /status verbs.
+// Operator-binary change only → image v0.1.124 → v0.1.125;
+// chart appVersion bump propagates the new image.
+compatibility: "0.1.27": {
+	change:          "safe"
+	operatorVersion: "v0.1.125"
+	notes: """
+		Track B.1.76 closure — MigrationController +
+		strategy dispatch.
+
+		Third reconciler in the apprafter-operator binary
+		(peer to ApplicationController + PlatformController),
+		gated by the same leader Lease. Owns the
+		`MigrationPlan.status.phase` FSM:
+
+		    pending-approval ─[external: phase=approved]──→ approved
+		                     ─[external: phase=rejected,
+		                       platform scope only]──────→ rejected
+		    approved        ─[controller]─────────────────→ executing
+		    executing       ─[controller, last step]──────→ completed
+		    executing       ─[controller, step failed]────→ failed
+		    rejected        ─[controller: strategy.reject]─→ rejected (sealed)
+
+		`MigrationStrategy` trait in `operator-core` covers
+		execute_step + reject. Two impls in
+		`operator-controllers/migration`:
+
+		* `ApplicationMigrationStrategy`: execute_step is
+		  Succeeded (free-form action text, no machine
+		  semantics in 1.76); reject is Ok-no-op per ADR
+		  0027 (admission webhook also blocks the
+		  transition).
+		* `PlatformMigrationStrategy`: execute_step is
+		  Succeeded; reject reads
+		  `plan.spec.previousSpecSnapshot.pin` and
+		  SSA-patches `PlatformStack.spec.pin` back to that
+		  value (or `null` when the snapshot has no pin).
+		  Field manager `migration-controller-strategy`
+		  distinguishes the patch from
+		  PlatformController's `platform-controller`
+		  manager. Idempotent — repeated rejects after a
+		  successful revert produce byte-equivalent SSA
+		  patches.
+
+		Admission webhook (`validator_migrationplan.rs`)
+		gains a `status.phase` transition FSM (paired
+		with the existing `spec.scope` immutability):
+
+		* `pending-approval → approved` allowed (any scope).
+		* `pending-approval → rejected` allowed for
+		  platform scope; rejected for application scope
+		  with an ADR-0027 reference in the error message.
+		* Sealed states (`completed`, `failed`, `rejected`)
+		  are immutable.
+		* Controller transitions allowed without identity
+		  gating — trust RBAC for that surface.
+
+		RBAC ClusterRole extends with
+		`migrationplans` + `migrationplans/status` (get,
+		list, watch, patch, update).
+
+		Detection (`detect_destructive` for both scopes)
+		intentionally NOT in the trait. Detection
+		signatures differ per scope, so each strategy
+		exposes a concrete fn that callers in B.1.77
+		(Application reconciler) and B.1.78
+		(PlatformController) wire in.
+
+		Rendered chart vs 0.1.26: byte-equivalent
+		templates. Operator-binary change only (third
+		controller spawn + new crate + webhook FSM
+		extension); chart appVersion bump propagates the
+		new image.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md#176-migrationcontroller--strategy-dispatch",
+		"docs/changelog/UNRELEASED.md#v01125",
+	]
+}
+
 // Track B.1.75 closure — unified MigrationPlan CRD +
 // admission webhook validation. New CRD shipped by the
 // operator chart (sync-wave -5 alongside Application +

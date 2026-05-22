@@ -24,11 +24,34 @@ rules:
   # fails silently on its first list/watch call and the
   # PlatformStack's `.status` never populates. Walk-found bug
   # v0.1.114 → v0.1.115.
+  #
+  # B.1.76 extension: PlatformMigrationStrategy.reject also
+  # SSA-patches PlatformStack.spec.pin under the field manager
+  # `migration-controller-strategy`. The same ClusterRole
+  # rule covers both the PlatformController status writes and
+  # the strategy's reject patch because RBAC is verb-based,
+  # not field-manager-based.
   - apiGroups:
       - apprafter.io
     resources:
       - platformstacks
       - platformstacks/status
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  # MigrationPlan CRD — watched by the MigrationController in
+  # the same operator binary (B.1.76). The controller writes
+  # `.status` via SSA with field manager `migration-controller`;
+  # /status verb scoped separately so the operator can patch
+  # status even if subresource RBAC tightens later.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - migrationplans
+      - migrationplans/status
     verbs:
       - get
       - list

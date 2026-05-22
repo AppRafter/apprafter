@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 operator-core                          = { path = "../operator-core" }
 operator-controllers-application       = { path = "../operator-controllers/application" }
+operator-controllers-migration         = { path = "../operator-controllers/migration" }
 operator-controllers-platform-stack    = { path = "../operator-controllers/platform-stack" }
 
 axum               = { workspace = true }

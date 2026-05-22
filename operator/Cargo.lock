@@ -70,6 +70,7 @@ dependencies = [
  "http-body-util",
  "kube",
  "operator-controllers-application",
+ "operator-controllers-migration",
  "operator-controllers-platform-stack",
  "operator-core",
  "rustls",
@@ -1506,6 +1507,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "operator-controllers-migration"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "operator-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "operator-controllers-platform-stack"
 version = "0.1.2"
 dependencies = [
@@ -1531,6 +1549,7 @@ dependencies = [
 name = "operator-core"
 version = "0.1.2"
 dependencies = [
+ "async-trait",
  "chrono",
  "k8s-openapi",
  "kube",

@@ -5,6 +5,7 @@ members = [
     "admission-webhook",
     "apprafter-operator",
     "operator-controllers/application",
+    "operator-controllers/migration",
     "operator-controllers/platform-stack",
     "operator-core",
     "operator-rendering",

@@ -13,6 +13,236 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.125 — M1.5 Track B.1.76 closure — MigrationController + strategy dispatch (2026-05-22)
+
+The third reconciler in the `apprafter-operator` binary
+(peer to ApplicationController + PlatformController) now
+owns the `MigrationPlan.status.phase` FSM. External actors
+flip `pending-approval → approved | rejected`; the
+controller drives `approved → executing → completed |
+failed` and runs strategy-specific reject behaviour on
+`rejected`.
+
+Implements plan.md §1.76 and ADR 0027.
+
+### Phase FSM
+
+```text
+  pending-approval ──[external: phase=approved]────→ approved
+                   ──[external: phase=rejected,
+                     platform scope only]─────────→ rejected
+  approved        ──[controller]───────────────────→ executing
+  executing       ──[controller, last step]────────→ completed
+  executing       ──[controller, step failed]──────→ failed
+  rejected        ──[controller: strategy.reject]──→ rejected (sealed)
+```
+
+Sealed phases (`completed`, `failed`, `rejected`) cannot
+mutate further — the admission webhook FSM blocks any
+transition out of them.
+
+### New crate `operator-controllers/migration`
+
+Workspace member peer to `application` and `platform-stack`.
+Cargo manifest mirrors the platform-stack crate's deps. The
+controller is spawned from `apprafter-operator/src/main.rs`
+after leader election succeeds, so both Application and
+PlatformController peers continue to depend on the same
+single Lease.
+
+### `MigrationStrategy` trait (operator-core)
+
+```rust
+#[async_trait]
+pub trait MigrationStrategy: Send + Sync {
+    async fn execute_step(
+        &self,
+        plan: &MigrationPlan,
+        step: &MigrationStep,
+    ) -> Result<StepOutcome, MigrationError>;
+
+    async fn reject(&self, plan: &MigrationPlan) -> Result<(), MigrationError>;
+}
+```
+
+`StepOutcome` is `Succeeded | Failed { message } | Skipped
+{ reason }`. The controller appends an `ExecutedStep` to
+`status.executedSteps` after each call.
+
+`detect_destructive` from plan.md's pseudo-code is **not**
+in this trait. The Application detector takes an
+`ApplicationSpec` diff; the platform detector takes a
+version string + compatibility metadata. Forcing both
+through a shared signature either erases type information
+the callers need (`&dyn Any`-style) or introduces an
+associated type that breaks trait-object dispatch. Per-scope
+detection therefore lives as a concrete fn on each strategy
+struct; B.1.77 wires the application detector into the
+Application reconciler, B.1.78 wires the platform detector
+into PlatformController.
+
+### Strategy impls
+
+`ApplicationMigrationStrategy`:
+
+- `execute_step` returns `Succeeded` unconditionally — the
+  1.75 / 1.76 schema's `plan[].action` is free-form text
+  without machine semantics, so there's nothing to "run".
+  Real action runners can replace this impl when an action
+  vocabulary is settled.
+- `reject` is `Ok(())` per ADR 0027. The webhook FSM
+  blocks application-scope `→ rejected`; this Ok is a
+  defensive belt-and-braces in case the webhook is
+  misconfigured.
+
+`PlatformMigrationStrategy`:
+
+- `execute_step` same skeleton as Application.
+- `reject` is **real**: read `plan.spec.previousSpecSnapshot.pin`
+  (or `null` when the snapshot has no pin — represents
+  "revert to channel-following"), SSA-patch
+  `PlatformStack.spec.pin` back to that value with field
+  manager `migration-controller-strategy`. The manager
+  name is distinct from `platform-controller` so
+  `PlatformController.detect_outside_writer` (which watches
+  the parent platform Application, not the PlatformStack
+  CR itself) sees this as a different writer's footprint
+  if it ever surfaces on a managedFields path.
+- Idempotent: repeated rejects after a successful revert
+  produce byte-equivalent SSA patches (no resource-version
+  bump, no watch fan-out).
+
+### Reconcile loop
+
+`reconcile.rs` walks the FSM:
+
+- `pending-approval` → `Action::await_change()` (controller
+  waits for external phase transition).
+- `approved` → SSA-write `phase=executing` → requeue 1s
+  (next reconcile starts step execution).
+- `executing` → run step at index `executed_steps.len()`,
+  append `ExecutedStep`, transition to `completed` (last
+  step) or `failed` (step returned `Failed`) or stay on
+  `executing` (more steps remain). The `executed_steps`
+  vector doubles as the progress marker — a reconcile
+  mid-step re-runs an idempotent step; production strategies
+  with real side-effects will need stricter locking added
+  in a later phase.
+- `rejected` → call `strategy.reject(plan)`; sealed after.
+
+Status writes use server-side apply with field manager
+`migration-controller` (distinct from the strategy's
+`migration-controller-strategy` for outside-resource
+patches).
+
+### Webhook FSM extension
+
+`validator_migrationplan.rs` gains `validate_phase_transition`
++ `is_allowed_phase_transition`, paired with the existing
+`spec.scope` immutability check from B.1.75. Reads both
+`object.status.phase` and `oldObject.status.phase` from the
+AdmissionReview. The legal transitions:
+
+| From | To | Allowed |
+|------|-----|---------|
+| (empty) | pending-approval / approved / ... | Yes (CREATE-with-status) |
+| pending-approval | approved | Any scope |
+| pending-approval | rejected | **Platform scope only** |
+| approved | executing | Any (controller-driven) |
+| executing | completed / failed | Any (controller-driven) |
+| any | (same phase) | No-op, never reaches FSM |
+| sealed (completed / failed / rejected) | anything | **Forbidden** |
+
+Application-scope `pending-approval → rejected` triggers a
+specific error message referencing ADR 0027 — points the
+user at the Git-revert flow that supersedes the plan.
+
+Controller-side transitions are allowed without identity
+gating. Trust RBAC for "only the controller can write
+status" — humans don't have `migrationplans/status` patch
+verb in the chart's ClusterRole.
+
+### RBAC
+
+`operator/charts/apprafter-operator/templates/rbac.yaml`
+gains the `migrationplans` + `migrationplans/status`
+resources (verbs: get, list, watch, patch, update). The
+existing `platformstacks` rule already covers the
+strategy's reject patch path because RBAC is verb-based,
+not field-manager-based.
+
+### Departure from plan.md
+
+Plan.md task list says reject "reverts spec.pin to value
+from `metadata.annotations[apprafter.io/previous-spec]`."
+That annotation approach was an ADR 0027 placeholder; in
+practice the B.1.75 CRD schema already has a structured
+`spec.previousSpecSnapshot` field for exactly this
+purpose. The strategy reads from the structured field —
+cleaner, no annotation-shape contract to maintain, no
+JSON-as-string-in-annotation round-trip.
+
+### Detection deferral
+
+Plan.md task list ascribes detect-destructive impls to
+B.1.76 ("detect destructive changes in Application CR
+(needs.* selector changes, storage class changes, breaking
+image migrations)"). Those impls are NOT in this release —
+they have no callers in 1.76 (B.1.77 wires the application
+detector; B.1.78 wires the platform detector). Shipping
+detection logic without a caller is dead code; landing
+the trait + execute/reject halves with the controller is
+the part of 1.76 that has acceptance tests today.
+
+### Tests
+
+- 11 new unit tests in `operator-controllers-migration`:
+  4 reconcile FSM helpers + 5 strategy execute/reject /
+  snapshot extraction + 2 scope dispatch.
+- 12 new webhook unit tests covering the phase FSM:
+  4 happy paths + 7 rejections (sealed states, illegal
+  transitions, acceptance #4).
+- 2 new server-level integration tests: app-scope reject
+  blocked with ADR 0027 explanation, platform-scope reject
+  allowed.
+
+Total: 75 webhook lib tests (was 63) + 12 webhook
+integration (was 10) + 11 migration crate tests (new).
+
+### Files
+
+- `operator/Cargo.toml` — workspace member.
+- `operator/operator-core/Cargo.toml` — `async-trait` dep.
+- `operator/operator-core/src/migration.rs` — trait + types.
+- `operator/operator-core/src/lib.rs` — re-exports.
+- `operator/operator-controllers/migration/Cargo.toml` — new.
+- `operator/operator-controllers/migration/src/lib.rs` — new.
+- `operator/operator-controllers/migration/src/reconcile.rs` — FSM.
+- `operator/operator-controllers/migration/src/strategy.rs` — impls.
+- `operator/apprafter-operator/Cargo.toml` — dep on new crate.
+- `operator/apprafter-operator/src/main.rs` — third spawn line.
+- `operator/admission-webhook/src/validator_migrationplan.rs` — FSM.
+- `operator/admission-webhook/tests/server_test.rs` — +2 integration.
+- `operator/charts/apprafter-operator/templates/rbac.yaml` — verbs.
+
+### Versions
+
+- CLI: 0.1.124 → 0.1.125.
+- Operator chart: v0.1.105 → v0.1.106.
+- Admission-webhook chart: v0.1.105 → v0.1.106 (lockstep).
+- platform-stack chart: 0.1.26 → 0.1.27, with the matching
+  `compatibility: "0.1.27"` entry.
+
+### Walk
+
+Manual walk deferred — the B.1.77 + B.1.78 callers wire
+detection through real flows, and exercising the full
+destructive-change pipeline (Application reconciler detects
+→ creates plan → operator pauses child resources → user
+approves → controller executes; same for platform scope)
+covers B.1.74 / B.1.74a / B.1.75 / B.1.76 together in one
+end-to-end walk after B.1.78 closes.
+
 ## v0.1.124 — M1.5 Track B.1.75 closure — unified MigrationPlan CRD + admission webhook (2026-05-22)
 
 The third AppRafter CRD lands. `MigrationPlan` covers both
