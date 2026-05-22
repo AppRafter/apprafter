@@ -50,10 +50,24 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - id: detect
         run: |
-          dirs=$(find . -maxdepth 4 -name package.json \
+          # Skip Bun workspace children: their parent package.json
+          # already declares them via `workspaces`, and `bun test`
+          # walks the whole tree from the workspace root — running
+          # again per child re-discovers the same suite and re-
+          # installs deps for no gain.
+          dirs=""
+          while IFS= read -r pkg; do
+            d="$(dirname "$pkg")"
+            parent_pkg="$(dirname "$d")/package.json"
+            if [ -f "$parent_pkg" ] && grep -q '"workspaces"' "$parent_pkg"; then
+              continue
+            fi
+            dirs="$dirs $d"
+          done < <(find . -maxdepth 4 -name package.json \
               -not -path '*/node_modules/*' \
               -not -path '*/skeleton/*' \
-              | xargs -r -n1 dirname | sort -u | tr '\n' ' ')
+              | sort -u)
+          dirs="$(echo "$dirs" | xargs)"
           if [ -n "$dirs" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
