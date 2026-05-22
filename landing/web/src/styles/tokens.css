@@ -1,0 +1,57 @@
+/* SPDX-FileCopyrightText: 2026 AppRafter contributors */
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0          */
+
+/* ============================================================
+   AppRafter landing — design tokens.
+   Source-of-truth: landing/docs/design-source/styles.css :root
+   (Claude Design v2). Tokens map 1:1 with the design's variables.
+   ============================================================ */
+
+:root {
+  /* Colors — dark theme (default per BRIEF §3.6 fallback) */
+  --bg:            #0a0e1a;
+  --surface:       #111827;
+  --surface-2:     #161f30;
+  --fg:            #f1f5f9;
+  --fg-muted:      #94a3b8;
+  --fg-faint:      #64748b;
+  --accent:        #14b8a6;
+  --accent-2:      #0d9488;
+  --accent-fg:     #03110e;
+  --border:        #1e293b;
+  --border-strong: #2a3a55;
+  --code-bg:       #0c1322;
+  --code-border:   #1e293b;
+
+  /* Typography */
+  --font-sans: 'Roboto', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Roboto Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Density — overridable at runtime in case we ever expose
+     a compact/spacious switch (not in v1; see plan §0.2). */
+  --section-pad-y:   96px;
+  --container-w:     1200px;
+  --container-pad-x: 32px;
+
+  /* Type scale */
+  --t-display: 64px;
+  --t-h2:      40px;
+  --t-h3:      22px;
+  --t-body:    17px;
+  --t-small:   14px;
+  --t-mono:    14px;
+}
+
+[data-theme='light'] {
+  --bg:            #fafafa;
+  --surface:       #ffffff;
+  --surface-2:     #f1f5f9;
+  --fg:            #0f172a;
+  --fg-muted:      #475569;
+  --fg-faint:      #64748b;
+  --border:        #e2e8f0;
+  --border-strong: #cbd5e1;
+  --code-bg:       #0f172a;
+  --code-border:   #1e293b;
+  /* accent and code stay constant across themes — see BRIEF §3.3 */
+}

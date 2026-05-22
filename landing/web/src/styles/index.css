@@ -1,0 +1,10 @@
+/* SPDX-FileCopyrightText: 2026 AppRafter contributors */
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0          */
+
+/* Entry point — order matters:
+   fonts.css → tokens.css → reset.css → global.css */
+
+@import url('./fonts.css');
+@import url('./tokens.css');
+@import url('./reset.css');
+@import url('./global.css');

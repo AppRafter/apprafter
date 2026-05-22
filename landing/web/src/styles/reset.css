@@ -1,0 +1,59 @@
+/* SPDX-FileCopyrightText: 2026 AppRafter contributors */
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0          */
+
+/* Modern CSS reset — minimal, opinionated to taste.
+   Derived from Josh Comeau's reset (https://www.joshwcomeau.com/css/custom-css-reset/)
+   with project-specific trims. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+img,
+picture,
+video,
+canvas,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+input,
+button,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+p,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  overflow-wrap: break-word;
+}
+
+#root,
+#__next {
+  isolation: isolate;
+}

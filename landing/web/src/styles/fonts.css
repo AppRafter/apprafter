@@ -1,0 +1,49 @@
+/* SPDX-FileCopyrightText: 2026 AppRafter contributors */
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0          */
+
+/* Self-hosted Roboto + Roboto Mono. Latin subsets only (Apache 2.0,
+   attribution in public/fonts/LICENSE-Roboto.txt).
+
+   Weights used:
+     Roboto       — 400 (body), 500 (medium emphasis), 700 (headings)
+     Roboto Mono  — 400 (code), 500 (mono emphasis like nav .soon badge) */
+
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/roboto-400.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/roboto-500.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/roboto-700.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Roboto Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/roboto-mono-400.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Roboto Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/roboto-mono-500.woff2') format('woff2');
+}

@@ -3,6 +3,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //
 // Bootstrap stub — replaced by the real composition in Phase G.
+// For Phase B we wire the style foundation + no-FOUC theme init
+// to verify everything parses and theme switching round-trips.
+
+import { THEME_INIT_SCRIPT } from '../lib/theme-init';
+import '../styles/index.css';
 ---
 
 <!doctype html>
@@ -11,13 +16,32 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AppRafter — bootstrapping</title>
+    <link
+      rel="preload"
+      href="/fonts/roboto-400.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <script is:inline set:html={THEME_INIT_SCRIPT} />
   </head>
   <body>
-    <main style="font-family: system-ui, sans-serif; padding: 2rem;">
-      <h1>AppRafter landing — bootstrapping…</h1>
-      <p>
-        See <code>landing/docs/2026-05-22-landing-implementation-plan.md</code>
-        for progress.
+    <a href="#main" class="skip-to-content">Skip to content</a>
+    <main id="main" class="container" style="padding-top: var(--section-pad-y);">
+      <p class="eyebrow">/ Bootstrapping</p>
+      <h1>App<span style="color: var(--accent);">Rafter</span> landing</h1>
+      <p class="muted" style="margin-top: 1.5rem; font-size: 19px; max-width: 36rem;">
+        Style foundation wired. Tokens, Roboto self-hosted, dark/light theme
+        switching via <code class="mono">data-theme</code> on <code class="mono"
+          >&lt;html&gt;</code
+        >.
+      </p>
+      <p class="faint" style="margin-top: 1rem; font-size: 14px;">
+        Toggle the attribute in DevTools to verify both themes render before
+        the real components arrive in Phase C–G.
+      </p>
+      <p class="mono" style="margin-top: 2rem; font-size: 14px; color: var(--accent);">
+        See landing/docs/2026-05-22-landing-implementation-plan.md
       </p>
     </main>
   </body>

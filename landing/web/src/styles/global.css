@@ -1,0 +1,119 @@
+/* SPDX-FileCopyrightText: 2026 AppRafter contributors */
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0          */
+
+/* Base typography + layout primitives. Ported 1:1 from
+   landing/docs/design-source/styles.css (top section before
+   .site-header). Section-scoped styles live with their
+   components. */
+
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--t-body);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Visible focus for keyboard users. axe-core / Lighthouse a11y. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.container {
+  max-width: var(--container-w);
+  margin: 0 auto;
+  padding-left: var(--container-pad-x);
+  padding-right: var(--container-pad-x);
+}
+
+section {
+  padding: var(--section-pad-y) 0;
+}
+
+section + section {
+  border-top: 1px solid var(--border);
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+h1 {
+  font-size: var(--t-display);
+  line-height: 1.05;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+
+h2 {
+  font-size: var(--t-h2);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+
+h3 {
+  font-size: var(--t-h3);
+  line-height: 1.25;
+}
+
+p {
+  margin: 0;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  font-weight: 500;
+}
+
+.muted {
+  color: var(--fg-muted);
+}
+
+.faint {
+  color: var(--fg-faint);
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* Skip-to-content link — visible only on focus, helps keyboard users
+   bypass the sticky header. */
+.skip-to-content {
+  position: absolute;
+  left: 0;
+  top: 0;
+  background: var(--accent);
+  color: var(--accent-fg);
+  padding: 8px 14px;
+  z-index: 100;
+  transform: translateY(-100%);
+  transition: transform 150ms ease;
+}
+
+.skip-to-content:focus {
+  transform: translateY(0);
+}
