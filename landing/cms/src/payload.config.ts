@@ -11,10 +11,29 @@ import { Users } from './collections/Users';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const serverURL = process.env.PAYLOAD_PUBLIC_SERVER_URL;
+// Port + URL derivation. PAYLOAD_PUBLIC_SERVER_URL wins if set
+// (e.g. production https://cms.apprafter.dev); otherwise build the
+// dev URL from LANDING_CMS_PORT so changing the port in package.json
+// scripts flows here automatically.
+const cmsPort = process.env.LANDING_CMS_PORT ?? '3000';
+const serverURL = process.env.PAYLOAD_PUBLIC_SERVER_URL ?? `http://localhost:${cmsPort}`;
+
+// CORS allowlist. LANDING_CMS_CORS_ORIGINS is a comma-separated
+// override; the default tracks LANDING_WEB_PORT and
+// LANDING_WEB_PREVIEW_PORT so the dev pair stays consistent without
+// hand-editing the array.
+const webPort = process.env.LANDING_WEB_PORT ?? '4321';
+const webPreviewPort = process.env.LANDING_WEB_PREVIEW_PORT ?? '4322';
+const corsOrigins = (
+  process.env.LANDING_CMS_CORS_ORIGINS ??
+  `http://localhost:${webPort},http://localhost:${webPreviewPort},https://apprafter.dev`
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 export default buildConfig({
-  ...(serverURL ? { serverURL } : {}),
+  serverURL,
   secret: process.env.PAYLOAD_SECRET ?? '',
   db: postgresAdapter({
     pool: { connectionString: process.env.DATABASE_URI ?? '' },
@@ -30,7 +49,7 @@ export default buildConfig({
     defaultLocale: 'en',
     fallback: true,
   },
-  cors: ['http://localhost:4321', 'http://localhost:4322', 'https://apprafter.dev'],
+  cors: corsOrigins,
   admin: {
     user: Users.slug,
     meta: {

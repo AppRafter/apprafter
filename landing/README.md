@@ -45,6 +45,20 @@ bun run dev:web        # http://localhost:4321
 Astro proxies `/api/*` to the CMS in dev (`astro.config.ts`), so the waitlist
 form works against `localhost:3000` without CORS noise.
 
+### Ports — env-driven, defaults match the quickstart above
+
+| Var | Default | Used by |
+|---|---|---|
+| `LANDING_WEB_PORT` | `4321` | `bun run dev:web` |
+| `LANDING_WEB_PREVIEW_PORT` | `4322` | `bun run preview:web` |
+| `LANDING_CMS_PORT` | `3000` | `bun run dev:cms` / `bun start:cms` |
+| `LANDING_CMS_URL` | `http://localhost:${LANDING_CMS_PORT}` | Astro dev `/api` proxy upstream |
+| `LANDING_CMS_CORS_ORIGINS` | derived from web ports + `apprafter.dev` | Payload CORS allowlist |
+
+Change `LANDING_CMS_PORT` in one place (e.g. `LANDING_CMS_PORT=4000 bun run dev:cms`)
+and the Astro proxy + Payload CORS + Payload `serverURL` follow automatically.
+See `web/.env.example` and `cms/.env.example` for the full surface.
+
 ## Editing content
 
 Almost every string on the site is a Payload **Global**. Open

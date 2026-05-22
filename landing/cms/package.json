@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "next dev --port 3000",
+    "dev": "next dev --port ${LANDING_CMS_PORT:-3000}",
     "build": "next build",
-    "start": "next start --port 3000",
+    "start": "next start --port ${LANDING_CMS_PORT:-3000}",
     "lint": "biome check .",
     "typecheck": "tsc --noEmit",
     "payload": "payload",
