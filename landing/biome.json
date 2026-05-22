@@ -20,7 +20,8 @@
       "docs/archive",
       "**/*.lock",
       "**/bun.lockb",
-      "cms/payload-types.ts"
+      "cms/payload-types.ts",
+      "cms/src/app/(payload)/admin/importMap.js"
     ]
   },
   "linter": {

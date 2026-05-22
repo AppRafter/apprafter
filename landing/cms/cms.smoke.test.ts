@@ -45,6 +45,40 @@ describe('landing/cms scaffold', () => {
     expect(users).toContain('auth: true');
   });
 
+  test('WaitlistSignups collection — unique email + public create + admin-only read', () => {
+    const wl = readFileSync(join(ROOT, 'src/collections/WaitlistSignups.ts'), 'utf8');
+    expect(wl).toContain("slug: 'waitlist-signups'");
+    expect(wl).toContain('unique: true');
+    expect(wl).toContain('afterChange');
+    // public create — anyone may submit; read locked to authed users.
+    expect(wl).toMatch(/create:\s*\(\)\s*=>\s*true/);
+    expect(wl).toMatch(/read:.*Boolean\(req\.user\)/);
+  });
+
+  test('Booking global has Calendly default + {{url}} template placeholder', () => {
+    const b = readFileSync(join(ROOT, 'src/globals/Booking.ts'), 'utf8');
+    expect(b).toContain("slug: 'booking'");
+    expect(b).toContain('calendly.com');
+    expect(b).toContain('{{url}}');
+  });
+
+  test('sendDiscoveryEmail hook is idempotent + degrades without SMTP', () => {
+    const hook = readFileSync(join(ROOT, 'src/hooks/sendDiscoveryEmail.ts'), 'utf8');
+    // Idempotency: skip when callEmailSentAt already set.
+    expect(hook).toContain('callEmailSentAt');
+    // Degradation: warn + return when mailer is null.
+    expect(hook).toContain('SMTP not configured');
+    // Recursion guard for the .update() inside the hook.
+    expect(hook).toMatch(/depth:\s*0/);
+  });
+
+  test('mailer returns null when SMTP_HOST is empty (dev default)', () => {
+    const m = readFileSync(join(ROOT, 'src/lib/mailer.ts'), 'utf8');
+    expect(m).toContain('SMTP_HOST');
+    expect(m).toContain('return null');
+    expect(m).toContain('MAIL_FROM');
+  });
+
   test('Next root / redirects to /admin (no public frontend on the cms host)', () => {
     const nextCfg = readFileSync(join(ROOT, 'next.config.mjs'), 'utf8');
     expect(nextCfg).toContain('/admin');

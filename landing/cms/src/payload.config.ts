@@ -8,6 +8,8 @@ import { lexicalEditor } from '@payloadcms/richtext-lexical';
 import { buildConfig } from 'payload';
 
 import { Users } from './collections/Users';
+import { WaitlistSignups } from './collections/WaitlistSignups';
+import { Booking } from './globals/Booking';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -39,8 +41,8 @@ export default buildConfig({
     pool: { connectionString: process.env.DATABASE_URI ?? '' },
   }),
   editor: lexicalEditor(),
-  collections: [Users],
-  globals: [],
+  collections: [Users, WaitlistSignups],
+  globals: [Booking],
   typescript: {
     outputFile: path.resolve(dirname, '../payload-types.ts'),
   },

@@ -1,8 +1,6 @@
-// SPDX-FileCopyrightText: 2026 AppRafter contributors
-// SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// Generated/maintained by `payload generate:importmap`. Empty while
-// we have zero custom admin components; gets populated when any
-// collection or global references a custom UI component.
+import { CollectionCards as CollectionCards_f9c02e79a4aed9a3924487c0cd4cafb1 } from '@payloadcms/next/rsc'
 
-export const importMap = {};
+/** @type import('payload').ImportMap */
+export const importMap = {
+  "@payloadcms/next/rsc#CollectionCards": CollectionCards_f9c02e79a4aed9a3924487c0cd4cafb1
+}
