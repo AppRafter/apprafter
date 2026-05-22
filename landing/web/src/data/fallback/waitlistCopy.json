@@ -1,0 +1,10 @@
+{
+  "formIntro": "The managed version of AppRafter is in development. Drop your email — we'll let you know when it's ready. One email, no newsletter, no marketing drip.",
+  "emailLabel": "Email",
+  "useCaseLabel": "What's your use case? (optional)",
+  "callLabel": "I'd like a short call to discuss my use case.",
+  "submitLabel": "Notify me",
+  "successMessage": "→ We'll be in touch.",
+  "successWithCall": "→ We'll be in touch. You'll get a separate email with a calendar link.",
+  "storageNote": "Stored only for launch announcement."
+}

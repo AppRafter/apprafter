@@ -1,0 +1,39 @@
+{
+  "eyebrow": "Tier ladder",
+  "title": "One Application manifest. The backing changes — not your app.",
+  "cards": [
+    {
+      "num": "Tier 1",
+      "title": "Single VDS",
+      "price": "From €5/mo",
+      "desc": "A single VDS with sane simplifications (no HA quorum, single-node database, no multi-tenancy). For side-projects and solo founders. Hetzner Cloud at launch.",
+      "status": "live",
+      "statusText": "Available now"
+    },
+    {
+      "num": "Tier 2",
+      "title": "Production cluster",
+      "price": "3+ nodes",
+      "desc": "Production. 3 or more nodes of any size and any count — grows with your project. Hetzner Cloud at launch.",
+      "status": "live",
+      "statusText": "Available now"
+    },
+    {
+      "num": "Tier 3",
+      "title": "Bare metal",
+      "price": "Dedicated EPYC",
+      "desc": "Bare metal. Dedicated EPYC servers. For when you need a performance ceiling above VPS.",
+      "status": "roadmap",
+      "statusText": "Roadmap · Phase 5+"
+    },
+    {
+      "num": "Tier 4",
+      "title": "Hyperscalers",
+      "price": "AWS · GCP · Azure",
+      "desc": "Hyperscalers. Primarily for cases where regulation requires these specific providers.",
+      "status": "roadmap",
+      "statusText": "Roadmap · Phase 6+"
+    }
+  ],
+  "orthogonalNoteHtml": "<strong>Confidential containers</strong> — orthogonal capability, not a tier. Available on any hardware that supports TDX or SEV-SNP. Shipping Phase 6+."
+}

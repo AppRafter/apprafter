@@ -12,7 +12,7 @@
     "payload": "payload",
     "generate:types": "payload generate:types",
     "generate:importmap": "payload generate:importmap",
-    "seed": "bun run src/seed/seed.ts"
+    "seed": "bun --env-file=.env run src/seed/seed.ts"
   },
   "dependencies": {
     "payload": "^3.0.0",

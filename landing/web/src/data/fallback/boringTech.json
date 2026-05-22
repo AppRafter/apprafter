@@ -1,0 +1,60 @@
+{
+  "eyebrow": "The stack",
+  "title": "Boring tech, opinionated glue.",
+  "lede": "We don't reinvent the Kubernetes control plane. Under the hood — well-known, proven components. The real work is opinionated composition and a thin layer of code where no ready solution exists.",
+  "underHood": [
+    {
+      "name": "Talos Linux",
+      "desc": "Immutable OS, API-driven. Fewer snowflakes than a regular Linux node."
+    },
+    {
+      "name": "k3s / Cilium",
+      "desc": "k8s core + eBPF networking. Network policies, observability via Hubble, egress gateway."
+    },
+    {
+      "name": "NATS JetStream",
+      "desc": "Event/messaging backbone and control plane storage (via the community kine-nats adapter)."
+    },
+    {
+      "name": "CloudNativePG",
+      "desc": "Postgres operator with replication, backups, point-in-time recovery."
+    },
+    { "name": "Dragonfly", "desc": "Redis-compatible, scales better on a single node." },
+    { "name": "ClickHouse", "desc": "Logs, traces, application analytics." },
+    { "name": "OpenBao", "desc": "Secrets management (HashiCorp Vault fork, BSL-free)." },
+    { "name": "Backstage", "desc": "Developer portal with TypeScript plugins." },
+    { "name": "Kamaji + Capsule", "desc": "Hard multi-tenancy (Phase 5+)." },
+    { "name": "cert-manager · external-dns · KEDA", "desc": "Standard k8s add-ons." }
+  ],
+  "ourCode": [
+    {
+      "name": "Rust operator on kube-rs",
+      "desc": "Reconciles Application, ResourceClaim, ServiceProvider, MigrationPlan, Tenant, AccessGrant."
+    },
+    {
+      "name": "CUE-based admission webhook",
+      "desc": "Type-safe validation with line-level errors before apply."
+    },
+    {
+      "name": "apprafter CLI",
+      "desc": "Bootstrap, manifest workflow, dev mode, migration tooling."
+    },
+    {
+      "name": "MCP server with agentic safety gate",
+      "desc": "Hosted MCP endpoint proxying through customer agent. Operations classified by risk taxonomy — safe / reversible / bounded write / destructive — with automatic MigrationPlan creation for destructive operations."
+    },
+    {
+      "name": "NATS-based audit log layer on top of kine",
+      "desc": "Turning the control plane's NATS backing store into a replayable platform event log (Tier 2+; opt-in upgrade on Tier 1)."
+    },
+    {
+      "name": "MigrationPlan reconciler",
+      "desc": "Destructive-change gating with explicit approval."
+    },
+    {
+      "name": "ResourceClaim / ServiceProvider primitives",
+      "desc": "Typed contract for platform services."
+    }
+  ],
+  "closingHtml": "This is a thin layer <strong>on top of</strong> proven components — only where no ready solution exists. Boring, and that's intentional. <strong>Boring tech</strong> is easier to debug, easier to hire for, easier to keep running."
+}

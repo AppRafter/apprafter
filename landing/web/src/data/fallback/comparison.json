@@ -1,0 +1,62 @@
+{
+  "eyebrow": "How to run AppRafter",
+  "title": "Three ways to run AppRafter.",
+  "columns": {
+    "self": {
+      "label": "Self-host",
+      "statusKind": "live",
+      "statusLabel": "Available now"
+    },
+    "managed": {
+      "label": "Managed",
+      "badgeSuffix": "(waitlist)",
+      "statusKind": "waitlist",
+      "statusLabel": "Waitlist"
+    },
+    "turnkey": {
+      "label": "Turnkey",
+      "badgeSuffix": "(roadmap)",
+      "statusKind": "roadmap",
+      "statusLabel": "Roadmap"
+    }
+  },
+  "rows": [
+    {
+      "label": "Price",
+      "selfHtml": "<span class=\"price-cell\">Free<sup>†</sup><span class=\"price-sub\">FSL-1.1-Apache-2.0</span></span>",
+      "managedHtml": "<span class=\"price-cell\">€10/mo per cluster<span class=\"price-sub\">Hosted Services (launch)<br />+ €10/mo Operations add-on (Phase 4.5+)</span></span>",
+      "turnkeyHtml": "<span class=\"price-cell\">From €30/mo (Tier 1)<span class=\"price-sub\">Server cost + reseller markup<br />+ €20/mo per cluster</span></span>"
+    },
+    {
+      "label": "Who runs the infra",
+      "selfHtml": "You",
+      "managedHtml": "You (your Hetzner account)",
+      "turnkeyHtml": "We do"
+    },
+    {
+      "label": "Who runs the UI",
+      "selfHtml": "You (optional)",
+      "managedHtml": "We do",
+      "turnkeyHtml": "We do"
+    },
+    {
+      "label": "Where your data lives",
+      "selfHtml": "With you",
+      "managedHtml": "With you — your cluster, your control plane, your databases",
+      "turnkeyHtml": "With us, in our Hetzner account"
+    },
+    {
+      "label": "What we have visibility into",
+      "selfHtml": "Nothing",
+      "managedHtml": "Only metadata — architectural guarantee from cluster ownership",
+      "turnkeyHtml": "Metadata by design (Minimal Data Exposure architecture), but the account is ours — so the guarantee is policy-level rather than structural"
+    },
+    {
+      "label": "Exit when you stop paying",
+      "selfHtml": "<span class=\"faint\">n/a</span>",
+      "managedHtml": "Your cluster keeps running. OSS takes over management. UI/Backstage you can self-host (we ship the tooling). You only lose the thin cloud-native premium layer — AI insights, cross-cluster aggregator, smart bill analysis.",
+      "turnkeyHtml": "Cross-cluster MigrationPlan tooling (<a href=\"#roadmap-phase-phase-8\">Phase 8+</a>) for orchestrated migration."
+    }
+  ],
+  "footnoteHtml": "<sup>†</sup> FSL-1.1-Apache-2.0 allows any use — personal, internal business, commercial workloads — except offering AppRafter itself as a managed service to third parties. After two years, the license auto-converts to plain Apache 2.0 and that restriction lifts."
+}

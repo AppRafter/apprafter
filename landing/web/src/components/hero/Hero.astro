@@ -1,104 +1,30 @@
 ---
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// Hero section. Left column: headline + subhead + three CTAs +
-// status badge + (lazily expanded) WaitlistForm. Right column:
-// HeroCodeBlock with the canonical Application.cue. Phase H wires
-// the copy + CTAs to Payload's LandingHero global; for now copy
-// is hardcoded from sections.jsx (the design source-of-truth).
 
+import { getLandingHero, getWaitlistCopy } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
 import HeroCodeBlock from './HeroCodeBlock.astro';
 import WaitlistForm from './WaitlistForm.svelte';
 
-// Per Q7 (2026-05-22): badge starts at "v0.3 · Phase 3 · ...",
-// rest matches the design copy.
-const statusBadge = 'v0.3 · Phase 3 · MVP shipped on Tier 1 and Tier 2 · managed in development';
-
-const primary = {
-  label: 'Try self-host',
-  href: 'https://github.com/AppRafter/apprafter#quickstart',
-};
-const tertiary = {
-  label: 'View on GitHub',
-  href: 'https://github.com/AppRafter/apprafter',
-};
-
-const cueFilename = 'billing-api.cue';
-const cueSnippet = `apiVersion: apprafter.io/v1alpha1
-kind: Application
-metadata: {
-    name:      "billing-api"
-    namespace: "prod"
-}
-
-spec: {
-    base: {
-        image:    "ghcr.io/me/billing:v1.4.2"
-        replicas: 3
-
-        expose: {
-            port:    8080
-            public:  true
-            network: "public"
-        }
-
-        needs: {
-            pg: {size: "small"}
-        }
-
-        env: {
-            DATABASE_URL: from: claim.pg.uri
-            LOG_LEVEL:    "info"
-        }
-    }
-
-    environments: {
-        dev:  base & {replicas: 1, expose: network: "vpn"}
-        prod: base & {replicas: 3}
-    }
-}`;
-
-// Waitlist copy — hardcoded for Phase E; moves to Payload
-// WaitlistFormCopy global in Phase H.
-const waitlistCopy = {
-  formIntro:
-    "The managed version of AppRafter is in development. Drop your email — we'll let you know when it's ready. One email, no newsletter, no marketing drip.",
-  emailLabel: 'Email',
-  useCaseLabel: "What's your use case? (optional)",
-  callLabel: "I'd like a short call to discuss my use case.",
-  submitLabel: 'Notify me',
-  successMessage: "→ We'll be in touch.",
-  successWithCall:
-    "→ We'll be in touch. You'll get a separate email with a calendar link.",
-  storageNote: 'Stored only for launch announcement.',
-};
+const hero = await getLandingHero();
+const waitlistCopy = await getWaitlistCopy();
 ---
 
 <section class="hero" aria-label="Hero">
   <Container class="hero-grid">
     <div>
-      <h1>
-        One manifest. From a <span class="accented">€5 VPS</span> to production.
-        Open source.
-      </h1>
-      <p class="subhead">
-        AppRafter is an opinionated PaaS on Kubernetes. Describe your
-        applications in a single CUE manifest — the same one runs from a
-        single VDS to a multi-node production cluster. Open source
-        (FSL-1.1-Apache-2.0). A managed version is coming for those who'd
-        rather not run ops themselves.
-      </p>
+      <h1 set:html={hero.headlineHtml} />
+      <p class="subhead">{hero.subhead}</p>
 
       <div class="ctas">
         <a
           class="btn btn-primary"
-          href={primary.href}
+          href={hero.primaryCTA?.href}
           target="_blank"
           rel="noreferrer"
         >
-          {primary.label}
+          {hero.primaryCTA?.label}
           <svg
             width="14"
             height="14"
@@ -122,28 +48,43 @@ const waitlistCopy = {
           aria-controls="waitlist-form"
           aria-expanded="false"
         >
-          Notify me on managed launch
+          {hero.secondaryCTA?.label}
         </button>
 
-        <a class="btn btn-text" href={tertiary.href} target="_blank" rel="noreferrer">
+        <a
+          class="btn btn-text"
+          href={hero.tertiaryCTA?.href}
+          target="_blank"
+          rel="noreferrer"
+        >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path
               d="M12 .5A12 12 0 0 0 0 12.5a12 12 0 0 0 8.2 11.4c.6.1.8-.3.8-.6v-2.1c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.9 1.3 1.9 1.3 1.1 1.9 2.9 1.4 3.7 1 .1-.8.4-1.4.8-1.7-2.6-.3-5.4-1.3-5.4-6 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.6.1-3.3 0 0 1-.3 3.3 1.2a11.4 11.4 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.6 1.7.2 3 .1 3.3.8.8 1.2 1.9 1.2 3.2 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.3v3.3c0 .3.2.7.8.6A12 12 0 0 0 24 12.5 12 12 0 0 0 12 .5z"
             ></path>
           </svg>
-          {tertiary.label}
+          {hero.tertiaryCTA?.label}
         </a>
       </div>
 
       <div class="status-badge">
         <span class="dot"></span>
-        <span>{statusBadge}</span>
+        <span>{hero.statusBadge}</span>
       </div>
 
-      <WaitlistForm client:load {...waitlistCopy} />
+      <WaitlistForm
+        client:load
+        formIntro={waitlistCopy.formIntro}
+        emailLabel={waitlistCopy.emailLabel}
+        useCaseLabel={waitlistCopy.useCaseLabel}
+        callLabel={waitlistCopy.callLabel}
+        submitLabel={waitlistCopy.submitLabel}
+        successMessage={waitlistCopy.successMessage}
+        successWithCall={waitlistCopy.successWithCall}
+        storageNote={waitlistCopy.storageNote}
+      />
     </div>
 
-    <HeroCodeBlock filename={cueFilename} snippet={cueSnippet} />
+    <HeroCodeBlock filename={hero.cueFilename} snippet={hero.cueSnippet} />
   </Container>
 </section>
 
@@ -187,7 +128,6 @@ const waitlistCopy = {
     margin-top: 36px;
   }
 
-  /* Buttons — design-source/styles.css :182-217. */
   .btn {
     display: inline-flex;
     align-items: center;

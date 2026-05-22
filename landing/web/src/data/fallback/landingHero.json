@@ -1,0 +1,18 @@
+{
+  "headlineHtml": "One manifest. From a <span class=\"accented\">€5 VPS</span> to production. Open source.",
+  "subhead": "AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — the same one runs from a single VDS to a multi-node production cluster. Open source (FSL-1.1-Apache-2.0). A managed version is coming for those who'd rather not run ops themselves.",
+  "statusBadge": "v0.3 · Phase 3 · MVP shipped on Tier 1 and Tier 2 · managed in development",
+  "cueFilename": "billing-api.cue",
+  "cueSnippet": "apiVersion: apprafter.io/v1alpha1\nkind: Application\nmetadata: {\n    name:      \"billing-api\"\n    namespace: \"prod\"\n}\n\nspec: {\n    base: {\n        image:    \"ghcr.io/me/billing:v1.4.2\"\n        replicas: 3\n\n        expose: {\n            port:    8080\n            public:  true\n            network: \"public\"\n        }\n\n        needs: {\n            pg: {size: \"small\"}\n        }\n\n        env: {\n            DATABASE_URL: from: claim.pg.uri\n            LOG_LEVEL:    \"info\"\n        }\n    }\n\n    environments: {\n        dev:  base & {replicas: 1, expose: network: \"vpn\"}\n        prod: base & {replicas: 3}\n    }\n}",
+  "primaryCTA": {
+    "label": "Try self-host",
+    "href": "https://github.com/AppRafter/apprafter#quickstart"
+  },
+  "secondaryCTA": {
+    "label": "Notify me on managed launch"
+  },
+  "tertiaryCTA": {
+    "label": "View on GitHub",
+    "href": "https://github.com/AppRafter/apprafter"
+  }
+}

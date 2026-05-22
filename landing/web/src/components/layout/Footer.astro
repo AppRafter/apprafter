@@ -1,56 +1,14 @@
 ---
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// Site footer. Brand-with-blurb column + three link columns
-// (Project / Legal / Author) + bottom row with copyright, license
-// note, founder line. Copy hardcoded here for Phase D, wired to
-// Payload FooterContent global in Phase H.
 
 import Brand from '../brand/Brand.astro';
+import { getFooterContent, renderCopyright } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
 
-const year = new Date().getFullYear();
-
-const columns = [
-  {
-    heading: 'Project',
-    links: [
-      {
-        label: 'Spec',
-        href: 'https://github.com/AppRafter/apprafter/blob/main/spec.md',
-        external: true,
-      },
-      { label: 'GitHub', href: 'https://github.com/AppRafter/apprafter', external: true },
-      { label: 'Roadmap', href: '#roadmap', external: false },
-      {
-        label: 'Docs',
-        href: 'https://github.com/AppRafter/apprafter#readme',
-        external: true,
-        soon: true,
-      },
-    ],
-  },
-  {
-    heading: 'Legal',
-    links: [
-      {
-        label: 'License — FSL-1.1-Apache-2.0',
-        href: 'https://github.com/AppRafter/apprafter/blob/main/LICENSE',
-        external: true,
-      },
-      { label: 'Privacy', href: '/privacy', external: false },
-      { label: 'Terms', href: '/terms', external: false },
-    ],
-  },
-  {
-    heading: 'Author',
-    links: [
-      { label: 'Founder’s site', href: '#author', external: false },
-      { label: 'GitHub org', href: 'https://github.com/AppRafter', external: true },
-    ],
-  },
-];
+const footer = await getFooterContent();
+const copyright = renderCopyright(footer.copyright);
+const columns = footer.columns ?? [];
 ---
 
 <footer class="site-footer">
@@ -58,23 +16,18 @@ const columns = [
     <div class="footer-grid">
       <div class="footer-brand">
         <Brand variant="twoTone" size={22} />
-        <p class="desc">
-          An opinionated PaaS on Kubernetes. Open source, bootstrap-funded,
-          scaling with you instead of around you.
-        </p>
+        <p class="desc">{footer.brandDesc}</p>
       </div>
       {
         columns.map((col) => (
           <div>
             <h4>{col.heading}</h4>
             <ul>
-              {col.links.map((link) => (
+              {(col.links ?? []).map((link) => (
                 <li>
                   <a
                     href={link.href}
-                    {...(link.external
-                      ? { target: '_blank', rel: 'noreferrer' }
-                      : {})}
+                    {...(link.external ? { target: '_blank', rel: 'noreferrer' } : {})}
                   >
                     {link.label}
                     {link.soon && (
@@ -91,11 +44,9 @@ const columns = [
       }
     </div>
     <div class="footer-bottom">
-      <span>© {year} AppRafter · <a href="https://apprafter.dev" class="muted">apprafter.dev</a></span>
-      <span class="mono" style="font-size: 12px;">
-        FSL-1.1-Apache-2.0 · auto-converts to Apache 2.0 after 2 years
-      </span>
-      <span>Bootstrap-funded. Built solo.</span>
+      <span>{copyright}</span>
+      <span class="mono" style="font-size: 12px;">{footer.licenseNote}</span>
+      <span>{footer.founderNote}</span>
     </div>
   </Container>
 </footer>

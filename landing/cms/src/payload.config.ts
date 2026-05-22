@@ -9,7 +9,20 @@ import { buildConfig } from 'payload';
 
 import { Users } from './collections/Users';
 import { WaitlistSignups } from './collections/WaitlistSignups';
+import { Advantages } from './globals/Advantages';
 import { Booking } from './globals/Booking';
+import { BootstrapStrip } from './globals/BootstrapStrip';
+import { BoringTech } from './globals/BoringTech';
+import { Comparison } from './globals/Comparison';
+import { FooterContent } from './globals/FooterContent';
+import { LandingHero } from './globals/LandingHero';
+import { LandingTransparency } from './globals/LandingTransparency';
+import { Roadmap } from './globals/Roadmap';
+import { ScalingJourney } from './globals/ScalingJourney';
+import { SiteSettings } from './globals/SiteSettings';
+import { TierLadder } from './globals/TierLadder';
+import { ValueProps } from './globals/ValueProps';
+import { WaitlistFormCopy } from './globals/WaitlistFormCopy';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,7 +55,22 @@ export default buildConfig({
   }),
   editor: lexicalEditor(),
   collections: [Users, WaitlistSignups],
-  globals: [Booking],
+  globals: [
+    SiteSettings,
+    LandingHero,
+    ValueProps,
+    ScalingJourney,
+    TierLadder,
+    Comparison,
+    LandingTransparency,
+    BoringTech,
+    Advantages,
+    Roadmap,
+    BootstrapStrip,
+    FooterContent,
+    WaitlistFormCopy,
+    Booking,
+  ],
   typescript: {
     outputFile: path.resolve(dirname, '../payload-types.ts'),
   },

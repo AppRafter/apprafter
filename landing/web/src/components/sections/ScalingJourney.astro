@@ -1,13 +1,15 @@
 ---
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// Central thesis visual — Tier 1 single VPS → arrow → Tier 2 HA
-// cluster — both built from the same Application.cue. Ported from
-// sections.jsx :597-666 (BRIEF v2.2 §4 introduction).
 
+import { getScalingJourney } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
 import SectionHead from '../primitives/SectionHead.astro';
+
+const data = await getScalingJourney();
+const left = data.leftStage;
+const right = data.rightStage;
+const kickers = data.footerKickers ?? [];
 ---
 
 <section
@@ -16,34 +18,28 @@ import SectionHead from '../primitives/SectionHead.astro';
   data-screen-label="scaling-journey"
 >
   <Container>
-    <SectionHead
-      eyebrow="How scaling works"
-      title="One file. From single node to HA cluster."
-      lede={'Most PaaS platforms cap at vertical scaling — when you grow, you migrate. Most Kubernetes distros assume you’re starting big. AppRafter is the same platform from a €5 VPS to a multi-node HA cluster, and the same <code class="mono">Application.cue</code> deploys to both.'}
-    />
+    <SectionHead eyebrow={data.eyebrow} title={data.title} lede={data.ledeHtml} />
 
     <div class="journey">
       <!-- Left: Tier 1 — single node -->
       <div class="journey-side">
-        <div class="journey-eyebrow">Tier 1 · €5 VPS</div>
+        <div class="journey-eyebrow">{left?.eyebrow}</div>
         <div class="journey-stage">
           <div class="journey-node solo">
             <span class="node-label">node-1</span>
           </div>
           <div class="journey-file">
-            <span class="file-name">Application.cue</span>
-            <span class="file-meta">23 LOC</span>
+            <span class="file-name">{left?.fileName}</span>
+            <span class="file-meta">{left?.fileMeta}</span>
           </div>
         </div>
-        <div class="journey-caption">
-          A single VDS. Single-node Postgres. SealedSecrets. Sane defaults.
-        </div>
+        <div class="journey-caption">{left?.caption}</div>
       </div>
 
       <!-- Middle: arrow -->
       <div class="journey-arrow">
         <div class="arrow-bar">
-          <span class="arrow-label">Tier upgrade</span>
+          <span class="arrow-label">{data.arrowLabel}</span>
         </div>
         <svg viewBox="0 0 80 28" aria-hidden="true" class="arrow-head">
           <path
@@ -57,7 +53,7 @@ import SectionHead from '../primitives/SectionHead.astro';
 
       <!-- Right: Tier 2 — HA cluster -->
       <div class="journey-side">
-        <div class="journey-eyebrow">Tier 2 · HA cluster</div>
+        <div class="journey-eyebrow">{right?.eyebrow}</div>
         <div class="journey-stage">
           <div class="journey-cluster">
             <div class="journey-node"><span class="node-label">cp-1</span></div>
@@ -68,26 +64,19 @@ import SectionHead from '../primitives/SectionHead.astro';
             <div class="journey-node small"><span class="node-label">w-N</span></div>
           </div>
           <div class="journey-file">
-            <span class="file-name">Application.cue</span>
-            <span class="file-meta">identical · 23 LOC</span>
+            <span class="file-name">{right?.fileName}</span>
+            <span class="file-meta">{right?.fileMeta}</span>
           </div>
         </div>
-        <div class="journey-caption">
-          3+ nodes. CloudNativePG. Replayable audit log. OpenBao for secrets.
-        </div>
+        <div class="journey-caption">{right?.caption}</div>
       </div>
     </div>
 
     <div class="journey-footer">
-      <span class="footer-kicker">No rewrite.</span>
-      <span class="footer-kicker">No migration tool.</span>
-      <span class="footer-kicker">One CUE manifest.</span>
+      {kickers.map((k) => <span class="footer-kicker">{k.text}</span>)}
     </div>
 
-    <div class="journey-caveat">
-      <strong>Today:</strong> Tier 1 and Tier 2 ready at signup. T1→T2 migration
-      tool ships in the first post-launch bundle (~2–4 weeks after release).
-    </div>
+    <div class="journey-caveat" set:html={data.caveatHtml} />
   </Container>
 </section>
 
@@ -254,7 +243,7 @@ import SectionHead from '../primitives/SectionHead.astro';
     color: var(--fg-muted);
     line-height: 1.55;
   }
-  .journey-caveat strong {
+  .journey-caveat :global(strong) {
     color: var(--fg);
     font-weight: 500;
   }

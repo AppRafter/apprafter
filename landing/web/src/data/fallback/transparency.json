@@ -1,0 +1,19 @@
+{
+  "blocks": [
+    {
+      "kicker": "4.5.1 / Pricing",
+      "title": "Everything you pay for is in this table.",
+      "bodyHtml": "<p>No hidden tiers, no per-seat upsells, no “free tier that ends once you outgrow it”. Prepaid model — what you see is what you pay, no metered surprises. Annual billing optional, with a <strong>save two months</strong> discount.</p><p>14-day trial without a card, once per account.</p>"
+    },
+    {
+      "kicker": "4.5.2 / Anti-lock",
+      "title": "Architectural, not promised.",
+      "bodyHtml": "<p>In <strong>Managed</strong>, your cluster physically lives on your infrastructure. Cancel — the cluster keeps running, you lose the premium layer (which you can mostly self-host; we ship the tooling). An <strong>architectural fact</strong>, not a service-level promise.</p><p>For <strong>Turnkey</strong>, we invest engineering cycles into your <strong>exit path</strong>. Cross-cluster MigrationPlan is <strong>planned as shipped tooling</strong> (Phase 8+) — <code>apprafter migration plan</code> — for moving to self-host or another provider.</p>"
+    },
+    {
+      "kicker": "4.5.3 / Alignment",
+      "title": "Our model grows with you.",
+      "bodyHtml": "<p>Per-cluster billing means our revenue grows when your deployments grow. We don’t make more by locking you in or up-selling seats. We make more when you scale — more clusters, more workloads, more compute.</p><p>When you stay small, we stay small with you. An <strong>incentive structure</strong>, encoded in how we charge.</p>"
+    }
+  ]
+}

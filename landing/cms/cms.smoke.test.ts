@@ -79,6 +79,52 @@ describe('landing/cms scaffold', () => {
     expect(m).toContain('MAIL_FROM');
   });
 
+  test('all 13 content globals + Booking are registered + reachable from disk', () => {
+    const cfg = readFileSync(join(ROOT, 'src/payload.config.ts'), 'utf8');
+    const globals = [
+      'SiteSettings',
+      'LandingHero',
+      'ValueProps',
+      'ScalingJourney',
+      'TierLadder',
+      'Comparison',
+      'LandingTransparency',
+      'BoringTech',
+      'Advantages',
+      'Roadmap',
+      'BootstrapStrip',
+      'FooterContent',
+      'WaitlistFormCopy',
+      'Booking',
+    ];
+    for (const g of globals) {
+      expect(existsSync(join(ROOT, `src/globals/${g}.ts`))).toBe(true);
+      expect(cfg).toContain(`import { ${g} }`);
+    }
+  });
+
+  test('seed script maps every fallback JSON to a global slug', () => {
+    const seed = readFileSync(join(ROOT, 'src/seed/seed.ts'), 'utf8');
+    const mappings: [string, string][] = [
+      ['siteSettings', 'site-settings'],
+      ['landingHero', 'landing-hero'],
+      ['valueProps', 'value-props'],
+      ['scalingJourney', 'scaling-journey'],
+      ['tierLadder', 'tier-ladder'],
+      ['comparison', 'comparison'],
+      ['transparency', 'landing-transparency'],
+      ['boringTech', 'boring-tech'],
+      ['advantages', 'advantages'],
+      ['roadmap', 'roadmap'],
+      ['bootstrapStrip', 'bootstrap-strip'],
+      ['footer', 'footer-content'],
+      ['waitlistCopy', 'waitlist-form-copy'],
+    ];
+    for (const [file, slug] of mappings) {
+      expect(seed).toContain(`${file}: '${slug}'`);
+    }
+  });
+
   test('Next root / redirects to /admin (no public frontend on the cms host)', () => {
     const nextCfg = readFileSync(join(ROOT, 'next.config.mjs'), 'utf8');
     expect(nextCfg).toContain('/admin');

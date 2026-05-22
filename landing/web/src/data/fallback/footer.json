@@ -1,0 +1,57 @@
+{
+  "brandDesc": "An opinionated PaaS on Kubernetes. Open source, bootstrap-funded, scaling with you instead of around you.",
+  "columns": [
+    {
+      "heading": "Project",
+      "links": [
+        {
+          "label": "Spec",
+          "href": "https://github.com/AppRafter/apprafter/blob/main/spec.md",
+          "external": true,
+          "soon": false
+        },
+        {
+          "label": "GitHub",
+          "href": "https://github.com/AppRafter/apprafter",
+          "external": true,
+          "soon": false
+        },
+        { "label": "Roadmap", "href": "#roadmap", "external": false, "soon": false },
+        {
+          "label": "Docs",
+          "href": "https://github.com/AppRafter/apprafter#readme",
+          "external": true,
+          "soon": true
+        }
+      ]
+    },
+    {
+      "heading": "Legal",
+      "links": [
+        {
+          "label": "License — FSL-1.1-Apache-2.0",
+          "href": "https://github.com/AppRafter/apprafter/blob/main/LICENSE",
+          "external": true,
+          "soon": false
+        },
+        { "label": "Privacy", "href": "/privacy", "external": false, "soon": false },
+        { "label": "Terms", "href": "/terms", "external": false, "soon": false }
+      ]
+    },
+    {
+      "heading": "Author",
+      "links": [
+        { "label": "Founder’s site", "href": "#author", "external": false, "soon": false },
+        {
+          "label": "GitHub org",
+          "href": "https://github.com/AppRafter",
+          "external": true,
+          "soon": false
+        }
+      ]
+    }
+  ],
+  "copyright": "© {{year}} AppRafter · apprafter.dev",
+  "licenseNote": "FSL-1.1-Apache-2.0 · auto-converts to Apache 2.0 after 2 years",
+  "founderNote": "Bootstrap-funded. Built solo."
+}

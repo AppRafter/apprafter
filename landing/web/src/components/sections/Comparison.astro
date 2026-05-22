@@ -1,114 +1,48 @@
 ---
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// Self-host vs Managed vs Turnkey comparison table + three
-// transparency cards underneath. Content from sections.jsx
-// :428-525 (BRIEF v2.2 §4.5). Cell values are HTML strings so
-// the price-cell composition and inline strong/code render
-// without an extra renderer layer in Phase F; Phase H replaces
-// them with Lexical richText from Payload.
 
+import { getComparison, getTransparency } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
 import SectionHead from '../primitives/SectionHead.astro';
 import StatusPill from '../primitives/StatusPill.astro';
 
-type Row = {
-  label: string;
-  /** HTML — supports <span class="price-cell">, <strong>, etc. */
-  selfHtml: string;
-  managedHtml: string;
-  turnkeyHtml: string;
-};
+const data = await getComparison();
+const transparency = await getTransparency();
 
-const rows: Row[] = [
-  {
-    label: 'Price',
-    selfHtml:
-      '<span class="price-cell">Free<sup>†</sup><span class="price-sub">FSL-1.1-Apache-2.0</span></span>',
-    managedHtml:
-      '<span class="price-cell">€10/mo per cluster<span class="price-sub">Hosted Services (launch)<br />+ €10/mo Operations add-on (Phase 4.5+)</span></span>',
-    turnkeyHtml:
-      '<span class="price-cell">From €30/mo (Tier 1)<span class="price-sub">Server cost + reseller markup<br />+ €20/mo per cluster</span></span>',
-  },
-  {
-    label: 'Who runs the infra',
-    selfHtml: 'You',
-    managedHtml: 'You (your Hetzner account)',
-    turnkeyHtml: 'We do',
-  },
-  {
-    label: 'Who runs the UI',
-    selfHtml: 'You (optional)',
-    managedHtml: 'We do',
-    turnkeyHtml: 'We do',
-  },
-  {
-    label: 'Where your data lives',
-    selfHtml: 'With you',
-    managedHtml: 'With you — your cluster, your control plane, your databases',
-    turnkeyHtml: 'With us, in our Hetzner account',
-  },
-  {
-    label: 'What we have visibility into',
-    selfHtml: 'Nothing',
-    managedHtml: 'Only metadata — architectural guarantee from cluster ownership',
-    turnkeyHtml:
-      'Metadata by design (Minimal Data Exposure architecture), but the account is ours — so the guarantee is policy-level rather than structural',
-  },
-  {
-    label: 'Exit when you stop paying',
-    selfHtml: '<span class="faint">n/a</span>',
-    managedHtml:
-      'Your cluster keeps running. OSS takes over management. UI/Backstage you can self-host (we ship the tooling). You only lose the thin cloud-native premium layer — AI insights, cross-cluster aggregator, smart bill analysis.',
-    turnkeyHtml:
-      'Cross-cluster MigrationPlan tooling (<a href="#roadmap-phase-phase-8">Phase 8+</a>) for orchestrated migration.',
-  },
-];
+const rows = data.rows ?? [];
+const cols = data.columns;
+const blocks = transparency.blocks ?? [];
 
-type TransparencyBlock = {
-  kicker: string;
-  title: string;
-  /** HTML — supports <strong> and inline <code>. */
-  bodyHtml: string;
-};
-
-const transparency: TransparencyBlock[] = [
-  {
-    kicker: '4.5.1 / Pricing',
-    title: 'Everything you pay for is in this table.',
-    bodyHtml:
-      '<p>No hidden tiers, no per-seat upsells, no “free tier that ends once you outgrow it”. Prepaid model — what you see is what you pay, no metered surprises. Annual billing optional, with a <strong>save two months</strong> discount.</p><p>14-day trial without a card, once per account.</p>',
-  },
-  {
-    kicker: '4.5.2 / Anti-lock',
-    title: 'Architectural, not promised.',
-    bodyHtml:
-      '<p>In <strong>Managed</strong>, your cluster physically lives on your infrastructure. Cancel — the cluster keeps running, you lose the premium layer (which you can mostly self-host; we ship the tooling). An <strong>architectural fact</strong>, not a service-level promise.</p><p>For <strong>Turnkey</strong>, we invest engineering cycles into your <strong>exit path</strong>. Cross-cluster MigrationPlan is <strong>planned as shipped tooling</strong> (Phase 8+) — <code>apprafter migration plan</code> — for moving to self-host or another provider.</p>',
-  },
-  {
-    kicker: '4.5.3 / Alignment',
-    title: 'Our model grows with you.',
-    bodyHtml:
-      '<p>Per-cluster billing means our revenue grows when your deployments grow. We don’t make more by locking you in or up-selling seats. We make more when you scale — more clusters, more workloads, more compute.</p><p>When you stay small, we stay small with you. An <strong>incentive structure</strong>, encoded in how we charge.</p>',
-  },
-];
+type Kind = 'live' | 'waitlist' | 'roadmap';
+const safeKind = (k: string | null | undefined): Kind =>
+  k === 'waitlist' || k === 'roadmap' ? k : 'live';
 ---
 
 <section aria-label="Self-host vs Managed vs Turnkey" id="offerings" data-screen-label="offerings">
   <Container>
-    <SectionHead eyebrow="How to run AppRafter" title="Three ways to run AppRafter." />
+    <SectionHead eyebrow={data.eyebrow} title={data.title} />
 
     <table class="compare-table">
       <thead>
         <tr>
           <th scope="col"></th>
-          <th scope="col">Self-host</th>
+          <th scope="col">{cols?.self?.label}</th>
           <th scope="col" class="featured">
-            Managed <span class="mono faint" style="font-size: 11px; margin-left: 6px;">(waitlist)</span>
+            {cols?.managed?.label}
+            {cols?.managed?.badgeSuffix && (
+              <span class="mono faint" style="font-size: 11px; margin-left: 6px;">
+                {cols.managed.badgeSuffix}
+              </span>
+            )}
           </th>
           <th scope="col">
-            Turnkey <span class="mono faint" style="font-size: 11px; margin-left: 6px;">(roadmap)</span>
+            {cols?.turnkey?.label}
+            {cols?.turnkey?.badgeSuffix && (
+              <span class="mono faint" style="font-size: 11px; margin-left: 6px;">
+                {cols.turnkey.badgeSuffix}
+              </span>
+            )}
           </th>
         </tr>
       </thead>
@@ -125,23 +59,33 @@ const transparency: TransparencyBlock[] = [
         }
         <tr class="status-row">
           <td>Status</td>
-          <td><StatusPill kind="live" label="Available now" /></td>
-          <td><StatusPill kind="waitlist" label="Waitlist" /></td>
-          <td><StatusPill kind="roadmap" label="Roadmap" /></td>
+          <td>
+            <StatusPill
+              kind={safeKind(cols?.self?.statusKind)}
+              label={cols?.self?.statusLabel ?? ''}
+            />
+          </td>
+          <td>
+            <StatusPill
+              kind={safeKind(cols?.managed?.statusKind)}
+              label={cols?.managed?.statusLabel ?? ''}
+            />
+          </td>
+          <td>
+            <StatusPill
+              kind={safeKind(cols?.turnkey?.statusKind)}
+              label={cols?.turnkey?.statusLabel ?? ''}
+            />
+          </td>
         </tr>
       </tbody>
     </table>
 
-    <p class="footnote">
-      <sup>†</sup> FSL-1.1-Apache-2.0 allows any use — personal, internal business,
-      commercial workloads — except offering AppRafter itself as a managed service
-      to third parties. After two years, the license auto-converts to plain Apache
-      2.0 and that restriction lifts.
-    </p>
+    <p class="footnote" set:html={data.footnoteHtml} />
 
     <div class="transparency-grid">
       {
-        transparency.map((b) => (
+        blocks.map((b) => (
           <div class="transparency-card">
             <h4>
               <span class="kicker">{b.kicker}</span>
@@ -225,7 +169,7 @@ const transparency: TransparencyBlock[] = [
     max-width: 880px;
     line-height: 1.55;
   }
-  .footnote sup {
+  .footnote :global(sup) {
     color: var(--accent);
     font-style: normal;
     font-weight: 500;

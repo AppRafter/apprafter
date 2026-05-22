@@ -1,64 +1,18 @@
 ---
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// Four-tier ladder: cards + stair-step visual + orthogonal note.
-// Content from sections.jsx :350-423 (BRIEF v2.2 §4.4).
 
+import { getTierLadder } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
 import SectionHead from '../primitives/SectionHead.astro';
 
-type Tier = {
-  num: string;
-  title: string;
-  price: string;
-  desc: string;
-  status: 'live' | 'roadmap';
-  statusText: string;
-};
-
-const tiers: Tier[] = [
-  {
-    num: 'Tier 1',
-    title: 'Single VDS',
-    price: 'From €5/mo',
-    desc: 'A single VDS with sane simplifications (no HA quorum, single-node database, no multi-tenancy). For side-projects and solo founders. Hetzner Cloud at launch.',
-    status: 'live',
-    statusText: 'Available now',
-  },
-  {
-    num: 'Tier 2',
-    title: 'Production cluster',
-    price: '3+ nodes',
-    desc: 'Production. 3 or more nodes of any size and any count — grows with your project. Hetzner Cloud at launch.',
-    status: 'live',
-    statusText: 'Available now',
-  },
-  {
-    num: 'Tier 3',
-    title: 'Bare metal',
-    price: 'Dedicated EPYC',
-    desc: 'Bare metal. Dedicated EPYC servers. For when you need a performance ceiling above VPS.',
-    status: 'roadmap',
-    statusText: 'Roadmap · Phase 5+',
-  },
-  {
-    num: 'Tier 4',
-    title: 'Hyperscalers',
-    price: 'AWS · GCP · Azure',
-    desc: 'Hyperscalers. Primarily for cases where regulation requires these specific providers.',
-    status: 'roadmap',
-    statusText: 'Roadmap · Phase 6+',
-  },
-];
+const data = await getTierLadder();
+const cards = data.cards ?? [];
 ---
 
 <section aria-label="Tier ladder" id="tiers" data-screen-label="tiers">
   <Container>
-    <SectionHead
-      eyebrow="Tier ladder"
-      title="One Application manifest. The backing changes — not your app."
-    />
+    <SectionHead eyebrow={data.eyebrow} title={data.title} />
     <div class="ladder-wrap">
       <div class="stair" aria-hidden="true">
         {
@@ -71,7 +25,7 @@ const tiers: Tier[] = [
       </div>
       <div class="tier-cards">
         {
-          tiers.map((t) => (
+          cards.map((t) => (
             <div class="tier-card">
               <span class="tier-num">{t.num}</span>
               <h3>{t.title}</h3>
@@ -82,11 +36,7 @@ const tiers: Tier[] = [
           ))
         }
       </div>
-      <div class="orthogonal-note">
-        <strong>Confidential containers</strong> — orthogonal capability, not a tier.
-        Available on any hardware that supports TDX or SEV-SNP. Shipping Phase
-        6+.
-      </div>
+      <div class="orthogonal-note" set:html={data.orthogonalNoteHtml} />
     </div>
   </Container>
 </section>
@@ -210,7 +160,7 @@ const tiers: Tier[] = [
     font-size: 15px;
     color: var(--fg-muted);
   }
-  .orthogonal-note strong {
+  .orthogonal-note :global(strong) {
     color: var(--fg);
     font-weight: 500;
   }

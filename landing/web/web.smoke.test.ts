@@ -63,15 +63,16 @@ describe('hero section pieces', () => {
   });
 
   test('hero copy uses the BRIEF v2.2 headline + license + status badge', () => {
-    const hero = readFileSync(join(ROOT, 'src/components/hero/Hero.astro'), 'utf8');
-    // Headline — accent wraps "€5 VPS" per BRIEF section 4.2.
-    expect(hero).toContain('€5 VPS');
-    expect(hero).toContain('Open source');
+    // Phase H moved hero copy from Hero.astro into the
+    // landingHero.json fallback (mirroring the Payload global).
+    const heroJson = readFileSync(join(ROOT, 'src/data/fallback/landingHero.json'), 'utf8');
+    expect(heroJson).toContain('€5 VPS');
+    expect(heroJson).toContain('Open source');
     // ADR 0032 license string — must NOT slip back to FSL-1.1-MIT.
-    expect(hero).toContain('FSL-1.1-Apache-2.0');
-    expect(hero).not.toContain('FSL-1.1-MIT');
+    expect(heroJson).toContain('FSL-1.1-Apache-2.0');
+    expect(heroJson).not.toContain('FSL-1.1-MIT');
     // Status badge — Q7 (2026-05-22).
-    expect(hero).toContain('v0.3 · Phase 3');
+    expect(heroJson).toContain('v0.3 · Phase 3');
   });
 
   test('waitlist form POSTs to /api/waitlist-signups (Vite proxy / PUBLIC_CMS_URL)', () => {
@@ -126,34 +127,106 @@ describe('content sections (Phase F)', () => {
   });
 
   test('roadmap phase ids are stable anchors for comparison cross-links', () => {
+    // The slug formula lives in Roadmap.astro and the link target
+    // lives in comparison.json — both must agree on the same id.
     const rm = readFileSync(join(ROOT, 'src/components/sections/Roadmap.astro'), 'utf8');
-    const cmp = readFileSync(join(ROOT, 'src/components/sections/Comparison.astro'), 'utf8');
-    // Comparison links to #roadmap-phase-phase-8 in the Turnkey
-    // exit row — Roadmap must build the same slug from "Phase 8+".
-    expect(cmp).toContain('#roadmap-phase-phase-8');
-    expect(rm).toContain('Phase 8+');
+    const cmpJson = readFileSync(join(ROOT, 'src/data/fallback/comparison.json'), 'utf8');
+    const roadmapJson = readFileSync(join(ROOT, 'src/data/fallback/roadmap.json'), 'utf8');
+    // Slug-builder function still in component.
+    expect(rm).toContain('roadmap-phase-');
+    // Comparison row links to #roadmap-phase-phase-8.
+    expect(cmpJson).toContain('#roadmap-phase-phase-8');
+    // Roadmap data carries the matching Phase 8+ phase.
+    expect(roadmapJson).toContain('Phase 8+');
   });
 
   test('all section eyebrows are unique (no copy-paste collisions)', () => {
-    const sectionFiles = [
-      'ValueProps',
-      'ScalingJourney',
-      'TierLadder',
-      'Comparison',
-      'BoringTech',
-      'Advantages',
-      'Roadmap',
+    // Eyebrows moved out of Hero.astro into the fallback JSONs.
+    // Read each section's JSON and assert the set has the right
+    // size — no duplicates.
+    const sectionJsons = [
+      'valueProps', // ValueProps uses a hardcoded "Why AppRafter"
+      'scalingJourney',
+      'tierLadder',
+      'comparison',
+      'boringTech',
+      'advantages',
+      'roadmap',
     ];
     const eyebrows = new Set<string>();
-    for (const name of sectionFiles) {
-      const src = readFileSync(join(ROOT, `src/components/sections/${name}.astro`), 'utf8');
-      const m = src.match(/eyebrow="([^"]+)"/);
-      expect(m).not.toBeNull();
-      const eb = m?.[1] ?? '';
-      expect(eyebrows.has(eb)).toBe(false);
-      eyebrows.add(eb);
+    // ValueProps eyebrow lives in the component (no eyebrow field
+    // in the global) — pick it up from the source.
+    const vp = readFileSync(join(ROOT, 'src/components/sections/ValueProps.astro'), 'utf8');
+    const vpEyebrow = vp.match(/eyebrow="([^"]+)"/)?.[1];
+    expect(vpEyebrow).toBeTruthy();
+    if (vpEyebrow) eyebrows.add(vpEyebrow);
+
+    for (const name of sectionJsons.slice(1)) {
+      const data = JSON.parse(readFileSync(join(ROOT, `src/data/fallback/${name}.json`), 'utf8'));
+      expect(data.eyebrow).toBeTruthy();
+      expect(eyebrows.has(data.eyebrow)).toBe(false);
+      eyebrows.add(data.eyebrow);
     }
-    expect(eyebrows.size).toBe(sectionFiles.length);
+    // ValueProps + 6 JSON eyebrows = 7 unique.
+    expect(eyebrows.size).toBe(7);
+  });
+});
+
+describe('CMS client (Phase H)', () => {
+  test('lib/cms.ts exposes one getter per Payload global', () => {
+    const cms = readFileSync(join(ROOT, 'src/lib/cms.ts'), 'utf8');
+    const getters = [
+      'getSiteSettings',
+      'getLandingHero',
+      'getValueProps',
+      'getScalingJourney',
+      'getTierLadder',
+      'getComparison',
+      'getTransparency',
+      'getBoringTech',
+      'getAdvantages',
+      'getRoadmap',
+      'getBootstrapStrip',
+      'getFooterContent',
+      'getWaitlistCopy',
+    ];
+    for (const g of getters) {
+      expect(cms).toContain(`export const ${g}`);
+    }
+    // Dev fallback path + prod fail-loudly path both wired.
+    expect(cms).toContain('import.meta.glob');
+    expect(cms).toContain('PROD');
+    expect(cms).toContain('DEV');
+  });
+
+  test('fallback JSON for each global is present', () => {
+    const files = [
+      'siteSettings',
+      'landingHero',
+      'valueProps',
+      'scalingJourney',
+      'tierLadder',
+      'comparison',
+      'transparency',
+      'boringTech',
+      'advantages',
+      'roadmap',
+      'bootstrapStrip',
+      'footer',
+      'waitlistCopy',
+    ];
+    for (const f of files) {
+      expect(existsSync(join(ROOT, `src/data/fallback/${f}.json`))).toBe(true);
+    }
+  });
+
+  test('renderCopyright {{year}} substitution helper is exported from cms.ts', () => {
+    // The runtime function relies on Vite's import.meta.glob and
+    // can't be loaded under Bun test directly — assert its source
+    // shape instead.
+    const cms = readFileSync(join(ROOT, 'src/lib/cms.ts'), 'utf8');
+    expect(cms).toMatch(/export function renderCopyright\(/);
+    expect(cms).toContain('{{year}}');
   });
 });
 

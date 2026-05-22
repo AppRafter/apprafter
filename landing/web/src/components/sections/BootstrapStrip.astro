@@ -1,20 +1,15 @@
 ---
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// One-line italic strip above the footer — bootstrap-funded /
-// no-VC angle from BRIEF v2.2 §4.9. Ported literally from
-// sections.jsx :819-825 (not wrapped in <section>; lives between
-// <main> and <footer> as a structural break).
 
+import { getBootstrapStrip } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
+
+const strip = await getBootstrapStrip();
 ---
 
 <Container>
-  <div class="bootstrap-strip">
-    AppRafter is a bootstrap project. No VC funding, no exit pressure — we grow
-    with our customers, not at their expense.
-  </div>
+  <div class="bootstrap-strip">{strip.body}</div>
 </Container>
 
 <style>
