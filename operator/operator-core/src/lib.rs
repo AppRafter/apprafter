@@ -10,11 +10,11 @@ pub mod platform_stack;
 
 pub use application::{
     Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose, ApplicationSpec,
-    ApplicationStatus,
+    ApplicationStatus, COND_MIGRATION_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use metrics::Metrics;
-pub use migration::{MigrationError, MigrationStrategy, StepOutcome};
+pub use migration::{DestructiveChange, MigrationError, MigrationStrategy, StepOutcome};
 pub use migration_plan::{
     ExecutedStep, MigrationApplicationRef, MigrationApplicationScope, MigrationPlan,
     MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus, MigrationPlatformScope,

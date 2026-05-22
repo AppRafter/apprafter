@@ -13,8 +13,9 @@ repository.workspace   = true
 path = "src/lib.rs"
 
 [dependencies]
-operator-core      = { path = "../../operator-core" }
-operator-rendering = { path = "../../operator-rendering" }
+operator-core                  = { path = "../../operator-core" }
+operator-controllers-migration = { path = "../migration" }
+operator-rendering             = { path = "../../operator-rendering" }
 
 kube         = { workspace = true }
 k8s-openapi  = { workspace = true }

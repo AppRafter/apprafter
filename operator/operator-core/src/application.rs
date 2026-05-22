@@ -69,6 +69,18 @@ pub struct ApplicationStatus {
     pub endpoint_url: Option<String>,
 }
 
+/// Reserved phase: Application reconciler is paused awaiting
+/// approval of a MigrationPlan that gates the destructive
+/// change observed on this Application. Walk-fix B.1.77 / ADR
+/// 0027.
+pub const PHASE_AWAITING_MIGRATION_APPROVAL: &str = "AwaitingMigrationApproval";
+
+/// Condition type emitted alongside the
+/// `AwaitingMigrationApproval` phase. `condition.message`
+/// carries the MigrationPlan name so operators can `kubectl
+/// describe` straight from the Application status.
+pub const COND_MIGRATION_PENDING: &str = "MigrationPending";
+
 /// k8s-style condition (mirrors `meta/v1.Condition`). Operator
 /// emits `Ready` of `True` after a successful reconcile.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]

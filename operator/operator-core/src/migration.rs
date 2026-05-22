@@ -34,6 +34,38 @@ pub enum StepOutcome {
     Skipped { reason: String },
 }
 
+/// What detection produced when it found a destructive change.
+/// Mirrors the structured fields the MigrationPlan CRD's
+/// `spec.trigger` + `spec.risks.classification` carry — the
+/// strategy's `create_plan_for` helper rolls a Plan out of this.
+///
+/// Detection (`detect_destructive`) lives as a concrete fn on
+/// each strategy struct, NOT in the `MigrationStrategy` trait —
+/// per-scope signatures differ (Application takes an
+/// `ApplicationSpec` diff; platform takes version strings +
+/// compatibility data). See `migration::MigrationStrategy` doc
+/// comment for the rationale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestructiveChange {
+    /// Free-form trigger kind. Examples: `"selector-change"`,
+    /// `"storage-class-change"`, `"major-version-upgrade"`,
+    /// `"platform-classification"`.
+    pub trigger_type: String,
+    /// JSON Pointer-ish path of the field whose change triggered
+    /// the plan. Example: `"needs.pg.selector"`, `"spec.pin"`.
+    pub field: String,
+    /// Old value, serialised as JSON. Free-form because trigger
+    /// kinds span heterogeneous types.
+    pub from: Option<serde_json::Value>,
+    /// New value, serialised as JSON.
+    pub to: Option<serde_json::Value>,
+    /// One of `"safe" | "requires-restart" | "data-migration" | "breaking"`.
+    /// Mirrors the platform-stack compatibility classification
+    /// vocabulary so users see consistent terminology across
+    /// scopes.
+    pub classification: String,
+}
+
 #[derive(Debug, Error)]
 pub enum MigrationError {
     #[error("kube API error: {0}")]

@@ -59,6 +59,46 @@ _components: argocd: #Component & {
 	// fails with `Application referencing project default
 	// which does not exist`. Walk-found bug v0.1.103 → v0.1.104.
 	values: _loaderValues.argocd.values & {
+		// Custom resource-health Lua scripts merged into
+		// `argocd-cm`. Walk-fix B.1.77: surface the
+		// Application CR's `AwaitingMigrationApproval` phase
+		// (spec.md §3.8 + ADR 0027) in the Argo CD UI as
+		// `Degraded` with the MigrationPlan name. Without
+		// this, Argo CD treats every CR without a built-in
+		// health check as `Progressing` indefinitely and the
+		// operator never notices the pause from the UI.
+		//
+		// Argo CD chart 7.7.7 path: `configs.cm.<key>`. Key
+		// shape `resource.customizations.health.<group>_<Kind>`
+		// is Argo CD's documented schema for custom health
+		// scripts.
+		configs: cm: "resource.customizations.health.apprafter.io_Application": """
+			hs = {}
+			if obj.status ~= nil and obj.status.phase ~= nil then
+			  if obj.status.phase == "AwaitingMigrationApproval" then
+			    hs.status = "Degraded"
+			    hs.message = "Application paused; awaiting MigrationPlan approval"
+			    if obj.status.conditions ~= nil then
+			      for _, c in ipairs(obj.status.conditions) do
+			        if c.type == "MigrationPending" then
+			          hs.message = c.message or hs.message
+			          break
+			        end
+			      end
+			    end
+			    return hs
+			  end
+			  if obj.status.phase == "Ready" then
+			    hs.status = "Healthy"
+			    hs.message = "Reconcile complete"
+			    return hs
+			  end
+			end
+			hs.status = "Progressing"
+			hs.message = "Awaiting controller reconcile"
+			return hs
+			"""
+
 		// argocd-repo-server runs the cue-cmp sidecar that
 		// renders user app repositories' `apprafter*.cue`
 		// files into Kubernetes YAML at sync time (ADR 0029).

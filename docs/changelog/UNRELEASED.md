@@ -13,6 +13,201 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.126 — M1.5 Track B.1.77 closure — Application reconciler gate (2026-05-22)
+
+The Application reconciler now respects pending MigrationPlans
+— a destructive change observed on an Application pauses its
+child resource patches until an operator approves the
+gating plan. Implements plan.md §1.77 and ADR 0027.
+
+### Pause gate
+
+`operator-controllers/application/src/lib.rs` runs the new
+gate BEFORE patching Deployment / Service:
+
+```text
+                     ┌───────────────────────┐
+   reconcile begins ─┤  find_blocking_plan?  │
+                     └────┬──────────────────┘
+                          │
+              ┌───────────┴──────────────┐
+              │                          │
+        Some(plan)                     None
+              │                          │
+   write AwaitingMigrationApproval     usual flow
+   status + skip children            (apply children
+   + requeue 30s                      + Ready status)
+```
+
+The gate lists `MigrationPlan` CRs in `apprafter-system` and
+filters in-memory by:
+
+- `spec.scope.type == "application"`
+- `spec.scope.application.ref.{name,namespace}` matching the
+  reconciled Application
+- `spec.scope.application.environment` matching the
+  reconciler's `APPRAFTER_ENV` (skipped when env is unset —
+  wildcard match for single-env clusters)
+- `status.phase` is missing or one of `pending-approval` /
+  `approved` / `executing` / `failed`. Plans in `completed`
+  or `rejected` no longer gate (operator either approved or
+  reverted).
+
+Pause behaviour:
+
+- `status.phase = AwaitingMigrationApproval` (new constant
+  `PHASE_AWAITING_MIGRATION_APPROVAL` in `operator-core`).
+- `Ready=False` with reason `MigrationPending` + message
+  naming the plan.
+- `MigrationPending=True` with reason `MigrationPlanPending`
+  + plan name in the message. K8s-convention
+  `lastTransitionTime` is preserved when the condition is
+  already True (regression-guard tested).
+- `endpointURL` preserved — children still run their prior
+  spec.
+- Requeue after 30s so plan phase changes propagate
+  promptly.
+
+### Argo CD UI integration
+
+`platform-stack/cue/component_argocd.cue` extends the upstream
+chart's `configs.cm` with a custom health Lua script under the
+key `resource.customizations.health.apprafter.io_Application`:
+
+```lua
+hs = {}
+if obj.status ~= nil and obj.status.phase ~= nil then
+  if obj.status.phase == "AwaitingMigrationApproval" then
+    hs.status = "Degraded"
+    hs.message = "Application paused; awaiting MigrationPlan approval"
+    if obj.status.conditions ~= nil then
+      for _, c in ipairs(obj.status.conditions) do
+        if c.type == "MigrationPending" then
+          hs.message = c.message or hs.message
+          break
+        end
+      end
+    end
+    return hs
+  end
+  if obj.status.phase == "Ready" then
+    hs.status = "Healthy"
+    hs.message = "Reconcile complete"
+    return hs
+  end
+end
+hs.status = "Progressing"
+hs.message = "Awaiting controller reconcile"
+return hs
+```
+
+Without this, Argo CD treats every CR without a built-in
+health check as `Progressing` indefinitely — the pause would
+be invisible from the UI.
+
+### Detection (deferred)
+
+`ApplicationMigrationStrategy::detect_destructive(old, new)`
+lands on the strategy struct with a stable signature, but the
+implementation returns `None` unconditionally in 1.77. The
+current v1alpha1 Application schema (image / replicas /
+expose / env) carries no destructive operations per spec.md
+§3.8 — every routine update is `safe` and patches through
+without gating. Phase 2.x services (`needs.*`, storage
+classes, breaking image migrations) populate the diff
+logic when those schema fields land.
+
+Companion helper `ApplicationMigrationStrategy::create_plan_for(
+change, plan_name, app_ns, app_name, env)` builds a fully-
+populated `MigrationPlan` CR from a `DestructiveChange`. The
+Application reconciler doesn't call it in 1.77 (no detection
+hits), but the helper exists so Phase 2 callers wire through
+a single line:
+
+```rust
+let plan = ApplicationMigrationStrategy::create_plan_for(...);
+api.create(&PostParams::default(), &plan).await?;
+```
+
+### New `DestructiveChange` type
+
+`operator-core::DestructiveChange`:
+
+```rust
+pub struct DestructiveChange {
+    pub trigger_type: String,         // e.g. "selector-change"
+    pub field: String,                // e.g. "needs.pg.selector"
+    pub from: Option<serde_json::Value>,
+    pub to: Option<serde_json::Value>,
+    pub classification: String,       // "safe" | "requires-restart" | "data-migration" | "breaking"
+}
+```
+
+Mirrors the structured fields the MigrationPlan CRD's
+`spec.trigger` + `spec.risks.classification` carry. The
+strategy's `create_plan_for` builder is a thin rollup of
+this struct into a `MigrationPlanSpec`.
+
+### Status constants
+
+`operator-core::application` exports two new constants:
+
+- `PHASE_AWAITING_MIGRATION_APPROVAL = "AwaitingMigrationApproval"`
+- `COND_MIGRATION_PENDING = "MigrationPending"`
+
+The reconciler writes both; the Lua health script + future
+Backstage UI read the phase string verbatim.
+
+### Tests
+
++9 unit tests in the application controller crate:
+
+- 8 `pick_blocking_plan` filter cases (matching plan,
+  completed plan, rejected plan, missing-phase plan,
+  executing plan, failed plan, platform-scope plan,
+  wrong namespace, wrong environment, wildcard env).
+- 2 `build_paused_status` shape tests (sets phase +
+  conditions + preserves endpointURL; first-reconcile
+  case where status is None).
+- 1 `migration_pending_condition` k8s-convention timestamp
+  preservation test.
+
+Total in operator-controllers-application: 10 → 19.
+
+### Files
+
+- `operator/operator-core/src/migration.rs` — `DestructiveChange` type.
+- `operator/operator-core/src/application.rs` — constants.
+- `operator/operator-core/src/lib.rs` — re-exports.
+- `operator/operator-controllers/migration/src/strategy.rs`
+  — `detect_destructive` + `create_plan_for` on
+  ApplicationMigrationStrategy.
+- `operator/operator-controllers/application/Cargo.toml`
+  — dep on operator-controllers-migration.
+- `operator/operator-controllers/application/src/lib.rs`
+  — pause gate + helpers + tests.
+- `platform-stack/cue/component_argocd.cue` — Lua health
+  script in `configs.cm`.
+
+### Versions
+
+- CLI: 0.1.125 → 0.1.126.
+- Operator chart: v0.1.106 → v0.1.107.
+- Admission-webhook chart: v0.1.106 → v0.1.107 (lockstep).
+- platform-stack chart: 0.1.27 → 0.1.28, with the matching
+  `compatibility: "0.1.28"` entry. Argocd component's
+  values.yaml carries the new Lua block (the only chart-
+  side semantic change vs 0.1.27).
+
+### Walk
+
+Manual walk deferred — same rationale as B.1.76. B.1.78
+(PlatformController MigrationPlan integration) closes the
+loop on platform-scope detection + plan creation; exercising
+the full destructive-change pipeline end-to-end after B.1.78
+covers B.1.74 / B.1.74a / B.1.75 / B.1.76 / B.1.77 / B.1.78
+in one regression walk.
+
 ## v0.1.125 — M1.5 Track B.1.76 closure — MigrationController + strategy dispatch (2026-05-22)
 
 The third reconciler in the `apprafter-operator` binary

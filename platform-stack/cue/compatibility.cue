@@ -1649,6 +1649,96 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Track B.1.77 closure — Application reconciler gate
+// (pause/resume) + Argo CD UI surfacing of pending
+// MigrationPlans. ApplicationController now checks for
+// unsealed MigrationPlans matching the reconciled
+// Application + environment pair BEFORE patching child
+// resources; pauses with `status.phase =
+// AwaitingMigrationApproval` + `MigrationPending=True`
+// condition. argocd-cm gains a custom Lua health script
+// that surfaces the pause as `Degraded` in the Argo CD UI
+// with the MigrationPlan name in the card message.
+// Detection (`detect_destructive`) wired through
+// `ApplicationMigrationStrategy::detect_destructive` but
+// always returns None in 1.77 — current Application
+// v1alpha1 schema has no destructive surface. Phase 2.x
+// services wire detection alongside the schema fields.
+// Chart side ships only the Lua addition (byte-equivalent
+// templates otherwise). Operator-binary change → image
+// v0.1.125 → v0.1.126 via the standard chart appVersion
+// lockstep.
+compatibility: "0.1.28": {
+	change:          "safe"
+	operatorVersion: "v0.1.126"
+	notes: """
+		Track B.1.77 closure — Application reconciler
+		gate (pause/resume) + Argo CD UI integration.
+
+		ApplicationController gains a pause gate that
+		runs BEFORE child resource patches. The gate
+		lists MigrationPlans in `apprafter-system`,
+		filters to ones whose `spec.scope.type ==
+		application` matches this Application's name +
+		namespace + environment, and pauses when any
+		unsealed plan (phase != completed && phase !=
+		rejected) is found. Pause behaviour:
+
+		* `Application.status.phase` flips to
+		  `AwaitingMigrationApproval`.
+		* `Ready=False` condition with reason
+		  `MigrationPending` + message naming the plan.
+		* `MigrationPending=True` condition with reason
+		  `MigrationPlanPending` + plan name in message
+		  (k8s-convention `lastTransitionTime` preserved
+		  when condition is already True).
+		* Child Deployment / Service / HTTPRoute patches
+		  are SKIPPED — children keep running their
+		  prior spec.
+		* `endpointURL` is preserved.
+		* Requeue after 30s so plan-phase changes are
+		  picked up promptly.
+
+		Argo CD UI surfacing: `argocd-cm` ConfigMap gains
+		a custom resource-health Lua script under the key
+		`resource.customizations.health.apprafter.io_Application`.
+		Returns `Degraded` with the MigrationPlan name in
+		the card message when the Application's phase is
+		`AwaitingMigrationApproval`; `Healthy` on
+		`Ready`; `Progressing` otherwise.
+
+		`ApplicationMigrationStrategy::detect_destructive`
+		concrete fn lands on the strategy struct with the
+		full `(old, new)` signature, but the impl returns
+		`None` unconditionally in 1.77 — the v1alpha1
+		Application schema (image / replicas / expose /
+		env) carries no destructive operations per
+		spec.md §3.8. Phase 2.x services (`needs.*`,
+		storage classes, breaking image migrations)
+		populate the diff logic. The strategy also gains
+		`create_plan_for` — a `MigrationPlan` CR builder
+		used by future callers in Phase 2 once detection
+		actually finds destructive diffs.
+
+		`DestructiveChange` type lands in `operator-core`
+		(trigger_type + field + from + to +
+		classification). Mirrors the
+		`MigrationPlan.spec.trigger` + `spec.risks.classification`
+		shape so `create_plan_for` is a thin rollup.
+
+		Rendered chart vs 0.1.27: byte-equivalent for
+		every component except `argocd` (gains the Lua
+		script in `configs.cm`). Operator-binary change
+		propagates the new image; chart appVersion
+		lockstep.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md#177-application-reconciler-integration-gate-pauseresume",
+		"docs/changelog/UNRELEASED.md#v01126",
+	]
+}
+
 // Track B.1.76 closure — MigrationController + strategy
 // dispatch. Third reconciler in the apprafter-operator
 // binary owns the MigrationPlan phase FSM: external actors

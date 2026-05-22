@@ -22,14 +22,19 @@
 //! bump, no watch fan-out).
 
 use async_trait::async_trait;
-use kube::api::{Api, Patch, PatchParams};
+use chrono::Utc;
+use kube::api::{Api, ObjectMeta, Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::discovery::{ApiCapabilities, ApiResource};
 use kube::Client;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use operator_core::{MigrationError, MigrationPlan, MigrationStep, MigrationStrategy, StepOutcome};
+use operator_core::{
+    Application, ApplicationSpec, DestructiveChange, MigrationApplicationRef,
+    MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope, MigrationPlanSpec,
+    MigrationStep, MigrationStrategy, MigrationTrigger, StepOutcome,
+};
 
 /// SSA field manager used by the strategies' reject path when
 /// patching outside resources (currently only PlatformStack).
@@ -73,6 +78,118 @@ impl MigrationStrategy for ApplicationMigrationStrategy {
         Ok(())
     }
 }
+
+impl ApplicationMigrationStrategy {
+    /// Decide whether the change from `_old` → `new` warrants a
+    /// MigrationPlan. B.1.77 skeleton: returns `None`
+    /// unconditionally — the current Application v1alpha1 schema
+    /// (image / replicas / expose / env) carries no destructive
+    /// operations per spec.md §3.8. Phase 2.x services
+    /// (`needs.*`, storage class, breaking image migrations)
+    /// populate this with real diff logic.
+    ///
+    /// The function takes both states so callers in B.1.77 can
+    /// already wire the call site through with a stable
+    /// signature; the implementation will replace `None` with
+    /// real comparisons when the schema grows destructive fields.
+    pub fn detect_destructive(
+        _old: Option<&ApplicationSpec>,
+        _new: &ApplicationSpec,
+    ) -> Option<DestructiveChange> {
+        None
+    }
+
+    /// Build a `MigrationPlan` CR for an application-scope
+    /// destructive change. The Plan lands in
+    /// `apprafter-system` (per spec.md §3.8 — plans are
+    /// cluster-scoped from a user's POV even though the CR
+    /// itself is namespaced for RBAC granularity).
+    ///
+    /// `application_name` / `application_namespace` / `environment`
+    /// identify which Application + environment the plan
+    /// governs. The caller (B.1.77 Application reconciler) knows
+    /// these from the Application CR it just reconciled.
+    ///
+    /// `plan_name` should embed the application + a date / UID
+    /// so the resulting CR has a stable, human-readable name.
+    /// The Application reconciler synthesises one from
+    /// `<app>-<env>-migration-<timestamp>`.
+    pub fn create_plan_for(
+        change: &DestructiveChange,
+        plan_name: &str,
+        application_namespace: &str,
+        application_name: &str,
+        environment: &str,
+    ) -> MigrationPlan {
+        let spec = MigrationPlanSpec {
+            scope: MigrationPlanScope {
+                type_: "application".into(),
+                application: Some(MigrationApplicationScope {
+                    ref_: MigrationApplicationRef {
+                        name: application_name.to_string(),
+                        namespace: application_namespace.to_string(),
+                    },
+                    environment: environment.to_string(),
+                }),
+                platform: None,
+            },
+            trigger: MigrationTrigger {
+                type_: change.trigger_type.clone(),
+                field: change.field.clone(),
+                from: change.from.clone(),
+                to: change.to.clone(),
+            },
+            risks: Some(operator_core::MigrationRisks {
+                classification: change.classification.clone(),
+                estimated_downtime: None,
+                data_volume: None,
+                reversible: None,
+                requires_full_backup: None,
+            }),
+            plan: None,
+            approvers: None,
+            previous_spec_snapshot: None,
+        };
+        // ObjectMeta path used here (not `MigrationPlan::new`)
+        // because we need to set the namespace explicitly —
+        // `MigrationPlan::new` builds a cluster-scoped meta.
+        let mut mp = MigrationPlan::new(plan_name, spec);
+        mp.metadata = ObjectMeta {
+            name: Some(plan_name.to_string()),
+            namespace: Some("apprafter-system".to_string()),
+            labels: Some(
+                [
+                    ("apprafter.io/scope".to_string(), "application".to_string()),
+                    (
+                        "apprafter.io/application".to_string(),
+                        application_name.to_string(),
+                    ),
+                    (
+                        "apprafter.io/application-namespace".to_string(),
+                        application_namespace.to_string(),
+                    ),
+                    (
+                        "apprafter.io/environment".to_string(),
+                        environment.to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                Utc::now(),
+            )),
+            ..ObjectMeta::default()
+        };
+        mp
+    }
+}
+
+// Suppress the `Application` type-import that's only used in
+// the public concrete-fn signature comments; keeps the `use`
+// list tidy without `#[allow(unused_imports)]`.
+#[allow(dead_code)]
+fn _hint_application(_: &Application) {}
 
 /// Platform-scope strategy.
 ///
