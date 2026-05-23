@@ -35,7 +35,7 @@ use operator_core::{
 };
 
 use crate::compatibility::{
-    fetch_change_class, fetch_compatibility_doc, ChangeClass, CompatibilityDoc,
+    fetch_compatibility_doc, fetch_path_max_change_class, ChangeClass, CompatibilityDoc,
 };
 use crate::desired::{build as build_desired, DesiredSource};
 use crate::oci::{tags_in_channel, Channel};
@@ -427,9 +427,21 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                 current_target.clone()
             }
         } else {
-            // No existing plan — classify and either create
-            // one (destructive) or bump (safe).
-            let class = fetch_change_class(&spec.source.upstream, &desired.target_revision).await?;
+            // No existing plan — classify the full transition
+            // path и either create a plan (destructive) or
+            // bump (safe). Walk-fix #8 post-B.1.78: use
+            // `fetch_path_max_change_class` instead of single-
+            // target `fetch_change_class` so jumps that span
+            // intermediate destructive versions (e.g. 0.1.A →
+            // 0.1.C where 0.1.B was breaking) don't silently
+            // bypass the gate via classification of the C
+            // record alone.
+            let class = fetch_path_max_change_class(
+                &spec.source.upstream,
+                &current_target,
+                &desired.target_revision,
+            )
+            .await?;
             if matches!(
                 class,
                 ChangeClass::Breaking | ChangeClass::DataMigration | ChangeClass::RequiresRestart

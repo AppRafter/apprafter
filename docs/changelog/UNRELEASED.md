@@ -13,6 +13,159 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.134 — M1.5 walk-fix #8 post-B.1.78 — path-aware classification (2026-05-23)
+
+### Symptom
+
+User question on the B.1.78 acceptance walk: «Между ними
+же 36 с breaking ченджами и реджектом. Мы же не можем 35
+в 37 обновить не решив вопрос совместимости по пути,
+разве нет?»
+
+Scenario: cluster on 0.1.35 carries a rejected
+`platform-0-1-35-to-0-1-36` MigrationPlan (`spec.pin=null`,
+snapshot.pin=null). Chart 0.1.37 publishes as `safe`.
+autoUpgrade triggers bump 0.1.35 → 0.1.37:
+
+- Plan name = `platform-0-1-35-to-0-1-37` (new pair) →
+  GET 404.
+- `fetch_change_class(url, "0.1.37")` returns Safe (per
+  0.1.37's single record).
+- Straight bump к 0.1.37 — silently jumping over 0.1.36's
+  breaking content и bypassing the operator's reject
+  decision on it.
+
+### Root cause
+
+Classification was per-target-version, not per-transition.
+spec.md §3.11 implied semantics ("any path к target must
+respect the strictest class encountered"), но the code
+looked up only the destination record. Multi-version
+jumps that span an intermediate destructive version slip
+through.
+
+### Fix
+
+New public fn `fetch_path_max_change_class(url, from, to)`
+в `compatibility.rs`:
+
+```rust
+pub async fn fetch_path_max_change_class(
+    upstream_url: &str,
+    from_version: &str,
+    to_version: &str,
+) -> Result<ChangeClass, CompatError> {
+    let doc = fetch_compatibility_doc(upstream_url, to_version).await?;
+    Ok(path_max_change_class(&doc, from_version, to_version))
+}
+```
+
+`path_max_change_class` pure helper:
+
+```rust
+pub fn path_max_change_class(
+    doc: &CompatibilityDoc,
+    from_version: &str,
+    to_version: &str,
+) -> ChangeClass {
+    let from = semver::Version::parse(from_version).ok();
+    let to = semver::Version::parse(to_version).ok();
+    let (from, to) = match (from, to) {
+        (Some(f), Some(t)) => (f, t),
+        _ => return ChangeClass::Breaking, // fail-closed
+    };
+    if from >= to { return ChangeClass::Safe; }
+    let mut max = ChangeClass::Safe;
+    for (key, record) in doc {
+        let v = match semver::Version::parse(key) {
+            Ok(v) => v, Err(_) => continue,
+        };
+        if v > from && v <= to {
+            let class = parse_change_class(record.change.as_deref());
+            if class_order(class) > class_order(max) {
+                max = class;
+            }
+        }
+    }
+    max
+}
+```
+
+Half-open range `(from, to]` — `from`'s own class is excluded
+(operator already accepted it: it's the current state).
+Versions strictly greater than `from`, up к и including
+`to`, participate в the max.
+
+`reconcile.rs` swaps the single-target call для the path-
+aware one:
+
+```rust
+let class = fetch_path_max_change_class(
+    &spec.source.upstream,
+    &current_target,
+    &desired.target_revision,
+).await?;
+```
+
+### Edge cases
+
+- `from == to` (no-op) → Safe.
+- `from > to` (downgrade) → Safe. spec.md silent on
+  downgrade destructiveness; conservative default. Future
+  work can extend if a real downgrade scenario surfaces.
+- Unparseable version key in doc → skipped without
+  affecting other entries' contribution к the max.
+
+### Acceptance walk regression coverage
+
+Cluster carrying rejected `platform-0-1-35-to-0-1-36` plan,
+autoUpgrade=true, chart 0.1.37 published as safe:
+
+- Path-max sees 0.1.36's Breaking → classifies the
+  transition as Breaking.
+- PlatformController creates fresh
+  `platform-0-1-35-to-0-1-37` plan (different from the
+  rejected one — different `to`).
+- Bump blocked until operator approves OR rejects the
+  new pair.
+
+Operator's reject decision on 0.1.36's content carries
+forward properly — to skip 0.1.36, operator must explicitly
+re-evaluate whether 0.1.35→0.1.37 (which includes 0.1.36's
+breaking content) is acceptable.
+
+### Tests
+
++8 unit tests в
+`operator/operator-controllers/platform-stack/src/compatibility.rs`:
+
+- `path_max_change_class_picks_strictest_in_range`
+- `path_max_change_class_excludes_from_version`
+- `path_max_change_class_returns_safe_for_no_op_transition`
+- `path_max_change_class_returns_safe_for_downgrade`
+- `path_max_change_class_picks_requires_restart_over_safe`
+- `path_max_change_class_picks_data_migration_over_requires_restart`
+- `path_max_change_class_picks_breaking_over_data_migration`
+- `path_max_change_class_skips_unparseable_version_keys`
+
+Total platform-stack crate: 68 → 76.
+
+### Files
+
+- `operator/operator-controllers/platform-stack/src/compatibility.rs`
+  — new `fetch_path_max_change_class` + `path_max_change_class`
+  + `class_order` helpers + 8 tests.
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  — destructive check switches к path-aware call.
+
+### Versions
+
+- CLI: 0.1.133 → 0.1.134.
+- Operator chart: v0.1.114 → v0.1.115.
+- Admission-webhook chart: v0.1.114 → v0.1.115 (lockstep).
+- platform-stack chart: 0.1.37 → 0.1.38, with the matching
+  `compatibility: "0.1.38"` entry.
+
 ## v0.1.133 — M1.5 walk-fix #7 post-B.1.78 — reject for channel-following (2026-05-23)
 
 ### Symptom

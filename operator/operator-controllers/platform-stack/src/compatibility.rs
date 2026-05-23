@@ -147,6 +147,86 @@ pub async fn fetch_change_class(
     Ok(parse_change_class(record.change.as_deref()))
 }
 
+/// Classify a transition path from `from_version` к
+/// `to_version` based on the MOST DESTRUCTIVE classification
+/// encountered in the (from, to] range. Pulls the
+/// compatibility doc at `to_version`'s tarball (which contains
+/// records for every prior published version up к to_version)
+/// и walks each record whose semver lies in the half-open
+/// range.
+///
+/// Why path-max и not just the target's class — walk-fix #8
+/// post-B.1.78: with single-target-class semantics, jumping
+/// from 0.1.A directly к 0.1.C silently bypasses any
+/// destructive transitions in 0.1.B (or any version strictly
+/// between A и C). Operator-approved/rejected decisions on
+/// those intermediate versions don't carry forward к the
+/// new pair, but the destructive content does. Path-max
+/// guarantees the strictest classification along the way
+/// governs the transition.
+///
+/// Downgrade (`from > to`) returns Safe — no destructive
+/// transitions on the way back unless каждый интервалс
+/// `compatibility.yaml` separately records destructive
+/// downgrade semantics (which they don't today). spec.md
+/// doesn't address downgrade direction; conservative
+/// behaviour deferred.
+pub async fn fetch_path_max_change_class(
+    upstream_url: &str,
+    from_version: &str,
+    to_version: &str,
+) -> Result<ChangeClass, CompatError> {
+    let doc = fetch_compatibility_doc(upstream_url, to_version).await?;
+    Ok(path_max_change_class(&doc, from_version, to_version))
+}
+
+/// Pure path-max computation. Pulled out так что unit tests
+/// can exercise the range walk без a kube cluster.
+pub fn path_max_change_class(
+    doc: &CompatibilityDoc,
+    from_version: &str,
+    to_version: &str,
+) -> ChangeClass {
+    let from = semver::Version::parse(from_version).ok();
+    let to = semver::Version::parse(to_version).ok();
+    let (from, to) = match (from, to) {
+        (Some(f), Some(t)) => (f, t),
+        _ => return ChangeClass::Breaking, // unparseable — fail-closed
+    };
+    // Downgrade or no-op transition — no path к gate.
+    if from >= to {
+        return ChangeClass::Safe;
+    }
+    let mut max = ChangeClass::Safe;
+    for (version_key, record) in doc {
+        let v = match semver::Version::parse(version_key) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v > from && v <= to {
+            let class = parse_change_class(record.change.as_deref());
+            if class_order(class) > class_order(max) {
+                max = class;
+            }
+        }
+    }
+    max
+}
+
+/// Strict ordering on `ChangeClass` (Safe < RequiresRestart <
+/// DataMigration < Breaking) so `path_max_change_class` can
+/// reduce the range to a single value. Not exposed as `Ord`
+/// on the enum itself к keep the type's public surface
+/// minimal — only this module needs the ordering.
+fn class_order(c: ChangeClass) -> u8 {
+    match c {
+        ChangeClass::Safe => 0,
+        ChangeClass::RequiresRestart => 1,
+        ChangeClass::DataMigration => 2,
+        ChangeClass::Breaking => 3,
+    }
+}
+
 /// Walk a gzipped chart tarball blob and return the contents of
 /// the `*/compatibility.yaml` file. `*` is the chart's top-level
 /// directory inside the tar (Helm convention).
@@ -378,5 +458,107 @@ mod tests {
 
         let err = extract_compatibility_yaml(&tar_bytes).unwrap_err();
         assert!(matches!(err, CompatError::MissingFile));
+    }
+
+    fn record(change: &str) -> VersionRecord {
+        VersionRecord {
+            change: Some(change.to_string()),
+            yanked: false,
+            yanked_reason: None,
+        }
+    }
+
+    #[test]
+    fn path_max_change_class_picks_strictest_in_range() {
+        // Walk-fix #8 contract: bump 0.1.35 → 0.1.37 must
+        // surface 0.1.36's breaking class even though 0.1.37
+        // alone is `safe`. The strictest in (from, to] wins.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.34".to_string(), record("safe"));
+        doc.insert("0.1.35".to_string(), record("safe"));
+        doc.insert("0.1.36".to_string(), record("breaking"));
+        doc.insert("0.1.37".to_string(), record("safe"));
+        let class = path_max_change_class(&doc, "0.1.35", "0.1.37");
+        assert!(matches!(class, ChangeClass::Breaking));
+    }
+
+    #[test]
+    fn path_max_change_class_excludes_from_version() {
+        // Half-open range (from, to] — `from`'s own class
+        // doesn't count (operator already accepted it, by
+        // definition: it's the current state). Only versions
+        // strictly greater than `from`, up к и including
+        // `to`, participate в the max.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.35".to_string(), record("breaking")); // <- excluded
+        doc.insert("0.1.36".to_string(), record("safe"));
+        doc.insert("0.1.37".to_string(), record("safe"));
+        let class = path_max_change_class(&doc, "0.1.35", "0.1.37");
+        assert!(matches!(class, ChangeClass::Safe));
+    }
+
+    #[test]
+    fn path_max_change_class_returns_safe_for_no_op_transition() {
+        // from == to → empty range → Safe.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.37".to_string(), record("breaking"));
+        let class = path_max_change_class(&doc, "0.1.37", "0.1.37");
+        assert!(matches!(class, ChangeClass::Safe));
+    }
+
+    #[test]
+    fn path_max_change_class_returns_safe_for_downgrade() {
+        // spec.md doesn't address downgrade direction;
+        // conservative default — Safe. Future work: scan
+        // (to, from] also for cumulative reverse-direction
+        // destructiveness.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.35".to_string(), record("safe"));
+        doc.insert("0.1.36".to_string(), record("breaking"));
+        doc.insert("0.1.37".to_string(), record("safe"));
+        let class = path_max_change_class(&doc, "0.1.37", "0.1.35");
+        assert!(matches!(class, ChangeClass::Safe));
+    }
+
+    #[test]
+    fn path_max_change_class_picks_requires_restart_over_safe() {
+        // RequiresRestart strictly more destructive than Safe.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.36".to_string(), record("requires-restart"));
+        doc.insert("0.1.37".to_string(), record("safe"));
+        let class = path_max_change_class(&doc, "0.1.35", "0.1.37");
+        assert!(matches!(class, ChangeClass::RequiresRestart));
+    }
+
+    #[test]
+    fn path_max_change_class_picks_data_migration_over_requires_restart() {
+        // DataMigration ranks higher than RequiresRestart.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.36".to_string(), record("requires-restart"));
+        doc.insert("0.1.37".to_string(), record("data-migration"));
+        let class = path_max_change_class(&doc, "0.1.35", "0.1.37");
+        assert!(matches!(class, ChangeClass::DataMigration));
+    }
+
+    #[test]
+    fn path_max_change_class_picks_breaking_over_data_migration() {
+        // Breaking is the strictest class.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.36".to_string(), record("data-migration"));
+        doc.insert("0.1.37".to_string(), record("breaking"));
+        let class = path_max_change_class(&doc, "0.1.35", "0.1.37");
+        assert!(matches!(class, ChangeClass::Breaking));
+    }
+
+    #[test]
+    fn path_max_change_class_skips_unparseable_version_keys() {
+        // Garbage version strings in the doc don't break the
+        // walk — they're ignored, и valid entries still get
+        // classified.
+        let mut doc = BTreeMap::new();
+        doc.insert("0.1.36".to_string(), record("breaking"));
+        doc.insert("not-a-version".to_string(), record("data-migration"));
+        let class = path_max_change_class(&doc, "0.1.35", "0.1.37");
+        assert!(matches!(class, ChangeClass::Breaking));
     }
 }

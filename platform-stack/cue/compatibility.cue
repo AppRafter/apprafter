@@ -1658,6 +1658,101 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #8 post-B.1.78 — PlatformController's destructive
+// classification was per-target-version (single record's
+// `change` field), not per-transition. Version jumps that
+// span an intermediate destructive version silently bypassed
+// the gate если the target itself was safe. Fix: replace
+// `fetch_change_class(url, target)` с
+// `fetch_path_max_change_class(url, from, to)` — pulls the
+// compat doc and reduces к the MOST DESTRUCTIVE class в the
+// half-open range `(from, to]`. Operator-binary change → image
+// v0.1.133 → v0.1.134 via standard chart appVersion lockstep.
+compatibility: "0.1.38": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #8 post-B.1.78 — path-aware destructive
+		classification.
+
+		**Symptom (theoretical, demonstrated via reasoning
+		on 2026-05-23 walk).** Cluster on 0.1.35 with
+		walk-platform-1's `platform-0-1-35-to-0-1-36`
+		MigrationPlan в rejected phase. Chart 0.1.37
+		published as `safe`. autoUpgrade detects channel-
+		latest=0.1.37 и tries bump 0.1.35 → 0.1.37.
+		Plan name `platform-0-1-35-to-0-1-37` doesn't
+		exist (different pair). `fetch_change_class`
+		returns Safe для 0.1.37's single record. Straight
+		bump к 0.1.37 — silently jumping over 0.1.36's
+		breaking content и bypassing operator's reject
+		decision.
+
+		**Root cause.** Classification was per-target-
+		version, not per-transition. spec.md §3.11
+		semantics implied path-aware ("any path к 0.1.37
+		must respect the strictest class encountered"),
+		but code looked up only the destination record.
+
+		**Fix.** New `fetch_path_max_change_class(url,
+		from, to)` reads the compat doc at `to`'s tarball
+		and reduces the records in `(from, to]` к their
+		strictest class via `path_max_change_class(doc,
+		from, to)` pure helper. Reconcile body's
+		destructive check replaces single-target call.
+
+		Edge cases:
+
+		* `from == to` (no-op transition) → Safe.
+		* `from > to` (downgrade) → Safe. spec.md doesn't
+		  address downgrade destructiveness; conservative
+		  default. Future work can extend semantics if a
+		  real use case surfaces.
+		* Unparseable version key in doc → skipped без
+		  affecting other entries' contribution к the
+		  max.
+
+		Classification ordering (Safe < RequiresRestart <
+		DataMigration < Breaking) lives inside the module
+		via `class_order` helper rather than exposed on
+		`ChangeClass` itself — only path_max needs it.
+
+		**Tests.** +8 unit tests в
+		`operator-controllers/platform-stack/compatibility.rs`:
+		* `path_max_change_class_picks_strictest_in_range`
+		* `_excludes_from_version`
+		* `_returns_safe_for_no_op_transition`
+		* `_returns_safe_for_downgrade`
+		* `_picks_requires_restart_over_safe`
+		* `_picks_data_migration_over_requires_restart`
+		* `_picks_breaking_over_data_migration`
+		* `_skips_unparseable_version_keys`
+
+		Total platform-stack crate: 68 → 76.
+
+		**Acceptance walk regression coverage.** A
+		cluster carrying a rejected
+		`platform-0-1-35-to-0-1-36` plan (snapshot.pin=
+		null) and pinning autoUpgrade=true should NOT
+		auto-bump к 0.1.37 once 0.1.37 publishes. New
+		path-max classification surfaces 0.1.36's
+		Breaking → PlatformController creates a fresh
+		`platform-0-1-35-to-0-1-37` plan and blocks the
+		jump. Operator's reject decision on 0.1.36's
+		content carries forward — operator must
+		explicitly decide whether 0.1.35→0.1.37 (which
+		includes 0.1.36's breaking content) is acceptable.
+
+		Rendered chart vs 0.1.37: byte-equivalent
+		templates. Operator-binary change only.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md",
+		"docs/changelog/UNRELEASED.md#v01134",
+	]
+}
+
 // Walk-fix #7 post-B.1.78 — PlatformMigrationStrategy.reject's
 // SSA-apply of `spec.pin: null` for channel-following clusters
 // failed apiserver validation (`spec.pin must be of type
