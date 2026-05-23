@@ -4,25 +4,34 @@ package platformstack
 
 // Change classification per published version. Operators
 // upgrading platform-stack consult the entry for their target
-// version to understand what's safe to upgrade automatically
+// version к understand what's safe к upgrade automatically
 // and what requires manual intervention.
+//
+// The categories mirror the Rust `ChangeClass` enum
+// (`operator-controllers/platform-stack/src/compatibility.rs`)
+// и the MigrationPlan CRD's `spec.risks.classification` enum
+// (`schemas/v1alpha1/migrationplan.cue`). All three must
+// agree on the same vocabulary, otherwise the operator's
+// fail-closed default (`Breaking`) fires on legitimate
+// classifications.
 //
 // The categories are:
 //
-//   - `safe`     — version may be applied via Argo CD automated
-//                  sync; no manual step. Default for additive
-//                  component changes and intra-component patch
-//                  bumps that don't reshape the chart.
-//   - `caution`  — operator should pre-read this entry's
-//                  `notes`. Examples: a component bumping a
-//                  major CNI version, a default value flipping
-//                  (e.g. Hubble enabled-by-default in a tier
-//                  overlay).
+//   - `safe` — version may be applied via Argo CD automated
+//     sync; no manual step. Default for additive component
+//     changes and intra-component patch bumps that don't
+//     reshape the chart.
+//   - `requires-restart` — chart change requires component
+//     pod restarts but no data migration or backups. Operator
+//     approval gates the bump.
+//   - `data-migration` — chart change includes a destructive
+//     data migration (e.g. database schema change, storage
+//     class flip). Operator approval gates the bump; a
+//     MigrationPlan describes the migration steps.
 //   - `breaking` — chart values shape changed or a component
-//                  was removed. Operator must update their
-//                  `Infrastructure.cue` overlay before
-//                  upgrading.
-#ChangeClass: "safe" | "caution" | "breaking"
+//     was removed. Operator must update their
+//     `Infrastructure.cue` overlay before upgrading.
+#ChangeClass: "safe" | "requires-restart" | "data-migration" | "breaking"
 
 // #VersionRecord is one row in the compatibility table.
 #VersionRecord: {
@@ -1649,6 +1658,94 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// B.1.78 acceptance walk fixture — chart 0.1.35 classified
+// as `requires-restart` к exercise PlatformController's
+// destructive-transition gate end-to-end against a real
+// cluster. No operator-binary change; same image v0.1.132
+// pinned by chart components. PlatformController sees
+// autoUpgrade=true + non-safe classification → creates
+// MigrationPlan instead of immediately bumping the parent
+// `platform` Application's targetRevision. Walk approves via
+// `kubectl patch migrationplan ... --subresource=status` →
+// MigrationController completes plan → PlatformController
+// next reconcile bumps. Walk verifies acceptance criteria
+// from plan.md §1.78.
+compatibility: "0.1.35": {
+	change:          "requires-restart"
+	operatorVersion: "v0.1.132"
+	notes: """
+		Walk fixture — synthetic `requires-restart`
+		classification к exercise the B.1.78
+		destructive-transition gate end-to-end. Same
+		operator + webhook image (v0.1.132) as 0.1.34;
+		chart content и templates byte-equivalent.
+		Classification difference is the only test
+		surface.
+
+		Per spec.md §3.11: classification ∈
+		{requires-restart, data-migration, breaking}
+		triggers MigrationPlan creation; classification
+		== safe → auto-bump.
+
+		Expected walk behavior на cluster running chart
+		0.1.34 (или any 0.1.x с autoUpgrade=true):
+
+		* PlatformController's next OCI poll sees
+		  channel-latest=0.1.35.
+		* `fetch_change_class` returns
+		  ChangeClass::RequiresRestart.
+		* Plan name synthesizes к
+		  `platform-<current>-to-0-1-35`.
+		* `Api::get` of plan in apprafter-system returns
+		  404 → create branch fires.
+		* SSA-create plan with scope.type=platform,
+		  scope.platform.components=[platform-stack],
+		  trigger=platform-classification на spec.pin,
+		  classification=requires-restart, previousSpecSnapshot.pin
+		  = current spec.pin (или JSON null).
+		* `target_for_patch = current_target` (no bump).
+		* Conditions:
+		  UpgradeAvailable=True/BlockedByMigrationPlan
+		  with `apprafter-system/<plan>` in message;
+		  MigrationPending=True/requires-restart
+		  with same plan reference.
+		* parent platform Application's
+		  spec.source.targetRevision stays at current
+		  (NOT 0.1.35).
+
+		Approve flow: `kubectl patch migrationplan
+		<name> --subresource=status --type=merge -p
+		'{"status":{"phase":"approved"}}'` →
+		MigrationController transitions through
+		executing → completed → next PlatformController
+		reconcile sees plan completed → proceeds with
+		bump → parent App's targetRevision к 0.1.35 →
+		Argo CD reconciles → operator pod stays на
+		v0.1.132 (no image change since chart 0.1.34 +
+		0.1.35 both pin v0.1.132).
+
+		Reject flow not exercised by this fixture alone —
+		`PlatformMigrationStrategy.reject` (B.1.76)
+		reverts `spec.pin` к snapshot. If snapshot.pin
+		is null (cluster was channel-following), pin
+		stays null and rejected plan's name blocks
+		future same-transition attempts; operator
+		deletes plan or pins к specific version к retry.
+
+		Rendered chart vs 0.1.34: byte-equivalent
+		templates (components, values, RBAC unchanged).
+		ONLY classification differs in
+		compatibility.yaml. Safe к downgrade back via
+		`kubectl patch platformstack default --type=merge
+		-p '{"spec":{"pin":"0.1.34"}}'` once acceptance
+		walk completes.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md#178-platformcontroller-migrationplan-integration",
+	]
+}
+
 // Track B.1.78 closure — PlatformController MigrationPlan
 // integration per spec.md §3.11 + ADR 0027. PlatformController
 // reconcile loop теперь:
