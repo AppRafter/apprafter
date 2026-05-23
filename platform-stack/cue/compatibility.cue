@@ -1658,6 +1658,79 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// B.1.78 acceptance walk reject-flow fixture — chart 0.1.36
+// classified `breaking` к exercise PlatformController auto-
+// create → operator-reject → rejected-plan-blocks-retry
+// chain end-to-end. No operator-binary change; same image
+// v0.1.132 pinned by chart components 0.1.113. Reject flow
+// reads `previousSpecSnapshot.pin` (null since channel-
+// following) and SSA-patches `PlatformStack.spec.pin` к it
+// (no-op when already null). Walk-fix #3 sealing sets
+// `status.rejectedAt` so subsequent operator pod restarts
+// don't re-invoke `strategy.reject`. Next PlatformController
+// reconcile sees the rejected plan by name + blocks the
+// same transition forever; operator clears by deleting
+// plan or pinning к explicit version.
+compatibility: "0.1.36": {
+	change:          "breaking"
+	operatorVersion: "v0.1.132"
+	notes: """
+		Walk fixture — synthetic `breaking` classification
+		to exercise B.1.78's reject flow end-to-end.
+		Same operator + webhook image (v0.1.132) as
+		0.1.34 / 0.1.35; chart content и templates
+		byte-equivalent. Classification difference is
+		the only test surface.
+
+		Expected walk behavior on cluster running chart
+		0.1.35 (autoUpgrade=true, pin=null):
+
+		* PlatformController OCI poll sees channel-
+		  latest=0.1.36.
+		* `fetch_change_class` returns ChangeClass::Breaking.
+		* Plan name synthesizes к
+		  `platform-0-1-35-to-0-1-36`.
+		* 404 → SSA-create plan with classification=
+		  breaking, previousSpecSnapshot.pin=null.
+		* parent platform Application's
+		  spec.source.targetRevision stays at 0.1.35.
+		* Conditions: UpgradeAvailable=True/
+		  BlockedByMigrationPlan, MigrationPending=True/
+		  breaking.
+
+		Reject flow: `kubectl patch migrationplan
+		platform-0-1-35-to-0-1-36 --subresource=status
+		--type=merge -p '{"status":{"phase":"rejected"}}'`
+		→ webhook allows (platform-scope per ADR 0027) →
+		MigrationController reads phase=rejected →
+		PlatformMigrationStrategy.reject reads
+		previousSpecSnapshot.pin=null + SSA-patches
+		spec.pin=null (no-op, already null). Walk-fix #3
+		sealing sets `status.rejectedAt` timestamp;
+		subsequent operator pod restarts find the marker
+		and skip re-invocation of strategy.reject —
+		previously this clobbered operator pin changes.
+
+		Sealing verification: PlatformController next
+		reconcile finds the rejected plan by name →
+		blocks the same transition → MigrationPending=
+		True/breaking + UpgradeAvailable=True/
+		BlockedByMigrationPlan persist; cluster stays
+		на 0.1.35. To clear, operator either deletes the
+		plan (re-triggers same destructive transition,
+		creates fresh plan in pending-approval) or pins
+		к an explicit version different from 0.1.36.
+
+		Rendered chart vs 0.1.35: byte-equivalent
+		templates. ONLY classification differs in
+		compatibility.yaml.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md#178-platformcontroller-migrationplan-integration",
+	]
+}
+
 // B.1.78 acceptance walk fixture — chart 0.1.35 classified
 // as `requires-restart` к exercise PlatformController's
 // destructive-transition gate end-to-end against a real
