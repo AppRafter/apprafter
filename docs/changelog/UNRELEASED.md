@@ -13,6 +13,111 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.131 — M1.5 walk-fix #6 post-B.1.77 — webhook status subresource (2026-05-23)
+
+### Symptom
+
+Walk Phase 3.4 retest on v0.1.130: applied an app-scope
+MigrationPlan, then `kubectl patch ... --subresource=status
+--type=merge -p '{"status":{"phase":"rejected"}}'`. Walk-fix
+#2 (v0.1.128) added an ADR 0027 guard in the validator
+that denies app-scope phase=rejected for any path. Walk-fix
+#2's unit tests passed; integration tests passed; webhook
+ran on v0.1.130 image. **Yet the patch succeeded** — the
+plan transitioned to `phase=rejected` without admission
+check.
+
+### Root cause
+
+ValidatingWebhookConfiguration's `migrationplans.apprafter.io`
+webhook entry listed:
+
+```yaml
+rules:
+  - apiGroups: [apprafter.io]
+    apiVersions: [v1alpha1]
+    operations: [CREATE, UPDATE]
+    resources: [migrationplans]
+    scope: Namespaced
+```
+
+`kubectl patch --subresource=status` routes through the
+apiserver's `/status` SUB-resource endpoint, which is a
+distinct URL from the main resource. Webhook configurations
+must explicitly list `<resource>/status` to intercept
+status-subresource writes. Without that, status patches
+bypass the webhook entirely — the validator (with its
+ADR 0027 guard, phase transition FSM, scope immutability
+check) is never invoked.
+
+### Fix
+
+Chart change only:
+`operator/charts/apprafter-admission-webhook/templates/validatingwebhookconfiguration.yaml`
+adds `migrationplans/status` to `rules.resources`:
+
+```yaml
+resources:
+  - migrationplans
+  - migrationplans/status
+```
+
+The validator code (walk-fix #2 + B.1.76 FSM) is correct;
+this fix simply makes the webhook routing intercept the
+right requests.
+
+### No Rust code change
+
+Operator + admission-webhook binaries are byte-identical
+to v0.1.130. Image tag bumped to v0.1.131 via standard
+chart appVersion lockstep so chart 0.1.33's image pin
+matches a published tag.
+
+### Bonus: clean walk-fix #5 verification path
+
+Chart 0.1.33 pins operator chart 0.1.112 → appVersion
+v0.1.131 → same binary content as v0.1.130. A cluster
+currently on v0.1.130 (chart 0.1.32) that pins
+`PlatformStack.spec.pin=0.1.33` triggers no pod restart
+(identical image) — enabling clean isolated testing of
+walk-fix #5 (versionHistory SSA ownership merge) on a
+stable pod without chart-upgrade pod-cycle artifacts.
+
+Phase 6 second-bump regression (history → null after
+pin=null,autoUpgrade=true on v0.1.130 cluster) was caused
+by the bump landing on the INTERMEDIATE v0.1.127 pod
+during chart 0.1.31 cycle. v0.1.127 still has walk-fix
+#7's strip pattern, which wiped the entry before pod
+rolled to v0.1.130. With chart 0.1.33 pinning the same
+image as the running pod, walk-fix #5 fires cleanly
+without that confounder.
+
+### Webhook rule for `applications` + `platformstacks` —
+not similarly affected today
+
+Application + PlatformStack webhooks intercept on
+`resources: [applications]` / `[platformstacks]`. Neither
+has subresource-level validation requirements today —
+Application status is owned by the controller and lacks
+phase FSM rules; PlatformStack singleton + channel + pin
+shape are all on `.spec`, not `.status`. If future Phase
+2+ work adds status-subresource validation for those
+resources, those rules will need the same `/status`
+extension.
+
+### Files
+
+- `operator/charts/apprafter-admission-webhook/templates/validatingwebhookconfiguration.yaml`
+  — `migrationplans/status` added.
+
+### Versions
+
+- CLI: 0.1.130 → 0.1.131.
+- Operator chart: v0.1.111 → v0.1.112.
+- Admission-webhook chart: v0.1.111 → v0.1.112 (lockstep).
+- platform-stack chart: 0.1.32 → 0.1.33, with the matching
+  `compatibility: "0.1.33"` entry.
+
 ## v0.1.130 — M1.5 walk-fix #5 post-B.1.77 — versionHistory SSA ownership (2026-05-23)
 
 ### Symptom

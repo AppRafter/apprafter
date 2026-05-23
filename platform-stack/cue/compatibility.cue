@@ -1649,6 +1649,79 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #6 post-B.1.77 — webhook config missing
+// `migrationplans/status` resource. Walk-fix #2 added the
+// validator's ADR 0027 app-scope reject guard, but
+// ValidatingWebhookConfiguration rule listed только
+// `resources: [migrationplans]`. `kubectl patch
+// --subresource=status -p '{"status":{"phase":"rejected"}}'`
+// routes через separate `/status` endpoint, bypassing
+// webhook entirely → ADR 0027 guard never invoked → app-
+// scope plans transitioned к rejected без admission check.
+// Fix: add `migrationplans/status` к rules.resources list.
+// Operator binary unchanged (no Rust code change); image
+// stays at v0.1.130 binary content tagged v0.1.131 via
+// lockstep chart appVersion bump.
+compatibility: "0.1.33": {
+	change:          "safe"
+	operatorVersion: "v0.1.131"
+	notes: """
+		Walk-fix #6 post-B.1.77 — ValidatingWebhookConfiguration
+		missing `migrationplans/status` resource rule.
+
+		**Symptom (walk Phase 3.4 retest):** an
+		application-scope MigrationPlan applied + patched
+		с `kubectl patch --subresource=status --type=merge
+		-p '{"status":{"phase":"rejected"}}'`. Webhook
+		should have denied per ADR 0027 (walk-fix #2
+		validator logic). Actual: patch succeeded, plan
+		transitioned к `phase=rejected` без admission
+		check.
+
+		**Root cause:** ValidatingWebhookConfiguration's
+		`migrationplans.apprafter.io` webhook listed
+		`resources: [migrationplans]`. `kubectl patch
+		--subresource=status` routes через the apiserver's
+		`/status` SUB-resource endpoint, which is a
+		separate path from the main resource endpoint.
+		Webhook configs must explicitly list
+		`<resource>/status` к intercept status-subresource
+		writes. Without it, status patches bypass the
+		webhook entirely.
+
+		**Fix:** add `migrationplans/status` к rules.resources
+		alongside `migrationplans`. Validator code
+		(walk-fix #2 ADR 0027 guard, phase transition FSM)
+		unchanged — was correct, just never invoked для
+		status patches.
+
+		**No Rust code change.** Operator + webhook
+		binaries identical к v0.1.130. Image tag bumped
+		к v0.1.131 via standard chart lockstep
+		(appVersion bump propagates new tag, same binary
+		content).
+
+		**Bonus benefit:** chart 0.1.33 pins same image
+		v0.1.131 as the operator on a v0.1.130 cluster
+		uses after pulling 0.1.32. Pin'ing к 0.1.33
+		triggers no pod restart (identical image),
+		enabling clean isolation testing для walk-fix #5
+		(versionHistory SSA ownership merge) на stable
+		pod без chart-upgrade pod-cycle artifacts.
+
+		Rendered chart vs 0.1.32: byte-equivalent for
+		operator-chart's templates + values; webhook
+		chart's `templates/validatingwebhookconfiguration.yaml`
+		gains `migrationplans/status` к the migrationplans
+		webhook's resources list.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md",
+		"docs/changelog/UNRELEASED.md#v01131",
+	]
+}
+
 // Walk-fix #5 post-B.1.77 — versionHistory SSA ownership-
 // release bug. Walk-fix #7 (v0.1.122) introduced "omit
 // versionHistory from SSA patch когда не append'ил this

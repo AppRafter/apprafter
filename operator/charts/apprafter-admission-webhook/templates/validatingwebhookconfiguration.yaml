@@ -67,6 +67,17 @@ webhooks:
         path: /validate
         port: 443
     rules:
+      # `migrationplans` + `migrationplans/status` BOTH listed.
+      # `kubectl patch --subresource=status -p '{"status":{...}}'`
+      # routes through the `/status` subresource endpoint, which
+      # is a DIFFERENT URL from the main resource — admission
+      # webhook configs must list `<resource>/status` separately
+      # to intercept status-subresource writes. Walk-fix #6 post-
+      # B.1.77: prior config without `migrationplans/status` let
+      # `kubectl patch --subresource=status -p
+      # '{"status":{"phase":"rejected"}}'` bypass the webhook
+      # entirely, defeating the ADR 0027 application-scope reject
+      # guard that walk-fix #2 added to the validator.
       - apiGroups:
           - apprafter.io
         apiVersions:
@@ -76,4 +87,5 @@ webhooks:
           - UPDATE
         resources:
           - migrationplans
+          - migrationplans/status
         scope: Namespaced
