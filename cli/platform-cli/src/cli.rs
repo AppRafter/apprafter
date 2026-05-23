@@ -175,6 +175,76 @@ pub enum Commands {
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
     },
+    /// Inspect и control the cluster's PlatformStack — the
+    /// declarative platform-version resource managed by
+    /// PlatformController. Track B.1.79 thin wrapper.
+    Platform {
+        #[command(subcommand)]
+        action: PlatformCommand,
+    },
+    /// Inspect и approve / reject MigrationPlans. Track B.1.79
+    /// thin wrapper. Application-scope rejects denied by the
+    /// admission webhook per ADR 0027 — surface the denial
+    /// verbatim.
+    Migration {
+        #[command(subcommand)]
+        action: MigrationCommand,
+    },
+    /// Open a platform UI (Argo CD today; Backstage / Grafana /
+    /// Hubble follow в later sub-phases). Spawns a local
+    /// port-forward, prints credentials, opens the default
+    /// browser, blocks until Ctrl+C.
+    Open {
+        #[command(subcommand)]
+        ui: OpenUi,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PlatformCommand {
+    /// Print PlatformStack/default summary — versions,
+    /// conditions, recent history.
+    Status,
+    /// Patch PlatformStack.spec.pin. With `--to <version>` —
+    /// pin к that version. Без `--to` — clear pin и enable
+    /// autoUpgrade (channel-following mode).
+    Upgrade {
+        #[arg(long = "to")]
+        to: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MigrationCommand {
+    /// List MigrationPlans в the apprafter-system namespace
+    /// — name, scope, classification, phase.
+    #[command(alias = "ls")]
+    List,
+    /// Patch status.phase=approved on a MigrationPlan.
+    /// MigrationController transitions через executing →
+    /// completed.
+    Approve {
+        /// MigrationPlan name (as listed via `apprafter
+        /// migration list`).
+        name: String,
+    },
+    /// Patch status.phase=rejected. The admission webhook
+    /// denies application-scope rejects per ADR 0027 — the
+    /// CLI surfaces the denial message verbatim. Platform-
+    /// scope rejects succeed и PlatformMigrationStrategy.reject
+    /// reverts `spec.pin`.
+    Reject {
+        /// MigrationPlan name.
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OpenUi {
+    /// Open the Argo CD web UI on `https://localhost:8080`
+    /// via `kubectl port-forward`, prefilling the admin
+    /// username и printing the password.
+    Argocd,
 }
 
 #[derive(Debug, Subcommand)]

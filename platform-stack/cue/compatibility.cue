@@ -1658,6 +1658,72 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Track B.1.79 — CLI thin wrappers + Argo CD MigrationPlan
+// Lua action. Operator binary unchanged (still v0.1.134); CLI
+// `apprafter` binary gains `platform`/`migration`/`open argocd`
+// subcommands и а npm-style newer-release courtesy banner.
+// Chart delta is a single Lua resource-action block для the
+// MigrationPlan CR в `configs.cm` — Argo CD's UI Approve /
+// Reject buttons mirror the CLI verbs (ADR 0027 webhook
+// denial of application-scope rejects surfaces in the UI
+// the same way it does on the CLI).
+compatibility: "0.1.39": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Track B.1.79 — CLI thin wrappers + Argo CD
+		MigrationPlan resource-action buttons.
+
+		CLI surface (out-of-chart, binary v0.1.135):
+
+		* `apprafter platform status` — reads
+		  `PlatformStack/default` через kubectl shellout,
+		  prints channel / pin / autoUpgrade / current /
+		  target / available versions + conditions table +
+		  recent versionHistory (last 5).
+		* `apprafter platform upgrade --to <v>` — merge-
+		  patches `spec.pin: <v>`. Без `--to` — clears pin
+		  и flips autoUpgrade=true (channel-following).
+		* `apprafter migration list` — table of
+		  MigrationPlans в apprafter-system (name / scope /
+		  classification / phase).
+		* `apprafter migration approve <name>` /
+		  `reject <name>` — patches `status.phase` через
+		  the `status` subresource. Application-scope
+		  rejects denied by the existing webhook (ADR 0027)
+		  с the verbatim apiserver message.
+		* `apprafter open argocd` — spawns kubectl port-
+		  forward к `svc/argocd-server -n argocd 8080:443`,
+		  prints credentials, opens default browser (xdg-
+		  open / open / cmd), blocks until Ctrl+C.
+		* Every invocation runs a fail-quiet npm-style
+		  newer-release check (24h cache в
+		  `~/.cache/apprafter/version-check.json`).
+
+		Chart surface (this entry):
+
+		* `configs.cm.resource.customizations.actions.
+		  apprafter.io_MigrationPlan` — Argo CD Lua
+		  resource-action block. Discovery disables
+		  Approve / Reject once `status.phase` leaves
+		  `pending-approval`; action bodies mutate
+		  `status.phase` к `approved` / `rejected`. Argo
+		  CD routes the mutation через the status
+		  subresource automatically; webhook denial of
+		  application-scope rejects surfaces в the UI
+		  verbatim.
+
+		Rendered chart vs 0.1.38: a single new entry
+		under `configs.cm` in `values.yaml`; all
+		templates byte-equivalent. No operator change.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md#179-cli-thin-wrappers",
+		"docs/changelog/UNRELEASED.md#v01135",
+	]
+}
+
 // Walk-fix #8 post-B.1.78 — PlatformController's destructive
 // classification was per-target-version (single record's
 // `change` field), not per-transition. Version jumps that

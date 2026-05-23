@@ -14,7 +14,7 @@ use clap::Parser;
 use cli_core::logging;
 use miette::{IntoDiagnostic, Result};
 
-use crate::cli::{Cli, Commands};
+use crate::cli::{Cli, Commands, MigrationCommand, OpenUi, PlatformCommand};
 
 fn main() -> Result<()> {
     // Configure miette's `fancy` reporter as the global panic /
@@ -35,6 +35,12 @@ fn main() -> Result<()> {
     .into_diagnostic()?;
 
     logging::init();
+
+    // npm-style courtesy check для newer CLI release. Best-
+    // effort — никогда не fails the invocation. 24h cache
+    // means the network round-trip happens once a day at
+    // most.
+    commands::version_check::maybe_warn_about_newer_version();
 
     let args = Cli::parse();
     dispatch(args).map_err(miette::Report::new)
@@ -76,6 +82,18 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
         Commands::BootstrapAll { target, dry_run } => {
             commands::bootstrap_all::run(target.as_deref(), dry_run)?
         }
+        Commands::Platform { action } => match action {
+            PlatformCommand::Status => commands::platform::status()?,
+            PlatformCommand::Upgrade { to } => commands::platform::upgrade(to.as_deref())?,
+        },
+        Commands::Migration { action } => match action {
+            MigrationCommand::List => commands::migration::list()?,
+            MigrationCommand::Approve { name } => commands::migration::approve(&name)?,
+            MigrationCommand::Reject { name } => commands::migration::reject(&name)?,
+        },
+        Commands::Open { ui } => match ui {
+            OpenUi::Argocd => commands::open::argocd()?,
+        },
     }
     Ok(())
 }

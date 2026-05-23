@@ -72,32 +72,72 @@ _components: argocd: #Component & {
 		// shape `resource.customizations.health.<group>_<Kind>`
 		// is Argo CD's documented schema for custom health
 		// scripts.
-		configs: cm: "resource.customizations.health.apprafter.io_Application": """
-			hs = {}
-			if obj.status ~= nil and obj.status.phase ~= nil then
-			  if obj.status.phase == "AwaitingMigrationApproval" then
-			    hs.status = "Degraded"
-			    hs.message = "Application paused; awaiting MigrationPlan approval"
-			    if obj.status.conditions ~= nil then
-			      for _, c in ipairs(obj.status.conditions) do
-			        if c.type == "MigrationPending" then
-			          hs.message = c.message or hs.message
-			          break
-			        end
-			      end
-			    end
-			    return hs
-			  end
-			  if obj.status.phase == "Ready" then
-			    hs.status = "Healthy"
-			    hs.message = "Reconcile complete"
-			    return hs
-			  end
-			end
-			hs.status = "Progressing"
-			hs.message = "Awaiting controller reconcile"
-			return hs
-			"""
+		configs: cm: {
+			"resource.customizations.health.apprafter.io_Application": """
+				hs = {}
+				if obj.status ~= nil and obj.status.phase ~= nil then
+				  if obj.status.phase == "AwaitingMigrationApproval" then
+				    hs.status = "Degraded"
+				    hs.message = "Application paused; awaiting MigrationPlan approval"
+				    if obj.status.conditions ~= nil then
+				      for _, c in ipairs(obj.status.conditions) do
+				        if c.type == "MigrationPending" then
+				          hs.message = c.message or hs.message
+				          break
+				        end
+				      end
+				    end
+				    return hs
+				  end
+				  if obj.status.phase == "Ready" then
+				    hs.status = "Healthy"
+				    hs.message = "Reconcile complete"
+				    return hs
+				  end
+				end
+				hs.status = "Progressing"
+				hs.message = "Awaiting controller reconcile"
+				return hs
+				"""
+
+			// B.1.79: Argo CD resource action buttons for
+			// MigrationPlan. Operators can `Approve` / `Reject`
+			// directly from the Argo CD UI alongside the CLI
+			// path (`apprafter migration approve <name>`). Argo
+			// CD merges the returned object back via the
+			// apiserver; status.phase mutations route through
+			// the status subresource automatically.
+			//
+			// Reject for application-scope plans is denied by
+			// the admission webhook per ADR 0027; the apiserver
+			// denial bubbles up to the UI with the verbatim
+			// webhook message. Discovery disables BOTH actions
+			// once the plan leaves `pending-approval` so stale
+			// buttons cannot double-fire.
+			"resource.customizations.actions.apprafter.io_MigrationPlan": """
+				discovery.lua: |
+				  actions = {}
+				  local phase = ""
+				  if obj.status ~= nil and obj.status.phase ~= nil then
+				    phase = obj.status.phase
+				  end
+				  local decidable = phase == "" or phase == "pending-approval"
+				  actions["approve"] = {["disabled"] = not decidable}
+				  actions["reject"]  = {["disabled"] = not decidable}
+				  return actions
+				definitions:
+				- name: approve
+				  action.lua: |
+				    if obj.status == nil then obj.status = {} end
+				    obj.status.phase = "approved"
+				    return obj
+				- name: reject
+				  action.lua: |
+				    if obj.status == nil then obj.status = {} end
+				    obj.status.phase = "rejected"
+				    return obj
+				"""
+		}
 
 		// argocd-repo-server runs the cue-cmp sidecar that
 		// renders user app repositories' `apprafter*.cue`

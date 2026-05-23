@@ -13,6 +13,238 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.135 — M1.5 Track B.1.79 closure — CLI thin wrappers + Argo CD MigrationPlan action (2026-05-22)
+
+### What landed
+
+CLI surface для declarative platform resources плюс Argo CD UI
+parity для MigrationPlan approval. Five new subcommands в the
+`apprafter` binary plus one Argo CD resource-action Lua block в
+the platform-stack chart.
+
+### CLI subcommands
+
+`apprafter platform status` — reads `PlatformStack/default` from
+`apprafter-system` через kubectl shellout, formats human-
+readable summary:
+
+- Header: namespace/name, tier number (`spec.values.tier`).
+- Spec config: `channel`, `pin` (or `(unpinned)`), `autoUpgrade`.
+- Versions block: `currentVersion`, `targetVersion`,
+  `availableVersion`, `lastUpstreamCheck` (timestamps verbatim).
+- Conditions table: `TYPE | STATUS | REASON | MESSAGE`,
+  `tabled`-rendered with 60-char MESSAGE wrap.
+- Recent history table: last 5 `versionHistory` entries,
+  newest-first (`APPLIED AT | VERSION | OUTCOME`).
+
+`apprafter platform upgrade [--to <v>]` — merge-patches
+`PlatformStack.spec`:
+
+- `--to <v>` → `{"spec":{"pin":"<v>"}}` — pins к explicit
+  version, autoUpgrade preserved as-is.
+- Без `--to` → `{"spec":{"pin":null,"autoUpgrade":true}}` —
+  clears the pin (JSON merge-patch null deletes the field per
+  RFC 7396) and flips к channel-following mode. Used in
+  walk-fix #7 / #8 scenarios where operator wants to resume
+  auto-upgrade after pinning к a known-good version.
+
+`apprafter migration list` — table of MigrationPlans в
+`apprafter-system`:
+
+- Columns: `NAME | SCOPE | CLASSIFICATION | PHASE`.
+- `PHASE` defaults к `pending-approval` для CRs без status
+  (matches MigrationController's implicit initial-phase
+  semantics).
+- Empty namespace prints `No MigrationPlans in apprafter-system`.
+
+`apprafter migration approve <name>` / `reject <name>` — status-
+subresource merge-patches:
+
+- Approve: `{"status":{"phase":"approved"}}` через
+  `--subresource=status`. MigrationController's reconcile loop
+  transitions к executing → completed; PlatformController's
+  next reconcile sees the completed plan и proceeds с the bump.
+- Reject: `{"status":{"phase":"rejected"}}`. **Application-
+  scope rejects denied by the admission webhook per ADR 0027**
+  (walk-fix #2 hardened the FSM's first-write branch); the CLI
+  forwards the patch и surfaces the apiserver denial verbatim.
+  Platform-scope rejects succeed; `PlatformMigrationStrategy.
+  reject` (B.1.76 + walk-fix #7) reverts `spec.pin` к
+  `previousSpecSnapshot.pin` (or null когда snapshot has no
+  pin).
+
+`apprafter open argocd` — local Argo CD UI access helper:
+
+- Decrypts the cached kubeconfig (`commands::k8s_helpers::
+  ensure_kubeconfig_tempfile` — shared with `platform` /
+  `migration` wrappers) into a tempfile.
+- Resolves the admin password through
+  `commands::argocd_password::compute_argocd_password` (cached
+  age-encrypted в state on first call).
+- Spawns `kubectl port-forward svc/argocd-server -n argocd
+  8080:443` в background; drains stdout one line at a time
+  until `Forwarding from` lands, propagates early exits as
+  errors.
+- Prints `URL`, `Username: admin`, `Password`, blocks on
+  `child.wait()` so Ctrl+C tears down both via the process
+  group's SIGINT default.
+- Cross-platform browser open: `xdg-open` (Linux), `open`
+  (macOS), `cmd /c start` (Windows). Failures fall through
+  quietly — the URL is already на stdout, operator can paste
+  manually.
+
+### npm-style newer-release banner
+
+`commands::version_check::maybe_warn_about_newer_version()`
+runs once before clap parses arguments:
+
+```rust
+const RELEASE_URL: &str =
+    "https://api.github.com/repos/apprafter/apprafter/releases/latest";
+const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+```
+
+- 24h cache at `~/.cache/apprafter/version-check.json` (JSON
+  с `latest_tag` + `fetched_at_secs`).
+- `ureq` GET with 3s timeout, `User-Agent: apprafter-cli`,
+  `Accept: application/vnd.github+json`.
+- Strips `v` prefix from `tag_name` before comparison.
+- `newer_than(candidate, current)` uses semver crate; falls
+  back к `false` (no warning) on unparseable input —
+  fail-quiet.
+- Failures swallowed silently — network errors / GitHub rate-
+  limit / JSON parse / cache write errors all logged at debug
+  только. Version check is courtesy, not operational
+  prerequisite.
+
+### Shared kubectl helpers
+
+`commands::k8s_helpers` — three new utility functions used by
+all three wrappers, centralising the boilerplate:
+
+```rust
+pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile>;
+pub fn kubectl_get_json(
+    resource: &str, name: Option<&str>,
+    namespace: Option<&str>, kubeconfig_path: &Path,
+) -> Result<Option<serde_json::Value>>;
+pub fn kubectl_merge_patch(
+    resource: &str, name: &str,
+    namespace: Option<&str>, subresource: Option<&str>,
+    body_json: &str, kubeconfig_path: &Path,
+) -> Result<()>;
+```
+
+`kubectl_get_json` returns `Ok(None)` для 404 (callers decide
+whether absence is an error). `kubectl_merge_patch` routes
+through `--subresource=status` когда the optional subresource
+parameter is `Some("status")` — required для status.phase
+writes that bypass spec-only webhook rules.
+
+CLI shellout (rather than pulling in kube-rs's Tokio runtime)
+matches the pattern set by `commands::argocd_password` и
+`commands::cluster_bootstrap` — `apprafter` is a synchronous
+binary, kubectl shellout keeps the wire format consistent.
+
+### Argo CD MigrationPlan resource-action block
+
+Chart-side delta lands в `platform-stack/cue/component_argocd.
+cue` под `configs.cm` (Argo CD's `argocd-cm` ConfigMap):
+
+```yaml
+resource.customizations.actions.apprafter.io_MigrationPlan: |-
+  discovery.lua: |
+    actions = {}
+    local phase = ""
+    if obj.status ~= nil and obj.status.phase ~= nil then
+      phase = obj.status.phase
+    end
+    local decidable = phase == "" or phase == "pending-approval"
+    actions["approve"] = {["disabled"] = not decidable}
+    actions["reject"]  = {["disabled"] = not decidable}
+    return actions
+  definitions:
+  - name: approve
+    action.lua: |
+      if obj.status == nil then obj.status = {} end
+      obj.status.phase = "approved"
+      return obj
+  - name: reject
+    action.lua: |
+      if obj.status == nil then obj.status = {} end
+      obj.status.phase = "rejected"
+      return obj
+```
+
+Discovery disables **both** Approve + Reject once `status.phase`
+leaves `pending-approval` so stale buttons cannot double-fire.
+Argo CD routes the returned object's `status.phase` mutation
+через the status subresource automatically; ADR 0027's
+application-scope reject denial surfaces в the UI с the
+verbatim webhook message exactly as it does on the CLI.
+
+The existing `configs.cm` block grew from a single-key string
+(`resource.customizations.health.apprafter.io_Application`,
+shipped в B.1.77) к a multi-key map; both entries remain
+byte-equivalent в the rendered chart vs 0.1.38 outside the
+new action key.
+
+### Deferred к 1.79a
+
+- `apprafter platform channel <name>` — single-channel
+  (`stable`) ships в M1.5; multi-channel UX waits для Phase 2
+  where alternate channels actually exist.
+- `apprafter platform freeze <component> [--version <v>]` /
+  `unfreeze <component>` — component-level pinning is а
+  polish layer over the chart-level pin already shipped;
+  ships alongside ResourceClaim CRUD в 1.79a.
+- `apprafter platform rescue` — covered by `apprafter
+  cluster-bootstrap`'s re-adopt path that 1.79a's loader
+  extensions formalise.
+- `apprafter open backstage` — Backstage stack not tier-1
+  resident yet; ships when Phase 2's portal lands.
+- `apprafter open grafana` / `apprafter open hubble` —
+  deferred к Tier 2+.
+
+### Tests
+
++13 unit tests в the platform-cli crate:
+
+- `commands::version_check::tests`: `newer_than_strips_v_prefix`,
+  `newer_than_returns_false_for_equal`,
+  `newer_than_returns_false_for_older`,
+  `newer_than_returns_false_for_garbage` (fail-quiet contract).
+- `commands::platform::tests`:
+  `print_status_handles_minimal_object` (no-status CR doesn't
+  panic, prints `(unset)` / `(none)` placeholders),
+  `print_status_renders_full_object` (happy-path smoke).
+- `commands::migration::tests`:
+  `plan_row_defaults_to_pending_approval_when_status_missing`,
+  `plan_row_extracts_all_columns`.
+
+All clippy `-D warnings`, fmt, cue vet, SPDX gates clean.
+
+### Versioning
+
+- CLI 0.1.134 → 0.1.135 (`cli/Cargo.toml` workspace.package.
+  version).
+- platform-stack chart 0.1.38 → 0.1.39 (`platform-stack/cue/
+  platform.cue` `currentVersion`; new compatibility entry in
+  `compatibility.cue`).
+- Operator chart **unchanged** — no operator-binary delta.
+  appVersion remains v0.1.134; `RELEASED_OPERATOR_VERSION`
+  constant in `cli-providers` untouched.
+
+### References
+
+- ADR 0025 (Argo CD as the only GitOps engine).
+- ADR 0026 (PlatformStack CRD).
+- ADR 0027 (Unified MigrationPlan).
+- `plan.md` §1.79.
+
+---
+
 ## v0.1.134 — M1.5 walk-fix #8 post-B.1.78 — path-aware classification (2026-05-23)
 
 ### Symptom
