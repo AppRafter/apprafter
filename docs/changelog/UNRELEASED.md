@@ -13,6 +13,125 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.136 — M1.5 walk-fix #1 post-B.1.79 — `apprafter open argocd` SIGPIPE early-exit (2026-05-22)
+
+### Symptom
+
+Acceptance walk of v0.1.135 `apprafter open argocd`:
+
+```
+$ apprafter open argocd
+
+Opening Argo CD UI...
+  URL:       https://localhost:8080
+  Username:  admin
+  Password:  Hjy-lexPSth2cti2
+
+Press Ctrl+C к stop the port-forward.
+
+$
+```
+
+Process returned к the shell prompt immediately после
+printing the credentials banner. `child.wait()` resolved
+within milliseconds instead of blocking until Ctrl+C —
+local port 8080 was never actually bound for the operator's
+browser session.
+
+### Root cause
+
+`wait_port_forward_ready` took ownership of `child.stdout`
+via `child.stdout.take()`, read line-by-line until it saw
+`Forwarding from`, and returned. **The `BufReader` and
+`ChildStdout` dropped at the end of the function — closing
+the read end of kubectl's stdout pipe.**
+
+kubectl is а Go binary; Go's default SIGPIPE handler
+terminates the process on the next write к а closed stdout
+pipe (per `os/signal` docs:
+"When Go programs write к such а closed pipe, they will
+receive а SIGPIPE signal", и the default handler is к exit).
+
+kubectl port-forward emits at least one more line после
+the initial `Forwarding from 127.0.0.1:…` — typically
+`Forwarding from [::1]:…`. That second write hit the closed
+pipe → SIGPIPE → kubectl exit → `child.wait()` returned
+immediately.
+
+`stderr` had the same problem latent: also `Stdio::piped()`,
+also never drained. If kubectl had emitted significant
+stderr chatter before the ready banner, the stderr pipe's
+64 KiB kernel buffer would have filled up и blocked the
+child on its next stderr write. Not the trigger this walk,
+but the same class of bug.
+
+### Fix
+
+Spawn one drainer thread per pipe; both threads outlive
+`wait_port_forward_ready`'s return:
+
+```rust
+fn wait_port_forward_ready(child: &mut Child) -> Result<()> {
+    let stdout = child.stdout.take().ok_or_else(...)?;
+    let stderr = child.stderr.take().ok_or_else(...)?;
+
+    let rx = spawn_ready_drainer(stdout);
+    spawn_silent_drainer(stderr);
+
+    rx.recv().map_err(|_| {
+        CliError::Other("kubectl port-forward exited before binding local port".into())
+    })
+}
+```
+
+`spawn_ready_drainer` reads stdout line-by-line, signals
+readiness through а `mpsc::sync_channel::<()>(1)` on the
+first `Forwarding from` line, then **continues draining to
+EOF** so kubectl's stdout pipe stays open для the lifetime
+of the child. If EOF arrives before the banner, the sender
+drops; `recv()` resolves as `Err` и the caller surfaces
+"exited before binding local port".
+
+`spawn_silent_drainer` reads stderr to EOF и discards. Same
+contract — keep the pipe drained so the child never blocks
+on а write.
+
+### Regression coverage
+
++4 unit tests в `cli/platform-cli/src/commands/open.rs`,
+all driven by `std::io::Cursor` fakes (no real kubectl
+required):
+
+- `ready_drainer_signals_on_forwarding_line` — minimal
+  happy path: single ready line followed by EOF → `recv()`
+  returns Ok.
+- `ready_drainer_continues_draining_after_signal` — **the
+  load-bearing test для this fix.** Feeds the ready
+  banner followed by extra stdout bytes (`Forwarding from
+  [::1]:…\n`, `Handling connection for 8080\n`); wraps the
+  reader в а `Tracker` that counts consumed bytes;
+  asserts the drainer reads ALL of them. If the drainer
+  ever short-circuits after signaling, this test fails.
+- `ready_drainer_yields_recv_err_when_eof_before_banner`
+  — feeds а kubectl-style error message followed by EOF
+  with no banner; asserts `recv()` returns `Err`.
+- `silent_drainer_reads_to_eof` — feeds three lines of
+  fake stderr through а byte counter; asserts всё
+  consumed.
+
+### Versioning
+
+CLI 0.1.135 → 0.1.136. Chart-side (platform-stack +
+operator) unchanged — bug is а CLI-only IO handling
+defect.
+
+### References
+
+- Go `os/signal` docs: SIGPIPE termination semantics.
+- `plan.md` §1.79.
+
+---
+
 ## v0.1.135 — M1.5 Track B.1.79 closure — CLI thin wrappers + Argo CD MigrationPlan action (2026-05-22)
 
 ### What landed
