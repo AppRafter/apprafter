@@ -28,7 +28,7 @@ use kube::core::DynamicObject;
 use kube::discovery::{ApiCapabilities, ApiResource};
 use kube::Client;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::info;
 
 use operator_core::{
     Application, ApplicationSpec, DestructiveChange, MigrationApplicationRef,
@@ -260,52 +260,112 @@ impl MigrationStrategy for PlatformMigrationStrategy {
             .previous_spec_snapshot
             .as_ref()
             .ok_or_else(|| MigrationError::NoSnapshot(plan_name.clone()))?;
-        let pin_value = snapshot.get("pin").cloned();
+        let snapshot_pin = snapshot.get("pin");
 
-        // 2. Build the SSA payload. `spec.pin: null` removes
-        //    the pin (when the plan rolled forward from
-        //    "no pin set"); otherwise we revert to the snapshot
-        //    pin value.
-        let patch_pin = pin_value.unwrap_or(Value::Null);
-        let body = json!({
-            "apiVersion": "apprafter.io/v1alpha1",
-            "kind": "PlatformStack",
-            "metadata": { "name": Self::SINGLETON_NAME },
-            "spec": { "pin": patch_pin },
-        });
-
-        // 3. SSA-patch the singleton with our strategy field
-        //    manager. `force=true` so we win against a stale
-        //    user write; PlatformController's
-        //    `detect_outside_writer` sees the manager name and
-        //    treats it as an authorised peer (whitelisted via
-        //    the `WHITELISTED_FIELD_MANAGERS` list — extension
-        //    documented in this commit alongside the strategy
-        //    impl).
+        // 2. Read current state. Reject is idempotent — when
+        //    `PlatformStack.spec.pin` already matches the
+        //    snapshot (both same string, or both
+        //    absent/null), the patch is a no-op and we return
+        //    success without sending к the apiserver.
+        //
+        //    Walk-fix #7 post-B.1.78: without this no-op
+        //    short-circuit, channel-following clusters
+        //    (`spec.pin == null + snapshot.pin == null`)
+        //    forced an SSA-apply с `spec.pin: null` body,
+        //    which the apiserver rejects 422 ("spec.pin must
+        //    be of type string"). MigrationController's
+        //    reconcile errored, walk-fix #3 sealing
+        //    (`status.rejectedAt`) never landed, and the
+        //    error loop ran forever.
         let api: Api<DynamicObject> = Api::namespaced_with(
             self.client.clone(),
             Self::SINGLETON_NAMESPACE,
             &self.platformstack_api,
         );
-        let params = PatchParams::apply(STRATEGY_FIELD_MANAGER).force();
-        match api
-            .patch(Self::SINGLETON_NAME, &params, &Patch::Apply(&body))
-            .await
-        {
-            Ok(_) => {
+        let stack = api.get(Self::SINGLETON_NAME).await?;
+        let stack_json = serde_json::to_value(&stack)
+            .map_err(|e| MigrationError::SnapshotShape(plan_name.clone(), e.to_string()))?;
+        let current_pin = stack_json.pointer("/spec/pin");
+
+        if pins_equal(current_pin, snapshot_pin) {
+            info!(
+                plan = %plan_name,
+                "PlatformStack.spec.pin already matches snapshot — reject is no-op"
+            );
+            return Ok(());
+        }
+
+        // 3. Patch shape depends on whether we're SETTING
+        //    pin к a value or CLEARING it.
+        //
+        //    Setting (snapshot.pin = "0.1.X"): SSA-apply с
+        //    force=true so we win against a stale user
+        //    write. Field manager
+        //    `migration-controller-strategy` distinguishes
+        //    the patch from PlatformController's
+        //    `platform-controller`.
+        //
+        //    Clearing (snapshot.pin = null / absent): SSA
+        //    cannot represent field-deletion cleanly когда
+        //    the CRD field is `type: string` without
+        //    `nullable: true` — a `null` value fails
+        //    schema validation. JSON merge-patch (RFC 7396)
+        //    treats `null` as "delete this field", so we
+        //    use `Patch::Merge` for the clearing case.
+        match snapshot_pin {
+            Some(Value::String(value)) => {
+                let body = json!({
+                    "apiVersion": "apprafter.io/v1alpha1",
+                    "kind": "PlatformStack",
+                    "metadata": { "name": Self::SINGLETON_NAME },
+                    "spec": { "pin": value },
+                });
+                let params = PatchParams::apply(STRATEGY_FIELD_MANAGER).force();
+                api.patch(Self::SINGLETON_NAME, &params, &Patch::Apply(&body))
+                    .await?;
                 info!(
                     plan = %plan_name,
-                    pin_value = %patch_pin,
-                    "PlatformMigrationStrategy.reject — reverted PlatformStack.spec.pin"
+                    pin_value = %value,
+                    "PlatformMigrationStrategy.reject — reverted PlatformStack.spec.pin (SSA apply)"
                 );
                 Ok(())
             }
-            Err(e) => {
-                warn!(plan = %plan_name, error = %e, "PlatformStack reject patch failed");
-                Err(MigrationError::Kube(e))
+            None | Some(Value::Null) => {
+                let body = json!({ "spec": { "pin": Value::Null } });
+                let params = PatchParams {
+                    field_manager: Some(STRATEGY_FIELD_MANAGER.to_string()),
+                    ..PatchParams::default()
+                };
+                api.patch(Self::SINGLETON_NAME, &params, &Patch::Merge(body))
+                    .await?;
+                info!(
+                    plan = %plan_name,
+                    "PlatformMigrationStrategy.reject — cleared PlatformStack.spec.pin (merge patch null)"
+                );
+                Ok(())
             }
+            Some(other) => Err(MigrationError::SnapshotShape(
+                plan_name,
+                format!("previousSpecSnapshot.pin must be string or null, got {other:?}"),
+            )),
         }
     }
+}
+
+/// Treat a missing pin field, an explicit null value, and a
+/// concrete string as three distinct states. Two states are
+/// equal iff:
+///
+///   * Both are missing or null (channel-following mode).
+///   * Both are the same string.
+///
+/// Helper extracted so unit tests can exercise the equality
+/// rules без a running cluster.
+fn pins_equal(current: Option<&Value>, snapshot: Option<&Value>) -> bool {
+    fn normalise(v: Option<&Value>) -> Option<&str> {
+        v.and_then(|x| x.as_str())
+    }
+    normalise(current) == normalise(snapshot)
 }
 
 // `ApiCapabilities` is unused in the static-ApiResource path;
@@ -460,5 +520,54 @@ mod tests {
         let snapshot = json!({ "autoUpgrade": true });
         let pin = snapshot.get("pin").cloned().unwrap_or(Value::Null);
         assert_eq!(pin, Value::Null);
+    }
+
+    // ---- walk-fix #7 post-B.1.78 — pins_equal short-circuit ----
+
+    #[test]
+    fn pins_equal_treats_missing_and_null_and_explicit_null_as_equivalent() {
+        // Channel-following state can be represented three
+        // ways в JSON: field absent, field=null, или missing
+        // entirely from the snapshot. All collapse к "no pin
+        // is set". `pins_equal` must treat them as one state
+        // — without that, the reject no-op short-circuit
+        // wouldn't fire and the strategy would send an
+        // invalid SSA patch (`spec.pin: null` against a
+        // non-nullable string field).
+        let null = Value::Null;
+
+        // current=None, snapshot=None.
+        assert!(pins_equal(None, None));
+        // current=Some(null), snapshot=None.
+        assert!(pins_equal(Some(&null), None));
+        // current=None, snapshot=Some(null).
+        assert!(pins_equal(None, Some(&null)));
+        // current=Some(null), snapshot=Some(null).
+        assert!(pins_equal(Some(&null), Some(&null)));
+    }
+
+    #[test]
+    fn pins_equal_treats_same_string_as_equal() {
+        let a = Value::String("0.1.25".into());
+        let b = Value::String("0.1.25".into());
+        assert!(pins_equal(Some(&a), Some(&b)));
+    }
+
+    #[test]
+    fn pins_equal_distinguishes_different_strings() {
+        let a = Value::String("0.1.25".into());
+        let b = Value::String("0.1.26".into());
+        assert!(!pins_equal(Some(&a), Some(&b)));
+    }
+
+    #[test]
+    fn pins_equal_distinguishes_null_from_string() {
+        let null = Value::Null;
+        let s = Value::String("0.1.25".into());
+        assert!(!pins_equal(Some(&null), Some(&s)));
+        assert!(!pins_equal(Some(&s), Some(&null)));
+        // Missing field also distinct from a concrete string.
+        assert!(!pins_equal(None, Some(&s)));
+        assert!(!pins_equal(Some(&s), None));
     }
 }

@@ -13,6 +13,140 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.133 — M1.5 walk-fix #7 post-B.1.78 — reject for channel-following (2026-05-23)
+
+### Symptom
+
+B.1.78 acceptance walk reject test on chart 0.1.36 (synthetic
+`breaking` fixture). User created MigrationPlan
+`platform-0-1-35-to-0-1-36` via PlatformController's
+auto-create on destructive transition; cluster was channel-
+following (`spec.pin=null`), so `previousSpecSnapshot.pin =
+null`. User patched plan к `phase=rejected`. MigrationController
+observed the transition, invoked `strategy.reject` — and the
+SSA-apply errored:
+
+```
+PlatformStack.apprafter.io "default" is invalid:
+spec.pin: Invalid value: "null":
+spec.pin in body must be of type string
+```
+
+Error propagated к `error_policy` → 15s requeue → same error
+→ infinite loop. Walk-fix #3 sealing (`status.rejectedAt`
+write) never ran because it's positioned AFTER strategy.reject
+in the reconcile branch.
+
+Cluster blocking-by-rejected-plan still worked (plan phase=
+rejected was set by the kubectl status patch directly; the
+PlatformController's GET-by-name found a non-completed plan
+and blocked the bump). So the user-facing behavior was
+correct — cluster stayed on 0.1.35. But operator logs
+churned errors forever и the sealing fix from walk-fix #3
+silently regressed.
+
+### Root cause
+
+Original `PlatformMigrationStrategy.reject` ALWAYS built an
+SSA-apply body with `spec.pin: <snapshot_pin or null>`. The
+intent: SSA с `pin: null` should "remove the pin" — restoring
+channel-following mode. But the CRD's PlatformStack schema
+defines `pin` as `type: string` without `nullable: true`.
+Apiserver rejects an explicit `null` value as schema
+violation regardless of SSA Apply semantics — validation
+fires before merge.
+
+### Fix
+
+Three-branch dispatch:
+
+```rust
+async fn reject(&self, plan: &MigrationPlan) -> Result<(), MigrationError> {
+    let snapshot_pin = plan.spec.previous_spec_snapshot
+        .as_ref().ok_or(NoSnapshot)?.get("pin");
+
+    // Read current state.
+    let stack = api.get(SINGLETON_NAME).await?;
+    let current_pin = stack_json.pointer("/spec/pin");
+
+    // Idempotent no-op when already в desired state.
+    if pins_equal(current_pin, snapshot_pin) {
+        return Ok(());
+    }
+
+    match snapshot_pin {
+        Some(Value::String(v)) => {
+            // SSA-apply with force=true.
+            api.patch(name, &PatchParams::apply(MGR).force(),
+                      &Patch::Apply(&body_with_pin_str)).await?;
+        }
+        None | Some(Value::Null) => {
+            // JSON merge-patch: null means "delete field"
+            // per RFC 7396. Works regardless of CRD
+            // `nullable`.
+            api.patch(name, &PatchParams { field_manager: Some(MGR), .. },
+                      &Patch::Merge(json!({"spec":{"pin":null}}))).await?;
+        }
+        Some(other) => Err(SnapshotShape(...)),
+    }
+}
+```
+
+`pins_equal` helper treats missing-field, explicit-null, and
+both as equivalent ("channel-following"). Two pins are equal
+iff both are missing/null OR both are the same string.
+
+### Side-effect: walk-fix #3 sealing now reachable
+
+The walk-fix #3 `status.rejectedAt` marker was supposed to
+prevent re-invocation of `strategy.reject` on operator pod
+restart. It only works if the marker actually lands —
+which requires `strategy.reject` к return Ok. Before
+walk-fix #7, null-snapshot clusters never saw the marker
+set, so even after restart the strategy re-ran and re-failed.
+Post-fix, sealing reaches completion; subsequent reconciles
+see the marker и skip the strategy invocation.
+
+### Tests
+
++4 unit tests на `pins_equal` helper:
+
+- `pins_equal_treats_missing_and_null_and_explicit_null_as_equivalent`
+- `pins_equal_treats_same_string_as_equal`
+- `pins_equal_distinguishes_different_strings`
+- `pins_equal_distinguishes_null_from_string`
+
+Total migration crate: 14 → 18.
+
+The strategy.reject SSA-vs-merge dispatch itself isn't
+unit-tested directly (requires a kube cluster); the next
+walk against chart 0.1.37 cluster confirms via:
+
+- `kubectl get migrationplan platform-X-X-X-to-0-1-Y -o yaml
+  | yq '.status.rejectedAt'` returns a populated timestamp
+  (was always `null` before).
+- `kubectl logs -n apprafter-system deploy/apprafter-operator
+  | grep "PlatformStack reject patch failed"` returns empty
+  (was producing one error every 15s).
+- `kubectl get platformstack default -o jsonpath='{.spec.pin}'`
+  returns `""` (field absent / deleted) when snapshot.pin
+  was null AND current pin was non-null.
+
+### Files
+
+- `operator/operator-controllers/migration/src/strategy.rs`
+  — `pins_equal` helper + three-branch reject dispatch + 4
+  regression tests.
+
+### Versions
+
+- CLI: 0.1.132 → 0.1.133.
+- Operator chart: v0.1.113 → v0.1.114.
+- Admission-webhook chart: v0.1.113 → v0.1.114 (lockstep).
+- platform-stack chart: 0.1.36 → 0.1.37 (`safe` — operator
+  bugfix, no semantic chart change), with the matching
+  `compatibility: "0.1.37"` entry.
+
 ## v0.1.132 — M1.5 Track B.1.78 closure — PlatformController MigrationPlan integration (2026-05-23)
 
 PlatformController gains a destructive-transition gate per

@@ -1658,6 +1658,104 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #7 post-B.1.78 — PlatformMigrationStrategy.reject's
+// SSA-apply of `spec.pin: null` for channel-following clusters
+// failed apiserver validation (`spec.pin must be of type
+// string: "null"`), error_policy retried forever, walk-fix #3
+// sealing (`status.rejectedAt` write) never ran. Fix: read
+// PlatformStack first; if current pin already matches snapshot
+// pin (both string-equal или both null/missing), no-op return
+// Ok. Otherwise, set-к-string uses SSA force=true (existing
+// path); clear-к-null uses JSON merge-patch (RFC 7396 — null
+// means "delete this field", works regardless of CRD
+// `nullable`). Operator-binary change only → image v0.1.132 →
+// v0.1.133 via standard chart appVersion lockstep.
+compatibility: "0.1.37": {
+	change:          "safe"
+	operatorVersion: "v0.1.133"
+	notes: """
+		Walk-fix #7 post-B.1.78 —
+		`PlatformMigrationStrategy.reject` fix для
+		channel-following clusters (`snapshot.pin = null`).
+
+		**Symptom.** Walk Phase B.1.78 reject test on
+		v0.1.132 chart 0.1.36 — operator approved
+		application-scope reject denial earlier (walk-fix
+		#2 + #6 OK), but platform-scope reject on
+		`platform-0-1-35-to-0-1-36` (cluster channel-
+		following, snapshot.pin=null) loop'нул:
+		`PlatformStack.apprafter.io "default" is invalid:
+		spec.pin: Invalid value: "null": spec.pin in body
+		must be of type string`. Error_policy retried
+		every 15s; walk-fix #3 sealing's
+		`status.rejectedAt` write never landed → плагин
+		не sealed → infinite retry loop.
+
+		**Root cause.** Original strategy.reject ALWAYS
+		built SSA-apply body с `spec.pin: <snapshot_pin
+		или null>`. When snapshot.pin=null, body was
+		`{"spec":{"pin":null}}`. CRD's PlatformStack
+		schema:
+		```yaml
+		pin:
+		  type: string
+		  pattern: "..."
+		```
+		— `type: string` без `nullable: true` → apiserver
+		rejects explicit `null` value as schema
+		violation.
+
+		**Fix.** Three-branch dispatch в
+		`PlatformMigrationStrategy.reject`:
+
+		1. Read current PlatformStack via Api::get.
+		2. Compare current spec.pin vs snapshot.pin via
+		   `pins_equal` helper (treats missing /
+		   explicit null / both as equivalent).
+		3. Dispatch:
+		   * Pins equal → no-op return Ok (idempotent;
+		     no patch к apiserver). Sealing write fires.
+		   * snapshot.pin = Some(String) и pin differs
+		     → SSA-apply с force=true (existing path).
+		   * snapshot.pin = None / Null и pin is set →
+		     JSON merge-patch `{"spec":{"pin":null}}`.
+		     RFC 7396 semantics: `null` in merge-patch
+		     deletes the field. Works regardless of
+		     CRD `nullable`.
+
+		Pre-walk-fix #7 path was always SSA-apply,
+		which forced explicit `null` value into the
+		field — schema validation rejected. Post-fix,
+		clearing via merge-patch routes around the
+		schema constraint.
+
+		**Tests.** +4 unit tests in
+		`operator-controllers/migration/src/strategy.rs`:
+		`pins_equal_treats_missing_and_null_and_explicit_null_as_equivalent`,
+		`pins_equal_treats_same_string_as_equal`,
+		`pins_equal_distinguishes_different_strings`,
+		`pins_equal_distinguishes_null_from_string`.
+		Total migration crate: 14 → 18.
+
+		**Sealing side-effect.** With the strategy.reject
+		now returning Ok cleanly для null-snapshot
+		clusters, the walk-fix #3 sealing path
+		(`status.rejectedAt` write) runs к completion.
+		Subsequent reconciles see the marker и skip
+		strategy.reject — confirmed-fix к the original
+		B.1.76 walk-fix #3 logic that was masked by this
+		bug.
+
+		Rendered chart vs 0.1.36: byte-equivalent
+		templates. Operator-binary change only.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md",
+		"docs/changelog/UNRELEASED.md#v01133",
+	]
+}
+
 // B.1.78 acceptance walk reject-flow fixture — chart 0.1.36
 // classified `breaking` к exercise PlatformController auto-
 // create → operator-reject → rejected-plan-blocks-retry
