@@ -869,21 +869,62 @@ fn build_application_patch(desired: &DesiredSource) -> Value {
 async fn write_status(
     stack: &PlatformStack,
     ctx: &Context,
-    new_status: PlatformStackStatus,
-    include_version_history: bool,
+    mut new_status: PlatformStackStatus,
+    _include_version_history: bool,
 ) -> Result<(), Error> {
     let api: Api<PlatformStack> = Api::namespaced(ctx.client.clone(), SINGLETON_NAMESPACE);
     let name = stack.name_any();
-    // SSA REQUIRES apiVersion + kind + metadata.name in the patch
-    // body — the apiserver uses them to look up the resource's
-    // OpenAPI schema before merging. Walk-found bug v0.1.115 →
-    // v0.1.116: a `{"status": {...}}` patch alone hits the
-    // apiserver with `invalid object type: /, Kind=` (empty
-    // GroupVersion, empty Kind) and every reconcile retry loops
-    // on that error. Mirror'ed from
-    // `operator_controllers_application::apply_status` which has
-    // always carried the TypeMeta.
-    let patch = build_status_patch(&name, &new_status, include_version_history);
+
+    // Walk-fix #5 post-B.1.77: read server state + merge
+    // `versionHistory` BEFORE SSA-apply. Replaces the
+    // walk-fix #7 "omit field to preserve value" pattern,
+    // which was incorrect for SSA Apply semantics — when a
+    // field manager re-applies without a previously-owned
+    // field, ownership is RELINQUISHED, and if no other
+    // manager owns it, **apiserver removes the field**
+    // (Kubernetes SSA spec). The omit pattern thus deleted
+    // entries one reconcile after they landed.
+    //
+    // The race walk-fix #7 was originally guarding against:
+    // a follow-up reconcile fires from our own status write,
+    // reads the watcher cache (lagged → no entry visible),
+    // writes the stale vector back. Solution: fetch the
+    // authoritative server-side `versionHistory` per write
+    // and merge with whatever local entries the current
+    // reconcile produced. The cache's value is irrelevant —
+    // we always reflect server truth.
+    //
+    // Cost: one extra `Api::get_status` round-trip per
+    // write. `write_status_if_changed` shortcuts no-op
+    // writes, so steady-state reconciles (no diff) don't
+    // pay the extra GET.
+    let server_state = api.get_status(&name).await?;
+    let server_history = server_state
+        .status
+        .as_ref()
+        .and_then(|s| s.version_history.clone())
+        .unwrap_or_default();
+    let our_history = new_status.version_history.clone().unwrap_or_default();
+    new_status.version_history = Some(crate::status::merge_version_history(
+        server_history,
+        our_history,
+    ));
+
+    // SSA REQUIRES apiVersion + kind + metadata.name in the
+    // patch body — the apiserver uses them к look up the
+    // resource's OpenAPI schema before merging. Walk-found
+    // bug v0.1.115 → v0.1.116: a `{"status": {...}}` patch
+    // alone hits the apiserver с `invalid object type: /,
+    // Kind=` (empty GroupVersion, empty Kind).
+    //
+    // Always include `versionHistory` in the SSA body
+    // (`include_version_history=true`) — see comment above
+    // for the SSA ownership-release rationale. The
+    // `_include_version_history` parameter is retained as a
+    // no-op for binary compatibility with existing call
+    // sites; future cleanup removes it.
+    let patch = build_status_patch(&name, &new_status, true);
+
     // `force=true` for the same reason MigrationController's
     // status write uses it (walk-found bug v0.1.126 →
     // v0.1.127 on the migration side): a manual `kubectl
@@ -893,12 +934,6 @@ async fn write_status(
     // controller's desired status under
     // `platform-controller` — without `.force()` that 409s
     // with a managedFields conflict and freezes the loop.
-    //
-    // PlatformController has historically been the SOLE
-    // writer of `PlatformStack.status`, so the bug never
-    // surfaced in walks — but defensive coverage is cheap
-    // and prevents a future operator support session from
-    // chasing the same conflict.
     api.patch_status(
         &name,
         &PatchParams::apply(FIELD_MANAGER).force(),

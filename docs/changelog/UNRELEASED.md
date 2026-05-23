@@ -13,6 +13,171 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.130 — M1.5 walk-fix #5 post-B.1.77 — versionHistory SSA ownership (2026-05-23)
+
+### Symptom
+
+Walk Phase 6 (artificial pin downgrade + upgrade tests on
+v0.1.127→v0.1.129) consistently showed
+`PlatformStack.status.versionHistory` stays `null` after
+multiple successful targetRevision bumps. managedFields
+output never included `platform-controller` claiming
+`f:versionHistory`. Walk-fix #4's observability logs
+(landed v0.1.129) confirmed `include_version_history=false`
+on every settled-state reconcile.
+
+### Root cause
+
+Walk-fix #7 (v0.1.122) introduced conditional
+`versionHistory` stripping in the SSA patch body:
+
+```rust
+if !include_version_history {
+    if let Value::Object(map) = &mut status_value {
+        map.remove("versionHistory");
+    }
+}
+```
+
+When `include_version_history=false` (settled state, no
+new entry), the field was removed from the patch body to
+"preserve server-side value across cache-stale-overwrite
+races."
+
+This was incorrect for SSA Apply. Per Kubernetes SSA spec:
+
+> If a field is no longer in the applied configuration,
+> the field manager's ownership is removed. If no field
+> manager owns the field after that operation, the field
+> is removed.
+
+Sequence:
+
+1. Bump cycle: append fires, SSA body includes
+   `versionHistory: [entry]`, `platform-controller`
+   claims ownership, server stores entry.
+2. Next settled-state reconcile (typically within seconds):
+   `include_version_history=false`, field stripped from
+   body, SSA re-apply without field → ownership released.
+   No other manager owns versionHistory → **apiserver
+   removes the field**.
+3. Within ~30s of any bump, versionHistory is empty.
+
+All walks since v0.1.122 saw `null` versionHistory because
+status reads happened AFTER the ownership-release reconcile.
+
+### Fix
+
+Drop the "omit field" pattern entirely. Use server-state
+read + merge instead:
+
+```rust
+async fn write_status(...) -> Result<(), Error> {
+    let api: Api<PlatformStack> = Api::namespaced(...);
+
+    // Walk-fix #5: read server's authoritative versionHistory
+    // and merge with our in-memory copy. SSA always includes
+    // the field — ownership stays claimed.
+    let server_state = api.get_status(&name).await?;
+    let server_history = server_state.status.as_ref()
+        .and_then(|s| s.version_history.clone())
+        .unwrap_or_default();
+    let our_history = new_status.version_history.clone()
+        .unwrap_or_default();
+    new_status.version_history = Some(merge_version_history(
+        server_history,
+        our_history,
+    ));
+
+    let patch = build_status_patch(&name, &new_status, true);  // always include
+    api.patch_status(...).await?;
+    Ok(())
+}
+```
+
+New helper in `status.rs`:
+
+```rust
+pub fn merge_version_history(
+    server: Vec<PlatformStackVersionHistoryEntry>,
+    local: Vec<PlatformStackVersionHistoryEntry>,
+) -> Vec<PlatformStackVersionHistoryEntry> {
+    let mut merged = server;
+    for entry in local {
+        let already_present = merged.iter().any(|e|
+            e.version == entry.version && e.applied_at == entry.applied_at
+        );
+        if !already_present {
+            merged.push(entry);
+        }
+    }
+    if merged.len() > VERSION_HISTORY_CAP {
+        let drop = merged.len() - VERSION_HISTORY_CAP;
+        merged.drain(0..drop);
+    }
+    merged
+}
+```
+
+Semantics:
+
+- Server entries are the authoritative baseline.
+- Local-only entries (from current reconcile's `append`)
+  are appended.
+- Duplicate detection by `(version, appliedAt)` — a chart
+  rollback that re-applies the same version is treated as
+  a fresh transition (separate `appliedAt`, separate
+  audit entry).
+- Ring-buffer cap enforced after merge.
+
+### What about walk-fix #7's original race?
+
+Walk-fix #7 was protecting against: cycle 1 appends entry
++ writes; cycle 2 fires on watcher cache (lagged → no
+entry visible), writes stale vector back, clobbers
+server's entry.
+
+The new pattern is race-immune: cycle 2 reads server state
+directly (`Api::get_status`, not cache). Server is
+authoritative; cache lag doesn't matter.
+
+### Cost
+
+One extra `Api::get_status` round-trip per `write_status`
+call. `write_status_if_changed`'s no-diff shortcut still
+fires for byte-identical statuses, so steady-state
+reconciles don't pay the cost. Bump cycles + condition
+changes do.
+
+### Tests
+
++4 unit tests in `operator-controllers/platform-stack/status.rs`:
+
+- `merge_version_history_keeps_server_entries_when_local_is_empty`
+  — load-bearing settled-state guard.
+- `merge_version_history_appends_local_only_entries` —
+  bump cycle preserves new entry.
+- `merge_version_history_dedupes_by_version_and_applied_at`
+  — rollback semantics.
+- `merge_version_history_caps_at_max` — ring buffer.
+
+Total platform-stack crate: 58 → 62.
+
+### Files
+
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  — write_status read-merge-write rewrite.
+- `operator/operator-controllers/platform-stack/src/status.rs`
+  — `merge_version_history` helper + 4 tests.
+
+### Versions
+
+- CLI: 0.1.129 → 0.1.130.
+- Operator chart: v0.1.110 → v0.1.111.
+- Admission-webhook chart: v0.1.110 → v0.1.111 (lockstep).
+- platform-stack chart: 0.1.31 → 0.1.32, with the matching
+  `compatibility: "0.1.32"` entry.
+
 ## v0.1.129 — M1.5 walk-fix #3 + #4 post-B.1.77 (2026-05-23)
 
 Two bundled walk-fixes from acceptance walk

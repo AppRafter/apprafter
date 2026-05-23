@@ -1649,6 +1649,102 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #5 post-B.1.77 — versionHistory SSA ownership-
+// release bug. Walk-fix #7 (v0.1.122) introduced "omit
+// versionHistory from SSA patch когда не append'ил this
+// cycle" к prevent cache-stale-overwrite race. SSA Apply
+// semantics (per Kubernetes docs): when manager re-applies
+// without a previously-owned field, ownership relinquished;
+// if no other manager owns, **apiserver removes field**.
+// So bump cycle's append + write claimed ownership, but
+// the very next reconcile (settled state) stripped field +
+// released ownership → apiserver deleted entry. Within ~30s
+// of any bump, versionHistory disappeared. Walk-fix #4
+// observability confirmed `include_version_history=false`
+// every settled reconcile.
+// Fix: read server's authoritative `versionHistory` BEFORE
+// each SSA-apply; merge с local entries; ALWAYS include
+// field в patch body. `merge_version_history` helper dedupes
+// by `(version, appliedAt)` pair, preserves cap. Extra
+// `Api::get_status` round-trip per write; settled cycles
+// skip via existing `write_status_if_changed` shortcut.
+// Operator-binary change only → image v0.1.129 → v0.1.130
+// via standard chart appVersion lockstep.
+compatibility: "0.1.32": {
+	change:          "safe"
+	operatorVersion: "v0.1.130"
+	notes: """
+		Walk-fix #5 post-B.1.77 — versionHistory SSA
+		ownership-release bug fix.
+
+		**Symptom.** Walk Phase 6 (artificial pin
+		downgrade + upgrade testing on v0.1.129)
+		showed `PlatformStack.status.versionHistory` stays
+		`null` across multiple successful targetRevision
+		bumps. managedFields never showed
+		`platform-controller` claiming `f:versionHistory`
+		— ownership released ~30s after every bump.
+
+		**Root cause.** Walk-fix #7 (v0.1.122) introduced
+		conditional `versionHistory` stripping в SSA
+		patch body: when reconcile cycle did not append a
+		new entry (settled state, `appended_history=false`),
+		field removed from patch к "preserve server-side
+		value across cache-stale-overwrite races". Per
+		Kubernetes SSA spec:
+
+		> If a field is no longer in the applied
+		> configuration, the field manager's ownership
+		> is removed. If no field manager owns the field
+		> after that operation, the field is removed.
+
+		Pattern was incorrect for SSA Apply semantics —
+		bump cycle's append + write claimed ownership,
+		next settled-state write released ownership, no
+		other manager owned → apiserver deleted field.
+
+		**Fix.** Drop "omit field" pattern. Always include
+		`versionHistory` в SSA body. Race protection
+		via server-state read + merge:
+
+		1. Before each `patch_status`, `Api::get_status`
+		   reads authoritative server state.
+		2. `merge_version_history(server, local)` produces
+		   merged vector — preserves server entries,
+		   appends local-only entries, dedupes by
+		   `(version, appliedAt)`, enforces cap.
+		3. Patch body always includes the merged
+		   `versionHistory`.
+
+		Cost: extra `Api::get_status` per write.
+		`write_status_if_changed` shortcut skips no-op
+		writes, so steady-state reconciles don't pay
+		the round-trip.
+
+		**Tests.** +4 unit tests in
+		`operator-controllers/platform-stack/status.rs`:
+		`merge_version_history_keeps_server_entries_when_local_is_empty`
+		(load-bearing settled-state guard),
+		`merge_version_history_appends_local_only_entries`,
+		`merge_version_history_dedupes_by_version_and_applied_at`,
+		`merge_version_history_caps_at_max`.
+		Total platform-stack crate: 58 → 62.
+
+		**Compat with walk-fix #7's race protection.**
+		The original race (stale cache → write stale
+		vector clobbering apiserver's entry) is now
+		impossible — we always merge against fresh
+		server state, not cache.
+
+		Rendered chart vs 0.1.31: byte-equivalent
+		templates. Operator-binary change только.
+		"""
+	references: [
+		"plan.md",
+		"docs/changelog/UNRELEASED.md#v01130",
+	]
+}
+
 // Walk-fix #3 + #4 post-B.1.77. #3: MigrationController seals
 // rejected plans via `status.rejectedAt` marker — prior code
 // re-invoked `strategy.reject()` on every reconcile (cold-
