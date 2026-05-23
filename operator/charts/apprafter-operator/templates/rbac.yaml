@@ -47,6 +47,14 @@ rules:
   # `.status` via SSA with field manager `migration-controller`;
   # /status verb scoped separately so the operator can patch
   # status even if subresource RBAC tightens later.
+  #
+  # B.1.78 extension: PlatformController CREATES MigrationPlan
+  # CRs on destructive transitions detected during the bump
+  # cycle. `create` verb on the parent `migrationplans`
+  # resource enables that path. Without it,
+  # `create_platform_migration_plan` would 403 forbidden and
+  # the controller would never gate destructive platform-stack
+  # upgrades — silently bumping past breaking changes.
   - apiGroups:
       - apprafter.io
     resources:
@@ -56,6 +64,7 @@ rules:
       - get
       - list
       - watch
+      - create
       - patch
       - update
   # Argo CD's `Application` CRD lives under argoproj.io. The

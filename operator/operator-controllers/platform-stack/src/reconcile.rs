@@ -27,8 +27,11 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{info, warn};
 
+use kube::api::PostParams;
 use operator_core::{
-    Metrics, PlatformStack, PlatformStackStatus, PlatformStackVersionHistoryEntry,
+    Metrics, MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationPlatformScope,
+    MigrationRisks, MigrationTrigger, PlatformStack, PlatformStackStatus,
+    PlatformStackVersionHistoryEntry,
 };
 
 use crate::compatibility::{
@@ -36,7 +39,6 @@ use crate::compatibility::{
 };
 use crate::desired::{build as build_desired, DesiredSource};
 use crate::oci::{tags_in_channel, Channel};
-use crate::policy::{NoOpHooks, PolicyHooks};
 use crate::status::{
     append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING, COND_READY,
     COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
@@ -46,6 +48,13 @@ use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
 const PARENT_APPLICATION_NAME: &str = "platform";
 const PARENT_APPLICATION_NAMESPACE: &str = "argocd";
+
+/// Namespace where platform-scope MigrationPlans live. Mirrors
+/// `MIGRATION_PLAN_NAMESPACE` from
+/// `operator-controllers/application` — duplicated rather than
+/// imported to avoid a circular workspace-internal dep between
+/// the two controller crates.
+const MIGRATION_PLAN_NAMESPACE: &str = "apprafter-system";
 
 /// Reporter identity stamped onto every Kubernetes Event this
 /// controller publishes. Shows up in `kubectl describe
@@ -122,8 +131,6 @@ pub enum Error {
     Oci(#[from] crate::oci::OciError),
     #[error("compatibility fetch error: {0}")]
     Compatibility(#[from] crate::compatibility::CompatError),
-    #[error("policy hook error: {0}")]
-    Policy(#[from] crate::policy::PolicyError),
     #[error("serde_json error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("unparseable check interval {0:?}")]
@@ -134,7 +141,6 @@ struct Context {
     client: Client,
     #[allow(dead_code)]
     metrics: Arc<Metrics>,
-    hooks: Arc<dyn PolicyHooks>,
     app_api_resource: ApiResource,
 }
 
@@ -159,7 +165,6 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
     let ctx = Arc::new(Context {
         client,
         metrics,
-        hooks: Arc::new(NoOpHooks),
         app_api_resource,
     });
 
@@ -368,20 +373,91 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     let pin_set = spec.pin.is_some();
     let allow_target_bump = pin_set || spec.auto_upgrade;
 
-    let mut migration_pending: Option<ChangeClass> = None;
+    let mut migration_pending: Option<MigrationPendingState> = None;
     let target_for_patch = if target_changed && allow_target_bump {
-        // Pin OR autoUpgrade=true → classify diff. Safe /
-        // requires-restart bump; breaking / data-migration stays
-        // on current_target and surfaces MigrationPending=True.
-        let class = fetch_change_class(&spec.source.upstream, &desired.target_revision).await?;
-        if matches!(class, ChangeClass::Breaking | ChangeClass::DataMigration) {
-            ctx.hooks
-                .request_migration_plan(&current_target, &desired.target_revision, class)
-                .await?;
-            migration_pending = Some(class);
-            current_target.clone()
+        // Track B.1.78: gate destructive transitions behind a
+        // MigrationPlan. Deterministic plan name per
+        // `(from, to)` pair makes the controller's plan-
+        // create call idempotent (repeated reconciles on the
+        // same transition return the existing plan, not a
+        // duplicate). Per spec.md §3.11, any non-`safe`
+        // classification triggers a plan.
+        let plan_name = synthesize_platform_plan_name(&current_target, &desired.target_revision);
+        let plan_api: Api<MigrationPlan> =
+            Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
+        let existing_plan = match plan_api.get(&plan_name).await {
+            Ok(p) => Some(p),
+            Err(kube::Error::Api(api_err)) if api_err.code == 404 => None,
+            Err(e) => return Err(Error::from(e)),
+        };
+
+        if let Some(plan) = existing_plan {
+            let phase = plan
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("pending-approval");
+            if phase == "completed" {
+                // Approved + executed — proceed с bump.
+                info!(
+                    plan = %plan_name,
+                    "platform MigrationPlan completed — proceeding with bump"
+                );
+                desired.target_revision.clone()
+            } else {
+                // Pending / approved / executing / failed /
+                // rejected — block bump. Rejected blocks too:
+                // the operator explicitly declined, and
+                // `PlatformMigrationStrategy.reject` (B.1.76)
+                // reverted `spec.pin`; subsequent reconciles
+                // that find this rejected plan continue к
+                // skip the same transition. Operator clears
+                // it by deleting the plan or pinning к a
+                // different target.
+                info!(
+                    plan = %plan_name,
+                    %phase,
+                    "platform MigrationPlan blocks bump"
+                );
+                migration_pending = Some(MigrationPendingState {
+                    classification: plan_classification(&plan)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    plan_name: Some(plan_name.clone()),
+                });
+                current_target.clone()
+            }
         } else {
-            desired.target_revision.clone()
+            // No existing plan — classify and either create
+            // one (destructive) or bump (safe).
+            let class = fetch_change_class(&spec.source.upstream, &desired.target_revision).await?;
+            if matches!(
+                class,
+                ChangeClass::Breaking | ChangeClass::DataMigration | ChangeClass::RequiresRestart
+            ) {
+                info!(
+                    plan = %plan_name,
+                    classification = ?class,
+                    from = %current_target,
+                    to = %desired.target_revision,
+                    "creating platform MigrationPlan для destructive transition"
+                );
+                create_platform_migration_plan(
+                    &plan_api,
+                    &plan_name,
+                    &current_target,
+                    &desired.target_revision,
+                    class,
+                    spec.pin.as_deref(),
+                )
+                .await?;
+                migration_pending = Some(MigrationPendingState {
+                    classification: change_class_to_string(class).to_string(),
+                    plan_name: Some(plan_name.clone()),
+                });
+                current_target.clone()
+            } else {
+                desired.target_revision.clone()
+            }
         }
     } else {
         // Either no change needed OR policy forbids bump
@@ -481,16 +557,35 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     //     independent of values diffs and policy gates.
     let upgrade_available = semver_gt(&channel_latest_str, &target_for_patch);
     let cond_upgrade = if upgrade_available {
+        let (reason, message) = match &migration_pending {
+            Some(state) if state.plan_name.is_some() => {
+                let plan = state.plan_name.as_deref().unwrap_or("");
+                (
+                    "BlockedByMigrationPlan",
+                    format!(
+                        "channel {ch} latest is {channel_latest_str}; deployed target is \
+                         {target}; blocked by MigrationPlan \
+                         {MIGRATION_PLAN_NAMESPACE}/{plan} awaiting approval",
+                        ch = spec.channel,
+                        target = target_for_patch,
+                    ),
+                )
+            }
+            _ => (
+                "ManualApprovalRequired",
+                format!(
+                    "channel {ch} latest is {channel_latest_str}; deployed target is {target}; \
+                     set spec.autoUpgrade=true or spec.pin to advance",
+                    ch = spec.channel,
+                    target = target_for_patch,
+                ),
+            ),
+        };
         condition(
             COND_UPGRADE_AVAILABLE,
             "True",
-            "ManualApprovalRequired",
-            &format!(
-                "channel {ch} latest is {channel_latest_str}; deployed target is {target}; \
-                 set spec.autoUpgrade=true or spec.pin to advance",
-                ch = spec.channel,
-                target = target_for_patch
-            ),
+            reason,
+            &message,
             &prior_conds,
         )
     } else {
@@ -508,18 +603,27 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     };
     upsert_condition(&mut new_status, cond_upgrade);
 
-    let cond_migration = match migration_pending {
-        Some(class) => condition(
-            COND_MIGRATION_PENDING,
-            "True",
-            &format!("{class:?}"),
-            &format!(
-                "change from {current_target} → {desired_target} classified as {class:?}; \
-                 manual approval required (1.74 MigrationPlan)",
-                desired_target = desired.target_revision
-            ),
-            &prior_conds,
-        ),
+    let cond_migration = match &migration_pending {
+        Some(state) => {
+            let plan_part = match &state.plan_name {
+                Some(name) => {
+                    format!(" — see MigrationPlan {MIGRATION_PLAN_NAMESPACE}/{name}")
+                }
+                None => String::new(),
+            };
+            condition(
+                COND_MIGRATION_PENDING,
+                "True",
+                &state.classification,
+                &format!(
+                    "change from {current_target} → {desired_target} classified as {cls}; \
+                     manual approval required{plan_part}",
+                    desired_target = desired.target_revision,
+                    cls = state.classification,
+                ),
+                &prior_conds,
+            )
+        }
         None => condition(
             COND_MIGRATION_PENDING,
             "False",
@@ -1034,6 +1138,142 @@ fn error_policy(_: Arc<PlatformStack>, err: &Error, _: Arc<Context>) -> Action {
     Action::requeue(Duration::from_secs(60))
 }
 
+/// In-memory marker the reconcile body sets when a destructive
+/// transition is gated by a `MigrationPlan`. Drives:
+///
+///   * `MigrationPending` condition (reason + message).
+///   * `UpgradeAvailable` condition's plan-aware
+///     `BlockedByMigrationPlan` reason (vs the generic
+///     `ManualApprovalRequired` for pin-unset + autoUpgrade-
+///     false flows).
+///
+/// Walk-fix B.1.78. Prior shape was `Option<ChangeClass>` —
+/// sufficient when controller never created or read plans;
+/// fails to surface the plan name in condition messages so
+/// `kubectl describe platformstack default` shows nothing the
+/// operator can navigate from.
+#[derive(Debug, Clone)]
+struct MigrationPendingState {
+    classification: String,
+    plan_name: Option<String>,
+}
+
+/// Build a deterministic `MigrationPlan` CR name from a
+/// `(from_version, to_version)` pair. DNS-1123 names disallow
+/// dots — replace them with dashes. Repeated reconciles of
+/// the same transition arrive at the same name, making
+/// `Api::create` idempotent (404 → create; otherwise reuse).
+fn synthesize_platform_plan_name(from_version: &str, to_version: &str) -> String {
+    format!(
+        "platform-{}-to-{}",
+        from_version.replace('.', "-"),
+        to_version.replace('.', "-")
+    )
+}
+
+/// Convert the internal `ChangeClass` enum к the string token
+/// the MigrationPlan's `spec.risks.classification` schema
+/// accepts. Mirrors the `compatibility.cue` change-class
+/// vocabulary.
+fn change_class_to_string(class: ChangeClass) -> &'static str {
+    match class {
+        ChangeClass::Safe => "safe",
+        ChangeClass::RequiresRestart => "requires-restart",
+        ChangeClass::DataMigration => "data-migration",
+        ChangeClass::Breaking => "breaking",
+    }
+}
+
+/// Extract the classification field из an existing
+/// `MigrationPlan`. Returns `None` когда the field is absent
+/// (e.g. the plan was created manually without
+/// `spec.risks.classification`). Used к surface the existing
+/// plan's classification on subsequent reconciles так что the
+/// operator's `kubectl describe` output stays consistent
+/// across reconciles even when the controller doesn't
+/// re-classify.
+fn plan_classification(plan: &MigrationPlan) -> Option<String> {
+    plan.spec.risks.as_ref().map(|r| r.classification.clone())
+}
+
+/// SSA-create a `MigrationPlan` CR for a platform-scope
+/// destructive transition.
+///
+/// Caller guarantees the plan does NOT already exist (404
+/// path in the reconcile body); concurrent creates from
+/// other operators are protected by name uniqueness — the
+/// apiserver returns 409 Conflict that propagates up к
+/// reconcile's error_policy, which requeues 60s. The next
+/// reconcile sees the existing plan via the GET path and
+/// blocks the bump.
+async fn create_platform_migration_plan(
+    api: &Api<MigrationPlan>,
+    plan_name: &str,
+    from_version: &str,
+    to_version: &str,
+    class: ChangeClass,
+    current_pin: Option<&str>,
+) -> Result<(), Error> {
+    let plan =
+        build_platform_migration_plan_cr(plan_name, from_version, to_version, class, current_pin);
+    api.create(&PostParams::default(), &plan).await?;
+    Ok(())
+}
+
+/// Pure builder для a platform-scope `MigrationPlan` CR.
+/// Pulled out so unit tests can pin the resulting shape
+/// without a kube client.
+fn build_platform_migration_plan_cr(
+    plan_name: &str,
+    from_version: &str,
+    to_version: &str,
+    class: ChangeClass,
+    current_pin: Option<&str>,
+) -> MigrationPlan {
+    let classification = change_class_to_string(class).to_string();
+    // `previousSpecSnapshot.pin` — verbatim copy of the
+    // pre-transition `PlatformStack.spec.pin`. `null` (JSON)
+    // represents "no pin was set" — channel-following mode.
+    // `PlatformMigrationStrategy.reject` reads this back on
+    // rejection and SSA-patches `spec.pin` to it (B.1.76).
+    let snapshot_pin = match current_pin {
+        Some(v) => Value::String(v.to_string()),
+        None => Value::Null,
+    };
+    let spec = MigrationPlanSpec {
+        scope: MigrationPlanScope {
+            type_: "platform".into(),
+            application: None,
+            platform: Some(MigrationPlatformScope {
+                // 1.78 simplification: list the entire stack
+                // as the affected component. Future work can
+                // narrow по diff'ing component-level chart
+                // values между the two chart versions.
+                components: vec!["platform-stack".into()],
+            }),
+        },
+        trigger: MigrationTrigger {
+            type_: "platform-classification".into(),
+            field: "spec.pin".into(),
+            from: Some(Value::String(from_version.to_string())),
+            to: Some(Value::String(to_version.to_string())),
+        },
+        risks: Some(MigrationRisks {
+            classification,
+            estimated_downtime: None,
+            data_volume: None,
+            reversible: None,
+            requires_full_backup: None,
+        }),
+        plan: None,
+        approvers: None,
+        previous_spec_snapshot: Some(serde_json::json!({ "pin": snapshot_pin })),
+    };
+    let mut mp = MigrationPlan::new(plan_name, spec);
+    mp.metadata.namespace = Some(MIGRATION_PLAN_NAMESPACE.to_string());
+    mp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1529,5 +1769,184 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn synthesize_platform_plan_name_replaces_dots_with_dashes() {
+        // DNS-1123 names disallow dots — replace с dashes so
+        // the synthesized plan name is a valid Kubernetes
+        // resource name.
+        assert_eq!(
+            synthesize_platform_plan_name("0.1.32", "0.1.33"),
+            "platform-0-1-32-to-0-1-33"
+        );
+        // Pre-release suffixes use dashes too — round trip.
+        assert_eq!(
+            synthesize_platform_plan_name("0.2.0-rc.1", "0.2.0"),
+            "platform-0-2-0-rc-1-to-0-2-0"
+        );
+    }
+
+    #[test]
+    fn synthesize_platform_plan_name_is_deterministic() {
+        // Repeat calls with same args return identical name.
+        // Idempotency of plan creation depends on this.
+        let a = synthesize_platform_plan_name("0.1.32", "0.2.0");
+        let b = synthesize_platform_plan_name("0.1.32", "0.2.0");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn change_class_to_string_round_trips_known_classes() {
+        // CRD's `risks.classification` enum:
+        // [safe, requires-restart, data-migration, breaking].
+        // Producers (this helper) and consumers (apiserver)
+        // must agree on the spelling.
+        assert_eq!(change_class_to_string(ChangeClass::Safe), "safe");
+        assert_eq!(
+            change_class_to_string(ChangeClass::RequiresRestart),
+            "requires-restart"
+        );
+        assert_eq!(
+            change_class_to_string(ChangeClass::DataMigration),
+            "data-migration"
+        );
+        assert_eq!(change_class_to_string(ChangeClass::Breaking), "breaking");
+    }
+
+    #[test]
+    fn build_platform_migration_plan_cr_shape_matches_crd_schema() {
+        // Pin every required field of MigrationPlanSpec против
+        // CRD validation rules. CRD requires scope.type,
+        // scope.platform.components non-empty (for platform
+        // type), trigger.type + field, risks.classification.
+        let mp = build_platform_migration_plan_cr(
+            "platform-0-1-32-to-0-1-33",
+            "0.1.32",
+            "0.1.33",
+            ChangeClass::Breaking,
+            Some("0.1.32"),
+        );
+
+        assert_eq!(
+            mp.metadata.name.as_deref(),
+            Some("platform-0-1-32-to-0-1-33")
+        );
+        assert_eq!(
+            mp.metadata.namespace.as_deref(),
+            Some(MIGRATION_PLAN_NAMESPACE)
+        );
+
+        // Scope.
+        assert_eq!(mp.spec.scope.type_, "platform");
+        assert!(mp.spec.scope.application.is_none());
+        let platform = mp.spec.scope.platform.as_ref().expect("platform scope");
+        assert_eq!(platform.components, vec!["platform-stack".to_string()]);
+
+        // Trigger.
+        assert_eq!(mp.spec.trigger.type_, "platform-classification");
+        assert_eq!(mp.spec.trigger.field, "spec.pin");
+        assert_eq!(
+            mp.spec.trigger.from.as_ref().and_then(Value::as_str),
+            Some("0.1.32")
+        );
+        assert_eq!(
+            mp.spec.trigger.to.as_ref().and_then(Value::as_str),
+            Some("0.1.33")
+        );
+
+        // Risks.
+        let risks = mp.spec.risks.as_ref().expect("risks set");
+        assert_eq!(risks.classification, "breaking");
+
+        // Previous spec snapshot — pin verbatim для reject flow.
+        let snapshot = mp
+            .spec
+            .previous_spec_snapshot
+            .as_ref()
+            .expect("snapshot set");
+        assert_eq!(
+            snapshot.pointer("/pin").and_then(Value::as_str),
+            Some("0.1.32")
+        );
+    }
+
+    #[test]
+    fn build_platform_migration_plan_cr_snapshot_pin_is_null_when_unpinned() {
+        // No pin → snapshot.pin = JSON null. `PlatformMigrationStrategy.reject`
+        // reads `null` and clears `PlatformStack.spec.pin`,
+        // restoring channel-following mode.
+        let mp = build_platform_migration_plan_cr(
+            "platform-0-1-32-to-0-2-0",
+            "0.1.32",
+            "0.2.0",
+            ChangeClass::Breaking,
+            None,
+        );
+        let snapshot = mp.spec.previous_spec_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.pointer("/pin"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn plan_classification_returns_string_when_risks_set() {
+        use operator_core::{
+            MigrationPlanScope, MigrationPlanSpec, MigrationPlatformScope, MigrationRisks,
+            MigrationTrigger,
+        };
+        let spec = MigrationPlanSpec {
+            scope: MigrationPlanScope {
+                type_: "platform".into(),
+                application: None,
+                platform: Some(MigrationPlatformScope {
+                    components: vec!["x".into()],
+                }),
+            },
+            trigger: MigrationTrigger {
+                type_: "t".into(),
+                field: "f".into(),
+                from: None,
+                to: None,
+            },
+            risks: Some(MigrationRisks {
+                classification: "breaking".into(),
+                estimated_downtime: None,
+                data_volume: None,
+                reversible: None,
+                requires_full_backup: None,
+            }),
+            plan: None,
+            approvers: None,
+            previous_spec_snapshot: None,
+        };
+        let plan = MigrationPlan::new("p", spec);
+        assert_eq!(plan_classification(&plan), Some("breaking".to_string()));
+    }
+
+    #[test]
+    fn plan_classification_returns_none_when_risks_absent() {
+        use operator_core::{
+            MigrationPlanScope, MigrationPlanSpec, MigrationPlatformScope, MigrationTrigger,
+        };
+        let spec = MigrationPlanSpec {
+            scope: MigrationPlanScope {
+                type_: "platform".into(),
+                application: None,
+                platform: Some(MigrationPlatformScope {
+                    components: vec!["x".into()],
+                }),
+            },
+            trigger: MigrationTrigger {
+                type_: "t".into(),
+                field: "f".into(),
+                from: None,
+                to: None,
+            },
+            risks: None,
+            plan: None,
+            approvers: None,
+            previous_spec_snapshot: None,
+        };
+        let plan = MigrationPlan::new("p", spec);
+        assert_eq!(plan_classification(&plan), None);
     }
 }

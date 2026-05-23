@@ -13,6 +13,156 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.132 — M1.5 Track B.1.78 closure — PlatformController MigrationPlan integration (2026-05-23)
+
+PlatformController gains a destructive-transition gate per
+spec.md §3.11 + ADR 0027. Breaking / data-migration /
+requires-restart chart bumps now produce a MigrationPlan
+instead of an immediate parent Application patch; the
+operator approves (or rejects) before any reconcile touches
+the umbrella Application's targetRevision.
+
+### Decision tree
+
+For each reconcile cycle where `target_changed && allow_target_bump`:
+
+1. Synthesize plan name from `(from, to)` pair:
+   `platform-<from>-to-<to>` (dots replaced with dashes for
+   DNS-1123 compliance).
+2. GET the plan in `apprafter-system`.
+3. **Plan exists + phase == completed** → bump (operator
+   approved + the MigrationController executed the plan
+   steps).
+4. **Plan exists + any other phase** (pending-approval /
+   approved / executing / failed / rejected) → block bump,
+   surface conditions with the plan name.
+5. **No plan + classification ∈ {breaking, data-migration,
+   requires-restart}** → SSA-create a MigrationPlan CR,
+   block bump, surface conditions.
+6. **No plan + classification == safe** → bump as before.
+
+`rejected` blocks the same transition forever — operator's
+explicit decision. Re-attempting the same transition requires
+either deleting the rejected plan or pinning to a different
+target.
+
+### MigrationPlan shape
+
+```yaml
+apiVersion: apprafter.io/v1alpha1
+kind: MigrationPlan
+metadata:
+  name: platform-0-1-32-to-0-1-33
+  namespace: apprafter-system
+spec:
+  scope:
+    type: platform
+    platform:
+      components: [platform-stack]   # 1.78 simplification — single
+                                     # conservative entry; future
+                                     # enhancement: diff per-component
+  trigger:
+    type: platform-classification
+    field: spec.pin
+    from: 0.1.32
+    to: 0.1.33
+  risks:
+    classification: breaking
+  previousSpecSnapshot:
+    pin: 0.1.32                       # current spec.pin verbatim;
+                                      # JSON null when unpinned
+                                      # (channel-following mode).
+                                      # PlatformMigrationStrategy.reject
+                                      # (B.1.76) reads this on
+                                      # rejection.
+```
+
+### Condition surfaces
+
+- `UpgradeAvailable=True` reason flips к **`BlockedByMigrationPlan`**
+  when the upgrade is gated by a plan; message embeds
+  `apprafter-system/<plan-name>`.
+- `MigrationPending=True` reason = the classification
+  string (`breaking` / `data-migration` / `requires-restart`);
+  message embeds the plan name so `kubectl describe
+  platformstack default` surfaces it.
+
+The existing `ManualApprovalRequired` reason stays for the
+non-plan case (pin unset + autoUpgrade=false; user must
+manually advance).
+
+### Departure from plan.md
+
+Plan.md task list mentioned `metadata.annotations[apprafter.io/previous-spec]`
+as the snapshot source. That was an ADR 0027 placeholder
+from before B.1.75 landed the structured
+`spec.previousSpecSnapshot` field in the CRD schema. B.1.78
+uses the structured field — cleaner, no annotation-shape
+contract to maintain, no JSON-as-string-in-annotation
+round-trip.
+
+### Removed: `PolicyHooks` trait + `NoOpHooks`
+
+B.1.73 pre-positioned a `PolicyHooks` trait in
+`operator-controllers/platform-stack/src/policy.rs` with a
+stub `request_migration_plan` method, expected to grow a
+real impl in B.1.78. B.1.78's inline approach proved
+cleaner — no trait dispatch, fewer types, the call site
+where the work happens is also where the data lives
+(client, namespace, spec). The trait gained no value, so
+`policy.rs` is deleted; `Context.hooks` field removed;
+`Error::Policy(#[from] PolicyError)` variant removed.
+
+### RBAC
+
+`operator/charts/apprafter-operator/templates/rbac.yaml`'s
+`migrationplans` rule gains the `create` verb. Without it,
+the SSA-create call 403s and the destructive-transition
+gate silently fails open — controller would still try to
+bump destructive changes. With it, plans land cleanly.
+
+### Tests
+
++7 unit tests in `operator-controllers-platform-stack`:
+
+- `synthesize_platform_plan_name_replaces_dots_with_dashes`
+- `synthesize_platform_plan_name_is_deterministic`
+- `change_class_to_string_round_trips_known_classes`
+- `build_platform_migration_plan_cr_shape_matches_crd_schema`
+- `build_platform_migration_plan_cr_snapshot_pin_is_null_when_unpinned`
+- `plan_classification_returns_string_when_risks_set`
+- `plan_classification_returns_none_when_risks_absent`
+
+-1 test removed (NoOpHooks test in policy.rs deletion).
+Total platform-stack crate: 62 → 68.
+
+### Files
+
+- `operator/operator-controllers/platform-stack/src/reconcile.rs`
+  — decision tree + helpers + struct.
+- `operator/operator-controllers/platform-stack/src/lib.rs`
+  — drop `policy` module declaration.
+- `operator/operator-controllers/platform-stack/src/policy.rs`
+  — deleted.
+- `operator/charts/apprafter-operator/templates/rbac.yaml`
+  — `create` verb added.
+
+### Versions
+
+- CLI: 0.1.131 → 0.1.132.
+- Operator chart: v0.1.112 → v0.1.113.
+- Admission-webhook chart: v0.1.112 → v0.1.113 (lockstep).
+- platform-stack chart: 0.1.33 → 0.1.34, with the matching
+  `compatibility: "0.1.34"` entry.
+
+### Acceptance walk
+
+Manual walk deferred — B.1.78 closes the Phase 1.5
+destructive-change pipeline (1.74 / 1.74a / 1.75 / 1.76 /
+1.77 / 1.78). A clean walk against a published chart with
+a `breaking` compatibility class will exercise the full
+flow end-to-end. Defer to the next acceptance cycle.
+
 ## v0.1.131 — M1.5 walk-fix #6 post-B.1.77 — webhook status subresource (2026-05-23)
 
 ### Symptom

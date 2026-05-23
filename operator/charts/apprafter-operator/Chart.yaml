@@ -3,8 +3,8 @@ apiVersion: v2
 name: apprafter-operator
 description: AppRafter operator — Application controller + admission webhook glue + Prometheus metrics.
 type: application
-version: v0.1.112
-appVersion: "v0.1.131"
+version: v0.1.113
+appVersion: "v0.1.132"
 kubeVersion: ">= 1.29.0-0"
 home: https://github.com/apprafter/apprafter
 sources:

@@ -1649,6 +1649,152 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Track B.1.78 closure — PlatformController MigrationPlan
+// integration per spec.md §3.11 + ADR 0027. PlatformController
+// reconcile loop теперь:
+//
+//   * Pre-checks по deterministic `platform-<from>-to-<to>`
+//     plan name. If plan exists and phase != `completed`,
+//     block bump + surface MigrationPending=True/<class> +
+//     UpgradeAvailable=True/BlockedByMigrationPlan
+//     conditions with `apprafter-system/<plan-name>` in the
+//     message. If plan exists and phase == completed,
+//     proceed с bump (operator approved + ran the migration).
+//   * No existing plan + classification destructive
+//     (`breaking | data-migration | requires-restart` per
+//     spec.md §3.11) — CREATE a MigrationPlan CR в
+//     `apprafter-system` namespace, block bump, surface
+//     conditions.
+//   * No existing plan + safe classification — bump as
+//     before.
+//
+// Reject flow (B.1.76 PlatformMigrationStrategy.reject) reads
+// previousSpecSnapshot.pin and SSA-patches PlatformStack.spec.pin
+// back to it. B.1.78 populates the snapshot during plan
+// creation via `current_pin` arg.
+//
+// Removed: PolicyHooks trait + NoOpHooks. Was a placeholder
+// from B.1.73 that never had a real impl; replaced by inline
+// plan creation в the reconcile body. operator-controllers/
+// platform-stack/src/policy.rs deleted.
+//
+// RBAC: ClusterRole's migrationplans rule gains `create`
+// verb. operator chart's rbac.yaml template extended.
+//
+// Operator-binary change → image v0.1.131 → v0.1.132 via
+// standard chart appVersion lockstep.
+compatibility: "0.1.34": {
+	change:          "safe"
+	operatorVersion: "v0.1.132"
+	notes: """
+		Track B.1.78 closure — PlatformController
+		MigrationPlan integration.
+
+		PlatformController gains a destructive-transition
+		gate per spec.md §3.11 + ADR 0027. Before the
+		bump cycle's target_for_patch decision, the
+		reconciler:
+
+		1. Synthesizes a deterministic plan name from
+		   `(from, to)` pair: `platform-<from>-to-<to>`
+		   with dots → dashes для DNS-1123.
+		2. GETs the named plan in `apprafter-system`.
+		   * Exists + `phase=completed` → proceed bump
+		     (operator approved + ran the migration).
+		   * Exists + any other phase (pending /
+		     approved / executing / failed / rejected)
+		     → block bump, set MigrationPendingState
+		     with the existing plan name + classification.
+		   * Not found → fetch_change_class and classify.
+		3. No existing plan + class is destructive
+		   (`breaking | data-migration | requires-restart`)
+		   → CREATE MigrationPlan via SSA-create with
+		   `spec.scope.type=platform`,
+		   `spec.scope.platform.components=["platform-stack"]`,
+		   trigger fields, classification, and
+		   `previousSpecSnapshot.pin` = current `spec.pin`
+		   (or JSON null).
+		4. No existing plan + class is `safe` → bump
+		   as before.
+
+		Conditions surface plan name к the operator:
+
+		* `UpgradeAvailable=True/BlockedByMigrationPlan`
+		  with message `... blocked by MigrationPlan
+		  apprafter-system/<plan>`.
+		* `MigrationPending=True/<classification>` with
+		  message `... see MigrationPlan
+		  apprafter-system/<plan>`.
+
+		Plan-name idempotency makes repeated reconciles
+		on the same transition safe — they find the
+		existing plan via GET and don't create a duplicate.
+		Rejected plans block the same transition forever
+		(operator's explicit decision); transitioning к
+		a different target produces a different name +
+		fresh plan.
+
+		Removed: PolicyHooks trait + NoOpHooks stub from
+		`operator-controllers/platform-stack/src/policy.rs`.
+		Was a forward-compat placeholder from B.1.73 that
+		never had a real impl. Replaced by inline plan
+		creation in the reconcile body. policy.rs deleted;
+		Context.hooks field removed.
+
+		RBAC: operator chart's ClusterRole's `migrationplans`
+		rule gains `create` verb (was `get list watch patch
+		update`). Without `create`, PlatformController
+		would 403 forbidden silently and skip the gate.
+
+		**Tests.** +7 unit tests:
+		`synthesize_platform_plan_name_replaces_dots_with_dashes`,
+		`_is_deterministic`,
+		`change_class_to_string_round_trips_known_classes`,
+		`build_platform_migration_plan_cr_shape_matches_crd_schema`,
+		`_snapshot_pin_is_null_when_unpinned`,
+		`plan_classification_returns_string_when_risks_set`,
+		`_returns_none_when_risks_absent`. -1 test removed
+		(`no_op_hooks_succeed_on_migration_plan_request`
+		from deleted policy.rs). Total platform-stack
+		crate: 62 → 68.
+
+		**Acceptance gate.** Until B.1.78's walk lands
+		on a real published breaking chart, smoke
+		verification via:
+
+		   * `kubectl get migrationplan -n apprafter-system`
+		     after applying a chart whose
+		     `compatibility.yaml` classifies the transition
+		     as `breaking` → plan exists with expected
+		     scope + trigger + snapshot.
+		   * `kubectl get platformstack default -n
+		     apprafter-system -o yaml` shows
+		     UpgradeAvailable=True/BlockedByMigrationPlan
+		     and MigrationPending=True with classification.
+		   * Approve via `kubectl patch migrationplan
+		     <name> --subresource=status --type=merge
+		     -p '{"status":{"phase":"approved"}}'` →
+		     MigrationController executes → plan reaches
+		     `completed` → next PlatformController
+		     reconcile proceeds с bump.
+		   * Reject (platform-scope only per ADR 0027)
+		     → strategy.reject reverts spec.pin → next
+		     reconcile sees the rejected plan name
+		     blocking same transition; operator must
+		     delete plan or pin к a different target к
+		     retry.
+
+		Rendered chart vs 0.1.33: byte-equivalent
+		templates. Operator-binary change только;
+		chart appVersion lockstep propagates new image.
+		"""
+	references: [
+		"docs/adr/0027-migrationplan-unified.md",
+		"plan.md#178-platformcontroller-migrationplan-integration",
+		"docs/changelog/UNRELEASED.md#v01132",
+	]
+}
+
 // Walk-fix #6 post-B.1.77 — webhook config missing
 // `migrationplans/status` resource. Walk-fix #2 added the
 // validator's ADR 0027 app-scope reject guard, but

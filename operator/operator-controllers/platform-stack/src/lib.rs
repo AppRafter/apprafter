@@ -21,7 +21,6 @@ use tracing::info;
 pub mod compatibility;
 pub mod desired;
 pub mod oci;
-pub mod policy;
 pub mod reconcile;
 pub mod status;
 
