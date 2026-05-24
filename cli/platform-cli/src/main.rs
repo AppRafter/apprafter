@@ -116,6 +116,14 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 all_managed,
             } => commands::app::list(&project, all_projects, all_managed)?,
             AppCommand::Status { name } => commands::app::status(&name)?,
+            AppCommand::Logs {
+                name,
+                follow,
+                tail,
+                container,
+                pod,
+            } => commands::app::logs(&name, follow, tail, container, pod)?,
+            AppCommand::Rollback { name, to, yes } => commands::app::rollback(&name, to, yes)?,
             AppCommand::Remove {
                 name,
                 yes,

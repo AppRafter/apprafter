@@ -332,6 +332,55 @@ pub enum AppCommand {
         /// Application name (as listed via `apprafter app list`).
         name: String,
     },
+    /// Stream logs from the app's workload pods. Wraps
+    /// `kubectl logs` с label selector derived from the
+    /// Argo CD `Application` (the workload namespace is а
+    /// known property of the CR). Default: aggregate across
+    /// pods. `--pod <name>` narrows к а single pod;
+    /// `--container <c>` picks the container в multi-container
+    /// pods; `--follow` enables tail; `--tail <N>` caps the
+    /// initial backlog.
+    Logs {
+        /// Application name.
+        name: String,
+        /// Stream new log lines as they appear (`kubectl logs
+        /// -f`).
+        #[arg(short = 'f', long, default_value_t = false)]
+        follow: bool,
+        /// Show only the last `N` lines per pod / container
+        /// (`kubectl logs --tail`). `-1` means no limit
+        /// (`kubectl`'s default).
+        #[arg(long, default_value_t = -1)]
+        tail: i64,
+        /// Pick а specific container в multi-container pods.
+        /// Без флага `kubectl` падает на pod-у с двумя
+        /// containers (требует явный выбор); CLI surface
+        /// proxies that error verbatim.
+        #[arg(long)]
+        container: Option<String>,
+        /// Narrow к а single pod вместо all matching the
+        /// app's destination namespace.
+        #[arg(long)]
+        pod: Option<String>,
+    },
+    /// Roll back к а previous revision. Reads
+    /// `status.history` from the Argo CD `Application`,
+    /// patches `spec.source.targetRevision` к the target;
+    /// Argo CD's auto-sync picks up the change на следующем
+    /// reconcile cycle. Без `--to` — rollback к the
+    /// previous entry в history (offset -1).
+    Rollback {
+        /// Application name.
+        name: String,
+        /// Explicit revision (commit SHA / tag / branch).
+        /// Без флага: previous entry в `status.history`.
+        #[arg(long = "to")]
+        to: Option<String>,
+        /// Skip confirmation prompt. Required в non-interactive
+        /// shells.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
     /// Delete an Application и cascade-remove the Argo CD CR
     /// (which Argo CD then tears down child resources for).
     /// Interactive: prompts для confirmation; non-interactive

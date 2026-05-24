@@ -205,6 +205,140 @@ pub fn status(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `apprafter app logs <name>` — stream logs from the
+/// workload pods of an apprafter-managed Application. Pure
+/// shell-out к `kubectl logs`, scoped к the app's destination
+/// namespace (read from the Application CR's
+/// `spec.destination.namespace`).
+///
+/// Без `--pod`: aggregate via `-l <selector>` — Argo CD
+/// stamps `app.kubernetes.io/instance: <app-name>` on every
+/// child resource it manages (the documented standard label
+/// the kubectl + helm + argo ecosystem agrees on), so
+/// `-l app.kubernetes.io/instance=<name>` reaches all pods.
+/// `--pod` overrides the selector с а direct pod name.
+pub fn logs(
+    name: &str,
+    follow: bool,
+    tail: i64,
+    container: Option<String>,
+    pod: Option<String>,
+) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+
+    let app = kubectl_get_json(
+        "application.argoproj.io",
+        Some(name),
+        Some(ARGOCD_NAMESPACE),
+        kc.path(),
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "Application '{name}' не найден в namespace {ARGOCD_NAMESPACE}. Запусти \
+             `apprafter app list` для списка зарегистрированных приложений."
+        ))
+    })?;
+
+    let workload_ns = app
+        .pointer("/spec/destination/namespace")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "Application '{name}' не carry'ит `spec.destination.namespace` — некуда \
+                 направить kubectl logs. Возможно, CR создан вне `apprafter app add`."
+            ))
+        })?;
+
+    let target = build_kubectl_logs_target(name, pod.as_deref());
+    let args = build_kubectl_logs_args(&target, workload_ns, follow, tail, container.as_deref());
+
+    let status = Command::new("kubectl")
+        .args(&args)
+        .env("KUBECONFIG", kc.path())
+        .status()
+        .map_err(|e| CliError::Other(format!("spawn kubectl logs: {e}")))?;
+    if !status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl logs failed (exit {:?})",
+            status.code()
+        )));
+    }
+    Ok(())
+}
+
+/// `apprafter app rollback <name> [--to <rev>]` — patches
+/// `spec.source.targetRevision` к the requested revision (or
+/// the previous entry в `status.history` когда `--to` is
+/// omitted). Argo CD's automated sync picks up the change на
+/// следующем reconcile и rolls back the workload.
+pub fn rollback(name: &str, to: Option<String>, yes: bool) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let app = kubectl_get_json(
+        "application.argoproj.io",
+        Some(name),
+        Some(ARGOCD_NAMESPACE),
+        kc.path(),
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "Application '{name}' не найден в namespace {ARGOCD_NAMESPACE}."
+        ))
+    })?;
+
+    let current_revision = app
+        .pointer("/spec/source/targetRevision")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+
+    let target_revision = match to {
+        Some(explicit) => explicit,
+        None => pick_previous_revision(&app)?.to_string(),
+    };
+
+    if target_revision == current_revision {
+        return Err(CliError::Other(format!(
+            "Целевая revision '{target_revision}' совпадает с текущей `spec.source.targetRevision` \
+             — rollback would be а no-op."
+        )));
+    }
+
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "non-interactive shell — pass `--yes` чтобы пропустить confirmation prompt".into(),
+            ));
+        }
+        println!(
+            "Откатить Application '{name}' с revision '{current_revision}' к '{target_revision}'?"
+        );
+        let confirmed = inquire::Confirm::new("Подтвердить?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+        if !confirmed {
+            println!("Отмена.");
+            return Ok(());
+        }
+    }
+
+    let body = format!(r#"{{"spec":{{"source":{{"targetRevision":"{target_revision}"}}}}}}"#);
+    kubectl_merge_patch(
+        "application.argoproj.io",
+        name,
+        Some(ARGOCD_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+
+    println!(
+        "✓ Application '{name}' откатан к revision '{target_revision}'. Argo CD синканёт workload \
+         в течение reconcile cycle."
+    );
+    Ok(())
+}
+
 pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
@@ -458,6 +592,106 @@ fn ensure_repo_reachable(repo_url: &str) -> Result<()> {
         "git ls-remote {repo_url} не сработал (exit {:?}): {stderr}",
         out.status.code()
     )))
+}
+
+/// Build `kubectl logs` arg vector. Pure fn — tests cover
+/// flag combinations exhaustively.
+pub(crate) fn build_kubectl_logs_args(
+    target: &KubectlLogsTarget,
+    namespace: &str,
+    follow: bool,
+    tail: i64,
+    container: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["logs".to_string()];
+    match target {
+        KubectlLogsTarget::Pod(name) => args.push(name.clone()),
+        KubectlLogsTarget::Selector(selector) => {
+            args.push("-l".into());
+            args.push(selector.clone());
+        }
+    }
+    args.push("-n".into());
+    args.push(namespace.to_string());
+    if follow {
+        args.push("-f".into());
+    }
+    if tail >= 0 {
+        args.push(format!("--tail={tail}"));
+    }
+    if let Some(c) = container {
+        args.push("-c".into());
+        args.push(c.to_string());
+    }
+    // Когда selector — нет single-container guarantee, поэтому
+    // явно prefix lines с pod name'ом для multi-pod case.
+    // Single-pod target оставляем без prefix'а — там lines
+    // уже идут в естественном порядке.
+    if matches!(target, KubectlLogsTarget::Selector(_)) {
+        args.push("--prefix=true".into());
+        // На большом scale-out стрим из множества pod'ов
+        // мог бы захлестнуть терминал; --max-log-requests=N
+        // лочит kubectl на параллельную стрим-логику для
+        // selector mode. 10 — kubectl's documented default
+        // ceiling; передаём явно для предсказуемости.
+        args.push("--max-log-requests=10".into());
+    }
+    args
+}
+
+/// What `kubectl logs` targets — а direct pod name или а label
+/// selector. The two forms emit incompatible CLI flags
+/// (positional pod name vs `-l` selector), so we model the
+/// branch up-front.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KubectlLogsTarget {
+    Pod(String),
+    Selector(String),
+}
+
+/// Resolve the `kubectl logs` target. Без `--pod` — label
+/// selector via Argo CD's standard `app.kubernetes.io/instance:
+/// <app-name>` label (stamped on every resource it syncs).
+pub(crate) fn build_kubectl_logs_target(app_name: &str, pod: Option<&str>) -> KubectlLogsTarget {
+    match pod {
+        Some(name) => KubectlLogsTarget::Pod(name.to_string()),
+        None => KubectlLogsTarget::Selector(format!("app.kubernetes.io/instance={app_name}")),
+    }
+}
+
+/// Pick the "previous" revision из `status.history`. History
+/// is ordered chronologically (oldest first, newest last)
+/// with monotonically increasing `id`. The previous entry is
+/// the second-to-last; rollback к it.
+///
+/// Returns а static string lifetime tied к `app` через `Value`
+/// borrow lifetime.
+pub(crate) fn pick_previous_revision(app: &Value) -> Result<&str> {
+    let history = app
+        .pointer("/status/history")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::Other(
+                "Application status.history пуст — нет предыдущей revision для rollback'а. \
+                 Передай `--to <rev>` явно."
+                    .into(),
+            )
+        })?;
+    if history.len() < 2 {
+        return Err(CliError::Other(format!(
+            "Application status.history содержит {} entry — недостаточно для rollback'а \
+             к предыдущей revision. Передай `--to <rev>` явно.",
+            history.len()
+        )));
+    }
+    history[history.len() - 2]
+        .get("revision")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Other(
+                "Previous status.history entry не carry'ит `revision` field — corrupt CR?".into(),
+            )
+        })
 }
 
 /// Build the Argo CD `Application` CR manifest YAML. Pure fn
@@ -768,6 +1002,101 @@ mod tests {
             m.pointer("/spec/source/path").and_then(Value::as_str),
             Some("/p")
         );
+    }
+
+    #[test]
+    fn build_kubectl_logs_target_defaults_to_selector() {
+        let target = build_kubectl_logs_target("payments", None);
+        assert_eq!(
+            target,
+            KubectlLogsTarget::Selector("app.kubernetes.io/instance=payments".to_string())
+        );
+    }
+
+    #[test]
+    fn build_kubectl_logs_target_uses_pod_name_when_provided() {
+        let target = build_kubectl_logs_target("payments", Some("payments-7f9c-xyz"));
+        assert_eq!(
+            target,
+            KubectlLogsTarget::Pod("payments-7f9c-xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn build_kubectl_logs_args_selector_form_includes_prefix_and_max_requests() {
+        // Selector mode aggregates по multiple pods; kubectl
+        // benefits from --prefix чтобы distinguish lines, и
+        // --max-log-requests чтобы cap fan-out. Both are
+        // load-bearing для real usability on multi-pod apps.
+        let args = build_kubectl_logs_args(
+            &KubectlLogsTarget::Selector("app.kubernetes.io/instance=payments".to_string()),
+            "payments",
+            false,
+            -1,
+            None,
+        );
+        assert!(args.contains(&"-l".to_string()));
+        assert!(args.contains(&"app.kubernetes.io/instance=payments".to_string()));
+        assert!(args.contains(&"-n".to_string()));
+        assert!(args.contains(&"payments".to_string()));
+        assert!(args.contains(&"--prefix=true".to_string()));
+        assert!(args.contains(&"--max-log-requests=10".to_string()));
+        assert!(!args.contains(&"-f".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("--tail=")));
+    }
+
+    #[test]
+    fn build_kubectl_logs_args_pod_form_drops_prefix() {
+        // Single-pod target — no need для line prefix, kubectl's
+        // default output is already clean. Defensive: ensure
+        // we don't accidentally emit --prefix или --max-log-requests
+        // когда it would just clutter the output.
+        let args = build_kubectl_logs_args(
+            &KubectlLogsTarget::Pod("payments-7f9c-xyz".to_string()),
+            "payments",
+            true,
+            100,
+            Some("api"),
+        );
+        assert_eq!(args[0], "logs");
+        assert_eq!(args[1], "payments-7f9c-xyz");
+        assert!(args.contains(&"-f".to_string()));
+        assert!(args.contains(&"--tail=100".to_string()));
+        assert!(args.contains(&"-c".to_string()));
+        assert!(args.contains(&"api".to_string()));
+        assert!(!args.contains(&"--prefix=true".to_string()));
+        assert!(!args.iter().any(|a| a.contains("--max-log-requests")));
+    }
+
+    #[test]
+    fn pick_previous_revision_returns_second_to_last() {
+        // Argo CD's status.history is chronological — oldest
+        // first, newest last. Previous = second-to-last.
+        let app = serde_json::json!({
+            "status": {
+                "history": [
+                    {"id": 1, "revision": "abc123"},
+                    {"id": 2, "revision": "def456"},
+                    {"id": 3, "revision": "ghi789"}
+                ]
+            }
+        });
+        assert_eq!(pick_previous_revision(&app).unwrap(), "def456");
+    }
+
+    #[test]
+    fn pick_previous_revision_errors_when_history_too_short() {
+        // Fresh app — one or zero history entries — has no
+        // "previous" к roll back к. Operator must pass --to
+        // explicitly. Tests both edge cases.
+        let one = serde_json::json!({
+            "status": { "history": [ {"id": 1, "revision": "abc"} ] }
+        });
+        let zero = serde_json::json!({ "status": { "history": [] } });
+        let missing = serde_json::json!({ "status": {} });
+        assert!(pick_previous_revision(&one).is_err());
+        assert!(pick_previous_revision(&zero).is_err());
+        assert!(pick_previous_revision(&missing).is_err());
     }
 
     #[test]

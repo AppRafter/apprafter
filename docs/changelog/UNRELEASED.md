@@ -13,6 +13,90 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.140 — M1.5 Track B.1.79a part 4 — `apprafter app` logs/rollback (2026-05-22)
+
+### What landed
+
+Two new verbs under `apprafter app` — `logs` (tail workload
+pods) и `rollback` (revert к previous revision). Closes the
+delete-debug-revert loop без operator detour к raw kubectl /
+Argo CD UI.
+
+### `apprafter app logs <name>`
+
+Wraps `kubectl logs` scoped к the workload namespace read from
+the Application CR's `spec.destination.namespace`. Flags:
+
+- `-f / --follow` — tail mode.
+- `--tail <N>` — backlog cap (`-1` default = no limit;
+  matches `kubectl logs`'s own default).
+- `--container <c>` — disambiguate в multi-container pods;
+  kubectl's own error message surfaces verbatim когда a
+  multi-container pod requires explicit `-c`.
+- `--pod <name>` — narrow к а single pod (skips the label
+  selector path).
+
+Default — selector mode `-l app.kubernetes.io/instance=<name>`
+(Argo CD's documented standard label, stamped on every child
+resource it syncs). Selector mode additionally enables
+`--prefix=true` (so multi-pod stream lines are distinguishable)
++ `--max-log-requests=10` (cap fan-out на а large app).
+
+Pure helpers `build_kubectl_logs_target(app_name, pod)` +
+`build_kubectl_logs_args(target, namespace, follow, tail,
+container)` separate the arg-construction logic from the
+process spawn so tests can cover the matrix exhaustively.
+
+### `apprafter app rollback <name> [--to <rev>]`
+
+Reads `status.history` (Argo CD's chronologically-ordered list
+of completed syncs, newest last). Без `--to` — picks the
+second-to-last entry's `revision` через pure
+`pick_previous_revision(app)` helper. С `--to <rev>` — uses
+the explicit value verbatim.
+
+Pre-flight refuses когда target revision matches current
+`spec.source.targetRevision` (would be а no-op). Interactive
+confirms через `inquire::Confirm` (default No); non-interactive
+refuses без `--yes`.
+
+Patches `spec.source.targetRevision` через JSON merge-patch;
+Argo CD's automated sync rolls forward на следующем reconcile
+cycle.
+
+### Tests
+
++6 unit tests:
+
+- `build_kubectl_logs_target_defaults_to_selector` — selector
+  mode когда `--pod` не передан.
+- `build_kubectl_logs_target_uses_pod_name_when_provided` — pod
+  form override.
+- `build_kubectl_logs_args_selector_form_includes_prefix_and_max_requests`
+  — load-bearing: multi-pod stream usability depends on
+  these flags being present.
+- `build_kubectl_logs_args_pod_form_drops_prefix` — defensive
+  asymmetry: single-pod form must NOT add `--prefix` /
+  `--max-log-requests` (would clutter output для no reason).
+- `pick_previous_revision_returns_second_to_last` — happy
+  path on а 3-entry history.
+- `pick_previous_revision_errors_when_history_too_short` —
+  fresh app (0 / 1 / missing history) errors с pointer к
+  `--to` flag.
+
+Total app crate tests: 12 → 18.
+
+### Versioning
+
+CLI 0.1.139 → 0.1.140. Chart unchanged.
+
+### References
+
+- ADR 0025 (Argo CD).
+- `plan.md` §1.79a.
+
+---
+
 ## v0.1.139 — M1.5 Track B.1.79a part 3 — `apprafter app` add/list/status/remove (2026-05-22)
 
 ### What landed
