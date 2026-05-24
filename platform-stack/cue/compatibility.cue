@@ -1683,11 +1683,99 @@ compatibility: "0.1.23": {
 // 0.1.44 (`apprafter platform upgrade --to 0.1.45` +
 // `kubectl rollout restart deployment/argocd-repo-server
 // -n argocd`).
+// Walk-fix #11 post-B.1.79a — `Namespace` cluster resource
+// added к `apps` AppProject's `clusterResourceWhitelist`.
+// Wizard-generated user apps carry `syncOptions:
+// CreateNamespace=true`, so Argo CD generates a synthetic
+// `Namespace` resource for the destination namespace; the
+// previous empty whitelist blocked it with `SyncFailed:
+// resource :Namespace is not permitted in project apps`.
+// Permission narrows к `Namespace` only — everything else
+// cluster-scoped stays denied (Phase 4 AccessGrant will
+// layer real RBAC on top later).
+compatibility: "0.1.47": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #11 post-B.1.79a — `Namespace` cluster
+		resource permission for `apps` AppProject.
+
+		**Symptom.** After walk-fix #10 (chart 0.1.46) fixed
+		CMP discover and landing apps got past `package.json`
+		fallback, sync still failed:
+
+			```
+			SyncFailed
+			resource :Namespace is not permitted in project apps
+			```
+
+		**Root cause.** Wizard (`apprafter app add`) sets
+		`destination.namespace` to the app name (e.g.
+		`apprafter-landing-web`) and ships `syncOptions:
+		[CreateNamespace=true, ServerSideApply=true]`. Argo
+		CD on first sync generates a synthetic `Namespace`
+		resource for the destination namespace and tries to
+		apply it as a cluster-scoped resource. The `apps`
+		AppProject's `clusterResourceWhitelist: []` blocked
+		every cluster resource, including Namespace, so the
+		sync attempt errored out before any namespaced
+		resource was applied.
+
+		**Fix.** Narrow allow-list for `apps`:
+
+			```cue
+			apps: #AppProjectSpec & {
+			  ...
+			  clusterResourceWhitelist: [{
+			    group: ""
+			    kind:  "Namespace"
+			  }]
+			  ...
+			}
+			```
+
+		Only `Namespace` from the core API group. Nothing
+		else cluster-scoped (no CRD installs, no
+		ClusterRole/Binding, no PersistentVolume) reaches
+		the user-app surface. Phase 4 AccessGrant layers
+		runtime RBAC on top of this structural foundation.
+
+		**Caveat — orphan destination namespace.** The
+		wizard's defaulting of `destination.namespace` к
+		the app name (`apprafter-landing-web`) is mismatch'ed
+		with the manifest's actual `metadata.namespace`
+		(typically `apprafter` for landing apps). After this
+		walk-fix, sync succeeds:
+
+		  1. Argo CD creates `Namespace/apprafter-landing-
+		     web` (now permitted).
+		  2. Applies the Application CR to its manifest
+		     namespace (`apprafter`).
+		  3. AppRafter operator reconciles, lays down
+		     Deployment + Service в `apprafter`.
+
+		Result: `apprafter-landing-web` namespace exists
+		but is empty. Harmless but ugly — wizard polish
+		(separate walk-fix) should either drop
+		`CreateNamespace=true` for user apps or read
+		manifest's metadata.namespace at registration time.
+
+		**Rendered chart vs 0.1.46.** Only the `apps`
+		AppProject's `clusterResourceWhitelist` flips from
+		`[]` к `[{group: "", kind: "Namespace"}]`. No other
+		structural changes.
+		"""
+	references: [
+		"docs/changelog/UNRELEASED.md",
+		"platform-stack/cue/app_projects.cue",
+	]
+}
+
 // Walk-fix #10 post-B.1.79a — discover stdout fix in CMP
 // plugin.yaml. v0.1.4's snippet exited 0 on match but printed
 // nothing (`| grep -q .` swallowed find's output). Argo CD's
-// MatchRepository requires non-empty stdout to claim the repo,
-// so the cue plugin never engaged; landing apps fell back to
+// MatchRepository requires non-empty stdout к claim the repo,
+// so the cue plugin never engaged; landing apps fell back к
 // directory mode and choked on `package.json` exactly as in
 // walk-fix #8. Drop `| grep -q .`, let `find -print -quit`
 // speak for itself. Image bumps v0.1.4 → v0.1.5; chart pulls

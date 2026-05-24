@@ -97,13 +97,24 @@ _appProjects: {
 
 	// `apps` — user Applications registered via `apprafter
 	// app add`. Tightened relative to `platform`: in-cluster
-	// destinations only, no cluster-scoped resources,
-	// namespace-scoped resource whitelist constrained к
-	// Application / ConfigMap / Secret / HTTPRoute. RBAC
-	// enforcement через AppProject is not active in M1.5 —
-	// Phase 4 materialises that through AccessGrant. The
-	// tightening here is structural foundation rather than
-	// runtime enforcement.
+	// destinations only, narrow cluster-scoped surface
+	// (`Namespace` only, so `CreateNamespace=true` in the
+	// wizard-generated syncOptions can create destination
+	// namespaces; nothing else is cluster-scoped that user
+	// apps should touch), namespace-scoped resource whitelist
+	// constrained к Application / ConfigMap / Secret /
+	// HTTPRoute. RBAC enforcement через AppProject is not
+	// active в M1.5 — Phase 4 materialises that through
+	// AccessGrant. The tightening here is structural
+	// foundation rather than runtime enforcement.
+	//
+	// Walk-fix #11 post-B.1.79a (chart 0.1.47): `Namespace`
+	// added к `clusterResourceWhitelist`. Before this, an
+	// empty list blocked the synthetic `Namespace` resource
+	// Argo CD generates from `CreateNamespace=true` for any
+	// user app whose destination namespace doesn't exist
+	// yet — landing apps failed with `SyncFailed: resource
+	// :Namespace is not permitted in project apps`.
 	apps: #AppProjectSpec & {
 		description: "User applications registered via `apprafter app add`."
 		sourceRepos: ["*"]
@@ -111,7 +122,10 @@ _appProjects: {
 			namespace: "*"
 			server:    "https://kubernetes.default.svc"
 		}]
-		clusterResourceWhitelist: []
+		clusterResourceWhitelist: [{
+			group: ""
+			kind:  "Namespace"
+		}]
 		namespaceResourceWhitelist: [{
 			group: "apprafter.io"
 			kind:  "Application"
