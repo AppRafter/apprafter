@@ -62,10 +62,18 @@ RUN delgroup ping \
  && addgroup -S -g 999 argocd \
  && adduser -S -u 999 -G argocd -h /home/argocd argocd
 
-# `ca-certificates` is needed for CUE imports that resolve to
-# HTTPS module registries (CUE registries land in M2+; harmless
-# today, kept for forward-compat).
-RUN apk add --no-cache ca-certificates bash
+# `ca-certificates` — CUE imports that resolve to HTTPS module
+# registries (CUE registries land in M2+; harmless today,
+# forward-compat).
+# `bash` — entrypoint.sh shebang.
+# `jq` — walk-fix #5 post-B.1.79a (cue-cmp v0.1.2):
+# entrypoint.sh emits one k8s manifest per top-level value
+# из `cue export --out json`; needs jq for enumerating keys
+# и round-tripping each value individually back through `cue
+# export -e <key> --out yaml` so Argo CD receives a clean
+# YAML stream of unwrapped manifests instead of one nested
+# JSON object.
+RUN apk add --no-cache ca-certificates bash jq
 
 # Drop the CUE binary on PATH.
 COPY --from=fetcher /tmp/cue /usr/local/bin/cue

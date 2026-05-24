@@ -13,6 +13,103 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.152 — M1.5 walk-fix #5 post-B.1.79a — argocd-cue-cmp emits flat manifest stream (2026-05-24)
+
+### Symptom
+
+Operator asked how to register the AppRafter landing
+manifests (`landing/web/apprafter/Application.cue`,
+`landing/cms/apprafter/Application.cue`) on their test
+cluster via `apprafter app add`. Investigation surfaced two
+unsurfaced bugs in the cue-cmp plugin path:
+
+1. **CMP discovery glob** `**/apprafter*.cue` only matches
+   files whose basename starts with `apprafter`. The landing
+   manifests are named `Application.cue` inside an
+   `apprafter/` directory — a more readable convention for
+   larger repos, и the one AppRafter's own manifests use.
+   Without а matching file, Argo CD falls through to the
+   default raw-YAML handler и syncs the Application with
+   zero rendered manifests.
+
+2. **Entrypoint script** runs `cue export ./... --out yaml`
+   raw. For typical AppRafter source files like
+   `landingWeb: v1alpha1.#Application & { ... }`, that
+   produces а **nested** YAML document with the manifest
+   under the field key (`landingWeb: …`). Argo CD treats
+   that as one invalid document — `apiVersion` isn't at the
+   top level → sync fails.
+
+Both behaviours were unsurfaced because no user app had
+exercised the CMP path end-to-end before. The cue-cmp
+sidecar was wired into the chart in B.1.69 but nothing
+reached its render step until landing's first registration
+attempt.
+
+### Fix
+
+Three coordinated artefact updates:
+
+- **`argocd-cue-cmp/entrypoint.sh`** rewritten to enumerate
+  top-level k8s-shaped values (objects with `apiVersion` +
+  `kind`) via `cue export --out json | jq`, re-export each
+  via `cue export -e <key> --out yaml`, emit a `---`
+  separator per doc. Helper top-level values (shared
+  constants, library defs) are silently skipped — they're
+  imported by the real manifests anyway.
+
+- **`argocd-cue-cmp/Dockerfile`** adds `jq` to the Alpine
+  base layer (~600 KiB) for the enumeration step.
+
+- **`argocd-cue-cmp/plugin.yaml`** extends glob to
+  `{**/apprafter*.cue,**/apprafter/**/*.cue}` via doublestar
+  v4 brace alternation. Now matches both the filename-prefix
+  convention (`apprafter-web.cue`) and the directory-marker
+  convention (`landing/web/apprafter/Application.cue`).
+
+- **`platform-stack/cue/component_argocd.cue`** mirrors the
+  new glob inside the chart's embedded `plugin.yaml`
+  `extraObjects` ConfigMap (the actual config Argo CD's
+  repo-server reads at runtime).
+
+### Verification
+
+Local `bash argocd-cue-cmp/entrypoint.sh` against
+`landing/web/apprafter/` emits two well-formed YAML
+documents (landing-web + landing-web-preview), each with
+`apiVersion: apprafter.io/v1alpha1` at the top level and a
+`---` separator between them. Argo CD's downstream YAML
+parser will treat each as а separate manifest.
+
+### Versioning
+
+- `argocd-cue-cmp` v0.1.1 → v0.1.2 (image rebuild required;
+  the publish workflow auto-fires on the new
+  `argocd-cue-cmp/v0.1.2` git tag).
+- platform-stack chart 0.1.41 → 0.1.42 — picks up the new
+  cue-cmp image tag через the CUE import + extends the
+  embedded glob. Rendered diff vs 0.1.41: `image.tag` value
+  + ConfigMap `plugin.yaml` data string.
+- CLI 0.1.151 → 0.1.152 — picks up the new chart pin via
+  `RELEASED_PLATFORM_STACK_VERSION`.
+
+### Operator workflow once landed
+
+After upgrading к chart 0.1.42 (`apprafter platform upgrade
+--to 0.1.42`), operators can register an AppRafter user app
+from any path matching either convention:
+
+```sh
+apprafter app add https://github.com/AppRafter/apprafter \
+  --name landing-web \
+  --branch master \
+  --path landing/web/apprafter \
+  --project apps \
+  --no-interactive
+```
+
+---
+
 ## v0.1.151 — M1.5 walk-fix #4 post-B.1.79a — version_check picks wrong tag series (2026-05-24)
 
 ### Symptom

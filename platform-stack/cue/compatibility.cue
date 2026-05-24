@@ -1658,6 +1658,119 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #5 post-B.1.79a — argocd-cue-cmp emits flat k8s
+// manifest stream. Chart 0.1.41 shipped the cue-cmp sidecar
+// embedded в the argocd subchart, but the sidecar's
+// entrypoint script ran `cue export ./... --out yaml` raw —
+// which for typical apprafter manifests (`landingWeb:
+// v1alpha1.#Application & { ... }`) outputs а nested YAML
+// document с the manifest under the field key, not the flat
+// document Argo CD expects. Plus the discovery glob
+// (`**/apprafter*.cue`) only matched files starting with
+// "apprafter", missing the `apprafter/<resource>.cue`
+// directory-as-marker convention AppRafter's own landing
+// manifests use (`landing/web/apprafter/Application.cue`).
+//
+// Fix lands across three artefacts:
+//   * `argocd-cue-cmp/entrypoint.sh` — enumerates top-level
+//     k8s-shaped values (objects с `apiVersion` + `kind`)
+//     via `cue export --out json | jq`, re-exports each via
+//     `cue export -e <key> --out yaml`, separates each с
+//     `---`.
+//   * `argocd-cue-cmp/Dockerfile` — adds `jq` к the image
+//     for the key enumeration step (~600 KiB).
+//   * `argocd-cue-cmp/plugin.yaml` (and the chart's embed
+//     of the same в `component_argocd.cue`'s extraObjects)
+//     — extends glob к `{**/apprafter*.cue,**/apprafter/**/*.cue}` via doublestar v4 brace alternation.
+//
+// argocd-cue-cmp image bumps v0.1.1 → v0.1.2. Chart points
+// `_components.argocd-cue-cmp.values.image.tag` к the new
+// version through `argocd-cue-cmp/version.cue` (single SoT
+// for the image tag — chart pin tracks automatically).
+compatibility: "0.1.42": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #5 post-B.1.79a — argocd-cue-cmp emits
+		flat k8s manifest stream + accepts `apprafter/`
+		directory-marker layout.
+
+		**Symptom.** Operator runs `apprafter app add` against
+		the AppRafter monorepo pointing at
+		`landing/web/apprafter/Application.cue`. Two failure
+		modes:
+
+		  1. CMP discovery glob `**/apprafter*.cue` doesn't
+		     match the file (basename is `Application.cue`).
+		     Argo CD falls through к default raw-YAML
+		     handling, finds nothing, syncs the Application
+		     with zero rendered manifests.
+
+		  2. Even with а matching filename (e.g.
+		     `apprafter-web.cue` workaround), the entrypoint's
+		     `cue export ./... --out yaml` emits the
+		     manifest nested under а top-level field name
+		     (`landingWeb: …`). Argo CD treats that as ONE
+		     invalid document — no `apiVersion` at the top
+		     level → sync fails.
+
+		**Root cause.** Both behaviours were unsurfaced
+		because no user app actually exercised the CMP path
+		end-to-end before — the sidecar was wired into the
+		chart in B.1.69 but nothing reached its render step.
+		The landing-stream Application manifests are the
+		first real test.
+
+		**Fix.** Three coordinated artefact updates:
+
+		  * `argocd-cue-cmp/entrypoint.sh` rewritten к
+		    enumerate top-level k8s-shaped values via `cue
+		    export --out json | jq`, re-export each via `cue
+		    export -e <key> --out yaml`, emit а `---`
+		    separator per doc. Filter: only values whose JSON
+		    is an object и has both `apiVersion` и `kind`
+		    fields — helper top-level values (shared
+		    constants, library defs) are silently skipped.
+
+		  * `argocd-cue-cmp/Dockerfile` adds `jq` к the
+		    Alpine base layer (~600 KiB) for the enumeration
+		    step.
+
+		  * `argocd-cue-cmp/plugin.yaml` extends glob к
+		    `{**/apprafter*.cue,**/apprafter/**/*.cue}` via
+		    doublestar v4 brace alternation. Now matches both
+		    filename-prefix convention (`apprafter-web.cue`)
+		    and directory-marker convention
+		    (`landing/web/apprafter/Application.cue`).
+
+		  * `platform-stack/cue/component_argocd.cue` mirrors
+		    the new glob inside the embedded `plugin.yaml`
+		    `extraObjects` ConfigMap that the chart applies к
+		    the argocd-repo-server sidecar.
+
+		**Image bump.** `argocd-cue-cmp/version.cue` v0.1.1
+		→ v0.1.2; chart's
+		`_components.argocd-cue-cmp.values.image.tag` follows
+		automatically через the CUE import.
+
+		**Verification.** Local `bash argocd-cue-cmp/entrypoint.sh` against `landing/web/apprafter/` emits two
+		well-formed YAML docs (landing-web + landing-web-
+		preview), each with `apiVersion: apprafter.io/v1alpha1`
+		at the top level и а `---` separator between them.
+
+		Rendered chart vs 0.1.41: the embedded plugin.yaml
+		ConfigMap's `data."plugin.yaml"` string changed; the
+		image tag pin in argocd subchart values bumped from
+		v0.1.1 → v0.1.2. No other manifest changes.
+		"""
+	references: [
+		"docs/adr/0029-cue-cmp.md",
+		"argocd-cue-cmp/entrypoint.sh",
+		"argocd-cue-cmp/plugin.yaml",
+		"docs/changelog/UNRELEASED.md#v01152",
+	]
+}
+
 // Walk-fix #2 post-B.1.79a — AppProjects as standalone umbrella
 // manifests at sync-wave -30. Chart 0.1.40 shipped 4 AppProjects
 // via the argocd subchart's `configs.projects` mechanism, which

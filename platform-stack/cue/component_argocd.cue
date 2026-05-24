@@ -218,6 +218,13 @@ _components: argocd: #Component & {
 			}
 			data: "plugin.yaml": """
 				# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+				# Walk-fix #5 post-B.1.79a (chart 0.1.42 + cue-cmp
+				# v0.1.2): glob extended to also accept files in
+				# `apprafter/` directories (e.g.
+				# `landing/web/apprafter/Application.cue`) — the
+				# directory-as-marker convention used by AppRafter's
+				# own landing manifests. Both patterns are matched
+				# via doublestar v4 brace alternation.
 				apiVersion: argoproj.io/v1alpha1
 				kind: ConfigManagementPlugin
 				metadata:
@@ -225,7 +232,7 @@ _components: argocd: #Component & {
 				spec:
 				  discover:
 				    find:
-				      glob: "**/apprafter*.cue"
+				      glob: "{**/apprafter*.cue,**/apprafter/**/*.cue}"
 				  generate:
 				    command: [sh, "-c"]
 				    args:

@@ -19,14 +19,32 @@ metadata:
   name: cue
 spec:
   # Detection rule. Globs are evaluated relative to the
-  # repo-server's checkout of the user repository. The
-  # `apprafter*.cue` pattern is the canonical user-app
-  # filename per Phase 1.11 + ADR 0029 §"Still open" —
-  # subject to future migration to `.apprafter/app.cue` if
-  # that resolves.
+  # repo-server's checkout of the user repository. Two
+  # conventions are accepted:
+  #
+  #   1. `apprafter*.cue` filename anywhere in the tree —
+  #      e.g. `apprafter.cue`, `apprafter-web.cue`. The
+  #      "filename starts with apprafter" convention is
+  #      compact for small repos.
+  #
+  #   2. Any `*.cue` file inside an `apprafter/` directory —
+  #      e.g. `landing/web/apprafter/Application.cue`. The
+  #      directory-as-marker convention is more readable in
+  #      larger repos where multiple apps share а tree.
+  #
+  # Walk-fix #5 post-B.1.79a (cue-cmp v0.1.2) added the
+  # second pattern. The first was already supported but
+  # forced operators к use prefixed filenames; the directory-
+  # marker form matches how AppRafter's own landing manifests
+  # are laid out (`landing/web/apprafter/Application.cue`,
+  # `landing/cms/apprafter/Application.cue`).
+  #
+  # Doublestar v4 brace alternation handles both patterns in
+  # а single glob; Argo CD's repo-server uses that library
+  # for CMP discovery as of 2.13.
   discover:
     find:
-      glob: "**/apprafter*.cue"
+      glob: "{**/apprafter*.cue,**/apprafter/**/*.cue}"
   # Render command. `entrypoint.sh` lives in the sidecar
   # image and wraps `cue export` so CUE compile errors
   # surface as structured single-line summaries in the
