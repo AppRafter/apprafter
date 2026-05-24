@@ -5,11 +5,13 @@
 //! `*_yaml` renderers are gone; only `helm`, `kubectl`,
 //! `image_ref`, and the surviving values modules remain.
 
+pub mod channel_latest;
 pub mod helm;
 pub mod image_ref;
 pub mod kubectl;
 pub mod loader_values;
 
+pub use channel_latest::resolve_latest_platform_stack_version;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs};
 pub use image_ref::{
     resolve_image_ref, APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE, APPRAFTER_OPERATOR_DEFAULT_IMAGE,

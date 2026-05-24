@@ -67,7 +67,7 @@ use cli_providers::k8s::{
     HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
     APPRAFTER_CLI_FIELD_MANAGER, APPRAFTER_PLATFORM_STACK_CHART_NAME,
     APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, ARGOCD_CHART_VERSION, ARGOCD_LOADER_VALUES_YAML,
-    CILIUM_CHART_VERSION, CILIUM_VALUES_YAML, RELEASED_PLATFORM_STACK_VERSION,
+    CILIUM_CHART_VERSION, CILIUM_VALUES_YAML,
 };
 use cli_state::State;
 use tempfile::NamedTempFile;
@@ -473,8 +473,21 @@ fn platform_stack_repo() -> String {
     APPRAFTER_PLATFORM_STACK_DEFAULT_REPO.to_string()
 }
 
+/// Resolve the platform-stack chart version the loader pins
+/// the root Application to.
+///
+/// Walk-fix #9 post-B.1.79a (v0.1.159): used to return the
+/// baked-in `RELEASED_PLATFORM_STACK_VERSION` constant
+/// verbatim — every chart-only bump forced a CLI rebuild +
+/// release just to keep fresh installs current. New flow
+/// fetches the latest `platform-stack/v*` tag from the
+/// upstream GitHub Releases API at bootstrap time and uses
+/// that; the baked constant survives as а fallback for
+/// air-gapped / firewalled / network-broken installs.
+///
+/// See `cli_providers::k8s::channel_latest` for the resolver.
 fn platform_stack_version() -> String {
-    RELEASED_PLATFORM_STACK_VERSION.to_string()
+    cli_providers::k8s::resolve_latest_platform_stack_version()
 }
 
 fn decrypt_cached_kubeconfig(hetzner: &cli_state::HetznerCloudState) -> Result<String> {

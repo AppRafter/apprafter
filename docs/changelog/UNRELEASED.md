@@ -13,6 +13,114 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.159 — M1.5 walk-fix #9 post-B.1.79a — CLI resolves latest chart from upstream at bootstrap (2026-05-24)
+
+### Symptom
+
+Operator asked why CLI version had to bump on every
+chart-only release. Investigation surfaced the root cause:
+`cluster_bootstrap::platform_stack_version()` returned the
+baked-in `RELEASED_PLATFORM_STACK_VERSION` constant
+verbatim. The constant tracks `platform.cue` `currentVersion`
+via `cli-providers/build.rs` at compile time. Result: every
+chart-only bump forced a CLI rebuild + release to keep
+fresh installs current, otherwise new operators would
+bootstrap onto the previous chart и only reach the latest
+after the operator's PlatformController did a reconcile
+cycle.
+
+That coupling is wrong by design. The CLI binary has no
+business knowing the latest chart version at compile time —
+the latest chart is whatever is published к the upstream
+release stream.
+
+### Fix
+
+New `cli_providers::k8s::channel_latest` module:
+
+- `resolve_latest_platform_stack_version()` — public entry
+  point. GETs `https://api.github.com/repos/apprafter/
+  apprafter/releases?per_page=100` with a 3-second timeout,
+  filters `tag_name` к entries starting `platform-stack/v`,
+  strips the prefix, parses as semver, picks the highest
+  with stable preferred over prerelease.
+
+- Any failure path (network down, GitHub rate-limited, JSON
+  parse error, no matching tags) falls back к the baked
+  `RELEASED_PLATFORM_STACK_VERSION` constant so air-gapped
+  / firewalled / offline installs still bootstrap with a
+  known-good version. Failures log at debug level so
+  `RUST_LOG=apprafter=debug apprafter cluster-bootstrap`
+  surfaces the fallback path.
+
+`cluster_bootstrap::platform_stack_version()` now calls the
+resolver. The baked constant survives as the safety floor
+и as an asserts surface (loader_values.rs still validates
+its format).
+
+### Stable / prerelease semantics
+
+When both `platform-stack/v0.1.45` (stable) and
+`platform-stack/v0.1.46-rc.1` (prerelease) are published,
+the resolver picks `0.1.45`. Only when every candidate is a
+prerelease (fresh channel before its first stable cut) does
+it return one — better surface SOMETHING than fall back to
+the stale baked constant.
+
+### Why this is the right shape
+
+The PlatformController in the operator already does
+channel-following autonomously after bootstrap. The CLI
+loader's role is just "apply the initial root Application
+CR so the controller can take over". Pinning that initial
+CR к the freshest published chart minimises the operator's
+"newly-bootstrapped cluster lagging by one chart version"
+window к ~zero.
+
+The OCI registry (ghcr.io) also has а tag-list endpoint we
+could use, but using GitHub Releases API:
+
+- Matches the surface `version_check.rs` already polls.
+- Doesn't require an OCI auth token for а public chart.
+- Has the same rate-limit story (60 req/hour unauth, but
+  the resolver fires only at bootstrap time — rare).
+
+### Tests
+
++7 unit tests in `channel_latest::tests` on the pure
+`pick_latest_platform_stack_tag(releases)` helper:
+
+- `picks_highest_semver_from_mixed_streams` — happy path
+  with CLI, chart, cue-cmp, landing tags all mixed.
+- `returns_none_when_no_platform_stack_tags` — fork without
+  chart publishes.
+- `ignores_malformed_release_entries` — missing/null
+  tag_name, unparseable semver, empty value.
+- `returns_none_for_non_array` — defensive coverage for
+  schema drift.
+- `prefers_stable_over_prerelease_when_both_present` —
+  stable channel discipline.
+- `falls_back_to_prerelease_when_no_stable_exists` — fresh
+  channel before first stable cut.
+- `handles_two_digit_patch_versions_correctly` — regression
+  guard: `0.1.10` > `0.1.9` semver-wise but `<` lexically.
+
+### Versioning policy update
+
+Going forward: **chart-only bumps do NOT bump CLI**. The
+v0.1.158 bump that motivated the user's question was the
+last of its kind. Future chart releases (e.g.
+`platform-stack/v0.1.46` for whatever next walk-fix lands)
+are picked up by existing CLI binaries through the new
+resolver — no CLI rebuild needed.
+
+### Versioning
+
+CLI 0.1.158 → 0.1.159. Chart unchanged (still 0.1.45 from
+walk-fix #8b). cue-cmp unchanged at v0.1.4.
+
+---
+
 ## v0.1.158 — M1.5 walk-fix #8b post-B.1.79a — cue-cmp image bump alongside chart (2026-05-24)
 
 ### Symptom
