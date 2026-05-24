@@ -13,6 +13,98 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.149 — M1.5 polish post-B.1.79a #5 — CLI release workflow (2026-05-24)
+
+### Symptom
+
+Walk feedback on `apprafter`'s newer-release courtesy banner
+(v0.1.135's npm-style version check): the banner never fires
+even when an operator's CLI is many tags behind the current
+tip. Root cause: `version_check::resolve_latest_tag` polls
+`https://api.github.com/repos/apprafter/apprafter/releases/
+latest`, but the monorepo had no workflow creating GitHub
+Releases on `v0.*` tag pushes. The releases page is empty;
+the API returns 404; the banner stays quiet by design (fail-
+quiet on lookup errors per v0.1.135).
+
+### Fix
+
+New workflow `.github/workflows/release-cli.yml` builds the
+`apprafter` CLI binary on every `v0.*` / `v1.*` tag push and
+creates the corresponding GitHub Release with the binary
+tarballs as assets:
+
+- **`x86_64-unknown-linux-gnu`** — tier-1 substrate (Hetzner
+  CPX22). Native build on `ubuntu-latest`.
+- **`x86_64-apple-darwin`** — Intel Macs. Cross-compiled on
+  `macos-latest` (currently `macos-14`, ARM-based).
+- **`aarch64-apple-darwin`** — Apple Silicon Macs. Native on
+  `macos-latest`.
+
+Each target produces:
+
+- `apprafter-<tag>-<target>.tar.gz` — stripped binary +
+  README.md + LICENSE.
+- `apprafter-<tag>-<target>.tar.gz.sha256` — checksum.
+
+### Verification step
+
+The `Verify binary matches tag version` step runs
+`apprafter --version` against the freshly-built binary and
+asserts the output matches the tag minus the leading `v`.
+A mismatch means the commit that received the tag forgot
+to bump `cli/Cargo.toml` `workspace.package.version` per the
+CLAUDE.md versioning rule — the published binary would
+report a stale `--version` string, which `version_check`
+relies on for comparison. Failing the workflow here is
+better than silently shipping а broken courtesy banner.
+
+### Release notes
+
+The `Extract changelog section for this tag` step pulls the
+first `##` section in `docs/changelog/UNRELEASED.md` that
+mentions the tag и uses it as the release body. Falls back
+to а short default body for chart-only / landing-stream tags
+that don't have a dedicated changelog entry.
+
+### Security
+
+Every potentially-tainted GitHub Actions input
+(`inputs.tag`, `github.ref_name`, the extracted changelog
+text) flows through an `env:` binding before reaching any
+shell `run:` step. No `${{ }}` interpolation inside `run:`
+bodies — eliminates the action-injection class of risks
+documented at
+<https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/>.
+
+The tag-glob trigger (`v0.*` / `v1.*`) further constrains
+`github.ref_name` to a known-safe shape.
+
+### Linux aarch64
+
+Deliberately absent from this round — tier-1 ships on x86
+only и adding cross-compile for Linux ARM requires `cross`
+or Docker QEMU, а separate complication. Phase 2+ wires it
+in alongside Infrastructure-side arch detection.
+
+### Manual trigger
+
+The workflow also supports `workflow_dispatch` with an
+explicit tag input, so operators can re-build / re-upload
+release assets for а previously-tagged commit if the first
+run failed (network blip on `gh release create`, etc.). The
+re-run path deletes the existing release first to avoid
+`gh release create` errors on duplicate asset names.
+
+### Versioning
+
+CLI 0.1.148 → 0.1.149. Chart unchanged. This is the first
+release that — once tagged + pushed — will land on the
+GitHub Releases page, making `apprafter`'s
+newer-release banner functional for all future tags.
+
+---
+
 ## v0.1.148 — M1.5 polish post-B.1.79a #4 — `apprafter platform freeze` fallback (2026-05-24)
 
 ### Symptom
