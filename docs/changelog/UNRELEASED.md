@@ -13,6 +13,58 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.138 — M1.5 Track B.1.79a part 2 — `apprafter open argocd` polish (2026-05-22)
+
+### What landed
+
+- `apprafter open argocd` now appends Argo CD's `?proj=<name>`
+  filter к the opened URL. Default `--project apps` (the
+  AppProject `apprafter app add` writes user-app Applications
+  into per part 1) — operators land on their own apps first.
+  `--project platform` flips к the chart-managed components
+  view; `--all-projects` drops the filter entirely.
+- Password is copied к the system clipboard via `arboard`.
+  Fail-quiet on headless / no-clipboard environments — а
+  `(clipboard unavailable — copy manually)` hint replaces
+  the success marker when copy fails.
+- Output banner formalised:
+
+  ```
+  Opening Argo CD UI...
+    URL:       https://localhost:8080/applications?proj=apps
+    Username:  admin
+    Password:  H7x4kP9aB3...  (copied к clipboard)
+
+  ✓ Browser opened
+  ℹ Press Ctrl+C к stop port-forward
+  ```
+
+  Browser open failure surfaces `ℹ Browser open failed — paste
+  the URL into your browser` instead of the success line.
+
+### Tests
+
++3 unit tests on the pure `build_argocd_url` helper:
+
+- `build_argocd_url_defaults_no_filter` — `None` → bare
+  `https://localhost:8080`.
+- `build_argocd_url_appends_proj_filter` — `Some("apps")` /
+  `Some("platform")` → `…/applications?proj=<name>`.
+- `build_argocd_url_treats_empty_filter_as_no_filter` —
+  defensive: empty string filter renders как `--all-projects`,
+  чтобы а bare `?proj=` URL никогда не уходит к browser'у.
+
+### Versioning
+
+CLI 0.1.137 → 0.1.138. Чарт unchanged.
+
+### References
+
+- ADR 0025 (Argo CD).
+- `plan.md` §1.79a.
+
+---
+
 ## v0.1.137 — M1.5 Track B.1.79a part 1 — AppProjects + per-component project (2026-05-22)
 
 ### What landed

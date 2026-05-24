@@ -25,12 +25,21 @@ use crate::commands::k8s_helpers::ensure_kubeconfig_tempfile;
 ///   3. Spawn `kubectl port-forward svc/argocd-server -n argocd
 ///      8080:443` в background; wait until the bind message
 ///      lands on stdout.
-///   4. Print URL + username + password; open browser.
+///   4. Print URL (с optional `?proj=<filter>` AppProject
+///      filter) + username + password; copy password to
+///      clipboard когда возможно; open browser.
 ///   5. Block on the port-forward child; both die when the
 ///      operator Ctrl+C's the parent process (kubectl
 ///      inherits the terminal's SIGINT через the process
 ///      group, Rust's default).
-pub fn argocd() -> Result<()> {
+///
+/// `project_filter` controls the URL's `?proj=<name>` query
+/// parameter. `None` drops the filter entirely (renders
+/// `apprafter open argocd --all-projects`); `Some("apps")` is
+/// the CLI default per Track B.1.79a — operators land on
+/// their own user-apps view first, since platform components
+/// are mostly hands-off after bootstrap.
+pub fn argocd(project_filter: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
     // Resolve password through the existing cached path. This
@@ -43,22 +52,71 @@ pub fn argocd() -> Result<()> {
 
     wait_port_forward_ready(&mut child)?;
 
-    let url = format!("https://localhost:{local_port}");
+    let url = build_argocd_url(local_port, project_filter);
+    let clipboard_status = copy_password_to_clipboard(&password);
+
     println!();
     println!("Opening Argo CD UI...");
     println!("  URL:       {url}");
     println!("  Username:  admin");
-    println!("  Password:  {password}");
+    print!("  Password:  {password}");
+    match clipboard_status {
+        ClipboardStatus::Copied => println!("  (copied к clipboard)"),
+        ClipboardStatus::Failed => println!("  (clipboard unavailable — copy manually)"),
+    }
     println!();
-    println!("Press Ctrl+C к stop the port-forward.");
 
-    let _ = open_in_browser(&url);
+    let browser_status = open_in_browser(&url);
+    match browser_status {
+        Ok(()) => println!("✓ Browser opened"),
+        Err(_) => println!("ℹ Browser open failed — paste the URL into your browser"),
+    }
+    println!("ℹ Press Ctrl+C к stop port-forward");
 
     // Block until the port-forward child exits — which happens
     // when the operator Ctrl+C's this process (kubectl receives
     // SIGINT via the process group и tears down cleanly).
     let _ = child.wait();
     Ok(())
+}
+
+/// Build the Argo CD UI URL, optionally narrowing к
+/// а specific AppProject via Argo CD's `?proj=<name>` filter.
+///
+/// Pure fn (no IO, no globals) so tests can exhaustively
+/// cover the default / explicit / drop-filter shapes.
+fn build_argocd_url(local_port: u16, project_filter: Option<&str>) -> String {
+    let base = format!("https://localhost:{local_port}");
+    match project_filter {
+        Some(proj) if !proj.is_empty() => format!("{base}/applications?proj={proj}"),
+        _ => base,
+    }
+}
+
+/// Outcome of the optional clipboard copy step. Distinct
+/// variants so the printed banner can distinguish "we copied
+/// for you" from "we tried и failed" — the second case warns
+/// the operator that they need to manually copy from terminal
+/// before the buffer flushes.
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardStatus {
+    Copied,
+    Failed,
+}
+
+/// Copy `password` к the system clipboard via `arboard`.
+/// Fail-quiet — environment without а clipboard daemon
+/// (headless servers, sandboxed shells, fresh SSH session
+/// without X11 forwarding) returns `Failed` и the caller
+/// surfaces а hint, без поднятия error через `?` chain.
+fn copy_password_to_clipboard(password: &str) -> ClipboardStatus {
+    match arboard::Clipboard::new() {
+        Ok(mut cb) => match cb.set_text(password.to_string()) {
+            Ok(()) => ClipboardStatus::Copied,
+            Err(_) => ClipboardStatus::Failed,
+        },
+        Err(_) => ClipboardStatus::Failed,
+    }
 }
 
 fn spawn_port_forward(
@@ -281,6 +339,38 @@ mod tests {
             err.is_err(),
             "recv must Err when EOF arrives before the ready banner; got Ok"
         );
+    }
+
+    #[test]
+    fn build_argocd_url_defaults_no_filter() {
+        // Без project filter — голый base URL, никаких query
+        // params'ов. Matches the --all-projects code path.
+        assert_eq!(build_argocd_url(8080, None), "https://localhost:8080");
+    }
+
+    #[test]
+    fn build_argocd_url_appends_proj_filter() {
+        // Standard B.1.79a default — `apps` filter narrows the
+        // UI к user-application view. Regression: ensure the
+        // path is `/applications?proj=<name>` exactly (Argo CD's
+        // documented filter URL shape).
+        assert_eq!(
+            build_argocd_url(8080, Some("apps")),
+            "https://localhost:8080/applications?proj=apps"
+        );
+        assert_eq!(
+            build_argocd_url(9999, Some("platform")),
+            "https://localhost:9999/applications?proj=platform"
+        );
+    }
+
+    #[test]
+    fn build_argocd_url_treats_empty_filter_as_no_filter() {
+        // Defensive: an empty string filter (e.g. caller
+        // passed `Some("")`) renders как if --all-projects
+        // was set — а bare `?proj=` would mean "filter к
+        // project with empty name", which is nonsense.
+        assert_eq!(build_argocd_url(8080, Some("")), "https://localhost:8080");
     }
 
     #[test]

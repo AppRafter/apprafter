@@ -92,7 +92,13 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             MigrationCommand::Reject { name } => commands::migration::reject(&name)?,
         },
         Commands::Open { ui } => match ui {
-            OpenUi::Argocd => commands::open::argocd()?,
+            OpenUi::Argocd {
+                project,
+                all_projects,
+            } => {
+                let filter = if all_projects { None } else { Some(project) };
+                commands::open::argocd(filter.as_deref())?
+            }
         },
     }
     Ok(())

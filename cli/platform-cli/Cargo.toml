@@ -22,6 +22,7 @@ path = "src/bin/platform-cli.rs"
 
 [dependencies]
 age           = { workspace = true }
+arboard       = { workspace = true }
 cli-core      = { path = "../cli-core" }
 cli-state     = { path = "../cli-state" }
 cli-providers = { path = "../cli-providers" }

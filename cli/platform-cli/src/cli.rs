@@ -244,7 +244,25 @@ pub enum OpenUi {
     /// Open the Argo CD web UI on `https://localhost:8080`
     /// via `kubectl port-forward`, prefilling the admin
     /// username и printing the password.
-    Argocd,
+    Argocd {
+        /// AppProject filter applied к the opened URL —
+        /// Argo CD's UI honours `?proj=<name>` to scope the
+        /// Applications list. Defaults к `apps` so the
+        /// operator lands on their own apps first; pass
+        /// `--project platform` чтобы посмотреть
+        /// chart-managed compoments, или `--all-projects`
+        /// to drop the filter entirely.
+        #[arg(long = "project", default_value = "apps")]
+        project: String,
+        /// Drop the `?proj=<name>` filter — UI shows all
+        /// AppProjects.
+        #[arg(
+            long = "all-projects",
+            default_value_t = false,
+            conflicts_with = "project"
+        )]
+        all_projects: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
