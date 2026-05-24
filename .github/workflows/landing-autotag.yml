@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: landing-autotag
+
+# On every push to master that touches landing/**, bump the patch
+# component of the latest `landing-v*` tag and push the new tag.
+# release-landing.yml is triggered by `landing-v*` tags, so the
+# net effect is "merge to master → image build" without any human
+# tag-push in between.
+#
+# Triggering downstream workflows: GitHub's default GITHUB_TOKEN
+# cannot fire other workflows (anti-recursion). For the
+# release-landing.yml chain to actually run, the tag push has to
+# come from a "user" — concretely, a fine-grained PAT stored as
+# the LANDING_AUTOTAG_PAT secret. Setup:
+#
+#   1. github.com/settings/personal-access-tokens/new
+#   2. Repository access: this repo only.
+#   3. Repository permissions:
+#        Contents: Read and write   (for tag push)
+#        Metadata: Read              (auto-granted)
+#   4. Save the token, paste it into Settings → Secrets and
+#      variables → Actions → New repository secret named
+#      `LANDING_AUTOTAG_PAT`.
+#
+# Without the PAT the tag is still created and visible in the
+# repo, but release-landing.yml does NOT fire automatically.
+# Recover with:
+#
+#   gh workflow run release-landing.yml --ref <new-tag>
+#
+# Version bumping is patch-only: 0.1.0 → 0.1.1 → 0.1.2. Minor and
+# major are manual decisions — push a tag like `landing-v0.2.0` by
+# hand to set the new minor; the next auto-bump picks up from there.
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'landing/**'
+
+permissions:
+  contents: write
+
+# Serialise: two pushes in quick succession must NOT race for the
+# same tag number. cancel-in-progress=false means the second job
+# waits for the first to finish (and read the latest tag) before
+# computing its own next version.
+concurrency:
+  group: landing-autotag
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: bump landing-v* patch tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # PAT if available, falls back to the default token. With
+          # the default token the push succeeds but release-landing
+          # won't auto-fire — see header comment.
+          token: ${{ secrets.LANDING_AUTOTAG_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Compute next landing-v* tag
+        id: compute
+        run: |
+          git fetch --tags --force --quiet
+          latest=$(git tag --list 'landing-v*' --sort=-v:refname | head -n1)
+          if [ -z "$latest" ]; then
+            next="landing-v0.1.0"
+          else
+            current="${latest#landing-v}"
+            IFS='.' read -r major minor patch <<<"$current"
+            next="landing-v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Latest: ${latest:-<none>} → Next: $next"
+
+      - name: Create + push tag
+        env:
+          NEXT: ${{ steps.compute.outputs.next }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$NEXT" -m "Auto-tag: $NEXT (landing/** push to master)"
+          git push origin "$NEXT"
+          echo "::notice::Pushed $NEXT pointing at $COMMIT_SHA"

@@ -19,24 +19,61 @@ Target deploy (per Q1 + Q2, 2026-05-22):
 
 ## Releasing
 
-The recommended path is to pull prebuilt container images from
-GHCR — `.github/workflows/release-landing.yml` builds and pushes
-them on every `landing-v*` tag:
+Three workflows together cover the deploy flow — you usually
+don't have to touch them by hand:
+
+| Workflow | Trigger | Output |
+|---|---|---|
+| `landing-autotag.yml` | push to `master` with `landing/**` changes | bumps patch on latest `landing-v*` tag and pushes it |
+| `release-landing.yml` | `landing-v*` tag push | builds + pushes `:landing-vX.Y.Z` + `:latest` for both images |
+| `rebuild-landing-web.yml` | Payload `afterChange` on content globals | builds + pushes `:edge` + `:edge-<sha>` (web only, live CMS) |
+
+So the normal flow is:
 
 ```sh
-# Cut a release tag on master:
-git tag landing-v0.1.0
-git push origin landing-v0.1.0
-# GitHub Actions runs both image builds in parallel (~3-5 min
-# each on cache hits). After it lands:
-#   ghcr.io/apprafter/landing-web:landing-v0.1.0   (+ :latest)
-#   ghcr.io/apprafter/landing-cms:landing-v0.1.0   (+ :latest)
+# Commit landing changes to master:
+git push origin master
+
+# landing-autotag fires (because landing/** changed):
+#   landing-v0.1.5 → tagged at the same commit
+#
+# release-landing fires (because a landing-v* tag landed):
+#   ghcr.io/apprafter/landing-web:landing-v0.1.5  (+ :latest)
+#   ghcr.io/apprafter/landing-cms:landing-v0.1.5  (+ :latest)
+#
+# Argo CD on the cluster watches :latest (or pin to the explicit
+# tag) and rolls out the new image.
 ```
+
+For the auto-fire chain to work, **the auto-tag has to push the
+tag as a "user"**, not as the default `GITHUB_TOKEN` (which is
+explicitly blocked from triggering downstream workflows).
+Set `LANDING_AUTOTAG_PAT` repo secret with a fine-grained PAT —
+see the workflow's header comment for the exact scope. Without
+the PAT, the tag is still created (visible in the repo); the
+operator just re-runs the release manually:
+
+```sh
+gh workflow run release-landing.yml --ref landing-v0.1.5
+```
+
+### Manual / patched tags
+
+For minor/major bumps (auto-tag is patch-only) or to skip the
+auto-tag system entirely:
+
+```sh
+git tag landing-v0.2.0       # next minor — by hand
+git push origin landing-v0.2.0
+# auto-tag will pick up from here on the next push: 0.2.1, 0.2.2…
+```
+
+### Initial-pull note
 
 First push of each package on GHCR makes it private. Flip to
 public once via the GitHub UI: Packages → <package> → Settings →
-Change visibility → Public. After that the host can `podman pull`
-without auth.
+Change visibility → Public. After that the host (or in-cluster
+runtime) can pull without auth.
 
 ## One-time setup
 
