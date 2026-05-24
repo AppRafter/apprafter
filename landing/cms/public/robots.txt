@@ -1,0 +1,9 @@
+# AppRafter landing CMS — admin only, not crawlable.
+#
+# The cms host (cms.apprafter.dev) is a private Payload admin
+# panel. It must not show up in search results. Blanket disallow
+# is intentional; the public landing site lives at apprafter.dev
+# with its own robots.txt under landing/web/public/.
+
+User-agent: *
+Disallow: /

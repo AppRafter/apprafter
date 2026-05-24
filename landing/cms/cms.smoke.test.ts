@@ -140,6 +140,17 @@ describe('landing/cms scaffold', () => {
     // standalone copy paths.
     expect(df).toContain('.next/standalone/cms');
     expect(df).toContain('.next/static');
+    // public/ must exist in the source tree for the runtime COPY
+    // to succeed — Next standalone explicitly excludes it.
+    expect(df).toContain('/landing/cms/public');
+  });
+
+  test('public/ exists with robots.txt blocking crawlers', () => {
+    const robots = join(ROOT, 'public/robots.txt');
+    expect(existsSync(robots)).toBe(true);
+    const body = readFileSync(robots, 'utf8');
+    expect(body).toContain('User-agent: *');
+    expect(body).toContain('Disallow: /');
   });
 
   test('githubDispatch helper centralises the dispatch call', () => {

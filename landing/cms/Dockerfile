@@ -54,6 +54,9 @@ RUN apk add --no-cache libc6-compat
 COPY --from=builder /landing/cms/.next/standalone/cms /app
 COPY --from=builder /landing/cms/.next/standalone/node_modules /app/node_modules
 COPY --from=builder /landing/cms/.next/static /app/.next/static
+# Next standalone explicitly excludes public/ — copy it
+# manually. The directory MUST exist in the source tree;
+# landing/cms/public/robots.txt is the floor.
 COPY --from=builder /landing/cms/public /app/public
 
 EXPOSE 3000
