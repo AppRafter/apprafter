@@ -13,6 +13,52 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.150 — M1.5 walk-fix #3 post-B.1.79a — release-cli workflow CUE install (2026-05-24)
+
+### Symptom
+
+First v0.1.149 push к GitHub triggered the new `release-cli`
+workflow и all three target builds failed identically:
+
+```
+error: failed to run custom build command for `cli-providers v0.1.149`
+panicked at cli-providers/build.rs:109:14:
+cli-providers/build.rs: neither `cue` nor `nix run nixpkgs#cue`
+is on PATH. Install cue (v0.10+) or run the build under
+`nix develop`.: Os { code: 2, kind: NotFound, message: "No
+such file or directory" }
+Error: Process completed with exit code 101.
+```
+
+### Root cause
+
+`cli-providers/build.rs` shells out к `cue export` at compile
+time к extract `_loaderValues` + chart versions из
+`platform-stack/cue/`. GitHub-hosted runners (`ubuntu-latest`,
+`macos-latest`) don't ship `cue` by default; the build script
+panics on the missing binary.
+
+The fix existed in other workflows already — `lint.yml`
+(both `cue-lint` и `rust` jobs) and `nightly.yml` install
+`cue` via `cue-lang/setup-cue@v1.0.1` action before any
+`cargo` invocation. v0.1.149's release-cli workflow simply
+forgot к copy that step in.
+
+### Fix
+
+Add the `Install CUE` step between Rust toolchain setup and
+`cargo build` in every `build` matrix job. Pinned to
+`v0.10.0` so all three workflows (`lint`, `nightly`,
+`release-cli`) share one cue version.
+
+### Versioning
+
+CLI 0.1.149 → 0.1.150. Chart unchanged. Strictly а CI fix
+— no Rust code or chart content changed. CLI binary is
+byte-identical к 0.1.149.
+
+---
+
 ## v0.1.149 — M1.5 polish post-B.1.79a #5 — CLI release workflow (2026-05-24)
 
 ### Symptom

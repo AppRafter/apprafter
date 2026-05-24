@@ -99,6 +99,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # `cli-providers/build.rs` shells out to `cue export` at
+      # compile time to extract `_loaderValues` + chart versions
+      # from `platform-stack/cue/`. The runner doesn't ship `cue`
+      # by default — without it the build script panics with
+      # `neither cue nor nix run nixpkgs#cue is on PATH`. Use the
+      # upstream action; v1.0.1 matches what lint.yml +
+      # nightly.yml already pin so all CI workflows share one
+      # cue version.
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
       - name: Build CLI binary
         working-directory: cli
         env:
