@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter repo creds …` — manage Argo CD repo creds
-//! Secrets для private user repos. Track B.1.79a part 5.
+//! Secrets for private user repos. Track B.1.79a part 5.
 //!
 //! Argo CD's documented contract (`docs/operator-manual/
 //! declarative-setup.md#credential-templates`):
@@ -19,13 +19,13 @@
 //!   password: <token-or-password>
 //! ```
 //!
-//! Argo CD's repo-server scans `argocd` namespace for Secrets
-//! labeled `argocd.argoproj.io/secret-type: repo-creds` и uses
-//! whichever entry's `url` field is а prefix-match for an
-//! Application's `spec.source.repoURL`. So registering
-//! `https://github.com/myorg` makes every Application
-//! pointing к `https://github.com/myorg/<any>` inherit those
-//! creds automatically.
+//! Argo CD's repo-server scans the `argocd` namespace for
+//! Secrets labeled `argocd.argoproj.io/secret-type: repo-creds`
+//! and uses whichever entry's `url` field is a prefix-match for
+//! an Application's `spec.source.repoURL`. So registering
+//! `https://github.com/myorg` makes every Application pointing
+//! to `https://github.com/myorg/<any>` inherit those creds
+//! automatically.
 
 use std::io::{self, IsTerminal, Write as _};
 use std::path::Path;
@@ -77,22 +77,22 @@ pub fn add(
     let existing = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?;
     if existing.is_some() {
         return Err(CliError::Other(format!(
-            "Secret '{name}' уже существует в namespace {ARGOCD_NAMESPACE}. Запусти \
-             `apprafter repo creds rotate {name}` чтобы заменить token, либо \
-             `apprafter repo creds remove {name}` + `add` чтобы пересоздать с нуля."
+            "Secret '{name}' already exists in namespace {ARGOCD_NAMESPACE}. Run \
+             `apprafter repo creds rotate {name}` to replace the token, or \
+             `apprafter repo creds remove {name}` + `add` to recreate from scratch."
         )));
     }
 
     let manifest = build_repo_creds_secret(name, url_prefix, &auth, username, &token);
     apply_secret_manifest(&manifest, kc.path())?;
 
-    println!("✓ Repo creds '{name}' зарегистрированы для URL prefix '{url_prefix}'.");
+    println!("✓ Repo creds '{name}' registered for URL prefix '{url_prefix}'.");
     println!("  Type:     {auth_type}");
     println!("  Username: {username}");
     println!();
     println!(
-        "Все Argo CD Applications с `spec.source.repoURL` starting with '{url_prefix}' \
-         автоматически inherit эти creds."
+        "Every Argo CD Application with `spec.source.repoURL` starting with '{url_prefix}' \
+         will inherit these creds automatically."
     );
     Ok(())
 }
@@ -102,10 +102,10 @@ pub fn list() -> Result<()> {
     let secrets = fetch_repo_creds_secrets(kc.path())?;
 
     if secrets.is_empty() {
-        println!("No repo creds registered в namespace {ARGOCD_NAMESPACE}.");
+        println!("No repo creds registered in namespace {ARGOCD_NAMESPACE}.");
         println!(
-            "Подсказка: `apprafter repo creds add <name> --url-prefix <url> --type pat \
-             --token <pat>` чтобы зарегистрировать первый entry."
+            "Hint: run `apprafter repo creds add <name> --url-prefix <url> --type pat \
+             --token <pat>` to register the first entry."
         );
         return Ok(());
     }
@@ -120,7 +120,7 @@ pub fn show(name: &str) -> Result<()> {
     let secret = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?
         .ok_or_else(|| {
             CliError::Other(format!(
-                "Repo creds '{name}' не найдены в namespace {ARGOCD_NAMESPACE}."
+                "Repo creds '{name}' not found in namespace {ARGOCD_NAMESPACE}."
             ))
         })?;
 
@@ -133,7 +133,7 @@ pub fn rotate(name: &str, token: Option<String>, no_validate: bool) -> Result<()
     let secret = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?
         .ok_or_else(|| {
             CliError::Other(format!(
-                "Repo creds '{name}' не найдены в namespace {ARGOCD_NAMESPACE}."
+                "Repo creds '{name}' not found in namespace {ARGOCD_NAMESPACE}."
             ))
         })?;
 
@@ -150,9 +150,9 @@ pub fn rotate(name: &str, token: Option<String>, no_validate: bool) -> Result<()
     }
 
     // Patch Secret's `data.password` in-place rather than
-    // recreating — repo-server holds а cached resourceVersion
-    // pointer и а full recreate would cause а brief reconnect
-    // window. Base64-encode т.к. Secret's `data` (а не
+    // recreating — repo-server holds a cached resourceVersion
+    // pointer and a full recreate would cause a brief reconnect
+    // window. Base64-encode because Secret's `data` (not
     // `stringData`) expects encoded values.
     let encoded = B64.encode(new_token.as_bytes());
     let body = format!(r#"{{"data":{{"password":"{encoded}"}}}}"#);
@@ -166,8 +166,8 @@ pub fn rotate(name: &str, token: Option<String>, no_validate: bool) -> Result<()
         kc.path(),
     )?;
 
-    println!("✓ Token для repo creds '{name}' rotated.");
-    println!("Argo CD repo-server подхватит новый token на следующем pull cycle.");
+    println!("✓ Token for repo creds '{name}' rotated.");
+    println!("Argo CD repo-server will pick up the new token on the next pull cycle.");
     Ok(())
 }
 
@@ -176,7 +176,7 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
     let secret = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?
         .ok_or_else(|| {
             CliError::Other(format!(
-                "Repo creds '{name}' не найдены в namespace {ARGOCD_NAMESPACE}."
+                "Repo creds '{name}' not found in namespace {ARGOCD_NAMESPACE}."
             ))
         })?;
 
@@ -191,18 +191,17 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
         .unwrap_or_default();
 
     if !force {
-        // Dependency check: refuse если есть Argo CD
-        // Application(s) у которых `spec.source.repoURL`
-        // имеет урезанный prefix-match с этими creds.
-        // Operator может override через `--force` если
-        // понимает что делает (например, мигрирует к
-        // другому creds entry).
+        // Dependency check: refuse if there are Argo CD
+        // Application(s) whose `spec.source.repoURL` matches
+        // these creds by prefix. The operator can override
+        // with `--force` when they know what they're doing
+        // (e.g. migrating to another creds entry).
         let deps = find_dependent_applications(&url_prefix, kc.path())?;
         if !deps.is_empty() {
             return Err(CliError::Other(format!(
-                "Repo creds '{name}' используются {n} Application(s): {names}. \
-                 Перерегистрируй их с другими creds (`apprafter app remove`/`add`) \
-                 либо передай `--force` чтобы удалить creds anyway.",
+                "Repo creds '{name}' are used by {n} Application(s): {names}. \
+                 Re-register them with different creds (`apprafter app remove`/`add`) \
+                 or pass `--force` to delete the creds anyway.",
                 n = deps.len(),
                 names = deps.join(", ")
             )));
@@ -212,16 +211,16 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
     if !yes && !force {
         if !io::stdin().is_terminal() {
             return Err(CliError::Other(
-                "non-interactive shell — pass `--yes` (или `--force`) чтобы пропустить confirmation prompt".into(),
+                "non-interactive shell — pass `--yes` (or `--force`) to skip the confirmation prompt".into(),
             ));
         }
-        println!("Удалить repo creds '{name}' (URL prefix: {url_prefix})?");
-        let confirmed = inquire::Confirm::new("Подтвердить?")
+        println!("Delete repo creds '{name}' (URL prefix: {url_prefix})?");
+        let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
             .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
         if !confirmed {
-            println!("Отмена.");
+            println!("Cancelled.");
             return Ok(());
         }
     }
@@ -242,12 +241,12 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
             String::from_utf8_lossy(&out.stderr)
         )));
     }
-    println!("✓ Repo creds '{name}' удалены.");
+    println!("✓ Repo creds '{name}' deleted.");
     Ok(())
 }
 
 // =========================================================================
-// PURE HELPERS — testable без kube::Client / git binary / network.
+// PURE HELPERS — testable without kube::Client / git binary / network.
 // =========================================================================
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -261,10 +260,10 @@ fn parse_auth_type(raw: &str) -> Result<AuthType> {
         "pat" => Ok(AuthType::Pat),
         "basic" => Ok(AuthType::Basic),
         "ssh" => Err(CliError::Other(
-            "SSH-key auth deferred к Phase 2 — pass `--type pat` или `--type basic` для now".into(),
+            "SSH-key auth deferred to Phase 2 — pass `--type pat` or `--type basic` for now".into(),
         )),
         other => Err(CliError::Other(format!(
-            "Неизвестный `--type {other}` — допускаются `pat` / `basic`."
+            "Unknown `--type {other}` — accepted values are `pat` / `basic`."
         ))),
     }
 }
@@ -272,7 +271,7 @@ fn parse_auth_type(raw: &str) -> Result<AuthType> {
 fn validate_dns_1123(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         return Err(CliError::Other(format!(
-            "Имя creds '{name}' должно быть 1..63 символа DNS-1123 (lower-case [a-z0-9-])."
+            "Creds name '{name}' must be 1..63 DNS-1123 characters (lowercase [a-z0-9-])."
         )));
     }
     let ok = name
@@ -282,7 +281,7 @@ fn validate_dns_1123(name: &str) -> Result<()> {
         && !name.ends_with('-');
     if !ok {
         return Err(CliError::Other(format!(
-            "Имя creds '{name}' содержит недопустимые символы; ожидается DNS-1123."
+            "Creds name '{name}' contains invalid characters; expected DNS-1123."
         )));
     }
     Ok(())
@@ -292,7 +291,7 @@ fn resolve_token(token: Option<String>) -> Result<String> {
     if let Some(t) = token {
         if t.is_empty() {
             return Err(CliError::Other(
-                "пустой `--token` — передай non-empty token либо опусти флаг для interactive prompt"
+                "empty `--token` — pass a non-empty token or omit the flag for an interactive prompt"
                     .into(),
             ));
         }
@@ -300,8 +299,8 @@ fn resolve_token(token: Option<String>) -> Result<String> {
     }
     if !io::stdin().is_terminal() {
         return Err(CliError::Other(
-            "`--token` не передан и stdin не TTY — добавь `--token <value>` либо запусти из \
-             interactive shell"
+            "`--token` not provided and stdin is not a TTY — pass `--token <value>` or run from \
+             an interactive shell"
                 .into(),
         ));
     }
@@ -311,16 +310,16 @@ fn resolve_token(token: Option<String>) -> Result<String> {
         .prompt()
         .map_err(|e| CliError::Other(format!("token prompt: {e}")))?;
     if token.is_empty() {
-        return Err(CliError::Other("token не может быть пустым".into()));
+        return Err(CliError::Other("token cannot be empty".into()));
     }
     Ok(token)
 }
 
-/// Provider-aware token regex check. **Best-effort** — operator
-/// может передать `--no-validate` чтобы skip когда self-hosted
-/// Gitea/Forgejo с custom token shapes. Detection priority:
-/// GitHub fine-grained PAT > GitHub classic PAT > GitLab PAT >
-/// fallback к 8+-char generic check.
+/// Provider-aware token regex check. **Best-effort** — the
+/// operator can pass `--no-validate` to skip when running
+/// self-hosted Gitea/Forgejo with custom token shapes.
+/// Detection priority: GitHub fine-grained PAT > GitHub classic
+/// PAT > GitLab PAT > fallback to a 20+-char generic check.
 pub(crate) fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
     if matches!(auth, AuthType::Basic) {
         // Basic auth tokens are arbitrary passwords — no
@@ -334,11 +333,11 @@ pub(crate) fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> 
     if token.starts_with("github_pat_") {
         // Fine-grained GitHub PAT. Documented prefix +
         // 80+ char body. Minimum length check protects
-        // против partial paste.
+        // against a partial paste.
         if token.len() < 80 {
             return Err(CliError::Other(format!(
-                "GitHub fine-grained PAT length {} слишком короткий — ожидается 80+ символов. \
-                 Передай `--no-validate` если уверен что token корректный.",
+                "GitHub fine-grained PAT length {} is too short — expected 80+ characters. \
+                 Pass `--no-validate` if you're sure the token is correct.",
                 token.len()
             )));
         }
@@ -349,8 +348,8 @@ pub(crate) fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> 
         // alphanumeric body. Total 40 chars.
         if token.len() != 40 {
             return Err(CliError::Other(format!(
-                "GitHub classic PAT length {} ≠ 40 (ожидается `ghp_` + 36 alphanumeric). \
-                 Передай `--no-validate` для bypass.",
+                "GitHub classic PAT length {} ≠ 40 (expected `ghp_` + 36 alphanumeric). \
+                 Pass `--no-validate` to bypass.",
                 token.len()
             )));
         }
@@ -358,25 +357,25 @@ pub(crate) fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> 
     }
     if token.starts_with("glpat-") {
         // GitLab PAT. Documented `glpat-` + 20-char body
-        // (но операторы иногда обрезают; lenient check
-        // на minimum length).
+        // (but operators sometimes truncate; lenient
+        // minimum-length check).
         if token.len() < 20 {
             return Err(CliError::Other(format!(
-                "GitLab PAT length {} слишком короткий — ожидается `glpat-` + 20+ символов. \
-                 Передай `--no-validate` для bypass.",
+                "GitLab PAT length {} is too short — expected `glpat-` + 20+ characters. \
+                 Pass `--no-validate` to bypass.",
                 token.len()
             )));
         }
         return Ok(());
     }
-    // Unknown / generic — apply а minimum-length sanity
-    // check. Most providers (Gitea, Forgejo, Codeberg)
-    // issue tokens with а least 20 character bodies.
+    // Unknown / generic — apply a minimum-length sanity
+    // check. Most providers (Gitea, Forgejo, Codeberg) issue
+    // tokens with at least 20-character bodies.
     if token.len() < 20 {
         return Err(CliError::Other(format!(
-            "Token shape не распознан (не GitHub PAT, не GitLab PAT), а length {} < 20 \
-             — слишком короткий для большинства providers. Передай `--no-validate` если \
-             self-hosted Gitea/Forgejo с custom token shape.",
+            "Token shape not recognised (not a GitHub PAT, not a GitLab PAT), and length \
+             {} < 20 — too short for most providers. Pass `--no-validate` if running \
+             self-hosted Gitea/Forgejo with a custom token shape.",
             token.len()
         )));
     }
@@ -527,7 +526,7 @@ fn print_creds_detail(secret: &Value) {
     println!("  URL prefix: {url_prefix}");
     println!("  Type:       {auth_type}");
     println!("  Username:   {username}");
-    println!("  Password:   ****  (передай `kubectl get secret {name} -n {ARGOCD_NAMESPACE} -o jsonpath='{{.data.password}}' | base64 -d` чтобы decode plaintext)");
+    println!("  Password:   ****  (run `kubectl get secret {name} -n {ARGOCD_NAMESPACE} -o jsonpath='{{.data.password}}' | base64 -d` to decode the plaintext)");
 }
 
 fn find_dependent_applications(url_prefix: &str, kubeconfig_path: &Path) -> Result<Vec<String>> {
@@ -555,7 +554,7 @@ fn find_dependent_applications(url_prefix: &str, kubeconfig_path: &Path) -> Resu
 
 /// Filter Applications whose `spec.source.repoURL` starts with
 /// `url_prefix`. Pure fn — tests cover prefix-match semantics
-/// без cluster.
+/// without a cluster.
 pub(crate) fn find_apps_matching_prefix(
     applications_json: &Value,
     url_prefix: &str,
@@ -629,7 +628,7 @@ mod tests {
     #[test]
     fn validate_token_format_rejects_wrong_length_github_classic_pat() {
         // Documented spec: ghp_ + exactly 36 alphanumeric.
-        // Refuse both shorter и longer values — likely
+        // Refuse both shorter and longer values — likely
         // copy-paste error.
         assert!(validate_token_format("ghp_short", &AuthType::Pat).is_err());
         let too_long = format!("ghp_{}", "a".repeat(50));
@@ -653,8 +652,8 @@ mod tests {
 
     #[test]
     fn validate_token_format_rejects_short_generic_token() {
-        // Most likely а partial paste or accidental
-        // truncation — refuse и hint at --no-validate.
+        // Most likely a partial paste or accidental
+        // truncation — refuse and hint at --no-validate.
         let too_short = "shorty".to_string();
         let err = validate_token_format(&too_short, &AuthType::Pat)
             .unwrap_err()
@@ -683,8 +682,8 @@ mod tests {
     fn build_repo_creds_secret_carries_secret_type_label() {
         // Load-bearing — Argo CD's repo-server filters
         // Secrets by this label. If we drop it, the creds
-        // are invisible к Argo CD и Applications fail к pull
-        // private repos.
+        // are invisible to Argo CD and Applications fail to
+        // pull private repos.
         let s = build_repo_creds_secret(
             "github-myorg",
             "https://github.com/myorg",
@@ -725,11 +724,12 @@ mod tests {
 
     #[test]
     fn build_repo_creds_secret_uses_stringdata_for_round_trip() {
-        // `stringData` (rather than `data`) is critical для
-        // CLI ergonomics — kubectl encodes к base64 server-
-        // side, so we don't need к pre-encode. Если switch
-        // к `data`, апи возьмёт plaintext password как
-        // base64 и repo-server увидит garbage.
+        // `stringData` (rather than `data`) is critical for
+        // CLI ergonomics — kubectl encodes to base64 server-
+        // side, so we don't need to pre-encode. If we
+        // switched to `data`, the apiserver would take the
+        // plaintext password as base64 and the repo-server
+        // would see garbage.
         let s = build_repo_creds_secret("n", "u-prefix", &AuthType::Pat, "git", "TOKEN");
         assert_eq!(
             s.pointer("/stringData/url").and_then(Value::as_str),
@@ -744,7 +744,7 @@ mod tests {
             Some("TOKEN")
         );
         // `data` field must NOT exist — would break the
-        // stringData semantics by competing для precedence.
+        // stringData semantics by competing for precedence.
         assert!(s.get("data").is_none());
     }
 
@@ -763,9 +763,9 @@ mod tests {
 
     #[test]
     fn find_apps_matching_prefix_skips_apps_without_repo_url() {
-        // Defensive: an Application с missing/malformed
-        // `spec.source.repoURL` (e.g. helm chart source
-        // только без git) must not trip the filter.
+        // Defensive: an Application with a missing/malformed
+        // `spec.source.repoURL` (e.g. helm chart source only,
+        // no git) must not trip the filter.
         let apps = json!({
             "items": [
                 { "metadata": { "name": "helm-only" }, "spec": { "source": { "chart": "x", "repoURL": "https://charts.example/" } } },

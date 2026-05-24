@@ -2,15 +2,15 @@
 //! npm-style "newer CLI available" check. Track B.1.79.
 //!
 //! Runs at the start of every `apprafter` invocation. Caches
-//! the latest-release lookup в `~/.cache/apprafter/version-
+//! the latest-release lookup in `~/.cache/apprafter/version-
 //! check.json` with a 24-hour TTL — busy operators don't pay
 //! for a GitHub API round-trip on every shell command. The
-//! warning prints once per shell session (cache hit на
+//! warning prints once per shell session (cache hit on
 //! subsequent calls).
 //!
 //! Failures (network down, GitHub rate-limited, malformed
 //! response, parse error) are swallowed silently — version
-//! check is a courtesy banner, не an operational
+//! check is a courtesy banner, not an operational
 //! prerequisite. Logging at `debug` level surfaces what went
 //! wrong via `RUST_LOG=apprafter=debug`.
 
@@ -31,8 +31,8 @@ struct CachedCheck {
     fetched_at_secs: u64,
 }
 
-/// Check для a newer published CLI version и print a warning
-/// line к stderr if one exists. Best-effort — failures
+/// Check for a newer published CLI version and print a warning
+/// line to stderr if one exists. Best-effort — failures
 /// swallowed silently (logged at debug level).
 pub fn maybe_warn_about_newer_version() {
     let current = env!("CARGO_PKG_VERSION");
@@ -119,7 +119,7 @@ fn write_cache(path: &std::path::Path, entry: &CachedCheck) -> std::io::Result<(
 }
 
 /// Semver-aware "is `candidate` > `current`?" comparison.
-/// Tolerates `v` prefix on either side. Falls back к false
+/// Tolerates `v` prefix on either side. Falls back to false
 /// (no warning) on unparseable input — fail-quiet.
 fn newer_than(candidate: &str, current: &str) -> bool {
     use semver::Version;
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn newer_than_returns_false_for_garbage() {
-        // Fail-quiet — don't warn the operator на a stale
+        // Fail-quiet — don't warn the operator on a stale
         // cache OR malformed GitHub response.
         assert!(!newer_than("not-a-version", "0.1.134"));
         assert!(!newer_than("0.1.134", "garbage"));

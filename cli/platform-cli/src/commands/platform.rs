@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter platform …` thin wrappers. Track B.1.79.
 //!
-//! `status` reads `PlatformStack/default` from the cluster и
+//! `status` reads `PlatformStack/default` from the cluster and
 //! prints a human-readable summary (current/target/available
 //! versions, conditions, recent history). `upgrade --to <v>`
-//! patches `spec.pin`. Both shell out к `kubectl` rather than
-//! pulling in kube-rs's Tokio runtime для the synchronous CLI
+//! patches `spec.pin`. Both shell out to `kubectl` rather than
+//! pulling in kube-rs's Tokio runtime for the synchronous CLI
 //! binary.
 
 use cli_core::{CliError, Result};
@@ -61,7 +61,7 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-/// Pure formatter — pulled out so unit tests can drive с a
+/// Pure formatter — pulled out so unit tests can drive with a
 /// fixture JSON without a cluster.
 fn print_status(json: &Value) {
     let spec = json.get("spec").cloned().unwrap_or(Value::Null);
@@ -152,7 +152,7 @@ fn print_status(json: &Value) {
         let mut t = Table::new(&conditions);
         // Wrap MESSAGE column so long content doesn't blow up
         // the terminal width. 60-char wrap matches what
-        // `kubectl describe` does для condition messages.
+        // `kubectl describe` does for condition messages.
         t.with(Modify::new(Rows::new(1..)).with(Width::wrap(60)));
         println!("{t}");
     }
@@ -195,9 +195,10 @@ fn print_status(json: &Value) {
 }
 
 /// `apprafter platform freeze <component> [--version <v>]`
-/// patches PlatformStack.spec.overrides.<component>.pin. Без
-/// `--version` reads the current effective component version
-/// из `status.componentVersions.<component>` и locks that.
+/// patches PlatformStack.spec.overrides.<component>.pin.
+/// Without `--version` reads the current effective component
+/// version from `status.componentVersions.<component>` and
+/// locks that.
 pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
     let json = kubectl_get_json(
@@ -220,10 +221,9 @@ pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
             .map(str::to_string)
             .ok_or_else(|| {
                 CliError::Other(format!(
-                    "Не нашёл effective version для component '{component}' в \
-                     status.componentVersions. Передай `--version <v>` явно либо \
-                     запусти `apprafter platform status` чтобы посмотреть список \
-                     известных components."
+                    "No effective version found for component '{component}' in \
+                     status.componentVersions. Pass `--version <v>` explicitly or run \
+                     `apprafter platform status` to inspect the list of known components."
                 ))
             })?,
     };
@@ -240,24 +240,24 @@ pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
 
     println!("✓ Component '{component}' frozen at version '{pin}'.");
     println!(
-        "PlatformController reconcile cycle применит override; umbrella chart's \
-         curated pin для '{component}' игнорируется до тех пор пока override присутствует."
+        "The PlatformController reconcile cycle will apply the override; the umbrella \
+         chart's curated pin for '{component}' is ignored as long as the override is set."
     );
-    println!("Откатить: `apprafter platform unfreeze {component}`.");
+    println!("To revert: `apprafter platform unfreeze {component}`.");
     Ok(())
 }
 
 /// `apprafter platform unfreeze <component>` — RFC 7396
-/// merge-patch с `null` value удаляет the override entry.
+/// merge-patch with a `null` value removes the override entry.
 pub fn unfreeze(component: &str) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
     // RFC 7396: null deletes the field. Patches the
-    // `overrides.<component>` entry в whole — strips both `pin`
-    // и `values` overrides. Если operator wants к keep
-    // partial override (e.g. unfreeze pin but keep values
-    // overrides), они должны patch вручную; `unfreeze` —
-    // the "fully revert к chart's curated state" verb.
+    // `overrides.<component>` entry as a whole — strips both
+    // `pin` and `values` overrides. If the operator wants to
+    // keep a partial override (e.g. unfreeze the pin but keep
+    // values overrides), they should patch manually; `unfreeze`
+    // is the "fully revert to the chart's curated state" verb.
     let body = format!(r#"{{"spec":{{"overrides":{{"{component}":null}}}}}}"#);
     kubectl_merge_patch(
         "platformstack",
@@ -272,31 +272,31 @@ pub fn unfreeze(component: &str) -> Result<()> {
 }
 
 /// `apprafter platform rescue` — emergency recovery wrapper
-/// over `apprafter cluster-bootstrap`. Re-applies the
-/// loader's Cilium + Argo CD + CRDs + operator chain against
-/// the active target. Useful when Argo CD itself is unable к
-/// self-adopt и а regular upgrade flow won't reach the right
-/// reconcile state.
+/// over `apprafter cluster-bootstrap`. Re-applies the loader's
+/// Cilium + Argo CD + CRDs + operator chain against the active
+/// target. Useful when Argo CD itself is unable to self-adopt
+/// and a regular upgrade flow won't reach the right reconcile
+/// state.
 pub fn rescue(yes: bool) -> Result<()> {
     if !yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
             return Err(CliError::Other(
-                "non-interactive shell — pass `--yes` чтобы пропустить confirmation prompt".into(),
+                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
             ));
         }
         println!(
             "Emergency rescue: re-run the loader's cluster-bootstrap path against the active \
-             target. Это применит upstream Cilium / Argo CD / CRDs / operator manifests \
-             как при initial bootstrap'е — все Apprafter-managed Applications потеряют \
-             текущее состояние Sync/Healthy на несколько reconcile cycles."
+             target. This will apply the upstream Cilium / Argo CD / CRDs / operator manifests \
+             as in the initial bootstrap — all AppRafter-managed Applications will lose their \
+             current Sync/Healthy state for a few reconcile cycles."
         );
-        let confirmed = inquire::Confirm::new("Подтвердить?")
+        let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
             .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
         if !confirmed {
-            println!("Отмена.");
+            println!("Cancelled.");
             return Ok(());
         }
     }
@@ -319,9 +319,9 @@ pub fn upgrade(to: Option<&str>) -> Result<()> {
         kc.path(),
     )?;
     match to {
-        Some(v) => println!("Pinned PlatformStack/{PLATFORMSTACK_NAME} к {v}"),
+        Some(v) => println!("Pinned PlatformStack/{PLATFORMSTACK_NAME} to {v}"),
         None => println!(
-            "Cleared pin; autoUpgrade=true. PlatformController will resolve к channel-latest."
+            "Cleared pin; autoUpgrade=true. PlatformController will resolve to channel-latest."
         ),
     }
     Ok(())
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn print_status_handles_minimal_object() {
         // PlatformStack with only spec, no status (fresh CR).
-        // Must not panic; должно gracefully print "(unset)" /
+        // Must not panic; should gracefully print "(unset)" /
         // "(none)" placeholders.
         let obj = json!({
             "spec": { "channel": "stable", "values": { "tier": 1 } }
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn print_status_renders_full_object() {
-        // Smoke test for the happy path — все sections populated.
+        // Smoke test for the happy path — all sections populated.
         let obj = json!({
             "spec": {
                 "channel": "stable",

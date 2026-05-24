@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Manual smoke test for the v0.1.11/v0.1.12 cluster-bootstrap
-//! outcome: cilium-status зелёный, Gateway API admission works,
+//! outcome: cilium-status green, Gateway API admission works,
 //! default-deny NetworkPolicy is in place. Skipped by default —
 //! opt in with:
 //!

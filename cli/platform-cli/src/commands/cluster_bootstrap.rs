@@ -395,10 +395,10 @@ metadata:
 spec:
   # Track B.1.79a (chart 0.1.40): root platform Application
   # joins the dedicated `platform` AppProject. Project ships
-  # с initial Argo CD install через
+  # with the initial Argo CD install through
   # `_loaderValues.argocd.values.configs.projects.platform`,
   # so it exists by the time this manifest is applied. Legacy
-  # `default` project stays around для ad-hoc Applications
+  # `default` project stays around for ad-hoc Applications
   # operators apply outside of `apprafter app add`.
   project: platform
   source:
@@ -828,18 +828,19 @@ mod tests {
 
     #[test]
     fn render_root_application_joins_platform_app_project() {
-        // Track B.1.79a chart 0.1.40 — root Application is а
-        // platform-internal resource и должна жить в
-        // `platform` AppProject (declared в
+        // Track B.1.79a chart 0.1.40 — root Application is a
+        // platform-internal resource and must live in the
+        // `platform` AppProject (declared in
         // `_loaderValues.argocd.values.configs.projects` so it
-        // exists в the initial Argo CD install). The legacy
-        // `default` project stays around для ad-hoc Applications
-        // operators apply outside `apprafter app add`, but the
-        // chart-managed root Application no longer references
-        // it. Regression guard: if а future refactor flips back
-        // к `default`, walks would surface "AppProject default
-        // missing → root Application Degraded" only at runtime;
-        // this test fails at unit-test time instead.
+        // exists in the initial Argo CD install). The legacy
+        // `default` project stays around for ad-hoc
+        // Applications operators apply outside `apprafter app
+        // add`, but the chart-managed root Application no
+        // longer references it. Regression guard: if a future
+        // refactor flips back to `default`, walks would
+        // surface "AppProject default missing → root
+        // Application Degraded" only at runtime; this test
+        // fails at unit-test time instead.
         let yaml = render_root_application(APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, "0.1.0");
         assert!(
             yaml.contains("project: platform"),

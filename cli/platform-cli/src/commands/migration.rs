@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `apprafter migration …` thin wrappers. Track B.1.79.
 //!
-//! `list` reads MigrationPlans from `apprafter-system` и
+//! `list` reads MigrationPlans from `apprafter-system` and
 //! formats them as a table. `approve` patches
 //! `status.phase=approved`. `reject` patches
 //! `status.phase=rejected` — webhook denies for application-
@@ -95,8 +95,8 @@ pub fn approve(name: &str) -> Result<()> {
     )?;
     println!("Approved MigrationPlan {MIGRATION_PLAN_NAMESPACE}/{name}.");
     println!(
-        "MigrationController will transition к executing → completed; \
-         PlatformController next reconcile sees completed и proceeds с the bump."
+        "MigrationController will transition through executing → completed; the \
+         PlatformController's next reconcile sees completed and proceeds with the bump."
     );
     Ok(())
 }
@@ -105,10 +105,10 @@ pub fn reject(name: &str) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
     // Webhook denies application-scope rejects per ADR 0027;
     // platform-scope succeeds + PlatformMigrationStrategy.reject
-    // reverts spec.pin к previousSpecSnapshot.pin. The CLI just
-    // forwards the patch и surfaces whatever the apiserver
-    // returns — message body already contains the ADR-0027 hint
-    // когда the denial fires (walk-fix #2).
+    // reverts spec.pin to previousSpecSnapshot.pin. The CLI
+    // just forwards the patch and surfaces whatever the
+    // apiserver returns — the message body already contains
+    // the ADR-0027 hint when the denial fires (walk-fix #2).
     kubectl_merge_patch(
         "migrationplan",
         name,

@@ -3,8 +3,8 @@
 //! credentials, open default browser. Track B.1.79.
 //!
 //! Currently supports `argocd` only; `backstage` / `grafana`
-//! / `hubble` deferred к later phases (those UIs aren't tier-
-//! 1 resident yet).
+//! / `hubble` deferred to later phases (those UIs aren't
+//! tier-1 resident yet).
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -20,17 +20,17 @@ use crate::commands::k8s_helpers::ensure_kubeconfig_tempfile;
 /// Open Argo CD's web UI:
 ///
 ///   1. Decrypt the cached kubeconfig.
-///   2. Resolve the admin password (cached age-encrypted в
+///   2. Resolve the admin password (cached age-encrypted in
 ///      state via `apprafter argocd-password`).
 ///   3. Spawn `kubectl port-forward svc/argocd-server -n argocd
-///      8080:443` в background; wait until the bind message
-///      lands on stdout.
-///   4. Print URL (с optional `?proj=<filter>` AppProject
+///      8080:443` in the background; wait until the bind
+///      message lands on stdout.
+///   4. Print URL (with optional `?proj=<filter>` AppProject
 ///      filter) + username + password; copy password to
-///      clipboard когда возможно; open browser.
+///      clipboard when possible; open browser.
 ///   5. Block on the port-forward child; both die when the
 ///      operator Ctrl+C's the parent process (kubectl
-///      inherits the terminal's SIGINT через the process
+///      inherits the terminal's SIGINT through the process
 ///      group, Rust's default).
 ///
 /// `project_filter` controls the URL's `?proj=<name>` query
@@ -61,7 +61,7 @@ pub fn argocd(project_filter: Option<&str>) -> Result<()> {
     println!("  Username:  admin");
     print!("  Password:  {password}");
     match clipboard_status {
-        ClipboardStatus::Copied => println!("  (copied к clipboard)"),
+        ClipboardStatus::Copied => println!("  (copied to clipboard)"),
         ClipboardStatus::Failed => println!("  (clipboard unavailable — copy manually)"),
     }
     println!();
@@ -71,17 +71,17 @@ pub fn argocd(project_filter: Option<&str>) -> Result<()> {
         Ok(()) => println!("✓ Browser opened"),
         Err(_) => println!("ℹ Browser open failed — paste the URL into your browser"),
     }
-    println!("ℹ Press Ctrl+C к stop port-forward");
+    println!("ℹ Press Ctrl+C to stop port-forward");
 
     // Block until the port-forward child exits — which happens
     // when the operator Ctrl+C's this process (kubectl receives
-    // SIGINT via the process group и tears down cleanly).
+    // SIGINT via the process group and tears down cleanly).
     let _ = child.wait();
     Ok(())
 }
 
-/// Build the Argo CD UI URL, optionally narrowing к
-/// а specific AppProject via Argo CD's `?proj=<name>` filter.
+/// Build the Argo CD UI URL, optionally narrowing to a specific
+/// AppProject via Argo CD's `?proj=<name>` filter.
 ///
 /// Pure fn (no IO, no globals) so tests can exhaustively
 /// cover the default / explicit / drop-filter shapes.
@@ -95,7 +95,7 @@ fn build_argocd_url(local_port: u16, project_filter: Option<&str>) -> String {
 
 /// Outcome of the optional clipboard copy step. Distinct
 /// variants so the printed banner can distinguish "we copied
-/// for you" from "we tried и failed" — the second case warns
+/// for you" from "we tried and failed" — the second case warns
 /// the operator that they need to manually copy from terminal
 /// before the buffer flushes.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,11 +104,12 @@ enum ClipboardStatus {
     Failed,
 }
 
-/// Copy `password` к the system clipboard via `arboard`.
-/// Fail-quiet — environment without а clipboard daemon
+/// Copy `password` to the system clipboard via `arboard`.
+/// Fail-quiet — an environment without a clipboard daemon
 /// (headless servers, sandboxed shells, fresh SSH session
-/// without X11 forwarding) returns `Failed` и the caller
-/// surfaces а hint, без поднятия error через `?` chain.
+/// without X11 forwarding) returns `Failed` and the caller
+/// surfaces a hint, without raising an error through the
+/// `?` chain.
 fn copy_password_to_clipboard(password: &str) -> ClipboardStatus {
     match arboard::Clipboard::new() {
         Ok(mut cb) => match cb.set_text(password.to_string()) {
@@ -140,23 +141,23 @@ fn spawn_port_forward(
     Ok(child)
 }
 
-/// Waits для kubectl's `Forwarding from …` ready banner on
+/// Waits for kubectl's `Forwarding from …` ready banner on
 /// stdout AND keeps both pipes drained for the lifetime of the
 /// child.
 ///
 /// **Walk-fix #1 post-B.1.79.** The first implementation
 /// closed stdout the moment it saw the ready line (BufReader
 /// dropped + ChildStdout dropped + read-end of the pipe
-/// closed). kubectl is а Go binary; Go's default SIGPIPE
-/// handler terminates the process on the next write к а closed
-/// stdout pipe, so kubectl exited within milliseconds — well
-/// before the operator could use the forward. Symptom from the
-/// v0.1.135 walk: `apprafter open argocd` printed the
-/// credentials banner и returned к the shell immediately.
+/// closed). kubectl is a Go binary; Go's default SIGPIPE
+/// handler terminates the process on the next write to a
+/// closed stdout pipe, so kubectl exited within milliseconds —
+/// well before the operator could use the forward. Symptom
+/// from the v0.1.135 walk: `apprafter open argocd` printed the
+/// credentials banner and returned to the shell immediately.
 ///
 /// Fix: spawn one drainer thread per pipe. The stdout drainer
-/// signals readiness через а one-shot channel когда it sees
-/// the banner и continues reading until EOF, throwing the
+/// signals readiness through a one-shot channel when it sees
+/// the banner and continues reading until EOF, throwing the
 /// bytes away. The stderr drainer just reads and discards.
 /// Both threads outlive `wait_port_forward_ready`'s return;
 /// they exit naturally when the child closes its pipes on
@@ -165,11 +166,11 @@ fn wait_port_forward_ready(child: &mut Child) -> Result<()> {
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| CliError::Other("kubectl port-forward без stdout".into()))?;
+        .ok_or_else(|| CliError::Other("kubectl port-forward has no stdout".into()))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| CliError::Other("kubectl port-forward без stderr".into()))?;
+        .ok_or_else(|| CliError::Other("kubectl port-forward has no stderr".into()))?;
 
     let rx = spawn_ready_drainer(stdout);
     spawn_silent_drainer(stderr);
@@ -179,7 +180,7 @@ fn wait_port_forward_ready(child: &mut Child) -> Result<()> {
     })
 }
 
-/// Spawn а thread that reads stdout line-by-line, signals
+/// Spawn a thread that reads stdout line-by-line, signals
 /// readiness on the first `Forwarding from …` line, then keeps
 /// draining silently until EOF. The sender drops when the
 /// thread exits — if EOF lands before the ready banner, the
@@ -207,7 +208,7 @@ fn spawn_ready_drainer<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<()
     rx
 }
 
-/// Spawn а thread that silently drains а pipe to EOF. Used for
+/// Spawn a thread that silently drains a pipe to EOF. Used for
 /// stderr — we don't surface kubectl's diagnostic chatter
 /// upward (the operator sees "exited early" if the ready
 /// banner never lands; debugging beyond that is out of scope),
@@ -228,11 +229,11 @@ fn spawn_silent_drainer<R: Read + Send + 'static>(reader: R) {
     });
 }
 
-/// Open `url` в the operator's default browser. Cross-platform
-/// shellout — `xdg-open` on Linux, `open` on macOS, `cmd /c
-/// start` on Windows. Failures fall through quietly: the URL
-/// is already printed к stdout, so the operator can paste
-/// manually.
+/// Open `url` in the operator's default browser. Cross-
+/// platform shellout — `xdg-open` on Linux, `open` on macOS,
+/// `cmd /c start` on Windows. Failures fall through quietly:
+/// the URL is already printed to stdout, so the operator can
+/// paste it manually.
 fn open_in_browser(url: &str) -> Result<()> {
     let (program, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
         ("open", vec![url.to_string()])
@@ -343,17 +344,17 @@ mod tests {
 
     #[test]
     fn build_argocd_url_defaults_no_filter() {
-        // Без project filter — голый base URL, никаких query
-        // params'ов. Matches the --all-projects code path.
+        // Without a project filter — bare base URL, no query
+        // params. Matches the --all-projects code path.
         assert_eq!(build_argocd_url(8080, None), "https://localhost:8080");
     }
 
     #[test]
     fn build_argocd_url_appends_proj_filter() {
-        // Standard B.1.79a default — `apps` filter narrows the
-        // UI к user-application view. Regression: ensure the
-        // path is `/applications?proj=<name>` exactly (Argo CD's
-        // documented filter URL shape).
+        // Standard B.1.79a default — `apps` filter narrows
+        // the UI to the user-application view. Regression:
+        // ensure the path is `/applications?proj=<name>`
+        // exactly (Argo CD's documented filter URL shape).
         assert_eq!(
             build_argocd_url(8080, Some("apps")),
             "https://localhost:8080/applications?proj=apps"
@@ -367,17 +368,17 @@ mod tests {
     #[test]
     fn build_argocd_url_treats_empty_filter_as_no_filter() {
         // Defensive: an empty string filter (e.g. caller
-        // passed `Some("")`) renders как if --all-projects
-        // was set — а bare `?proj=` would mean "filter к
-        // project with empty name", which is nonsense.
+        // passed `Some("")`) renders as if --all-projects
+        // was set — a bare `?proj=` would mean "filter to
+        // a project with an empty name", which is nonsense.
         assert_eq!(build_argocd_url(8080, Some("")), "https://localhost:8080");
     }
 
     #[test]
     fn silent_drainer_reads_to_eof() {
         // Stderr drainer must NOT block the calling thread
-        // и must read every byte so kubectl's stderr pipe
-        // doesn't fill up — а full pipe deadlocks the
+        // and must read every byte so kubectl's stderr pipe
+        // doesn't fill up — a full pipe deadlocks the
         // child's next stderr write.
         let stream = b"warning A\nwarning B\nwarning C\n".to_vec();
         let total = stream.len();

@@ -39,10 +39,9 @@ fn main() -> Result<()> {
 
     logging::init();
 
-    // npm-style courtesy check для newer CLI release. Best-
-    // effort — никогда не fails the invocation. 24h cache
-    // means the network round-trip happens once a day at
-    // most.
+    // npm-style courtesy check for a newer CLI release. Best-
+    // effort — never fails the invocation. 24h cache means
+    // the network round-trip happens once a day at most.
     commands::version_check::maybe_warn_about_newer_version();
 
     let args = Cli::parse();

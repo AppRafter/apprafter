@@ -175,14 +175,14 @@ pub enum Commands {
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
     },
-    /// Inspect и control the cluster's PlatformStack — the
+    /// Inspect and control the cluster's PlatformStack — the
     /// declarative platform-version resource managed by
     /// PlatformController. Track B.1.79 thin wrapper.
     Platform {
         #[command(subcommand)]
         action: PlatformCommand,
     },
-    /// Inspect и approve / reject MigrationPlans. Track B.1.79
+    /// Inspect and approve / reject MigrationPlans. Track B.1.79
     /// thin wrapper. Application-scope rejects denied by the
     /// admission webhook per ADR 0027 — surface the denial
     /// verbatim.
@@ -191,24 +191,24 @@ pub enum Commands {
         action: MigrationCommand,
     },
     /// Open a platform UI (Argo CD today; Backstage / Grafana /
-    /// Hubble follow в later sub-phases). Spawns a local
+    /// Hubble follow in later sub-phases). Spawns a local
     /// port-forward, prints credentials, opens the default
     /// browser, blocks until Ctrl+C.
     Open {
         #[command(subcommand)]
         ui: OpenUi,
     },
-    /// Manage user Applications — Argo CD Applications scoped к
+    /// Manage user Applications — Argo CD Applications scoped to
     /// the `apps` AppProject, labeled `apprafter.io/managed-by:
-    /// apprafter`. Track B.1.79a thin wrapper над Argo CD CR
+    /// apprafter`. Track B.1.79a thin wrapper over Argo CD CR
     /// patching.
     #[command(alias = "a")]
     App {
         #[command(subcommand)]
         action: AppCommand,
     },
-    /// Manage git-repo creds Argo CD uses к pull private user
-    /// repos. Writes `repo-creds`-typed Secrets в the `argocd`
+    /// Manage git-repo creds Argo CD uses to pull private user
+    /// repos. Writes `repo-creds`-typed Secrets in the `argocd`
     /// namespace per Argo CD's documented contract. Track
     /// B.1.79a part 5.
     Repo {
@@ -228,42 +228,42 @@ pub enum RepoCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum RepoCredsCommand {
-    /// Register а git-repo credential. Creates an Argo CD
-    /// `repo-creds`-typed Secret в the `argocd` namespace.
-    /// All Applications с а `repoURL` starting with the
+    /// Register a git-repo credential. Creates an Argo CD
+    /// `repo-creds`-typed Secret in the `argocd` namespace.
+    /// All Applications with a `repoURL` starting with the
     /// registered `--url-prefix` inherit these creds.
     Add {
         /// Friendly name. Used as the Secret's
-        /// `metadata.name` (DNS-1123) и surfaces в
+        /// `metadata.name` (DNS-1123) and surfaces in
         /// `apprafter repo creds list`.
         name: String,
         /// URL prefix for which these creds apply (e.g.
         /// `https://github.com/myorg`). Required.
         #[arg(long = "url-prefix")]
         url_prefix: String,
-        /// Auth type. Default `pat` — а personal access
+        /// Auth type. Default `pat` — a personal access
         /// token (GitHub `github_pat_*` / `ghp_*`, GitLab
         /// `glpat-*`, etc). `basic` — username + password
-        /// pair. SSH-key auth deferred к Phase 2 (Argo CD
-        /// supports it, но CLI prompts get involved).
+        /// pair. SSH-key auth deferred to Phase 2 (Argo CD
+        /// supports it, but CLI prompts get involved).
         #[arg(long = "type", default_value = "pat")]
         auth_type: String,
-        /// Username. Когда `--type pat` — обычно the token
+        /// Username. When `--type pat` — usually the token
         /// holder's git username (GitHub: any non-empty
         /// string works; GitLab requires the username).
-        /// Defaults к `git` для PAT auth which works
+        /// Defaults to `git` for PAT auth which works
         /// across most providers.
         #[arg(long, default_value = "git")]
         username: String,
-        /// Token / password. Required. Reads из stdin via
-        /// `inquire::Password` (masked entry) когда
-        /// omitted и stdin is а TTY; required as flag в
+        /// Token / password. Required. Reads from stdin via
+        /// `inquire::Password` (masked entry) when
+        /// omitted and stdin is a TTY; required as flag in
         /// non-interactive shells.
         #[arg(long, env = "APPRAFTER_REPO_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Skip provider-specific token format regex check
         /// (GitHub: `github_pat_*` / `ghp_*`; GitLab:
-        /// `glpat-*`). Useful для self-hosted Gitea / Forgejo
+        /// `glpat-*`). Useful for self-hosted Gitea / Forgejo
         /// where token formats are arbitrary.
         #[arg(long = "no-validate", default_value_t = false)]
         no_validate: bool,
@@ -271,30 +271,30 @@ pub enum RepoCredsCommand {
     /// List registered creds.
     #[command(alias = "ls")]
     List,
-    /// Show а creds entry; token is masked.
+    /// Show a creds entry; token is masked.
     Show {
         /// Creds name (as listed via `repo creds list`).
         name: String,
     },
-    /// Rotate а creds entry's token in-place. Patches the
+    /// Rotate a creds entry's token in-place. Patches the
     /// existing Secret rather than recreating it — Argo CD
-    /// repo-server holds а cached reference к the Secret's
-    /// resourceVersion и а recreate would cause а brief
+    /// repo-server holds a cached reference to the Secret's
+    /// resourceVersion and a recreate would cause a brief
     /// reconnect window.
     Rotate {
         /// Creds name.
         name: String,
         /// New token. Reads from stdin (masked) when
-        /// omitted и stdin is а TTY.
+        /// omitted and stdin is a TTY.
         #[arg(long, env = "APPRAFTER_REPO_TOKEN", hide_env_values = true)]
         token: Option<String>,
-        /// Skip token format validation. См. `repo creds add
+        /// Skip token format validation. See `repo creds add
         /// --no-validate`.
         #[arg(long = "no-validate", default_value_t = false)]
         no_validate: bool,
     },
-    /// Delete а creds entry. Refuses by default когда
-    /// Applications depending на the `urlPrefix` are
+    /// Delete a creds entry. Refuses by default when
+    /// Applications depending on the `urlPrefix` are
     /// registered; `--force` overrides.
     #[command(alias = "rm")]
     Remove {
@@ -303,7 +303,7 @@ pub enum RepoCredsCommand {
         /// Skip confirmation + the dependency check.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Skip confirmation prompt только (still runs
+        /// Skip confirmation prompt only (still runs
         /// dependency check).
         #[arg(long, default_value_t = false)]
         yes: bool,
@@ -316,45 +316,45 @@ pub enum PlatformCommand {
     /// conditions, recent history.
     Status,
     /// Patch PlatformStack.spec.pin. With `--to <version>` —
-    /// pin к that version. Без `--to` — clear pin и enable
+    /// pin to that version. Without `--to` — clear pin and enable
     /// autoUpgrade (channel-following mode).
     Upgrade {
         #[arg(long = "to")]
         to: Option<String>,
     },
-    /// Freeze а specific component's version through
+    /// Freeze a specific component's version through
     /// `PlatformStack.spec.overrides.<component>.pin`. Useful
-    /// для out-of-band security backports или когда the
-    /// curated bundle's pinned version regresses а workload-
-    /// specific shape. Без `--version` — uses the component's
-    /// current effective version (read из status), reading the
+    /// for out-of-band security backports or when the
+    /// curated bundle's pinned version regresses a workload-
+    /// specific shape. Without `--version` — uses the component's
+    /// current effective version (read from status), reading the
     /// chart's own pin and locking that in.
     Freeze {
-        /// Component name (must match а key в the umbrella
+        /// Component name (must match a key in the umbrella
         /// chart's `values.components` map; e.g. `cilium`,
         /// `argocd`, `cert-manager`, `apprafter-operator`).
         component: String,
-        /// Pin version. Omit чтобы lock the current effective
-        /// version (read из `status.componentVersions`).
+        /// Pin version. Omit to lock the current effective
+        /// version (read from `status.componentVersions`).
         #[arg(long = "version")]
         version: Option<String>,
     },
-    /// Remove а previously-set
+    /// Remove a previously-set
     /// `PlatformStack.spec.overrides.<component>` entry —
-    /// component falls back к the umbrella chart's curated pin.
+    /// component falls back to the umbrella chart's curated pin.
     Unfreeze {
         /// Component name.
         component: String,
     },
     /// Emergency recovery: re-run the loader's cluster-bootstrap
     /// path (Cilium → Argo CD → CRDs → operator) against the
-    /// active target. Useful when Argo CD itself is unable к
-    /// self-adopt — а stale chart, а corrupted ConfigMap, или
-    /// а pod-eviction loop that no `apprafter platform upgrade`
+    /// active target. Useful when Argo CD itself is unable to
+    /// self-adopt — a stale chart, a corrupted ConfigMap, or
+    /// a pod-eviction loop that no `apprafter platform upgrade`
     /// can resolve. Thin wrapper around
-    /// `apprafter cluster-bootstrap` с the recovery banner.
+    /// `apprafter cluster-bootstrap` with the recovery banner.
     Rescue {
-        /// Skip confirmation prompt. Required в non-interactive
+        /// Skip confirmation prompt. Required in non-interactive
         /// shells.
         #[arg(long, default_value_t = false)]
         yes: bool,
@@ -363,12 +363,12 @@ pub enum PlatformCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum MigrationCommand {
-    /// List MigrationPlans в the apprafter-system namespace
+    /// List MigrationPlans in the apprafter-system namespace
     /// — name, scope, classification, phase.
     #[command(alias = "ls")]
     List,
     /// Patch status.phase=approved on a MigrationPlan.
-    /// MigrationController transitions через executing →
+    /// MigrationController transitions through executing →
     /// completed.
     Approve {
         /// MigrationPlan name (as listed via `apprafter
@@ -378,7 +378,7 @@ pub enum MigrationCommand {
     /// Patch status.phase=rejected. The admission webhook
     /// denies application-scope rejects per ADR 0027 — the
     /// CLI surfaces the denial message verbatim. Platform-
-    /// scope rejects succeed и PlatformMigrationStrategy.reject
+    /// scope rejects succeed and PlatformMigrationStrategy.reject
     /// reverts `spec.pin`.
     Reject {
         /// MigrationPlan name.
@@ -390,64 +390,64 @@ pub enum MigrationCommand {
 pub enum AppCommand {
     /// Register a user Application. Without `<git-url>`, detects
     /// the git origin remote of the current working directory.
-    /// Writes an Argo CD Application CR в namespace `argocd`
-    /// joined к AppProject `apps` (or `--project`), labeled
+    /// Writes an Argo CD Application CR in namespace `argocd`
+    /// joined to AppProject `apps` (or `--project`), labeled
     /// `apprafter.io/managed-by: apprafter` so `app list` can
     /// surface only apprafter-managed Applications.
     Add {
         /// Explicit git URL. Required when cwd is not a git
         /// repo. Accepted forms: `https://…`, `git@host:org/repo.git`
-        /// (SSH normalised к HTTPS), `ssh://git@host/repo`. Any
-        /// trailing `.git` stripped когда normalising.
+        /// (SSH normalised to HTTPS), `ssh://git@host/repo`. Any
+        /// trailing `.git` stripped when normalising.
         git_url: Option<String>,
-        /// Application name. Defaults к the repo's basename
+        /// Application name. Defaults to the repo's basename
         /// (last path segment after stripping `.git`).
         #[arg(long)]
         name: Option<String>,
-        /// Git branch / tag / commit SHA passed verbatim к
-        /// `spec.source.targetRevision`. Defaults к the cwd's
-        /// current branch когда detected; `main` для explicit
-        /// `<git-url>` без cwd context.
+        /// Git branch / tag / commit SHA passed verbatim to
+        /// `spec.source.targetRevision`. Defaults to the cwd's
+        /// current branch when detected; `main` for explicit
+        /// `<git-url>` without cwd context.
         #[arg(long)]
         branch: Option<String>,
-        /// Path under the repo to render. Defaults к `/` —
+        /// Path under the repo to render. Defaults to `/` —
         /// matches the cue-cmp plugin's `discover.find.glob:
         /// **/apprafter*.cue` rule (sidecar walks the entire
         /// repo for matching files when path is `/`).
         #[arg(long, default_value = "/")]
         path: String,
         /// AppProject the Application joins. Default `apps`
-        /// matches the AppProject created в chart 0.1.40
+        /// matches the AppProject created in chart 0.1.40
         /// (Track B.1.79a part 1). Pass `--project platform`
-        /// для platform-internal apps, `platform-providers`
-        /// для ServiceProvider operators.
+        /// for platform-internal apps, `platform-providers`
+        /// for ServiceProvider operators.
         #[arg(long, default_value = "apps")]
         project: String,
         /// Git remote name when detecting origin from cwd.
-        /// Defaults к `origin`.
+        /// Defaults to `origin`.
         #[arg(long, default_value = "origin")]
         remote: String,
         /// Skip the `git ls-remote` reachability check. Useful
-        /// для CI где network isolation blocks external git
-        /// hosts, or когда the repo is freshly created и does
+        /// for CI where network isolation blocks external git
+        /// hosts, or when the repo is freshly created and does
         /// not yet have an `HEAD` ref.
         #[arg(long = "no-ping", default_value_t = false)]
         no_ping: bool,
     },
-    /// List Applications scoped к the `apps` AppProject (or
-    /// `--project <name>`). Filters к Applications labeled
+    /// List Applications scoped to the `apps` AppProject (or
+    /// `--project <name>`). Filters to Applications labeled
     /// `apprafter.io/managed-by: apprafter` by default;
     /// `--all-managed` drops that filter (shows ALL Applications
-    /// в the project regardless of management label — useful
-    /// для debugging stray applications that bypassed `app add`).
+    /// in the project regardless of management label — useful
+    /// for debugging stray applications that bypassed `app add`).
     #[command(alias = "ls")]
     List {
-        /// AppProject filter. Defaults к `apps`. Use
+        /// AppProject filter. Defaults to `apps`. Use
         /// `--all-projects` to drop the filter.
         #[arg(long, default_value = "apps")]
         project: String,
-        /// Drop the `--project` filter; list Applications в
-        /// EVERY AppProject (subject к the managed-by label
+        /// Drop the `--project` filter; list Applications in
+        /// EVERY AppProject (subject to the managed-by label
         /// filter unless `--all-managed` is also set).
         #[arg(
             long = "all-projects",
@@ -456,26 +456,26 @@ pub enum AppCommand {
         )]
         all_projects: bool,
         /// Drop the `apprafter.io/managed-by: apprafter` label
-        /// filter — list every Application в the resolved
-        /// project scope, не just apprafter-managed ones.
+        /// filter — list every Application in the resolved
+        /// project scope, not just apprafter-managed ones.
         #[arg(long = "all-managed", default_value_t = false)]
         all_managed: bool,
     },
-    /// Show detail view для one Application: sync state, health,
+    /// Show detail view for one Application: sync state, health,
     /// source repo + revision, destinations, pending
     /// MigrationPlans (when AppRafter `Application` CR exists
-    /// в the workload namespace), recent sync history (last 3
+    /// in the workload namespace), recent sync history (last 3
     /// revisions).
     Status {
         /// Application name (as listed via `apprafter app list`).
         name: String,
     },
     /// Stream logs from the app's workload pods. Wraps
-    /// `kubectl logs` с label selector derived from the
-    /// Argo CD `Application` (the workload namespace is а
+    /// `kubectl logs` with a label selector derived from the
+    /// Argo CD `Application` (the workload namespace is a
     /// known property of the CR). Default: aggregate across
-    /// pods. `--pod <name>` narrows к а single pod;
-    /// `--container <c>` picks the container в multi-container
+    /// pods. `--pod <name>` narrows to a single pod;
+    /// `--container <c>` picks the container in multi-container
     /// pods; `--follow` enables tail; `--tail <N>` caps the
     /// initial backlog.
     Logs {
@@ -490,54 +490,54 @@ pub enum AppCommand {
         /// (`kubectl`'s default).
         #[arg(long, default_value_t = -1)]
         tail: i64,
-        /// Pick а specific container в multi-container pods.
-        /// Без флага `kubectl` падает на pod-у с двумя
-        /// containers (требует явный выбор); CLI surface
-        /// proxies that error verbatim.
+        /// Pick a specific container in multi-container pods.
+        /// Without the flag `kubectl` fails on a pod with two
+        /// containers (requires an explicit choice); the CLI
+        /// surface proxies that error verbatim.
         #[arg(long)]
         container: Option<String>,
-        /// Narrow к а single pod вместо all matching the
+        /// Narrow to a single pod instead of all matching the
         /// app's destination namespace.
         #[arg(long)]
         pod: Option<String>,
     },
-    /// Roll back к а previous revision. Reads
+    /// Roll back to a previous revision. Reads
     /// `status.history` from the Argo CD `Application`,
-    /// patches `spec.source.targetRevision` к the target;
-    /// Argo CD's auto-sync picks up the change на следующем
-    /// reconcile cycle. Без `--to` — rollback к the
-    /// previous entry в history (offset -1).
+    /// patches `spec.source.targetRevision` to the target;
+    /// Argo CD's auto-sync picks up the change on the next
+    /// reconcile cycle. Without `--to` — rollback to the
+    /// previous entry in history (offset -1).
     Rollback {
         /// Application name.
         name: String,
         /// Explicit revision (commit SHA / tag / branch).
-        /// Без флага: previous entry в `status.history`.
+        /// Without the flag: previous entry in `status.history`.
         #[arg(long = "to")]
         to: Option<String>,
-        /// Skip confirmation prompt. Required в non-interactive
+        /// Skip confirmation prompt. Required in non-interactive
         /// shells.
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
-    /// Delete an Application и cascade-remove the Argo CD CR
+    /// Delete an Application and cascade-remove the Argo CD CR
     /// (which Argo CD then tears down child resources for).
-    /// Interactive: prompts для confirmation; non-interactive
+    /// Interactive: prompts for confirmation; non-interactive
     /// requires `--yes` to skip the prompt.
     #[command(alias = "rm")]
     Remove {
         /// Application name.
         name: String,
-        /// Skip confirmation prompt. Required в non-interactive
+        /// Skip confirmation prompt. Required in non-interactive
         /// shells (no TTY) — there's no silent destruction
         /// path.
         #[arg(long, default_value_t = false)]
         yes: bool,
         /// Preserve PVCs / `ResourceClaim`s when tearing down.
-        /// Implemented as а post-delete cleanup that strips
+        /// Implemented as a post-delete cleanup that strips
         /// the destructive child-prune from the cascading
         /// delete. Phase 2 ServiceProvider-backed claims need
-        /// this to survive а user app teardown when the
-        /// operator wants к re-attach the data later.
+        /// this to survive a user app teardown when the
+        /// operator wants to re-attach the data later.
         #[arg(long = "keep-data", default_value_t = false)]
         keep_data: bool,
     },
@@ -547,15 +547,15 @@ pub enum AppCommand {
 pub enum OpenUi {
     /// Open the Argo CD web UI on `https://localhost:8080`
     /// via `kubectl port-forward`, prefilling the admin
-    /// username и printing the password.
+    /// username and printing the password.
     Argocd {
-        /// AppProject filter applied к the opened URL —
+        /// AppProject filter applied to the opened URL —
         /// Argo CD's UI honours `?proj=<name>` to scope the
-        /// Applications list. Defaults к `apps` so the
+        /// Applications list. Defaults to `apps` so the
         /// operator lands on their own apps first; pass
-        /// `--project platform` чтобы посмотреть
-        /// chart-managed compoments, или `--all-projects`
-        /// to drop the filter entirely.
+        /// `--project platform` to inspect chart-managed
+        /// components, or `--all-projects` to drop the
+        /// filter entirely.
         #[arg(long = "project", default_value = "apps")]
         project: String,
         /// Drop the `?proj=<name>` filter — UI shows all

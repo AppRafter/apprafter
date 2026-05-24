@@ -13,6 +13,83 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.143 — M1.5 polish post-B.1.79a #1 — CLI Cyrillic → English sweep (2026-05-24)
+
+### Symptom
+
+Walk feedback on B.1.79a closures: CLI output, comments, and
+error messages в new modules (`app.rs`, `repo_creds.rs`,
+`platform.rs`, `open.rs`, …) contained mixed Cyrillic/English
+text — both fully-Russian sentences and Cyrillic letters used
+as Latin look-alikes inside English text (`к` for `to`, `и`
+for `and`, `с` for `with`, etc.).
+
+User example:
+
+```
+$ apprafter platform freeze cilium
+Error: ...
+× Не нашёл effective version для component 'cilium' в status.componentVersions ...
+```
+
+### Fix
+
+Mass translation across 10 CLI files driven by а subagent
+through `Edit` calls:
+
+- `cli/platform-cli/src/cli.rs` (101 → 0 Cyrillic occurrences)
+- `cli/platform-cli/src/main.rs` (2 → 0)
+- `cli/platform-cli/src/commands/app.rs` (121 → 0)
+- `cli/platform-cli/src/commands/repo_creds.rs` (74 → 0)
+- `cli/platform-cli/src/commands/open.rs` (35 → 0)
+- `cli/platform-cli/src/commands/platform.rs` (31 → 0)
+- `cli/platform-cli/src/commands/cluster_bootstrap.rs` (9 → 0)
+- `cli/platform-cli/src/commands/version_check.rs` (7 → 0)
+- `cli/platform-cli/src/commands/migration.rs` (6 → 0)
+- `cli/platform-cli/src/commands/k8s_helpers.rs` (4 → 0)
+- bonus: `cli/platform-cli/tests/cluster_smoke_test.rs` (1
+  stray Cyrillic word).
+
+Repo-wide audit: `grep -cE '[А-Яа-яЁё]'` returns 0 across the
+entire `cli/` tree.
+
+Translation principles:
+
+- Preserve technical terms verbatim (kubectl, Argo CD,
+  MigrationPlan, AppProject, SSA, etc.).
+- Rewrite for idiomatic English rather than word-by-word
+  translation.
+- Standardise common phrases: confirmation prompts now read
+  `Confirm?`, cancellation prints `Cancelled.`, hints
+  prefixed `Hint:`.
+- Match the style of pre-existing English-only modules
+  (`apply.rs`, `target.rs`).
+
+### Tests
+
+`cargo test --workspace --all-features`: every suite reports
+`ok`, zero failures. Test names and assertion messages that
+previously contained Cyrillic were translated alongside the
+production code so test bodies match the new English error
+strings.
+
+`cargo clippy --workspace --all-features --all-targets --
+-D warnings`: clean.
+
+### Versioning
+
+CLI 0.1.142 → 0.1.143. Chart unchanged.
+
+### Why this matters
+
+CLI documentation, `--help` output, and error messages now
+reliably render correctly across all terminals (some shells
+in CI / container environments fail to display Cyrillic),
+and operator-facing strings match the broader codebase's
+English-only style.
+
+---
+
 ## v0.1.142 — M1.5 Track B.1.79a closure — platform freeze/unfreeze/rescue (2026-05-22)
 
 ### What landed

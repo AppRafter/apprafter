@@ -2,10 +2,10 @@
 //! Thin `kubectl` shellout helpers shared by the B.1.79 thin-
 //! wrapper CLI subcommands (`apprafter platform …`, `apprafter
 //! migration …`, `apprafter open …`). The CLI already depends
-//! on `kubectl` being on PATH через other commands
+//! on `kubectl` being on PATH through other commands
 //! (`argocd-password`, `cluster-bootstrap`), so spawning it
 //! here keeps the wire format consistent and avoids pulling
-//! in kube-rs's Tokio runtime для the synchronous CLI binary.
+//! in kube-rs's Tokio runtime for the synchronous CLI binary.
 
 use std::io::Write;
 use std::path::Path;
@@ -16,7 +16,7 @@ use cli_core::{CliError, Result};
 use cli_state::{State, StatePaths};
 use tempfile::NamedTempFile;
 
-/// Decrypt the cached kubeconfig from state и write it к a
+/// Decrypt the cached kubeconfig from state and write it to a
 /// `NamedTempFile`. Callers MUST keep the returned file alive
 /// for the duration of the `kubectl` invocation — when the
 /// `NamedTempFile` drops, the file is deleted.
@@ -54,7 +54,7 @@ pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile> {
 }
 
 /// Run `kubectl get -o json ...` and return the parsed JSON
-/// value. Returns `Ok(None)` when the resource is 404 — каждый
+/// value. Returns `Ok(None)` when the resource is 404 — each
 /// caller decides whether absence is an error.
 pub fn kubectl_get_json(
     resource: &str,
