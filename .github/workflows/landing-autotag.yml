@@ -2,35 +2,32 @@
 name: landing-autotag
 
 # On every push to master that touches landing/**, bump the patch
-# component of the latest `landing-v*` tag and push the new tag.
-# release-landing.yml is triggered by `landing-v*` tags, so the
-# net effect is "merge to master → image build" without any human
-# tag-push in between.
+# component of the latest `landing-v*` tag, push the new tag, and
+# kick release-landing.yml at that tag. release-landing.yml is the
+# image-build pipeline; this workflow is just the auto-tag glue
+# in front of it.
 #
-# Triggering downstream workflows: GitHub's default GITHUB_TOKEN
-# cannot fire other workflows (anti-recursion). For the
-# release-landing.yml chain to actually run, the tag push has to
-# come from a "user" — concretely, a fine-grained PAT stored as
-# the LANDING_AUTOTAG_PAT secret. Setup:
+# Why we use `gh workflow run` instead of a PAT:
 #
-#   1. github.com/settings/personal-access-tokens/new
-#   2. Repository access: this repo only.
-#   3. Repository permissions:
-#        Contents: Read and write   (for tag push)
-#        Metadata: Read              (auto-granted)
-#   4. Save the token, paste it into Settings → Secrets and
-#      variables → Actions → New repository secret named
-#      `LANDING_AUTOTAG_PAT`.
+#   GitHub's default GITHUB_TOKEN cannot trigger downstream
+#   workflows via `push: tags` (anti-recursion), so naively
+#   pushing the tag here would leave release-landing dormant.
 #
-# Without the PAT the tag is still created and visible in the
-# repo, but release-landing.yml does NOT fire automatically.
-# Recover with:
+#   BUT — `workflow_dispatch` and `repository_dispatch` are the
+#   two explicit exceptions to that anti-recursion rule. Calling
+#   `gh workflow run release-landing.yml --ref <new-tag>` (which
+#   is a workflow_dispatch call) DOES fire release-landing even
+#   though the caller is GITHUB_TOKEN. release-landing reads
+#   `github.ref_name` exactly the same way it would for a tag
+#   push, so the image gets tagged correctly.
 #
-#   gh workflow run release-landing.yml --ref <new-tag>
+#   Net result: no PAT, no extra repo secret, the chain "just
+#   works" out of the box.
 #
 # Version bumping is patch-only: 0.1.0 → 0.1.1 → 0.1.2. Minor and
-# major are manual decisions — push a tag like `landing-v0.2.0` by
-# hand to set the new minor; the next auto-bump picks up from there.
+# major are manual decisions — push a tag like `landing-v0.2.0`
+# by hand to set the new minor; the next auto-bump picks up
+# from there.
 
 on:
   push:
@@ -39,19 +36,20 @@ on:
       - 'landing/**'
 
 permissions:
-  contents: write
+  contents: write   # for `git push <tag>`
+  actions:  write   # for `gh workflow run release-landing.yml`
 
-# Serialise: two pushes in quick succession must NOT race for the
-# same tag number. cancel-in-progress=false means the second job
-# waits for the first to finish (and read the latest tag) before
-# computing its own next version.
+# Serialise: two pushes in quick succession must NOT race for
+# the same tag number. cancel-in-progress=false means the second
+# job waits for the first to finish (and read the latest tag)
+# before computing its own next version.
 concurrency:
   group: landing-autotag
   cancel-in-progress: false
 
 jobs:
-  bump:
-    name: bump landing-v* patch tag
+  bump-and-release:
+    name: bump landing-v* + trigger release-landing
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -59,10 +57,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # PAT if available, falls back to the default token. With
-          # the default token the push succeeds but release-landing
-          # won't auto-fire — see header comment.
-          token: ${{ secrets.LANDING_AUTOTAG_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute next landing-v* tag
         id: compute
@@ -89,3 +83,14 @@ jobs:
           git tag -a "$NEXT" -m "Auto-tag: $NEXT (landing/** push to master)"
           git push origin "$NEXT"
           echo "::notice::Pushed $NEXT pointing at $COMMIT_SHA"
+
+      - name: Trigger release-landing.yml at the new tag
+        env:
+          NEXT: ${{ steps.compute.outputs.next }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The tag is fresh; give GitHub a beat to index it
+          # before workflow_dispatch validates --ref.
+          sleep 2
+          gh workflow run release-landing.yml --ref "$NEXT"
+          echo "::notice::Triggered release-landing.yml at $NEXT"

@@ -46,13 +46,16 @@ git push origin master
 # tag) and rolls out the new image.
 ```
 
-For the auto-fire chain to work, **the auto-tag has to push the
-tag as a "user"**, not as the default `GITHUB_TOKEN` (which is
-explicitly blocked from triggering downstream workflows).
-Set `LANDING_AUTOTAG_PAT` repo secret with a fine-grained PAT —
-see the workflow's header comment for the exact scope. Without
-the PAT, the tag is still created (visible in the repo); the
-operator just re-runs the release manually:
+No repo secret needed for the auto-fire chain. `GITHUB_TOKEN`
+alone can't trigger `push: tags`-listening workflows (GitHub's
+anti-recursion), but it CAN call `workflow_dispatch` — that is
+an explicit exception to the rule. landing-autotag exploits it
+by running `gh workflow run release-landing.yml --ref <new-tag>`
+right after pushing the tag, which fires release-landing with
+`github.ref_name = <new-tag>` exactly as a tag-push would.
+
+If you ever need to re-fire release-landing by hand (e.g. a
+build flaked, an orphaned tag from before this workflow shape):
 
 ```sh
 gh workflow run release-landing.yml --ref landing-v0.1.5
