@@ -1683,6 +1683,111 @@ compatibility: "0.1.23": {
 // 0.1.44 (`apprafter platform upgrade --to 0.1.45` +
 // `kubectl rollout restart deployment/argocd-repo-server
 // -n argocd`).
+// Walk-fix #10 post-B.1.79a — discover stdout fix in CMP
+// plugin.yaml. v0.1.4's snippet exited 0 on match but printed
+// nothing (`| grep -q .` swallowed find's output). Argo CD's
+// MatchRepository requires non-empty stdout to claim the repo,
+// so the cue plugin never engaged; landing apps fell back to
+// directory mode and choked on `package.json` exactly as in
+// walk-fix #8. Drop `| grep -q .`, let `find -print -quit`
+// speak for itself. Image bumps v0.1.4 → v0.1.5; chart pulls
+// the new tag via `_components.argocd-cue-cmp.values.image.
+// tag = "v" + argocdcuecmp.version`.
+compatibility: "0.1.46": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #10 post-B.1.79a — CMP discover stdout fix
+		(cue-cmp v0.1.4 → v0.1.5, chart 0.1.45 → 0.1.46).
+
+		**Symptom.** Operator on chart 0.1.45 (which carried
+		walk-fix #8's command-based discover plus the v0.1.4
+		image rebuild from #8b) still saw landing apps fail
+		with the original `Failed to unmarshal "package.json":
+		Object 'Kind' is missing` error (cached). After
+		`kubectl exec deployment/argocd-redis -- redis-cli
+		FLUSHDB` and a `argocd.argoproj.io/refresh=hard`
+		annotation on each Application, the error reproduced
+		identically — i.e. not a stale cache, the CMP plugin
+		was actually never matching.
+
+		**Diagnosis.** `kubectl -n argocd logs deployment/
+		argocd-repo-server -c cue-cmp` showed the discover
+		shell snippet running, exiting 0, but every entry
+		followed by:
+
+			```
+			level=warning msg="Plugin command returned zero
+			output" command="{[sh -c if [ ... ] ; then find
+			. -maxdepth 1 ... -print -quit | grep -q .
+			else find . -type f -name '*.cue' \\( -path '*/
+			apprafter/*' -o -name 'apprafter*.cue' \\) -print
+			-quit | grep -q . fi] []}" execID=... stderr=
+			```
+
+		Argo CD's `MatchRepository` in `cmpserver/plugin/
+		plugin.go` keys on **stdout emptiness**, not exit
+		code. `grep -q` is silent (the `-q` flag suppresses
+		stdout entirely), so even when the find command
+		matched a real `landing/web/apprafter/Application.
+		cue`, no output reached Argo CD's runCommand return
+		value, the plugin was marked `IsSupported: false`,
+		and the directory-mode fallback re-fired the
+		`package.json` parse.
+
+		**Fix.** Drop the `| grep -q .` pipe entirely.
+		`find -print -quit` already prints the first
+		matched path to stdout on hit and prints nothing on
+		miss (both code paths exit 0). Stdout emptiness IS
+		the signal Argo CD reads. The discover snippet is
+		now:
+
+			```sh
+			if [ "$(basename "$PWD")" = "apprafter" ]; then
+			  find . -maxdepth 1 -type f -name '*.cue' \\
+			      -print -quit
+			else
+			  find . -type f -name '*.cue' \\
+			      \\( -path '*/apprafter/*' \\
+			         -o -name 'apprafter*.cue' \\) \\
+			      -print -quit
+			fi
+			```
+
+		Image bumps `argocd-cue-cmp` v0.1.4 → v0.1.5
+		(plugin.yaml-only change but baked into the
+		container's `/home/argocd/cmp-server/config/
+		plugin.yaml` per the Dockerfile; chart-managed
+		ConfigMap mount overlays it at runtime so existing
+		installs pick up the fix without an image roll, but
+		the published v0.1.5 image is right for installers
+		that bypass the chart).
+
+		**Regression guard.** New `argocd-cue-cmp/test-
+		discover.sh` extracts the discover shell snippet
+		from the in-tree `plugin.yaml`, runs it against
+		fixture directories that exercise both conventions
+		(`apprafter/Application.cue` sibling, `apprafter*.
+		cue` filename prefix, cwd-is-apprafter, plain repo
+		with no `.cue` files), and asserts stdout non-
+		emptiness matches the expected match/no-match
+		signal. Wired into `argocd-cue-cmp-check.yml` so
+		every PR touching plugin.yaml must keep this
+		discipline.
+
+		**Rendered chart vs 0.1.45.** Sidecar image tag
+		flips `v0.1.4` → `v0.1.5`. ConfigMap `cue-cmp-
+		plugin-config` content updates the inline shell
+		snippet (drops `| grep -q .` from both branches).
+		"""
+	references: [
+		"docs/adr/0029-cue-cmp.md",
+		"argocd-cue-cmp/plugin.yaml",
+		"argocd-cue-cmp/test-discover.sh",
+		"docs/changelog/UNRELEASED.md",
+	]
+}
+
 compatibility: "0.1.45": {
 	change:          "safe"
 	operatorVersion: "v0.1.134"

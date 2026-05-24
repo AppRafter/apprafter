@@ -10,31 +10,46 @@
 # of truth that the CI smoke test (`argocd-cue-cmp-check.yml`)
 # verifies on every cue-cmp change.
 #
-# Walk-fix #8 post-B.1.79a (cue-cmp v0.1.3 → unchanged image,
+# Walk-fix #10 post-B.1.79a (cue-cmp v0.1.4 → v0.1.5,
 # config-only):
 #
-#   Initial v0.1.2 plugin used `discover.find.glob:
-#   "{**/apprafter*.cue,**/apprafter/**/*.cue}"` — brace
-#   alternation that doublestar v4 supports. Argo CD 2.13.1's
-#   vendored doublestar either treats the braces literally or
-#   never received the v4 brace support — CMP returned
-#   no-match on real-world paths and Argo CD fell back to
-#   default directory mode, choking on `package.json`.
+#   v0.1.4 switched discover from glob to a shell snippet
+#   that piped `find -print -quit` through `grep -q .`. The
+#   intent was "filter through grep so the exit code reflects
+#   match/no-match". The bug: `grep -q` is silent (`-q` =
+#   quiet, no stdout) — Argo CD's CMP discover layer treats
+#   the command as a match only when stdout is non-empty
+#   (the `runCommand` return value of `MatchRepository`).
+#   Result: the command exited 0 on match, but stdout was
+#   empty, so the sidecar logged
 #
-#   Switched to `discover.find.command` — a shell script that
-#   runs from the path's directory and exits 0 on match. Two
-#   conventions handled in one expression:
+#     "Plugin command returned zero output"
 #
-#     * cwd basename `apprafter` (operator's path points
-#       directly at the convention directory): match any
-#       `.cue` file at depth 1.
-#     * otherwise: match any `.cue` file inside an
-#       `apprafter/` subdirectory OR with a filename starting
-#       `apprafter`.
+#   and Argo CD fell back to default directory mode — same
+#   end-state as the original glob bug, just via a different
+#   path.
+#
+#   v0.1.5 drops the `| grep -q .` pipe entirely. `find
+#   -print -quit` already prints the first matched path and
+#   exits 0; if nothing matches, it prints nothing and still
+#   exits 0. Stdout emptiness IS the signal Argo CD reads.
+#
+# Two conventions handled in one expression:
+#
+#   * cwd basename `apprafter` (operator's path points
+#     directly at the convention directory): match any
+#     `.cue` file at depth 1.
+#   * otherwise: match any `.cue` file inside an
+#     `apprafter/` subdirectory OR with a filename starting
+#     `apprafter`.
 #
 # Users who prefer raw YAML are unaffected — without a
-# matching `.cue` file the CMP discover step exits non-zero
+# matching `.cue` file the CMP discover step prints nothing
 # and Argo CD picks the next plugin / default handler.
+#
+# Regression-guarded by `argocd-cue-cmp/test-discover.sh`,
+# run from the `argocd-cue-cmp-check` workflow on every
+# `argocd-cue-cmp/**` change.
 apiVersion: argoproj.io/v1alpha1
 kind: ConfigManagementPlugin
 metadata:
@@ -47,9 +62,9 @@ spec:
         - -c
         - |
           if [ "$(basename "$PWD")" = "apprafter" ]; then
-            find . -maxdepth 1 -type f -name '*.cue' -print -quit | grep -q .
+            find . -maxdepth 1 -type f -name '*.cue' -print -quit
           else
-            find . -type f -name '*.cue' \( -path '*/apprafter/*' -o -name 'apprafter*.cue' \) -print -quit | grep -q .
+            find . -type f -name '*.cue' \( -path '*/apprafter/*' -o -name 'apprafter*.cue' \) -print -quit
           fi
   # Render command. `entrypoint.sh` lives in the sidecar
   # image and wraps `cue export` so CUE compile errors

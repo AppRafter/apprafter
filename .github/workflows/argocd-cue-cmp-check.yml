@@ -80,6 +80,17 @@ jobs:
           cache-from: type=gha,scope=argocd-cue-cmp
           cache-to: type=gha,mode=max,scope=argocd-cue-cmp
 
+      - name: Discover script regression test
+        # Walk-fix #10 (chart 0.1.46, cue-cmp v0.1.5)
+        # discipline — extracts the `discover.find.command`
+        # shell snippet from plugin.yaml, runs it against
+        # fixture repos, asserts stdout non-emptiness matches
+        # the expected match/no-match signal. Catches both
+        # "stdout silently empty" regressions (the v0.1.4 →
+        # v0.1.5 bug) and "matches too eagerly" regressions
+        # (plain CUE repos getting intercepted).
+        run: bash argocd-cue-cmp/test-discover.sh
+
       - name: Entrypoint smoke (cue export of a tiny fixture)
         run: |
           mkdir -p /tmp/cue-smoke/apprafter

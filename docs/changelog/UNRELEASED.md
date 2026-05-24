@@ -13,6 +13,187 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## platform-stack 0.1.46 + argocd-cue-cmp v0.1.5 — M1.5 walk-fix #10 post-B.1.79a — CMP discover stdout (2026-05-24)
+
+### Symptom
+
+After walk-fix #8 (chart 0.1.44, command-based discover) and
+walk-fix #8b (chart 0.1.45, cue-cmp v0.1.4 image rebuild),
+landing apps STILL failed with the original
+
+```
+Failed to load target state: failed to generate manifest
+for source 1 of 1: rpc error: code = FailedPrecondition
+desc = Failed to unmarshal "package.json": Object 'Kind'
+is missing
+```
+
+even after `kubectl exec deployment/argocd-redis --
+redis-cli FLUSHDB` plus an `argocd.argoproj.io/refresh=hard`
+annotation on each Application — i.e. not a stale-cache
+artefact, the CMP plugin was genuinely never matching the
+repo.
+
+### Diagnosis
+
+`kubectl -n argocd logs deployment/argocd-repo-server -c
+cue-cmp` showed the discover shell snippet running, exiting
+0, but every invocation followed by:
+
+```
+level=warning msg="Plugin command returned zero output"
+command="{[sh -c if [ ... ] ; then find . -maxdepth 1 ...
+ -print -quit | grep -q . else find . -type f -name '*.cue'
+ \( -path '*/apprafter/*' -o -name 'apprafter*.cue' \)
+ -print -quit | grep -q . fi] []}" execID=... stderr=
+```
+
+Argo CD's `MatchRepository` in `cmpserver/plugin/plugin.go`
+keys on the **stdout** of the discover command, not the
+exit code:
+
+```go
+find, err := runCommand(ctx, ...)
+if err != nil { return ... }
+if find != "" {
+    return stream.SendAndClose(
+        &apiclient.RepositoryResponse{IsSupported: true})
+}
+```
+
+`grep -q` is silent — `-q` (quiet) suppresses stdout
+entirely. So even when find matched a real
+`landing/web/apprafter/Application.cue`, no output reached
+runCommand's return value, the plugin was marked
+`IsSupported: false`, and the directory-mode fallback
+re-fired the `package.json` parse exactly as before
+walk-fix #8.
+
+### Fix
+
+Drop the `| grep -q .` pipe from BOTH branches of the
+discover snippet (`argocd-cue-cmp/plugin.yaml` source-of-
+truth and the chart's `extraObjects` ConfigMap mirror in
+`platform-stack/cue/component_argocd.cue`). `find -print
+-quit` already prints the first matched path on hit and
+prints nothing on miss; both code paths exit 0. Stdout
+emptiness IS the signal Argo CD reads — the original
+shell wrapper was layered cargo-cult.
+
+New snippet:
+
+```sh
+if [ "$(basename "$PWD")" = "apprafter" ]; then
+  find . -maxdepth 1 -type f -name '*.cue' -print -quit
+else
+  find . -type f -name '*.cue' \
+      \( -path '*/apprafter/*' \
+         -o -name 'apprafter*.cue' \) -print -quit
+fi
+```
+
+### Image bump
+
+`argocd-cue-cmp` v0.1.4 → v0.1.5 — content-only change but
+the Dockerfile bakes `plugin.yaml` into `/home/argocd/cmp-
+server/config/plugin.yaml`, so the published image needs к
+match the chart-mirror for installers that bypass the
+ConfigMap overlay path. Existing chart-managed installs
+pick up the fix from the ConfigMap mount alone — the image
+roll is observability + correctness for the unmanaged
+install surface.
+
+### Chart bump
+
+`platform-stack` 0.1.45 → 0.1.46 — flips
+`_components.argocd-cue-cmp.values.image.tag` from v0.1.4
+к v0.1.5 via the `argocdcuecmp.version` CUE import and
+rewrites the embedded `plugin.yaml` ConfigMap. Compat
+entry `compatibility: "0.1.46"` shipped with detailed
+notes.
+
+### Regression test
+
+New `argocd-cue-cmp/test-discover.sh` — a shell-level
+regression guard that extracts the `discover.find.command`
+shell snippet from `plugin.yaml`, runs it against five
+fixture directories, and asserts stdout non-emptiness
+matches the expected match/no-match signal:
+
+1. Parent-dir convention (`apprafter/Application.cue` one
+   level down — the landing-web/landing-cms case).
+2. cwd-is-apprafter (path points directly at the
+   convention directory — depth-1 branch).
+3. Filename-prefix convention (`apprafter-foo.cue` at
+   path root).
+4. Plain repo with no apprafter files (must return empty
+   stdout — fall through к next handler).
+5. Generic `.cue` files with no `apprafter` prefix (must
+   not match — the inverse regression for case 3).
+
+Plus a hard string-match guard: any re-introduction of
+`grep -q` into the discover script fails the test
+immediately with a clear error before the fixture cases
+run.
+
+Wired into `.github/workflows/argocd-cue-cmp-check.yml` so
+every PR touching `argocd-cue-cmp/**` runs the test.
+
+### Why this took until walk-fix #10
+
+The bug was masked twice over. Walk-fix #8 replaced an
+already-broken glob (`{...}` brace alternation unsupported
+in Argo CD 2.13.1's vendored doublestar) with a command-
+based snippet whose author thought "I'll filter through
+`grep -q` to convert find's output к a yes/no exit code".
+The intent was correct (Argo CD does check exit code) but
+the implementation broke the OTHER signal Argo CD checks
+(stdout emptiness). Operator's bootstrap saw the warning
+in cue-cmp logs but never connected it back — "Plugin
+command returned zero output" reads as "command
+intentionally produced nothing" rather than "command's
+output disappeared into /dev/null".
+
+Coverage gap: `argocd-cue-cmp-check.yml` had Dockerfile
+smoke + entrypoint smoke + tag-vs-source drift, but no
+actual discover smoke. `test-discover.sh` plugs that hole
+— going forward, no plugin.yaml change can ship without
+proving the discover signal works.
+
+### Files touched
+
+- `argocd-cue-cmp/plugin.yaml` — drop `| grep -q .` from
+  both branches, refresh the header comment к explain
+  walk-fix #10 vs #8.
+- `argocd-cue-cmp/version.cue` — bump 0.1.4 → 0.1.5.
+- `argocd-cue-cmp/test-discover.sh` — new regression test.
+- `platform-stack/cue/component_argocd.cue` — sync the
+  ConfigMap embed with the new discover snippet.
+- `platform-stack/cue/platform.cue` — bump
+  `currentVersion` 0.1.45 → 0.1.46.
+- `platform-stack/cue/compatibility.cue` — new
+  `compatibility: "0.1.46"` entry.
+- `.github/workflows/argocd-cue-cmp-check.yml` — run
+  `test-discover.sh` between image build and drift
+  detection.
+
+### No CLI bump
+
+Per the v0.1.159 channel-latest design, CLI does NOT bump
+on chart-only or cue-cmp-image-only changes. The fix flows
+into existing installs through:
+
+1. PlatformController on operator-side polls the chart
+   release stream and updates the parent platform
+   Application's `targetRevision` к 0.1.46.
+2. New installs' `apprafter cluster-bootstrap` calls
+   `resolve_latest_platform_stack_version()` which picks
+   the freshest published `platform-stack/v*` tag at the
+   bootstrap moment — 0.1.46 once published.
+
+Existing CLI binaries (≥v0.1.159) reach the fix without
+needing к download а new CLI release.
+
 ## v0.1.159 — M1.5 walk-fix #9 post-B.1.79a — CLI resolves latest chart from upstream at bootstrap (2026-05-24)
 
 ### Symptom

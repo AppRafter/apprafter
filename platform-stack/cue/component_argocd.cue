@@ -218,40 +218,24 @@ _components: argocd: #Component & {
 			}
 			data: "plugin.yaml": """
 				# SPDX-License-Identifier: FSL-1.1-Apache-2.0
-				# Walk-fix #8 post-B.1.79a (chart 0.1.44): discover
-				# switches from `glob` to `command`. Operator
-				# upgraded to chart 0.1.43, registered landing apps,
-				# Argo CD failed with
-				# `Failed to unmarshal "package.json": Object 'Kind'
-				# is missing` — CMP plugin didn't engage. Root cause:
-				# the brace alternation `{a,b}` in
-				# `**/apprafter*.cue,**/apprafter/**/*.cue}` was
-				# never matching in Argo CD 2.13.1's vendored
-				# doublestar — either it's not the v4 release that
-				# supports brace expansion, or the pattern is
-				# treated literally. CMP returned no-match,
-				# Argo CD fell back to default directory mode,
-				# directory mode walked `landing/cms/` and tried to
-				# parse `package.json` as a k8s manifest.
+				# Walk-fix #10 post-B.1.79a (chart 0.1.46, cue-cmp
+				# v0.1.5): drop the `| grep -q .` filter from the
+				# discover shell snippet. `grep -q` is silent, so
+				# the command exited 0 on match but printed nothing
+				# to stdout. Argo CD's CMP MatchRepository treats
+				# the command as a match only when stdout is non-
+				# empty (the `runCommand` return value, not the
+				# exit code) — so every discover returned the
+				# warning `Plugin command returned zero output` and
+				# the sidecar fell back to default directory mode,
+				# choking on `package.json` in landing/cms/ exactly
+				# as before walk-fix #8.
 				#
-				# `discover.find.command` runs an arbitrary script
-				# from the path's directory; exit 0 means match,
-				# non-zero means no match. The shell snippet below
-				# handles BOTH conventions in one expression:
-				#
-				#   * cwd basename `apprafter` (operator pointed
-				#     `path` directly at the convention directory):
-				#     look for any `.cue` file at depth 1.
-				#   * otherwise: look for any `.cue` file inside an
-				#     `apprafter/` subdirectory anywhere, OR with a
-				#     filename starting `apprafter`. Matches both
-				#     `landing/cms/apprafter/Application.cue` (path
-				#     = parent) and `landing/cms/apprafter-web.cue`
-				#     (filename-prefix convention).
-				#
-				# `-print -quit | grep -q .` short-circuits after
-				# the first match — discovery doesn't need a full
-				# scan, just a yes/no signal.
+				# Fix: `find -print -quit` itself prints the first
+				# matched path on success and nothing on miss; both
+				# code paths exit 0. Stdout emptiness IS the signal.
+				# Regression-guarded by `argocd-cue-cmp/test-
+				# discover.sh` running in CI.
 				apiVersion: argoproj.io/v1alpha1
 				kind: ConfigManagementPlugin
 				metadata:
@@ -264,9 +248,9 @@ _components: argocd: #Component & {
 				        - -c
 				        - |
 				          if [ "$(basename "$PWD")" = "apprafter" ]; then
-				            find . -maxdepth 1 -type f -name '*.cue' -print -quit | grep -q .
+				            find . -maxdepth 1 -type f -name '*.cue' -print -quit
 				          else
-				            find . -type f -name '*.cue' \\( -path '*/apprafter/*' -o -name 'apprafter*.cue' \\) -print -quit | grep -q .
+				            find . -type f -name '*.cue' \\( -path '*/apprafter/*' -o -name 'apprafter*.cue' \\) -print -quit
 				          fi
 				  generate:
 				    command: [sh, "-c"]
