@@ -13,6 +13,86 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.158 — M1.5 walk-fix #8b post-B.1.79a — cue-cmp image bump alongside chart (2026-05-24)
+
+### Symptom
+
+Push of v0.1.157 (which bundled chart 0.1.44 with the new
+command-based CMP discover в `plugin.yaml`) tripped the
+`argocd-cue-cmp-check` workflow's drift detection:
+
+```
+Error: Image source under argocd-cue-cmp/ changed since
+argocd-cue-cmp/v0.1.3 was published, but version.cue is
+still 0.1.3.
+Error: Either bump argocd-cue-cmp/version.cue, or revert
+the source changes.
+```
+
+### Root cause
+
+Walk-fix #8 (v0.1.157 / chart 0.1.44) changed
+`argocd-cue-cmp/plugin.yaml` content but did NOT bump the
+cue-cmp image version. The reasoning was "the ConfigMap
+mount in the chart overrides the image's plugin.yaml at
+runtime, so the image bytes don't matter".
+
+The drift policy disagrees, и rightly so: an operator who
+installs cue-cmp manually (e.g. attaching it to а stock
+Argo CD install without the AppRafter chart) gets the
+image's baked-in plugin.yaml — no ConfigMap overlay. Stale
+image content = wrong behaviour for that path.
+
+### Fix
+
+Bump alongside:
+
+- `argocd-cue-cmp/version.cue` v0.1.3 → v0.1.4. The
+  cue-cmp publish workflow auto-fires on the new tag,
+  rebuilds the image with the new plugin.yaml baked in,
+  pushes `ghcr.io/<owner>/argocd-cue-cmp:v0.1.4`.
+- `platform-stack/cue/platform.cue` `currentVersion`
+  0.1.44 → 0.1.45. The chart's `_components.argocd-cue-
+  cmp.values.image.tag` follows the CUE import (`"v" +
+  argocdcuecmp.version`), so the rendered chart now pins
+  the new v0.1.4 image. Operator on chart 0.1.44 can
+  upgrade к 0.1.45 directly — argocd-repo-server's
+  sidecar reference flips и kubelet rolls the pod.
+- `cli/Cargo.toml` 0.1.157 → 0.1.158. `RELEASED_PLATFORM_
+  STACK_VERSION` follows.
+
+### Operator workflow
+
+After this lands and chart upgrades to 0.1.45:
+
+```bash
+apprafter platform upgrade --to 0.1.45
+apprafter platform status   # current=target=available=0.1.45
+
+# Sidecar rotation:
+kubectl rollout restart deployment/argocd-repo-server -n argocd
+kubectl rollout status deployment/argocd-repo-server -n argocd
+
+# Hard-refresh affected apps (same as v0.1.157 recovery):
+kubectl -n argocd annotate application landing-web \
+    argocd.argoproj.io/refresh=hard --overwrite
+kubectl -n argocd annotate application landing-cms \
+    argocd.argoproj.io/refresh=hard --overwrite
+```
+
+Apps re-sync, CMP plugin engages via the new command-
+based discover (verified локально in walk-fix #8), runs
+the same `entrypoint.sh` (unchanged), emits the rendered
+manifest stream. landing-web и landing-cms should turn
+green.
+
+### Versioning
+
+CLI 0.1.157 → 0.1.158. Chart 0.1.44 → 0.1.45. cue-cmp
+v0.1.3 → v0.1.4.
+
+---
+
 ## v0.1.157 — M1.5 walk-fix #8 post-B.1.79a — CMP discover switches from glob to command (2026-05-24)
 
 ### Symptom

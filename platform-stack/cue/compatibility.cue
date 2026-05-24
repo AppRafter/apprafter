@@ -1658,6 +1658,78 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #8b post-B.1.79a — cue-cmp image bump to v0.1.4
+// alongside chart 0.1.45. Walk-fix #8 (chart 0.1.44)
+// changed plugin.yaml without bumping the cue-cmp image
+// version — argument was "ConfigMap mount overrides the
+// image's plugin.yaml at runtime, so image content does
+// not matter". cue-cmp-check workflow's drift detection
+// disagreed: image-source files (Dockerfile, entrypoint.sh,
+// plugin.yaml) changed since the published v0.1.3 tag
+// without a matching version.cue bump → red CI.
+//
+// The drift check has the right policy: an operator who
+// installs cue-cmp manually (without the chart's
+// ConfigMap mount overlay) pulls the image and runs
+// against its baked-in plugin.yaml. Stale image content
+// = wrong behaviour for that path. Bumping the image
+// version-with-source-change keeps the v0.1.4 ghcr tag
+// honest.
+//
+// Effect on the chart: same plugin.yaml content via the
+// ConfigMap (unchanged from chart 0.1.44), plus image
+// pin advances from v0.1.3 → v0.1.4. cue-cmp sidecar pod
+// rotates on chart upgrade. Operator workflow same as
+// 0.1.44 (`apprafter platform upgrade --to 0.1.45` +
+// `kubectl rollout restart deployment/argocd-repo-server
+// -n argocd`).
+compatibility: "0.1.45": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #8b — cue-cmp image bump to v0.1.4.
+
+		Follow-up to walk-fix #8 (chart 0.1.44) which
+		changed plugin.yaml content without a matching cue-cmp
+		image version bump. cue-cmp-check CI workflow's
+		drift detection flagged it red:
+
+			```
+			Error: Image source under argocd-cue-cmp/ changed
+			since argocd-cue-cmp/v0.1.3 was published, but
+			version.cue is still 0.1.3.
+			```
+
+		The drift policy is right — an operator who installs
+		cue-cmp manually (without the chart's ConfigMap
+		overlay) pulls the image and runs against its baked-
+		in plugin.yaml. Stale image content = wrong behaviour
+		for that install path. Bumping the image version
+		alongside source changes keeps the ghcr tag honest.
+
+		Image rebuild: cue-cmp v0.1.3 → v0.1.4. Same
+		Dockerfile, same entrypoint.sh, new plugin.yaml
+		(with command-based discover from walk-fix #8). The
+		cue-cmp publish workflow auto-fires on the new tag.
+
+		Chart 0.1.44 → 0.1.45 follows the cue-cmp pin
+		via `_components.argocd-cue-cmp.values.image.tag =
+		"v" + argocdcuecmp.version`. Operator on 0.1.44
+		can upgrade to 0.1.45 directly — argocd-repo-server
+		Deployment's sidecar image reference flips from
+		v0.1.3 → v0.1.4 and kubelet rolls the pod.
+
+		Rendered chart vs 0.1.44: sidecar image tag pin
+		flipped. plugin.yaml ConfigMap content unchanged
+		(same command-based discover from walk-fix #8).
+		"""
+	references: [
+		"docs/adr/0029-cue-cmp.md",
+		".github/workflows/argocd-cue-cmp-check.yml",
+		"docs/changelog/UNRELEASED.md#v01158",
+	]
+}
+
 // Walk-fix #8 post-B.1.79a — CMP discover switches from glob
 // to command. Chart 0.1.43 shipped `discover.find.glob:
 // "{**/apprafter*.cue,**/apprafter/**/*.cue}"` — brace
