@@ -13,6 +13,85 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.148 — M1.5 polish post-B.1.79a #4 — `apprafter platform freeze` fallback (2026-05-24)
+
+### Symptom
+
+Walk feedback from v0.1.142 closure: `apprafter platform
+freeze cilium` without `--version` errored with:
+
+```
+Error: apprafter::cli::other
+× No effective version found for component 'cilium' in
+  status.componentVersions. Pass `--version <v>` explicitly
+  or run `apprafter platform status` to inspect the list of
+  known components.
+```
+
+PlatformController ships in M1.5 without populating
+`PlatformStack.status.componentVersions` — that field is
+reserved for а Phase 2 enhancement. The verb was unusable
+without manually looking up the version operator wanted to
+freeze.
+
+### Fix
+
+New pure helper `resolve_effective_pin(stack, argocd_app,
+component)` walks a fallback chain:
+
+1. **`PlatformStack.status.componentVersions.<component>`**
+   — the canonical version dial when present (Phase 2+).
+2. **`Argo CD Application argocd/<component>.spec.source.
+   targetRevision`** — the version Argo CD is actively
+   reconciling against. Always present for а chart-managed
+   component since the umbrella's `templates/applications.
+   yaml` template emits it.
+3. Hard error pointing the operator at `--version <v>` and
+   `apprafter platform status` for the canonical component
+   list.
+
+`freeze()` now reads the PlatformStack CR, fetches the Argo
+CD child Application (404 = `None` passed through, treated
+as "no signal"), then calls `resolve_effective_pin` to make
+the choice.
+
+### Why source preference order matters
+
+PlatformStack.status wins over Argo CD targetRevision
+because during а bump cycle the Argo CD Application's
+`spec.source.targetRevision` may briefly lag behind the
+umbrella's reconciled state — the umbrella patches its
+children's targetRevision on each component cycle, and
+mid-flight the value reflects the OLD version until the
+patch lands. PlatformStack.status, when populated, surfaces
+the operator's intended version. When status isn't
+populated (M1.5 default), Argo CD's targetRevision is the
+next-best authoritative signal.
+
+### Tests
+
++4 unit tests on the pure resolver:
+
+- `resolve_effective_pin_prefers_platformstack_status` —
+  both sources present, status wins.
+- `resolve_effective_pin_falls_back_to_argocd_target_revision`
+  — M1.5-typical state (no componentVersions) succeeds via
+  the Argo CD fallback instead of erroring.
+- `resolve_effective_pin_errors_when_both_sources_empty` —
+  unknown component / half-bootstrapped cluster surfaces
+  а clean error pointing at `--version` + `platform status`.
+- `resolve_effective_pin_handles_argocd_app_without_target_revision`
+  — defensive: malformed CR with empty spec.source treated
+  the same as the 404 case.
+
+### Versioning
+
+CLI 0.1.146 → 0.1.148 (`v0.1.147` taken by landing-stream
+release `558acad`; CLI version skips ahead к 0.1.148 to
+avoid а tag collision). Chart unchanged.
+
+---
+
 ## v0.1.146 — M1.5 walk-fix #2 post-B.1.79a — AppProjects as umbrella manifests (2026-05-24)
 
 ### Symptom

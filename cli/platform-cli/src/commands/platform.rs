@@ -339,13 +339,26 @@ fn humanise_relative(delta: chrono::Duration) -> String {
 }
 
 /// `apprafter platform freeze <component> [--version <v>]`
-/// patches PlatformStack.spec.overrides.<component>.pin.
-/// Without `--version` reads the current effective component
-/// version from `status.componentVersions.<component>` and
-/// locks that.
+/// patches `PlatformStack.spec.overrides.<component>.pin`.
+/// Without `--version` resolves the current effective version
+/// through a fallback chain so the verb is always actionable
+/// no matter which signals the cluster currently surfaces.
+///
+/// Resolution chain (walk-fix #3 post-B.1.79a / v0.1.147):
+///
+///   1. **PlatformStack.status.componentVersions.<component>**
+///      — the operator's canonical version dial when present.
+///      M1.5 ships this populated only on bump cycles though,
+///      so it can be absent on steady state.
+///   2. **Argo CD `Application argocd/<component>.spec.source.
+///      targetRevision`** — the version Argo CD is actively
+///      reconciling against. Always present for а chart-managed
+///      component, since the umbrella's `templates/applications.
+///      yaml` template emits it. This is the new fallback.
+///   3. Hard error pointing the operator at `--version <v>`.
 pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let json = kubectl_get_json(
+    let stack = kubectl_get_json(
         "platformstack",
         Some(PLATFORMSTACK_NAME),
         Some(PLATFORMSTACK_NAMESPACE),
@@ -359,17 +372,20 @@ pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
 
     let pin = match version {
         Some(v) => v.to_string(),
-        None => json
-            .pointer(&format!("/status/componentVersions/{component}"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                CliError::Other(format!(
-                    "No effective version found for component '{component}' in \
-                     status.componentVersions. Pass `--version <v>` explicitly or run \
-                     `apprafter platform status` to inspect the list of known components."
-                ))
-            })?,
+        None => {
+            // Try the Argo CD Application as fallback when
+            // PlatformStack.status doesn't carry the version
+            // yet. 404 on the lookup is fine — we'll pass
+            // `None` along to the resolver and let it surface
+            // a clean error pointing at `--version <v>`.
+            let app = kubectl_get_json(
+                "application.argoproj.io",
+                Some(component),
+                Some("argocd"),
+                kc.path(),
+            )?;
+            resolve_effective_pin(&stack, app.as_ref(), component)?
+        }
     };
 
     let body = format!(r#"{{"spec":{{"overrides":{{"{component}":{{"pin":"{pin}"}}}}}}}}"#);
@@ -389,6 +405,43 @@ pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
     );
     println!("To revert: `apprafter platform unfreeze {component}`.");
     Ok(())
+}
+
+/// Resolve the effective pin for `component` through the
+/// PlatformStack-then-Argo-CD fallback chain. Pure fn — tests
+/// drive every branch with fixture JSON instead of needing а
+/// live cluster.
+///
+/// Returns the rendered string verbatim. Caller threads it
+/// into the merge-patch body. None Argo CD source is allowed
+/// (caller may have 404'd on the lookup); the resolver only
+/// errors when BOTH signals are absent.
+pub(crate) fn resolve_effective_pin(
+    stack: &Value,
+    argocd_app: Option<&Value>,
+    component: &str,
+) -> Result<String> {
+    if let Some(v) = stack
+        .pointer(&format!("/status/componentVersions/{component}"))
+        .and_then(Value::as_str)
+    {
+        return Ok(v.to_string());
+    }
+    if let Some(app) = argocd_app {
+        if let Some(v) = app
+            .pointer("/spec/source/targetRevision")
+            .and_then(Value::as_str)
+        {
+            return Ok(v.to_string());
+        }
+    }
+    Err(CliError::Other(format!(
+        "No effective version known for component '{component}' — \
+         PlatformStack.status.componentVersions.{component} is empty and \
+         Argo CD Application argocd/{component} carries no spec.source.targetRevision. \
+         Pass `--version <v>` to set the pin explicitly, or run `apprafter platform status` \
+         to inspect the list of known components."
+    )))
 }
 
 /// `apprafter platform unfreeze <component>` — RFC 7396
@@ -610,6 +663,74 @@ mod tests {
         // entry sinks to the bottom.
         assert_eq!(rows.first().map(|r| r.version.as_str()), Some("0.1.40"));
         assert_eq!(rows.get(1).map(|r| r.version.as_str()), Some("0.0.0"));
+    }
+
+    #[test]
+    fn resolve_effective_pin_prefers_platformstack_status() {
+        // Both sources present — PlatformStack status wins
+        // because it's the operator's canonical version dial
+        // and the Argo CD targetRevision may lag during а
+        // bump cycle (in-flight reconcile shows the OLD
+        // version on app.spec.source.targetRevision until
+        // the umbrella patches it).
+        let stack = json!({
+            "status": { "componentVersions": { "cilium": "1.16.5" } }
+        });
+        let app = json!({
+            "spec": { "source": { "targetRevision": "1.15.0" } }
+        });
+        let pin = resolve_effective_pin(&stack, Some(&app), "cilium").unwrap();
+        assert_eq!(pin, "1.16.5");
+    }
+
+    #[test]
+    fn resolve_effective_pin_falls_back_to_argocd_target_revision() {
+        // Operator hits `freeze` on а cluster where the
+        // operator binary doesn't (yet) write
+        // componentVersions — this is the M1.5 default state.
+        // The Argo CD Application's targetRevision is THE
+        // authoritative version Argo CD is actively
+        // reconciling against, so fall back to it instead
+        // of erroring.
+        let stack = json!({ "status": {} });
+        let app = json!({
+            "spec": { "source": { "targetRevision": "v1.16.5" } }
+        });
+        let pin = resolve_effective_pin(&stack, Some(&app), "cilium").unwrap();
+        assert_eq!(pin, "v1.16.5");
+    }
+
+    #[test]
+    fn resolve_effective_pin_errors_when_both_sources_empty() {
+        // Neither PlatformStack.status nor Argo CD Application
+        // carries а version — likely an unknown component
+        // name OR а half-bootstrapped cluster. Error message
+        // must point operators at the `--version <v>` escape
+        // hatch and `platform status` for the canonical
+        // component list.
+        let stack = json!({ "status": {} });
+        let err = resolve_effective_pin(&stack, None, "ghost-component")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ghost-component"),
+            "must surface component name: {err}"
+        );
+        assert!(err.contains("--version"), "must hint at --version: {err}");
+        assert!(
+            err.contains("platform status"),
+            "must hint at platform status: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_pin_handles_argocd_app_without_target_revision() {
+        // Defensive: malformed Argo CD CR (e.g. mid-edit
+        // with empty spec.source) is treated as "no signal"
+        // — equivalent to passing None.
+        let stack = json!({ "status": {} });
+        let app = json!({ "spec": { "source": {} } });
+        assert!(resolve_effective_pin(&stack, Some(&app), "x").is_err());
     }
 
     #[test]
