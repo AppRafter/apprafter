@@ -14,7 +14,10 @@ use clap::Parser;
 use cli_core::logging;
 use miette::{IntoDiagnostic, Result};
 
-use crate::cli::{AppCommand, Cli, Commands, MigrationCommand, OpenUi, PlatformCommand};
+use crate::cli::{
+    AppCommand, Cli, Commands, MigrationCommand, OpenUi, PlatformCommand, RepoCommand,
+    RepoCredsCommand,
+};
 
 fn main() -> Result<()> {
     // Configure miette's `fancy` reporter as the global panic /
@@ -129,6 +132,35 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 yes,
                 keep_data,
             } => commands::app::remove(&name, yes, keep_data)?,
+        },
+        Commands::Repo { action } => match action {
+            RepoCommand::Creds { action } => match action {
+                RepoCredsCommand::Add {
+                    name,
+                    url_prefix,
+                    auth_type,
+                    username,
+                    token,
+                    no_validate,
+                } => commands::repo_creds::add(
+                    &name,
+                    &url_prefix,
+                    &auth_type,
+                    &username,
+                    token,
+                    no_validate,
+                )?,
+                RepoCredsCommand::List => commands::repo_creds::list()?,
+                RepoCredsCommand::Show { name } => commands::repo_creds::show(&name)?,
+                RepoCredsCommand::Rotate {
+                    name,
+                    token,
+                    no_validate,
+                } => commands::repo_creds::rotate(&name, token, no_validate)?,
+                RepoCredsCommand::Remove { name, force, yes } => {
+                    commands::repo_creds::remove(&name, force, yes)?
+                }
+            },
         },
     }
     Ok(())

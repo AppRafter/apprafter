@@ -13,6 +13,165 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.141 — M1.5 Track B.1.79a part 5 — `apprafter repo creds` subcommands (2026-05-22)
+
+### What landed
+
+`apprafter repo creds` subcommand family для managing Argo CD
+repo-creds Secrets. Closes the private-repo onboarding loop —
+operators больше не нужно вручную составлять YAML для
+`argocd.argoproj.io/secret-type: repo-creds` labeled Secrets.
+
+### Contract
+
+Argo CD's documented declarative-setup contract:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <friendly-name>
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repo-creds
+stringData:
+  url: <url-prefix>
+  username: <user>
+  password: <token>
+```
+
+`stringData` (not `data`) — kubectl base64-encodes server-side
+when applying, so the CLI ships plaintext token и avoids
+а dual-encoding bug.
+
+Argo CD's repo-server scans `argocd` namespace for Secrets
+labeled `argocd.argoproj.io/secret-type: repo-creds` и uses
+whichever entry's `url` field is а **prefix match** for an
+Application's `spec.source.repoURL`. So registering
+`https://github.com/myorg` makes every Application pointing к
+`https://github.com/myorg/<any-repo>` inherit those creds.
+
+### `repo creds add <name>`
+
+- `--url-prefix <url>` (required) — the URL prefix Argo CD
+  uses к match Applications.
+- `--type <pat|basic>` (default `pat`). `ssh` rejected с
+  Phase 2 deferral hint.
+- `--username <user>` (default `git` — works для most PAT
+  providers). GitLab requires the username explicitly.
+- `--token <value>` (required). Reads из stdin via
+  `inquire::Password` (masked) когда omitted и stdin is а
+  TTY. Honours `APPRAFTER_REPO_TOKEN` env (hidden values).
+- `--no-validate` skips provider-specific token regex check.
+  Useful для self-hosted Gitea/Forgejo с custom token shapes.
+
+Pre-flight refuses когда Secret name collision; suggests
+`rotate` or `remove + add`.
+
+Token validation rules (best-effort, override-able):
+
+- `github_pat_*` — fine-grained PAT, requires 80+ char body.
+- `ghp_*` — classic PAT, requires exactly 40 chars total
+  (`ghp_` + 36 alphanumeric).
+- `glpat-*` — GitLab PAT, requires 20+ char body.
+- Generic fallback: 20+ chars (Gitea, Codeberg, Forgejo).
+- Basic auth: accepts any non-empty password.
+
+### `repo creds list`
+
+Table NAME / URL PREFIX / TYPE / USERNAME. Auth type pulled
+from the `apprafter.io/auth-type` annotation. Empty result
+prints hint pointing к `repo creds add` syntax.
+
+### `repo creds show <name>`
+
+Detail view с masked password (`****`) + а pointer к the
+plaintext-decode kubectl command для operators who really
+need it. Argo CD's standard `kubectl get secret -o
+jsonpath='{.data.password}' | base64 -d` invocation is а
+common debugging step, so surfacing it inline beats forcing
+the operator к remember the syntax.
+
+### `repo creds rotate <name>`
+
+- Patches `data.password` in-place (base64-encoded since
+  we're patching `data` not `stringData`) via JSON
+  merge-patch — repo-server holds а cached
+  `resourceVersion` pointer и а full recreate would cause а
+  brief reconnect window.
+- Re-runs token format validation against the recorded
+  `apprafter.io/auth-type` annotation; `--no-validate`
+  available.
+- Reads new token from stdin (masked) когда omitted on TTY.
+
+### `repo creds remove <name>`
+
+- **Dependency check** by default: refuses когда есть Argo
+  CD Application(s) с `spec.source.repoURL` starting with
+  the creds' `url` field. Pure helper
+  `find_apps_matching_prefix` walks the Application list
+  filter testable без cluster.
+- `--force` skips dependency check (for migrations к а
+  different creds entry).
+- `--yes` skips confirmation prompt только (still runs
+  dependency check).
+- Both flags non-interactive shell compatible.
+
+### Inline PAT prompt в `apprafter app add` — deferred
+
+The inline PAT-add prompt during `apprafter app add` когда
+`git ls-remote` hits auth failure (originally planned with
+this commit) **остаётся deferred** — sufficient к surface
+the hint pointing к `apprafter repo creds add` from
+`app add`'s error message (already shipped в v0.1.139).
+Inline prompt is а UX nice-to-have что rarely fires (most
+operators register creds once и forget them); landing
+needs interactive shell management we'll batch с `target add`
+wizard refresh в а later patch.
+
+### Tests
+
++18 unit tests:
+
+- `parse_auth_type_accepts_pat_and_basic`
+- `parse_auth_type_rejects_ssh_with_phase2_hint`
+- `parse_auth_type_rejects_unknown`
+- `validate_token_format_accepts_github_fine_grained_pat`
+- `validate_token_format_rejects_short_github_fine_grained_pat`
+- `validate_token_format_accepts_github_classic_pat`
+- `validate_token_format_rejects_wrong_length_github_classic_pat`
+  (both shorter и longer).
+- `validate_token_format_accepts_gitlab_pat`
+- `validate_token_format_accepts_generic_long_token`
+- `validate_token_format_rejects_short_generic_token` (hints
+  at `--no-validate`).
+- `validate_token_format_basic_accepts_anything_non_empty`
+- `validate_dns_1123_for_creds_name`
+- `build_repo_creds_secret_carries_secret_type_label` —
+  load-bearing: Argo CD's repo-server filters by this label.
+- `build_repo_creds_secret_includes_managed_by_and_cred_name_labels`
+- `build_repo_creds_secret_routes_to_argocd_namespace`
+- `build_repo_creds_secret_uses_stringdata_for_round_trip` —
+  defensive: `data` field MUST be absent (would compete
+  с `stringData` для apiserver precedence).
+- `find_apps_matching_prefix_filters_by_repo_url`
+- `find_apps_matching_prefix_skips_apps_without_repo_url` —
+  defensive: helm-chart-only Applications без а
+  `spec.source.repoURL` git URL must not trip the prefix
+  match.
+
+### Versioning
+
+CLI 0.1.140 → 0.1.141. Chart unchanged.
+
+### References
+
+- ADR 0025 (Argo CD).
+- Argo CD's `declarative-setup.md#credential-templates`.
+- `plan.md` §1.79a.
+
+---
+
 ## v0.1.140 — M1.5 Track B.1.79a part 4 — `apprafter app` logs/rollback (2026-05-22)
 
 ### What landed

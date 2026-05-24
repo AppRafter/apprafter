@@ -207,6 +207,107 @@ pub enum Commands {
         #[command(subcommand)]
         action: AppCommand,
     },
+    /// Manage git-repo creds Argo CD uses к pull private user
+    /// repos. Writes `repo-creds`-typed Secrets в the `argocd`
+    /// namespace per Argo CD's documented contract. Track
+    /// B.1.79a part 5.
+    Repo {
+        #[command(subcommand)]
+        action: RepoCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RepoCommand {
+    /// Repository credentials subcommands.
+    Creds {
+        #[command(subcommand)]
+        action: RepoCredsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RepoCredsCommand {
+    /// Register а git-repo credential. Creates an Argo CD
+    /// `repo-creds`-typed Secret в the `argocd` namespace.
+    /// All Applications с а `repoURL` starting with the
+    /// registered `--url-prefix` inherit these creds.
+    Add {
+        /// Friendly name. Used as the Secret's
+        /// `metadata.name` (DNS-1123) и surfaces в
+        /// `apprafter repo creds list`.
+        name: String,
+        /// URL prefix for which these creds apply (e.g.
+        /// `https://github.com/myorg`). Required.
+        #[arg(long = "url-prefix")]
+        url_prefix: String,
+        /// Auth type. Default `pat` — а personal access
+        /// token (GitHub `github_pat_*` / `ghp_*`, GitLab
+        /// `glpat-*`, etc). `basic` — username + password
+        /// pair. SSH-key auth deferred к Phase 2 (Argo CD
+        /// supports it, но CLI prompts get involved).
+        #[arg(long = "type", default_value = "pat")]
+        auth_type: String,
+        /// Username. Когда `--type pat` — обычно the token
+        /// holder's git username (GitHub: any non-empty
+        /// string works; GitLab requires the username).
+        /// Defaults к `git` для PAT auth which works
+        /// across most providers.
+        #[arg(long, default_value = "git")]
+        username: String,
+        /// Token / password. Required. Reads из stdin via
+        /// `inquire::Password` (masked entry) когда
+        /// omitted и stdin is а TTY; required as flag в
+        /// non-interactive shells.
+        #[arg(long, env = "APPRAFTER_REPO_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Skip provider-specific token format regex check
+        /// (GitHub: `github_pat_*` / `ghp_*`; GitLab:
+        /// `glpat-*`). Useful для self-hosted Gitea / Forgejo
+        /// where token formats are arbitrary.
+        #[arg(long = "no-validate", default_value_t = false)]
+        no_validate: bool,
+    },
+    /// List registered creds.
+    #[command(alias = "ls")]
+    List,
+    /// Show а creds entry; token is masked.
+    Show {
+        /// Creds name (as listed via `repo creds list`).
+        name: String,
+    },
+    /// Rotate а creds entry's token in-place. Patches the
+    /// existing Secret rather than recreating it — Argo CD
+    /// repo-server holds а cached reference к the Secret's
+    /// resourceVersion и а recreate would cause а brief
+    /// reconnect window.
+    Rotate {
+        /// Creds name.
+        name: String,
+        /// New token. Reads from stdin (masked) when
+        /// omitted и stdin is а TTY.
+        #[arg(long, env = "APPRAFTER_REPO_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Skip token format validation. См. `repo creds add
+        /// --no-validate`.
+        #[arg(long = "no-validate", default_value_t = false)]
+        no_validate: bool,
+    },
+    /// Delete а creds entry. Refuses by default когда
+    /// Applications depending на the `urlPrefix` are
+    /// registered; `--force` overrides.
+    #[command(alias = "rm")]
+    Remove {
+        /// Creds name.
+        name: String,
+        /// Skip confirmation + the dependency check.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Skip confirmation prompt только (still runs
+        /// dependency check).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

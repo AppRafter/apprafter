@@ -19,6 +19,7 @@ pub mod migration;
 pub mod open;
 pub mod plan;
 pub mod platform;
+pub mod repo_creds;
 pub mod status;
 pub mod target;
 pub mod target_wizard;
