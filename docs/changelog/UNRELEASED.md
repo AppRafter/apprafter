@@ -13,6 +13,94 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.151 — M1.5 walk-fix #4 post-B.1.79a — version_check picks wrong tag series (2026-05-24)
+
+### Symptom
+
+User ran `apprafter` (binary built from v0.1.142) after v0.1.150
+GitHub Release went live; courtesy banner stayed silent.
+Inspected the cache:
+
+```
+$ cat ~/.cache/apprafter/version-check.json
+{"latest_tag":"platform-stack/v0.1.38","fetched_at_secs":1779577658}
+```
+
+The cached `latest_tag` is а chart-stream tag, not а CLI
+version. `Version::parse("platform-stack/v0.1.38")` fails
+silently; `newer_than` returns `false`; banner suppressed.
+
+### Root cause
+
+The monorepo publishes **four** release streams via separate
+workflows:
+
+| Stream | Tag shape | Workflow |
+|---|---|---|
+| Canonical CLI | `v0.1.150` | `release-cli.yml` |
+| Chart | `platform-stack/v0.1.38` | `platform-stack-publish.yml` |
+| Landing site | `landing-v0.1.2` | `release-landing.yml` |
+| Argo CD CMP | `argocd-cue-cmp/v0.1.1` | `argocd-cue-cmp-publish.yml` |
+
+The `/releases/latest` API endpoint returns the most recently
+CREATED release across all four streams — not the latest CLI
+release. v0.1.149's `version_check` polled `/releases/latest`,
+took the chart-stream tag at face value, and `trim_start_matches
+('v')` didn't touch the `platform-stack/` prefix. The semver
+parse silently failed and the banner went quiet.
+
+### Fix
+
+Switch the endpoint to `/releases?per_page=30` (newest-first
+array). New pure helper `pick_canonical_cli_tag(releases)`
+walks the array и returns the first `tag_name` whose stripped
+form parses as а canonical `semver::Version`. All four
+prefixed streams fail `Version::parse` naturally — no
+explicit prefix denylist needed.
+
+Cache also gains а defensive validation step:
+`read_fresh_cache` re-parses the cached `latest_tag` as
+semver and treats а non-semver value as а cache miss. This
+clears leftover garbage from pre-fix caches without making
+operators delete the file by hand on first run of the new
+binary.
+
+### TTL reduction
+
+Cache TTL drops from 24h к 6h. The project is in active daily
+development; а 6h dial keeps operators current without burning
+GitHub API quota on every shell command.
+
+### Tests
+
++8 new unit tests covering every prefix permutation +
+edge cases; total `version_check` module: 4 → 13.
+
+- `canonicalise_cli_tag_strips_v_prefix_for_canonical_semver`
+- `canonicalise_cli_tag_rejects_platform_stack_prefix` —
+  load-bearing: this is the exact case that broke the
+  banner on the v0.1.150 walk.
+- `canonicalise_cli_tag_rejects_landing_prefix`
+- `canonicalise_cli_tag_rejects_argocd_cue_cmp_prefix`
+- `canonicalise_cli_tag_rejects_empty_and_garbage`
+- `pick_canonical_cli_tag_skips_prefixed_tags` — happy
+  path on а realistic mixed-stream release window.
+- `pick_canonical_cli_tag_returns_none_when_no_canonical_in_window`
+  — pathological case (no CLI tag in the recent 30 releases);
+  banner stays silent without surprise.
+- `pick_canonical_cli_tag_handles_malformed_release_objects`
+  — defensive: missing/null/empty `tag_name` fields skipped
+  rather than crashing.
+- `pick_canonical_cli_tag_returns_none_for_non_array` — old
+  endpoint returned а single object; defensive coverage for
+  future schema drift.
+
+### Versioning
+
+CLI 0.1.150 → 0.1.151. Chart unchanged.
+
+---
+
 ## v0.1.150 — M1.5 walk-fix #3 post-B.1.79a — release-cli workflow CUE install (2026-05-24)
 
 ### Symptom
