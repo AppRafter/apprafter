@@ -58,10 +58,19 @@ Error: apprafter::io::error
 ```
 
 `std::fs::rename` is a single syscall and fails with EXDEV
-when source and destination cross filesystems. The
-operator's `/projects/...` lives on a separate device from
-`$HOME` (NixOS workstation), so the legacy → per-target
-move hit EXDEV.
+whenever source and destination cross **any** mount-point
+boundary — not just different physical partitions. Common
+causes on Linux: btrfs subvolumes mounted at separate paths
+on the same fs (NixOS lays out `/`, `/home`, `/projects` as
+sibling subvolumes of one btrfs); ZFS datasets in one pool
+mounted at separate points; bind mounts; overlay / fuse
+mounts. All return EXDEV on rename across the boundary even
+when the bytes physically live on the same block device.
+
+The operator's `/projects/...` and `$HOME` lived on the
+same partition but different mount points (NixOS btrfs
+subvolume layout), so the legacy → per-target move hit
+EXDEV anyway.
 
 ### Fix
 

@@ -273,18 +273,32 @@ pub fn migrate_legacy_state_if_present(
 }
 
 /// `std::fs::rename` is a single syscall and fails with EXDEV
-/// (`os error 18` on Linux + macOS) when source and destination
-/// live on different filesystems. The migration helper crosses
-/// filesystems by design — the legacy file lives in the
-/// operator's project dir (often /projects, /work, etc., a
-/// separate mount) while the per-target slot lives under
-/// `~/.config` (typically on the home partition). When the
-/// rename hits EXDEV, fall back to copy + remove so the move
-/// still completes.
+/// (`os error 18` on Linux + macOS) whenever source and
+/// destination cross **any** mount-point boundary — not just
+/// different physical partitions. Common causes on a modern
+/// Linux box:
 ///
-/// Walk-fix v0.1.156: operator on NixOS with `/projects` on a
-/// separate device hit `Invalid cross-device link (os error 18)`
-/// during migration. Pure `fs::rename` had no fallback.
+///   - btrfs subvolumes mounted at separate paths on the same
+///     underlying device (NixOS often lays out `/`, `/home`,
+///     `/projects`, `/nix` as sibling subvolumes of one fs).
+///   - ZFS datasets in the same pool surfaced at separate
+///     mount points.
+///   - bind mounts (`/var/lib/foo` bind-mounted from
+///     `/mnt/data/foo`, etc.).
+///   - overlay / fuse mounts (devcontainer projects, sshfs).
+///
+/// All of those return EXDEV on rename even when the bytes
+/// physically live on the same block device. The migration
+/// helper crosses these boundaries by design — the legacy
+/// file lives in the operator's project dir while the
+/// per-target slot lives under `~/.config`, and the two
+/// almost always cross at least one of the above.
+///
+/// Walk-fix v0.1.156: operator on NixOS hit `Invalid cross-
+/// device link (os error 18)` during migration even though
+/// the source and destination were on the same partition —
+/// just different mount points. Pure `fs::rename` had no
+/// fallback.
 ///
 /// Returns the original `io::Error` for any non-EXDEV failure,
 /// since those usually indicate a real problem (permission,
