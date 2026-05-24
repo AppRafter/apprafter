@@ -2,55 +2,182 @@
 name: release-operator
 
 # Builds and pushes the AppRafter operator + admission-webhook
-# container images to ghcr.io on every `v0.*` / `v1.*` tag, plus
-# on demand via `workflow_dispatch`. Uses the auto-provided
-# `GITHUB_TOKEN` — no PAT or external secrets required.
+# container images + Helm charts on operator changes. Mirrors
+# the path-filtered + per-stream-tag pattern used by
+# `platform-stack-publish.yml` and `argocd-cue-cmp-publish.yml`.
 #
-# First push of each package creates it as private. Operators
-# wanting a no-imagePullSecret pull (the tier-1 default that
-# `cluster-bootstrap` assumes) flip visibility to public via the
-# GitHub UI once: Packages → <package> → Settings → Change
-# visibility → Public. This is a one-shot UI action; subsequent
-# tag pushes update the existing public package.
+# ## Trigger discipline
 #
-# Security note: every dynamic value (`github.ref_name`,
-# `github.repository_owner`, `github.actor`) is consumed only as
-# an input to docker/login-action / docker/build-push-action —
-# never interpolated into a shell `run:` command. The one shell
-# step ("Compute lowercase image base") consumes
-# `github.repository_owner` via an `env:` binding rather than
+# Walk-fix post-v0.1.156 (operator question: "почему сейчас я
+# сделал пуш и запустились 5 воркфлоу, они все нужны были
+# разве?"): until now the workflow triggered on every `v0.*` /
+# `v1.*` tag push — the canonical CLI tag stream — even when
+# the operator binary itself hadn't changed since the last
+# release. Every CLI release silently rebuilt and re-pushed
+# identical operator + webhook images under а new tag,
+# burning CI minutes and ghcr.io storage without producing
+# any consumer-visible delta (the chart's
+# `RELEASED_OPERATOR_VERSION` constant stayed pinned at the
+# old version).
+#
+# New trigger: master push when files under `operator/**`
+# change, plus `workflow_dispatch` for manual re-runs. CLI tag
+# pushes no longer wake this workflow; pushes that don't touch
+# `operator/` no longer wake it; pushes that touch a chart
+# YAML without bumping operator code wake it but skip publish
+# via the gate below (same image already on ghcr.io). Net
+# result: the workflow runs roughly once per operator-binary
+# version bump, not once per push.
+#
+# ## Tag stream
+#
+# Operator releases live on their own `operator/v<appVersion>`
+# tag series (matches `platform-stack/v*` and
+# `argocd-cue-cmp/v*` style). `appVersion` comes from the
+# operator chart's `Chart.yaml` and is the SoT for the image
+# tag. Bumping the chart's appVersion is the operator-side
+# equivalent of bumping `cli/Cargo.toml` `workspace.package.
+# version` for а CLI release.
+#
+# The publish job creates the `operator/v<appVersion>` git
+# tag itself via `gh release create` at the end of а
+# successful run — operators must NOT pre-emptively `git tag`
+# the value locally (that would trip the "tag exists" gate
+# and skip publish — see `argocd-cue-cmp-publish.yml`'s
+# equivalent walk-fix v0.1.154).
+#
+# ## Detect gate
+#
+# `detect` reads `operator/charts/apprafter-operator/
+# Chart.yaml` `appVersion`, computes the tag, and checks
+# TWO axes:
+#
+#   1. Git tag `operator/v<appVersion>` exists on origin.
+#   2. Operator image at `ghcr.io/<owner>/apprafter-operator:
+#      v<appVersion>` exists.
+#
+# BOTH must be present to skip publish. Either being absent
+# triggers the build — recovers from the walk-found scenario
+# where а tag was created without а matching image push (or
+# vice versa).
+#
+# ## First push of each package
+#
+# First push creates the ghcr package as private. Operators
+# wanting а no-imagePullSecret pull (the tier-1 default that
+# `cluster-bootstrap` assumes) flip visibility to public via
+# the GitHub UI once: Packages → <package> → Settings →
+# Change visibility → Public. This is а one-shot UI action;
+# subsequent runs update the existing public package.
+#
+# ## Security
+#
+# Every dynamic value (`github.repository_owner`,
+# `github.actor`) is consumed only as an input to
+# docker/login-action / docker/build-push-action — never
+# interpolated into а shell `run:` command. The detect job's
+# shell step consumes inputs via `env:` bindings rather than
 # direct expression substitution, which is the documented
-# anti-injection pattern. So the action-injection class of risks
-# does not apply.
-#
-# Why the lowercase shim: docker registry repository names MUST
-# be lowercase, but `${{ github.repository_owner }}` preserves
-# the org's display casing (e.g. `AppRafter`). GitHub Actions
-# does not provide a built-in `toLower` expression function, so
-# a shell `tr '[:upper:]' '[:lower:]'` step computes the
-# lowercase base once per job and exposes it via outputs.
-#
-# Image references after a successful run:
-#
-#   ghcr.io/<owner-lowercased>/apprafter-operator:<tag>
-#   ghcr.io/<owner-lowercased>/apprafter-operator:latest
-#   ghcr.io/<owner-lowercased>/apprafter-admission-webhook:<tag>
-#   ghcr.io/<owner-lowercased>/apprafter-admission-webhook:latest
+# anti-injection pattern.
 
 on:
   push:
-    tags:
-      - 'v0.*'
-      - 'v1.*'
+    branches: [master]
+    paths:
+      - 'operator/**'
+      - '.github/workflows/release-operator.yml'
   workflow_dispatch: {}
 
 permissions:
-  contents: read
-  packages: write
+  contents: write   # create GitHub Release + tag
+  packages: write   # push to ghcr.io
 
 jobs:
+  detect:
+    name: resolve appVersion + check if publish needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve appVersion from operator chart
+        id: version
+        env:
+          CHART_FILE: operator/charts/apprafter-operator/Chart.yaml
+        run: |
+          # The operator + webhook charts share the same
+          # appVersion (the chart Chart.yaml files are kept in
+          # lockstep by hand). Reading from one is enough.
+          app_version=$(grep '^appVersion:' "$CHART_FILE" \
+              | awk '{print $2}' | tr -d '"')
+          if [[ -z "${app_version:-}" ]]; then
+            echo "::error::failed to extract appVersion from $CHART_FILE"
+            exit 1
+          fi
+          # Tag form mirrors platform-stack/v* etc. Always
+          # carries the `v` prefix so image tag and git tag
+          # match by construction.
+          # Strip leading `v` from appVersion when the chart
+          # author included one — recover the bare semver
+          # before re-prefixing — so `appVersion: "v0.1.134"`
+          # and `appVersion: 0.1.134` both produce the same
+          # `operator/v0.1.134` tag.
+          app_version="${app_version#v}"
+          tag="operator/v${app_version}"
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved appVersion=$app_version, tag=$tag"
+
+      - name: Check whether version is already published
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          TAG: ${{ steps.version.outputs.tag }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          # Two-axis gate (mirrors argocd-cue-cmp-publish.yml
+          # walk-fix v0.1.154): the published version requires
+          # BOTH the git tag AND the operator + webhook images
+          # on ghcr.io. Tag-alone is insufficient — а manually
+          # pushed tag without a build leaves the chart pinning
+          # а phantom image. Default к "publish" on any
+          # uncertainty.
+          tag_exists=false
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            tag_exists=true
+          fi
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          operator_image="ghcr.io/${owner_lc}/apprafter-operator:v${APP_VERSION}"
+          webhook_image="ghcr.io/${owner_lc}/apprafter-admission-webhook:v${APP_VERSION}"
+          echo "${GH_TOKEN}" | docker login ghcr.io \
+              -u "${GITHUB_ACTOR}" --password-stdin >/dev/null
+          operator_image_exists=false
+          webhook_image_exists=false
+          if docker manifest inspect "${operator_image}" >/dev/null 2>&1; then
+            operator_image_exists=true
+          fi
+          if docker manifest inspect "${webhook_image}" >/dev/null 2>&1; then
+            webhook_image_exists=true
+          fi
+          if [[ "$tag_exists" == "true" && "$operator_image_exists" == "true" && "$webhook_image_exists" == "true" ]]; then
+            echo "::notice::All three exist (tag ${TAG}, ${operator_image}, ${webhook_image}) — skipping publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::tag_exists=${tag_exists}, operator_image_exists=${operator_image_exists}, webhook_image_exists=${webhook_image_exists} — proceeding to publish."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   operator:
     name: build apprafter-operator
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -82,7 +209,7 @@ jobs:
           file: operator/apprafter-operator/Dockerfile
           push: true
           tags: |
-            ${{ steps.image-base.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.image-base.outputs.image }}:v${{ needs.detect.outputs.app_version }}
             ${{ steps.image-base.outputs.image }}:latest
           # Tier-1 substrate is x86 only (Hetzner CPX22).
           # Multi-arch (arm64 for Hetzner CAX*) lands when
@@ -95,6 +222,8 @@ jobs:
 
   admission-webhook:
     name: build admission-webhook
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -126,7 +255,7 @@ jobs:
           file: operator/admission-webhook/Dockerfile
           push: true
           tags: |
-            ${{ steps.image-base.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.image-base.outputs.image }}:v${{ needs.detect.outputs.app_version }}
             ${{ steps.image-base.outputs.image }}:latest
           platforms: linux/amd64
           cache-from: type=gha,scope=admission-webhook
@@ -136,24 +265,22 @@ jobs:
     name: package + push helm charts
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [operator, admission-webhook]
+    needs: [detect, operator, admission-webhook]
+    if: needs.detect.outputs.should_publish == 'true'
 
     # Why publish the helm charts here instead of a standalone
     # workflow: the chart references the operator + webhook
-    # container images by version, and a walk-fix that bumps
-    # the chart version is meaningful only if the matching
-    # image exists. Coupling the chart publish to the same
-    # workflow that pushes the images keeps the two in
-    # lockstep — image build fails, chart isn't pushed.
+    # container images by version, and bumping the chart
+    # version is meaningful only if the matching image exists.
+    # Coupling the chart publish to the same workflow that
+    # pushes the images keeps the two in lockstep — image
+    # build fails, chart isn't pushed.
     #
-    # The chart version comes from Chart.yaml (NOT from
-    # github.ref_name). The platform-stack chart pins each
-    # operator chart to a specific version (e.g. v0.1.91)
-    # that may lag the current monorepo tag — every CLI tag
-    # push therefore re-publishes the same chart version,
-    # which GHCR's OCI registry tolerates (mutable tags by
-    # default). Bumping the chart version is a separate,
-    # intentional edit to operator/charts/<chart>/Chart.yaml.
+    # The chart's `version` field (not `appVersion`) comes
+    # from Chart.yaml. The platform-stack chart pins each
+    # operator chart to а specific version (e.g. v0.1.115).
+    # Bumping the chart version is а separate, intentional
+    # edit alongside the appVersion bump.
 
     steps:
       - uses: actions/checkout@v4
@@ -198,3 +325,62 @@ jobs:
                      | awk '{print $2}')
           helm package "$chart_dir" --destination /tmp
           helm push "/tmp/apprafter-admission-webhook-${version}.tgz" "$OCI"
+
+  release:
+    name: create GitHub Release + operator/v<appVersion> tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [detect, operator, admission-webhook, helm-charts]
+    if: needs.detect.outputs.should_publish == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release + tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          APP_VERSION: ${{ needs.detect.outputs.app_version }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          operator_image="ghcr.io/${owner_lc}/apprafter-operator:v${APP_VERSION}"
+          webhook_image="ghcr.io/${owner_lc}/apprafter-admission-webhook:v${APP_VERSION}"
+          notes_file=$(mktemp)
+          cat > "$notes_file" <<EOF
+          ## apprafter-operator + admission-webhook ${APP_VERSION}
+
+          Operator + admission-webhook container images and
+          Helm charts. Mounted into the platform-stack chart via
+          the chart's `_components` map.
+
+          ### Pull
+
+          \`\`\`sh
+          docker pull ${operator_image}
+          docker pull ${webhook_image}
+          \`\`\`
+
+          Source: [\`operator/\`](https://github.com/${REPO}/tree/${TAG}/operator).
+          EOF
+          # Recovery path: if the git tag already exists on
+          # origin without а matching release (operator pushed
+          # а local tag eagerly before the workflow ran, gate
+          # saw the tag and skipped, the workflow was re-triggered
+          # by another path), reset the release entry cleanly.
+          # `gh release create --target $SHA` errors when the
+          # tag already exists; drop `--target` in that case so
+          # gh anchors the release к the existing tag's SHA.
+          release_args=()
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::Tag ${TAG} already on origin — recovering via release re-create."
+            gh release delete "$TAG" --yes 2>/dev/null || true
+          else
+            release_args+=(--target "$SHA")
+          fi
+          gh release create "$TAG" \
+            --title "apprafter-operator ${APP_VERSION}" \
+            --notes-file "$notes_file" \
+            "${release_args[@]}"
