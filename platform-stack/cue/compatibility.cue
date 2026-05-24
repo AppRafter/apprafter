@@ -1658,6 +1658,98 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #5b post-B.1.79a — argocd-cue-cmp entrypoint
+// accepts both source-layout styles. Walk-fix #5 (chart
+// 0.1.42, cue-cmp v0.1.2) added jq-based enumeration of
+// top-level k8s-shaped values for source files using the
+// named-wrapper convention (`landingWeb: v1alpha1.
+// #Application & { ... }`). Argo CD's own CMP-check
+// smoke test fixture, however, uses the **unwrapped**
+// convention — `apiVersion + kind + metadata + spec`
+// declared directly at package scope:
+//
+//   ```cue
+//   package app
+//   apiVersion: "apprafter.io/v1alpha1"
+//   kind:       "Application"
+//   metadata: name: "hello"
+//   spec: image: "..."
+//   ```
+//
+// For style A the top-level JSON itself IS the manifest;
+// the v0.1.2 entrypoint's key-enumeration logic skipped
+// it because `apiVersion` / `kind` themselves aren't
+// objects-with-`apiVersion`+`kind` — fell through к the
+// "no manifests" branch, smoke test failed с
+// `entrypoint did not render Application kind`.
+//
+// Fix: dispatch on whether the top-level JSON object
+// carries `apiVersion` + `kind`. Style A — emit `cue
+// export ./... --out yaml` verbatim. Style B — fall
+// through к the existing per-key enumeration logic.
+//
+// argocd-cue-cmp v0.1.2 → v0.1.3. Chart pin tracks через
+// the CUE import.
+compatibility: "0.1.43": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #5b — entrypoint accepts both unwrapped
+		и named-wrapper CUE source layouts.
+
+		**Symptom.** v0.1.42 chart + cue-cmp v0.1.2 CI
+		`argocd-cue-cmp-check` smoke test failed:
+
+			```
+			Error: entrypoint did not render Application kind
+			Exception: Process completed with exit code 1.
+			```
+
+		**Root cause.** The smoke fixture writes apiVersion,
+		kind, metadata, spec directly at package scope —
+		CUE export emits the whole package as ONE flat JSON
+		object. v0.1.2 entrypoint's logic walked
+		`to_entries[]` looking for nested objects-with-
+		apiVersion+kind; `apiVersion` and `kind` themselves
+		weren't objects, so the filter rejected everything
+		и the loop exited без emitting anything.
+
+		**Fix.** Dispatch before enumeration:
+
+		  ```sh
+		  is_top_level_manifest=$(jq -r '
+		    if (type == "object" and has("apiVersion") and
+		        has("kind"))
+		    then "yes" else "no" end' "$json_out")
+		  if [ "$is_top_level_manifest" = "yes" ]; then
+		    echo "---"
+		    cue export ./... --out yaml
+		    exit 0
+		  fi
+		  # else fall through to per-key enumeration ...
+		  ```
+
+		Style A — single manifest, emit verbatim. Style B
+		(`landingWeb: …`) — existing per-key logic. Both
+		verified locally against `/tmp/cue-smoke/apprafter/
+		Application.cue` (style A) и
+		`landing/web/apprafter/` (style B); each emits
+		well-formed YAML stream с `apiVersion:` at the top
+		level of every doc.
+
+		**Image bump.** `argocd-cue-cmp/version.cue` v0.1.2
+		→ v0.1.3; chart pin follows automatically.
+
+		Rendered chart vs 0.1.42: image tag pin bumped from
+		v0.1.2 → v0.1.3. No other manifest changes.
+		"""
+	references: [
+		"docs/adr/0029-cue-cmp.md",
+		"argocd-cue-cmp/entrypoint.sh",
+		"docs/changelog/UNRELEASED.md#v01153",
+	]
+}
+
 // Walk-fix #5 post-B.1.79a — argocd-cue-cmp emits flat k8s
 // manifest stream. Chart 0.1.41 shipped the cue-cmp sidecar
 // embedded в the argocd subchart, but the sidecar's

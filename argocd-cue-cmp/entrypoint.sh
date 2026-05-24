@@ -79,13 +79,60 @@ if ! cue export ./... --out json >"$json_out" 2>"$err_out"; then
     exit 1
 fi
 
-# Enumerate top-level keys whose value is a k8s-shaped
-# object (`apiVersion` + `kind` set). Unsorted iteration
-# preserves CUE's declaration order, which matches operator
-# expectations when scanning the rendered manifest stream.
+# Two source-layout conventions are accepted:
 #
-# `--raw-output` strips the JSON quoting so each line is a
-# bare key the `for` loop reads cleanly.
+#   A) **Unwrapped**: the package's top-level fields ARE
+#      the manifest — `apiVersion` + `kind` + `metadata` +
+#      `spec` declared directly at package scope. Common
+#      for single-resource files.
+#
+#      ```cue
+#      package app
+#      apiVersion: "apprafter.io/v1alpha1"
+#      kind:       "Application"
+#      metadata: name: "hello"
+#      spec: image: "..."
+#      ```
+#
+#   B) **Named wrapper(s)**: each top-level field is a
+#      complete manifest under а readable name. Required
+#      for multi-resource files (a single CUE file declares
+#      `landingWeb: …`, `landingWebPreview: …` side-by-side).
+#
+#      ```cue
+#      package apprafter
+#      landingWeb: v1alpha1.#Application & { ... }
+#      landingWebPreview: v1alpha1.#Application & { ... }
+#      ```
+#
+# `cue export` emits style A as а bare `{apiVersion, kind,
+# metadata, spec}` JSON object. Style B emits the same with
+# the manifest nested under а field key. We dispatch on
+# whether the top-level JSON itself carries `apiVersion`
+# + `kind`.
+is_top_level_manifest=$(jq -r '
+    if (type == "object" and has("apiVersion") and has("kind"))
+    then "yes" else "no" end' "$json_out")
+
+if [ "$is_top_level_manifest" = "yes" ]; then
+    # Style A — single manifest, emit verbatim. Re-run cue
+    # export with `--out yaml` (instead of round-tripping the
+    # captured JSON through yq) so the output matches what
+    # operators get when they run `cue export ./...` locally;
+    # consistent surface beats one fewer subprocess.
+    echo "---"
+    cue export ./... --out yaml
+    exit 0
+fi
+
+# Style B — enumerate top-level keys whose value is а k8s-
+# shaped object (`apiVersion` + `kind` set). Unsorted
+# iteration preserves CUE's declaration order, which
+# matches operator expectations when scanning the rendered
+# manifest stream.
+#
+# `--raw-output` strips JSON quoting so each line is а bare
+# key the `for` loop reads cleanly.
 keys=$(jq --raw-output \
     'to_entries[]
      | select(.value | type == "object" and has("apiVersion") and has("kind"))
@@ -93,10 +140,10 @@ keys=$(jq --raw-output \
 
 if [ -z "$keys" ]; then
     # No k8s manifests in the source. Argo CD treats empty
-    # output as "no resources to sync" — which is the right
-    # behaviour when the user's path doesn't carry any
-    # AppRafter / Argo CD resources (e.g. they pointed `path`
-    # at a directory that only has supporting CUE).
+    # output as "no resources to sync" — the right behaviour
+    # when the user's path doesn't carry any AppRafter /
+    # Argo CD resources (e.g. they pointed `path` at а
+    # directory that only has supporting CUE).
     exit 0
 fi
 
@@ -108,12 +155,8 @@ fi
 # well-formed even when only one manifest is present
 # (operators reading the rendered output get a consistent
 # shape).
-first_doc=1
 echo "$keys" | while IFS= read -r key; do
     [ -z "$key" ] && continue
-    if [ "$first_doc" -eq 1 ]; then
-        first_doc=0
-    fi
     echo "---"
     if ! cue export ./... -e "$key" --out yaml 2>"$err_out"; then
         # Surface the per-key error к stderr so operators can

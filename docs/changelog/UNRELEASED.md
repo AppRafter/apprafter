@@ -13,6 +13,95 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.153 — M1.5 walk-fix #5b post-B.1.79a — cue-cmp entrypoint accepts both source layouts (2026-05-24)
+
+### Symptom
+
+v0.1.152 push triggered the `argocd-cue-cmp-check` CI
+workflow; the `Entrypoint smoke (cue export of a tiny
+fixture)` step failed:
+
+```
+Run mkdir -p /tmp/cue-smoke/apprafter
+Error: entrypoint did not render Application kind
+--- captured output ---
+
+Error: Process completed with exit code 1.
+```
+
+### Root cause
+
+The smoke fixture writes the manifest **unwrapped** at
+package scope:
+
+```cue
+package app
+apiVersion: "apprafter.io/v1alpha1"
+kind:       "Application"
+metadata: name: "hello"
+spec: image: "..."
+```
+
+`cue export ./... --out json` emits the whole package as а
+flat object `{apiVersion, kind, metadata, spec}`. The
+walk-fix #5 entrypoint enumerated `to_entries[]` looking
+for **nested** objects with `apiVersion + kind`; the
+top-level `apiVersion` is а string, not an object, so the
+filter rejected everything и the loop exited without
+emitting anything.
+
+Two legitimate CUE source layouts:
+
+- **A) Unwrapped** — package scope IS the manifest. Common
+  for single-resource files.
+- **B) Named wrapper(s)** — each top-level field is а
+  manifest under а readable name. Required for multi-
+  resource files (one file declares `landingWeb: …`,
+  `landingWebPreview: …`).
+
+Walk-fix #5 handled only B; the smoke fixture uses A.
+
+### Fix
+
+Dispatch before enumeration: if the top-level JSON object
+itself carries `apiVersion + kind`, emit `cue export ./...
+--out yaml` verbatim (style A). Otherwise fall through к
+the existing per-key enumeration logic (style B).
+
+```sh
+is_top_level_manifest=$(jq -r '
+    if (type == "object" and has("apiVersion") and has("kind"))
+    then "yes" else "no" end' "$json_out")
+
+if [ "$is_top_level_manifest" = "yes" ]; then
+    echo "---"
+    cue export ./... --out yaml
+    exit 0
+fi
+
+# style B per-key enumeration as before...
+```
+
+### Verification
+
+Local re-runs against both fixtures:
+
+- `/tmp/cue-smoke/apprafter/Application.cue` (style A) →
+  single YAML doc с `apiVersion` at the top level.
+- `landing/web/apprafter/` (style B) → two YAML docs
+  (landing-web + landing-web-preview), `---` separator
+  between them.
+
+### Versioning
+
+- `argocd-cue-cmp` v0.1.2 → v0.1.3 (publish workflow
+  auto-fires on the new tag).
+- platform-stack chart 0.1.42 → 0.1.43 — picks up new
+  image tag через CUE import.
+- CLI 0.1.152 → 0.1.153.
+
+---
+
 ## v0.1.152 — M1.5 walk-fix #5 post-B.1.79a — argocd-cue-cmp emits flat manifest stream (2026-05-24)
 
 ### Symptom
