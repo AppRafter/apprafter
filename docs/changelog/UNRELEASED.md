@@ -13,6 +13,96 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.137 — M1.5 Track B.1.79a part 1 — AppProjects + per-component project (2026-05-22)
+
+### What landed
+
+Three new Argo CD `AppProject` resources в the platform-stack
+chart plus а new `#Component.project` field that defaults к
+`"platform"`. Sets up the structural foundation для
+`apprafter app` / `apprafter repo creds` (lands в follow-up
+patches) и future Phase 4 AccessGrant enforcement.
+
+### Chart surface
+
+`_loaderValues.argocd.values.configs.projects` теперь объявляет
+**4** AppProjects (бывший single-entry `default`):
+
+- **`platform`** — chart-managed platform components (cilium,
+  argocd self-adopt, cert-manager, network-policies,
+  apprafter-operator, admission-webhook, backstage,
+  argocd-cue-cmp). `destinations: server:
+  https://kubernetes.default.svc, namespace: *`. Все
+  resource-whitelist'ы открыты — platform нужно создавать
+  cluster-scoped objects (CRDs, ClusterRoles, etc.).
+- **`platform-providers`** — для ServiceProvider operators
+  (CNPG, Dragonfly, NATS, Kamaji…) которые лендятся в Phase 2+.
+  Project заводится сейчас (а не лениво в Phase 2), чтобы
+  селектор в UI показывал его сразу после bootstrap'а.
+- **`apps`** — для пользовательских Applications
+  зарегистрированных через `apprafter app add`. Ужесточено:
+  `destinations.server` лочен на in-cluster API,
+  `clusterResourceWhitelist: []` (юзеры не создают
+  cluster-scoped ресурсы), `namespaceResourceWhitelist`
+  ограничен `apprafter.io/Application` + `ConfigMap` +
+  `Secret` + `gateway.networking.k8s.io/HTTPRoute`.
+- **`default`** — сохранён как legacy + ad-hoc fallback для
+  Applications которые операторы применят руками вне
+  платформенного pipeline'а.
+
+`#Component.project: string | *"platform"` (DNS-1123
+constrained, default `"platform"`). Render template emits
+`spec.project: {{ default "platform" $component.project | quote }}`
+per Application. Все текущие компоненты наследуют дефолт →
+land в `platform` project.
+
+### CLI surface
+
+`cluster_bootstrap::render_root_application` теперь рендерит
+bootstrap "platform" Application с `spec.project: platform`
+вместо `default`. Safe потому что AppProject `platform`
+ships в initial Argo CD install (через `loader_values`).
+
+### RBAC и enforcement
+
+AppProject sourceRepos / destinations / resourceWhitelists
+сейчас выполняют **визуальную** роль (UI selector в Argo CD
+группирует Applications по project) плюс кладут структурный
+фундамент для будущего Phase 4 RBAC enforcement через
+AccessGrant. В M1.5 они НЕ блокируют sync — у `platform`
+sourceRepos: ["*"], у `apps` whitelist тоже не enforce'ится
+ни kube apiserver'ом ни AccessGrant'ом которого пока нет.
+
+### Upgrade impact
+
+Operators upgrading 0.1.39 → 0.1.40 see every chart-managed
+Application drift `spec.project` from `default` to
+`platform`. Argo CD reconciles via the normal sync path —
+metadata-only change, no pod restart, no resource churn. The
+root platform Application also drifts (CLI loader re-renders
+on the next `apprafter cluster-bootstrap` или `bootstrap-all`
+invocation).
+
+### Tests
+
++1 regression unit test:
+`render_root_application_joins_platform_app_project` —
+asserts the CLI loader's root Application carries
+`project: platform` и **не** carries `project: default`.
+
+### Versioning
+
+CLI 0.1.136 → 0.1.137; platform-stack chart 0.1.39 → 0.1.40.
+Operator chart unchanged (no operator-binary delta).
+
+### References
+
+- ADR 0025 (Argo CD).
+- ADR 0026 (PlatformStack CRD).
+- `plan.md` §1.79a.
+
+---
+
 ## v0.1.136 — M1.5 walk-fix #1 post-B.1.79 — `apprafter open argocd` SIGPIPE early-exit (2026-05-22)
 
 ### Symptom

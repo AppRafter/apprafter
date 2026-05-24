@@ -393,7 +393,14 @@ metadata:
   name: platform
   namespace: argocd
 spec:
-  project: default
+  # Track B.1.79a (chart 0.1.40): root platform Application
+  # joins the dedicated `platform` AppProject. Project ships
+  # с initial Argo CD install через
+  # `_loaderValues.argocd.values.configs.projects.platform`,
+  # so it exists by the time this manifest is applied. Legacy
+  # `default` project stays around для ad-hoc Applications
+  # operators apply outside of `apprafter app add`.
+  project: platform
   source:
     repoURL: "{repo_url}"
     chart: {chart_name}
@@ -817,6 +824,31 @@ mod tests {
         // component. Critical for upgrades.
         assert!(yaml.contains("prune: true"));
         assert!(yaml.contains("selfHeal: true"));
+    }
+
+    #[test]
+    fn render_root_application_joins_platform_app_project() {
+        // Track B.1.79a chart 0.1.40 — root Application is а
+        // platform-internal resource и должна жить в
+        // `platform` AppProject (declared в
+        // `_loaderValues.argocd.values.configs.projects` so it
+        // exists в the initial Argo CD install). The legacy
+        // `default` project stays around для ad-hoc Applications
+        // operators apply outside `apprafter app add`, but the
+        // chart-managed root Application no longer references
+        // it. Regression guard: if а future refactor flips back
+        // к `default`, walks would surface "AppProject default
+        // missing → root Application Degraded" only at runtime;
+        // this test fails at unit-test time instead.
+        let yaml = render_root_application(APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, "0.1.0");
+        assert!(
+            yaml.contains("project: platform"),
+            "root Application should join the `platform` AppProject, got:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("project: default"),
+            "root Application must NOT use the legacy `default` project, got:\n{yaml}"
+        );
     }
 
     #[test]

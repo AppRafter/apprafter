@@ -116,6 +116,23 @@ package platformstack
 		syncOptions: [...string] | *["CreateNamespace=true", "ServerSideApply=true"]
 	}
 
+	// Argo CD AppProject this component's Application belongs
+	// to. Defaults to `"platform"` per Track B.1.79a — all
+	// chart-managed components are platform-internal. Tier
+	// overlays и ServiceProvider charts могут override на
+	// `"platform-providers"` (например, когда Phase 2-ы CNPG /
+	// Dragonfly / NATS компоненты лендятся в umbrella). User-
+	// app Applications проходят через `apprafter app add` и
+	// получают `project: "apps"` напрямую, не через #Component.
+	//
+	// AppProject'ы (`platform`, `platform-providers`, `apps`,
+	// + legacy `default`) объявлены в
+	// `_loaderValues.argocd.values.configs.projects`, что
+	// гарантирует их создание initial Argo CD install'ом
+	// до того как первый component'ный Application
+	// засинкается.
+	project: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$" | *"platform"
+
 	// Argo CD sync-wave for the rendered Application. Argo CD
 	// sorts Applications by `argocd.argoproj.io/sync-wave`
 	// annotation ascending; a wave starts only after the
@@ -254,7 +271,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.1.39"
+currentVersion: #Version & "0.1.40"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

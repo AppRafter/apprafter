@@ -1658,6 +1658,81 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Track B.1.79a (part 1) — AppProjects + per-component project
+// field. Chart adds three new AppProject resources alongside
+// the existing `default` one: `platform` (chart-internal
+// components), `platform-providers` (Phase 2+ ServiceProviders),
+// `apps` (user Applications via `apprafter app add`). All
+// existing components transition `spec.project: default → platform`
+// при следующем sync'е; CLI loader's root platform
+// Application также переезжает на `platform`. **Safe class** —
+// AppProject change на existing Application is а metadata-only
+// drift handled by Argo CD as а normal sync (no pod restart,
+// no resource churn).
+compatibility: "0.1.40": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Track B.1.79a part 1 — AppProjects + per-component
+		project field.
+
+		Chart surface:
+
+		* `_loaderValues.argocd.values.configs.projects` gains
+		  three AppProject entries: `platform`,
+		  `platform-providers`, `apps`. Existing `default`
+		  retained as legacy + ad-hoc fallback. All four
+		  projects ship in the initial Argo CD install so
+		  они существуют до того как любой Application
+		  ссылающийся на них впервые засинкается.
+
+		* `#Component.project: string | *"platform"` (new
+		  optional field with default). render_tool.cue
+		  template emits `spec.project: {{ component.project
+		  | default "platform" }}` per Application. All
+		  current components (cilium, argocd, cert-manager,
+		  network-policies, apprafter-operator,
+		  admission-webhook, backstage, argocd-cue-cmp)
+		  inherit the default → land in `platform` project.
+
+		CLI surface (binary v0.1.137):
+
+		* `cluster_bootstrap::render_root_application` —
+		  bootstrap "platform" Application teraz writes
+		  `spec.project: platform` instead of `default`.
+		  Safe потому что AppProject ships в initial
+		  Argo CD install (см. выше).
+
+		Upgrade impact: existing operators upgrading
+		0.1.39 → 0.1.40 see every chart-managed
+		Application drift `spec.project` from `default`
+		to `platform`. Argo CD reconciles via the normal
+		sync path; pod-level workload unaffected. The
+		root platform Application also drifts (CLI loader
+		re-renders на next `apprafter cluster-bootstrap`
+		или `bootstrap-all` invocation).
+
+		RBAC и AccessGrant enforcement через AppProject
+		не активируется в M1.5 — Phase 4 материализует
+		через AccessGrant CRD. Projects сейчас выполняют
+		визуальную роль (UI selector в Argo CD группирует
+		Applications по project), плюс кладут структурный
+		фундамент для будущего enforcement'а.
+
+		Rendered chart vs 0.1.39: only `values.yaml`
+		`configs.projects` map grows from 1 → 4 entries;
+		`templates/applications.yaml` template gains а
+		`{{ default "platform" $component.project | quote }}`
+		render. Operator + webhook binaries unchanged.
+		"""
+	references: [
+		"docs/adr/0025-argo-cd.md",
+		"docs/adr/0026-platformstack-crd.md",
+		"plan.md#179a-cli-apprepo-subcommands--appprojects",
+		"docs/changelog/UNRELEASED.md#v01137",
+	]
+}
+
 // Track B.1.79 — CLI thin wrappers + Argo CD MigrationPlan
 // Lua action. Operator binary unchanged (still v0.1.134); CLI
 // `apprafter` binary gains `platform`/`migration`/`open argocd`

@@ -76,21 +76,124 @@ _loaderValues: {
 					type:      "helm"
 					enableOCI: "true"
 				}
-				projects: default: {
-					description: "Default project — Argo CD baseline, unrestricted."
-					sourceRepos: ["*"]
-					destinations: [{
-						namespace: "*"
-						server:    "*"
-					}]
-					clusterResourceWhitelist: [{
-						group: "*"
-						kind:  "*"
-					}]
-					namespaceResourceWhitelist: [{
-						group: "*"
-						kind:  "*"
-					}]
+				projects: {
+					// `default` стартовала как единственный AppProject
+					// в чарте (v0.1.7 hotfix); сохранён как
+					// неограниченный fallback для ad-hoc Applications,
+					// которые юзеры могут применить вне платформенного
+					// chart pipeline'а. Платформенные компоненты сами
+					// переехали в `platform` в чарте 0.1.40
+					// (Track B.1.79a).
+					default: {
+						description: "Default project — Argo CD baseline, unrestricted (legacy + ad-hoc fallback)."
+						sourceRepos: ["*"]
+						destinations: [{
+							namespace: "*"
+							server:    "*"
+						}]
+						clusterResourceWhitelist: [{
+							group: "*"
+							kind:  "*"
+						}]
+						namespaceResourceWhitelist: [{
+							group: "*"
+							kind:  "*"
+						}]
+					}
+
+					// `platform` — для core platform components
+					// рендеримых umbrella chart'ом (cilium,
+					// argocd self-adopt, cert-manager, network-
+					// policies, operator, admission-webhook,
+					// backstage, argocd-cue-cmp). #Component-ы
+					// получают `project: "platform"` по дефолту.
+					// sourceRepos широкие — компоненты тянутся
+					// откуда угодно (Argo CD upstream chart с
+					// argoproj.github.io, cilium с helm.cilium.io,
+					// cert-manager с charts.jetstack.io, наш OCI
+					// pull для apprafter-operator). RBAC через
+					// AppProject не enforces в M1.5 — Phase 4
+					// материализует через AccessGrant.
+					platform: {
+						description: "Platform components — umbrella chart payload."
+						sourceRepos: ["*"]
+						destinations: [{
+							namespace: "*"
+							server:    "https://kubernetes.default.svc"
+						}]
+						clusterResourceWhitelist: [{
+							group: "*"
+							kind:  "*"
+						}]
+						namespaceResourceWhitelist: [{
+							group: "*"
+							kind:  "*"
+						}]
+					}
+
+					// `platform-providers` — для ServiceProvider
+					// operators (CNPG, Dragonfly, NATS, Kamaji…)
+					// которые приедут в Phase 2. Разделение
+					// чисто визуальное + lifecycle-категорийное:
+					// permissions те же что у `platform`. Project
+					// заводится сейчас (а не лениво в Phase 2),
+					// чтобы операторы видели его в UI selector
+					// сразу после bootstrap'а и не возникало
+					// удивления когда provider'ы посыпятся туда
+					// поштучно.
+					"platform-providers": {
+						description: "Platform service providers (CNPG, Dragonfly, NATS, Kamaji, …)."
+						sourceRepos: ["*"]
+						destinations: [{
+							namespace: "*"
+							server:    "https://kubernetes.default.svc"
+						}]
+						clusterResourceWhitelist: [{
+							group: "*"
+							kind:  "*"
+						}]
+						namespaceResourceWhitelist: [{
+							group: "*"
+							kind:  "*"
+						}]
+					}
+
+					// `apps` — для пользовательских Applications
+					// зарегистрированных через `apprafter app add`.
+					// Ужесточено по сравнению с `platform`:
+					// destinations лочены на in-cluster API
+					// server, clusterResourceWhitelist пустой
+					// (юзеры не создают cluster-scoped ресурсы),
+					// namespaceResourceWhitelist ограничен типами
+					// которые user-app может легитимно
+					// применить (`Application` + `ConfigMap` +
+					// `Secret` + `HTTPRoute`). Webhook + Argo CD
+					// RBAC сейчас не enforce'ят это (нет AccessGrant
+					// в M1.5), но whitelist уже стоит — кладёт
+					// фундамент под Phase 4 без миграции в момент
+					// его enforcement'а.
+					apps: {
+						description: "User applications registered via `apprafter app add`."
+						sourceRepos: ["*"]
+						destinations: [{
+							namespace: "*"
+							server:    "https://kubernetes.default.svc"
+						}]
+						clusterResourceWhitelist: []
+						namespaceResourceWhitelist: [{
+							group: "apprafter.io"
+							kind:  "Application"
+						}, {
+							group: ""
+							kind:  "ConfigMap"
+						}, {
+							group: ""
+							kind:  "Secret"
+						}, {
+							group: "gateway.networking.k8s.io"
+							kind:  "HTTPRoute"
+						}]
+					}
 				}
 			}
 			repoServer: replicas: 1

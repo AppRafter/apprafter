@@ -158,7 +158,7 @@ _applicationsTemplate: """
 	    apprafter.io/tier: {{ $.Values.tier | quote }}
 	    apprafter.io/channel: {{ $.Values.channel | quote }}
 	spec:
-	  project: default
+	  project: {{ default "platform" $component.project | quote }}
 	  source:
 	    repoURL: {{ $component.source.repoURL | quote }}
 	    {{- with $component.source.chart }}
