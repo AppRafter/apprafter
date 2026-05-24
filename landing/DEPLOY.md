@@ -142,6 +142,15 @@ PAYLOAD_PUBLIC_SERVER_URL=https://cms.apprafter.dev
 LANDING_CMS_PORT=3000
 LANDING_CMS_CORS_ORIGINS=https://apprafter.dev
 
+# Auto-rebuild of the static web image on content changes.
+# Generate a fine-grained PAT at
+#   github.com/settings/personal-access-tokens/new
+# scoped to the apprafter repo with permission
+#   "Repository permissions > Contents: write"
+# (or a classic PAT with `repo` scope).
+GITHUB_DISPATCH_TOKEN=<token>
+GITHUB_REPO=AppRafter/apprafter
+
 # SMTP (Resend example)
 SMTP_HOST=smtp.resend.com
 SMTP_PORT=587
@@ -177,19 +186,83 @@ The `try_files` line keeps trailing-slash routing working
 (`/privacy` and `/privacy/` both resolve), and the `handle_errors`
 block serves the prebuilt 404 page on misses.
 
-## Rebuild trigger
+## Content-driven rebuilds
 
-The site is fully static. Content changes in Payload do not
-auto-rebuild the static output — the dev-server-style live reload
-only happens locally. Two pragmatic options:
+Two tag streams cover the two flows:
 
-1. **Manual rebuild after big edits.** `ssh` to the host, run
-   `bun run build:web && rsync ... /var/www/apprafter.dev/`.
-2. **Webhook-driven rebuild.** Add a Payload `afterChange` hook on
-   each content global that POSTs to a small webhook endpoint on
-   the host (e.g. via Caddy + a tiny systemd-managed bash script)
-   which runs the rebuild script. Defer until edit cadence justifies
-   the moving piece.
+| Tag | When | Built by |
+|---|---|---|
+| `landing-vX.Y.Z` + `latest` | git tag (pinned release) | `release-landing.yml` — uses `LANDING_USE_FALLBACK=1` (no CMS required at build time) |
+| `edge` + `edge-<sha>` | Payload content edit | `rebuild-landing-web.yml` — uses `LANDING_USE_FALLBACK=0` + `LANDING_CMS_URL=https://cms.apprafter.dev` (live fetch) |
+
+`edge` is a moving tag. The deploy host pulls it on a timer.
+Recommended setup with podman:
+
+**Option A — podman auto-update (preferred).** Run the web
+container with `--label io.containers.autoupdate=registry`
+and enable the `podman-auto-update.timer` systemd unit:
+
+```sh
+sudo systemctl enable --now podman-auto-update.timer
+```
+
+`podman auto-update` polls each tagged image, pulls the new
+digest, and restarts the container if the digest changed. The
+default timer fires daily; for tighter loops drop a `[Timer]
+OnCalendar=*:0/5` override.
+
+**Option B — explicit pull cycle.** A short systemd timer:
+
+```ini
+# /etc/systemd/system/apprafter-landing-web-pull.timer
+[Unit]
+Description=Periodic pull for landing-web edge tag
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```ini
+# /etc/systemd/system/apprafter-landing-web-pull.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman pull ghcr.io/apprafter/landing-web:edge
+ExecStartPost=/bin/systemctl try-restart apprafter-landing-web.service
+```
+
+### CMS-side wiring
+
+The Payload hook lives at `landing/cms/src/hooks/notifyRebuild.ts`
+and fires on every content global's afterChange. It POSTs to
+GitHub's `repository_dispatch` API with type
+`landing-content-changed`, which the workflow listens for.
+
+For the hook to fire, set `GITHUB_DISPATCH_TOKEN` and `GITHUB_REPO`
+in `/etc/apprafter-cms.env` (see the env block above). Without
+them the hook logs a warning and skips — useful in dev.
+
+### Manual rebuild (escape hatch)
+
+```sh
+# Either trigger the workflow by hand:
+gh workflow run rebuild-landing-web.yml
+
+# Or send the dispatch event directly (mirrors what the Payload
+# hook does):
+curl -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $GITHUB_DISPATCH_TOKEN" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  https://api.github.com/repos/AppRafter/apprafter/dispatches \
+  -d '{"event_type":"landing-content-changed"}'
+```
+
+The workflow has `concurrency: cancel-in-progress: true`, so
+rapid-fire edits coalesce to a single final build.
 
 ## Backups
 

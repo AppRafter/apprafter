@@ -33,8 +33,20 @@ RUN bun install --frozen-lockfile
 # Bring in the web sources only — cms/ is not needed for this image.
 COPY web web
 
-# Tell lib/cms.ts to read JSON fallbacks during SSG.
-ENV LANDING_USE_FALLBACK=1
+# Defaults to 1 → lib/cms.ts reads JSON fallbacks during SSG, no
+# CMS connection required. The release workflow takes this path.
+# The rebuild workflow overrides to 0 so the build fetches live
+# content from LANDING_CMS_URL — that workflow then re-publishes
+# `landing-web:edge` after each admin edit.
+ARG LANDING_USE_FALLBACK=1
+ENV LANDING_USE_FALLBACK=${LANDING_USE_FALLBACK}
+
+# When LANDING_USE_FALLBACK=0 the build needs a reachable Payload.
+# Default points at the public CMS host so the rebuild workflow
+# Just Works; the release workflow ignores this since fallback is on.
+ARG LANDING_CMS_URL=https://cms.apprafter.dev
+ENV LANDING_CMS_URL=${LANDING_CMS_URL}
+
 # PUBLIC_CMS_URL is what the browser fetches at runtime (waitlist
 # form). Default points at the public deploy; override via
 # `--build-arg PUBLIC_CMS_URL=...`.

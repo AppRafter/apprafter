@@ -277,10 +277,16 @@ describe('container build surface (Phase J+)', () => {
     expect(existsSync(join(ROOT, 'Caddyfile'))).toBe(true);
   });
 
-  test('web Dockerfile builds via fallback (no live CMS required at build time)', () => {
+  test('web Dockerfile builds via fallback by default + accepts the override args', () => {
     const df = readFileSync(join(ROOT, 'Dockerfile'), 'utf8');
-    expect(df).toContain('LANDING_USE_FALLBACK=1');
-    expect(df).toContain('PUBLIC_CMS_URL');
+    // Default ARGs match the release path (release-landing.yml).
+    expect(df).toMatch(/ARG LANDING_USE_FALLBACK=1/);
+    expect(df).toMatch(/ARG LANDING_CMS_URL=https:\/\/cms\.apprafter\.dev/);
+    expect(df).toMatch(/ARG PUBLIC_CMS_URL=https:\/\/cms\.apprafter\.dev/);
+    // Rebuild path (rebuild-landing-web.yml) overrides the first
+    // two — verify the build-arg surface exists.
+    expect(df).toContain('ENV LANDING_USE_FALLBACK=${LANDING_USE_FALLBACK}');
+    expect(df).toContain('ENV LANDING_CMS_URL=${LANDING_CMS_URL}');
     // Two-stage: bun builder + caddy runtime.
     expect(df).toMatch(/FROM oven\/bun.*AS builder/);
     expect(df).toMatch(/FROM caddy.*AS runtime/);

@@ -142,6 +142,28 @@ describe('landing/cms scaffold', () => {
     expect(df).toContain('.next/static');
   });
 
+  test('notifyRebuild + withRebuildHook fire repository_dispatch on content edits', () => {
+    const hook = readFileSync(join(ROOT, 'src/hooks/notifyRebuild.ts'), 'utf8');
+    expect(hook).toContain('landing-content-changed');
+    expect(hook).toContain('GITHUB_DISPATCH_TOKEN');
+    expect(hook).toContain('GITHUB_REPO');
+    expect(hook).toContain('/repos/');
+    expect(hook).toContain('/dispatches');
+
+    const helper = readFileSync(join(ROOT, 'src/lib/withRebuildHook.ts'), 'utf8');
+    expect(helper).toContain('notifyRebuild');
+    expect(helper).toContain('afterChange');
+
+    // Every content global wrapped, Booking NOT wrapped.
+    const cfg = readFileSync(join(ROOT, 'src/payload.config.ts'), 'utf8');
+    expect(cfg).toContain('withRebuildHook(SiteSettings)');
+    expect(cfg).toContain('withRebuildHook(LandingHero)');
+    expect(cfg).toContain('withRebuildHook(WaitlistFormCopy)');
+    // Booking is the explicit exception — its content never flows
+    // into the static page so a rebuild on its edit is pure waste.
+    expect(cfg).not.toContain('withRebuildHook(Booking)');
+  });
+
   test('Next root / redirects to /admin (no public frontend on the cms host)', () => {
     const nextCfg = readFileSync(join(ROOT, 'next.config.mjs'), 'utf8');
     expect(nextCfg).toContain('/admin');

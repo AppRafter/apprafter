@@ -23,6 +23,7 @@ import { SiteSettings } from './globals/SiteSettings';
 import { TierLadder } from './globals/TierLadder';
 import { ValueProps } from './globals/ValueProps';
 import { WaitlistFormCopy } from './globals/WaitlistFormCopy';
+import { withRebuildHook } from './lib/withRebuildHook';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -55,20 +56,23 @@ export default buildConfig({
   }),
   editor: lexicalEditor(),
   collections: [Users, WaitlistSignups],
+  // Every content global is wrapped with the rebuild-dispatch
+  // afterChange hook (see lib/withRebuildHook). Booking stays
+  // bare — its content never flows into the static page.
   globals: [
-    SiteSettings,
-    LandingHero,
-    ValueProps,
-    ScalingJourney,
-    TierLadder,
-    Comparison,
-    LandingTransparency,
-    BoringTech,
-    Advantages,
-    Roadmap,
-    BootstrapStrip,
-    FooterContent,
-    WaitlistFormCopy,
+    withRebuildHook(SiteSettings),
+    withRebuildHook(LandingHero),
+    withRebuildHook(ValueProps),
+    withRebuildHook(ScalingJourney),
+    withRebuildHook(TierLadder),
+    withRebuildHook(Comparison),
+    withRebuildHook(LandingTransparency),
+    withRebuildHook(BoringTech),
+    withRebuildHook(Advantages),
+    withRebuildHook(Roadmap),
+    withRebuildHook(BootstrapStrip),
+    withRebuildHook(FooterContent),
+    withRebuildHook(WaitlistFormCopy),
     Booking,
   ],
   typescript: {
