@@ -13,6 +13,123 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.161 — M1.5 Track B.1.79b part 1 — `apprafter app open <name>` (2026-05-24)
+
+### What
+
+First deliverable of the §1.79b CLI app ergonomics sub-phase:
+`apprafter app open <name>` port-forwards a registered
+Application's primary Service к localhost and opens it in
+the default browser. Wraps `kubectl port-forward` с AppRafter-
+aware resolution so the operator never has to assemble
+`kubectl port-forward svc/<name> -n <ns> 8080:<port>` by
+hand.
+
+### Resolution chain
+
+```
+Application name
+  → Argo CD Application CR в `argocd` namespace
+  → `spec.destination.namespace`
+  → Service в that ns via label `app.kubernetes.io/instance=<name>`
+  → Container port (Service.spec.ports[0] OR `--container-port`)
+  → Local port (8080 OR `--port`, with auto-increment 8080→8090)
+  → `kubectl port-forward svc/<svc> -n <ns> <local>:<container>`
+  → Wait for ready banner, print URL, open browser
+```
+
+Per plan.md §1.79b first деliverable's output spec:
+
+```
+$ apprafter app open landing-web
+
+Forwarding to landing-web on namespace 'apprafter'...
+  Service:   landing-web
+  Port:      80 (container) → 8080 (localhost)
+  URL:       http://localhost:8080
+
+✓ Browser opened
+ℹ Press Ctrl+C to stop port-forward
+```
+
+### CLI surface
+
+```
+apprafter app open <name>
+    [--port <N>]               # local port, default 8080 (probes 8080..8090)
+    [--container-port <N>]     # override the Service.spec.ports[0] auto-pick
+    [--no-browser]             # skip browser launch (useful for CI / scripts)
+```
+
+### Error handling
+
+- App not found в Argo CD → `Application '<name>' not found in
+  namespace argocd. List with apprafter app list.`
+- App missing `spec.destination.namespace` → diagnostic
+  pointing at `apprafter app status <name>`.
+- App not Healthy → warns с sync/health states; interactive
+  `Continue anyway?` confirm (default No); non-TTY refuses
+  safely с pointer к either rerunning в TTY or picking а
+  healthy app.
+- No Service matches label → diagnostic enumerates the three
+  likely causes (not yet reconciled, manifests render no
+  Service, label overridden by manifest's labels block).
+- Multiple Services match label → lists candidates с pointer
+  к manual `kubectl port-forward` until disambiguation lands
+  as а follow-up.
+- Service declares no `spec.ports` → diagnostic requires
+  `--container-port <N>` explicit value.
+- All probed local ports (start..start+9) busy → error с
+  `--port <N>` override hint.
+
+### Architecture
+
+New shared `commands::port_forward` module hosts the generic
+kubectl-port-forward + browser-open + drainer helpers
+previously private к `commands::open`. Both `apprafter open
+argocd` and `apprafter app open <name>` now consume it; the
+Go SIGPIPE walk-fix #1 post-B.1.79 drainer pattern is
+inherited automatically. `commands::open` shrinks к ~100
+lines (Argo CD-specific composition only); `commands::
+app_open` is the new ~270-line caller.
+
+### Tests
+
++14 new unit tests (all on pure helpers without spawning
+kubectl):
+
+- `port_forward::ready_drainer_signals_on_forwarding_line`,
+  `_continues_draining_after_signal`,
+  `_yields_recv_err_when_eof_before_banner`,
+  `silent_drainer_reads_to_eof` — moved from `open.rs`,
+  unchanged behaviour, ensures the SIGPIPE drainer pattern
+  remains shared correctly.
+- `app_open::parse_services_extracts_name_and_ports`,
+  `_handles_multi_port_service`,
+  `_skips_malformed_items`,
+  `_empty_payload_returns_empty_vec` — kubectl JSON shape
+  parsing.
+- `app_open::select_service_happy_single_match`,
+  `_zero_matches_errors_with_diagnostic_hint`,
+  `_multi_match_lists_candidate_names` — Service selection
+  logic + error message shape.
+- `app_open::resolve_container_port_prefers_override`,
+  `_falls_back_to_first_service_port`,
+  `_errors_when_service_has_no_ports_and_no_override` —
+  container-port precedence and missing-ports rejection.
+- `app_open::is_port_free_returns_false_when_port_is_bound`,
+  `pick_local_port_returns_starting_port_when_free` — port
+  probe surface using ephemeral TcpListener bindings (no
+  hardcoded 8080 since CI runners may have it busy).
+
+Total CLI test suite: 174 → 188.
+
+### Bump
+
+CLI 0.1.160 → 0.1.161. Chart and cue-cmp unchanged. No
+walk-fix sequence — `app open` is fresh code on top of the
+closed §1.79a surface.
+
 ## v0.1.160 — M1.5 walk-fix #12 post-B.1.79a — `apprafter app add` defaults destination to `apprafter` namespace (2026-05-24)
 
 ### Symptom

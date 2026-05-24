@@ -544,6 +544,36 @@ pub enum AppCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Port-forward the app's primary Service to localhost and
+    /// open it in а browser. Wraps `kubectl port-forward` with
+    /// AppRafter-aware resolution: Application name → Argo CD
+    /// CR → `spec.destination.namespace` → child Service via
+    /// the `app.kubernetes.io/instance=<name>` label →
+    /// container port (Service.spec.ports[0] OR
+    /// `--container-port` override). Picks а free local port
+    /// starting at 8080 with auto-increment to 8090 if busy.
+    /// Blocks on Ctrl+C — the port-forward dies with the
+    /// command. Walk-fix #1 post-B.1.79 (Go SIGPIPE drainer
+    /// pattern) is inherited from `commands::port_forward`.
+    Open {
+        /// Application name (as listed via `apprafter app list`).
+        name: String,
+        /// Local port к bind. Defaults to 8080; if busy, the
+        /// command probes 8081…8090 before giving up.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Container port к forward к. Defaults к the
+        /// Service's first declared `spec.ports[]` entry.
+        /// Required when the Service declares no ports or when
+        /// the operator wants а secondary port.
+        #[arg(long = "container-port")]
+        container_port: Option<u16>,
+        /// Skip opening the browser; just print the URL and
+        /// block on the port-forward. Useful for CI / scripts
+        /// that want to forward в the background.
+        #[arg(long = "no-browser", default_value_t = false)]
+        no_browser: bool,
+    },
     /// Delete an Application and cascade-remove the Argo CD CR
     /// (which Argo CD then tears down child resources for).
     /// Interactive: prompts for confirmation; non-interactive

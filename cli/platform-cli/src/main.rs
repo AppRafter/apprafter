@@ -143,6 +143,12 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 pod,
             } => commands::app::logs(&name, follow, tail, container, pod)?,
             AppCommand::Rollback { name, to, yes } => commands::app::rollback(&name, to, yes)?,
+            AppCommand::Open {
+                name,
+                port,
+                container_port,
+                no_browser,
+            } => commands::app_open::open(&name, port, container_port, no_browser)?,
             AppCommand::Remove {
                 name,
                 yes,
