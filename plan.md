@@ -2162,7 +2162,9 @@ instead of carrying parallel definitions.
 
 ---
 
-### 1.79 CLI thin wrappers + `apprafter open` commands
+### 1.79 CLI thin wrappers + `apprafter open` commands ✅
+
+> v0.1.142 — sub-phase 1.79 shipped. `apprafter platform {status,upgrade}` + `apprafter migration {list,approve,reject}` + `apprafter open argocd` (port-forward + clipboard + browser launch) + npm-style version check + Argo CD UI Resource Action Lua scripts для MigrationPlan approve/reject. `platform {freeze,unfreeze,rescue}` rolled forward в 1.79a part 5 (closed v0.1.142). `platform channel` deferred к Phase 2 (multi-channel UX waits for stable/edge divergence); `open {backstage,grafana,hubble}` deferred к Tier 2+ (не tier-1 residents).
 
 **Source:** ADR 0025, 0026, 0027.
 
@@ -2203,7 +2205,9 @@ instead of carrying parallel definitions.
 
 ---
 
-### 1.79a CLI app/repo subcommands + AppProjects + `open` polish
+### 1.79a CLI app/repo subcommands + AppProjects + `open` polish ✅
+
+> v0.1.142 originally; v0.1.160 + platform-stack 0.1.47 + argocd-cue-cmp v0.1.5 fully validated. Sub-phase shipped через 5 parts (AppProjects + project field; `open argocd` polish; `app {add,list,status,remove}`; `app {logs,rollback}`; `repo creds {add,list,show,rotate,remove}`) + `platform {freeze,unfreeze,rescue}` rollup. Real-cluster manual walk surfaced 12 walk-fixes (history rows below — #1 sync-wave/AppProject race, #2 standalone AppProject manifests at wave -30, #3 release-cli CUE install, #4 version_check tag stream picker, #5/#5b CMP entrypoint flat-stream + apprafter/ dir layout, #6 per-target state migration, #7 EXDEV cross-mount + richer-legacy preference, #8/#8b CMP discover glob→command + cue-cmp v0.1.4 rebuild, #9 channel-latest resolver decouples CLI from chart, #10 CMP discover stdout fix `grep -q` removed, #11 Namespace permitted в apps AppProject, #12 wizard defaults destination namespace к apprafter). Each walk-fix landed с regression-guard test; phase boundary tech-debt = zero. Deferred с rationale: interactive wizard для `repo creds add` (flag-driven sufficient, operator feedback gates); inline PAT prompt при private-repo cred miss (hint sufficient); API ping для PAT validation (format regex catches most copy-paste errors, adds flakiness); App CR conditions + pending MigrationPlan section в `app status` (Phase 2 destructive change detection prerequisite); last-used / expires в `repo creds list` (Argo CD / GitHub не surface'ят данные); `open backstage` (Tier 2+); URL pre-fill username `?username=admin` (Argo CD 7.7.7 не поддерживает — negative result).
 
 **Source:** ADR 0025, 0026 (Argo CD projects model); продолжение 1.79.
 
@@ -2216,7 +2220,7 @@ instead of carrying parallel definitions.
     - [x] `platform-providers` — для ServiceProvider operators (CNPG, Dragonfly, NATS, Kamaji). Те же permissions что и `platform`, разделение чисто визуальное + lifecycle-категория. Project заводится сейчас (а не лениво в Phase 2), чтобы UI selector показывал его сразу после bootstrap'а.
     - [x] `apps` — для user applications. `sourceRepos: ["*"]` (пока не введён RBAC через AccessGrant Phase 4), `destinations: [{namespace: "*", server: "https://kubernetes.default.svc"}]`, `clusterResourceWhitelist: []`, `namespaceResourceWhitelist: [{group: "apprafter.io", kind: "Application"}, {group: "", kind: "ConfigMap"}, {group: "", kind: "Secret"}, {group: "gateway.networking.k8s.io", kind: "HTTPRoute"}]`.
 - [x] Update umbrella Helm templates — все chart-managed Applications получают `spec.project: {{ default "platform" $component.project }}` через новое поле `#Component.project: string | *"platform"`. Default = `platform`; tier overlays / ServiceProvider charts могут override на `platform-providers` per-component. CLI loader's root platform Application также переехал на `spec.project: platform` (`cluster_bootstrap::render_root_application`).
-- [ ] CMP plugin (`argocd-cue-cmp`) рендерит user Application CRs с `spec.project: apps` по умолчанию. **Отдельный коммит в составе `apprafter app add` (1.79a part 3)** — там же где появится user-app flow вообще.
+- [x] CMP plugin (`argocd-cue-cmp`) рендерит user Application CRs с `spec.project: apps` по умолчанию. **Закрыто:** `apprafter app add` wizard (`app_wizard.rs`) defaults parent Argo CD Application's `spec.project` к `apps` (clap default), а CMP-rendered user manifests (apprafter.io/Application) сами не несут `spec.project` (это Argo CD-specific поле, не AppRafter); end-to-end проверено walk-fix #10/#11/#12 на real cluster — landing-web/landing-cms apps зарегистрированы в Argo CD под project `apps`.
 
 #### Поставка — `apprafter open` polish
 
@@ -2244,7 +2248,7 @@ instead of carrying parallel definitions.
 - [x] `apprafter app add [<git-url>]`:
     - [x] Без аргумента: детектит git origin из cwd через `git remote get-url origin`, нормализует (SSH→HTTPS, убирает `.git`).
     - [x] Флаги: `--name <name>` (default = repo name), `--branch <branch>` (default = current branch для cwd-режима, `main` для explicit URL), `--path <path>` (default `/`), `--project <name>` (default `apps`), `--remote <name>` (default `origin`), `--no-ping` (skip reachability check).
-    - [ ] Interactive: спрашивает name/branch/path с дефолтами; non-interactive: использует defaults или fails если `--git-url` не задан. **В v0.1.139 non-interactive flag-driven only; interactive wizard деферрен** — flag defaults уже покрывают 95% случаев (cwd-detect + автодеривация name/branch). Wizard приедет если поступит реальный operator feedback что не хватает.
+    - [x] Interactive: спрашивает name/branch/path с дефолтами; non-interactive: использует defaults или fails если `--git-url` не задан. **Закрыто v0.1.145** через `cli/platform-cli/src/commands/app_wizard.rs` (Text+Select prompts, cwd-detect для path/branch/origin, inline DNS-1123 валидация); v0.1.160 (walk-fix #12) добавил шестой prompt «Destination namespace» с DNS-1123 валидацией. `--no-interactive` opt-out для CI/headless.
     - [x] Проверка доступности репо — `git ls-remote` через subprocess (поддерживает HTTPS auth check без token, для private — детект unauthorized). `--no-ping` для air-gapped CI.
     - [ ] Если репо private и не зарегистрирован cred — inline prompt: "Use existing PAT / Add new PAT / Skip". **Deferred к v0.1.141** — лендится вместе с `apprafter repo creds add`. Сейчас auth failure surfaces hint pointing к `apprafter repo creds add`.
     - [x] Пишет Argo CD `Application` CR в `argocd` namespace с label `apprafter.io/managed-by: apprafter` и annotation `apprafter.io/source: cli`. CR указывает на пользовательский repo, CMP plugin рендерит `apprafter/Application.cue` оттуда.
@@ -2335,6 +2339,145 @@ instead of carrying parallel definitions.
 **Зависит от:** 1.79 (CLI thin wrappers infrastructure + `open` для argocd базовый).
 
 **Размер:** M
+
+---
+
+### 1.79b CLI app ergonomics — `app open` + scaffolding + runtime templates
+
+**Source:** Продолжение 1.79a. Closes gaps в quickstart flow для unfamiliar users.
+
+**Цель:** убрать k8s complexity из первого запуска приложения. Юзер не должен знать про port-forward / kubectl, и не должен с нуля писать `apprafter/Application.cue` если у него стандартный stack.
+
+#### Поставка — `apprafter app open <name>`
+
+- [ ] Wrapper над `kubectl port-forward` для пользовательского app'а:
+    - Резолвит Application name → Service в namespace (через AppRafter Application CR labels).
+    - Определяет primary port из Application.expose.port или Service.spec.ports[0].
+    - `kubectl port-forward svc/<app> 8080:<port>` в background process.
+    - Открытие `http://localhost:8080` в браузере через `open` (Linux/Mac) / `start` (Windows) / `xdg-open`.
+    - Output формат:
+        ```
+        $ apprafter app open my-parser
+
+        Forwarding to my-parser on namespace 'default'...
+          Service:   my-parser
+          Port:      3000 (container) → 8080 (localhost)
+          URL:       http://localhost:8080
+
+        ✓ Browser opened
+        ℹ Press Ctrl+C to stop port-forward
+        ```
+- [ ] Флаги:
+    - `--port <port>` — override local port (default 8080, со shift на 8081/8082/etc. если занят).
+    - `--container-port <port>` — override container port если app exposed multiple.
+    - `--no-browser` — только port-forward, без открытия браузера (для CI/scripts).
+- [ ] Error handling:
+    - App не найден → "Application '<name>' not found. List with `apprafter app list`."
+    - App not Healthy → warning "Application is in state <state>; port-forward may fail. Continue anyway? [y/N]".
+    - Local port занят → auto-increment до 8090, дальше error.
+    - kubectl missing → error с hint к target add.
+- [ ] Graceful shutdown по Ctrl+C — kill port-forward, exit clean.
+
+#### Поставка — Runtime detection в `apprafter app add`/`scaffold`
+
+- [ ] Detection heuristic из cwd:
+
+  | Маркер | Detected runtime | Priority |
+      |---|---|---|
+  | `bun.lock` или `bun.lockb` | `bun` | High |
+  | `pnpm-lock.yaml` | `node-pnpm` | High |
+  | `yarn.lock` | `node-yarn` | High |
+  | `package-lock.json` | `node-npm` | High |
+  | `package.json` без lock-файла | `node-npm` (fallback) | Medium |
+  | `pyproject.toml` с `[tool.poetry]` | `python-poetry` | High |
+  | `pyproject.toml` с `[tool.uv]` или `uv.lock` | `python-uv` | High |
+  | `Pipfile` | `python-pipenv` | High |
+  | `requirements.txt` без других | `python-pip` | Medium |
+  | `Cargo.toml` | `rust` | High |
+  | `go.mod` | `go` | High |
+  | `Dockerfile` без других маркеров | `docker` (build-only template) | Low |
+  | Ничего | `blank` (пустой шаблон с TODO) | Fallback |
+
+- [ ] Confidence levels:
+    - `High`: явный lock-файл = runtime установлен, версии воспроизводимы. Default-select без вопросов в auto-mode.
+    - `Medium`: маркер есть, но lock отсутствует — менее уверенно, confirm prompt всё равно.
+    - `Low` / `Fallback`: prompt со списком всех runtimes, юзер выбирает руками.
+
+- [ ] Multiple маркеры одновременно (monorepo, мультистек):
+    - Если детектится 2+ runtime с High confidence — prompt со списком, default = первый по алфавиту.
+    - Можно подсказать через CLI флаг `--runtime <name>` сразу для non-interactive.
+
+#### Поставка — Application.cue templates
+
+- [ ] Template engine: Handlebars-like substitution на статичных `.cue.hbs` файлах в CLI binary через `include_str!` (embedded в release).
+- [ ] Variables в шаблоне:
+    - `{{app_name}}` — из cwd name или CLI flag.
+    - `{{image_ref}}` — placeholder `ghcr.io/<org>/<app>:latest` для пользовательской подстановки.
+    - `{{primary_port}}` — defaults per runtime (bun/node: 3000, python: 8000, rust/go: 8080, docker: 8080).
+    - `{{healthcheck_path}}` — default `/health` со комментарием "// adjust if your app uses different path".
+- [ ] Шаблоны (`cli/templates/application/*.cue.hbs`):
+    - `bun.cue.hbs` — runtime=bun, build с bun build script.
+    - `node-pnpm.cue.hbs`, `node-yarn.cue.hbs`, `node-npm.cue.hbs` — соответствующий package manager в build steps.
+    - `python-poetry.cue.hbs`, `python-uv.cue.hbs`, `python-pipenv.cue.hbs`, `python-pip.cue.hbs`.
+    - `rust.cue.hbs` — cargo build --release.
+    - `go.cue.hbs` — go build, static binary.
+    - `docker.cue.hbs` — assume Dockerfile в корне, no build steps generation (юзер сам Dockerfile управляет).
+    - `blank.cue.hbs` — пустой Application с TODO-комментариями на все required поля.
+- [ ] Каждый шаблон содержит:
+    - `apiVersion`, `kind`, `metadata.name`
+    - `spec.image` — placeholder
+    - `spec.expose` — minimal (port + comment "set public: true и hostname when ready to expose")
+    - `spec.resources` — sensible defaults (100m CPU / 128Mi RAM с комментарием "tune based on observed usage")
+    - `spec.healthcheck` — default path `/health` с note про customization
+    - Inline-комментарии на русском или английском объясняющие что каждое поле делает (selectable через `--lang ru|en`, default `en`)
+
+#### Поставка — Scaffold flow в `app add` и `app scaffold`
+
+- [ ] `apprafter app add` (расширение из 1.79a):
+    - Шаг 0 (before any prompts): проверка наличия `apprafter/Application.cue` в cwd.
+    - Если **отсутствует**:
+        - Run runtime detection.
+        - Wizard prompt: "No `apprafter/Application.cue` found. Generate one? [Y/n]". На "Y" — continue scaffolding.
+        - List с pre-selected default = detected runtime. Юзер может выбрать другой.
+        - Запрос на app name (default = repo dir name).
+        - Confirm: "Generate `apprafter/Application.cue` and `.gitignore` entries?".
+        - Создание файла из template, append `.apprafter/local/` в `.gitignore` если отсутствует (для будущих local secrets).
+        - Print "✓ Created apprafter/Application.cue — review and adjust before committing".
+    - Если **присутствует**: пропускает scaffold step, идёт к existing flow (`git remote get-url origin` → register Application).
+    - В non-interactive mode без `--scaffold`: если файл отсутствует — fail с hint к `apprafter app scaffold`.
+
+- [ ] `apprafter app scaffold` — standalone команда для re-scaffolding или explicit-only flow:
+    - Без аргументов: detection + interactive wizard, генерит файл.
+    - Флаги: `--runtime <name>` (override detection), `--name <app>`, `--lang ru|en` (комментарии), `--force` (overwrite existing).
+    - Без `--force` отказывается перезаписать existing `apprafter/Application.cue` — exit code 2.
+
+#### Поставка — README updates + examples directory
+
+- [ ] `examples/applications/` в monorepo — реальные working Application.cue для каждого preset (используются как fixture для тестов template engine + reference в docs).
+- [ ] `docs/user-guide/cli/app-scaffold.md` — описание templates, runtime detection logic, customization guide.
+- [ ] Update `docs/operator-guide/quickstart.md` — шаг "Write Application.cue" заменён на "Run `apprafter app add` — it scaffolds for you".
+
+#### Acceptance
+
+- [ ] `cd <bun-project> && apprafter app add` детектит bun, генерит `apprafter/Application.cue` с bun preset, регистрирует Argo CD Application.
+- [ ] `apprafter app open <name>` после `apprafter app status` показывающего Healthy → port-forward работает, browser открывается на app'е.
+- [ ] `apprafter app open` для app в Pending/CrashLoopBackOff показывает warning, но всё равно делает port-forward по confirmation.
+- [ ] Multiple маркеры (e.g., python-poetry + Dockerfile) → prompt со списком, не auto-pick.
+- [ ] `apprafter app scaffold` для пустого репо генерит `blank` template с TODO-комментариями.
+- [ ] `apprafter app scaffold` для существующего `Application.cue` без `--force` → exit 2.
+- [ ] Generated `apprafter/Application.cue` проходит `cue vet` (валидный CUE).
+- [ ] Generated файл с `image` placeholder + push в репо → Argo CD синкает; AppRafter Application reaches `OutOfSync` / `Suspended` until юзер обновит image. Status condition объясняет что делать.
+
+#### Не входит в этот item
+
+- Auto-generation Dockerfile для runtime presets (отдельный future item, нетривиально и небезопасно).
+- Backstage Software Templates integration (Phase 3, Backstage plugin).
+- Live `cue vet` + linting в CLI на каждом save (Phase 3+).
+- AI-assisted Application.cue refinement (вне scope OSS платформы).
+
+**Зависит от:** 1.79a (`apprafter app add` базовый flow, AppProjects, repo creds).
+
+**Размер:** S-M
 
 ---
 
@@ -3154,6 +3297,581 @@ instead of carrying parallel definitions.
 - Cascading delete: Application removal → HTTPRoute + Certificate gone.
 
 **Зависит от:** 4.1 (ExternalSurface CRD with Gateway domain config)
+
+**Размер:** M
+
+---
+
+### 4.1b TLS schema + custom cert import + manual DNS-01 + domain management
+
+**Source:** Продолжение 4.1a; ADR 0027 (MigrationPlan) для destructive domain ops. Automated DNS provider integration вынесен в 4.1c.
+
+**Цель:** production-grade hostname/TLS support без обязательной DNS API integration. Юзер может использовать LE (HTTP-01 для specific hostnames, manual DNS-01 для wildcards) или принести собственный cert от любого CA (DigiCert/Comodo/Sectigo/etc.). Cluster получает domain management CLI и MigrationPlan-защиту от destructive operations.
+
+#### Поставка — ExternalSurface schema расширение
+
+- [ ] `ExternalSurface.spec` получает новые optional поля:
+    ```cue
+    spec: {
+        // Existing fields из 4.1...
+
+        // Default suffix для apps с expose.public=true без hostname.
+        // Если задан, operator auto-generates `<app-name>.<defaultDomain>`.
+        defaultDomain?: string
+
+        // Whitelist доменов которые этот кластер обслуживает.
+        // Apps с hostname вне этого списка отклоняются admission webhook.
+        // Wildcard entries (`*.example.com`) матчат suffix.
+        // Если массив пуст — нет whitelist (любой hostname accept'ится).
+        allowedDomains?: [...#DomainEntry]
+    }
+
+    #DomainEntry: {
+        domain:    string      // "example.com" или "*.example.com"
+        wildcard:  bool | *false  // computed: true если starts with "*."
+        certMode:  "letsencrypt-http01" | "letsencrypt-dns01-manual" | "imported" | *"letsencrypt-http01"
+        importedCertRef?: string  // когда certMode == "imported", имя из target cert list
+        addedAt:   string      // ISO timestamp
+        addedBy:   string      // email/identity who added
+    }
+    ```
+
+- [ ] PlatformController reconciles `ExternalSurface` → creates cert-manager `ClusterIssuer` ресурсы:
+    - `apprafter-letsencrypt-http01` — для не-wildcard hostnames через HTTP-01 (всегда создан).
+    - `apprafter-letsencrypt-dns01-manual` — для wildcards через manual DNS-01 (cert-manager в "manual" режиме, требует юзерского участия для каждого challenge).
+
+#### Поставка — `tls: bool | TlsOptions` schema
+
+- [ ] CUE schema (`apprafter/Application.cue`):
+    ```cue
+    #Expose: {
+        public:   bool | *false
+        hostname: string | *""
+        tls:      bool | #TlsOptions | *true
+        // ...
+    }
+
+    #TlsOptions: {
+        enabled:    bool | *true
+        redirect:   bool | *true        // HTTP→HTTPS 301 redirect
+        hsts:       bool | *true        // Strict-Transport-Security header
+        hstsMaxAge: int  | *31536000   // 1 year
+        minVersion: "TLSv1.2" | "TLSv1.3" | *"TLSv1.2"
+        // Future: cipherSuites, alpn, clientCert
+    }
+    ```
+- [ ] Operator renderer:
+    - `tls: true` → expand to `#TlsOptions{}` defaults; generates Certificate + HTTPRoute с HTTPS redirect filter + HSTS response header filter.
+    - `tls: false` → no Certificate, HTTP-only HTTPRoute (port 80), no redirect, no HSTS. Никаких warnings (юзер явно выключил).
+    - `tls: {...}` object → use provided values, fill missing с defaults.
+- [ ] HTTPS redirect: HTTPRoute с `filters: [{type: RequestRedirect, requestRedirect: {scheme: "https", statusCode: 301}}]` для port 80 listener.
+- [ ] HSTS: HTTPRoute с `filters: [{type: ResponseHeaderModifier, responseHeaderModifier: {set: [{name: "Strict-Transport-Security", value: "max-age=<hstsMaxAge>; includeSubDomains"}]}}]`.
+
+#### Поставка — Custom cert import (`apprafter target cert ...`)
+
+- [ ] `apprafter target cert import <name>`:
+    - Флаги: `--cert <file>` (PEM-encoded certificate, fullchain), `--key <file>` (PEM-encoded private key), `--chain <file>` (optional separate intermediate chain если не включён в fullchain).
+    - Pre-validation:
+        - Parse PEM, проверить что cert и key соответствуют (key matches cert public key).
+        - Extract subject + SANs + expiry; output для confirmation.
+        - Warn если expiry < 30 days ("Certificate expires в N days. Continue? [y/N]").
+    - Создаёт k8s Secret type `kubernetes.io/tls` в namespace `cert-manager` с labels:
+        - `apprafter.io/managed-by: apprafter`
+        - `apprafter.io/cert-name: <name>`
+        - `apprafter.io/cert-mode: imported`
+        - Annotations: `apprafter.io/cert-not-before`, `apprafter.io/cert-not-after`, `apprafter.io/cert-sans` (для бystrого querying без re-parsing).
+    - Output:
+        ```
+        ✓ Certificate 'my-wildcard' imported
+
+          Subject:     CN=*.example.com
+          SANs:        *.example.com, example.com
+          Issuer:      DigiCert TLS RSA SHA256 2020 CA1
+          Valid from:  2025-11-12
+          Expires:     2026-11-12 (in 357 days)
+
+        Use in Application.cue:
+          expose.tls.useCert: "my-wildcard"
+
+        Or register associated domain:
+          apprafter target domain add "*.example.com" --cert my-wildcard
+        ```
+
+- [ ] `apprafter target cert list`:
+    - Таблица: name, subject, SANs (truncated если > 80 chars), expires (с цветовой подсветкой: red если < 30d, yellow < 60d, green иначе), used by (count apps + domains references).
+
+- [ ] `apprafter target cert show <name>`:
+    - Full detail: полные SANs, issuer chain, fingerprint, всех Applications/domains references.
+
+- [ ] `apprafter target cert renew <name>`:
+    - Для `imported` certs: instructional output "Re-purchase from CA, then run `apprafter target cert import <name> --cert <new-fullchain> --key <new-key> --replace`".
+    - Для `letsencrypt-dns01-manual`: триггерит manual DNS-01 challenge cycle (см. ниже).
+
+- [ ] `apprafter target cert remove <name>`:
+    - Pre-check: scan domains и Applications references.
+    - Если есть active references — error "Certificate used by domain '<domain>' and N applications. Remove references first или используй `--force` (apps will lose TLS)".
+    - `--force` создаёт **platform-scope MigrationPlan** (см. ниже про MigrationPlan integration).
+
+- [ ] `apprafter target cert import <name> --replace` для rotation:
+    - Pre-validation идентична `import`.
+    - Updates existing Secret in-place (sequence: validate → write new keys → no downtime).
+    - HTTPRoutes референсящие этот cert автоматически подхватывают новый (cert-manager и Gateway API делают reload).
+
+#### Поставка — Manual DNS-01 instructional flow
+
+- [ ] Triggered через `apprafter target domain add "*.example.com"` (без `--cert` flag):
+    - Wizard prompt:
+        ```
+        Wildcard certificates require DNS-01 challenge (LE limitation, not ours).
+        
+        How would you like to proceed?
+          > Manual TXT record (one-time setup, manual renewal every ~60 days)
+            Use existing certificate from a CA (Comodo, DigiCert, etc.)
+            Configure automated DNS provider (requires API token)
+            Cancel
+        ```
+    - "Use existing certificate" → редиректит к `apprafter target cert import` wizard.
+    - "Automated DNS provider" → message "Available в Phase 4.1c (coming soon). Use manual TXT для now".
+    - "Manual TXT record" → continue с challenge initiation.
+
+- [ ] Manual TXT record sub-flow:
+    1. CLI создаёт cert-manager `Certificate` resource с `issuerRef: apprafter-letsencrypt-dns01-manual`.
+    2. cert-manager начинает challenge, generates required TXT record.
+    3. CLI polls challenge status until TXT requirement доступен.
+    4. CLI outputs:
+        ```
+        DNS configuration required:
+          
+          Type:    TXT
+          Name:    _acme-challenge.example.com
+          Value:   abc123XYZ_long_token_string...
+          TTL:     300 (short, will be deleted after challenge)
+        
+        Steps:
+          1. Add the TXT record above at your DNS registrar
+          2. Wait 1-5 minutes for DNS propagation
+          3. Run: apprafter target cert verify-challenge "*.example.com"
+        
+        Or, if you want CLI to wait и auto-verify:
+          apprafter target cert wait-challenge "*.example.com" --timeout 10m
+        ```
+    5. `apprafter target cert verify-challenge` или `wait-challenge`:
+        - Periodic `dig +short _acme-challenge.example.com TXT` поlling.
+        - Когда matches expected value → notify cert-manager, ждёт issuance.
+        - Successful → output cert details + reminder про renewal.
+    6. Issuance complete → cert хранится в Secret аналогично imported cert, но с label `apprafter.io/cert-mode: letsencrypt-dns01-manual`.
+
+- [ ] Renewal reminder:
+    - cert-manager сам пытается renew в day 60 (стандартное LE поведение).
+    - cert-manager в manual режиме surface'ит новое TXT-требование через event на Certificate resource.
+    - AppRafter operator scan'ит Certificates с `cert-mode: letsencrypt-dns01-manual` и status `Renewing`, surface'ит в:
+        - `Application.status.conditions[CertificateRenewalRequired]=True` с TXT details
+        - `apprafter app status` показывает actionable instructions
+        - (Phase 3, когда notifications service) — push notification по email/slack/telegram
+    - CLI helper: `apprafter target cert continue-renewal "<domain>"` → выводит current TXT requirement, ждёт пока юзер не поставит, верифицирует.
+
+#### Поставка — `public: true` + hostname validation rules
+
+- [ ] Admission webhook расширение:
+    - `expose.public: true` + `hostname` задан → используем заданный.
+    - `expose.public: true` + `hostname` пустой + `ExternalSurface.spec.defaultDomain` задан → operator auto-generates `<app-name>.<defaultDomain>`, reflected в `Application.status.effectiveHostname` для visibility.
+    - `expose.public: true` + `hostname` пустой + `defaultDomain` пустой → **reject** с error "expose.public: true requires either expose.hostname или platform-wide defaultDomain. Set hostname в Application.cue, или run `apprafter target domain set-default <domain>`".
+- [ ] `allowedDomains` enforcement:
+    - При не-пустом `allowedDomains` — hostname app'а должен match'ить минимум одну entry (exact или wildcard suffix).
+    - Mismatch → reject с error "Hostname '<host>' not в cluster's allowed domains list. Add via `apprafter target domain add <domain>`".
+    - При пустом `allowedDomains` — без enforcement (любой hostname accept'ится, для dev/experimental clusters).
+
+#### Поставка — Path conflict detection (расширение 4.1a)
+
+- [ ] Admission webhook для HTTPRoute:
+    - Existing check: hostname conflict — из 4.1a.
+    - New check: exact `(hostname, pathPrefix, pathType)` tuple duplication across Applications:
+        - **Exact match** → reject с error "Path '<path>' on hostname '<hostname>' already claimed by Application '<other-app>'".
+        - **Subset/superset paths** (catch-all `/` + specific `/api`) → **accept с warning** в admission response: "Application '<name>' acts as catch-all for `<hostname>`; requests not matching more specific paths will route here. This is correct per Gateway API spec but can be surprising. Consider explicit path prefixes if intended."
+        - Warning visible в kubectl output ("Warning: ..."), не блокирует apply.
+
+#### Поставка — `apprafter target domain` CLI группа
+
+- [ ] `apprafter target domain add <domain> [--cert <imported-cert-name>]`:
+    - Validation: формат (RFC 1123 hostname, wildcard `*.<domain>`).
+    - `--cert <name>` — использовать existing imported cert. `certMode: imported`, `importedCertRef: <name>`.
+    - Без `--cert`:
+        - Для specific hostname — `certMode: letsencrypt-http01` (default).
+        - Для wildcard — triggers manual DNS-01 wizard (см. выше).
+    - Append в `ExternalSurface.spec.allowedDomains`.
+    - Output: floating IP + DNS A/AAAA-record instructions + warning если домен уже резолвится не в кластер.
+
+- [ ] `apprafter target domain list`:
+    - Таблица: domain, type (specific/wildcard), cert mode (LE/imported/manual), cert status, DNS verification, apps count, added.
+
+- [ ] `apprafter target domain verify <domain>`:
+    - `dig <domain> +short` → сравнение с cluster floating IP (A для IPv4, AAAA для IPv6 если dual-stack).
+    - LE rate limit pre-check: `--check-rate-limit` пингует LE rate-limit endpoint (полезно перед issuance multiple certs).
+
+- [ ] `apprafter target domain status <domain>`:
+    - Detail view: cert (mode, expiry, last renewal attempt + result), apps using, DNS resolution, recent challenges (last 5).
+
+- [ ] `apprafter target domain set-default <domain>`:
+    - Patches `ExternalSurface.spec.defaultDomain`.
+    - Если domain не в `allowedDomains` — **explicit reject** ("Domain '<d>' not registered. Run `apprafter target domain add <d>` first") — без implicit auto-add, чтобы не было surprise mutations.
+    - Если меняет existing default → **platform-scope MigrationPlan** (existing apps без explicit hostname могут получить новый effective hostname).
+
+- [ ] `apprafter target domain remove <domain>`:
+    - Pre-check: scan Applications использующих этот domain или его wildcard scope.
+    - Active apps есть → **platform-scope MigrationPlan** создаётся, removal не происходит до approve.
+    - Active apps нет → immediate remove, confirmation prompt + `--yes` для skip.
+
+#### Поставка — MigrationPlan integration для destructive domain/cert ops
+
+- [ ] При `target domain remove <domain>` с active apps создаётся MigrationPlan:
+    - `scope.type: platform`
+    - `scope.platform.target: ExternalSurface/default`
+    - `trigger.kind: domain-removal`
+    - `trigger.removing: "<domain>"`
+    - `risks.classification: breaking`
+    - `risks.affectedApps: ["<app1>", "<app2>", ...]`
+    - `risks.estimatedDowntime: "immediate"`
+    - `risks.reversible: true`
+    - `plan` steps: remove from allowedDomains → cleanup HTTPRoutes referencing → cleanup orphaned Certificates → (M3) notify affected app owners.
+- [ ] Аналогично для `target cert remove --force` с active references — platform-scope MigrationPlan с affected apps.
+- [ ] `target domain set-default <new>` с existing default → platform-scope MigrationPlan с listing apps чей effective hostname изменится.
+- [ ] Approve via `apprafter migration approve <name>` → PlatformMigrationStrategy выполняет; reject — no-op.
+
+#### Поставка — `apprafter app status` cert visibility
+
+- [ ] Расширить `app status` output для apps с TLS:
+    ```
+    Application: my-parser
+      Sync:     Synced (12 seconds ago)
+      Health:   Healthy
+
+      Endpoints:
+        Internal:  http://my-parser.default.svc.cluster.local:3000
+        External:  https://parser.example.com
+          Certificate: my-wildcard (imported)
+            Issuer:      DigiCert TLS RSA SHA256 2020 CA1
+            Valid until: 2026-11-12 (in 357 days)
+          TLS:         enabled (redirect ON, HSTS ON, minVersion TLSv1.2)
+
+      Pods:     1/1 Ready
+    ```
+- [ ] Cert status conditions:
+    - `Valid until: 2026-XX-XX (in N days)` — normal state.
+    - Pending issuance → `Certificate: pending issuance (HTTP-01 challenge, attempt 2/3)`.
+    - Failed → `Certificate: FAILED (last attempt 5m ago: <error>). Will retry. See: kubectl describe certificate <name>`.
+    - Close to expiry для LE → `Certificate: expires in 11 days (auto-renewal scheduled in 2 days)` — informational.
+    - Close to expiry для imported → `Certificate: expires in 11 days. Re-purchase from CA and run \`apprafter target cert import <name> --replace\``.
+    - Manual DNS-01 renewal required → `Certificate: renewal requires DNS TXT update. Run \`apprafter target cert continue-renewal "<domain>"\``.
+- [ ] AppRafter operator periodically scan'ит Certificates и Secrets с label `apprafter.io/managed-by: apprafter`:
+    - Bump `Application.status.conditions[CertificateExpiringSoon]=True` при < 30 days.
+    - Bump `Application.status.conditions[CertificateRenewalRequired]=True` для manual DNS-01 в Renewing state.
+
+#### Acceptance
+
+- [ ] `apprafter target cert import` с валидным fullchain + key → Secret создан, cert details выведены, expiry правильно распарсен.
+- [ ] `apprafter target cert import` с mismatched cert/key → fail с error до записи Secret.
+- [ ] `apprafter target domain add app.example.com` (specific) → registered, DNS A-record instructions, certMode `letsencrypt-http01`.
+- [ ] `apprafter target domain add "*.example.com"` без `--cert` → wizard offers manual DNS-01 / cert import / cancel.
+- [ ] Manual DNS-01 flow: TXT instructions → юзер ставит record → `verify-challenge` → cert issued.
+- [ ] `apprafter target domain add "*.example.com" --cert my-wildcard` (imported) → registered, certMode `imported`, никакого challenge не происходит.
+- [ ] Application с `tls: false` + `public: true` — deployed без warnings, HTTP-only, accessible на port 80.
+- [ ] Application с `tls: {redirect: false}` — TLS включён, но HTTP не редиректит.
+- [ ] Two apps с same hostname + same path → second reject'ится.
+- [ ] Two apps с same hostname, один `/`, другой `/api` → both accepted, warning в kubectl output.
+- [ ] `expose.public: true` + no hostname + defaultDomain → effective hostname auto-generated, HTTPRoute generated.
+- [ ] `expose.public: true` + no hostname + no defaultDomain → admission reject.
+- [ ] `apprafter target domain set-default <new>` с existing default → MigrationPlan создан.
+- [ ] `apprafter target cert remove <name>` с active references → MigrationPlan создан; без references → immediate remove с confirmation.
+- [ ] `apprafter app status` для healthy app с imported cert показывает cert mode (imported), expiry, re-import instructions при < 30d.
+
+#### Не входит в этот item
+
+- Automated DNS provider integration для wildcard auto-issuance — **4.1c**.
+- mTLS / client certificate auth (Phase 5+ для regulated workloads).
+- Custom internal CA (Phase 6 для confidential containers tier).
+- Notifications service integration для cert expiry alerts — depends on M3 notifications service.
+- ALPN / HTTP/3 / QUIC support.
+
+**Зависит от:** 4.1a (basic HTTPRoute + Certificate generation, hostname conflict detection); 1.79a (CLI infrastructure для `apprafter target ...` group).
+
+**Размер:** L
+
+---
+
+### 4.1c Automated DNS provider integration + lazy add-on system
+
+**Source:** Продолжение 4.1b. Закрывает renewal pain manual DNS-01 через автоматизацию DNS-01 challenge. Вводит lazy add-on activation: ExternalSurface — single source of truth, PlatformController реагирует.
+
+**Цель:** zero-touch wildcard certificate issuance и renewal для built-in providers (Cloudflare, Route53, Google Cloud DNS, DigitalOcean) сразу через core platform-stack, и для community-maintained providers (GoDaddy, Hetzner DNS) через on-demand add-ons без раздувания default deployment.
+
+#### Поставка — Add-on registry architecture
+
+- [ ] **Built-in providers** (cert-manager native solvers, no extra deployment):
+    - Cloudflare
+    - Route53 (AWS)
+    - Google Cloud DNS
+    - DigitalOcean
+- [ ] **Add-on providers** (community webhook plugins, lazy-deployed on-demand):
+    - GoDaddy через `cert-manager-webhook-godaddy`
+    - Hetzner DNS через `cert-manager-webhook-hetzner`
+- [ ] **Out of scope (V1):**
+    - Namecheap — IP allowlist + balance requirements + community webhook maturity не оправдывают MVP complexity. Может быть добавлен позже как community-contributed registry entry без архитектурных изменений.
+    - Azure DNS, Akamai, Gandi и прочие — добавляются on-demand small items (XS каждый).
+- [ ] Add-on registry: статичная таблица `addons/dns-providers/<name>/manifest.yaml` в platform-stack repo, каждая запись:
+    - `name`: identifier (e.g., `godaddy`)
+    - `displayName`: human-readable
+    - `webhookChart`: OCI ref Helm chart
+    - `chartVersion`: pinned version
+    - `credentialsSchema`: keys которые Secret должен содержать
+    - `validationEndpoint`: provider API endpoint для пинга при configure
+    - `documentation`: link к provider's API token instructions
+
+#### Поставка — Lazy activation через ExternalSurface (Path B)
+
+- [ ] **Source of truth:** `ExternalSurface.spec.dnsProvider`. PlatformController watches это поле и реагирует.
+- [ ] **State machine** в `ExternalSurface.status`:
+    ```
+    Pending → ResolvingAddon → InstallingAddon → ValidatingCredentials → Ready
+                                                           ↓
+                                                         Failed (with reason)
+    ```
+- [ ] **Reconcile logic** PlatformController при изменении `dnsProvider.type`:
+    1. Если type — built-in (cloudflare/route53/google-cloud-dns/digitalocean):
+        - Skip add-on installation, go straight to ValidatingCredentials.
+        - Создаёт ClusterIssuer `apprafter-letsencrypt-dns01-auto` с native solver config.
+    2. Если type — add-on (godaddy/hetzner-dns):
+        - Lookup registry entry для type.
+        - Создаёт Argo CD `Application` в project `platform-providers` для webhook chart.
+        - Waits для webhook Application `Healthy` (с timeout 5 min).
+        - После Healthy → создаёт ClusterIssuer с webhook solver config.
+        - Если timeout — status.phase=Failed, conditions[AddonInstallFailed]=True с actionable hint.
+    3. **ClusterIssuer создаётся только в фазе Ready** — это критично, чтобы cert-manager не пытался issue cert через несуществующий webhook.
+- [ ] **Reconcile logic при removal** (юзер делает `dns-provider remove`):
+    1. Удаляет ClusterIssuer.
+    2. Если был add-on type — удаляет webhook Argo CD Application из `platform-providers`.
+    3. Очищает Secret с credentials.
+    4. status.phase → Pending (либо undefined если не configured).
+- [ ] **Future extension point** (multi-tenant Phase 7+, не сейчас): `PlatformStack.spec.overrides.dnsProviders.<name>.policy: "auto" | "allow" | "deny"`. Default `auto` — текущее lazy поведение. `allow`/`deny` для explicit platform-admin override в multi-tenant scenarios. Backward-compatible добавление, не требует переписывания текущей логики.
+
+#### Поставка — ExternalSurface schema расширение
+
+- [ ] `ExternalSurface.spec.dnsProvider` field:
+    ```cue
+    spec: {
+        // ...existing fields из 4.1, 4.1b...
+
+        dnsProvider?: #DnsProviderConfig
+    }
+
+    #DnsProviderConfig: {
+        // Type matches registry entry name.
+        type: "cloudflare" | "godaddy" | "hetzner-dns" | "digitalocean" | "route53" | "google-cloud-dns"
+
+        // Provider-specific credentials через Secret reference (не inline).
+        credentialsSecretRef: {
+            name:      string
+            namespace: string | *"cert-manager"
+            // Keys внутри Secret конкретны для provider:
+            //   cloudflare:       "api-token"
+            //   godaddy:          "api-key" + "api-secret"
+            //   hetzner-dns:      "api-token"
+            //   digitalocean:     "access-token"
+            //   route53:          "access-key-id" + "secret-access-key" + "region"
+            //   google-cloud-dns: "service-account-json"
+        }
+
+        // Optional zone hint когда есть несколько зон под одним provider.
+        zoneSelector?: string
+    }
+    ```
+- [ ] Также добавляется `certMode: "letsencrypt-dns01-auto"` в `#DomainEntry` (из 4.1b).
+
+#### Поставка — Built-in provider configurations
+
+- [ ] **Cloudflare** (priority 1):
+    - Required: API Token с permission `Zone:DNS:Edit` для target zone (или `User:All Zones`).
+    - cert-manager built-in solver `cloudflare`.
+    - Wizard validation: `GET https://api.cloudflare.com/client/v4/user/tokens/verify`.
+
+- [ ] **Route53** (AWS):
+    - Required: AWS access key + secret + region.
+    - cert-manager built-in solver `route53`.
+    - Wizard validation: STS `GetCallerIdentity`.
+
+- [ ] **Google Cloud DNS**:
+    - Required: GCP service account JSON с роли `roles/dns.admin`.
+    - cert-manager built-in solver `clouddns`.
+    - Wizard validation: parse JSON + API call.
+
+- [ ] **DigitalOcean**:
+    - Required: DO API token.
+    - cert-manager built-in solver `digitalocean`.
+    - Wizard validation: API call.
+
+#### Поставка — Add-on provider configurations
+
+- [ ] **GoDaddy** add-on:
+    - Webhook chart: `cert-manager-webhook-godaddy` (community).
+    - Required: API key + API secret pair from developer.godaddy.com.
+    - Token format: separate `<key>` and `<secret>` (NOT colon-separated string).
+    - Pre-requirements (CLI выводит до prompt'а token):
+        ```
+        GoDaddy API access requires:
+          • Active GoDaddy account with at least one registered domain
+          • Production API keys (OTE test keys do NOT work for real DNS-01)
+          • Get keys from: https://developer.godaddy.com/keys
+        ```
+    - Wizard validation: `GET https://api.godaddy.com/v1/domains` с `Authorization: sso-key <key>:<secret>`.
+
+- [ ] **Hetzner DNS** add-on:
+    - Webhook chart: `cert-manager-webhook-hetzner` (community).
+    - Required: Hetzner DNS API token (отдельный от Hetzner Cloud token — выдаётся в Hetzner DNS Console, не в Hetzner Cloud Console).
+    - Pre-requirements:
+        ```
+        Hetzner DNS API access requires:
+          • Hetzner DNS Console account (separate from Hetzner Cloud account if applicable)
+          • DNS API token from: https://dns.hetzner.com/settings/api-token
+          
+        Note: This is NOT the same as your Hetzner Cloud token (which AppRafter uses
+        for infrastructure provisioning). DNS API tokens are managed separately.
+        ```
+    - Wizard validation: `GET https://dns.hetzner.com/api/v1/zones` с token.
+
+#### Поставка — `apprafter target dns-provider` CLI группа
+
+- [ ] `apprafter target dns-provider configure`:
+    - Interactive wizard:
+        ```
+        ? Which DNS provider hosts your domain(s)?
+            Built-in (no extra deployment):
+            > Cloudflare
+              DigitalOcean
+              Route53 (AWS)
+              Google Cloud DNS
+            Add-ons (lazy-deployed):
+              GoDaddy
+              Hetzner DNS
+
+        ? GoDaddy API Key: › ****
+        ? GoDaddy API Secret: › ****
+          ✓ Format valid
+          ✓ Credentials verified (12 domains accessible)
+
+        Installing GoDaddy webhook add-on...
+          ✓ cert-manager-webhook-godaddy installed (Argo CD synced in 23s)
+          ✓ ClusterIssuer apprafter-letsencrypt-dns01-auto ready
+
+        ✓ GoDaddy DNS provider configured
+        ℹ Wildcard certificates can now be auto-issued.
+        ℹ Existing manual-DNS-01 domains will auto-migrate on next renewal.
+        ```
+    - Non-interactive: provider-specific флаги, e.g.:
+        - `--type cloudflare --token "$CF_TOKEN"`
+        - `--type godaddy --api-key "$GD_KEY" --api-secret "$GD_SECRET"`
+        - `--type hetzner-dns --token "$HD_TOKEN"`
+    - Под капотом:
+        - Validates credentials через provider API.
+        - Создаёт Secret в namespace `cert-manager`.
+        - Patches `ExternalSurface.spec.dnsProvider`.
+        - PlatformController берёт на себя add-on installation (если нужно) + ClusterIssuer creation.
+        - CLI ждёт `ExternalSurface.status.phase=Ready` (или Failed) с progress indication.
+
+- [ ] `apprafter target dns-provider status`:
+    - Output:
+        ```
+        DNS Provider:  GoDaddy (add-on)
+        Status:        Ready (validated 5m ago)
+        Webhook:       cert-manager-webhook-godaddy v1.2.3 (Healthy)
+        Zone access:   3 zones (example.com, example.org, example.dev)
+        Last DNS-01:   2 hours ago (success, *.example.com renewal)
+
+        Auto-renewal:  enabled для 4 domains
+          *.example.com    (renews in 28d, auto)
+          *.example.dev    (renews in 45d, auto)
+          api.example.org  (specific, HTTP-01, renews in 12d, auto)
+        ```
+    - Для built-in providers webhook line опускается.
+
+- [ ] `apprafter target dns-provider rotate`:
+    - Wizard prompt только для новых credentials, остальные fields preserved.
+    - Pre-validation, потом patches Secret in-place.
+
+- [ ] `apprafter target dns-provider remove`:
+    - Pre-check: scan domains с `certMode: letsencrypt-dns01-auto`.
+    - Active wildcards с auto mode → **platform-scope MigrationPlan** (см. ниже).
+    - No auto-mode wildcards → immediate remove с confirmation.
+    - При add-on type — webhook Application автоматом удаляется PlatformController'ом.
+
+- [ ] `apprafter target dns-provider list-available`:
+    - Output: registry таблица всех supported providers, помечает "built-in" / "add-on" + ссылки на documentation.
+
+#### Поставка — Migration existing manual-DNS-01 → auto
+
+- [ ] При первом `dns-provider configure` после того как существуют wildcards с `certMode: letsencrypt-dns01-manual`:
+    - Prompt:
+        ```
+        Found 2 existing wildcard domains using manual DNS-01:
+          *.example.com   (next renewal in 28 days)
+          *.example.dev   (next renewal in 45 days)
+
+        Migrate to automated renewal? [Y/n]
+        ```
+    - "Y" → patches `DomainEntry.certMode: letsencrypt-dns01-manual` → `letsencrypt-dns01-auto`.
+    - При следующем renewal cycle cert-manager использует auto issuer.
+    - "n" → existing certs остаются manual до explicit `target cert migrate-to-auto <domain>`.
+
+- [ ] `apprafter target cert migrate-to-auto <domain>` для explicit migration:
+    - Patches certMode на auto.
+    - Опционально с `--force-renew-now` — triggers immediate re-issuance.
+
+#### Поставка — MigrationPlan integration
+
+- [ ] При `dns-provider remove` с active auto-mode wildcards создаётся MigrationPlan:
+    - `scope.type: platform`
+    - `scope.platform.target: ExternalSurface/default`
+    - `trigger.kind: dns-provider-removal`
+    - `risks.classification: requires-restart`
+    - `risks.affectedDomains: [...]`
+    - `risks.estimatedImpact: "Wildcards will fail next renewal (~60 days). Apps lose TLS at that point."`
+    - `risks.reversible: true`
+    - `plan` steps: remove dns-provider config → uninstall add-on webhook (если был) → mark affected domains → (M3) notify owners.
+- [ ] Approve/reject через standard `migration approve`/`migration reject`.
+
+#### Поставка — Cert renewal monitoring (расширение 4.1b)
+
+- [ ] AppRafter operator periodic scan Certificates с `cert-mode: letsencrypt-dns01-auto`:
+    - Successful renewal in last 60 days → silently track `lastRenewalAt`.
+    - Failed renewal с last attempt > 7 days ago → bump `Application.status.conditions[CertificateAutoRenewalStuck]=True` с last error.
+    - Continuous failures (3+ attempts) → suggest action: "DNS provider credentials may be invalid. Run `apprafter target dns-provider check`."
+
+- [ ] `apprafter target dns-provider check`:
+    - Re-validate credentials через provider API.
+    - Output статус каждого manageable zone.
+    - `--full-check` opt-in флаг (5-10s overhead): создаёт + verifies + удаляет test TXT record для end-to-end проверки.
+
+#### Acceptance
+
+- [ ] `apprafter target dns-provider configure --type cloudflare` (built-in) → ExternalSurface переходит Pending → ValidatingCredentials → Ready за < 5s, no webhook deployment.
+- [ ] `apprafter target dns-provider configure --type godaddy` → ExternalSurface проходит Pending → ResolvingAddon → InstallingAddon → ValidatingCredentials → Ready, webhook deployed в `platform-providers` project.
+- [ ] Если webhook chart install failed (e.g., OCI registry недоступен) → ExternalSurface.status.phase=Failed, conditions[AddonInstallFailed]=True с actionable hint, ClusterIssuer не создаётся.
+- [ ] Wildcard cert auto-issued через DNS-01 в течение 60s после `target domain add` (built-in или add-on provider).
+- [ ] Existing manual-mode wildcard после `configure` + prompt "Y" → migrated к auto mode, next renewal automatic.
+- [ ] `dns-provider remove` для add-on provider → webhook Application автоматом удаляется из `platform-providers` project.
+- [ ] `dns-provider remove` с active auto-wildcards → MigrationPlan создан.
+- [ ] `dns-provider check --full-check` создаёт + verifies + удаляет test TXT record, output success/failure detail.
+- [ ] Invalid token (revoked у provider) после rotation → next renewal fails, `CertificateAutoRenewalStuck` condition bumped.
+- [ ] Switch между providers (cloudflare → godaddy): cleanup старого + setup нового через standard `remove` + `configure` flow. CLI и controller handle gracefully.
+
+#### Не входит в этот item
+
+- Namecheap support — deferred из-за IP allowlist complexity + balance requirements. Может быть добавлен позже как community-contributed registry entry.
+- Multi-tenant explicit add-on control (`PlatformStack.spec.overrides.dnsProviders.<name>.policy`) — future Phase 7+, backward-compatible extension.
+- Concurrent multiple DNS providers per cluster (out of scope, single provider per cluster).
+- External-DNS integration для automatic A/AAAA record provisioning (Phase 4, orthogonal item).
+- HSM-backed certs / regulated workloads patterns.
+- Cert pinning / Certificate Transparency monitoring.
+
+**Зависит от:** 4.1b (custom cert import, manual DNS-01, ExternalSurface.spec.allowedDomains/defaultDomain, target domain/cert CLI groups); 1.79a (`platform-providers` Argo CD project для add-on deployment).
 
 **Размер:** M
 
@@ -4179,6 +4897,9 @@ instead of carrying parallel definitions.
 | 2026-05-20 | M1.5 Track B.1.70 walk-fix #11 — walk-fix #10 ConfigMap зашёл OK, новый argocd-repo-server pod теперь stuck на image pull instead of mount: `Back-off pulling image "ghcr.io/apprafter/argocd-cue-cmp:v0.1.0": ErrImagePull MANIFEST_UNKNOWN`. **Bug P** — `crane ls` показал image **существует**, но tag = `:0.1.0` (без `v`), а chart pin = `:v0.1.0`. `argocd-cue-cmp-publish.yml` workflow tag line was `${IMAGE}:${VERSION}` где VERSION = `0.1.0` (без v) из VERSION file. Git tag создавался как `argocd-cue-cmp/v<version>` (с `v`), но image tag — без. Inconsistency с operator + webhook workflows (там `image:${github.ref_name}` = `:v0.1.x`). Latent с chart 0.1.2 (Track B.1.69), masked walks #5-10 upstream blockers (broken ConfigMap не давал pull happen). Fix: (1) workflow `tags:` line gets `v` prefix: `${IMAGE}:v${VERSION}`; (2) `Tag :latest` source + release notes example updated; (3) `argocd-cue-cmp/VERSION` 0.1.0 → 0.1.1 (workflow detect gates на git tag existence, без bump skipnет publish); (4) `component_argocd-cue-cmp.cue` pin к `v0.1.1`. v0.1.1 image — re-publish source v0.1.0 с corrected tag form. v0.1.0 image stays на registry как historical artefact. Chart bumped 0.1.11 → 0.1.12 с full compat entry + known-issue note в 0.1.11; CLI bumped 0.1.107 → 0.1.108, RELEASED_PLATFORM_STACK_VERSION → "0.1.12". 557 cli tests passed; все гейты clean | v0.1.108 |
 | 2026-05-20 | M1.5 Track B.1.71 closure — chart as single source of truth. `cli/cli-providers/build.rs` extracts `_loaderValues.{cilium,argocd}` + `currentVersion` from `platform-stack/cue/` at compile time, emits `CILIUM_VALUES_YAML`, `ARGOCD_LOADER_VALUES_YAML`, `RELEASED_PLATFORM_STACK_VERSION` as generated Rust constants. `cluster_bootstrap.rs` swaps hand-rolled YAML for these. 12 dead `*_yaml` renderers deleted (admission_webhook, application_crd, argocd_gateway, argocd_repo_secret, backstage_app_config, backstage_manifests, bootstrap_app, cert_manager_values, cilium_values, issuer, network_policy, operator_chart, operator_values) plus 3 dead examples. CUE invariant `_components.cilium.values ≡ _loaderValues.cilium` makes walk-fix #6's drift class structurally impossible; Argo CD chart's `values:` derives from `_loaderValues.argocd & { ...extras... }` so loader stays a strict subset by construction. `RELEASED_PLATFORM_STACK_VERSION` drift class also gone. Chart bumped 0.1.12 → 0.1.13 (refactor, no rendered-output change); CLI bumped 0.1.108 → 0.1.109. Test count 557 → 479 (~80 deleted renderer tests, 4 new loader_values regression guards). Deferred: `RELEASED_OPERATOR_VERSION` from operator chart's Chart.yaml (cross-workspace path), `argocd-cue-cmp/plugin.yaml` embedded in component_argocd as string literal | v0.1.109 |
 | 2026-05-20 | M1.5 Track B.1.71b closure — closed the remaining 6 version-duplication classes from B.1.71's deferred follow-ups. Cilium + Argo CD upstream chart versions migrated to `_loaderValues.{cilium,argocd}.chartVersion` in CUE; chart-side invariants + build.rs-derived `CILIUM_CHART_VERSION` / `ARGOCD_CHART_VERSION` constants. Hand-maintained consts in `helm.rs` + entire `argocd_values.rs` deleted. Operator + admission-webhook container image tags now sourced from `operator/charts/<chart>/Chart.yaml#appVersion` via a tiny grep-based reader in build.rs; chart's `values.image.tag` dropped so Helm template's `.Chart.AppVersion` fallback drives the image. Hand-maintained `RELEASED_OPERATOR_VERSION` in `image_ref.rs` deleted. cue-cmp `VERSION` plain-text file replaced by `argocd-cue-cmp/version.cue` (package at `apprafter.io/argocd-cue-cmp`); chart imports via CUE, publish + check workflows read via `cue export -e version --out text`. Chart bumped 0.1.13 → 0.1.14 (refactor, byte-equivalent rendering); CLI bumped 0.1.109 → 0.1.110. Test count +3 new regression guards. B.1.71's deferred-follow-up section is now empty | v0.1.110 |
+| 2026-05-24 | M1.5 walk-fix #12 post-B.1.79a — `apprafter app add` wizard defaults destination namespace к `apprafter`. After walk-fix #11 permitted `Namespace` в `apps` AppProject, landing apps still failed с `namespaces "apprafter" not found`. Root cause: wizard's `build_application_manifest` hardcoded `destination.namespace = name` (app-name-based), so first sync создавал orphan `Namespace/apprafter-landing-web` (`CreateNamespace=true` creates ONLY destination namespace, never manifest's own) и затем падал на apply Application CR к манифестному `metadata.namespace: apprafter` (несуществующему). Fix: new `--namespace` flag в `AppCommand::Add` clap surface с default `apprafter` + wizard sixth prompt «Destination namespace» с DNS-1123 валидацией; `build_application_manifest()` получает explicit `destination_namespace: &str` параметр (name-based defaulting удалён); `DEFAULT_DESTINATION_NAMESPACE = "apprafter"` константа в `app_wizard.rs` как load-bearing анкер (anchored unit test). +4 новых unit-test (renamed `..._routes_to_argocd_namespace` → `..._routes_argocd_cr_to_argocd_ns_destination_to_param`, новый `..._destination_namespace_honours_explicit_caller_value`, `default_destination_namespace_constant_is_apprafter`, `validate_dns_1123_for_namespace_accepts_kubernetes_namespace_shapes`). Folded fmt-fix `a500144` (style-only — pre-commit local gate run clippy+test но пропустил `cargo fmt --check`, CI lint flag'нул двух call site'ов которые fit на одну строку после rustfmt; updated `feedback_cue_bin_local.md` memory с явным "clippy ≠ fmt; запускать все три гейта одним `&&`-chain'ом"). Existing user apps требуют one-off `kubectl -n argocd patch applications.argoproj.io <name> --type=merge -p '{"spec":{"destination":{"namespace":"apprafter"}}}'` migration step (документировано в UNRELEASED.md). CLI 0.1.159 → 0.1.160. Chart unchanged | v0.1.160 |
+| 2026-05-24 | M1.5 walk-fix #11 post-B.1.79a — `Namespace` cluster resource permitted в `apps` AppProject. После walk-fix #10 разблокировал CMP discover, landing apps продвинулись дальше и упали с `SyncFailed: resource :Namespace is not permitted in project apps`. Wizard-generated user Applications carry `syncOptions: [CreateNamespace=true, ServerSideApply=true]`; Argo CD на first sync генерирует synthetic `Namespace` resource для destination namespace и пытается его apply'ть как cluster-scoped. `apps` AppProject's `clusterResourceWhitelist: []` (полностью закрытый, B.1.79a part 1 baseline) блокировал любой cluster resource включая Namespace. Fix: narrow whitelist `[{group: "", kind: "Namespace"}]` — только Namespace, ничего другого cluster-scoped не достигает user-app surface (no CRD installs, no ClusterRole/Binding, no PV). Phase 4 AccessGrant ляжет runtime RBAC на этот structural foundation. Caveat — orphan destination namespace: wizard'ов default `destination.namespace = <app-name>` не совпадает с manifest'ом `metadata.namespace`; после walk-fix #11 sync проходит но destination ns остаётся пустым (Application CR попадает к своему manifest namespace per manifest's metadata, operator там создаёт Deployment+Service). Wizard polish для defaulting destination к manifest's namespace отложена на walk-fix #12. Compat entry `compatibility: "0.1.47"` shipped с full diagnosis. No CLI bump per v0.1.159 channel-latest design — PlatformController polls upstream и rolls existing installs; новые bootstraps подхватывают через `resolve_latest_platform_stack_version()`. Chart 0.1.46 → 0.1.47 | platform-stack 0.1.47 |
+| 2026-05-24 | M1.5 walk-fix #10 post-B.1.79a — CMP discover stdout fix (cue-cmp v0.1.4 → v0.1.5, chart 0.1.45 → 0.1.46). После walk-fix #8 (command-based discover) + walk-fix #8b (cue-cmp v0.1.4 image rebuild), landing apps STILL failed с тем же `Failed to unmarshal "package.json": Object 'Kind' is missing` (cached). После `kubectl exec deployment/argocd-redis -- redis-cli FLUSHDB` + `argocd.argoproj.io/refresh=hard` annotation на каждый Application, ошибка воспроизводилась идентично — не stale-cache artefact, CMP plugin реально не matches repo. Diagnosis: `kubectl -n argocd logs deployment/argocd-repo-server -c cue-cmp` показал discover shell snippet running, exiting 0, но каждое invocation followed by `Plugin command returned zero output`. Root cause: Argo CD's `MatchRepository` в `cmpserver/plugin/plugin.go` keys on **stdout** of discover command, not exit code; v0.1.4 snippet piped `find -print -quit` через `grep -q .`, и `-q` (quiet) suppresses stdout entirely. Even когда find matched real `landing/web/apprafter/Application.cue`, no output reached runCommand's return value, plugin marked `IsSupported: false`, и directory-mode fallback re-fired `package.json` parse exactly as before walk-fix #8. Fix: drop `\| grep -q .` pipe из BOTH branches discover snippet в `argocd-cue-cmp/plugin.yaml` source-of-truth и chart's `extraObjects` ConfigMap mirror в `platform-stack/cue/component_argocd.cue`. `find -print -quit` сам печатает первый matched path on hit, prints nothing on miss; both code paths exit 0. Stdout emptiness IS the signal Argo CD reads. New `argocd-cue-cmp/test-discover.sh` regression test: extracts discover shell snippet из plugin.yaml directly (no duplication — drift would bite), runs против 5 fixture directories (parent-dir convention `apprafter/Application.cue` subdir, cwd-is-apprafter depth-1, filename-prefix `apprafter*.cue` at root, plain repo без apprafter files must return empty stdout, generic `.cue` без apprafter prefix must not match) — asserts stdout non-emptiness matches expected match/no-match signal, NOT just exit code. Plus hard string-match guard `grep -Fq 'grep -q'` valит test immediately если reintroduced. Wired в `.github/workflows/argocd-cue-cmp-check.yml` между image build и drift detection. Memory `feedback_cmp_discover_test.md` сохранён с правилом: каждое изменение plugin.yaml обязано крутить test-discover.sh; Argo CD reads stdout не exit code; specific traps к watch (`grep -q`, `>/dev/null`, `cmp /dev/null -`, etc.). No CLI bump per v0.1.159 policy. cue-cmp v0.1.4 → v0.1.5 (image rebuild с baked plugin.yaml), chart 0.1.45 → 0.1.46 (`_components.argocd-cue-cmp.values.image.tag` follows via CUE import + ConfigMap content updated). Compat entry `compatibility: "0.1.46"` shipped | argocd-cue-cmp v0.1.5 + platform-stack 0.1.46 |
 | 2026-05-24 | M1.5 walk-fix #9 post-B.1.79a — CLI resolves latest platform-stack version from upstream GitHub Releases API at bootstrap time. Operator asked why CLI had to bump on every chart-only release; investigation surfaced `cluster_bootstrap::platform_stack_version()` returned baked-in `RELEASED_PLATFORM_STACK_VERSION` constant verbatim. Constant tracks `platform.cue` `currentVersion` via `cli-providers/build.rs` at compile time. Coupling forced а CLI rebuild + release on every chart bump just to keep fresh installs current — wrong by design (CLI binary has no business knowing latest chart version at compile time; latest chart is whatever is published к upstream release stream). Fix: new `cli_providers::k8s::channel_latest` module с `resolve_latest_platform_stack_version()` entry point. GETs `https://api.github.com/repos/apprafter/apprafter/releases?per_page=100` с 3s timeout, filters `tag_name` к entries starting `platform-stack/v`, strips prefix, parses as semver, picks highest с stable preferred over prerelease. Any failure path (network / parse / no matching tags) falls back к baked constant so air-gapped / firewalled installs still bootstrap. `cluster_bootstrap::platform_stack_version()` now calls the resolver. Stable / prerelease semantics: when both stable and prerelease published, picks stable; only when ALL candidates are prereleases (fresh channel before first stable cut) returns one. Uses GitHub Releases API (same surface as `version_check.rs`) rather than OCI registry tag list — no auth token needed, same rate-limit story (resolver fires only at bootstrap, rare). +7 unit tests on pure `pick_latest_platform_stack_tag(releases)` helper covering mixed streams happy path, no-platform-stack-tags fork case, malformed entries skipped, non-array defensive, stable vs prerelease precedence, prerelease fallback when no stable, two-digit-patch semver vs lexical regression guard. **Versioning policy update:** going forward chart-only bumps do NOT bump CLI — the v0.1.158 bump that motivated this question was the last of its kind. Future chart releases picked up by existing CLI binaries through new resolver, no CLI rebuild needed. CLI 0.1.158 → 0.1.159. Chart unchanged. cue-cmp unchanged | v0.1.159 |
 | 2026-05-24 | M1.5 walk-fix #8b post-B.1.79a — cue-cmp image bump alongside chart 0.1.45. Push of v0.1.157 (which bundled chart 0.1.44 with new command-based CMP discover in plugin.yaml) tripped `argocd-cue-cmp-check` workflow's drift detection: `Image source under argocd-cue-cmp/ changed since argocd-cue-cmp/v0.1.3 was published, but version.cue is still 0.1.3`. Walk-fix #8 reasoning that "ConfigMap mount overrides the image's plugin.yaml at runtime" is correct for chart-installed clusters, but operators who install cue-cmp manually (attaching to stock Argo CD without the AppRafter chart) get the image's baked-in plugin.yaml — stale image content = wrong behaviour for that path. Drift policy enforced rightly. Fix: bump cue-cmp v0.1.3 → v0.1.4 (publish workflow auto-fires on new tag, rebuilds image with new plugin.yaml baked in) + chart 0.1.44 → 0.1.45 (image pin follows CUE import) + CLI 0.1.157 → 0.1.158. plugin.yaml content unchanged from walk-fix #8 — same command-based discover. argocd-repo-server's sidecar image reference flips на chart upgrade, kubelet rolls pod, operator hard-refreshes affected apps. Recovery same as walk-fix #8 just with chart 0.1.45 instead of 0.1.44 | v0.1.158 |
 | 2026-05-24 | M1.5 walk-fix #8 post-B.1.79a — CMP discover switches from glob to command (chart 0.1.44) + wizard strips trailing `apprafter` segment. Operator on chart 0.1.43 registered landing apps via `apprafter app add --path landing/cms`; Argo CD UI surfaced `Failed to unmarshal "package.json": Object 'Kind' is missing` для both `landing-web` и `landing-cms`. Diagnostics confirmed chart at 0.1.43, configmap with the new brace-alternation glob, `MatchRepository` gRPC calls returning OK (success) but absence of any downstream `generate` activity implied all match calls returned false. Root cause: chart 0.1.42-0.1.43 plugin.yaml used `discover.find.glob: "{**/apprafter*.cue,**/apprafter/**/*.cue}"` — brace alternation that `doublestar/v4` supports, but Argo CD 2.13.1's vendored doublestar either treats braces literally or never received v4 brace support. CMP returned no-match; Argo CD fell back to default directory mode, walked `landing/cms/`, и tried to parse `package.json` as а k8s manifest. Fix: switch `discover.find.glob` to `discover.find.command` (find-based shell snippet running from path's directory, exits 0 on match) — handles both conventions in one expression: cwd basename `apprafter` → match any `.cue` at depth 1, otherwise → match any `.cue` inside `apprafter/` subdir OR with filename starting `apprafter`. `-print -quit | grep -q .` short-circuits after first match. No doublestar dependency. cue-cmp Docker image unchanged at v0.1.3 — entire fix lives в the chart-managed `cue-cmp-plugin-config` ConfigMap content. Chart upgrade + argocd-repo-server rollout-restart picks up new discovery rule. Wizard polish bundled: new pure `strip_apprafter_tail(rel)` helper strips trailing `apprafter` segment so `cd landing/cms/apprafter && apprafter app add` defaults to `landing/cms` (parent-of-apprafter form is the cleaner convention; CMP handles either with the new command-based discover, но wizard suggests the canonical shape). +5 unit tests на `strip_apprafter_tail`. Operator recovery: `apprafter platform upgrade --to 0.1.44` + `kubectl rollout restart deployment/argocd-repo-server -n argocd` + hard-refresh affected apps. CLI 0.1.156 → 0.1.157. Chart 0.1.43 → 0.1.44 | v0.1.157 |
