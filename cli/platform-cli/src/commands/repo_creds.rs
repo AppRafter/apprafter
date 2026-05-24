@@ -57,6 +57,7 @@ struct CredsRow {
     username: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn add(
     name: &str,
     url_prefix: &str,
@@ -64,7 +65,23 @@ pub fn add(
     username: &str,
     token: Option<String>,
     no_validate: bool,
+    no_interactive: bool,
 ) -> Result<()> {
+    // Wizard gate — TTY + not opted out. Wizard fills every
+    // missing field via inquire prompts; the token prompt is
+    // masked. Pre-fills come from the flag values above so an
+    // operator passing `--name x --url-prefix y` only gets
+    // prompted for type/username/token.
+    let stdin_is_tty = io::stdin().is_terminal();
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    if crate::commands::repo_creds_wizard::should_use_wizard(
+        no_interactive,
+        stdin_is_tty,
+        stdout_is_tty,
+    ) {
+        return add_via_wizard(name, url_prefix, auth_type, username, token, no_validate);
+    }
+
     validate_dns_1123(name)?;
     let auth = parse_auth_type(auth_type)?;
     let token = resolve_token(token)?;
@@ -95,6 +112,46 @@ pub fn add(
          will inherit these creds automatically."
     );
     Ok(())
+}
+
+/// Wizard entry point — gathers missing fields via inquire
+/// prompts (masked Password for the token) and re-dispatches
+/// into the non-interactive `add` path with
+/// `no_interactive=true` to avoid recursion.
+fn add_via_wizard(
+    name: &str,
+    url_prefix: &str,
+    auth_type: &str,
+    username: &str,
+    token: Option<String>,
+    no_validate: bool,
+) -> Result<()> {
+    let inputs = crate::commands::repo_creds_wizard::WizardInputs {
+        name: if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        },
+        url_prefix: if url_prefix.is_empty() {
+            None
+        } else {
+            Some(url_prefix.to_string())
+        },
+        auth_type: Some(auth_type.to_string()),
+        username: Some(username.to_string()),
+        token,
+        no_validate,
+    };
+    let out = crate::commands::repo_creds_wizard::run(inputs)?;
+    add(
+        &out.name,
+        &out.url_prefix,
+        &out.auth_type,
+        &out.username,
+        Some(out.token),
+        no_validate,
+        true, // no_interactive — prevents wizard recursion.
+    )
 }
 
 pub fn list() -> Result<()> {
@@ -250,7 +307,7 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
 // =========================================================================
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum AuthType {
+pub enum AuthType {
     Pat,
     Basic,
 }
@@ -320,7 +377,7 @@ fn resolve_token(token: Option<String>) -> Result<String> {
 /// self-hosted Gitea/Forgejo with custom token shapes.
 /// Detection priority: GitHub fine-grained PAT > GitHub classic
 /// PAT > GitLab PAT > fallback to a 20+-char generic check.
-pub(crate) fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
+pub fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
     if matches!(auth, AuthType::Basic) {
         // Basic auth tokens are arbitrary passwords — no
         // shape to validate. Just non-empty.

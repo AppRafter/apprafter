@@ -2,6 +2,7 @@
 //! Subcommand handlers. Each module implements one verb.
 
 pub mod app;
+pub mod app_wizard;
 pub mod apply;
 pub mod argocd_password;
 pub mod auth;
@@ -20,6 +21,7 @@ pub mod open;
 pub mod plan;
 pub mod platform;
 pub mod repo_creds;
+pub mod repo_creds_wizard;
 pub mod status;
 pub mod target;
 pub mod target_wizard;

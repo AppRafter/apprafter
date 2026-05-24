@@ -13,6 +13,102 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.145 — M1.5 polish post-B.1.79a #3 — wizards for `app add` and `repo creds add` (2026-05-24)
+
+### What landed
+
+Interactive wizards for the two CLI verbs that had been
+flag-driven-only since their first release. Mirrors the
+`target add` wizard pattern from v0.1.76: gates on `stdin +
+stdout are TTYs` AND `--no-interactive` not set, pre-fills
+every prompt from the matching flag value or auto-detected
+context, falls through to the existing non-interactive code
+path with `no_interactive=true` to avoid recursion.
+
+### `apprafter app add` wizard
+
+Prompts in order:
+
+1. **Git URL** (Text, default = explicit `--git-url` or the
+   cwd's `git remote get-url <remote>` output, normalised
+   via `normalise_git_url`). Required, non-empty.
+2. **Application name** (Text, default = `--name` flag or
+   `derive_app_name(url)`). DNS-1123 validated inline so the
+   operator sees `✗ DNS-1123 only ...` immediately on bad
+   input instead of after the whole form.
+3. **Branch / revision** (Text, default = `--branch` flag or
+   the cwd's current branch via `git symbolic-ref --short
+   HEAD`, else `main`). Required.
+4. **Path within repo** (Text, default `/`).
+5. **AppProject** (Select: `apps` / `platform` /
+   `platform-providers`, default = `--project` flag's value).
+
+`detect_git_origin(remote)` and `detect_git_branch()` shell
+out to `git` non-fatally — missing binary, non-repo cwd, or
+unconfigured remote returns `None` and the wizard just
+falls back to an empty default instead of erroring. Operators
+can register apps from any cwd.
+
+### `apprafter repo creds add` wizard
+
+Prompts in order:
+
+1. **Friendly name** (Text, DNS-1123 validated).
+2. **URL prefix** (Text, validated for scheme+host shape —
+   accepts `https://...`, `git@host:...`; rejects bare
+   paths that could never prefix-match an Argo CD repoURL).
+3. **Auth type** (Select: `pat` / `basic`).
+4. **Username** (Text, default `git`).
+5. **Token / password** (`inquire::Password`,
+   `PasswordDisplayMode::Masked`, `without_confirmation`).
+   Inline provider-aware format validation runs as the
+   operator types unless `--no-validate` flowed through —
+   `✗ GitHub fine-grained PAT length 40 too short`
+   surfaces immediately instead of after the full form.
+
+### Flag additions
+
+- `apprafter app add` gains `--no-interactive` (default
+  false). Disables the wizard even on a TTY shell.
+- `apprafter repo creds add` gains `--no-interactive` (same
+  semantics).
+
+### Visibility changes
+
+`commands::repo_creds::AuthType` and `validate_token_format`
+promoted from `pub(crate)` to `pub` so
+`repo_creds_wizard` can call them without re-implementing
+the rules. No behaviour change.
+
+### Tests
+
++11 unit tests across the two new modules:
+
+**`app_wizard`:**
+- `should_use_wizard_respects_no_interactive_flag`
+- `should_use_wizard_requires_both_streams_to_be_terminals`
+- `validate_dns_1123_for_app_accepts_well_formed`
+- `validate_dns_1123_for_app_rejects_uppercase_and_dashes`
+- `validate_non_empty_trims_whitespace`
+
+**`repo_creds_wizard`:**
+- `should_use_wizard_gate`
+- `validate_url_prefix_accepts_https_and_scp_forms`
+- `validate_url_prefix_rejects_bare_paths` — defensive: bare
+  paths can't prefix-match a fully-qualified Argo CD
+  repoURL.
+- `validate_dns_1123_for_creds_accepts_well_formed`
+- `validate_dns_1123_for_creds_rejects_uppercase`
+- `parse_auth_type_safe_defaults_to_pat_on_garbage`
+
+All other tests still pass; clippy `-D warnings` clean.
+
+### Versioning
+
+CLI 0.1.144 → 0.1.145. Chart unchanged.
+
+---
+
 ## v0.1.144 — M1.5 polish post-B.1.79a #2 — `apprafter platform status` UX (2026-05-24)
 
 ### Symptom

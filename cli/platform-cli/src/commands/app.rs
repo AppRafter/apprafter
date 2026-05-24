@@ -66,7 +66,20 @@ pub fn add(
     project: &str,
     remote: &str,
     no_ping: bool,
+    no_interactive: bool,
 ) -> Result<()> {
+    // Trigger the interactive wizard when stdin + stdout are
+    // TTYs and the operator hasn't opted out via
+    // `--no-interactive`. The wizard pre-fills every field
+    // from the flags above plus cwd-detected git origin and
+    // branch where available; the operator may accept defaults
+    // or override per-field.
+    let stdin_is_tty = io::stdin().is_terminal();
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    if crate::commands::app_wizard::should_use_wizard(no_interactive, stdin_is_tty, stdout_is_tty) {
+        return add_via_wizard(git_url, name, branch, path, project, remote, no_ping);
+    }
+
     let (repo_url, derived_branch) = match git_url {
         Some(explicit) => (normalise_git_url(&explicit), None),
         None => detect_git_repo_for_cwd(remote)?,
@@ -116,6 +129,45 @@ pub fn add(
     println!("Argo CD will sync the workload within a reconcile cycle. State:");
     println!("  apprafter app status {derived_name}");
     Ok(())
+}
+
+/// Wizard entry point — gathers any missing field via inquire
+/// prompts and re-dispatches to the non-interactive `add` with
+/// `no_interactive=true` to avoid recursion. The flag values
+/// above are passed through verbatim; cwd detection pre-fills
+/// the wizard's Git URL and branch suggestions.
+#[allow(clippy::too_many_arguments)]
+fn add_via_wizard(
+    git_url: Option<String>,
+    name: Option<String>,
+    branch: Option<String>,
+    path: &str,
+    project: &str,
+    remote: &str,
+    no_ping: bool,
+) -> Result<()> {
+    let detected_origin = crate::commands::app_wizard::detect_git_origin(remote);
+    let detected_branch = crate::commands::app_wizard::detect_git_branch();
+    let inputs = crate::commands::app_wizard::WizardInputs {
+        git_url,
+        name,
+        branch,
+        path: Some(path.to_string()),
+        project: Some(project.to_string()),
+        detected_origin,
+        detected_branch,
+    };
+    let out = crate::commands::app_wizard::run(inputs)?;
+    add(
+        Some(out.git_url),
+        Some(out.name),
+        Some(out.branch),
+        &out.path,
+        &out.project,
+        remote,
+        no_ping,
+        true, // no_interactive — prevent recursion into the wizard.
+    )
 }
 
 pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> {

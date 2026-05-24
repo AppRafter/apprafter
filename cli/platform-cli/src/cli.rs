@@ -267,6 +267,12 @@ pub enum RepoCredsCommand {
         /// where token formats are arbitrary.
         #[arg(long = "no-validate", default_value_t = false)]
         no_validate: bool,
+        /// Skip the interactive wizard even when stdin + stdout
+        /// are TTYs. Wizard fires by default and walks through
+        /// name / URL prefix / type / username / token (token
+        /// prompt is masked).
+        #[arg(long = "no-interactive", default_value_t = false)]
+        no_interactive: bool,
     },
     /// List registered creds.
     #[command(alias = "ls")]
@@ -433,6 +439,13 @@ pub enum AppCommand {
         /// not yet have an `HEAD` ref.
         #[arg(long = "no-ping", default_value_t = false)]
         no_ping: bool,
+        /// Skip the interactive wizard even when stdin + stdout
+        /// are TTYs. The wizard fires by default on TTY shells
+        /// and asks for any field not supplied via flag,
+        /// pre-filling defaults from the cwd's git remote + the
+        /// current branch where available.
+        #[arg(long = "no-interactive", default_value_t = false)]
+        no_interactive: bool,
     },
     /// List Applications scoped to the `apps` AppProject (or
     /// `--project <name>`). Filters to Applications labeled
