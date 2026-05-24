@@ -272,17 +272,25 @@ describe('CMS client (Phase H)', () => {
 });
 
 describe('Application manifests — prod + preview pair', () => {
-  test('Application.cue (prod) pins :prod + carries apprafter.dev hostname label', () => {
+  // Walk-fix 2026-05-25: temporarily pinned to :latest while
+  // the landing-promote-to-prod.yml + landing-preview-build.yml
+  // workflows haven't yet seeded :prod / :preview tags in
+  // ghcr. The registry currently carries only :latest +
+  // landing-vX.Y.Z, so pinning к :prod / :preview produces
+  // ImagePullBackOff on real clusters. Revisit once the
+  // promotion workflows fire and the manifests can flip back
+  // к their proper rolling-tag conventions.
+  test('Application.cue (prod) pins landing-web image + carries apprafter.dev hostname label', () => {
     const m = readFileSync(join(ROOT, 'apprafter/Application.cue'), 'utf8');
     expect(m).toContain('name:      "landing-web"');
-    expect(m).toContain('"ghcr.io/apprafter/landing-web:prod"');
+    expect(m).toContain('"ghcr.io/apprafter/landing-web:latest"');
     expect(m).toContain('"apprafter.io/hostname":  "apprafter.dev"');
   });
 
-  test('Application-preview.cue pins :preview + carries preview.apprafter.dev label', () => {
+  test('Application-preview.cue pins landing-web image + carries preview.apprafter.dev label', () => {
     const m = readFileSync(join(ROOT, 'apprafter/Application-preview.cue'), 'utf8');
     expect(m).toContain('name:      "landing-web-preview"');
-    expect(m).toContain('"ghcr.io/apprafter/landing-web:preview"');
+    expect(m).toContain('"ghcr.io/apprafter/landing-web:latest"');
     expect(m).toContain('"apprafter.io/hostname": "preview.apprafter.dev"');
     // Same package so `cue vet ./apprafter/` covers both files in
     // one pass.

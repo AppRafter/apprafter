@@ -13,6 +13,118 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.165 — M1.5 walk-fix #4 post-B.1.79b — Cargo.lock + bun-smoke sync с v0.1.164 (2026-05-25)
+
+### Symptom
+
+v0.1.164 CI `release-cli` matrix build failed identically on
+all three targets (linux-x86_64, darwin-x86_64, darwin-
+aarch64):
+
+```
+Run cargo build --release --locked --target "$TARGET" -p apprafter
+    Updating crates.io index
+error: cannot update the lock file /Users/runner/work/apprafter/
+apprafter/cli/Cargo.lock because --locked was passed to prevent
+this
+help: to generate the lock file without accessing the network,
+remove the --locked flag and use --offline instead.
+```
+
+`cli/Cargo.lock` recorded `apprafter`/`cli-core`/`cli-providers`/
+`cli-state` at `0.1.163`; `cli/Cargo.toml` `workspace.package.
+version = "0.1.164"`. Mismatch → `--locked` refused к touch
+the lock file → exit 101.
+
+Separately, bun smoke tests `web.smoke.test.ts` failed:
+walk-fix #3 flipped `landing/web/apprafter/Application.cue`
++ `Application-preview.cue` from `:prod`/`:preview` к
+`:latest`, but the existing «Application manifests — prod +
+preview pair» test assertions still expected `:prod` +
+`:preview` literally. CI bun job exit 1.
+
+### Root cause
+
+**Cargo.lock drift.** Walk-fix #3 session sequence:
+
+1. Edited `cli/Cargo.toml` 0.1.163 → 0.1.164.
+2. Edited UNRELEASED.md / landing manifests / plan.md.
+3. `git add ...; git commit ...; git tag v0.1.164`.
+
+Step 1 changes `workspace.package.version`, which propagates
+к the four workspace crates на the next `cargo build`/`test`/
+`check`. But I bumped Cargo.toml **after** running the lint
+gate (clippy + test on 0.1.163 layout), and didn't run
+cargo again before staging. So Cargo.lock kept 0.1.163
+references — CI's `--locked` build saw the drift и refused.
+
+**Bun smoke staleness.** Walk-fix #3 changed `image:` field
+в both .cue files but I didn't grep for tests asserting на
+the prior tag values. Bun gate wasn't part of the local
+gate chain I ran (`cargo fmt + clippy + test` only) —
+classic gap of «my workspace gate is Rust-only, but the
+monorepo CI runs every language's gate».
+
+### Fix
+
+1. Bump `cli/Cargo.toml` 0.1.164 → 0.1.165.
+2. `cargo build` to regenerate Cargo.lock с 0.1.165
+   references for all four workspace crates.
+3. Update `web.smoke.test.ts` «Application manifests — prod +
+   preview pair» assertions: pin к `:latest` matching the
+   actual manifests; rename test titles dropping `(prod)` /
+   `pins :prod` phrasing (now generic «pins landing-web
+   image»). Block-level comment в the test file documenting
+   why we're temporarily on `:latest` (promotion workflows
+   haven't seeded :prod/:preview yet).
+
+### Why a fresh patch вместо re-tagging v0.1.164
+
+v0.1.164 tag is already on origin (workflow ran, failed,
+release artifacts have v0.1.164 in their hash). Force-
+updating the tag к а new commit is destructive (per
+`feedback_push_policy.md` — no force-push without explicit
+operator authorisation). Cleanest path: ship the fix as
+v0.1.165 and treat v0.1.164 as «released but artifacts
+missing».
+
+### Tests
+
+Existing Rust suite (205 tests) unchanged — no source code
+shifted. Bun suite: 85 → 87 pass (web.smoke updated, 2
+formerly-failing tests now green). Full local gate run as
+single `&&` chain before commit:
+
+```
+cargo fmt --all -- --check \
+  && cargo clippy --workspace --all-features --all-targets -- -D warnings \
+  && cargo test --workspace --all-features \
+  && bun test            # ← walk-fix #4 lesson: bun is part of the gate
+```
+
+### Memory update
+
+`feedback_cue_bin_local.md` augmented с two new operational
+disciplines:
+
+1. **Cargo.lock-sync rule**: any `cli/Cargo.toml` `workspace.
+   package.version` edit MUST be followed by `cargo build`
+   (or `cargo test`) BEFORE `git add` к refresh Cargo.lock
+   versions in lockstep. Skipping it lands а commit где
+   Cargo.toml and Cargo.lock disagree, and CI's `--locked`
+   surfaces the drift loudly.
+2. **Bun-in-gate rule**: monorepo's local gate is not just
+   the Rust trio. After any change к `landing/**/*.{cue,ts}`
+   / `backstage-plugins/**` / other TS-touched paths, `bun
+   test` MUST run alongside cargo. Single-chain shape:
+   `cargo fmt … && cargo clippy … && cargo test … && bun test`.
+
+### Bump
+
+CLI 0.1.164 → 0.1.165. Chart and cue-cmp unchanged. v0.1.164
+release artifacts officially «missing in action» — operators
+should jump directly to 0.1.165.
+
 ## v0.1.164 — M1.5 walk-fix #3 post-B.1.79b — `app status --resources` shows child workload state (2026-05-25)
 
 ### Background
