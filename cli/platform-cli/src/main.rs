@@ -134,7 +134,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 all_projects,
                 all_managed,
             } => commands::app::list(&project, all_projects, all_managed)?,
-            AppCommand::Status { name } => commands::app::status(&name)?,
+            AppCommand::Status { name, resources } => commands::app::status(&name, resources)?,
             AppCommand::Logs {
                 name,
                 follow,

@@ -43,7 +43,7 @@ landingWeb: v1alpha1.#Application & {
 			// promotes (preview → prod retag) and by tagged
 			// releases. Pin to :landing-vX.Y.Z for full
 			// determinism in regulated rollouts.
-			image:    "ghcr.io/apprafter/landing-web:prod"
+			image:    "ghcr.io/apprafter/landing-web:latest"
 			replicas: 2
 			expose: {
 				port:    80

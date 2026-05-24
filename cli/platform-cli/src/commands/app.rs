@@ -253,7 +253,7 @@ pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> 
     Ok(())
 }
 
-pub fn status(name: &str) -> Result<()> {
+pub fn status(name: &str, show_resources: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
     let app = kubectl_get_json(
         "application.argoproj.io",
@@ -269,7 +269,347 @@ pub fn status(name: &str) -> Result<()> {
     })?;
 
     print_status(&app);
+
+    if show_resources {
+        print_argocd_resources(&app);
+        // Fetch pods из destination ns using the inner
+        // AppRafter Application name (operator's label value)
+        // resolved via `app_open::find_apprafter_app_name`.
+        // Best-effort: errors during pod fetch surface as а
+        // warning, not а hard failure — the operator already
+        // has the basic status they came for.
+        if let Some(inner_name) = crate::commands::app_open::find_apprafter_app_name(&app) {
+            if let Some(dest_ns) = app
+                .pointer("/spec/destination/namespace")
+                .and_then(Value::as_str)
+            {
+                match list_pods_for_apprafter_app(&inner_name, dest_ns, kc.path()) {
+                    Ok(pods) => print_pod_summaries(&pods, &inner_name, dest_ns),
+                    Err(e) => {
+                        eprintln!();
+                        eprintln!(
+                            "⚠ Could not fetch workload pod state ({e}). \
+                             Argo CD's view (above) is still authoritative \
+                             for sync/health from the apiserver perspective."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Pod state snapshot rendered into the `--resources` table.
+/// Public(crate) so tests can drive `print_pod_summaries`
+/// без spawning kubectl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PodSummary {
+    pub name: String,
+    /// `<ready>/<total>` — matches `kubectl get pods` shape.
+    pub ready: String,
+    /// Container `waiting.reason` if any (e.g.
+    /// `ImagePullBackOff`, `CrashLoopBackOff`, `ContainerCreating`);
+    /// otherwise pod phase (Pending / Running / Succeeded /
+    /// Failed). Matches kubectl's STATUS column heuristic.
+    pub status: String,
+    pub restarts: i64,
+    /// Human-readable age computed at print time. Format
+    /// mirrors `kubectl get pods` (`s`, `m`, `h`, `d` units).
+    pub age: String,
+}
+
+/// Argo CD resource entry rendered into the tracked-
+/// resources table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackedResource {
+    pub name: String,
+    pub kind: String,
+    pub namespace: String,
+    pub status: String,
+    pub health: String,
+}
+
+/// Shell out к `kubectl get pods` filtered к the AppRafter
+/// operator's label. Mirrors `app_open::list_services_for_
+/// apprafter_app` shape.
+fn list_pods_for_apprafter_app(
+    apprafter_app_name: &str,
+    namespace: &str,
+    kubeconfig: &Path,
+) -> Result<Vec<PodSummary>> {
+    let selector = format!("app.kubernetes.io/name={apprafter_app_name}");
+    let out = Command::new("kubectl")
+        .arg("get")
+        .arg("pods")
+        .arg("-n")
+        .arg(namespace)
+        .arg("-l")
+        .arg(&selector)
+        .arg("-o")
+        .arg("json")
+        .env("KUBECONFIG", kubeconfig)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl get pods: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl get pods failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let parsed: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
+    Ok(parse_pod_summaries(&parsed, &chrono::Utc::now()))
+}
+
+/// Pure helper — parse `kubectl get pods -o json` items into
+/// `PodSummary` rows. `now` injected so tests can pin а
+/// deterministic clock when computing ages.
+pub(crate) fn parse_pod_summaries(
+    payload: &Value,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Vec<PodSummary> {
+    let items = payload.get("items").and_then(Value::as_array);
+    let Some(items) = items else { return vec![] };
+    items.iter().map(|p| summarise_pod(p, now)).collect()
+}
+
+fn summarise_pod(pod: &Value, now: &chrono::DateTime<chrono::Utc>) -> PodSummary {
+    let name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+
+    let mut ready_count = 0usize;
+    let mut total_count = 0usize;
+    let mut restarts = 0i64;
+    let mut waiting_reason: Option<String> = None;
+
+    if let Some(arr) = pod
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+    {
+        for cs in arr {
+            total_count += 1;
+            if cs.get("ready").and_then(Value::as_bool).unwrap_or(false) {
+                ready_count += 1;
+            }
+            restarts += cs.get("restartCount").and_then(Value::as_i64).unwrap_or(0);
+            if waiting_reason.is_none() {
+                if let Some(reason) = cs.pointer("/state/waiting/reason").and_then(Value::as_str) {
+                    waiting_reason = Some(reason.to_string());
+                }
+            }
+        }
+    }
+
+    if total_count == 0 {
+        // Pod has not been admitted yet, or has init containers
+        // only. Use spec.containers length as the denominator
+        // so the column reads sensibly («0/N» — none yet).
+        total_count = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(1);
+    }
+
+    let phase = pod
+        .pointer("/status/phase")
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown")
+        .to_string();
+    let status = waiting_reason.unwrap_or(phase);
+
+    let age = pod
+        .pointer("/metadata/creationTimestamp")
+        .and_then(Value::as_str)
+        .map(|ts| format_pod_age(ts, now))
+        .unwrap_or_else(|| "?".to_string());
+
+    PodSummary {
+        name,
+        ready: format!("{ready_count}/{total_count}"),
+        status,
+        restarts,
+        age,
+    }
+}
+
+/// Pure helper — format а duration from `since` к `now` using
+/// kubectl-style shorthand: `s` under а minute, `m` under an
+/// hour, `<h>h<m>m` under а day, `<d>d<h>h` beyond. Returns
+/// the original timestamp string when parsing fails (defensive
+/// против Argo CD shape drift).
+pub(crate) fn format_pod_age(timestamp: &str, now: &chrono::DateTime<chrono::Utc>) -> String {
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return timestamp.to_string();
+    };
+    let secs = now
+        .signed_duration_since(t.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m}m")
+        }
+    } else {
+        let d = secs / 86400;
+        let h = (secs % 86400) / 3600;
+        if h == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d{h}h")
+        }
+    }
+}
+
+/// Pure helper — extract `status.resources[]` entries из the
+/// Argo CD Application CR JSON.
+pub(crate) fn extract_tracked_resources(app: &Value) -> Vec<TrackedResource> {
+    let arr = app.pointer("/status/resources").and_then(Value::as_array);
+    let Some(arr) = arr else { return vec![] };
+    arr.iter()
+        .filter_map(|r| {
+            let name = r.get("name").and_then(Value::as_str)?.to_string();
+            let kind = r
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let namespace = r
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string();
+            let status = r
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let health = r
+                .pointer("/health/status")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string();
+            Some(TrackedResource {
+                name,
+                kind,
+                namespace,
+                status,
+                health,
+            })
+        })
+        .collect()
+}
+
+fn print_argocd_resources(app: &Value) {
+    let resources = extract_tracked_resources(app);
+    println!();
+    println!("Argo CD tracked resources:");
+    if resources.is_empty() {
+        println!("  (none — Application has not yet reported `status.resources[]`)");
+        return;
+    }
+    let name_w = resources
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let kind_w = resources
+        .iter()
+        .map(|r| r.kind.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let ns_w = resources
+        .iter()
+        .map(|r| r.namespace.len())
+        .max()
+        .unwrap_or(9)
+        .max(9);
+    let status_w = resources
+        .iter()
+        .map(|r| r.status.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    println!(
+        "  {:<name_w$}  {:<kind_w$}  {:<ns_w$}  {:<status_w$}  HEALTH",
+        "NAME",
+        "KIND",
+        "NAMESPACE",
+        "STATUS",
+        name_w = name_w,
+        kind_w = kind_w,
+        ns_w = ns_w,
+        status_w = status_w,
+    );
+    for r in &resources {
+        println!(
+            "  {:<name_w$}  {:<kind_w$}  {:<ns_w$}  {:<status_w$}  {}",
+            r.name,
+            r.kind,
+            r.namespace,
+            r.status,
+            r.health,
+            name_w = name_w,
+            kind_w = kind_w,
+            ns_w = ns_w,
+            status_w = status_w,
+        );
+    }
+}
+
+fn print_pod_summaries(pods: &[PodSummary], inner_name: &str, namespace: &str) {
+    println!();
+    println!("Workload pods ({namespace}, app.kubernetes.io/name={inner_name}):");
+    if pods.is_empty() {
+        println!(
+            "  (none — operator may not have rendered the Deployment yet, or \
+             the AppRafter Application's `spec.expose` is omitted so no \
+             workload runs)"
+        );
+        return;
+    }
+    let name_w = pods.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
+    let status_w = pods
+        .iter()
+        .map(|p| p.status.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    println!(
+        "  {:<name_w$}  READY  {:<status_w$}  RESTARTS  AGE",
+        "NAME",
+        "STATUS",
+        name_w = name_w,
+        status_w = status_w,
+    );
+    for p in pods {
+        println!(
+            "  {:<name_w$}  {:<5}  {:<status_w$}  {:<8}  {}",
+            p.name,
+            p.ready,
+            p.status,
+            p.restarts,
+            p.age,
+            name_w = name_w,
+            status_w = status_w,
+        );
+    }
 }
 
 /// `apprafter app logs <name>` — stream logs from the
@@ -1226,5 +1566,224 @@ mod tests {
             }
         });
         print_status(&app);
+    }
+
+    #[test]
+    fn parse_pod_summaries_running_pod() {
+        // Happy path: container is ready, no waiting state,
+        // pod phase Running. STATUS column reflects phase.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "landing-web-abc",
+                    "creationTimestamp": "2026-05-25T11:30:00Z"
+                },
+                "spec": { "containers": [{ "name": "landing-web" }] },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{
+                        "ready": true,
+                        "restartCount": 0,
+                        "state": { "running": { "startedAt": "2026-05-25T11:31:00Z" } }
+                    }]
+                }
+            }]
+        });
+        let pods = parse_pod_summaries(&payload, &now);
+        assert_eq!(pods.len(), 1);
+        assert_eq!(pods[0].name, "landing-web-abc");
+        assert_eq!(pods[0].ready, "1/1");
+        assert_eq!(pods[0].status, "Running");
+        assert_eq!(pods[0].restarts, 0);
+        assert_eq!(pods[0].age, "30m");
+    }
+
+    #[test]
+    fn parse_pod_summaries_image_pull_back_off() {
+        // The walk-fix-#2 regression scenario. Pod phase
+        // Pending, container waiting.reason=ImagePullBackOff;
+        // status column reflects the waiting reason — that's
+        // what's actionable for the operator.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "landing-web-mrpfx",
+                    "creationTimestamp": "2026-05-25T09:10:00Z"
+                },
+                "spec": { "containers": [{ "name": "landing-web" }] },
+                "status": {
+                    "phase": "Pending",
+                    "containerStatuses": [{
+                        "ready": false,
+                        "restartCount": 0,
+                        "state": {
+                            "waiting": {
+                                "reason": "ImagePullBackOff",
+                                "message": "Back-off pulling image ..."
+                            }
+                        }
+                    }]
+                }
+            }]
+        });
+        let pods = parse_pod_summaries(&payload, &now);
+        assert_eq!(pods[0].ready, "0/1");
+        assert_eq!(pods[0].status, "ImagePullBackOff");
+        assert_eq!(pods[0].age, "2h50m");
+    }
+
+    #[test]
+    fn parse_pod_summaries_crash_loop_back_off_carries_restart_count() {
+        // CMS scenario — container exists but crashes. Restart
+        // count surfaces; STATUS column shows CrashLoopBackOff.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "landing-cms-b8tsv",
+                    "creationTimestamp": "2026-05-25T09:10:00Z"
+                },
+                "spec": { "containers": [{ "name": "landing-cms" }] },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{
+                        "ready": false,
+                        "restartCount": 38,
+                        "state": {
+                            "waiting": {
+                                "reason": "CrashLoopBackOff",
+                                "message": "back-off restarting failed container"
+                            }
+                        }
+                    }]
+                }
+            }]
+        });
+        let pods = parse_pod_summaries(&payload, &now);
+        assert_eq!(pods[0].status, "CrashLoopBackOff");
+        assert_eq!(pods[0].restarts, 38);
+    }
+
+    #[test]
+    fn parse_pod_summaries_missing_container_statuses_falls_back_to_spec() {
+        // Brand-new pod that's been admitted to scheduling
+        // but not yet had any containers materialised. Must
+        // not panic; column denominator comes from spec.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "fresh-pod",
+                    "creationTimestamp": "2026-05-25T11:59:30Z"
+                },
+                "spec": {
+                    "containers": [
+                        { "name": "first" },
+                        { "name": "sidecar" }
+                    ]
+                },
+                "status": { "phase": "Pending" }
+            }]
+        });
+        let pods = parse_pod_summaries(&payload, &now);
+        assert_eq!(pods[0].ready, "0/2");
+        assert_eq!(pods[0].status, "Pending");
+        assert_eq!(pods[0].age, "30s");
+    }
+
+    #[test]
+    fn parse_pod_summaries_handles_empty_payload() {
+        let now = chrono::Utc::now();
+        assert!(parse_pod_summaries(&serde_json::json!({}), &now).is_empty());
+        assert!(parse_pod_summaries(&serde_json::json!({ "items": [] }), &now).is_empty());
+    }
+
+    #[test]
+    fn format_pod_age_seconds_minutes_hours_days() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(format_pod_age("2026-05-25T11:59:55Z", &now), "5s");
+        assert_eq!(format_pod_age("2026-05-25T11:55:00Z", &now), "5m");
+        assert_eq!(format_pod_age("2026-05-25T09:30:00Z", &now), "2h30m");
+        assert_eq!(format_pod_age("2026-05-25T11:00:00Z", &now), "1h");
+        assert_eq!(format_pod_age("2026-05-22T12:00:00Z", &now), "3d");
+        assert_eq!(format_pod_age("2026-05-22T09:00:00Z", &now), "3d3h");
+    }
+
+    #[test]
+    fn format_pod_age_returns_input_on_unparseable_timestamp() {
+        // Defensive against Argo CD shape drift — must not
+        // panic, just echo whatever was passed.
+        let now = chrono::Utc::now();
+        assert_eq!(format_pod_age("not-а-timestamp", &now), "not-а-timestamp");
+    }
+
+    #[test]
+    fn extract_tracked_resources_happy_multi_entry() {
+        // Walk-fix #3 regression guard. status.resources[]
+        // entries come back с the fields kubectl + Argo CD
+        // both populate; health.status sits one level deep.
+        let app = serde_json::json!({
+            "status": {
+                "resources": [
+                    {
+                        "group": "",
+                        "kind": "Namespace",
+                        "name": "apprafter-landing-web",
+                        "status": "Synced",
+                        "health": { "status": "Healthy" },
+                        "version": "v1"
+                    },
+                    {
+                        "group": "apprafter.io",
+                        "kind": "Application",
+                        "name": "landing-web",
+                        "namespace": "apprafter",
+                        "status": "Synced",
+                        "health": { "status": "Healthy" },
+                        "version": "v1alpha1"
+                    }
+                ]
+            }
+        });
+        let rs = extract_tracked_resources(&app);
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].kind, "Namespace");
+        assert_eq!(rs[0].namespace, "-"); // cluster-scoped
+        assert_eq!(rs[1].name, "landing-web");
+        assert_eq!(rs[1].namespace, "apprafter");
+        assert_eq!(rs[1].health, "Healthy");
+    }
+
+    #[test]
+    fn extract_tracked_resources_missing_status_returns_empty() {
+        let app = serde_json::json!({ "spec": {} });
+        assert!(extract_tracked_resources(&app).is_empty());
+    }
+
+    #[test]
+    fn extract_tracked_resources_skips_entries_without_name() {
+        let app = serde_json::json!({
+            "status": {
+                "resources": [
+                    { "kind": "Service", "status": "Synced" }, // no name
+                    { "name": "ok", "kind": "Service", "status": "Synced" }
+                ]
+            }
+        });
+        let rs = extract_tracked_resources(&app);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].name, "ok");
     }
 }

@@ -13,6 +13,157 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.164 — M1.5 walk-fix #3 post-B.1.79b — `app status --resources` shows child workload state (2026-05-25)
+
+### Background
+
+Walk diagnostics after walk-fix #2 surfaced а semantic gap:
+`apprafter app status` showed `health: Healthy` for an app
+whose pods were in `ImagePullBackOff` / `CrashLoopBackOff`.
+Argo CD's app-level health is computed from the resources it
+**directly applies** — for an AppRafter Application, that's
+the `apprafter.io/Application` CR alone. The operator marks
+that CR `status.phase = Ready` as soon as it lays down the
+Deployment + Service templates, without waiting for pods к
+actually reach Running. Operator-side health propagation is
+а Phase 2/3 concern (ResourceClaim wait semantics + Pod-
+state aggregation в the reconciler); meanwhile, CLI-side
+visibility into the actual workload state closes the
+operator's diagnostic gap.
+
+Also closes plan.md §1.79a line 2257 («child resources в `app
+status`») which was deferred к v0.1.140 / Phase 2 — но
+post-walk-fix-#10 the CMP plugin actually renders the
+Application CR end-to-end, so child-resource introspection
+is finally useful.
+
+### Surface
+
+New `--resources` / `-r` flag on `apprafter app status`:
+
+```
+$ apprafter app status apprafter-landing-web --resources
+
+Application argocd/apprafter-landing-web
+  project:       apps
+  ...
+  sync state:    Synced
+  health:        Healthy
+
+Argo CD tracked resources:
+  NAME          KIND          NAMESPACE   STATUS    HEALTH
+  landing-web   Application   apprafter   Synced    Healthy
+
+Workload pods (apprafter, app.kubernetes.io/name=landing-web):
+  NAME                          READY  STATUS              RESTARTS  AGE
+  landing-web-6fb86ccb-mrpfx    0/1    ImagePullBackOff    0         2h50m
+  landing-web-6fb86ccb-sxkpg    0/1    ImagePullBackOff    0         2h50m
+```
+
+Operators immediately see the discrepancy between Argo CD's
+view («Healthy») и the actual Pod state (`ImagePullBackOff`,
+`CrashLoopBackOff`, restart counts) — the actionable signal
+for image misconfigurations.
+
+### Resolution chain
+
+`apprafter app status <name> --resources`:
+
+1. Fetch Argo CD Application CR (existing path).
+2. Render the standard status header (unchanged).
+3. Extract `status.resources[]` from the Argo CD CR →
+   render «Argo CD tracked resources» section с NAME / KIND
+   / NAMESPACE / STATUS / HEALTH columns. Cluster-scoped
+   resources show `-` для namespace.
+4. Reuse `app_open::find_apprafter_app_name(app)` to extract
+   the inner AppRafter Application name from
+   `status.resources[]`.
+5. Shell out к `kubectl get pods -n <dest-ns> -l
+   app.kubernetes.io/name=<inner-name> -o json`.
+6. Parse pod summaries — STATUS column = `containerStatuses[
+   0].state.waiting.reason` when waiting (ImagePullBackOff,
+   CrashLoopBackOff, etc.), else `status.phase` (Running,
+   Pending, etc.). READY = ready/total container counts.
+   RESTARTS = sum across containers. AGE = relative format
+   matching `kubectl get pods` shorthand (`30s`, `5m`,
+   `2h30m`, `3d3h`).
+7. Render «Workload pods» section.
+
+Pod fetch errors are non-fatal — operator already has the
+Argo CD view; an inability to introspect pods (RBAC, kubectl
+missing, network blip) surfaces as а stderr warning без
+exiting non-zero.
+
+### Pure helpers
+
+- `parse_pod_summaries(payload, now)` — extracts
+  `PodSummary` rows from а `kubectl get pods -o json`
+  payload. `now` injected so tests can pin а deterministic
+  clock when computing ages.
+- `summarise_pod(pod, now)` — extracts а single pod's
+  ready/status/restarts/age. STATUS column heuristic mirrors
+  `kubectl get pods`: container `waiting.reason` wins over
+  pod phase когда any container is waiting.
+- `format_pod_age(timestamp, now)` — kubectl-style relative
+  shorthand. `<60s` → `Ns`, `<1h` → `Nm`, `<1d` → `NhNm`,
+  else `NdNh`. Defensive — returns input verbatim when RFC
+  3339 parse fails.
+- `extract_tracked_resources(app)` — pulls `status.resources[]`
+  into `TrackedResource` rows. Filters entries missing а
+  `name` field (defensive against Argo CD shape drift).
+- `print_argocd_resources(app)` + `print_pod_summaries(pods,
+  inner_name, namespace)` — manual table formatters
+  matching the existing `print_status` style. Width
+  calculation auto-adjusts to longest entry.
+
+### Tests
+
++10 new unit tests:
+
+- `parse_pod_summaries_running_pod` — happy path,
+  ready=1/1, status=Running, age=30m.
+- `parse_pod_summaries_image_pull_back_off` — the exact
+  walk diagnostic scenario; status reflects waiting.reason
+  не phase.
+- `parse_pod_summaries_crash_loop_back_off_carries_restart_count`
+  — landing-cms shape (38 restarts, CrashLoopBackOff in
+  waiting.reason).
+- `parse_pod_summaries_missing_container_statuses_falls_back_to_spec`
+  — brand-new pod без containerStatuses; uses spec for
+  denominator.
+- `parse_pod_summaries_handles_empty_payload` — defensive
+  для empty arrays / missing fields.
+- `format_pod_age_seconds_minutes_hours_days` — happy paths
+  для all 4 magnitude bands + boundary cases (`1h` vs
+  `1h0m`, `3d` vs `3d3h`).
+- `format_pod_age_returns_input_on_unparseable_timestamp` —
+  defensive против Argo CD shape drift.
+- `extract_tracked_resources_happy_multi_entry` — namespace
+  vs cluster-scoped (renders `-`), health.status one level
+  deep.
+- `extract_tracked_resources_missing_status_returns_empty` —
+  fresh CR без а status block.
+- `extract_tracked_resources_skips_entries_without_name` —
+  defensive против partial entries.
+
+Existing `print_status_handles_app_without_status_block`
+unchanged. Total CLI suite: 195 → 205.
+
+### Landing manifests temporarily на :latest
+
+Walk-found: `ghcr.io/apprafter/landing-web` реестр содержит
+только `landing-v0.1.2`, `latest`, `landing-v0.1.3` — нет
+ни `:prod`, ни `:preview`. Manifest pinned к `:prod` →
+ImagePullBackOff. Temporarily switch `landing/web/apprafter/
+Application.cue` и `Application-preview.cue` к `:latest`
+для unblock'а walk; revisit `landing-promote-to-prod.yml`
++ `landing-preview-build.yml` workflows separately.
+
+### Bump
+
+CLI 0.1.163 → 0.1.164. Chart and cue-cmp unchanged. Plan.md
+§1.79a line 2257 checkbox flipped к [x] in the same commit.
+
 ## v0.1.163 — M1.5 walk-fix #2 post-B.1.79b — `app open` surfaces kubectl stderr on early exit (2026-05-25)
 
 ### Symptom

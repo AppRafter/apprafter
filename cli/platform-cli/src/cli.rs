@@ -487,13 +487,23 @@ pub enum AppCommand {
         all_managed: bool,
     },
     /// Show detail view for one Application: sync state, health,
-    /// source repo + revision, destinations, pending
-    /// MigrationPlans (when AppRafter `Application` CR exists
-    /// in the workload namespace), recent sync history (last 3
-    /// revisions).
+    /// source repo + revision, destinations, recent sync history
+    /// (last 3 revisions). With `--resources`: additionally lists
+    /// Argo CD's tracked resources + workload pod states (READY,
+    /// STATUS, RESTARTS, AGE) — surfaces image-pull / crash-loop
+    /// issues that Argo CD's app-level Healthy aggregation hides
+    /// when the operator marks the CR `phase=Ready` before pods
+    /// reach Running.
     Status {
         /// Application name (as listed via `apprafter app list`).
         name: String,
+        /// Show child workload state — Argo CD's
+        /// `status.resources[]` plus pods в the destination
+        /// namespace matching `app.kubernetes.io/name=<inner-
+        /// app-name>` (the AppRafter operator's label). Walk-fix
+        /// #3 post-B.1.79b closure of §1.79a line 2257.
+        #[arg(long, short = 'r', default_value_t = false)]
+        resources: bool,
     },
     /// Stream logs from the app's workload pods. Wraps
     /// `kubectl logs` with a label selector derived from the

@@ -2258,7 +2258,7 @@ instead of carrying parallel definitions.
     - [x] `--all-managed` toggle drops the managed-by label filter.
 - [x] `apprafter app status <name>`:
     - [x] Detail view: Argo CD Application sync/health + source + destination + recent revisions (last 3 из `status.history`).
-    - [ ] AppRafter Application CR conditions (если CMP уже отрендерил) + перечень child resources. **Deferred к v0.1.140 / Phase 2** — когда CMP plugin реально начнёт рендерить AppRafter Applications и child resources станут предсказуемой структурой.
+    - [x] AppRafter Application CR conditions (если CMP уже отрендерил) + перечень child resources. **Закрыто v0.1.164** через `apprafter app status <name> --resources`/`-r` flag — рендерит Argo CD's `status.resources[]` (NAME/KIND/NAMESPACE/STATUS/HEALTH) + Pods в destination ns через operator's `app.kubernetes.io/name=<inner-name>` label (READY/STATUS/RESTARTS/AGE с kubectl-style waiting.reason heuristic — surfaces ImagePullBackOff / CrashLoopBackOff / etc. что Argo CD app-level Healthy aggregation скрывает). Pod fetch non-fatal — соблюдает Argo CD's view как authoritative для sync/health. Operator-side health propagation (CR status.phase отражающий actual Pod state) остаётся Phase 2/3 concern (ResourceClaim wait semantics).
     - [ ] Если есть pending MigrationPlan для этого app — выводит в верхней секции с approve-командой. **Deferred к v0.1.140 / Phase 2** — нужны user-app MigrationPlans из Phase 2 destructive change detection.
 - [x] `apprafter app logs <name> [--follow] [--tail <N>] [--container <c>] [--pod <name>]`:
     - [x] Wrapper над `kubectl logs` с label selector `app.kubernetes.io/instance=<app-name>` (Argo CD's documented standard label, stamped на every child resource).

@@ -52,8 +52,12 @@ landingWebPreview: v1alpha1.#Application & {
 		base: {
 			// Rolling preview tag — bumped by
 			// .github/workflows/landing-preview-build.yml on
-			// every Payload content-global save.
-			image:    "ghcr.io/apprafter/landing-web:preview"
+			// every Payload content-global save. Temporarily
+			// pinned to :latest while the promotion workflow
+			// hasn't seeded :preview yet (2026-05-25 walk —
+			// switch back to :preview once landing-preview-
+			// build.yml fires the first publish).
+			image:    "ghcr.io/apprafter/landing-web:latest"
 			replicas: 1
 			expose: {
 				port:    80
