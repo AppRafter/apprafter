@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 name: test
 
+# Per-stack test gating. Same pattern as `lint.yml`: each
+# stack's job opts in via a `dorny/paths-filter` flag so a
+# CLI-only push doesn't `cargo test` the operator workspace
+# (300+ tests, slow to compile fresh), and a TypeScript-only
+# change doesn't compile any Rust. Walk-fix post-v0.1.156.
+
 on:
   pull_request:
   push:
@@ -10,8 +16,35 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    name: cargo test
+  changes:
+    name: detect stack changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      rust_cli: ${{ steps.filter.outputs.rust_cli }}
+      rust_operator: ${{ steps.filter.outputs.rust_operator }}
+      bun: ${{ steps.filter.outputs.bun }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust_cli:
+              - 'cli/**'
+              - '.github/workflows/test.yml'
+            rust_operator:
+              - 'operator/**'
+              - '.github/workflows/test.yml'
+            bun:
+              - 'landing/**'
+              - 'backstage-plugins/**'
+              - '.github/workflows/test.yml'
+
+  rust-cli:
+    name: cargo test cli/
+    needs: changes
+    if: needs.changes.outputs.rust_cli == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,28 +55,24 @@ jobs:
         with:
           version: v0.10.0
       - uses: dtolnay/rust-toolchain@stable
-      - id: detect
-        run: |
-          dirs=$(find . -mindepth 2 -maxdepth 2 -name Cargo.toml \
-              -not -path './target/*' -not -path '*/node_modules/*' \
-              | xargs -r -n1 dirname | sort -u | tr '\n' ' ')
-          if [ -n "$dirs" ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::no Cargo.toml yet — skipping cargo test"
-          fi
-      - if: steps.detect.outputs.found == 'true'
-        run: |
-          for dir in ${{ steps.detect.outputs.dirs }}; do
-            echo "::group::cargo test in $dir"
-            (cd "$dir" && cargo test --all --all-features)
-            echo "::endgroup::"
-          done
+      - working-directory: cli
+        run: cargo test --all --all-features
+
+  rust-operator:
+    name: cargo test operator/
+    needs: changes
+    if: needs.changes.outputs.rust_operator == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - working-directory: operator
+        run: cargo test --all --all-features
 
   bun:
     name: bun test
+    needs: changes
+    if: needs.changes.outputs.bun == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

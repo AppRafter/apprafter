@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 name: license-check
 
+# SPDX-header check gated on source-tree path changes. Skips
+# entirely for pure docs / changelog / markdown edits, which
+# don't carry SPDX headers anyway. Walk-fix post-v0.1.156.
+#
+# The `.github/workflows/**` filter entry covers self-changes —
+# editing this workflow re-runs it so an SPDX rule tweak takes
+# effect on the same push that ships the change.
+
 on:
   pull_request:
   push:
@@ -10,8 +18,38 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: detect source changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      sources: ${{ steps.filter.outputs.sources }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            sources:
+              - 'cli/**'
+              - 'operator/**'
+              - 'schemas/**'
+              - 'providers/**'
+              - 'manifests/**'
+              - 'platform-stack/**'
+              - 'argocd-cue-cmp/**'
+              - 'examples/**'
+              - 'scripts/**'
+              - 'e2e/**'
+              - 'backstage-plugins/**'
+              - 'landing/**'
+              - '.github/workflows/**'
+              - 'cue.mod/**'
+
   spdx:
     name: SPDX headers
+    needs: changes
+    if: needs.changes.outputs.sources == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,6 +1,19 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 name: lint
 
+# Per-stack lint gating. Each stack's job is gated on a
+# `dorny/paths-filter` flag so а CLI-only push doesn't run
+# CUE vet, а CUE-only push doesn't run rust clippy, и а
+# landing TypeScript change doesn't run anything else.
+#
+# Walk-fix post-v0.1.156: operator pointed out а single push
+# triggered five separate workflows и all three lint
+# sub-jobs (cue / rust / bun) regardless of what actually
+# changed. Now the workflow always fires on push к master
+# and on every PR, но the per-stack jobs each opt in via
+# their path filter — fast-path runs to ~10-30 seconds when
+# nothing in а given stack changed.
+
 on:
   pull_request:
   push:
@@ -10,8 +23,52 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: detect stack changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      cue: ${{ steps.filter.outputs.cue }}
+      rust_cli: ${{ steps.filter.outputs.rust_cli }}
+      rust_operator: ${{ steps.filter.outputs.rust_operator }}
+      bun: ${{ steps.filter.outputs.bun }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # Filters per stack. Paths are evaluated against
+          # the PR's diff (vs base) on pull_request events
+          # and against the previous commit on push events.
+          #
+          # Each list deliberately overlaps with CI source
+          # files (`scripts/lint-*.sh`, the workflow itself)
+          # so editing the linting tooling re-runs the
+          # relevant job.
+          filters: |
+            cue:
+              - 'schemas/**'
+              - 'examples/**'
+              - 'platform-stack/cue/**'
+              - 'argocd-cue-cmp/version.cue'
+              - 'cue.mod/**'
+              - 'scripts/lint-cue.sh'
+              - '.github/workflows/lint.yml'
+            rust_cli:
+              - 'cli/**'
+              - '.github/workflows/lint.yml'
+            rust_operator:
+              - 'operator/**'
+              - '.github/workflows/lint.yml'
+            bun:
+              - 'landing/**'
+              - 'backstage-plugins/**'
+              - '.github/workflows/lint.yml'
+
   cue:
     name: CUE (fmt + vet)
+    needs: changes
+    if: needs.changes.outputs.cue == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,8 +78,10 @@ jobs:
       - name: lint-cue.sh
         run: ./scripts/lint-cue.sh
 
-  rust:
-    name: Rust (fmt + clippy)
+  rust-cli:
+    name: Rust cli/ (fmt + clippy)
+    needs: changes
+    if: needs.changes.outputs.rust_cli == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,31 +96,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Detect Cargo workspaces
-        id: detect
-        run: |
-          dirs=$(find . -mindepth 2 -maxdepth 2 -name Cargo.toml \
-              -not -path './target/*' -not -path '*/node_modules/*' \
-              | xargs -r -n1 dirname | sort -u | tr '\n' ' ')
-          if [ -n "$dirs" ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::no Cargo.toml yet — skipping rustfmt/clippy"
-          fi
       - name: cargo fmt + clippy
-        if: steps.detect.outputs.found == 'true'
+        working-directory: cli
         run: |
-          for dir in ${{ steps.detect.outputs.dirs }}; do
-            echo "::group::cargo fmt + clippy in $dir"
-            (cd "$dir" && cargo fmt --all -- --check)
-            (cd "$dir" && cargo clippy --all-targets --all-features -- -D warnings)
-            echo "::endgroup::"
-          done
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+
+  rust-operator:
+    name: Rust operator/ (fmt + clippy)
+    needs: changes
+    if: needs.changes.outputs.rust_operator == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt + clippy
+        working-directory: operator
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
 
   bun:
     name: Bun / TypeScript (lint)
+    needs: changes
+    if: needs.changes.outputs.bun == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
