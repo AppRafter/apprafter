@@ -8,9 +8,10 @@
 //! pulling in kube-rs's Tokio runtime for the synchronous CLI
 //! binary.
 
+use chrono::{DateTime, Utc};
 use cli_core::{CliError, Result};
 use serde_json::Value;
-use tabled::settings::{object::Rows, Modify, Width};
+use tabled::settings::{object::Columns, Modify, Width};
 use tabled::{Table, Tabled};
 
 use crate::commands::k8s_helpers::{
@@ -57,13 +58,15 @@ pub fn status() -> Result<()> {
         ))
     })?;
 
-    print_status(&json);
+    print_status(&json, Utc::now());
     Ok(())
 }
 
 /// Pure formatter — pulled out so unit tests can drive with a
-/// fixture JSON without a cluster.
-fn print_status(json: &Value) {
+/// fixture JSON without a cluster. `now` lets tests pin "now"
+/// for deterministic relative-date formatting; production
+/// callers use `Utc::now()`.
+fn print_status(json: &Value, now: DateTime<Utc>) {
     let spec = json.get("spec").cloned().unwrap_or(Value::Null);
     let status = json.get("status").cloned().unwrap_or(Value::Null);
 
@@ -97,10 +100,10 @@ fn print_status(json: &Value) {
         .pointer("/availableVersion")
         .and_then(Value::as_str)
         .unwrap_or("(unset)");
-    let last_check = status
-        .pointer("/lastUpstreamCheck")
-        .and_then(Value::as_str)
-        .unwrap_or("(never)");
+    let last_check_raw = status.pointer("/lastUpstreamCheck").and_then(Value::as_str);
+    let last_check = last_check_raw
+        .map(|s| format_timestamp_with_relative(s, now))
+        .unwrap_or_else(|| "(never)".to_string());
 
     println!("PlatformStack {PLATFORMSTACK_NAMESPACE}/{PLATFORMSTACK_NAME} — tier {tier}");
     println!("  channel:     {channel}");
@@ -149,48 +152,189 @@ fn print_status(json: &Value) {
         println!("Conditions: (none)");
     } else {
         println!("Conditions:");
-        let mut t = Table::new(&conditions);
-        // Wrap MESSAGE column so long content doesn't blow up
-        // the terminal width. 60-char wrap matches what
-        // `kubectl describe` does for condition messages.
-        t.with(Modify::new(Rows::new(1..)).with(Width::wrap(60)));
-        println!("{t}");
+        println!("{}", render_conditions_table(&conditions));
     }
     println!();
 
-    let history: Vec<HistoryRow> = status
-        .pointer("/versionHistory")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .rev() // newest first per UX expectation
-                .take(5) // recent N
-                .map(|e| HistoryRow {
-                    applied_at: e
-                        .get("appliedAt")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    version: e
-                        .get("version")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    outcome: e
-                        .get("outcome")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let history: Vec<HistoryRow> = collect_history_rows(&status, now, 5);
 
     if history.is_empty() {
         println!("Recent history: (none)");
     } else {
         println!("Recent history (last {}):", history.len());
         println!("{}", Table::new(&history));
+    }
+}
+
+/// Render the conditions table sized to the operator's
+/// terminal. Without sizing the `MESSAGE` column dominates
+/// (some operator-controller messages run hundreds of
+/// characters); previous heuristic of a flat 60-char wrap
+/// blew out narrow terminals (80 cols → table sprawled at
+/// 130-ish cols). Compute a budget that subtracts the other
+/// three columns' max widths plus separator overhead, then
+/// wrap MESSAGE to that budget. Falls back to a sane 60 when
+/// stdout isn't a TTY (CI, pipes — width unknown).
+fn render_conditions_table(conditions: &[ConditionRow]) -> String {
+    let terminal_width = terminal_width_or_default();
+    // Compute the visible width each non-message column will
+    // claim: max(header, cells). Plus 3 separators (` | `) of
+    // 3 chars each × column gaps.
+    let type_w = column_width(conditions, |r| &r.type_, "TYPE");
+    let status_w = column_width(conditions, |r| &r.status, "STATUS");
+    let reason_w = column_width(conditions, |r| &r.reason, "REASON");
+    // Tabled adds borders / paddings; budget 12 char overhead
+    // empirically (4 columns × 3-char gap + outer borders).
+    let overhead = 12usize;
+    let used = type_w + status_w + reason_w + overhead;
+    let message_budget = terminal_width.saturating_sub(used).max(20);
+    let mut t = Table::new(conditions);
+    t.with(Modify::new(Columns::single(3)).with(Width::wrap(message_budget)));
+    t.to_string()
+}
+
+fn column_width<F: Fn(&ConditionRow) -> &str>(
+    rows: &[ConditionRow],
+    field: F,
+    header: &str,
+) -> usize {
+    rows.iter()
+        .map(|r| field(r).len())
+        .max()
+        .unwrap_or(0)
+        .max(header.len())
+}
+
+/// Look up the operator's terminal width with sane fallbacks
+/// — `terminal_size` for TTYs, 100 when stdout is piped or
+/// the lookup fails. 100 keeps tables readable on common CI
+/// log capture without surprising sprawl.
+fn terminal_width_or_default() -> usize {
+    match terminal_size::terminal_size() {
+        Some((terminal_size::Width(w), _)) => w as usize,
+        None => 100,
+    }
+}
+
+/// Collect the most recent history entries, sorted by
+/// `appliedAt` desc. Falls back to declaration order when the
+/// timestamp is missing/unparseable (puts unparseable last so
+/// they don't dominate the visible head of the table).
+fn collect_history_rows(status: &Value, now: DateTime<Utc>, take: usize) -> Vec<HistoryRow> {
+    let mut entries: Vec<&Value> = status
+        .pointer("/versionHistory")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().collect())
+        .unwrap_or_default();
+    // Stable sort by parsed `appliedAt` desc; entries without
+    // a parseable timestamp sink to the bottom (they're either
+    // corrupt CRs or freshly-created records still missing the
+    // field).
+    entries.sort_by(|a, b| {
+        let ta = a
+            .get("appliedAt")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+        let tb = b
+            .get("appliedAt")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+        match (ta, tb) {
+            (Some(a), Some(b)) => b.cmp(&a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+    entries
+        .into_iter()
+        .take(take)
+        .map(|e| {
+            let raw_at = e.get("appliedAt").and_then(Value::as_str).unwrap_or("");
+            HistoryRow {
+                applied_at: if raw_at.is_empty() {
+                    String::new()
+                } else {
+                    format_timestamp_with_relative(raw_at, now)
+                },
+                version: e
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                outcome: e
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Render an RFC3339 timestamp as `2026-05-24 14:30 UTC
+/// (2 hours ago)` style. Operators don't think in raw RFC3339
+/// — the relative suffix surfaces "is this recent?" at a
+/// glance, the absolute prefix keeps the exact moment
+/// available for audit.
+///
+/// Returns the original string verbatim when parsing fails so
+/// we never lose information operators may need; the only cost
+/// of a parse failure is the missing relative suffix.
+pub(crate) fn format_timestamp_with_relative(raw: &str, now: DateTime<Utc>) -> String {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(raw) else {
+        return raw.to_string();
+    };
+    let utc = parsed.with_timezone(&Utc);
+    let absolute = utc.format("%Y-%m-%d %H:%M UTC");
+    let delta = now.signed_duration_since(utc);
+    let relative = humanise_relative(delta);
+    format!("{absolute} ({relative})")
+}
+
+/// Render a signed duration relative to "now" as a short
+/// English phrase: `just now`, `2 minutes ago`, `3 hours ago`,
+/// `5 days ago`, `in 3 minutes`, etc. Granularity matches
+/// what operators actually care about — sub-minute precision
+/// is noise on platform-level events.
+fn humanise_relative(delta: chrono::Duration) -> String {
+    let secs = delta.num_seconds();
+    let abs = secs.unsigned_abs();
+    let in_past = secs >= 0;
+
+    let (unit, value) = if abs < 45 {
+        return if in_past {
+            "just now".to_string()
+        } else {
+            "in a few seconds".to_string()
+        };
+    } else if abs < 90 {
+        ("minute", 1u64)
+    } else if abs < 60 * 60 {
+        ("minute", (abs as f64 / 60.0).round() as u64)
+    } else if abs < 60 * 60 * 2 {
+        ("hour", 1u64)
+    } else if abs < 60 * 60 * 24 {
+        ("hour", (abs as f64 / 3600.0).round() as u64)
+    } else if abs < 60 * 60 * 24 * 2 {
+        ("day", 1u64)
+    } else if abs < 60 * 60 * 24 * 30 {
+        ("day", (abs as f64 / 86_400.0).round() as u64)
+    } else if abs < 60 * 60 * 24 * 60 {
+        ("month", 1u64)
+    } else if abs < 60 * 60 * 24 * 365 {
+        ("month", (abs as f64 / 2_592_000.0).round() as u64)
+    } else if abs < 60 * 60 * 24 * 365 * 2 {
+        ("year", 1u64)
+    } else {
+        ("year", (abs as f64 / 31_536_000.0).round() as u64)
+    };
+
+    let plural = if value == 1 { "" } else { "s" };
+    if in_past {
+        format!("{value} {unit}{plural} ago")
+    } else {
+        format!("in {value} {unit}{plural}")
     }
 }
 
@@ -332,6 +476,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use chrono::TimeZone;
+
+    fn frozen_now() -> DateTime<Utc> {
+        // A fixed reference moment so relative-date tests
+        // don't drift with wall-clock — picks a known
+        // RFC3339 timestamp the helpers can subtract from.
+        Utc.with_ymd_and_hms(2026, 5, 24, 14, 30, 0).unwrap()
+    }
+
     #[test]
     fn print_status_handles_minimal_object() {
         // PlatformStack with only spec, no status (fresh CR).
@@ -340,7 +493,7 @@ mod tests {
         let obj = json!({
             "spec": { "channel": "stable", "values": { "tier": 1 } }
         });
-        print_status(&obj);
+        print_status(&obj, frozen_now());
     }
 
     #[test]
@@ -366,6 +519,112 @@ mod tests {
                 ]
             }
         });
-        print_status(&obj);
+        print_status(&obj, frozen_now());
+    }
+
+    #[test]
+    fn format_timestamp_renders_absolute_and_relative() {
+        // 90 minutes before the frozen `now` reference. The
+        // absolute prefix is the parsed UTC moment; the
+        // relative suffix is rounded to the most relevant
+        // unit ("2 hours ago" matches the 1.5h → 2h round).
+        let ts = "2026-05-24T13:00:00Z";
+        let s = format_timestamp_with_relative(ts, frozen_now());
+        assert!(s.starts_with("2026-05-24 13:00 UTC"), "got: {s}");
+        assert!(s.contains("ago"), "expected past tense: {s}");
+        assert!(s.contains("hour"), "expected hour unit: {s}");
+    }
+
+    #[test]
+    fn format_timestamp_handles_unparseable_input() {
+        // Unparseable input must surface verbatim so operators
+        // don't lose information. Audit value > prettiness.
+        let s = format_timestamp_with_relative("not-a-date", frozen_now());
+        assert_eq!(s, "not-a-date");
+    }
+
+    #[test]
+    fn humanise_relative_uses_just_now_under_45_seconds() {
+        // Sub-minute precision is noise for platform events.
+        // Up to 45s past or future renders as "just now" /
+        // "in a few seconds" — keeps the output uncluttered.
+        let now = frozen_now();
+        let ten_seconds_ago = now - chrono::Duration::seconds(10);
+        let s = format_timestamp_with_relative(&ten_seconds_ago.to_rfc3339(), now);
+        assert!(s.contains("just now"), "got: {s}");
+    }
+
+    #[test]
+    fn humanise_relative_handles_minutes_hours_days_months_years() {
+        // Span coverage across every unit branch — guards
+        // against an accidental thresholding regression that
+        // could surface "60 minutes ago" instead of "1 hour
+        // ago".
+        let now = frozen_now();
+        let cases = [
+            (chrono::Duration::minutes(5), "5 minutes ago"),
+            (chrono::Duration::hours(3), "3 hours ago"),
+            (chrono::Duration::days(2), "2 days ago"),
+            (chrono::Duration::days(45), "1 month ago"),
+            (chrono::Duration::days(400), "1 year ago"),
+        ];
+        for (delta, expected_suffix) in cases {
+            let ts = (now - delta).to_rfc3339();
+            let s = format_timestamp_with_relative(&ts, now);
+            assert!(
+                s.contains(expected_suffix),
+                "for delta {delta:?}, expected '{expected_suffix}' in '{s}'"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_history_rows_sorts_by_applied_at_desc() {
+        // Source data deliberately out-of-order to assert the
+        // sort actually fires (instead of merely preserving
+        // declaration order which happens to be sorted).
+        let status = json!({
+            "versionHistory": [
+                { "appliedAt": "2026-05-20T10:00:00Z", "version": "0.1.30", "outcome": "succeeded" },
+                { "appliedAt": "2026-05-24T10:00:00Z", "version": "0.1.40", "outcome": "succeeded" },
+                { "appliedAt": "2026-05-22T10:00:00Z", "version": "0.1.35", "outcome": "succeeded" }
+            ]
+        });
+        let rows = collect_history_rows(&status, frozen_now(), 10);
+        let versions: Vec<&str> = rows.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(versions, vec!["0.1.40", "0.1.35", "0.1.30"]);
+    }
+
+    #[test]
+    fn collect_history_rows_puts_unparseable_timestamps_last() {
+        // Corrupt / mid-write CRs (timestamp not yet stamped)
+        // shouldn't dominate the visible head of the table.
+        let status = json!({
+            "versionHistory": [
+                { "appliedAt": "garbage", "version": "0.0.0", "outcome": "succeeded" },
+                { "appliedAt": "2026-05-24T10:00:00Z", "version": "0.1.40", "outcome": "succeeded" }
+            ]
+        });
+        let rows = collect_history_rows(&status, frozen_now(), 10);
+        // First row must be the parseable one; the unparseable
+        // entry sinks to the bottom.
+        assert_eq!(rows.first().map(|r| r.version.as_str()), Some("0.1.40"));
+        assert_eq!(rows.get(1).map(|r| r.version.as_str()), Some("0.0.0"));
+    }
+
+    #[test]
+    fn collect_history_rows_caps_at_take() {
+        let entries: Vec<_> = (0..10)
+            .map(|i| {
+                json!({
+                    "appliedAt": format!("2026-05-{:02}T10:00:00Z", 10 + i),
+                    "version": format!("0.1.{i}"),
+                    "outcome": "succeeded"
+                })
+            })
+            .collect();
+        let status = json!({ "versionHistory": entries });
+        let rows = collect_history_rows(&status, frozen_now(), 3);
+        assert_eq!(rows.len(), 3);
     }
 }

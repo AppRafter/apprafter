@@ -12,7 +12,7 @@ members = [
 # Bumped to match each released patch tag per the CONTRIBUTING.md
 # "Versioning" rule. Drifted at 0.1.2 from initial v0.1.2 commit
 # through v0.1.76; the policy starts at v0.1.77.
-version      = "0.1.143"
+version      = "0.1.144"
 edition      = "2021"
 rust-version = "1.88"
 license      = "FSL-1.1-Apache-2.0"
@@ -43,6 +43,8 @@ inquire              = "0.7"
 tabled               = "0.15"
 semver               = { version = "1", features = ["serde"] }
 arboard              = { version = "3", default-features = false }
+chrono               = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+terminal_size        = "0.4"
 
 [profile.release]
 lto         = "thin"

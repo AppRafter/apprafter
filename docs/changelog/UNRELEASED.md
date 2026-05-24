@@ -13,6 +13,100 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.144 — M1.5 polish post-B.1.79a #2 — `apprafter platform status` UX (2026-05-24)
+
+### Symptom
+
+Walk feedback on B.1.79a status output:
+
+- Raw RFC3339 timestamps (`2026-05-23T22:30:00Z`) — operators
+  can't tell at a glance if a check happened five minutes ago
+  or last week.
+- `versionHistory` table was ordered by JSON document position
+  rather than `appliedAt` desc — entries appeared in upstream
+  reverse-insertion order, which is brittle across server-side
+  re-sorts.
+- Conditions table sprawled past the operator's 80-column
+  terminal because the previous heuristic wrapped only the
+  `MESSAGE` column to a flat 60 chars without accounting for
+  the four-column layout's total width.
+
+### Fix
+
+- **Timestamps render as `2026-05-24 14:30 UTC (2 hours ago)`**.
+  New pure helper `format_timestamp_with_relative(raw, now)`
+  parses RFC3339 via `chrono`, prefixes with the absolute
+  moment, suffixes with a humanised relative phrase. Falls
+  back to the original string verbatim on parse failure so
+  audit information is never lost — only the relative suffix
+  goes missing.
+- **`versionHistory` sorted by parsed `appliedAt` desc**.
+  Entries with unparseable timestamps sink to the bottom
+  (corrupt CRs / freshly-created records still missing the
+  field don't dominate the visible head).
+- **Conditions table adapts to terminal width**. New
+  `render_conditions_table` queries `terminal_size::
+  terminal_size()`, computes a budget by subtracting the
+  other three columns' max widths plus separator overhead,
+  and wraps `MESSAGE` to the remainder. Falls back to 100
+  columns when stdout is piped or the lookup fails.
+
+### Dependencies added (workspace + platform-cli)
+
+- `chrono = { default-features = false, features = ["clock",
+  "serde"] }` — RFC3339 parsing + `Utc::now()` for relative
+  formatting.
+- `terminal_size = "0.4"` — TTY width detection.
+
+### Humanise rules
+
+`humanise_relative(delta)` matches what operators actually
+care about:
+
+| Range | Output |
+|---|---|
+| < 45 s | `just now` / `in a few seconds` |
+| 45 s – 90 s | `1 minute ago` / `in 1 minute` |
+| < 1 h | `N minutes ago` |
+| 1 – 2 h | `1 hour ago` |
+| < 1 d | `N hours ago` |
+| 1 – 2 d | `1 day ago` |
+| < 30 d | `N days ago` |
+| 30 – 60 d | `1 month ago` |
+| < 1 y | `N months ago` |
+| 1 – 2 y | `1 year ago` |
+| ≥ 2 y | `N years ago` |
+
+Sub-minute precision is noise for platform events;
+granularity climbs through minutes / hours / days / months
+/ years.
+
+### Tests
+
++7 unit tests; total platform module: 2 → 9.
+
+- `format_timestamp_renders_absolute_and_relative` — happy
+  path: absolute prefix + relative `ago` suffix.
+- `format_timestamp_handles_unparseable_input` — defensive:
+  garbage input renders verbatim (audit value > prettiness).
+- `humanise_relative_uses_just_now_under_45_seconds` —
+  sub-minute precision suppressed.
+- `humanise_relative_handles_minutes_hours_days_months_years`
+  — span coverage across every unit branch.
+- `collect_history_rows_sorts_by_applied_at_desc` —
+  out-of-order source sorted correctly.
+- `collect_history_rows_puts_unparseable_timestamps_last` —
+  defensive: corrupt entries sink.
+- `collect_history_rows_caps_at_take` — top-N limit honoured.
+
+All other tests still pass; clippy clean.
+
+### Versioning
+
+CLI 0.1.143 → 0.1.144. Chart unchanged.
+
+---
+
 ## v0.1.143 — M1.5 polish post-B.1.79a #1 — CLI Cyrillic → English sweep (2026-05-24)
 
 ### Symptom
