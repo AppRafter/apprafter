@@ -1063,14 +1063,8 @@ mod tests {
         // convention. `spec.destination.namespace` is now an
         // explicit caller parameter (walk-fix #12 / v0.1.160)
         // — must reflect what's passed, not the app name.
-        let m = build_application_manifest(
-            "payments",
-            "https://x/y",
-            "v1.0",
-            "/",
-            "apps",
-            "apprafter",
-        );
+        let m =
+            build_application_manifest("payments", "https://x/y", "v1.0", "/", "apps", "apprafter");
         assert_eq!(
             m.pointer("/metadata/namespace").and_then(Value::as_str),
             Some("argocd")
@@ -1088,14 +1082,8 @@ mod tests {
         // namespace (e.g. an operator who knows their manifest
         // lives in `tenant-x`) must NOT be silently overridden
         // by the prior `<app-name>` default.
-        let m = build_application_manifest(
-            "payments",
-            "https://x/y",
-            "v1.0",
-            "/",
-            "apps",
-            "tenant-x",
-        );
+        let m =
+            build_application_manifest("payments", "https://x/y", "v1.0", "/", "apps", "tenant-x");
         assert_eq!(
             m.pointer("/spec/destination/namespace")
                 .and_then(Value::as_str),
