@@ -125,6 +125,23 @@ describe('landing/cms scaffold', () => {
     }
   });
 
+  test('Next standalone output enabled for Docker build', () => {
+    const nextCfg = readFileSync(join(ROOT, 'next.config.mjs'), 'utf8');
+    expect(nextCfg).toContain("output: 'standalone'");
+    expect(nextCfg).toContain('outputFileTracingRoot');
+  });
+
+  test('Dockerfile present + two-stage (bun builder → node runtime)', () => {
+    const dfPath = join(ROOT, 'Dockerfile');
+    expect(existsSync(dfPath)).toBe(true);
+    const df = readFileSync(dfPath, 'utf8');
+    expect(df).toMatch(/FROM oven\/bun.*AS builder/);
+    expect(df).toMatch(/FROM node.*AS runtime/);
+    // standalone copy paths.
+    expect(df).toContain('.next/standalone/cms');
+    expect(df).toContain('.next/static');
+  });
+
   test('Next root / redirects to /admin (no public frontend on the cms host)', () => {
     const nextCfg = readFileSync(join(ROOT, 'next.config.mjs'), 'utf8');
     expect(nextCfg).toContain('/admin');

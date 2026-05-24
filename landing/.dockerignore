@@ -1,0 +1,30 @@
+# Shared .dockerignore for both web/Dockerfile and cms/Dockerfile
+# (build context is `landing/`). Each Dockerfile selectively COPYs
+# the workspace folders it needs.
+
+# Workspace deps — re-installed in the builder stage.
+**/node_modules/
+
+# Build artefacts.
+**/dist/
+**/.astro/
+**/.next/
+
+# Local design-bundle export (1.3 MB, gitignored anyway).
+.design-bundle/
+
+# Docs + design source — not used at runtime.
+docs/
+
+# Secrets, never bake into the image.
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Logs + editor noise.
+*.log
+.DS_Store
+
+# Don't ship test sources into the runtime layer.
+**/*.smoke.test.ts
+**/*.test.ts

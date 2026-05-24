@@ -261,6 +261,39 @@ describe('CMS client (Phase H)', () => {
     expect(cms).toMatch(/export function renderCopyright\(/);
     expect(cms).toContain('{{year}}');
   });
+
+  test('LANDING_USE_FALLBACK=1 opts the prod build into JSON fallbacks', () => {
+    // Docker build sets this so the image is reproducible without
+    // a reachable Payload at image-build time.
+    const cms = readFileSync(join(ROOT, 'src/lib/cms.ts'), 'utf8');
+    expect(cms).toContain('LANDING_USE_FALLBACK');
+    expect(cms).toContain('USE_FALLBACK');
+  });
+});
+
+describe('container build surface (Phase J+)', () => {
+  test('Dockerfile + Caddyfile present for web', () => {
+    expect(existsSync(join(ROOT, 'Dockerfile'))).toBe(true);
+    expect(existsSync(join(ROOT, 'Caddyfile'))).toBe(true);
+  });
+
+  test('web Dockerfile builds via fallback (no live CMS required at build time)', () => {
+    const df = readFileSync(join(ROOT, 'Dockerfile'), 'utf8');
+    expect(df).toContain('LANDING_USE_FALLBACK=1');
+    expect(df).toContain('PUBLIC_CMS_URL');
+    // Two-stage: bun builder + caddy runtime.
+    expect(df).toMatch(/FROM oven\/bun.*AS builder/);
+    expect(df).toMatch(/FROM caddy.*AS runtime/);
+  });
+
+  test('Caddyfile serves dist + 404 fallback + immutable cache for assets', () => {
+    const cf = readFileSync(join(ROOT, 'Caddyfile'), 'utf8');
+    expect(cf).toContain('/usr/share/caddy');
+    expect(cf).toContain('try_files');
+    expect(cf).toContain('/404.html');
+    expect(cf).toContain('encode gzip zstd');
+    expect(cf).toMatch(/\/fonts\/\*.*immutable/);
+  });
 });
 
 describe('cue-highlight build-time tokenizer', () => {

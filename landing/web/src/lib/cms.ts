@@ -36,7 +36,26 @@ function loadFallback<U>(name: string): U {
   return mod.default as U;
 }
 
+/**
+ * Build-time opt-in to use the fallback JSONs even in prod. Set
+ * `LANDING_USE_FALLBACK=1` during `astro build` to skip the CMS
+ * fetch entirely — pages render from web/src/data/fallback/*.json.
+ *
+ * This is the path the Docker build takes: the image is reproducible
+ * without a running Payload reachable from the CI runner, and the
+ * resulting static output uses the JSONs that ship in the repo.
+ *
+ * Operators who want CMS-driven static builds (rebuild after edits
+ * in admin) leave LANDING_USE_FALLBACK unset and run the build
+ * inside the cluster where the CMS is reachable.
+ */
+const USE_FALLBACK = (process.env.LANDING_USE_FALLBACK ?? '') === '1';
+
 async function fetchGlobal<U>(slug: string, fallbackName: string): Promise<U> {
+  if (USE_FALLBACK) {
+    return loadFallback<U>(fallbackName);
+  }
+
   // Astro SSR runs on the server — relative URLs won't work there.
   // Use SERVER_CMS_URL (resolved via env at build/SSR time) for the
   // base; the browser-side islands set PUBLIC_CMS_URL to make
@@ -51,7 +70,8 @@ async function fetchGlobal<U>(slug: string, fallbackName: string): Promise<U> {
   } catch (err) {
     if (import.meta.env.PROD) {
       // Prod must not silently fall back — build should fail loudly
-      // so we don't ship a stale or partial page.
+      // so we don't ship a stale or partial page (unless the
+      // operator opted in via LANDING_USE_FALLBACK=1, handled above).
       throw err;
     }
     if (import.meta.env.DEV) {

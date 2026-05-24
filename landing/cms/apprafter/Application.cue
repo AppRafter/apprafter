@@ -3,6 +3,15 @@
 // AppRafter Application manifest for the landing CMS (Payload 3
 // + Next 15). Vets against schemas/v1alpha1/application.cue.
 //
+// Container image: built by
+// `.github/workflows/release-landing.yml` on every `landing-v*`
+// tag. The image runs Next standalone on :3000 — see
+// landing/cms/Dockerfile.
+//
+// Image tag convention:
+//   ghcr.io/apprafter/landing-cms:landing-v0.1.0   (pinned, prod)
+//   ghcr.io/apprafter/landing-cms:latest           (head, dev)
+//
 // Postgres dependency is NOT declared here per the operator's
 // 2026-05-22 request — `spec.base.needs.pg` ships with v2.x of
 // the platform API once ResourceClaim lands. Until then the

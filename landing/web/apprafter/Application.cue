@@ -3,15 +3,19 @@
 // AppRafter Application manifest for the landing site (Astro 5
 // static output). Vets against schemas/v1alpha1/application.cue.
 //
-// Built artefact: `bun run build:web` produces landing/web/dist/
-// which is baked into the container image at deploy time. The
-// container's static-file server (Caddy / nginx — left to the
-// image builder) listens on :80 and serves dist/.
+// Container image: built by
+// `.github/workflows/release-landing.yml` on every `landing-v*`
+// tag. The image bundles `landing/web/dist/` + Caddy on :80; see
+// landing/web/Dockerfile.
+//
+// Image tag convention:
+//   ghcr.io/apprafter/landing-web:landing-v0.1.0   (pinned, prod)
+//   ghcr.io/apprafter/landing-web:latest           (head, dev)
 //
 // Postgres is intentionally not declared — the web app has no
-// runtime DB dependency. It does need to reach the cms host at
-// build time for the SSR Payload fetch, but that happens inside
-// the CI image-build step (PUBLIC_CMS_URL env), not at runtime.
+// runtime DB dependency. The Astro build SSRs from the CMS at
+// image-build time (or uses fallback JSON via
+// LANDING_USE_FALLBACK=1, which is what the workflow does).
 
 package apprafter
 

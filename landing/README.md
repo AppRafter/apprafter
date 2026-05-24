@@ -143,6 +143,40 @@ logs a warning and the signup still persists.
 Payload global) should add one assertion here per slug so CI
 catches regressions.
 
+## Container images
+
+Two GHCR images cover prod. They are built and pushed by
+[`.github/workflows/release-landing.yml`](../.github/workflows/release-landing.yml)
+on every `landing-v*` tag:
+
+| Image | Stage | Runtime | Built from |
+|---|---|---|---|
+| `ghcr.io/apprafter/landing-web:<tag>` | Caddy 2 / alpine | `:80` static | [`web/Dockerfile`](web/Dockerfile) + [`web/Caddyfile`](web/Caddyfile) |
+| `ghcr.io/apprafter/landing-cms:<tag>` | Node 22 / alpine | `:3000` Next standalone | [`cms/Dockerfile`](cms/Dockerfile) |
+
+The web image is content-static — it ships with the JSON
+fallbacks baked in (`LANDING_USE_FALLBACK=1` during image build),
+so it renders without a live CMS. To refresh static output after
+content edits in the admin, cut a new `landing-v*` tag (or
+trigger the workflow via `workflow_dispatch`) and re-pull.
+
+Local build (no tag, no GHCR):
+
+```sh
+# build context MUST be the landing/ workspace root
+cd landing
+docker build -f web/Dockerfile -t landing-web:dev .
+docker build -f cms/Dockerfile -t landing-cms:dev .
+```
+
+The Application manifests at `web/apprafter/Application.cue` and
+`cms/apprafter/Application.cue` reference these images and vet
+against `schemas/v1alpha1/application.cue`. v1alpha1 doesn't
+expose `needs.pg`, secret refs, or hostname routing yet — those
+arrive in Phase 2.x (ResourceClaim) and 4.x (OpenBao). The
+Postgres URL + secrets currently live in the systemd
+EnvironmentFile (see `DEPLOY.md`).
+
 ## License
 
 `FSL-1.1-Apache-2.0` per

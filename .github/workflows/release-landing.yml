@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: release-landing
+
+# Builds and pushes the landing web + cms container images to
+# ghcr.io on every `landing-v*` tag, plus on demand via
+# `workflow_dispatch`. Uses the auto-provided `GITHUB_TOKEN` — no
+# PAT or external secrets required.
+#
+# Tag namespace is intentionally separate from the operator's
+# `v0.*` / `v1.*` series so landing releases don't accidentally
+# fire the operator pipeline and vice-versa. Example: `landing-v0.1.0`.
+#
+# Image references after a successful run:
+#
+#   ghcr.io/<owner-lowercased>/landing-web:<tag>
+#   ghcr.io/<owner-lowercased>/landing-web:latest
+#   ghcr.io/<owner-lowercased>/landing-cms:<tag>
+#   ghcr.io/<owner-lowercased>/landing-cms:latest
+#
+# Security: dynamic github.* values flow only into action inputs;
+# the one shell step uses an `env:` binding to avoid expression
+# injection (same anti-injection pattern as release-operator.yml).
+#
+# Why the lowercase shim: docker registry names MUST be lowercase
+# but ${{ github.repository_owner }} preserves the org's display
+# casing (e.g. `AppRafter`). GitHub Actions has no built-in
+# `toLower` function, so a shell `tr` step computes it once.
+
+on:
+  push:
+    tags:
+      - 'landing-v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  landing-web:
+    name: build landing-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image base
+        id: image-base
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/landing-web" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push landing-web image
+        uses: docker/build-push-action@v5
+        with:
+          context: landing
+          file: landing/web/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image-base.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.image-base.outputs.image }}:latest
+          # PUBLIC_CMS_URL is baked into the client JS at build
+          # time. Override per environment by editing the workflow
+          # or via workflow_dispatch + a future build-arg input.
+          build-args: |
+            PUBLIC_CMS_URL=https://cms.apprafter.dev
+          # Same x86-only stance as release-operator until the
+          # platform learns multi-arch (Hetzner CAX*).
+          platforms: linux/amd64
+          cache-from: type=gha,scope=landing-web
+          cache-to: type=gha,mode=max,scope=landing-web
+
+  landing-cms:
+    name: build landing-cms
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image base
+        id: image-base
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/landing-cms" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push landing-cms image
+        uses: docker/build-push-action@v5
+        with:
+          context: landing
+          file: landing/cms/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image-base.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.image-base.outputs.image }}:latest
+          platforms: linux/amd64
+          cache-from: type=gha,scope=landing-cms
+          cache-to: type=gha,mode=max,scope=landing-cms

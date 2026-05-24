@@ -17,28 +17,79 @@ Target deploy (per Q1 + Q2, 2026-05-22):
 - **Mail:** `nodemailer` over an SMTP relay (Resend / Postmark /
   similar — chosen at deploy time, secret injected via env).
 
+## Releasing
+
+The recommended path is to pull prebuilt container images from
+GHCR — `.github/workflows/release-landing.yml` builds and pushes
+them on every `landing-v*` tag:
+
+```sh
+# Cut a release tag on master:
+git tag landing-v0.1.0
+git push origin landing-v0.1.0
+# GitHub Actions runs both image builds in parallel (~3-5 min
+# each on cache hits). After it lands:
+#   ghcr.io/apprafter/landing-web:landing-v0.1.0   (+ :latest)
+#   ghcr.io/apprafter/landing-cms:landing-v0.1.0   (+ :latest)
+```
+
+First push of each package on GHCR makes it private. Flip to
+public once via the GitHub UI: Packages → <package> → Settings →
+Change visibility → Public. After that the host can `podman pull`
+without auth.
+
 ## One-time setup
 
 ```sh
-# 1) Build the artefacts on the deploy host (or anywhere with bun
-#    available, then rsync the dist/ + .next/ trees over):
+# 1) Pull the images on the deploy host (or run via systemd-unit
+#    below which pulls automatically on each restart).
+podman pull ghcr.io/apprafter/landing-web:landing-v0.1.0
+podman pull ghcr.io/apprafter/landing-cms:landing-v0.1.0
+
+# 2) Wire the CMS env + Postgres (see following sections), then
+#    start the systemd units (one for web, one for cms).
+sudo systemctl daemon-reload
+sudo systemctl enable --now apprafter-landing-web apprafter-landing-cms
+
+# 3) Seed the content globals into the running CMS (one-shot;
+#    idempotent — re-run after JSON edits if you want them
+#    mirrored back into Payload). Either:
+#    (a) inside the cms container:
+podman exec apprafter-landing-cms node /app/seed.js
+#    (b) or with a local bun checkout pointed at the prod CMS:
+DATABASE_URI=... PAYLOAD_SECRET=... \
+  bun --filter @apprafter/landing-cms run seed
+```
+
+The web image is content-static — it ships with the JSON
+fallbacks baked in (`LANDING_USE_FALLBACK=1` during image build),
+so it renders without depending on the live CMS at boot. To
+refresh static output after content edits, cut a new
+`landing-v*` tag (or trigger the workflow via `workflow_dispatch`)
+and re-pull.
+
+## Building from source (fallback path)
+
+If you don't want to tag a release yet, build locally:
+
+```sh
 cd landing
 bun install --frozen-lockfile
-bun run build:cms          # produces cms/.next/
-PUBLIC_CMS_URL=https://cms.apprafter.dev bun run build:web
-                            # produces web/dist/
 
-# 2) Place static output where Caddy serves from:
-sudo rsync -a --delete web/dist/ /var/www/apprafter.dev/
+# Web — uses fallback JSONs unless LANDING_USE_FALLBACK=0 is set
+# and the CMS is reachable. Defaults are correct for offline
+# image builds.
+docker build -f web/Dockerfile -t landing-web:dev .
 
-# 3) Set up the CMS systemd unit (template below) and start it.
-sudo systemctl daemon-reload
-sudo systemctl enable --now apprafter-cms
+# CMS — Next standalone output; runtime is node:22-alpine.
+docker build -f cms/Dockerfile -t landing-cms:dev .
 
-# 4) Seed the content globals (one-shot; idempotent — re-run after
-#    JSON edits if you want them mirrored back into Payload):
-sudo -u apprafter-cms env $(cat /etc/apprafter-cms.env | xargs) \
-  bun --filter @apprafter/landing-cms run seed
+# Smoke-run locally on the same ports as the dev workflow:
+docker run --rm -p 4321:80 landing-web:dev
+docker run --rm -p 3000:3000 \
+  -e DATABASE_URI=postgres://... \
+  -e PAYLOAD_SECRET=... \
+  landing-cms:dev
 ```
 
 ## Postgres container
