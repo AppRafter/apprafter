@@ -3,48 +3,54 @@
 # Argo CD Config Management Plugin manifest for CUE
 # compilation of user application repositories. ADR 0029.
 #
-# The plugin activates only when an Argo CD Application's
-# source repository contains a file matching `**/apprafter*.cue`.
-# When it does, Argo CD's repo-server hands control to this
-# sidecar, which runs `cue export ./... --out yaml` via
-# `entrypoint.sh` and pipes the rendered manifests back into
-# Argo CD's standard sync pipeline.
+# This file is kept in sync with the chart's embedded mirror
+# at `platform-stack/cue/component_argocd.cue` —
+# `data."plugin.yaml"`. The chart-side ConfigMap is what Argo
+# CD actually mounts at runtime; the file here is the source
+# of truth that the CI smoke test (`argocd-cue-cmp-check.yml`)
+# verifies on every cue-cmp change.
 #
-# Users who prefer raw YAML are unaffected — without
-# `apprafter*.cue` in the repo, the CMP discover step skips
-# the repository.
+# Walk-fix #8 post-B.1.79a (cue-cmp v0.1.3 → unchanged image,
+# config-only):
+#
+#   Initial v0.1.2 plugin used `discover.find.glob:
+#   "{**/apprafter*.cue,**/apprafter/**/*.cue}"` — brace
+#   alternation that doublestar v4 supports. Argo CD 2.13.1's
+#   vendored doublestar either treats the braces literally or
+#   never received the v4 brace support — CMP returned
+#   no-match on real-world paths and Argo CD fell back to
+#   default directory mode, choking on `package.json`.
+#
+#   Switched to `discover.find.command` — a shell script that
+#   runs from the path's directory and exits 0 on match. Two
+#   conventions handled in one expression:
+#
+#     * cwd basename `apprafter` (operator's path points
+#       directly at the convention directory): match any
+#       `.cue` file at depth 1.
+#     * otherwise: match any `.cue` file inside an
+#       `apprafter/` subdirectory OR with a filename starting
+#       `apprafter`.
+#
+# Users who prefer raw YAML are unaffected — without a
+# matching `.cue` file the CMP discover step exits non-zero
+# and Argo CD picks the next plugin / default handler.
 apiVersion: argoproj.io/v1alpha1
 kind: ConfigManagementPlugin
 metadata:
   name: cue
 spec:
-  # Detection rule. Globs are evaluated relative to the
-  # repo-server's checkout of the user repository. Two
-  # conventions are accepted:
-  #
-  #   1. `apprafter*.cue` filename anywhere in the tree —
-  #      e.g. `apprafter.cue`, `apprafter-web.cue`. The
-  #      "filename starts with apprafter" convention is
-  #      compact for small repos.
-  #
-  #   2. Any `*.cue` file inside an `apprafter/` directory —
-  #      e.g. `landing/web/apprafter/Application.cue`. The
-  #      directory-as-marker convention is more readable in
-  #      larger repos where multiple apps share а tree.
-  #
-  # Walk-fix #5 post-B.1.79a (cue-cmp v0.1.2) added the
-  # second pattern. The first was already supported but
-  # forced operators к use prefixed filenames; the directory-
-  # marker form matches how AppRafter's own landing manifests
-  # are laid out (`landing/web/apprafter/Application.cue`,
-  # `landing/cms/apprafter/Application.cue`).
-  #
-  # Doublestar v4 brace alternation handles both patterns in
-  # а single glob; Argo CD's repo-server uses that library
-  # for CMP discovery as of 2.13.
   discover:
     find:
-      glob: "{**/apprafter*.cue,**/apprafter/**/*.cue}"
+      command:
+        - sh
+        - -c
+        - |
+          if [ "$(basename "$PWD")" = "apprafter" ]; then
+            find . -maxdepth 1 -type f -name '*.cue' -print -quit | grep -q .
+          else
+            find . -type f -name '*.cue' \( -path '*/apprafter/*' -o -name 'apprafter*.cue' \) -print -quit | grep -q .
+          fi
   # Render command. `entrypoint.sh` lives in the sidecar
   # image and wraps `cue export` so CUE compile errors
   # surface as structured single-line summaries in the

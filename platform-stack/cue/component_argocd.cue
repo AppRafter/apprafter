@@ -218,13 +218,40 @@ _components: argocd: #Component & {
 			}
 			data: "plugin.yaml": """
 				# SPDX-License-Identifier: FSL-1.1-Apache-2.0
-				# Walk-fix #5 post-B.1.79a (chart 0.1.42 + cue-cmp
-				# v0.1.2): glob extended to also accept files in
-				# `apprafter/` directories (e.g.
-				# `landing/web/apprafter/Application.cue`) — the
-				# directory-as-marker convention used by AppRafter's
-				# own landing manifests. Both patterns are matched
-				# via doublestar v4 brace alternation.
+				# Walk-fix #8 post-B.1.79a (chart 0.1.44): discover
+				# switches from `glob` to `command`. Operator
+				# upgraded to chart 0.1.43, registered landing apps,
+				# Argo CD failed with
+				# `Failed to unmarshal "package.json": Object 'Kind'
+				# is missing` — CMP plugin didn't engage. Root cause:
+				# the brace alternation `{a,b}` in
+				# `**/apprafter*.cue,**/apprafter/**/*.cue}` was
+				# never matching in Argo CD 2.13.1's vendored
+				# doublestar — either it's not the v4 release that
+				# supports brace expansion, or the pattern is
+				# treated literally. CMP returned no-match,
+				# Argo CD fell back to default directory mode,
+				# directory mode walked `landing/cms/` and tried to
+				# parse `package.json` as a k8s manifest.
+				#
+				# `discover.find.command` runs an arbitrary script
+				# from the path's directory; exit 0 means match,
+				# non-zero means no match. The shell snippet below
+				# handles BOTH conventions in one expression:
+				#
+				#   * cwd basename `apprafter` (operator pointed
+				#     `path` directly at the convention directory):
+				#     look for any `.cue` file at depth 1.
+				#   * otherwise: look for any `.cue` file inside an
+				#     `apprafter/` subdirectory anywhere, OR with a
+				#     filename starting `apprafter`. Matches both
+				#     `landing/cms/apprafter/Application.cue` (path
+				#     = parent) and `landing/cms/apprafter-web.cue`
+				#     (filename-prefix convention).
+				#
+				# `-print -quit | grep -q .` short-circuits after
+				# the first match — discovery doesn't need a full
+				# scan, just a yes/no signal.
 				apiVersion: argoproj.io/v1alpha1
 				kind: ConfigManagementPlugin
 				metadata:
@@ -232,7 +259,15 @@ _components: argocd: #Component & {
 				spec:
 				  discover:
 				    find:
-				      glob: "{**/apprafter*.cue,**/apprafter/**/*.cue}"
+				      command:
+				        - sh
+				        - -c
+				        - |
+				          if [ "$(basename "$PWD")" = "apprafter" ]; then
+				            find . -maxdepth 1 -type f -name '*.cue' -print -quit | grep -q .
+				          else
+				            find . -type f -name '*.cue' \\( -path '*/apprafter/*' -o -name 'apprafter*.cue' \\) -print -quit | grep -q .
+				          fi
 				  generate:
 				    command: [sh, "-c"]
 				    args:

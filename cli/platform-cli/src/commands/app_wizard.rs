@@ -191,14 +191,49 @@ pub fn detect_path_relative_to_repo_root() -> Option<String> {
     let rendered = rel
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
-    if rendered.is_empty() {
-        // cwd == repo root. Empty string rendered as `/` so
-        // the prompt UI matches operator expectations
-        // ("render the whole repo").
-        Some("/".to_string())
-    } else {
-        Some(rendered)
+    Some(strip_apprafter_tail(&rendered))
+}
+
+/// If the relative path ends in the convention directory
+/// segment `apprafter`, strip it. Walk-fix #8 post-B.1.79a:
+/// when the operator runs `apprafter app add` from inside
+/// `landing/cms/apprafter/` (the convention directory itself,
+/// not its parent), the natural cwd → path mapping would
+/// suggest `landing/cms/apprafter` — but the CMP plugin's
+/// discover prefers the **parent** because that's where
+/// `cue export ./...` finds the manifest under a recognisable
+/// `apprafter/Application.cue` shape. Stripping the trailing
+/// `apprafter` segment in the wizard's suggested default
+/// gives the operator the right path without needing to
+/// know the discovery internals.
+///
+/// Pure fn — operates on the rendered slash-separated string.
+/// Returns the input verbatim when there's no `apprafter`
+/// tail to strip, or `/` when the strip would leave an
+/// empty path (matches the documented "render whole repo"
+/// idiom).
+fn strip_apprafter_tail(rel: &str) -> String {
+    if rel.is_empty() {
+        return "/".to_string();
     }
+    // Use rsplit_once so we strip only the LAST segment if
+    // it's `apprafter`. `landing/apprafter/x` (apprafter in
+    // the middle) is left alone — that's a weird layout an
+    // operator probably has a reason for.
+    if let Some((parent, tail)) = rel.rsplit_once('/') {
+        if tail == "apprafter" {
+            return if parent.is_empty() {
+                "/".to_string()
+            } else {
+                parent.to_string()
+            };
+        }
+    } else if rel == "apprafter" {
+        // cwd is `<repo-root>/apprafter` — the entire
+        // relative path IS `apprafter`. Strip to repo root.
+        return "/".to_string();
+    }
+    rel.to_string()
 }
 
 /// Probe `git symbolic-ref --short HEAD` non-fatally — returns
@@ -323,6 +358,51 @@ mod tests {
         assert!(matches!(r, Validation::Invalid(_)));
         let r = validate_dns_1123_for_app("").unwrap();
         assert!(matches!(r, Validation::Invalid(_)));
+    }
+
+    #[test]
+    fn strip_apprafter_tail_drops_trailing_apprafter_segment() {
+        // Walk-fix #8 scenario: operator ran `apprafter app add`
+        // from inside `landing/cms/apprafter/` (the convention
+        // directory). Wizard's path default should be
+        // `landing/cms`, not `landing/cms/apprafter`, so the
+        // CMP discover from the parent locates the manifest
+        // under a recognisable shape.
+        assert_eq!(strip_apprafter_tail("landing/cms/apprafter"), "landing/cms");
+    }
+
+    #[test]
+    fn strip_apprafter_tail_collapses_top_level_apprafter_to_root() {
+        // cwd == `<repo-root>/apprafter` — the entire
+        // relative path IS `apprafter`. Strip to repo root
+        // (rendered as `/`).
+        assert_eq!(strip_apprafter_tail("apprafter"), "/");
+    }
+
+    #[test]
+    fn strip_apprafter_tail_leaves_subdir_apprafter_alone() {
+        // `landing/apprafter/web` — apprafter is a middle
+        // segment, not the trailing one. Likely intentional
+        // (operator may have a weird layout); don't touch.
+        assert_eq!(
+            strip_apprafter_tail("landing/apprafter/web"),
+            "landing/apprafter/web"
+        );
+    }
+
+    #[test]
+    fn strip_apprafter_tail_handles_empty_input() {
+        // Repo root case — empty relative path becomes the
+        // documented `/` placeholder.
+        assert_eq!(strip_apprafter_tail(""), "/");
+    }
+
+    #[test]
+    fn strip_apprafter_tail_preserves_unrelated_paths() {
+        assert_eq!(strip_apprafter_tail("landing/cms"), "landing/cms");
+        assert_eq!(strip_apprafter_tail("foo"), "foo");
+        // Same-segment-name-but-not-apprafter case.
+        assert_eq!(strip_apprafter_tail("landing/cms/web"), "landing/cms/web");
     }
 
     #[test]

@@ -1658,6 +1658,115 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #8 post-B.1.79a — CMP discover switches from glob
+// to command. Chart 0.1.43 shipped `discover.find.glob:
+// "{**/apprafter*.cue,**/apprafter/**/*.cue}"` — brace
+// alternation that doublestar v4 supports. Argo CD 2.13.1's
+// vendored doublestar either treats the braces literally or
+// never received the v4 brace support — operator's actual
+// cluster returned no-match on `landing/cms/apprafter/
+// Application.cue`, Argo CD fell back to default directory
+// mode, choked on `package.json`. New shape: command-based
+// discovery using `find` with an inline shell snippet,
+// supports both path-is-parent-of-apprafter и
+// path-is-apprafter-itself conventions, no doublestar
+// dependency.
+//
+// Image unchanged (cue-cmp stays at v0.1.3) — the fix is
+// entirely in the chart-managed ConfigMap content.
+compatibility: "0.1.44": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #8 post-B.1.79a — CMP discover switches
+		from glob to command for cross-doublestar-version
+		robustness.
+
+		**Symptom.** Operator on chart 0.1.43 registered
+		landing apps via `apprafter app add --path
+		landing/cms`; Argo CD UI surfaced:
+
+			```
+			Failed to load target state: failed to generate
+			manifest for source 1 of 1: rpc error: code =
+			FailedPrecondition desc = Failed to unmarshal
+			"package.json": Object 'Kind' is missing
+			```
+
+		**Root cause.** Chart 0.1.42-0.1.43 plugin.yaml used
+		`discover.find.glob: "{**/apprafter*.cue,**/
+		apprafter/**/*.cue}"` — brace alternation that
+		doublestar v4 supports. Argo CD 2.13.1's vendored
+		doublestar either treats the braces literally or
+		never received the v4 brace support. CMP returned
+		no-match for both apps; Argo CD fell back to default
+		directory mode, walked `landing/cms/`, and tried to
+		parse `package.json` as a k8s manifest.
+
+		Diagnostics confirmed: configmap had the new glob,
+		repo-server's `MatchRepository` gRPC calls returned
+		OK (success) with no match (silent — the protocol
+		has no "explicit no-match" log entry, only "matched"
+		activity downstream).
+
+		**Fix.** Switch `discover.find.glob` к `discover.
+		find.command`. The command runs from the path's
+		directory; exit 0 means match, non-zero means no
+		match. Inline shell handles both convention shapes
+		in one expression:
+
+			```sh
+			if [ "$(basename "$PWD")" = "apprafter" ]; then
+			  find . -maxdepth 1 -type f -name "*.cue" \\
+			      -print -quit | grep -q .
+			else
+			  find . -type f -name "*.cue" \\
+			      \\( -path "*/apprafter/*" \\
+			         -o -name "apprafter*.cue" \\) \\
+			      -print -quit | grep -q .
+			fi
+			```
+
+		* cwd basename `apprafter` (operator pointed path
+		  directly at convention dir) → match any `.cue`
+		  file at depth 1.
+		* otherwise → match any `.cue` file inside an
+		  `apprafter/` subdirectory OR with а filename
+		  starting `apprafter`. Covers both path = parent
+		  (`landing/cms`) и filename-prefix (`apprafter-
+		  web.cue`) conventions.
+
+		`-print -quit | grep -q .` short-circuits after the
+		first match — discovery doesn't need а full scan,
+		just а yes/no signal.
+
+		**Image unchanged.** cue-cmp Docker image stays at
+		v0.1.3; the entire fix lives in the chart-managed
+		`cue-cmp-plugin-config` ConfigMap content. Upgrading
+		the chart к 0.1.44 + restarting `argocd-repo-server`
+		deployment is sufficient к pick up the new
+		discovery rule.
+
+		**Wizard polish bundled.** `apprafter app add`
+		wizard's `detect_path_relative_to_repo_root` now
+		strips а trailing `apprafter` segment from the
+		suggested path — operator running the command from
+		inside `landing/cms/apprafter/` gets default
+		`landing/cms`. (CMP would handle either case with
+		the new command-based discover, but the parent
+		form is the cleaner convention.)
+
+		Rendered chart vs 0.1.43: ConfigMap `cue-cmp-plugin-
+		config` content changed (glob → command stanza).
+		Other manifests byte-identical.
+		"""
+	references: [
+		"docs/adr/0029-cue-cmp.md",
+		"argocd-cue-cmp/plugin.yaml",
+		"docs/changelog/UNRELEASED.md#v01157",
+	]
+}
+
 // Walk-fix #5b post-B.1.79a — argocd-cue-cmp entrypoint
 // accepts both source-layout styles. Walk-fix #5 (chart
 // 0.1.42, cue-cmp v0.1.2) added jq-based enumeration of

@@ -13,6 +13,139 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.157 — M1.5 walk-fix #8 post-B.1.79a — CMP discover switches from glob to command (2026-05-24)
+
+### Symptom
+
+Operator on chart 0.1.43 registered landing apps via
+`apprafter app add --path landing/cms`; Argo CD UI surfaced:
+
+```
+Failed to load target state: failed to generate manifest
+for source 1 of 1: rpc error: code = FailedPrecondition
+desc = Failed to unmarshal "package.json": Object 'Kind'
+is missing in '{ "name": "@apprafter/landing-cms", ... }'
+```
+
+Same error для both `landing-web` and `landing-cms`. The
+CMP plugin was supposed to render `apprafter/Application.
+cue` files into k8s manifests; instead Argo CD fell through
+to default directory mode, walked `landing/cms/`, и tried
+to parse `package.json` as a k8s manifest.
+
+### Root cause
+
+Chart 0.1.42-0.1.43 plugin.yaml used `discover.find.glob:
+"{**/apprafter*.cue,**/apprafter/**/*.cue}"` — brace
+alternation that `doublestar/v4` supports. Argo CD 2.13.1's
+vendored doublestar either treats the braces literally or
+never received the v4 brace support. CMP returned no-match
+for the operator's path; Argo CD fell back to default
+directory handler.
+
+Diagnostics confirmed the issue:
+
+- chart on cluster: 0.1.43 (current = target = available).
+- live `cue-cmp-plugin-config` ConfigMap has the new glob
+  with brace alternation.
+- `argocd-repo-server`'s cue-cmp sidecar logs show
+  `MatchRepository` gRPC calls returning OK (success) —
+  but the protocol has no explicit "matched / no-match"
+  log entry, only downstream `generate` activity. Absence
+  of any `generate` call OR `cue export` invocation
+  implies all `MatchRepository` calls returned false.
+
+So the glob isn't matching. We can't reasonably ship а
+fixed brace-aware doublestar into Argo CD; switch the
+discovery to а mechanism we control.
+
+### Fix
+
+Replace `discover.find.glob` with `discover.find.command`.
+The command runs from the path's directory; exit 0 means
+match, non-zero means no-match. Inline shell handles both
+convention shapes in а single expression:
+
+```sh
+if [ "$(basename "$PWD")" = "apprafter" ]; then
+  find . -maxdepth 1 -type f -name "*.cue" \
+      -print -quit | grep -q .
+else
+  find . -type f -name "*.cue" \
+      \( -path "*/apprafter/*" \
+         -o -name "apprafter*.cue" \) \
+      -print -quit | grep -q .
+fi
+```
+
+- cwd basename `apprafter` (operator pointed `path`
+  directly at the convention directory) → match any
+  `.cue` file at depth 1.
+- otherwise → match any `.cue` file inside an
+  `apprafter/` subdirectory OR with a filename starting
+  `apprafter`. Covers both path = parent
+  (`landing/cms`) and filename-prefix (`apprafter-web.cue`)
+  conventions.
+
+`-print -quit | grep -q .` short-circuits after the first
+match — discovery doesn't need a full scan, just a yes/no
+signal.
+
+### Image unchanged
+
+cue-cmp Docker image stays at v0.1.3 — the entire fix
+lives in the chart-managed `cue-cmp-plugin-config`
+ConfigMap content. Upgrading the chart to 0.1.44 +
+restarting `argocd-repo-server` deployment is sufficient
+to pick up the new discovery rule.
+
+### Wizard polish bundled
+
+`apprafter app add` wizard's
+`detect_path_relative_to_repo_root` now strips a trailing
+`apprafter` segment from the suggested path — operator
+running the command from inside `landing/cms/apprafter/`
+gets default `landing/cms`. New pure helper
+`strip_apprafter_tail(rel)` is exhaustively tested.
+
+CMP would handle either case with the new command-based
+discover, but the parent-of-apprafter form is the cleaner
+convention (the file inside `apprafter/` is the rendered
+manifest, the directory `apprafter/` is the marker — like
+`charts/` for Helm or `.argocd/` for Argo CD itself).
+
+### Operator recovery
+
+After this lands and chart upgrades to 0.1.44:
+
+```bash
+apprafter platform upgrade --to 0.1.44
+kubectl rollout restart deployment/argocd-repo-server -n argocd
+kubectl rollout status deployment/argocd-repo-server -n argocd
+
+# Hard-refresh affected apps:
+kubectl -n argocd annotate application landing-web \
+    argocd.argoproj.io/refresh=hard --overwrite
+kubectl -n argocd annotate application landing-cms \
+    argocd.argoproj.io/refresh=hard --overwrite
+```
+
+Apps re-sync, CMP plugin engages, manifests render.
+
+### Tests
+
++5 unit tests on `strip_apprafter_tail` covering trailing
+`apprafter` strip, top-level `apprafter` → repo root,
+subdir-`apprafter` left alone, empty input, unrelated
+paths.
+
+### Versioning
+
+CLI 0.1.156 → 0.1.157. Chart 0.1.43 → 0.1.44. cue-cmp
+image unchanged at v0.1.3.
+
+---
+
 ## v0.1.156 — M1.5 walk-fix #7 post-B.1.79a — migration helper observability + cross-fs (2026-05-24)
 
 ### Symptom
