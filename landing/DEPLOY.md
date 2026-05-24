@@ -26,7 +26,8 @@ don't have to touch them by hand:
 |---|---|---|
 | `landing-autotag.yml` | push to `master` with `landing/**` changes | bumps patch on latest `landing-v*` tag and pushes it |
 | `release-landing.yml` | `landing-v*` tag push | builds + pushes `:landing-vX.Y.Z` + `:latest` for both images |
-| `rebuild-landing-web.yml` | Payload `afterChange` on content globals | builds + pushes `:edge` + `:edge-<sha>` (web only, live CMS) |
+| `landing-preview-build.yml` | Payload `afterChange` on content globals | builds + pushes `:preview` + `:preview-<sha>` (web only, live CMS) |
+| `landing-promote-to-prod.yml` | Publishing.promoteToProd checkbox | retags `:preview` → `:prod` + `:latest` (no rebuild, byte-identical image) |
 
 So the normal flow is:
 
@@ -223,16 +224,55 @@ The `try_files` line keeps trailing-slash routing working
 (`/privacy` and `/privacy/` both resolve), and the `handle_errors`
 block serves the prebuilt 404 page on misses.
 
-## Content-driven rebuilds
+## Content-driven rebuilds — preview / promote / prod
 
-Two tag streams cover the two flows:
+Three tag streams on `landing-web`:
 
-| Tag | When | Built by |
+| Tag | Stream | Updated by |
 |---|---|---|
-| `landing-vX.Y.Z` + `latest` | git tag (pinned release) | `release-landing.yml` — uses `LANDING_USE_FALLBACK=1` (no CMS required at build time) |
-| `edge` + `edge-<sha>` | Payload content edit | `rebuild-landing-web.yml` — uses `LANDING_USE_FALLBACK=0` + `LANDING_CMS_URL=https://cms.apprafter.dev` (live fetch) |
+| `:preview` + `:preview-<sha>` | every CMS save | `landing-preview-build.yml` — builds with `LANDING_USE_FALLBACK=0` + `LANDING_CMS_URL=https://cms.apprafter.dev` (live fetch) |
+| `:prod` + `:latest` | every Publish in admin | `landing-promote-to-prod.yml` — retags `:preview` → `:prod` + `:latest` via `docker buildx imagetools create`, no rebuild |
+| `:landing-vX.Y.Z` | every release tag | `release-landing.yml` — independent pinned-release path |
 
-`edge` is a moving tag. The deploy host pulls it on a timer.
+Argo CD on the cluster watches `:prod` for the production app
+(`landing-web` Application) and `:preview` for the preview app
+(`landing-web-preview` Application — copy of the manifest with
+the image tag changed; manifest lives in
+`landing/web/apprafter/Application-preview.cue` when wired up).
+Preview should sit behind basic-auth / IP-allowlist on
+`preview.apprafter.dev`.
+
+### Promote flow (admin)
+
+1. Admin edits any content global → `notifyRebuild` stamps
+   `Publishing.lastEditAt` + `lastEditedGlobal` and fires the
+   `landing-content-changed` dispatch.
+2. `landing-preview-build.yml` rebuilds and pushes `:preview`
+   within ~2–3 min (cache hits).
+3. Admin opens the Publishing global, inspects the diff:
+   - `lastEditAt` = newest content save
+   - `lastPromotedAt` = newest prod promote
+   - if `lastEditAt > lastPromotedAt`, preview is ahead.
+4. Admin reviews `preview.apprafter.dev` (gated host).
+5. Ticks `promoteToProd` checkbox and saves.
+6. `promoteToProd` beforeChange fires
+   `landing-promote-to-prod` dispatch, stamps `lastPromotedAt`,
+   and resets the checkbox to `false`.
+7. `landing-promote-to-prod.yml` retags `:preview` → `:prod` +
+   `:latest`. Same image bytes as preview — no rebuild, no drift.
+8. Argo CD pulls the new digest and rolls out.
+
+Failure modes the design covers:
+- GitHub outage during `notifyRebuild` → save still persists,
+  Publishing.lastEditAt still stamped, dispatch failure logged.
+  Re-trigger via `gh workflow run landing-preview-build.yml`.
+- `:preview` doesn't exist yet (first promote) →
+  `landing-promote-to-prod.yml` fails with a clear error
+  ("trigger landing-preview-build first").
+- Operator promotes by accident → next save in any content
+  global re-creates `:preview`, then a second Promote click
+  fixes prod.
+
 Recommended setup with podman:
 
 **Option A — podman auto-update (preferred).** Run the web
@@ -253,7 +293,7 @@ OnCalendar=*:0/5` override.
 ```ini
 # /etc/systemd/system/apprafter-landing-web-pull.timer
 [Unit]
-Description=Periodic pull for landing-web edge tag
+Description=Periodic pull for landing-web :prod tag
 
 [Timer]
 OnCalendar=*:0/5
@@ -267,7 +307,7 @@ WantedBy=timers.target
 # /etc/systemd/system/apprafter-landing-web-pull.service
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/podman pull ghcr.io/apprafter/landing-web:edge
+ExecStart=/usr/bin/podman pull ghcr.io/apprafter/landing-web:prod
 ExecStartPost=/bin/systemctl try-restart apprafter-landing-web.service
 ```
 
@@ -286,7 +326,7 @@ them the hook logs a warning and skips — useful in dev.
 
 ```sh
 # Either trigger the workflow by hand:
-gh workflow run rebuild-landing-web.yml
+gh workflow run landing-preview-build.yml
 
 # Or send the dispatch event directly (mirrors what the Payload
 # hook does):

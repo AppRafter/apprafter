@@ -93,9 +93,16 @@ work can extend it without a chart-shape break.
 _appProjects` so the rendered values.yaml carries the
 map.
 
-### Workaround for 0.1.40 operators (not needed on 0.1.41+)
+### Manual unblocker for 0.1.40 operators (optional)
 
-Apply the four AppProjects manually:
+**The fix is structural — fresh installs on `0.1.41+` and
+`0.1.40 → 0.1.41` upgrades both work without any manual
+intervention.** Existing operators on `0.1.40` who don't
+want к wait for the chart-pull + reconcile cycle к clear
+the refresh-error condition can apply the four AppProjects
+inline. Argo CD picks them up immediately и un-breaks
+within seconds rather than the ~1-2 minutes а full
+`apprafter platform upgrade --to 0.1.41` typically takes:
 
 ```bash
 kubectl apply -f - <<'EOF'

@@ -142,26 +142,57 @@ describe('landing/cms scaffold', () => {
     expect(df).toContain('.next/static');
   });
 
-  test('notifyRebuild + withRebuildHook fire repository_dispatch on content edits', () => {
+  test('githubDispatch helper centralises the dispatch call', () => {
+    const helper = readFileSync(join(ROOT, 'src/lib/githubDispatch.ts'), 'utf8');
+    expect(helper).toContain('GITHUB_DISPATCH_TOKEN');
+    expect(helper).toContain('GITHUB_REPO');
+    expect(helper).toContain('/dispatches');
+    expect(helper).toMatch(/export async function fireGithubDispatch\(/);
+  });
+
+  test('notifyRebuild + withRebuildHook fire content-changed dispatch + stamp Publishing', () => {
     const hook = readFileSync(join(ROOT, 'src/hooks/notifyRebuild.ts'), 'utf8');
-    expect(hook).toContain('landing-content-changed');
-    expect(hook).toContain('GITHUB_DISPATCH_TOKEN');
-    expect(hook).toContain('GITHUB_REPO');
-    expect(hook).toContain('/repos/');
-    expect(hook).toContain('/dispatches');
+    expect(hook).toContain("'landing-content-changed'");
+    expect(hook).toContain('fireGithubDispatch');
+    // Also stamps Publishing.lastEditAt + lastEditedGlobal.
+    expect(hook).toContain("slug: 'publishing'");
+    expect(hook).toContain('lastEditAt');
+    expect(hook).toContain('lastEditedGlobal');
 
     const helper = readFileSync(join(ROOT, 'src/lib/withRebuildHook.ts'), 'utf8');
     expect(helper).toContain('notifyRebuild');
     expect(helper).toContain('afterChange');
 
-    // Every content global wrapped, Booking NOT wrapped.
     const cfg = readFileSync(join(ROOT, 'src/payload.config.ts'), 'utf8');
     expect(cfg).toContain('withRebuildHook(SiteSettings)');
     expect(cfg).toContain('withRebuildHook(LandingHero)');
     expect(cfg).toContain('withRebuildHook(WaitlistFormCopy)');
-    // Booking is the explicit exception — its content never flows
-    // into the static page so a rebuild on its edit is pure waste.
+    // Booking + Publishing are the explicit exceptions: Booking
+    // never flows into the static page; Publishing IS the
+    // promotion controller and has its own beforeChange hook.
     expect(cfg).not.toContain('withRebuildHook(Booking)');
+    expect(cfg).not.toContain('withRebuildHook(Publishing)');
+  });
+
+  test('Publishing global tracks last edit / last promote + carries the trigger checkbox', () => {
+    const pub = readFileSync(join(ROOT, 'src/globals/Publishing.ts'), 'utf8');
+    expect(pub).toContain("slug: 'publishing'");
+    expect(pub).toContain('lastEditAt');
+    expect(pub).toContain('lastEditedGlobal');
+    expect(pub).toContain('lastPromotedAt');
+    expect(pub).toContain('promoteToProd');
+    expect(pub).toContain('beforeChange');
+    // Admin-only read access — these timestamps reveal edit cadence.
+    expect(pub).toMatch(/read:.*Boolean\(req\.user\)/);
+  });
+
+  test('promoteToProd hook fires landing-promote-to-prod + resets the checkbox', () => {
+    const hook = readFileSync(join(ROOT, 'src/hooks/promoteToProd.ts'), 'utf8');
+    expect(hook).toContain("'landing-promote-to-prod'");
+    expect(hook).toContain('fireGithubDispatch');
+    // One-shot: clear the trigger so re-saving doesn't re-fire.
+    expect(hook).toContain('promoteToProd: false');
+    expect(hook).toContain('lastPromotedAt');
   });
 
   test('Next root / redirects to /admin (no public frontend on the cms host)', () => {

@@ -3,72 +3,61 @@
 
 import type { GlobalAfterChangeHook } from 'payload';
 
+import { fireGithubDispatch } from '../lib/githubDispatch';
+
 /**
- * Fires a GitHub `repository_dispatch` event when any content
- * global changes, so .github/workflows/rebuild-landing-web.yml
- * picks the edit up and rebuilds the static web image with
- * LANDING_USE_FALLBACK=0 + LANDING_CMS_URL=<live>. The release
- * workflow on `landing-v*` tags is unaffected — that path stays
- * deterministic via the JSON fallbacks.
+ * Two-step fan-out on every content-global save:
  *
- * Env requirements (set in cms/.env on the deploy host):
+ *   1. Stamp Publishing.lastEditAt + lastEditedGlobal so the admin
+ *      UI can show "preview is N minutes ahead of prod" without
+ *      reaching out to GHCR.
+ *   2. Fire a GitHub `repository_dispatch` of type
+ *      `landing-content-changed`, which
+ *      .github/workflows/landing-preview-build.yml picks up. That
+ *      workflow rebuilds the web image and pushes it as :preview
+ *      (+ :preview-<sha>).
  *
- *   GITHUB_DISPATCH_TOKEN   fine-grained PAT with
- *                           "Repository permissions > Contents:
- *                           write" on the apprafter repo. Or a
- *                           classic PAT with `repo` scope.
- *   GITHUB_REPO             "AppRafter/apprafter" (owner/name).
+ * The promote-to-prod flow (Publishing.promoteToProd checkbox →
+ * landing-promote-to-prod.yml retags :preview → :prod) is
+ * intentionally a separate path so saves never accidentally
+ * deploy to prod.
  *
- * Without those vars the hook logs a warning and returns — admin
- * edits still persist, the rebuild just doesn't fire. Useful in
- * dev where you're hammering globals while iterating on copy.
- *
- * Debouncing: GitHub Actions handles coalescing via the workflow's
- * `concurrency: { group: ..., cancel-in-progress: true }` setting,
- * so we don't bother throttling here. Multiple saves in quick
- * succession → multiple dispatches → only the latest build
- * completes; the rest are aborted by Actions.
+ * No infinite loop: Publishing is NOT wrapped with this hook
+ * (see payload.config.ts) — its own beforeChange handles promote
+ * logic.
  */
 export const notifyRebuild: GlobalAfterChangeHook = async ({ doc, global, req }) => {
-  const token = process.env.GITHUB_DISPATCH_TOKEN;
-  const repo = process.env.GITHUB_REPO;
-  if (!token || !repo) {
+  // Step 1 — Publishing tracker (best-effort, doesn't block dispatch).
+  try {
+    await req.payload.updateGlobal({
+      slug: 'publishing',
+      data: {
+        lastEditAt: new Date().toISOString(),
+        lastEditedGlobal: global.slug,
+      },
+      // Tag so Publishing's own hooks can ignore this internal update
+      // if/when we add them.
+      context: { fromNotifyRebuild: true },
+      depth: 0,
+      overrideAccess: true,
+    });
+  } catch (err) {
     req.payload.logger.warn(
-      `[notifyRebuild] GITHUB_DISPATCH_TOKEN / GITHUB_REPO not set — skipping rebuild dispatch for ${global.slug}`,
+      { err },
+      `[notifyRebuild] Publishing.lastEditAt update failed for ${global.slug} (preview will still fire)`,
     );
-    return doc;
   }
 
-  try {
-    const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        event_type: 'landing-content-changed',
-        client_payload: {
-          source: 'payload-cms',
-          global: global.slug,
-          at: new Date().toISOString(),
-        },
-      }),
-    });
-    if (!res.ok) {
-      req.payload.logger.error(
-        `[notifyRebuild] dispatch returned ${res.status} for ${global.slug}`,
-      );
-    } else {
-      req.payload.logger.info(
-        `[notifyRebuild] dispatch fired for ${global.slug} (HTTP ${res.status})`,
-      );
-    }
-  } catch (err) {
-    req.payload.logger.error({ err }, '[notifyRebuild] dispatch failed');
-  }
+  // Step 2 — fire the preview-build dispatch.
+  await fireGithubDispatch({
+    eventType: 'landing-content-changed',
+    clientPayload: {
+      source: 'payload-cms',
+      global: global.slug,
+      at: new Date().toISOString(),
+    },
+    payload: req.payload,
+  });
 
   return doc;
 };

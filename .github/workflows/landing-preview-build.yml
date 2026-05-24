@@ -1,25 +1,27 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
-name: rebuild-landing-web
+name: landing-preview-build
 
-# Triggered by Payload's afterChange hook on every content global
-# (see landing/cms/src/hooks/notifyRebuild.ts) via a GitHub
-# `repository_dispatch` event of type `landing-content-changed`.
+# Triggered by Payload's notifyRebuild afterChange hook on every
+# content-global save (see landing/cms/src/hooks/notifyRebuild.ts)
+# via a GitHub `repository_dispatch` event of type
+# `landing-content-changed`.
 #
-# Rebuilds the static landing-web image with LANDING_USE_FALLBACK=0
+# Builds the static landing-web image with LANDING_USE_FALLBACK=0
 # so the build fetches live content from cms.apprafter.dev, then
-# pushes:
+# pushes the PREVIEW stream:
 #
-#   ghcr.io/<owner-lc>/landing-web:edge
-#   ghcr.io/<owner-lc>/landing-web:edge-<sha>
+#   ghcr.io/<owner-lc>/landing-web:preview
+#   ghcr.io/<owner-lc>/landing-web:preview-<sha>
 #
-# `edge` is a moving tag — the deploy host pulls it on a timer
-# (see landing/DEPLOY.md). The `landing-v*` release path is
-# unaffected and stays the source of truth for pinned versions.
+# Promotion to prod happens in a separate workflow
+# (landing-promote-to-prod.yml) which retags :preview → :prod
+# byte-for-byte via `docker buildx imagetools create` — there's
+# no second build, so prod is guaranteed to match what the
+# operator just inspected on the preview host.
 #
 # Concurrency: only the latest dispatch finishes. Multiple admin
 # saves in a row → in-flight builds get cancelled and replaced by
-# a single fresh build, so we don't waste runner minutes coalescing
-# in the Payload hook.
+# a single fresh build.
 
 on:
   repository_dispatch:
@@ -31,12 +33,12 @@ permissions:
   packages: write
 
 concurrency:
-  group: rebuild-landing-web
+  group: landing-preview-build
   cancel-in-progress: true
 
 jobs:
   build:
-    name: rebuild landing-web (live CMS)
+    name: build landing-web :preview (live CMS)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -61,24 +63,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push landing-web (LANDING_USE_FALLBACK=0)
+      - name: Build and push landing-web :preview
         uses: docker/build-push-action@v5
         with:
           context: landing
           file: landing/web/Dockerfile
           push: true
           tags: |
-            ${{ steps.image-base.outputs.image }}:edge
-            ${{ steps.image-base.outputs.image }}:edge-${{ github.sha }}
-          # Force live-CMS fetch + bake the public CMS origin
-          # into the client JS.
+            ${{ steps.image-base.outputs.image }}:preview
+            ${{ steps.image-base.outputs.image }}:preview-${{ github.sha }}
           build-args: |
             LANDING_USE_FALLBACK=0
             LANDING_CMS_URL=https://cms.apprafter.dev
             PUBLIC_CMS_URL=https://cms.apprafter.dev
           platforms: linux/amd64
           # Share the cache scope with release-landing.yml's web
-          # job — most layers (bun install, workspace copy) hit
-          # the same cache entries.
+          # job so install + build layers are reused.
           cache-from: type=gha,scope=landing-web
           cache-to: type=gha,mode=max,scope=landing-web

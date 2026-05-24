@@ -102,6 +102,7 @@ export interface Config {
     'footer-content': FooterContent;
     'waitlist-form-copy': WaitlistFormCopy;
     booking: Booking;
+    publishing: Publishing;
   };
   globalsSelect: {
     'site-settings': SiteSettingsSelect<false> | SiteSettingsSelect<true>;
@@ -118,6 +119,7 @@ export interface Config {
     'footer-content': FooterContentSelect<false> | FooterContentSelect<true>;
     'waitlist-form-copy': WaitlistFormCopySelect<false> | WaitlistFormCopySelect<true>;
     booking: BookingSelect<false> | BookingSelect<true>;
+    publishing: PublishingSelect<false> | PublishingSelect<true>;
   };
   locale: 'en';
   widgets: {
@@ -731,6 +733,33 @@ export interface Booking {
   createdAt?: string | null;
 }
 /**
+ * Preview ↔ prod promotion control. Tick `promoteToProd` and save to retag :preview → :prod. The checkbox auto-resets after each save.
+ *
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "publishing".
+ */
+export interface Publishing {
+  id: number;
+  /**
+   * Latest content-global save (stamped by notifyRebuild).
+   */
+  lastEditAt?: string | null;
+  /**
+   * Slug of the global that was edited last.
+   */
+  lastEditedGlobal?: string | null;
+  /**
+   * Most recent successful Promote-to-prod. Preview is ahead of prod when lastEditAt is later than this.
+   */
+  lastPromotedAt?: string | null;
+  /**
+   * Tick + Save to retag ghcr.io/<owner>/landing-web:preview → :prod (+ :latest). Auto-resets to false after save.
+   */
+  promoteToProd?: boolean | null;
+  updatedAt?: string | null;
+  createdAt?: string | null;
+}
+/**
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "site-settings_select".
  */
@@ -1053,6 +1082,19 @@ export interface BookingSelect<T extends boolean = true> {
   discoveryCallUrl?: T;
   discoveryCallEmailSubject?: T;
   discoveryCallEmailBody?: T;
+  updatedAt?: T;
+  createdAt?: T;
+  globalType?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "publishing_select".
+ */
+export interface PublishingSelect<T extends boolean = true> {
+  lastEditAt?: T;
+  lastEditedGlobal?: T;
+  lastPromotedAt?: T;
+  promoteToProd?: T;
   updatedAt?: T;
   createdAt?: T;
   globalType?: T;

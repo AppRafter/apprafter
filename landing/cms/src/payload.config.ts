@@ -17,6 +17,7 @@ import { Comparison } from './globals/Comparison';
 import { FooterContent } from './globals/FooterContent';
 import { LandingHero } from './globals/LandingHero';
 import { LandingTransparency } from './globals/LandingTransparency';
+import { Publishing } from './globals/Publishing';
 import { Roadmap } from './globals/Roadmap';
 import { ScalingJourney } from './globals/ScalingJourney';
 import { SiteSettings } from './globals/SiteSettings';
@@ -57,8 +58,11 @@ export default buildConfig({
   editor: lexicalEditor(),
   collections: [Users, WaitlistSignups],
   // Every content global is wrapped with the rebuild-dispatch
-  // afterChange hook (see lib/withRebuildHook). Booking stays
-  // bare — its content never flows into the static page.
+  // afterChange hook (see lib/withRebuildHook). Booking and
+  // Publishing stay bare — Booking's content never flows into the
+  // static page, and Publishing IS the promotion controller (its
+  // own beforeChange handles the promote-to-prod dispatch, so
+  // wrapping with notifyRebuild would cause double-fires).
   globals: [
     withRebuildHook(SiteSettings),
     withRebuildHook(LandingHero),
@@ -74,6 +78,7 @@ export default buildConfig({
     withRebuildHook(FooterContent),
     withRebuildHook(WaitlistFormCopy),
     Booking,
+    Publishing,
   ],
   typescript: {
     outputFile: path.resolve(dirname, '../payload-types.ts'),

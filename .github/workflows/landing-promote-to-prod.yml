@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: landing-promote-to-prod
+
+# Triggered by Payload's promoteToProd beforeChange hook on the
+# Publishing global (see landing/cms/src/hooks/promoteToProd.ts)
+# via a GitHub `repository_dispatch` event of type
+# `landing-promote-to-prod`.
+#
+# Retags the current :preview image to :prod + :latest in-place
+# using `docker buildx imagetools create` — no rebuild. This
+# guarantees the image bytes on prod are exactly what the
+# operator just inspected on the preview host.
+#
+# The :landing-vX.Y.Z pinned tags pushed by release-landing.yml
+# are independent of this stream — those represent
+# code+content release boundaries, this is the rolling
+# content-promotion stream.
+#
+# Manual fire (escape hatch when CMS is unreachable):
+#
+#   gh workflow run landing-promote-to-prod.yml
+#
+# Or via the dispatch API:
+#
+#   curl -X POST \
+#     -H "Accept: application/vnd.github+json" \
+#     -H "Authorization: Bearer $TOKEN" \
+#     https://api.github.com/repos/AppRafter/apprafter/dispatches \
+#     -d '{"event_type":"landing-promote-to-prod"}'
+
+on:
+  repository_dispatch:
+    types: [landing-promote-to-prod]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: landing-promote-to-prod
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: retag landing-web :preview → :prod + :latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Compute lowercase image base
+        id: image-base
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/landing-web" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag :preview → :prod + :latest
+        env:
+          IMAGE: ${{ steps.image-base.outputs.image }}
+        run: |
+          # Verify :preview exists before attempting retag.
+          if ! docker buildx imagetools inspect "${IMAGE}:preview" > /dev/null 2>&1; then
+            echo "::error::No :preview tag exists yet on ${IMAGE}. Trigger landing-preview-build first (or save any global in the CMS admin)."
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --tag "${IMAGE}:prod" \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:preview"
+          echo "::notice::Promoted ${IMAGE}:preview → :prod + :latest"

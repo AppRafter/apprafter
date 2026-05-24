@@ -3,19 +3,25 @@
 // AppRafter Application manifest for the landing site (Astro 5
 // static output). Vets against schemas/v1alpha1/application.cue.
 //
-// Container image: built by
-// `.github/workflows/release-landing.yml` on every `landing-v*`
-// tag. The image bundles `landing/web/dist/` + Caddy on :80; see
-// landing/web/Dockerfile.
+// Image streams (see .github/workflows/landing-*.yml):
 //
-// Image tag convention:
-//   ghcr.io/apprafter/landing-web:landing-v0.1.0   (pinned, prod)
-//   ghcr.io/apprafter/landing-web:latest           (head, dev)
+//   :prod              promoted preview, served at apprafter.dev
+//                      → this manifest (Argo CD watches :prod)
+//   :latest            alias of :prod (every promote retags both)
+//   :landing-vX.Y.Z    pinned release from landing-vX.Y.Z tag
+//   :preview           every CMS save — separate Application
+//                      (see Application-preview.cue, TBD) at
+//                      preview.apprafter.dev with basic-auth
+//                      gating
+//
+// Promotion: admin ticks Publishing.promoteToProd in the CMS →
+// landing-promote-to-prod.yml retags :preview → :prod (byte-
+// identical image, just a registry tag move).
 //
 // Postgres is intentionally not declared — the web app has no
-// runtime DB dependency. The Astro build SSRs from the CMS at
-// image-build time (or uses fallback JSON via
-// LANDING_USE_FALLBACK=1, which is what the workflow does).
+// runtime DB dependency. The image-build SSRs from the live CMS
+// when LANDING_USE_FALLBACK=0 (preview-build path) or from JSON
+// fallbacks when =1 (release-landing path).
 
 package apprafter
 
@@ -32,10 +38,11 @@ landingWeb: v1alpha1.#Application & {
 	}
 	spec: {
 		base: {
-			// Replace with the actual GHCR tag pinned per release.
-			// The image bundles dist/ + a static file server; no
-			// node runtime needed at request time.
-			image:    "ghcr.io/apprafter/landing-web:latest"
+			// :prod is the rolling prod tag — bumped both by
+			// promotes (preview → prod retag) and by tagged
+			// releases. Pin to :landing-vX.Y.Z for full
+			// determinism in regulated rollouts.
+			image:    "ghcr.io/apprafter/landing-web:prod"
 			replicas: 2
 			expose: {
 				port:    80
