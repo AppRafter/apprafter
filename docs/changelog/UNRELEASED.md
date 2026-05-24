@@ -13,6 +13,111 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.162 — M1.5 walk-fix #1 post-B.1.79b — `app open` keys off operator's label, not Argo CD's (2026-05-25)
+
+### Symptom
+
+First operator-run of `apprafter app open apprafter-landing-web`
+on the cluster that had landing apps Synced/Healthy:
+
+```
+Error: No Service found in the destination namespace with
+label `app.kubernetes.io/instance=apprafter-landing-web`.
+Argo CD stamps that label on every child resource it syncs.
+```
+
+`apprafter app status apprafter-landing-web` showed
+sync=Synced, health=Healthy, destination=apprafter — the app
+is definitely running. `kubectl get svc -n apprafter` showed
+the Service exists. Just not with the label v0.1.161's
+resolver expected.
+
+### Root cause
+
+Argo CD's `app.kubernetes.io/instance` auto-label is stamped
+only on resources Argo CD **directly applies** — for an
+AppRafter Application, that's the apprafter.io/Application
+CR alone. The operator (`apprafter-operator`) reconciles
+that CR into Deployment + Service as **owned children**
+(second-level resources); Argo CD doesn't touch them on the
+apply path, so its standard label never lands.
+
+The operator's labels come from `operator-rendering::make_
+labels`:
+
+  * `app.kubernetes.io/name: <apprafter-app-name>`
+  * `app.kubernetes.io/managed-by: apprafter-operator`
+  * `apprafter: true`
+
+The value of `app.kubernetes.io/name` is the **inner**
+AppRafter Application's `metadata.name` (e.g. `landing-web`
+from `landing/web/apprafter/Application.cue:33`), NOT the
+**outer** Argo CD parent's name (`apprafter-landing-web`).
+v0.1.161 keyed off the outer name and the wrong label
+entirely.
+
+### Fix
+
+Bridge from outer к inner naming through Argo CD's
+`status.resources[]`. New pure helper
+`find_apprafter_app_name(argocd_app) -> Option<String>`
+walks the resources array, picks the first entry with
+`group: "apprafter.io", kind: "Application"`, returns its
+`name`. That value flows into the new label selector
+`app.kubernetes.io/name=<apprafter-app-name>` — matching
+what the operator actually stamps.
+
+Resolver chain is now:
+
+```
+Argo CD app name (apprafter-landing-web)
+  → Argo CD CR в `argocd` ns
+  → spec.destination.namespace (apprafter)
+  → status.resources[] → apprafter.io/Application entry → name (landing-web)
+  → kubectl get svc -n apprafter -l app.kubernetes.io/name=landing-web
+  → Service (landing-web) → spec.ports[0].port (80)
+  → kubectl port-forward svc/landing-web -n apprafter 8080:80
+```
+
+### Caveat — non-AppRafter apps
+
+Apps registered via `apprafter app add` для repos that
+render raw helm / kustomize / plain YAML (no
+apprafter.io/Application CR в the CMP output) hit
+`find_apprafter_app_name` returning None →
+diagnostic-er-erorr suggesting manual port-forward. Walk-fix
+support for the non-AppRafter case is deferred — adds either
+а Service-by-cli-app-name fallback or operator-side
+introspection without а clear primary-Service heuristic.
+For tier-1 self-served scenarios where `app open` matters
+most, all apps go through the AppRafter Application CR
+route anyway.
+
+### Tests
+
++4 new unit tests on the pure helper:
+
+- `find_apprafter_app_name_picks_application_entry_from_status_resources`
+  — happy path with mixed resource kinds (Namespace +
+  apprafter.io/Application).
+- `find_apprafter_app_name_returns_none_for_raw_yaml_apps`
+  — raw Deployment + Service shape; must NOT misidentify а
+  Deployment as the inner app.
+- `find_apprafter_app_name_returns_none_when_status_missing`
+  — fresh CR без а status block; must not panic.
+- `find_apprafter_app_name_picks_first_when_multiple_apprafter_applications`
+  — defensive: deterministic first-entry pick.
+
+Existing `select_service_zero_matches_errors_with_diagnostic_hint`
+updated к assert the new diagnostic mentions
+`app.kubernetes.io/name` + `kubectl get
+applications.apprafter.io` (operator-side introspection,
+not Argo CD's). Total CLI suite: 188 → 192.
+
+### Bump
+
+CLI 0.1.161 → 0.1.162. Chart and cue-cmp unchanged.
+
 ## v0.1.161 — M1.5 Track B.1.79b part 1 — `apprafter app open <name>` (2026-05-24)
 
 ### What

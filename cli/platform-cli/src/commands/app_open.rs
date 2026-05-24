@@ -10,15 +10,27 @@
 //!      `apprafter app list`).
 //!   2. `spec.destination.namespace` = the namespace where
 //!      Argo CD lays down children.
-//!   3. Service in that namespace via Argo CD's standard
-//!      label `app.kubernetes.io/instance=<name>` (stamped on
-//!      every child resource). Single-result case is happy
-//!      path; multiple matches → caller must pass
-//!      `--container-port` AND the Service name disambiguation
-//!      is rendered as an error hint.
-//!   4. Container port: `--container-port` override > Service's
-//!      first `spec.ports[].port`.
-//!   5. Local port: `--port` override > 8080 with auto-
+//!   3. AppRafter Application name through Argo CD's
+//!      `status.resources[]` — first entry с `group:
+//!      "apprafter.io", kind: "Application"`. Walk-fix #1
+//!      post-B.1.79b: Argo CD only stamps the standard
+//!      `app.kubernetes.io/instance=<argocd-app-name>` label
+//!      on resources it directly applies. Service +
+//!      Deployment for AppRafter apps are rendered by the
+//!      operator from the Application CR (second-level
+//!      ownership), so they carry the operator's labels
+//!      (`app.kubernetes.io/name=<apprafter-app-name>`,
+//!      `apprafter=true`, `managed-by=apprafter-operator`)
+//!      keyed off the **inner** AppRafter Application's
+//!      `metadata.name`, not the outer Argo CD parent's
+//!      name.
+//!   4. Service in destination namespace via
+//!      `app.kubernetes.io/name=<apprafter-app-name>`.
+//!      Single-result is happy path; multi-match errors с
+//!      candidate enumeration.
+//!   5. Container port: `--container-port` override >
+//!      Service's first `spec.ports[].port`.
+//!   6. Local port: `--port` override > 8080 with auto-
 //!      increment к 8090 if busy (probe via TcpListener::bind
 //!      on 127.0.0.1).
 //!
@@ -90,8 +102,20 @@ pub fn open(
 
     confirm_or_proceed_on_unhealthy(&app, name)?;
 
-    let services = list_services_for_app(name, &dest_ns, kc.path())?;
-    let service = select_service(&services, name)?;
+    let apprafter_app_name = find_apprafter_app_name(&app).ok_or_else(|| {
+        CliError::Other(format!(
+            "Could not determine the AppRafter Application name from Argo CD's \
+             `status.resources[]` for '{name}'. The Argo CD Application's CMP \
+             output should declare exactly one `apprafter.io/Application` \
+             resource. If your manifest renders only raw Kubernetes resources \
+             (Deployment/Service direct), `app open` doesn't know which \
+             Service is primary yet — port-forward manually until walk-fix \
+             support for non-AppRafter apps lands."
+        ))
+    })?;
+
+    let services = list_services_for_apprafter_app(&apprafter_app_name, &dest_ns, kc.path())?;
+    let service = select_service(&services, &apprafter_app_name)?;
 
     let resolved_container_port = resolve_container_port(container_port, &service)?;
     let resolved_local_port = pick_local_port(local_port.unwrap_or(DEFAULT_LOCAL_PORT))?;
@@ -170,17 +194,44 @@ fn confirm_or_proceed_on_unhealthy(app: &Value, name: &str) -> Result<()> {
     }
 }
 
+/// Pure helper — walk Argo CD's `status.resources[]` to find
+/// the AppRafter Application CR it owns. Returns the inner
+/// `metadata.name` (which is the value the operator uses for
+/// `app.kubernetes.io/name` labels на rendered Service +
+/// Deployment) or `None` if no `apprafter.io/Application`
+/// entry exists в the array (raw-helm/kustomize apps без а
+/// CMP-rendered AppRafter CR).
+///
+/// Walk-fix #1 post-B.1.79b: original v0.1.161 implementation
+/// keyed off Argo CD's standard `app.kubernetes.io/instance`
+/// label, but Argo CD only stamps that on resources it
+/// directly applies — operator-rendered children carry а
+/// different label set. This helper bridges from outer (Argo
+/// CD) к inner (AppRafter) naming.
+pub(crate) fn find_apprafter_app_name(argocd_app: &Value) -> Option<String> {
+    let resources = argocd_app.pointer("/status/resources")?.as_array()?;
+    for r in resources {
+        let group = r.get("group").and_then(Value::as_str).unwrap_or("");
+        let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
+        if group == "apprafter.io" && kind == "Application" {
+            return r.get("name").and_then(Value::as_str).map(String::from);
+        }
+    }
+    None
+}
+
 /// Shell out к `kubectl get svc -n <ns> -l app.kubernetes.io/
-/// instance=<name> -o json`. Argo CD stamps the instance
-/// label on every child resource it manages; AppRafter
-/// operator-rendered Services inherit it transitively (Argo
-/// CD applies the label-stamping on apply-time).
-fn list_services_for_app(
-    app_name: &str,
+/// name=<apprafter-app-name> -o json`. The label is stamped
+/// by `operator-rendering::make_labels`; its value is the
+/// AppRafter Application CR's `metadata.name` (NOT the Argo
+/// CD parent name) — see `find_apprafter_app_name` for the
+/// mapping.
+fn list_services_for_apprafter_app(
+    apprafter_app_name: &str,
     namespace: &str,
     kubeconfig: &Path,
 ) -> Result<Vec<ServiceInfo>> {
-    let selector = format!("app.kubernetes.io/instance={app_name}");
+    let selector = format!("app.kubernetes.io/name={apprafter_app_name}");
     let out = Command::new("kubectl")
         .arg("get")
         .arg("svc")
@@ -238,24 +289,31 @@ pub(crate) fn parse_services(payload: &Value) -> Vec<ServiceInfo> {
 /// matches, we're done. Zero matches → fall through к а direct
 /// `svc/<app-name>` lookup in а follow-up walk-fix (for now —
 /// error with hint). Multi-match → error with names listed.
-pub(crate) fn select_service(services: &[ServiceInfo], app_name: &str) -> Result<ServiceInfo> {
+pub(crate) fn select_service(
+    services: &[ServiceInfo],
+    apprafter_app_name: &str,
+) -> Result<ServiceInfo> {
     match services.len() {
         0 => Err(CliError::Other(format!(
             "No Service found in the destination namespace with label \
-             `app.kubernetes.io/instance={app_name}`. Argo CD stamps that label \
-             on every child resource it syncs — possible causes: (a) the app's \
-             not yet reconciled (`apprafter app status {app_name}` should show \
-             Synced/Healthy); (b) the app's manifests don't render а Service \
-             (only а Deployment/StatefulSet); (c) the label was overridden by \
-             а manifest's `metadata.labels` block.",
+             `app.kubernetes.io/name={apprafter_app_name}` (the value comes \
+             from the AppRafter Application CR's `metadata.name`, stamped by \
+             the operator on every rendered Service / Deployment). Possible \
+             causes: (a) operator hasn't yet rendered the Service — check \
+             `kubectl get applications.apprafter.io -n <dest-ns>` and \
+             `kubectl logs -n apprafter-system deployment/apprafter-operator`; \
+             (b) the Application CR's `spec.expose` block is omitted, so no \
+             Service is rendered (Deployment-only flow — no port-forward \
+             target); (c) the label was overridden by а manifest's \
+             `metadata.labels` block on the AppRafter CR."
         ))),
         1 => Ok(services[0].clone()),
         _ => {
             let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
             Err(CliError::Other(format!(
-                "Multiple Services match label `app.kubernetes.io/instance=\
-                 {app_name}`: {}. Disambiguation by Service name is а future \
-                 walk-fix; for now, port-forward manually: \
+                "Multiple Services match label `app.kubernetes.io/name=\
+                 {apprafter_app_name}`: {}. Disambiguation by Service name is \
+                 а future walk-fix; for now, port-forward manually: \
                  `kubectl port-forward svc/<name> -n <ns> 8080:<port>`.",
                 names.join(", ")
             )))
@@ -388,6 +446,104 @@ mod tests {
     }
 
     #[test]
+    fn find_apprafter_app_name_picks_application_entry_from_status_resources() {
+        // Walk-fix #1 post-B.1.79b regression guard.
+        // Real-world `kubectl get application -o json` shape:
+        // status.resources lists every resource Argo CD
+        // tracks. The first apprafter.io/Application entry
+        // is the inner app name we need for the operator's
+        // label selector.
+        let app = json!({
+            "status": {
+                "resources": [
+                    {
+                        "group": "",
+                        "kind": "Namespace",
+                        "name": "apprafter",
+                        "version": "v1"
+                    },
+                    {
+                        "group": "apprafter.io",
+                        "kind": "Application",
+                        "name": "landing-web",
+                        "namespace": "apprafter",
+                        "version": "v1alpha1"
+                    }
+                ]
+            }
+        });
+        assert_eq!(
+            find_apprafter_app_name(&app),
+            Some("landing-web".to_string())
+        );
+    }
+
+    #[test]
+    fn find_apprafter_app_name_returns_none_for_raw_yaml_apps() {
+        // App registered с raw helm / kustomize content
+        // (no AppRafter Application CR в the rendered
+        // manifests). `app open` errors with а clear
+        // diagnostic; this test pins that the helper
+        // returns None rather than misidentifying е.g. а
+        // Deployment as the inner app name.
+        let app = json!({
+            "status": {
+                "resources": [
+                    {
+                        "group": "apps",
+                        "kind": "Deployment",
+                        "name": "my-app",
+                        "version": "v1"
+                    },
+                    {
+                        "group": "",
+                        "kind": "Service",
+                        "name": "my-app",
+                        "version": "v1"
+                    }
+                ]
+            }
+        });
+        assert_eq!(find_apprafter_app_name(&app), None);
+    }
+
+    #[test]
+    fn find_apprafter_app_name_returns_none_when_status_missing() {
+        // Fresh Application CR без а status block yet —
+        // Argo CD не ещё reconciled. Helper must not panic.
+        let app = json!({ "spec": { "destination": { "namespace": "x" } } });
+        assert_eq!(find_apprafter_app_name(&app), None);
+    }
+
+    #[test]
+    fn find_apprafter_app_name_picks_first_when_multiple_apprafter_applications() {
+        // Defensive — if а manifest somehow renders two
+        // apprafter.io/Application CRs, the helper picks
+        // the first. Walk-fix #2 post-B.1.79b territory if
+        // operators actually do this; for now, take the
+        // first deterministic-order entry.
+        let app = json!({
+            "status": {
+                "resources": [
+                    {
+                        "group": "apprafter.io",
+                        "kind": "Application",
+                        "name": "first",
+                        "version": "v1alpha1"
+                    },
+                    {
+                        "group": "apprafter.io",
+                        "kind": "Application",
+                        "name": "second",
+                        "version": "v1alpha1"
+                    }
+                ]
+            }
+        });
+        assert_eq!(find_apprafter_app_name(&app), Some("first".to_string()));
+    }
+
+    #[test]
     fn select_service_happy_single_match() {
         let svc = ServiceInfo {
             name: "landing-web".into(),
@@ -403,11 +559,15 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("missing-app"),
-            "error must echo the app name; got: {msg}"
+            "error must echo the apprafter app name; got: {msg}"
         );
         assert!(
-            msg.contains("apprafter app status"),
-            "error must hint at `app status` for diagnostics; got: {msg}"
+            msg.contains("app.kubernetes.io/name"),
+            "error must name the label the operator stamps; got: {msg}"
+        );
+        assert!(
+            msg.contains("kubectl get applications.apprafter.io"),
+            "error must hint at how to introspect operator-side state; got: {msg}"
         );
     }
 
