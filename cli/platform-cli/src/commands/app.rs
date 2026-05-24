@@ -148,6 +148,7 @@ fn add_via_wizard(
 ) -> Result<()> {
     let detected_origin = crate::commands::app_wizard::detect_git_origin(remote);
     let detected_branch = crate::commands::app_wizard::detect_git_branch();
+    let detected_path = crate::commands::app_wizard::detect_path_relative_to_repo_root();
     let inputs = crate::commands::app_wizard::WizardInputs {
         git_url,
         name,
@@ -156,6 +157,7 @@ fn add_via_wizard(
         project: Some(project.to_string()),
         detected_origin,
         detected_branch,
+        detected_path,
     };
     let out = crate::commands::app_wizard::run(inputs)?;
     add(

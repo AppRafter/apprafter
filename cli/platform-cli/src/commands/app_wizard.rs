@@ -52,6 +52,16 @@ pub struct WizardInputs {
     pub project: Option<String>,
     pub detected_origin: Option<String>,
     pub detected_branch: Option<String>,
+    /// cwd-relative-to-repo-root path detected by the caller
+    /// via `detect_path_relative_to_repo_root`. Used as the
+    /// default value for the "Path within repo" prompt when
+    /// `path` is the clap default (`"/"`) — running `apprafter
+    /// app add` from `landing/cms/` should default the prompt
+    /// to `landing/cms` rather than the repo root, since
+    /// that's almost always what the operator means.
+    /// `None` when cwd isn't inside a git working tree, or git
+    /// is unavailable.
+    pub detected_path: Option<String>,
 }
 
 /// Wizard result — every field filled, ready to flow into
@@ -89,7 +99,25 @@ pub fn run(inputs: WizardInputs) -> Result<WizardOutput> {
         .unwrap_or_else(|| "main".into());
     let branch = prompt_text("Branch / revision", &branch_default, validate_non_empty)?;
 
-    let path_default = inputs.path.unwrap_or_else(|| "/".into());
+    // Path default precedence:
+    //   1. Operator passed `--path X` explicitly with a
+    //      non-default value → honour it.
+    //   2. cwd lives inside a git working tree → use the
+    //      cwd-relative-to-repo-root path (e.g. cwd =
+    //      `landing/cms/` → default `landing/cms`).
+    //   3. Fall back to the clap default `"/"`.
+    //
+    // `inputs.path` is always `Some("/")` when the wizard is
+    // entered via the `app add` dispatch with clap's default,
+    // so "operator did not specify --path" looks identical to
+    // "operator specified --path /". We treat both the same:
+    // override with the cwd-detect if available. Operators
+    // who want the repo root explicitly can still type `/`
+    // at the prompt.
+    let explicit_path = inputs.path.filter(|p| !p.is_empty() && p != "/");
+    let path_default = explicit_path
+        .or(inputs.detected_path)
+        .unwrap_or_else(|| "/".into());
     let path = prompt_text("Path within repo", &path_default, validate_non_empty)?;
 
     let project_default = inputs.project.unwrap_or_else(|| "apps".into());
@@ -122,6 +150,55 @@ pub fn detect_git_origin(remote: &str) -> Option<String> {
         return None;
     }
     Some(normalise_git_url(&raw))
+}
+
+/// Probe `git rev-parse --show-toplevel` to find the repo
+/// root and compute the cwd's path relative to it. Returns
+/// `Some("landing/cms")` when cwd is a subdir of a git work
+/// tree, `Some("")` when cwd IS the repo root (rendered as
+/// `/` upstream so the prompt default matches the documented
+/// "render the whole repo" idiom), and `None` when cwd
+/// isn't inside any git tree or git is missing.
+///
+/// The convention `apprafter app add` defaults to feels
+/// natural for a monorepo: `cd landing/cms && apprafter
+/// app add` → prompt defaults to `landing/cms`. The CMP
+/// plugin's discover glob (chart 0.1.42+) matches files
+/// in any `apprafter/` directory under that path, so the
+/// operator doesn't have to spell out `landing/cms/apprafter`
+/// — pointing at the subdir that owns the manifests is
+/// enough.
+pub fn detect_path_relative_to_repo_root() -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if root_raw.is_empty() {
+        return None;
+    }
+    let root = std::path::PathBuf::from(&root_raw);
+    let cwd = std::env::current_dir().ok()?;
+    // Canonicalise both so symlinks (common on macOS where
+    // `/var` is a symlink to `/private/var`, plus arbitrary
+    // operator setups) don't trip the strip_prefix check.
+    let root = root.canonicalize().unwrap_or(root);
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let rel = cwd.strip_prefix(&root).ok()?;
+    let rendered = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    if rendered.is_empty() {
+        // cwd == repo root. Empty string rendered as `/` so
+        // the prompt UI matches operator expectations
+        // ("render the whole repo").
+        Some("/".to_string())
+    } else {
+        Some(rendered)
+    }
 }
 
 /// Probe `git symbolic-ref --short HEAD` non-fatally — returns

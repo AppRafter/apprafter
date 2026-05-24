@@ -13,6 +13,77 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.155 — M1.5 post-B.1.79a #7 — `app add` wizard defaults path to cwd-relative (2026-05-24)
+
+### What landed
+
+Two coordinated UX improvements for `apprafter app add`'s
+"Path within repo" prompt:
+
+1. **Default path = cwd-relative-to-repo-root**. Running
+   `apprafter app add` from `/projects/.../apprafter/landing/cms/`
+   now defaults the prompt to `landing/cms` instead of `/`.
+   Operators don't have to remember the repo's directory
+   structure — the wizard reads it off the cwd.
+
+2. **The `apprafter/` subdirectory is implicit**. Operators
+   can specify the project root (`landing/cms`) rather than
+   the convention directory (`landing/cms/apprafter`); the
+   CMP plugin's discovery glob (`{**/apprafter*.cue,**/apprafter/**/*.cue}`,
+   chart 0.1.42+) matches files at any depth, and
+   `cue export ./...` from cwd recurses through
+   subdirectories. Both paths produce identical rendered
+   YAML — confirmed locally by running the entrypoint
+   against `landing/cms/` (parent) and `landing/cms/apprafter/`
+   (exact); both emit the same manifest stream.
+
+### Implementation
+
+New pure helper `detect_path_relative_to_repo_root()` shells
+out to `git rev-parse --show-toplevel`, computes cwd relative
+to the result, canonicalises both ends to dodge macOS-style
+`/var → /private/var` symlinks, returns:
+
+- `Some("landing/cms")` when cwd is a subdirectory.
+- `Some("/")` when cwd IS the repo root.
+- `None` when git is missing, cwd isn't inside any work
+  tree, or the toplevel lookup fails (wizard falls back to
+  the existing `/` default).
+
+`WizardInputs` gains a `detected_path: Option<String>`
+field. `app::add_via_wizard` populates it via the new
+detector. Wizard's `run` chooses the prompt default by
+precedence:
+
+1. Operator passed `--path X` explicitly with a non-default
+   value → honour it.
+2. cwd lives inside a git working tree → use
+   `detected_path`.
+3. Clap default `/`.
+
+`inputs.path` is always `Some("/")` when the wizard fires
+through the `app add` dispatch, so "operator didn't specify
+--path" looks identical to "operator specified --path /". We
+treat both the same: override with the cwd-detect. Operators
+who want the repo root explicitly can still type `/` at the
+prompt.
+
+### Verification
+
+- Local test: `bash argocd-cue-cmp/entrypoint.sh` from both
+  `landing/cms` and `landing/cms/apprafter` produces the
+  same `apiVersion: apprafter.io/v1alpha1`-prefixed YAML
+  doc stream — the parent-of-apprafter path is a first-
+  class option.
+- Clippy `-D warnings` clean; tests pass; no Cyrillic leaks
+  (audit grep returns 0 across `cli/`).
+
+### Versioning
+
+CLI 0.1.154 → 0.1.155. Chart unchanged.
+
+---
+
 ## v0.1.154 — M1.5 polish post-B.1.79a #6 — state migrates from per-cwd to per-target store (2026-05-24)
 
 ### Symptom
