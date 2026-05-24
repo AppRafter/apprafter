@@ -88,6 +88,11 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
         Commands::Platform { action } => match action {
             PlatformCommand::Status => commands::platform::status()?,
             PlatformCommand::Upgrade { to } => commands::platform::upgrade(to.as_deref())?,
+            PlatformCommand::Freeze { component, version } => {
+                commands::platform::freeze(&component, version.as_deref())?
+            }
+            PlatformCommand::Unfreeze { component } => commands::platform::unfreeze(&component)?,
+            PlatformCommand::Rescue { yes } => commands::platform::rescue(yes)?,
         },
         Commands::Migration { action } => match action {
             MigrationCommand::List => commands::migration::list()?,

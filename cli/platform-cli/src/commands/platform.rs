@@ -194,6 +194,116 @@ fn print_status(json: &Value) {
     }
 }
 
+/// `apprafter platform freeze <component> [--version <v>]`
+/// patches PlatformStack.spec.overrides.<component>.pin. Без
+/// `--version` reads the current effective component version
+/// из `status.componentVersions.<component>` и locks that.
+pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let json = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "PlatformStack {PLATFORMSTACK_NAMESPACE}/{PLATFORMSTACK_NAME} not found"
+        ))
+    })?;
+
+    let pin = match version {
+        Some(v) => v.to_string(),
+        None => json
+            .pointer(&format!("/status/componentVersions/{component}"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                CliError::Other(format!(
+                    "Не нашёл effective version для component '{component}' в \
+                     status.componentVersions. Передай `--version <v>` явно либо \
+                     запусти `apprafter platform status` чтобы посмотреть список \
+                     известных components."
+                ))
+            })?,
+    };
+
+    let body = format!(r#"{{"spec":{{"overrides":{{"{component}":{{"pin":"{pin}"}}}}}}}}"#);
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+
+    println!("✓ Component '{component}' frozen at version '{pin}'.");
+    println!(
+        "PlatformController reconcile cycle применит override; umbrella chart's \
+         curated pin для '{component}' игнорируется до тех пор пока override присутствует."
+    );
+    println!("Откатить: `apprafter platform unfreeze {component}`.");
+    Ok(())
+}
+
+/// `apprafter platform unfreeze <component>` — RFC 7396
+/// merge-patch с `null` value удаляет the override entry.
+pub fn unfreeze(component: &str) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+
+    // RFC 7396: null deletes the field. Patches the
+    // `overrides.<component>` entry в whole — strips both `pin`
+    // и `values` overrides. Если operator wants к keep
+    // partial override (e.g. unfreeze pin but keep values
+    // overrides), они должны patch вручную; `unfreeze` —
+    // the "fully revert к chart's curated state" verb.
+    let body = format!(r#"{{"spec":{{"overrides":{{"{component}":null}}}}}}"#);
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+    println!("✓ Component '{component}' unfrozen. Chart's curated pin restored.");
+    Ok(())
+}
+
+/// `apprafter platform rescue` — emergency recovery wrapper
+/// over `apprafter cluster-bootstrap`. Re-applies the
+/// loader's Cilium + Argo CD + CRDs + operator chain against
+/// the active target. Useful when Argo CD itself is unable к
+/// self-adopt и а regular upgrade flow won't reach the right
+/// reconcile state.
+pub fn rescue(yes: bool) -> Result<()> {
+    if !yes {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "non-interactive shell — pass `--yes` чтобы пропустить confirmation prompt".into(),
+            ));
+        }
+        println!(
+            "Emergency rescue: re-run the loader's cluster-bootstrap path against the active \
+             target. Это применит upstream Cilium / Argo CD / CRDs / operator manifests \
+             как при initial bootstrap'е — все Apprafter-managed Applications потеряют \
+             текущее состояние Sync/Healthy на несколько reconcile cycles."
+        );
+        let confirmed = inquire::Confirm::new("Подтвердить?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+        if !confirmed {
+            println!("Отмена.");
+            return Ok(());
+        }
+    }
+    println!("Re-running cluster-bootstrap chain...");
+    crate::commands::cluster_bootstrap::run()
+}
+
 pub fn upgrade(to: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
     let body = match to {

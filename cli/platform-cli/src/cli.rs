@@ -322,6 +322,43 @@ pub enum PlatformCommand {
         #[arg(long = "to")]
         to: Option<String>,
     },
+    /// Freeze а specific component's version through
+    /// `PlatformStack.spec.overrides.<component>.pin`. Useful
+    /// для out-of-band security backports или когда the
+    /// curated bundle's pinned version regresses а workload-
+    /// specific shape. Без `--version` — uses the component's
+    /// current effective version (read из status), reading the
+    /// chart's own pin and locking that in.
+    Freeze {
+        /// Component name (must match а key в the umbrella
+        /// chart's `values.components` map; e.g. `cilium`,
+        /// `argocd`, `cert-manager`, `apprafter-operator`).
+        component: String,
+        /// Pin version. Omit чтобы lock the current effective
+        /// version (read из `status.componentVersions`).
+        #[arg(long = "version")]
+        version: Option<String>,
+    },
+    /// Remove а previously-set
+    /// `PlatformStack.spec.overrides.<component>` entry —
+    /// component falls back к the umbrella chart's curated pin.
+    Unfreeze {
+        /// Component name.
+        component: String,
+    },
+    /// Emergency recovery: re-run the loader's cluster-bootstrap
+    /// path (Cilium → Argo CD → CRDs → operator) against the
+    /// active target. Useful when Argo CD itself is unable к
+    /// self-adopt — а stale chart, а corrupted ConfigMap, или
+    /// а pod-eviction loop that no `apprafter platform upgrade`
+    /// can resolve. Thin wrapper around
+    /// `apprafter cluster-bootstrap` с the recovery banner.
+    Rescue {
+        /// Skip confirmation prompt. Required в non-interactive
+        /// shells.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

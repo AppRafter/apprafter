@@ -13,6 +13,89 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.142 — M1.5 Track B.1.79a closure — platform freeze/unfreeze/rescue (2026-05-22)
+
+### What landed
+
+Three new `apprafter platform` verbs closing the loop started
+в v0.1.135 (`platform status` / `upgrade`):
+
+- `platform freeze <component> [--version <v>]` — patches
+  `PlatformStack.spec.overrides.<component>.pin`. Without
+  `--version`, reads the current effective version из
+  `status.componentVersions.<component>` и locks that. Per
+  the CRD schema (`schemas/v1alpha1/platformstack.cue`),
+  `overrides` is keyed by component name; pin takes
+  precedence over the umbrella chart's curated version for
+  that component.
+
+- `platform unfreeze <component>` — RFC 7396 merge-patch
+  с `null` value strips the `overrides.<component>` entry
+  entirely. Component falls back к the chart's curated pin.
+  Strips both `pin` и `values` overrides — operator who
+  wants partial revert должен patch вручную; `unfreeze` —
+  the "fully revert к chart's curated state" verb.
+
+- `platform rescue [--yes]` — thin wrapper over
+  `apprafter cluster-bootstrap` с а recovery banner и
+  confirmation prompt. Use case: Argo CD itself is unable
+  к self-adopt (stale chart, corrupted ConfigMap,
+  pod-eviction loop) и а regular upgrade flow won't reach
+  the right reconcile state. The loader re-applies Cilium →
+  Argo CD → CRDs → operator manifests as on initial
+  bootstrap — all apprafter-managed Applications потеряют
+  текущее Sync/Healthy state на несколько reconcile cycles.
+
+### 1.79a closure — what's в, what's deferred
+
+**В:**
+
+- AppProjects (`platform` / `platform-providers` / `apps` +
+  legacy `default`) в platform-stack chart 0.1.40 (part 1).
+- `#Component.project: string | *"platform"` field + render
+  template (part 1).
+- `apprafter open argocd --project apps` default + clipboard
+  copy + structured output (part 2).
+- `apprafter app add/list/status/remove` (part 3).
+- `apprafter app logs/rollback` (part 4).
+- `apprafter repo creds add/list/show/rotate/remove` (part 5).
+- `apprafter platform freeze/unfreeze/rescue` (this commit).
+- Context-aware error hints (already в part 3's `app add`:
+  no-git-repo, auth-failure-points-to-`repo creds add`,
+  name-collision-points-to-`app status`/`app remove`).
+
+**Deferred (per per-part deferral rationale, не blockers
+для closure):**
+
+- `apprafter platform channel <name>` — single-channel
+  `stable` ships в M1.5; multi-channel UX waits для Phase 2.
+- Interactive wizards для `app add` / `repo creds add` —
+  flag-driven paths уже cover 95% of cases; wizard
+  refresh batched с future `target add` wizard polish.
+- Inline PAT prompt в `app add` для private repos — hint
+  pointing к `repo creds add` уже surfaces в auth-failure
+  message.
+- CMP plugin renders user `apprafter*.cue` с
+  `spec.project: apps` by default — applied at CMP plugin
+  evolution, не CLI flow; CMP сейчас does not write
+  Application CRs (operator-managed user-app CR rendering
+  is а Phase 2 concern).
+- `apprafter open backstage/grafana/hubble` — Tier 2+
+  services, not tier-1 resident.
+
+### Versioning
+
+CLI 0.1.141 → 0.1.142. **Closes 1.79a** sub-phase. Chart
+unchanged.
+
+### References
+
+- ADR 0025 (Argo CD).
+- ADR 0026 (PlatformStack CRD).
+- `plan.md` §1.79a.
+
+---
+
 ## v0.1.141 — M1.5 Track B.1.79a part 5 — `apprafter repo creds` subcommands (2026-05-22)
 
 ### What landed
