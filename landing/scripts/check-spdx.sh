@@ -21,8 +21,10 @@ PATTERNS=(
   'landing/web/src/**/*.css'
   'landing/web/astro.config.ts'
   'landing/web/svelte.config.js'
+  'landing/web/apprafter/*.cue'
   'landing/cms/src/**/*.ts'
   'landing/cms/next.config.mjs'
+  'landing/cms/apprafter/*.cue'
   'landing/scripts/*.sh'
 )
 

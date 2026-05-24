@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// AppRafter Application manifest for the landing CMS (Payload 3
+// + Next 15). Vets against schemas/v1alpha1/application.cue.
+//
+// Postgres dependency is NOT declared here per the operator's
+// 2026-05-22 request — `spec.base.needs.pg` ships with v2.x of
+// the platform API once ResourceClaim lands. Until then the
+// DATABASE_URI is provided externally:
+//   - dev:  docker-compose Postgres on the host's 5432 (see
+//           landing/docker-compose.yml).
+//   - prod: standalone Postgres container on the deploy host
+//           (see landing/DEPLOY.md), URL injected via the
+//           systemd EnvironmentFile at /etc/apprafter-cms.env.
+//
+// Same channel injects PAYLOAD_SECRET + SMTP_* secrets. v1alpha1
+// `env` only accepts string literals; secret-ref support lands
+// with ResourceClaim (2.x) and OpenBao (4.x). Until then, the
+// secrets stay in the env-file outside the manifest, and the
+// non-secret config lives in `env` below.
+//
+// Replicas: 1 in both environments. Payload caches in-process
+// state (importMap, server functions) that doesn't shard across
+// replicas without shared session storage — adding HA is a Phase
+// 2+ exercise once we move file uploads to S3 and sessions to
+// Redis.
+
+package apprafter
+
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+landingCms: v1alpha1.#Application & {
+	metadata: {
+		name:      "landing-cms"
+		namespace: "apprafter"
+		labels: {
+			"apprafter.io/component": "landing"
+			"apprafter.io/role":      "cms"
+		}
+	}
+	spec: {
+		base: {
+			// Image carries the Next build output (.next/) + node
+			// runtime. Built via `bun run build:cms`.
+			image:    "ghcr.io/apprafter/landing-cms:latest"
+			replicas: 1
+			expose: {
+				port:    3000
+				public:  true
+				network: "public"
+			}
+			env: {
+				// Server URL Payload reports back in admin links,
+				// password-reset emails, etc.
+				PAYLOAD_PUBLIC_SERVER_URL: "https://cms.apprafter.dev"
+				// LANDING_CMS_PORT keeps payload.config + Next + the
+				// healthcheck on the same port. Override in dev via
+				// the env-file if needed.
+				LANDING_CMS_PORT: "3000"
+				// CORS allowlist for the landing web origin + future
+				// preview branches.
+				LANDING_CMS_CORS_ORIGINS: "https://apprafter.dev"
+				// SMTP envelope sender for the discovery-call hook.
+				SMTP_FROM: "noreply@apprafter.dev"
+			}
+		}
+		environments: {
+			dev: {
+				replicas: 1
+				expose: {
+					port:    3000
+					public:  false
+					network: "internal"
+				}
+				env: {
+					PAYLOAD_PUBLIC_SERVER_URL: "http://cms.dev.apprafter.local:3000"
+					LANDING_CMS_PORT:          "3000"
+					LANDING_CMS_CORS_ORIGINS:  "http://localhost:4321,http://localhost:4322"
+					SMTP_FROM:                 "dev@apprafter.local"
+				}
+			}
+			prod: {
+				replicas: 1
+			}
+		}
+	}
+}
