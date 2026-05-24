@@ -5,16 +5,16 @@
 use cli_core::secrets::{
     decrypt_with_identity, default_age_key_path, encrypt_for_recipient, load_or_create_identity,
 };
-use cli_core::target::{default_config_root, TargetStorePaths};
 use cli_core::{resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{
     default_ssh_identity_path, rewrite_server_url, HetznerCloudClient, KubeconfigFetcher,
     SshKubeconfigFetcher, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
 };
-use cli_state::{State, StatePaths};
+use cli_state::State;
 use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
+use crate::commands::state_paths::resolve_state_paths;
 
 pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
     info!(refresh, target_override, "kubeconfig invoked");
@@ -28,8 +28,13 @@ pub fn run(refresh: bool, target_override: Option<&str>) -> Result<()> {
 /// future orchestrators) can retry the cold-fetch loop in-process
 /// without spawning a child or capturing stdout.
 pub fn fetch_and_cache(refresh: bool, target_override: Option<&str>) -> Result<String> {
-    let cwd = std::env::current_dir()?;
-    let paths = StatePaths::for_root(&cwd);
+    // Per-target state (v0.1.154). `bootstrap-all` calls into this
+    // in a tight retry loop, so the migration helper inside
+    // `resolve_state_paths` is no-cost after the first iteration —
+    // the legacy file has already been moved.
+    let resolved = resolve_state_paths(target_override)?;
+    let paths = resolved.paths;
+    let target_store = resolved.store;
     let mut state = State::load_or_default(&paths)?;
 
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
@@ -56,7 +61,9 @@ pub fn fetch_and_cache(refresh: bool, target_override: Option<&str>) -> Result<S
     // Cold path or --refresh: SSH-fetch from the live server.
     // Credential resolution chain (cli-dx-task.md §7) — picks up
     // the active target's token when `HCLOUD_TOKEN` isn't set.
-    let target_store = TargetStorePaths::for_root(default_config_root()?);
+    // `target_store` is the same handle the caller already
+    // resolved above; the legacy two-step (default_config_root +
+    // for_root) was redundant.
     let token = resolve_hetzner_token(None, &target_store, target_override)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let public_ip = resolve_public_ip(&client, hetzner.server_id)?;

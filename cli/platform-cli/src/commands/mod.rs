@@ -22,6 +22,7 @@ pub mod plan;
 pub mod platform;
 pub mod repo_creds;
 pub mod repo_creds_wizard;
+pub mod state_paths;
 pub mod status;
 pub mod target;
 pub mod target_wizard;

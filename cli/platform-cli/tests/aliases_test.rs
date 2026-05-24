@@ -56,12 +56,43 @@ fn target_info_alias_routes_to_target_show() {
         .stderr(contains("apprafter::target::not_found"));
 }
 
+/// Seed an active target named `default` in the supplied config
+/// dir so subsequent state-reading commands resolve past the
+/// "no active target" gate and exercise the "no hetzner_cloud
+/// state" path the aliases are supposed to share with their
+/// canonical verbs. v0.1.154 layout: state location pivots on
+/// the active target rather than cwd.
+fn seed_active_target(cfg_dir: &std::path::Path) {
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir)
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "default",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &"a".repeat(64),
+            "--region",
+            "nbg1",
+            "--tier",
+            "solo",
+            "--no-ping",
+            "--no-interactive",
+        ])
+        .assert()
+        .success();
+}
+
 #[test]
 fn kc_alias_routes_to_kubeconfig() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    // `apprafter kc` without state surfaces the same
-    // "no hetzner_cloud state" error as `apprafter kubeconfig`.
+    seed_active_target(cfg_dir.path());
+    // `apprafter kc` against an empty per-target state surfaces
+    // the same "no hetzner_cloud state" error as `apprafter
+    // kubeconfig` — both routes go through the canonical handler.
     cli()
         .current_dir(dir.path())
         .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
@@ -76,6 +107,7 @@ fn kc_alias_routes_to_kubeconfig() {
 fn cb_alias_routes_to_cluster_bootstrap() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     cli()
         .current_dir(dir.path())
         .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())

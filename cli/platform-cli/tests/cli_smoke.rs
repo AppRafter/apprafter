@@ -1,10 +1,55 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
+use std::path::{Path, PathBuf};
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 fn cli() -> Command {
     Command::cargo_bin("apprafter").unwrap()
+}
+
+/// Path to the per-target state file under the supplied config
+/// dir (v0.1.154 layout). Equivalent to
+/// `cli_state::StatePaths::for_active_target` minus the type
+/// wrapper.
+fn state_path(cfg_dir: &Path, target: &str) -> PathBuf {
+    cfg_dir
+        .join("state")
+        .join(target)
+        .join(".apprafter")
+        .join("state.json")
+}
+
+/// Create an active target named `default` under the supplied
+/// config dir. The non-interactive `target add` invocation seeds
+/// `GlobalConfig.active_target = "default"` on the first call so
+/// subsequent commands (`init`, `apply`, `kubeconfig`, …)
+/// resolve to the same target without an explicit `--target`
+/// flag. Pin used by every test that needs a working
+/// `apprafter init` / `apprafter apply` path under v0.1.154's
+/// per-target state layout.
+fn seed_active_target(cfg_dir: &Path) {
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir)
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "default",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &"a".repeat(64),
+            "--region",
+            "nbg1",
+            "--tier",
+            "solo",
+            "--no-ping",
+            "--no-interactive",
+        ])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -38,8 +83,11 @@ fn version_flag_works() {
 #[test]
 fn init_prints_would_init_and_writes_state() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -55,17 +103,23 @@ fn init_prints_would_init_and_writes_state() {
         .stdout(contains("hetzner-cloud"))
         .stdout(contains("solo"))
         .stdout(contains("nbg1"));
+    // v0.1.154: state lives at
+    // <cfg_dir>/state/<active-target>/.apprafter/state.json
+    // rather than <cwd>/.apprafter/state.json.
     assert!(
-        dir.path().join(".apprafter/state.json").exists(),
-        "init should write the state file"
+        state_path(cfg_dir.path(), "default").exists(),
+        "init should write the per-target state file"
     );
 }
 
 #[test]
 fn plan_on_empty_state_says_no_changes() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .arg("plan")
         .assert()
         .success()
@@ -74,11 +128,24 @@ fn plan_on_empty_state_says_no_changes() {
 
 #[test]
 fn apply_without_token_reports_missing_token() {
+    // Active target exists (so state resolution passes the "no
+    // active target" gate) but `credentials.yaml` is empty by
+    // virtue of being hand-removed below — the token resolver
+    // then walks the full chain and surfaces the operator-facing
+    // hint mentioning all three remediation paths.
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    // Run init first so state has provider=hetzner-cloud.
+    seed_active_target(cfg_dir.path());
+    // Wipe out the token Hetzner-side. `target add` refused to
+    // create the target with a missing `--token` (the wizard /
+    // CLI requires one), so we run the seed first and remove
+    // afterwards. Equivalent to an operator who edited
+    // credentials.yaml by hand.
+    std::fs::remove_file(cfg_dir.path().join("targets/default/credentials.yaml"))
+        .expect("credentials.yaml must exist after target add");
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -92,25 +159,28 @@ fn apply_without_token_reports_missing_token() {
         .success();
     cli()
         .current_dir(dir.path())
-        // Empty target store + no env → resolver fails through
-        // all three chain steps. APPRAFTER_CONFIG_DIR isolates
-        // from the developer's real ~/.config/apprafter/.
         .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .env_remove("HCLOUD_TOKEN")
         .arg("apply")
         .assert()
         .failure()
-        // Error mentions every path the resolver tried.
+        // Error mentions every path the resolver tried. Miette's
+        // terminal renderer wraps long lines so a substring
+        // straddling a wrap point doesn't match — keep each
+        // assertion to a single word that survives the wrap.
         .stderr(contains("--token"))
         .stderr(contains("HCLOUD_TOKEN"))
-        .stderr(contains("apprafter target add"));
+        .stderr(contains("apprafter target"));
 }
 
 #[test]
 fn status_prints_would_show() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .arg("status")
         .assert()
         .success()
@@ -144,8 +214,14 @@ fn upgrade_tier_prints_target() {
 fn apply_with_ssh_public_key_env_still_requires_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
+    // Remove the token Hetzner-side so the resolver chain fails
+    // through to the "target has no token stored" branch even
+    // though the active target exists.
+    std::fs::remove_file(cfg_dir.path().join("targets/default/credentials.yaml")).unwrap();
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -170,10 +246,12 @@ fn apply_with_ssh_public_key_env_still_requires_token() {
 
 #[test]
 fn import_without_provider_in_state_errors_clearly() {
-    // Isolate from the developer's real ~/.config/apprafter/
-    // target store — otherwise v0.1.83's "fall back to target
-    // store config" wiring kicks in and the test asserts the
-    // wrong error.
+    // v0.1.154: an empty config dir now fails at state
+    // resolution with "no active target" instead of at the
+    // provider-resolution step. Both error paths are friendly
+    // — they nudge the operator to `apprafter target add`. We
+    // pin the same hint-substring expectations so the test
+    // still proves the operator gets a non-cryptic message.
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
     cli()
@@ -183,9 +261,10 @@ fn import_without_provider_in_state_errors_clearly() {
         .arg("import")
         .assert()
         .failure()
-        // Error now mentions both the recommended new path
-        // (`apprafter target add`) and the legacy `init`.
-        .stderr(contains("provider"))
+        // Either the state-resolution error ("no active target")
+        // or the legacy provider-resolution error must mention
+        // `apprafter target add` so the operator knows the
+        // remediation path.
         .stderr(contains("apprafter target add").or(contains("apprafter init")));
 }
 
@@ -193,8 +272,13 @@ fn import_without_provider_in_state_errors_clearly() {
 fn import_without_token_reports_missing_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
+    // Strip the stored token so the resolver chain fails through
+    // to the "target has no token stored" branch.
+    std::fs::remove_file(cfg_dir.path().join("targets/default/credentials.yaml")).unwrap();
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -316,6 +400,7 @@ fn apply_target_flag_routes_resolution_at_named_target_and_surfaces_not_found() 
 
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -344,8 +429,11 @@ fn apply_target_flag_routes_resolution_at_named_target_and_surfaces_not_found() 
 #[test]
 fn destroy_with_empty_state_is_noop() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .env_remove("HCLOUD_TOKEN")
         .args(["destroy", "--yes"])
         .assert()
@@ -356,8 +444,11 @@ fn destroy_with_empty_state_is_noop() {
 #[test]
 fn cluster_bootstrap_without_hetzner_cloud_state_errors_with_hint() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -371,6 +462,7 @@ fn cluster_bootstrap_without_hetzner_cloud_state_errors_with_hint() {
         .success();
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .arg("cluster-bootstrap")
         .assert()
         .failure()
@@ -380,8 +472,11 @@ fn cluster_bootstrap_without_hetzner_cloud_state_errors_with_hint() {
 #[test]
 fn argocd_password_without_hetzner_cloud_state_errors_with_hint() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",
@@ -395,6 +490,7 @@ fn argocd_password_without_hetzner_cloud_state_errors_with_hint() {
         .success();
     cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .arg("argocd-password")
         .assert()
         .failure()
@@ -413,9 +509,12 @@ fn platform_cli_shim_warns_and_forwards() {
     //      so pipelines like `platform-cli kubeconfig | kubectl …`
     //      keep working during the deprecation cycle.
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     let output = Command::cargo_bin("platform-cli")
         .unwrap()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .arg("plan")
         .output()
         .expect("shim runs");
@@ -445,8 +544,11 @@ fn tracing_logs_go_to_stderr_not_stdout() {
     // invoked …` and prints `would init …` to stdout — after the
     // v0.1.44 fix, only the latter should land on stdout.
     let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    seed_active_target(cfg_dir.path());
     let output = cli()
         .current_dir(dir.path())
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
         .args([
             "init",
             "--provider",

@@ -1,22 +1,29 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Read live Hetzner Cloud resources labelled `apprafter=true` and
-//! rebuild `.apprafter/state.json`. See plan.md phase 1.2 (v0.1.7).
+//! rebuild the per-target `state.json`. See plan.md phase 1.2
+//! (v0.1.7) for the original scope; v0.1.154 moved the file
+//! location from per-cwd to per-target (see
+//! `commands::state_paths`).
 
-use cli_core::target::{default_config_root, load_active_target_config, TargetStorePaths};
+use cli_core::target::load_active_target_config;
 use cli_core::{resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{HetznerCloudClient, APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE};
-use cli_state::{HetznerCloudState, State, StatePaths};
+use cli_state::{HetznerCloudState, State};
 use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
+use crate::commands::state_paths::resolve_state_paths;
 
 pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<()> {
     info!(force, dry_run, target_override, "import invoked");
-    let cwd = std::env::current_dir()?;
-    let paths = StatePaths::for_root(&cwd);
+
+    // Per-target state + reuse of the target-store handle so the
+    // credential resolver below doesn't pay for a second env probe.
+    let resolved = resolve_state_paths(target_override)?;
+    let paths = resolved.paths;
+    let target_store = resolved.store;
     let mut state = State::load_or_default(&paths)?;
 
-    let target_store = TargetStorePaths::for_root(default_config_root()?);
     let target_config = load_active_target_config(&target_store, target_override);
 
     // Provider resolves from state.json → active target's

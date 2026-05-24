@@ -1,11 +1,31 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Thin `kubectl` shellout helpers shared by the B.1.79 thin-
 //! wrapper CLI subcommands (`apprafter platform …`, `apprafter
-//! migration …`, `apprafter open …`). The CLI already depends
-//! on `kubectl` being on PATH through other commands
+//! migration …`, `apprafter open …`, `apprafter app …`,
+//! `apprafter repo creds …`). The CLI already depends on
+//! `kubectl` being on PATH through other commands
 //! (`argocd-password`, `cluster-bootstrap`), so spawning it
 //! here keeps the wire format consistent and avoids pulling
 //! in kube-rs's Tokio runtime for the synchronous CLI binary.
+//!
+//! ## State location — v0.1.154
+//!
+//! `ensure_kubeconfig_tempfile` reads the cached kubeconfig
+//! from the per-target state directory
+//! (`<config>/state/<active-target>/.apprafter/state.json`).
+//! Up through v0.1.153 the lookup was anchored to cwd, which
+//! broke the most common operator flow: `apprafter apply` from
+//! the project root, then `apprafter app add` from
+//! `landing/cms/` — the second invocation's cwd had its own
+//! (empty) `.apprafter/` directory and the kubeconfig wasn't
+//! found. Per-target state pins the cache to the deployment
+//! target the operator selected with `apprafter target use`,
+//! independent of cwd.
+//!
+//! These thin-wrappers don't expose a `--target <name>`
+//! override of their own (yet — Track A.9 will add it
+//! uniformly across the CLI). The helper therefore always
+//! resolves the active target.
 
 use std::io::Write;
 use std::path::Path;
@@ -13,8 +33,10 @@ use std::process::Command;
 
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::{CliError, Result};
-use cli_state::{State, StatePaths};
+use cli_state::State;
 use tempfile::NamedTempFile;
+
+use crate::commands::state_paths::resolve_state_paths;
 
 /// Decrypt the cached kubeconfig from state and write it to a
 /// `NamedTempFile`. Callers MUST keep the returned file alive
@@ -22,12 +44,12 @@ use tempfile::NamedTempFile;
 /// `NamedTempFile` drops, the file is deleted.
 ///
 /// Centralises the boilerplate that
-/// `commands::argocd_password` carries; B.1.79 commands reuse
-/// it instead of re-implementing the chain three times.
+/// `commands::argocd_password` carries; the thin-wrapper
+/// commands reuse it instead of re-implementing the chain
+/// across five modules.
 pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile> {
-    let cwd = std::env::current_dir()?;
-    let paths = StatePaths::for_root(&cwd);
-    let state = State::load_or_default(&paths)?;
+    let resolved = resolve_state_paths(None)?;
+    let state = State::load_or_default(&resolved.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
             "state has no hetzner_cloud section; run `apprafter apply` first".to_string(),

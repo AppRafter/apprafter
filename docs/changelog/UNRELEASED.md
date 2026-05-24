@@ -13,6 +13,156 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.154 — M1.5 polish post-B.1.79a #6 — state migrates from per-cwd to per-target store (2026-05-24)
+
+### Symptom
+
+Operator wires up a Hetzner cluster from the repo root:
+
+```sh
+cd ~/code/customer-project
+apprafter target add prod --provider hetzner-cloud --token ...
+apprafter bootstrap-all
+# cluster reconciling, kubeconfig cached
+```
+
+…then opens a second shell to register their first
+Application:
+
+```sh
+cd ~/code/customer-project/landing/cms
+apprafter app add https://github.com/me/customer-project --path landing/cms/apprafter
+```
+
+→ `Error: state has no hetzner_cloud section; run \`apprafter apply\` first`.
+
+Apply was already run; the second invocation simply
+couldn't find the state because its cwd
+(`landing/cms/`) had its own (empty) `.apprafter/`
+directory instead of the one created up at the project
+root.
+
+### Root cause
+
+`StatePaths::for_root(&cwd)` was the only constructor;
+every operational command opened with
+`std::env::current_dir()? → for_root(&cwd) →
+State::load_or_default(&paths)`. State location was thus
+implicitly tied to the operator's cwd at invocation
+time.
+
+The per-target store scaffolding was already in place:
+`cli-core/src/target.rs:186`'s
+`TargetStorePaths::state_dir(name)` returns
+`<store>/state/<target>/`, ready to host state. The
+comment at line 184 noted "Track A.8 wires the existing
+per-CWD `.apprafter/state.json` flow over here" — that
+wiring was deferred at the time of A.8 closure and never
+revisited.
+
+### Fix
+
+- **`cli-state/src/state.rs`** — new
+  `StatePaths::for_active_target(&TargetStorePaths,
+  &str)` factory points at
+  `<store>/state/<target>/.apprafter/`. The
+  intermediate `.apprafter` segment is kept so the
+  on-disk shape mirrors the legacy layout operators
+  already grep for; only the parent path moved. Old
+  `for_root` constructor preserved for tests + the
+  migration source (no surface removal).
+
+- **`cli-state/src/state.rs`** — new
+  `migrate_legacy_state_if_present(legacy_root,
+  target_paths)` helper. Called before every read site;
+  on first run after the upgrade it moves
+  `<cwd>/.apprafter/state.json` (and sibling
+  `known_hosts`) into the new per-target slot, printing
+  one stderr notice. Idempotent + new-wins: legacy file
+  left alone when per-target slot already populated.
+
+- **`platform-cli/src/commands/state_paths.rs`** — new
+  shared helper `resolve_state_paths(target_override)`
+  threads the three steps every command repeats:
+  resolve `TargetStorePaths` via
+  `default_config_root()`, resolve active target name
+  (with `--target` override), build per-target
+  `StatePaths`, run the legacy migration. Returns a
+  bundle that also carries the `TargetStorePaths` so
+  credential resolution downstream doesn't re-probe the
+  env. Eager existence check when `--target <name>` is
+  supplied — surfaces `target X not found (available:
+  …)` instead of the much later "no provider
+  configured" generic error when operators typo a target
+  name.
+
+- **Callsites updated** — `commands/apply.rs`,
+  `commands/destroy.rs`, `commands/import.rs`,
+  `commands/kubeconfig.rs`, `commands/argocd_password.rs`,
+  `commands/cluster_bootstrap.rs`, `commands/init.rs`,
+  `commands/status.rs`, `commands/plan.rs`,
+  `commands/k8s_helpers.rs`. Each now opens with
+  `let resolved = resolve_state_paths(target_override)?;`
+  instead of the legacy three-line cwd boilerplate. The
+  thin-wrapper commands (`platform`, `migration`, `app`,
+  `repo creds`, `open`) reach state through
+  `ensure_kubeconfig_tempfile` in `k8s_helpers`, so
+  fixing the helper transparently fixes all five
+  surfaces.
+
+- **`apply.rs`** keeps a residual
+  `std::env::current_dir()?` for the
+  `APPRAFTER_MANIFEST` parse path. State no longer
+  touches cwd, but manifest-on-disk authoring still
+  does — operators expect `APPRAFTER_MANIFEST=./infra.yaml
+  apprafter apply` to read the file they're looking at.
+
+- **`cli-state/src/state.rs`** — dead code removal:
+  the `discover_from` / `discover_or_root` helpers
+  added speculatively for a walk-up-from-cwd approach
+  were never adopted (walk-up can't help when the cwd
+  is `landing/cms/` and the state is per-target, not
+  per-project-root). Removed before they entered any
+  callsite.
+
+### Tests
+
+- **`cli-state/src/state.rs::tests`** — 5 new unit
+  tests covering the migration helper:
+  `for_active_target_lays_out_state_under_store_state_target`
+  (path layout pin),
+  `migrate_legacy_no_op_when_legacy_absent` (fast path),
+  `migrate_legacy_moves_state_when_only_legacy_exists`
+  (happy path),
+  `migrate_legacy_leaves_existing_target_state_untouched`
+  (new-wins),
+  `migrate_legacy_moves_known_hosts_alongside_state`
+  (known_hosts preservation).
+
+- **Integration test fixtures updated** —
+  `tests/import_test.rs`, `tests/kubeconfig_test.rs`,
+  `tests/argocd_password_test.rs`,
+  `tests/aliases_test.rs`, `tests/cli_smoke.rs`,
+  `tests/miette_render_test.rs`. The
+  `workspace_with_state()` helper in each suite now
+  seeds `APPRAFTER_CONFIG_DIR` + an active target named
+  `default` before invoking `apprafter init`, mirroring
+  the production resolution chain. State paths in
+  assertions switched from `<cwd>/.apprafter/state.json`
+  to `<cfg_dir>/state/default/.apprafter/state.json`
+  via a shared `state_path()` helper.
+
+- **`tests/cli_smoke.rs::apply_target_flag_routes_resolution_at_named_target_and_surfaces_not_found`**
+  — error message updated to reflect the eager
+  `--target X not found` surface introduced by the
+  resolver upgrade above.
+
+### Versioning
+
+- CLI 0.1.153 → 0.1.154. Chart unchanged (CLI-only
+  behaviour fix). Operator / admission-webhook
+  unchanged.
+
 ## v0.1.153 — M1.5 walk-fix #5b post-B.1.79a — cue-cmp entrypoint accepts both source layouts (2026-05-24)
 
 ### Symptom

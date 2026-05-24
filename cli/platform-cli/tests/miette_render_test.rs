@@ -29,6 +29,30 @@ fn cli() -> Command {
 fn unhandled_error_renders_with_miette_help_line() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    // Seed an active target without a token so the apply below
+    // fails at the credential resolver (the `Other` variant with
+    // the `apprafter::cli::other` code we're asserting on).
+    cli()
+        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
+        .env_remove("HCLOUD_TOKEN")
+        .args([
+            "target",
+            "add",
+            "default",
+            "--provider",
+            "hetzner-cloud",
+            "--token",
+            &"a".repeat(64),
+            "--region",
+            "nbg1",
+            "--tier",
+            "solo",
+            "--no-ping",
+            "--no-interactive",
+        ])
+        .assert()
+        .success();
+    std::fs::remove_file(cfg_dir.path().join("targets/default/credentials.yaml")).unwrap();
     cli()
         .current_dir(dir.path())
         .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())

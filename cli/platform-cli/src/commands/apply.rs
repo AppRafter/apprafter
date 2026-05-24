@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use cli_core::manifest::{self, FirewallIngressRule, InfrastructureManifest};
-use cli_core::target::{default_config_root, load_active_target_config, TargetStorePaths};
+use cli_core::target::{load_active_target_config, TargetStorePaths};
 use cli_core::{resolve_hetzner_ssh_public_key, resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{
     build_k3s_user_data, FirewallRuleSpec, FirewallSpec, FloatingIpSpec, HetznerCloudClient,
@@ -14,6 +14,7 @@ use cli_state::{HetznerCloudState, State, StatePaths};
 use tracing::info;
 
 use crate::commands::hcloud::hcloud_base_url;
+use crate::commands::state_paths::resolve_state_paths;
 
 const DEFAULT_NETWORK_IP_RANGE: &str = "10.0.0.0/16";
 const DEFAULT_SUBNET_IP_RANGE: &str = "10.0.0.0/24";
@@ -27,11 +28,15 @@ const DEFAULT_INGRESS_SOURCES: &[&str] = &["0.0.0.0/0", "::/0"];
 
 pub fn run(target_override: Option<&str>) -> Result<()> {
     info!(target_override, "apply invoked");
-    let cwd = std::env::current_dir()?;
-    let paths = StatePaths::for_root(&cwd);
+
+    // State now lives under `<config>/state/<active-target>/`
+    // (v0.1.154 migration); see `commands::state_paths` for the
+    // rationale and the legacy-file rescue path.
+    let resolved = resolve_state_paths(target_override)?;
+    let paths = resolved.paths;
+    let target_store = resolved.store;
     let mut state = State::load_or_default(&paths)?;
 
-    let target_store = TargetStorePaths::for_root(default_config_root()?);
     let target_config = load_active_target_config(&target_store, target_override);
 
     // Provider resolves from state.json first (legacy `init`
@@ -67,10 +72,15 @@ pub fn run(target_override: Option<&str>) -> Result<()> {
 
     // Optional manifest path. If APPRAFTER_MANIFEST is set, parse
     // and overlay onto the v0.1.4 defaults; otherwise keep the
-    // hardcoded behaviour.
+    // hardcoded behaviour. Manifest paths are interpreted relative
+    // to cwd because that matches the operator's mental model
+    // ("`APPRAFTER_MANIFEST=./infra.yaml apprafter apply` reads the
+    // file I'm looking at"); state location no longer touches cwd
+    // but manifest-on-disk authoring still does.
     let manifest = match std::env::var("APPRAFTER_MANIFEST") {
         Ok(p) => {
             info!(path = %p, "reading Infrastructure manifest");
+            let cwd = std::env::current_dir()?;
             Some(manifest::parse_infrastructure(&cwd, Path::new(&p))?)
         }
         Err(_) => None,

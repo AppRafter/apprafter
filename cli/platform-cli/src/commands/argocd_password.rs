@@ -10,9 +10,11 @@ use cli_core::secrets::{
 };
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{KubectlCli, KubectlRunner};
-use cli_state::{State, StatePaths};
+use cli_state::State;
 use tempfile::NamedTempFile;
 use tracing::info;
+
+use crate::commands::state_paths::resolve_state_paths;
 
 const ARGOCD_NAMESPACE: &str = "argocd";
 const ARGOCD_ADMIN_SECRET: &str = "argocd-initial-admin-secret";
@@ -20,8 +22,12 @@ const ARGOCD_ADMIN_KEY: &str = "password";
 
 pub fn run(refresh: bool) -> Result<()> {
     info!(refresh, "argocd-password invoked");
-    let cwd = std::env::current_dir()?;
-    let paths = StatePaths::for_root(&cwd);
+
+    // Per-target state (v0.1.154). `argocd-password` has no
+    // `--target` override — it always operates against the active
+    // target, matching the behaviour of the kubeconfig it reuses.
+    let resolved = resolve_state_paths(None)?;
+    let paths = resolved.paths;
     let mut state = State::load_or_default(&paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(

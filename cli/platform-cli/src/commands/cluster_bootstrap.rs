@@ -61,7 +61,7 @@ use std::io::Write;
 use std::path::Path;
 
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
-use cli_core::target::{default_config_root, load_active_target_config, TargetStorePaths};
+use cli_core::target::load_active_target_config;
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
     HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
@@ -69,9 +69,11 @@ use cli_providers::k8s::{
     APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, ARGOCD_CHART_VERSION, ARGOCD_LOADER_VALUES_YAML,
     CILIUM_CHART_VERSION, CILIUM_VALUES_YAML, RELEASED_PLATFORM_STACK_VERSION,
 };
-use cli_state::{State, StatePaths};
+use cli_state::State;
 use tempfile::NamedTempFile;
 use tracing::info;
+
+use crate::commands::state_paths::resolve_state_paths;
 
 /// Per-step timeouts. Generous enough that the loop survives a
 /// slow cpx22 cold start (cloud-init + image pulls + helm pod
@@ -137,8 +139,14 @@ const CRD_ESTABLISHED_TIMEOUT_SECS: u64 = 60;
 
 pub fn run() -> Result<()> {
     info!("cluster-bootstrap invoked (GitOps loader)");
-    let cwd = std::env::current_dir()?;
-    let paths = StatePaths::for_root(&cwd);
+
+    // Per-target state (v0.1.154). `cluster-bootstrap` has no
+    // `--target` flag — it runs against the active target the
+    // preceding `apply` populated, same as `argocd-password` and
+    // the kubeconfig fetch.
+    let resolved = resolve_state_paths(None)?;
+    let paths = resolved.paths;
+    let target_store = resolved.store;
     let state = State::load_or_default(&paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(
@@ -149,13 +157,12 @@ pub fn run() -> Result<()> {
     let plaintext = decrypt_cached_kubeconfig(&hetzner)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
 
-    let store_root = default_config_root().ok();
-    let target_store = store_root
-        .as_ref()
-        .map(|p| TargetStorePaths::for_root(p.clone()));
-    let target_config = target_store
-        .as_ref()
-        .and_then(|s| load_active_target_config(s, None));
+    // Consult the active target for tier hint. Previously the
+    // store handle was constructed inline (and tolerated a
+    // missing config dir); per-target state resolution already
+    // gives us a known-good `target_store`, so we just read off
+    // it directly.
+    let target_config = load_active_target_config(&target_store, None);
 
     let active_tier: u8 = target_config
         .as_ref()

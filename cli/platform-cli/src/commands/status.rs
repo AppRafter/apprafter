@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 use cli_core::Result;
-use cli_state::{State, StatePaths};
+use cli_state::State;
 use tracing::info;
 
-pub fn run() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let paths = StatePaths::for_root(&cwd);
-    let state = State::load_or_default(&paths)?;
-    info!(?state, "status invoked");
+use crate::commands::state_paths::resolve_state_paths;
 
-    println!("would show status:");
+pub fn run() -> Result<()> {
+    // Per-target state (v0.1.154). Read-only command, no
+    // `--target` override yet — surfaces the active target's
+    // last-known cluster pointer.
+    let resolved = resolve_state_paths(None)?;
+    let state = State::load_or_default(&resolved.paths)?;
+    info!(?state, target = %resolved.target_name, "status invoked");
+
+    println!("would show status for target `{}`:", resolved.target_name);
     println!("  cluster: {:?}", state.cluster_name);
     println!("  tier:    {:?}", state.tier);
     println!("  provider:{:?}", state.provider);
