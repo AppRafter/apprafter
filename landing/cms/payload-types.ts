@@ -756,6 +756,17 @@ export interface Publishing {
    * Tick + Save to retag ghcr.io/<owner>/landing-web:preview → :prod (+ :latest). Auto-resets to false after save.
    */
   promoteToProd?: boolean | null;
+  /**
+   * Last 20 content edits since the most recent promote. Cleared on Promote-to-prod.
+   */
+  editLog?:
+    | {
+        at: string;
+        global: string;
+        editor?: string | null;
+        id?: string | null;
+      }[]
+    | null;
   updatedAt?: string | null;
   createdAt?: string | null;
 }
@@ -1095,6 +1106,14 @@ export interface PublishingSelect<T extends boolean = true> {
   lastEditedGlobal?: T;
   lastPromotedAt?: T;
   promoteToProd?: T;
+  editLog?:
+    | T
+    | {
+        at?: T;
+        global?: T;
+        editor?: T;
+        id?: T;
+      };
   updatedAt?: T;
   createdAt?: T;
   globalType?: T;

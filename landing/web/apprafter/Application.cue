@@ -34,6 +34,7 @@ landingWeb: v1alpha1.#Application & {
 		labels: {
 			"apprafter.io/component": "landing"
 			"apprafter.io/role":      "web"
+			"apprafter.io/hostname":  "apprafter.dev"
 		}
 	}
 	spec: {

@@ -174,7 +174,7 @@ describe('landing/cms scaffold', () => {
     expect(cfg).not.toContain('withRebuildHook(Publishing)');
   });
 
-  test('Publishing global tracks last edit / last promote + carries the trigger checkbox', () => {
+  test('Publishing global tracks last edit / last promote + edit log + trigger checkbox', () => {
     const pub = readFileSync(join(ROOT, 'src/globals/Publishing.ts'), 'utf8');
     expect(pub).toContain("slug: 'publishing'");
     expect(pub).toContain('lastEditAt');
@@ -182,17 +182,34 @@ describe('landing/cms scaffold', () => {
     expect(pub).toContain('lastPromotedAt');
     expect(pub).toContain('promoteToProd');
     expect(pub).toContain('beforeChange');
+    // editLog is the rolling "edits since last promote" buffer,
+    // capped at 20 entries so the admin doesn't drown in history.
+    expect(pub).toContain('editLog');
+    expect(pub).toContain('maxRows: 20');
     // Admin-only read access — these timestamps reveal edit cadence.
     expect(pub).toMatch(/read:.*Boolean\(req\.user\)/);
   });
 
-  test('promoteToProd hook fires landing-promote-to-prod + resets the checkbox', () => {
+  test('promoteToProd hook fires landing-promote-to-prod + resets checkbox + clears log', () => {
     const hook = readFileSync(join(ROOT, 'src/hooks/promoteToProd.ts'), 'utf8');
     expect(hook).toContain("'landing-promote-to-prod'");
     expect(hook).toContain('fireGithubDispatch');
     // One-shot: clear the trigger so re-saving doesn't re-fire.
     expect(hook).toContain('promoteToProd: false');
     expect(hook).toContain('lastPromotedAt');
+    // The edit log is the "what changed since last promote" buffer
+    // — wipe it so the admin gets a clean slate after a promote.
+    expect(hook).toContain('editLog: []');
+  });
+
+  test('notifyRebuild prepends to editLog + caps at 20 entries', () => {
+    const hook = readFileSync(join(ROOT, 'src/hooks/notifyRebuild.ts'), 'utf8');
+    expect(hook).toContain('editLog');
+    // Implementation contract: read current → prepend → slice(0, 20).
+    expect(hook).toContain('EDIT_LOG_CAP');
+    expect(hook).toMatch(/slice\(0,\s*EDIT_LOG_CAP\)/);
+    // Entry shape — at, global, editor email.
+    expect(hook).toContain('req.user?.email');
   });
 
   test('Next root / redirects to /admin (no public frontend on the cms host)', () => {

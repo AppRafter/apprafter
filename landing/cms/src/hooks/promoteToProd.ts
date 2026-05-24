@@ -46,5 +46,8 @@ export const promoteToProd: GlobalBeforeChangeHook = async ({ data, req }) => {
     lastPromotedAt: new Date().toISOString(),
     // One-shot: clear the trigger so re-saving doesn't re-fire.
     promoteToProd: false,
+    // The edit log accumulates "edits since last promote" — clear
+    // it now so the next admin glance shows a clean slate.
+    editLog: [],
   };
 };

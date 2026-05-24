@@ -26,14 +26,33 @@ import { fireGithubDispatch } from '../lib/githubDispatch';
  * (see payload.config.ts) — its own beforeChange handles promote
  * logic.
  */
+type EditLogEntry = { at: string; global: string; editor?: string };
+
+const EDIT_LOG_CAP = 20;
+
 export const notifyRebuild: GlobalAfterChangeHook = async ({ doc, global, req }) => {
   // Step 1 — Publishing tracker (best-effort, doesn't block dispatch).
+  const now = new Date().toISOString();
   try {
+    const current = (await req.payload.findGlobal({
+      slug: 'publishing',
+      depth: 0,
+      overrideAccess: true,
+    })) as { editLog?: EditLogEntry[] };
+
+    const entry: EditLogEntry = {
+      at: now,
+      global: global.slug,
+      editor: req.user?.email ?? 'unknown',
+    };
+    const editLog = [entry, ...(current.editLog ?? [])].slice(0, EDIT_LOG_CAP);
+
     await req.payload.updateGlobal({
       slug: 'publishing',
       data: {
-        lastEditAt: new Date().toISOString(),
+        lastEditAt: now,
         lastEditedGlobal: global.slug,
+        editLog,
       },
       // Tag so Publishing's own hooks can ignore this internal update
       // if/when we add them.

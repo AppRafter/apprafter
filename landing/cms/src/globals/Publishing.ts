@@ -80,6 +80,49 @@ export const Publishing: GlobalConfig = {
           'Tick + Save to retag ghcr.io/<owner>/landing-web:preview → :prod (+ :latest). Auto-resets to false after save.',
       },
     },
+    {
+      name: 'editLog',
+      type: 'array',
+      // Capped — last 20 entries since the most recent promote.
+      // Each Promote-to-prod clears the array (see promoteToProd
+      // hook), so the visible list answers: "what's been edited
+      // since prod was last refreshed?"
+      maxRows: 20,
+      labels: {
+        singular: 'Edit',
+        plural: 'Edits since last promote',
+      },
+      admin: {
+        readOnly: true,
+        description:
+          'Last 20 content edits since the most recent promote. Cleared on Promote-to-prod.',
+        initCollapsed: true,
+      },
+      fields: [
+        {
+          type: 'row',
+          fields: [
+            {
+              name: 'at',
+              type: 'date',
+              required: true,
+              admin: { readOnly: true, width: '40%' },
+            },
+            {
+              name: 'global',
+              type: 'text',
+              required: true,
+              admin: { readOnly: true, width: '40%' },
+            },
+            {
+              name: 'editor',
+              type: 'text',
+              admin: { readOnly: true, width: '20%' },
+            },
+          ],
+        },
+      ],
+    },
   ],
   hooks: {
     beforeChange: [promoteToProd],

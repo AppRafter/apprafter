@@ -235,12 +235,25 @@ Three tag streams on `landing-web`:
 | `:landing-vX.Y.Z` | every release tag | `release-landing.yml` — independent pinned-release path |
 
 Argo CD on the cluster watches `:prod` for the production app
-(`landing-web` Application) and `:preview` for the preview app
-(`landing-web-preview` Application — copy of the manifest with
-the image tag changed; manifest lives in
-`landing/web/apprafter/Application-preview.cue` when wired up).
+(`landing-web` Application — `landing/web/apprafter/Application.cue`)
+and `:preview` for the preview app (`landing-web-preview` Application
+— `landing/web/apprafter/Application-preview.cue`, same package,
+both vet in one `cue vet ./landing/web/apprafter/` pass).
+
 Preview should sit behind basic-auth / IP-allowlist on
-`preview.apprafter.dev`.
+`preview.apprafter.dev`. v1alpha1 doesn't model HTTP middleware,
+so the gating lives at the outer Caddy layer — add to your
+Caddyfile:
+
+```caddy
+preview.apprafter.dev {
+  basicauth /* {
+    apprafter <bcrypt hash from `caddy hash-password`>
+  }
+  reverse_proxy <preview-pod-ip>:80
+  encode gzip zstd
+}
+```
 
 ### Promote flow (admin)
 
@@ -253,6 +266,9 @@ Preview should sit behind basic-auth / IP-allowlist on
    - `lastEditAt` = newest content save
    - `lastPromotedAt` = newest prod promote
    - if `lastEditAt > lastPromotedAt`, preview is ahead.
+   - `editLog` shows the last 20 edits since the most recent
+     promote (cleared on each Promote), with `{at, global, editor}`
+     per entry so reviewers can spot exactly what's pending.
 4. Admin reviews `preview.apprafter.dev` (gated host).
 5. Ticks `promoteToProd` checkbox and saves.
 6. `promoteToProd` beforeChange fires

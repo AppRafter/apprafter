@@ -271,6 +271,25 @@ describe('CMS client (Phase H)', () => {
   });
 });
 
+describe('Application manifests — prod + preview pair', () => {
+  test('Application.cue (prod) pins :prod + carries apprafter.dev hostname label', () => {
+    const m = readFileSync(join(ROOT, 'apprafter/Application.cue'), 'utf8');
+    expect(m).toContain('name:      "landing-web"');
+    expect(m).toContain('"ghcr.io/apprafter/landing-web:prod"');
+    expect(m).toContain('"apprafter.io/hostname":  "apprafter.dev"');
+  });
+
+  test('Application-preview.cue pins :preview + carries preview.apprafter.dev label', () => {
+    const m = readFileSync(join(ROOT, 'apprafter/Application-preview.cue'), 'utf8');
+    expect(m).toContain('name:      "landing-web-preview"');
+    expect(m).toContain('"ghcr.io/apprafter/landing-web:preview"');
+    expect(m).toContain('"apprafter.io/hostname": "preview.apprafter.dev"');
+    // Same package so `cue vet ./apprafter/` covers both files in
+    // one pass.
+    expect(m).toContain('package apprafter');
+  });
+});
+
 describe('container build surface (Phase J+)', () => {
   test('Dockerfile + Caddyfile present for web', () => {
     expect(existsSync(join(ROOT, 'Dockerfile'))).toBe(true);
