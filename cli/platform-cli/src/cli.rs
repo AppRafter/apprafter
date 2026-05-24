@@ -429,6 +429,18 @@ pub enum AppCommand {
         /// for ServiceProvider operators.
         #[arg(long, default_value = "apps")]
         project: String,
+        /// Destination namespace — Argo CD's
+        /// `spec.destination.namespace`. With `CreateNamespace=
+        /// true` in syncOptions, Argo CD creates this namespace
+        /// on first sync if it doesn't exist. Default `apprafter`
+        /// matches the namespace where AppRafter operator watches
+        /// for Application CRs and where landing-web /
+        /// landing-cms manifests declare their CR. Walk-fix #12
+        /// (v0.1.160) replaced the prior `<app-name>` default
+        /// which created an orphan destination namespace
+        /// mismatched with the manifest's own metadata.namespace.
+        #[arg(long = "namespace", default_value = "apprafter")]
+        namespace: String,
         /// Git remote name when detecting origin from cwd.
         /// Defaults to `origin`.
         #[arg(long, default_value = "origin")]

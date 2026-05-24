@@ -13,6 +13,130 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.160 — M1.5 walk-fix #12 post-B.1.79a — `apprafter app add` defaults destination to `apprafter` namespace (2026-05-24)
+
+### Symptom
+
+After walk-fix #11 (chart 0.1.47) permitted `Namespace` in the
+`apps` AppProject, landing apps still failed:
+
+```
+Failed sync attempt to <SHA>: one or more objects failed to
+apply, reason: namespaces "apprafter" not found
+(retried 5 times).
+```
+
+### Root cause
+
+The wizard (`apprafter app add`) defaulted
+`destination.namespace` к the app name (e.g.
+`apprafter-landing-web`). The user's manifest in
+`landing/web/apprafter/Application.cue:33` declares
+`metadata.namespace: "apprafter"`. Argo CD's flow on first
+sync:
+
+1. `CreateNamespace=true` synthesises a `Namespace` resource
+   for the **destination** namespace
+   (`apprafter-landing-web`) and applies it. Now permitted
+   per walk-fix #11.
+2. Renders the user's Application CR via CMP — its
+   `metadata.namespace` is `apprafter`, NOT the destination.
+3. Attempts к apply the CR к `apprafter` namespace.
+4. `apprafter` namespace doesn't exist on the cluster (only
+   `apprafter-landing-web` was created in step 1).
+5. Apply fails: `namespaces "apprafter" not found`.
+
+`CreateNamespace=true` only materialises the **destination**
+namespace; manifests with their own `metadata.namespace`
+are never granted automatic namespace creation. Misalignment
+between destination namespace и manifest namespace ⇒ apply
+failure.
+
+### Fix
+
+Decouple destination.namespace from the app name in the
+wizard. New `--namespace` flag on `apprafter app add`,
+default `apprafter`:
+
+- CLI surface: `apprafter app add --namespace <NS>` (clap
+  arg, default `apprafter`).
+- Wizard prompt order grows a sixth step "Destination
+  namespace" with DNS-1123 validation (same constraints as
+  app name, since Kubernetes namespace constraints are
+  byte-identical).
+- `build_application_manifest()` takes a new
+  `destination_namespace: &str` parameter, sets
+  `spec.destination.namespace` к it verbatim. The prior
+  `name`-based defaulting is gone.
+
+Default `apprafter` matches the namespace landing manifests
+already declare и aligns with the namespace where the
+AppRafter operator watches for `Application` CRs by
+convention. Operators with multi-tenant layouts can pass
+`--namespace tenant-x` (or accept the prompt's default
+overridden via the prefilled `--namespace` flag).
+
+### Tests
+
+- `build_application_manifest_routes_argocd_cr_to_argocd_ns_destination_to_param`
+  — renamed from `..._routes_to_argocd_namespace`; asserts
+  `spec.destination.namespace` reflects the caller's
+  parameter, not the app name.
+- `build_application_manifest_destination_namespace_honours_explicit_caller_value`
+  — new regression guard: passing `tenant-x` results in
+  `spec.destination.namespace: "tenant-x"`, and the app
+  name (`payments`) does not leak into the destination
+  field.
+- `default_destination_namespace_constant_is_apprafter` —
+  load-bearing constant guard. If a future refactor changes
+  the default, this test fires.
+- `validate_dns_1123_for_namespace_accepts_kubernetes_namespace_shapes`
+  — wizard-prompt validator coverage: well-formed namespaces
+  pass, empty / uppercase / leading-dash fail.
+
+### Migration for existing user apps
+
+User apps registered with the prior wizard already have
+`spec.destination.namespace: <app-name>`. Two options:
+
+1. **Quick patch** (in-place):
+   ```bash
+   kubectl -n argocd patch applications.argoproj.io \
+       <app-name> --type=merge \
+       -p '{"spec":{"destination":{"namespace":"apprafter"}}}'
+   kubectl -n argocd annotate \
+       applications.argoproj.io <app-name> \
+       argocd.argoproj.io/refresh=hard --overwrite
+   ```
+2. **Re-register**: `apprafter app remove <app-name>` →
+   `apprafter app add ...` (wizard's new default kicks in).
+
+Both work; (1) is faster, (2) is cleaner if the operator
+wants to re-walk the wizard for the audit trail.
+
+### Files touched
+
+- `cli/platform-cli/src/cli.rs` — new `--namespace` flag on
+  `AppCommand::Add` (default `apprafter`).
+- `cli/platform-cli/src/main.rs` — thread `namespace`
+  through `commands::app::add`.
+- `cli/platform-cli/src/commands/app.rs` — `add()` and
+  `build_application_manifest()` take
+  `destination_namespace`. Test suite updated.
+- `cli/platform-cli/src/commands/app_wizard.rs` — new
+  prompt + namespace fields on `WizardInputs` /
+  `WizardOutput` + `DEFAULT_DESTINATION_NAMESPACE`
+  constant.
+- `cli/Cargo.toml` — `workspace.package.version` bumped
+  0.1.159 → 0.1.160 per the versioning rule (CLI source
+  changed).
+
+### Why a CLI bump
+
+This is a CLI source change (clap surface + wizard
+behaviour), so `cli/Cargo.toml` bumps per the versioning
+discipline. Chart and cue-cmp untouched.
+
 ## platform-stack 0.1.47 — M1.5 walk-fix #11 post-B.1.79a — `Namespace` permitted in `apps` AppProject (2026-05-24)
 
 ### Symptom

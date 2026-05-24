@@ -14,9 +14,12 @@
 //!  5. AppProject (Select: `apps` / `platform` /
 //!     `platform-providers`, default = the `--project` flag's
 //!     value).
+//!  6. Destination namespace (Text, default `apprafter` — see
+//!     walk-fix #12 / v0.1.160).
 //!
 //! Validators run inline on each prompt: URL is normalised,
-//! name is DNS-1123 checked, branch is non-empty.
+//! name is DNS-1123 checked, branch is non-empty, namespace is
+//! DNS-1123 (Kubernetes namespace constraints).
 
 use std::process::Command;
 
@@ -48,6 +51,7 @@ pub struct WizardInputs {
     pub git_url: Option<String>,
     pub name: Option<String>,
     pub branch: Option<String>,
+    pub namespace: Option<String>,
     pub path: Option<String>,
     pub project: Option<String>,
     pub detected_origin: Option<String>,
@@ -72,7 +76,18 @@ pub struct WizardOutput {
     pub branch: String,
     pub path: String,
     pub project: String,
+    pub namespace: String,
 }
+
+/// Default destination namespace for user apps registered via
+/// the wizard. Aligns with the `apprafter` namespace where the
+/// AppRafter operator watches for `Application` CRs and where
+/// landing manifests (and most user manifests by convention)
+/// declare their `metadata.namespace`. Walk-fix #12 (v0.1.160)
+/// replaced the prior `<app-name>` default that produced
+/// orphan destination namespaces mismatched with the manifest's
+/// own namespace.
+pub const DEFAULT_DESTINATION_NAMESPACE: &str = "apprafter";
 
 const PROJECT_CHOICES: &[&str] = &["apps", "platform", "platform-providers"];
 
@@ -123,12 +138,23 @@ pub fn run(inputs: WizardInputs) -> Result<WizardOutput> {
     let project_default = inputs.project.unwrap_or_else(|| "apps".into());
     let project = prompt_project(&project_default)?;
 
+    let namespace_default = inputs
+        .namespace
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| DEFAULT_DESTINATION_NAMESPACE.into());
+    let namespace = prompt_text(
+        "Destination namespace",
+        &namespace_default,
+        validate_dns_1123_for_namespace,
+    )?;
+
     Ok(WizardOutput {
         git_url: normalised,
         name,
         branch,
         path,
         project,
+        namespace,
     })
 }
 
@@ -324,6 +350,17 @@ fn validate_dns_1123_for_app(
     Ok(Validation::Valid)
 }
 
+/// Same DNS-1123 ruleset as the application name (Kubernetes
+/// namespace constraints are byte-identical to its label
+/// constraints). Wrapper exists so the namespace prompt's
+/// error message reads "must be a valid namespace" rather
+/// than the more generic app-name phrasing.
+fn validate_dns_1123_for_namespace(
+    value: &str,
+) -> std::result::Result<Validation, inquire::CustomUserError> {
+    validate_dns_1123_for_app(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +455,43 @@ mod tests {
         assert!(matches!(
             validate_non_empty("a").unwrap(),
             Validation::Valid
+        ));
+    }
+
+    #[test]
+    fn default_destination_namespace_constant_is_apprafter() {
+        // Walk-fix #12 anchor — load-bearing constant. Drift
+        // here would re-introduce the orphan-namespace bug.
+        assert_eq!(DEFAULT_DESTINATION_NAMESPACE, "apprafter");
+    }
+
+    #[test]
+    fn validate_dns_1123_for_namespace_accepts_kubernetes_namespace_shapes() {
+        // Sanity-check the namespace validator surfaces against
+        // the cases an operator is likely to type at the prompt.
+        assert!(matches!(
+            validate_dns_1123_for_namespace("apprafter").unwrap(),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_dns_1123_for_namespace("tenant-1").unwrap(),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_dns_1123_for_namespace("a").unwrap(),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_dns_1123_for_namespace("").unwrap(),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_dns_1123_for_namespace("Tenant").unwrap(),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_dns_1123_for_namespace("-leading").unwrap(),
+            Validation::Invalid(_)
         ));
     }
 }

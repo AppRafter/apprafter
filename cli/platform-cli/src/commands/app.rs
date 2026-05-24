@@ -64,6 +64,7 @@ pub fn add(
     branch: Option<String>,
     path: &str,
     project: &str,
+    namespace: &str,
     remote: &str,
     no_ping: bool,
     no_interactive: bool,
@@ -77,7 +78,9 @@ pub fn add(
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = std::io::stdout().is_terminal();
     if crate::commands::app_wizard::should_use_wizard(no_interactive, stdin_is_tty, stdout_is_tty) {
-        return add_via_wizard(git_url, name, branch, path, project, remote, no_ping);
+        return add_via_wizard(
+            git_url, name, branch, path, project, namespace, remote, no_ping,
+        );
     }
 
     let (repo_url, derived_branch) = match git_url {
@@ -117,14 +120,21 @@ pub fn add(
         )));
     }
 
-    let manifest =
-        build_application_manifest(&derived_name, &repo_url, &target_revision, path, project);
+    let manifest = build_application_manifest(
+        &derived_name,
+        &repo_url,
+        &target_revision,
+        path,
+        project,
+        namespace,
+    );
     apply_application_manifest(&manifest, kc.path())?;
 
     println!("✓ Application '{derived_name}' registered in AppProject '{project}'.");
-    println!("  Repo:     {repo_url}");
-    println!("  Revision: {target_revision}");
-    println!("  Path:     {path}");
+    println!("  Repo:        {repo_url}");
+    println!("  Revision:    {target_revision}");
+    println!("  Path:        {path}");
+    println!("  Destination: {namespace} (created if missing)");
     println!();
     println!("Argo CD will sync the workload within a reconcile cycle. State:");
     println!("  apprafter app status {derived_name}");
@@ -143,6 +153,7 @@ fn add_via_wizard(
     branch: Option<String>,
     path: &str,
     project: &str,
+    namespace: &str,
     remote: &str,
     no_ping: bool,
 ) -> Result<()> {
@@ -155,6 +166,7 @@ fn add_via_wizard(
         branch,
         path: Some(path.to_string()),
         project: Some(project.to_string()),
+        namespace: Some(namespace.to_string()),
         detected_origin,
         detected_branch,
         detected_path,
@@ -166,6 +178,7 @@ fn add_via_wizard(
         Some(out.branch),
         &out.path,
         &out.project,
+        &out.namespace,
         remote,
         no_ping,
         true, // no_interactive — prevent recursion into the wizard.
@@ -754,12 +767,23 @@ pub(crate) fn pick_previous_revision(app: &Value) -> Result<&str> {
 
 /// Build the Argo CD `Application` CR manifest YAML. Pure fn
 /// — tests cover the shape exhaustively without a cluster.
+///
+/// `destination_namespace` controls Argo CD's
+/// `spec.destination.namespace` — the namespace whose existence
+/// `CreateNamespace=true` in syncOptions guarantees, AND the
+/// namespace Argo CD uses for namespaced resources that don't
+/// declare one in their own metadata. Walk-fix #12 (v0.1.160)
+/// detached this from the app name (which created an orphan
+/// destination namespace mismatched with the manifest's
+/// `metadata.namespace`); operators now pass `--namespace` (or
+/// accept the `apprafter` default) when registering user apps.
 pub(crate) fn build_application_manifest(
     name: &str,
     repo_url: &str,
     target_revision: &str,
     path: &str,
     project: &str,
+    destination_namespace: &str,
 ) -> Value {
     json!({
         "apiVersion": "argoproj.io/v1alpha1",
@@ -783,7 +807,7 @@ pub(crate) fn build_application_manifest(
             },
             "destination": {
                 "server": "https://kubernetes.default.svc",
-                "namespace": name,
+                "namespace": destination_namespace,
             },
             "syncPolicy": {
                 "automated": {
@@ -1013,8 +1037,14 @@ mod tests {
     fn build_application_manifest_includes_managed_by_label() {
         // Load-bearing — `app list` filters by this label.
         // If a future refactor drops it, `list` shows nothing.
-        let m =
-            build_application_manifest("my-app", "https://github.com/foo/bar", "main", "/", "apps");
+        let m = build_application_manifest(
+            "my-app",
+            "https://github.com/foo/bar",
+            "main",
+            "/",
+            "apps",
+            "apprafter",
+        );
         assert_eq!(
             m.pointer("/metadata/labels/apprafter.io~1managed-by")
                 .and_then(Value::as_str),
@@ -1028,17 +1058,52 @@ mod tests {
     }
 
     #[test]
-    fn build_application_manifest_routes_to_argocd_namespace() {
-        // Argo CD CRs live in the `argocd` namespace by
-        // convention; the destination namespace defaults to
-        // the app name (workload lives there, app CR lives
-        // in argocd).
-        let m = build_application_manifest("payments", "https://x/y", "v1.0", "/", "apps");
+    fn build_application_manifest_routes_argocd_cr_to_argocd_ns_destination_to_param() {
+        // The CR itself lives in the `argocd` namespace by
+        // convention. `spec.destination.namespace` is now an
+        // explicit caller parameter (walk-fix #12 / v0.1.160)
+        // — must reflect what's passed, not the app name.
+        let m = build_application_manifest(
+            "payments",
+            "https://x/y",
+            "v1.0",
+            "/",
+            "apps",
+            "apprafter",
+        );
         assert_eq!(
             m.pointer("/metadata/namespace").and_then(Value::as_str),
             Some("argocd")
         );
         assert_eq!(
+            m.pointer("/spec/destination/namespace")
+                .and_then(Value::as_str),
+            Some("apprafter")
+        );
+    }
+
+    #[test]
+    fn build_application_manifest_destination_namespace_honours_explicit_caller_value() {
+        // Walk-fix #12 regression guard: passing an explicit
+        // namespace (e.g. an operator who knows their manifest
+        // lives in `tenant-x`) must NOT be silently overridden
+        // by the prior `<app-name>` default.
+        let m = build_application_manifest(
+            "payments",
+            "https://x/y",
+            "v1.0",
+            "/",
+            "apps",
+            "tenant-x",
+        );
+        assert_eq!(
+            m.pointer("/spec/destination/namespace")
+                .and_then(Value::as_str),
+            Some("tenant-x")
+        );
+        // Make sure the name doesn't accidentally leak into
+        // destination.namespace anywhere else.
+        assert_ne!(
             m.pointer("/spec/destination/namespace")
                 .and_then(Value::as_str),
             Some("payments")
@@ -1047,7 +1112,7 @@ mod tests {
 
     #[test]
     fn build_application_manifest_carries_project_and_revision() {
-        let m = build_application_manifest("a", "u", "v", "/p", "apps");
+        let m = build_application_manifest("a", "u", "v", "/p", "apps", "apprafter");
         assert_eq!(
             m.pointer("/spec/project").and_then(Value::as_str),
             Some("apps")
