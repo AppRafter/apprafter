@@ -13,6 +13,155 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.146 — M1.5 walk-fix #2 post-B.1.79a — AppProjects as umbrella manifests (2026-05-24)
+
+### Symptom
+
+Operator upgrades from chart `0.1.39` → `0.1.40` (B.1.79a
+part 1 — AppProjects + `#Component.project: *"platform"`).
+Argo CD UI surfaces refresh errors on the chart-managed
+child Applications:
+
+```
+Unable to refresh admission-webhook:
+app is not allowed in project "platform", or the project does not exist
+```
+
+User report: «В Арго вижу ошибки вроде: Unable to refresh
+admission-webhook: app is not allowed in project "platform",
+or the project does not exist. Это надо бутстрап заново
+будет сделать?»
+
+### Root cause
+
+Chart `0.1.40` shipped 4 AppProject definitions through
+`_loaderValues.argocd.values.configs.projects`. The argocd
+subchart renders those entries as AppProject CRs only when
+it syncs, at sync-wave `-15`. Child Applications at
+sync-wave `0` (admission-webhook, apprafter-operator,
+network-policies, backstage, argocd-cue-cmp) reference
+`spec.project: platform` — the new default.
+
+Argo CD's app-of-applications model **does not strictly
+serialise sync-waves between separate Applications**. Inside
+a single Application's sync, sync-waves do order child
+resources; but across multiple Applications managed by an
+umbrella, Argo CD treats each as an independent reconciler
+and starts them roughly together. Result: admission-webhook
+(wave 0) and argocd (wave -15) race; the former sometimes
+tries to refresh **before** the AppProject `platform` has
+landed.
+
+This was a timing bug masked by typical 0.1.40 sync paths
+that happened к serialise correctly when nothing else was
+load on argocd-server — but reproducible on the operator's
+walk-test cluster.
+
+### Fix
+
+Ship AppProject CRs as **standalone manifests in the
+umbrella chart** at sync-wave `-30`, earlier than even
+Cilium at `-20`.
+
+**New shared map** `_appProjects` in
+`platform-stack/cue/app_projects.cue` carries the four
+definitions (`default` + `platform` + `platform-providers`
++ `apps`). Two sites consume it:
+
+1. **`templates/appprojects.yaml`** (new umbrella template)
+   — emits one `kind: AppProject` per entry at sync-wave
+   `-30`. Manifests apply BEFORE any child Application that
+   references them, on every umbrella sync.
+2. **`_loaderValues.argocd.values.configs.projects`** —
+   same definitions, retained for the initial
+   `apprafter cluster-bootstrap` install (when no umbrella
+   has synced yet).
+
+On steady state both sites describe identical resources
+(same group/kind/name/namespace); Argo CD's reconciler
+treats them as one logical object. The duplication is
+idempotent.
+
+**New CUE shape** `#AppProjectSpec` constrains the four
+entries to the AppProject fields the umbrella actually
+sets — defensive enough that future Phase 4 AccessGrant
+work can extend it without a chart-shape break.
+
+**`#PlatformValues`** gains а top-level `appProjects:
+[string]: #AppProjectSpec` field. Tier overlays
+(`tier_solo.cue`, `tier_team.cue`) wire `appProjects:
+_appProjects` so the rendered values.yaml carries the
+map.
+
+### Workaround for 0.1.40 operators (not needed on 0.1.41+)
+
+Apply the four AppProjects manually:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: {name: platform, namespace: argocd}
+spec:
+  description: Platform components.
+  sourceRepos: ['*']
+  destinations: [{namespace: '*', server: https://kubernetes.default.svc}]
+  clusterResourceWhitelist: [{group: '*', kind: '*'}]
+  namespaceResourceWhitelist: [{group: '*', kind: '*'}]
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: {name: platform-providers, namespace: argocd}
+spec:
+  description: Platform service providers.
+  sourceRepos: ['*']
+  destinations: [{namespace: '*', server: https://kubernetes.default.svc}]
+  clusterResourceWhitelist: [{group: '*', kind: '*'}]
+  namespaceResourceWhitelist: [{group: '*', kind: '*'}]
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: {name: apps, namespace: argocd}
+spec:
+  description: User apps.
+  sourceRepos: ['*']
+  destinations: [{namespace: '*', server: https://kubernetes.default.svc}]
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+  - {group: apprafter.io, kind: Application}
+  - {group: '', kind: ConfigMap}
+  - {group: '', kind: Secret}
+  - {group: gateway.networking.k8s.io, kind: HTTPRoute}
+EOF
+```
+
+Argo CD picks them up immediately; the refresh-error
+condition clears on the next reconcile. No re-bootstrap
+needed.
+
+### Tests
+
+CUE renders cleanly; `helm template` against the rendered
+chart emits 4 AppProject CRs at sync-wave -30 alongside
+the existing child Applications. The pure helpers in the
+CLI did not change, so no new unit tests; manual walk
+confirms the structural fix.
+
+### Versioning
+
+Chart `0.1.40` → `0.1.41`. CLI 0.1.145 → 0.1.146 (operator
+chart unchanged — CLI-only release picks up the chart bump
+via `RELEASED_PLATFORM_STACK_VERSION`).
+
+### References
+
+- `app_projects.cue` (new shared map).
+- `render_tool.cue` (`_appProjectsTemplate`).
+- ADR 0025 (Argo CD).
+- `plan.md` §1.79a walk-fix #2.
+
+---
+
 ## v0.1.145 — M1.5 polish post-B.1.79a #3 — wizards for `app add` and `repo creds add` (2026-05-24)
 
 ### What landed

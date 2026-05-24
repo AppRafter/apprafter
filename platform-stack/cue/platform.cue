@@ -251,6 +251,55 @@ package platformstack
 	// Empty by default — the chart's curated bundle stands on
 	// its own without any override block.
 	overrides?: [string]: #ComponentOverride
+
+	// Argo CD `AppProject` definitions shipped as standalone
+	// umbrella manifests at sync-wave -30 (walk-fix #2 post-
+	// B.1.79a, chart 0.1.41). Iterated by the chart's
+	// `templates/appprojects.yaml` template into one
+	// `kind: AppProject` per entry.
+	//
+	// **Why both here AND in `_loaderValues.argocd.values.
+	// configs.projects`?** The argocd subchart's
+	// `configs.projects` mechanism renders AppProjects ONLY
+	// when the Argo CD chart syncs, which happens at sync-wave
+	// -15. Child Applications at sync-wave 0 (admission-webhook,
+	// operator, etc.) reference these projects but are sometimes
+	// applied before wave -15 finishes when Argo CD does NOT
+	// strictly serialise inter-Application sync-waves on the
+	// app-of-applications pattern. Result: walk-found bug —
+	// `Unable к refresh admission-webhook: app is not allowed
+	// in project "platform", or the project does not exist`.
+	//
+	// Fix: the umbrella chart itself emits AppProject CRs at
+	// sync-wave -30 (earliest possible — before Cilium at -20).
+	// configs.projects in argocd subchart stays для initial
+	// loader install (when there's no umbrella yet). Once the
+	// umbrella adopts on first sync, the umbrella-managed
+	// AppProjects take ownership — Argo CD's reconciler treats
+	// the two as the same logical resource (same group/kind/
+	// name/namespace), so this is byte-equivalent on steady
+	// state, deterministically-ordered on first sync.
+	appProjects: [string]: #AppProjectSpec
+}
+
+// `#AppProjectSpec` — the small shape `templates/appprojects.
+// yaml` iterates. Mirrors Argo CD's AppProject v1alpha1 CRD
+// only on the fields the umbrella actually sets.
+#AppProjectSpec: {
+	description: string
+	sourceRepos: [...string]
+	destinations: [...{
+		namespace: string
+		server:    string
+	}]
+	clusterResourceWhitelist: [...{
+		group: string
+		kind:  string
+	}]
+	namespaceResourceWhitelist: [...{
+		group: string
+		kind:  string
+	}]
 }
 
 // `currentVersion` is THE single source of truth for the chart
@@ -271,7 +320,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.1.40"
+currentVersion: #Version & "0.1.41"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

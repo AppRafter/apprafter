@@ -31,9 +31,10 @@ package platformstack
 // declaration rather than shadowing it.
 
 tier1: #PlatformValues & {
-	version: currentVersion
-	tier:    1
-	channel: "stable"
+	version:     currentVersion
+	tier:        1
+	channel:     "stable"
+	appProjects: _appProjects
 	components: _components & {
 		cilium: values: hubble: enabled: false
 		backstage: enabled:        false

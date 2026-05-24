@@ -1658,6 +1658,99 @@ compatibility: "0.1.23": {
 // present in the patch. Operator-binary change only; image
 // v0.1.121 → v0.1.122 via the standard chart appVersion
 // lockstep.
+// Walk-fix #2 post-B.1.79a — AppProjects as standalone umbrella
+// manifests at sync-wave -30. Chart 0.1.40 shipped 4 AppProjects
+// via the argocd subchart's `configs.projects` mechanism, which
+// renders them only when the argocd Application syncs at sync-
+// wave -15. Child Applications at sync-wave 0 (admission-webhook,
+// apprafter-operator, etc.) reference `spec.project: platform`
+// but Argo CD does NOT strictly serialise sync-waves across
+// Applications in the app-of-applications pattern — these
+// children sometimes try к apply before wave -15 finishes,
+// triggering `Unable к refresh admission-webhook: app is not
+// allowed in project "platform", or the project does not exist`.
+//
+// Fix: the umbrella chart itself emits AppProject CRs at sync-
+// wave -30 — before Cilium at -20 — via а new
+// `templates/appprojects.yaml` template iterating
+// `.Values.appProjects`. `configs.projects` in the argocd
+// subchart stays для initial loader install (when no umbrella
+// exists yet). Both sites consume the new shared `_appProjects`
+// map (`app_projects.cue`), so definitions are byte-identical
+// и idempotent — Argo CD's reconciler treats both as the same
+// logical resource.
+compatibility: "0.1.41": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #2 post-B.1.79a — AppProjects as
+		standalone umbrella manifests.
+
+		**Symptom.** Operator upgrades from chart 0.1.39 →
+		0.1.40. Child Application `admission-webhook` (sync-
+		wave 0) gets reapplied with `spec.project: platform`
+		(new default after part 1). Argo CD UI surfaces
+		refresh errors:
+
+			```
+			Unable to refresh admission-webhook: app is not
+			allowed in project "platform", or the project
+			does not exist
+			```
+
+		**Root cause.** Chart 0.1.40 shipped 4 AppProject
+		definitions via `_loaderValues.argocd.values.configs.
+		projects`. The argocd subchart renders these as
+		AppProject CRs only when it syncs at sync-wave -15.
+		Argo CD's app-of-applications model does NOT strictly
+		serialise sync-waves between separate Applications —
+		only within а single Application's child-resource
+		sync. Result: admission-webhook (wave 0) and argocd
+		(wave -15) race; the former sometimes tries к refresh
+		before the AppProject `platform` has landed.
+
+		**Fix.** Ship AppProject manifests as part of the
+		umbrella chart itself, at sync-wave -30 (earlier than
+		even Cilium's -20). New template
+		`templates/appprojects.yaml` iterates `.Values.
+		appProjects` and emits one `kind: AppProject` per
+		entry. New shared `_appProjects` map in
+		`app_projects.cue` is consumed by both the loader
+		(`_loaderValues.argocd.values.configs.projects`) and
+		the umbrella template — definitions are byte-identical
+		и idempotent. Argo CD's reconciler treats the two
+		render sites as the same resource (same
+		group/kind/name/namespace).
+
+		**Why both sites stay.** The argocd subchart's
+		`configs.projects` covers the initial `apprafter
+		cluster-bootstrap` install — before any umbrella sync
+		has run. The umbrella's manifest renderer covers every
+		subsequent sync. Removing the loader path would mean
+		an initial cluster has no AppProjects until the first
+		umbrella sync completes — а regression vs 0.1.40.
+
+		**Workaround for 0.1.40 operators (not needed on
+		0.1.41+).** Apply the four AppProjects manually with
+		`kubectl apply -f` — Argo CD picks them up immediately
+		и the refresh-error condition clears on the next
+		reconcile.
+
+		Rendered chart vs 0.1.40: new `templates/appprojects.
+		yaml` template (additive — no existing template
+		changed). values.yaml grows а new top-level
+		`appProjects` map (4 entries, byte-identical к
+		`configs.projects` in the argocd subchart values).
+		Operator binary unchanged.
+		"""
+	references: [
+		"docs/adr/0025-argo-cd.md",
+		"docs/adr/0026-platformstack-crd.md",
+		"plan.md#179a-cli-apprepo-subcommands--appprojects",
+		"docs/changelog/UNRELEASED.md#v01146",
+	]
+}
+
 // Track B.1.79a (part 1) — AppProjects + per-component project
 // field. Chart adds three new AppProject resources alongside
 // the existing `default` one: `platform` (chart-internal

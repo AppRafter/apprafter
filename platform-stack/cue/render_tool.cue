@@ -122,6 +122,50 @@ _chartYaml: """
 // Note the double-curly braces: this string is itself a Go
 // template that Helm will execute at install time, so we keep
 // the `{{ }}` literal. CUE happily ships this verbatim.
+// `_appProjectsTemplate` — emits one `kind: AppProject` per
+// entry в `.Values.appProjects`. All projects render at
+// sync-wave -30 — earlier than even Cilium (-20) so the
+// projects exist before any Application referencing them is
+// applied by Argo CD. Walk-fix #2 post-B.1.79a; see
+// `app_projects.cue` for the why and the `_appProjects` map
+// for the contents.
+//
+// Note the double-curly braces: this string is itself a Go
+// template Helm executes at install time, so we keep the
+// `{{ }}` literal. CUE ships it verbatim.
+_appProjectsTemplate: """
+	{{/*
+	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
+	  Rendered by `cue cmd render`. Do not edit.
+	  Iterates over .Values.appProjects and emits one
+	  kind: AppProject per entry at sync-wave -30.
+	*/}}
+	{{- range $name, $project := .Values.appProjects }}
+	---
+	apiVersion: argoproj.io/v1alpha1
+	kind: AppProject
+	metadata:
+	  name: {{ $name | quote }}
+	  namespace: argocd
+	  annotations:
+	    argocd.argoproj.io/sync-wave: "-30"
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	spec:
+	  description: {{ $project.description | quote }}
+	  sourceRepos:
+	{{ toYaml $project.sourceRepos | indent 4 }}
+	  destinations:
+	{{ toYaml $project.destinations | indent 4 }}
+	  clusterResourceWhitelist:
+	{{ toYaml $project.clusterResourceWhitelist | indent 4 }}
+	  namespaceResourceWhitelist:
+	{{ toYaml $project.namespaceResourceWhitelist | indent 4 }}
+	{{- end }}
+
+	"""
+
 _applicationsTemplate: """
 	{{/*
 	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
@@ -353,6 +397,12 @@ command: render: {
 	appsTemplate: file.Create & {
 		filename: "\(_distDir)/templates/applications.yaml"
 		contents: _applicationsTemplate
+		$dep:     mktemplates.$done
+	}
+
+	appProjectsTemplate: file.Create & {
+		filename: "\(_distDir)/templates/appprojects.yaml"
+		contents: _appProjectsTemplate
 		$dep:     mktemplates.$done
 	}
 

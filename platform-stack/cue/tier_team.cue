@@ -27,9 +27,10 @@ package platformstack
 // actually wires those components in.
 
 tier2: #PlatformValues & {
-	version: currentVersion
-	tier:    2
-	channel: "stable"
+	version:     currentVersion
+	tier:        2
+	channel:     "stable"
+	appProjects: _appProjects
 	components: _components & {
 		cilium: values: hubble: {
 			enabled: true
