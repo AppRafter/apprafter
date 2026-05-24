@@ -14,7 +14,7 @@ use clap::Parser;
 use cli_core::logging;
 use miette::{IntoDiagnostic, Result};
 
-use crate::cli::{Cli, Commands, MigrationCommand, OpenUi, PlatformCommand};
+use crate::cli::{AppCommand, Cli, Commands, MigrationCommand, OpenUi, PlatformCommand};
 
 fn main() -> Result<()> {
     // Configure miette's `fancy` reporter as the global panic /
@@ -99,6 +99,28 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 let filter = if all_projects { None } else { Some(project) };
                 commands::open::argocd(filter.as_deref())?
             }
+        },
+        Commands::App { action } => match action {
+            AppCommand::Add {
+                git_url,
+                name,
+                branch,
+                path,
+                project,
+                remote,
+                no_ping,
+            } => commands::app::add(git_url, name, branch, &path, &project, &remote, no_ping)?,
+            AppCommand::List {
+                project,
+                all_projects,
+                all_managed,
+            } => commands::app::list(&project, all_projects, all_managed)?,
+            AppCommand::Status { name } => commands::app::status(&name)?,
+            AppCommand::Remove {
+                name,
+                yes,
+                keep_data,
+            } => commands::app::remove(&name, yes, keep_data)?,
         },
     }
     Ok(())

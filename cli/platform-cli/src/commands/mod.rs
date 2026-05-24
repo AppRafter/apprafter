@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Subcommand handlers. Each module implements one verb.
 
+pub mod app;
 pub mod apply;
 pub mod argocd_password;
 pub mod auth;

@@ -198,6 +198,15 @@ pub enum Commands {
         #[command(subcommand)]
         ui: OpenUi,
     },
+    /// Manage user Applications — Argo CD Applications scoped к
+    /// the `apps` AppProject, labeled `apprafter.io/managed-by:
+    /// apprafter`. Track B.1.79a thin wrapper над Argo CD CR
+    /// patching.
+    #[command(alias = "a")]
+    App {
+        #[command(subcommand)]
+        action: AppCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -236,6 +245,114 @@ pub enum MigrationCommand {
     Reject {
         /// MigrationPlan name.
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AppCommand {
+    /// Register a user Application. Without `<git-url>`, detects
+    /// the git origin remote of the current working directory.
+    /// Writes an Argo CD Application CR в namespace `argocd`
+    /// joined к AppProject `apps` (or `--project`), labeled
+    /// `apprafter.io/managed-by: apprafter` so `app list` can
+    /// surface only apprafter-managed Applications.
+    Add {
+        /// Explicit git URL. Required when cwd is not a git
+        /// repo. Accepted forms: `https://…`, `git@host:org/repo.git`
+        /// (SSH normalised к HTTPS), `ssh://git@host/repo`. Any
+        /// trailing `.git` stripped когда normalising.
+        git_url: Option<String>,
+        /// Application name. Defaults к the repo's basename
+        /// (last path segment after stripping `.git`).
+        #[arg(long)]
+        name: Option<String>,
+        /// Git branch / tag / commit SHA passed verbatim к
+        /// `spec.source.targetRevision`. Defaults к the cwd's
+        /// current branch когда detected; `main` для explicit
+        /// `<git-url>` без cwd context.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Path under the repo to render. Defaults к `/` —
+        /// matches the cue-cmp plugin's `discover.find.glob:
+        /// **/apprafter*.cue` rule (sidecar walks the entire
+        /// repo for matching files when path is `/`).
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// AppProject the Application joins. Default `apps`
+        /// matches the AppProject created в chart 0.1.40
+        /// (Track B.1.79a part 1). Pass `--project platform`
+        /// для platform-internal apps, `platform-providers`
+        /// для ServiceProvider operators.
+        #[arg(long, default_value = "apps")]
+        project: String,
+        /// Git remote name when detecting origin from cwd.
+        /// Defaults к `origin`.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Skip the `git ls-remote` reachability check. Useful
+        /// для CI где network isolation blocks external git
+        /// hosts, or когда the repo is freshly created и does
+        /// not yet have an `HEAD` ref.
+        #[arg(long = "no-ping", default_value_t = false)]
+        no_ping: bool,
+    },
+    /// List Applications scoped к the `apps` AppProject (or
+    /// `--project <name>`). Filters к Applications labeled
+    /// `apprafter.io/managed-by: apprafter` by default;
+    /// `--all-managed` drops that filter (shows ALL Applications
+    /// в the project regardless of management label — useful
+    /// для debugging stray applications that bypassed `app add`).
+    #[command(alias = "ls")]
+    List {
+        /// AppProject filter. Defaults к `apps`. Use
+        /// `--all-projects` to drop the filter.
+        #[arg(long, default_value = "apps")]
+        project: String,
+        /// Drop the `--project` filter; list Applications в
+        /// EVERY AppProject (subject к the managed-by label
+        /// filter unless `--all-managed` is also set).
+        #[arg(
+            long = "all-projects",
+            default_value_t = false,
+            conflicts_with = "project"
+        )]
+        all_projects: bool,
+        /// Drop the `apprafter.io/managed-by: apprafter` label
+        /// filter — list every Application в the resolved
+        /// project scope, не just apprafter-managed ones.
+        #[arg(long = "all-managed", default_value_t = false)]
+        all_managed: bool,
+    },
+    /// Show detail view для one Application: sync state, health,
+    /// source repo + revision, destinations, pending
+    /// MigrationPlans (when AppRafter `Application` CR exists
+    /// в the workload namespace), recent sync history (last 3
+    /// revisions).
+    Status {
+        /// Application name (as listed via `apprafter app list`).
+        name: String,
+    },
+    /// Delete an Application и cascade-remove the Argo CD CR
+    /// (which Argo CD then tears down child resources for).
+    /// Interactive: prompts для confirmation; non-interactive
+    /// requires `--yes` to skip the prompt.
+    #[command(alias = "rm")]
+    Remove {
+        /// Application name.
+        name: String,
+        /// Skip confirmation prompt. Required в non-interactive
+        /// shells (no TTY) — there's no silent destruction
+        /// path.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Preserve PVCs / `ResourceClaim`s when tearing down.
+        /// Implemented as а post-delete cleanup that strips
+        /// the destructive child-prune from the cascading
+        /// delete. Phase 2 ServiceProvider-backed claims need
+        /// this to survive а user app teardown when the
+        /// operator wants к re-attach the data later.
+        #[arg(long = "keep-data", default_value_t = false)]
+        keep_data: bool,
     },
 }
 

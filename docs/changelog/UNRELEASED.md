@@ -13,6 +13,128 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.139 — M1.5 Track B.1.79a part 3 — `apprafter app` add/list/status/remove (2026-05-22)
+
+### What landed
+
+`apprafter app` subcommand family для user-application
+lifecycle. Operates на Argo CD Applications labeled
+`apprafter.io/managed-by: apprafter` so chart-managed
+platform Applications stay out of these views.
+
+### `apprafter app add [<git-url>]`
+
+- Без аргумента: detects git origin remote of cwd via
+  `git remote get-url <remote>` (default `--remote origin`).
+  Errors с CLI-friendly hint when cwd is not а git repo.
+- Normalises git URL к Argo-CD-friendly HTTPS form:
+  - `git@host:org/repo[.git]` → `https://host/org/repo`
+  - `ssh://git@host/org/repo[.git]` → `https://host/org/repo`
+  - `https://host/org/repo[.git]` → `https://host/org/repo`
+- `--name <name>` (default = repo basename, lowercased,
+  invalid chars → dashes, validated against DNS-1123).
+- `--branch <ref>` (default = cwd's current branch когда
+  detectable; `main` для explicit `<git-url>`).
+- `--path <path>` (default `/`).
+- `--project <name>` (default `apps`).
+- Reachability check via `git ls-remote --exit-code <url>
+  HEAD`; auth failure surfaces hint pointing к
+  `apprafter repo creds add` (lands в v0.1.141). `--no-ping`
+  skips для air-gapped CI.
+- Pre-flight: refuses когда Application с таким name уже
+  существует, с pointer к `app status` / `app remove`.
+- Writes Argo CD `Application` CR в `argocd` namespace:
+  - `metadata.labels.apprafter.io/managed-by: apprafter`
+    (load-bearing — `app list` filters by this).
+  - `metadata.annotations.apprafter.io/source: cli`.
+  - `spec.project`, `spec.source.{repoURL,path,targetRevision}`,
+    `spec.destination.{server: https://kubernetes.default.svc,
+    namespace: <app-name>}`, `spec.syncPolicy.automated.{prune:
+    true, selfHeal: true}` + `CreateNamespace=true,
+    ServerSideApply=true` syncOptions.
+
+### `apprafter app list`
+
+- `--project <name>` (default `apps`) / `--all-projects`
+  toggle filters the project scope.
+- `--all-managed` drops the `apprafter.io/managed-by:
+  apprafter` label filter — surfaces Applications created
+  outside the CLI.
+- Table: NAME / PROJECT / REPO / REV / SYNC / HEALTH.
+- Empty result surfaces context-aware hint pointing к
+  `--all-managed` когда the label filter is active.
+
+### `apprafter app status <name>`
+
+- Detail view: project, repo, revision, path, destination
+  namespace, sync state, health.
+- Recent revisions (last 3 from `status.history` reversed).
+- Handles status-less Applications (fresh CRs) без panic'а
+  — defaults к Unknown / `?` placeholders.
+
+### `apprafter app remove <name>`
+
+- Interactive: prompts via `inquire::Confirm` (defaults к
+  No). Non-interactive shell without `--yes` errors out
+  rather than silently delete.
+- `--keep-data` flips `syncPolicy.automated.prune: false`
+  via JSON merge-patch BEFORE delete, so Argo CD tears
+  down only the Application CR — child resources (PVCs,
+  ResourceClaims when they land в Phase 2) survive для
+  re-attach.
+- Surfaces success message with re-attach hint когда
+  `--keep-data` is in effect.
+
+### `apprafter a` alias
+
+`apprafter a add/list/status/rm` accepted as shorthand
+(`#[command(alias = "a")]` on the `App` enum variant,
+existing `--alias` policy on subcommands like `rm` for
+`remove`, `ls` for `list`).
+
+### Tests
+
++12 unit tests на the pure helpers (kubectl shellout left
+к manual walks):
+
+- `normalise_git_url_strips_dotgit_suffix`
+- `normalise_git_url_converts_scp_style_to_https`
+- `normalise_git_url_strips_ssh_scheme`
+- `normalise_git_url_passes_through_https`
+- `derive_app_name_takes_last_path_segment`
+- `derive_app_name_strips_invalid_chars`
+- `validate_dns_1123_accepts_well_formed_names`
+- `validate_dns_1123_rejects_uppercase_underscore_leading_dash`
+- `build_application_manifest_includes_managed_by_label`
+  (load-bearing: `app list` filter relies on this label).
+- `build_application_manifest_routes_to_argocd_namespace`
+- `build_application_manifest_carries_project_and_revision`
+- `print_status_handles_app_without_status_block`
+
+### Deferred к v0.1.140
+
+- `apprafter app logs` — kubectl logs wrapper.
+- `apprafter app rollback` — patches `spec.source.targetRevision`
+  back к а previous revision read from `status.history`.
+
+### Deferred к v0.1.141
+
+- Inline PAT prompt for private repos when `git ls-remote`
+  hits "authentication required" — lands together с
+  `apprafter repo creds add`.
+
+### Versioning
+
+CLI 0.1.138 → 0.1.139. Chart unchanged.
+
+### References
+
+- ADR 0025 (Argo CD).
+- ADR 0026 (PlatformStack CRD).
+- `plan.md` §1.79a.
+
+---
+
 ## v0.1.138 — M1.5 Track B.1.79a part 2 — `apprafter open argocd` polish (2026-05-22)
 
 ### What landed
