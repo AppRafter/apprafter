@@ -13,6 +13,127 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.156 — M1.5 walk-fix #7 post-B.1.79a — migration helper observability + cross-fs (2026-05-24)
+
+### Symptom
+
+Operator upgraded к v0.1.155, ran `apprafter app add` from
+`cli/` (legacy state location), hit `no cached kubeconfig
+in state`. Inspecting state files:
+
+- `cli/.apprafter/state.json` (5375 bytes, May 22) — real
+  hetzner_cloud block with kubeconfig + argocd_admin_password.
+- `~/.config/apprafter/state/dev/.apprafter/state.json`
+  (412 bytes, May 24) — placeholder hetzner_cloud with
+  round-number IDs (`server_id: 42`, `firewall_id: 200`,
+  `floating_ip_ids: [300]`), kubeconfig fields null.
+
+The migration helper's "both files exist → skip" branch
+silently preserved the placeholder и stranded the operator's
+real state in the legacy location. No stderr notice was
+printed, so the operator had no signal that legacy data was
+sitting unmigrated.
+
+### Root cause
+
+`migrate_legacy_state_if_present` (v0.1.154) implemented
+"new-wins" by file existence alone:
+
+```rust
+if target_paths.state_file().exists() {
+    return Ok(()); // silent skip
+}
+```
+
+Existence ≠ correctness. A placeholder file would pass the
+check just as well as а freshly-applied state. The operator
+got no signal about the conflict.
+
+Then after deleting the placeholder file manually to trigger
+migration, the operator hit a second bug:
+
+```
+Error: apprafter::io::error
+× io error: Invalid cross-device link (os error 18)
+```
+
+`std::fs::rename` is a single syscall and fails with EXDEV
+when source and destination cross filesystems. The
+operator's `/projects/...` lives on a separate device from
+`$HOME` (NixOS workstation), so the legacy → per-target
+move hit EXDEV.
+
+### Fix
+
+Three layered improvements:
+
+1. **Prefer richer legacy on conflict**. When both files
+   exist, parse both и compare hetzner_cloud presence. If
+   the legacy file has hetzner_cloud and the per-target one
+   doesn't, back up the placeholder to
+   `state.json.bak` и migrate the legacy file as the
+   authoritative state. Stderr notice names both paths so
+   the operator sees what happened.
+
+2. **Loud stderr notice on skip path**. When both files
+   carry hetzner_cloud (the genuine "operator has two
+   separate clusters" case), still skip but emit а notice:
+   `legacy state at <path> detected but per-target slot
+   <path> is already populated. Skipping migration. Inspect
+   both files and delete whichever is stale...`. Silent
+   skip is removed.
+
+`read_has_hetzner_cloud(path)` pure helper drives the
+decision — parse failures absorb into `false` so corrupt
+state is treated as empty, and the richer legacy file wins.
+
+3. **Cross-filesystem safe rename**. New
+   `cross_fs_safe_rename(src, dst)` helper tries
+   `std::fs::rename` first, falls back to `std::fs::copy` +
+   `std::fs::remove_file` on EXDEV (os error 18). All three
+   rename callsites in the migration helper (state move,
+   known_hosts move, backup rename) routed through it.
+
+### Verification
+
++2 unit tests covering the new branches:
+
+- `migrate_legacy_prefers_richer_legacy_when_per_target_lacks_hetzner_cloud`
+  — the v0.1.155 walk's exact scenario; asserts legacy
+  becomes the per-target state и placeholder is backed up
+  to `.json.bak`.
+- `migrate_legacy_keeps_per_target_when_both_carry_hetzner_cloud`
+  — defensive: two real clusters → per-target wins, legacy
+  preserved for inspection.
+
+Existing 5 migration tests still pass. Total `cli-state`
+migration tests: 5 → 7.
+
+### Recovery for v0.1.154/v0.1.155 operators
+
+If the per-target slot was populated with а scaffold or
+placeholder before this fix lands:
+
+```bash
+# Inspect:
+cat ~/.config/apprafter/state/<active-target>/.apprafter/state.json
+
+# If hetzner_cloud is empty/null AND your real state is
+# still at <cwd>/.apprafter/state.json, delete the scaffold:
+rm ~/.config/apprafter/state/<active-target>/.apprafter/state.json
+
+# Next CLI invocation picks up the legacy file и migrates.
+```
+
+After upgrading к v0.1.156 the auto-prefer logic handles
+this on first invocation — no manual `rm` needed.
+
+### Versioning
+
+CLI 0.1.155 → 0.1.156. Chart unchanged.
+
+---
+
 ## v0.1.155 — M1.5 post-B.1.79a #7 — `app add` wizard defaults path to cwd-relative (2026-05-24)
 
 ### What landed

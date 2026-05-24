@@ -161,17 +161,71 @@ pub fn migrate_legacy_state_if_present(
         return Ok(());
     }
     if target_paths.state_file().exists() {
-        // New-wins: don't clobber an already-populated per-target
-        // cache with the legacy per-cwd one. The two sources may
-        // describe different clusters, and the operator's recent
-        // intent is more likely encoded in the per-target file
-        // (they had to opt into the new layout by running a
-        // command under v0.1.154+).
-        return Ok(());
+        // Both files exist — decide between "new-wins" (default)
+        // and "prefer legacy when richer".
+        //
+        // Walk-fix v0.1.156 (post-v0.1.155 walk): the v0.1.155
+        // helper had a silent "new-wins" skip that stranded the
+        // operator's real state in `cli/.apprafter/state.json`
+        // when an unrelated per-target file happened to exist
+        // (manual fixture from a prior session, stale write
+        // from a dev build, etc.). The operator was left
+        // wondering why `apprafter app add` couldn't find their
+        // kubeconfig — silent skip gave them no signal.
+        //
+        // New behaviour:
+        //   * Always log a stderr notice naming BOTH files when
+        //     we skip, so the operator can investigate.
+        //   * Prefer the richer file: if the per-target state is
+        //     "essentially empty" (no `hetzner_cloud`) and the
+        //     legacy state has hetzner_cloud, treat the migration
+        //     as a recovery — back up the empty per-target file
+        //     to `.bak` and proceed with the move. Operators
+        //     genuinely on a fresh target won't have a legacy
+        //     file at all (`legacy_state.exists()` check above
+        //     short-circuits), so this branch is a pure UX win.
+        let legacy_has_hetzner = read_has_hetzner_cloud(&legacy_state);
+        let target_has_hetzner = read_has_hetzner_cloud(&target_paths.state_file());
+        if legacy_has_hetzner && !target_has_hetzner {
+            let backup = target_paths.state_file().with_extension("json.bak");
+            match cross_fs_safe_rename(&target_paths.state_file(), &backup) {
+                Ok(()) => {
+                    eprintln!(
+                        "note: per-target state at {new} was empty (no hetzner_cloud); \
+                         backed it up to {backup} and migrating richer legacy state from {legacy}",
+                        new = target_paths.state_file().display(),
+                        backup = backup.display(),
+                        legacy = legacy_state.display(),
+                    );
+                    // Fall through into the migration block
+                    // below — both files no longer exist at
+                    // the destination, so the move proceeds.
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: legacy state at {legacy} looks richer than per-target {new} \
+                         (legacy has hetzner_cloud, target does not), but the backup rename failed: {e}. \
+                         Inspect both files and resolve manually.",
+                        legacy = legacy_state.display(),
+                        new = target_paths.state_file().display(),
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            eprintln!(
+                "note: legacy state at {legacy} detected but per-target slot {new} is already populated. \
+                 Skipping migration. Inspect both files and delete whichever is stale; \
+                 once a stale per-target state is gone, the next CLI invocation will migrate the legacy one.",
+                legacy = legacy_state.display(),
+                new = target_paths.state_file().display(),
+            );
+            return Ok(());
+        }
     }
 
     std::fs::create_dir_all(target_paths.state_dir())?;
-    std::fs::rename(&legacy_state, target_paths.state_file())?;
+    cross_fs_safe_rename(&legacy_state, &target_paths.state_file())?;
 
     // known_hosts is best-effort: a fresh cluster cache without
     // SSH activity won't have one, and we shouldn't fail the whole
@@ -181,7 +235,7 @@ pub fn migrate_legacy_state_if_present(
     let legacy_known = legacy_root.join(STATE_DIR).join(KNOWN_HOSTS_FILE);
     let mut moved_known_hosts = false;
     if legacy_known.exists() {
-        match std::fs::rename(&legacy_known, target_paths.known_hosts_file()) {
+        match cross_fs_safe_rename(&legacy_known, &target_paths.known_hosts_file()) {
             Ok(()) => {
                 moved_known_hosts = true;
             }
@@ -216,6 +270,58 @@ pub fn migrate_legacy_state_if_present(
     }
 
     Ok(())
+}
+
+/// `std::fs::rename` is a single syscall and fails with EXDEV
+/// (`os error 18` on Linux + macOS) when source and destination
+/// live on different filesystems. The migration helper crosses
+/// filesystems by design — the legacy file lives in the
+/// operator's project dir (often /projects, /work, etc., a
+/// separate mount) while the per-target slot lives under
+/// `~/.config` (typically on the home partition). When the
+/// rename hits EXDEV, fall back to copy + remove so the move
+/// still completes.
+///
+/// Walk-fix v0.1.156: operator on NixOS with `/projects` on a
+/// separate device hit `Invalid cross-device link (os error 18)`
+/// during migration. Pure `fs::rename` had no fallback.
+///
+/// Returns the original `io::Error` for any non-EXDEV failure,
+/// since those usually indicate a real problem (permission,
+/// disk full, missing source).
+pub(crate) fn cross_fs_safe_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+            std::fs::copy(src, dst)?;
+            std::fs::remove_file(src)?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// EXDEV os-error code on Linux + macOS. Windows uses a
+/// different number but cross-volume rename also fails there;
+/// the CLI substrate is Linux + macOS (per Cargo workspace
+/// build target matrix), so the constant covers the surface
+/// we ship.
+const EXDEV: i32 = 18;
+
+/// Read a state.json and report whether it carries a populated
+/// `hetzner_cloud` block. Used by `migrate_legacy_state_if_present`
+/// to decide whether a pre-existing per-target file is "real
+/// state" or just a scaffolded placeholder. Errors on parse
+/// failure are absorbed into a `false` answer — corrupt state
+/// is treated as "empty" so the richer legacy file wins.
+fn read_has_hetzner_cloud(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(state) = serde_json::from_str::<State>(&raw) else {
+        return false;
+    };
+    state.hetzner_cloud.is_some()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +469,103 @@ mod tests {
         assert!(body.contains("\"cluster_name\":\"new\""), "{body}");
         // Legacy file kept where it was — operator can inspect /
         // delete it manually.
+        assert!(legacy_dir.join(STATE_FILE).exists());
+    }
+
+    #[test]
+    fn migrate_legacy_prefers_richer_legacy_when_per_target_lacks_hetzner_cloud() {
+        // Walk-fix post-v0.1.155: the operator hit a scenario
+        // where a stale per-target state.json existed (no
+        // hetzner_cloud — just placeholder cluster_name etc.)
+        // and the legacy file had the full hetzner_cloud block
+        // including kubeconfig. New-wins-by-existence stranded
+        // the operator's real state in legacy.
+        //
+        // New rule: if the per-target state has no
+        // hetzner_cloud and the legacy state does, treat the
+        // pre-existing target file as a scaffold, back it up
+        // to `.bak`, and migrate the legacy file as the
+        // authoritative state.
+        let (_dir, store) = make_store();
+        let paths = StatePaths::for_active_target(&store, "default");
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        // Pre-existing per-target state has cluster metadata
+        // but no hetzner_cloud — looks like a scaffolded
+        // placeholder.
+        std::fs::write(
+            paths.state_file(),
+            br#"{"cluster_name":"placeholder","tier":"solo"}"#,
+        )
+        .unwrap();
+
+        let legacy_root = tempdir().unwrap();
+        let legacy_dir = legacy_root.path().join(STATE_DIR);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        // Legacy state carries a full hetzner_cloud block.
+        std::fs::write(
+            legacy_dir.join(STATE_FILE),
+            br#"{
+                "cluster_name": "real-cluster",
+                "tier": "solo",
+                "hetzner_cloud": {
+                    "server_id": 12345678,
+                    "server_name": "n1",
+                    "ssh_key_ids": [],
+                    "network_id": null,
+                    "firewall_id": null,
+                    "floating_ip_ids": []
+                }
+            }"#,
+        )
+        .unwrap();
+
+        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+
+        // Per-target state.json is now the migrated legacy
+        // content (real hetzner_cloud block).
+        let body = std::fs::read_to_string(paths.state_file()).unwrap();
+        assert!(body.contains("real-cluster"), "{body}");
+        assert!(body.contains("hetzner_cloud"), "{body}");
+        // Placeholder backed up to `.bak` so operators can
+        // inspect and delete it.
+        let backup = paths.state_file().with_extension("json.bak");
+        assert!(backup.exists(), "backup expected at {}", backup.display());
+        let backup_body = std::fs::read_to_string(&backup).unwrap();
+        assert!(
+            backup_body.contains("placeholder"),
+            "backup should carry the original placeholder content: {backup_body}"
+        );
+        // Legacy file moved out of cwd.
+        assert!(!legacy_dir.join(STATE_FILE).exists());
+    }
+
+    #[test]
+    fn migrate_legacy_keeps_per_target_when_both_carry_hetzner_cloud() {
+        // Defensive: when both files carry hetzner_cloud (two
+        // real clusters, somehow simultaneously cached), don't
+        // touch the per-target one — operator's recent intent
+        // wins. The notice on stderr (not asserted here, captured
+        // by external observability) lets them resolve manually.
+        let (_dir, store) = make_store();
+        let paths = StatePaths::for_active_target(&store, "default");
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        let target_body = br#"{"hetzner_cloud":{"server_id":999,"server_name":"new","ssh_key_ids":[],"network_id":null,"firewall_id":null,"floating_ip_ids":[]}}"#;
+        std::fs::write(paths.state_file(), target_body).unwrap();
+
+        let legacy_root = tempdir().unwrap();
+        let legacy_dir = legacy_root.path().join(STATE_DIR);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join(STATE_FILE),
+            br#"{"hetzner_cloud":{"server_id":111,"server_name":"old","ssh_key_ids":[],"network_id":null,"firewall_id":null,"floating_ip_ids":[]}}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_state_if_present(legacy_root.path(), &paths).unwrap();
+
+        let body = std::fs::read_to_string(paths.state_file()).unwrap();
+        assert!(body.contains("\"server_id\":999"), "{body}");
+        // Legacy file still there for operator inspection.
         assert!(legacy_dir.join(STATE_FILE).exists());
     }
 
