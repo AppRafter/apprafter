@@ -90,13 +90,48 @@ jobs:
       - name: Check whether version is already published
         id: gate
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
           TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
+          # Two-axis gate (walk-fix post-v0.1.153): a published
+          # version requires BOTH а git tag AND the image on
+          # ghcr.io. Tag-alone is insufficient — operators may
+          # accidentally push а manually-created tag (e.g. via
+          # `git tag` locally + `git push --tags`) before the
+          # workflow has had a chance to build and push. The
+          # old gate skipped в that case и left the chart
+          # pinning а phantom image tag, breaking Argo CD's
+          # argocd-repo-server pull.
+          #
+          # Default к "publish" on any uncertainty (manifest
+          # lookup error, transient ghcr 5xx) — re-publishing
+          # the same digest is idempotent on ghcr.io, but
+          # skipping а needed publish leaves the cluster
+          # broken.
+          tag_exists=false
           if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::notice::Tag ${TAG} already exists on origin. Skipping publish."
+            tag_exists=true
+          fi
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner_lc}/argocd-cue-cmp:v${VERSION}"
+          # Log in to ghcr for the manifest lookup. Public
+          # packages don't strictly require auth, but the org's
+          # cue-cmp package starts private on first push;
+          # logging in covers both shapes uniformly.
+          echo "${GH_TOKEN}" | docker login ghcr.io \
+              -u "${GITHUB_ACTOR}" --password-stdin >/dev/null
+          image_exists=false
+          if docker manifest inspect "${image}" >/dev/null 2>&1; then
+            image_exists=true
+          fi
+          if [[ "$tag_exists" == "true" && "$image_exists" == "true" ]]; then
+            echo "::notice::Both ${TAG} and ${image} exist — skipping publish."
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::Tag ${TAG} not yet on origin. Proceeding to publish."
+            echo "::notice::tag_exists=${tag_exists}, image_exists=${image_exists} — proceeding to publish."
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -240,15 +275,28 @@ jobs:
 
           Source: [\`argocd-cue-cmp/\`](https://github.com/${REPO}/tree/${TAG}/argocd-cue-cmp).
           EOF
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            gh release create "$TAG" \
-              --target "$SHA" \
-              --title "argocd-cue-cmp ${VERSION}" \
-              --notes-file "$notes_file" \
-              --prerelease
+          # Recovery path: the git tag may already exist on
+          # origin without а matching ghcr image (operator
+          # pushed а local tag eagerly before the workflow
+          # ran, gate v1 saw the tag and skipped, the image
+          # never landed). We just built and pushed the image
+          # in this run; now finalise the release. `gh release
+          # create --target` only works for non-existent tags
+          # — drop it when the tag is already there and let
+          # gh anchor the release к the existing tag's SHA.
+          # Also drop any pre-existing release entry so the
+          # re-publish overwrites cleanly.
+          release_args=()
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::Tag ${TAG} already on origin — recovering via release re-create."
+            gh release delete "$TAG" --yes 2>/dev/null || true
           else
-            gh release create "$TAG" \
-              --target "$SHA" \
-              --title "argocd-cue-cmp ${VERSION}" \
-              --notes-file "$notes_file"
+            release_args+=(--target "$SHA")
           fi
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --title "argocd-cue-cmp ${VERSION}" \
+            --notes-file "$notes_file" \
+            "${release_args[@]}"
