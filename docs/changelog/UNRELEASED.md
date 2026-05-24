@@ -13,6 +13,96 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.163 — M1.5 walk-fix #2 post-B.1.79b — `app open` surfaces kubectl stderr on early exit (2026-05-25)
+
+### Symptom
+
+After walk-fix #1 fixed the label resolution and the wizard
+found the right Service, `apprafter app open
+apprafter-landing-web` still failed — but with а maximally
+unhelpful error:
+
+```
+Error: kubectl port-forward exited before binding local port
+```
+
+No clue from the CLI **why** kubectl exited. Real cause
+could be: no ready Pods (ImagePullBackOff / CrashLoopBackOff),
+RBAC denial, kubeconfig pointing at the wrong cluster, port
+already in use on the cluster side, etc. — but the operator
+had to rerun `kubectl port-forward` manually к find out.
+
+### Root cause
+
+`commands::port_forward::wait_ready` used а silent stderr
+drainer whose only job was «keep the pipe alive so kubectl
+doesn't SIGPIPE» (the walk-fix #1 post-B.1.79 reason). It
+drained every byte to /dev/null, dropping kubectl's
+diagnostic chatter on the floor. When the ready banner never
+landed on stdout, `rx.recv()` resolved Err — and we
+hand-rolled а generic «exited before binding» message with
+no further context.
+
+### Fix
+
+Replace `spawn_silent_drainer` with
+`spawn_capturing_drainer` that records the last
+`STDERR_CAPTURE_LIMIT = 20` lines into an
+`Arc<Mutex<Vec<String>>>`. Buffer is bounded by а ring-
+eviction rule (drop oldest on each new push beyond the
+limit) — practical memory ceiling ~5 KiB, effectively zero
+for а command that spends most of its life blocked on
+`child.wait()`.
+
+`wait_ready` on the Err path now:
+
+1. Sleeps `STDERR_FLUSH_GRACE_MS = 100ms` to let the stderr
+   drainer push its last line before we read the buffer
+   (kubectl is already dead when we get the Err; the
+   drainer is just finishing its read syscall).
+2. Calls а new pure helper `format_early_exit_error(buf)`
+   that renders different messages for the empty-buffer
+   and populated-buffer cases.
+
+Populated-buffer message looks like:
+
+```
+Error: kubectl port-forward exited before binding local port.
+       kubectl stderr:
+         error: unable to forward port because pod is not running
+         current status=ContainerCreating
+```
+
+Empty-buffer message (unusual — kubectl segfaulted or was
+killed by the OS) suggests а manual repro command.
+
+### Tests
+
++4 unit tests:
+
+- `capturing_drainer_records_all_lines_under_limit` — three
+  lines, well under limit, all preserved in order.
+- `capturing_drainer_evicts_oldest_when_over_limit` — feed
+  `LIMIT + 3` lines, buffer keeps exactly `LIMIT` newest.
+- `format_early_exit_error_uses_no_output_message_when_buffer_empty`
+  — empty buffer renders the «no stderr output» message
+  with а manual-repro hint.
+- `format_early_exit_error_includes_captured_stderr` —
+  populated buffer renders captured lines verbatim, indented
+  for multi-line miette readability.
+
+Existing `silent_drainer_reads_to_eof` test deleted (the
+function it tested is gone).
+
+Total CLI suite: 192 → 195.
+
+### Bump
+
+CLI 0.1.162 → 0.1.163. Chart and cue-cmp unchanged.
+
+Both `apprafter open argocd` AND `apprafter app open` benefit
+from the improved diagnostic — they share `wait_ready`.
+
 ## v0.1.162 — M1.5 walk-fix #1 post-B.1.79b — `app open` keys off operator's label, not Argo CD's (2026-05-25)
 
 ### Symptom

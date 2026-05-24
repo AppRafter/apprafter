@@ -25,10 +25,26 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use cli_core::{CliError, Result};
+
+/// Cap on captured stderr lines в `spawn_capturing_drainer`.
+/// kubectl typically emits 1–3 stderr lines on the failure
+/// paths we care about (no Endpoints, unauthorized,
+/// unreachable kubeconfig); а small buffer keeps memory
+/// bounded for long-running success paths где stderr might
+/// stream forever.
+const STDERR_CAPTURE_LIMIT: usize = 20;
+
+/// Brief wait after `rx.recv()` resolves Err — gives the
+/// stderr drainer thread time to push its last line into the
+/// shared buffer before we read it. kubectl is already
+/// exiting когда we get the Err, the drainer is just finishing
+/// its read syscall. 100ms is plenty in practice.
+const STDERR_FLUSH_GRACE_MS: u64 = 100;
 
 /// Spawn `kubectl port-forward <target> -n <namespace>
 /// <local>:<remote>` with piped stdout/stderr (the drainer
@@ -88,11 +104,42 @@ pub fn wait_ready(child: &mut Child) -> Result<()> {
         .ok_or_else(|| CliError::Other("kubectl port-forward has no stderr".into()))?;
 
     let rx = spawn_ready_drainer(stdout);
-    spawn_silent_drainer(stderr);
+    let stderr_buf = spawn_capturing_drainer(stderr);
 
-    rx.recv().map_err(|_| {
-        CliError::Other("kubectl port-forward exited before binding local port".into())
-    })
+    match rx.recv() {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            thread::sleep(Duration::from_millis(STDERR_FLUSH_GRACE_MS));
+            Err(format_early_exit_error(&stderr_buf))
+        }
+    }
+}
+
+/// Pure helper — render the «kubectl exited early» error
+/// message, attaching captured stderr lines когда available.
+/// Walk-fix #2 post-B.1.79b: previous silent drainer
+/// swallowed kubectl's diagnostic stderr, leaving operators
+/// staring at а generic «exited before binding local port»
+/// with no clue why (image pull error? RBAC? no Endpoints?).
+fn format_early_exit_error(stderr_buf: &Arc<Mutex<Vec<String>>>) -> CliError {
+    let captured = stderr_buf.lock().unwrap();
+    if captured.is_empty() {
+        CliError::Other(
+            "kubectl port-forward exited before binding local port — and \
+             kubectl produced no stderr output. This is unusual; kubectl may \
+             have been killed by the OS, or the binary is broken. Try \
+             `kubectl port-forward svc/<name> -n <ns> 8080:80` manually to see \
+             the raw error."
+                .into(),
+        )
+    } else {
+        let text = captured.join("\n");
+        CliError::Other(format!(
+            "kubectl port-forward exited before binding local port. \
+             kubectl stderr:\n  {}",
+            text.replace('\n', "\n  ")
+        ))
+    }
 }
 
 /// Spawn a thread that reads stdout line-by-line, signals
@@ -114,20 +161,34 @@ fn spawn_ready_drainer<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<()
     rx
 }
 
-/// Spawn a thread that silently drains a pipe to EOF.
-fn spawn_silent_drainer<R: Read + Send + 'static>(reader: R) {
+/// Spawn а thread that drains а pipe to EOF AND captures
+/// the last `STDERR_CAPTURE_LIMIT` lines in а shared buffer.
+/// Walk-fix #2 post-B.1.79b — replaced the silent drainer
+/// whose only job was «keep the pipe alive»; we now also
+/// remember what was on it, so `wait_ready` can surface
+/// kubectl's actual error when the ready banner never lands.
+///
+/// The buffer is bounded by а ring-eviction rule: when full,
+/// the oldest line is dropped on each new push. Practical
+/// memory ceiling: `STDERR_CAPTURE_LIMIT × longest-stderr-
+/// line ≈ 20 × 256 bytes = 5 KiB`. Effectively zero для а
+/// command that spends most of its time blocked on
+/// `child.wait()`.
+fn spawn_capturing_drainer<R: Read + Send + 'static>(reader: R) -> Arc<Mutex<Vec<String>>> {
+    let buf = Arc::new(Mutex::new(Vec::with_capacity(STDERR_CAPTURE_LIMIT)));
+    let buf_clone = Arc::clone(&buf);
     thread::spawn(move || {
-        let mut buf = BufReader::new(reader);
-        let mut sink = Vec::with_capacity(256);
-        loop {
-            sink.clear();
-            match buf.read_until(b'\n', &mut sink) {
-                Ok(0) => break,
-                Ok(_) => continue,
-                Err(_) => break,
+        let reader = BufReader::new(reader);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let mut guard = buf_clone.lock().unwrap();
+            if guard.len() >= STDERR_CAPTURE_LIMIT {
+                guard.remove(0);
             }
+            guard.push(line);
         }
     });
+    buf
 }
 
 /// Open `url` in the operator's default browser. Cross-
@@ -228,34 +289,107 @@ mod tests {
     }
 
     #[test]
-    fn silent_drainer_reads_to_eof() {
-        let stream = b"warning A\nwarning B\nwarning C\n".to_vec();
-        let total = stream.len();
-        let consumed = Arc::new(Mutex::new(0usize));
+    fn capturing_drainer_records_all_lines_under_limit() {
+        // Three lines, well under STDERR_CAPTURE_LIMIT (20).
+        // Buffer must end up with all three в order.
+        let stream = b"error: foo\nerror: bar\nerror: baz\n".to_vec();
+        let buf = spawn_capturing_drainer(Cursor::new(stream));
 
-        struct Counter {
-            inner: Cursor<Vec<u8>>,
-            consumed: Arc<Mutex<usize>>,
-        }
-        impl Read for Counter {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let n = self.inner.read(buf)?;
-                *self.consumed.lock().unwrap() += n;
-                Ok(n)
-            }
-        }
-
-        spawn_silent_drainer(Counter {
-            inner: Cursor::new(stream),
-            consumed: Arc::clone(&consumed),
-        });
-
+        // Wait for the drainer thread to finish reading EOF.
         for _ in 0..100 {
-            if *consumed.lock().unwrap() >= total {
+            if buf.lock().unwrap().len() >= 3 {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(*consumed.lock().unwrap(), total);
+        let captured = buf.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0], "error: foo");
+        assert_eq!(captured[1], "error: bar");
+        assert_eq!(captured[2], "error: baz");
+    }
+
+    #[test]
+    fn capturing_drainer_evicts_oldest_when_over_limit() {
+        // Feed STDERR_CAPTURE_LIMIT + 3 lines; buffer keeps
+        // the last STDERR_CAPTURE_LIMIT — oldest 3 dropped.
+        let mut stream = Vec::new();
+        for i in 0..(STDERR_CAPTURE_LIMIT + 3) {
+            stream.extend(format!("line {i}\n").bytes());
+        }
+        let buf = spawn_capturing_drainer(Cursor::new(stream));
+
+        for _ in 0..100 {
+            if buf.lock().unwrap().len() >= STDERR_CAPTURE_LIMIT {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Drainer may briefly hold more than limit during
+        // push-then-evict; give it а moment to settle.
+        thread::sleep(Duration::from_millis(50));
+
+        let captured = buf.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            STDERR_CAPTURE_LIMIT,
+            "buffer must stay bounded; got {} lines",
+            captured.len()
+        );
+        // Oldest line ("line 0") dropped; newest must be
+        // present.
+        assert_eq!(captured.first().unwrap(), "line 3");
+        assert_eq!(
+            captured.last().unwrap(),
+            &format!("line {}", STDERR_CAPTURE_LIMIT + 2)
+        );
+    }
+
+    #[test]
+    fn format_early_exit_error_uses_no_output_message_when_buffer_empty() {
+        // No stderr captured — operator sees the generic
+        // hint pointing к manual port-forward. Walk-fix #2
+        // covers the case where the buffer carries content;
+        // this test pins the empty path so future refactors
+        // don't conflate it.
+        let buf = Arc::new(Mutex::new(Vec::<String>::new()));
+        let err = format_early_exit_error(&buf);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no stderr output"),
+            "empty-buffer error must say so explicitly; got: {msg}"
+        );
+        assert!(
+            msg.contains("kubectl port-forward svc/"),
+            "must hint at manual repro command; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_early_exit_error_includes_captured_stderr() {
+        // Walk-fix #2 regression guard. The diagnostic must
+        // surface kubectl's actual error verbatim — operator
+        // shouldn't have to rerun manually to find out why.
+        let buf = Arc::new(Mutex::new(vec![
+            "error: unable to forward port because pod is not running".to_string(),
+            "current status=ContainerCreating".to_string(),
+        ]));
+        let err = format_early_exit_error(&buf);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pod is not running"),
+            "captured first stderr line must appear in error; got: {msg}"
+        );
+        assert!(
+            msg.contains("ContainerCreating"),
+            "captured second stderr line must appear in error; got: {msg}"
+        );
+        // Indented continuation lines are easier to scan when
+        // the error renders в multi-line `miette` format.
+        assert!(
+            msg.contains("\n  "),
+            "multi-line error should indent continuation lines for readability; \
+             got: {msg}"
+        );
     }
 }
