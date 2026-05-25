@@ -13,6 +13,126 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.166 — M1.5 Track B.1.79b Part 2 — runtime detection primitives (2026-05-25)
+
+### What
+
+Second deliverable of the §1.79b CLI app ergonomics sub-
+phase. New pure module `commands::runtime_detect` provides
+filesystem-marker → runtime mapping (per plan.md §1.79b
+table) с confidence levels, ready для Part 3's scaffold
+flow к consume.
+
+### Surface
+
+```rust
+pub enum Runtime {
+    Bun, NodePnpm, NodeYarn, NodeNpm,
+    PythonPoetry, PythonUv, PythonPipenv, PythonPip,
+    Rust, Go, Docker, Blank,
+}
+
+pub enum Confidence { Fallback, Low, Medium, High }
+
+pub struct Detection {
+    pub runtime: Runtime,
+    pub confidence: Confidence,
+    pub marker: Option<String>,  // which file / section triggered match
+}
+
+pub fn detect_runtimes(dir: &Path) -> Vec<Detection>
+```
+
+Marker evaluation order (stable): bun.lock(b) → pnpm-lock.
+yaml → yarn.lock → package-lock.json → bare package.json
+(Medium) → pyproject.toml `[tool.poetry]` → pyproject.toml
+`[tool.uv]` OR uv.lock → Pipfile → bare requirements.txt
+(Medium, skipped когда stronger Python marker fired) →
+Cargo.toml → go.mod → Dockerfile (Low, ONLY когда nothing
+else matched) → Blank fallback.
+
+Multi-stack monorepos (e.g. cwd с bun.lock alongside Cargo.
+toml) surface multiple High entries — Part 3 wizard prompts
+the operator, defaulting к first alphabetically per plan.md.
+
+### Confidence semantics (caller contract)
+
+- `High` — lockfile present. Part 3 auto-selects в non-
+  interactive mode unless multiple Highs collide.
+- `Medium` — primary marker без lockfile (bare package.json
+  / requirements.txt). Prompt even в `--auto` mode.
+- `Low` — weak signal (Dockerfile alone). Always prompt с
+  list of all runtimes.
+- `Fallback` — no markers; only Blank candidate.
+
+### Design notes
+
+- **Pure** — никаких subprocess'ов, никаких сетевых
+  обращений. Tests drive every branch с `tempfile::tempdir()`
+  fixtures (instant).
+- **pyproject.toml content** parsed via text-grep for
+  `[tool.poetry]` / `[tool.uv]` section headers — avoids
+  pulling в а TOML parser for two string tokens.
+- **`requirements.txt` precedence** — skipped when poetry/
+  uv/pipenv already matched (common pattern: poetry-managed
+  project ships а side-channel requirements.txt for tools
+  that don't grok poetry; не misclassify as bare-pip).
+- **Docker precedence** — Dockerfile alongside а runtime
+  lockfile is ignored (operator's bun + Dockerfile = bun
+  app, не docker app). Docker entry only emitted when
+  NOTHING else matched (Low).
+- **Directory-vs-file guard** — `file_exists` uses
+  `is_file()` so а directory accidentally named
+  `Dockerfile/` или `package.json/` (build-artefact
+  directories) doesn't misclassify.
+- **`#![allow(dead_code)]`** at module scope until Part 3
+  wires the consumers — public surface intentionally
+  future-consumed; remove когда Part 3 lands.
+
+### Tests
+
++21 fixture-based unit tests, all using `tempfile::tempdir`
+for hermetic isolation:
+
+- `slug_is_kebab_case_for_every_variant` — load-bearing,
+  templates are named `<slug>.cue.hbs`.
+- `detects_bun_via_lockfile` / `detects_bun_via_legacy_lockb`
+  — modern + legacy bun lockfile shapes.
+- `detects_pnpm_only_when_pnpm_lock_present` /
+  `detects_yarn_only_when_yarn_lock_present` /
+  `detects_npm_when_package_lock_present` — per-manager
+  lockfile recognition.
+- `bare_package_json_defaults_to_npm_with_medium_confidence`
+  — bare package.json fallback.
+- `lockfile_priority_beats_bare_package_json` — bun.lock +
+  package.json yields bun only (no duplicate npm Medium).
+- `detects_python_poetry_from_pyproject_section` /
+  `detects_python_uv_from_pyproject_section` /
+  `detects_python_uv_from_lockfile_when_pyproject_lacks_marker`
+  — Python managers via content section + lockfile.
+- `detects_pipenv_from_pipfile` /
+  `bare_requirements_txt_is_pip_only_without_stronger_python_signal`
+  /
+  `requirements_txt_skipped_when_poetry_already_matched` —
+  pip precedence rules.
+- `detects_rust_from_cargo_toml` / `detects_go_from_go_mod`
+  — compiled runtimes.
+- `detects_docker_only_as_last_resort_when_alone` /
+  `dockerfile_alongside_lockfile_does_not_add_docker_entry`
+  — Docker is Low and only когда nothing else matched.
+- `empty_dir_falls_back_to_blank` — fallback path.
+- `multi_stack_monorepo_surfaces_all_matches` — bun + rust
+  side-by-side; both High entries surface.
+- `ignores_directories_named_like_markers` — defensive
+  guard against weird build-output layouts.
+
+Total CLI suite: 205 → 226.
+
+### Bump
+
+CLI 0.1.165 → 0.1.166. Chart and cue-cmp unchanged. Part 3
+(templates + scaffold flow) lands in а follow-up.
+
 ## v0.1.165 — M1.5 walk-fix #4 post-B.1.79b — Cargo.lock + bun-smoke sync с v0.1.164 (2026-05-25)
 
 ### Symptom
