@@ -1,0 +1,758 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//! `apprafter app scaffold` — generate а starter
+//! `apprafter/Application.cue` based on the cwd's runtime
+//! markers. Track B.1.79b Part 3.
+//!
+//! Two templates live в `cli/platform-cli/templates/
+//! application/` and embed in the binary via `include_str!`:
+//!
+//!   * `default.cue.hbs` — used for every runtime that the
+//!     detector could pin (Bun, Node-{pnpm,yarn,npm},
+//!     Python-{poetry,uv,pipenv,pip}, Rust, Go, Docker).
+//!     Runtime-specific bits (primary port, display name,
+//!     slug) come from а small registry.
+//!   * `blank.cue.hbs` — used when the detector returned
+//!     `Blank/Fallback`. Every field carries а TODO; no
+//!     runtime-hint comments.
+//!
+//! Template engine is а straight `{{name}}` substitution
+//! pass — no conditionals, no loops, no escaping. The vars
+//! set is fixed AND known по template-content review, so the
+//! «no `{{` remains after substitution» sanity check at the
+//! end of `render_template` reliably catches typo-в-template
+//! bugs without false positives.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use cli_core::{CliError, Result};
+
+use crate::commands::runtime_detect::{detect_runtimes, Runtime};
+
+const DEFAULT_TEMPLATE: &str = include_str!("../../templates/application/default.cue.hbs");
+const BLANK_TEMPLATE: &str = include_str!("../../templates/application/blank.cue.hbs");
+
+/// Default destination namespace for scaffolded manifests.
+/// Mirrors `apprafter app add`'s `--namespace` default (walk-
+/// fix #12 post-B.1.79a) so the scaffolded manifest и the
+/// Argo CD parent CR agree out of the box.
+pub const DEFAULT_NAMESPACE: &str = "apprafter";
+
+/// Per-runtime defaults baked into the template. The `slug`
+/// must match the `Runtime::slug()` value (load-bearing for
+/// the `--runtime <slug>` flag round-trip).
+pub struct RuntimeDefaults {
+    pub primary_port: u16,
+    pub display: &'static str,
+    pub slug: &'static str,
+}
+
+/// Per-runtime defaults. Plan.md §1.79b «Runtime detection»
+/// table: bun/node = 3000, python = 8000, rust/go = 8080,
+/// docker = 8080, blank = 8080 (placeholder).
+pub fn defaults_for(runtime: Runtime) -> RuntimeDefaults {
+    match runtime {
+        Runtime::Bun => RuntimeDefaults {
+            primary_port: 3000,
+            display: "Bun",
+            slug: "bun",
+        },
+        Runtime::NodePnpm => RuntimeDefaults {
+            primary_port: 3000,
+            display: "Node.js (pnpm)",
+            slug: "node-pnpm",
+        },
+        Runtime::NodeYarn => RuntimeDefaults {
+            primary_port: 3000,
+            display: "Node.js (yarn)",
+            slug: "node-yarn",
+        },
+        Runtime::NodeNpm => RuntimeDefaults {
+            primary_port: 3000,
+            display: "Node.js (npm)",
+            slug: "node-npm",
+        },
+        Runtime::PythonPoetry => RuntimeDefaults {
+            primary_port: 8000,
+            display: "Python (poetry)",
+            slug: "python-poetry",
+        },
+        Runtime::PythonUv => RuntimeDefaults {
+            primary_port: 8000,
+            display: "Python (uv)",
+            slug: "python-uv",
+        },
+        Runtime::PythonPipenv => RuntimeDefaults {
+            primary_port: 8000,
+            display: "Python (pipenv)",
+            slug: "python-pipenv",
+        },
+        Runtime::PythonPip => RuntimeDefaults {
+            primary_port: 8000,
+            display: "Python (pip)",
+            slug: "python-pip",
+        },
+        Runtime::Rust => RuntimeDefaults {
+            primary_port: 8080,
+            display: "Rust",
+            slug: "rust",
+        },
+        Runtime::Go => RuntimeDefaults {
+            primary_port: 8080,
+            display: "Go",
+            slug: "go",
+        },
+        Runtime::Docker => RuntimeDefaults {
+            primary_port: 8080,
+            display: "Docker",
+            slug: "docker",
+        },
+        Runtime::Blank => RuntimeDefaults {
+            primary_port: 8080,
+            display: "blank",
+            slug: "blank",
+        },
+    }
+}
+
+/// Pure template engine — substitutes `{{key}}` → value for
+/// every entry in `vars`. Refuses to return when any `{{...}}`
+/// remains after substitution (caught typo in а template's
+/// placeholder name OR forgotten variable). String-based
+/// `replace` is sufficient for our tiny templates — no
+/// conditionals, no nesting, no escaping.
+pub fn render_template(template: &str, vars: &BTreeMap<&str, String>) -> Result<String> {
+    let mut out = template.to_string();
+    for (key, value) in vars {
+        let placeholder = format!("{{{{{key}}}}}");
+        out = out.replace(&placeholder, value);
+    }
+    if let Some(idx) = out.find("{{") {
+        let end = (idx + 30).min(out.len());
+        return Err(CliError::Other(format!(
+            "template renderer left an unsubstituted placeholder near `{}` \
+             — likely а typo in а template `{{{{key}}}}` или а variable \
+             missing from the scaffold callsite.",
+            &out[idx..end]
+        )));
+    }
+    Ok(out)
+}
+
+/// Pure helper — `my-app-name` → `myAppName`. Used to derive
+/// the CUE binding identifier from the app's DNS-1123 name.
+/// CUE identifiers must start с а letter; we lower-case-
+/// первый character to keep idiomatic CUE style (`appName:`
+/// not `AppName:`).
+pub fn kebab_to_camel(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut capitalise_next = false;
+    for (idx, c) in name.chars().enumerate() {
+        if c == '-' || c == '_' {
+            capitalise_next = true;
+        } else if capitalise_next {
+            out.extend(c.to_uppercase());
+            capitalise_next = false;
+        } else if idx == 0 {
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    if out.is_empty() {
+        "app".to_string()
+    } else {
+        out
+    }
+}
+
+/// Pure helper — render а complete Application.cue body for
+/// the given `runtime`/`app_name`/`namespace`. Tests cover
+/// every runtime through this entry point.
+pub fn render_application(runtime: Runtime, app_name: &str, namespace: &str) -> Result<String> {
+    let defaults = defaults_for(runtime);
+    let camel = kebab_to_camel(app_name);
+    let image = format!("ghcr.io/REPLACE-ME/{app_name}:latest");
+    let port = defaults.primary_port.to_string();
+
+    let mut vars: BTreeMap<&str, String> = BTreeMap::new();
+    vars.insert("app_name", app_name.to_string());
+    vars.insert("app_name_camel", camel);
+    vars.insert("namespace", namespace.to_string());
+    vars.insert("primary_port", port);
+    vars.insert("runtime_display", defaults.display.to_string());
+    vars.insert("runtime_slug", defaults.slug.to_string());
+    vars.insert("image_placeholder", image);
+
+    let template = if runtime == Runtime::Blank {
+        BLANK_TEMPLATE
+    } else {
+        DEFAULT_TEMPLATE
+    };
+    render_template(template, &vars)
+}
+
+/// Options surface для `apprafter app scaffold`. Mirrors the
+/// clap arg shape в `cli::AppCommand::Scaffold`.
+#[derive(Debug, Clone)]
+pub struct ScaffoldOpts {
+    /// Force-pick а runtime instead of detecting from cwd
+    /// markers. `Runtime::slug` round-trip — `--runtime bun`
+    /// resolves to `Runtime::Bun`.
+    pub runtime: Option<Runtime>,
+
+    /// Application name. Default = cwd basename (validated
+    /// DNS-1123).
+    pub name: Option<String>,
+
+    /// Destination namespace for `metadata.namespace`.
+    /// Default = `DEFAULT_NAMESPACE`.
+    pub namespace: Option<String>,
+
+    /// Working directory the scaffold writes into. Resolves
+    /// the `apprafter/Application.cue` path under it.
+    pub path: PathBuf,
+
+    /// Overwrite an existing `apprafter/Application.cue`
+    /// (without — refuse и exit error).
+    pub force: bool,
+}
+
+/// Resolve runtime from explicit override OR detection. When
+/// detection surfaces multiple Highs (или а Medium/Low/
+/// Fallback) AND no explicit override, error out with а
+/// clear hint pointing к the `--runtime <slug>` flag —
+/// interactive prompt belongs к the wizard step в Part 3b's
+/// `app add` integration, not the standalone command.
+fn resolve_runtime(opts: &ScaffoldOpts) -> Result<Runtime> {
+    if let Some(r) = opts.runtime {
+        return Ok(r);
+    }
+    let detections = detect_runtimes(&opts.path);
+    let highs: Vec<Runtime> = detections
+        .iter()
+        .filter(|d| d.confidence == crate::commands::runtime_detect::Confidence::High)
+        .map(|d| d.runtime)
+        .collect();
+
+    match highs.as_slice() {
+        [single] => Ok(*single),
+        [] => {
+            let detected = detections
+                .iter()
+                .map(|d| format!("{} ({:?})", d.runtime.slug(), d.confidence))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CliError::Other(format!(
+                "Runtime auto-detection was inconclusive (matches: {detected}). \
+                 Pass `--runtime <slug>` к pick one explicitly. Available slugs: \
+                 bun, node-pnpm, node-yarn, node-npm, python-poetry, python-uv, \
+                 python-pipenv, python-pip, rust, go, docker, blank."
+            )))
+        }
+        many => {
+            let slugs: Vec<&'static str> = many.iter().map(|r| r.slug()).collect();
+            Err(CliError::Other(format!(
+                "Multiple runtimes detected at high confidence ({}). Pass \
+                 `--runtime <slug>` к pick one explicitly.",
+                slugs.join(", ")
+            )))
+        }
+    }
+}
+
+/// Resolve app name from explicit override OR cwd basename.
+/// DNS-1123 validation applies к both paths.
+fn resolve_app_name(opts: &ScaffoldOpts) -> Result<String> {
+    let name = if let Some(n) = &opts.name {
+        n.clone()
+    } else {
+        opts.path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "app".to_string())
+    };
+    validate_dns_1123(&name)?;
+    Ok(name)
+}
+
+fn validate_dns_1123(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(CliError::Other("app name must not be empty".into()));
+    }
+    if name.len() > 63 {
+        return Err(CliError::Other(
+            "app name must be 1-63 characters (DNS-1123)".into(),
+        ));
+    }
+    let ok = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !ok {
+        return Err(CliError::Other(format!(
+            "app name '{name}' is not DNS-1123 (lower-case [a-z0-9-], no \
+             leading/trailing dash). Pass `--name <name>` к override the \
+             cwd-derived default."
+        )));
+    }
+    Ok(())
+}
+
+/// Match `--runtime <slug>` к `Runtime`. Returns `None` для
+/// unknown slugs; caller turns that into а clap-side error
+/// before reaching `scaffold`.
+pub fn parse_runtime_slug(slug: &str) -> Option<Runtime> {
+    match slug {
+        "bun" => Some(Runtime::Bun),
+        "node-pnpm" => Some(Runtime::NodePnpm),
+        "node-yarn" => Some(Runtime::NodeYarn),
+        "node-npm" => Some(Runtime::NodeNpm),
+        "python-poetry" => Some(Runtime::PythonPoetry),
+        "python-uv" => Some(Runtime::PythonUv),
+        "python-pipenv" => Some(Runtime::PythonPipenv),
+        "python-pip" => Some(Runtime::PythonPip),
+        "rust" => Some(Runtime::Rust),
+        "go" => Some(Runtime::Go),
+        "docker" => Some(Runtime::Docker),
+        "blank" => Some(Runtime::Blank),
+        _ => None,
+    }
+}
+
+/// Entry point for `apprafter app scaffold`. Resolves the
+/// runtime and app name, renders the template, writes к the
+/// target `apprafter/Application.cue` file, and appends а
+/// `.apprafter/local/` ignore line к the repo's `.gitignore`
+/// when it isn't already listed (best-effort).
+pub fn scaffold(opts: ScaffoldOpts) -> Result<()> {
+    let runtime = resolve_runtime(&opts)?;
+    let name = resolve_app_name(&opts)?;
+    let namespace = opts
+        .namespace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+
+    let apprafter_dir = opts.path.join("apprafter");
+    let target_file = apprafter_dir.join("Application.cue");
+
+    if target_file.exists() && !opts.force {
+        return Err(CliError::Other(format!(
+            "{} already exists. Pass `--force` к overwrite, or edit the \
+             existing manifest in place.",
+            target_file.display()
+        )));
+    }
+
+    std::fs::create_dir_all(&apprafter_dir)
+        .map_err(|e| CliError::Other(format!("create {}: {e}", apprafter_dir.display())))?;
+
+    let rendered = render_application(runtime, &name, &namespace)?;
+    std::fs::write(&target_file, &rendered)
+        .map_err(|e| CliError::Other(format!("write {}: {e}", target_file.display())))?;
+
+    let gitignore_updated = append_to_gitignore(&opts.path, ".apprafter/local/").unwrap_or(false);
+
+    println!("✓ Scaffolded {}", target_file.display());
+    println!(
+        "  Runtime:   {} ({})",
+        defaults_for(runtime).display,
+        runtime.slug()
+    );
+    println!("  Name:      {name}");
+    println!("  Namespace: {namespace}");
+    if gitignore_updated {
+        println!("  .gitignore: appended `.apprafter/local/`");
+    }
+    println!();
+    println!("Next steps:");
+    println!(
+        "  1. Edit {} — replace `REPLACE-ME` in the image ref, tune ports.",
+        target_file.display()
+    );
+    println!("  2. Commit + push к your git remote.");
+    println!("  3. `apprafter app add` to register с Argo CD (from the same directory).");
+
+    Ok(())
+}
+
+/// Append `line` к `<dir>/.gitignore` if the file exists AND
+/// doesn't already contain that line. Returns Ok(true) when
+/// the file was modified, Ok(false) когда the entry was
+/// already present OR no .gitignore exists. Errors return
+/// `false` к the caller (non-fatal — scaffold should still
+/// succeed even if .gitignore is read-only).
+fn append_to_gitignore(dir: &Path, line: &str) -> std::io::Result<bool> {
+    let path = dir.join(".gitignore");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&path)?;
+    if content.lines().any(|l| l.trim() == line) {
+        return Ok(false);
+    }
+    let suffix = if content.ends_with('\n') { "" } else { "\n" };
+    let new = format!("{content}{suffix}{line}\n");
+    std::fs::write(&path, new)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn render_template_substitutes_known_keys() {
+        let tpl = "name: {{name}}, port: {{port}}";
+        let mut vars = BTreeMap::new();
+        vars.insert("name", "myapp".to_string());
+        vars.insert("port", "3000".to_string());
+        let out = render_template(tpl, &vars).unwrap();
+        assert_eq!(out, "name: myapp, port: 3000");
+    }
+
+    #[test]
+    fn render_template_handles_repeated_placeholder() {
+        let tpl = "{{name}}-{{name}}";
+        let mut vars = BTreeMap::new();
+        vars.insert("name", "x".to_string());
+        assert_eq!(render_template(tpl, &vars).unwrap(), "x-x");
+    }
+
+    #[test]
+    fn render_template_errors_on_unsubstituted_placeholder() {
+        // Catches typo-в-template bugs at render time
+        // instead of leaking literal `{{foo}}` into the
+        // operator's filesystem.
+        let tpl = "name: {{name}}, missing: {{forgot_to_add}}";
+        let mut vars = BTreeMap::new();
+        vars.insert("name", "ok".to_string());
+        let err = render_template(tpl, &vars).unwrap_err();
+        assert!(
+            err.to_string().contains("unsubstituted placeholder"),
+            "error must explicitly call out the unsubstituted placeholder; got: {err}"
+        );
+    }
+
+    #[test]
+    fn kebab_to_camel_basic() {
+        assert_eq!(kebab_to_camel("my-app"), "myApp");
+        assert_eq!(kebab_to_camel("landing-web"), "landingWeb");
+        assert_eq!(kebab_to_camel("a-b-c-d"), "aBCD");
+    }
+
+    #[test]
+    fn kebab_to_camel_single_segment() {
+        assert_eq!(kebab_to_camel("app"), "app");
+        assert_eq!(kebab_to_camel("payments"), "payments");
+    }
+
+    #[test]
+    fn kebab_to_camel_treats_underscore_same_as_dash() {
+        // Defensive: operators occasionally type snake_case
+        // for app names. DNS-1123 rejects underscores at
+        // validation time, but если the helper is called с
+        // pre-validation input it shouldn't panic.
+        assert_eq!(kebab_to_camel("my_app"), "myApp");
+    }
+
+    #[test]
+    fn kebab_to_camel_empty_input_returns_app() {
+        assert_eq!(kebab_to_camel(""), "app");
+    }
+
+    #[test]
+    fn defaults_for_every_runtime_has_unique_slug() {
+        let runtimes = [
+            Runtime::Bun,
+            Runtime::NodePnpm,
+            Runtime::NodeYarn,
+            Runtime::NodeNpm,
+            Runtime::PythonPoetry,
+            Runtime::PythonUv,
+            Runtime::PythonPipenv,
+            Runtime::PythonPip,
+            Runtime::Rust,
+            Runtime::Go,
+            Runtime::Docker,
+            Runtime::Blank,
+        ];
+        let mut slugs: Vec<&'static str> = runtimes.iter().map(|r| defaults_for(*r).slug).collect();
+        slugs.sort_unstable();
+        let pre_dedup_len = slugs.len();
+        slugs.dedup();
+        assert_eq!(
+            pre_dedup_len,
+            slugs.len(),
+            "defaults_for slugs must be unique; got duplicates"
+        );
+
+        // AND each defaults.slug must round-trip через
+        // parse_runtime_slug — load-bearing для `--runtime
+        // <slug>` flag.
+        for r in runtimes {
+            let slug = defaults_for(r).slug;
+            assert_eq!(
+                parse_runtime_slug(slug),
+                Some(r),
+                "slug `{slug}` must round-trip к its Runtime variant"
+            );
+        }
+    }
+
+    #[test]
+    fn render_application_renders_every_runtime_cleanly() {
+        // Every runtime must produce non-empty output, must
+        // contain the app name + namespace + primary port,
+        // and must NOT leak unsubstituted placeholders.
+        let runtimes = [
+            Runtime::Bun,
+            Runtime::NodePnpm,
+            Runtime::NodeYarn,
+            Runtime::NodeNpm,
+            Runtime::PythonPoetry,
+            Runtime::PythonUv,
+            Runtime::PythonPipenv,
+            Runtime::PythonPip,
+            Runtime::Rust,
+            Runtime::Go,
+            Runtime::Docker,
+            Runtime::Blank,
+        ];
+        for r in runtimes {
+            let out = render_application(r, "my-app", "apprafter")
+                .unwrap_or_else(|e| panic!("render failed для {r:?}: {e}"));
+            assert!(out.contains("\"my-app\""), "{r:?}: missing app name");
+            assert!(
+                out.contains("namespace: \"apprafter\""),
+                "{r:?}: missing namespace"
+            );
+            assert!(out.contains("myApp"), "{r:?}: missing CUE binding ident");
+            assert!(
+                !out.contains("{{"),
+                "{r:?}: unsubstituted placeholder leaked"
+            );
+
+            let port = defaults_for(r).primary_port.to_string();
+            assert!(
+                out.contains(&format!("port: {port}")),
+                "{r:?}: rendered output missing port {port}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_application_blank_uses_blank_template() {
+        let out = render_application(Runtime::Blank, "x", "apprafter").unwrap();
+        assert!(
+            out.contains("blank template"),
+            "Blank runtime should pick BLANK_TEMPLATE which mentions 'blank template'"
+        );
+    }
+
+    #[test]
+    fn render_application_default_template_has_runtime_display() {
+        let out = render_application(Runtime::Bun, "x", "apprafter").unwrap();
+        assert!(
+            out.contains("Bun"),
+            "default template должен carry runtime display name; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn validate_dns_1123_accepts_well_formed() {
+        assert!(validate_dns_1123("my-app").is_ok());
+        assert!(validate_dns_1123("payments").is_ok());
+        assert!(validate_dns_1123("a").is_ok());
+        assert!(validate_dns_1123("app1").is_ok());
+    }
+
+    #[test]
+    fn validate_dns_1123_rejects_uppercase_underscore_dashes() {
+        assert!(validate_dns_1123("MyApp").is_err());
+        assert!(validate_dns_1123("my_app").is_err());
+        assert!(validate_dns_1123("-leading").is_err());
+        assert!(validate_dns_1123("trailing-").is_err());
+        assert!(validate_dns_1123("").is_err());
+    }
+
+    #[test]
+    fn parse_runtime_slug_round_trip() {
+        assert_eq!(parse_runtime_slug("bun"), Some(Runtime::Bun));
+        assert_eq!(
+            parse_runtime_slug("python-poetry"),
+            Some(Runtime::PythonPoetry)
+        );
+        assert_eq!(parse_runtime_slug("rust"), Some(Runtime::Rust));
+        assert_eq!(parse_runtime_slug("blank"), Some(Runtime::Blank));
+        assert_eq!(parse_runtime_slug("BUN"), None);
+        assert_eq!(parse_runtime_slug("unknown"), None);
+    }
+
+    #[test]
+    fn scaffold_writes_application_cue_and_creates_apprafter_dir() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+        let opts = ScaffoldOpts {
+            runtime: None, // detect should pick Rust
+            name: Some("my-rust-app".to_string()),
+            namespace: None,
+            path: dir.path().to_path_buf(),
+            force: false,
+        };
+        scaffold(opts).unwrap();
+
+        let target = dir.path().join("apprafter").join("Application.cue");
+        assert!(target.is_file(), "scaffold должен create the target file");
+        let content = fs::read_to_string(&target).unwrap();
+        assert!(content.contains("my-rust-app"));
+        assert!(content.contains("port: 8080")); // rust default
+        assert!(content.contains("Rust"));
+    }
+
+    #[test]
+    fn scaffold_refuses_overwrite_without_force() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::create_dir(dir.path().join("apprafter")).unwrap();
+        fs::write(
+            dir.path().join("apprafter").join("Application.cue"),
+            "existing\n",
+        )
+        .unwrap();
+
+        let opts = ScaffoldOpts {
+            runtime: Some(Runtime::Rust),
+            name: Some("x".to_string()),
+            namespace: None,
+            path: dir.path().to_path_buf(),
+            force: false,
+        };
+        let err = scaffold(opts).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // Existing file untouched.
+        let content =
+            fs::read_to_string(dir.path().join("apprafter").join("Application.cue")).unwrap();
+        assert_eq!(content, "existing\n");
+    }
+
+    #[test]
+    fn scaffold_force_overwrites_existing() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::create_dir(dir.path().join("apprafter")).unwrap();
+        fs::write(
+            dir.path().join("apprafter").join("Application.cue"),
+            "existing\n",
+        )
+        .unwrap();
+
+        let opts = ScaffoldOpts {
+            runtime: Some(Runtime::Rust),
+            name: Some("x".to_string()),
+            namespace: None,
+            path: dir.path().to_path_buf(),
+            force: true,
+        };
+        scaffold(opts).unwrap();
+        let content =
+            fs::read_to_string(dir.path().join("apprafter").join("Application.cue")).unwrap();
+        assert!(!content.starts_with("existing"));
+        assert!(content.contains("\"x\""));
+    }
+
+    #[test]
+    fn scaffold_appends_gitignore_entry_when_absent() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+
+        let opts = ScaffoldOpts {
+            runtime: Some(Runtime::Rust),
+            name: Some("x".to_string()),
+            namespace: None,
+            path: dir.path().to_path_buf(),
+            force: false,
+        };
+        scaffold(opts).unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            content.contains(".apprafter/local/"),
+            "scaffold должен append the local-state ignore; got:\n{content}"
+        );
+        // Original entries still there.
+        assert!(content.contains("target/"));
+        assert!(content.contains("node_modules/"));
+    }
+
+    #[test]
+    fn scaffold_does_not_double_append_existing_gitignore_entry() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            dir.path().join(".gitignore"),
+            "target/\n.apprafter/local/\n",
+        )
+        .unwrap();
+
+        let opts = ScaffoldOpts {
+            runtime: Some(Runtime::Rust),
+            name: Some("x".to_string()),
+            namespace: None,
+            path: dir.path().to_path_buf(),
+            force: false,
+        };
+        scaffold(opts).unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let count = content.matches(".apprafter/local/").count();
+        assert_eq!(count, 1, "scaffold должен not duplicate gitignore entries");
+    }
+
+    #[test]
+    fn scaffold_errors_on_inconclusive_runtime_detection_without_override() {
+        // Empty dir → only Blank/Fallback. No High match;
+        // requires explicit --runtime для standalone scaffold
+        // (Part 3b's wizard will prompt).
+        let dir = tempdir().unwrap();
+        let opts = ScaffoldOpts {
+            runtime: None,
+            name: Some("x".to_string()),
+            namespace: None,
+            path: dir.path().to_path_buf(),
+            force: false,
+        };
+        let err = scaffold(opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--runtime <slug>"),
+            "error must point к the override flag; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn scaffold_errors_on_multi_high_runtime_detection_without_override() {
+        // bun + Cargo.toml → two Highs. Refuses к pick для
+        // operator; requires explicit --runtime.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("bun.lock"), "").unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+        let opts = ScaffoldOpts {
+            runtime: None,
+            name: Some("x".to_string()),
+            namespace: None,
+            path: dir.path().to_path_buf(),
+            force: false,
+        };
+        let err = scaffold(opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Multiple runtimes"), "error: {msg}");
+        assert!(msg.contains("bun"));
+        assert!(msg.contains("rust"));
+    }
+}

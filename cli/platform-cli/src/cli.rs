@@ -554,6 +554,36 @@ pub enum AppCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Generate а starter `apprafter/Application.cue` based
+    /// on the cwd's runtime markers (bun.lock / Cargo.toml /
+    /// pyproject.toml / etc.). Writes to `<--path>/apprafter/
+    /// Application.cue` and appends `.apprafter/local/` к the
+    /// repo's `.gitignore` when present. Refuses к overwrite
+    /// an existing manifest without `--force`. Track B.1.79b
+    /// Part 3.
+    Scaffold {
+        /// Force-pick а runtime instead of detecting from
+        /// cwd. Slugs: bun, node-pnpm, node-yarn, node-npm,
+        /// python-poetry, python-uv, python-pipenv, python-
+        /// pip, rust, go, docker, blank.
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Application name (DNS-1123 lowercase). Default =
+        /// cwd basename.
+        #[arg(long)]
+        name: Option<String>,
+        /// Destination namespace для `metadata.namespace`.
+        /// Default `apprafter` matches `app add --namespace`.
+        #[arg(long = "namespace")]
+        namespace: Option<String>,
+        /// Working directory the scaffold writes into.
+        /// Default = current cwd.
+        #[arg(long, default_value = ".")]
+        path: std::path::PathBuf,
+        /// Overwrite an existing `apprafter/Application.cue`.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Port-forward the app's primary Service to localhost and
     /// open it in а browser. Wraps `kubectl port-forward` with
     /// AppRafter-aware resolution: Application name → Argo CD

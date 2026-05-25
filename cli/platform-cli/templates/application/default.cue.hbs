@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: FSL-1.1-MIT
+// AppRafter Application manifest scaffolded by `apprafter
+// app scaffold` (runtime preset: {{runtime_display}}).
+//
+// Review each block and tune before committing — the scaffold
+// is а starting point, not а finished spec. The CMP plugin
+// renders this file at sync time; `cue vet ./apprafter/...`
+// catches typos locally before you push.
+
+package apprafter
+
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+{{app_name_camel}}: v1alpha1.#Application & {
+	metadata: {
+		// DNS-1123 lowercase. Free to rename — the
+		// scaffold pulls this from the directory you ran
+		// `apprafter app scaffold` in.
+		name: "{{app_name}}"
+
+		// Namespace the AppRafter operator watches and
+		// where Argo CD applies the rendered Deployment +
+		// Service. Matches the default `apprafter app add
+		// --namespace` value; override if you've carved
+		// out а tenant-specific namespace.
+		namespace: "{{namespace}}"
+
+		labels: {
+			"apprafter.io/runtime":   "{{runtime_slug}}"
+			"apprafter.io/component": "user-app"
+		}
+	}
+
+	spec: base: {
+		// TODO: replace `REPLACE-ME` with your registry
+		// owner / org, and pin а concrete tag once your CI
+		// publishes the image. The CMP plugin doesn't pull
+		// the image — that's kubelet's job; the tag must
+		// already exist in the registry by the time Argo CD
+		// syncs, or pods land in `ImagePullBackOff`.
+		image: "{{image_placeholder}}"
+
+		// Start с а single replica; scale once you have
+		// observed load. The operator handles rolling
+		// updates automatically.
+		replicas: 1
+
+		expose: {
+			// Container port the {{runtime_display}} app
+			// listens on. Defaults к {{primary_port}} for
+			// {{runtime_display}} apps; override if your
+			// process binds elsewhere.
+			port: {{primary_port}}
+
+			// Internal-only until you're ready to expose
+			// publicly. Flip к `true` + uncomment
+			// `network: "public"` below + add а `hostname`
+			// label on metadata when ready; the Gateway
+			// API HTTPRoute is rendered by the operator
+			// automatically once those three line up.
+			public: false
+
+			// network: "public"  // also accepts "internal" / "vpn"
+		}
+
+		// Literal env values only в v1alpha1. Secret /
+		// ConfigMap references land в 4.x with OpenBao and
+		// 2.x with ResourceClaim respectively. Uncomment
+		// and replace placeholders when needed:
+		//
+		// env: {
+		//     "LOG_LEVEL": "info"
+		//     "APP_PORT":  "{{primary_port}}"
+		// }
+	}
+
+	// Per-environment overrides — CUE unification merges the
+	// chosen environment onto `spec.base` at render time
+	// (`APPRAFTER_ENV=dev` / `=prod`). Uncomment and tune as
+	// you grow beyond а single environment:
+	//
+	// spec: environments: {
+	//     dev: {
+	//         replicas: 1
+	//         expose: public: false
+	//     }
+	//     prod: {
+	//         replicas: 3
+	//         // expose: { public: true, network: "public" }
+	//     }
+	// }
+}

@@ -31,14 +31,11 @@
 //! repo root) get all matches surfaced; the caller's prompt
 //! shows them and picks default alphabetically per plan.md.
 //!
-//! `#![allow(dead_code)]` at module scope: Part 2 ships the
-//! detection primitives as а standalone landable; Part 3
-//! (`apprafter app scaffold` + scaffold wizard step в `app
-//! add`) wires the consumers. Until then, clippy's
-//! `-D dead-code` would reject the public surface даже though
-//! it's intentionally future-consumed. Remove the allow
-//! once Part 3 lands.
-#![allow(dead_code)]
+//! Part 3 (`app_scaffold` module + `apprafter app scaffold`
+//! command) is now the primary consumer; the wizard step в
+//! `apprafter app add` lands в Part 3b. Module-level
+//! `#![allow(dead_code)]` removed at Part 3 landing — every
+//! exported item now has а real call-site.
 
 use std::path::Path;
 
@@ -80,14 +77,6 @@ impl Runtime {
             Runtime::Docker => "docker",
             Runtime::Blank => "blank",
         }
-    }
-
-    /// Human-readable display for the `inquire::Select`
-    /// prompt's option labels. Currently same as slug but
-    /// reserved for future "Bun · TypeScript runtime" style
-    /// expansion without breaking flag values.
-    pub const fn display_name(self) -> &'static str {
-        self.slug()
     }
 }
 

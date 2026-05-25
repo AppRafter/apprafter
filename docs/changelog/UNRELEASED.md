@@ -13,6 +13,178 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.167 — M1.5 Track B.1.79b Part 3 — `apprafter app scaffold` (2026-05-25)
+
+### What
+
+Third deliverable of §1.79b. New `apprafter app scaffold`
+generates а starter `apprafter/Application.cue` based on the
+cwd's runtime markers, consuming Part 2's detection module и
+two embedded templates. Operators with а fresh repo get а
+valid Application.cue с runtime-appropriate defaults in one
+command, instead of hand-writing the CRD shape.
+
+### Surface
+
+```
+apprafter app scaffold
+    [--runtime <slug>]           # override detection; slugs: bun,
+                                 # node-pnpm, node-yarn, node-npm,
+                                 # python-poetry, python-uv,
+                                 # python-pipenv, python-pip,
+                                 # rust, go, docker, blank
+    [--name <name>]              # default = cwd basename (DNS-1123)
+    [--namespace <ns>]           # default = "apprafter" (matches
+                                 # `app add --namespace`)
+    [--path <path>]              # default = "." (write target dir)
+    [--force]                    # overwrite existing manifest
+```
+
+Sample run:
+
+```
+$ cd my-rust-service && apprafter app scaffold
+
+✓ Scaffolded my-rust-service/apprafter/Application.cue
+  Runtime:    Rust (rust)
+  Name:       my-rust-service
+  Namespace:  apprafter
+  .gitignore: appended `.apprafter/local/`
+
+Next steps:
+  1. Edit Application.cue — replace `REPLACE-ME` in the image
+     ref, tune ports.
+  2. Commit + push к your git remote.
+  3. `apprafter app add` to register с Argo CD.
+```
+
+### Resolution chain
+
+1. **Runtime** — explicit `--runtime <slug>` wins; otherwise
+   `runtime_detect::detect_runtimes(path)`. Detection failure
+   modes (zero High, multiple High, only Medium/Low/Fallback)
+   error out с pointer к `--runtime <slug>` flag. Interactive
+   prompt deferred к Part 3b (`app add` wizard integration).
+2. **App name** — explicit `--name` wins; otherwise canonicalised
+   `<path>` basename. DNS-1123 validation applies к both
+   paths.
+3. **Namespace** — explicit `--namespace` wins; otherwise
+   `DEFAULT_NAMESPACE = "apprafter"` (mirrors walk-fix #12
+   `app add --namespace` default — scaffolded manifest и
+   Argo CD parent CR agree out of the box).
+
+### Template engine
+
+Pure `{{key}}` substitution pass — no conditionals, no
+loops, no escaping. Vars set is fixed (`app_name`,
+`app_name_camel`, `namespace`, `primary_port`,
+`runtime_display`, `runtime_slug`, `image_placeholder`); the
+«no `{{` remains after substitution» sanity check at the end
+of `render_template` catches typo-в-template OR missing-var
+bugs without false positives.
+
+`kebab_to_camel("my-app")` → `"myApp"` for the CUE binding
+identifier; empty input returns `"app"` к keep the rendered
+manifest valid even на edge cases.
+
+### Templates
+
+Two `.cue.hbs` files embedded в the binary via `include_str!`:
+
+- `default.cue.hbs` — every non-Blank runtime. Renders
+  metadata + spec.base.{image, replicas, expose} с inline
+  comments mentioning `{{runtime_display}}` и
+  `{{primary_port}}`. v1alpha1 fields only (no `resources` /
+  `healthcheck` yet — those land в 1.7c+).
+- `blank.cue.hbs` — Blank/Fallback runtime. Identical shape
+  но every field carries а TODO comment; no runtime hint.
+
+Per-runtime port defaults baked into `defaults_for`: bun /
+node-* = 3000, python-* = 8000, rust / go / docker / blank
+= 8080. Matches plan.md §1.79b Runtime detection table.
+
+### `.gitignore` append
+
+Best-effort append of `.apprafter/local/` к `<path>/
+.gitignore` (only when the file exists и the line isn't
+already present). Non-fatal — scaffold succeeds even on
+read-only repos. Idempotent — re-running doesn't duplicate.
+
+### Tests
+
++21 new unit tests on pure helpers и scaffold integration
+(all `tempfile::tempdir()`-based для hermetic isolation):
+
+- `render_template_substitutes_known_keys` /
+  `render_template_handles_repeated_placeholder` /
+  `render_template_errors_on_unsubstituted_placeholder` —
+  engine happy path + repeated subs + typo-detection.
+- `kebab_to_camel_basic` /
+  `kebab_to_camel_single_segment` /
+  `kebab_to_camel_treats_underscore_same_as_dash` /
+  `kebab_to_camel_empty_input_returns_app` — name
+  transformation.
+- `defaults_for_every_runtime_has_unique_slug` — load-bearing
+  invariant (slug must round-trip к Runtime variant и stay
+  unique).
+- `render_application_renders_every_runtime_cleanly` —
+  parameterised loop over all 12 runtimes; asserts non-empty
+  output, correct app name / namespace / port / camel ident,
+  no leaked placeholders.
+- `render_application_blank_uses_blank_template` /
+  `render_application_default_template_has_runtime_display`
+  — template selection branch.
+- `validate_dns_1123_accepts_well_formed` /
+  `validate_dns_1123_rejects_uppercase_underscore_dashes` —
+  name validation surface.
+- `parse_runtime_slug_round_trip` — `--runtime <slug>` →
+  `Runtime` mapping happy + uppercase rejection + unknown
+  rejection.
+- `scaffold_writes_application_cue_and_creates_apprafter_dir`
+  — happy E2E с tempdir fixture, asserts file written с
+  correct content.
+- `scaffold_refuses_overwrite_without_force` — pre-existing
+  manifest preserved.
+- `scaffold_force_overwrites_existing` — `--force` honoured.
+- `scaffold_appends_gitignore_entry_when_absent` /
+  `scaffold_does_not_double_append_existing_gitignore_entry`
+  — gitignore append idempotency.
+- `scaffold_errors_on_inconclusive_runtime_detection_without_override`
+  /
+  `scaffold_errors_on_multi_high_runtime_detection_without_override`
+  — failure modes route к `--runtime` flag hint.
+
+Total CLI suite: 226 → 247. Bun gate: 87/0 unchanged.
+
+Smoke verified — scaffolded output passes `cue vet` inside
+the apprafter monorepo (where `cue.mod/module.cue` exposes
+the `apprafter.io/schemas/v1alpha1` import path).
+
+### Cleanup
+
+`#![allow(dead_code)]` removed from `runtime_detect.rs` —
+every exported item now has а real call-site через
+`app_scaffold` consumer.
+
+### What's deferred к Part 3b
+
+- Scaffold flow integration into `apprafter app add` wizard
+  (step 0: check для `apprafter/Application.cue`, prompt
+  «Generate one?» on missing). Standalone `scaffold` ships
+  first; the `app add` step lands as а follow-up.
+- Interactive runtime picker когда detection is inconclusive
+  (uses `inquire::Select`). Currently errors с pointer к
+  `--runtime`.
+- `--lang ru|en` flag для template comments. English-only
+  ships now; Russian variant deferred.
+- `examples/applications/` reference manifests + docs
+  updates (`docs/user-guide/cli/app-scaffold.md`,
+  quickstart). Deferred к Part 4.
+
+### Bump
+
+CLI 0.1.166 → 0.1.167. Chart and cue-cmp unchanged.
+
 ## v0.1.166 — M1.5 Track B.1.79b Part 2 — runtime detection primitives (2026-05-25)
 
 ### What

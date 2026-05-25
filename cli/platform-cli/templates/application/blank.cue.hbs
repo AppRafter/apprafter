@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: FSL-1.1-MIT
+// AppRafter Application manifest scaffolded by `apprafter
+// app scaffold` (blank template — runtime auto-detection
+// surfaced no markers).
+//
+// Every field below carries а TODO; fill them in before
+// committing. The CMP plugin renders this file at sync
+// time, so `cue vet ./apprafter/...` will catch typos
+// locally.
+
+package apprafter
+
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+{{app_name_camel}}: v1alpha1.#Application & {
+	metadata: {
+		// TODO: DNS-1123 lowercase name. Free to rename.
+		name: "{{app_name}}"
+
+		// TODO: namespace the AppRafter operator watches.
+		// Match `apprafter app add --namespace` (default
+		// `apprafter`) unless you've carved out а tenant-
+		// specific namespace.
+		namespace: "{{namespace}}"
+
+		labels: {
+			"apprafter.io/component": "user-app"
+		}
+	}
+
+	spec: base: {
+		// TODO: OCI registry reference. The CMP plugin
+		// doesn't pull the image — kubelet does. Pin к а
+		// concrete tag that already exists in the registry,
+		// or your pods land в `ImagePullBackOff`.
+		image: "{{image_placeholder}}"
+
+		// TODO: replica count. Start с 1; scale once you
+		// have observed load.
+		replicas: 1
+
+		expose: {
+			// TODO: container port your app listens on.
+			port: {{primary_port}}
+
+			// TODO: flip к `true` and add а `hostname`
+			// label on metadata when ready к expose
+			// publicly.
+			public: false
+		}
+
+		// TODO: env map. Literal values only in v1alpha1.
+		// env: {
+		//     "LOG_LEVEL": "info"
+		// }
+	}
+
+	// TODO: per-environment overrides.
+	// spec: environments: {
+	//     dev:  { replicas: 1 }
+	//     prod: { replicas: 3 }
+	// }
+}

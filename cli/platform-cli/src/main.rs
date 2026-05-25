@@ -149,6 +149,33 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 container_port,
                 no_browser,
             } => commands::app_open::open(&name, port, container_port, no_browser)?,
+            AppCommand::Scaffold {
+                runtime,
+                name,
+                namespace,
+                path,
+                force,
+            } => {
+                let resolved_runtime = match runtime {
+                    Some(slug) => Some(
+                        commands::app_scaffold::parse_runtime_slug(&slug).ok_or_else(|| {
+                            cli_core::CliError::Other(format!(
+                                "unknown runtime slug '{slug}'. Valid: bun, node-pnpm, \
+                                 node-yarn, node-npm, python-poetry, python-uv, \
+                                 python-pipenv, python-pip, rust, go, docker, blank."
+                            ))
+                        })?,
+                    ),
+                    None => None,
+                };
+                commands::app_scaffold::scaffold(commands::app_scaffold::ScaffoldOpts {
+                    runtime: resolved_runtime,
+                    name,
+                    namespace,
+                    path,
+                    force,
+                })?
+            }
             AppCommand::Remove {
                 name,
                 yes,
