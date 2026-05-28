@@ -13,6 +13,129 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.171 — M1.5 walk-fix #3 post-B.1.79b-Part-3b — scaffold drops CUE import (2026-05-28)
+
+### Symptom
+
+After walk-fix #2 unblocked the absolute-path issue,
+operator's procvue-landing app hit the next CMP failure:
+
+```
+ComparisonError
+Failed to load target state: ... plugin sidecar failed.
+error generating manifests: `sh -c /usr/local/bin/entrypoint.sh`
+failed exit status 1: ::cue-cmp:: CUE compile failed:
+import failed: imports are unavailable because there is no
+cue.mod/module.cue file:
+./apprafter/Application.cue:13:8
+```
+
+### Root cause
+
+Part 3's scaffold templates emitted:
+
+```cue
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+landing: v1alpha1.#Application & { ... }
+```
+
+CUE resolves imports against `cue.mod/module.cue` (module
+manifest) + `cue.mod/pkg/<path>/` (vendored modules).
+**Inside the apprafter monorepo** оба artefacts present —
+that's why `landing/web/apprafter/Application.cue` worked
+end-to-end. User app repos scaffolded fresh have neither;
+CUE refuses к resolve the import и CMP fails.
+
+Two paths к а fix:
+
+- **Long-term (deferred)**: CMP image bundles AppRafter
+  schemas; entrypoint.sh symlinks them into
+  `cue.mod/pkg/apprafter.io/schemas` before running `cue
+  export`. Keeps typed CUE everywhere; ships through cue-
+  cmp image + chart bump + publish workflow.
+- **Short-term (this walk-fix)**: scaffold templates emit
+  untyped CUE — no `import`, no schema constraint.
+  Works against vanilla CMP without any module setup;
+  trade-off is loss of local `cue vet` static type
+  checking, но Argo CD's CRD validation остаётся
+  authoritative at apply time so typos still surface.
+
+The long-term fix lands in а follow-up walk-fix (cue-cmp
+image bump). This walk-fix unblocks operators immediately.
+
+### Fix
+
+Both `default.cue.hbs` и `blank.cue.hbs` updated:
+
+- `import v1alpha1 "apprafter.io/schemas/v1alpha1"` line
+  dropped.
+- `{{app_name_camel}}: v1alpha1.#Application & {` changed к
+  `{{app_name_camel}}: {`.
+- `apiVersion` + `kind` set explicitly inside the struct
+  (was implicit from the schema's `#TypeMeta`).
+- Header comment updated к explain the trade-off и point
+  forward к the «add cue.mod yourself if you want local
+  vet» path.
+
+Resulting rendered manifest:
+
+```cue
+package apprafter
+
+landing: {
+    apiVersion: "apprafter.io/v1alpha1"
+    kind:       "Application"
+    metadata: { name: "landing", namespace: "apprafter", ... }
+    spec: base: { image: "...", replicas: 1, expose: { ... } }
+}
+```
+
+`cue export ./apprafter/...` from а repo with NO
+`cue.mod/module.cue` now produces valid JSON for CMP к
+ship к Argo CD's apiserver, which validates against the
+AppRafter CRD as usual.
+
+### Verified smoke
+
+```
+$ mkdir /tmp/no-mod-test && cd /tmp/no-mod-test && touch Cargo.toml
+$ apprafter app scaffold --name smoke --runtime rust
+$ cue export ./apprafter/...
+{ "smoke": { "apiVersion": "apprafter.io/v1alpha1", ... } }
+```
+
+End-to-end smoke without `cue.mod` works — render is byte-
+identical к what CMP's `cue export` produces in production.
+
+### Existing apps
+
+Operators с existing scaffolded apps need к either:
+
+1. Re-scaffold (`rm apprafter/Application.cue; apprafter
+   app scaffold --force`) и push the updated file.
+2. Or manually drop the `import` line и change `v1alpha1.
+   #Application & { ... }` к plain `{ apiVersion:
+   "apprafter.io/v1alpha1", kind: "Application", ... }`.
+
+The walk-fix's templates are byte-identical к option (2) so
+either path produces the same result.
+
+### Tests
+
+Existing 274 tests unchanged — assertions on
+`render_application` output checked: app name quoted in
+metadata.name, namespace, CUE binding ident
+(`{{app_name_camel}}`), no unsubstituted `{{`, port —
+ALL still present и pass через the untyped templates.
+Bun gate: 87/0 unchanged.
+
+### Bump
+
+CLI 0.1.171. Chart and cue-cmp unchanged. Long-term schema-
+resolution walk-fix bumps cue-cmp + chart separately когда
+it ships.
+
 ## v0.1.170 — M1.5 walk-fix #2 post-B.1.79b-Part-3b — `path is absolute` + cred-hint polish (2026-05-28)
 
 ### Symptoms
