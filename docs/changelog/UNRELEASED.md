@@ -13,6 +13,164 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.173 — M1.5 walk-fix #5 post-B.1.79b-Part-3b — scaffold vendors schemas as CUE module (2026-05-29)
+
+### Reframe (again)
+
+Walk-fix #4 inlined the v1alpha1 schema directly into the
+scaffolded `Application.cue` body для typed validation
+without external setup. Operator pushed back: if scaffold
+already creates an `apprafter/` directory, vendoring the
+schemas as а proper CUE module under that directory is
+cleaner — Application.cue stays free of «framework code»,
+schema definitions live в their own files, and the layout
+mirrors how CUE projects vendor deps idiomatically.
+
+Right call. Inline schema was а compromise; vendored
+module is the natural shape.
+
+### What ships
+
+Scaffold output is now а full mini-CUE-module:
+
+```
+apprafter/
+├── Application.cue                                          (operator's binding — typed via import)
+└── cue.mod/
+    ├── module.cue                                           (local module manifest)
+    └── pkg/
+        └── apprafter.io/
+            └── schemas/
+                └── v1alpha1/
+                    ├── types.cue                            (vendored)
+                    └── application.cue                      (vendored)
+```
+
+`Application.cue` returns к the typed-with-import form:
+
+```cue
+package apprafter
+
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+landing: v1alpha1.#Application & {
+    metadata: { name: "landing", namespace: "apprafter", ... }
+    spec: base: { image: "...", replicas: 1, expose: { ... } }
+}
+```
+
+CUE walks up from `Application.cue`, finds `cue.mod/`,
+resolves `apprafter.io/schemas/v1alpha1` к the vendored
+package. Works locally + in CMP без external setup OR
+network calls.
+
+### Embed mechanics
+
+Two `include_str!` constants compile the schema source files
+into the CLI binary at build time:
+
+```rust
+const SCHEMA_TYPES_CUE: &str = include_str!("../../../../schemas/v1alpha1/types.cue");
+const SCHEMA_APPLICATION_CUE: &str = include_str!("../../../../schemas/v1alpha1/application.cue");
+```
+
+Cargo's `include_str!` tracks these as build dependencies —
+cargo rebuilds the CLI when `schemas/v1alpha1/` source
+changes, so the vendored copy can never silently lag the
+real CRD shape.
+
+New `write_vendored_cue_module(&apprafter_dir)` creates the
+`cue.mod/` tree:
+
+- `cue.mod/module.cue` — pinned к CUE language v0.10.0,
+  module path `apprafter.io/local-app` (neutral string;
+  has к differ from the imported path so CUE's resolver
+  treats the import as а dependency lookup, not а self-
+  reference).
+- `cue.mod/pkg/apprafter.io/schemas/v1alpha1/types.cue` —
+  vendored copy of source.
+- `cue.mod/pkg/apprafter.io/schemas/v1alpha1/application.cue`
+  — vendored copy of source.
+
+### `cue vet` from inside
+
+CUE's module resolution walks up from the **working
+directory**, not from the source file's path. The scaffold's
+final-step hint reflects this:
+
+```
+Next steps:
+  1. Edit /path/to/repo/apprafter/Application.cue — replace `REPLACE-ME` ...
+  2. Optional: typed-validate locally —
+       cd /path/to/repo/apprafter && cue vet ./...
+     The vendored schemas resolve the `apprafter.io/schemas/
+     v1alpha1` import без any `cue mod tidy` step.
+  3. Commit + push к your git remote.
+  4. `apprafter app add` to register с Argo CD (from the same directory).
+```
+
+CMP runs `cue export` from inside `apprafter/` via the
+existing discover script, so it picks up the cue.mod tree
+naturally.
+
+### Verified smoke
+
+```
+$ apprafter app scaffold --path /tmp/smoke --name landing --runtime docker
+$ cd /tmp/smoke/apprafter && cue vet ./...
+# (quiet — typed validation succeeds)
+
+# Out-of-range value caught:
+$ sed -i 's/replicas: 1/replicas: -7/' Application.cue
+$ cue vet ./...
+landing.spec.base.replicas: invalid value -7 (out of bound >=0):
+    ./cue.mod/pkg/apprafter.io/schemas/v1alpha1/application.cue:46:19
+    ./Application.cue:49:13
+
+# Typo caught:
+$ sed -i 's/port: 8080/porrt: 8080/' Application.cue
+$ cue vet ./...
+landing.spec.base.expose.porrt: field not allowed:
+    ./Application.cue:56:4
+```
+
+Error messages point at the vendored schema source for
+out-of-range constraints, giving the operator а clear «what
+constraint did I trip» trail.
+
+### Existing apps
+
+Operators rerunning scaffold с `--force` get the new layout:
+typed import + cue.mod tree. The inline-schema layout from
+v0.1.172 can stay в place if the operator hasn't re-scaffold-
+ed yet — both produce byte-identical `cue export` output,
+so CMP / Argo CD don't care which version generated the
+file. Re-scaffold at convenience.
+
+### Tests
+
++2 new fixture-based unit tests:
+
+- `scaffold_writes_cue_mod_module_and_vendored_schemas` —
+  asserts `cue.mod/module.cue` + both vendored schema files
+  exist в the expected path после scaffold.
+- `scaffold_vendored_schemas_match_embedded_source_byte_for_byte`
+  — load-bearing identity check; if а refactor accidentally
+  diverges the vendored copy from the embedded source, the
+  typed-vet contract breaks silently and this test fires.
+
+Existing 274 tests pass unchanged; the
+`scaffold_writes_application_cue_and_creates_apprafter_dir`
+test gained two extra assertions verifying the typed
+`import v1alpha1` line и `v1alpha1.#Application & {`
+constraint are present (would have caught accidental
+template regression). Total CLI suite: 274 → 276. Bun
+gate: 87/0.
+
+### Bump
+
+CLI 0.1.172 → 0.1.173. Chart and cue-cmp unchanged.
+
 ## v0.1.172 — M1.5 walk-fix #4 post-B.1.79b-Part-3b — scaffold inlines schema for typed validation (2026-05-28)
 
 ### Reframe
