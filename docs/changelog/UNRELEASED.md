@@ -13,6 +13,141 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.170 — M1.5 walk-fix #2 post-B.1.79b-Part-3b — `path is absolute` + cred-hint polish (2026-05-28)
+
+### Symptoms
+
+Operator ran v0.1.169's `apprafter app add` end-to-end и hit
+three operator-facing rough edges:
+
+1. **`app path is absolute`** — Argo CD's apiserver refused
+   the rendered Application CR с:
+   ```
+   ComparisonError
+   Failed to load target state: ... Manifest generation error:
+   /: app path is absolute
+   ```
+   Cause: wizard's path default «/» (our internal «whole
+   repo» idiom) was emitted verbatim into `spec.source.path`,
+   which Argo CD validates as relative-к-repo-root и
+   rejects absolute values.
+
+2. **`url-prefix` unclear** — walk-fix #1's cred-hint
+   printed а generic template:
+   ```
+   apprafter repo creds add <name> --url-prefix <prefix> --token <pat>
+   ```
+   Operator legitimately asked: «What's the url-prefix? Can
+   you derive it from the repo URL?»
+
+3. **No PAT-creation link** — для а private repo, operator
+   has к hunt для GitHub's PAT page on their own. Trivial
+   но annoying friction.
+
+### Fixes
+
+**Fix A — normalise `spec.source.path`**
+
+New pure helper `normalise_argocd_source_path(path) ->
+String` runs at manifest-build time:
+
+- `"/"` / empty / whitespace → `"."`.
+- `"/landing/web"` → `"landing/web"` (strip leading slash).
+- `"."`, `"landing/web"`, `"./apps/x"` → unchanged.
+
+`build_application_manifest` now calls it before populating
+`spec.source.path`. Wizard's UI default stays «/» для
+familiarity; the normalisation lives at the apiserver-
+contract boundary. Existing operators rerunning `app add`
+get а valid CR; the prior absolute-path failure won't
+recur.
+
+For their existing broken CR, the one-liner fix is:
+
+```
+kubectl -n argocd patch applications.argoproj.io <name> \
+    --type=merge -p '{"spec":{"source":{"path":"."}}}'
+```
+
+**Fix B — auto-derive cred-hint defaults**
+
+New pure helper `derive_creds_suggestion(repo_url) ->
+Option<CredsSuggestion>`. Parses HTTPS URLs into:
+
+- `suggested_name` — `<host-slug>-<org-slug>` (e.g.
+  `github-procvue`, `gitlab-acme`, `gitea-team` для self-
+  hosted).
+- `url_prefix` — `https://<host>/<org>` (org-level — one
+  PAT covers every repo в the org).
+- `pat_creation_url` — provider-specific PAT-creation page
+  с pre-filled scopes; `Some(...)` для github.com /
+  gitlab.com, `None` otherwise.
+
+**Fix C — provider PAT-creation links**
+
+GitHub: `https://github.com/settings/tokens/new?scopes=
+repo,read:packages&description=AppRafter%20<org>` — covers
+both code access (Argo CD) and image pulls (kubelet
+through ghcr.io) с the classic-PAT shape the operator
+asked about.
+
+GitLab: `https://gitlab.com/-/user_settings/personal_access_
+tokens?name=AppRafter+<org>&scopes=read_repository,
+read_registry`.
+
+Self-hosted Gitea / Forgejo / Bitbucket Server → no link
+(too varied), just the `repo creds add` template with
+pre-filled name + prefix.
+
+Resulting hint (the user's procvue-landing scenario):
+
+```
+ℹ Repo has no matching credentials in Argo CD.
+  If https://github.com/ProcVue/landing is private:
+    1. Generate а PAT here:
+       https://github.com/settings/tokens/new?scopes=repo,read:packages&description=AppRafter%20procvue
+       Required scopes: `repo` for code; add `read:packages`
+       if your CI publishes container images к the same provider.
+    2. Register it с AppRafter:
+       apprafter repo creds add github-procvue --url-prefix https://github.com/ProcVue --token <paste-the-pat>
+  Public repos can ignore this.
+```
+
+### Tests
+
++9 new unit tests:
+
+- `normalise_argocd_source_path_translates_slash_to_dot` /
+  `_strips_leading_slash` /
+  `_preserves_dot_and_relative_paths` — path normalisation
+  surface (3 cases each).
+- `build_application_manifest_normalises_slash_path_to_dot`
+  — end-to-end regression guard на the actual manifest
+  shape Argo CD will see.
+- `derive_creds_suggestion_github_full_shape` — happy GitHub
+  path: org-level prefix, kebab cred name, PAT URL с
+  required scopes.
+- `derive_creds_suggestion_gitlab_full_shape` — happy GitLab
+  path: PAT URL points at `user_settings/personal_access_
+  tokens` с `read_repository,read_registry`.
+- `derive_creds_suggestion_unknown_provider_omits_pat_url`
+  — self-hosted Gitea / Forgejo / etc. yield name + prefix
+  без а PAT link.
+- `derive_creds_suggestion_rejects_non_https_urls` /
+  `_rejects_malformed_urls` — defensive paths.
+
+Existing `build_application_manifest_carries_project_and_
+revision` updated к assert `"p"` (post-normalisation) instead
+of `"/p"`. Total CLI suite: 265 → 274. Bun gate: 87/0
+unchanged.
+
+### Bump
+
+CLI 0.1.169 → 0.1.170. Chart and cue-cmp unchanged.
+Operators rerunning `apprafter app add` after upgrade get
+the path normalisation automatically; existing apps need а
+one-line `kubectl patch` (см. Fix A above).
+
 ## v0.1.169 — M1.5 walk-fix #1 post-B.1.79b-Part-3b — scaffold UX polish (2026-05-28)
 
 ### Symptoms

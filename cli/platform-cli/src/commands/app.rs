@@ -204,25 +204,17 @@ pub fn add(
     Ok(())
 }
 
-/// Post-register cred check (Fix 3 walk-fix post-Part-3b).
+/// Post-register cred check (walk-fix #1 + #2 post-Part-3b).
 /// `git ls-remote` succeeds locally on private repos when the
 /// operator's user-side git is authenticated, но Argo CD's
 /// repo-server has its own credential store; an unmatched
-/// private repo lands in а sync failure later. After
-/// successful registration, scan Argo CD's repo-creds
-/// (`argocd.argoproj.io/secret-type=repo-creds`) for any
-/// whose `data.url` is а prefix of `repo_url`; warn если none
-/// matches AND the URL is HTTPS (private-likely heuristic).
+/// private repo lands в а sync failure later. Walk-fix #2
+/// adds auto-derived defaults (cred name, URL prefix at org
+/// level) и а PAT-creation URL для GitHub / GitLab so the
+/// operator doesn't hunt для it.
 ///
-/// Best-effort — failure to fetch secrets prints а quiet
-/// debug-style warning, не fail the command. Operator sees:
-///
-/// ```
-/// ℹ Repo has no matching credentials in Argo CD.
-///   If https://github.com/... is private, run:
-///     apprafter repo creds add <name> --url-prefix <prefix> ...
-///   before Argo CD attempts to sync.
-/// ```
+/// Best-effort — failure к fetch secrets prints nothing, не
+/// fail the command.
 fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
     if !repo_url.starts_with("https://") {
         // Only HTTPS triggers the warning — git@ / ssh://
@@ -238,11 +230,90 @@ fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
     if any_secret_url_is_prefix_of(&secrets, repo_url) {
         return;
     }
+
+    let suggestion = derive_creds_suggestion(repo_url);
+
     println!();
     println!("ℹ Repo has no matching credentials in Argo CD.");
-    println!("  If {repo_url} is private, run:");
-    println!("    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>");
-    println!("  before Argo CD attempts to sync (public repos can ignore this).");
+    println!("  If {repo_url} is private:");
+
+    if let Some(ref s) = suggestion {
+        if let Some(ref pat_url) = s.pat_creation_url {
+            println!("    1. Generate а PAT here:");
+            println!("       {pat_url}");
+            println!("       Required scopes: `repo` for code; add `read:packages`");
+            println!("       if your CI publishes container images к the same provider.");
+            println!("    2. Register it с AppRafter:");
+            println!(
+                "       apprafter repo creds add {} --url-prefix {} --token <paste-the-pat>",
+                s.suggested_name, s.url_prefix
+            );
+        } else {
+            println!(
+                "    apprafter repo creds add {} --url-prefix {} --token <pat>",
+                s.suggested_name, s.url_prefix
+            );
+        }
+    } else {
+        println!("    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>");
+    }
+    println!("  Public repos can ignore this.");
+}
+
+/// Surface for the walk-fix #2 hint — auto-derived defaults
+/// from а Git HTTPS URL. Pure-fn tests cover every supported
+/// provider shape, plus the generic fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredsSuggestion {
+    /// Suggested cred-secret name — DNS-1123. e.g.
+    /// `github-procvue`, `gitlab-acme`.
+    pub suggested_name: String,
+    /// URL prefix the operator should pass к `--url-prefix`.
+    /// Org-level so one PAT covers every repo в the org.
+    pub url_prefix: String,
+    /// Pre-filled PAT-creation URL (provider-specific). None
+    /// для unknown providers — operator still gets the
+    /// `repo creds add` template, just без the link.
+    pub pat_creation_url: Option<String>,
+}
+
+/// Derive cred-add hint values from а repo URL. Recognises
+/// `github.com` и `gitlab.com`; everything else falls
+/// through к а generic «host-org» name + org-level prefix
+/// heuristic.
+pub(crate) fn derive_creds_suggestion(repo_url: &str) -> Option<CredsSuggestion> {
+    let rest = repo_url.strip_prefix("https://")?;
+    let mut iter = rest.split('/');
+    let host = iter.next()?;
+    let org = iter.next()?;
+    if host.is_empty() || org.is_empty() {
+        return None;
+    }
+
+    let url_prefix = format!("https://{host}/{org}");
+    let host_slug = host.split('.').next().unwrap_or(host).to_ascii_lowercase();
+    let org_slug = org.to_ascii_lowercase();
+    let suggested_name = format!("{host_slug}-{org_slug}");
+
+    let pat_creation_url = match host {
+        "github.com" => Some(format!(
+            "https://github.com/settings/tokens/new\
+             ?scopes=repo,read:packages\
+             &description=AppRafter%20{org_slug}",
+        )),
+        "gitlab.com" => Some(format!(
+            "https://gitlab.com/-/user_settings/personal_access_tokens\
+             ?name=AppRafter+{org_slug}\
+             &scopes=read_repository,read_registry",
+        )),
+        _ => None,
+    };
+
+    Some(CredsSuggestion {
+        suggested_name,
+        url_prefix,
+        pat_creation_url,
+    })
 }
 
 /// Pure helper — does any secret's decoded `data.url` field
@@ -1274,6 +1345,7 @@ pub(crate) fn build_application_manifest(
     project: &str,
     destination_namespace: &str,
 ) -> Value {
+    let normalised_path = normalise_argocd_source_path(path);
     json!({
         "apiVersion": "argoproj.io/v1alpha1",
         "kind": "Application",
@@ -1291,7 +1363,7 @@ pub(crate) fn build_application_manifest(
             "project": project,
             "source": {
                 "repoURL": repo_url,
-                "path": path,
+                "path": normalised_path,
                 "targetRevision": target_revision,
             },
             "destination": {
@@ -1310,6 +1382,27 @@ pub(crate) fn build_application_manifest(
             },
         },
     })
+}
+
+/// Pure helper — translate AppRafter-side path conventions
+/// (`/`, empty, leading `/`) to Argo CD's `spec.source.path`
+/// shape (relative-к-repo-root). Walk-fix #2 post-Part-3b:
+/// our wizard documented `/` as the «whole repo» idiom, but
+/// Argo CD's apiserver validates `spec.source.path` as а
+/// relative path и rejects absolute values with `app path is
+/// absolute`. Map at the boundary so the wizard UX stays
+/// familiar и the stored CR remains valid.
+pub(crate) fn normalise_argocd_source_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return ".".to_string();
+    }
+    let stripped = trimmed.trim_start_matches('/');
+    if stripped.is_empty() {
+        ".".to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 fn apply_application_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
@@ -1628,6 +1721,112 @@ mod tests {
     }
 
     #[test]
+    fn normalise_argocd_source_path_translates_slash_to_dot() {
+        // Walk-fix #2 post-Part-3b — Argo CD rejects «/»
+        // (absolute) but the wizard's documented default is
+        // «/». Map at the manifest-build boundary.
+        assert_eq!(normalise_argocd_source_path("/"), ".");
+        assert_eq!(normalise_argocd_source_path(""), ".");
+        assert_eq!(normalise_argocd_source_path("   "), ".");
+    }
+
+    #[test]
+    fn normalise_argocd_source_path_strips_leading_slash() {
+        // Operator typing `--path /landing/web` is а common
+        // muscle-memory shape; translate к relative-form
+        // automatically.
+        assert_eq!(normalise_argocd_source_path("/landing/web"), "landing/web");
+        assert_eq!(normalise_argocd_source_path("landing/web"), "landing/web");
+    }
+
+    #[test]
+    fn normalise_argocd_source_path_preserves_dot_and_relative_paths() {
+        assert_eq!(normalise_argocd_source_path("."), ".");
+        assert_eq!(normalise_argocd_source_path("./apps/x"), "./apps/x");
+        assert_eq!(normalise_argocd_source_path("apps/x"), "apps/x");
+    }
+
+    #[test]
+    fn build_application_manifest_normalises_slash_path_to_dot() {
+        // Regression guard для the walk-fix — the operator's
+        // procvue-landing CR had `path: "/"` and Argo CD
+        // surfaced «app path is absolute». build_application_
+        // manifest must emit «.» whenever the wizard hands us
+        // «/».
+        let m = build_application_manifest(
+            "test-app",
+            "https://github.com/foo/bar",
+            "main",
+            "/",
+            "apps",
+            "apprafter",
+        );
+        assert_eq!(
+            m.pointer("/spec/source/path").and_then(Value::as_str),
+            Some(".")
+        );
+    }
+
+    #[test]
+    fn derive_creds_suggestion_github_full_shape() {
+        // Walk-fix #2: GitHub URL → org-level prefix, kebab
+        // cred name, и pre-filled PAT-creation URL с the
+        // required scopes.
+        let s = derive_creds_suggestion("https://github.com/ProcVue/landing")
+            .expect("github URL must yield а suggestion");
+        assert_eq!(s.suggested_name, "github-procvue");
+        assert_eq!(s.url_prefix, "https://github.com/ProcVue");
+        let pat_url = s.pat_creation_url.expect("github PAT URL");
+        assert!(pat_url.starts_with("https://github.com/settings/tokens/new"));
+        assert!(pat_url.contains("scopes=repo,read:packages"));
+        assert!(pat_url.contains("AppRafter%20procvue"));
+    }
+
+    #[test]
+    fn derive_creds_suggestion_gitlab_full_shape() {
+        let s = derive_creds_suggestion("https://gitlab.com/acme/app")
+            .expect("gitlab URL must yield а suggestion");
+        assert_eq!(s.suggested_name, "gitlab-acme");
+        assert_eq!(s.url_prefix, "https://gitlab.com/acme");
+        let pat_url = s.pat_creation_url.expect("gitlab PAT URL");
+        assert!(
+            pat_url.starts_with("https://gitlab.com/-/user_settings/personal_access_tokens"),
+            "{pat_url}"
+        );
+        assert!(pat_url.contains("read_repository"));
+        assert!(pat_url.contains("read_registry"));
+    }
+
+    #[test]
+    fn derive_creds_suggestion_unknown_provider_omits_pat_url() {
+        // Self-hosted Gitea / Forgejo / etc. — we don't know
+        // their PAT pages. Suggestion still carries name +
+        // prefix; pat_creation_url is None так hint falls
+        // back к the one-liner.
+        let s = derive_creds_suggestion("https://gitea.example.com/team/app")
+            .expect("known shape must yield а suggestion");
+        assert_eq!(s.suggested_name, "gitea-team");
+        assert_eq!(s.url_prefix, "https://gitea.example.com/team");
+        assert!(s.pat_creation_url.is_none());
+    }
+
+    #[test]
+    fn derive_creds_suggestion_rejects_non_https_urls() {
+        // SSH / git@ shapes use SSH keys; our cred-suggestion
+        // surface doesn't apply.
+        assert!(derive_creds_suggestion("git@github.com:foo/bar").is_none());
+        assert!(derive_creds_suggestion("ssh://git@github.com/foo/bar").is_none());
+    }
+
+    #[test]
+    fn derive_creds_suggestion_rejects_malformed_urls() {
+        // No org segment, или empty fields after the scheme.
+        assert!(derive_creds_suggestion("https://github.com").is_none());
+        assert!(derive_creds_suggestion("https://github.com/").is_none());
+        assert!(derive_creds_suggestion("https://").is_none());
+    }
+
+    #[test]
     fn build_application_manifest_includes_managed_by_label() {
         // Load-bearing — `app list` filters by this label.
         // If a future refactor drops it, `list` shows nothing.
@@ -1704,9 +1903,12 @@ mod tests {
                 .and_then(Value::as_str),
             Some("v")
         );
+        // Walk-fix #2: `build_application_manifest` strips
+        // leading `/` к keep Argo CD's `spec.source.path`
+        // relative; «/p» → «p».
         assert_eq!(
             m.pointer("/spec/source/path").and_then(Value::as_str),
-            Some("/p")
+            Some("p")
         );
     }
 
