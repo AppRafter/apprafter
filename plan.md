@@ -2732,6 +2732,80 @@ instead of carrying parallel definitions.
 
 ---
 
+### 2.6b needs.disk → persistent block storage
+
+**Source:** design session 2026-05-27; ADR TBD before implementation (disk class abstraction, shareMode semantics, tier mapping).
+
+**Цель:** declarative persistent block storage для Application через `needs.disk` claim; tier-portable через storage class abstraction; operator под капотом emits StatefulSet + PVC machinery + CSI snapshot scheduling.
+
+**Поставка:**
+
+Schema:
+- [ ] CUE schema `#DiskClaim` в `schemas/v1alpha1/application.cue` под `needs.disk?: #DiskClaim | [...#DiskClaim]` (union scalar | array).
+- [ ] Поля: `name?` (string, optional), `size` (string, e.g. "10Gi"), `mountPath` (string), `class?: "local" | "replicated" | "shared" | *"local"`, `shareMode?: "per-replica" | "shared" | *"per-replica"`, `readOnly?: bool | *false`, `backup?: { enabled, schedule, retention }`, `autoExpand?: { enabled, threshold, maxSize }`.
+
+Admission webhook:
+- [ ] Name uniqueness validation across array entries (implicit name from `mountPath` segment когда `name` omit'нут — `/data` → `data`, `/var/lib/uploads` → `uploads`; explicit wins; conflict → reject с suggestion).
+- [ ] `shareMode: shared` requires `class` supporting RWX (`shared` only в v1) — reject otherwise с suggestion.
+- [ ] `class: replicated` или `class: shared` на T1 → reject («single-node tier does not support replicated/shared storage; use `local` or upgrade to T2»).
+- [ ] `class: replicated` или `class: shared` на T2 без opt-in platform values (`enableReplicatedStorage` / `enableSharedStorage`) → reject с install hint.
+- [ ] Optional advisory warning: `shareMode: per-replica` + `replicas > 1` → не reject, но print warning «new replicas start with empty disks; if shared data needed, use shareMode: shared».
+- [ ] Quota enforcement: sum `disk.size` across all claims в Application против Tenant quota → reject если over.
+
+Operator rendering (`operator-rendering` crate):
+- [ ] Detect `needs.disk` non-empty в Application → emit StatefulSet вместо Deployment (existing renderer pivot).
+- [ ] Normalize union format: scalar → single-element array внутри renderer pipeline.
+- [ ] Per claim emit: PVC template (для `shareMode: per-replica`) или standalone PVC (для `shareMode: shared`) с tier-mapped StorageClass.
+- [ ] VolumeMount per claim в container spec.
+- [ ] StorageClass resolution table (per tier from platform values):
+    - T1: `local` → `local-path` (k3s default).
+    - T2: `local` → `hcloud-volumes` (Hetzner CSI), `replicated` → `longhorn` (opt-in), `shared` → `rook-nfs` (opt-in).
+    - T3+: `local` → `linstor-single-replica`, `replicated` → `linstor-three-replica`, `shared` → `rook-nfs` / `cephfs`.
+    - T4: cloud-provider specific (EBS gp3, Azure Premium SSD, GCP PD).
+
+Backup integration (CSI snapshot):
+- [ ] При `backup.enabled: true` operator создаёт `VolumeSnapshotClass` reference + Velero `Schedule` (или native CronJob if Velero не installed) per claim.
+- [ ] Snapshot schedule per claim's `backup.schedule` (default daily `0 2 * * *`), retention per `backup.retention` (default 30d).
+- [ ] Snapshots store в external S3 destination (configured platform-wide через 4.12, fallback на local CSI snapshot если 4.12 не deployed).
+
+Auto-expand:
+- [ ] При `autoExpand.enabled: true` operator periodically reads PVC usage (через `kubelet_volume_stats_used_bytes` metric или `df` exec в pod).
+- [ ] При usage > `autoExpand.threshold` (default 80%) → patch PVC.spec.resources.requests.storage к next size step (e.g., +20% или next round Gi) до `autoExpand.maxSize`.
+- [ ] Online expansion supported большинством modern StorageClass (CSI provisioner + ExpandInUsePersistentVolumes feature gate).
+
+Platform-stack chart:
+- [ ] Component `local-path-provisioner` (k3s ships это automatically, но explicit pin в chart values для T2 если k3s не используется).
+- [ ] Optional components с opt-in flags: `longhorn` (replicated), `rook-nfs` (shared), gated по `enableReplicatedStorage` / `enableSharedStorage` platform values.
+
+Documentation:
+- [ ] `docs/operator-guide/storage.md` — disk claims reference, class semantics, shareMode behaviour при scaling, restore procedure.
+- [ ] `docs/operator-guide/disaster-recovery.md` — per-claim restore steps (manual procedure: identify VolumeSnapshot → create PVC from snapshot → patch Application's claim к нему). Automation deferred к later DR drill phase.
+
+Tests:
+- [ ] CUE schema validation: scalar + array forms, name conflict detection, shareMode/class compatibility.
+- [ ] Renderer unit tests: per-replica vs shared rendering, StatefulSet emission, StorageClass selection по tier.
+- [ ] Webhook unit tests: validation rules (quota, T1 reject for replicated/shared, opt-in reject T2, mountPath uniqueness).
+- [ ] Integration test (T1 single-node k3s): SQLite-app с `needs.disk.db: { size: "1Gi", mountPath: "/data" }` стартует, file persists через pod restart, через `dev down` + `dev up`.
+- [ ] Integration test (T2 multi-node): `shareMode: shared` + `class: shared` (с installed Rook-NFS) deploys multi-replica app с shared storage, все replicas видят writes друг друга.
+- [ ] Snapshot test: backup schedule создаёт VolumeSnapshot, retention enforces deletion старых.
+
+**Acceptance:**
+- SQLite-app deploys через `needs.disk` с `class: local`, single replica → file persists через pod restart, через node reboot.
+- Multi-disk app (массив с двумя `disk` claims разных `mountPath`) deploys корректно, обе PVCs создаются, mounts работают.
+- `shareMode: shared` + RWX class deploys multi-replica app, cross-replica file visibility verified.
+- `shareMode: per-replica` + `replicas: 3` → 3 separate PVCs, каждая replica имеет own data, scaling to 5 создаёт 2 fresh empty PVCs.
+- `autoExpand.enabled: true` + filling disk past threshold → PVC автоматически resize'ит до `maxSize`.
+- Backup schedule emits VolumeSnapshots по cron; retention удаляет старые.
+- T1 reject для `class: replicated/shared` с helpful message.
+- T2 без opt-in → reject с install hint.
+- Quota over → reject с remaining quota info.
+
+**Зависит от:** 1.83 (M1.5 closure), 4.12 (для full backup destination integration — без 4.12 backups landed но локальный CSI snapshot only).
+
+**Размер:** L
+
+---
+
 ### 2.7 SPIRE installation + workload identity
 
 **Поставка:**
