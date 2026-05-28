@@ -505,6 +505,20 @@ fn apply_secret_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()>
     Ok(())
 }
 
+/// Public alias for `commands::app::warn_if_no_matching_repo_creds`.
+/// Wraps the private `fetch_repo_creds_secrets` so the cred-
+/// check helper in `app.rs` can stay private к this crate без
+/// requiring the broader visibility shift.
+pub(crate) fn fetch_repo_creds_secrets_public(kubeconfig_path: &Path) -> Result<Vec<Value>> {
+    fetch_repo_creds_secrets(kubeconfig_path)
+}
+
+/// Public alias for `commands::app::any_secret_url_is_prefix_of`.
+/// See `fetch_repo_creds_secrets_public` for the rationale.
+pub(crate) fn decode_data_field_public(secret: &Value, field: &str) -> String {
+    decode_data_field(secret, field)
+}
+
 fn fetch_repo_creds_secrets(kubeconfig_path: &Path) -> Result<Vec<Value>> {
     let out = Command::new("kubectl")
         .arg("get")

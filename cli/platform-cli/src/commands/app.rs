@@ -90,6 +90,13 @@ pub fn add(
         use_wizard,
         scaffold_flag,
     );
+    // Step 0 may settle а namespace ≠ clap's `--namespace`
+    // default. Carry it forward к the outer wizard so the
+    // operator doesn't double-enter и end up с the scaffold's
+    // `metadata.namespace` mismatched against Argo CD's
+    // `destination.namespace` (walk-fix post-Part-3b — the
+    // procvue/apprafter mismatch operator reported).
+    let mut effective_namespace = namespace.to_string();
     match decision {
         crate::commands::scaffold_wizard::ScaffoldDecision::Skip => {}
         crate::commands::scaffold_wizard::ScaffoldDecision::Interactive => {
@@ -98,19 +105,19 @@ pub fn add(
                 .map(|s| s.to_string_lossy().into_owned())
                 .map(|raw| sanitise_for_dns_1123(&raw))
                 .unwrap_or_else(|| "app".into());
-            crate::commands::scaffold_wizard::run_step_zero(&cwd, &suggested)?;
+            let out = crate::commands::scaffold_wizard::run_step_zero(&cwd, &suggested)?;
+            effective_namespace = out.namespace;
         }
         crate::commands::scaffold_wizard::ScaffoldDecision::NonInteractive => {
-            // `--no-interactive --scaffold`: auto-detect and
-            // generate. The standalone `app_scaffold::scaffold`
-            // helper enforces "single High match required"
-            // for the non-TTY path; inconclusive detection
-            // surfaces а clear error pointing к
-            // `apprafter app scaffold --runtime <slug>`.
+            // `--no-interactive --scaffold`: auto-detect и
+            // generate. Pass the clap `--namespace` value
+            // through к scaffold so both layers agree (walk-fix
+            // post-Part-3b — was hard-defaulting к "apprafter"
+            // regardless of operator's flag).
             crate::commands::app_scaffold::scaffold(crate::commands::app_scaffold::ScaffoldOpts {
                 runtime: None,
                 name: None,
-                namespace: None,
+                namespace: Some(effective_namespace.clone()),
                 path: cwd.clone(),
                 force: false,
             })?;
@@ -127,7 +134,14 @@ pub fn add(
 
     if use_wizard {
         return add_via_wizard(
-            git_url, name, branch, path, project, namespace, remote, no_ping,
+            git_url,
+            name,
+            branch,
+            path,
+            project,
+            &effective_namespace,
+            remote,
+            no_ping,
         );
     }
 
@@ -174,7 +188,7 @@ pub fn add(
         &target_revision,
         path,
         project,
-        namespace,
+        &effective_namespace,
     );
     apply_application_manifest(&manifest, kc.path())?;
 
@@ -182,11 +196,64 @@ pub fn add(
     println!("  Repo:        {repo_url}");
     println!("  Revision:    {target_revision}");
     println!("  Path:        {path}");
-    println!("  Destination: {namespace} (created if missing)");
+    println!("  Destination: {effective_namespace} (created if missing)");
     println!();
+    warn_if_no_matching_repo_creds(&repo_url, kc.path());
     println!("Argo CD will sync the workload within a reconcile cycle. State:");
     println!("  apprafter app status {derived_name}");
     Ok(())
+}
+
+/// Post-register cred check (Fix 3 walk-fix post-Part-3b).
+/// `git ls-remote` succeeds locally on private repos when the
+/// operator's user-side git is authenticated, но Argo CD's
+/// repo-server has its own credential store; an unmatched
+/// private repo lands in а sync failure later. After
+/// successful registration, scan Argo CD's repo-creds
+/// (`argocd.argoproj.io/secret-type=repo-creds`) for any
+/// whose `data.url` is а prefix of `repo_url`; warn если none
+/// matches AND the URL is HTTPS (private-likely heuristic).
+///
+/// Best-effort — failure to fetch secrets prints а quiet
+/// debug-style warning, не fail the command. Operator sees:
+///
+/// ```
+/// ℹ Repo has no matching credentials in Argo CD.
+///   If https://github.com/... is private, run:
+///     apprafter repo creds add <name> --url-prefix <prefix> ...
+///   before Argo CD attempts to sync.
+/// ```
+fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
+    if !repo_url.starts_with("https://") {
+        // Only HTTPS triggers the warning — git@ / ssh://
+        // shapes typically use SSH keys which Argo CD picks
+        // up via а different cred entry shape we don't probe.
+        return;
+    }
+    let secrets =
+        match crate::commands::repo_creds::fetch_repo_creds_secrets_public(kubeconfig_path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+    if any_secret_url_is_prefix_of(&secrets, repo_url) {
+        return;
+    }
+    println!();
+    println!("ℹ Repo has no matching credentials in Argo CD.");
+    println!("  If {repo_url} is private, run:");
+    println!("    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>");
+    println!("  before Argo CD attempts to sync (public repos can ignore this).");
+}
+
+/// Pure helper — does any secret's decoded `data.url` field
+/// serve as а prefix of `repo_url`? Argo CD's repo-server
+/// uses the same prefix-match semantics for cred lookup, so
+/// matching the same logic here keeps our hint accurate.
+pub(crate) fn any_secret_url_is_prefix_of(secrets: &[serde_json::Value], repo_url: &str) -> bool {
+    secrets.iter().any(|s| {
+        let prefix = crate::commands::repo_creds::decode_data_field_public(s, "url");
+        !prefix.is_empty() && repo_url.starts_with(&prefix)
+    })
 }
 
 /// Wizard entry point — gathers any missing field via inquire
@@ -1502,6 +1569,62 @@ mod tests {
         let out = sanitise_for_dns_1123(&long);
         assert_eq!(out.len(), 63);
         assert!(!out.ends_with('-'));
+    }
+
+    fn cred_secret(b64_url: &str) -> serde_json::Value {
+        // Build а minimal kubectl-shape secret JSON с the
+        // `data.url` field base64-encoded so the cred-prefix
+        // helper can decode it.
+        serde_json::json!({
+            "metadata": { "name": "test-creds" },
+            "data": { "url": b64_url }
+        })
+    }
+
+    #[test]
+    fn any_secret_url_is_prefix_of_matches_repo_under_registered_prefix() {
+        // Walk-fix Fix 3 post-Part-3b: cred check helper.
+        // `data.url` is base64'd; the helper decodes и
+        // prefix-matches against `repo_url`.
+        // base64("https://github.com/myorg") =
+        //   "aHR0cHM6Ly9naXRodWIuY29tL215b3Jn"
+        let secrets = vec![cred_secret("aHR0cHM6Ly9naXRodWIuY29tL215b3Jn")];
+        assert!(any_secret_url_is_prefix_of(
+            &secrets,
+            "https://github.com/myorg/repo-name"
+        ));
+    }
+
+    #[test]
+    fn any_secret_url_is_prefix_of_rejects_non_matching_url() {
+        // Different org → no match. Operator's hint should
+        // fire (their repo isn't covered by а cred).
+        let secrets = vec![cred_secret("aHR0cHM6Ly9naXRodWIuY29tL215b3Jn")];
+        assert!(!any_secret_url_is_prefix_of(
+            &secrets,
+            "https://github.com/otherorg/repo"
+        ));
+    }
+
+    #[test]
+    fn any_secret_url_is_prefix_of_handles_empty_secret_list() {
+        // No creds registered → no match. This is the
+        // first-ever-app case where the hint MUST fire.
+        assert!(!any_secret_url_is_prefix_of(
+            &[],
+            "https://github.com/myorg/repo"
+        ));
+    }
+
+    #[test]
+    fn any_secret_url_is_prefix_of_skips_secrets_without_url_field() {
+        // Defensive — а malformed cred secret без `data.url`
+        // shouldn't false-positive the match.
+        let bogus = serde_json::json!({ "metadata": { "name": "broken" } });
+        assert!(!any_secret_url_is_prefix_of(
+            &[bogus],
+            "https://github.com/myorg/repo"
+        ));
     }
 
     #[test]

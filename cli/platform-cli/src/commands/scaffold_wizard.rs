@@ -18,9 +18,10 @@
 use std::path::Path;
 
 use cli_core::{CliError, Result};
-use inquire::{Confirm, InquireError, Select};
+use inquire::validator::Validation;
+use inquire::{Confirm, InquireError, Select, Text};
 
-use crate::commands::app_scaffold::{defaults_for, scaffold, ScaffoldOpts};
+use crate::commands::app_scaffold::{defaults_for, scaffold, ScaffoldOpts, DEFAULT_NAMESPACE};
 use crate::commands::runtime_detect::{detect_runtimes, Confidence, Detection, Runtime};
 
 /// All twelve runtimes, в the order they appear в the
@@ -156,6 +157,21 @@ pub fn pick_runtime_interactive(detections: &[Detection]) -> Result<Runtime> {
     Ok(runtimes[idx])
 }
 
+/// Values that step 0 settled on; the caller (`app::add`)
+/// uses these к pre-fill the outer wizard's «name» и
+/// «namespace» prompts so the operator doesn't restate the
+/// same answer twice. Without this propagation, scaffold's
+/// `metadata.namespace` would race the wizard's `--namespace`
+/// — see walk-fix post-Part-3b: scaffold wrote `apprafter`
+/// while operator later picked `procvue` в the wizard,
+/// leaving the manifest's namespace inconsistent с Argo CD's
+/// `destination.namespace`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepZeroOutput {
+    pub name: String,
+    pub namespace: String,
+}
+
 /// Full step-0 wizard surface called by `commands::app::add`
 /// когда `<cwd>/apprafter/Application.cue` is missing AND
 /// stdio is а TTY. Sequence:
@@ -165,11 +181,18 @@ pub fn pick_runtime_interactive(detections: &[Detection]) -> Result<Runtime> {
 ///      к standalone `apprafter app scaffold`.
 ///   2. Run detection и render а Select с all 12 runtimes;
 ///      default cursor on the first High match.
-///   3. Final Confirm с summary (runtime + name + namespace).
+///   3. Text prompt: «AppRafter app name?» (default =
+///      sanitised cwd basename). DNS-1123 validated inline.
+///   4. Text prompt: «Destination namespace?» (default =
+///      `apprafter`). DNS-1123 validated inline.
+///   5. Final Confirm с summary (runtime + name + namespace).
 ///      No → «scaffold cancelled».
-///   4. Invoke `commands::app_scaffold::scaffold(opts)` to
+///   6. Invoke `commands::app_scaffold::scaffold(opts)` to
 ///      write the file и update `.gitignore`.
-pub fn run_step_zero(cwd: &Path, suggested_name: &str) -> Result<()> {
+///
+/// Returns the `(name, namespace)` actually used so the
+/// caller can propagate к the outer wizard's prompts.
+pub fn run_step_zero(cwd: &Path, suggested_name: &str) -> Result<StepZeroOutput> {
     let proceed = Confirm::new("No `apprafter/Application.cue` found. Generate one?")
         .with_default(true)
         .prompt()
@@ -187,11 +210,18 @@ pub fn run_step_zero(cwd: &Path, suggested_name: &str) -> Result<()> {
     let runtime = pick_runtime_interactive(&detections)?;
     let defaults = defaults_for(runtime);
 
+    let name = prompt_dns_1123_text("AppRafter app name (metadata.name)", suggested_name)?;
+    let namespace = prompt_dns_1123_text(
+        "Destination namespace (metadata.namespace)",
+        DEFAULT_NAMESPACE,
+    )?;
+
     eprintln!();
     eprintln!("→ Will generate apprafter/Application.cue with:");
-    eprintln!("    runtime: {} ({})", defaults.display, runtime.slug());
-    eprintln!("    name:    {suggested_name}");
-    eprintln!("    port:    {}", defaults.primary_port);
+    eprintln!("    runtime:   {} ({})", defaults.display, runtime.slug());
+    eprintln!("    name:      {name}");
+    eprintln!("    namespace: {namespace}");
+    eprintln!("    port:      {}", defaults.primary_port);
     eprintln!();
 
     let confirm = Confirm::new("Generate now?")
@@ -204,14 +234,44 @@ pub fn run_step_zero(cwd: &Path, suggested_name: &str) -> Result<()> {
 
     let opts = ScaffoldOpts {
         runtime: Some(runtime),
-        name: Some(suggested_name.to_string()),
-        namespace: None,
+        name: Some(name.clone()),
+        namespace: Some(namespace.clone()),
         path: cwd.to_path_buf(),
         force: false,
     };
     scaffold(opts)?;
     eprintln!();
-    Ok(())
+    Ok(StepZeroOutput { name, namespace })
+}
+
+fn prompt_dns_1123_text(label: &str, default: &str) -> Result<String> {
+    let value = Text::new(label)
+        .with_default(default)
+        .with_validator(dns_1123_validator)
+        .prompt()
+        .map_err(prompt_err)?;
+    Ok(value.trim().to_string())
+}
+
+fn dns_1123_validator(value: &str) -> std::result::Result<Validation, inquire::CustomUserError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Validation::Invalid("must not be empty".into()));
+    }
+    if trimmed.len() > 63 {
+        return Ok(Validation::Invalid("must be 1-63 characters".into()));
+    }
+    let ok = trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !trimmed.starts_with('-')
+        && !trimmed.ends_with('-');
+    if !ok {
+        return Ok(Validation::Invalid(
+            "DNS-1123 only: lower-case [a-z0-9-], no leading/trailing dash".into(),
+        ));
+    }
+    Ok(Validation::Valid)
 }
 
 fn prompt_err(e: InquireError) -> CliError {

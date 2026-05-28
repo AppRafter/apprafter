@@ -13,6 +13,131 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.169 — M1.5 walk-fix #1 post-B.1.79b-Part-3b — scaffold UX polish (2026-05-28)
+
+### Symptoms
+
+Three operator-found defects на first real-cwd run of
+`apprafter app add` from а fresh project directory
+(`/projects/.../procvue/landing`):
+
+1. **SPDX header leaked into user code.** Scaffold template
+   started с `// SPDX-License-Identifier: FSL-1.1-MIT`,
+   which is OUR core license — operators don't license their
+   apps under FSL-1.1-MIT just because they used `apprafter
+   app scaffold`. The generated file imposed our SPDX on
+   their codebase.
+
+2. **Namespace mismatch між scaffold и wizard.** Step 0
+   wrote `metadata.namespace: "apprafter"` (hard-defaulted к
+   `DEFAULT_NAMESPACE`); the outer wizard then asked для а
+   destination namespace и the operator answered `procvue`.
+   Result: scaffolded manifest says `apprafter`, Argo CD
+   Application's `spec.destination.namespace` says `procvue`
+   — sync would later fail с the exact walk-fix #12 pattern
+   (namespaces mismatched, neither created by `CreateNamespace
+   =true` since that creates ONLY destination).
+
+3. **Private repo went unchecked.** `git ls-remote` succeeded
+   locally because operator's user-side git is authenticated;
+   Argo CD's repo-server has its own credential store, but
+   we never checked whether а matching cred exists in
+   `argocd` namespace. The mismatch would surface only at
+   sync time as «failed to fetch repository: 401
+   Unauthorized», long after the operator left the
+   registration flow.
+
+### Fixes
+
+**Fix 1 — drop SPDX header from templates.** Both `default.
+cue.hbs` и `blank.cue.hbs` now lead с а neutral header
+that explicitly invites operators к add their own SPDX line:
+
+```
+// AppRafter Application manifest scaffolded by `apprafter
+// app scaffold` (runtime preset: …).
+//
+// This is your code under your license — feel free to add
+// your own SPDX-License-Identifier header on top. …
+```
+
+**Fix 2 — propagate step 0 namespace к outer wizard.**
+
+`run_step_zero` extended с two new prompts (between the
+runtime Select и the final Confirm):
+
+- «AppRafter app name (metadata.name)» — Text, default =
+  sanitised cwd basename, DNS-1123 validated inline.
+- «Destination namespace (metadata.namespace)» — Text,
+  default = `apprafter`, DNS-1123 validated inline.
+
+Returns а new `StepZeroOutput { name, namespace }` struct.
+`app::add` captures the namespace и threads it through к
+`add_via_wizard` as the wizard's namespace input — the outer
+namespace prompt now pre-fills с the value step 0 settled
+on, so the operator confirms once и both the manifest и
+Argo CD Application agree.
+
+Non-interactive `--scaffold` path also fixed: scaffold now
+takes the clap `--namespace` value (rather than hard-
+defaulting к `apprafter`) so the manifest matches what the
+operator passed.
+
+Build-up surface для interactive validation:
+`prompt_dns_1123_text` + `dns_1123_validator` — inline
+inquire validators reject invalid input before exiting the
+prompt, mirroring `app_wizard.rs`'s existing `validate_dns_
+1123_for_app`.
+
+**Fix 3 — warn on missing repo-creds after register.**
+
+New `warn_if_no_matching_repo_creds(repo_url, kubeconfig)`
+fires right after `apply_application_manifest` succeeds (so
+the registration itself isn't blocked):
+
+```
+ℹ Repo has no matching credentials in Argo CD.
+  If https://github.com/ProcVue/landing is private, run:
+    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>
+  before Argo CD attempts to sync (public repos can ignore this).
+```
+
+Only fires для HTTPS URLs (`git@` / `ssh://` shapes use SSH
+keys, а different cred entry shape we don't probe). Pure
+helper `any_secret_url_is_prefix_of(secrets, repo_url)`
+mirrors Argo CD's prefix-match semantics — if it says «no
+match», Argo CD will report the same.
+
+Two new pub(crate) aliases в `repo_creds`:
+`fetch_repo_creds_secrets_public` и `decode_data_field_
+public` — lets `app::warn_if_no_matching_repo_creds` reuse
+the existing fetch + base64-decode helpers без relaxing
+visibility on the private versions.
+
+### Tests
+
++4 new unit tests covering the cred-prefix surface:
+
+- `any_secret_url_is_prefix_of_matches_repo_under_registered_prefix`
+  — happy path: cred URL prefix matches the app's repo URL.
+- `any_secret_url_is_prefix_of_rejects_non_matching_url` —
+  different org → no match, hint fires.
+- `any_secret_url_is_prefix_of_handles_empty_secret_list` —
+  first-ever-app case (no creds registered).
+- `any_secret_url_is_prefix_of_skips_secrets_without_url_field`
+  — defensive against malformed secrets.
+
+Existing scaffold tests (261) unchanged — the namespace +
+name prompts are interactive, не unit-testable directly;
+sanitise_for_dns_1123 already covered. Total CLI suite:
+261 → 265. Bun gate: 87/0 unchanged.
+
+### Bump
+
+CLI 0.1.168 → 0.1.169. Chart and cue-cmp unchanged. Operators
+re-running `apprafter app add` after upgrade will see the
+three new prompts в step 0 + post-register cred hint.
+
 ## v0.1.168 — M1.5 Track B.1.79b Part 3b — scaffold wizard in `app add` + interactive picker (2026-05-28)
 
 ### What
