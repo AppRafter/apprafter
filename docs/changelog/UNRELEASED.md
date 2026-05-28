@@ -13,6 +13,167 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.172 — M1.5 walk-fix #4 post-B.1.79b-Part-3b — scaffold inlines schema for typed validation (2026-05-28)
+
+### Reframe
+
+Walk-fix #3 traded typed CUE для зеро-setup operation —
+untyped struct + explicit `apiVersion`/`kind`. Operator
+pushed back: «не можем терять типизацию в манифестах».
+Agreed — losing static type-check on user code was the
+wrong call.
+
+Three approaches surveyed for restoring typed CUE:
+
+1. **OCI module from public repo.** Publish AppRafter
+   schemas as а CUE module к OCI registry; operator's
+   `cue.mod/module.cue` references it; `cue mod tidy`
+   fetches. Pros: schemas live в one place, versioned.
+   Cons: requires CMP к make network calls on every sync,
+   operator setup steps (mod tidy), publish workflow for
+   schemas-as-module, dependency on OCI registry uptime
+   during sync. Heavyweight.
+
+2. **CMP sidecar bundles schemas + auto-symlinks.** CMP
+   image carries а copy of schemas; entrypoint.sh symlinks
+   them into `cue.mod/pkg/apprafter.io/` before `cue
+   export`. Pros: zero operator setup, no OCI network call.
+   Cons: still doesn't help local `cue vet` — operator
+   doesn't have schemas on disk locally without manual
+   clone. Half-measure.
+
+3. **Inline schema in scaffolded file.** Scaffold embeds
+   the v1alpha1 CRD definitions (`#Application`,
+   `#ObjectMeta`, `#ApplicationSpec`, `#TypeMeta`) at the
+   top of `Application.cue`, then binds the operator's app
+   к `#Application & { ... }`. Pros: works locally без
+   any setup, works в CMP без any setup, schema visible
+   inline (educational), `cue export` hides definitions
+   from JSON output naturally — they're prefixed `#` so
+   они're hidden by CUE's export semantics. Cons: schema
+   needs к match what AppRafter ships — re-scaffold on
+   v1alpha2 если/когда it lands.
+
+Option 3 wins. The v1alpha1 contract is stable for the
+foreseeable future (pre-1.0 CRD); when v1alpha2 ships,
+scaffold templates bump в the same CLI release. Operators
+re-scaffold OR manually update the inlined schema block.
+
+### What ships
+
+Both `default.cue.hbs` и `blank.cue.hbs` updated с the same
+schema block before the app binding. Source-of-truth path
+(github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/
+{types,application}.cue) referenced in the header comment
+so operators can audit drift.
+
+Inlined definitions:
+
+```cue
+#APIVersion: "apprafter.io/v1alpha1"
+
+#TypeMeta: {
+    apiVersion: #APIVersion
+    kind:       string
+}
+
+#ObjectMeta: {
+    name:       string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
+    namespace?: string
+    labels?: [string]:      string
+    annotations?: [string]: string
+}
+
+#Application: {
+    #TypeMeta
+    kind:     "Application"
+    metadata: #ObjectMeta
+    spec: {
+        base?: #ApplicationSpec
+        environments?: [string]: #ApplicationSpec
+    }
+}
+
+#ApplicationSpec: {
+    image?:    string
+    replicas?: int & >=0
+    expose?: {
+        port:     int & >0 & <=65535
+        public?:  bool | *false
+        network?: "public" | "internal" | "vpn" | *"internal"
+    }
+    env?: [string]: string
+}
+```
+
+App binding now constrained: `{{app_name_camel}}:
+#Application & { ... }`. CUE catches typos
+(`portt` instead of `port`), out-of-range values
+(`replicas: -5`), and structural mismatches locally before
+`git push`.
+
+### Verified smoke
+
+```
+$ mkdir /tmp/no-mod-test && cd /tmp/no-mod-test
+$ touch Cargo.toml
+$ apprafter app scaffold --name smoke --runtime rust
+
+# Typed vet succeeds на the rendered manifest:
+$ cue vet ./apprafter/...
+# (no output = success)
+
+# Typos surface:
+$ sed -i 's/replicas: 1/replicas: -5/' apprafter/Application.cue
+$ cue vet ./apprafter/...
+smoke.spec.base.replicas: invalid value -5 (out of bound >=0):
+    ./apprafter/Application.cue:50:19
+
+$ sed -i 's/port: 8080/portt: 8080/' apprafter/Application.cue
+$ cue vet ./apprafter/...
+smoke.spec.base.expose.portt: field not allowed:
+    ./apprafter/Application.cue:100:4
+
+# Export hides definitions (only `smoke` value emitted):
+$ cue export ./apprafter/...
+{ "smoke": { "apiVersion": "...", "kind": "Application", ... } }
+```
+
+CMP pipeline produces byte-identical JSON к the untyped
+walk-fix #3 version — definitions hidden by CUE's `#`-
+prefix export semantics, only bound values emitted.
+
+### Existing apps
+
+Operators с stale untyped scaffolds (v0.1.171) can:
+
+1. Re-scaffold с `--force` к pick up the typed version.
+2. Or manually copy the schema block from а freshly-
+   scaffolded file into their existing Application.cue
+   above the app binding, then constrain the binding с
+   `#Application & { ... }`.
+
+Both paths converge на the same rendered output.
+
+### Tests
+
+Existing 274 tests pass unchanged — assertions on
+`render_application` output check app name, namespace,
+CUE binding ident, port. All still present в the typed
+templates. Bun gate: 87/0.
+
+### Bump
+
+CLI 0.1.171 → 0.1.172. Chart and cue-cmp unchanged.
+
+### Long-term
+
+Long-term path stays open: when AppRafter ships а CUE
+schema OCI module + CMP-side `cue mod tidy`, the inlined
+block can become а `// optional inline schema — for
+operators without OCI access» fallback и typed users
+import from the module. Не blocking today.
+
 ## v0.1.171 — M1.5 walk-fix #3 post-B.1.79b-Part-3b — scaffold drops CUE import (2026-05-28)
 
 ### Symptom

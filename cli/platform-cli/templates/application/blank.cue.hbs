@@ -2,20 +2,67 @@
 // app scaffold` (blank template — runtime auto-detection
 // surfaced no markers).
 //
-// This is your code under your license — feel free to add
+// This is your code under your license — feel free к add
 // your own SPDX-License-Identifier header on top. Every
 // field below carries а TODO; fill them in before
 // committing. The CMP plugin renders this file at sync
-// time and Argo CD's apiserver validates the resulting CR
-// against the AppRafter CRD, so typos surface at sync time.
+// time, and Argo CD's apiserver validates the rendered CR
+// against the AppRafter CRD on apply, so `cue vet ./
+// apprafter/...` локально catches what you can и the CRD
+// catches the rest.
 
 package apprafter
 
-{{app_name_camel}}: {
-	apiVersion: "apprafter.io/v1alpha1"
-	kind:       "Application"
+// ─── AppRafter Application schema (v1alpha1) ───────────────────
+//
+// Inlined faithfully from github.com/apprafter/apprafter/blob/
+// master/schemas/v1alpha1/{types,application}.cue so `cue vet`
+// works without setting up а `cue.mod/module.cue` или vendoring
+// schemas externally. Re-scaffold к refresh when AppRafter
+// publishes а new CRD revision; the in-cluster CRD will surface
+// validation errors if your binding ever drifts from the
+// inlined schema.
+
+#APIVersion: "apprafter.io/v1alpha1"
+
+#TypeMeta: {
+	apiVersion: #APIVersion
+	kind:       string
+}
+
+#ObjectMeta: {
+	name:       string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
+	namespace?: string
+	labels?: [string]:      string
+	annotations?: [string]: string
+}
+
+#Application: {
+	#TypeMeta
+	kind:     "Application"
+	metadata: #ObjectMeta
+	spec: {
+		base?: #ApplicationSpec
+		environments?: [string]: #ApplicationSpec
+	}
+}
+
+#ApplicationSpec: {
+	image?:    string
+	replicas?: int & >=0
+	expose?: {
+		port:     int & >0 & <=65535
+		public?:  bool | *false
+		network?: "public" | "internal" | "vpn" | *"internal"
+	}
+	env?: [string]: string
+}
+
+// ─── Your app starts here ──────────────────────────────────────
+
+{{app_name_camel}}: #Application & {
 	metadata: {
-		// TODO: DNS-1123 lowercase name. Free to rename.
+		// TODO: DNS-1123 lowercase name. Free к rename.
 		name: "{{app_name}}"
 
 		// TODO: namespace the AppRafter operator watches.
