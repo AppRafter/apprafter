@@ -23,6 +23,7 @@
 //! bugs without false positives.
 
 use std::collections::BTreeMap;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use cli_core::{CliError, Result};
@@ -218,12 +219,21 @@ pub struct ScaffoldOpts {
     pub force: bool,
 }
 
-/// Resolve runtime from explicit override OR detection. When
-/// detection surfaces multiple Highs (или а Medium/Low/
-/// Fallback) AND no explicit override, error out with а
-/// clear hint pointing к the `--runtime <slug>` flag —
-/// interactive prompt belongs к the wizard step в Part 3b's
-/// `app add` integration, not the standalone command.
+/// Resolve runtime from explicit override OR detection.
+/// Three-way fork:
+///
+///   1. `--runtime <slug>` passed → use it verbatim.
+///   2. Detection finds exactly one High match → use it.
+///   3. Otherwise (zero Highs, multiple Highs, only Medium /
+///      Low / Fallback): drop into the interactive picker
+///      via `scaffold_wizard::pick_runtime_interactive`
+///      when both stdio ends are TTYs. Non-TTY surfaces the
+///      original error с pointer к `--runtime <slug>`.
+///
+/// Walk-fix Part 3b — pre-Part-3b every inconclusive case
+/// errored. Standalone `app scaffold` now feels natural on
+/// а TTY (no need to memorise slugs) while staying
+/// scriptable в CI.
 fn resolve_runtime(opts: &ScaffoldOpts) -> Result<Runtime> {
     if let Some(r) = opts.runtime {
         return Ok(r);
@@ -235,29 +245,33 @@ fn resolve_runtime(opts: &ScaffoldOpts) -> Result<Runtime> {
         .map(|d| d.runtime)
         .collect();
 
-    match highs.as_slice() {
-        [single] => Ok(*single),
-        [] => {
-            let detected = detections
-                .iter()
-                .map(|d| format!("{} ({:?})", d.runtime.slug(), d.confidence))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(CliError::Other(format!(
-                "Runtime auto-detection was inconclusive (matches: {detected}). \
-                 Pass `--runtime <slug>` к pick one explicitly. Available slugs: \
-                 bun, node-pnpm, node-yarn, node-npm, python-poetry, python-uv, \
-                 python-pipenv, python-pip, rust, go, docker, blank."
-            )))
-        }
-        many => {
-            let slugs: Vec<&'static str> = many.iter().map(|r| r.slug()).collect();
-            Err(CliError::Other(format!(
-                "Multiple runtimes detected at high confidence ({}). Pass \
-                 `--runtime <slug>` к pick one explicitly.",
-                slugs.join(", ")
-            )))
-        }
+    if let [single] = highs.as_slice() {
+        return Ok(*single);
+    }
+
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return crate::commands::scaffold_wizard::pick_runtime_interactive(&detections);
+    }
+
+    if highs.is_empty() {
+        let detected = detections
+            .iter()
+            .map(|d| format!("{} ({:?})", d.runtime.slug(), d.confidence))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(CliError::Other(format!(
+            "Runtime auto-detection was inconclusive (matches: {detected}). \
+             Pass `--runtime <slug>` к pick one explicitly. Available slugs: \
+             bun, node-pnpm, node-yarn, node-npm, python-poetry, python-uv, \
+             python-pipenv, python-pip, rust, go, docker, blank."
+        )))
+    } else {
+        let slugs: Vec<&'static str> = highs.iter().map(|r| r.slug()).collect();
+        Err(CliError::Other(format!(
+            "Multiple runtimes detected at high confidence ({}). Pass \
+             `--runtime <slug>` к pick one explicitly.",
+            slugs.join(", ")
+        )))
     }
 }
 

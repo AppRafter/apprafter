@@ -68,16 +68,64 @@ pub fn add(
     remote: &str,
     no_ping: bool,
     no_interactive: bool,
+    scaffold_flag: bool,
 ) -> Result<()> {
-    // Trigger the interactive wizard when stdin + stdout are
-    // TTYs and the operator hasn't opted out via
-    // `--no-interactive`. The wizard pre-fills every field
-    // from the flags above plus cwd-detected git origin and
-    // branch where available; the operator may accept defaults
-    // or override per-field.
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = std::io::stdout().is_terminal();
-    if crate::commands::app_wizard::should_use_wizard(no_interactive, stdin_is_tty, stdout_is_tty) {
+    let use_wizard =
+        crate::commands::app_wizard::should_use_wizard(no_interactive, stdin_is_tty, stdout_is_tty);
+
+    // Step 0 (Track B.1.79b Part 3b) — bridge from а fresh
+    // repo to а registered app. Check `<cwd>/apprafter/
+    // Application.cue`; missing → scaffold interactively
+    // (TTY) или per `--scaffold` flag (non-TTY), or refuse
+    // с pointer to standalone `apprafter app scaffold`.
+    // After this block, `<cwd>/apprafter/Application.cue` is
+    // guaranteed to exist for the wizard / non-interactive
+    // flow below.
+    let cwd = std::env::current_dir().map_err(|e| CliError::Other(format!("cwd: {e}")))?;
+    let scaffold_target = cwd.join("apprafter").join("Application.cue");
+    let decision = crate::commands::scaffold_wizard::decide_scaffold_step(
+        scaffold_target.exists(),
+        use_wizard,
+        scaffold_flag,
+    );
+    match decision {
+        crate::commands::scaffold_wizard::ScaffoldDecision::Skip => {}
+        crate::commands::scaffold_wizard::ScaffoldDecision::Interactive => {
+            let suggested = cwd
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .map(|raw| sanitise_for_dns_1123(&raw))
+                .unwrap_or_else(|| "app".into());
+            crate::commands::scaffold_wizard::run_step_zero(&cwd, &suggested)?;
+        }
+        crate::commands::scaffold_wizard::ScaffoldDecision::NonInteractive => {
+            // `--no-interactive --scaffold`: auto-detect and
+            // generate. The standalone `app_scaffold::scaffold`
+            // helper enforces "single High match required"
+            // for the non-TTY path; inconclusive detection
+            // surfaces а clear error pointing к
+            // `apprafter app scaffold --runtime <slug>`.
+            crate::commands::app_scaffold::scaffold(crate::commands::app_scaffold::ScaffoldOpts {
+                runtime: None,
+                name: None,
+                namespace: None,
+                path: cwd.clone(),
+                force: false,
+            })?;
+        }
+        crate::commands::scaffold_wizard::ScaffoldDecision::Refuse => {
+            return Err(CliError::Other(format!(
+                "apprafter/Application.cue not found in {}. Run \
+                 `apprafter app scaffold` first to generate one, or rerun \
+                 with `--scaffold` to chain scaffolding into this command.",
+                cwd.display()
+            )));
+        }
+    }
+
+    if use_wizard {
         return add_via_wizard(
             git_url, name, branch, path, project, namespace, remote, no_ping,
         );
@@ -182,7 +230,41 @@ fn add_via_wizard(
         remote,
         no_ping,
         true, // no_interactive — prevent recursion into the wizard.
+        false, // scaffold_flag — step 0 already ran in the outer call;
+              // by here `<cwd>/apprafter/Application.cue` exists и
+              // `decide_scaffold_step` will return Skip on re-entry.
     )
+}
+
+/// Cwd-basename → DNS-1123 lowercase. `MyProject` → `myproject`,
+/// `acme_app` → `acme-app`, leading/trailing non-`[a-z0-9]`
+/// characters trimmed; empty result falls back to `"app"`.
+/// Used for step 0's suggested name default; operators see this
+/// in the wizard's «name» prompt and can override.
+fn sanitise_for_dns_1123(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Collapse repeated dashes ⇒ single.
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    // Trim leading / trailing dashes.
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "app".to_string()
+    } else if trimmed.len() > 63 {
+        trimmed[..63].trim_end_matches('-').to_string()
+    } else {
+        trimmed
+    }
 }
 
 pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> {
@@ -1371,6 +1453,55 @@ mod tests {
         assert!(validate_dns_1123("-leading").is_err());
         assert!(validate_dns_1123("trailing-").is_err());
         assert!(validate_dns_1123("").is_err());
+    }
+
+    #[test]
+    fn sanitise_for_dns_1123_lowercases_and_replaces_specials() {
+        // Walk-fix Part 3b — cwd basename → DNS-1123-safe
+        // suggestion for step 0's «name» default. Operators
+        // see this в the wizard's name prompt; должно быть
+        // valid DNS-1123 already so the wizard's prefill
+        // doesn't fail validation.
+        assert_eq!(sanitise_for_dns_1123("MyProject"), "myproject");
+        assert_eq!(sanitise_for_dns_1123("acme_app"), "acme-app");
+        assert_eq!(sanitise_for_dns_1123("Hello World"), "hello-world");
+        assert_eq!(sanitise_for_dns_1123("payments"), "payments");
+    }
+
+    #[test]
+    fn sanitise_for_dns_1123_collapses_repeated_dashes() {
+        // `foo__bar` → `foo-bar`, NOT `foo--bar` (which
+        // CUE / kube accept but is ugly).
+        assert_eq!(sanitise_for_dns_1123("foo__bar"), "foo-bar");
+        assert_eq!(sanitise_for_dns_1123("a  b  c"), "a-b-c");
+        assert_eq!(sanitise_for_dns_1123("x--y--z"), "x-y-z");
+    }
+
+    #[test]
+    fn sanitise_for_dns_1123_trims_leading_trailing_dashes() {
+        assert_eq!(sanitise_for_dns_1123("-leading"), "leading");
+        assert_eq!(sanitise_for_dns_1123("trailing-"), "trailing");
+        assert_eq!(sanitise_for_dns_1123("__bracketed__"), "bracketed");
+    }
+
+    #[test]
+    fn sanitise_for_dns_1123_empty_input_falls_back_to_app() {
+        // operator's cwd is `/` или а garbage-only name —
+        // suggestion must still be valid DNS-1123 so the
+        // wizard prefill doesn't fail.
+        assert_eq!(sanitise_for_dns_1123(""), "app");
+        assert_eq!(sanitise_for_dns_1123("___"), "app");
+        assert_eq!(sanitise_for_dns_1123("..."), "app");
+    }
+
+    #[test]
+    fn sanitise_for_dns_1123_truncates_at_63_characters() {
+        // DNS-1123 length limit. Trim trailing dash после
+        // cut to avoid landing on an invalid suffix.
+        let long = "a".repeat(70);
+        let out = sanitise_for_dns_1123(&long);
+        assert_eq!(out.len(), 63);
+        assert!(!out.ends_with('-'));
     }
 
     #[test]

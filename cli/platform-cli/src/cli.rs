@@ -458,6 +458,16 @@ pub enum AppCommand {
         /// current branch where available.
         #[arg(long = "no-interactive", default_value_t = false)]
         no_interactive: bool,
+        /// Auto-scaffold `<cwd>/apprafter/Application.cue` when
+        /// missing, before registering. In а TTY the step-0
+        /// wizard fires regardless of this flag; the flag only
+        /// matters in `--no-interactive` mode where it gates
+        /// silent scaffold (without the flag, the command
+        /// refuses с pointer to `apprafter app scaffold`).
+        /// Walk-fix-able non-interactive convenience for CI
+        /// scripts that want one-shot scaffold + register.
+        #[arg(long, default_value_t = false)]
+        scaffold: bool,
     },
     /// List Applications scoped to the `apps` AppProject (or
     /// `--project <name>`). Filters to Applications labeled

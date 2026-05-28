@@ -13,6 +13,171 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.168 — M1.5 Track B.1.79b Part 3b — scaffold wizard in `app add` + interactive picker (2026-05-28)
+
+### What
+
+Closes the two remaining items from §1.79b's «deferred к
+Part 3b» list:
+
+- Scaffold flow integrated into `apprafter app add` wizard
+  as step 0 — checks `<cwd>/apprafter/Application.cue`
+  before any other prompt; missing → interactive scaffold
+  prompt OR `--scaffold` non-interactive auto-scaffold OR
+  refuse с pointer.
+- Interactive runtime picker в standalone `apprafter app
+  scaffold` — когда detection is inconclusive AND stdio is
+  а TTY, drops into а Select prompt instead of erroring с
+  pointer к `--runtime <slug>`.
+
+Operator quickstart now collapses to:
+
+```
+cd ~/new-rust-service
+apprafter app add https://github.com/me/new-rust-service
+  # → Step 0: «No apprafter/Application.cue found. Generate
+  #   one?» Y/n (default Y)
+  # → Select runtime (default = detected Rust)
+  # → Confirm
+  # → ✓ Scaffolded apprafter/Application.cue
+  # → Continues into existing wizard (Git URL prefilled,
+  #   branch detected, namespace prompt, etc.)
+```
+
+### New module
+
+`commands::scaffold_wizard` exposes:
+
+- `decide_scaffold_step(target_exists, use_wizard,
+  scaffold_flag) -> ScaffoldDecision` — pure decision tree
+  (Skip / Interactive / NonInteractive / Refuse). Drives
+  `app::add` step 0 routing.
+- `build_runtime_select_options(detections) -> (labels,
+  runtimes, default_idx)` — pure helper, generates the data
+  shape `inquire::Select` consumes. Default cursor walks
+  `ALL_RUNTIMES` order to find the first High-confidence
+  match; ties resolve by display order. Labels render as
+  `"<slug>"` (undetected) or `"<slug> (detected via
+  <marker>)"` (detected).
+- `pick_runtime_interactive(detections) -> Result<Runtime>`
+  — wraps `Select::new` over the pure helper. Used by both
+  `run_step_zero` AND `app_scaffold::resolve_runtime`'s
+  inconclusive-TTY path.
+- `run_step_zero(cwd, suggested_name)` — full sequence
+  (Confirm → runtime Select → Confirm → invoke `app_
+  scaffold::scaffold(opts)`).
+
+### `app add` integration
+
+`commands::app::add` gains а step 0 block at the top:
+
+```rust
+let decision = scaffold_wizard::decide_scaffold_step(
+    target.exists(), use_wizard, scaffold_flag,
+);
+match decision {
+    Skip => {}                              // existing flow
+    Interactive => run_step_zero(...)?,     // TTY wizard
+    NonInteractive => app_scaffold::scaffold(opts)?,  // --scaffold
+    Refuse => return Err(/* pointer to `app scaffold` */),
+}
+```
+
+The recursive `add_via_wizard → add` re-entry passes
+`scaffold_flag: false` because by then the target file
+exists и `decide_scaffold_step` returns `Skip`.
+
+### `--scaffold` flag
+
+New `apprafter app add --scaffold` opt-in для non-
+interactive mode. In TTY mode the step 0 wizard fires
+regardless of this flag (interactive operators always
+prompt-confirm). In `--no-interactive` mode without
+`--scaffold`, missing target refuses с а pointer к the
+standalone `apprafter app scaffold` (silent scaffolding
+behind operators в CI scripts would be surprising).
+
+### Suggested-name helper
+
+`sanitise_for_dns_1123(raw)` — cwd basename → DNS-1123-safe
+suggestion для step 0's prompt:
+
+- `"MyProject"` → `"myproject"` (lowercase ASCII alnum).
+- `"acme_app"` → `"acme-app"` (`_` and other non-alnum →
+  `-`).
+- `"foo__bar"` → `"foo-bar"` (collapse repeated dashes).
+- `"-leading"` → `"leading"` (trim).
+- `"___"` или `"..."` → `"app"` (empty result fallback).
+- 70-char input → truncated к 63 chars + trailing dash
+  trim.
+
+Operator sees the suggestion в the wizard's «name» prompt
+and overrides as needed; sanitisation ensures the prefill
+itself is а valid DNS-1123 string.
+
+### `app scaffold` standalone — TTY-aware
+
+`resolve_runtime` now branches three ways:
+
+1. `--runtime <slug>` → use it.
+2. Single High detection → use it.
+3. Otherwise: drop into `pick_runtime_interactive` on TTY,
+   error с pointer in non-TTY (existing Part 3 behaviour
+   preserved for CI).
+
+Tests cover the non-TTY paths exhaustively; the TTY-
+inconclusive branch doesn't trigger в `cargo test` because
+test stdio isn't а TTY.
+
+### Tests
+
++14 new unit tests:
+
+- `decide_scaffold_step_skips_when_target_exists` (3
+  permutations).
+- `decide_scaffold_step_routes_interactive_when_wizard_active`
+  (`scaffold_flag` irrelevant в TTY).
+- `decide_scaffold_step_routes_non_interactive_when_scaffold_flag_set`.
+- `decide_scaffold_step_refuses_when_neither_wizard_nor_scaffold_flag`
+  — the default non-TTY case.
+- `build_runtime_select_options_lists_all_twelve_with_default_blank_when_no_detections`.
+- `build_runtime_select_options_marks_detected_runtimes_with_marker`.
+- `build_runtime_select_options_default_idx_picks_first_high_in_array_order`
+  — regression guard for ties (detections array order ≠
+  display order; default must walk `ALL_RUNTIMES`).
+- `build_runtime_select_options_falls_back_to_medium_when_no_high`.
+- `build_runtime_select_options_handles_detection_without_marker`.
+- `sanitise_for_dns_1123_lowercases_and_replaces_specials` /
+  `_collapses_repeated_dashes` /
+  `_trims_leading_trailing_dashes` /
+  `_empty_input_falls_back_to_app` /
+  `_truncates_at_63_characters`.
+
+Total CLI suite: 247 → 261. Bun gate: 87/0 unchanged.
+
+Smoke-verified end-to-end:
+
+- `app scaffold --path <tmp> --name X` standalone — works
+  unchanged (Part 3 regression guard).
+- `app add <url> --no-interactive --no-ping` без manifest →
+  refuses с the new diagnostic pointing к `app scaffold`.
+- `app add <url> --no-interactive --no-ping --scaffold` →
+  scaffolds, then attempts register (fails downstream на
+  kubectl missing в test env — scaffold step itself
+  succeeded).
+
+### Still deferred к Part 4
+
+- `examples/applications/` reference manifests.
+- `docs/user-guide/cli/app-scaffold.md` walkthrough.
+- Quickstart update в operator-guide.
+- `--lang ru|en` for template comments (English-only ships
+  through 3b).
+
+### Bump
+
+CLI 0.1.167 → 0.1.168. Chart and cue-cmp unchanged.
+
 ## v0.1.167 — M1.5 Track B.1.79b Part 3 — `apprafter app scaffold` (2026-05-25)
 
 ### What

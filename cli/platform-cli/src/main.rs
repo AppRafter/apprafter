@@ -118,6 +118,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 remote,
                 no_ping,
                 no_interactive,
+                scaffold,
             } => commands::app::add(
                 git_url,
                 name,
@@ -128,6 +129,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 &remote,
                 no_ping,
                 no_interactive,
+                scaffold,
             )?,
             AppCommand::List {
                 project,
