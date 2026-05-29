@@ -17,9 +17,9 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ### Symptom
 
-After walk-fix #5 (scaffold vendors schemas as а `cue.mod/`
-inside `apprafter/`), the operator re-scaffolded и pushed,
-but Argo CD still failed — а NEW error this time:
+After walk-fix #5 (scaffold vendors schemas as a `cue.mod/`
+inside `apprafter/`), the operator re-scaffolded and pushed,
+but Argo CD still failed — a NEW error this time:
 
 ```
 plugin sidecar failed. error generating manifests in cmp:
@@ -35,15 +35,15 @@ in CMP manifest generation.
 
 ### Root cause
 
-A nested `cue.mod/` defines а CUE **module boundary**. Argo
-CD sets the CMP working directory к the Application's
-`spec.source.path` (repo-root-relative). For а scaffolded
+A nested `cue.mod/` defines a CUE **module boundary**. Argo
+CD sets the CMP working directory to the Application's
+`spec.source.path` (repo-root-relative). For a scaffolded
 repo with the manifest at `apprafter/Application.cue` and
 `source.path` = repo root, the entrypoint ran `cue export
 ./...` from the repo root — which does NOT descend into the
 nested `apprafter/` module, hence "matched no packages".
 
-This is а regression introduced by walk-fix #5: before the
+This is a regression introduced by walk-fix #5: before the
 vendored `cue.mod/`, `cue export ./...` from the parent
 recursed freely into `apprafter/` (no module boundary). The
 walk-fix #5 smoke ran `cd apprafter && cue vet` from INSIDE
@@ -78,14 +78,14 @@ walking UP from the new cwd, so it works in all three layouts:
 
 `cue.mod/pkg/` (the dependency cache) is excluded from `./...`
 evaluation, so the vendored schema package is never emitted
-as а manifest.
+as a manifest.
 
 ### Self-healing
 
 Existing registrations work after the image upgrade WITHOUT
 re-registering, regardless of which `spec.source.path` they
 were created with — the entrypoint locates the package dir
-either way. procvue-landing (registered с `source.path` =
+either way. procvue-landing (registered with `source.path` =
 repo root) just works after:
 
 ```
@@ -97,10 +97,10 @@ kubectl -n argocd annotate applications.argoproj.io \
 
 ### Regression guard
 
-`argocd-cue-cmp-check.yml` gains а second entrypoint smoke
-that builds the EXACT scaffold layout — `apprafter/` with а
+`argocd-cue-cmp-check.yml` gains a second entrypoint smoke
+that builds the EXACT scaffold layout — `apprafter/` with a
 nested `cue.mod/` carrying vendored schemas (copied from the
-repo's `schemas/v1alpha1/`) + а typed manifest that `import`s
+repo's `schemas/v1alpha1/`) + a typed manifest that `import`s
 `apprafter.io/schemas/v1alpha1` — runs the entrypoint with
 cwd = the PARENT (as Argo CD does for `source.path` = repo
 root), and asserts it cds in and renders the typed manifest
@@ -124,7 +124,7 @@ renders correctly through the cd. `test-discover.sh`: 5/5.
   `image: ghcr.io/apprafter/argocd-cue-cmp:v0.1.6`.
 - **No CLI bump** — per the v0.1.159 channel-latest design,
   chart + cue-cmp-image changes flow into existing installs
-  through PlatformController polling и
+  through PlatformController polling and
   `resolve_latest_platform_stack_version()` on fresh
   bootstraps. `cli/Cargo.toml` stays at 0.1.174.
 
