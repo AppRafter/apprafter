@@ -2,21 +2,23 @@
 
 ## Status
 
-Draft.
+Accepted (2026-05-29).
+
+The gRPC-streaming-on-launch decision (gRPC streaming over HTTP/2 with TLS, Rust agent, Bun host) is ratified.
 
 ## Context
 
-`MANAGED_STRATEGY.md` §3 defines a three-tier managed offering: Hosted Services, Managed Operations, and Turnkey Cloud. The launch tier is Hosted Services (per `MANAGED_LAUNCH_SPEEDRUN.md` §0.5): we host Backstage portal, Account UI, MCP server, and supporting infrastructure on our side; customer clusters live on customer Hetzner accounts and remain fully autonomous OSS installs. The two sides communicate via a long-lived connection initiated from the customer cluster.
+AppRafter's managed offering comprises three managed plans (ADR 0034): Hosted Services, Managed Operations, and Turnkey Cloud. The launch managed plan is Hosted Services (`speedrun-plan.md` §0.5): we host the Backstage portal, Account UI, MCP server, and supporting infrastructure on our side; customer clusters live on the customer's own infrastructure and remain fully autonomous open-source installs. The two sides communicate via a long-lived connection initiated from the customer cluster.
 
 This communication channel — designated `apprafter-agent` ↔ hosted-bus — has the following requirements:
 
-- **Outbound-only from customer cluster.** Customer must not configure inbound firewall rules; Lisa-class users are not equipped to manage Hetzner Cloud firewall configuration or VPS-level iptables. The agent initiates the connection; the hosted side never reaches into customer kubeapi.
+- **Outbound-only from customer cluster.** Customer must not configure inbound firewall rules; the target operators are not expected to manage cloud-firewall or VPS-level iptables configuration. The agent initiates the connection; the hosted side never reaches into the customer's Kubernetes API.
 - **Bi-directional message flow over a single connection.** Customer → hosted: status updates, audit events, deploy notifications, log streams (opt-in). Hosted → customer: MCP-initiated operations (deploy, scale, restart), `MigrationPlan` creation triggers, configuration push (token rotation).
 - **Persistent and resilient.** Long-lived connection with automatic reconnect on transient network failures. Status cache on hosted side absorbs short disconnects without surfacing them as customer-visible failures.
 - **Strong authentication and authorization.** Each agent carries a customer-scoped registration token (issued during cluster registration, revocable from the Account UI). All operations are auditable to a (customer, cluster, session) tuple.
-- **Resource-frugal in the customer cluster.** Tier 1 substrate is a single `cpx22` (4 GB RAM, 2 vCPU) on Hetzner; the agent should consume a small fraction of those resources, since the customer paid for the box to run their workloads, not our control surface.
+- **Resource-frugal in the customer cluster.** Tier 1 substrate is a single `cpx22` (4 GB RAM, 2 vCPU) on Hetzner; the agent should consume a small fraction of those resources, leaving the substrate available for the customer's own workloads.
 - **Type-safe across language boundaries.** Customer-side runtime and hosted-side runtime are different. Manual JSON schema synchronization across two stacks is error-prone in API evolution; the project's experience with schema drift has already motivated CUE adoption for configuration (ADR 0029). A similar discipline applies to the agent protocol.
-- **Compatible with a future transition to NATS-backed control plane.** ADR 0028 and the kine+NATS deferred item (`plan.md` 3.2, `MANAGED_LAUNCH_SPEEDRUN.md` §2.3 bucket C) describe a path where the audit log becomes replayable via JetStream. The launch protocol must not preclude a migration to NATS-based transport, but should not force NATS infrastructure on day one when it is not yet in the OSS-core scope.
+- **Compatible with a future transition to NATS-backed control plane.** ADR 0028 and the kine+NATS deferred item (`plan.md` 3.2, `speedrun-plan.md` §2.3 bucket C) describe a path where the audit log becomes replayable via JetStream. The launch protocol must not preclude a migration to NATS-based transport, but should not force NATS infrastructure on day one when it is not yet in the OSS-core scope.
 
 Three protocol candidates were evaluated: WebSocket, gRPC streaming, and a NATS client. Agent-side runtime candidates were Rust (matching the existing `apprafter` operator) and OneBun/TypeScript (matching the host-side stack).
 
@@ -43,7 +45,7 @@ The agent runs on customer hardware, which is finite. Approximate resource footp
 - **Rust binary**: 10–20 MB statically linked binary; 20–50 MB resident memory under typical control-plane load. Compiles to a single binary; no runtime dependencies on the cluster.
 - **OneBun (Bun + TypeScript bundle)**: 80–150 MB on disk (Bun runtime + dependencies); 100–200 MB resident memory.
 
-In a Tier 1 `cpx22` (4 GB RAM total), the OneBun path consumes 2.5–5% of customer RAM purely for control surface. The Rust path consumes 0.5–1%. The customer paid for that RAM to run their applications; a managed offering that visibly eats single-digit percent of customer capacity before their first workload deploys gives the wrong impression.
+In a Tier 1 `cpx22` (4 GB RAM total), the OneBun path consumes 2.5–5% of cluster RAM purely for control surface. The Rust path consumes 0.5–1%. The substrate exists to run the customer's workloads, so the control surface should remain a small fraction of available RAM.
 
 The Rust agent also reuses the existing `apprafter` operator's toolchain: `kube-rs` for Kubernetes client work, `tonic` for gRPC, `serde` for serialization, `tokio` for async runtime. Whether the agent ships as a subcommand of the `apprafter` operator binary or as a sibling binary in the same Cargo workspace is an implementation detail; both options use the same dependency tree and CI pipeline. No new language runtime, no new security surface in the customer cluster, no new release process.
 
@@ -77,7 +79,7 @@ Connection lifecycle:
 
 Heartbeat is implicit in the HTTP/2 stream lifecycle (keepalive frames). No application-level heartbeat is needed for liveness detection on the launch protocol; observability of the connection state can be added later if metrics show it is needed.
 
-## Rejected alternatives
+## Alternatives considered
 
 ### WebSocket
 
@@ -87,7 +89,7 @@ The simplicity advantage of WebSocket evaporates when the protocol has to grow: 
 
 ### NATS client
 
-A NATS-based agent would be a natural fit if NATS were already in the substrate. The kine+NATS migration (`plan.md` 3.2) and the replayable audit log story (killer feature #21, `KILLER_FEATURES_MATRIX.md`) both lean toward NATS as transport. However, on launch:
+A NATS-based agent would be a natural fit if NATS were already in the substrate. The kine+NATS migration (`plan.md` 3.2) and the replayable audit log story (a structural moat in the launch positioning) both lean toward NATS as transport. However, on launch:
 
 - Hosted side has no NATS server in scope — it would have to be added as new infrastructure purely to support the agent protocol.
 - Customer side has no NATS server in scope — running a NATS client requires the JetStream account/stream provisioning that `needs.jetstream` (`plan.md` 2.5, bucket D in the speedrun) would normally handle, but `needs.jetstream` is dropped for launch.
@@ -137,22 +139,22 @@ Core platform team. The agent and the hosted-bus server are co-owned during init
 
 ## Re-evaluation triggers
 
-- **NATS-backed control plane lands in OSS-core.** When `plan.md` 3.2 (kine+NATS migration) ships and JetStream becomes part of the substrate, re-evaluate switching the agent ↔ host transport from gRPC to NATS. Expected to coincide with prioritizing killer feature #21 (replayable audit log).
+- **NATS-backed control plane lands in OSS-core.** When `plan.md` 3.2 (kine+NATS migration) ships and JetStream becomes part of the substrate, re-evaluate switching the agent ↔ host transport from gRPC to NATS. Expected to coincide with prioritizing the replayable-audit-log capability.
 - **Bun-native gRPC implementation matures.** If a first-class Bun gRPC library appears (e.g., via WebTransport or HTTP/2 native bindings), evaluate dropping `@grpc/grpc-js`. The proto schema is unaffected; only the host-side client/server library changes.
 - **OneBun resource footprint shrinks dramatically.** If Bun's runtime overhead drops below ~30 MB resident in a hardened production build, reconsider OneBun for the agent — type sharing convenience would then outweigh the resource cost.
 - **Schema evolution pain.** If protobuf's evolution model proves too restrictive in practice (e.g., field deprecation cycles cause two-week development blocks), re-evaluate. The most likely fallback is `bufbuild` tooling additions rather than a protocol change.
 
 ## Still open
 
-- **Agent binary distribution model.** Two options: (a) ship as a separate binary `apprafter-agent` alongside the operator; (b) ship as a subcommand `apprafter operator agent`. Option (a) is simpler operationally; option (b) reuses the single-binary release artifact. Decision deferred to implementation (`MANAGED_LAUNCH_SPEEDRUN.md` §3.2).
-- **Audit log retention on hosted side.** The 90-day retention promise in `PRICING_AND_LAUNCH_NOTES.md` §2 applies to events flowing over this channel. The storage backing (PostgreSQL row store, ClickHouse if §2.3 bucket C lands, NATS JetStream if NATS migration lands) is out of scope for this ADR.
-- **Multi-region hosted bus.** Launch tier assumes a single hosted region. Multi-region failover for the hosted bus is out of scope; if customer base distributes geographically, this becomes a managed-offering scaling concern.
+- **Agent binary distribution model.** Two options: (a) ship as a separate binary `apprafter-agent` alongside the operator; (b) ship as a subcommand `apprafter operator agent`. Option (a) is simpler operationally; option (b) reuses the single-binary release artifact. Decision deferred to implementation (`speedrun-plan.md` §3.2).
+- **Audit log retention on hosted side.** The 90-day audit-retention target for the managed plan applies to events flowing over this channel. The storage backing (PostgreSQL row store, ClickHouse if §2.3 bucket C lands, NATS JetStream if NATS migration lands) is out of scope for this ADR.
+- **Multi-region hosted bus.** The launch managed plan assumes a single hosted region. Multi-region failover for the hosted bus is out of scope; if customer base distributes geographically, this becomes a managed-offering scaling concern.
 
 ## References
 
-- `MANAGED_STRATEGY.md` §3 (three-tier managed offering).
-- `MANAGED_LAUNCH_SPEEDRUN.md` §0.5 (Hosted Services as launch tier), §3.1 (hosted multi-tenant SaaS scaffolding), §3.2 (`apprafter-agent` + registration), §5.6 (this ADR landing point).
-- `PRICING_AND_LAUNCH_NOTES.md` §2 (Hosted Services price tier, 90-day audit retention).
+- ADR 0034 — managed offering model and terminology (the three managed plans; Hosted Services as the launch managed plan; hardware-tier vs managed-plan terminology).
+- `speedrun-plan.md` §0.5 (Hosted Services as launch tier), §3.1 (hosted multi-tenant SaaS scaffolding), §3.2 (`apprafter-agent` + registration), §5.6 (this ADR landing point).
+- ADR 0033 — tenant security configuration (orthogonal `strictMode` / `confidential` switches).
 - ADR 0028 (Platform-stack distribution — CUE source, dual-channel publishing; precedent for codegen discipline).
 - ADR 0029 (CUE compilation via Argo CD CMP; precedent for schema source-of-truth pattern).
 - [tonic — Rust gRPC implementation](https://github.com/hyperium/tonic).

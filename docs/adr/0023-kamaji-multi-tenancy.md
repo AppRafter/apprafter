@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-05-12).
+Accepted (2026-05-12). Amended by ADR 0038 (2026-05-29): for Tier 2 the Kamaji hard-multi-tenancy default is changed from default-opt-out to OPT-IN (`PlatformStack.spec.values.multitenancy`, default off); Kamaji remains the single hard-MT mechanism when enabled. The original Kamaji mechanism choice stands.
 
 ## Context
 
@@ -10,18 +10,20 @@ AppRafter's security values (CoCo, OpenBao, workload identity, default-deny netw
 
 - **Per-environment isolation** within one customer (dev/staging/prod of the same team).
 - **Multi-team isolation** within one organisation (several teams of one customer).
-- **Multi-customer isolation** (MSP scenario from Andrey-A audience: one AppRafter instance hosting multiple unrelated customers).
-- **Managed Ops Plane A/B separation** (we trust ourselves for management plane; we do **not** trust ourselves for customer data plane).
-- **Turnkey customer cluster hosting** (one AppRafter HQ provisions and operates clusters for many customers).
+- **Multi-customer isolation** (managed-service-provider scenario: one AppRafter instance hosting multiple unrelated customers).
+- **Managed Operations Plane A/B separation** (the management plane and the customer data plane are isolated by structure, so management access never extends to the customer data plane).
+- **Turnkey Cloud customer cluster hosting** (AppRafter provisions and operates clusters for many customers).
+
+(Per ADR 0034, hard multi-tenancy is an orthogonal, opt-in layer — not tier-defining and not a managed plan. "Managed Operations" and "Turnkey Cloud" above are the ADR 0033 deployment modes that a managed plan selects, distinct from the managed plans themselves.)
 
 Four mainstream Kubernetes multi-tenancy mechanisms were considered:
 
 | Tool | Type | Cluster-admin scope | Insider attack surface |
 |---|---|---|---|
-| Capsule | Soft (policy CRD) | Host cluster-admin = god | High (shared API server) |
+| Capsule | Soft (policy CRD) | Host cluster-admin has unrestricted scope | High (shared API server) |
 | vCluster | Hard (per-tenant k3s control plane in pod) | Vcluster-admin ≠ host-admin | Medium (syncer mediates) |
 | Kamaji | Hard (per-tenant kube-apiserver pod, shared datastore) | Tenant-admin ≠ host-admin | Low (separate API server pod) |
-| HNC | Soft (namespace hierarchy) | Host cluster-admin = god | High |
+| HNC | Soft (namespace hierarchy) | Host cluster-admin has unrestricted scope | High |
 
 The initial framing was "Capsule as foundation, vCluster as opt-in for hard cases". That framing was reconsidered after security threat model recalibration: Capsule alone fails the MSP scenario, vCluster has higher insider attack surface than Kamaji, and operating two mechanisms (Capsule + vCluster) adds complexity without security gain.
 
@@ -34,13 +36,13 @@ The initial framing was "Capsule as foundation, vCluster as opt-in for hard case
 | Tier | Hard multi-tenancy | Capsule policy layer | Note |
 |---|---|---|---|
 | **T1** | Not possible (single-node) | Default, opt-out | Soft mt only: Capsule + default-deny NetworkPolicy + workload identity. Solo founders migrate to T2 with same manifests to get hard mt. |
-| **T2+** | Kamaji default, opt-out | Default, opt-out | Per AppRafter Tenant = Kamaji TenantControlPlane. |
+| **T2+** | Kamaji (T2 default changed to opt-in by ADR 0038 — `PlatformStack.spec.values.multitenancy`, default off; T3/T4 unchanged) | Default, opt-out | Per AppRafter Tenant = Kamaji TenantControlPlane. |
 | **T3** | Kamaji + selective CoCo for sensitive workloads | Default | CoCo orthogonal opt-in. |
 | **T4** | Kamaji + CoCo default for confidential workloads | Default | Maximum isolation. |
 
 ### Datastore
 
-**Default: integrated Postgres via CloudNativePG.** Kamaji's datastore is a `ResourceClaim` on the `pg-integrated` provider. This is the same primitive applications use; Kamaji eats its own dogfood:
+**Default: integrated Postgres via CloudNativePG.** Kamaji's datastore is a `ResourceClaim` on the `pg-integrated` provider. This is the same primitive applications use; Kamaji consumes it like any other platform workload:
 
 ```cue
 platformServices: {
@@ -161,6 +163,7 @@ Core platform team; Phase 3.8 (Kamaji install) and Phase 3.9 (Tenant CRD operato
 - ADR 0016 (Hetzner+AWS native — bootstrap problem disqualified Crossplane).
 - ADR 0022 (Tier model — T1 simplifications).
 - ADR 0024 (Cluster-admin constrain — Kamaji TCP separation is a layer in the bundle).
+- ADR 0038 (Tier 2 hard-multi-tenancy changed to opt-in — amends this ADR's per-tier T2 default).
 - spec.md §3.9 Tenant CRD (new section).
 - spec.md §4.1 Compute Substrate (per-tier multi-tenancy column).
-- Managed Strategy §9 Multi-tenancy MSP.
+- `speedrun-plan.md` §5.7 (managed multi-tenancy / MSP scenario; Tier 2 Kamaji opt-in).
