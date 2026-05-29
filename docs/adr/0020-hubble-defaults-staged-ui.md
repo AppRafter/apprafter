@@ -29,7 +29,7 @@ Hubble UI surface is delivered in three stages, sequential and additive:
 
 **Stage 2 — Backstage flow visualizer plugin.** AppRafter ships a Backstage plugin that shows Hubble flows on the Application page (embedded, not separate UI). The plugin adds a "convert observed flow to explicit policy" button: developers see actual traffic, click the button, the plugin generates a Pull Request that adds the observed destination to the Application's `connects.egress` declaration.
 
-**Stage 3 (possible, contingent on Managed Strategy §13.5) — Custom OneBun portal flow visualizer.** If the project moves to a custom OneBun-based portal as a replacement for Backstage, the flow visualizer is re-implemented there. This stage is not committed; it depends on the broader Backstage-vs-custom-portal decision in Managed Strategy.
+**Stage 3 (possible, contingent on the marketing strategy's Backstage-vs-custom-portal decision) — Custom OneBun portal flow visualizer.** If the project moves to a custom OneBun-based portal as a replacement for Backstage, the flow visualizer is re-implemented there. This stage is not committed; it depends on the broader Backstage-vs-custom-portal decision in the marketing strategy.
 
 ## Rationale
 
@@ -77,7 +77,7 @@ Core platform team; Stage 1 in Phase 3.7a, Stage 2 in Phase 3.7b.
 ## Re-evaluation triggers
 
 - Cilium drops Hubble as a feature (unlikely; Hubble is core Cilium).
-- Backstage-vs-custom-portal decision (Managed Strategy §13.5) resolves, triggering Stage 3 work.
+- The Backstage-vs-custom-portal decision (in the marketing strategy) resolves, triggering Stage 3 work.
 - Customers report that Hubble UI is sufficient and Backstage plugin is not adopted — could lead to Stage 2 deprioritisation.
 
 ## References
@@ -87,4 +87,4 @@ Core platform team; Stage 1 in Phase 3.7a, Stage 2 in Phase 3.7b.
 - spec.md §4.3 Networking (default-deny + Hubble observability).
 - spec.md §4.10 Observability.
 - spec.md §4.11 UX Layer (Backstage plugins).
-- Managed Strategy §13.5 (Backstage vs custom portal open question).
+- The marketing strategy (Backstage vs custom portal open question).

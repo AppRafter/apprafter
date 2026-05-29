@@ -46,7 +46,7 @@ Tier 3 bare metal cannot be autoscaled at Karpenter speeds (Hetzner Robot server
 
 ### Suggestions advisor — managed-side feature
 
-A separate "you should scale up" advisor service is **not** shipped in OSS. OSS users either use Karpenter (when available) or manage capacity manually. The advisor is a managed-side feature, leveraging observability data (VictoriaMetrics + ClickHouse logs) plus potential LLM analytics. Phase 4+ managed work, recorded in Managed Strategy open questions.
+A separate "you should scale up" advisor service is **not** shipped in OSS. OSS users either use Karpenter (when available) or manage capacity manually. The advisor is a managed-side feature, leveraging observability data (VictoriaMetrics + ClickHouse logs) plus potential LLM analytics. Phase 4+ managed work, recorded in the marketing strategy's open questions.
 
 ## Rationale
 
@@ -93,7 +93,7 @@ cluster-autoscaler's only advantage is wider provider support. With Hetzner need
 
 ## Owner
 
-Core platform team; AWS native in Phase 6.2, Hetzner via CAPI when CAPI lands in Phase 5+, managed advisor as separate Managed Strategy work.
+Core platform team; AWS native in Phase 6.2, Hetzner via CAPI when CAPI lands in Phase 5+, managed advisor as separate marketing-strategy work.
 
 ## Re-evaluation triggers
 
@@ -109,4 +109,4 @@ Core platform team; AWS native in Phase 6.2, Hetzner via CAPI when CAPI lands in
 - ADR 0023 (Multi-tenancy / CAPI dependency for Hetzner path).
 - spec.md §4.1 Compute Substrate (per-tier).
 - spec.md §5 Tech Stack (Node autoscaling row).
-- Managed Strategy §13 (Karpenter advisor open question).
+- The marketing strategy (Karpenter advisor open question).

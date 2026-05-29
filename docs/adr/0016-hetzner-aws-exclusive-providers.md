@@ -83,4 +83,4 @@ Core platform team; AWS provider in Phase 6.2, additional native providers on de
 - spec.md §3.7 Infrastructure (provider model).
 - spec.md §4.12 Infrastructure Tooling.
 - spec.md Appendix B Non-goals (multi-cloud entry).
-- Managed Strategy §3.3 Turnkey Cloud (CAPI dependency for Phase 5+).
+- The marketing strategy (Turnkey Cloud — CAPI dependency for Phase 5+).

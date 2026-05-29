@@ -70,7 +70,7 @@ The `manifests/tier-1/`, `manifests/tier-2/`, `manifests/tier-3/`, `manifests/ti
 
 ## Risk
 
-- Documentation drift if all references to old tier descriptions aren't updated. Mitigation: comprehensive pass through spec.md, plan.md, DEV_MODE_SPEC.md, Managed Strategy. See PRE_0_2_FIXES task list.
+- Documentation drift if all references to old tier descriptions aren't updated. Mitigation: comprehensive pass through spec.md, plan.md, DEV_MODE_SPEC.md, and the marketing strategy.
 
 ## Owner
 
