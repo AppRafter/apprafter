@@ -13092,8 +13092,7 @@ FSL-1.1-Apache-2.0 — see ADR 0032.)
   render-with-env, render-without-env). Phase 1.9 closes ✅.
   HTTPRoute (mentioned in plan.md §1.9 goal as
   "Application → Deployment + Service + HTTPRoute") is
-  deliberately deferred — the §1.9 acceptance ("HTTP endpoint,
-  доступный изнутри кластера") is satisfied by the Service alone,
+  deliberately deferred — the §1.9 acceptance ("HTTP endpoint accessible from inside the cluster") is satisfied by the Service alone,
   and external traffic management is the cleanest fit for a phase
   that owns Gateway domain config end-to-end.
 - **Application reconcile via SSA + status subresource (sub-phase

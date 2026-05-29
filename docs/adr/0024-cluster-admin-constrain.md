@@ -6,7 +6,7 @@ Accepted (2026-05-12).
 
 ## Context
 
-One of AppRafter's core security values is minimising cluster-admin intervention in application workloads. The default Kubernetes RBAC model grants cluster-admin god-mode powers: read any secret, exec into any pod, modify any resource. This is fundamentally incompatible with positioning AppRafter as a security-first platform.
+One of AppRafter's core security values is minimising cluster-admin intervention in application workloads. The default Kubernetes RBAC model grants cluster-admin unrestricted powers: read any secret, exec into any pod, modify any resource. This is fundamentally incompatible with positioning AppRafter as a security-first platform.
 
 A complete cryptographic solution exists (Confidential Containers / CoCo, Phase 6), but it requires specific hardware and is limited to confidential workloads. Defense in depth requires layered mechanisms that reduce cluster-admin power across all workloads, not just confidential ones.
 

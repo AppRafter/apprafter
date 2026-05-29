@@ -105,7 +105,7 @@ Rejected, by definition. If the rescue cluster were operated through the AppRaft
 
 ### Defer the rescue cluster / staging / canary to post-launch
 
-Rejected. The asymmetric cost of a destructive control-plane regression — borne against the explicit "we eat our own dog food" promise — means the recovery and staged-rollout machinery must exist before customers depend on the hosted layer, not after the first incident proves it was needed.
+Rejected. The asymmetric cost of a destructive control-plane regression — borne against the explicit dogfooding promise — means the recovery and staged-rollout machinery must exist before customers depend on the hosted layer, not after the first incident proves it was needed.
 
 ## Risks
 
