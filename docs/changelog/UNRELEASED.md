@@ -18,20 +18,20 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 ### Reframe (again)
 
 Walk-fix #4 inlined the v1alpha1 schema directly into the
-scaffolded `Application.cue` body для typed validation
+scaffolded `Application.cue` body for typed validation
 without external setup. Operator pushed back: if scaffold
 already creates an `apprafter/` directory, vendoring the
-schemas as а proper CUE module under that directory is
-cleaner — Application.cue stays free of «framework code»,
-schema definitions live в their own files, and the layout
+schemas as a proper CUE module under that directory is
+cleaner — Application.cue stays free of "framework code",
+schema definitions live in their own files, and the layout
 mirrors how CUE projects vendor deps idiomatically.
 
-Right call. Inline schema was а compromise; vendored
+Right call. Inline schema was a compromise; vendored
 module is the natural shape.
 
 ### What ships
 
-Scaffold output is now а full mini-CUE-module:
+Scaffold output is now a full mini-CUE-module:
 
 ```
 apprafter/
@@ -46,7 +46,7 @@ apprafter/
                     └── application.cue                      (vendored)
 ```
 
-`Application.cue` returns к the typed-with-import form:
+`Application.cue` returns to the typed-with-import form:
 
 ```cue
 package apprafter
@@ -60,8 +60,8 @@ landing: v1alpha1.#Application & {
 ```
 
 CUE walks up from `Application.cue`, finds `cue.mod/`,
-resolves `apprafter.io/schemas/v1alpha1` к the vendored
-package. Works locally + in CMP без external setup OR
+resolves `apprafter.io/schemas/v1alpha1` to the vendored
+package. Works locally + in CMP without external setup OR
 network calls.
 
 ### Embed mechanics
@@ -82,10 +82,10 @@ real CRD shape.
 New `write_vendored_cue_module(&apprafter_dir)` creates the
 `cue.mod/` tree:
 
-- `cue.mod/module.cue` — pinned к CUE language v0.10.0,
+- `cue.mod/module.cue` — pinned to CUE language v0.10.0,
   module path `apprafter.io/local-app` (neutral string;
-  has к differ from the imported path so CUE's resolver
-  treats the import as а dependency lookup, not а self-
+  has to differ from the imported path so CUE's resolver
+  treats the import as a dependency lookup, not a self-
   reference).
 - `cue.mod/pkg/apprafter.io/schemas/v1alpha1/types.cue` —
   vendored copy of source.
@@ -104,9 +104,9 @@ Next steps:
   2. Optional: typed-validate locally —
        cd /path/to/repo/apprafter && cue vet ./...
      The vendored schemas resolve the `apprafter.io/schemas/
-     v1alpha1` import без any `cue mod tidy` step.
-  3. Commit + push к your git remote.
-  4. `apprafter app add` to register с Argo CD (from the same directory).
+     v1alpha1` import without any `cue mod tidy` step.
+  3. Commit + push to your git remote.
+  4. `apprafter app add` to register with Argo CD (from the same directory).
 ```
 
 CMP runs `cue export` from inside `apprafter/` via the
@@ -135,14 +135,14 @@ landing.spec.base.expose.porrt: field not allowed:
 ```
 
 Error messages point at the vendored schema source for
-out-of-range constraints, giving the operator а clear «what
-constraint did I trip» trail.
+out-of-range constraints, giving the operator a clear "what
+constraint did I trip" trail.
 
 ### Existing apps
 
-Operators rerunning scaffold с `--force` get the new layout:
+Operators rerunning scaffold with `--force` get the new layout:
 typed import + cue.mod tree. The inline-schema layout from
-v0.1.172 can stay в place if the operator hasn't re-scaffold-
+v0.1.172 can stay in place if the operator hasn't re-scaffold-
 ed yet — both produce byte-identical `cue export` output,
 so CMP / Argo CD don't care which version generated the
 file. Re-scaffold at convenience.
@@ -153,16 +153,16 @@ file. Re-scaffold at convenience.
 
 - `scaffold_writes_cue_mod_module_and_vendored_schemas` —
   asserts `cue.mod/module.cue` + both vendored schema files
-  exist в the expected path после scaffold.
+  exist in the expected path after scaffold.
 - `scaffold_vendored_schemas_match_embedded_source_byte_for_byte`
-  — load-bearing identity check; if а refactor accidentally
+  — load-bearing identity check; if a refactor accidentally
   diverges the vendored copy from the embedded source, the
   typed-vet contract breaks silently and this test fires.
 
 Existing 274 tests pass unchanged; the
 `scaffold_writes_application_cue_and_creates_apprafter_dir`
 test gained two extra assertions verifying the typed
-`import v1alpha1` line и `v1alpha1.#Application & {`
+`import v1alpha1` line and `v1alpha1.#Application & {`
 constraint are present (would have caught accidental
 template regression). Total CLI suite: 274 → 276. Bun
 gate: 87/0.
@@ -175,25 +175,25 @@ CLI 0.1.172 → 0.1.173. Chart and cue-cmp unchanged.
 
 ### Reframe
 
-Walk-fix #3 traded typed CUE для зеро-setup operation —
+Walk-fix #3 traded typed CUE for zero-setup operation —
 untyped struct + explicit `apiVersion`/`kind`. Operator
-pushed back: «не можем терять типизацию в манифестах».
+pushed back: "we can't lose type-checking in the manifests".
 Agreed — losing static type-check on user code was the
 wrong call.
 
 Three approaches surveyed for restoring typed CUE:
 
 1. **OCI module from public repo.** Publish AppRafter
-   schemas as а CUE module к OCI registry; operator's
+   schemas as a CUE module to OCI registry; operator's
    `cue.mod/module.cue` references it; `cue mod tidy`
-   fetches. Pros: schemas live в one place, versioned.
-   Cons: requires CMP к make network calls on every sync,
+   fetches. Pros: schemas live in one place, versioned.
+   Cons: requires CMP to make network calls on every sync,
    operator setup steps (mod tidy), publish workflow for
    schemas-as-module, dependency on OCI registry uptime
    during sync. Heavyweight.
 
 2. **CMP sidecar bundles schemas + auto-symlinks.** CMP
-   image carries а copy of schemas; entrypoint.sh symlinks
+   image carries a copy of schemas; entrypoint.sh symlinks
    them into `cue.mod/pkg/apprafter.io/` before `cue
    export`. Pros: zero operator setup, no OCI network call.
    Cons: still doesn't help local `cue vet` — operator
@@ -204,22 +204,22 @@ Three approaches surveyed for restoring typed CUE:
    the v1alpha1 CRD definitions (`#Application`,
    `#ObjectMeta`, `#ApplicationSpec`, `#TypeMeta`) at the
    top of `Application.cue`, then binds the operator's app
-   к `#Application & { ... }`. Pros: works locally без
-   any setup, works в CMP без any setup, schema visible
+   to `#Application & { ... }`. Pros: works locally without
+   any setup, works in CMP without any setup, schema visible
    inline (educational), `cue export` hides definitions
    from JSON output naturally — they're prefixed `#` so
-   они're hidden by CUE's export semantics. Cons: schema
-   needs к match what AppRafter ships — re-scaffold on
-   v1alpha2 если/когда it lands.
+   they're hidden by CUE's export semantics. Cons: schema
+   needs to match what AppRafter ships — re-scaffold on
+   v1alpha2 if/when it lands.
 
 Option 3 wins. The v1alpha1 contract is stable for the
 foreseeable future (pre-1.0 CRD); when v1alpha2 ships,
-scaffold templates bump в the same CLI release. Operators
+scaffold templates bump in the same CLI release. Operators
 re-scaffold OR manually update the inlined schema block.
 
 ### What ships
 
-Both `default.cue.hbs` и `blank.cue.hbs` updated с the same
+Both `default.cue.hbs` and `blank.cue.hbs` updated with the same
 schema block before the app binding. Source-of-truth path
 (github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/
 {types,application}.cue) referenced in the header comment
@@ -277,7 +277,7 @@ $ mkdir /tmp/no-mod-test && cd /tmp/no-mod-test
 $ touch Cargo.toml
 $ apprafter app scaffold --name smoke --runtime rust
 
-# Typed vet succeeds на the rendered manifest:
+# Typed vet succeeds on the rendered manifest:
 $ cue vet ./apprafter/...
 # (no output = success)
 
@@ -297,27 +297,27 @@ $ cue export ./apprafter/...
 { "smoke": { "apiVersion": "...", "kind": "Application", ... } }
 ```
 
-CMP pipeline produces byte-identical JSON к the untyped
+CMP pipeline produces byte-identical JSON to the untyped
 walk-fix #3 version — definitions hidden by CUE's `#`-
 prefix export semantics, only bound values emitted.
 
 ### Existing apps
 
-Operators с stale untyped scaffolds (v0.1.171) can:
+Operators with stale untyped scaffolds (v0.1.171) can:
 
-1. Re-scaffold с `--force` к pick up the typed version.
-2. Or manually copy the schema block from а freshly-
+1. Re-scaffold with `--force` to pick up the typed version.
+2. Or manually copy the schema block from a freshly-
    scaffolded file into their existing Application.cue
-   above the app binding, then constrain the binding с
+   above the app binding, then constrain the binding with
    `#Application & { ... }`.
 
-Both paths converge на the same rendered output.
+Both paths converge on the same rendered output.
 
 ### Tests
 
 Existing 274 tests pass unchanged — assertions on
 `render_application` output check app name, namespace,
-CUE binding ident, port. All still present в the typed
+CUE binding ident, port. All still present in the typed
 templates. Bun gate: 87/0.
 
 ### Bump
@@ -326,11 +326,11 @@ CLI 0.1.171 → 0.1.172. Chart and cue-cmp unchanged.
 
 ### Long-term
 
-Long-term path stays open: when AppRafter ships а CUE
+Long-term path stays open: when AppRafter ships a CUE
 schema OCI module + CMP-side `cue mod tidy`, the inlined
-block can become а `// optional inline schema — for
-operators without OCI access» fallback и typed users
-import from the module. Не blocking today.
+block can become a `// optional inline schema — for
+operators without OCI access" fallback and typed users
+import from the module. Not blocking today.
 
 ## v0.1.171 — M1.5 walk-fix #3 post-B.1.79b-Part-3b — scaffold drops CUE import (2026-05-28)
 
@@ -361,12 +361,12 @@ landing: v1alpha1.#Application & { ... }
 
 CUE resolves imports against `cue.mod/module.cue` (module
 manifest) + `cue.mod/pkg/<path>/` (vendored modules).
-**Inside the apprafter monorepo** оба artefacts present —
+**Inside the apprafter monorepo** both artefacts present —
 that's why `landing/web/apprafter/Application.cue` worked
 end-to-end. User app repos scaffolded fresh have neither;
-CUE refuses к resolve the import и CMP fails.
+CUE refuses to resolve the import and CMP fails.
 
-Two paths к а fix:
+Two paths to a fix:
 
 - **Long-term (deferred)**: CMP image bundles AppRafter
   schemas; entrypoint.sh symlinks them into
@@ -377,25 +377,25 @@ Two paths к а fix:
   untyped CUE — no `import`, no schema constraint.
   Works against vanilla CMP without any module setup;
   trade-off is loss of local `cue vet` static type
-  checking, но Argo CD's CRD validation остаётся
+  checking, but Argo CD's CRD validation remains
   authoritative at apply time so typos still surface.
 
-The long-term fix lands in а follow-up walk-fix (cue-cmp
+The long-term fix lands in a follow-up walk-fix (cue-cmp
 image bump). This walk-fix unblocks operators immediately.
 
 ### Fix
 
-Both `default.cue.hbs` и `blank.cue.hbs` updated:
+Both `default.cue.hbs` and `blank.cue.hbs` updated:
 
 - `import v1alpha1 "apprafter.io/schemas/v1alpha1"` line
   dropped.
-- `{{app_name_camel}}: v1alpha1.#Application & {` changed к
+- `{{app_name_camel}}: v1alpha1.#Application & {` changed to
   `{{app_name_camel}}: {`.
 - `apiVersion` + `kind` set explicitly inside the struct
   (was implicit from the schema's `#TypeMeta`).
-- Header comment updated к explain the trade-off и point
-  forward к the «add cue.mod yourself if you want local
-  vet» path.
+- Header comment updated to explain the trade-off and point
+  forward to the "add cue.mod yourself if you want local
+  vet" path.
 
 Resulting rendered manifest:
 
@@ -410,9 +410,9 @@ landing: {
 }
 ```
 
-`cue export ./apprafter/...` from а repo with NO
-`cue.mod/module.cue` now produces valid JSON for CMP к
-ship к Argo CD's apiserver, which validates against the
+`cue export ./apprafter/...` from a repo with NO
+`cue.mod/module.cue` now produces valid JSON for CMP to
+ship to Argo CD's apiserver, which validates against the
 AppRafter CRD as usual.
 
 ### Verified smoke
@@ -425,19 +425,19 @@ $ cue export ./apprafter/...
 ```
 
 End-to-end smoke without `cue.mod` works — render is byte-
-identical к what CMP's `cue export` produces in production.
+identical to what CMP's `cue export` produces in production.
 
 ### Existing apps
 
-Operators с existing scaffolded apps need к either:
+Operators with existing scaffolded apps need to either:
 
 1. Re-scaffold (`rm apprafter/Application.cue; apprafter
-   app scaffold --force`) и push the updated file.
-2. Or manually drop the `import` line и change `v1alpha1.
-   #Application & { ... }` к plain `{ apiVersion:
+   app scaffold --force`) and push the updated file.
+2. Or manually drop the `import` line and change `v1alpha1.
+   #Application & { ... }` to plain `{ apiVersion:
    "apprafter.io/v1alpha1", kind: "Application", ... }`.
 
-The walk-fix's templates are byte-identical к option (2) so
+The walk-fix's templates are byte-identical to option (2) so
 either path produces the same result.
 
 ### Tests
@@ -446,45 +446,45 @@ Existing 274 tests unchanged — assertions on
 `render_application` output checked: app name quoted in
 metadata.name, namespace, CUE binding ident
 (`{{app_name_camel}}`), no unsubstituted `{{`, port —
-ALL still present и pass через the untyped templates.
+ALL still present and pass through the untyped templates.
 Bun gate: 87/0 unchanged.
 
 ### Bump
 
 CLI 0.1.171. Chart and cue-cmp unchanged. Long-term schema-
-resolution walk-fix bumps cue-cmp + chart separately когда
+resolution walk-fix bumps cue-cmp + chart separately when
 it ships.
 
 ## v0.1.170 — M1.5 walk-fix #2 post-B.1.79b-Part-3b — `path is absolute` + cred-hint polish (2026-05-28)
 
 ### Symptoms
 
-Operator ran v0.1.169's `apprafter app add` end-to-end и hit
+Operator ran v0.1.169's `apprafter app add` end-to-end and hit
 three operator-facing rough edges:
 
 1. **`app path is absolute`** — Argo CD's apiserver refused
-   the rendered Application CR с:
+   the rendered Application CR with:
    ```
    ComparisonError
    Failed to load target state: ... Manifest generation error:
    /: app path is absolute
    ```
-   Cause: wizard's path default «/» (our internal «whole
-   repo» idiom) was emitted verbatim into `spec.source.path`,
-   which Argo CD validates as relative-к-repo-root и
+   Cause: wizard's path default "/" (our internal "whole
+   repo" idiom) was emitted verbatim into `spec.source.path`,
+   which Argo CD validates as relative-to-repo-root and
    rejects absolute values.
 
 2. **`url-prefix` unclear** — walk-fix #1's cred-hint
-   printed а generic template:
+   printed a generic template:
    ```
    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>
    ```
-   Operator legitimately asked: «What's the url-prefix? Can
-   you derive it from the repo URL?»
+   Operator legitimately asked: "What's the url-prefix? Can
+   you derive it from the repo URL?"
 
-3. **No PAT-creation link** — для а private repo, operator
-   has к hunt для GitHub's PAT page on their own. Trivial
-   но annoying friction.
+3. **No PAT-creation link** — for a private repo, operator
+   has to hunt for GitHub's PAT page on their own. Trivial
+   but annoying friction.
 
 ### Fixes
 
@@ -498,10 +498,10 @@ String` runs at manifest-build time:
 - `"."`, `"landing/web"`, `"./apps/x"` → unchanged.
 
 `build_application_manifest` now calls it before populating
-`spec.source.path`. Wizard's UI default stays «/» для
+`spec.source.path`. Wizard's UI default stays "/" for
 familiarity; the normalisation lives at the apiserver-
 contract boundary. Existing operators rerunning `app add`
-get а valid CR; the prior absolute-path failure won't
+get a valid CR; the prior absolute-path failure won't
 recur.
 
 For their existing broken CR, the one-liner fix is:
@@ -517,12 +517,12 @@ New pure helper `derive_creds_suggestion(repo_url) ->
 Option<CredsSuggestion>`. Parses HTTPS URLs into:
 
 - `suggested_name` — `<host-slug>-<org-slug>` (e.g.
-  `github-procvue`, `gitlab-acme`, `gitea-team` для self-
+  `github-procvue`, `gitlab-acme`, `gitea-team` for self-
   hosted).
 - `url_prefix` — `https://<host>/<org>` (org-level — one
-  PAT covers every repo в the org).
+  PAT covers every repo in the org).
 - `pat_creation_url` — provider-specific PAT-creation page
-  с pre-filled scopes; `Some(...)` для github.com /
+  with pre-filled scopes; `Some(...)` for github.com /
   gitlab.com, `None` otherwise.
 
 **Fix C — provider PAT-creation links**
@@ -530,7 +530,7 @@ Option<CredsSuggestion>`. Parses HTTPS URLs into:
 GitHub: `https://github.com/settings/tokens/new?scopes=
 repo,read:packages&description=AppRafter%20<org>` — covers
 both code access (Argo CD) and image pulls (kubelet
-through ghcr.io) с the classic-PAT shape the operator
+through ghcr.io) with the classic-PAT shape the operator
 asked about.
 
 GitLab: `https://gitlab.com/-/user_settings/personal_access_
@@ -546,11 +546,11 @@ Resulting hint (the user's procvue-landing scenario):
 ```
 ℹ Repo has no matching credentials in Argo CD.
   If https://github.com/ProcVue/landing is private:
-    1. Generate а PAT here:
+    1. Generate a PAT here:
        https://github.com/settings/tokens/new?scopes=repo,read:packages&description=AppRafter%20procvue
        Required scopes: `repo` for code; add `read:packages`
-       if your CI publishes container images к the same provider.
-    2. Register it с AppRafter:
+       if your CI publishes container images to the same provider.
+    2. Register it with AppRafter:
        apprafter repo creds add github-procvue --url-prefix https://github.com/ProcVue --token <paste-the-pat>
   Public repos can ignore this.
 ```
@@ -564,22 +564,22 @@ Resulting hint (the user's procvue-landing scenario):
   `_preserves_dot_and_relative_paths` — path normalisation
   surface (3 cases each).
 - `build_application_manifest_normalises_slash_path_to_dot`
-  — end-to-end regression guard на the actual manifest
+  — end-to-end regression guard on the actual manifest
   shape Argo CD will see.
 - `derive_creds_suggestion_github_full_shape` — happy GitHub
-  path: org-level prefix, kebab cred name, PAT URL с
+  path: org-level prefix, kebab cred name, PAT URL with
   required scopes.
 - `derive_creds_suggestion_gitlab_full_shape` — happy GitLab
   path: PAT URL points at `user_settings/personal_access_
-  tokens` с `read_repository,read_registry`.
+  tokens` with `read_repository,read_registry`.
 - `derive_creds_suggestion_unknown_provider_omits_pat_url`
   — self-hosted Gitea / Forgejo / etc. yield name + prefix
-  без а PAT link.
+  without a PAT link.
 - `derive_creds_suggestion_rejects_non_https_urls` /
   `_rejects_malformed_urls` — defensive paths.
 
 Existing `build_application_manifest_carries_project_and_
-revision` updated к assert `"p"` (post-normalisation) instead
+revision` updated to assert `"p"` (post-normalisation) instead
 of `"/p"`. Total CLI suite: 265 → 274. Bun gate: 87/0
 unchanged.
 
@@ -587,48 +587,48 @@ unchanged.
 
 CLI 0.1.169 → 0.1.170. Chart and cue-cmp unchanged.
 Operators rerunning `apprafter app add` after upgrade get
-the path normalisation automatically; existing apps need а
-one-line `kubectl patch` (см. Fix A above).
+the path normalisation automatically; existing apps need a
+one-line `kubectl patch` (see Fix A above).
 
 ## v0.1.169 — M1.5 walk-fix #1 post-B.1.79b-Part-3b — scaffold UX polish (2026-05-28)
 
 ### Symptoms
 
-Three operator-found defects на first real-cwd run of
-`apprafter app add` from а fresh project directory
+Three operator-found defects on first real-cwd run of
+`apprafter app add` from a fresh project directory
 (`/projects/.../procvue/landing`):
 
 1. **SPDX header leaked into user code.** Scaffold template
-   started с `// SPDX-License-Identifier: FSL-1.1-MIT`,
+   started with `// SPDX-License-Identifier: FSL-1.1-MIT`,
    which is OUR core license — operators don't license their
    apps under FSL-1.1-MIT just because they used `apprafter
    app scaffold`. The generated file imposed our SPDX on
    their codebase.
 
-2. **Namespace mismatch між scaffold и wizard.** Step 0
-   wrote `metadata.namespace: "apprafter"` (hard-defaulted к
-   `DEFAULT_NAMESPACE`); the outer wizard then asked для а
-   destination namespace и the operator answered `procvue`.
+2. **Namespace mismatch between scaffold and wizard.** Step 0
+   wrote `metadata.namespace: "apprafter"` (hard-defaulted to
+   `DEFAULT_NAMESPACE`); the outer wizard then asked for a
+   destination namespace and the operator answered `procvue`.
    Result: scaffolded manifest says `apprafter`, Argo CD
    Application's `spec.destination.namespace` says `procvue`
-   — sync would later fail с the exact walk-fix #12 pattern
+   — sync would later fail with the exact walk-fix #12 pattern
    (namespaces mismatched, neither created by `CreateNamespace
    =true` since that creates ONLY destination).
 
 3. **Private repo went unchecked.** `git ls-remote` succeeded
    locally because operator's user-side git is authenticated;
    Argo CD's repo-server has its own credential store, but
-   we never checked whether а matching cred exists in
+   we never checked whether a matching cred exists in
    `argocd` namespace. The mismatch would surface only at
-   sync time as «failed to fetch repository: 401
-   Unauthorized», long after the operator left the
+   sync time as "failed to fetch repository: 401
+   Unauthorized", long after the operator left the
    registration flow.
 
 ### Fixes
 
 **Fix 1 — drop SPDX header from templates.** Both `default.
-cue.hbs` и `blank.cue.hbs` now lead с а neutral header
-that explicitly invites operators к add their own SPDX line:
+cue.hbs` and `blank.cue.hbs` now lead with a neutral header
+that explicitly invites operators to add their own SPDX line:
 
 ```
 // AppRafter Application manifest scaffolded by `apprafter
@@ -638,29 +638,29 @@ that explicitly invites operators к add their own SPDX line:
 // your own SPDX-License-Identifier header on top. …
 ```
 
-**Fix 2 — propagate step 0 namespace к outer wizard.**
+**Fix 2 — propagate step 0 namespace to outer wizard.**
 
-`run_step_zero` extended с two new prompts (between the
-runtime Select и the final Confirm):
+`run_step_zero` extended with two new prompts (between the
+runtime Select and the final Confirm):
 
-- «AppRafter app name (metadata.name)» — Text, default =
+- "AppRafter app name (metadata.name)" — Text, default =
   sanitised cwd basename, DNS-1123 validated inline.
-- «Destination namespace (metadata.namespace)» — Text,
+- "Destination namespace (metadata.namespace)" — Text,
   default = `apprafter`, DNS-1123 validated inline.
 
-Returns а new `StepZeroOutput { name, namespace }` struct.
-`app::add` captures the namespace и threads it through к
+Returns a new `StepZeroOutput { name, namespace }` struct.
+`app::add` captures the namespace and threads it through to
 `add_via_wizard` as the wizard's namespace input — the outer
-namespace prompt now pre-fills с the value step 0 settled
-on, so the operator confirms once и both the manifest и
+namespace prompt now pre-fills with the value step 0 settled
+on, so the operator confirms once and both the manifest and
 Argo CD Application agree.
 
 Non-interactive `--scaffold` path also fixed: scaffold now
 takes the clap `--namespace` value (rather than hard-
-defaulting к `apprafter`) so the manifest matches what the
+defaulting to `apprafter`) so the manifest matches what the
 operator passed.
 
-Build-up surface для interactive validation:
+Build-up surface for interactive validation:
 `prompt_dns_1123_text` + `dns_1123_validator` — inline
 inquire validators reject invalid input before exiting the
 prompt, mirroring `app_wizard.rs`'s existing `validate_dns_
@@ -679,16 +679,16 @@ the registration itself isn't blocked):
   before Argo CD attempts to sync (public repos can ignore this).
 ```
 
-Only fires для HTTPS URLs (`git@` / `ssh://` shapes use SSH
-keys, а different cred entry shape we don't probe). Pure
+Only fires for HTTPS URLs (`git@` / `ssh://` shapes use SSH
+keys, a different cred entry shape we don't probe). Pure
 helper `any_secret_url_is_prefix_of(secrets, repo_url)`
-mirrors Argo CD's prefix-match semantics — if it says «no
-match», Argo CD will report the same.
+mirrors Argo CD's prefix-match semantics — if it says "no
+match", Argo CD will report the same.
 
-Two new pub(crate) aliases в `repo_creds`:
-`fetch_repo_creds_secrets_public` и `decode_data_field_
+Two new pub(crate) aliases in `repo_creds`:
+`fetch_repo_creds_secrets_public` and `decode_data_field_
 public` — lets `app::warn_if_no_matching_repo_creds` reuse
-the existing fetch + base64-decode helpers без relaxing
+the existing fetch + base64-decode helpers without relaxing
 visibility on the private versions.
 
 ### Tests
@@ -705,7 +705,7 @@ visibility on the private versions.
   — defensive against malformed secrets.
 
 Existing scaffold tests (261) unchanged — the namespace +
-name prompts are interactive, не unit-testable directly;
+name prompts are interactive, not unit-testable directly;
 sanitise_for_dns_1123 already covered. Total CLI suite:
 261 → 265. Bun gate: 87/0 unchanged.
 
@@ -713,32 +713,32 @@ sanitise_for_dns_1123 already covered. Total CLI suite:
 
 CLI 0.1.168 → 0.1.169. Chart and cue-cmp unchanged. Operators
 re-running `apprafter app add` after upgrade will see the
-three new prompts в step 0 + post-register cred hint.
+three new prompts in step 0 + post-register cred hint.
 
 ## v0.1.168 — M1.5 Track B.1.79b Part 3b — scaffold wizard in `app add` + interactive picker (2026-05-28)
 
 ### What
 
-Closes the two remaining items from §1.79b's «deferred к
-Part 3b» list:
+Closes the two remaining items from §1.79b's "deferred to
+Part 3b" list:
 
 - Scaffold flow integrated into `apprafter app add` wizard
   as step 0 — checks `<cwd>/apprafter/Application.cue`
   before any other prompt; missing → interactive scaffold
   prompt OR `--scaffold` non-interactive auto-scaffold OR
-  refuse с pointer.
-- Interactive runtime picker в standalone `apprafter app
-  scaffold` — когда detection is inconclusive AND stdio is
-  а TTY, drops into а Select prompt instead of erroring с
-  pointer к `--runtime <slug>`.
+  refuse with pointer.
+- Interactive runtime picker in standalone `apprafter app
+  scaffold` — when detection is inconclusive AND stdio is
+  a TTY, drops into a Select prompt instead of erroring with
+  pointer to `--runtime <slug>`.
 
 Operator quickstart now collapses to:
 
 ```
 cd ~/new-rust-service
 apprafter app add https://github.com/me/new-rust-service
-  # → Step 0: «No apprafter/Application.cue found. Generate
-  #   one?» Y/n (default Y)
+  # → Step 0: "No apprafter/Application.cue found. Generate
+  #   one?" Y/n (default Y)
   # → Select runtime (default = detected Rust)
   # → Confirm
   # → ✓ Scaffolded apprafter/Application.cue
@@ -771,7 +771,7 @@ apprafter app add https://github.com/me/new-rust-service
 
 ### `app add` integration
 
-`commands::app::add` gains а step 0 block at the top:
+`commands::app::add` gains a step 0 block at the top:
 
 ```rust
 let decision = scaffold_wizard::decide_scaffold_step(
@@ -787,35 +787,35 @@ match decision {
 
 The recursive `add_via_wizard → add` re-entry passes
 `scaffold_flag: false` because by then the target file
-exists и `decide_scaffold_step` returns `Skip`.
+exists and `decide_scaffold_step` returns `Skip`.
 
 ### `--scaffold` flag
 
-New `apprafter app add --scaffold` opt-in для non-
+New `apprafter app add --scaffold` opt-in for non-
 interactive mode. In TTY mode the step 0 wizard fires
 regardless of this flag (interactive operators always
 prompt-confirm). In `--no-interactive` mode without
-`--scaffold`, missing target refuses с а pointer к the
+`--scaffold`, missing target refuses with a pointer to the
 standalone `apprafter app scaffold` (silent scaffolding
-behind operators в CI scripts would be surprising).
+behind operators in CI scripts would be surprising).
 
 ### Suggested-name helper
 
 `sanitise_for_dns_1123(raw)` — cwd basename → DNS-1123-safe
-suggestion для step 0's prompt:
+suggestion for step 0's prompt:
 
 - `"MyProject"` → `"myproject"` (lowercase ASCII alnum).
 - `"acme_app"` → `"acme-app"` (`_` and other non-alnum →
   `-`).
 - `"foo__bar"` → `"foo-bar"` (collapse repeated dashes).
 - `"-leading"` → `"leading"` (trim).
-- `"___"` или `"..."` → `"app"` (empty result fallback).
-- 70-char input → truncated к 63 chars + trailing dash
+- `"___"` or `"..."` → `"app"` (empty result fallback).
+- 70-char input → truncated to 63 chars + trailing dash
   trim.
 
-Operator sees the suggestion в the wizard's «name» prompt
+Operator sees the suggestion in the wizard's "name" prompt
 and overrides as needed; sanitisation ensures the prefill
-itself is а valid DNS-1123 string.
+itself is a valid DNS-1123 string.
 
 ### `app scaffold` standalone — TTY-aware
 
@@ -824,12 +824,12 @@ itself is а valid DNS-1123 string.
 1. `--runtime <slug>` → use it.
 2. Single High detection → use it.
 3. Otherwise: drop into `pick_runtime_interactive` on TTY,
-   error с pointer in non-TTY (existing Part 3 behaviour
+   error with pointer in non-TTY (existing Part 3 behaviour
    preserved for CI).
 
 Tests cover the non-TTY paths exhaustively; the TTY-
-inconclusive branch doesn't trigger в `cargo test` because
-test stdio isn't а TTY.
+inconclusive branch doesn't trigger in `cargo test` because
+test stdio isn't a TTY.
 
 ### Tests
 
@@ -838,7 +838,7 @@ test stdio isn't а TTY.
 - `decide_scaffold_step_skips_when_target_exists` (3
   permutations).
 - `decide_scaffold_step_routes_interactive_when_wizard_active`
-  (`scaffold_flag` irrelevant в TTY).
+  (`scaffold_flag` irrelevant in TTY).
 - `decide_scaffold_step_routes_non_interactive_when_scaffold_flag_set`.
 - `decide_scaffold_step_refuses_when_neither_wizard_nor_scaffold_flag`
   — the default non-TTY case.
@@ -861,18 +861,18 @@ Smoke-verified end-to-end:
 
 - `app scaffold --path <tmp> --name X` standalone — works
   unchanged (Part 3 regression guard).
-- `app add <url> --no-interactive --no-ping` без manifest →
-  refuses с the new diagnostic pointing к `app scaffold`.
+- `app add <url> --no-interactive --no-ping` without manifest →
+  refuses with the new diagnostic pointing to `app scaffold`.
 - `app add <url> --no-interactive --no-ping --scaffold` →
-  scaffolds, then attempts register (fails downstream на
-  kubectl missing в test env — scaffold step itself
+  scaffolds, then attempts register (fails downstream on
+  kubectl missing in test env — scaffold step itself
   succeeded).
 
-### Still deferred к Part 4
+### Still deferred to Part 4
 
 - `examples/applications/` reference manifests.
 - `docs/user-guide/cli/app-scaffold.md` walkthrough.
-- Quickstart update в operator-guide.
+- Quickstart update in operator-guide.
 - `--lang ru|en` for template comments (English-only ships
   through 3b).
 
@@ -885,10 +885,10 @@ CLI 0.1.167 → 0.1.168. Chart and cue-cmp unchanged.
 ### What
 
 Third deliverable of §1.79b. New `apprafter app scaffold`
-generates а starter `apprafter/Application.cue` based on the
-cwd's runtime markers, consuming Part 2's detection module и
-two embedded templates. Operators with а fresh repo get а
-valid Application.cue с runtime-appropriate defaults in one
+generates a starter `apprafter/Application.cue` based on the
+cwd's runtime markers, consuming Part 2's detection module and
+two embedded templates. Operators with a fresh repo get a
+valid Application.cue with runtime-appropriate defaults in one
 command, instead of hand-writing the CRD shape.
 
 ### Surface
@@ -921,8 +921,8 @@ $ cd my-rust-service && apprafter app scaffold
 Next steps:
   1. Edit Application.cue — replace `REPLACE-ME` in the image
      ref, tune ports.
-  2. Commit + push к your git remote.
-  3. `apprafter app add` to register с Argo CD.
+  2. Commit + push to your git remote.
+  3. `apprafter app add` to register with Argo CD.
 ```
 
 ### Resolution chain
@@ -930,14 +930,14 @@ Next steps:
 1. **Runtime** — explicit `--runtime <slug>` wins; otherwise
    `runtime_detect::detect_runtimes(path)`. Detection failure
    modes (zero High, multiple High, only Medium/Low/Fallback)
-   error out с pointer к `--runtime <slug>` flag. Interactive
-   prompt deferred к Part 3b (`app add` wizard integration).
+   error out with pointer to `--runtime <slug>` flag. Interactive
+   prompt deferred to Part 3b (`app add` wizard integration).
 2. **App name** — explicit `--name` wins; otherwise canonicalised
-   `<path>` basename. DNS-1123 validation applies к both
+   `<path>` basename. DNS-1123 validation applies to both
    paths.
 3. **Namespace** — explicit `--namespace` wins; otherwise
    `DEFAULT_NAMESPACE = "apprafter"` (mirrors walk-fix #12
-   `app add --namespace` default — scaffolded manifest и
+   `app add --namespace` default — scaffolded manifest and
    Argo CD parent CR agree out of the box).
 
 ### Template engine
@@ -946,25 +946,25 @@ Pure `{{key}}` substitution pass — no conditionals, no
 loops, no escaping. Vars set is fixed (`app_name`,
 `app_name_camel`, `namespace`, `primary_port`,
 `runtime_display`, `runtime_slug`, `image_placeholder`); the
-«no `{{` remains after substitution» sanity check at the end
-of `render_template` catches typo-в-template OR missing-var
+"no `{{` remains after substitution" sanity check at the end
+of `render_template` catches typo-in-template OR missing-var
 bugs without false positives.
 
 `kebab_to_camel("my-app")` → `"myApp"` for the CUE binding
-identifier; empty input returns `"app"` к keep the rendered
-manifest valid even на edge cases.
+identifier; empty input returns `"app"` to keep the rendered
+manifest valid even on edge cases.
 
 ### Templates
 
-Two `.cue.hbs` files embedded в the binary via `include_str!`:
+Two `.cue.hbs` files embedded in the binary via `include_str!`:
 
 - `default.cue.hbs` — every non-Blank runtime. Renders
-  metadata + spec.base.{image, replicas, expose} с inline
-  comments mentioning `{{runtime_display}}` и
+  metadata + spec.base.{image, replicas, expose} with inline
+  comments mentioning `{{runtime_display}}` and
   `{{primary_port}}`. v1alpha1 fields only (no `resources` /
-  `healthcheck` yet — those land в 1.7c+).
+  `healthcheck` yet — those land in 1.7c+).
 - `blank.cue.hbs` — Blank/Fallback runtime. Identical shape
-  но every field carries а TODO comment; no runtime hint.
+  but every field carries a TODO comment; no runtime hint.
 
 Per-runtime port defaults baked into `defaults_for`: bun /
 node-* = 3000, python-* = 8000, rust / go / docker / blank
@@ -972,15 +972,15 @@ node-* = 3000, python-* = 8000, rust / go / docker / blank
 
 ### `.gitignore` append
 
-Best-effort append of `.apprafter/local/` к `<path>/
-.gitignore` (only when the file exists и the line isn't
+Best-effort append of `.apprafter/local/` to `<path>/
+.gitignore` (only when the file exists and the line isn't
 already present). Non-fatal — scaffold succeeds even on
 read-only repos. Idempotent — re-running doesn't duplicate.
 
 ### Tests
 
-+21 new unit tests on pure helpers и scaffold integration
-(all `tempfile::tempdir()`-based для hermetic isolation):
++21 new unit tests on pure helpers and scaffold integration
+(all `tempfile::tempdir()`-based for hermetic isolation):
 
 - `render_template_substitutes_known_keys` /
   `render_template_handles_repeated_placeholder` /
@@ -992,7 +992,7 @@ read-only repos. Idempotent — re-running doesn't duplicate.
   `kebab_to_camel_empty_input_returns_app` — name
   transformation.
 - `defaults_for_every_runtime_has_unique_slug` — load-bearing
-  invariant (slug must round-trip к Runtime variant и stay
+  invariant (slug must round-trip to Runtime variant and stay
   unique).
 - `render_application_renders_every_runtime_cleanly` —
   parameterised loop over all 12 runtimes; asserts non-empty
@@ -1008,7 +1008,7 @@ read-only repos. Idempotent — re-running doesn't duplicate.
   `Runtime` mapping happy + uppercase rejection + unknown
   rejection.
 - `scaffold_writes_application_cue_and_creates_apprafter_dir`
-  — happy E2E с tempdir fixture, asserts file written с
+  — happy E2E with tempdir fixture, asserts file written with
   correct content.
 - `scaffold_refuses_overwrite_without_force` — pre-existing
   manifest preserved.
@@ -1019,7 +1019,7 @@ read-only repos. Idempotent — re-running doesn't duplicate.
 - `scaffold_errors_on_inconclusive_runtime_detection_without_override`
   /
   `scaffold_errors_on_multi_high_runtime_detection_without_override`
-  — failure modes route к `--runtime` flag hint.
+  — failure modes route to `--runtime` flag hint.
 
 Total CLI suite: 226 → 247. Bun gate: 87/0 unchanged.
 
@@ -1030,23 +1030,23 @@ the `apprafter.io/schemas/v1alpha1` import path).
 ### Cleanup
 
 `#![allow(dead_code)]` removed from `runtime_detect.rs` —
-every exported item now has а real call-site через
+every exported item now has a real call-site through
 `app_scaffold` consumer.
 
-### What's deferred к Part 3b
+### What's deferred to Part 3b
 
 - Scaffold flow integration into `apprafter app add` wizard
-  (step 0: check для `apprafter/Application.cue`, prompt
-  «Generate one?» on missing). Standalone `scaffold` ships
-  first; the `app add` step lands as а follow-up.
-- Interactive runtime picker когда detection is inconclusive
-  (uses `inquire::Select`). Currently errors с pointer к
+  (step 0: check for `apprafter/Application.cue`, prompt
+  "Generate one?" on missing). Standalone `scaffold` ships
+  first; the `app add` step lands as a follow-up.
+- Interactive runtime picker when detection is inconclusive
+  (uses `inquire::Select`). Currently errors with pointer to
   `--runtime`.
-- `--lang ru|en` flag для template comments. English-only
+- `--lang ru|en` flag for template comments. English-only
   ships now; Russian variant deferred.
 - `examples/applications/` reference manifests + docs
   updates (`docs/user-guide/cli/app-scaffold.md`,
-  quickstart). Deferred к Part 4.
+  quickstart). Deferred to Part 4.
 
 ### Bump
 
@@ -1059,8 +1059,8 @@ CLI 0.1.166 → 0.1.167. Chart and cue-cmp unchanged.
 Second deliverable of the §1.79b CLI app ergonomics sub-
 phase. New pure module `commands::runtime_detect` provides
 filesystem-marker → runtime mapping (per plan.md §1.79b
-table) с confidence levels, ready для Part 3's scaffold
-flow к consume.
+table) with confidence levels, ready for Part 3's scaffold
+flow to consume.
 
 ### Surface
 
@@ -1086,47 +1086,47 @@ Marker evaluation order (stable): bun.lock(b) → pnpm-lock.
 yaml → yarn.lock → package-lock.json → bare package.json
 (Medium) → pyproject.toml `[tool.poetry]` → pyproject.toml
 `[tool.uv]` OR uv.lock → Pipfile → bare requirements.txt
-(Medium, skipped когда stronger Python marker fired) →
-Cargo.toml → go.mod → Dockerfile (Low, ONLY когда nothing
+(Medium, skipped when stronger Python marker fired) →
+Cargo.toml → go.mod → Dockerfile (Low, ONLY when nothing
 else matched) → Blank fallback.
 
-Multi-stack monorepos (e.g. cwd с bun.lock alongside Cargo.
+Multi-stack monorepos (e.g. cwd with bun.lock alongside Cargo.
 toml) surface multiple High entries — Part 3 wizard prompts
-the operator, defaulting к first alphabetically per plan.md.
+the operator, defaulting to first alphabetically per plan.md.
 
 ### Confidence semantics (caller contract)
 
-- `High` — lockfile present. Part 3 auto-selects в non-
+- `High` — lockfile present. Part 3 auto-selects in non-
   interactive mode unless multiple Highs collide.
-- `Medium` — primary marker без lockfile (bare package.json
-  / requirements.txt). Prompt even в `--auto` mode.
-- `Low` — weak signal (Dockerfile alone). Always prompt с
+- `Medium` — primary marker without lockfile (bare package.json
+  / requirements.txt). Prompt even in `--auto` mode.
+- `Low` — weak signal (Dockerfile alone). Always prompt with
   list of all runtimes.
 - `Fallback` — no markers; only Blank candidate.
 
 ### Design notes
 
-- **Pure** — никаких subprocess'ов, никаких сетевых
-  обращений. Tests drive every branch с `tempfile::tempdir()`
+- **Pure** — no subprocesses, no network
+  calls. Tests drive every branch with `tempfile::tempdir()`
   fixtures (instant).
 - **pyproject.toml content** parsed via text-grep for
   `[tool.poetry]` / `[tool.uv]` section headers — avoids
-  pulling в а TOML parser for two string tokens.
+  pulling in a TOML parser for two string tokens.
 - **`requirements.txt` precedence** — skipped when poetry/
   uv/pipenv already matched (common pattern: poetry-managed
-  project ships а side-channel requirements.txt for tools
-  that don't grok poetry; не misclassify as bare-pip).
-- **Docker precedence** — Dockerfile alongside а runtime
+  project ships a side-channel requirements.txt for tools
+  that don't grok poetry; don't misclassify as bare-pip).
+- **Docker precedence** — Dockerfile alongside a runtime
   lockfile is ignored (operator's bun + Dockerfile = bun
-  app, не docker app). Docker entry only emitted when
+  app, not docker app). Docker entry only emitted when
   NOTHING else matched (Low).
 - **Directory-vs-file guard** — `file_exists` uses
-  `is_file()` so а directory accidentally named
-  `Dockerfile/` или `package.json/` (build-artefact
+  `is_file()` so a directory accidentally named
+  `Dockerfile/` or `package.json/` (build-artefact
   directories) doesn't misclassify.
 - **`#![allow(dead_code)]`** at module scope until Part 3
   wires the consumers — public surface intentionally
-  future-consumed; remove когда Part 3 lands.
+  future-consumed; remove when Part 3 lands.
 
 ### Tests
 
@@ -1158,7 +1158,7 @@ for hermetic isolation:
   — compiled runtimes.
 - `detects_docker_only_as_last_resort_when_alone` /
   `dockerfile_alongside_lockfile_does_not_add_docker_entry`
-  — Docker is Low and only когда nothing else matched.
+  — Docker is Low and only when nothing else matched.
 - `empty_dir_falls_back_to_blank` — fallback path.
 - `multi_stack_monorepo_surfaces_all_matches` — bun + rust
   side-by-side; both High entries surface.
@@ -1170,9 +1170,9 @@ Total CLI suite: 205 → 226.
 ### Bump
 
 CLI 0.1.165 → 0.1.166. Chart and cue-cmp unchanged. Part 3
-(templates + scaffold flow) lands in а follow-up.
+(templates + scaffold flow) lands in a follow-up.
 
-## v0.1.165 — M1.5 walk-fix #4 post-B.1.79b — Cargo.lock + bun-smoke sync с v0.1.164 (2026-05-25)
+## v0.1.165 — M1.5 walk-fix #4 post-B.1.79b — Cargo.lock + bun-smoke sync with v0.1.164 (2026-05-25)
 
 ### Symptom
 
@@ -1192,14 +1192,14 @@ remove the --locked flag and use --offline instead.
 
 `cli/Cargo.lock` recorded `apprafter`/`cli-core`/`cli-providers`/
 `cli-state` at `0.1.163`; `cli/Cargo.toml` `workspace.package.
-version = "0.1.164"`. Mismatch → `--locked` refused к touch
+version = "0.1.164"`. Mismatch → `--locked` refused to touch
 the lock file → exit 101.
 
 Separately, bun smoke tests `web.smoke.test.ts` failed:
 walk-fix #3 flipped `landing/web/apprafter/Application.cue`
-+ `Application-preview.cue` from `:prod`/`:preview` к
-`:latest`, but the existing «Application manifests — prod +
-preview pair» test assertions still expected `:prod` +
++ `Application-preview.cue` from `:prod`/`:preview` to
+`:latest`, but the existing "Application manifests — prod +
+preview pair" test assertions still expected `:prod` +
 `:preview` literally. CI bun job exit 1.
 
 ### Root cause
@@ -1211,41 +1211,41 @@ preview pair» test assertions still expected `:prod` +
 3. `git add ...; git commit ...; git tag v0.1.164`.
 
 Step 1 changes `workspace.package.version`, which propagates
-к the four workspace crates на the next `cargo build`/`test`/
+to the four workspace crates on the next `cargo build`/`test`/
 `check`. But I bumped Cargo.toml **after** running the lint
 gate (clippy + test on 0.1.163 layout), and didn't run
 cargo again before staging. So Cargo.lock kept 0.1.163
-references — CI's `--locked` build saw the drift и refused.
+references — CI's `--locked` build saw the drift and refused.
 
 **Bun smoke staleness.** Walk-fix #3 changed `image:` field
-в both .cue files but I didn't grep for tests asserting на
+in both .cue files but I didn't grep for tests asserting on
 the prior tag values. Bun gate wasn't part of the local
 gate chain I ran (`cargo fmt + clippy + test` only) —
-classic gap of «my workspace gate is Rust-only, but the
-monorepo CI runs every language's gate».
+classic gap of "my workspace gate is Rust-only, but the
+monorepo CI runs every language's gate".
 
 ### Fix
 
 1. Bump `cli/Cargo.toml` 0.1.164 → 0.1.165.
-2. `cargo build` to regenerate Cargo.lock с 0.1.165
+2. `cargo build` to regenerate Cargo.lock with 0.1.165
    references for all four workspace crates.
-3. Update `web.smoke.test.ts` «Application manifests — prod +
-   preview pair» assertions: pin к `:latest` matching the
+3. Update `web.smoke.test.ts` "Application manifests — prod +
+   preview pair" assertions: pin to `:latest` matching the
    actual manifests; rename test titles dropping `(prod)` /
-   `pins :prod` phrasing (now generic «pins landing-web
-   image»). Block-level comment в the test file documenting
+   `pins :prod` phrasing (now generic "pins landing-web
+   image"). Block-level comment in the test file documenting
    why we're temporarily on `:latest` (promotion workflows
    haven't seeded :prod/:preview yet).
 
-### Why a fresh patch вместо re-tagging v0.1.164
+### Why a fresh patch instead of re-tagging v0.1.164
 
 v0.1.164 tag is already on origin (workflow ran, failed,
 release artifacts have v0.1.164 in their hash). Force-
-updating the tag к а new commit is destructive (per
+updating the tag to a new commit is destructive (per
 `feedback_push_policy.md` — no force-push without explicit
 operator authorisation). Cleanest path: ship the fix as
-v0.1.165 and treat v0.1.164 as «released but artifacts
-missing».
+v0.1.165 and treat v0.1.164 as "released but artifacts
+missing".
 
 ### Tests
 
@@ -1263,17 +1263,17 @@ cargo fmt --all -- --check \
 
 ### Memory update
 
-`feedback_cue_bin_local.md` augmented с two new operational
+`feedback_cue_bin_local.md` augmented with two new operational
 disciplines:
 
 1. **Cargo.lock-sync rule**: any `cli/Cargo.toml` `workspace.
    package.version` edit MUST be followed by `cargo build`
-   (or `cargo test`) BEFORE `git add` к refresh Cargo.lock
-   versions in lockstep. Skipping it lands а commit где
+   (or `cargo test`) BEFORE `git add` to refresh Cargo.lock
+   versions in lockstep. Skipping it lands a commit where
    Cargo.toml and Cargo.lock disagree, and CI's `--locked`
    surfaces the drift loudly.
 2. **Bun-in-gate rule**: monorepo's local gate is not just
-   the Rust trio. After any change к `landing/**/*.{cue,ts}`
+   the Rust trio. After any change to `landing/**/*.{cue,ts}`
    / `backstage-plugins/**` / other TS-touched paths, `bun
    test` MUST run alongside cargo. Single-chain shape:
    `cargo fmt … && cargo clippy … && cargo test … && bun test`.
@@ -1281,29 +1281,29 @@ disciplines:
 ### Bump
 
 CLI 0.1.164 → 0.1.165. Chart and cue-cmp unchanged. v0.1.164
-release artifacts officially «missing in action» — operators
+release artifacts officially "missing in action" — operators
 should jump directly to 0.1.165.
 
 ## v0.1.164 — M1.5 walk-fix #3 post-B.1.79b — `app status --resources` shows child workload state (2026-05-25)
 
 ### Background
 
-Walk diagnostics after walk-fix #2 surfaced а semantic gap:
+Walk diagnostics after walk-fix #2 surfaced a semantic gap:
 `apprafter app status` showed `health: Healthy` for an app
 whose pods were in `ImagePullBackOff` / `CrashLoopBackOff`.
 Argo CD's app-level health is computed from the resources it
 **directly applies** — for an AppRafter Application, that's
 the `apprafter.io/Application` CR alone. The operator marks
 that CR `status.phase = Ready` as soon as it lays down the
-Deployment + Service templates, without waiting for pods к
+Deployment + Service templates, without waiting for pods to
 actually reach Running. Operator-side health propagation is
-а Phase 2/3 concern (ResourceClaim wait semantics + Pod-
-state aggregation в the reconciler); meanwhile, CLI-side
+a Phase 2/3 concern (ResourceClaim wait semantics + Pod-
+state aggregation in the reconciler); meanwhile, CLI-side
 visibility into the actual workload state closes the
 operator's diagnostic gap.
 
-Also closes plan.md §1.79a line 2257 («child resources в `app
-status`») which was deferred к v0.1.140 / Phase 2 — но
+Also closes plan.md §1.79a line 2257 ("child resources in `app
+status`") which was deferred to v0.1.140 / Phase 2 — but
 post-walk-fix-#10 the CMP plugin actually renders the
 Application CR end-to-end, so child-resource introspection
 is finally useful.
@@ -1332,7 +1332,7 @@ Workload pods (apprafter, app.kubernetes.io/name=landing-web):
 ```
 
 Operators immediately see the discrepancy between Argo CD's
-view («Healthy») и the actual Pod state (`ImagePullBackOff`,
+view ("Healthy") and the actual Pod state (`ImagePullBackOff`,
 `CrashLoopBackOff`, restart counts) — the actionable signal
 for image misconfigurations.
 
@@ -1343,13 +1343,13 @@ for image misconfigurations.
 1. Fetch Argo CD Application CR (existing path).
 2. Render the standard status header (unchanged).
 3. Extract `status.resources[]` from the Argo CD CR →
-   render «Argo CD tracked resources» section с NAME / KIND
+   render "Argo CD tracked resources" section with NAME / KIND
    / NAMESPACE / STATUS / HEALTH columns. Cluster-scoped
-   resources show `-` для namespace.
+   resources show `-` for namespace.
 4. Reuse `app_open::find_apprafter_app_name(app)` to extract
    the inner AppRafter Application name from
    `status.resources[]`.
-5. Shell out к `kubectl get pods -n <dest-ns> -l
+5. Shell out to `kubectl get pods -n <dest-ns> -l
    app.kubernetes.io/name=<inner-name> -o json`.
 6. Parse pod summaries — STATUS column = `containerStatuses[
    0].state.waiting.reason` when waiting (ImagePullBackOff,
@@ -1358,29 +1358,29 @@ for image misconfigurations.
    RESTARTS = sum across containers. AGE = relative format
    matching `kubectl get pods` shorthand (`30s`, `5m`,
    `2h30m`, `3d3h`).
-7. Render «Workload pods» section.
+7. Render "Workload pods" section.
 
 Pod fetch errors are non-fatal — operator already has the
 Argo CD view; an inability to introspect pods (RBAC, kubectl
-missing, network blip) surfaces as а stderr warning без
+missing, network blip) surfaces as a stderr warning without
 exiting non-zero.
 
 ### Pure helpers
 
 - `parse_pod_summaries(payload, now)` — extracts
-  `PodSummary` rows from а `kubectl get pods -o json`
-  payload. `now` injected so tests can pin а deterministic
+  `PodSummary` rows from a `kubectl get pods -o json`
+  payload. `now` injected so tests can pin a deterministic
   clock when computing ages.
-- `summarise_pod(pod, now)` — extracts а single pod's
+- `summarise_pod(pod, now)` — extracts a single pod's
   ready/status/restarts/age. STATUS column heuristic mirrors
   `kubectl get pods`: container `waiting.reason` wins over
-  pod phase когда any container is waiting.
+  pod phase when any container is waiting.
 - `format_pod_age(timestamp, now)` — kubectl-style relative
   shorthand. `<60s` → `Ns`, `<1h` → `Nm`, `<1d` → `NhNm`,
   else `NdNh`. Defensive — returns input verbatim when RFC
   3339 parse fails.
 - `extract_tracked_resources(app)` — pulls `status.resources[]`
-  into `TrackedResource` rows. Filters entries missing а
+  into `TrackedResource` rows. Filters entries missing a
   `name` field (defensive against Argo CD shape drift).
 - `print_argocd_resources(app)` + `print_pod_summaries(pods,
   inner_name, namespace)` — manual table formatters
@@ -1395,45 +1395,45 @@ exiting non-zero.
   ready=1/1, status=Running, age=30m.
 - `parse_pod_summaries_image_pull_back_off` — the exact
   walk diagnostic scenario; status reflects waiting.reason
-  не phase.
+  not phase.
 - `parse_pod_summaries_crash_loop_back_off_carries_restart_count`
   — landing-cms shape (38 restarts, CrashLoopBackOff in
   waiting.reason).
 - `parse_pod_summaries_missing_container_statuses_falls_back_to_spec`
-  — brand-new pod без containerStatuses; uses spec for
+  — brand-new pod without containerStatuses; uses spec for
   denominator.
 - `parse_pod_summaries_handles_empty_payload` — defensive
-  для empty arrays / missing fields.
+  for empty arrays / missing fields.
 - `format_pod_age_seconds_minutes_hours_days` — happy paths
-  для all 4 magnitude bands + boundary cases (`1h` vs
+  for all 4 magnitude bands + boundary cases (`1h` vs
   `1h0m`, `3d` vs `3d3h`).
 - `format_pod_age_returns_input_on_unparseable_timestamp` —
-  defensive против Argo CD shape drift.
+  defensive against Argo CD shape drift.
 - `extract_tracked_resources_happy_multi_entry` — namespace
   vs cluster-scoped (renders `-`), health.status one level
   deep.
 - `extract_tracked_resources_missing_status_returns_empty` —
-  fresh CR без а status block.
+  fresh CR without a status block.
 - `extract_tracked_resources_skips_entries_without_name` —
-  defensive против partial entries.
+  defensive against partial entries.
 
 Existing `print_status_handles_app_without_status_block`
 unchanged. Total CLI suite: 195 → 205.
 
-### Landing manifests temporarily на :latest
+### Landing manifests temporarily on :latest
 
-Walk-found: `ghcr.io/apprafter/landing-web` реестр содержит
-только `landing-v0.1.2`, `latest`, `landing-v0.1.3` — нет
-ни `:prod`, ни `:preview`. Manifest pinned к `:prod` →
+Walk-found: the `ghcr.io/apprafter/landing-web` registry contains
+only `landing-v0.1.2`, `latest`, `landing-v0.1.3` — neither
+`:prod` nor `:preview`. Manifest pinned to `:prod` →
 ImagePullBackOff. Temporarily switch `landing/web/apprafter/
-Application.cue` и `Application-preview.cue` к `:latest`
-для unblock'а walk; revisit `landing-promote-to-prod.yml`
+Application.cue` and `Application-preview.cue` to `:latest`
+to unblock the walk; revisit `landing-promote-to-prod.yml`
 + `landing-preview-build.yml` workflows separately.
 
 ### Bump
 
 CLI 0.1.163 → 0.1.164. Chart and cue-cmp unchanged. Plan.md
-§1.79a line 2257 checkbox flipped к [x] in the same commit.
+§1.79a line 2257 checkbox flipped to [x] in the same commit.
 
 ## v0.1.163 — M1.5 walk-fix #2 post-B.1.79b — `app open` surfaces kubectl stderr on early exit (2026-05-25)
 
@@ -1441,7 +1441,7 @@ CLI 0.1.163 → 0.1.164. Chart and cue-cmp unchanged. Plan.md
 
 After walk-fix #1 fixed the label resolution and the wizard
 found the right Service, `apprafter app open
-apprafter-landing-web` still failed — but with а maximally
+apprafter-landing-web` still failed — but with a maximally
 unhelpful error:
 
 ```
@@ -1452,17 +1452,17 @@ No clue from the CLI **why** kubectl exited. Real cause
 could be: no ready Pods (ImagePullBackOff / CrashLoopBackOff),
 RBAC denial, kubeconfig pointing at the wrong cluster, port
 already in use on the cluster side, etc. — but the operator
-had to rerun `kubectl port-forward` manually к find out.
+had to rerun `kubectl port-forward` manually to find out.
 
 ### Root cause
 
-`commands::port_forward::wait_ready` used а silent stderr
-drainer whose only job was «keep the pipe alive so kubectl
-doesn't SIGPIPE» (the walk-fix #1 post-B.1.79 reason). It
+`commands::port_forward::wait_ready` used a silent stderr
+drainer whose only job was "keep the pipe alive so kubectl
+doesn't SIGPIPE" (the walk-fix #1 post-B.1.79 reason). It
 drained every byte to /dev/null, dropping kubectl's
 diagnostic chatter on the floor. When the ready banner never
 landed on stdout, `rx.recv()` resolved Err — and we
-hand-rolled а generic «exited before binding» message with
+hand-rolled a generic "exited before binding" message with
 no further context.
 
 ### Fix
@@ -1470,10 +1470,10 @@ no further context.
 Replace `spawn_silent_drainer` with
 `spawn_capturing_drainer` that records the last
 `STDERR_CAPTURE_LIMIT = 20` lines into an
-`Arc<Mutex<Vec<String>>>`. Buffer is bounded by а ring-
+`Arc<Mutex<Vec<String>>>`. Buffer is bounded by a ring-
 eviction rule (drop oldest on each new push beyond the
 limit) — practical memory ceiling ~5 KiB, effectively zero
-for а command that spends most of its life blocked on
+for a command that spends most of its life blocked on
 `child.wait()`.
 
 `wait_ready` on the Err path now:
@@ -1482,7 +1482,7 @@ for а command that spends most of its life blocked on
    drainer push its last line before we read the buffer
    (kubectl is already dead when we get the Err; the
    drainer is just finishing its read syscall).
-2. Calls а new pure helper `format_early_exit_error(buf)`
+2. Calls a new pure helper `format_early_exit_error(buf)`
    that renders different messages for the empty-buffer
    and populated-buffer cases.
 
@@ -1496,7 +1496,7 @@ Error: kubectl port-forward exited before binding local port.
 ```
 
 Empty-buffer message (unusual — kubectl segfaulted or was
-killed by the OS) suggests а manual repro command.
+killed by the OS) suggests a manual repro command.
 
 ### Tests
 
@@ -1507,8 +1507,8 @@ killed by the OS) suggests а manual repro command.
 - `capturing_drainer_evicts_oldest_when_over_limit` — feed
   `LIMIT + 3` lines, buffer keeps exactly `LIMIT` newest.
 - `format_early_exit_error_uses_no_output_message_when_buffer_empty`
-  — empty buffer renders the «no stderr output» message
-  with а manual-repro hint.
+  — empty buffer renders the "no stderr output" message
+  with a manual-repro hint.
 - `format_early_exit_error_includes_captured_stderr` —
   populated buffer renders captured lines verbatim, indented
   for multi-line miette readability.
@@ -1570,7 +1570,7 @@ entirely.
 
 ### Fix
 
-Bridge from outer к inner naming through Argo CD's
+Bridge from outer to inner naming through Argo CD's
 `status.resources[]`. New pure helper
 `find_apprafter_app_name(argocd_app) -> Option<String>`
 walks the resources array, picks the first entry with
@@ -1583,7 +1583,7 @@ Resolver chain is now:
 
 ```
 Argo CD app name (apprafter-landing-web)
-  → Argo CD CR в `argocd` ns
+  → Argo CD CR in `argocd` ns
   → spec.destination.namespace (apprafter)
   → status.resources[] → apprafter.io/Application entry → name (landing-web)
   → kubectl get svc -n apprafter -l app.kubernetes.io/name=landing-web
@@ -1593,14 +1593,14 @@ Argo CD app name (apprafter-landing-web)
 
 ### Caveat — non-AppRafter apps
 
-Apps registered via `apprafter app add` для repos that
+Apps registered via `apprafter app add` for repos that
 render raw helm / kustomize / plain YAML (no
-apprafter.io/Application CR в the CMP output) hit
+apprafter.io/Application CR in the CMP output) hit
 `find_apprafter_app_name` returning None →
 diagnostic-er-erorr suggesting manual port-forward. Walk-fix
 support for the non-AppRafter case is deferred — adds either
-а Service-by-cli-app-name fallback or operator-side
-introspection without а clear primary-Service heuristic.
+a Service-by-cli-app-name fallback or operator-side
+introspection without a clear primary-Service heuristic.
 For tier-1 self-served scenarios where `app open` matters
 most, all apps go through the AppRafter Application CR
 route anyway.
@@ -1613,15 +1613,15 @@ route anyway.
   — happy path with mixed resource kinds (Namespace +
   apprafter.io/Application).
 - `find_apprafter_app_name_returns_none_for_raw_yaml_apps`
-  — raw Deployment + Service shape; must NOT misidentify а
+  — raw Deployment + Service shape; must NOT misidentify a
   Deployment as the inner app.
 - `find_apprafter_app_name_returns_none_when_status_missing`
-  — fresh CR без а status block; must not panic.
+  — fresh CR without a status block; must not panic.
 - `find_apprafter_app_name_picks_first_when_multiple_apprafter_applications`
   — defensive: deterministic first-entry pick.
 
 Existing `select_service_zero_matches_errors_with_diagnostic_hint`
-updated к assert the new diagnostic mentions
+updated to assert the new diagnostic mentions
 `app.kubernetes.io/name` + `kubectl get
 applications.apprafter.io` (operator-side introspection,
 not Argo CD's). Total CLI suite: 188 → 192.
@@ -1636,8 +1636,8 @@ CLI 0.1.161 → 0.1.162. Chart and cue-cmp unchanged.
 
 First deliverable of the §1.79b CLI app ergonomics sub-phase:
 `apprafter app open <name>` port-forwards a registered
-Application's primary Service к localhost and opens it in
-the default browser. Wraps `kubectl port-forward` с AppRafter-
+Application's primary Service to localhost and opens it in
+the default browser. Wraps `kubectl port-forward` with AppRafter-
 aware resolution so the operator never has to assemble
 `kubectl port-forward svc/<name> -n <ns> 8080:<port>` by
 hand.
@@ -1646,16 +1646,16 @@ hand.
 
 ```
 Application name
-  → Argo CD Application CR в `argocd` namespace
+  → Argo CD Application CR in `argocd` namespace
   → `spec.destination.namespace`
-  → Service в that ns via label `app.kubernetes.io/instance=<name>`
+  → Service in that ns via label `app.kubernetes.io/instance=<name>`
   → Container port (Service.spec.ports[0] OR `--container-port`)
   → Local port (8080 OR `--port`, with auto-increment 8080→8090)
   → `kubectl port-forward svc/<svc> -n <ns> <local>:<container>`
   → Wait for ready banner, print URL, open browser
 ```
 
-Per plan.md §1.79b first деliverable's output spec:
+Per plan.md §1.79b first deliverable's output spec:
 
 ```
 $ apprafter app open landing-web
@@ -1680,33 +1680,33 @@ apprafter app open <name>
 
 ### Error handling
 
-- App not found в Argo CD → `Application '<name>' not found in
+- App not found in Argo CD → `Application '<name>' not found in
   namespace argocd. List with apprafter app list.`
 - App missing `spec.destination.namespace` → diagnostic
   pointing at `apprafter app status <name>`.
-- App not Healthy → warns с sync/health states; interactive
+- App not Healthy → warns with sync/health states; interactive
   `Continue anyway?` confirm (default No); non-TTY refuses
-  safely с pointer к either rerunning в TTY or picking а
+  safely with a pointer to either rerunning in a TTY or picking a
   healthy app.
 - No Service matches label → diagnostic enumerates the three
   likely causes (not yet reconciled, manifests render no
   Service, label overridden by manifest's labels block).
-- Multiple Services match label → lists candidates с pointer
-  к manual `kubectl port-forward` until disambiguation lands
-  as а follow-up.
+- Multiple Services match label → lists candidates with a pointer
+  to manual `kubectl port-forward` until disambiguation lands
+  as a follow-up.
 - Service declares no `spec.ports` → diagnostic requires
   `--container-port <N>` explicit value.
-- All probed local ports (start..start+9) busy → error с
+- All probed local ports (start..start+9) busy → error with
   `--port <N>` override hint.
 
 ### Architecture
 
 New shared `commands::port_forward` module hosts the generic
 kubectl-port-forward + browser-open + drainer helpers
-previously private к `commands::open`. Both `apprafter open
+previously private to `commands::open`. Both `apprafter open
 argocd` and `apprafter app open <name>` now consume it; the
 Go SIGPIPE walk-fix #1 post-B.1.79 drainer pattern is
-inherited automatically. `commands::open` shrinks к ~100
+inherited automatically. `commands::open` shrinks to ~100
 lines (Argo CD-specific composition only); `commands::
 app_open` is the new ~270-line caller.
 
@@ -1763,7 +1763,7 @@ apply, reason: namespaces "apprafter" not found
 ### Root cause
 
 The wizard (`apprafter app add`) defaulted
-`destination.namespace` к the app name (e.g.
+`destination.namespace` to the app name (e.g.
 `apprafter-landing-web`). The user's manifest in
 `landing/web/apprafter/Application.cue:33` declares
 `metadata.namespace: "apprafter"`. Argo CD's flow on first
@@ -1775,7 +1775,7 @@ sync:
    per walk-fix #11.
 2. Renders the user's Application CR via CMP — its
    `metadata.namespace` is `apprafter`, NOT the destination.
-3. Attempts к apply the CR к `apprafter` namespace.
+3. Attempts to apply the CR to the `apprafter` namespace.
 4. `apprafter` namespace doesn't exist on the cluster (only
    `apprafter-landing-web` was created in step 1).
 5. Apply fails: `namespaces "apprafter" not found`.
@@ -1783,7 +1783,7 @@ sync:
 `CreateNamespace=true` only materialises the **destination**
 namespace; manifests with their own `metadata.namespace`
 are never granted automatic namespace creation. Misalignment
-between destination namespace и manifest namespace ⇒ apply
+between destination namespace and manifest namespace ⇒ apply
 failure.
 
 ### Fix
@@ -1800,11 +1800,11 @@ default `apprafter`:
   byte-identical).
 - `build_application_manifest()` takes a new
   `destination_namespace: &str` parameter, sets
-  `spec.destination.namespace` к it verbatim. The prior
+  `spec.destination.namespace` to it verbatim. The prior
   `name`-based defaulting is gone.
 
 Default `apprafter` matches the namespace landing manifests
-already declare и aligns with the namespace where the
+already declare and aligns with the namespace where the
 AppRafter operator watches for `Application` CRs by
 convention. Operators with multi-tenant layouts can pass
 `--namespace tenant-x` (or accept the prompt's default
@@ -1889,14 +1889,14 @@ resource :Namespace is not permitted in project apps
 The wizard (`apprafter app add`) generates each user
 Application with:
 
-- `spec.destination.namespace` defaulting к the app name
+- `spec.destination.namespace` defaulting to the app name
   (e.g. `apprafter-landing-web`).
 - `spec.syncPolicy.syncOptions: [CreateNamespace=true,
   ServerSideApply=true]`.
 
 Argo CD on the first sync wave sees `CreateNamespace=true`
-plus a destination namespace that doesn't yet exist и
-generates a synthetic `Namespace` object для applying. That
+plus a destination namespace that doesn't yet exist and
+generates a synthetic `Namespace` object for applying. That
 object is cluster-scoped (`""`/`Namespace` from core/v1).
 
 The `apps` AppProject (walk-fix #2 chart 0.1.41) shipped
@@ -1908,7 +1908,7 @@ could be applied:
 resource :Namespace is not permitted in project apps
 ```
 
-(Empty `group:` segment renders as `:Namespace` в the error
+(Empty `group:` segment renders as `:Namespace` in the error
 message — core/v1.)
 
 ### Fix
@@ -1934,7 +1934,7 @@ structural foundation.
 
 ### Caveat — orphan destination namespace
 
-The wizard's defaulting of `destination.namespace` к app
+The wizard's defaulting of `destination.namespace` to app
 name doesn't match what landing apps actually declare in
 their manifests (`metadata.namespace: "apprafter"`).
 Post-walk-fix-#11 sequence:
@@ -1945,7 +1945,7 @@ Post-walk-fix-#11 sequence:
    `metadata.namespace: "apprafter"` wins, so the CR lands
    in `apprafter`, not in the destination namespace.
 3. AppRafter operator reconciles, lays down Deployment +
-   Service в `apprafter` next to the CR.
+   Service in `apprafter` next to the CR.
 
 Net result: `apprafter-landing-web` namespace exists but is
 empty. Functional but ugly. Wizard polish (separate
@@ -1953,7 +1953,7 @@ walk-fix) should either:
 
 - Drop `CreateNamespace=true` from user-app syncOptions
   (the operator's reconcile creates everything in the CR's
-  namespace; Argo CD doesn't need к pre-create one).
+  namespace; Argo CD doesn't need to pre-create one).
 - Or read the rendered manifest's `metadata.namespace` at
   registration time and use it for `destination.namespace`
   (no synthetic Namespace needed if it matches an existing
@@ -1964,7 +1964,7 @@ walk-fix) should either:
 Per the v0.1.159 channel-latest design, chart-only changes
 flow into existing installs without a new CLI binary.
 PlatformController polls upstream releases on the operator
-side и will roll к `0.1.47` on its next reconcile. New
+side and will roll to `0.1.47` on its next reconcile. New
 bootstraps' `resolve_latest_platform_stack_version()` picks
 up `platform-stack/v0.1.47` once the publish workflow lands
 it.
@@ -1972,7 +1972,7 @@ it.
 ### Files touched
 
 - `platform-stack/cue/app_projects.cue` — `apps` project
-  `clusterResourceWhitelist` flips from `[]` к
+  `clusterResourceWhitelist` flips from `[]` to
   `[{group: "", kind: "Namespace"}]`.
 - `platform-stack/cue/platform.cue` — `currentVersion`
   0.1.46 → 0.1.47.
@@ -2062,7 +2062,7 @@ fi
 
 `argocd-cue-cmp` v0.1.4 → v0.1.5 — content-only change but
 the Dockerfile bakes `plugin.yaml` into `/home/argocd/cmp-
-server/config/plugin.yaml`, so the published image needs к
+server/config/plugin.yaml`, so the published image needs to
 match the chart-mirror for installers that bypass the
 ConfigMap overlay path. Existing chart-managed installs
 pick up the fix from the ConfigMap mount alone — the image
@@ -2073,7 +2073,7 @@ install surface.
 
 `platform-stack` 0.1.45 → 0.1.46 — flips
 `_components.argocd-cue-cmp.values.image.tag` from v0.1.4
-к v0.1.5 via the `argocdcuecmp.version` CUE import and
+to v0.1.5 via the `argocdcuecmp.version` CUE import and
 rewrites the embedded `plugin.yaml` ConfigMap. Compat
 entry `compatibility: "0.1.46"` shipped with detailed
 notes.
@@ -2093,7 +2093,7 @@ matches the expected match/no-match signal:
 3. Filename-prefix convention (`apprafter-foo.cue` at
    path root).
 4. Plain repo with no apprafter files (must return empty
-   stdout — fall through к next handler).
+   stdout — fall through to next handler).
 5. Generic `.cue` files with no `apprafter` prefix (must
    not match — the inverse regression for case 3).
 
@@ -2111,7 +2111,7 @@ The bug was masked twice over. Walk-fix #8 replaced an
 already-broken glob (`{...}` brace alternation unsupported
 in Argo CD 2.13.1's vendored doublestar) with a command-
 based snippet whose author thought "I'll filter through
-`grep -q` to convert find's output к a yes/no exit code".
+`grep -q` to convert find's output to a yes/no exit code".
 The intent was correct (Argo CD does check exit code) but
 the implementation broke the OTHER signal Argo CD checks
 (stdout emptiness). Operator's bootstrap saw the warning
@@ -2129,7 +2129,7 @@ proving the discover signal works.
 ### Files touched
 
 - `argocd-cue-cmp/plugin.yaml` — drop `| grep -q .` from
-  both branches, refresh the header comment к explain
+  both branches, refresh the header comment to explain
   walk-fix #10 vs #8.
 - `argocd-cue-cmp/version.cue` — bump 0.1.4 → 0.1.5.
 - `argocd-cue-cmp/test-discover.sh` — new regression test.
@@ -2151,14 +2151,14 @@ into existing installs through:
 
 1. PlatformController on operator-side polls the chart
    release stream and updates the parent platform
-   Application's `targetRevision` к 0.1.46.
+   Application's `targetRevision` to 0.1.46.
 2. New installs' `apprafter cluster-bootstrap` calls
    `resolve_latest_platform_stack_version()` which picks
    the freshest published `platform-stack/v*` tag at the
    bootstrap moment — 0.1.46 once published.
 
 Existing CLI binaries (≥v0.1.159) reach the fix without
-needing к download а new CLI release.
+needing to download a new CLI release.
 
 ## v0.1.159 — M1.5 walk-fix #9 post-B.1.79a — CLI resolves latest chart from upstream at bootstrap (2026-05-24)
 
@@ -2172,13 +2172,13 @@ verbatim. The constant tracks `platform.cue` `currentVersion`
 via `cli-providers/build.rs` at compile time. Result: every
 chart-only bump forced a CLI rebuild + release to keep
 fresh installs current, otherwise new operators would
-bootstrap onto the previous chart и only reach the latest
+bootstrap onto the previous chart and only reach the latest
 after the operator's PlatformController did a reconcile
 cycle.
 
 That coupling is wrong by design. The CLI binary has no
 business knowing the latest chart version at compile time —
-the latest chart is whatever is published к the upstream
+the latest chart is whatever is published to the upstream
 release stream.
 
 ### Fix
@@ -2188,12 +2188,12 @@ New `cli_providers::k8s::channel_latest` module:
 - `resolve_latest_platform_stack_version()` — public entry
   point. GETs `https://api.github.com/repos/apprafter/
   apprafter/releases?per_page=100` with a 3-second timeout,
-  filters `tag_name` к entries starting `platform-stack/v`,
+  filters `tag_name` to entries starting `platform-stack/v`,
   strips the prefix, parses as semver, picks the highest
   with stable preferred over prerelease.
 
 - Any failure path (network down, GitHub rate-limited, JSON
-  parse error, no matching tags) falls back к the baked
+  parse error, no matching tags) falls back to the baked
   `RELEASED_PLATFORM_STACK_VERSION` constant so air-gapped
   / firewalled / offline installs still bootstrap with a
   known-good version. Failures log at debug level so
@@ -2202,7 +2202,7 @@ New `cli_providers::k8s::channel_latest` module:
 
 `cluster_bootstrap::platform_stack_version()` now calls the
 resolver. The baked constant survives as the safety floor
-и as an asserts surface (loader_values.rs still validates
+and as an asserts surface (loader_values.rs still validates
 its format).
 
 ### Stable / prerelease semantics
@@ -2220,15 +2220,15 @@ The PlatformController in the operator already does
 channel-following autonomously after bootstrap. The CLI
 loader's role is just "apply the initial root Application
 CR so the controller can take over". Pinning that initial
-CR к the freshest published chart minimises the operator's
+CR to the freshest published chart minimises the operator's
 "newly-bootstrapped cluster lagging by one chart version"
-window к ~zero.
+window to ~zero.
 
-The OCI registry (ghcr.io) also has а tag-list endpoint we
+The OCI registry (ghcr.io) also has a tag-list endpoint we
 could use, but using GitHub Releases API:
 
 - Matches the surface `version_check.rs` already polls.
-- Doesn't require an OCI auth token for а public chart.
+- Doesn't require an OCI auth token for a public chart.
 - Has the same rate-limit story (60 req/hour unauth, but
   the resolver fires only at bootstrap time — rare).
 
@@ -2273,7 +2273,7 @@ walk-fix #8b). cue-cmp unchanged at v0.1.4.
 ### Symptom
 
 Push of v0.1.157 (which bundled chart 0.1.44 with the new
-command-based CMP discover в `plugin.yaml`) tripped the
+command-based CMP discover in `plugin.yaml`) tripped the
 `argocd-cue-cmp-check` workflow's drift detection:
 
 ```
@@ -2292,8 +2292,8 @@ cue-cmp image version. The reasoning was "the ConfigMap
 mount in the chart overrides the image's plugin.yaml at
 runtime, so the image bytes don't matter".
 
-The drift policy disagrees, и rightly so: an operator who
-installs cue-cmp manually (e.g. attaching it to а stock
+The drift policy disagrees, and rightly so: an operator who
+installs cue-cmp manually (e.g. attaching it to a stock
 Argo CD install without the AppRafter chart) gets the
 image's baked-in plugin.yaml — no ConfigMap overlay. Stale
 image content = wrong behaviour for that path.
@@ -2311,8 +2311,8 @@ Bump alongside:
   cmp.values.image.tag` follows the CUE import (`"v" +
   argocdcuecmp.version`), so the rendered chart now pins
   the new v0.1.4 image. Operator on chart 0.1.44 can
-  upgrade к 0.1.45 directly — argocd-repo-server's
-  sidecar reference flips и kubelet rolls the pod.
+  upgrade to 0.1.45 directly — argocd-repo-server's
+  sidecar reference flips and kubelet rolls the pod.
 - `cli/Cargo.toml` 0.1.157 → 0.1.158. `RELEASED_PLATFORM_
   STACK_VERSION` follows.
 
@@ -2336,9 +2336,9 @@ kubectl -n argocd annotate application landing-cms \
 ```
 
 Apps re-sync, CMP plugin engages via the new command-
-based discover (verified локально in walk-fix #8), runs
+based discover (verified locally in walk-fix #8), runs
 the same `entrypoint.sh` (unchanged), emits the rendered
-manifest stream. landing-web и landing-cms should turn
+manifest stream. landing-web and landing-cms should turn
 green.
 
 ### Versioning
@@ -2362,10 +2362,10 @@ desc = Failed to unmarshal "package.json": Object 'Kind'
 is missing in '{ "name": "@apprafter/landing-cms", ... }'
 ```
 
-Same error для both `landing-web` and `landing-cms`. The
+Same error for both `landing-web` and `landing-cms`. The
 CMP plugin was supposed to render `apprafter/Application.
 cue` files into k8s manifests; instead Argo CD fell through
-to default directory mode, walked `landing/cms/`, и tried
+to default directory mode, walked `landing/cms/`, and tried
 to parse `package.json` as a k8s manifest.
 
 ### Root cause
@@ -2390,16 +2390,16 @@ Diagnostics confirmed the issue:
   of any `generate` call OR `cue export` invocation
   implies all `MatchRepository` calls returned false.
 
-So the glob isn't matching. We can't reasonably ship а
+So the glob isn't matching. We can't reasonably ship a
 fixed brace-aware doublestar into Argo CD; switch the
-discovery to а mechanism we control.
+discovery to a mechanism we control.
 
 ### Fix
 
 Replace `discover.find.glob` with `discover.find.command`.
 The command runs from the path's directory; exit 0 means
 match, non-zero means no-match. Inline shell handles both
-convention shapes in а single expression:
+convention shapes in a single expression:
 
 ```sh
 if [ "$(basename "$PWD")" = "apprafter" ]; then
@@ -2485,7 +2485,7 @@ image unchanged at v0.1.3.
 
 ### Symptom
 
-Operator upgraded к v0.1.155, ran `apprafter app add` from
+Operator upgraded to v0.1.155, ran `apprafter app add` from
 `cli/` (legacy state location), hit `no cached kubeconfig
 in state`. Inspecting state files:
 
@@ -2497,7 +2497,7 @@ in state`. Inspecting state files:
   `floating_ip_ids: [300]`), kubeconfig fields null.
 
 The migration helper's "both files exist → skip" branch
-silently preserved the placeholder и stranded the operator's
+silently preserved the placeholder and stranded the operator's
 real state in the legacy location. No stderr notice was
 printed, so the operator had no signal that legacy data was
 sitting unmigrated.
@@ -2514,7 +2514,7 @@ if target_paths.state_file().exists() {
 ```
 
 Existence ≠ correctness. A placeholder file would pass the
-check just as well as а freshly-applied state. The operator
+check just as well as a freshly-applied state. The operator
 got no signal about the conflict.
 
 Then after deleting the placeholder file manually to trigger
@@ -2545,16 +2545,16 @@ EXDEV anyway.
 Three layered improvements:
 
 1. **Prefer richer legacy on conflict**. When both files
-   exist, parse both и compare hetzner_cloud presence. If
+   exist, parse both and compare hetzner_cloud presence. If
    the legacy file has hetzner_cloud and the per-target one
    doesn't, back up the placeholder to
-   `state.json.bak` и migrate the legacy file as the
+   `state.json.bak` and migrate the legacy file as the
    authoritative state. Stderr notice names both paths so
    the operator sees what happened.
 
 2. **Loud stderr notice on skip path**. When both files
    carry hetzner_cloud (the genuine "operator has two
-   separate clusters" case), still skip but emit а notice:
+   separate clusters" case), still skip but emit a notice:
    `legacy state at <path> detected but per-target slot
    <path> is already populated. Skipping migration. Inspect
    both files and delete whichever is stale...`. Silent
@@ -2577,7 +2577,7 @@ state is treated as empty, and the richer legacy file wins.
 
 - `migrate_legacy_prefers_richer_legacy_when_per_target_lacks_hetzner_cloud`
   — the v0.1.155 walk's exact scenario; asserts legacy
-  becomes the per-target state и placeholder is backed up
+  becomes the per-target state and placeholder is backed up
   to `.json.bak`.
 - `migrate_legacy_keeps_per_target_when_both_carry_hetzner_cloud`
   — defensive: two real clusters → per-target wins, legacy
@@ -2588,7 +2588,7 @@ migration tests: 5 → 7.
 
 ### Recovery for v0.1.154/v0.1.155 operators
 
-If the per-target slot was populated with а scaffold or
+If the per-target slot was populated with a scaffold or
 placeholder before this fix lands:
 
 ```bash
@@ -2599,10 +2599,10 @@ cat ~/.config/apprafter/state/<active-target>/.apprafter/state.json
 # still at <cwd>/.apprafter/state.json, delete the scaffold:
 rm ~/.config/apprafter/state/<active-target>/.apprafter/state.json
 
-# Next CLI invocation picks up the legacy file и migrates.
+# Next CLI invocation picks up the legacy file and migrates.
 ```
 
-After upgrading к v0.1.156 the auto-prefer logic handles
+After upgrading to v0.1.156 the auto-prefer logic handles
 this on first invocation — no manual `rm` needed.
 
 ### Versioning
@@ -2861,20 +2861,20 @@ metadata: name: "hello"
 spec: image: "..."
 ```
 
-`cue export ./... --out json` emits the whole package as а
+`cue export ./... --out json` emits the whole package as a
 flat object `{apiVersion, kind, metadata, spec}`. The
 walk-fix #5 entrypoint enumerated `to_entries[]` looking
 for **nested** objects with `apiVersion + kind`; the
-top-level `apiVersion` is а string, not an object, so the
-filter rejected everything и the loop exited without
+top-level `apiVersion` is a string, not an object, so the
+filter rejected everything and the loop exited without
 emitting anything.
 
 Two legitimate CUE source layouts:
 
 - **A) Unwrapped** — package scope IS the manifest. Common
   for single-resource files.
-- **B) Named wrapper(s)** — each top-level field is а
-  manifest under а readable name. Required for multi-
+- **B) Named wrapper(s)** — each top-level field is a
+  manifest under a readable name. Required for multi-
   resource files (one file declares `landingWeb: …`,
   `landingWebPreview: …`).
 
@@ -2884,7 +2884,7 @@ Walk-fix #5 handled only B; the smoke fixture uses A.
 
 Dispatch before enumeration: if the top-level JSON object
 itself carries `apiVersion + kind`, emit `cue export ./...
---out yaml` verbatim (style A). Otherwise fall through к
+--out yaml` verbatim (style A). Otherwise fall through to
 the existing per-key enumeration logic (style B).
 
 ```sh
@@ -2906,7 +2906,7 @@ fi
 Local re-runs against both fixtures:
 
 - `/tmp/cue-smoke/apprafter/Application.cue` (style A) →
-  single YAML doc с `apiVersion` at the top level.
+  single YAML doc with `apiVersion` at the top level.
 - `landing/web/apprafter/` (style B) → two YAML docs
   (landing-web + landing-web-preview), `---` separator
   between them.
@@ -2916,7 +2916,7 @@ Local re-runs against both fixtures:
 - `argocd-cue-cmp` v0.1.2 → v0.1.3 (publish workflow
   auto-fires on the new tag).
 - platform-stack chart 0.1.42 → 0.1.43 — picks up new
-  image tag через CUE import.
+  image tag via CUE import.
 - CLI 0.1.152 → 0.1.153.
 
 ---
@@ -2935,15 +2935,15 @@ unsurfaced bugs in the cue-cmp plugin path:
    files whose basename starts with `apprafter`. The landing
    manifests are named `Application.cue` inside an
    `apprafter/` directory — a more readable convention for
-   larger repos, и the one AppRafter's own manifests use.
-   Without а matching file, Argo CD falls through to the
-   default raw-YAML handler и syncs the Application with
+   larger repos, and the one AppRafter's own manifests use.
+   Without a matching file, Argo CD falls through to the
+   default raw-YAML handler and syncs the Application with
    zero rendered manifests.
 
 2. **Entrypoint script** runs `cue export ./... --out yaml`
    raw. For typical AppRafter source files like
    `landingWeb: v1alpha1.#Application & { ... }`, that
-   produces а **nested** YAML document with the manifest
+   produces a **nested** YAML document with the manifest
    under the field key (`landingWeb: …`). Argo CD treats
    that as one invalid document — `apiVersion` isn't at the
    top level → sync fails.
@@ -2987,7 +2987,7 @@ Local `bash argocd-cue-cmp/entrypoint.sh` against
 documents (landing-web + landing-web-preview), each with
 `apiVersion: apprafter.io/v1alpha1` at the top level and a
 `---` separator between them. Argo CD's downstream YAML
-parser will treat each as а separate manifest.
+parser will treat each as a separate manifest.
 
 ### Versioning
 
@@ -2995,7 +2995,7 @@ parser will treat each as а separate manifest.
   the publish workflow auto-fires on the new
   `argocd-cue-cmp/v0.1.2` git tag).
 - platform-stack chart 0.1.41 → 0.1.42 — picks up the new
-  cue-cmp image tag через the CUE import + extends the
+  cue-cmp image tag via the CUE import + extends the
   embedded glob. Rendered diff vs 0.1.41: `image.tag` value
   + ConfigMap `plugin.yaml` data string.
 - CLI 0.1.151 → 0.1.152 — picks up the new chart pin via
@@ -3003,7 +3003,7 @@ parser will treat each as а separate manifest.
 
 ### Operator workflow once landed
 
-After upgrading к chart 0.1.42 (`apprafter platform upgrade
+After upgrading to chart 0.1.42 (`apprafter platform upgrade
 --to 0.1.42`), operators can register an AppRafter user app
 from any path matching either convention:
 
@@ -3031,7 +3031,7 @@ $ cat ~/.cache/apprafter/version-check.json
 {"latest_tag":"platform-stack/v0.1.38","fetched_at_secs":1779577658}
 ```
 
-The cached `latest_tag` is а chart-stream tag, not а CLI
+The cached `latest_tag` is a chart-stream tag, not a CLI
 version. `Version::parse("platform-stack/v0.1.38")` fails
 silently; `newer_than` returns `false`; banner suppressed.
 
@@ -3058,22 +3058,22 @@ parse silently failed and the banner went quiet.
 
 Switch the endpoint to `/releases?per_page=30` (newest-first
 array). New pure helper `pick_canonical_cli_tag(releases)`
-walks the array и returns the first `tag_name` whose stripped
-form parses as а canonical `semver::Version`. All four
+walks the array and returns the first `tag_name` whose stripped
+form parses as a canonical `semver::Version`. All four
 prefixed streams fail `Version::parse` naturally — no
 explicit prefix denylist needed.
 
-Cache also gains а defensive validation step:
+Cache also gains a defensive validation step:
 `read_fresh_cache` re-parses the cached `latest_tag` as
-semver and treats а non-semver value as а cache miss. This
+semver and treats a non-semver value as a cache miss. This
 clears leftover garbage from pre-fix caches without making
 operators delete the file by hand on first run of the new
 binary.
 
 ### TTL reduction
 
-Cache TTL drops from 24h к 6h. The project is in active daily
-development; а 6h dial keeps operators current without burning
+Cache TTL drops from 24h to 6h. The project is in active daily
+development; a 6h dial keeps operators current without burning
 GitHub API quota on every shell command.
 
 ### Tests
@@ -3089,7 +3089,7 @@ edge cases; total `version_check` module: 4 → 13.
 - `canonicalise_cli_tag_rejects_argocd_cue_cmp_prefix`
 - `canonicalise_cli_tag_rejects_empty_and_garbage`
 - `pick_canonical_cli_tag_skips_prefixed_tags` — happy
-  path on а realistic mixed-stream release window.
+  path on a realistic mixed-stream release window.
 - `pick_canonical_cli_tag_returns_none_when_no_canonical_in_window`
   — pathological case (no CLI tag in the recent 30 releases);
   banner stays silent without surprise.
@@ -3097,7 +3097,7 @@ edge cases; total `version_check` module: 4 → 13.
   — defensive: missing/null/empty `tag_name` fields skipped
   rather than crashing.
 - `pick_canonical_cli_tag_returns_none_for_non_array` — old
-  endpoint returned а single object; defensive coverage for
+  endpoint returned a single object; defensive coverage for
   future schema drift.
 
 ### Versioning
@@ -3110,8 +3110,8 @@ CLI 0.1.150 → 0.1.151. Chart unchanged.
 
 ### Symptom
 
-First v0.1.149 push к GitHub triggered the new `release-cli`
-workflow и all three target builds failed identically:
+First v0.1.149 push to GitHub triggered the new `release-cli`
+workflow and all three target builds failed identically:
 
 ```
 error: failed to run custom build command for `cli-providers v0.1.149`
@@ -3125,17 +3125,17 @@ Error: Process completed with exit code 101.
 
 ### Root cause
 
-`cli-providers/build.rs` shells out к `cue export` at compile
-time к extract `_loaderValues` + chart versions из
+`cli-providers/build.rs` shells out to `cue export` at compile
+time to extract `_loaderValues` + chart versions from
 `platform-stack/cue/`. GitHub-hosted runners (`ubuntu-latest`,
 `macos-latest`) don't ship `cue` by default; the build script
 panics on the missing binary.
 
 The fix existed in other workflows already — `lint.yml`
-(both `cue-lint` и `rust` jobs) and `nightly.yml` install
+(both `cue-lint` and `rust` jobs) and `nightly.yml` install
 `cue` via `cue-lang/setup-cue@v1.0.1` action before any
 `cargo` invocation. v0.1.149's release-cli workflow simply
-forgot к copy that step in.
+forgot to copy that step in.
 
 ### Fix
 
@@ -3146,9 +3146,9 @@ Add the `Install CUE` step between Rust toolchain setup and
 
 ### Versioning
 
-CLI 0.1.149 → 0.1.150. Chart unchanged. Strictly а CI fix
+CLI 0.1.149 → 0.1.150. Chart unchanged. Strictly a CI fix
 — no Rust code or chart content changed. CLI binary is
-byte-identical к 0.1.149.
+byte-identical to 0.1.149.
 
 ---
 
@@ -3196,14 +3196,14 @@ to bump `cli/Cargo.toml` `workspace.package.version` per the
 CLAUDE.md versioning rule — the published binary would
 report a stale `--version` string, which `version_check`
 relies on for comparison. Failing the workflow here is
-better than silently shipping а broken courtesy banner.
+better than silently shipping a broken courtesy banner.
 
 ### Release notes
 
 The `Extract changelog section for this tag` step pulls the
 first `##` section in `docs/changelog/UNRELEASED.md` that
-mentions the tag и uses it as the release body. Falls back
-to а short default body for chart-only / landing-stream tags
+mentions the tag and uses it as the release body. Falls back
+to a short default body for chart-only / landing-stream tags
 that don't have a dedicated changelog entry.
 
 ### Security
@@ -3222,15 +3222,15 @@ The tag-glob trigger (`v0.*` / `v1.*`) further constrains
 ### Linux aarch64
 
 Deliberately absent from this round — tier-1 ships on x86
-only и adding cross-compile for Linux ARM requires `cross`
-or Docker QEMU, а separate complication. Phase 2+ wires it
+only and adding cross-compile for Linux ARM requires `cross`
+or Docker QEMU, a separate complication. Phase 2+ wires it
 in alongside Infrastructure-side arch detection.
 
 ### Manual trigger
 
 The workflow also supports `workflow_dispatch` with an
 explicit tag input, so operators can re-build / re-upload
-release assets for а previously-tagged commit if the first
+release assets for a previously-tagged commit if the first
 run failed (network blip on `gh release create`, etc.). The
 re-run path deletes the existing release first to avoid
 `gh release create` errors on duplicate asset names.
@@ -3261,7 +3261,7 @@ Error: apprafter::cli::other
 
 PlatformController ships in M1.5 without populating
 `PlatformStack.status.componentVersions` — that field is
-reserved for а Phase 2 enhancement. The verb was unusable
+reserved for a Phase 2 enhancement. The verb was unusable
 without manually looking up the version operator wanted to
 freeze.
 
@@ -3274,7 +3274,7 @@ component)` walks a fallback chain:
    — the canonical version dial when present (Phase 2+).
 2. **`Argo CD Application argocd/<component>.spec.source.
    targetRevision`** — the version Argo CD is actively
-   reconciling against. Always present for а chart-managed
+   reconciling against. Always present for a chart-managed
    component since the umbrella's `templates/applications.
    yaml` template emits it.
 3. Hard error pointing the operator at `--version <v>` and
@@ -3289,7 +3289,7 @@ the choice.
 ### Why source preference order matters
 
 PlatformStack.status wins over Argo CD targetRevision
-because during а bump cycle the Argo CD Application's
+because during a bump cycle the Argo CD Application's
 `spec.source.targetRevision` may briefly lag behind the
 umbrella's reconciled state — the umbrella patches its
 children's targetRevision on each component cycle, and
@@ -3310,7 +3310,7 @@ next-best authoritative signal.
   the Argo CD fallback instead of erroring.
 - `resolve_effective_pin_errors_when_both_sources_empty` —
   unknown component / half-bootstrapped cluster surfaces
-  а clean error pointing at `--version` + `platform status`.
+  a clean error pointing at `--version` + `platform status`.
 - `resolve_effective_pin_handles_argocd_app_without_target_revision`
   — defensive: malformed CR with empty spec.source treated
   the same as the 404 case.
@@ -3318,8 +3318,8 @@ next-best authoritative signal.
 ### Versioning
 
 CLI 0.1.146 → 0.1.148 (`v0.1.147` taken by landing-stream
-release `558acad`; CLI version skips ahead к 0.1.148 to
-avoid а tag collision). Chart unchanged.
+release `558acad`; CLI version skips ahead to 0.1.148 to
+avoid a tag collision). Chart unchanged.
 
 ---
 
@@ -3337,10 +3337,10 @@ Unable to refresh admission-webhook:
 app is not allowed in project "platform", or the project does not exist
 ```
 
-User report: «В Арго вижу ошибки вроде: Unable to refresh
+User report: "In Argo CD I see errors like: Unable to refresh
 admission-webhook: app is not allowed in project "platform",
-or the project does not exist. Это надо бутстрап заново
-будет сделать?»
+or the project does not exist. Will I need to re-run bootstrap
+to fix this?"
 
 ### Root cause
 
@@ -3363,7 +3363,7 @@ tries to refresh **before** the AppProject `platform` has
 landed.
 
 This was a timing bug masked by typical 0.1.40 sync paths
-that happened к serialise correctly when nothing else was
+that happened to serialise correctly when nothing else was
 load on argocd-server — but reproducible on the operator's
 walk-test cluster.
 
@@ -3397,7 +3397,7 @@ entries to the AppProject fields the umbrella actually
 sets — defensive enough that future Phase 4 AccessGrant
 work can extend it without a chart-shape break.
 
-**`#PlatformValues`** gains а top-level `appProjects:
+**`#PlatformValues`** gains a top-level `appProjects:
 [string]: #AppProjectSpec` field. Tier overlays
 (`tier_solo.cue`, `tier_team.cue`) wire `appProjects:
 _appProjects` so the rendered values.yaml carries the
@@ -3408,10 +3408,10 @@ map.
 **The fix is structural — fresh installs on `0.1.41+` and
 `0.1.40 → 0.1.41` upgrades both work without any manual
 intervention.** Existing operators on `0.1.40` who don't
-want к wait for the chart-pull + reconcile cycle к clear
+want to wait for the chart-pull + reconcile cycle to clear
 the refresh-error condition can apply the four AppProjects
-inline. Argo CD picks them up immediately и un-breaks
-within seconds rather than the ~1-2 minutes а full
+inline. Argo CD picks them up immediately and un-breaks
+within seconds rather than the ~1-2 minutes a full
 `apprafter platform upgrade --to 0.1.41` typically takes:
 
 ```bash
@@ -3674,23 +3674,23 @@ CLI 0.1.143 → 0.1.144. Chart unchanged.
 ### Symptom
 
 Walk feedback on B.1.79a closures: CLI output, comments, and
-error messages в new modules (`app.rs`, `repo_creds.rs`,
+error messages in new modules (`app.rs`, `repo_creds.rs`,
 `platform.rs`, `open.rs`, …) contained mixed Cyrillic/English
 text — both fully-Russian sentences and Cyrillic letters used
-as Latin look-alikes inside English text (`к` for `to`, `и`
-for `and`, `с` for `with`, etc.).
+as Latin look-alikes inside English text (Cyrillic letter looking like `k` for `to`, the one looking like `u`
+for `and`, the one looking like `c` for `with`, etc.).
 
 User example:
 
 ```
 $ apprafter platform freeze cilium
 Error: ...
-× Не нашёл effective version для component 'cilium' в status.componentVersions ...
+× Could not find effective version for component 'cilium' in status.componentVersions ...
 ```
 
 ### Fix
 
-Mass translation across 10 CLI files driven by а subagent
+Mass translation across 10 CLI files driven by a subagent
 through `Edit` calls:
 
 - `cli/platform-cli/src/cli.rs` (101 → 0 Cyrillic occurrences)
@@ -3706,7 +3706,7 @@ through `Edit` calls:
 - bonus: `cli/platform-cli/tests/cluster_smoke_test.rs` (1
   stray Cyrillic word).
 
-Repo-wide audit: `grep -cE '[А-Яа-яЁё]'` returns 0 across the
+Repo-wide audit: a `grep -cE` for any Cyrillic letter returns 0 across the
 entire `cli/` tree.
 
 Translation principles:
@@ -3751,40 +3751,40 @@ English-only style.
 ### What landed
 
 Three new `apprafter platform` verbs closing the loop started
-в v0.1.135 (`platform status` / `upgrade`):
+in v0.1.135 (`platform status` / `upgrade`):
 
 - `platform freeze <component> [--version <v>]` — patches
   `PlatformStack.spec.overrides.<component>.pin`. Without
-  `--version`, reads the current effective version из
-  `status.componentVersions.<component>` и locks that. Per
+  `--version`, reads the current effective version from
+  `status.componentVersions.<component>` and locks that. Per
   the CRD schema (`schemas/v1alpha1/platformstack.cue`),
   `overrides` is keyed by component name; pin takes
   precedence over the umbrella chart's curated version for
   that component.
 
 - `platform unfreeze <component>` — RFC 7396 merge-patch
-  с `null` value strips the `overrides.<component>` entry
-  entirely. Component falls back к the chart's curated pin.
-  Strips both `pin` и `values` overrides — operator who
-  wants partial revert должен patch вручную; `unfreeze` —
-  the "fully revert к chart's curated state" verb.
+  with a `null` value strips the `overrides.<component>` entry
+  entirely. Component falls back to the chart's curated pin.
+  Strips both `pin` and `values` overrides — operator who
+  wants partial revert must patch manually; `unfreeze` —
+  the "fully revert to chart's curated state" verb.
 
 - `platform rescue [--yes]` — thin wrapper over
-  `apprafter cluster-bootstrap` с а recovery banner и
+  `apprafter cluster-bootstrap` with a recovery banner and
   confirmation prompt. Use case: Argo CD itself is unable
-  к self-adopt (stale chart, corrupted ConfigMap,
-  pod-eviction loop) и а regular upgrade flow won't reach
+  to self-adopt (stale chart, corrupted ConfigMap,
+  pod-eviction loop) and a regular upgrade flow won't reach
   the right reconcile state. The loader re-applies Cilium →
   Argo CD → CRDs → operator manifests as on initial
-  bootstrap — all apprafter-managed Applications потеряют
-  текущее Sync/Healthy state на несколько reconcile cycles.
+  bootstrap — all apprafter-managed Applications will lose
+  their current Sync/Healthy state for several reconcile cycles.
 
-### 1.79a closure — what's в, what's deferred
+### 1.79a closure — what's in, what's deferred
 
-**В:**
+**In:**
 
 - AppProjects (`platform` / `platform-providers` / `apps` +
-  legacy `default`) в platform-stack chart 0.1.40 (part 1).
+  legacy `default`) in platform-stack chart 0.1.40 (part 1).
 - `#Component.project: string | *"platform"` field + render
   template (part 1).
 - `apprafter open argocd --project apps` default + clipboard
@@ -3793,26 +3793,26 @@ Three new `apprafter platform` verbs closing the loop started
 - `apprafter app logs/rollback` (part 4).
 - `apprafter repo creds add/list/show/rotate/remove` (part 5).
 - `apprafter platform freeze/unfreeze/rescue` (this commit).
-- Context-aware error hints (already в part 3's `app add`:
+- Context-aware error hints (already in part 3's `app add`:
   no-git-repo, auth-failure-points-to-`repo creds add`,
   name-collision-points-to-`app status`/`app remove`).
 
-**Deferred (per per-part deferral rationale, не blockers
-для closure):**
+**Deferred (per per-part deferral rationale, not blockers
+for closure):**
 
 - `apprafter platform channel <name>` — single-channel
-  `stable` ships в M1.5; multi-channel UX waits для Phase 2.
-- Interactive wizards для `app add` / `repo creds add` —
-  flag-driven paths уже cover 95% of cases; wizard
-  refresh batched с future `target add` wizard polish.
-- Inline PAT prompt в `app add` для private repos — hint
-  pointing к `repo creds add` уже surfaces в auth-failure
+  `stable` ships in M1.5; multi-channel UX waits for Phase 2.
+- Interactive wizards for `app add` / `repo creds add` —
+  flag-driven paths already cover 95% of cases; wizard
+  refresh batched with future `target add` wizard polish.
+- Inline PAT prompt in `app add` for private repos — hint
+  pointing to `repo creds add` already surfaces in auth-failure
   message.
-- CMP plugin renders user `apprafter*.cue` с
+- CMP plugin renders user `apprafter*.cue` with
   `spec.project: apps` by default — applied at CMP plugin
-  evolution, не CLI flow; CMP сейчас does not write
+  evolution, not CLI flow; CMP currently does not write
   Application CRs (operator-managed user-app CR rendering
-  is а Phase 2 concern).
+  is a Phase 2 concern).
 - `apprafter open backstage/grafana/hubble` — Tier 2+
   services, not tier-1 resident.
 
@@ -3833,9 +3833,9 @@ unchanged.
 
 ### What landed
 
-`apprafter repo creds` subcommand family для managing Argo CD
+`apprafter repo creds` subcommand family for managing Argo CD
 repo-creds Secrets. Closes the private-repo onboarding loop —
-operators больше не нужно вручную составлять YAML для
+operators no longer need to manually craft YAML for
 `argocd.argoproj.io/secret-type: repo-creds` labeled Secrets.
 
 ### Contract
@@ -3857,31 +3857,31 @@ stringData:
 ```
 
 `stringData` (not `data`) — kubectl base64-encodes server-side
-when applying, so the CLI ships plaintext token и avoids
-а dual-encoding bug.
+when applying, so the CLI ships plaintext token and avoids
+a dual-encoding bug.
 
 Argo CD's repo-server scans `argocd` namespace for Secrets
-labeled `argocd.argoproj.io/secret-type: repo-creds` и uses
-whichever entry's `url` field is а **prefix match** for an
+labeled `argocd.argoproj.io/secret-type: repo-creds` and uses
+whichever entry's `url` field is a **prefix match** for an
 Application's `spec.source.repoURL`. So registering
-`https://github.com/myorg` makes every Application pointing к
+`https://github.com/myorg` makes every Application pointing to
 `https://github.com/myorg/<any-repo>` inherit those creds.
 
 ### `repo creds add <name>`
 
 - `--url-prefix <url>` (required) — the URL prefix Argo CD
-  uses к match Applications.
-- `--type <pat|basic>` (default `pat`). `ssh` rejected с
+  uses to match Applications.
+- `--type <pat|basic>` (default `pat`). `ssh` rejected with
   Phase 2 deferral hint.
-- `--username <user>` (default `git` — works для most PAT
+- `--username <user>` (default `git` — works for most PAT
   providers). GitLab requires the username explicitly.
-- `--token <value>` (required). Reads из stdin via
-  `inquire::Password` (masked) когда omitted и stdin is а
+- `--token <value>` (required). Reads from stdin via
+  `inquire::Password` (masked) when omitted and stdin is a
   TTY. Honours `APPRAFTER_REPO_TOKEN` env (hidden values).
 - `--no-validate` skips provider-specific token regex check.
-  Useful для self-hosted Gitea/Forgejo с custom token shapes.
+  Useful for self-hosted Gitea/Forgejo with custom token shapes.
 
-Pre-flight refuses когда Secret name collision; suggests
+Pre-flight refuses on a Secret name collision; suggests
 `rotate` or `remove + add`.
 
 Token validation rules (best-effort, override-able):
@@ -3897,53 +3897,53 @@ Token validation rules (best-effort, override-able):
 
 Table NAME / URL PREFIX / TYPE / USERNAME. Auth type pulled
 from the `apprafter.io/auth-type` annotation. Empty result
-prints hint pointing к `repo creds add` syntax.
+prints hint pointing to `repo creds add` syntax.
 
 ### `repo creds show <name>`
 
-Detail view с masked password (`****`) + а pointer к the
-plaintext-decode kubectl command для operators who really
+Detail view with masked password (`****`) + a pointer to the
+plaintext-decode kubectl command for operators who really
 need it. Argo CD's standard `kubectl get secret -o
-jsonpath='{.data.password}' | base64 -d` invocation is а
+jsonpath='{.data.password}' | base64 -d` invocation is a
 common debugging step, so surfacing it inline beats forcing
-the operator к remember the syntax.
+the operator to remember the syntax.
 
 ### `repo creds rotate <name>`
 
 - Patches `data.password` in-place (base64-encoded since
   we're patching `data` not `stringData`) via JSON
-  merge-patch — repo-server holds а cached
-  `resourceVersion` pointer и а full recreate would cause а
+  merge-patch — repo-server holds a cached
+  `resourceVersion` pointer and a full recreate would cause a
   brief reconnect window.
 - Re-runs token format validation against the recorded
   `apprafter.io/auth-type` annotation; `--no-validate`
   available.
-- Reads new token from stdin (masked) когда omitted on TTY.
+- Reads new token from stdin (masked) when omitted on TTY.
 
 ### `repo creds remove <name>`
 
-- **Dependency check** by default: refuses когда есть Argo
-  CD Application(s) с `spec.source.repoURL` starting with
+- **Dependency check** by default: refuses when there are Argo
+  CD Application(s) with `spec.source.repoURL` starting with
   the creds' `url` field. Pure helper
   `find_apps_matching_prefix` walks the Application list
-  filter testable без cluster.
-- `--force` skips dependency check (for migrations к а
+  filter testable without a cluster.
+- `--force` skips dependency check (for migrations to a
   different creds entry).
-- `--yes` skips confirmation prompt только (still runs
+- `--yes` skips confirmation prompt only (still runs
   dependency check).
 - Both flags non-interactive shell compatible.
 
-### Inline PAT prompt в `apprafter app add` — deferred
+### Inline PAT prompt in `apprafter app add` — deferred
 
-The inline PAT-add prompt during `apprafter app add` когда
+The inline PAT-add prompt during `apprafter app add` when
 `git ls-remote` hits auth failure (originally planned with
-this commit) **остаётся deferred** — sufficient к surface
-the hint pointing к `apprafter repo creds add` from
-`app add`'s error message (already shipped в v0.1.139).
-Inline prompt is а UX nice-to-have что rarely fires (most
-operators register creds once и forget them); landing
-needs interactive shell management we'll batch с `target add`
-wizard refresh в а later patch.
+this commit) **remains deferred** — sufficient to surface
+the hint pointing to `apprafter repo creds add` from
+`app add`'s error message (already shipped in v0.1.139).
+Inline prompt is a UX nice-to-have that rarely fires (most
+operators register creds once and forget them); landing
+needs interactive shell management we'll batch with `target add`
+wizard refresh in a later patch.
 
 ### Tests
 
@@ -3956,7 +3956,7 @@ wizard refresh в а later patch.
 - `validate_token_format_rejects_short_github_fine_grained_pat`
 - `validate_token_format_accepts_github_classic_pat`
 - `validate_token_format_rejects_wrong_length_github_classic_pat`
-  (both shorter и longer).
+  (both shorter and longer).
 - `validate_token_format_accepts_gitlab_pat`
 - `validate_token_format_accepts_generic_long_token`
 - `validate_token_format_rejects_short_generic_token` (hints
@@ -3969,10 +3969,10 @@ wizard refresh в а later patch.
 - `build_repo_creds_secret_routes_to_argocd_namespace`
 - `build_repo_creds_secret_uses_stringdata_for_round_trip` —
   defensive: `data` field MUST be absent (would compete
-  с `stringData` для apiserver precedence).
+  with `stringData` for apiserver precedence).
 - `find_apps_matching_prefix_filters_by_repo_url`
 - `find_apps_matching_prefix_skips_apps_without_repo_url` —
-  defensive: helm-chart-only Applications без а
+  defensive: helm-chart-only Applications without a
   `spec.source.repoURL` git URL must not trip the prefix
   match.
 
@@ -3993,29 +3993,29 @@ CLI 0.1.140 → 0.1.141. Chart unchanged.
 ### What landed
 
 Two new verbs under `apprafter app` — `logs` (tail workload
-pods) и `rollback` (revert к previous revision). Closes the
-delete-debug-revert loop без operator detour к raw kubectl /
+pods) and `rollback` (revert to previous revision). Closes the
+delete-debug-revert loop without operator detour to raw kubectl /
 Argo CD UI.
 
 ### `apprafter app logs <name>`
 
-Wraps `kubectl logs` scoped к the workload namespace read from
+Wraps `kubectl logs` scoped to the workload namespace read from
 the Application CR's `spec.destination.namespace`. Flags:
 
 - `-f / --follow` — tail mode.
 - `--tail <N>` — backlog cap (`-1` default = no limit;
   matches `kubectl logs`'s own default).
-- `--container <c>` — disambiguate в multi-container pods;
-  kubectl's own error message surfaces verbatim когда a
+- `--container <c>` — disambiguate in multi-container pods;
+  kubectl's own error message surfaces verbatim when a
   multi-container pod requires explicit `-c`.
-- `--pod <name>` — narrow к а single pod (skips the label
+- `--pod <name>` — narrow to a single pod (skips the label
   selector path).
 
 Default — selector mode `-l app.kubernetes.io/instance=<name>`
 (Argo CD's documented standard label, stamped on every child
 resource it syncs). Selector mode additionally enables
 `--prefix=true` (so multi-pod stream lines are distinguishable)
-+ `--max-log-requests=10` (cap fan-out на а large app).
++ `--max-log-requests=10` (cap fan-out on a large app).
 
 Pure helpers `build_kubectl_logs_target(app_name, pod)` +
 `build_kubectl_logs_args(target, namespace, follow, tail,
@@ -4025,18 +4025,18 @@ process spawn so tests can cover the matrix exhaustively.
 ### `apprafter app rollback <name> [--to <rev>]`
 
 Reads `status.history` (Argo CD's chronologically-ordered list
-of completed syncs, newest last). Без `--to` — picks the
-second-to-last entry's `revision` через pure
-`pick_previous_revision(app)` helper. С `--to <rev>` — uses
+of completed syncs, newest last). Without `--to` — picks the
+second-to-last entry's `revision` through pure
+`pick_previous_revision(app)` helper. With `--to <rev>` — uses
 the explicit value verbatim.
 
-Pre-flight refuses когда target revision matches current
-`spec.source.targetRevision` (would be а no-op). Interactive
-confirms через `inquire::Confirm` (default No); non-interactive
-refuses без `--yes`.
+Pre-flight refuses when target revision matches current
+`spec.source.targetRevision` (would be a no-op). Interactive
+confirms through `inquire::Confirm` (default No); non-interactive
+refuses without `--yes`.
 
-Patches `spec.source.targetRevision` через JSON merge-patch;
-Argo CD's automated sync rolls forward на следующем reconcile
+Patches `spec.source.targetRevision` through JSON merge-patch;
+Argo CD's automated sync rolls forward on the next reconcile
 cycle.
 
 ### Tests
@@ -4044,7 +4044,7 @@ cycle.
 +6 unit tests:
 
 - `build_kubectl_logs_target_defaults_to_selector` — selector
-  mode когда `--pod` не передан.
+  mode when `--pod` is not passed.
 - `build_kubectl_logs_target_uses_pod_name_when_provided` — pod
   form override.
 - `build_kubectl_logs_args_selector_form_includes_prefix_and_max_requests`
@@ -4052,11 +4052,11 @@ cycle.
   these flags being present.
 - `build_kubectl_logs_args_pod_form_drops_prefix` — defensive
   asymmetry: single-pod form must NOT add `--prefix` /
-  `--max-log-requests` (would clutter output для no reason).
+  `--max-log-requests` (would clutter output for no reason).
 - `pick_previous_revision_returns_second_to_last` — happy
-  path on а 3-entry history.
+  path on a 3-entry history.
 - `pick_previous_revision_errors_when_history_too_short` —
-  fresh app (0 / 1 / missing history) errors с pointer к
+  fresh app (0 / 1 / missing history) errors with pointer to
   `--to` flag.
 
 Total app crate tests: 12 → 18.
@@ -4076,33 +4076,33 @@ CLI 0.1.139 → 0.1.140. Chart unchanged.
 
 ### What landed
 
-`apprafter app` subcommand family для user-application
-lifecycle. Operates на Argo CD Applications labeled
+`apprafter app` subcommand family for user-application
+lifecycle. Operates on Argo CD Applications labeled
 `apprafter.io/managed-by: apprafter` so chart-managed
 platform Applications stay out of these views.
 
 ### `apprafter app add [<git-url>]`
 
-- Без аргумента: detects git origin remote of cwd via
+- Without an argument: detects git origin remote of cwd via
   `git remote get-url <remote>` (default `--remote origin`).
-  Errors с CLI-friendly hint when cwd is not а git repo.
-- Normalises git URL к Argo-CD-friendly HTTPS form:
+  Errors with CLI-friendly hint when cwd is not a git repo.
+- Normalises git URL to Argo-CD-friendly HTTPS form:
   - `git@host:org/repo[.git]` → `https://host/org/repo`
   - `ssh://git@host/org/repo[.git]` → `https://host/org/repo`
   - `https://host/org/repo[.git]` → `https://host/org/repo`
 - `--name <name>` (default = repo basename, lowercased,
   invalid chars → dashes, validated against DNS-1123).
-- `--branch <ref>` (default = cwd's current branch когда
-  detectable; `main` для explicit `<git-url>`).
+- `--branch <ref>` (default = cwd's current branch when
+  detectable; `main` for explicit `<git-url>`).
 - `--path <path>` (default `/`).
 - `--project <name>` (default `apps`).
 - Reachability check via `git ls-remote --exit-code <url>
-  HEAD`; auth failure surfaces hint pointing к
-  `apprafter repo creds add` (lands в v0.1.141). `--no-ping`
-  skips для air-gapped CI.
-- Pre-flight: refuses когда Application с таким name уже
-  существует, с pointer к `app status` / `app remove`.
-- Writes Argo CD `Application` CR в `argocd` namespace:
+  HEAD`; auth failure surfaces hint pointing to
+  `apprafter repo creds add` (lands in v0.1.141). `--no-ping`
+  skips for air-gapped CI.
+- Pre-flight: refuses when an Application with that name already
+  exists, with pointer to `app status` / `app remove`.
+- Writes Argo CD `Application` CR in `argocd` namespace:
   - `metadata.labels.apprafter.io/managed-by: apprafter`
     (load-bearing — `app list` filters by this).
   - `metadata.annotations.apprafter.io/source: cli`.
@@ -4120,28 +4120,28 @@ platform Applications stay out of these views.
   apprafter` label filter — surfaces Applications created
   outside the CLI.
 - Table: NAME / PROJECT / REPO / REV / SYNC / HEALTH.
-- Empty result surfaces context-aware hint pointing к
-  `--all-managed` когда the label filter is active.
+- Empty result surfaces context-aware hint pointing to
+  `--all-managed` when the label filter is active.
 
 ### `apprafter app status <name>`
 
 - Detail view: project, repo, revision, path, destination
   namespace, sync state, health.
 - Recent revisions (last 3 from `status.history` reversed).
-- Handles status-less Applications (fresh CRs) без panic'а
-  — defaults к Unknown / `?` placeholders.
+- Handles status-less Applications (fresh CRs) without a panic
+  — defaults to Unknown / `?` placeholders.
 
 ### `apprafter app remove <name>`
 
-- Interactive: prompts via `inquire::Confirm` (defaults к
+- Interactive: prompts via `inquire::Confirm` (defaults to
   No). Non-interactive shell without `--yes` errors out
   rather than silently delete.
 - `--keep-data` flips `syncPolicy.automated.prune: false`
   via JSON merge-patch BEFORE delete, so Argo CD tears
   down only the Application CR — child resources (PVCs,
-  ResourceClaims when they land в Phase 2) survive для
+  ResourceClaims when they land in Phase 2) survive for
   re-attach.
-- Surfaces success message with re-attach hint когда
+- Surfaces success message with re-attach hint when
   `--keep-data` is in effect.
 
 ### `apprafter a` alias
@@ -4153,8 +4153,8 @@ existing `--alias` policy on subcommands like `rm` for
 
 ### Tests
 
-+12 unit tests на the pure helpers (kubectl shellout left
-к manual walks):
++12 unit tests on the pure helpers (kubectl shellout left
+to manual walks):
 
 - `normalise_git_url_strips_dotgit_suffix`
 - `normalise_git_url_converts_scp_style_to_https`
@@ -4170,16 +4170,16 @@ existing `--alias` policy on subcommands like `rm` for
 - `build_application_manifest_carries_project_and_revision`
 - `print_status_handles_app_without_status_block`
 
-### Deferred к v0.1.140
+### Deferred to v0.1.140
 
 - `apprafter app logs` — kubectl logs wrapper.
 - `apprafter app rollback` — patches `spec.source.targetRevision`
-  back к а previous revision read from `status.history`.
+  back to a previous revision read from `status.history`.
 
-### Deferred к v0.1.141
+### Deferred to v0.1.141
 
 - Inline PAT prompt for private repos when `git ls-remote`
-  hits "authentication required" — lands together с
+  hits "authentication required" — lands together with
   `apprafter repo creds add`.
 
 ### Versioning
@@ -4199,13 +4199,13 @@ CLI 0.1.138 → 0.1.139. Chart unchanged.
 ### What landed
 
 - `apprafter open argocd` now appends Argo CD's `?proj=<name>`
-  filter к the opened URL. Default `--project apps` (the
+  filter to the opened URL. Default `--project apps` (the
   AppProject `apprafter app add` writes user-app Applications
   into per part 1) — operators land on their own apps first.
-  `--project platform` flips к the chart-managed components
+  `--project platform` flips to the chart-managed components
   view; `--all-projects` drops the filter entirely.
-- Password is copied к the system clipboard via `arboard`.
-  Fail-quiet on headless / no-clipboard environments — а
+- Password is copied to the system clipboard via `arboard`.
+  Fail-quiet on headless / no-clipboard environments — a
   `(clipboard unavailable — copy manually)` hint replaces
   the success marker when copy fails.
 - Output banner formalised:
@@ -4214,10 +4214,10 @@ CLI 0.1.138 → 0.1.139. Chart unchanged.
   Opening Argo CD UI...
     URL:       https://localhost:8080/applications?proj=apps
     Username:  admin
-    Password:  H7x4kP9aB3...  (copied к clipboard)
+    Password:  H7x4kP9aB3...  (copied to clipboard)
 
   ✓ Browser opened
-  ℹ Press Ctrl+C к stop port-forward
+  ℹ Press Ctrl+C to stop port-forward
   ```
 
   Browser open failure surfaces `ℹ Browser open failed — paste
@@ -4232,12 +4232,12 @@ CLI 0.1.138 → 0.1.139. Chart unchanged.
 - `build_argocd_url_appends_proj_filter` — `Some("apps")` /
   `Some("platform")` → `…/applications?proj=<name>`.
 - `build_argocd_url_treats_empty_filter_as_no_filter` —
-  defensive: empty string filter renders как `--all-projects`,
-  чтобы а bare `?proj=` URL никогда не уходит к browser'у.
+  defensive: empty string filter renders like `--all-projects`,
+  so that a bare `?proj=` URL never goes to the browser.
 
 ### Versioning
 
-CLI 0.1.137 → 0.1.138. Чарт unchanged.
+CLI 0.1.137 → 0.1.138. Chart unchanged.
 
 ### References
 
@@ -4250,61 +4250,61 @@ CLI 0.1.137 → 0.1.138. Чарт unchanged.
 
 ### What landed
 
-Three new Argo CD `AppProject` resources в the platform-stack
-chart plus а new `#Component.project` field that defaults к
-`"platform"`. Sets up the structural foundation для
-`apprafter app` / `apprafter repo creds` (lands в follow-up
-patches) и future Phase 4 AccessGrant enforcement.
+Three new Argo CD `AppProject` resources in the platform-stack
+chart plus a new `#Component.project` field that defaults to
+`"platform"`. Sets up the structural foundation for
+`apprafter app` / `apprafter repo creds` (lands in follow-up
+patches) and future Phase 4 AccessGrant enforcement.
 
 ### Chart surface
 
-`_loaderValues.argocd.values.configs.projects` теперь объявляет
-**4** AppProjects (бывший single-entry `default`):
+`_loaderValues.argocd.values.configs.projects` now declares
+**4** AppProjects (formerly single-entry `default`):
 
 - **`platform`** — chart-managed platform components (cilium,
   argocd self-adopt, cert-manager, network-policies,
   apprafter-operator, admission-webhook, backstage,
   argocd-cue-cmp). `destinations: server:
-  https://kubernetes.default.svc, namespace: *`. Все
-  resource-whitelist'ы открыты — platform нужно создавать
+  https://kubernetes.default.svc, namespace: *`. All
+  resource-whitelists are open — platform needs to create
   cluster-scoped objects (CRDs, ClusterRoles, etc.).
-- **`platform-providers`** — для ServiceProvider operators
-  (CNPG, Dragonfly, NATS, Kamaji…) которые лендятся в Phase 2+.
-  Project заводится сейчас (а не лениво в Phase 2), чтобы
-  селектор в UI показывал его сразу после bootstrap'а.
-- **`apps`** — для пользовательских Applications
-  зарегистрированных через `apprafter app add`. Ужесточено:
-  `destinations.server` лочен на in-cluster API,
-  `clusterResourceWhitelist: []` (юзеры не создают
-  cluster-scoped ресурсы), `namespaceResourceWhitelist`
-  ограничен `apprafter.io/Application` + `ConfigMap` +
+- **`platform-providers`** — for ServiceProvider operators
+  (CNPG, Dragonfly, NATS, Kamaji…) which land in Phase 2+.
+  Project is created now (rather than lazily in Phase 2) so that
+  the UI selector shows it right after bootstrap.
+- **`apps`** — for user Applications
+  registered through `apprafter app add`. Tightened:
+  `destinations.server` locked to in-cluster API,
+  `clusterResourceWhitelist: []` (users do not create
+  cluster-scoped resources), `namespaceResourceWhitelist`
+  limited to `apprafter.io/Application` + `ConfigMap` +
   `Secret` + `gateway.networking.k8s.io/HTTPRoute`.
-- **`default`** — сохранён как legacy + ad-hoc fallback для
-  Applications которые операторы применят руками вне
-  платформенного pipeline'а.
+- **`default`** — kept as legacy + ad-hoc fallback for
+  Applications that operators apply by hand outside
+  the platform pipeline.
 
 `#Component.project: string | *"platform"` (DNS-1123
 constrained, default `"platform"`). Render template emits
 `spec.project: {{ default "platform" $component.project | quote }}`
-per Application. Все текущие компоненты наследуют дефолт →
-land в `platform` project.
+per Application. All current components inherit the default →
+land in `platform` project.
 
 ### CLI surface
 
-`cluster_bootstrap::render_root_application` теперь рендерит
-bootstrap "platform" Application с `spec.project: platform`
-вместо `default`. Safe потому что AppProject `platform`
-ships в initial Argo CD install (через `loader_values`).
+`cluster_bootstrap::render_root_application` now renders
+bootstrap "platform" Application with `spec.project: platform`
+instead of `default`. Safe because AppProject `platform`
+ships in initial Argo CD install (through `loader_values`).
 
-### RBAC и enforcement
+### RBAC and enforcement
 
 AppProject sourceRepos / destinations / resourceWhitelists
-сейчас выполняют **визуальную** роль (UI selector в Argo CD
-группирует Applications по project) плюс кладут структурный
-фундамент для будущего Phase 4 RBAC enforcement через
-AccessGrant. В M1.5 они НЕ блокируют sync — у `platform`
-sourceRepos: ["*"], у `apps` whitelist тоже не enforce'ится
-ни kube apiserver'ом ни AccessGrant'ом которого пока нет.
+currently serve a **visual** role (UI selector in Argo CD
+groups Applications by project) plus lay the structural
+foundation for future Phase 4 RBAC enforcement through
+AccessGrant. In M1.5 they do NOT block sync — `platform` has
+sourceRepos: ["*"], and `apps`'s whitelist is likewise not enforced
+by neither the kube apiserver nor an AccessGrant, which does not exist yet.
 
 ### Upgrade impact
 
@@ -4313,7 +4313,7 @@ Application drift `spec.project` from `default` to
 `platform`. Argo CD reconciles via the normal sync path —
 metadata-only change, no pod restart, no resource churn. The
 root platform Application also drifts (CLI loader re-renders
-on the next `apprafter cluster-bootstrap` или `bootstrap-all`
+on the next `apprafter cluster-bootstrap` or `bootstrap-all`
 invocation).
 
 ### Tests
@@ -4321,7 +4321,7 @@ invocation).
 +1 regression unit test:
 `render_root_application_joins_platform_app_project` —
 asserts the CLI loader's root Application carries
-`project: platform` и **не** carries `project: default`.
+`project: platform` and does **not** carry `project: default`.
 
 ### Versioning
 
@@ -4350,12 +4350,12 @@ Opening Argo CD UI...
   Username:  admin
   Password:  Hjy-lexPSth2cti2
 
-Press Ctrl+C к stop the port-forward.
+Press Ctrl+C to stop the port-forward.
 
 $
 ```
 
-Process returned к the shell prompt immediately после
+Process returned to the shell prompt immediately after
 printing the credentials banner. `child.wait()` resolved
 within milliseconds instead of blocking until Ctrl+C —
 local port 8080 was never actually bound for the operator's
@@ -4369,13 +4369,13 @@ via `child.stdout.take()`, read line-by-line until it saw
 `ChildStdout` dropped at the end of the function — closing
 the read end of kubectl's stdout pipe.**
 
-kubectl is а Go binary; Go's default SIGPIPE handler
-terminates the process on the next write к а closed stdout
+kubectl is a Go binary; Go's default SIGPIPE handler
+terminates the process on the next write to a closed stdout
 pipe (per `os/signal` docs:
-"When Go programs write к such а closed pipe, they will
-receive а SIGPIPE signal", и the default handler is к exit).
+"When Go programs write to such a closed pipe, they will
+receive a SIGPIPE signal", and the default handler is to exit).
 
-kubectl port-forward emits at least one more line после
+kubectl port-forward emits at least one more line after
 the initial `Forwarding from 127.0.0.1:…` — typically
 `Forwarding from [::1]:…`. That second write hit the closed
 pipe → SIGPIPE → kubectl exit → `child.wait()` returned
@@ -4384,7 +4384,7 @@ immediately.
 `stderr` had the same problem latent: also `Stdio::piped()`,
 also never drained. If kubectl had emitted significant
 stderr chatter before the ready banner, the stderr pipe's
-64 KiB kernel buffer would have filled up и blocked the
+64 KiB kernel buffer would have filled up and blocked the
 child on its next stderr write. Not the trigger this walk,
 but the same class of bug.
 
@@ -4408,20 +4408,20 @@ fn wait_port_forward_ready(child: &mut Child) -> Result<()> {
 ```
 
 `spawn_ready_drainer` reads stdout line-by-line, signals
-readiness through а `mpsc::sync_channel::<()>(1)` on the
+readiness through a `mpsc::sync_channel::<()>(1)` on the
 first `Forwarding from` line, then **continues draining to
-EOF** so kubectl's stdout pipe stays open для the lifetime
+EOF** so kubectl's stdout pipe stays open for the lifetime
 of the child. If EOF arrives before the banner, the sender
-drops; `recv()` resolves as `Err` и the caller surfaces
+drops; `recv()` resolves as `Err` and the caller surfaces
 "exited before binding local port".
 
-`spawn_silent_drainer` reads stderr to EOF и discards. Same
+`spawn_silent_drainer` reads stderr to EOF and discards. Same
 contract — keep the pipe drained so the child never blocks
-on а write.
+on a write.
 
 ### Regression coverage
 
-+4 unit tests в `cli/platform-cli/src/commands/open.rs`,
++4 unit tests in `cli/platform-cli/src/commands/open.rs`,
 all driven by `std::io::Cursor` fakes (no real kubectl
 required):
 
@@ -4429,23 +4429,23 @@ required):
   happy path: single ready line followed by EOF → `recv()`
   returns Ok.
 - `ready_drainer_continues_draining_after_signal` — **the
-  load-bearing test для this fix.** Feeds the ready
+  load-bearing test for this fix.** Feeds the ready
   banner followed by extra stdout bytes (`Forwarding from
   [::1]:…\n`, `Handling connection for 8080\n`); wraps the
-  reader в а `Tracker` that counts consumed bytes;
+  reader in a `Tracker` that counts consumed bytes;
   asserts the drainer reads ALL of them. If the drainer
   ever short-circuits after signaling, this test fails.
 - `ready_drainer_yields_recv_err_when_eof_before_banner`
-  — feeds а kubectl-style error message followed by EOF
+  — feeds a kubectl-style error message followed by EOF
   with no banner; asserts `recv()` returns `Err`.
 - `silent_drainer_reads_to_eof` — feeds three lines of
-  fake stderr through а byte counter; asserts всё
+  fake stderr through a byte counter; asserts everything
   consumed.
 
 ### Versioning
 
 CLI 0.1.135 → 0.1.136. Chart-side (platform-stack +
-operator) unchanged — bug is а CLI-only IO handling
+operator) unchanged — bug is a CLI-only IO handling
 defect.
 
 ### References
@@ -4459,15 +4459,15 @@ defect.
 
 ### What landed
 
-CLI surface для declarative platform resources плюс Argo CD UI
-parity для MigrationPlan approval. Five new subcommands в the
-`apprafter` binary plus one Argo CD resource-action Lua block в
+CLI surface for declarative platform resources plus Argo CD UI
+parity for MigrationPlan approval. Five new subcommands in the
+`apprafter` binary plus one Argo CD resource-action Lua block in
 the platform-stack chart.
 
 ### CLI subcommands
 
 `apprafter platform status` — reads `PlatformStack/default` from
-`apprafter-system` через kubectl shellout, formats human-
+`apprafter-system` through kubectl shellout, formats human-
 readable summary:
 
 - Header: namespace/name, tier number (`spec.values.tier`).
@@ -4482,19 +4482,19 @@ readable summary:
 `apprafter platform upgrade [--to <v>]` — merge-patches
 `PlatformStack.spec`:
 
-- `--to <v>` → `{"spec":{"pin":"<v>"}}` — pins к explicit
+- `--to <v>` → `{"spec":{"pin":"<v>"}}` — pins to explicit
   version, autoUpgrade preserved as-is.
-- Без `--to` → `{"spec":{"pin":null,"autoUpgrade":true}}` —
+- Without `--to` → `{"spec":{"pin":null,"autoUpgrade":true}}` —
   clears the pin (JSON merge-patch null deletes the field per
-  RFC 7396) and flips к channel-following mode. Used in
+  RFC 7396) and flips to channel-following mode. Used in
   walk-fix #7 / #8 scenarios where operator wants to resume
-  auto-upgrade after pinning к a known-good version.
+  auto-upgrade after pinning to a known-good version.
 
-`apprafter migration list` — table of MigrationPlans в
+`apprafter migration list` — table of MigrationPlans in
 `apprafter-system`:
 
 - Columns: `NAME | SCOPE | CLASSIFICATION | PHASE`.
-- `PHASE` defaults к `pending-approval` для CRs без status
+- `PHASE` defaults to `pending-approval` for CRs without status
   (matches MigrationController's implicit initial-phase
   semantics).
 - Empty namespace prints `No MigrationPlans in apprafter-system`.
@@ -4502,17 +4502,17 @@ readable summary:
 `apprafter migration approve <name>` / `reject <name>` — status-
 subresource merge-patches:
 
-- Approve: `{"status":{"phase":"approved"}}` через
+- Approve: `{"status":{"phase":"approved"}}` through
   `--subresource=status`. MigrationController's reconcile loop
-  transitions к executing → completed; PlatformController's
-  next reconcile sees the completed plan и proceeds с the bump.
+  transitions to executing → completed; PlatformController's
+  next reconcile sees the completed plan and proceeds with the bump.
 - Reject: `{"status":{"phase":"rejected"}}`. **Application-
   scope rejects denied by the admission webhook per ADR 0027**
   (walk-fix #2 hardened the FSM's first-write branch); the CLI
-  forwards the patch и surfaces the apiserver denial verbatim.
+  forwards the patch and surfaces the apiserver denial verbatim.
   Platform-scope rejects succeed; `PlatformMigrationStrategy.
-  reject` (B.1.76 + walk-fix #7) reverts `spec.pin` к
-  `previousSpecSnapshot.pin` (or null когда snapshot has no
+  reject` (B.1.76 + walk-fix #7) reverts `spec.pin` to
+  `previousSpecSnapshot.pin` (or null when snapshot has no
   pin).
 
 `apprafter open argocd` — local Argo CD UI access helper:
@@ -4522,9 +4522,9 @@ subresource merge-patches:
   `migration` wrappers) into a tempfile.
 - Resolves the admin password through
   `commands::argocd_password::compute_argocd_password` (cached
-  age-encrypted в state on first call).
+  age-encrypted in state on first call).
 - Spawns `kubectl port-forward svc/argocd-server -n argocd
-  8080:443` в background; drains stdout one line at a time
+  8080:443` in background; drains stdout one line at a time
   until `Forwarding from` lands, propagates early exits as
   errors.
 - Prints `URL`, `Username: admin`, `Password`, blocks on
@@ -4532,7 +4532,7 @@ subresource merge-patches:
   group's SIGINT default.
 - Cross-platform browser open: `xdg-open` (Linux), `open`
   (macOS), `cmd /c start` (Windows). Failures fall through
-  quietly — the URL is already на stdout, operator can paste
+  quietly — the URL is already on stdout, operator can paste
   manually.
 
 ### npm-style newer-release banner
@@ -4548,16 +4548,16 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 ```
 
 - 24h cache at `~/.cache/apprafter/version-check.json` (JSON
-  с `latest_tag` + `fetched_at_secs`).
+  with `latest_tag` + `fetched_at_secs`).
 - `ureq` GET with 3s timeout, `User-Agent: apprafter-cli`,
   `Accept: application/vnd.github+json`.
 - Strips `v` prefix from `tag_name` before comparison.
 - `newer_than(candidate, current)` uses semver crate; falls
-  back к `false` (no warning) on unparseable input —
+  back to `false` (no warning) on unparseable input —
   fail-quiet.
 - Failures swallowed silently — network errors / GitHub rate-
   limit / JSON parse / cache write errors all logged at debug
-  только. Version check is courtesy, not operational
+  only. Version check is courtesy, not operational
   prerequisite.
 
 ### Shared kubectl helpers
@@ -4578,21 +4578,21 @@ pub fn kubectl_merge_patch(
 ) -> Result<()>;
 ```
 
-`kubectl_get_json` returns `Ok(None)` для 404 (callers decide
+`kubectl_get_json` returns `Ok(None)` for 404 (callers decide
 whether absence is an error). `kubectl_merge_patch` routes
-through `--subresource=status` когда the optional subresource
-parameter is `Some("status")` — required для status.phase
+through `--subresource=status` when the optional subresource
+parameter is `Some("status")` — required for status.phase
 writes that bypass spec-only webhook rules.
 
 CLI shellout (rather than pulling in kube-rs's Tokio runtime)
-matches the pattern set by `commands::argocd_password` и
+matches the pattern set by `commands::argocd_password` and
 `commands::cluster_bootstrap` — `apprafter` is a synchronous
 binary, kubectl shellout keeps the wire format consistent.
 
 ### Argo CD MigrationPlan resource-action block
 
-Chart-side delta lands в `platform-stack/cue/component_argocd.
-cue` под `configs.cm` (Argo CD's `argocd-cm` ConfigMap):
+Chart-side delta lands in `platform-stack/cue/component_argocd.
+cue` under `configs.cm` (Argo CD's `argocd-cm` ConfigMap):
 
 ```yaml
 resource.customizations.actions.apprafter.io_MigrationPlan: |-
@@ -4622,36 +4622,36 @@ resource.customizations.actions.apprafter.io_MigrationPlan: |-
 Discovery disables **both** Approve + Reject once `status.phase`
 leaves `pending-approval` so stale buttons cannot double-fire.
 Argo CD routes the returned object's `status.phase` mutation
-через the status subresource automatically; ADR 0027's
-application-scope reject denial surfaces в the UI с the
+through the status subresource automatically; ADR 0027's
+application-scope reject denial surfaces in the UI with the
 verbatim webhook message exactly as it does on the CLI.
 
 The existing `configs.cm` block grew from a single-key string
 (`resource.customizations.health.apprafter.io_Application`,
-shipped в B.1.77) к a multi-key map; both entries remain
-byte-equivalent в the rendered chart vs 0.1.38 outside the
+shipped in B.1.77) to a multi-key map; both entries remain
+byte-equivalent in the rendered chart vs 0.1.38 outside the
 new action key.
 
-### Deferred к 1.79a
+### Deferred to 1.79a
 
 - `apprafter platform channel <name>` — single-channel
-  (`stable`) ships в M1.5; multi-channel UX waits для Phase 2
+  (`stable`) ships in M1.5; multi-channel UX waits for Phase 2
   where alternate channels actually exist.
 - `apprafter platform freeze <component> [--version <v>]` /
-  `unfreeze <component>` — component-level pinning is а
+  `unfreeze <component>` — component-level pinning is a
   polish layer over the chart-level pin already shipped;
-  ships alongside ResourceClaim CRUD в 1.79a.
+  ships alongside ResourceClaim CRUD in 1.79a.
 - `apprafter platform rescue` — covered by `apprafter
   cluster-bootstrap`'s re-adopt path that 1.79a's loader
   extensions formalise.
 - `apprafter open backstage` — Backstage stack not tier-1
   resident yet; ships when Phase 2's portal lands.
 - `apprafter open grafana` / `apprafter open hubble` —
-  deferred к Tier 2+.
+  deferred to Tier 2+.
 
 ### Tests
 
-+13 unit tests в the platform-cli crate:
++13 unit tests in the platform-cli crate:
 
 - `commands::version_check::tests`: `newer_than_strips_v_prefix`,
   `newer_than_returns_false_for_equal`,
@@ -4691,10 +4691,10 @@ All clippy `-D warnings`, fmt, cue vet, SPDX gates clean.
 
 ### Symptom
 
-User question on the B.1.78 acceptance walk: «Между ними
-же 36 с breaking ченджами и реджектом. Мы же не можем 35
-в 37 обновить не решив вопрос совместимости по пути,
-разве нет?»
+User question on the B.1.78 acceptance walk: "Between them
+there's 36 with breaking changes and a reject. We can't update 35
+to 37 without resolving the compatibility question along the path,
+can we?"
 
 Scenario: cluster on 0.1.35 carries a rejected
 `platform-0-1-35-to-0-1-36` MigrationPlan (`spec.pin=null`,
@@ -4705,15 +4705,15 @@ autoUpgrade triggers bump 0.1.35 → 0.1.37:
   GET 404.
 - `fetch_change_class(url, "0.1.37")` returns Safe (per
   0.1.37's single record).
-- Straight bump к 0.1.37 — silently jumping over 0.1.36's
-  breaking content и bypassing the operator's reject
+- Straight bump to 0.1.37 — silently jumping over 0.1.36's
+  breaking content and bypassing the operator's reject
   decision on it.
 
 ### Root cause
 
 Classification was per-target-version, not per-transition.
-spec.md §3.11 implied semantics ("any path к target must
-respect the strictest class encountered"), но the code
+spec.md §3.11 implied semantics ("any path to target must
+respect the strictest class encountered"), but the code
 looked up only the destination record. Multi-version
 jumps that span an intermediate destructive version slip
 through.
@@ -4721,7 +4721,7 @@ through.
 ### Fix
 
 New public fn `fetch_path_max_change_class(url, from, to)`
-в `compatibility.rs`:
+in `compatibility.rs`:
 
 ```rust
 pub async fn fetch_path_max_change_class(
@@ -4767,10 +4767,10 @@ pub fn path_max_change_class(
 
 Half-open range `(from, to]` — `from`'s own class is excluded
 (operator already accepted it: it's the current state).
-Versions strictly greater than `from`, up к и including
-`to`, participate в the max.
+Versions strictly greater than `from`, up to and including
+`to`, participate in the max.
 
-`reconcile.rs` swaps the single-target call для the path-
+`reconcile.rs` swaps the single-target call for the path-
 aware one:
 
 ```rust
@@ -4788,7 +4788,7 @@ let class = fetch_path_max_change_class(
   downgrade destructiveness; conservative default. Future
   work can extend if a real downgrade scenario surfaces.
 - Unparseable version key in doc → skipped without
-  affecting other entries' contribution к the max.
+  affecting other entries' contribution to the max.
 
 ### Acceptance walk regression coverage
 
@@ -4810,7 +4810,7 @@ breaking content) is acceptable.
 
 ### Tests
 
-+8 unit tests в
++8 unit tests in
 `operator/operator-controllers/platform-stack/src/compatibility.rs`:
 
 - `path_max_change_class_picks_strictest_in_range`
@@ -4830,7 +4830,7 @@ Total platform-stack crate: 68 → 76.
   — new `fetch_path_max_change_class` + `path_max_change_class`
   + `class_order` helpers + 8 tests.
 - `operator/operator-controllers/platform-stack/src/reconcile.rs`
-  — destructive check switches к path-aware call.
+  — destructive check switches to path-aware call.
 
 ### Versions
 
@@ -4849,7 +4849,7 @@ B.1.78 acceptance walk reject test on chart 0.1.36 (synthetic
 `platform-0-1-35-to-0-1-36` via PlatformController's
 auto-create on destructive transition; cluster was channel-
 following (`spec.pin=null`), so `previousSpecSnapshot.pin =
-null`. User patched plan к `phase=rejected`. MigrationController
+null`. User patched plan to `phase=rejected`. MigrationController
 observed the transition, invoked `strategy.reject` — and the
 SSA-apply errored:
 
@@ -4859,7 +4859,7 @@ spec.pin: Invalid value: "null":
 spec.pin in body must be of type string
 ```
 
-Error propagated к `error_policy` → 15s requeue → same error
+Error propagated to `error_policy` → 15s requeue → same error
 → infinite loop. Walk-fix #3 sealing (`status.rejectedAt`
 write) never ran because it's positioned AFTER strategy.reject
 in the reconcile branch.
@@ -4869,14 +4869,14 @@ rejected was set by the kubectl status patch directly; the
 PlatformController's GET-by-name found a non-completed plan
 and blocked the bump). So the user-facing behavior was
 correct — cluster stayed on 0.1.35. But operator logs
-churned errors forever и the sealing fix from walk-fix #3
+churned errors forever and the sealing fix from walk-fix #3
 silently regressed.
 
 ### Root cause
 
 Original `PlatformMigrationStrategy.reject` ALWAYS built an
 SSA-apply body with `spec.pin: <snapshot_pin or null>`. The
-intent: SSA с `pin: null` should "remove the pin" — restoring
+intent: SSA with `pin: null` should "remove the pin" — restoring
 channel-following mode. But the CRD's PlatformStack schema
 defines `pin` as `type: string` without `nullable: true`.
 Apiserver rejects an explicit `null` value as schema
@@ -4896,7 +4896,7 @@ async fn reject(&self, plan: &MigrationPlan) -> Result<(), MigrationError> {
     let stack = api.get(SINGLETON_NAME).await?;
     let current_pin = stack_json.pointer("/spec/pin");
 
-    // Idempotent no-op when already в desired state.
+    // Idempotent no-op when already in desired state.
     if pins_equal(current_pin, snapshot_pin) {
         return Ok(());
     }
@@ -4928,15 +4928,15 @@ iff both are missing/null OR both are the same string.
 The walk-fix #3 `status.rejectedAt` marker was supposed to
 prevent re-invocation of `strategy.reject` on operator pod
 restart. It only works if the marker actually lands —
-which requires `strategy.reject` к return Ok. Before
+which requires `strategy.reject` to return Ok. Before
 walk-fix #7, null-snapshot clusters never saw the marker
 set, so even after restart the strategy re-ran and re-failed.
 Post-fix, sealing reaches completion; subsequent reconciles
-see the marker и skip the strategy invocation.
+see the marker and skip the strategy invocation.
 
 ### Tests
 
-+4 unit tests на `pins_equal` helper:
++4 unit tests on the `pins_equal` helper:
 
 - `pins_equal_treats_missing_and_null_and_explicit_null_as_equivalent`
 - `pins_equal_treats_same_string_as_equal`
@@ -5040,7 +5040,7 @@ spec:
 
 ### Condition surfaces
 
-- `UpgradeAvailable=True` reason flips к **`BlockedByMigrationPlan`**
+- `UpgradeAvailable=True` reason flips to **`BlockedByMigrationPlan`**
   when the upgrade is gated by a plan; message embeds
   `apprafter-system/<plan-name>`.
 - `MigrationPending=True` reason = the classification
@@ -5404,10 +5404,10 @@ B.1.74→B.1.77 on v0.1.127.
 **Symptom.** Walk Phase 3.3 created a platform-scope
 MigrationPlan, patched its status.phase to `rejected`;
 PlatformMigrationStrategy.reject reverted
-`PlatformStack.spec.pin` к the plan's snapshot value
+`PlatformStack.spec.pin` to the plan's snapshot value
 (`"0.1.25"`). Then walk's cleanup `kubectl patch
 platformstack default --type=merge -p '{"spec":{"pin":null}}'`
-was supposed к restore the cluster k channel-following,
+was supposed to restore the cluster to channel-following,
 but PlatformStack stayed locked at `pin="0.1.25"`,
 PlatformController errored on `fetch_change_class("0.1.25")`
 (version unpublished in OCI registry), and the cluster
@@ -5527,7 +5527,7 @@ Total in migration crate: 12 → 14.
 
 ## v0.1.128 — M1.5 walk-fix #2 post-B.1.77 — webhook ADR 0027 bypass (2026-05-22)
 
-Walk-found bug on acceptance walk B.1.74→B.1.77 на v0.1.127.
+Walk-found bug on acceptance walk B.1.74→B.1.77 on v0.1.127.
 
 ### Symptom
 
@@ -5537,7 +5537,7 @@ MigrationPlan, then `kubectl patch <plan>
 The webhook was supposed to deny with the ADR 0027 error
 message ("application-scope MigrationPlans cannot be
 rejected; revert the Git commit ..."). Instead the patch
-succeeded, the plan transitioned к `phase=rejected`, and
+succeeded, the plan transitioned to `phase=rejected`, and
 the audit trail recorded a phase that ADR 0027 explicitly
 forbids for application scope.
 
@@ -5547,7 +5547,7 @@ forbids for application scope.
 had two layers:
 
 1. **First-write fast-path** — when `oldObject.status.phase`
-   is empty (fresh CR без status), allow any plausible
+   is empty (fresh CR without status), allow any plausible
    target phase. Intended for tooling that pre-populates
    status on CREATE (admin shortcut).
 2. **FSM match arms** — for non-empty old_phase, walk a
@@ -5556,7 +5556,7 @@ had two layers:
    arm.
 
 When the user `kubectl apply`'d a fresh CR, its `status.phase`
-defaulted к empty. Subsequent `kubectl patch --subresource=
+defaulted to empty. Subsequent `kubectl patch --subresource=
 status` fired an UPDATE event with `oldObject.status.phase
 == ""` (the pre-patch state) — first-write fast-path
 matched, returned `true`, ADR 0027 scope check bypassed.
@@ -5564,14 +5564,14 @@ matched, returned `true`, ADR 0027 scope check bypassed.
 ### Fix
 
 Apply the ADR 0027 scope rule BEFORE the first-write
-fast-path. Any path к `rejected` on application scope is
+fast-path. Any path to `rejected` on application scope is
 blocked:
 
 ```rust
 fn is_allowed_phase_transition(old_phase, new_phase, scope_type) -> bool {
     // ADR 0027 — application-scope plans cannot be rejected.
     // Must run BEFORE the empty-old-phase first-write
-    // fast-path so a fresh CR + patch к rejected can't slip
+    // fast-path so a fresh CR + patch to rejected can't slip
     // through.
     if new_phase == "rejected" && scope_type == "application" {
         return false;
@@ -5588,7 +5588,7 @@ Error message extended too — was only triggered on
 
 `ApplicationMigrationStrategy.reject` (operator-controllers/
 migration/strategy.rs) is `Ok-no-op` by design per ADR 0027
-— defensive belt-and-braces from B.1.76 для exactly this
+— defensive belt-and-braces from B.1.76 for exactly this
 "webhook misconfigures and lets app-scope reject through"
 scenario. The controller observed phase=rejected, called
 strategy.reject (no-op), sealed the plan. No PlatformStack
@@ -5601,7 +5601,7 @@ the spec says that state is unreachable.
 +3 new unit tests pin the corner cases:
 
 - `rejects_application_scope_first_write_to_rejected_per_adr_0027`
-  — the load-bearing guard. Fresh CR без status, patch к
+  — the load-bearing guard. Fresh CR without status, patch to
   rejected, expect ADR 0027 error.
 - `allows_platform_scope_first_write_to_rejected` — the
   counterpart. Platform-scope plans CAN be rejected from any
@@ -5632,10 +5632,10 @@ Total admission-webhook lib: 75 → 78.
 
 ### Walk continuation
 
-User's frozen `walk-app-1` plan на v0.1.126 auto-unfroze
+User's frozen `walk-app-1` plan on v0.1.126 auto-unfroze
 when v0.1.127 deployed (SSA `.force()` fix landed). Same
 auto-recovery applies here: the `walk-app-reject-test` plan
-that slipped к `phase=rejected` on v0.1.127 stays in its
+that slipped to `phase=rejected` on v0.1.127 stays in its
 sealed state (no operator action gets re-run). After
 v0.1.128 deploys, future fresh CRs + reject patches will
 be properly denied; the walk Phase 3.4 acceptance test
@@ -5643,14 +5643,14 @@ should produce the ADR 0027 error message.
 
 ## v0.1.127 — M1.5 walk-fix #1 post-B.1.76 — SSA `.force()` on status writes (2026-05-22)
 
-Walk-found bug на acceptance walk B.1.74→B.1.77 на v0.1.126.
+Walk-found bug on acceptance walk B.1.74→B.1.77 on v0.1.126.
 
 ### Symptom
 
 Phase 3.2 of the walk: `kubectl patch migrationplan walk-app-1
 -n apprafter-system --subresource=status --type=merge -p
 '{"status":{"phase":"approved"}}'` returned success, plan
-status flipped к `approved` — but the MigrationController
+status flipped to `approved` — but the MigrationController
 never transitioned the plan to `executing` / `completed`.
 Phase stayed at `approved` indefinitely; controller logs
 showed `migration reconcile completed plan=walk-app-1` on
@@ -6611,8 +6611,8 @@ test was updated for the new 3-arg signature.
 
 ### Walk
 
-User invocation 2026-05-22: "Давай А без ре-волка и сразу к
-1.74а перейдём" — Option A landed without re-walk; B.1.74a
+User invocation 2026-05-22: "Let's go with A without a re-walk and straight over to
+1.74a" — Option A landed without re-walk; B.1.74a
 (yanking) follows in the next patch.
 
 ## v0.1.121 — M1.5 Track B.1.74 closure — versionHistory + Ready condition (2026-05-22)
