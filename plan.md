@@ -23,6 +23,7 @@
 - `🔒` — заблокировано (с указанием блокера)
 - `⚡` — критический путь
 - `🌱` — можно запараллелить
+- `> 🏁 SR:` — speedrun bucket: **A** keep (launch) · **B** pull-up (launch) · **C** defer post-launch (+ trigger) · **D** drop (+ reactivate). "order N" = OSS-core build sequence (speedrun §4.2). See `speedrun-plan.md`.
 
 ---
 
@@ -769,6 +770,7 @@ Phase 7 запускается параллельно с 3+ как только 
 ---
 
 ## Фаза 1.5 — Self-managing platform rethink (M1.5) ⚡
+> 🏁 SR: A · order 1 — M1.5 Track B subset (ADR 0025/0028/0029: GitOps + platform-stack distribution + CUE CMP); managed substrate, largely closed
 
 **Цель фазы:** архитектурный rethink из ADR 0025–0029. Переход от imperative `cluster-bootstrap` к Argo CD-managed platform stack из versioned OCI chart, declarative version control через PlatformStack CRD, unified MigrationPlan для application + platform scopes, CUE compilation для user app repos через CMP sidecar.
 
@@ -1893,6 +1895,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 1.72 PlatformStack CRD schema + admission webhook
+> 🏁 SR: A · order 2 — PlatformController + MigrationPlan CRD, condensed (1.72–1.78); closes killer features #3 + #7. SPLIT: 4.16 Backstage MigrationPlan plugin → C
 
 **Source:** ADR 0026.
 
@@ -2586,6 +2589,7 @@ instead of carrying parallel definitions.
 ---
 
 ## Фаза 1.9 — Dev Mode MVP (Phase 1B из dev-mode-task.md)
+> 🏁 SR: D — dev mode dropped from launch (managed users don't bootstrap local clusters); reactivate after managed traction
 
 **Цель фазы:** ship minimum viable dev mode для локальной разработки на k3d. CLI команды: `apprafter dev cluster up/down/status/wipe`, `apprafter dev init`, `apprafter dev up`, `apprafter dev down`, `apprafter dev list`, `apprafter dev logs`. Manifest layering 4 уровня (Application.base + environments.dev + DevProfile + DevProfileLocal). `needs.*` resolution в эту фазу **не входит** — лендится в Фазе 2.9. Помечается `experimental` для users.
 
@@ -2610,6 +2614,7 @@ instead of carrying parallel definitions.
 **Spec:** §6 M2, §3.2, §3.3, §4.4, §4.6, §3.1 (per-env overrides).
 
 ### 2.1 ServiceProvider CRD
+> 🏁 SR: A · order 3 (Phase-2 minimum)
 
 **Поставка:**
 - [ ] CUE-схема + admission webhook.
@@ -2626,6 +2631,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.2 ResourceClaim CRD
+> 🏁 SR: A · order 3 (Phase-2 minimum)
 
 **Поставка:**
 - [ ] CUE-схема + admission webhook.
@@ -2639,6 +2645,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.3 Selector matching и provider scheduler
+> 🏁 SR: A · order 3 (Phase-2 minimum)
 
 **Цель:** Reconcile ResourceClaim → matching ServiceProvider по labels.
 
@@ -2655,6 +2662,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.4 needs.pg → CloudNativePG
+> 🏁 SR: A · order 3 (Phase-2 minimum) — needs.pg, the launch database
 
 **Поставка:**
 - [ ] Установка CloudNativePG operator как platform-service.
@@ -2672,6 +2680,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.5 needs.jetstream → NATS account/stream
+> 🏁 SR: D — needs.jetstream dropped; reactivate on 2+ explicit requests
 
 **Поставка:**
 - [ ] NATS-кластер как platform-service (в Tier 1 — single node, embedded в kine — 3.2).
@@ -2688,6 +2697,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.6 needs.redis → Dragonfly
+> 🏁 SR: A · order 3 — needs.redis; pulled C→A (closes 2/6 platform services)
 
 **Поставка:**
 - [ ] Dragonfly как platform-service (single instance Tier 1).
@@ -2703,6 +2713,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.6a KEDA install + ScaledObject rendering
+> 🏁 SR: C — trigger: first autoscaling customer signal
 
 **Source:** ADR 0019.
 
@@ -2733,6 +2744,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.6b needs.disk → persistent block storage
+> 🏁 SR: A · order 3 — needs.disk block storage; launch scope (not in earlier speedrun revisions)
 
 **Source:** design session 2026-05-27; ADR TBD before implementation (disk class abstraction, shareMode semantics, tier mapping).
 
@@ -2807,6 +2819,7 @@ Tests:
 ---
 
 ### 2.7 SPIRE installation + workload identity
+> 🏁 SR: C — SPIRE; trigger: first Tier-2 OpenBao-grade or compliance ask
 
 **Поставка:**
 - [ ] SPIRE server + agent на каждой ноде.
@@ -2823,6 +2836,7 @@ Tests:
 ---
 
 ### 2.8 Credential injection через SPIFFE
+> 🏁 SR: C — credential injection via SPIFFE; with 2.7
 
 **Поставка:**
 - [ ] Замена «mounted Secret with DSN» на «приложение получает DSN через workload identity (короткоживущие credentials)».
@@ -2838,6 +2852,7 @@ Tests:
 ---
 
 ### 2.9 Per-environment overrides через CUE unification
+> 🏁 SR: D — dev mode dropped from launch
 
 **Цель:** реализовать §3.1 пример (dev/staging/prod в одном файле).
 
@@ -2856,6 +2871,7 @@ Tests:
 ---
 
 ### 2.10 needs → NetworkPolicy auto-derivation
+> 🏁 SR: A · order 3 — needs→NetworkPolicy auto-derivation (free security win)
 
 **Цель:** при `needs.pg` оператор создаёт egress NetworkPolicy к pg-кластеру.
 
@@ -2874,6 +2890,7 @@ Tests:
 ---
 
 ### 2.11 SealedSecrets интеграция (Tier 1 секреты)
+> 🏁 SR: A · order 3 — SealedSecrets (default Tier-1 secrets)
 
 **Поставка:**
 - [ ] Установка sealed-secrets controller.
@@ -2891,6 +2908,7 @@ Tests:
 ---
 
 ### 2.12 Application.env: secret() и claim.* references
+> 🏁 SR: A · order 3 — secret()/claim.* refs in Application.env
 
 **Поставка:**
 - [ ] CUE-функции `secret("path/to/key")` и `claim.<need>.<field>` в схеме.
@@ -2909,6 +2927,7 @@ Tests:
 ---
 
 ### 2.13 Notifications service — каркас (HTTP API + NATS внутрь)
+> 🏁 SR: D — Notifications service dropped from launch (managed portal + direct transactional email); reactivate with AccessGrant
 
 **Поставка:**
 - [ ] OneBun-сервис `notifications` в `providers/notifications-integrated/`.
@@ -2926,6 +2945,7 @@ Tests:
 ---
 
 ### 2.14 Notifications channels: SMTP / Slack / Telegram
+> 🏁 SR: D — Notifications channels; with 2.13
 
 **Поставка:**
 - [ ] Воркеры на OneBun: `email-worker`, `slack-worker`, `telegram-worker`.
@@ -2942,6 +2962,7 @@ Tests:
 ---
 
 ### 2.15 Platform-only notification templates
+> 🏁 SR: D — Notification templates; with 2.13
 
 **Поставка:**
 - [ ] `templates/access-grant/{issued,renewal-reminder,expired,revoked}.{html,md}`.
@@ -2959,6 +2980,7 @@ Tests:
 ---
 
 ### 2.16 Backstage notifications-плагин
+> 🏁 SR: D — Notifications Backstage plugin; with 2.13
 
 **Поставка:**
 - [ ] Inbox-view: pending / sent / failed / DLQ per Application.
@@ -3009,6 +3031,7 @@ Tests:
 ---
 
 ## Фаза 2.9 — Dev Mode + Services (Phase 2B из dev-mode-task.md)
+> 🏁 SR: D — dev mode dropped from launch
 
 **Цель фазы:** dev mode поддерживает `needs.{pg, jetstream, redis}` end-to-end локально через lightweight in-cluster providers (single-node Postgres pod, embedded NATS, single Redis). Дев-кластер на `dev cluster up` поднимает все ServiceProviders по умолчанию с `--without` opt-out флагом. Helper команда `dev claim status <app>` для диагностики ResourceClaim. Помечается `experimental` (полный DX в Фазе 3.9).
 
@@ -3033,6 +3056,7 @@ Tests:
 **Spec:** §6 M3, §4.1 (Tier 2), §4.2, §4.10, §4.4 (OpenBao).
 
 ### 3.1 HA-bootstrap в platform-cli + dual-stack validation
+> 🏁 SR: A · order 4 — HA-bootstrap (k3s 3-node + kube-vip + embedded etcd, NOT kine+NATS); T2 substrate, pulled C→A
 
 **Source:** ADR 0017.
 
@@ -3056,6 +3080,7 @@ Tests:
 ---
 
 ### 3.2 kine + NATS JetStream как control-plane storage
+> 🏁 SR: C — kine+NATS storage; trigger: audit-replayability marketing-critical OR etcd scale ceiling
 
 **Поставка:**
 - [ ] NATS JetStream cluster (3 replica, embedded или workload — ADR).
@@ -3073,6 +3098,7 @@ Tests:
 ---
 
 ### 3.3 Cilium mTLS между workloads
+> 🏁 SR: A · order 4 — Cilium mTLS; T2 substrate, pulled C→A
 
 **Поставка:**
 - [ ] Включение Cilium service mesh с mTLS.
@@ -3089,6 +3115,7 @@ Tests:
 ---
 
 ### 3.4 OpenTelemetry pipeline по умолчанию
+> 🏁 SR: B · order 5 — OTel/Tempo/Prometheus subset (EXCLUDES sidecar auto-inject + full ClickHouse)
 
 **Поставка:**
 - [ ] OTel Collector как daemonset.
@@ -3105,6 +3132,7 @@ Tests:
 ---
 
 ### 3.5 ClickHouse provider (logs + traces)
+> 🏁 SR: C — ClickHouse provider; trigger: long-term traces/logs retention signal
 
 **Поставка:**
 - [ ] clickhouse-operator (Altinity).
@@ -3121,6 +3149,7 @@ Tests:
 ---
 
 ### 3.6 VictoriaMetrics integration
+> 🏁 SR: C — VictoriaMetrics; trigger: same as 3.5
 
 **Поставка:**
 - [ ] VictoriaMetrics single (Tier 2) / cluster (Tier 3+).
@@ -3136,6 +3165,7 @@ Tests:
 ---
 
 ### 3.7a Hubble enable + Hubble UI + Grafana network dashboards
+> 🏁 SR: B · order 5 — Hubble enable + UI subset
 
 **Source:** ADR 0020.
 
@@ -3157,6 +3187,7 @@ Tests:
 ---
 
 ### 3.7b Backstage flow visualizer plugin
+> 🏁 SR: C — Backstage flow visualizer; depends on Hubble + Backstage UX
 
 **Source:** ADR 0020.
 
@@ -3177,6 +3208,7 @@ Tests:
 ---
 
 ### 3.8 Kamaji + Capsule — multi-tenancy primitives (REWORK)
+> 🏁 SR: C — Kamaji + Capsule hard-MT; trigger: first hard-MT or MSP signal (ADR 0038: T2 opt-in)
 
 **Source:** ADR 0023.
 
@@ -3203,6 +3235,7 @@ Tests:
 ---
 
 ### 3.8a AppRafter `Tenant` CRD operator integration
+> 🏁 SR: C — Tenant CRD; with 3.8
 
 **Source:** ADR 0023.
 
@@ -3232,6 +3265,7 @@ Tests:
 ---
 
 ### 3.9 Cilium Egress Gateway + family-aware static egress IPs
+> 🏁 SR: C — Cilium Egress Gateway + static IPs; trigger: static-IP-for-third-party-API signal
 
 **Source:** ADR 0017.
 
@@ -3252,6 +3286,7 @@ Tests:
 ---
 
 ### 3.10 upgrade-tier 1→2
+> 🏁 SR: C — upgrade-tier 1→2; post-launch first bundle (~2-4 wks), bundled with 4.16
 
 **Поставка:**
 - [ ] Команда `apprafter upgrade-tier --to team`.
@@ -3270,6 +3305,7 @@ Tests:
 ---
 
 ### 3.11 OpenBao как platform-service (Tier 2+)
+> 🏁 SR: C — OpenBao HA; depends on SPIRE (2.7/2.8)
 
 **Поставка:**
 - [ ] OpenBao 3-node HA через Helm.
@@ -3286,6 +3322,7 @@ Tests:
 ---
 
 ### 3.12 Migration: SealedSecrets → OpenBao
+> 🏁 SR: C — SealedSecrets→OpenBao migration; with 3.11
 
 **Поставка:**
 - [ ] `platform-cli upgrade-tier` шаг: импорт SealedSecrets в OpenBao kv-v2.
@@ -3311,6 +3348,7 @@ Tests:
 ---
 
 ## Фаза 3.9 — Dev Mode Full (Phase 3B из dev-mode-task.md)
+> 🏁 SR: D — dev mode dropped from launch
 
 **Цель фазы:** production-ready local dev experience. Heuristic runtime detection (Bun / Node / Rust / Go / Python), preset library (Bun HTTP service, Rust async worker, и т.д.), полный `dev reset / restore` lifecycle с backups, observability tab в Backstage equivalent для dev. Снимается `experimental` tag — dev mode становится официальной частью MVP completion.
 
@@ -3335,6 +3373,7 @@ Tests:
 **Spec:** §6 M4, §3.4, §3.5, §4.7, §4.8, §4.9.
 
 ### 4.1 ExternalSurface CRD
+> 🏁 SR: B · order 5 — ExternalSurface CRD
 
 **Поставка:**
 - [ ] CUE-схема (§3.5).
@@ -3346,6 +3385,7 @@ Tests:
 ---
 
 ### 4.1a HTTPRoute auto-generation
+> 🏁 SR: B · order 5 — HTTPRoute auto-gen (deployed = reachable; cheapest UX win)
 
 **Source:** tracker 2.6.
 
@@ -3377,6 +3417,7 @@ Tests:
 ---
 
 ### 4.1b TLS schema + custom cert import + manual DNS-01 + domain management
+> 🏁 SR: C — advanced TLS/cert/DNS-01 beyond launch minimum (4.1a + 4.4a cover launch)
 
 **Source:** Продолжение 4.1a; ADR 0027 (MigrationPlan) для destructive domain ops. Automated DNS provider integration вынесен в 4.1c.
 
@@ -3673,6 +3714,7 @@ Tests:
 ---
 
 ### 4.1c Automated DNS provider integration + lazy add-on system
+> 🏁 SR: C — automated DNS provider + lazy add-ons; beyond launch minimum
 
 **Source:** Продолжение 4.1b. Закрывает renewal pain manual DNS-01 через автоматизацию DNS-01 challenge. Вводит lazy add-on activation: ExternalSurface — single source of truth, PlatformController реагирует.
 
@@ -3952,6 +3994,7 @@ Tests:
 ---
 
 ### 4.2 Forgejo (или GitLab self-hosted) deployable из манифеста
+> 🏁 SR: D — Forgejo/GitLab self-hosted dropped (GitHub+ghcr.io suffice); reactivate for Group-C self-host compliance
 
 **Поставка:**
 - [ ] Helm chart (готовый upstream) обёрнут в ServiceProvider-style ресурс.
@@ -3968,6 +4011,7 @@ Tests:
 ---
 
 ### 4.3 Harbor registry deployable из манифеста
+> 🏁 SR: D — Harbor dropped; with 4.2
 
 **Поставка:**
 - [ ] Helm chart Harbor.
@@ -3984,6 +4028,7 @@ Tests:
 ---
 
 ### 4.4 Headscale + Tailscale Operator
+> 🏁 SR: D — Headscale/Tailscale dropped (managed portal auth replaces VPN)
 
 **Поставка:**
 - [ ] Headscale-controller pod, persistence pg.
@@ -3999,6 +4044,7 @@ Tests:
 ---
 
 ### 4.4a external-dns integration + `DNSZone` CRD
+> 🏁 SR: B · order 5 — external-dns + DNSZone CRD (closes DNS friction)
 
 **Source:** tracker 2.8.
 
@@ -4032,6 +4078,7 @@ Tests:
 ---
 
 ### 4.5 AccessGrant CRD + reconciler — tenant scoping + approvers (REWORK)
+> 🏁 SR: C — AccessGrant + JIT; trigger: team-of-3+ (solo handled by portal auth)
 
 **Source:** ADR 0023, ADR 0024.
 
@@ -4065,6 +4112,7 @@ Tests:
 ---
 
 ### 4.5a JIT cluster-admin AccessGrant flow
+> 🏁 SR: C — JIT cluster-admin; with 4.5
 
 **Source:** ADR 0024.
 
@@ -4089,6 +4137,7 @@ Tests:
 ---
 
 ### 4.6 OIDC SSO интеграция
+> 🏁 SR: C — OIDC SSO; trigger: same as 4.5
 
 **Поставка:**
 - [ ] Поддержка внешних провайдеров (Authentik / Keycloak / Auth0 / Google Workspace).
@@ -4104,6 +4153,7 @@ Tests:
 ---
 
 ### 4.7 platform-cli login (OIDC kubeconfig)
+> 🏁 SR: C — login OIDC kubeconfig; with 4.6
 
 **Поставка:**
 - [ ] Device-flow OIDC, токен 8h, auto-refresh.
@@ -4119,6 +4169,7 @@ Tests:
 ---
 
 ### 4.8 Magic-link flow для AccessGrant
+> 🏁 SR: C — magic-link; with 4.6
 
 **Поставка:**
 - [ ] Notifications-template из 2.15 (`access-grant/issued`).
@@ -4134,6 +4185,7 @@ Tests:
 ---
 
 ### 4.9 Auto-revocation на expiry
+> 🏁 SR: C — auto-revocation; with 4.6
 
 **Поставка:**
 - [ ] Cron-reconciler сканирует AccessGrant.expiry.
@@ -4150,6 +4202,7 @@ Tests:
 ---
 
 ### 4.10 Audit log в JetStream — cluster-admin tagging (REWORK)
+> 🏁 SR: C — audit-log cluster-admin tagging; trigger: Group-C compliance
 
 **Source:** ADR 0024.
 
@@ -4177,6 +4230,7 @@ Tests:
 ---
 
 ### 4.11 Synthetic monitoring (Uptime Kuma external)
+> 🏁 SR: D — synthetic monitoring dropped (external SaaS at launch)
 
 **Поставка:**
 - [ ] `platform-cli ext-vps init --provider hetzner-cloud --tier nano`.
@@ -4193,6 +4247,7 @@ Tests:
 ---
 
 ### 4.12 Backups в external S3
+> 🏁 SR: B · order 5 — backups to external S3 (default ON Tier 1)
 
 **Поставка:**
 - [ ] Velero (или встроенный backup-controller) для k8s ресурсов.
@@ -4210,6 +4265,7 @@ Tests:
 ---
 
 ### 4.13 Build pipeline: Trivy + Grype + Cosign + SBOM
+> 🏁 SR: C — Trivy/Grype/SBOM; trigger: Phase-5+ security
 
 **Поставка:**
 - [ ] CI-шаблон (Forgejo Actions / GitLab CI / Woodpecker) для multi-stage build.
@@ -4227,6 +4283,7 @@ Tests:
 ---
 
 ### 4.14 Backstage Build Report plugin
+> 🏁 SR: C — Build Report plugin; with 4.13
 
 **Поставка:**
 - [ ] View per Application image: размер, layers, CVE-list, SBOM, cache-эффективность, рекомендации.
@@ -4242,6 +4299,7 @@ Tests:
 ---
 
 ### 4.15 Cost view в Backstage
+> 🏁 SR: C — Cost view; managed portal billing covers launch
 
 **Поставка:**
 - [ ] Per Application: CPU/RAM/disk/network usage из VictoriaMetrics.
@@ -4258,6 +4316,7 @@ Tests:
 ---
 
 ### 4.15a Cilium FQDN policies for `connects.egress.external`
+> 🏁 SR: D — Cilium FQDN policies (advisory only); reactivate with Tier-2 security ask
 
 **Source:** tracker «Known limitations» elimination.
 
@@ -4284,6 +4343,7 @@ Tests:
 ---
 
 ### 4.16 MigrationPlan Backstage UI (REWORK — alignment with M1.5)
+> 🏁 SR: C — MigrationPlan Backstage UI; post-launch first bundle (with 3.10)
 
 **Source:** ADR 0027.
 
@@ -4312,6 +4372,7 @@ Tests:
 ---
 
 ## Фаза 5 — Tier 3, bare metal (M5)
+> 🏁 SR: D — Tier 3 (Talos/LINSTOR/Kata) post-launch territory
 
 **Цель фазы:** платформа разворачивается на Talos+EPYC; LINSTOR как replicated storage; Kata по умолчанию.
 
@@ -4464,6 +4525,7 @@ Tests:
 ---
 
 ## Фаза 6 — Tier 4, confidential (M6)
+> 🏁 SR: D — Tier 4 (CoCo/AWS); trigger: compliance/sovereignty signal
 
 **Цель фазы:** workloads с `confidential: true` на SEV-SNP / TDX нодах; attestation; AWS C8i интеграция.
 
@@ -4587,6 +4649,7 @@ Tests:
 ---
 
 ## Фаза 7 — Plugin ecosystem 🌱
+> 🏁 SR: D — plugin ecosystem; community-contribution timeframe
 
 **Цель фазы:** комьюнити может расширять платформу без trunk-доступа.
 
@@ -4800,6 +4863,24 @@ Tests:
 - [ ] Tag `v1.0.0`.
 
 **Размер:** S
+
+---
+
+## Фаза M — Managed track (product 2)
+
+> 🏁 Speedrun managed-specific work (`speedrun-plan.md` §3). No OSS plan.md backing — the §M.x numbers are NOT Phase 3 subphases. Ordered per speedrun §4.3 (PASS 1–6). Grounded in ADR 0034 (managed model), 0036 (MCP safety), 0037 (control-plane infra).
+
+- [ ] **M.1 (PASS 1)** Hosted multi-tenant SaaS scaffolding — auth / customer registry / agent-bus (speedrun §3.1)
+- [ ] **M.2 (PASS 1)** `apprafter-agent` + cluster registration (speedrun §3.2; ADR 0031)
+- [ ] **M.3 (PASS 1)** Customer offboarding = revoke registration token (speedrun §3.2a)
+- [ ] **M.4 (PASS 2)** Hosted Backstage — namespace-per-customer + `<customer>.apprafter.dev` (speedrun §3.3)
+- [ ] **M.5 (PASS 2)** Subdomain delegation `*.<customer>.apprafter.dev` (speedrun §3.6)
+- [ ] **M.6 (PASS 3)** Hosted MCP server + agent passthrough (speedrun §3.4; ADR 0036)
+- [ ] **M.7 (PASS 3)** Destructive-op gate via MigrationPlan CRD (speedrun §3.5; ADR 0036). Approvals at launch: `apprafter` CLI + Argo CD approve/reject buttons; Backstage plugin post-launch
+- [ ] **M.8 (PASS 4)** Stripe subscription + 14-day trial (speedrun §3.7)
+- [ ] **M.9 (PASS 5)** Migration helpers — Supabase / Railway basic (speedrun §3.8)
+- [ ] **M.10 (PASS 5)** Internal customer support tooling (speedrun §3.10)
+- [ ] **M.11 (PASS 6)** Polish + soft launch (closed beta → invite waves → public)
 
 ---
 
