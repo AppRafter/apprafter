@@ -32,10 +32,7 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 	}
 
 	spec: base: {
-		// TODO: OCI registry reference. The CMP plugin
-		// doesn't pull the image — kubelet does. Pin к а
-		// concrete tag that already exists in the registry,
-		// or your pods land в `ImagePullBackOff`.
+		{{image_comment}}
 		image: "{{image_placeholder}}"
 
 		// TODO: replica count. Start с 1; scale once you

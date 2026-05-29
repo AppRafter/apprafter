@@ -13,6 +13,129 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## v0.1.174 — M1.5 walk-fix #6 post-B.1.79b-Part-3b — scaffold derives image ref from git origin (2026-05-29)
+
+### Reframe
+
+Operator asked: the scaffold's `ghcr.io/REPLACE-ME/<app>:latest`
+placeholder — can't we substitute REPLACE-ME from the git
+origin? It's usually the org/group visible in the origin URL.
+And: does the scheme differ for GitHub vs GitLab?
+
+Both yes. The registry scheme genuinely differs per host, and
+getting the conventions exactly right matters (a wrong image
+ref points Argo CD / kubelet at a non-existent image). Ran a
+research workflow that adversarially verified the three
+load-bearing claims against primary sources:
+
+- **ghcr.io requires lowercase** owner + image-name path
+  segments (OCI distribution-spec grammar; GitHub's own
+  publish workflow does `tr '[A-Z]' '[a-z]'`).
+  `github.com/ProcVue/landing` → `ghcr.io/procvue/landing`,
+  NOT `ghcr.io/ProcVue/landing` (rejected). **Confirmed.**
+- **GitLab Container Registry path mirrors the FULL project
+  path including subgroups** (CI_REGISTRY_IMAGE docs: "The
+  path of a container repository always matches the related
+  project's repository path"). **Confirmed.**
+- **OCI repository names are lowercase-only** by spec grammar
+  (not just a Docker Hub policy). **Confirmed.**
+
+### Derivation rules
+
+New pure `derive_image_from_url(repo_url) -> Option<String>`:
+
+| Git origin | Image ref |
+|---|---|
+| `github.com/ProcVue/landing` | `ghcr.io/procvue/landing:latest` |
+| `gitlab.com/acme/app` | `registry.gitlab.com/acme/app:latest` |
+| `gitlab.com/acme/team/app` (subgroup) | `registry.gitlab.com/acme/team/app:latest` |
+| `gitlab.example.com/g/p` (self-managed) | `registry.gitlab.example.com/g/p:latest` |
+| `gitea.example.com/u/r` / forgejo | `gitea.example.com/u/r:latest` |
+| bitbucket / GHES / unknown / non-HTTPS | `None` → `ghcr.io/REPLACE-ME/<app>:latest` |
+
+Key decisions:
+
+- **github.com is flat** owner/repo (extra URL segments like
+  `/tree/main` ignored; `.git` suffix stripped). gitlab.com
+  takes the FULL path (subgroups).
+- **Self-managed GitLab** (host contains `gitlab`, ≠
+  gitlab.com): guess the GitLab-documented `registry.<host>`
+  subdomain. Operator's explicit call — the registry host is
+  genuinely admin-configured (subdomain vs `<host>:5050`),
+  but the path is always right and a guessed host beats a
+  100%-wrong placeholder for GitLab users. The verify comment
+  flags the `:5050` possibility.
+- **Gitea / Forgejo** (host contains `gitea` / `forgejo`):
+  same-host registry, flat owner/repo (structurally
+  unambiguous — Gitea serves the OCI registry on the
+  identical host).
+- **Security**: github.com / gitlab.com SaaS matches are
+  EXACT — `github.com.attacker.net` does NOT map to ghcr.io
+  (falls through to None). Regression-tested.
+- **Lowercase**: the entire image path is ASCII-lowercased
+  (OCI grammar); the registry host literal and the `:latest`
+  tag are left as-is. An `is_oci_safe_segment` guard rejects
+  pathological inputs rather than emitting an invalid ref.
+
+### Always-TODO
+
+Per operator guidance, the image is a STARTING POINT even
+when derived — the image NAME may differ from the repo
+(monorepo subpath, `-web`/`-api` suffix, custom CI). So the
+scaffold's image comment is now templated (`{{image_comment}}`)
+with two variants:
+
+- **Derived**: "Derived from your git origin — VERIFY before
+  relying on it. The registry host AND image name may differ
+  from what your CI actually publishes …"
+- **Placeholder**: "TODO: replace REPLACE-ME with your
+  registry owner / org and pin a concrete tag …"
+
+The "Next steps" line 1 also branches: "Verify the derived
+image ref matches what your CI publishes" vs "replace
+REPLACE-ME".
+
+### Plumbing
+
+- `render_application` gains a `git_origin: Option<&str>`
+  param; derivation + comment selection happen inside (pure,
+  string-testable).
+- New `detect_git_origin_in(path, remote)` — path-aware
+  sibling of `app_wizard::detect_git_origin` (`git -C <path>
+  remote get-url origin`), so `scaffold` resolves the origin
+  of an arbitrary `--path`, not just cwd. IO lives in the
+  `scaffold` caller; the derivation fn stays pure.
+
+### Tests
+
++13 new unit tests: GitHub flat/lowercase/.git/extra-segments,
+GitLab flat + subgroups + deep nesting, self-managed GitLab
+registry.<host> guess, Gitea/Forgejo same-host, unmappable
+hosts → None, non-HTTPS/SSH → None, host-suffix-spoof
+security regression, too-few-segments, derive_image_ref
+Placeholder/Derived wrapping, is_oci_safe_segment validation,
+plus two render_application end-to-end comment-selection
+tests.
+
+Smoke-verified: scaffold inside a real `git init` repo with
+`origin = https://github.com/ProcVue/landing.git` →
+`image: "ghcr.io/procvue/landing:latest"` + the verify
+comment, `cue vet ./...` passes. Total CLI suite: 276 → 289.
+Bun gate: 87/0.
+
+### Research provenance
+
+Registry conventions verified by an 8-agent research workflow
+(218k subagent tokens, 76 tool uses) that fanned out web
+research per provider + adversarially verified the three
+load-bearing claims against opencontainers/distribution-spec,
+docs.github.com, and docs.gitlab.com primary sources before
+any code was written.
+
+### Bump
+
+CLI 0.1.173 → 0.1.174. Chart and cue-cmp unchanged.
+
 ## v0.1.173 — M1.5 walk-fix #5 post-B.1.79b-Part-3b — scaffold vendors schemas as CUE module (2026-05-29)
 
 ### Reframe (again)

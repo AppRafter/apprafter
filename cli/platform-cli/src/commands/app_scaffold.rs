@@ -212,13 +212,199 @@ pub fn kebab_to_camel(name: &str) -> String {
     }
 }
 
+/// Outcome of image-reference derivation. The caller picks the
+/// scaffold's image comment from the variant: а `Derived` ref
+/// gets а «verify it matches your CI» note; а `Placeholder`
+/// gets the «replace REPLACE-ME» TODO. Walk-fix post-Part-3b:
+/// derive the registry image ref from the repo's git origin
+/// where the host is recognised, otherwise fall back к the
+/// obvious placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImageRef {
+    /// Confidently derived from the git origin — full ref incl.
+    /// `:latest` tag.
+    Derived(String),
+    /// Could not derive — placeholder the operator must fill.
+    Placeholder(String),
+}
+
+impl ImageRef {
+    fn value(&self) -> &str {
+        match self {
+            ImageRef::Derived(s) | ImageRef::Placeholder(s) => s,
+        }
+    }
+    fn is_derived(&self) -> bool {
+        matches!(self, ImageRef::Derived(_))
+    }
+}
+
+/// Pure — resolve the image reference for the scaffold from an
+/// optional git origin URL. `None` origin (not а git repo / no
+/// remote) → placeholder. `app_name` is used only for the
+/// placeholder fallback path.
+pub(crate) fn derive_image_ref(git_origin: Option<&str>, app_name: &str) -> ImageRef {
+    let placeholder = || ImageRef::Placeholder(format!("ghcr.io/REPLACE-ME/{app_name}:latest"));
+    match git_origin.and_then(derive_image_from_url) {
+        Some(s) => ImageRef::Derived(s),
+        None => placeholder(),
+    }
+}
+
+/// Pure workhorse — map an HTTPS git URL к а registry image
+/// reference. Returns `None` for any URL we cannot confidently
+/// map (caller keeps the REPLACE-ME placeholder).
+///
+/// Rules (verified against OCI distribution-spec + GitHub /
+/// GitLab docs, walk research 2026-05-29):
+///
+///   * `github.com` (exact) → `ghcr.io/<owner>/<repo>:latest`.
+///     GitHub repos are flat owner/repo; extra URL segments
+///     (`/tree/main`) are ignored.
+///   * `gitlab.com` (exact) → `registry.gitlab.com/<full-
+///     path>:latest`. The registry path mirrors the FULL
+///     project path including every subgroup level.
+///   * host containing `gitlab` (self-managed GitLab) →
+///     `registry.<host>/<full-path>:latest`. The registry
+///     host is admin-configured (subdomain vs `:5050`); we
+///     guess the GitLab-documented subdomain default и flag
+///     it в the scaffold comment.
+///   * host containing `gitea` / `forgejo` → `<host>/<owner>/
+///     <repo>:latest`. Gitea/Forgejo serve the OCI registry
+///     on the identical host; repos are flat owner/repo.
+///   * anything else (Bitbucket, GitHub Enterprise, unknown)
+///     → `None`.
+///
+/// Host match for the SaaS specials is EXACT (so
+/// `github.com.attacker.net` does NOT map к ghcr.io). The
+/// entire image path is ASCII-lowercased (OCI grammar mandates
+/// lowercase repository names); the registry host literal и
+/// the `:latest` tag are left as-is.
+pub(crate) fn derive_image_from_url(repo_url: &str) -> Option<String> {
+    let rest = repo_url.trim().strip_prefix("https://")?;
+    let (authority, path) = rest.split_once('/')?;
+
+    // Authority → bare host: drop userinfo (after last '@'),
+    // then port (before first ':').
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc.is_empty() {
+        return None;
+    }
+
+    // Path → clean segments: cut query/fragment, split on '/',
+    // strip trailing `.git` on the last segment, drop empties.
+    let path_clean = path.split(['?', '#']).next().unwrap_or(path);
+    let mut segs: Vec<&str> = path_clean.split('/').filter(|s| !s.is_empty()).collect();
+    if let Some(last) = segs.last_mut() {
+        *last = last.strip_suffix(".git").unwrap_or(last);
+    }
+    segs.retain(|s| !s.is_empty());
+    if segs.len() < 2 {
+        return None;
+    }
+
+    let image_path = if host_lc == "github.com" {
+        // Flat owner/repo; ignore any trailing /tree/main etc.
+        format!("{}/{}", segs[0], segs[1])
+    } else if host_lc == "gitlab.com" || host_lc.contains("gitlab") {
+        // Full project path incl. subgroups.
+        segs.join("/")
+    } else if host_lc.contains("gitea") || host_lc.contains("forgejo") {
+        // Same-host registry, flat owner/repo.
+        format!("{}/{}", segs[0], segs[1])
+    } else {
+        return None;
+    };
+
+    let image_path = image_path.to_ascii_lowercase();
+    // Guard: every segment must be an OCI-legal lowercase atom.
+    // GitHub/GitLab names already qualify after lowercasing;
+    // this rejects pathological inputs rather than emitting an
+    // invalid ref.
+    if !image_path.split('/').all(is_oci_safe_segment) {
+        return None;
+    }
+
+    let registry = if host_lc == "github.com" {
+        "ghcr.io".to_string()
+    } else if host_lc == "gitlab.com" {
+        "registry.gitlab.com".to_string()
+    } else if host_lc.contains("gitlab") {
+        // Self-managed GitLab — GitLab-documented subdomain
+        // default. Operator edits if their registry is on
+        // `<host>:5050` instead (scaffold comment flags this).
+        format!("registry.{host_lc}")
+    } else {
+        // Gitea / Forgejo — registry on the same host.
+        host_lc.clone()
+    };
+
+    Some(format!("{registry}/{image_path}:latest"))
+}
+
+/// True iff `s` is а valid lowercase OCI repository-name path
+/// component: non-empty, only `[a-z0-9._-]`, не starting or
+/// ending with а separator.
+fn is_oci_safe_segment(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+    {
+        return false;
+    }
+    let first = s.chars().next().unwrap();
+    let last = s.chars().next_back().unwrap();
+    !matches!(first, '.' | '_' | '-') && !matches!(last, '.' | '_' | '-')
+}
+
+/// Build the multi-line image comment for the scaffold. The
+/// `Derived` variant warns the operator к verify (host + name
+/// may differ from what their CI publishes); the `Placeholder`
+/// variant is the «fill in REPLACE-ME» TODO. Lines are joined
+/// with `\n\t\t` so they align under `spec: base:` (two tabs);
+/// the template supplies the leading `\t\t` for the first line.
+fn image_comment(derived: bool) -> String {
+    let lines: &[&str] = if derived {
+        &[
+            "// Derived from your git origin — VERIFY before relying on it.",
+            "// The registry host AND image name may differ from what your CI",
+            "// actually publishes (monorepo subpath, -web / -api suffix, a",
+            "// self-managed registry on a different host or :5050 port). The",
+            "// CMP plugin doesn't pull the image — kubelet does; the tag must",
+            "// exist in the registry by sync time, or pods ImagePullBackOff.",
+        ]
+    } else {
+        &[
+            "// TODO: replace `REPLACE-ME` with your registry owner / org and",
+            "// pin a concrete tag. The CMP plugin doesn't pull the image —",
+            "// that's kubelet's job; the tag must already exist in the",
+            "// registry by the time Argo CD syncs, or pods land in",
+            "// `ImagePullBackOff`.",
+        ]
+    };
+    lines.join("\n\t\t")
+}
+
 /// Pure helper — render а complete Application.cue body for
-/// the given `runtime`/`app_name`/`namespace`. Tests cover
-/// every runtime through this entry point.
-pub fn render_application(runtime: Runtime, app_name: &str, namespace: &str) -> Result<String> {
+/// the given `runtime`/`app_name`/`namespace`/`git_origin`.
+/// `git_origin` is the detected `remote.origin.url` (or `None`
+/// when undetectable) used to derive the image reference; the
+/// detection itself lives in the IO-bearing `scaffold` caller
+/// so this fn stays pure и string-testable.
+pub fn render_application(
+    runtime: Runtime,
+    app_name: &str,
+    namespace: &str,
+    git_origin: Option<&str>,
+) -> Result<String> {
     let defaults = defaults_for(runtime);
     let camel = kebab_to_camel(app_name);
-    let image = format!("ghcr.io/REPLACE-ME/{app_name}:latest");
+    let image = derive_image_ref(git_origin, app_name);
     let port = defaults.primary_port.to_string();
 
     let mut vars: BTreeMap<&str, String> = BTreeMap::new();
@@ -228,7 +414,8 @@ pub fn render_application(runtime: Runtime, app_name: &str, namespace: &str) -> 
     vars.insert("primary_port", port);
     vars.insert("runtime_display", defaults.display.to_string());
     vars.insert("runtime_slug", defaults.slug.to_string());
-    vars.insert("image_placeholder", image);
+    vars.insert("image_placeholder", image.value().to_string());
+    vars.insert("image_comment", image_comment(image.is_derived()));
 
     let template = if runtime == Runtime::Blank {
         BLANK_TEMPLATE
@@ -236,6 +423,29 @@ pub fn render_application(runtime: Runtime, app_name: &str, namespace: &str) -> 
         DEFAULT_TEMPLATE
     };
     render_template(template, &vars)
+}
+
+/// Probe `git -C <path> remote get-url <remote>` non-fatally —
+/// returns the normalised HTTPS origin URL, or `None` outside а
+/// git repo / with git missing / when the remote isn't
+/// configured. Path-aware sibling of `app_wizard::
+/// detect_git_origin` so scaffold can resolve the origin of an
+/// arbitrary `--path`, not just cwd.
+fn detect_git_origin_in(path: &Path, remote: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", remote])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(crate::commands::app::normalise_git_url(&raw))
 }
 
 /// Options surface для `apprafter app scaffold`. Mirrors the
@@ -408,7 +618,9 @@ pub fn scaffold(opts: ScaffoldOpts) -> Result<()> {
     std::fs::create_dir_all(&apprafter_dir)
         .map_err(|e| CliError::Other(format!("create {}: {e}", apprafter_dir.display())))?;
 
-    let rendered = render_application(runtime, &name, &namespace)?;
+    let git_origin = detect_git_origin_in(&opts.path, "origin");
+    let image_derived = derive_image_ref(git_origin.as_deref(), &name).is_derived();
+    let rendered = render_application(runtime, &name, &namespace, git_origin.as_deref())?;
     std::fs::write(&target_file, &rendered)
         .map_err(|e| CliError::Other(format!("write {}: {e}", target_file.display())))?;
 
@@ -435,10 +647,18 @@ pub fn scaffold(opts: ScaffoldOpts) -> Result<()> {
     }
     println!();
     println!("Next steps:");
-    println!(
-        "  1. Edit {} — replace `REPLACE-ME` in the image ref, tune ports.",
-        target_file.display()
-    );
+    if image_derived {
+        println!(
+            "  1. Verify the derived image ref in {} matches what your",
+            target_file.display()
+        );
+        println!("     CI publishes (host + name); tune ports.");
+    } else {
+        println!(
+            "  1. Edit {} — replace `REPLACE-ME` in the image ref, tune ports.",
+            target_file.display()
+        );
+    }
     println!("  2. Optional: typed-validate locally —");
     println!("       cd {} && cue vet ./...", apprafter_dir.display());
     println!("     The vendored schemas resolve the `apprafter.io/schemas/");
@@ -641,7 +861,7 @@ mod tests {
             Runtime::Blank,
         ];
         for r in runtimes {
-            let out = render_application(r, "my-app", "apprafter")
+            let out = render_application(r, "my-app", "apprafter", None)
                 .unwrap_or_else(|e| panic!("render failed для {r:?}: {e}"));
             assert!(out.contains("\"my-app\""), "{r:?}: missing app name");
             assert!(
@@ -664,7 +884,7 @@ mod tests {
 
     #[test]
     fn render_application_blank_uses_blank_template() {
-        let out = render_application(Runtime::Blank, "x", "apprafter").unwrap();
+        let out = render_application(Runtime::Blank, "x", "apprafter", None).unwrap();
         assert!(
             out.contains("blank template"),
             "Blank runtime should pick BLANK_TEMPLATE which mentions 'blank template'"
@@ -673,11 +893,203 @@ mod tests {
 
     #[test]
     fn render_application_default_template_has_runtime_display() {
-        let out = render_application(Runtime::Bun, "x", "apprafter").unwrap();
+        let out = render_application(Runtime::Bun, "x", "apprafter", None).unwrap();
         assert!(
             out.contains("Bun"),
             "default template должен carry runtime display name; got:\n{out}"
         );
+    }
+
+    #[test]
+    fn render_application_without_origin_emits_placeholder_image_and_todo() {
+        // No git origin → REPLACE-ME placeholder + the «replace
+        // REPLACE-ME» TODO comment, not the «verify derived» one.
+        let out = render_application(Runtime::Rust, "my-app", "apprafter", None).unwrap();
+        assert!(out.contains("ghcr.io/REPLACE-ME/my-app:latest"));
+        assert!(
+            out.contains("replace `REPLACE-ME`"),
+            "placeholder image must carry the REPLACE-ME TODO; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Derived from your git origin"),
+            "placeholder path must NOT claim the image was derived"
+        );
+    }
+
+    #[test]
+    fn render_application_with_github_origin_derives_image_and_verify_comment() {
+        // GitHub origin → ghcr.io/<owner-lower>/<repo-lower> +
+        // the «verify derived» comment (host/name may differ).
+        let out = render_application(
+            Runtime::Docker,
+            "landing",
+            "procvue",
+            Some("https://github.com/ProcVue/landing"),
+        )
+        .unwrap();
+        assert!(
+            out.contains("ghcr.io/procvue/landing:latest"),
+            "github origin must derive lowercased ghcr ref; got:\n{out}"
+        );
+        assert!(
+            out.contains("Derived from your git origin"),
+            "derived image must carry the verify comment"
+        );
+        assert!(
+            !out.contains("REPLACE-ME"),
+            "derived path must not leave the REPLACE-ME placeholder"
+        );
+    }
+
+    // ── derive_image_from_url — pure derivation rules ──────────
+
+    #[test]
+    fn derive_github_lowercases_owner_and_repo() {
+        assert_eq!(
+            derive_image_from_url("https://github.com/ProcVue/landing").as_deref(),
+            Some("ghcr.io/procvue/landing:latest")
+        );
+    }
+
+    #[test]
+    fn derive_github_strips_dotgit_and_extra_segments() {
+        // `.git` suffix dropped; `/tree/main` ignored — flat
+        // owner/repo only.
+        assert_eq!(
+            derive_image_from_url("https://github.com/acme/web.git").as_deref(),
+            Some("ghcr.io/acme/web:latest")
+        );
+        assert_eq!(
+            derive_image_from_url("https://github.com/acme/web/tree/main").as_deref(),
+            Some("ghcr.io/acme/web:latest")
+        );
+    }
+
+    #[test]
+    fn derive_gitlab_saas_flat_and_subgroups() {
+        assert_eq!(
+            derive_image_from_url("https://gitlab.com/acme/app").as_deref(),
+            Some("registry.gitlab.com/acme/app:latest")
+        );
+        // Full project path incl. subgroups — NOT just org/repo.
+        assert_eq!(
+            derive_image_from_url("https://gitlab.com/acme/team/app").as_deref(),
+            Some("registry.gitlab.com/acme/team/app:latest")
+        );
+        assert_eq!(
+            derive_image_from_url("https://gitlab.com/a/b/c/d").as_deref(),
+            Some("registry.gitlab.com/a/b/c/d:latest")
+        );
+    }
+
+    #[test]
+    fn derive_self_managed_gitlab_guesses_registry_subdomain() {
+        // host contains "gitlab" but ≠ gitlab.com → guess the
+        // GitLab-documented registry.<host> subdomain, full path.
+        assert_eq!(
+            derive_image_from_url("https://gitlab.example.com/mygroup/myproject").as_deref(),
+            Some("registry.gitlab.example.com/mygroup/myproject:latest")
+        );
+        assert_eq!(
+            derive_image_from_url("https://gitlab.example.com/acme/team/app").as_deref(),
+            Some("registry.gitlab.example.com/acme/team/app:latest")
+        );
+    }
+
+    #[test]
+    fn derive_gitea_forgejo_same_host_flat() {
+        assert_eq!(
+            derive_image_from_url("https://gitea.example.com/testuser/myrepo").as_deref(),
+            Some("gitea.example.com/testuser/myrepo:latest")
+        );
+        assert_eq!(
+            derive_image_from_url("https://forgejo.example.org/team/svc").as_deref(),
+            Some("forgejo.example.org/team/svc:latest")
+        );
+    }
+
+    #[test]
+    fn derive_returns_none_for_unmappable_hosts() {
+        // Bitbucket (non-derivable image name), GitHub Enterprise
+        // (own GHES registry conventions), totally unknown host.
+        assert_eq!(
+            derive_image_from_url("https://bitbucket.org/workspace/repo"),
+            None
+        );
+        assert_eq!(
+            derive_image_from_url("https://github.company.com/org/repo"),
+            None
+        );
+        assert_eq!(
+            derive_image_from_url("https://code.example.com/org/repo"),
+            None
+        );
+    }
+
+    #[test]
+    fn derive_returns_none_for_non_https_and_ssh() {
+        // HTTPS-only in v1. SSH shorthand, ssh://, git://, http://
+        // all fall back to the placeholder.
+        assert_eq!(
+            derive_image_from_url("git@github.com:ProcVue/landing.git"),
+            None
+        );
+        assert_eq!(
+            derive_image_from_url("ssh://git@github.com/ProcVue/landing"),
+            None
+        );
+        assert_eq!(derive_image_from_url("http://github.com/acme/web"), None);
+    }
+
+    #[test]
+    fn derive_returns_none_for_host_suffix_spoof() {
+        // SECURITY: github.com must match EXACTLY — a spoof host
+        // like github.com.attacker.net must NOT map to ghcr.io.
+        // It contains neither "gitlab" nor "gitea"/"forgejo", so
+        // it falls through to None.
+        assert_eq!(
+            derive_image_from_url("https://github.com.attacker.net/a/b"),
+            None
+        );
+    }
+
+    #[test]
+    fn derive_returns_none_for_too_few_path_segments() {
+        assert_eq!(derive_image_from_url("https://github.com/onlyowner"), None);
+        assert_eq!(derive_image_from_url("https://gitlab.com/solo"), None);
+        assert_eq!(derive_image_from_url("https://github.com/"), None);
+        assert_eq!(derive_image_from_url("https://github.com"), None);
+    }
+
+    #[test]
+    fn derive_image_ref_wraps_placeholder_and_derived() {
+        // None origin → Placeholder; recognised origin → Derived.
+        assert_eq!(
+            derive_image_ref(None, "my-app"),
+            ImageRef::Placeholder("ghcr.io/REPLACE-ME/my-app:latest".to_string())
+        );
+        assert_eq!(
+            derive_image_ref(Some("https://github.com/Acme/Web"), "web"),
+            ImageRef::Derived("ghcr.io/acme/web:latest".to_string())
+        );
+        // Unmappable origin → Placeholder (falls back, doesn't error).
+        assert_eq!(
+            derive_image_ref(Some("https://bitbucket.org/ws/repo"), "repo"),
+            ImageRef::Placeholder("ghcr.io/REPLACE-ME/repo:latest".to_string())
+        );
+    }
+
+    #[test]
+    fn is_oci_safe_segment_accepts_legal_rejects_illegal() {
+        assert!(is_oci_safe_segment("landing"));
+        assert!(is_oci_safe_segment("my-app"));
+        assert!(is_oci_safe_segment("app.v2"));
+        assert!(is_oci_safe_segment("a1_b2"));
+        assert!(!is_oci_safe_segment("")); // empty
+        assert!(!is_oci_safe_segment("Upper")); // uppercase
+        assert!(!is_oci_safe_segment("-lead")); // leading sep
+        assert!(!is_oci_safe_segment("trail-")); // trailing sep
+        assert!(!is_oci_safe_segment("has space")); // space
     }
 
     #[test]
