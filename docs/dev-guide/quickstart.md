@@ -43,7 +43,7 @@ cargo run --bin apprafter -- cluster-bootstrap
 ```
 
 The full flow + opt-ins (Backstage, Argo CD Gateway, admission
-webhook) is documented in [`cli/README.md`](../../cli/README.md).
+webhook) is documented in [`cli/README.md`](https://github.com/apprafter/apprafter/blob/main/cli/README.md).
 
 ## 2. Scaffold an Application
 
@@ -120,11 +120,11 @@ KUBECONFIG=/tmp/kc kubectl run -it --rm curl-test \
 
 ## Where to look next
 
-- [`examples/templates/bun-http/README.md`](../../examples/templates/bun-http/README.md) —
+- [`examples/templates/bun-http/README.md`](https://github.com/apprafter/apprafter/blob/main/examples/templates/bun-http/README.md) —
   starter internals (controller / module / bootstrap).
-- [`schemas/v1alpha1/application.cue`](../../schemas/v1alpha1/application.cue) —
+- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/main/schemas/v1alpha1/application.cue) —
   the Application CRD shape your manifest gets validated against.
-- [`operator/README.md`](../../operator/README.md) — operator
+- [`operator/README.md`](https://github.com/apprafter/apprafter/blob/main/operator/README.md) — operator
   reconcile loop + per-environment expansion semantics.
-- [`backstage-plugins/applications-frontend/README.md`](../../backstage-plugins/applications-frontend/README.md) —
+- [`backstage-plugins/applications-frontend/README.md`](https://github.com/apprafter/apprafter/blob/main/backstage-plugins/applications-frontend/README.md) —
   Backstage page that lists Applications + their status.

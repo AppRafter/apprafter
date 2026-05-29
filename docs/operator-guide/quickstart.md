@@ -194,7 +194,7 @@ spec: {
 }
 ```
 
-See [`schemas/v1alpha1/infrastructure.cue`](../../schemas/v1alpha1/infrastructure.cue)
+See [`schemas/v1alpha1/infrastructure.cue`](https://github.com/apprafter/apprafter/blob/main/schemas/v1alpha1/infrastructure.cue)
 for the full block reference and
 [`gitops-walk.md`](./gitops-walk.md) for the Argo CD + repo-creds
 walk.
@@ -240,7 +240,7 @@ byte-identical to v0.1.85's pre-colour baseline.
   reference with every flag + alias.
 - [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md) —
   scaffold a new Application from the bun-http template.
-- [`operator/README.md`](../../operator/README.md) — operator
+- [`operator/README.md`](https://github.com/apprafter/apprafter/blob/main/operator/README.md) — operator
   reconcile loop + leader-election + per-environment expansion.
-- [`schemas/v1alpha1/`](../../schemas/v1alpha1/) — the CRD CUE
+- [`schemas/v1alpha1/`](https://github.com/apprafter/apprafter/tree/main/schemas/v1alpha1/) — the CRD CUE
   schemas that admission validates against.
