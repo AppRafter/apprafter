@@ -4,7 +4,7 @@
 > **Domain:** `apprafter.dev`.
 > **Status:** Phase 1 (Tier 1 single-node MVP) delivered as `v0.1.0-mvp` on 2026-05-08; Phases 2–8 in active design. See `plan.md` for the phase ledger.
 > **Audience:** Architecture decisions, contributors onboarding, design rationale.
-> **Revision:** 7 (Pre-Phase-2 spec refinements: tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD as declarative platform version control plane, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
+> **Revision:** 8 (Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
 
 ---
 
@@ -93,7 +93,8 @@ Concrete examples:
 - Tier 1: SMTP relay for notifications, no advanced routing
 - Tier 2+: full notifications service with multi-channel routing
 - Tier 1: soft multi-tenancy (Capsule policies + default-deny NetworkPolicy + workload identity); hard multi-tenancy is structurally not available on a single-node deployment
-- Tier 2+: hard multi-tenancy via Kamaji (separate Kubernetes control plane per tenant); see §3.9 Tenant CRD
+- Tier 2: HA substrate by default with the same soft multi-tenancy as Tier 1; hard multi-tenancy via Kamaji (separate Kubernetes control plane per tenant) is opt-in (`PlatformStack.spec.values.multitenancy: true`, default off — see ADR 0038)
+- Tier 3+: hard multi-tenancy via Kamaji by default; see §3.9 Tenant CRD
 - Tier 1 / dev mode: Hubble observability opt-in (default off to minimise footprint)
 - Tier 2+: Hubble enabled by default (network observability + flow visualisation)
 
@@ -635,7 +636,8 @@ This is structural separation, not disciplinary. The Plane A operator has no cre
 **Tier behaviour:**
 
 - **Tier 1:** Tenant CRD is accepted but produces Capsule-only enforcement (no Kamaji TCP — structurally unavailable on single-node). Soft multi-tenancy via Capsule + workload identity + default-deny NetworkPolicy.
-- **Tier 2+:** Full hard multi-tenancy with Kamaji TCP per Tenant.
+- **Tier 2:** HA substrate by default, with the same soft multi-tenancy as Tier 1. Hard multi-tenancy with a Kamaji TCP per Tenant is **opt-in** (`PlatformStack.spec.values.multitenancy: true`, default off; see ADR 0038); Kamaji remains the mechanism when enabled (ADR 0023).
+- **Tier 3+:** Full hard multi-tenancy with Kamaji TCP per Tenant by default.
 
 Granularity is at the Tenant level. A single team (one customer of an MSP) typically maps to one Tenant containing multiple Applications and environments. For strict per-environment isolation (e.g. prod isolated from dev at API level), create separate Tenants (`team-nonprod`, `team-prod`).
 
@@ -735,7 +737,7 @@ See ADR 0026 for the full decision record, including channel semantics, override
 
 **Tier 1 (single VDS):** k3s in single-node mode with default SQLite backend during M1; kine + NATS JetStream backend introduced in M3. 1–2 GB RAM overhead. Cilium in CNI mode, kube-proxy replacement, KubeVirt disabled, Kata disabled. Dual-stack IPv4+IPv6 default. No quorum (single node). Hard multi-tenancy structurally unavailable on a single-node deployment; soft multi-tenancy via Capsule policies + default-deny NetworkPolicy + workload identity. Hubble opt-in (default off to minimise footprint).
 
-**Tier 2 (3+ nodes, heterogeneous allowed):** k3s in HA mode, kine + NATS JetStream cluster as control plane storage (≥3 replicas, embedded or as a workload). Cilium with mTLS, full Gateway API. Hubble enabled by default. Hard multi-tenancy via Kamaji (one TenantControlPlane per AppRafter Tenant); see §3.9. Capsule policy layer applied inside each tenant. Dual-stack IPv4+IPv6 default. Node configuration heterogeneous — mixed sizes allowed, scaling out from Tier 1 supported through `apprafter upgrade-tier`.
+**Tier 2 (3+ nodes, heterogeneous allowed):** k3s in HA mode. Control-plane storage at managed launch is **embedded etcd** (the standard k3s HA pattern); kine + NATS JetStream (≥3 replicas, embedded or as a workload) remains the eventual target and is introduced post-launch when audit-replayability or the etcd scale ceiling warrants it (see §4.2 and ADR 0005). Cilium with mTLS, full Gateway API. Hubble enabled by default. Hard multi-tenancy via Kamaji (one TenantControlPlane per AppRafter Tenant) is **opt-in** (`PlatformStack.spec.values.multitenancy: true`, default off — see §3.9 and ADR 0038); the Capsule policy layer applies regardless. Dual-stack IPv4+IPv6 default. Node configuration heterogeneous — mixed sizes allowed, scaling out from Tier 1 supported through `apprafter upgrade-tier`.
 
 **Tier 3 (bare metal):** Talos Linux on dedicated EPYC servers. Full Kubernetes (not k3s). Cilium with full Gateway API, Hubble default. Kata containers as default runtime. KubeVirt enabled for VM workloads. LINSTOR for replicated block storage. Kamaji multi-tenancy. Confidential containers opt-in (when SEV-SNP-capable hardware is provisioned). Dual-stack networking default.
 
@@ -759,6 +761,8 @@ Replace etcd with kine, configured with NATS JetStream backend. Benefits:
 - kine implements a subset of etcd v3 API; verify k8s features work end-to-end (admission webhooks, watch behavior on CRDs)
 - Update semantics require correct conditional-write handling in NATS KV (kine v0.10+ handles this, must verify on production CRD churn)
 - Performance ceiling vs etcd unclear at very large scale (>1000 nodes, >100k objects)
+
+**Launch sequencing.** kine + NATS JetStream is the committed control-plane storage and the basis for the replayable-audit-log capability. At the managed launch, however, the Tier 2 HA substrate uses **embedded etcd** (the standard k3s HA pattern); kine + NATS is introduced post-launch when audit-replayability becomes a priority or the etcd scale ceiling is approached (see §4.1 Tier 2, ADR 0005, and `speedrun-plan.md`).
 
 ### 4.3 Networking
 
@@ -878,6 +882,8 @@ Leader election via Lease (10s renew / 30s expiry, holder identity from `POD_NAM
 
 Enforces cross-field invariants the OpenAPI v3 CRD schema can't express — `image` non-empty (via `base.image` or every `environments[*].image`), env names DNS-1123, env keys `^[A-Z_][A-Z0-9_]*$`. CUE schemas stay free of half-measure regex stubs and remain the design-time view; runtime enforcement layers as **CRD OpenAPI v3 → admission webhook**. TLS cert is auto-rotated via cert-manager; `caBundle` is synced onto the `ValidatingWebhookConfiguration` via the `cert-manager.io/inject-ca-from` annotation.
 
+**`apprafter-agent` — managed-plan connectivity (optional).** When a cluster is attached to a managed plan (ADR 0034), an `apprafter-agent` opens an **outbound** connection from the customer cluster to the hosted bus (gRPC streaming over HTTP/2 + TLS; see ADR 0031). It ships from the open-source operator workspace — so the cluster stays fully functional without it — has no inbound listener, and exposes only AppRafter-CRD operations and metadata, never raw Kubernetes access or customer data (ADR 0035). It is absent on self-host-only clusters.
+
 **Why custom over Crossplane:** see design rationale in §8.
 
 ### 4.6 Platform Services
@@ -892,6 +898,8 @@ Six canonical types, each with at least an `integrated` ServiceProvider that run
 | `redis` | Dragonfly or KeyDB | DB-namespace per claim |
 | `s3` | MinIO or Garage | Bucket + IAM user per claim |
 | `notifications` | NATS-backed queue + provider workers | Subjects per claim, isolated DLQs |
+
+**Managed launch scope.** At the Hosted Services managed launch the integrated providers shipped are **`pg` (CloudNativePG)** and **`redis` (Dragonfly)** — 2 of the 6 — together with the **`needs.disk`** block-storage claim primitive. `jetstream`, `clickhouse`, `s3`, and `notifications` are deferred to a prioritised post-launch backlog and re-activated on demand (see `speedrun-plan.md`); transactional email at launch goes direct rather than through the notifications service. The full six-service set remains the eventual target.
 
 #### Notifications — detailed design
 
@@ -1180,12 +1188,14 @@ See ADR 0024 for the full rationale and per-layer detail.
 | Workload autoscaling | **KEDA** | Mature CNCF Graduated project; ScaledObject-based, exhaustive trigger ecosystem. See ADR 0019. |
 | Node autoscaling | **Karpenter** — AWS native in Phase 6.2; Hetzner via Cluster API in Phase 5+ | Cluster-autoscaler not supported. See ADR 0021. |
 | Network observability | **Hubble** (eBPF, Cilium-native) | Default Tier 2+; opt-in Tier 1 and dev mode. See ADR 0020. |
-| Hard multi-tenancy | **Kamaji** + **Capsule** policy layer | Per-tenant separate kube-apiserver via Kamaji; Capsule for policy enforcement. Tier 2+ default; Tier 1 structurally unavailable. See ADR 0023. |
+| Hard multi-tenancy | **Kamaji** + **Capsule** policy layer | Per-tenant separate kube-apiserver via Kamaji; Capsule for policy enforcement. Tier 3+ default; **Tier 2 opt-in** (`multitenancy: true`, ADR 0038); Tier 1 structurally unavailable. See ADR 0023. |
 | Infrastructure providers | **Hetzner Cloud, Hetzner Robot, AWS** (native Rust SDKs) | Additional clouds deferred to v2. See ADR 0016. |
 
 ---
 
 ## 6. Roadmap
+
+> **Managed-launch sequencing.** The ledger below is the open-source roadmap. The Hosted Services managed launch (ADR 0034) re-orders which items ship first — pulling a Tier 2 HA substrate (embedded etcd), a condensed MigrationPlan primitive, `needs.pg` / `needs.redis` / `needs.disk`, and selected Phase 4 items (ExternalSurface, HTTPRoute auto-gen, external-dns, backups, a Hubble + OTel subset) into the launch scope, while deferring others (the full six platform services, kine + NATS, Kamaji hard multi-tenancy, AccessGrant/OIDC) to a prioritised post-launch backlog. The managed track itself (hosted scaffolding, `apprafter-agent`, MCP server, billing) is product-2 work outside this ledger. See `speedrun-plan.md` for the launch sequencing; the milestone boxes here flip only on actual phase closure.
 
 ### Milestone M0 — Architecture (current)
 
@@ -1321,7 +1331,7 @@ The following features are declared in the Application manifest schema and accep
 
 - **Static egress IP allocation manual.** `network.egressIP.static: true` is accepted in the manifest but not provisioned by the operator yet. Cilium Egress Gateway with family-aware static IP allocation lands in Phase 4.
 
-- **Hard multi-tenancy not enforced at Tier 2.** v0.1.x runs single-tenant by default. Kamaji + Capsule + AppRafter Tenant CRD land in Phase 3 (M3).
+- **Hard multi-tenancy is opt-in at Tier 2.** Tier 2's default is an HA substrate only; v0.1.x runs single-tenant. Hard multi-tenancy via Kamaji is opt-in (`PlatformStack.spec.values.multitenancy: true`, default off — ADR 0038). Kamaji + Capsule + AppRafter Tenant CRD land in Phase 3 (M3).
 
 - **AccessGrant `approvers` / JIT cluster-admin** — fields accepted but reconciliation lands in Phase 4 (M4).
 
@@ -1351,7 +1361,7 @@ The following features are declared in the Application manifest schema and accep
 - **Tier-1 control-plane firewall topology:** **defense in depth** via fail2ban (SSH brute-force) + the cloud-provider firewall (network-level allow-list). Evaluated and dropped (v0.1.43): ufw — silent initcaps failure on Ubuntu noble during cloud-init.
 - **Built-in cloud-provider idempotency:** every managed object is labeled `apprafter=true`; that label is the canonical anchor for `apply` / `destroy` / `import`. State at `.apprafter/state.json`; sensitive material (kubeconfig YAML, Argo CD admin password) cached **age-encrypted** under `APPRAFTER_AGE_KEY` (default `~/.config/apprafter/age.key`, mode 0600, auto-created on first run).
 - **k3s install profile (Tier 1):** k3s starts with five disabled subsystems — `--disable=traefik,servicelb`, `--disable-kube-proxy`, `--flannel-backend=none`, `--disable-network-policy` — so Cilium owns CNI / kube-proxy replacement / NetworkPolicy without port collisions (the embedded flannel-vxlan daemon would otherwise sit on UDP 8472 alongside Cilium's VXLAN).
-- **Multi-tenancy isolation choice:** **Kamaji** for hard multi-tenancy at Tier 2+ (one TenantControlPlane per AppRafter Tenant); **Capsule** as policy enforcement layer within tenant. vCluster and HNC evaluated and rejected. T1 not eligible for hard multi-tenancy (structural limitation); soft mt via Capsule + workload identity. See ADR 0023.
+- **Multi-tenancy isolation choice:** **Kamaji** is the hard-multi-tenancy mechanism (one TenantControlPlane per AppRafter Tenant); **Capsule** as policy enforcement layer within tenant. vCluster and HNC evaluated and rejected. Default-on at Tier 3+; **opt-in at Tier 2** (`PlatformStack.spec.values.multitenancy: true`, default off — ADR 0038). T1 not eligible (structural limitation); soft mt via Capsule + workload identity. See ADR 0023 (mechanism) and ADR 0038 (Tier 2 default).
 
 ### License decision
 
@@ -1689,6 +1699,7 @@ apprafter/
 - `cue.mod/` is at the **repo root** (not under `schemas/`) so `schemas/` and `examples/` share import paths (`apprafter.io/schemas/v1alpha1`) — standard CUE monorepo practice.
 - `cli/` and `operator/` are **separate Cargo workspaces** (no top-level `Cargo.toml`); always `cd` into one before running `cargo`.
 - The OpenAPI v3 CRD shipped by `cli-providers::k8s::application_crd` and the kube-rs `Application` Rust type in `operator-core` are **hand-rolled mirrors** of `schemas/v1alpha1/Application` kept in sync by hand. There is no CUE→CRD/Rust generator yet.
+- The `apprafter-agent` (managed-plan outbound connector, ADR 0031) ships from the `operator/` workspace — as a sibling binary or an `apprafter-operator` subcommand (distribution model still open) — and is not required for a self-host cluster to function.
 
 **CI publishes:**
 
@@ -1736,7 +1747,7 @@ The matrix below describes default behaviours and opt-in availability of platfor
 | Confidential containers (CoCo) | opt-in (hardware-dep, rare) | ✗ | opt-in (hardware-dep, rare) | opt-in (SEV-SNP hardware) | opt-in (TDX/SEV-SNP instances) | opt-in | opt-in |
 | Karpenter (node autoscaling) | ✗ | ✗ | opt-in (Phase 5+ via CAPI) | research (slow autoscaling design constraint) | AWS native default (Phase 6.2) | default | default |
 | Cluster-autoscaler | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Hard multi-tenancy (Kamaji) | ✗ structurally | ✗ | default (opt-out) | default | default | default | default |
+| Hard multi-tenancy (Kamaji) | ✗ structurally | ✗ | opt-in (ADR 0038) | default | default | default | default |
 | Capsule policy layer | default (opt-out) | default | default | default | default | default | default |
 | OpenTelemetry pipeline | opt-in | minimal | default | default | default | default | default |
 | ClickHouse (logs/traces) | opt-in | ✗ | default | default | default | default | default |
@@ -1751,3 +1762,5 @@ The matrix below describes default behaviours and opt-in availability of platfor
 | Harbor registry | opt-in | ✗ | opt-in | opt-in | opt-in | opt-in | opt-in |
 
 The matrix is a living document; new features added in future phases are recorded here as defaults are established. Application-level fields (`needs.*`, `expose.*`, `confidential`, etc.) are not part of this matrix — they are described in §3 Core Concepts.
+
+**Managed plans.** The `Managed Ops` and `Turnkey` columns are managed **plans**, a separate axis from the hardware tier (per ADR 0034). The launch managed plan is **Hosted Services**, in which AppRafter hosts only the management/UX layer while the customer's cluster stays a standard open-source install on the customer's own infrastructure; its feature behaviour is that of the customer's underlying hardware tier (T1/T2), so it is not a separate column. `Managed Operations` and `Turnkey Cloud` are post-launch plans. See ADR 0034 (managed-plan model), ADR 0035 (Minimal Data Exposure), and ADR 0037 (managed control-plane infrastructure).
