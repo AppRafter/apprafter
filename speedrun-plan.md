@@ -1,7 +1,7 @@
 # AppRafter — Managed Launch Speedrun
 
 > **Источник:** сессия 2026-05-17 — разбор кратчайшего пути до managed launch.
-> **Назначение:** working roadmap для managed-first launch. Ссылается на `plan.md` по точным подфазам, на `spec.md` по разделам, на `MANAGED_STRATEGY.md` / `KILLER_FEATURES_MATRIX.md` по контексту.
+> **Назначение:** working roadmap для managed-first launch. Ссылается на `plan.md` по точным подфазам, на `spec.md` по разделам, на `marketing-strategy.md` по контексту.
 > **Scope:** managed-track + минимальный OSS-core substrate для него.
 > **Статус:** draft, требует ADR-decisions перед стартом managed-track (см. §6).
 > **Дата сборки:** 2026-05-17.
@@ -18,7 +18,7 @@
 
 ### 0.2 Зачем speedrun
 
-Текущий `plan.md` → Phase 3 closure ≈ 14-18 месяцев FT solo. Managed launch естественно tied к Phase 4 в `KILLER_FEATURES_MATRIX.md` §2.4. Speedrun даёт **~7.5-11 месяцев календарно** до managed launch — экономия 6-10 месяцев.
+Текущий `plan.md` → Phase 3 closure ≈ 14-18 месяцев FT solo. Managed launch естественно tied к Phase 4 в `marketing-strategy.md`. Speedrun даёт **~7.5-11 месяцев календарно** до managed launch — экономия 6-10 месяцев.
 
 ### 0.3 Target persona на launch
 
@@ -36,7 +36,7 @@ Frontend-heavy work в managed-track (Bun + Svelte portal) может иметь
 
 ### 0.5 Managed offering tier на launch — Hosted Services (Tier 1 из трёх)
 
-Из трёх managed tiers per `MANAGED_STRATEGY.md` §3 — **на launch только Hosted Services** (самый лёгкий первый уровень).
+Из трёх managed tiers per `marketing-strategy.md` — **на launch только Hosted Services** (самый лёгкий первый уровень).
 
 | Tier | Что мы хостим | Customer's responsibility | Hetzner relationship | Cash flow exposure |
 |---|---|---|---|---|
@@ -44,14 +44,14 @@ Frontend-heavy work в managed-track (Bun + Svelte portal) может иметь
 | **2. Managed Operations** (Phase 4/4.5) | Всё из Tier 1 + abuse email parsing + cost monitoring + backup orchestration + API token health checks | Sам платит Hetzner; не управляет Hetzner UI | Customer's account + наш operational access (API token) | Низкая |
 | **3. Turnkey Cloud** (Phase 5+) | Всё, включая Hetzner relationship | Только платит нам | Наш | Существенная (юр.лицо, VAT, DPA chain, abuse process) |
 
-(Hosted **notifications service** в `MANAGED_STRATEGY.md` §3.1 list'ится для Tier 1, но scope = AccessGrant lifecycle emails. AccessGrant CRD в bucket C post-launch, поэтому hosted notifications **drop из launch scope**. Transactional emails — direct через Postmark/Sendgrid, не через notifications service abstraction. См. §7.5.)
+(Hosted **notifications service** в `marketing-strategy.md` list'ится для Tier 1, но scope = AccessGrant lifecycle emails. AccessGrant CRD в bucket C post-launch, поэтому hosted notifications **drop из launch scope**. Transactional emails — direct через Postmark/Sendgrid, не через notifications service abstraction. См. §7.5.)
 
 **Hosted Services architecture (launch tier):**
 
 - **Customer's cluster полностью автономен.** AppRafter operator + kine + NATS + все данные — на их Hetzner. Если они отключают наши hosted services — OSS-кластер продолжает работать.
 - **Подключение через outbound + agent.** В customer's cluster живёт `apprafter-agent` который establishes outbound connection к нашему hosted MCP/Backstage. Inbound listener на customer side не нужен — никакой firewall config.
 - **Registration token** заменяет наше владение customer credentials. Customer issues token к их cluster через `apprafter` CLI, paste'ит в Account UI signup, agent connects.
-- **Что мы видим:** только metadata (per `MANAGED_STRATEGY.md` §2 Minimal Data Exposure principle) — manifest applies, status events, log streams (если customer opt'инт), audit events. **Не видим:** customer data в PG/Redis, secret values, в общем-то ничего из application data plane.
+- **Что мы видим:** только metadata (per `marketing-strategy.md` Minimal Data Exposure principle) — manifest applies, status events, log streams (если customer opt'инт), audit events. **Не видим:** customer data в PG/Redis, secret values, в общем-то ничего из application data plane.
 
 **Implications для speedrun:**
 
@@ -59,7 +59,7 @@ Frontend-heavy work в managed-track (Bun + Svelte portal) может иметь
 2. **Killer feature #5 (Minimal Data Exposure) closes с launch** — by architecture мы literally видим только metadata. Hosted Services design = MDE ADR pre-launch enforceable.
 3. **Compliance positioning сильнейшее из 3 tiers** — мы НЕ touch customer data plane, мы НЕ sub-processor для compute, мы НЕ оператор customer infra. Group C-friendly architecture с дня 1.
 4. **Юр.поверхность minimal** — свой ToS, простой DPA (metadata only), нет sub-processor chain для compute.
-5. **Hetzner reseller risk (`MANAGED_STRATEGY.md` §4) — NOT APPLICABLE** на launch tier (это Tier 3 concern).
+5. **Hetzner reseller risk (`marketing-strategy.md`) — NOT APPLICABLE** на launch tier (это Tier 3 concern).
 6. **Onboarding journey — 4 шага** (Hetzner setup → CLI install → `target add` + `bootstrap-all` → managed signup + register). Friction acceptable если Account UI signup walkthrough hood. Soft wrapper `curl | sh` orchestrator — fallback option если в beta friction blocking. См. §7.6.
 
 **Tier 2 / Tier 3 ladder up** post-launch когда:
@@ -70,7 +70,7 @@ Frontend-heavy work в managed-track (Bun + Svelte portal) может иметь
 
 ## 1. Killer features на managed launch
 
-Per `KILLER_FEATURES_MATRIX.md`:
+Per `marketing-strategy.md`:
 
 ### 1.1 Закрываются на launch (sufficient для primary persona)
 
@@ -107,7 +107,7 @@ Per `KILLER_FEATURES_MATRIX.md`:
 
 ### 1.4 Marketing implication
 
-Launch claims следуют **strict KILLER_FEATURES_MATRIX §2.4 ruleset**: говорим только то что работает.
+Launch claims следуют **strict launch-claims ruleset** (`marketing-strategy.md`): говорим только то что работает.
 
 Honest launch claims:
 - ✅ «Sign up for T1 single-node или T2 3-node HA — both available today»
@@ -311,13 +311,13 @@ Items **отсутствующие в `plan.md`** — это правильно,
 
 **Что:** наш hosted MCP endpoint. AI клиент (Cursor/Claude) connects к `mcp.apprafter.app` с token. Запрос proxies через `apprafter-agent` в нужный customer cluster.
 
-Tools per `MANAGED_STRATEGY.md` §8.2 risk taxonomy:
+Tools per `marketing-strategy.md` risk taxonomy:
 - **Safe** (без ограничений): `list_apps`, `get_logs`, `get_status`, `get_metrics`
 - **Reversible write** (audit log): `scale_app`, `restart_app`, `redeploy_app`
 - **Bounded write** (heuristic + approval): `create_dev_env`, `deploy_to_staging`, `add_secret_to_dev`
 - **Destructive** (через gate, см. §3.5): `delete_app`, `drop_claim`, `change_tier`
 
-MCP token derivation per `MANAGED_STRATEGY.md` §8.5 — derived из customer Account UI auth (на launch упрощённо; full AccessGrant integration post-launch).
+MCP token derivation per `marketing-strategy.md` — derived из customer Account UI auth (на launch упрощённо; full AccessGrant integration post-launch).
 
 **Acceptance:** Cursor с MCP token → `list_apps` returns customer's apps в их зарегистрированном cluster → `scale_app` reaches агента → выполняется в их кластере → audit log на нашей стороне записывает.
 
@@ -326,12 +326,12 @@ MCP token derivation per `MANAGED_STRATEGY.md` §8.5 — derived из customer A
 ### 3.5 Destructive-op gate (via real MigrationPlan CRD)
 
 **Что:** managed control plane hooks MCP/portal writes к **real MigrationPlan CRD primitive** (landed в OSS-core per §2.1 — PlatformController + MigrationPlan condensed). API middleware:
-1. Classifies operation per `MANAGED_STRATEGY.md` §8.2 risk taxonomy
+1. Classifies operation per `marketing-strategy.md` risk taxonomy
 2. Safe/reversible → execute directly with audit log
 3. Bounded write → check heuristics (blast radius, time window, rate limit, diff size, environment-aware), then either execute or escalate
 4. Destructive → **create MigrationPlan CRD instance** в customer cluster через agent → pending approval
 
-Heuristics для bounded writes per `MANAGED_STRATEGY.md` §8.3:
+Heuristics для bounded writes per `marketing-strategy.md`:
 - Blast radius (refuse если > N apps)
 - Time-window (вне рабочих часов heuristic ужесточается)
 - Rate limit per MCP session
@@ -378,7 +378,7 @@ Heuristics для bounded writes per `MANAGED_STRATEGY.md` §8.3:
 
 ### 3.7 Stripe subscription + 14-day trial (no free tier)
 
-**Per `PRICING_AND_LAUNCH_NOTES.md` §2:**
+**Per `marketing-strategy.md`:**
 
 | Линия | Price |
 |---|---|
@@ -401,9 +401,9 @@ Heuristics для bounded writes per `MANAGED_STRATEGY.md` §8.3:
 - Customer's domain + DNS
 - Customer's email / external integrations
 
-**Prepaid model** per `PRICING_AND_LAUNCH_NOTES.md` §3.4. **Нет metered usage**, **нет free tier** (OSS играет эту роль).
+**Prepaid model** per `marketing-strategy.md`. **Нет metered usage**, **нет free tier** (OSS играет эту роль).
 
-**Trial scope:** 14 days full Hosted Services access без credit card. **Once per account** — abuse vector mitigation. После trial — credit card обязателен или access expires. Per `PRICING_AND_LAUNCH_NOTES.md` Section 1 принцип: «Hosted free tier — money sink без conversion path».
+**Trial scope:** 14 days full Hosted Services access без credit card. **Once per account** — abuse vector mitigation. После trial — credit card обязателен или access expires. Per `marketing-strategy.md` Section 1 принцип: «Hosted free tier — money sink без conversion path».
 
 **Acceptance:** customer signup без cc → 14-day trial activated → trial expiry → access expires (cluster продолжает работать как OSS, но без hosted UI/MCP) → customer adds card → access resumes.
 
@@ -424,7 +424,7 @@ Heuristics для bounded writes per `MANAGED_STRATEGY.md` §8.3:
 ### 3.9 ~~Free tier abuse prevention~~ — DROPPED (no free tier, no compute responsibility)
 
 **Why dropped в Hosted Services tier:**
-1. **No free tier** на managed — OSS plays the free role per `PRICING_AND_LAUNCH_NOTES.md` §1
+1. **No free tier** на managed — OSS plays the free role per `marketing-strategy.md`
 2. **14-day trial без cc** — abuse window mitigation: max 14 days × N email accounts; once-per-account check prevents serial abuse
 3. **Compute не наш** — crypto mining etc. — это customer's Hetzner account problem, Hetzner abuse process handles это
 4. **Hosted services usage минимален per customer** — Backstage views, MCP calls. Rate-limit-able через standard middleware (~1 day work, included в §3.1), не отдельная subphase
@@ -516,7 +516,7 @@ Sequential 6.5-9.5 месяцев календарно — это **на 5-9 м�
 
 **Status:** spec §7 open question #6 уже резолвлен: «Stay on Backstage for v1.0».
 **Speedrun choice:** Hosted Backstage с custom плагинами per spec. Custom portal на Bun+Svelte/OneBun — **post-1.0 option** если Lisa-feedback на Backstage UX окажется слабым.
-**My previous draft был wrong** про custom portal на launch — это противоречит spec и `PRICING_AND_LAUNCH_NOTES.md` §2 («Hosted Backstage portal с нашими плагинами»).
+**My previous draft был wrong** про custom portal на launch — это противоречит spec и `marketing-strategy.md` («Hosted Backstage portal с нашими плагинами»).
 **Action:** ничего. Спека уже зафиксировала.
 
 ### 5.2 ~~ADR: namespace-per-customer + Capsule vs Kamaji~~ — N/A в Hosted Services
@@ -525,7 +525,7 @@ Sequential 6.5-9.5 месяцев календарно — это **на 5-9 м�
 
 **Re-opens когда:** Tier 3 Turnkey Cloud landит post-launch — там мы держим многих customers' compute, hard mt vs soft mt становится релевантен.
 
-### 5.3 Pricing — fixed per `PRICING_AND_LAUNCH_NOTES.md` §2
+### 5.3 Pricing — fixed per `marketing-strategy.md`
 
 **No open question — values уже зафиксированы:**
 
@@ -538,7 +538,7 @@ Sequential 6.5-9.5 месяцев календарно — это **на 5-9 м�
 
 **No free tier.** No per-user pricing. No per-workspace base fee. **Prepaid model.**
 
-**Phase 4 measure (§9 `PRICING_AND_LAUNCH_NOTES.md`):**
+**Phase 4 measure (§9 `marketing-strategy.md`):**
 - COGS per cluster (actual cost)
 - Trial-to-paid conversion rate
 - Annual vs monthly mix
@@ -563,7 +563,7 @@ Sequential 6.5-9.5 месяцев календарно — это **на 5-9 м�
 
 ### 5.5 Managed control plane infrastructure decisions
 
-- **Domain:** `apprafter.dev` (existing) или новый `apprafter.app` для managed services? `PRICING_AND_LAUNCH_NOTES.md` использует `apprafter.app` — likely уже decided
+- **Domain:** `apprafter.dev` (existing) или новый `apprafter.app` для managed services? `marketing-strategy.md` использует `apprafter.app` — likely уже decided
 - **Где хостить:** **dogfooding plan — наш host = AppRafter на собственном Hetzner account** (Tier 2 substrate теперь в OSS-core). Account UI backend → k8s API → spawns customer namespaces as standard AppRafter Application instances. Marketing claim «we host AppRafter on AppRafter». customer's tokens мы НЕ держим, KMS choice не критичен — но host security всё ещё важен для customer metadata
 - **Backup и DR plan для control plane itself** — important, потому что control plane outage = customers потеряют UI/MCP access (clusters сами продолжают работать, но это плохой experience). Через standard 4.12 backups к external S3
 - **Rescue cluster setup (#22 killer feature)** — отдельный кластер для emergency host access к нашему host-кластеру. Это **dogfooding signal** для marketing — «у нас тоже рассе есть»
@@ -654,7 +654,7 @@ Remaining gap: LLM-reviewer для MigrationPlan approval — Phase 4+ feature, 
 
 ### 7.5 Notifications service drop — confirmed для launch
 
-Hosted notifications service в `MANAGED_STRATEGY.md` §3.1 listed as part of Hosted Services. Но **scope hosted notifications — это AccessGrant lifecycle emails** (magic link, expiry warnings, revocation notifications per `spec.md` §3.4).
+Hosted notifications service в `marketing-strategy.md` listed as part of Hosted Services. Но **scope hosted notifications — это AccessGrant lifecycle emails** (magic link, expiry warnings, revocation notifications per `spec.md` §3.4).
 
 AccessGrant CRD сам **в bucket C post-launch** (см. §2.3 — `plan.md` 4.5/4.5a, trigger condition «team-of-3+ customer signal»). Без AccessGrant — hosted notifications service на launch **не нужен**.
 
@@ -681,9 +681,9 @@ Lisa-class customer проходит **4 шага** (по `apprafter` infrastruc
 
 **Mitigations для launch:**
 - **Account UI onboarding walkthrough — primary mitigation.** При signup показываем все 4 шага со screenshots, copy-pasteable commands, real-time status check («connection from your CLI detected ✓»). Это **наша core UX work** в §3.3 Backstage / Account UI scope
-- llms.txt + AI-friendly docs (per `PRELAUNCH_CHECKLIST.md` §3.3) — AI агенты могут guide
+- llms.txt + AI-friendly docs (per `marketing-strategy.md`) — AI агенты могут guide
 - 90-second video walkthrough
-- Affiliate link Hetzner signup (заработать % per `MANAGED_STRATEGY.md`)
+- Affiliate link Hetzner signup (заработать % per `marketing-strategy.md`)
 
 **Soft wrapper option — если в beta friction окажется high:**
 
@@ -703,7 +703,7 @@ curl -fsSL https://apprafter.dev/launch | sh -- --account-token <managed-token>
 
 ### 7.7 Solo execution risk
 
-Sequential 6.5-9.5 месяцев — это **window для конкурентов** (Coolify добавляет MCP, Vercel/Railway добавляют agentic safety, новый entrant появляется). Mitigation: public roadmap + early developer mindshare через AI-discoverability (llms.txt, public presence per `PRELAUNCH_CHECKLIST.md` §3.3-3.4) даже до launch.
+Sequential 6.5-9.5 месяцев — это **window для конкурентов** (Coolify добавляет MCP, Vercel/Railway добавляют agentic safety, новый entrant появляется). Mitigation: public roadmap + early developer mindshare через AI-discoverability (llms.txt, public presence per `marketing-strategy.md`-3.4) даже до launch.
 
 ### 7.8 T1→T2 migration delay risk
 
@@ -752,12 +752,12 @@ T1→T2 migration deliverable отложен на post-launch first bundle (~2-4
     - **§4.1 sequential total:** 24.5-37 нед FT ≈ 6-9 месяцев календарно
 
 - **2026-05-17 (revision 3)** — Managed offering tier ladder correction:
-    - Recognized 3-tier ladder per `MANAGED_STRATEGY.md` §3: Hosted Services / Managed Operations / Turnkey Cloud
+    - Recognized 3-tier ladder per `marketing-strategy.md`: Hosted Services / Managed Operations / Turnkey Cloud
     - **Hosted Services** (lightest) — launch tier. Previous revision incorrectly identified Managed Operations as launch.
     - 3.1-3.4 переписаны radically: hosted multi-tenant SaaS scaffolding + `apprafter-agent` для outbound connection vs «control plane operating customer clusters»
     - **3.2a simpler:** customer offboarding это просто revoke registration token — OSS-кластер уже автономен, нет необходимости в self-host kit shipping
     - **3.3 переосмыслен — Hosted Backstage**, не custom portal. Spec §7 #6 уже резолвлен в favour of Backstage, мой previous draft был wrong
-    - **3.7 fixed pricing:** €10/mo per cluster, 14-day trial без cc once per account, NO free tier (OSS plays free role per `PRICING_AND_LAUNCH_NOTES.md` §1), prepaid only, annual = save 2 months
+    - **3.7 fixed pricing:** €10/mo per cluster, 14-day trial без cc once per account, NO free tier (OSS plays free role per `marketing-strategy.md`), prepaid only, annual = save 2 months
     - **5.1 RESOLVED** (custom vs Backstage) — spec already decided
     - **5.5 KMS не критичен** — мы не держим customer credentials в Hosted Services
     - **5.6 NEW:** ADR для `apprafter-agent` protocol (gRPC/WebSocket/NATS client)

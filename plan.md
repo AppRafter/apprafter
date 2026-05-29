@@ -1828,7 +1828,7 @@ instead of carrying parallel definitions.
 **Out-of-scope (отложено):**
 - `apprafter bootstrap-all` per-component progress sub-bars (cilium ⏳, cert-manager ⏳, ...). Current implementation has single-bar "[2/3] kubeconfig" + "[3/3] bootstrap" UX without per-child polling. Adding `kubectl get applications -n argocd -o jsonpath='...'` poll loop is a UX-polish iteration, not blocking 1.70.
 - `apprafter cluster-bootstrap --manifest <path>` flag + auto-discovery from CWD — current `APPRAFTER_MANIFEST` env-var still works. Manifest overlay → root Application's `helm.valuesObject` requires CLI knowledge of chart values shape; defer to 1.71 cutover.
-- Idempotent resume на каждом шаге (PRELAUNCH_CHECKLIST P1 item 3.1) — `helm upgrade --install` + `kubectl apply` уже idempotent на step level; what's NOT yet idempotent — partial state when waits timeout (e.g. argocd-server up but root Application apply failed). Defer полная resume semantics.
+- Idempotent resume на каждом шаге (pre-launch P1 requirement) — `helm upgrade --install` + `kubectl apply` уже idempotent на step level; what's NOT yet idempotent — partial state when waits timeout (e.g. argocd-server up but root Application apply failed). Defer полная resume semantics.
 - E2E test (`e2e/mvp.sh`) update — currently tests imperative install. Rewriting it для GitOps path = separate iteration после first real-cluster verification.
 
 **Зависит от:** 1.66 ✅, 1.67 ✅, 1.68 ✅, 1.69 ✅ (platform-stack chart must be publishable + CMP sidecar wired before CLI references it).
