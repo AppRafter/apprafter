@@ -99,7 +99,7 @@ Per `KILLER_FEATURES_MATRIX.md`:
 - **#4** Cross-cluster MigrationPlan (Product 2) — Phase 8 territory
 - **#8** Tier 4 confidential containers — Phase 6
 - **#10** Cluster-admin constrain 8-layer — Phase 4+ (но Hosted Services architecture даёт #3 layer structurally — мы external, не оперируем customer cluster-admin)
-- **#11** Hard multi-tenancy via Kamaji — post-launch backlog (Tier 2+ opt-in feature, не default на launch — spec deviation requires ADR §5.6)
+- **#11** Hard multi-tenancy via Kamaji — post-launch backlog (Tier 2+ opt-in feature, не default на launch — spec deviation requires ADR §5.7)
 - **#12** Vertical integration audit/identity — depends on SPIRE (post-launch)
 - **#20** Plugin Migration Interface — Phase 5+
 - **#21** kine+NATS replayable audit log — etcd на launch, kine+NATS post-launch когда audit replayability нужна как differentiator
@@ -168,7 +168,7 @@ Honest launch claims:
 | **3.5** | ClickHouse provider (full obs backend) | Маша-class signal «нужны long-term traces/logs retention» |
 | **3.6** | VictoriaMetrics integration | Same as 3.5 |
 | **3.7b** | Backstage flow visualizer plugin | Depends on Hubble + Backstage UX priority |
-| **3.8/3.8a** | Kamaji + Capsule + Tenant CRD (opt-in для T2, default для T3+) | First hard-mt customer ask, OR MSP scenario (Андрей-A) signal. **Spec deviation требует ADR (§5.6)** |
+| **3.8/3.8a** | Kamaji + Capsule + Tenant CRD (opt-in для T2, default для T3+) | First hard-mt customer ask, OR MSP scenario (Андрей-A) signal. **Spec deviation требует ADR (§5.7)** |
 | **3.9** | Cilium Egress Gateway + family-aware static IPs | Customer signal «нужен static IP для third-party API» |
 | **3.10 + post-launch first bundle** | `apprafter migrate-to-tier --to team` CLI tool + **4.16 Backstage MigrationPlan plugin** | **Post-launch first bundle (~2-4 недели после launch)**. Customer-side CLI tool (мы не управляем клиентскими кластерами) + Backstage plugin bundled because second user-visible MigrationPlan case lands then |
 | **3.11/3.12** | OpenBao 3-node HA + SealedSecrets migration | Depends on SPIRE (2.7-2.8) landed |

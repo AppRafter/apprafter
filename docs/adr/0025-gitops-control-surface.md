@@ -93,7 +93,7 @@ This is the standard pattern used by Argo CD Autopilot and similar tools; not a 
 
 **Main risk:** poor bootstrap UX during the reconciliation phase. Users see "nothing is happening" between loader completion and platform-stack ready.
 
-**Mitigation:** `apprafter bootstrap-all` uses `indicatif::MultiProgress` to show both the loader phase and the post-loader reconcile phase. The reconcile-phase progress queries Argo CD via API for the root Application's child statuses and updates the bar as each platform component reports `Healthy`. Idempotent resume on any step (already in the PRELAUNCH_CHECKLIST as P1 item 3.1).
+**Mitigation:** `apprafter bootstrap-all` uses `indicatif::MultiProgress` to show both the loader phase and the post-loader reconcile phase. The reconcile-phase progress queries Argo CD via API for the root Application's child statuses and updates the bar as each platform component reports `Healthy`. Idempotent resume on any step (a pre-launch P1 requirement).
 
 **Secondary risk:** an Argo CD self-update that produces a broken Argo CD pod that cannot recover itself. Mitigation: Argo CD version changes are classified as at least `requires-restart` in MigrationPlan (ADR 0027), so approval is explicit and the user has been warned about the procedure. A documented manual recovery path (`apprafter platform rescue`) reinstalls Argo CD from the loader in case of total Argo CD failure.
 

@@ -1404,7 +1404,7 @@ The following features are declared in the Application manifest schema and accep
 
 15. **Cross-tier PlatformStack semantics.** When a user upgrades from Tier 1 to Tier 2, does the existing PlatformStack mutate (`spec.values.tier: solo → team`) or is a new instance created? Lean toward in-place mutation with MigrationPlan gating; will revisit in tier-upgrade design work for Phase 3. See ADR 0026 still-open.
 
-16. **Multi-cluster PlatformStack aggregation.** Managed offering (MANAGED_STRATEGY.md) requires viewing platform versions across many customer clusters. Out of scope for v1; addressed in managed-offering control-plane design.
+16. **Multi-cluster PlatformStack aggregation.** The managed offering (ADR 0034; the cross-cluster aggregator) requires viewing platform versions across many customer clusters. Out of scope for v1; addressed in the managed-offering control-plane design (ADR 0037).
 
 17. **Canonical filename for user app CUE.** Phase 1.11 uses `apprafter/Application.cue`. Alternatives include `apprafter.cue` at repository root or `.apprafter/app.cue`. Recommendation per ADR 0029 is to keep `apprafter/Application.cue`; settling early prevents fragmentation across user repositories.
 
