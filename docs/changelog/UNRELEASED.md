@@ -13,6 +13,121 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## platform-stack 0.1.48 + argocd-cue-cmp v0.1.6 — M1.5 walk-fix #11 post-B.1.79b-Part-3b — CMP entrypoint cds into package dir (2026-05-29)
+
+### Symptom
+
+After walk-fix #5 (scaffold vendors schemas as а `cue.mod/`
+inside `apprafter/`), the operator re-scaffolded и pushed,
+but Argo CD still failed — а NEW error this time:
+
+```
+plugin sidecar failed. error generating manifests in cmp:
+... `sh -c /usr/local/bin/entrypoint.sh` failed exit status 1:
+::cue-cmp:: CUE compile failed: cue: "./..." matched no
+packages
+```
+
+The manifest was pushed (github.com/ProcVue/landing
+`apprafter/Application.cue`) and the image published
+(`ghcr.io/procvue/landing:latest`) — the failure was purely
+in CMP manifest generation.
+
+### Root cause
+
+A nested `cue.mod/` defines а CUE **module boundary**. Argo
+CD sets the CMP working directory к the Application's
+`spec.source.path` (repo-root-relative). For а scaffolded
+repo with the manifest at `apprafter/Application.cue` and
+`source.path` = repo root, the entrypoint ran `cue export
+./...` from the repo root — which does NOT descend into the
+nested `apprafter/` module, hence "matched no packages".
+
+This is а regression introduced by walk-fix #5: before the
+vendored `cue.mod/`, `cue export ./...` from the parent
+recursed freely into `apprafter/` (no module boundary). The
+walk-fix #5 smoke ran `cd apprafter && cue vet` from INSIDE
+the package dir, so it never exercised the parent-cwd path
+CMP actually uses.
+
+### Fix
+
+`argocd-cue-cmp/entrypoint.sh` now resolves the package
+directory before `cue export`, mirroring the
+`discover.find.command` convention in plugin.yaml:
+
+```sh
+if [ "$(basename "$PWD")" != "apprafter" ] \
+   && [ -d ./apprafter ] \
+   && find ./apprafter -maxdepth 1 -type f -name '*.cue' -print -quit | grep -q .; then
+    cd ./apprafter
+fi
+```
+
+After the cd, `cue export ./...` resolves the module by
+walking UP from the new cwd, so it works in all three layouts:
+
+- **Scaffolded external repo** — vendored `cue.mod/` inside
+  `apprafter/` (local module). cd in, resolve locally.
+- **AppRafter monorepo** — `cue.mod/` at the repo root,
+  shared across many apps (`spec.source.path` =
+  `landing/web`). cd into `landing/web/apprafter`, cue walks
+  up to the root module.
+- **source.path already = apprafter** — basename is
+  `apprafter`, no cd, run in place.
+
+`cue.mod/pkg/` (the dependency cache) is excluded from `./...`
+evaluation, so the vendored schema package is never emitted
+as а manifest.
+
+### Self-healing
+
+Existing registrations work after the image upgrade WITHOUT
+re-registering, regardless of which `spec.source.path` they
+were created with — the entrypoint locates the package dir
+either way. procvue-landing (registered с `source.path` =
+repo root) just works after:
+
+```
+apprafter platform upgrade --to 0.1.48
+kubectl rollout restart deployment/argocd-repo-server -n argocd
+kubectl -n argocd annotate applications.argoproj.io \
+    procvue-landing argocd.argoproj.io/refresh=hard --overwrite
+```
+
+### Regression guard
+
+`argocd-cue-cmp-check.yml` gains а second entrypoint smoke
+that builds the EXACT scaffold layout — `apprafter/` with а
+nested `cue.mod/` carrying vendored schemas (copied from the
+repo's `schemas/v1alpha1/`) + а typed manifest that `import`s
+`apprafter.io/schemas/v1alpha1` — runs the entrypoint with
+cwd = the PARENT (as Argo CD does for `source.path` = repo
+root), and asserts it cds in and renders the typed manifest
++ the expected image ref. Before this fix the new smoke
+fails with "matched no packages".
+
+Verified locally against the real schemas: entrypoint from
+the parent dir renders `kind: Application` +
+`ghcr.io/procvue/landing:latest`. The pre-existing style-A
+smoke (no cue.mod, manifest in `apprafter/` subdir) still
+renders correctly through the cd. `test-discover.sh`: 5/5.
+
+### Versions
+
+- `argocd-cue-cmp` v0.1.5 → v0.1.6 (entrypoint.sh change
+  baked into the image; the ConfigMap-mounted plugin.yaml is
+  unchanged).
+- `platform-stack` 0.1.47 → 0.1.48 (image pin flips via the
+  `argocdcuecmp.version` CUE import; compat entry
+  `compatibility: "0.1.48"` shipped). Rendered chart:
+  `image: ghcr.io/apprafter/argocd-cue-cmp:v0.1.6`.
+- **No CLI bump** — per the v0.1.159 channel-latest design,
+  chart + cue-cmp-image changes flow into existing installs
+  through PlatformController polling и
+  `resolve_latest_platform_stack_version()` on fresh
+  bootstraps. `cli/Cargo.toml` stays at 0.1.174.
+
 ## v0.1.174 — M1.5 walk-fix #6 post-B.1.79b-Part-3b — scaffold derives image ref from git origin (2026-05-29)
 
 ### Reframe

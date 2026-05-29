@@ -117,6 +117,64 @@ jobs:
           fi
           echo "::notice::entrypoint smoke: rendered Application correctly"
 
+      - name: Entrypoint smoke — vendored cue.mod from parent dir (walk-fix #11)
+        # Reproduces the `apprafter app scaffold` layout: an
+        # `apprafter/` directory carrying its OWN `cue.mod/`
+        # (vendored AppRafter schemas), with a typed manifest
+        # that `import`s `apprafter.io/schemas/v1alpha1`. The
+        # entrypoint runs with cwd = the PARENT (as Argo CD
+        # does when `spec.source.path` is the repo root), and
+        # must cd into `apprafter/` so `cue export` crosses the
+        # nested module boundary. Before walk-fix #11 this
+        # failed with `cue: "./..." matched no packages`.
+        run: |
+          root=/tmp/cue-mod-smoke
+          pkg="$root/apprafter/cue.mod/pkg/apprafter.io/schemas/v1alpha1"
+          mkdir -p "$pkg"
+          # Vendor the real schemas (exactly what scaffold copies).
+          cp schemas/v1alpha1/types.cue "$pkg/types.cue"
+          cp schemas/v1alpha1/application.cue "$pkg/application.cue"
+          cat > "$root/apprafter/cue.mod/module.cue" <<'EOF'
+          module: "apprafter.io/local-app"
+
+          language: {
+          	version: "v0.10.0"
+          }
+          EOF
+          cat > "$root/apprafter/Application.cue" <<'EOF'
+          package apprafter
+
+          import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+          landing: v1alpha1.#Application & {
+          	metadata: {
+          		name:      "landing"
+          		namespace: "apprafter"
+          	}
+          	spec: base: {
+          		image: "ghcr.io/procvue/landing:latest"
+          		expose: port: 8080
+          	}
+          }
+          EOF
+          out=$(docker run --rm \
+              -v "$root":/repo \
+              -w /repo \
+              --entrypoint /usr/local/bin/entrypoint.sh \
+              argocd-cue-cmp:check)
+          if ! echo "$out" | grep -q "kind: Application"; then
+            echo "::error::entrypoint did not render typed manifest from nested cue.mod"
+            echo "--- captured output ---"
+            echo "$out"
+            exit 1
+          fi
+          if ! echo "$out" | grep -q "ghcr.io/procvue/landing:latest"; then
+            echo "::error::entrypoint output missing the expected image ref"
+            echo "$out"
+            exit 1
+          fi
+          echo "::notice::entrypoint smoke: vendored cue.mod from parent dir rendered correctly"
+
       - name: Drift detection (image source changed without version.cue bump)
         env:
           VERSION: ${{ steps.version.outputs.version }}

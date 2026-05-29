@@ -1683,6 +1683,105 @@ compatibility: "0.1.23": {
 // 0.1.44 (`apprafter platform upgrade --to 0.1.45` +
 // `kubectl rollout restart deployment/argocd-repo-server
 // -n argocd`).
+// Walk-fix #11 post-B.1.79b-Part-3b — CMP entrypoint cds
+// into the `apprafter/` package directory before `cue
+// export`. The scaffold (walk-fix #5 post-Part-3b) vendors
+// AppRafter schemas as a `cue.mod/` INSIDE `apprafter/`,
+// which defines a CUE module boundary; `cue export ./...`
+// run from a parent (Argo CD's cwd when `spec.source.path`
+// is the repo root) does not cross into the nested module
+// and fails with `cue: "./..." matched no packages`. The
+// entrypoint now mirrors the discover convention: if cwd
+// isn't already `apprafter/` and `./apprafter/` holds `.cue`
+// files, cd into it. Self-healing — existing registrations
+// (any source.path) work after the image upgrade without
+// re-registering. cue-cmp image v0.1.5 → v0.1.6 (entrypoint
+// .sh change baked into the image), chart pin follows via
+// the `argocdcuecmp.version` CUE import.
+compatibility: "0.1.48": {
+	change:          "safe"
+	operatorVersion: "v0.1.134"
+	notes: """
+		Walk-fix #11 post-B.1.79b-Part-3b — CMP entrypoint
+		runs `cue export` from inside the `apprafter/`
+		package directory (cue-cmp v0.1.6).
+
+		**Symptom.** Operator scaffolded а user app
+		(`apprafter app scaffold`), which now vendors the
+		AppRafter v1alpha1 schemas as а `cue.mod/` INSIDE
+		`apprafter/` (walk-fix #5 post-Part-3b — typed CUE
+		without external module setup). After pushing the
+		manifest и hard-refreshing, Argo CD surfaced:
+
+			```
+			plugin sidecar failed. error generating manifests
+			in cmp: ... `sh -c /usr/local/bin/entrypoint.sh`
+			failed exit status 1: ::cue-cmp:: CUE compile
+			failed: cue: "./..." matched no packages
+			```
+
+		**Root cause.** А nested `cue.mod/` defines а CUE
+		MODULE BOUNDARY. Argo CD sets the CMP working
+		directory к the Application's `spec.source.path`
+		(repo-root-relative). For а scaffolded repo with the
+		manifest at `apprafter/Application.cue` и
+		`source.path` = repo root, the entrypoint ran
+		`cue export ./...` from the repo root — which does
+		NOT descend into the nested `apprafter/` module,
+		hence "matched no packages". (Local `cd apprafter &&
+		cue vet` worked, which is why the scaffold smoke
+		didn't catch it — the smoke ran from inside the
+		package dir.)
+
+		**Fix.** The entrypoint now resolves the package
+		directory before `cue export`, mirroring the
+		`discover.find.command` convention:
+
+		  * cwd basename `apprafter` → run here.
+		  * else if `./apprafter/` holds `.cue` files → cd
+		    into it.
+		  * else → run in cwd (filename-prefix / fixture).
+
+		After the cd, `cue export ./...` resolves the module
+		by walking UP — so it works whether the `cue.mod/` is
+		the vendored one inside `apprafter/` (external
+		scaffolded repo) OR a repo-root module shared across
+		many apps (the AppRafter monorepo's own landing
+		manifests, `spec.source.path` = `landing/web`). The
+		`cue.mod/pkg/` dependency cache is excluded from
+		`./...`, so the vendored schema package is never
+		emitted as а manifest.
+
+		**Self-healing.** Existing registrations work after
+		the image upgrade без re-registering, regardless of
+		the `spec.source.path` they were created with —
+		`apprafter platform upgrade --to 0.1.48` +
+		`kubectl rollout restart deployment/argocd-repo-server
+		-n argocd` + hard-refresh the affected apps.
+
+		**Regression guard.** `argocd-cue-cmp-check.yml`
+		gains а second entrypoint smoke that builds the exact
+		scaffold layout (apprafter/ + nested cue.mod with
+		vendored schemas + а typed manifest that `import`s
+		`apprafter.io/schemas/v1alpha1`), runs the entrypoint
+		with cwd = the PARENT, and asserts it cds in and
+		renders the typed manifest. Before this fix the new
+		smoke fails with "matched no packages".
+
+		**Rendered chart vs 0.1.47.** cue-cmp sidecar image
+		pin flips v0.1.5 → v0.1.6 (entrypoint.sh change baked
+		into the image; the ConfigMap-mounted plugin.yaml is
+		unchanged). argocd-repo-server's sidecar rotates on
+		chart upgrade.
+		"""
+	references: [
+		"docs/adr/0029-cue-cmp.md",
+		"argocd-cue-cmp/entrypoint.sh",
+		".github/workflows/argocd-cue-cmp-check.yml",
+		"docs/changelog/UNRELEASED.md",
+	]
+}
+
 // Walk-fix #11 post-B.1.79a — `Namespace` cluster resource
 // added к `apps` AppProject's `clusterResourceWhitelist`.
 // Wizard-generated user apps carry `syncOptions:

@@ -54,6 +54,39 @@
 
 set -eu
 
+# ── Locate the CUE package directory ───────────────────────
+#
+# Argo CD sets the working directory to the Application's
+# `spec.source.path` (repo-root-relative). The AppRafter
+# manifest lives in an `apprafter/` directory that, for
+# scaffolded user repos, carries its OWN `cue.mod/` (vendored
+# schemas — `apprafter app scaffold` walk-fix post-Part-3b).
+#
+# A nested `cue.mod/` defines a MODULE BOUNDARY: `cue export
+# ./...` run from a PARENT directory does not descend into the
+# nested module, so it reports "matched no packages". The fix
+# is to run `cue export` from INSIDE the package directory.
+# Mirror the discovery convention from plugin.yaml:
+#
+#   * cwd basename `apprafter` → source.path already points at
+#     the convention directory; run here (cue.mod, if any, is
+#     in cwd or an ancestor).
+#   * else if `./apprafter/` holds `.cue` files → cd into it.
+#     Covers source.path pointing at the repo root / a parent.
+#   * else → run in cwd (filename-prefix convention, or the
+#     CI fixture that writes the manifest at cwd directly).
+#
+# After the cd, `cue export ./...` resolves the module by
+# walking UP from the new cwd — so this works whether the
+# `cue.mod/` is the vendored one inside `apprafter/` (external
+# scaffolded repo) OR a repo-root `cue.mod/` shared across
+# many apps (the AppRafter monorepo's own landing manifests).
+if [ "$(basename "$PWD")" != "apprafter" ] \
+   && [ -d ./apprafter ] \
+   && find ./apprafter -maxdepth 1 -type f -name '*.cue' -print -quit | grep -q .; then
+    cd ./apprafter
+fi
+
 # Use temp files so we can capture both the JSON body and
 # any stderr without merging streams (Argo CD reads stdout
 # for manifests; stderr is the diagnostic surface).
@@ -62,11 +95,13 @@ err_out=$(mktemp)
 trap 'rm -f "$json_out" "$err_out"' EXIT
 
 # `./...` recursively evaluates all CUE files under the
-# current directory, including imports that resolve through
-# `cue.mod/module.cue` at the repo root (CUE walks upward
-# from cwd to find the module manifest, so a sub-directory
-# source path works as long as the repo root carries
-# cue.mod/).
+# current directory (now the package dir after the cd above),
+# resolving imports through the nearest `cue.mod/module.cue`
+# CUE finds walking upward — the vendored module inside
+# `apprafter/` for scaffolded repos, or a repo-root module
+# for the monorepo. `cue.mod/pkg/` itself is the dependency
+# cache and is excluded from `./...` evaluation, so the
+# vendored schema package is never emitted as a manifest.
 #
 # JSON intermediate (rather than YAML) keeps key extraction
 # trivial via `jq`.
