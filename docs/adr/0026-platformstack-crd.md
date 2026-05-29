@@ -189,7 +189,7 @@ Core platform team. PlatformController may become a sub-team responsibility in P
 ## Still open
 
 - **Cross-tier `PlatformStack` semantics.** When a user upgrades from Tier 1 to Tier 2, does the existing `PlatformStack` mutate (`spec.values.tier: solo → team`) or is a new instance created? Lean toward in-place mutation with MigrationPlan gating; will revisit in tier-upgrade design work for Phase 3.
-- **Multi-cluster `PlatformStack` aggregation.** Managed offering (MANAGED_STRATEGY.md) requires viewing platform versions across many customer clusters. Out of scope for this ADR; addressed in managed-offering control-plane design.
+- **Multi-cluster `PlatformStack` aggregation.** The managed offering (ADR 0034; the cross-cluster aggregator) requires viewing platform versions across many customer clusters. Out of scope for this ADR; addressed in the managed-offering control-plane design (ADR 0037).
 
 ## References
 

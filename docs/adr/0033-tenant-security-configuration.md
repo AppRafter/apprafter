@@ -12,7 +12,7 @@ Two prior ADRs touched on workload data protection but left the trust model unde
 
 - **ADR 0024** declared an 8-layer defense-in-depth bundle for cluster-admin constraint. Layer 8 (CoCo) was described as "the complete cryptographic solution" — but if AppRafter controls the attestation verifier and the key store, Layer 8 is decorative against AppRafter as adversary.
 
-Customer discussions for Turnkey Cloud (Phase 4 launch, see `PRICING_AND_LAUNCH_NOTES.md`) surfaced two distinct threat models requiring distinct responses:
+Customer discussions for Turnkey Cloud (the most operated managed plan, see ADR 0034) surfaced two distinct threat models requiring distinct responses:
 
 1. **Tenant-internal adversary** — small and mid-size companies with strong technical leadership but limited trust in their own ops/devops teams. Want to constrain what cluster admins can see without requiring confidential hardware.
 
@@ -118,7 +118,7 @@ security: {
 
 The following names are used in marketing, onboarding flows, and pricing pages. They are *not* CRD constructs — they describe common combinations of switch values, deployment modes, and URL placements.
 
-The patterns reference two cluster deployment modes (defined in `MANAGED_STRATEGY.md`):
+The patterns reference two cluster deployment modes (reconciled with the managed plans in ADR 0034):
 - **Turnkey** — AppRafter's Hetzner account, AppRafter operates host. AppRafter has host access; customer has only kubectl into their TenantControlPlane.
 - **Managed Ops** — customer's Hetzner account, AppRafter operates the cluster via Kubernetes API only (no host SSH, no Hetzner token). Customer's people (CTO and/or devops, depending on their internal access carving) have host access.
 
@@ -371,5 +371,5 @@ Specific sub-phase numbering recorded in PLAN_CHANGES after this ADR lands.
 - Sigstore + Cosign: https://www.sigstore.dev
 - AWS KMS: https://aws.amazon.com/kms/
 - spec.md §3.9 (Tenant CRD), §4.1 (Compute Substrate per-tier), §4.4 (Workload identity), §4.10 (Audit pipeline).
-- MANAGED_STRATEGY.md (Plane A/B separation context).
-- PRICING_AND_LAUNCH_NOTES.md (Turnkey Cloud customer segments and pricing principles).
+- ADR 0034 — managed offering model and terminology (managed plans, Plane A/B separation, deployment-mode reconciliation).
+- ADR 0037 — managed control-plane infrastructure (AppRafter-hosted KMS/verifier on dogfooded infrastructure for the Managed Operations confidential pattern).

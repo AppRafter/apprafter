@@ -2,7 +2,7 @@
 
 ## Status
 
-`Proposed` | `Accepted` | `Deprecated` | `Superseded by ADR NNNN`
+`Proposed` | `Draft` | `Accepted` | `Deprecated` | `Superseded by ADR NNNN`
 
 Date: YYYY-MM-DD.
 

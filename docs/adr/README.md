@@ -13,10 +13,13 @@ an ADR is later superseded.
 
 ## Statuses
 
-- `Proposed` — under discussion, not yet ratified.
+- `Proposed` — raised for discussion; the decision is not yet made.
+- `Draft` — the decision is made and written, but not yet ratified.
 - `Accepted` — ratified; implementations should follow it.
 - `Deprecated` — no longer applies, but kept for history.
 - `Superseded by ADR NNNN` — replaced by a newer decision.
+- `Template` — the ADR template itself, not a decision.
+- `Unused` — a reserved number that was never used; kept to preserve sequential numbering.
 
 ADRs are never deleted; supersession preserves the historical record.
 
@@ -54,3 +57,12 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0027 | [MigrationPlan unification with scope discriminator](./0027-migrationplan-unification.md)                  | Draft    |
 | 0028 | [Platform-stack distribution — CUE source, dual-channel publishing](./0028-platform-stack-distribution.md) | Draft    |
 | 0029 | [CUE compilation for user app repositories via Argo CD CMP](./0029-cue-cmp.md)                             | Draft    |
+| 0030 | [CLI target store and credential resolution chain](./0030-cli-target-store-and-credential-chain.md)        | Accepted |
+| 0031 | [`apprafter-agent` ↔ hosted-bus protocol — gRPC streaming with Rust agent](./0031-apprafter-agent-protocol.md) | Accepted |
+| 0032 | [Migrate core license base from FSL-1.1-MIT to FSL-1.1-Apache-2.0](./0032-license-fsl-1-1-apache-2-0.md)   | Accepted |
+| 0033 | [Tenant security configuration — strictMode and confidential as orthogonal switches](./0033-tenant-security-configuration.md) | Accepted |
+| 0034 | [Managed offering model and terminology — hosted-management layer, hardware tier vs managed plan](./0034-managed-offering-model.md) | Accepted |
+| 0035 | [Minimal Data Exposure — managed services see metadata only, never customer data](./0035-minimal-data-exposure.md) | Accepted |
+| 0036 | [MCP server and agentic-safety model — structural enforcement at the platform boundary](./0036-mcp-agentic-safety.md) | Accepted |
+| 0037 | [Managed control plane infrastructure — dogfooded on AppRafter, rescue-cluster recovery](./0037-managed-control-plane-infrastructure.md) | Accepted |
+| 0038 | [Tier 2 default is an HA substrate only; hard multi-tenancy via Kamaji is opt-in](./0038-tier2-kamaji-opt-in.md) | Accepted |
