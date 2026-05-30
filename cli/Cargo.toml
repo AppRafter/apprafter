@@ -12,7 +12,7 @@ members = [
 # Bumped to match each released patch tag per the CONTRIBUTING.md
 # "Versioning" rule. Drifted at 0.1.2 from initial v0.1.2 commit
 # through v0.1.76; the policy starts at v0.1.77.
-version      = "0.1.174"
+version      = "0.1.175"
 edition      = "2021"
 rust-version = "1.88"
 license      = "FSL-1.1-Apache-2.0"
@@ -36,6 +36,11 @@ ureq                 = { version = "2.10", features = ["json"] }
 mockito              = "1.5"
 age                  = { version = "0.10", default-features = false, features = ["armor"] }
 base64               = "0.22"
+rsa                  = "0.9"
+aes-gcm              = "0.10"
+sha2                 = "0.10"
+x509-cert            = { version = "0.2", features = ["pem"] }
+rand                 = "0.8"
 include_dir          = "0.7"
 dirs                 = "5"
 indicatif            = "0.17"

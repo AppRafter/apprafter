@@ -10,6 +10,7 @@ pub mod helm;
 pub mod image_ref;
 pub mod kubectl;
 pub mod loader_values;
+pub mod sealing;
 
 pub use channel_latest::resolve_latest_platform_stack_version;
 pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs};

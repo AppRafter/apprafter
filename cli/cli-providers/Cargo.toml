@@ -21,6 +21,12 @@ serde_json = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
 ureq       = { workspace = true }
+# Native sealed-secrets sealing (1.79c S0): RSA-OAEP-SHA256 ⊗ AES-256-GCM.
+rsa        = { workspace = true }
+aes-gcm    = { workspace = true }
+sha2       = { workspace = true }
+x509-cert  = { workspace = true }
+rand       = { workspace = true }
 
 [dev-dependencies]
 mockito = { workspace = true }

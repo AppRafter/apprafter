@@ -215,6 +215,45 @@ pub enum Commands {
         #[command(subcommand)]
         action: RepoCommand,
     },
+    /// Seal secret material with the in-cluster sealed-secrets
+    /// controller's public cert. The CLI cannot decrypt what it
+    /// seals (no cluster private key), so the output is safe to
+    /// print, commit to Git, or apply. Backs the private-repo
+    /// credential flow (1.79c / ADR 0039).
+    Secret {
+        #[command(subcommand)]
+        action: SecretCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Seal one or more `--from-literal KEY=VALUE` pairs into a
+    /// bitnami `SealedSecret`. Fetches the controller's public
+    /// cert over the TLS-authenticated kube API (strict scope:
+    /// the sealed blob only unseals as `<namespace>/<name>`).
+    Seal {
+        /// SealedSecret `metadata.name` (and the resulting
+        /// Secret's name). DNS-1123.
+        name: String,
+        /// Repeatable `KEY=VALUE`. The value may be empty or
+        /// contain `=` (only the first `=` splits the pair).
+        #[arg(long = "from-literal", required = true)]
+        from_literal: Vec<String>,
+        /// Target namespace. Defaults to `apprafter-system`,
+        /// where platform credential material lives.
+        #[arg(long, short = 'n', default_value = "apprafter-system")]
+        namespace: String,
+        /// Resulting Secret `type` (e.g. `Opaque`,
+        /// `kubernetes.io/dockerconfigjson`).
+        #[arg(long = "type", default_value = "Opaque")]
+        secret_type: String,
+        /// Print the SealedSecret YAML to stdout instead of
+        /// applying it (for `kubectl apply -f -` or committing
+        /// to a config repo).
+        #[arg(long, default_value_t = false)]
+        stdout: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

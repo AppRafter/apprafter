@@ -27,6 +27,7 @@ pub mod repo_creds;
 pub mod repo_creds_wizard;
 pub mod runtime_detect;
 pub mod scaffold_wizard;
+pub mod secret;
 pub mod state_paths;
 pub mod status;
 pub mod target;

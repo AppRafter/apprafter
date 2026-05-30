@@ -153,6 +153,9 @@ mod tests {
         ) -> Result<()> {
             unreachable!("argocd-password never waits on resources")
         }
+        fn get_raw(&self, _: &str, _: &Path) -> Result<String> {
+            unreachable!("argocd-password never reads raw API paths")
+        }
     }
 
     #[test]

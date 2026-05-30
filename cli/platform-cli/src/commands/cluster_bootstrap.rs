@@ -595,6 +595,9 @@ mod tests {
             });
             Ok(())
         }
+        fn get_raw(&self, _: &str, _: &Path) -> Result<String> {
+            unreachable!("cluster-bootstrap never reads raw API paths")
+        }
     }
 
     #[test]

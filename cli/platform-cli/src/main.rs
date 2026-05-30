@@ -16,7 +16,7 @@ use miette::{IntoDiagnostic, Result};
 
 use crate::cli::{
     AppCommand, Cli, Commands, MigrationCommand, OpenUi, PlatformCommand, RepoCommand,
-    RepoCredsCommand,
+    RepoCredsCommand, SecretCommand,
 };
 
 fn main() -> Result<()> {
@@ -214,6 +214,17 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                     commands::repo_creds::remove(&name, force, yes)?
                 }
             },
+        },
+        Commands::Secret { action } => match action {
+            SecretCommand::Seal {
+                name,
+                from_literal,
+                namespace,
+                secret_type,
+                stdout,
+            } => {
+                commands::secret::run_seal(&name, &namespace, &from_literal, &secret_type, stdout)?
+            }
         },
     }
     Ok(())

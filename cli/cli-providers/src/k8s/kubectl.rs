@@ -96,6 +96,15 @@ pub trait KubectlRunner {
         timeout_seconds: u64,
         kubeconfig_path: &Path,
     ) -> Result<()>;
+
+    /// Read a raw API path through the kube apiserver
+    /// (`kubectl get --raw <path>`) and return the response body
+    /// verbatim. Used by the sealing flow (1.79c) to fetch the
+    /// sealed-secrets controller's public cert over the
+    /// TLS-authenticated kube API service proxy — no direct pod
+    /// network is needed (the default-deny NetworkPolicy does not
+    /// block apiserver-proxied requests).
+    fn get_raw(&self, path: &str, kubeconfig_path: &Path) -> Result<String>;
 }
 
 #[derive(Debug, Default)]
@@ -180,6 +189,15 @@ impl KubectlCli {
             .arg(namespace)
             .arg("-o")
             .arg(format!("jsonpath={{.data.{key}}}"))
+            .env("KUBECONFIG", kubeconfig_path);
+        c
+    }
+
+    fn build_get_raw_command(path: &str, kubeconfig_path: &Path) -> Command {
+        let mut c = Command::new("kubectl");
+        c.arg("get")
+            .arg("--raw")
+            .arg(path)
             .env("KUBECONFIG", kubeconfig_path);
         c
     }
@@ -276,6 +294,21 @@ impl KubectlRunner for KubectlCli {
         }
         Ok(())
     }
+
+    fn get_raw(&self, path: &str, kubeconfig_path: &Path) -> Result<String> {
+        let output = Self::build_get_raw_command(path, kubeconfig_path)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl get --raw: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(CliError::Other(format!(
+                "kubectl get --raw {path} failed (exit {:?}): {stderr}",
+                output.status.code()
+            )));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|e| CliError::Other(format!("kubectl get --raw {path} stdout not utf-8: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +339,23 @@ mod tests {
         );
         let args = argv(&cmd);
         assert_eq!(args, vec!["apply", "-f", "/tmp/m.yaml"]);
+    }
+
+    #[test]
+    fn get_raw_command_passes_get_minus_minus_raw_with_the_path() {
+        let cmd = KubectlCli::build_get_raw_command(
+            "/api/v1/namespaces/apprafter-system/services/http:sealed-secrets-controller:http/proxy/v1/cert.pem",
+            Path::new("/tmp/kubeconfig"),
+        );
+        let args = argv(&cmd);
+        assert_eq!(
+            args,
+            vec![
+                "get",
+                "--raw",
+                "/api/v1/namespaces/apprafter-system/services/http:sealed-secrets-controller:http/proxy/v1/cert.pem",
+            ]
+        );
     }
 
     #[test]
