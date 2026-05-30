@@ -341,7 +341,11 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //     discovery resolution for the subsequent SSA apply at
     //     step 5 — closing the stale-discovery-cache angle
     //     mentioned in v0.1.111 → v0.1.112 notes.
-    for crd_name in ["applications.apprafter.io", "platformstacks.apprafter.io"] {
+    for crd_name in [
+        "applications.apprafter.io",
+        "platformstacks.apprafter.io",
+        "sourcecredentials.apprafter.io",
+    ] {
         let crd_ref = format!("crd/{crd_name}");
         kubectl.wait_for_condition(
             &crd_ref,
@@ -672,7 +676,7 @@ mod tests {
         // children) while Sync=Unknown on chart-pull failure.
         // Walk-found false-positive v0.1.99 → v0.1.100.
         let waits = kubectl.waits.borrow();
-        assert_eq!(waits.len(), 8, "{waits:?}");
+        assert_eq!(waits.len(), 10, "{waits:?}");
         assert_eq!(waits[0].resource_ref, "node --all");
         assert_eq!(waits[0].namespace, None);
         assert_eq!(waits[0].condition_expr, "condition=Ready");
@@ -718,6 +722,16 @@ mod tests {
         assert_eq!(waits[7].namespace, None);
         assert_eq!(waits[7].condition_expr, "condition=Established");
         assert_eq!(waits[7].timeout_seconds, CRD_ESTABLISHED_TIMEOUT_SECS);
+
+        assert_eq!(waits[8].resource_ref, "crd/sourcecredentials.apprafter.io");
+        assert_eq!(waits[8].namespace, None);
+        assert_eq!(waits[8].condition_expr, "create");
+        assert_eq!(waits[8].timeout_seconds, CRD_CREATE_TIMEOUT_SECS);
+
+        assert_eq!(waits[9].resource_ref, "crd/sourcecredentials.apprafter.io");
+        assert_eq!(waits[9].namespace, None);
+        assert_eq!(waits[9].condition_expr, "condition=Established");
+        assert_eq!(waits[9].timeout_seconds, CRD_ESTABLISHED_TIMEOUT_SECS);
     }
 
     #[test]
@@ -749,8 +763,8 @@ mod tests {
             .collect();
         assert_eq!(
             crd_wait_positions.len(),
-            4,
-            "expected exactly four CRD waits (2 per CRD × 2 CRDs), got {crd_wait_positions:?}"
+            6,
+            "expected exactly six CRD waits (2 per CRD × 3 CRDs), got {crd_wait_positions:?}"
         );
         // All CRD waits must come AFTER the App Healthy wait.
         assert!(
@@ -769,6 +783,11 @@ mod tests {
         assert_eq!(waits[crd_wait_positions[2]].condition_expr, "create");
         assert_eq!(
             waits[crd_wait_positions[3]].condition_expr,
+            "condition=Established"
+        );
+        assert_eq!(waits[crd_wait_positions[4]].condition_expr, "create");
+        assert_eq!(
+            waits[crd_wait_positions[5]].condition_expr,
             "condition=Established"
         );
         // And the SSA applies happen after the waits return; the
