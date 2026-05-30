@@ -12,7 +12,7 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{LocalObjectReference, Secret, Service};
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
@@ -21,8 +21,12 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{info, warn};
 
+mod pull_secret;
+use pull_secret::{app_pull_secret_name, pick_pull_credential};
+
+use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
-    Application, ApplicationCondition, ApplicationStatus, Metrics, MigrationPlan,
+    Application, ApplicationCondition, ApplicationStatus, Metrics, MigrationPlan, SourceCredential,
     COND_MIGRATION_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
@@ -159,8 +163,13 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
-    let rendered = render_application_for_env(&app, ctx.env_name.as_deref());
+    let mut rendered = render_application_for_env(&app, ctx.env_name.as_deref());
     let pp = PatchParams::apply(FIELD_MANAGER).force();
+
+    // Seam A (1.79c S3): if a SourceCredential covers this image's
+    // registry, project its derived pull-secret into the workload
+    // namespace and attach it to the Deployment's imagePullSecrets.
+    attach_pull_secret(&ctx.client, &namespace, &mut rendered.deployment, &pp).await?;
 
     apply_deployment(&ctx.client, &namespace, &rendered.deployment, &pp).await?;
 
@@ -253,6 +262,119 @@ async fn apply_service(
     let payload = into_apply_payload("v1", "Service", service)?;
     api.patch(&name, pp, &Patch::Apply(&payload)).await?;
     Ok(())
+}
+
+/// Namespace SourceCredentials and their canonical derived
+/// pull-secrets live in.
+const SOURCECRED_NAMESPACE: &str = "apprafter-system";
+
+/// The effective container image of the rendered Deployment.
+fn deployment_image(deployment: &Deployment) -> Option<String> {
+    deployment
+        .spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .first()?
+        .image
+        .clone()
+}
+
+/// Seam A: host-match the rendered image to a SourceCredential, project
+/// its derived `dockerconfigjson` into the workload namespace, and set
+/// the Deployment's `imagePullSecrets`. A no-op (leaves the Deployment
+/// untouched) when the image is public or no covering credential's
+/// pull-secret has been derived yet — the next reconcile retries.
+async fn attach_pull_secret(
+    client: &Client,
+    namespace: &str,
+    deployment: &mut Deployment,
+    pp: &PatchParams,
+) -> Result<(), ReconcileError> {
+    let Some(image) = deployment_image(deployment) else {
+        return Ok(());
+    };
+    let creds = list_source_credentials(client).await?;
+    let Some(cred) = pick_pull_credential(&image, &creds) else {
+        return Ok(());
+    };
+    let cred_name = cred.name_any();
+
+    // The canonical dockerconfigjson the SourceCredential controller
+    // derived. Absent if it has not reconciled yet — skip, retry later.
+    let canonical = pull_secret_name(&cred_name);
+    let Some(dockercfg) = read_dockercfgjson(client, SOURCECRED_NAMESPACE, &canonical).await?
+    else {
+        info!(%cred_name, "covering SourceCredential found but pull-secret not derived yet; deferring attach");
+        return Ok(());
+    };
+
+    let copy_name = app_pull_secret_name(&cred_name);
+    apply_pull_secret_copy(client, namespace, &copy_name, &dockercfg, pp).await?;
+    set_image_pull_secret(deployment, &copy_name);
+    info!(%cred_name, %copy_name, %namespace, "attached pull-secret to workload");
+    Ok(())
+}
+
+async fn list_source_credentials(client: &Client) -> Result<Vec<SourceCredential>, ReconcileError> {
+    let api: Api<SourceCredential> = Api::namespaced(client.clone(), SOURCECRED_NAMESPACE);
+    Ok(api.list(&Default::default()).await?.items)
+}
+
+/// Read the `.dockerconfigjson` value of a dockerconfigjson Secret.
+/// Returns `None` if the Secret does not exist.
+async fn read_dockercfgjson(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<String>, ReconcileError> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let Some(secret) = api.get_opt(name).await? else {
+        return Ok(None);
+    };
+    let value = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get(".dockerconfigjson"))
+        .map(|b| String::from_utf8_lossy(&b.0).into_owned());
+    Ok(value)
+}
+
+/// SSA-apply a per-workload copy of the derived pull-secret.
+async fn apply_pull_secret_copy(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    dockercfg: &str,
+    pp: &PatchParams,
+) -> Result<(), ReconcileError> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let payload = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": { "apprafter.io/managed-by": "apprafter" }
+        },
+        "type": "kubernetes.io/dockerconfigjson",
+        "stringData": { ".dockerconfigjson": dockercfg }
+    });
+    api.patch(name, pp, &Patch::Apply(&payload)).await?;
+    Ok(())
+}
+
+/// Set the Deployment's `imagePullSecrets` to the projected copy.
+fn set_image_pull_secret(deployment: &mut Deployment, secret_name: &str) {
+    if let Some(spec) = deployment.spec.as_mut() {
+        if let Some(pod) = spec.template.spec.as_mut() {
+            pod.image_pull_secrets = Some(vec![LocalObjectReference {
+                name: secret_name.to_string(),
+            }]);
+        }
+    }
 }
 
 async fn apply_status(

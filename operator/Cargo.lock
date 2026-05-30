@@ -1499,6 +1499,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "operator-controllers-migration",
+ "operator-controllers-sourcecredential",
  "operator-core",
  "operator-rendering",
  "serde",
@@ -1551,6 +1552,7 @@ dependencies = [
 name = "operator-controllers-sourcecredential"
 version = "0.1.2"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "futures",
  "k8s-openapi",

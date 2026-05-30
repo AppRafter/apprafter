@@ -5,11 +5,13 @@
 //! A `SourceCredential` is a config-only reference object. This
 //! controller is the single owner of every derived materialisation:
 //!
-//!   - **git half (S2, here):** for each `repoPrefixes` entry, a
-//!     prefix-matched Argo CD `repo-creds` Secret in the `argocd`
-//!     namespace, so Argo CD can clone the private repo.
-//!   - **registry half (S3):** a `dockerconfigjson` pull-secret —
-//!     derivation lands in the next slice.
+//!   - **git half:** for each `repoPrefixes` entry, a prefix-matched
+//!     Argo CD `repo-creds` Secret in the `argocd` namespace, so Argo
+//!     CD can clone the private repo.
+//!   - **registry half:** a canonical `dockerconfigjson` Secret in the
+//!     SourceCredential's namespace; the Application controller projects
+//!     a per-workload copy and attaches it to `imagePullSecrets`
+//!     (Seam A).
 //!
 //! The credential material is read from the Secret the sealed-secrets
 //! controller unsealed (`spec.git.backend.sealedSecretRef.name`,
@@ -34,6 +36,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use chrono::Utc;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
@@ -47,7 +50,7 @@ use tracing::{info, warn};
 
 use operator_core::{
     Metrics, SourceCredential, SourceCredentialCondition, SourceCredentialStatus, COND_GIT_PRESENT,
-    COND_GIT_VALID, REASON_UNVERIFIED,
+    COND_GIT_VALID, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID, REASON_UNVERIFIED,
 };
 
 const KIND: &str = "SourceCredential";
@@ -101,9 +104,10 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
     Ok(())
 }
 
-/// Reconcile: derive the git half's Argo `repo-creds` Secret(s) from the
-/// unsealed material and report status. Requeues every 60s so material
-/// rotation is picked up.
+/// Reconcile: derive the git half's Argo `repo-creds` Secret(s) and the
+/// registry half's canonical `dockerconfigjson` from the unsealed
+/// material, and report per-half status. Requeues every 60s so material
+/// rotation is picked up (15s while material is still unsealing).
 pub async fn reconcile(
     cred: Arc<SourceCredential>,
     ctx: Arc<Context>,
@@ -126,104 +130,142 @@ pub async fn reconcile(
 
     let mut conditions: Vec<SourceCredentialCondition> = Vec::new();
     let mut covered_prefixes: Vec<String> = Vec::new();
+    let mut covered_hosts: Vec<String> = Vec::new();
+    let mut pending = false;
+    let pp = PatchParams::apply(FIELD_MANAGER).force();
 
+    // ---- git half → Argo repo-creds Secret(s) in `argocd` ----
     if let Some(git) = &cred.spec.git {
-        let Some(sealed_ref) = &git.backend.sealed_secret_ref else {
-            // OpenBao backend (Tier 2) — not derivable on a Tier-1
-            // SealedSecrets cluster. Surface, do not fail.
-            conditions.push(condition(
+        match &git.backend.sealed_secret_ref {
+            None => conditions.push(condition(
                 COND_GIT_PRESENT,
                 "Unknown",
                 REASON_UNVERIFIED,
                 "git backend uses openBaoPath; not derivable on Tier 1",
                 previous,
-            ));
-            return finish(&ctx, &name, &namespace, &cred, conditions, covered_prefixes).await;
-        };
-
-        let material_ns = sealed_ref.namespace.clone().unwrap_or(namespace.clone());
-        match read_material(&ctx.client, &material_ns, &sealed_ref.name).await? {
-            None => {
-                conditions.push(condition(
-                    COND_GIT_PRESENT,
-                    "False",
-                    "MaterialMissing",
-                    &format!(
-                        "unsealed material Secret {material_ns}/{} not found yet",
-                        sealed_ref.name
-                    ),
-                    previous,
-                ));
-                // Material may still be unsealing — requeue sooner.
-                patch_status(
-                    &ctx.client,
-                    &namespace,
-                    &name,
-                    &build_status(conditions, covered_prefixes),
-                )
-                .await?;
-                ctx.metrics
-                    .reconcile_total
-                    .with_label_values(&[KIND, &namespace, "pending"])
-                    .inc();
-                return Ok(Action::requeue(Duration::from_secs(15)));
-            }
-            Some((username, password)) => {
-                let pp = PatchParams::apply(FIELD_MANAGER).force();
-                for (idx, prefix) in git.repo_prefixes.iter().enumerate() {
-                    let url = normalize_repo_url(prefix);
-                    let secret_name = repo_cred_secret_name(&name, idx);
-                    let payload =
-                        repo_cred_payload(&secret_name, &url, &username, &password, &name);
-                    let api: Api<Secret> = Api::namespaced(ctx.client.clone(), ARGOCD_NAMESPACE);
-                    api.patch(&secret_name, &pp, &Patch::Apply(&payload))
-                        .await?;
-                    covered_prefixes.push(prefix.clone());
+            )),
+            Some(sealed_ref) => {
+                let material_ns = sealed_ref.namespace.clone().unwrap_or(namespace.clone());
+                match read_material(&ctx.client, &material_ns, &sealed_ref.name).await? {
+                    None => {
+                        conditions.push(condition(
+                            COND_GIT_PRESENT,
+                            "False",
+                            "MaterialMissing",
+                            &format!(
+                                "unsealed material Secret {material_ns}/{} not found yet",
+                                sealed_ref.name
+                            ),
+                            previous,
+                        ));
+                        pending = true;
+                    }
+                    Some((username, password)) => {
+                        let api: Api<Secret> =
+                            Api::namespaced(ctx.client.clone(), ARGOCD_NAMESPACE);
+                        for (idx, prefix) in git.repo_prefixes.iter().enumerate() {
+                            let url = normalize_repo_url(prefix);
+                            let secret_name = repo_cred_secret_name(&name, idx);
+                            let payload =
+                                repo_cred_payload(&secret_name, &url, &username, &password, &name);
+                            api.patch(&secret_name, &pp, &Patch::Apply(&payload))
+                                .await?;
+                            covered_prefixes.push(prefix.clone());
+                        }
+                        conditions.push(condition(
+                            COND_GIT_PRESENT,
+                            "True",
+                            "Derived",
+                            "Argo repo-creds Secret(s) derived from sealed material",
+                            previous,
+                        ));
+                        // Live reachability probe not implemented — report
+                        // Unverified, which the `present` gate accepts.
+                        conditions.push(condition(
+                            COND_GIT_VALID,
+                            "Unknown",
+                            REASON_UNVERIFIED,
+                            "validity probe not yet implemented; coverage gated by presence",
+                            previous,
+                        ));
+                    }
                 }
-                conditions.push(condition(
-                    COND_GIT_PRESENT,
-                    "True",
-                    "Derived",
-                    "Argo repo-creds Secret(s) derived from sealed material",
-                    previous,
-                ));
-                // Live reachability probe not implemented — report
-                // Unverified, which the `present` coverage gate accepts.
-                conditions.push(condition(
-                    COND_GIT_VALID,
-                    "Unknown",
-                    REASON_UNVERIFIED,
-                    "validity probe not yet implemented; coverage gated by presence",
-                    previous,
-                ));
             }
         }
     }
 
-    finish(&ctx, &name, &namespace, &cred, conditions, covered_prefixes).await
-}
+    // ---- registry half → canonical dockerconfigjson in this ns ----
+    if let Some(registry) = &cred.spec.registry {
+        match &registry.backend.sealed_secret_ref {
+            None => conditions.push(condition(
+                COND_REGISTRY_PRESENT,
+                "Unknown",
+                REASON_UNVERIFIED,
+                "registry backend uses openBaoPath; not derivable on Tier 1",
+                previous,
+            )),
+            Some(sealed_ref) => {
+                let material_ns = sealed_ref.namespace.clone().unwrap_or(namespace.clone());
+                match read_material(&ctx.client, &material_ns, &sealed_ref.name).await? {
+                    None => {
+                        conditions.push(condition(
+                            COND_REGISTRY_PRESENT,
+                            "False",
+                            "MaterialMissing",
+                            &format!(
+                                "unsealed material Secret {material_ns}/{} not found yet",
+                                sealed_ref.name
+                            ),
+                            previous,
+                        ));
+                        pending = true;
+                    }
+                    Some((username, password)) => {
+                        let dockercfg = dockerconfigjson(&registry.hosts, &username, &password);
+                        let secret_name = pull_secret_name(&name);
+                        let payload =
+                            dockercfg_payload(&secret_name, &namespace, &dockercfg, &name);
+                        let api: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
+                        api.patch(&secret_name, &pp, &Patch::Apply(&payload))
+                            .await?;
+                        covered_hosts.extend(registry.hosts.iter().cloned());
+                        conditions.push(condition(
+                            COND_REGISTRY_PRESENT,
+                            "True",
+                            "Derived",
+                            "dockerconfigjson pull-secret derived from sealed material",
+                            previous,
+                        ));
+                        conditions.push(condition(
+                            COND_REGISTRY_VALID,
+                            "Unknown",
+                            REASON_UNVERIFIED,
+                            "validity probe not yet implemented; coverage gated by presence",
+                            previous,
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
-/// Patch status + record metric + requeue 60s.
-async fn finish(
-    ctx: &Arc<Context>,
-    name: &str,
-    namespace: &str,
-    _cred: &Arc<SourceCredential>,
-    conditions: Vec<SourceCredentialCondition>,
-    covered_prefixes: Vec<String>,
-) -> Result<Action, ReconcileError> {
     patch_status(
         &ctx.client,
-        namespace,
-        name,
-        &build_status(conditions, covered_prefixes),
+        &namespace,
+        &name,
+        &build_status(conditions, covered_prefixes, covered_hosts),
     )
     .await?;
+    let outcome = if pending { "pending" } else { "ok" };
     ctx.metrics
         .reconcile_total
-        .with_label_values(&[KIND, namespace, "ok"])
+        .with_label_values(&[KIND, &namespace, outcome])
         .inc();
-    Ok(Action::requeue(Duration::from_secs(60)))
+    Ok(Action::requeue(Duration::from_secs(if pending {
+        15
+    } else {
+        60
+    })))
 }
 
 pub fn error_policy(
@@ -335,9 +377,64 @@ fn repo_cred_payload(
     })
 }
 
+/// Registry hostname (the `dockerconfigjson` auths key) from a host
+/// prefix: the first path segment. `"ghcr.io/myorg/"` → `"ghcr.io"`.
+fn registry_hostname(host_prefix: &str) -> String {
+    host_prefix
+        .split('/')
+        .next()
+        .unwrap_or(host_prefix)
+        .to_string()
+}
+
+/// Deterministic name for the canonical derived pull-secret (lives in
+/// the SourceCredential's namespace). The Application controller reads
+/// it by this name to project per-workload copies (Seam A).
+pub fn pull_secret_name(cred_name: &str) -> String {
+    format!("srccred-{cred_name}-dockercfg")
+}
+
+/// Build a `.dockerconfigjson` body: one `auths` entry per distinct
+/// registry hostname covered by `hosts`, all using the same material.
+fn dockerconfigjson(hosts: &[String], username: &str, password: &str) -> String {
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    let mut auths = serde_json::Map::new();
+    for host in hosts {
+        let hostname = registry_hostname(host);
+        auths
+            .entry(hostname)
+            .or_insert_with(|| json!({ "username": username, "password": password, "auth": auth }));
+    }
+    serde_json::to_string(&json!({ "auths": auths })).expect("serialise dockerconfigjson")
+}
+
+/// SSA payload for a `kubernetes.io/dockerconfigjson` Secret.
+fn dockercfg_payload(
+    secret_name: &str,
+    namespace: &str,
+    dockercfg: &str,
+    cred_name: &str,
+) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": secret_name,
+            "namespace": namespace,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+                "apprafter.io/source-credential": cred_name,
+            }
+        },
+        "type": "kubernetes.io/dockerconfigjson",
+        "stringData": { ".dockerconfigjson": dockercfg }
+    })
+}
+
 fn build_status(
     conditions: Vec<SourceCredentialCondition>,
     covered_prefixes: Vec<String>,
+    covered_hosts: Vec<String>,
 ) -> SourceCredentialStatus {
     SourceCredentialStatus {
         conditions: Some(conditions),
@@ -346,7 +443,11 @@ fn build_status(
         } else {
             Some(covered_prefixes)
         },
-        covered_hosts: None,
+        covered_hosts: if covered_hosts.is_empty() {
+            None
+        } else {
+            Some(covered_hosts)
+        },
         last_validated: None,
     }
 }
@@ -462,10 +563,65 @@ mod tests {
     }
 
     #[test]
-    fn build_status_omits_empty_covered_prefixes() {
-        let s = build_status(vec![], vec![]);
+    fn build_status_omits_empty_covered_lists() {
+        let s = build_status(vec![], vec![], vec![]);
         assert!(s.covered_repo_prefixes.is_none());
-        let s = build_status(vec![], vec!["github.com/acme/".to_string()]);
+        assert!(s.covered_hosts.is_none());
+        let s = build_status(
+            vec![],
+            vec!["github.com/acme/".to_string()],
+            vec!["ghcr.io/acme/".to_string()],
+        );
         assert_eq!(s.covered_repo_prefixes.unwrap(), vec!["github.com/acme/"]);
+        assert_eq!(s.covered_hosts.unwrap(), vec!["ghcr.io/acme/"]);
+    }
+
+    #[test]
+    fn registry_hostname_takes_the_first_path_segment() {
+        assert_eq!(registry_hostname("ghcr.io/myorg/"), "ghcr.io");
+        assert_eq!(registry_hostname("ghcr.io/myorg"), "ghcr.io");
+        assert_eq!(registry_hostname("ghcr.io"), "ghcr.io");
+        assert_eq!(
+            registry_hostname("registry.gitlab.com/grp/proj"),
+            "registry.gitlab.com"
+        );
+    }
+
+    #[test]
+    fn pull_secret_name_is_deterministic() {
+        assert_eq!(pull_secret_name("acme"), "srccred-acme-dockercfg");
+    }
+
+    #[test]
+    fn dockerconfigjson_dedups_hosts_and_encodes_auth() {
+        let body = dockerconfigjson(
+            &["ghcr.io/org1/".to_string(), "ghcr.io/org2/".to_string()],
+            "git",
+            "ghp_x",
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Both prefixes collapse to the single ghcr.io host.
+        assert_eq!(v["auths"].as_object().unwrap().len(), 1);
+        assert_eq!(v["auths"]["ghcr.io"]["username"], "git");
+        assert_eq!(v["auths"]["ghcr.io"]["password"], "ghp_x");
+        let expected_auth = base64::engine::general_purpose::STANDARD.encode("git:ghp_x");
+        assert_eq!(v["auths"]["ghcr.io"]["auth"], expected_auth);
+    }
+
+    #[test]
+    fn dockercfg_payload_is_a_dockerconfigjson_secret() {
+        let p = dockercfg_payload(
+            "srccred-acme-dockercfg",
+            "apprafter-system",
+            "{\"auths\":{}}",
+            "acme",
+        );
+        assert_eq!(p["type"], "kubernetes.io/dockerconfigjson");
+        assert_eq!(p["metadata"]["namespace"], "apprafter-system");
+        assert_eq!(
+            p["metadata"]["labels"]["apprafter.io/source-credential"],
+            "acme"
+        );
+        assert_eq!(p["stringData"][".dockerconfigjson"], "{\"auths\":{}}");
     }
 }
