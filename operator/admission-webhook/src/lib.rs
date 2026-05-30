@@ -5,9 +5,11 @@ pub mod server;
 pub mod validator;
 pub mod validator_migrationplan;
 pub mod validator_platformstack;
+pub mod validator_sourcecredential;
 
 pub use server::build_router;
 pub use validator::{validate_application_spec, ValidationError};
+pub use validator_sourcecredential::validate_sourcecredential;
 
 /// Install `aws-lc-rs` as the process-level rustls
 /// `CryptoProvider`. Mirrors `apprafter_operator::install_rustls_crypto_provider`

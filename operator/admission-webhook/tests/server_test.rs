@@ -380,3 +380,63 @@ async fn validate_rejects_migrationplan_scope_mutation_on_update() {
     assert!(message.contains("spec.scope"), "{message}");
     assert!(message.contains("immutable"), "{message}");
 }
+
+#[tokio::test]
+async fn validate_allows_single_pat_sourcecredential() {
+    let payload = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "sc-1",
+            "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "SourceCredential" },
+            "operation": "CREATE",
+            "object": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "SourceCredential",
+                "metadata": { "name": "acme", "namespace": "apprafter-system" },
+                "spec": {
+                    "git": {
+                        "backend": { "sealedSecretRef": { "name": "srccred-acme-material" } },
+                        "repoPrefixes": ["github.com/acme/"]
+                    },
+                    "registry": {
+                        "backend": { "sealedSecretRef": { "name": "srccred-acme-material" } },
+                        "hosts": ["ghcr.io/acme/"]
+                    }
+                }
+            }
+        }
+    });
+    let (status, body) = post_validate(payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["response"]["uid"], "sc-1");
+    assert_eq!(body["response"]["allowed"], true);
+}
+
+#[tokio::test]
+async fn validate_rejects_sourcecredential_with_neither_half() {
+    let payload = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "sc-2",
+            "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "SourceCredential" },
+            "operation": "CREATE",
+            "object": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "SourceCredential",
+                "metadata": { "name": "empty", "namespace": "apprafter-system" },
+                "spec": {}
+            }
+        }
+    });
+    let (status, body) = post_validate(payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["response"]["allowed"], false);
+    let message = body["response"]["status"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("at least one of git or registry"),
+        "{message}"
+    );
+    assert!(message.contains("SourceCredential is invalid"), "{message}");
+}

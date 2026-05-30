@@ -102,6 +102,7 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         "MigrationPlan" => {
             crate::validator_migrationplan::validate_migrationplan(&object, old_object.as_ref())
         }
+        "SourceCredential" => crate::validator_sourcecredential::validate_sourcecredential(&object),
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The

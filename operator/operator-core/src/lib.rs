@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod migration;
 pub mod migration_plan;
 pub mod platform_stack;
+pub mod sourcecredential;
 
 pub use application::{
     Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose, ApplicationSpec,
@@ -24,4 +25,9 @@ pub use platform_stack::{
     PlatformStack, PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,
     PlatformStackSource, PlatformStackSpec, PlatformStackStatus, PlatformStackValues,
     PlatformStackVersionHistoryEntry,
+};
+pub use sourcecredential::{
+    SealedSecretRef, SourceBackend, SourceCredential, SourceCredentialCondition,
+    SourceCredentialSpec, SourceCredentialStatus, SourceGit, SourceRegistry, COND_GIT_PRESENT,
+    COND_GIT_VALID, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID, REASON_UNVERIFIED,
 };
