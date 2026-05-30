@@ -1698,6 +1698,26 @@ compatibility: "0.1.23": {
 // re-registering. cue-cmp image v0.1.5 → v0.1.6 (entrypoint
 // .sh change baked into the image), chart pin follows via
 // the `argocdcuecmp.version` CUE import.
+compatibility: "0.1.49": {
+	change:          "safe"
+	operatorVersion: "v0.1.135"
+	notes: """
+		1.79c — private-repo credential flow (`SourceCredential`,
+		ADR 0039). Additive across the board:
+
+		  * new `sealed-secrets` component (bitnami controller +
+		    its `SealedSecret` CRD) — the Tier-1 secret backend;
+		  * new `SourceCredential` CRD + controller in the
+		    operator image (derives prefix-matched Argo
+		    `repo-creds` and host-matched workload pull-secrets
+		    from sealed material) — operator v0.1.134 → v0.1.135;
+		  * new admission validator for `SourceCredential`.
+
+		No component values reshaped, no data migration, nothing
+		removed — safe to apply via Argo CD automated sync.
+		"""
+	references: ["ADR 0039", "plan.md 1.79c"]
+}
 compatibility: "0.1.48": {
 	change:          "safe"
 	operatorVersion: "v0.1.134"
