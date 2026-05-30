@@ -108,6 +108,38 @@ rules:
       - update
       - patch
       - delete
+  # SourceCredential CRD + its derivations (1.79c / ADR 0039).
+  # The controller watches SourceCredentials, reads the
+  # controller-unsealed material Secret (in apprafter-system),
+  # and SSA-writes the derived Argo `repo-creds` Secret (in
+  # `argocd`) and the workload `dockerconfigjson` pull-secret
+  # (in app namespaces). Cluster-scoped because the material,
+  # repo-cred, and pull-secret live in different namespaces; the
+  # operator is the only holder of derived credential material
+  # (ADR 0024 Layer 2). No `delete` yet — derived-Secret GC on
+  # coverage removal is gated by MigrationPlan (S5).
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - sourcecredentials
+      - sourcecredentials/status
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
   - apiGroups:
       - gateway.networking.k8s.io
     resources:

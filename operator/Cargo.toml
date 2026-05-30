@@ -7,6 +7,7 @@ members = [
     "operator-controllers/application",
     "operator-controllers/migration",
     "operator-controllers/platform-stack",
+    "operator-controllers/sourcecredential",
     "operator-core",
     "operator-rendering",
 ]

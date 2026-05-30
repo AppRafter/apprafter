@@ -127,11 +127,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // SourceCredentialController — fourth controller (1.79c / ADR
+    // 0039). Derives Argo `repo-creds` (git half) and workload
+    // pull-secrets (registry half) from sealed material, under
+    // field manager `apprafter-sourcecredential`, and reports
+    // per-half status.
+    let sourcecred_controller_handle = tokio::spawn({
+        let client = client.clone();
+        let metrics = metrics.clone();
+        async move {
+            if let Err(err) = operator_controllers_sourcecredential::run(client, metrics).await {
+                error!(%err, "SourceCredentialController error");
+            }
+        }
+    });
+
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
         _ = platform_controller_handle => warn!("PlatformController exited"),
         _ = migration_controller_handle => warn!("MigrationController exited"),
+        _ = sourcecred_controller_handle => warn!("SourceCredentialController exited"),
         _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }
