@@ -13,7 +13,8 @@
 //!   3. RSA-OAEP (SHA-256 for both the hash and the MGF1 mask) encrypt
 //!      the session key, with the OAEP **label = scope bytes**. Strict
 //!      scope (the default, and what we use for platform material in a
-//!      fixed namespace) is `namespace || name`.
+//!      fixed namespace) is `namespace + "/" + name` — byte-identical to
+//!      bitnami's `fmt.Sprintf("%s/%s", namespace, name)`.
 //!   4. Wire bytes = big-endian `u16` length of the RSA block, then the
 //!      RSA block, then the AES-GCM ciphertext.
 //!   5. `SealedSecret.spec.encryptedData[key]` = standard-base64(wire).
@@ -36,12 +37,14 @@ use sha2::Sha256;
 use x509_cert::der::{DecodePem, Encode};
 use x509_cert::Certificate;
 
-/// Strict-scope RSA-OAEP label per bitnami sealed-secrets: the namespace
-/// concatenated with the name, no separator.
+/// Strict-scope RSA-OAEP label, byte-identical to bitnami sealed-secrets'
+/// `EncryptionLabel`: `fmt.Sprintf("%s/%s", namespace, name)` — the
+/// namespace and name joined by a forward slash. The separator is
+/// load-bearing: the controller derives the same label from the
+/// SealedSecret's namespace+name when decrypting, so any divergence makes
+/// RSA-OAEP decryption fail with "no key could decrypt".
 pub fn strict_label(namespace: &str, name: &str) -> Vec<u8> {
-    let mut label = namespace.as_bytes().to_vec();
-    label.extend_from_slice(name.as_bytes());
-    label
+    format!("{namespace}/{name}").into_bytes()
 }
 
 /// Seal one value into the bitnami wire format. `label` is the scope —
@@ -194,11 +197,16 @@ mod tests {
     }
 
     #[test]
-    fn strict_label_is_namespace_then_name() {
-        assert_eq!(strict_label("ns", "nm"), b"nsnm".to_vec());
+    fn strict_label_is_namespace_slash_name() {
+        // Known-answer vector pinned to bitnami sealed-secrets'
+        // `EncryptionLabel`: strict scope = fmt.Sprintf("%s/%s",
+        // namespace, name) — a forward slash separates the two.
+        // Self-consistent round-trip tests CANNOT catch a label that
+        // diverges from the controller's; only this exact assertion can.
+        assert_eq!(strict_label("ns", "nm"), b"ns/nm".to_vec());
         assert_eq!(
             strict_label("apprafter-system", "srccred-demo-material"),
-            b"apprafter-systemsrccred-demo-material".to_vec()
+            b"apprafter-system/srccred-demo-material".to_vec()
         );
     }
 
