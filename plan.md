@@ -2488,6 +2488,11 @@ instead of carrying parallel definitions.
 
 ### 1.79c Private-repo credential flow — `SourceCredential` CRD
 > 🏁 SR: A · order 3 — private-repo credential flow (`SourceCredential`, ADR 0039); **must follow the 2.11 SealedSecrets controller+seal slice** в SR-порядке (cross-phase dep — phase-номера немонотонны: Phase-1 item выполняется после Phase-2 slice, это ожидаемо; см. `speedrun-plan.md` §4.2).
+>
+> 🚧 **В работе** (ветка `feat/1.79c-sourcecredential`, design+plan в `docs/superpowers/{specs,plans}/2026-05-30-1-79c-*`). Sliced S0→S4.
+> **S0 ✅** (v0.1.175 + platform-stack component, chart-only): sealed-secrets controller компонент (bitnami 2.18.6, ns `apprafter-system`, `fullnameOverride` пинит Service) + **нативный Rust-seal** в `cli-providers::k8s::sealing` (RSA-OAEP-SHA256 ⊗ AES-256-GCM single-use, strict scope, bitnami wire-format; cert fetch через kube API service-proxy `KubectlRunner::get_raw`) + команда `apprafter secret seal`. Это вынесенный вперёд prereq-slice из 2.11.
+> **S1 ✅** (v0.1.176): `SourceCredential` CRD в 3 слоя — CUE `schemas/v1alpha1/sourcecredential.cue` + example; kube-rs тип `operator-core/src/sourcecredential.rs` (per-half status conditions); OpenAPI v3 CRD `crd-sourcecredential.yaml` (sync-wave -5); admission `validator_sourcecredential.rs` (at-least-one-of git/registry, exactly-one backend, non-empty coverage) + dispatch + integration-тесты; bootstrap CRD-Established wait. Полный гейт зелёный; apiserver-side structural-Established проверка — в ручном walk.
+> **S2–S4 ⏳ остаются**: operator SourceCredential-контроллер (git→argocd repo-cred + validation + status), registry→dockerconfigjson + Application-ctrl host-match attach (Seam A), CLI `repo creds`→SourceCredential рефактор. **Release-координация**: operator/webhook appVersion + `RELEASED_OPERATOR_VERSION` бампаются ОДНИМ publish'ем после S3 (не помежслайсно — иначе `apply` тянет неопубликованный GHCR-тег).
 
 **Source:** ADR 0039. Продолжение 1.79a (repo/app subcommands). Новый item — не затрагивает отгруженный 1.79b (`app open`/scaffolding/runtime templates сохраняют свой номер и историю v0.1.161–v0.1.174).
 
