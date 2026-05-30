@@ -4,7 +4,7 @@
 > **Domain:** `apprafter.dev`.
 > **Status:** Phase 1 (Tier 1 single-node MVP) delivered as `v0.1.0-mvp` on 2026-05-08; Phases 2–8 in active design. See `plan.md` for the phase ledger.
 > **Audience:** Architecture decisions, contributors onboarding, design rationale.
-> **Revision:** 8 (Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
+> **Revision:** 9 (SourceCredential CRD for private-repo credentials — ADR 0039: a config-only credential-reference CRD (§3.12) carrying zero secret material, the material sealed (SealedSecrets on Tier 1, OpenBao on Tier 2); the Application Operator derives both the Argo CD git repo-cred and the workload registry pull-secret from one source and reports validity in status; the `repo creds` CLI becomes a thin SourceCredential front-end; destructive credential change is gated via MigrationPlan. Rev 8: Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
 
 ---
 
@@ -729,6 +729,43 @@ The OCI registry tag is the canonical source of version truth; `status.currentVe
 
 See ADR 0026 for the full decision record, including channel semantics, override behaviour, and re-evaluation triggers.
 
+### 3.12 SourceCredential
+
+A `SourceCredential` is a **config / reference CRD that carries zero secret material**. It declares which private git repositories and container registries a credential covers; the credential material itself lives **sealed** outside the spec (a SealedSecret on Tier 1, an OpenBao path on Tier 2). It exists because deploying an Application from a private repository needs two distinct accesses — Argo CD must read the repo (git-read) and the kubelet must pull the image (registry-pull) — and both must be stored without a plaintext Secret and gated like any other change. See ADR 0039.
+
+```cue
+apiVersion: apprafter.io/v1alpha1
+kind: SourceCredential
+metadata: {
+    name:      "myorg"
+    namespace: "apprafter-system"
+}
+spec: {
+    // At least one of git / registry. The two halves are independent;
+    // a single classic PAT is simply the same backend in both.
+    git?: {
+        backend:      #Backend         // sealedSecretRef | openBaoPath
+        repoPrefixes: ["github.com/myorg/"]
+    }
+    registry?: {
+        backend: #Backend
+        hosts:   ["ghcr.io/myorg/"]
+    }
+}
+// #Backend = { sealedSecretRef: {...} } | { openBaoPath: string }
+// No token, no base64 material, ever, in the spec.
+```
+
+**One source, two derived outputs.** The Application Operator owns all derivation (§4.5): from the single `SourceCredential` plus its sealed material it derives a **prefix-matched** Argo CD `repo-creds` Secret in `argocd` (Argo selects the credential for a clone by URL-prefix match) and a **host-matched** `dockerconfigjson` pull-secret in the workload namespace, auto-attached to the workload ServiceAccount / `Deployment.imagePullSecrets` by registry-host match against the rendered image. These derived Secrets are operator outputs, never hand-managed; rotating the material re-derives both halves. There is no second source of truth.
+
+**Status.** Per-half `conditions` carry `Present` / `Valid` / `Invalid` / `Unverified`, the covered prefixes/hosts, and `lastValidated`. The operator performs real reachability validation (`git ls-remote` for git, a registry token-exchange/HEAD for registry) on change and periodically with backoff. Where the operator has no egress (air-gapped / restricted) validity is `Unverified`, not `Invalid`, and the coverage gate is configurable between `present` and `confirmed`.
+
+**Material never in the spec, never in the app repo.** A CRD is not a Secret; material in `spec` would be plaintext-at-rest and scavenge-able (ADR 0024). It is also kept out of the application repository for a hard ordering reason: Argo needs the git credential to clone the private repo, so a credential living inside that repo could not be read to obtain it. The sealed blob is safe in transit, at rest, and in Git, which is what makes both delivery modes safe — CLI→cluster (`kubectl apply` the SealedSecret + CR) or commit-to-config-repo for Argo to sync. Host/prefix auto-match means the application repository carries nothing about credentials.
+
+**Tier and gating.** The flow is identical on Tier 1 and Tier 2 — only the `backend` changes (SealedSecrets ↔ OpenBao path, see §4.4), behind the same CRD. Because `SourceCredential` is an AppRafter CRD, registration mutations pass through the admission webhook and the MigrationPlan gate (§3.8): rotating to an equivalent valid credential is non-destructive, while removing a covered repo-prefix or registry-host, deleting a credential while applications match it, or narrowing scope are destructive and produce a `MigrationPlan`. The gate is actor-agnostic — it catches a human editing a credential and the CLI alike.
+
+The launch default is a single classic GitHub PAT (`repo` + `read:packages`) used in both halves — GitHub's coarse scopes, not a platform choice. The schema is split-ready (independent git / registry backends from day one), so a least-privilege split — a deploy-key or fine-grained PAT for git plus a `read:packages`-only PAT for registry, or a single narrow token on GitLab — is available as an opt-in. The `repo creds` CLI (§4.12) is a thin front-end over this CRD. See ADR 0039.
+
 ---
 
 ## 4. Layer Specifications
@@ -875,6 +912,7 @@ Custom operator written in **Rust** on **kube-rs**. Distributed as a single Helm
 5. Apply children via server-side apply with field manager `apprafter-operator` (cooperates with co-owners on shared fields); cascading delete via `ownerReferences`
 6. Inject credentials via workload identity (SPIFFE), not mounted Secrets; configure secret injection from OpenBao (Vault Agent / CSI driver)
 7. Update `Application.status` per environment with `phase`, `observedGeneration`, `conditions` (`lastTransitionTime` preserved across same-status reconciles per k8s `meta/v1.Condition` semantics), traffic, replicas, autoscale state, recent events, current egress IP
+8. Reconcile `SourceCredential` (§3.12): derive a prefix-matched Argo CD `repo-creds` Secret in `argocd` and a host-matched `dockerconfigjson` pull-secret in the workload namespace (auto-attached to the workload ServiceAccount / `Deployment.imagePullSecrets` by registry-host match against the rendered image); validate git (`git ls-remote`) and registry (token-exchange/HEAD) reachability on change and periodically with backoff; write `Present` / `Valid` / `Invalid` / `Unverified` into `SourceCredential.status`, surfacing `Unverified` (not `Invalid`) where the operator has no egress. The derived Secrets are operator outputs; rotating the sealed material re-derives both halves.
 
 Leader election via Lease (10s renew / 30s expiry, holder identity from `POD_NAME`). Prometheus signals (`reconcile_total`, `reconcile_duration`, `reconcile_errors`) and axum `/healthz` / `/readyz` / `/metrics` routes.
 
@@ -1002,7 +1040,7 @@ platformServices: {
 
 In-scope as first-class platform components, not "set up separately."
 
-- **Git host:** GitLab self-hosted or Forgejo. Container registry can be inside (GitLab Registry / Harbor) or external.
+- **Git host & container registry:** at the Hosted Services launch the source of truth is **GitHub + GHCR** (`ghcr.io`); self-hosted git hosts (GitLab, Forgejo) and registries (Harbor) re-activate only for self-host compliance customers (see `speedrun-plan.md`). Private-repo and private-registry access is carried by the **`SourceCredential`** CRD (§3.12) — a config-only object with sealed material from which the operator derives both the Argo CD git repo-cred and the workload registry pull-secret. Credentials are never set up separately or stored as plaintext Secrets.
 - **CI runners:** GitLab Runner or Woodpecker, deployed as workloads on the same platform.
 - **Synthetic monitoring:** Uptime Kuma on a separate small VPS (the only required external dependency) or external SaaS free-tier. Watches platform endpoints from outside.
 - **Backup destination:** external S3-compatible (Hetzner Storage Box, Cloudflare R2). Required external — never store backups in the same failure domain.
@@ -1114,6 +1152,18 @@ apprafter migration list
 apprafter migration approve <name>
 apprafter migration reject <name>      # platform-scope only; application-scope reverts via Git
 
+# User application lifecycle (apps connected to Argo CD via the CUE CMP).
+apprafter app add [<git-url>]          # register an app repo as an Argo CD Application
+apprafter app list | status | logs | rollback | remove
+apprafter app open <name>              # port-forward a user app + open the browser
+apprafter app scaffold                 # generate apprafter/Application.cue from a runtime preset
+
+# Private-repo / private-registry credentials — a SourceCredential front-end (§3.12).
+apprafter repo creds add <name>        # shape-check + seal material + create/update a SourceCredential CR
+apprafter repo creds list | show       # read status (coverage + validity) only — never the material
+apprafter repo creds rotate <name>     # re-seal the material; the operator re-derives both halves
+apprafter repo creds remove <name>     # delete the CR behind a reverse-dependency gate
+
 # Tier upgrade (e.g., solo → team)
 apprafter upgrade-tier --to team
 
@@ -1121,7 +1171,7 @@ apprafter upgrade-tier --to team
 apprafter login
 ```
 
-The CLI is a thin client over declarative resources. Most commands map directly to `kubectl patch` or `kubectl edit` on PlatformStack or MigrationPlan CRs. The same effects are achievable by editing the CRs directly; the CLI provides ergonomic wrappers. CLI version is independent of platform version (see §3.11), and the CLI separately tracks its own update availability against upstream releases, warning when a CLI update is available.
+The CLI is a thin client over declarative resources. Most commands map directly to `kubectl patch` or `kubectl edit` on PlatformStack or MigrationPlan CRs. The same effects are achievable by editing the CRs directly; the CLI provides ergonomic wrappers. The `app` and `repo creds` groups manage Argo CD `Application` and `SourceCredential` CRs the same way; `repo creds` seals material client-side and can read only status, never the credential material (cryptographic, not merely RBAC — §3.12). CLI version is independent of platform version (see §3.11), and the CLI separately tracks its own update availability against upstream releases, warning when a CLI update is available.
 
 **State and idempotency:**
 
@@ -1626,6 +1676,7 @@ The following features are declared in the Application manifest schema and accep
 - **Workload Identity:** a SPIFFE-issued X.509 identity that pods use to authenticate to OpenBao, ServiceProviders, and other workloads.
 - **Static Egress IP:** a fixed IP address assigned to an Application's outbound traffic, for third-party whitelisting.
 - **SealedSecrets:** Bitnami's mechanism for encrypted secrets in Git, used as the Tier 1 default before OpenBao is required.
+- **SourceCredential:** a config-only CRD (§3.12) referencing sealed git/registry credential material; the operator derives the Argo CD repo-cred and the workload pull-secret from it and reports validity in status. The `repo creds` CLI is a front-end over it. See ADR 0039.
 - **Bootstrap loader:** the minimal scope of `apprafter cluster-bootstrap` after the M1.5 rethink — installs Argo CD via Helm and applies the root Application that points to the platform-stack chart. Everything else arrives through Argo CD reconciliation. See §3.10.
 - **Channel (platform):** one of `stable`, `beta`, `edge` — determines which set of platform-stack versions the PlatformController considers when resolving `spec.pin: unset` and when reporting `status.availableVersion`. See §3.11 and ADR 0026.
 - **CMP (Config Management Plugin):** an Argo CD extension point implemented as a sidecar in `argocd-repo-server`. AppRafter ships a CMP for CUE so user app repositories can use CUE as source and have Argo CD render it to YAML at sync time. See ADR 0029.

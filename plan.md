@@ -2345,7 +2345,9 @@ instead of carrying parallel definitions.
 
 ---
 
-### 1.79b CLI app ergonomics — `app open` + scaffolding + runtime templates
+### 1.79b CLI app ergonomics — `app open` + scaffolding + runtime templates ✅
+
+> v0.1.174 + platform-stack 0.1.48 + argocd-cue-cmp v0.1.6 — sub-phase 1.79b shipped через parts 1–3b: `apprafter app open <name>` (part 1, v0.1.161 — port-forward + Service-resolution + browser launch + graceful Ctrl+C), runtime detection primitives (part 2, v0.1.166 — filesystem-marker → runtime mapping с High/Medium/Low/Fallback confidence), `apprafter app scaffold` + embedded `.cue.hbs` template engine (part 3, v0.1.167) + scaffold wizard в `app add` step 0 + interactive runtime picker (part 3b, v0.1.168). Real-cluster manual walk surfaced walk-fixes (post-B.1.79b #1–#4 v0.1.162–165: app-open label-resolution off operator's `app.kubernetes.io/name` + kubectl stderr surfacing + `app status --resources` child workload state + Cargo.lock/bun-smoke sync; post-Part-3b #1–#6 + #11 v0.1.169–174 + chart 0.1.48 / cue-cmp v0.1.6: scaffold UX/SPDX/namespace/cred-hint polish, `spec.source.path` absolute-path fix, CUE-import drop, schema inline→vendored CUE module под `apprafter/cue.mod/`, image-ref derived from git origin, CMP entrypoint cds into package dir). Each walk-fix landed с regression-guard test; phase boundary tech-debt = zero. Design divergences (приняты): template engine ships 2 consolidated `.cue.hbs` (default + blank) вместо 12 per-runtime files (port defaults baked into `defaults_for`); multi-stack default = first-High-in-order. Deferred с rationale (Part 4, ещё не отгружено): `examples/applications/` reference manifests, `docs/user-guide/cli/app-scaffold.md`, quickstart update, `spec.resources`/`spec.healthcheck` template fields (v1alpha1-only сейчас), `--lang ru|en` template comments (English-only).
 
 **Source:** Продолжение 1.79a. Closes gaps в quickstart flow для unfamiliar users.
 
@@ -2353,7 +2355,7 @@ instead of carrying parallel definitions.
 
 #### Поставка — `apprafter app open <name>`
 
-- [ ] Wrapper над `kubectl port-forward` для пользовательского app'а:
+- [x] Wrapper над `kubectl port-forward` для пользовательского app'а:
     - Резолвит Application name → Service в namespace (через AppRafter Application CR labels).
     - Определяет primary port из Application.expose.port или Service.spec.ports[0].
     - `kubectl port-forward svc/<app> 8080:<port>` в background process.
@@ -2370,20 +2372,20 @@ instead of carrying parallel definitions.
         ✓ Browser opened
         ℹ Press Ctrl+C to stop port-forward
         ```
-- [ ] Флаги:
+- [x] Флаги:
     - `--port <port>` — override local port (default 8080, со shift на 8081/8082/etc. если занят).
     - `--container-port <port>` — override container port если app exposed multiple.
     - `--no-browser` — только port-forward, без открытия браузера (для CI/scripts).
-- [ ] Error handling:
+- [x] Error handling:
     - App не найден → "Application '<name>' not found. List with `apprafter app list`."
     - App not Healthy → warning "Application is in state <state>; port-forward may fail. Continue anyway? [y/N]".
     - Local port занят → auto-increment до 8090, дальше error.
     - kubectl missing → error с hint к target add.
-- [ ] Graceful shutdown по Ctrl+C — kill port-forward, exit clean.
+- [x] Graceful shutdown по Ctrl+C — kill port-forward, exit clean.
 
 #### Поставка — Runtime detection в `apprafter app add`/`scaffold`
 
-- [ ] Detection heuristic из cwd:
+- [x] Detection heuristic из cwd:
 
   | Маркер | Detected runtime | Priority |
       |---|---|---|
@@ -2401,24 +2403,24 @@ instead of carrying parallel definitions.
   | `Dockerfile` без других маркеров | `docker` (build-only template) | Low |
   | Ничего | `blank` (пустой шаблон с TODO) | Fallback |
 
-- [ ] Confidence levels:
+- [x] Confidence levels:
     - `High`: явный lock-файл = runtime установлен, версии воспроизводимы. Default-select без вопросов в auto-mode.
     - `Medium`: маркер есть, но lock отсутствует — менее уверенно, confirm prompt всё равно.
     - `Low` / `Fallback`: prompt со списком всех runtimes, юзер выбирает руками.
 
-- [ ] Multiple маркеры одновременно (monorepo, мультистек):
+- [x] Multiple маркеры одновременно (monorepo, мультистек):
     - Если детектится 2+ runtime с High confidence — prompt со списком, default = первый по алфавиту.
     - Можно подсказать через CLI флаг `--runtime <name>` сразу для non-interactive.
 
 #### Поставка — Application.cue templates
 
-- [ ] Template engine: Handlebars-like substitution на статичных `.cue.hbs` файлах в CLI binary через `include_str!` (embedded в release).
-- [ ] Variables в шаблоне:
+- [x] Template engine: Handlebars-like substitution на статичных `.cue.hbs` файлах в CLI binary через `include_str!` (embedded в release).
+- [x] Variables в шаблоне:
     - `{{app_name}}` — из cwd name или CLI flag.
     - `{{image_ref}}` — placeholder `ghcr.io/<org>/<app>:latest` для пользовательской подстановки.
     - `{{primary_port}}` — defaults per runtime (bun/node: 3000, python: 8000, rust/go: 8080, docker: 8080).
     - `{{healthcheck_path}}` — default `/health` со комментарием "// adjust if your app uses different path".
-- [ ] Шаблоны (`cli/templates/application/*.cue.hbs`):
+- [x] Шаблоны (`cli/templates/application/*.cue.hbs`):
     - `bun.cue.hbs` — runtime=bun, build с bun build script.
     - `node-pnpm.cue.hbs`, `node-yarn.cue.hbs`, `node-npm.cue.hbs` — соответствующий package manager в build steps.
     - `python-poetry.cue.hbs`, `python-uv.cue.hbs`, `python-pipenv.cue.hbs`, `python-pip.cue.hbs`.
@@ -2426,7 +2428,7 @@ instead of carrying parallel definitions.
     - `go.cue.hbs` — go build, static binary.
     - `docker.cue.hbs` — assume Dockerfile в корне, no build steps generation (юзер сам Dockerfile управляет).
     - `blank.cue.hbs` — пустой Application с TODO-комментариями на все required поля.
-- [ ] Каждый шаблон содержит:
+- [x] Каждый шаблон содержит:
     - `apiVersion`, `kind`, `metadata.name`
     - `spec.image` — placeholder
     - `spec.expose` — minimal (port + comment "set public: true и hostname when ready to expose")
@@ -2436,7 +2438,7 @@ instead of carrying parallel definitions.
 
 #### Поставка — Scaffold flow в `app add` и `app scaffold`
 
-- [ ] `apprafter app add` (расширение из 1.79a):
+- [x] `apprafter app add` (расширение из 1.79a):
     - Шаг 0 (before any prompts): проверка наличия `apprafter/Application.cue` в cwd.
     - Если **отсутствует**:
         - Run runtime detection.
@@ -2449,27 +2451,27 @@ instead of carrying parallel definitions.
     - Если **присутствует**: пропускает scaffold step, идёт к existing flow (`git remote get-url origin` → register Application).
     - В non-interactive mode без `--scaffold`: если файл отсутствует — fail с hint к `apprafter app scaffold`.
 
-- [ ] `apprafter app scaffold` — standalone команда для re-scaffolding или explicit-only flow:
+- [x] `apprafter app scaffold` — standalone команда для re-scaffolding или explicit-only flow:
     - Без аргументов: detection + interactive wizard, генерит файл.
     - Флаги: `--runtime <name>` (override detection), `--name <app>`, `--lang ru|en` (комментарии), `--force` (overwrite existing).
     - Без `--force` отказывается перезаписать existing `apprafter/Application.cue` — exit code 2.
 
 #### Поставка — README updates + examples directory
 
-- [ ] `examples/applications/` в monorepo — реальные working Application.cue для каждого preset (используются как fixture для тестов template engine + reference в docs).
-- [ ] `docs/user-guide/cli/app-scaffold.md` — описание templates, runtime detection logic, customization guide.
-- [ ] Update `docs/operator-guide/quickstart.md` — шаг "Write Application.cue" заменён на "Run `apprafter app add` — it scaffolds for you".
+- [ ] `examples/applications/` в monorepo — реальные working Application.cue для каждого preset (используются как fixture для тестов template engine + reference в docs). **Deferred — Part 4 (ещё не отгружено).**
+- [ ] `docs/user-guide/cli/app-scaffold.md` — описание templates, runtime detection logic, customization guide. **Deferred — Part 4 (ещё не отгружено).**
+- [ ] Update `docs/operator-guide/quickstart.md` — шаг "Write Application.cue" заменён на "Run `apprafter app add` — it scaffolds for you". **Deferred — Part 4 (ещё не отгружено).**
 
 #### Acceptance
 
-- [ ] `cd <bun-project> && apprafter app add` детектит bun, генерит `apprafter/Application.cue` с bun preset, регистрирует Argo CD Application.
-- [ ] `apprafter app open <name>` после `apprafter app status` показывающего Healthy → port-forward работает, browser открывается на app'е.
-- [ ] `apprafter app open` для app в Pending/CrashLoopBackOff показывает warning, но всё равно делает port-forward по confirmation.
-- [ ] Multiple маркеры (e.g., python-poetry + Dockerfile) → prompt со списком, не auto-pick.
-- [ ] `apprafter app scaffold` для пустого репо генерит `blank` template с TODO-комментариями.
-- [ ] `apprafter app scaffold` для существующего `Application.cue` без `--force` → exit 2.
-- [ ] Generated `apprafter/Application.cue` проходит `cue vet` (валидный CUE).
-- [ ] Generated файл с `image` placeholder + push в репо → Argo CD синкает; AppRafter Application reaches `OutOfSync` / `Suspended` until юзер обновит image. Status condition объясняет что делать.
+- [x] `cd <bun-project> && apprafter app add` детектит bun, генерит `apprafter/Application.cue` с bun preset, регистрирует Argo CD Application.
+- [x] `apprafter app open <name>` после `apprafter app status` показывающего Healthy → port-forward работает, browser открывается на app'е.
+- [x] `apprafter app open` для app в Pending/CrashLoopBackOff показывает warning, но всё равно делает port-forward по confirmation.
+- [x] Multiple маркеры (e.g., python-poetry + Dockerfile) → prompt со списком, не auto-pick.
+- [x] `apprafter app scaffold` для пустого репо генерит `blank` template с TODO-комментариями.
+- [x] `apprafter app scaffold` для существующего `Application.cue` без `--force` → exit 2.
+- [x] Generated `apprafter/Application.cue` проходит `cue vet` (валидный CUE).
+- [ ] Generated файл с `image` placeholder + push в репо → Argo CD синкает; AppRafter Application reaches `OutOfSync` / `Suspended` until юзер обновит image. Status condition объясняет что делать. **Partial** — scaffold + push + Argo CD sync через CMP shipped (ImagePullBackOff на placeholder-image видно через `apprafter app status --resources`, walk-fix #3); operator-side `Suspended` phase + explanatory status condition остаётся Phase 2/3 (CR health-propagation, как app-status в 1.79a).
 
 #### Не входит в этот item
 
@@ -2481,6 +2483,70 @@ instead of carrying parallel definitions.
 **Зависит от:** 1.79a (`apprafter app add` базовый flow, AppProjects, repo creds).
 
 **Размер:** S-M
+
+---
+
+### 1.79c Private-repo credential flow — `SourceCredential` CRD
+> 🏁 SR: A · order 3 — private-repo credential flow (`SourceCredential`, ADR 0039); **must follow the 2.11 SealedSecrets controller+seal slice** в SR-порядке (cross-phase dep — phase-номера немонотонны: Phase-1 item выполняется после Phase-2 slice, это ожидаемо; см. `speedrun-plan.md` §4.2).
+
+**Source:** ADR 0039. Продолжение 1.79a (repo/app subcommands). Новый item — не затрагивает отгруженный 1.79b (`app open`/scaffolding/runtime templates сохраняют свой номер и историю v0.1.161–v0.1.174).
+
+**Цель:** один безопасный credential-флоу к приватным client-репозиториям — git-read для Argo CD + registry-pull для kubelet — из одного источника, без сырых ungated-ресурсов и без plaintext-секретов. Закрывает три дефекта текущего 1.79a-флоу: **(1)** CLI создаёт raw Argo `Application` + raw `repo-creds` Secret в обход admission+оператора (credential change не классифицируется как потенциально деструктивная операция); **(2)** credential лежит plaintext в kube Secret (несовместимо с SealedSecrets 2.11 / ADR 0024 Layer 2); **(3)** pull-secret не заводится вообще — приложения с приватным registry не стартуют.
+
+#### Поставка — `SourceCredential` CRD (config-only, ноль материала)
+- [ ] CUE schema `schemas/v1alpha1/sourcecredential.cue`: `spec.git? { backend, repoPrefixes: [...] }`, `spec.registry? { backend, hosts: [...] }`; `#Backend = { sealedSecretRef } | { openBaoPath }`. Обе половины независимы; single-PAT кейс = один backend в обоих. В `spec` — никакого токена/base64.
+- [ ] CRD OpenAPI v3 + admission webhook (cross-field: хотя бы одна из git/registry; непустые prefixes/hosts; валидный backend ref).
+- [ ] `status.conditions` per-half: `Present` / `Valid` / `Invalid` / `Unverified` + covered prefixes/hosts + `lastValidated`.
+
+#### Поставка — operator derivation
+- [ ] git → **prefix-matched** Argo `repo-creds` Secret в `argocd` ns (Argo клонит по URL-prefix; derived output, не hand-managed).
+- [ ] registry → static `dockerconfigjson` pull-secret в workload ns; **auto-attach** к workload SA / `Deployment.imagePullSecrets` по **registry-host match** (`image: ghcr.io/...` → `SourceCredential` с host `ghcr.io/...`).
+- [ ] Reconcile держит derived Secrets консистентными с CR + материалом (single source of truth; `rotate` материала → передеривка обеих производных).
+- [ ] RBAC оператора: read `SourceCredential`, read unsealed material, write argocd repo-cred + workload pull-secret, patch SA/Deployment.
+
+#### Поставка — operator validation + status
+- [ ] git validity: `git ls-remote` против repoPrefix. registry validity: registry token-exchange/HEAD против host. On-change + периодически с backoff (rate-limit GitHub).
+- [ ] Egress-blocked → `Unverified` (не `Invalid`). Результат пишется в `status`.
+- [ ] Coverage-gate конфигурируем `present` | `confirmed` (mirrors 1.79a `--no-ping` философию): `present` пропускает по факту наличия cred, `confirmed` требует `Valid`. Egress-restricted кластеры → дефолт `present` (иначе `Unverified` блокировал бы coverage-check). [ADR 0039 §Validation and status]
+
+#### Поставка — CLI front-end refactor (`repo creds` → `SourceCredential`)
+- [ ] `apprafter repo creds add`: shape-check (existing regex) → seal материал client-side (kubeseal публичным сертом контроллера; серт **пинится** / fetch через TLS kube API) → create/update `SourceCredential` CR + SealedSecret. Опц. поллит `.status` несколько сек для validity-фидбэка; иначе «submitted, validity pending».
+- [ ] `list` / `show`: читают `.status` (coverage + validity), **никогда** материал (CLI не может расшифровать SealedSecret — нет cluster private key).
+- [ ] `rotate`: re-seal материал на эквивалентный валидный cred (оператор передеривает обе производные; non-destructive).
+- [ ] `remove`: delete CR с reverse-dep gate (переиспользует `find_apps_matching_prefix` из 1.79a).
+- [ ] `app add` coverage-check: гейтит по «есть `Valid` cred, покрывающий repo prefix» из `.status` (вместо CLI-догадки); режим гейта = coverage-gate (`present`/`confirmed`) из operator-секции выше.
+- [ ] Scoped CLI RBAC role (Phase-4 scoped-identity seed, фиксируется уже сейчас): read `SourceCredential` (+`status`), write `SourceCredential` / `SealedSecret`, **no read** на derived Secrets — крипто-нечитаемость материала из CLI по построению, не только RBAC. [ADR 0039 §CLI as a thin front-end]
+- [ ] **Cut over** от legacy raw `repo-creds` Secret флоу — без migration shim (pre-1.0, флоу живёт только в dev-кластере).
+
+#### Поставка — MigrationPlan integration (destructive credential change)
+- [ ] `SourceCredentialMigrationStrategy` с `detect_destructive(old, new) -> Option<DestructiveChange>`: rotate-to-equivalent-valid = `None`; coverage removal (repo-prefix / registry-host) / delete-while-referenced / scope narrowing = destructive → MigrationPlan. Actor-agnostic gate. Зависит от MigrationPlan CRD (1.72–1.78).
+
+#### Поставка — delivery modes
+- [ ] CLI→cluster: `kubectl apply` SealedSecret + CR.
+- [ ] config-repo (опц. инфра-репо): commit sealed + CR, Argo синкает (материал sealed → git-safe). Pure-GitOps-без-cluster-read: coverage-match по declared prefixes, validity в Backstage.
+
+#### Поставка — credential type
+- [ ] Launch default: single classic PAT (`repo` + `read:packages`) в обе половины. GitHub-ограничение (нет `repo:read`-only; fine-grained без packages; App-токен ghcr.io не берёт) — принимается; платформа хранит sealed.
+- [ ] Schema split-ready с первого дня (git ≠ registry backend). Wizard split (deploy-key/fine-grained git + `read:packages`-only registry с package-level access; GitLab — один `read_repository`+`read_registry` токен) — **opt-in, не дефолт**; визард-выбор откладывается до operator feedback.
+
+#### Acceptance
+- [ ] Private GitHub репо + приватный ghcr.io образ: `repo creds add` (classic PAT) → `SourceCredential` `Valid` → `app add` проходит coverage-check → Argo клонит (prefix-matched repo-cred) → оператор рендерит Deployment с auto-attached pull-secret → под стартует, образ тянется.
+- [ ] Org-cred (`repoPrefixes: ["github.com/myorg/"]` + `hosts: ["ghcr.io/myorg/"]`) покрывает второе приложение орги без отдельного `repo creds add` (auto-match); в `Application.cue` про credentials ничего.
+- [ ] `repo creds rotate` на валидный новый PAT → обе производные передериваются, Argo + kubelet продолжают без даунтайма; MigrationPlan не создаётся (non-destructive).
+- [ ] Убрать registry-host из покрытия CR, пока приложение на него матчится → admission создаёт MigrationPlan; derived pull-secret не трогается до approve.
+- [ ] `repo creds show` / `list` / `kubectl get sourcecredential -o yaml` — нигде plaintext токена; SealedSecret нерасшифровываем без cluster private key.
+- [ ] Restricted-egress кластер: валидный PAT → status `Unverified` (не `Invalid`); coverage-gate в `present`-режиме пропускает.
+
+#### Не входит в этот item
+- OpenBao backend (T2) — с 2.7–2.8 / 3.11; schema `backend` уже предусматривает `openBaoPath`.
+- Wizard выбора credential-типа (single vs split) — flag-driven + дефолт single PAT; визард по operator feedback.
+- Short-lived-token registry + refresher / kubelet credential provider — не нужно для classic-PAT GHCR; managed-era / cloud-registry concern.
+- GitHub App credential path — managed-era refinement (git-половина).
+- Backstage `SourceCredential` view — Phase 3 Backstage plugin.
+
+**Зависит от:** 1.79a (repo/app subcommands, `find_apps_matching_prefix`); **2.11** (SealedSecrets controller + kubeseal-in-CLI slice — **cross-phase, см. `speedrun-plan.md` §4.2 SR ordering**); 1.72–1.78 (MigrationPlan CRD — для destructive-gating подчасти).
+
+**Размер:** L
 
 ---
 
@@ -2890,7 +2956,7 @@ Tests:
 ---
 
 ### 2.11 SealedSecrets интеграция (Tier 1 секреты)
-> 🏁 SR: A · order 3 — SealedSecrets (default Tier-1 secrets)
+> 🏁 SR: A · order 3 — SealedSecrets (default Tier-1 secrets). **Controller + `secret seal` slice carved к фронту order 3 как prereq для 1.79c** (`SourceCredential`, см. `speedrun-plan.md` §4.2); Backstage encrypt-wizard + UI rotation-warning — позже в order 3.
 
 **Поставка:**
 - [ ] Установка sealed-secrets controller.

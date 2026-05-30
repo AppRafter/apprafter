@@ -136,6 +136,7 @@ Honest launch claims:
 |---|---|---|
 | **1.66-1.83 subset** (M1.5 Track B) | ADR 0025 + 0028 + 0029 only | Platform reconciles itself через Argo CD; substrate для managed updates |
 | **1.72-1.78 condensed** | PlatformController + MigrationPlan CRD (embedded в apprafter-operator) | ~1 нед FT condensed implementation. Closes #3 и #7 killer features через real CRD primitive. T1↔T2 диff небольшой; gate работает для tier change + Application destructive ops. CLI approve commands included. **Backstage MigrationPlan plugin (4.16) остаётся в bucket C** — bundles с migrate-to-tier post-launch |
+| **1.79c** | Private-repo credential flow (`SourceCredential`) | Один безопасный credential-флоу git+registry из одного источника; defect-fix raw-bypass / plaintext / missing-pull-secret; foundational для деплоя приватных apps (нужно и OSS-launch, и managed Hosted Services). **Cross-phase:** требует 2.11 SealedSecrets controller+seal slice → в SR-порядке после него (см. §4.2). ADR 0039. *(Номер — следующий свободный суффикс; отгруженный 1.79b `app open`/scaffolding не renumber'ится.)* |
 | **2.1-2.4** | ServiceProvider + ResourceClaim + selector + `needs.pg` (CloudNativePG) | Без БД managed launch = пустая demo |
 | **2.6** | `needs.redis` (Dragonfly) | Pull from bucket C: closes 2 из 6 platform services (#9), dogfooded by Account UI session storage / rate limiting |
 | **2.6b** | `needs.disk` (block storage) | Launch storage primitive alongside pg+redis; добавлен в launch-scope (не было в ревизиях ≤5). |
@@ -218,7 +219,10 @@ Honest launch claims:
 | Pulled Phase 4 (4.1, 4.1a, 4.4a, 4.12) | 3-4 |
 | Hubble enable (3.7a subset) | 0.5-1 |
 | OTel minimal (3.4 subset) | 1.5 |
-| **OSS-core total** | **13.5-17 нед FT** |
+| Private-repo credential flow (1.79c `SourceCredential`) | L — size-only¹ |
+| **OSS-core total** | **13.5-17 нед FT** (excl. 1.79c¹) |
+
+> **¹ 1.79c велосити (rev 7):** 1.79c (`SourceCredential`, ADR 0039) — size-L cross-phase item в bucket A. нед-FT оценка намеренно **не выведена** из T-shirt-размера и оставлена size-only: нет FORECASTING-RULE basis, чтобы дать число не изобретая его (reconcile-инструкция §7 ссылается на «memory FORECASTING RULE» — такой памяти в проекте нет). **OSS-core total выше пока не включает 1.79c и требует пересчёта** при сайзинге. Carve 2.11 SealedSecrets controller+seal slice к фронту order 3 — net-zero к total (работа уже учтена в «Phase 2 minimum»).
 
 ---
 
@@ -487,7 +491,10 @@ OSS-core (13.5-17 нед FT) → Managed-specific (13-22.5 нед FT) → Launch
 
 1. M1.5 Track B subset (in progress, ~50% done) — ADR 0025 + 0028 + 0029
 2. **PlatformController + MigrationPlan CRD** (embedded в apprafter-operator, condensed 1.72-1.78 implementation) — closes #3 + #7 killer features
-3. Phase 2 minimum — 2.1, 2.2, 2.3, 2.4, **2.6 redis**, 2.10, 2.11, 2.12
+3. **Phase 2 minimum + cross-phase credential pull-in** — explicit linear order внутри шага:
+   - a. **2.11 SealedSecrets controller + `platform-cli secret seal` slice** — carved out of monolithic 2.11 и pulled к фронту: установка sealed-secrets controller + public-key publish (`manifests/tier-1/sealed-secrets/`) + CLI seal helper. **Только этот slice;** Backstage encrypt-wizard + UI rotation-warning остаются с остатком 2.11 в (c).
+   - b. **1.79c — private-repo credential flow (`SourceCredential`, ADR 0039)** — Phase-1 label, но в SR-порядке здесь: требует 2.11 controller+seal slice (a) + MigrationPlan CRD (шаг 2). Phase-номера в SR-порядке немонотонны — ожидаемо и приемлемо (отгруженный 1.79b `app open`/scaffolding уже выпущен и предшествует всей оставшейся build-последовательности).
+   - c. **Остаток Phase 2 minimum** — 2.1, 2.2, 2.3, 2.4, **2.6 redis**, 2.10, остаток 2.11 (Backstage encrypt-wizard + UI rotation-warning), 2.12.
 4. **T2 substrate** — 3.1 HA-bootstrap + 3.3 Cilium mTLS
 5. Pulled Phase 4 + obs minimal — 4.1, 4.1a, 4.4a, 4.12, 3.7a subset, 3.4 subset
 
@@ -720,6 +727,13 @@ T1→T2 migration deliverable отложен на post-launch first bundle (~2-4
 ---
 
 ## 8. Changelog
+
+- **2026-05-30 (revision 7)** — SourceCredential private-repo credential flow:
+    - **SourceCredential credential flow (ADR 0039)** добавлен в bucket A (§2.1) — config-only CRD, operator-derived Argo repo-cred + workload pull-secret, sealed material; closes 3 дефекта 1.79a-флоу (raw-bypass / plaintext / missing pull-secret). Foundational для деплоя приватных apps — нужно и OSS-launch, и managed Hosted Services.
+    - **Numbering correction vs reconcile instruction.** Инструкция предлагала переименовать предыдущий 1.79b (`app open`/scaffolding) → 1.79c и отдать 1.79b новому флоу. Но предыдущий 1.79b **уже отгружен** (releases v0.1.161–v0.1.174, 22 заголовка UNRELEASED.md, ~18 doc-комментариев, platform-stack 0.1.48 — git-история immutable). Renumber отгруженного sub-phase нарушает конвенцию, поэтому новый флоу взял **следующий свободный суффикс 1.79c**, а отгруженный 1.79b сохранил номер. Нулевой churn в changelog/коде/git.
+    - **SR-order (§4.2):** монолитный 2.11 — SealedSecrets controller + `secret seal` slice carved к фронту order 3 и **precedes new 1.79c**; остаток 2.11 (Backstage encrypt-wizard + UI warning) — позже в order 3. **Cross-phase dep — phase-номера в SR-порядке немонотонны** (Phase-1 1.79c выполняется после Phase-2 slice), ожидаемо.
+    - **§2.5 velocity:** 1.79c добавлен size-only (нед-FT pending recompute — no FORECASTING-RULE basis, не изобретаем число); OSS-core total пока без 1.79c.
+    - **Spec-update** — отдельный SPEC_CHANGES follow-up: ADR 0039 §Consequences мандатит новую секцию `SourceCredential` CRD + дополнение §4.5 (operator responsibility) + §4.7 (External Surface) + repo-creds CLI семантику. Точное размещение (предположительно новый §3.12 + строка в §9 Glossary) определяется в follow-up — не названо в ADR. Executed at 1.79c closure с Revision bump; не часть этой reconcile-задачи. Флаг: §4.7 содержит устаревший self-hosted GitLab/Forgejo/Harbor контент (bucket-D drop) — follow-up должен переформулировать на GitHub+GHCR одновременно.
 
 - **2026-05-29 (revision 6)** — sync with the docs-actualization wave:
     - **2.6b needs.disk** added to launch bucket A (block-storage primitive alongside pg+redis).
