@@ -1,60 +1,49 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! `apprafter repo creds …` — manage Argo CD repo creds
-//! Secrets for private user repos. Track B.1.79a part 5.
+//! `apprafter repo creds …` — manage private-source credentials via the
+//! `SourceCredential` CRD (1.79c / ADR 0039).
 //!
-//! Argo CD's documented contract (`docs/operator-manual/
-//! declarative-setup.md#credential-templates`):
+//! The CLI is a thin, gated front-end: it shape-checks the PAT, seals the
+//! material client-side with the in-cluster sealed-secrets controller's
+//! public cert, and writes a `SealedSecret` (the material, never
+//! plaintext) plus a `SourceCredential` CR (config-only, references the
+//! sealed material). The operator derives a prefix-matched Argo
+//! `repo-creds` Secret and a host-matched workload pull-secret from the
+//! one CR. `list` / `show` read `.status` only — the CLI cannot decrypt a
+//! SealedSecret (no cluster private key), so the material is unreadable
+//! from here by construction.
 //!
-//! ```yaml
-//! apiVersion: v1
-//! kind: Secret
-//! metadata:
-//!   name: <friendly-name>
-//!   namespace: argocd
-//!   labels:
-//!     argocd.argoproj.io/secret-type: repo-creds
-//! stringData:
-//!   url: <url-prefix>
-//!   username: <user>
-//!   password: <token-or-password>
-//! ```
-//!
-//! Argo CD's repo-server scans the `argocd` namespace for
-//! Secrets labeled `argocd.argoproj.io/secret-type: repo-creds`
-//! and uses whichever entry's `url` field is a prefix-match for
-//! an Application's `spec.source.repoURL`. So registering
-//! `https://github.com/myorg` makes every Application pointing
-//! to `https://github.com/myorg/<any>` inherit those creds
-//! automatically.
+//! Launch default: a single classic PAT used in both halves. For a
+//! `github.com/<org>` repo the registry host (`ghcr.io/<org>`) is
+//! inferred automatically; other hosts get a git-only credential.
 
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::Path;
 use std::process::Command;
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
 use cli_core::{CliError, Result};
+use cli_providers::k8s::kubectl::KubectlCli;
+use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::{json, Value};
 use tabled::{Table, Tabled};
 
 use crate::commands::k8s_helpers::{ensure_kubeconfig_tempfile, kubectl_get_json};
 
-const ARGOCD_NAMESPACE: &str = "argocd";
-const SECRET_TYPE_LABEL_VALUE: &str = "repo-creds";
-const SECRET_TYPE_SELECTOR: &str = "argocd.argoproj.io/secret-type=repo-creds";
-const APPRAFTER_MANAGED_LABEL_KEY: &str = "apprafter.io/managed-by";
-const APPRAFTER_CRED_NAME_LABEL_KEY: &str = "apprafter.io/cred-name";
+/// Namespace SourceCredentials + their sealed material live in.
+const SOURCECRED_NAMESPACE: &str = "apprafter-system";
+const GIT_USERNAME_ANNOTATION: &str = "apprafter.io/git-username";
+const AUTH_TYPE_ANNOTATION: &str = "apprafter.io/auth-type";
 
 #[derive(Tabled)]
 struct CredsRow {
     #[tabled(rename = "NAME")]
     name: String,
-    #[tabled(rename = "URL PREFIX")]
-    url_prefix: String,
-    #[tabled(rename = "TYPE")]
-    auth_type: String,
-    #[tabled(rename = "USERNAME")]
-    username: String,
+    #[tabled(rename = "REPO PREFIXES")]
+    repo_prefixes: String,
+    #[tabled(rename = "REGISTRY HOSTS")]
+    hosts: String,
+    #[tabled(rename = "STATUS")]
+    status: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67,11 +56,6 @@ pub fn add(
     no_validate: bool,
     no_interactive: bool,
 ) -> Result<()> {
-    // Wizard gate — TTY + not opted out. Wizard fills every
-    // missing field via inquire prompts; the token prompt is
-    // masked. Pre-fills come from the flag values above so an
-    // operator passing `--name x --url-prefix y` only gets
-    // prompted for type/username/token.
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = std::io::stdout().is_terminal();
     if crate::commands::repo_creds_wizard::should_use_wizard(
@@ -85,39 +69,66 @@ pub fn add(
     validate_dns_1123(name)?;
     let auth = parse_auth_type(auth_type)?;
     let token = resolve_token(token)?;
-
     if !no_validate {
         validate_token_format(&token, &auth)?;
     }
 
     let kc = ensure_kubeconfig_tempfile()?;
-    let existing = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?;
+    let existing = kubectl_get_json(
+        "sourcecredential",
+        Some(name),
+        Some(SOURCECRED_NAMESPACE),
+        kc.path(),
+    )?;
     if existing.is_some() {
         return Err(CliError::Other(format!(
-            "Secret '{name}' already exists in namespace {ARGOCD_NAMESPACE}. Run \
+            "SourceCredential '{name}' already exists in {SOURCECRED_NAMESPACE}. Run \
              `apprafter repo creds rotate {name}` to replace the token, or \
-             `apprafter repo creds remove {name}` + `add` to recreate from scratch."
+             `apprafter repo creds remove {name}` then `add` to recreate."
         )));
     }
 
-    let manifest = build_repo_creds_secret(name, url_prefix, &auth, username, &token);
-    apply_secret_manifest(&manifest, kc.path())?;
+    // Seal the material client-side and write the SealedSecret. Only the
+    // controller's private key can decrypt — the CLI never holds it.
+    let pub_key = fetch_controller_public_key(&KubectlCli, kc.path())?;
+    let material_name = material_secret_name(name);
+    let sealed = build_sealed_secret(
+        &pub_key,
+        SOURCECRED_NAMESPACE,
+        &material_name,
+        &material_data(username, &token),
+        "Opaque",
+    )?;
+    apply_manifest(&sealed, kc.path())?;
 
-    println!("✓ Repo creds '{name}' registered for URL prefix '{url_prefix}'.");
-    println!("  Type:     {auth_type}");
-    println!("  Username: {username}");
+    let git_prefix = normalize_git_prefix(url_prefix);
+    let registry_host = infer_registry_host(&git_prefix);
+    let cr = build_source_credential_cr(
+        name,
+        &git_prefix,
+        registry_host.as_deref(),
+        &material_name,
+        username,
+        auth_type,
+    );
+    apply_manifest(&cr, kc.path())?;
+
+    println!("✓ SourceCredential '{name}' registered (material sealed).");
+    println!("  Repo prefix:   {git_prefix}");
+    match &registry_host {
+        Some(h) => println!("  Registry host: {h}  (inferred)"),
+        None => println!("  Registry host: —  (git-only; pass a github.com repo to infer ghcr.io)"),
+    }
     println!();
     println!(
-        "Every Argo CD Application with `spec.source.repoURL` starting with '{url_prefix}' \
-         will inherit these creds automatically."
+        "The operator derives the Argo repo-cred + workload pull-secret. Check validity with:"
     );
+    println!("  apprafter repo creds show {name}");
     Ok(())
 }
 
-/// Wizard entry point — gathers missing fields via inquire
-/// prompts (masked Password for the token) and re-dispatches
-/// into the non-interactive `add` path with
-/// `no_interactive=true` to avoid recursion.
+/// Wizard entry point — gathers missing fields via inquire prompts
+/// (masked token) and re-dispatches into the non-interactive `add`.
 fn add_via_wizard(
     name: &str,
     url_prefix: &str,
@@ -156,109 +167,124 @@ fn add_via_wizard(
 
 pub fn list() -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let secrets = fetch_repo_creds_secrets(kc.path())?;
-
-    if secrets.is_empty() {
-        println!("No repo creds registered in namespace {ARGOCD_NAMESPACE}.");
+    let creds = fetch_source_credentials(kc.path())?;
+    if creds.is_empty() {
+        println!("No SourceCredentials registered in {SOURCECRED_NAMESPACE}.");
         println!(
-            "Hint: run `apprafter repo creds add <name> --url-prefix <url> --type pat \
-             --token <pat>` to register the first entry."
+            "Hint: run `apprafter repo creds add <name> --url-prefix <url> --token <pat>` to \
+             register the first entry."
         );
         return Ok(());
     }
-
-    let rows: Vec<CredsRow> = secrets.iter().map(creds_row).collect();
+    let rows: Vec<CredsRow> = creds.iter().map(creds_row).collect();
     println!("{}", Table::new(&rows));
     Ok(())
 }
 
 pub fn show(name: &str) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let secret = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?
-        .ok_or_else(|| {
-            CliError::Other(format!(
-                "Repo creds '{name}' not found in namespace {ARGOCD_NAMESPACE}."
-            ))
-        })?;
-
-    print_creds_detail(&secret);
+    let cred = kubectl_get_json(
+        "sourcecredential",
+        Some(name),
+        Some(SOURCECRED_NAMESPACE),
+        kc.path(),
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "SourceCredential '{name}' not found in {SOURCECRED_NAMESPACE}."
+        ))
+    })?;
+    print_creds_detail(&cred);
     Ok(())
 }
 
 pub fn rotate(name: &str, token: Option<String>, no_validate: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let secret = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?
-        .ok_or_else(|| {
-            CliError::Other(format!(
-                "Repo creds '{name}' not found in namespace {ARGOCD_NAMESPACE}."
-            ))
-        })?;
+    let cred = kubectl_get_json(
+        "sourcecredential",
+        Some(name),
+        Some(SOURCECRED_NAMESPACE),
+        kc.path(),
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "SourceCredential '{name}' not found in {SOURCECRED_NAMESPACE}."
+        ))
+    })?;
 
-    let auth_type = secret
-        .pointer("/metadata/annotations/apprafter.io~1auth-type")
+    let username = cred
+        .pointer(&format!(
+            "/metadata/annotations/{}",
+            esc(GIT_USERNAME_ANNOTATION)
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or("git")
+        .to_string();
+    let auth_type = cred
+        .pointer(&format!(
+            "/metadata/annotations/{}",
+            esc(AUTH_TYPE_ANNOTATION)
+        ))
         .and_then(Value::as_str)
         .unwrap_or("pat")
         .to_string();
     let auth = parse_auth_type(&auth_type)?;
     let new_token = resolve_token(token)?;
-
     if !no_validate {
         validate_token_format(&new_token, &auth)?;
     }
 
-    // Patch Secret's `data.password` in-place rather than
-    // recreating — repo-server holds a cached resourceVersion
-    // pointer and a full recreate would cause a brief reconnect
-    // window. Base64-encode because Secret's `data` (not
-    // `stringData`) expects encoded values.
-    let encoded = B64.encode(new_token.as_bytes());
-    let body = format!(r#"{{"data":{{"password":"{encoded}"}}}}"#);
-
-    crate::commands::k8s_helpers::kubectl_merge_patch(
-        "secret",
-        name,
-        Some(ARGOCD_NAMESPACE),
-        None,
-        &body,
-        kc.path(),
+    // Re-seal the material in place — the operator re-derives both halves.
+    let pub_key = fetch_controller_public_key(&KubectlCli, kc.path())?;
+    let material_name = material_secret_name(name);
+    let sealed = build_sealed_secret(
+        &pub_key,
+        SOURCECRED_NAMESPACE,
+        &material_name,
+        &material_data(&username, &new_token),
+        "Opaque",
     )?;
+    apply_manifest(&sealed, kc.path())?;
 
-    println!("✓ Token for repo creds '{name}' rotated.");
-    println!("Argo CD repo-server will pick up the new token on the next pull cycle.");
+    println!("✓ Material for SourceCredential '{name}' re-sealed.");
+    println!("The operator re-derives the Argo repo-cred + pull-secret on its next reconcile.");
     Ok(())
 }
 
 pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let secret = kubectl_get_json("secret", Some(name), Some(ARGOCD_NAMESPACE), kc.path())?
-        .ok_or_else(|| {
-            CliError::Other(format!(
-                "Repo creds '{name}' not found in namespace {ARGOCD_NAMESPACE}."
-            ))
-        })?;
+    let cred = kubectl_get_json(
+        "sourcecredential",
+        Some(name),
+        Some(SOURCECRED_NAMESPACE),
+        kc.path(),
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "SourceCredential '{name}' not found in {SOURCECRED_NAMESPACE}."
+        ))
+    })?;
 
-    let url_prefix = secret
-        .pointer("/data/url")
-        .and_then(Value::as_str)
-        .and_then(|b64| {
-            B64.decode(b64)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-        })
-        .unwrap_or_default();
+    let prefixes = repo_prefixes_of(&cred);
 
     if !force {
-        // Dependency check: refuse if there are Argo CD
-        // Application(s) whose `spec.source.repoURL` matches
-        // these creds by prefix. The operator can override
-        // with `--force` when they know what they're doing
-        // (e.g. migrating to another creds entry).
-        let deps = find_dependent_applications(&url_prefix, kc.path())?;
+        // Best-effort reverse-dependency gate: refuse if Argo CD
+        // Application(s) point under one of this credential's repo
+        // prefixes. (The operator's MigrationPlan gate is the
+        // authoritative actor-agnostic check; this is fast UX.)
+        let mut deps: Vec<String> = Vec::new();
+        for prefix in &prefixes {
+            deps.extend(find_dependent_applications(
+                &normalize_repo_url(prefix),
+                kc.path(),
+            )?);
+        }
+        deps.sort();
+        deps.dedup();
         if !deps.is_empty() {
             return Err(CliError::Other(format!(
-                "Repo creds '{name}' are used by {n} Application(s): {names}. \
-                 Re-register them with different creds (`apprafter app remove`/`add`) \
-                 or pass `--force` to delete the creds anyway.",
+                "SourceCredential '{name}' is used by {n} Application(s): {names}. \
+                 Re-point them or pass `--force` to delete anyway.",
                 n = deps.len(),
                 names = deps.join(", ")
             )));
@@ -268,10 +294,11 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
     if !yes && !force {
         if !io::stdin().is_terminal() {
             return Err(CliError::Other(
-                "non-interactive shell — pass `--yes` (or `--force`) to skip the confirmation prompt".into(),
+                "non-interactive shell — pass `--yes` (or `--force`) to skip the confirmation prompt"
+                    .into(),
             ));
         }
-        println!("Delete repo creds '{name}' (URL prefix: {url_prefix})?");
+        println!("Delete SourceCredential '{name}' and its sealed material?");
         let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
@@ -282,28 +309,23 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
         }
     }
 
-    let out = Command::new("kubectl")
-        .arg("delete")
-        .arg("secret")
-        .arg(name)
-        .arg("-n")
-        .arg(ARGOCD_NAMESPACE)
-        .env("KUBECONFIG", kc.path())
-        .output()
-        .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
-    if !out.status.success() {
-        return Err(CliError::Other(format!(
-            "kubectl delete failed (exit {:?}): {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    println!("✓ Repo creds '{name}' deleted.");
+    // Delete the CR + the SealedSecret. The sealed-secrets controller
+    // owns the unsealed material Secret via ownerReference, so it
+    // cascades. Derived repo-cred / pull-secret are left as-is (GC on
+    // coverage removal is the operator's MigrationPlan concern).
+    kubectl_delete("sourcecredential", name, SOURCECRED_NAMESPACE, kc.path())?;
+    kubectl_delete_ignore_missing(
+        "sealedsecret",
+        &material_secret_name(name),
+        SOURCECRED_NAMESPACE,
+        kc.path(),
+    )?;
+    println!("✓ SourceCredential '{name}' deleted.");
     Ok(())
 }
 
 // =========================================================================
-// PURE HELPERS — testable without kube::Client / git binary / network.
+// PURE HELPERS — testable without kube::Client / network.
 // =========================================================================
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -372,25 +394,16 @@ fn resolve_token(token: Option<String>) -> Result<String> {
     Ok(token)
 }
 
-/// Provider-aware token regex check. **Best-effort** — the
-/// operator can pass `--no-validate` to skip when running
-/// self-hosted Gitea/Forgejo with custom token shapes.
-/// Detection priority: GitHub fine-grained PAT > GitHub classic
-/// PAT > GitLab PAT > fallback to a 20+-char generic check.
+/// Provider-aware token regex check. **Best-effort** — `--no-validate`
+/// skips it for self-hosted Gitea/Forgejo with custom token shapes.
 pub fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
     if matches!(auth, AuthType::Basic) {
-        // Basic auth tokens are arbitrary passwords — no
-        // shape to validate. Just non-empty.
         if token.is_empty() {
             return Err(CliError::Other("`--token` cannot be empty".into()));
         }
         return Ok(());
     }
-    // PAT — try the known formats.
     if token.starts_with("github_pat_") {
-        // Fine-grained GitHub PAT. Documented prefix +
-        // 80+ char body. Minimum length check protects
-        // against a partial paste.
         if token.len() < 80 {
             return Err(CliError::Other(format!(
                 "GitHub fine-grained PAT length {} is too short — expected 80+ characters. \
@@ -401,8 +414,6 @@ pub fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
         return Ok(());
     }
     if token.starts_with("ghp_") {
-        // Classic GitHub PAT. Documented `ghp_` + 36-char
-        // alphanumeric body. Total 40 chars.
         if token.len() != 40 {
             return Err(CliError::Other(format!(
                 "GitHub classic PAT length {} ≠ 40 (expected `ghp_` + 36 alphanumeric). \
@@ -413,9 +424,6 @@ pub fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
         return Ok(());
     }
     if token.starts_with("glpat-") {
-        // GitLab PAT. Documented `glpat-` + 20-char body
-        // (but operators sometimes truncate; lenient
-        // minimum-length check).
         if token.len() < 20 {
             return Err(CliError::Other(format!(
                 "GitLab PAT length {} is too short — expected `glpat-` + 20+ characters. \
@@ -425,9 +433,6 @@ pub fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
         }
         return Ok(());
     }
-    // Unknown / generic — apply a minimum-length sanity
-    // check. Most providers (Gitea, Forgejo, Codeberg) issue
-    // tokens with at least 20-character bodies.
     if token.len() < 20 {
         return Err(CliError::Other(format!(
             "Token shape not recognised (not a GitHub PAT, not a GitLab PAT), and length \
@@ -439,54 +444,204 @@ pub fn validate_token_format(token: &str, auth: &AuthType) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn build_repo_creds_secret(
-    name: &str,
-    url_prefix: &str,
-    auth: &AuthType,
-    username: &str,
-    token: &str,
-) -> Value {
-    let auth_type_str = match auth {
-        AuthType::Pat => "pat",
-        AuthType::Basic => "basic",
+fn material_secret_name(cred_name: &str) -> String {
+    format!("srccred-{cred_name}-material")
+}
+
+fn material_data(username: &str, token: &str) -> BTreeMap<String, Vec<u8>> {
+    let mut m = BTreeMap::new();
+    m.insert("username".to_string(), username.as_bytes().to_vec());
+    m.insert("password".to_string(), token.as_bytes().to_vec());
+    m
+}
+
+/// Normalise a `--url-prefix` into a scheme-less, trailing-slash repo
+/// prefix for `spec.git.repoPrefixes`: `"https://github.com/myorg"` →
+/// `"github.com/myorg/"`.
+fn normalize_git_prefix(url_prefix: &str) -> String {
+    let no_scheme = url_prefix
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url_prefix);
+    format!("{}/", no_scheme.trim_end_matches('/'))
+}
+
+/// Add the scheme back for a repoURL prefix comparison against Argo CD
+/// Applications (`"github.com/myorg/"` → `"https://github.com/myorg"`).
+fn normalize_repo_url(prefix: &str) -> String {
+    let with_scheme = if prefix.contains("://") {
+        prefix.to_string()
+    } else {
+        format!("https://{prefix}")
     };
+    with_scheme.trim_end_matches('/').to_string()
+}
+
+/// Infer the registry-host prefix for the launch-default single PAT.
+/// GitHub repos publish images to GHCR under the same org:
+/// `"github.com/myorg/"` → `"ghcr.io/myorg/"`. Other hosts return
+/// `None` (git-only credential).
+fn infer_registry_host(git_prefix: &str) -> Option<String> {
+    let org = git_prefix.strip_prefix("github.com/")?;
+    let org = org.split('/').next().filter(|s| !s.is_empty())?;
+    Some(format!("ghcr.io/{org}/"))
+}
+
+fn build_source_credential_cr(
+    name: &str,
+    git_prefix: &str,
+    registry_host: Option<&str>,
+    material_name: &str,
+    username: &str,
+    auth_type: &str,
+) -> Value {
+    let mut spec = json!({
+        "git": {
+            "backend": { "sealedSecretRef": { "name": material_name } },
+            "repoPrefixes": [git_prefix],
+        }
+    });
+    if let Some(host) = registry_host {
+        spec["registry"] = json!({
+            "backend": { "sealedSecretRef": { "name": material_name } },
+            "hosts": [host],
+        });
+    }
     json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "type": "Opaque",
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "SourceCredential",
         "metadata": {
             "name": name,
-            "namespace": ARGOCD_NAMESPACE,
-            "labels": {
-                "argocd.argoproj.io/secret-type": SECRET_TYPE_LABEL_VALUE,
-                APPRAFTER_MANAGED_LABEL_KEY: "apprafter",
-                APPRAFTER_CRED_NAME_LABEL_KEY: name,
-            },
+            "namespace": SOURCECRED_NAMESPACE,
+            "labels": { "apprafter.io/managed-by": "apprafter" },
             "annotations": {
-                "apprafter.io/auth-type": auth_type_str,
-                "apprafter.io/source": "cli",
+                GIT_USERNAME_ANNOTATION: username,
+                AUTH_TYPE_ANNOTATION: auth_type,
             },
         },
-        "stringData": {
-            "url": url_prefix,
-            "username": username,
-            "password": token,
-        },
+        "spec": spec,
     })
 }
 
-fn apply_secret_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
+/// JSON-pointer escaping for an annotation key (the `/` in
+/// `apprafter.io/...` becomes `~1`).
+fn esc(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+fn repo_prefixes_of(cred: &Value) -> Vec<String> {
+    cred.pointer("/spec/git/repoPrefixes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn hosts_of(cred: &Value) -> Vec<String> {
+    cred.pointer("/spec/registry/hosts")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One-line status summary from `.status.conditions` — e.g.
+/// `git:True registry:True` or `pending`.
+fn status_summary(cred: &Value) -> String {
+    let conds = cred.pointer("/status/conditions").and_then(Value::as_array);
+    let Some(conds) = conds else {
+        return "pending".to_string();
+    };
+    let find = |type_: &str| {
+        conds
+            .iter()
+            .find(|c| c.get("type").and_then(Value::as_str) == Some(type_))
+            .and_then(|c| c.get("status").and_then(Value::as_str))
+    };
+    let mut parts = Vec::new();
+    if let Some(s) = find("GitPresent") {
+        parts.push(format!("git:{s}"));
+    }
+    if let Some(s) = find("RegistryPresent") {
+        parts.push(format!("registry:{s}"));
+    }
+    if parts.is_empty() {
+        "pending".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn creds_row(cred: &Value) -> CredsRow {
+    let name = cred
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    CredsRow {
+        name,
+        repo_prefixes: join_or_dash(&repo_prefixes_of(cred)),
+        hosts: join_or_dash(&hosts_of(cred)),
+        status: status_summary(cred),
+    }
+}
+
+fn join_or_dash(items: &[String]) -> String {
+    if items.is_empty() {
+        "—".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn print_creds_detail(cred: &Value) {
+    let name = cred
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    println!("SourceCredential {SOURCECRED_NAMESPACE}/{name}");
+    println!(
+        "  Repo prefixes:  {}",
+        join_or_dash(&repo_prefixes_of(cred))
+    );
+    println!("  Registry hosts: {}", join_or_dash(&hosts_of(cred)));
+    println!("  Status:         {}", status_summary(cred));
+    if let Some(conds) = cred.pointer("/status/conditions").and_then(Value::as_array) {
+        for c in conds {
+            let t = c.get("type").and_then(Value::as_str).unwrap_or("?");
+            let s = c.get("status").and_then(Value::as_str).unwrap_or("?");
+            let r = c.get("reason").and_then(Value::as_str).unwrap_or("");
+            let m = c.get("message").and_then(Value::as_str).unwrap_or("");
+            println!("    - {t}={s} ({r}) {m}");
+        }
+    }
+    println!("  Material:       sealed — unreadable from the CLI (no cluster private key).");
+}
+
+// =========================================================================
+// kube-touching helpers.
+// =========================================================================
+
+fn apply_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
     let mut file = tempfile::Builder::new()
-        .prefix("apprafter-creds-")
+        .prefix("apprafter-srccred-")
         .suffix(".json")
         .tempfile()
-        .map_err(|e| CliError::Other(format!("create secret manifest tempfile: {e}")))?;
+        .map_err(|e| CliError::Other(format!("create manifest tempfile: {e}")))?;
     let body = serde_json::to_vec_pretty(manifest)
-        .map_err(|e| CliError::Other(format!("serialise secret manifest: {e}")))?;
+        .map_err(|e| CliError::Other(format!("serialise manifest: {e}")))?;
     file.write_all(&body)
-        .map_err(|e| CliError::Other(format!("write secret manifest tempfile: {e}")))?;
+        .map_err(|e| CliError::Other(format!("write manifest tempfile: {e}")))?;
     file.flush()
-        .map_err(|e| CliError::Other(format!("flush secret manifest tempfile: {e}")))?;
+        .map_err(|e| CliError::Other(format!("flush manifest tempfile: {e}")))?;
 
     let out = Command::new("kubectl")
         .arg("apply")
@@ -505,28 +660,64 @@ fn apply_secret_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()>
     Ok(())
 }
 
-/// Public alias for `commands::app::warn_if_no_matching_repo_creds`.
-/// Wraps the private `fetch_repo_creds_secrets` so the cred-
-/// check helper in `app.rs` can stay private к this crate без
-/// requiring the broader visibility shift.
-pub(crate) fn fetch_repo_creds_secrets_public(kubeconfig_path: &Path) -> Result<Vec<Value>> {
-    fetch_repo_creds_secrets(kubeconfig_path)
+fn kubectl_delete(kind: &str, name: &str, namespace: &str, kubeconfig_path: &Path) -> Result<()> {
+    let out = Command::new("kubectl")
+        .arg("delete")
+        .arg(kind)
+        .arg(name)
+        .arg("-n")
+        .arg(namespace)
+        .env("KUBECONFIG", kubeconfig_path)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl delete {kind} {name} failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
 }
 
-/// Public alias for `commands::app::any_secret_url_is_prefix_of`.
-/// See `fetch_repo_creds_secrets_public` for the rationale.
-pub(crate) fn decode_data_field_public(secret: &Value, field: &str) -> String {
-    decode_data_field(secret, field)
+fn kubectl_delete_ignore_missing(
+    kind: &str,
+    name: &str,
+    namespace: &str,
+    kubeconfig_path: &Path,
+) -> Result<()> {
+    let out = Command::new("kubectl")
+        .arg("delete")
+        .arg(kind)
+        .arg(name)
+        .arg("-n")
+        .arg(namespace)
+        .arg("--ignore-not-found")
+        .env("KUBECONFIG", kubeconfig_path)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl delete {kind} {name} failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
 }
 
-fn fetch_repo_creds_secrets(kubeconfig_path: &Path) -> Result<Vec<Value>> {
+/// Fetch all SourceCredentials in the platform namespace (for `app add`
+/// coverage checks too).
+pub(crate) fn fetch_source_credentials_public(kubeconfig_path: &Path) -> Result<Vec<Value>> {
+    fetch_source_credentials(kubeconfig_path)
+}
+
+fn fetch_source_credentials(kubeconfig_path: &Path) -> Result<Vec<Value>> {
     let out = Command::new("kubectl")
         .arg("get")
-        .arg("secret")
+        .arg("sourcecredential")
         .arg("-n")
-        .arg(ARGOCD_NAMESPACE)
-        .arg("-l")
-        .arg(SECRET_TYPE_SELECTOR)
+        .arg(SOURCECRED_NAMESPACE)
         .arg("-o")
         .arg("json")
         .env("KUBECONFIG", kubeconfig_path)
@@ -534,7 +725,7 @@ fn fetch_repo_creds_secrets(kubeconfig_path: &Path) -> Result<Vec<Value>> {
         .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
     if !out.status.success() {
         return Err(CliError::Other(format!(
-            "kubectl get secrets failed (exit {:?}): {}",
+            "kubectl get sourcecredentials failed (exit {:?}): {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
         )));
@@ -548,56 +739,14 @@ fn fetch_repo_creds_secrets(kubeconfig_path: &Path) -> Result<Vec<Value>> {
         .unwrap_or_default())
 }
 
-fn creds_row(secret: &Value) -> CredsRow {
-    let name = secret
-        .pointer("/metadata/name")
-        .and_then(Value::as_str)
-        .unwrap_or("?")
-        .to_string();
-    let url_prefix = decode_data_field(secret, "url");
-    let username = decode_data_field(secret, "username");
-    let auth_type = secret
-        .pointer("/metadata/annotations/apprafter.io~1auth-type")
-        .and_then(Value::as_str)
-        .unwrap_or("pat")
-        .to_string();
-    CredsRow {
-        name,
-        url_prefix,
-        auth_type,
-        username,
-    }
-}
-
-fn decode_data_field(secret: &Value, field: &str) -> String {
-    secret
-        .pointer(&format!("/data/{field}"))
-        .and_then(Value::as_str)
-        .and_then(|b64| {
-            B64.decode(b64)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-        })
-        .unwrap_or_default()
-}
-
-fn print_creds_detail(secret: &Value) {
-    let name = secret
-        .pointer("/metadata/name")
-        .and_then(Value::as_str)
-        .unwrap_or("?");
-    let auth_type = secret
-        .pointer("/metadata/annotations/apprafter.io~1auth-type")
-        .and_then(Value::as_str)
-        .unwrap_or("pat");
-    let url_prefix = decode_data_field(secret, "url");
-    let username = decode_data_field(secret, "username");
-
-    println!("Repo creds {ARGOCD_NAMESPACE}/{name}");
-    println!("  URL prefix: {url_prefix}");
-    println!("  Type:       {auth_type}");
-    println!("  Username:   {username}");
-    println!("  Password:   ****  (run `kubectl get secret {name} -n {ARGOCD_NAMESPACE} -o jsonpath='{{.data.password}}' | base64 -d` to decode the plaintext)");
+/// Does any SourceCredential's declared repo prefix cover `repo_url`?
+/// Used by `app add`'s coverage hint (pure — tested without a cluster).
+pub(crate) fn any_credential_covers(creds: &[Value], repo_url: &str) -> bool {
+    creds.iter().any(|cred| {
+        repo_prefixes_of(cred)
+            .iter()
+            .any(|p| repo_url.starts_with(&normalize_repo_url(p)))
+    })
 }
 
 fn find_dependent_applications(url_prefix: &str, kubeconfig_path: &Path) -> Result<Vec<String>> {
@@ -605,7 +754,7 @@ fn find_dependent_applications(url_prefix: &str, kubeconfig_path: &Path) -> Resu
         .arg("get")
         .arg("application.argoproj.io")
         .arg("-n")
-        .arg(ARGOCD_NAMESPACE)
+        .arg("argocd")
         .arg("-o")
         .arg("json")
         .env("KUBECONFIG", kubeconfig_path)
@@ -624,8 +773,7 @@ fn find_dependent_applications(url_prefix: &str, kubeconfig_path: &Path) -> Resu
 }
 
 /// Filter Applications whose `spec.source.repoURL` starts with
-/// `url_prefix`. Pure fn — tests cover prefix-match semantics
-/// without a cluster.
+/// `url_prefix`. Pure fn — tests cover prefix-match semantics.
 pub(crate) fn find_apps_matching_prefix(
     applications_json: &Value,
     url_prefix: &str,
@@ -666,10 +814,7 @@ mod tests {
     #[test]
     fn parse_auth_type_rejects_ssh_with_phase2_hint() {
         let err = parse_auth_type("ssh").unwrap_err().to_string();
-        assert!(
-            err.contains("Phase 2"),
-            "SSH error must hint at Phase 2 deferral: {err}"
-        );
+        assert!(err.contains("Phase 2"), "{err}");
     }
 
     #[test]
@@ -698,9 +843,6 @@ mod tests {
 
     #[test]
     fn validate_token_format_rejects_wrong_length_github_classic_pat() {
-        // Documented spec: ghp_ + exactly 36 alphanumeric.
-        // Refuse both shorter and longer values — likely
-        // copy-paste error.
         assert!(validate_token_format("ghp_short", &AuthType::Pat).is_err());
         let too_long = format!("ghp_{}", "a".repeat(50));
         assert!(validate_token_format(&too_long, &AuthType::Pat).is_err());
@@ -714,25 +856,17 @@ mod tests {
 
     #[test]
     fn validate_token_format_accepts_generic_long_token() {
-        // Self-hosted Gitea/Forgejo issue tokens that don't
-        // match GitHub/GitLab prefixes; lenient length-only
-        // fallback applies.
         let token = "abcdefghij1234567890abc".to_string();
         assert!(validate_token_format(&token, &AuthType::Pat).is_ok());
     }
 
     #[test]
     fn validate_token_format_rejects_short_generic_token() {
-        // Most likely a partial paste or accidental
-        // truncation — refuse and hint at --no-validate.
         let too_short = "shorty".to_string();
         let err = validate_token_format(&too_short, &AuthType::Pat)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("no-validate"),
-            "must hint at --no-validate: {err}"
-        );
+        assert!(err.contains("no-validate"), "{err}");
     }
 
     #[test]
@@ -750,73 +884,96 @@ mod tests {
     }
 
     #[test]
-    fn build_repo_creds_secret_carries_secret_type_label() {
-        // Load-bearing — Argo CD's repo-server filters
-        // Secrets by this label. If we drop it, the creds
-        // are invisible to Argo CD and Applications fail to
-        // pull private repos.
-        let s = build_repo_creds_secret(
-            "github-myorg",
-            "https://github.com/myorg",
-            &AuthType::Pat,
+    fn material_secret_name_is_deterministic() {
+        assert_eq!(material_secret_name("acme"), "srccred-acme-material");
+    }
+
+    #[test]
+    fn normalize_git_prefix_strips_scheme_and_adds_trailing_slash() {
+        assert_eq!(
+            normalize_git_prefix("https://github.com/myorg"),
+            "github.com/myorg/"
+        );
+        assert_eq!(
+            normalize_git_prefix("github.com/myorg/"),
+            "github.com/myorg/"
+        );
+    }
+
+    #[test]
+    fn infer_registry_host_maps_github_org_to_ghcr() {
+        assert_eq!(
+            infer_registry_host("github.com/myorg/"),
+            Some("ghcr.io/myorg/".to_string())
+        );
+        assert_eq!(infer_registry_host("gitlab.com/myorg/"), None);
+    }
+
+    #[test]
+    fn build_source_credential_cr_single_pat_covers_both_halves() {
+        let cr = build_source_credential_cr(
+            "acme",
+            "github.com/acme/",
+            Some("ghcr.io/acme/"),
+            "srccred-acme-material",
             "git",
-            "ghp_x",
+            "pat",
         );
+        assert_eq!(cr["apiVersion"], "apprafter.io/v1alpha1");
+        assert_eq!(cr["kind"], "SourceCredential");
+        assert_eq!(cr["metadata"]["namespace"], "apprafter-system");
         assert_eq!(
-            s.pointer("/metadata/labels/argocd.argoproj.io~1secret-type")
+            cr["spec"]["git"]["backend"]["sealedSecretRef"]["name"],
+            "srccred-acme-material"
+        );
+        assert_eq!(cr["spec"]["git"]["repoPrefixes"][0], "github.com/acme/");
+        assert_eq!(cr["spec"]["registry"]["hosts"][0], "ghcr.io/acme/");
+        assert_eq!(
+            cr.pointer("/metadata/annotations/apprafter.io~1git-username")
                 .and_then(Value::as_str),
-            Some("repo-creds")
-        );
-    }
-
-    #[test]
-    fn build_repo_creds_secret_includes_managed_by_and_cred_name_labels() {
-        let s = build_repo_creds_secret("github-myorg", "u", &AuthType::Pat, "git", "t");
-        assert_eq!(
-            s.pointer("/metadata/labels/apprafter.io~1managed-by")
-                .and_then(Value::as_str),
-            Some("apprafter")
-        );
-        assert_eq!(
-            s.pointer("/metadata/labels/apprafter.io~1cred-name")
-                .and_then(Value::as_str),
-            Some("github-myorg")
-        );
-    }
-
-    #[test]
-    fn build_repo_creds_secret_routes_to_argocd_namespace() {
-        let s = build_repo_creds_secret("n", "u", &AuthType::Pat, "git", "t");
-        assert_eq!(
-            s.pointer("/metadata/namespace").and_then(Value::as_str),
-            Some("argocd")
-        );
-    }
-
-    #[test]
-    fn build_repo_creds_secret_uses_stringdata_for_round_trip() {
-        // `stringData` (rather than `data`) is critical for
-        // CLI ergonomics — kubectl encodes to base64 server-
-        // side, so we don't need to pre-encode. If we
-        // switched to `data`, the apiserver would take the
-        // plaintext password as base64 and the repo-server
-        // would see garbage.
-        let s = build_repo_creds_secret("n", "u-prefix", &AuthType::Pat, "git", "TOKEN");
-        assert_eq!(
-            s.pointer("/stringData/url").and_then(Value::as_str),
-            Some("u-prefix")
-        );
-        assert_eq!(
-            s.pointer("/stringData/username").and_then(Value::as_str),
             Some("git")
         );
-        assert_eq!(
-            s.pointer("/stringData/password").and_then(Value::as_str),
-            Some("TOKEN")
+    }
+
+    #[test]
+    fn build_source_credential_cr_git_only_when_no_registry() {
+        let cr = build_source_credential_cr(
+            "acme",
+            "gitlab.com/acme/",
+            None,
+            "srccred-acme-material",
+            "git",
+            "pat",
         );
-        // `data` field must NOT exist — would break the
-        // stringData semantics by competing for precedence.
-        assert!(s.get("data").is_none());
+        assert!(cr["spec"]["registry"].is_null());
+        assert_eq!(cr["spec"]["git"]["repoPrefixes"][0], "gitlab.com/acme/");
+    }
+
+    #[test]
+    fn status_summary_reads_conditions() {
+        let cred = json!({
+            "status": { "conditions": [
+                { "type": "GitPresent", "status": "True" },
+                { "type": "RegistryPresent", "status": "True" }
+            ]}
+        });
+        assert_eq!(status_summary(&cred), "git:True registry:True");
+        assert_eq!(status_summary(&json!({})), "pending");
+    }
+
+    #[test]
+    fn any_credential_covers_matches_declared_prefix() {
+        let creds = vec![json!({
+            "spec": { "git": { "repoPrefixes": ["github.com/myorg/"] } }
+        })];
+        assert!(any_credential_covers(
+            &creds,
+            "https://github.com/myorg/repo"
+        ));
+        assert!(!any_credential_covers(
+            &creds,
+            "https://github.com/other/repo"
+        ));
     }
 
     #[test]
@@ -834,9 +991,6 @@ mod tests {
 
     #[test]
     fn find_apps_matching_prefix_skips_apps_without_repo_url() {
-        // Defensive: an Application with a missing/malformed
-        // `spec.source.repoURL` (e.g. helm chart source only,
-        // no git) must not trip the filter.
         let apps = json!({
             "items": [
                 { "metadata": { "name": "helm-only" }, "spec": { "source": { "chart": "x", "repoURL": "https://charts.example/" } } },

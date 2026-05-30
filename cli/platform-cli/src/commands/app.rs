@@ -222,12 +222,12 @@ fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
         // up via а different cred entry shape we don't probe.
         return;
     }
-    let secrets =
-        match crate::commands::repo_creds::fetch_repo_creds_secrets_public(kubeconfig_path) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-    if any_secret_url_is_prefix_of(&secrets, repo_url) {
+    let creds = match crate::commands::repo_creds::fetch_source_credentials_public(kubeconfig_path)
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if crate::commands::repo_creds::any_credential_covers(&creds, repo_url) {
         return;
     }
 
@@ -313,17 +313,6 @@ pub(crate) fn derive_creds_suggestion(repo_url: &str) -> Option<CredsSuggestion>
         suggested_name,
         url_prefix,
         pat_creation_url,
-    })
-}
-
-/// Pure helper — does any secret's decoded `data.url` field
-/// serve as а prefix of `repo_url`? Argo CD's repo-server
-/// uses the same prefix-match semantics for cred lookup, so
-/// matching the same logic here keeps our hint accurate.
-pub(crate) fn any_secret_url_is_prefix_of(secrets: &[serde_json::Value], repo_url: &str) -> bool {
-    secrets.iter().any(|s| {
-        let prefix = crate::commands::repo_creds::decode_data_field_public(s, "url");
-        !prefix.is_empty() && repo_url.starts_with(&prefix)
     })
 }
 
@@ -1662,62 +1651,6 @@ mod tests {
         let out = sanitise_for_dns_1123(&long);
         assert_eq!(out.len(), 63);
         assert!(!out.ends_with('-'));
-    }
-
-    fn cred_secret(b64_url: &str) -> serde_json::Value {
-        // Build а minimal kubectl-shape secret JSON с the
-        // `data.url` field base64-encoded so the cred-prefix
-        // helper can decode it.
-        serde_json::json!({
-            "metadata": { "name": "test-creds" },
-            "data": { "url": b64_url }
-        })
-    }
-
-    #[test]
-    fn any_secret_url_is_prefix_of_matches_repo_under_registered_prefix() {
-        // Walk-fix Fix 3 post-Part-3b: cred check helper.
-        // `data.url` is base64'd; the helper decodes и
-        // prefix-matches against `repo_url`.
-        // base64("https://github.com/myorg") =
-        //   "aHR0cHM6Ly9naXRodWIuY29tL215b3Jn"
-        let secrets = vec![cred_secret("aHR0cHM6Ly9naXRodWIuY29tL215b3Jn")];
-        assert!(any_secret_url_is_prefix_of(
-            &secrets,
-            "https://github.com/myorg/repo-name"
-        ));
-    }
-
-    #[test]
-    fn any_secret_url_is_prefix_of_rejects_non_matching_url() {
-        // Different org → no match. Operator's hint should
-        // fire (their repo isn't covered by а cred).
-        let secrets = vec![cred_secret("aHR0cHM6Ly9naXRodWIuY29tL215b3Jn")];
-        assert!(!any_secret_url_is_prefix_of(
-            &secrets,
-            "https://github.com/otherorg/repo"
-        ));
-    }
-
-    #[test]
-    fn any_secret_url_is_prefix_of_handles_empty_secret_list() {
-        // No creds registered → no match. This is the
-        // first-ever-app case where the hint MUST fire.
-        assert!(!any_secret_url_is_prefix_of(
-            &[],
-            "https://github.com/myorg/repo"
-        ));
-    }
-
-    #[test]
-    fn any_secret_url_is_prefix_of_skips_secrets_without_url_field() {
-        // Defensive — а malformed cred secret без `data.url`
-        // shouldn't false-positive the match.
-        let bogus = serde_json::json!({ "metadata": { "name": "broken" } });
-        assert!(!any_secret_url_is_prefix_of(
-            &[bogus],
-            "https://github.com/myorg/repo"
-        ));
     }
 
     #[test]
