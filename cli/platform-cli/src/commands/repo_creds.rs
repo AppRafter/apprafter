@@ -484,7 +484,12 @@ fn normalize_repo_url(prefix: &str) -> String {
 fn infer_registry_host(git_prefix: &str) -> Option<String> {
     let org = git_prefix.strip_prefix("github.com/")?;
     let org = org.split('/').next().filter(|s| !s.is_empty())?;
-    Some(format!("ghcr.io/{org}/"))
+    // GHCR namespaces are lowercase (OCI image refs are lowercase-only),
+    // even when the GitHub org has mixed case — the operator host-matches
+    // a lowercase rendered image. Only the registry host is lowercased;
+    // the git prefix keeps its case to prefix-match the Application's
+    // repoURL (which carries whatever case the user typed).
+    Some(format!("ghcr.io/{}/", org.to_ascii_lowercase()))
 }
 
 fn build_source_credential_cr(
@@ -907,6 +912,18 @@ mod tests {
             Some("ghcr.io/myorg/".to_string())
         );
         assert_eq!(infer_registry_host("gitlab.com/myorg/"), None);
+    }
+
+    #[test]
+    fn infer_registry_host_lowercases_the_org() {
+        // GHCR namespaces are canonically lowercase (OCI image refs are
+        // lowercase-only), even when the GitHub org has mixed case. The
+        // operator host-matches a lowercase rendered image, so the stored
+        // host must be lowercase or the pull-secret never attaches.
+        assert_eq!(
+            infer_registry_host("github.com/ProcVue/landing/"),
+            Some("ghcr.io/procvue/".to_string())
+        );
     }
 
     #[test]
