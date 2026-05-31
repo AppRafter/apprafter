@@ -40,6 +40,12 @@ use crate::commands::k8s_helpers::{
 const ARGOCD_NAMESPACE: &str = "argocd";
 const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
 const APPRAFTER_SOURCE_ANNOTATION: &str = "apprafter.io/source";
+/// Argo CD cascade-deletion finalizer (background variant). EXACT string
+/// per the Argo CD docs — note `resources-finalizer` (NOT
+/// `resources-finalization`); a typo here makes Argo ignore it and the
+/// Application hangs in `Terminating` forever. `/background` deletes the
+/// managed resources without blocking the delete call on child cleanup.
+const ARGOCD_CASCADE_FINALIZER: &str = "resources-finalizer.argocd.argoproj.io/background";
 
 #[derive(Tabled)]
 struct AppRow {
@@ -1004,32 +1010,25 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
         }
     }
 
-    // Find the AppRafter Application CR(s) this Argo App manages, read
-    // from its `status.resources`, BEFORE deleting it. We delete those
-    // explicitly rather than relying on Argo CD's cascade-deletion
-    // finalizer: that finalizer does NOT reliably delete an
-    // operator-managed custom resource (it leaves the CR + Deployment
-    // running and hangs the Argo Application in `Terminating` — 1.79c
-    // walk-fix #5, confirmed on a real cluster). Deleting the CR triggers
-    // the operator's deletion gate (walk-fix #4) and the Deployment's
-    // ownerReference cascade (→ ReplicaSet → pods).
-    let managed = managed_apprafter_applications(&app);
+    // `app remove` manages ONLY the Argo CD Application; Argo CD owns the
+    // cascade-deletion of the resource it synced (the AppRafter Application
+    // CR), whose ownerReference then GC's the operator's Deployment → RS →
+    // pods. The CLI does not touch the CR.
+    if keep_data {
+        // Strip the cascade finalizer so deleting the Argo Application does
+        // NOT prune the synced AppRafter CR — the workload is preserved.
+        kubectl_merge_patch(
+            "application.argoproj.io",
+            name,
+            Some(ARGOCD_NAMESPACE),
+            None,
+            r#"{"metadata":{"finalizers":[]}}"#,
+            kc.path(),
+        )?;
+    }
 
-    // Strip any finalizer first so the delete returns immediately. New
-    // apps carry none, but apps registered by a finalizer-setting CLI
-    // (0.1.180) would otherwise block on the Argo cascade finalizer that
-    // never clears. We do explicit cascade below, so the finalizer is not
-    // needed. This also lets `app remove` recover an already-stuck app.
-    kubectl_merge_patch(
-        "application.argoproj.io",
-        name,
-        Some(ARGOCD_NAMESPACE),
-        None,
-        r#"{"metadata":{"finalizers":[]}}"#,
-        kc.path(),
-    )?;
-
-    // Delete the Argo CD Application first so it stops re-syncing.
+    // Delete the Argo CD Application. It carries the cascade finalizer
+    // (set at `app add`), so Argo cascade-prunes the synced AppRafter CR.
     let out = Command::new("kubectl")
         .arg("delete")
         .arg("application.argoproj.io")
@@ -1052,69 +1051,11 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
             "✓ Application '{name}' deleted (Argo CD object only). The workload and its \
              AppRafter Application CR are preserved — re-register to re-adopt."
         );
-        return Ok(());
-    }
-
-    // Cascade the workload by deleting the managed AppRafter Application
-    // CR(s); the operator skips the deletion-marked CR and the
-    // ownerReference GC tears down the Deployment → ReplicaSet → pods.
-    for (cr_ns, cr_name) in &managed {
-        delete_apprafter_application(cr_name, cr_ns, kc.path())?;
-    }
-    if managed.is_empty() {
-        println!("✓ Application '{name}' deleted. (No AppRafter Application CR was tracked.)");
     } else {
-        let listed: Vec<String> = managed.iter().map(|(ns, n)| format!("{ns}/{n}")).collect();
         println!(
-            "✓ Application '{name}' deleted, including its workload(s): {}.",
-            listed.join(", ")
+            "✓ Application '{name}' deleted. Argo CD cascade-prunes the synced AppRafter \
+             resources; the operator then removes the workload."
         );
-    }
-    Ok(())
-}
-
-/// The AppRafter `Application` CR(s) an Argo CD Application manages,
-/// extracted from its `status.resources` (group `apprafter.io`, kind
-/// `Application`). Returns `(namespace, name)` pairs. Pure — tests cover
-/// the extraction without a cluster.
-pub(crate) fn managed_apprafter_applications(argo_app: &Value) -> Vec<(String, String)> {
-    argo_app
-        .pointer("/status/resources")
-        .and_then(Value::as_array)
-        .map(|resources| {
-            resources
-                .iter()
-                .filter(|r| {
-                    r.get("group").and_then(Value::as_str) == Some("apprafter.io")
-                        && r.get("kind").and_then(Value::as_str) == Some("Application")
-                })
-                .filter_map(|r| {
-                    let ns = r.get("namespace").and_then(Value::as_str)?;
-                    let name = r.get("name").and_then(Value::as_str)?;
-                    Some((ns.to_string(), name.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn delete_apprafter_application(name: &str, namespace: &str, kubeconfig_path: &Path) -> Result<()> {
-    let out = Command::new("kubectl")
-        .arg("delete")
-        .arg("application.apprafter.io")
-        .arg(name)
-        .arg("-n")
-        .arg(namespace)
-        .arg("--ignore-not-found")
-        .env("KUBECONFIG", kubeconfig_path)
-        .output()
-        .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
-    if !out.status.success() {
-        return Err(CliError::Other(format!(
-            "kubectl delete application.apprafter.io {name} -n {namespace} failed (exit {:?}): {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
     }
     Ok(())
 }
@@ -1407,6 +1348,11 @@ pub(crate) fn build_application_manifest(
             "annotations": {
                 APPRAFTER_SOURCE_ANNOTATION: "cli",
             },
+            // Argo CD owns cascade deletion of the resources it syncs (the
+            // AppRafter Application CR), whose ownerReference then GC's the
+            // operator's Deployment. Without this finalizer, deleting the
+            // Argo Application orphans the synced CR + workload.
+            "finalizers": [ARGOCD_CASCADE_FINALIZER],
         },
         "spec": {
             "project": project,
@@ -1844,11 +1790,11 @@ mod tests {
     }
 
     #[test]
-    fn build_application_manifest_carries_no_finalizer() {
-        // Walk-fix #5: the Argo cascade-deletion finalizer was removed —
-        // it does not reliably delete operator-managed CRs and hangs the
-        // Argo App in Terminating. `app remove` deletes the managed
-        // AppRafter CR explicitly instead.
+    fn build_application_manifest_carries_correct_cascade_finalizer() {
+        // Load-bearing — Argo CD owns cascade deletion of the synced
+        // AppRafter CR via THIS finalizer. The exact string matters:
+        // `resources-finalizer` (NOT `resources-finalization` — walk-fix
+        // #3's typo, which Argo ignored, hanging deletion in Terminating).
         let m = build_application_manifest(
             "my-app",
             "https://github.com/foo/bar",
@@ -1857,35 +1803,17 @@ mod tests {
             "apps",
             "apprafter",
         );
-        assert!(m.pointer("/metadata/finalizers").is_none());
-    }
-
-    #[test]
-    fn managed_apprafter_applications_extracts_apprafter_apps_from_status() {
-        // `app remove` reads the Argo App's status.resources to find the
-        // AppRafter Application CR(s) to delete explicitly. Only
-        // apprafter.io/Application entries are returned, with their ns+name.
-        let argo_app = serde_json::json!({
-            "status": { "resources": [
-                { "group": "apprafter.io", "kind": "Application", "namespace": "procvue", "name": "landing" },
-                { "group": "apprafter.io", "kind": "Application", "namespace": "demo", "name": "web" },
-                { "group": "", "kind": "ConfigMap", "namespace": "procvue", "name": "cfg" }
-            ]}
-        });
-        let managed = managed_apprafter_applications(&argo_app);
+        let finalizers = m
+            .pointer("/metadata/finalizers")
+            .and_then(Value::as_array)
+            .expect("finalizers array present");
         assert_eq!(
-            managed,
-            vec![
-                ("procvue".to_string(), "landing".to_string()),
-                ("demo".to_string(), "web".to_string()),
-            ]
+            finalizers
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["resources-finalizer.argocd.argoproj.io/background"]
         );
-    }
-
-    #[test]
-    fn managed_apprafter_applications_empty_when_no_status_resources() {
-        assert!(managed_apprafter_applications(&serde_json::json!({})).is_empty());
-        assert!(managed_apprafter_applications(&serde_json::json!({ "status": {} })).is_empty());
     }
 
     #[test]
