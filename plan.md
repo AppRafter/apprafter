@@ -2524,7 +2524,7 @@ instead of carrying parallel definitions.
 - [x] `rotate`: re-seal материал на эквивалентный валидный cred (оператор передеривает обе производные; non-destructive).
 - [x] `remove`: delete CR с reverse-dep gate (переиспользует `find_apps_matching_prefix` из 1.79a).
 - [x] `app add` coverage-check: гейтит по «есть `Valid` cred, покрывающий repo prefix» из `.status` (вместо CLI-догадки); режим гейта = coverage-gate (`present`/`confirmed`) из operator-секции выше.
-- [ ] Scoped CLI RBAC role (Phase-4 scoped-identity seed, фиксируется уже сейчас): read `SourceCredential` (+`status`), write `SourceCredential` / `SealedSecret`, **no read** на derived Secrets — крипто-нечитаемость материала из CLI по построению, не только RBAC. [ADR 0039 §CLI as a thin front-end]
+- [x] Scoped CLI RBAC role (Phase-4 scoped-identity seed, фиксируется уже сейчас): `Role` `<fullname>-credential-author` в release-ns (`operator/charts/.../templates/rbac-cli.yaml`, gate `.Values.cliRole.create`), shipped **UNBOUND** (Phase 4 биндит к scoped identity). read `SourceCredential` (+`status`), write `SourceCredential` / `SealedSecret` (bitnami.com), **no read** на core/v1 Secrets — крипто-нечитаемость материала из CLI по построению, не только RBAC. Public-cert fetch через service-proxy — отдельный non-sensitive grant, не в seed. [ADR 0039 §CLI as a thin front-end]
 - [x] **Cut over** от legacy raw `repo-creds` Secret флоу — без migration shim (pre-1.0, флоу живёт только в dev-кластере).
 
 #### Поставка — MigrationPlan integration (destructive credential change)

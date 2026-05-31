@@ -33,6 +33,16 @@ serviceAccount:
 rbac:
   create: true
 
+# Scoped ClusterRole for the CLI / human "credential author" identity
+# (1.79c / ADR 0039 §"CLI as a thin front-end"; a Phase-4
+# scoped-identity seed). Grants write on SourceCredential + SealedSecret
+# and read on SourceCredential status, with NO read on the derived
+# Secrets — the material is cryptographically unreadable from the CLI by
+# construction, not merely by RBAC. Shipped unbound: Phase 4 binds it to
+# the CLI's scoped identity. Set to false to omit the seed role.
+cliRole:
+  create: true
+
 # Pod-level security context.
 podSecurityContext:
   runAsNonRoot: true

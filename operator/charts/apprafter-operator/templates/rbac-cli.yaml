@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MIT
+{{- if .Values.cliRole.create }}
+# Scoped CLI "credential author" role (1.79c / ADR 0039 §"CLI as a thin
+# front-end"). A Phase-4 scoped-identity seed, shipped UNBOUND — there
+# is no RoleBinding here; Phase 4 binds it to the CLI's scoped identity.
+#
+# Deliberately grants NO read on core/v1 Secrets: the sealed material is
+# cryptographically unreadable from the CLI without the cluster private
+# key, so the CLI never needs — and must not have — Secret read. This
+# realises ADR 0024's "tokens do not sit where an agent can find them"
+# by construction, not merely by RBAC. The public sealing cert is
+# fetched over the sealed-secrets controller's service proxy (a separate,
+# non-sensitive grant), not modelled in this seed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "apprafter-operator.fullname" . }}-credential-author
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+rules:
+  # SourceCredential — full author lifecycle.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - sourcecredentials
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  # SourceCredential status — read coverage + validity (never material).
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - sourcecredentials/status
+    verbs:
+      - get
+  # SealedSecret — write the sealed material (the CLI seals client-side;
+  # the plaintext Secret never exists, and the derived Secrets are off
+  # limits per the comment above).
+  - apiGroups:
+      - bitnami.com
+    resources:
+      - sealedsecrets
+    verbs:
+      - get
+      - list
+      - create
+      - update
+      - patch
+      - delete
+{{- end }}
