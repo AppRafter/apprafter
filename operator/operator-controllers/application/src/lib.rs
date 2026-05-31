@@ -141,6 +141,20 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
 
     info!(%name, %namespace, env = ?ctx.env_name, "reconciling Application");
 
+    // Deletion gate (1.79c walk-fix #4). Once the Application carries
+    // a `deletionTimestamp` (e.g. Argo CD is cascade-deleting it via
+    // the `resources-finalization.argocd.argoproj.io` finalizer the
+    // CLI sets at `app add`), the operator must NOT re-apply children:
+    // re-creating the Deployment that the cascade is removing keeps
+    // the managed-resource tree non-empty, so Argo's finalizer never
+    // clears and the Application hangs in `Terminating` forever. The
+    // ownerReference cascade handles child cleanup; there is nothing
+    // for us to reconcile on a dying object.
+    if is_deletion_marked(&app) {
+        info!(%name, %namespace, "Application is being deleted; skipping reconcile");
+        return Ok(Action::await_change());
+    }
+
     // B.1.77 pause gate. Must run BEFORE child patches —
     // otherwise we'd race the user's "I just pushed a
     // destructive change, please pause" flow.
@@ -499,6 +513,13 @@ fn plan_is_blocking(plan: &MigrationPlan) -> bool {
         .and_then(|s| s.phase.as_deref())
         .unwrap_or("pending-approval");
     !matches!(phase, "completed" | "rejected")
+}
+
+/// True once the Application is marked for deletion. The reconcile loop
+/// skips deletion-marked objects so it never re-applies children that a
+/// cascade delete (Argo CD finalizer) is trying to remove.
+fn is_deletion_marked(app: &Application) -> bool {
+    app.metadata.deletion_timestamp.is_some()
 }
 
 /// Build the Application status payload for the pause path.
@@ -1006,5 +1027,18 @@ mod tests {
             "{}",
             c.last_transition_time
         );
+    }
+
+    #[test]
+    fn is_deletion_marked_detects_deletion_timestamp() {
+        // Regression guard (1.79c walk-fix #4): the reconcile loop must
+        // skip Applications carrying a deletionTimestamp, otherwise it
+        // re-applies the Deployment a cascade delete is removing and the
+        // Argo CD finalizer hangs forever.
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        let mut app = Application::new("web", ApplicationSpec::default());
+        assert!(!is_deletion_marked(&app));
+        app.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        assert!(is_deletion_marked(&app));
     }
 }
