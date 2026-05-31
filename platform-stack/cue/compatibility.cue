@@ -1698,6 +1698,20 @@ compatibility: "0.1.23": {
 // re-registering. cue-cmp image v0.1.5 → v0.1.6 (entrypoint
 // .sh change baked into the image), chart pin follows via
 // the `argocdcuecmp.version` CUE import.
+compatibility: "0.1.50": {
+	change:          "safe"
+	operatorVersion: "v0.1.136"
+	notes: """
+		1.79c walk-fix #4 — operator skips reconcile for an
+		Application carrying a deletionTimestamp. Without it, the
+		Argo CD cascade-deletion finalizer (set by `app add`)
+		hangs: the operator keeps re-applying the Deployment a
+		cascade is removing, so the managed-resource tree never
+		empties. Operator image v0.1.135 → v0.1.136; behavioural
+		bugfix only, no values reshaped — safe to auto-sync.
+		"""
+	references: ["plan.md 1.79c"]
+}
 compatibility: "0.1.49": {
 	change:          "safe"
 	operatorVersion: "v0.1.135"
