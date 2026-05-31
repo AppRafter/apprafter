@@ -40,6 +40,9 @@ use crate::commands::k8s_helpers::{
 const ARGOCD_NAMESPACE: &str = "argocd";
 const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
 const APPRAFTER_SOURCE_ANNOTATION: &str = "apprafter.io/source";
+/// Argo CD cascade-deletion finalizer — drives deletion of the
+/// resources an Application manages when the Application is deleted.
+const ARGOCD_CASCADE_FINALIZER: &str = "resources-finalization.argocd.argoproj.io";
 
 #[derive(Tabled)]
 struct AppRow {
@@ -1005,32 +1008,29 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
     }
 
     if keep_data {
-        // Strip destructive child-prune by flipping the
-        // syncPolicy.automated.prune flag to false BEFORE
-        // deleting the CR. Argo CD will tear down the
-        // Application object itself, but child resources
-        // (Deployments, PVCs, etc.) will be left behind — the
-        // operator can re-attach later by re-registering the
-        // Application against the same destination namespace.
-        //
-        // RFC 7396 merge-patch — leaves the rest of
-        // `syncPolicy` untouched.
+        // Keep child resources: strip the cascade finalizer (so
+        // deleting the Application does NOT tear down its managed
+        // resources) and flip prune off. The operator can re-attach
+        // later by re-registering against the same destination
+        // namespace. RFC 7396 merge-patch — `finalizers: []` clears
+        // the cascade finalizer, the rest of metadata/syncPolicy is
+        // untouched.
         kubectl_merge_patch(
             "application.argoproj.io",
             name,
             Some(ARGOCD_NAMESPACE),
             None,
-            r#"{"spec":{"syncPolicy":{"automated":{"prune":false}}}}"#,
+            r#"{"metadata":{"finalizers":[]},"spec":{"syncPolicy":{"automated":{"prune":false}}}}"#,
             kc.path(),
         )?;
     }
 
-    // Cascading delete: Argo CD's `Application` CR owns its
-    // child resources through ownerReferences only when
-    // `syncPolicy.automated.prune: true`. With prune=false
-    // (`--keep-data`), Argo CD will delete only the CR; child
-    // resources stay around. Either way the kubectl invocation
-    // is the same.
+    // Cascading delete: the Argo CD `Application` carries the
+    // `resources-finalization.argocd.argoproj.io` finalizer (set at
+    // `app add`), so deleting it cascades to every resource it
+    // manages — the AppRafter Application CR, its Deployment, and
+    // thus the ReplicaSet + pods. With `--keep-data` the finalizer
+    // was stripped above, so only the Application object is removed.
     let out = Command::new("kubectl")
         .arg("delete")
         .arg("application.argoproj.io")
@@ -1347,6 +1347,14 @@ pub(crate) fn build_application_manifest(
             "annotations": {
                 APPRAFTER_SOURCE_ANNOTATION: "cli",
             },
+            // Argo CD cascade-deletion finalizer. Without it,
+            // `kubectl delete application <name>` removes only the
+            // Argo Application object and ORPHANS everything it
+            // manages (the AppRafter Application CR → Deployment →
+            // ReplicaSet → pods) — Argo's cascade is driven by this
+            // finalizer, NOT by ownerReferences. `app remove
+            // --keep-data` strips it before delete to keep children.
+            "finalizers": [ARGOCD_CASCADE_FINALIZER],
         },
         "spec": {
             "project": project,
@@ -1781,6 +1789,30 @@ mod tests {
                 .and_then(Value::as_str),
             Some("cli")
         );
+    }
+
+    #[test]
+    fn build_application_manifest_carries_argo_cascade_finalizer() {
+        // Load-bearing — without this finalizer, `apprafter app remove`
+        // (kubectl delete application) deletes only the Argo App object
+        // and orphans the managed AppRafter Application → Deployment →
+        // ReplicaSet → pods (Argo's cascade is finalizer-driven, not
+        // ownerReference-driven). Walk-fix #3 post-1.79c.
+        let m = build_application_manifest(
+            "my-app",
+            "https://github.com/foo/bar",
+            "main",
+            "/",
+            "apps",
+            "apprafter",
+        );
+        let finalizers = m
+            .pointer("/metadata/finalizers")
+            .and_then(Value::as_array)
+            .expect("finalizers array present");
+        assert!(finalizers
+            .iter()
+            .any(|f| f.as_str() == Some("resources-finalization.argocd.argoproj.io")));
     }
 
     #[test]
