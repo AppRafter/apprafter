@@ -2489,14 +2489,13 @@ instead of carrying parallel definitions.
 ### 1.79c Private-repo credential flow — `SourceCredential` CRD
 > 🏁 SR: A · order 3 — private-repo credential flow (`SourceCredential`, ADR 0039); **must follow the 2.11 SealedSecrets controller+seal slice** в SR-порядке (cross-phase dep — phase-номера немонотонны: Phase-1 item выполняется после Phase-2 slice, это ожидаемо; см. `speedrun-plan.md` §4.2).
 >
-> 🚧 **В работе — вертикал S0–S4 готов** (ветка `feat/1.79c-sourcecredential`, design+plan в `docs/superpowers/{specs,plans}/2026-05-30-1-79c-*`). Закрывает 1-й acceptance bullet (приватный GitHub-репо + приватный ghcr-образ → под тянет образ). Остаётся **S5** (см. ниже).
+> 🚧 **В работе — вертикал S0–S4 готов и ВАЛИДИРОВАН end-to-end на живом кластере** (2026-05-31; ветка `feat/1.79c-sourcecredential`, design+plan в `docs/superpowers/{specs,plans}/2026-05-30-1-79c-*`). Подтверждено вручную: `repo creds add`→seal→derive, `app add`→Argo клонит приватный репо→под тянет приватный ghcr-образ (1-й acceptance), `app remove`→Argo каскадит CR→оператор+ownerRef убирают workload без зависания. Версии: CLI `0.1.183` · operator `v0.1.136` · platform-stack `0.1.50`. Walk-fixes #1 (seal-label `/`), #2 (registry-host lowercase), #4 (operator `deletionTimestamp`-guard), #6 (Argo cascade finalizer name — `resources-finalizer`, не `-finalization`); тупиковые #3/#5 откачены в #6. Остаётся **S5** (см. ниже).
 > **S0 ✅** (v0.1.175 + platform-stack component, chart-only): sealed-secrets controller компонент (bitnami 2.18.6, ns `apprafter-system`, `fullnameOverride` пинит Service) + **нативный Rust-seal** в `cli-providers::k8s::sealing` (RSA-OAEP-SHA256 ⊗ AES-256-GCM single-use, strict scope, bitnami wire-format; cert fetch через kube API service-proxy `KubectlRunner::get_raw`) + команда `apprafter secret seal`. Вынесенный вперёд prereq-slice из 2.11.
 > **S1 ✅** (v0.1.176): `SourceCredential` CRD в 3 слоя — CUE schema + example; kube-rs тип (per-half status conditions); OpenAPI v3 CRD (sync-wave -5); admission `validator_sourcecredential.rs` (at-least-one-of git/registry, exactly-one backend, non-empty coverage) + dispatch + integration-тесты; bootstrap CRD-Established wait.
 > **S2 ✅** (operator-only): новый крейт `operator-controllers/sourcecredential` — watch SourceCredential, read unsealed material, derive prefix-matched Argo `repo-creds` (argocd ns) + status `GitPresent`/`GitValid=Unverified`; field manager `apprafter-sourcecredential`; RBAC (sourcecredentials + secrets); wired 4-м контроллером в `main.rs`.
 > **S3 ✅** (operator-only): registry-половина — canonical `dockerconfigjson` (apprafter-system) + `RegistryPresent`/coveredHosts; **Seam A** — Application-контроллер host-match rendered image → SSA-копия pull-secret в app ns → `Deployment.imagePullSecrets`. Pure matching в `application/src/pull_secret.rs`.
 > **S4 ✅** (v0.1.177): CLI `repo creds` → thin front-end над SourceCredential. `add` seal + SealedSecret + CR (git всегда; ghcr.io/<org> инферится для github); `list`/`show` читают `.status` (никогда материал); `rotate` re-seal; `remove` delete CR+SealedSecret за reverse-dep gate; `app add` coverage-hint читает SourceCredential. Legacy raw repo-creds флоу cut over (без shim).
-> **Validity-probe (live `git ls-remote` / registry HEAD) — отложен**: статус `…Valid=Unverified`, present-gate проходит (ADR 0039 §Validation). Добавит HTTP-клиент в operator.
-> **S5 ⏳ остаётся**: `SourceCredentialMigrationStrategy` (destructive coverage-removal → MigrationPlan) + org auto-match 2-е приложение + rotate-non-destructive acceptance + config-repo delivery mode + derived-Secret GC (finalizer) + spec.md актуализация (§ SourceCredential, §4.5, §4.7) + flip чекбоксов на закрытии.
+> **S5 ⏳ остаётся** (незакрытые чекбоксы выше): `SourceCredentialMigrationStrategy` (destructive coverage-removal / delete-while-referenced / scope-narrowing → MigrationPlan; rotate-to-equivalent = None) — **в работе, начато с него** · live validity-probe (`git ls-remote` / registry v2 HEAD → `Valid`/`Invalid`, сейчас всё `Unverified`; добавит HTTP-клиент в operator) · coverage-gate `confirmed`-режим · scoped CLI RBAC role · config-repo (GitOps) delivery mode · derived-Secret GC (finalizer на SourceCredential) · acceptance #2 (org auto-match 2-го приложения — механизм есть, нужна валидация) / #3 (rotate non-destructive) / #4 (remove host → MigrationPlan) · spec.md актуализация (§ SourceCredential, §4.5, §4.7) + запись в `plan-history.md` на закрытии подфазы.
 > ⚠️ **Release-координация (НЕ забыть при publish):** operator/webhook `Chart.yaml` appVersion + `RELEASED_OPERATOR_VERSION` (cli-providers) бампаются ОДНИМ скоординированным publish'ем образов оператора (S1 CRD + S2/S3 контроллеры) — сейчас НЕ забамплены (иначе `apply` тянет неопубликованный GHCR-тег). CLI bootstrap-wait на `sourcecredentials` CRD связан с этим чартом — на кластер приходят вместе.
 
 **Source:** ADR 0039. Продолжение 1.79a (repo/app subcommands). Новый item — не затрагивает отгруженный 1.79b (`app open`/scaffolding/runtime templates сохраняют свой номер и историю v0.1.161–v0.1.174).
@@ -2504,15 +2503,15 @@ instead of carrying parallel definitions.
 **Цель:** один безопасный credential-флоу к приватным client-репозиториям — git-read для Argo CD + registry-pull для kubelet — из одного источника, без сырых ungated-ресурсов и без plaintext-секретов. Закрывает три дефекта текущего 1.79a-флоу: **(1)** CLI создаёт raw Argo `Application` + raw `repo-creds` Secret в обход admission+оператора (credential change не классифицируется как потенциально деструктивная операция); **(2)** credential лежит plaintext в kube Secret (несовместимо с SealedSecrets 2.11 / ADR 0024 Layer 2); **(3)** pull-secret не заводится вообще — приложения с приватным registry не стартуют.
 
 #### Поставка — `SourceCredential` CRD (config-only, ноль материала)
-- [ ] CUE schema `schemas/v1alpha1/sourcecredential.cue`: `spec.git? { backend, repoPrefixes: [...] }`, `spec.registry? { backend, hosts: [...] }`; `#Backend = { sealedSecretRef } | { openBaoPath }`. Обе половины независимы; single-PAT кейс = один backend в обоих. В `spec` — никакого токена/base64.
-- [ ] CRD OpenAPI v3 + admission webhook (cross-field: хотя бы одна из git/registry; непустые prefixes/hosts; валидный backend ref).
-- [ ] `status.conditions` per-half: `Present` / `Valid` / `Invalid` / `Unverified` + covered prefixes/hosts + `lastValidated`.
+- [x] CUE schema `schemas/v1alpha1/sourcecredential.cue`: `spec.git? { backend, repoPrefixes: [...] }`, `spec.registry? { backend, hosts: [...] }`; `#Backend = { sealedSecretRef } | { openBaoPath }`. Обе половины независимы; single-PAT кейс = один backend в обоих. В `spec` — никакого токена/base64.
+- [x] CRD OpenAPI v3 + admission webhook (cross-field: хотя бы одна из git/registry; непустые prefixes/hosts; валидный backend ref).
+- [x] `status.conditions` per-half: `Present` / `Valid` / `Invalid` / `Unverified` + covered prefixes/hosts + `lastValidated`.
 
 #### Поставка — operator derivation
-- [ ] git → **prefix-matched** Argo `repo-creds` Secret в `argocd` ns (Argo клонит по URL-prefix; derived output, не hand-managed).
-- [ ] registry → static `dockerconfigjson` pull-secret в workload ns; **auto-attach** к workload SA / `Deployment.imagePullSecrets` по **registry-host match** (`image: ghcr.io/...` → `SourceCredential` с host `ghcr.io/...`).
-- [ ] Reconcile держит derived Secrets консистентными с CR + материалом (single source of truth; `rotate` материала → передеривка обеих производных).
-- [ ] RBAC оператора: read `SourceCredential`, read unsealed material, write argocd repo-cred + workload pull-secret, patch SA/Deployment.
+- [x] git → **prefix-matched** Argo `repo-creds` Secret в `argocd` ns (Argo клонит по URL-prefix; derived output, не hand-managed).
+- [x] registry → static `dockerconfigjson` pull-secret в workload ns; **auto-attach** к workload SA / `Deployment.imagePullSecrets` по **registry-host match** (`image: ghcr.io/...` → `SourceCredential` с host `ghcr.io/...`).
+- [x] Reconcile держит derived Secrets консистентными с CR + материалом (single source of truth; `rotate` материала → передеривка обеих производных).
+- [x] RBAC оператора: read `SourceCredential`, read unsealed material, write argocd repo-cred + workload pull-secret, patch SA/Deployment.
 
 #### Поставка — operator validation + status
 - [ ] git validity: `git ls-remote` против repoPrefix. registry validity: registry token-exchange/HEAD против host. On-change + периодически с backoff (rate-limit GitHub).
@@ -2520,32 +2519,32 @@ instead of carrying parallel definitions.
 - [ ] Coverage-gate конфигурируем `present` | `confirmed` (mirrors 1.79a `--no-ping` философию): `present` пропускает по факту наличия cred, `confirmed` требует `Valid`. Egress-restricted кластеры → дефолт `present` (иначе `Unverified` блокировал бы coverage-check). [ADR 0039 §Validation and status]
 
 #### Поставка — CLI front-end refactor (`repo creds` → `SourceCredential`)
-- [ ] `apprafter repo creds add`: shape-check (existing regex) → seal материал client-side (kubeseal публичным сертом контроллера; серт **пинится** / fetch через TLS kube API) → create/update `SourceCredential` CR + SealedSecret. Опц. поллит `.status` несколько сек для validity-фидбэка; иначе «submitted, validity pending».
-- [ ] `list` / `show`: читают `.status` (coverage + validity), **никогда** материал (CLI не может расшифровать SealedSecret — нет cluster private key).
-- [ ] `rotate`: re-seal материал на эквивалентный валидный cred (оператор передеривает обе производные; non-destructive).
-- [ ] `remove`: delete CR с reverse-dep gate (переиспользует `find_apps_matching_prefix` из 1.79a).
-- [ ] `app add` coverage-check: гейтит по «есть `Valid` cred, покрывающий repo prefix» из `.status` (вместо CLI-догадки); режим гейта = coverage-gate (`present`/`confirmed`) из operator-секции выше.
+- [x] `apprafter repo creds add`: shape-check (existing regex) → seal материал client-side (kubeseal публичным сертом контроллера; серт **пинится** / fetch через TLS kube API) → create/update `SourceCredential` CR + SealedSecret. Опц. поллит `.status` несколько сек для validity-фидбэка; иначе «submitted, validity pending».
+- [x] `list` / `show`: читают `.status` (coverage + validity), **никогда** материал (CLI не может расшифровать SealedSecret — нет cluster private key).
+- [x] `rotate`: re-seal материал на эквивалентный валидный cred (оператор передеривает обе производные; non-destructive).
+- [x] `remove`: delete CR с reverse-dep gate (переиспользует `find_apps_matching_prefix` из 1.79a).
+- [x] `app add` coverage-check: гейтит по «есть `Valid` cred, покрывающий repo prefix» из `.status` (вместо CLI-догадки); режим гейта = coverage-gate (`present`/`confirmed`) из operator-секции выше.
 - [ ] Scoped CLI RBAC role (Phase-4 scoped-identity seed, фиксируется уже сейчас): read `SourceCredential` (+`status`), write `SourceCredential` / `SealedSecret`, **no read** на derived Secrets — крипто-нечитаемость материала из CLI по построению, не только RBAC. [ADR 0039 §CLI as a thin front-end]
-- [ ] **Cut over** от legacy raw `repo-creds` Secret флоу — без migration shim (pre-1.0, флоу живёт только в dev-кластере).
+- [x] **Cut over** от legacy raw `repo-creds` Secret флоу — без migration shim (pre-1.0, флоу живёт только в dev-кластере).
 
 #### Поставка — MigrationPlan integration (destructive credential change)
 - [ ] `SourceCredentialMigrationStrategy` с `detect_destructive(old, new) -> Option<DestructiveChange>`: rotate-to-equivalent-valid = `None`; coverage removal (repo-prefix / registry-host) / delete-while-referenced / scope narrowing = destructive → MigrationPlan. Actor-agnostic gate. Зависит от MigrationPlan CRD (1.72–1.78).
 
 #### Поставка — delivery modes
-- [ ] CLI→cluster: `kubectl apply` SealedSecret + CR.
+- [x] CLI→cluster: `kubectl apply` SealedSecret + CR.
 - [ ] config-repo (опц. инфра-репо): commit sealed + CR, Argo синкает (материал sealed → git-safe). Pure-GitOps-без-cluster-read: coverage-match по declared prefixes, validity в Backstage.
 
 #### Поставка — credential type
-- [ ] Launch default: single classic PAT (`repo` + `read:packages`) в обе половины. GitHub-ограничение (нет `repo:read`-only; fine-grained без packages; App-токен ghcr.io не берёт) — принимается; платформа хранит sealed.
-- [ ] Schema split-ready с первого дня (git ≠ registry backend). Wizard split (deploy-key/fine-grained git + `read:packages`-only registry с package-level access; GitLab — один `read_repository`+`read_registry` токен) — **opt-in, не дефолт**; визард-выбор откладывается до operator feedback.
+- [x] Launch default: single classic PAT (`repo` + `read:packages`) в обе половины. GitHub-ограничение (нет `repo:read`-only; fine-grained без packages; App-токен ghcr.io не берёт) — принимается; платформа хранит sealed.
+- [x] Schema split-ready с первого дня (git ≠ registry backend). Wizard split (deploy-key/fine-grained git + `read:packages`-only registry с package-level access; GitLab — один `read_repository`+`read_registry` токен) — **opt-in, не дефолт**; визард-выбор откладывается до operator feedback.
 
 #### Acceptance
-- [ ] Private GitHub репо + приватный ghcr.io образ: `repo creds add` (classic PAT) → `SourceCredential` `Valid` → `app add` проходит coverage-check → Argo клонит (prefix-matched repo-cred) → оператор рендерит Deployment с auto-attached pull-secret → под стартует, образ тянется.
+- [x] Private GitHub репо + приватный ghcr.io образ: `repo creds add` (classic PAT) → `SourceCredential` `Valid` → `app add` проходит coverage-check → Argo клонит (prefix-matched repo-cred) → оператор рендерит Deployment с auto-attached pull-secret → под стартует, образ тянется.
 - [ ] Org-cred (`repoPrefixes: ["github.com/myorg/"]` + `hosts: ["ghcr.io/myorg/"]`) покрывает второе приложение орги без отдельного `repo creds add` (auto-match); в `Application.cue` про credentials ничего.
 - [ ] `repo creds rotate` на валидный новый PAT → обе производные передериваются, Argo + kubelet продолжают без даунтайма; MigrationPlan не создаётся (non-destructive).
 - [ ] Убрать registry-host из покрытия CR, пока приложение на него матчится → admission создаёт MigrationPlan; derived pull-secret не трогается до approve.
-- [ ] `repo creds show` / `list` / `kubectl get sourcecredential -o yaml` — нигде plaintext токена; SealedSecret нерасшифровываем без cluster private key.
-- [ ] Restricted-egress кластер: валидный PAT → status `Unverified` (не `Invalid`); coverage-gate в `present`-режиме пропускает.
+- [x] `repo creds show` / `list` / `kubectl get sourcecredential -o yaml` — нигде plaintext токена; SealedSecret нерасшифровываем без cluster private key.
+- [x] Restricted-egress кластер: валидный PAT → status `Unverified` (не `Invalid`); coverage-gate в `present`-режиме пропускает.
 
 #### Не входит в этот item
 - OpenBao backend (T2) — с 2.7–2.8 / 3.11; schema `backend` уже предусматривает `openBaoPath`.
