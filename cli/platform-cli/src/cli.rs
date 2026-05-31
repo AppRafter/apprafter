@@ -490,6 +490,15 @@ pub enum AppCommand {
         /// not yet have an `HEAD` ref.
         #[arg(long = "no-ping", default_value_t = false)]
         no_ping: bool,
+        /// Credential coverage gate. `present` (default) only warns,
+        /// post-registration, when no `SourceCredential` declares a
+        /// covering prefix. `confirmed` pre-flight-blocks a private
+        /// (`https`) repo unless a `SourceCredential` whose status
+        /// reports `GitValid=True` covers it — fail-fast for clusters
+        /// whose operator has egress to validate. Restricted-egress
+        /// clusters keep `present` (validity stays `Unverified`).
+        #[arg(long = "coverage-gate", value_enum, default_value_t = crate::commands::app::CoverageGate::Present)]
+        coverage_gate: crate::commands::app::CoverageGate,
         /// Skip the interactive wizard even when stdin + stdout
         /// are TTYs. The wizard fires by default on TTY shells
         /// and asks for any field not supplied via flag,

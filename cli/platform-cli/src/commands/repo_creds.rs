@@ -747,11 +747,39 @@ fn fetch_source_credentials(kubeconfig_path: &Path) -> Result<Vec<Value>> {
 /// Does any SourceCredential's declared repo prefix cover `repo_url`?
 /// Used by `app add`'s coverage hint (pure — tested without a cluster).
 pub(crate) fn any_credential_covers(creds: &[Value], repo_url: &str) -> bool {
-    creds.iter().any(|cred| {
-        repo_prefixes_of(cred)
-            .iter()
-            .any(|p| repo_url.starts_with(&normalize_repo_url(p)))
-    })
+    creds
+        .iter()
+        .any(|cred| credential_prefix_covers(cred, repo_url))
+}
+
+/// Does any SourceCredential cover `repo_url` **and** report
+/// `GitValid=True` in its status? The confirmed coverage gate
+/// (1.79c S5) requires a validated credential, not merely a declared
+/// prefix. Pure — tested without a cluster.
+pub(crate) fn valid_credential_covers(creds: &[Value], repo_url: &str) -> bool {
+    creds
+        .iter()
+        .any(|cred| credential_prefix_covers(cred, repo_url) && git_valid_is_true(cred))
+}
+
+/// Shared prefix-coverage predicate for one credential.
+fn credential_prefix_covers(cred: &Value, repo_url: &str) -> bool {
+    repo_prefixes_of(cred)
+        .iter()
+        .any(|p| repo_url.starts_with(&normalize_repo_url(p)))
+}
+
+/// Is the credential's `status.conditions[type=GitValid].status` == "True"?
+fn git_valid_is_true(cred: &Value) -> bool {
+    cred.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some("GitValid")
+                    && c.get("status").and_then(Value::as_str) == Some("True")
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn find_dependent_applications(url_prefix: &str, kubeconfig_path: &Path) -> Result<Vec<String>> {
@@ -989,6 +1017,34 @@ mod tests {
         ));
         assert!(!any_credential_covers(
             &creds,
+            "https://github.com/other/repo"
+        ));
+    }
+
+    #[test]
+    fn valid_credential_covers_requires_gitvalid_true() {
+        let repo = "https://github.com/myorg/repo";
+        let covering_unverified = vec![json!({
+            "spec": { "git": { "repoPrefixes": ["github.com/myorg/"] } },
+            "status": { "conditions": [
+                { "type": "GitValid", "status": "Unknown", "reason": "Unverified" }
+            ] }
+        })];
+        // present (prefix declared) but NOT confirmed (not GitValid=True)
+        assert!(any_credential_covers(&covering_unverified, repo));
+        assert!(!valid_credential_covers(&covering_unverified, repo));
+
+        let covering_valid = vec![json!({
+            "spec": { "git": { "repoPrefixes": ["github.com/myorg/"] } },
+            "status": { "conditions": [
+                { "type": "GitValid", "status": "True", "reason": "Reachable" }
+            ] }
+        })];
+        assert!(valid_credential_covers(&covering_valid, repo));
+
+        // GitValid=True but prefix does not cover the repo → not covered
+        assert!(!valid_credential_covers(
+            &covering_valid,
             "https://github.com/other/repo"
         ));
     }

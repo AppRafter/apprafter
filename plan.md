@@ -2514,9 +2514,9 @@ instead of carrying parallel definitions.
 - [x] RBAC оператора: read `SourceCredential`, read unsealed material, write argocd repo-cred + workload pull-secret, patch SA/Deployment.
 
 #### Поставка — operator validation + status
-- [ ] git validity: `git ls-remote` против repoPrefix. registry validity: registry token-exchange/HEAD против host. On-change + периодически с backoff (rate-limit GitHub).
-- [ ] Egress-blocked → `Unverified` (не `Invalid`). Результат пишется в `status`.
-- [ ] Coverage-gate конфигурируем `present` | `confirmed` (mirrors 1.79a `--no-ping` философию): `present` пропускает по факту наличия cred, `confirmed` требует `Valid`. Egress-restricted кластеры → дефолт `present` (иначе `Unverified` блокировал бы coverage-check). [ADR 0039 §Validation and status]
+- [x] git validity: smart-HTTP `GET <repo>/info/refs?service=git-upload-pack` (Basic auth, reqwest) против **представительного репо** из матчащегося Argo Application (префикс — орга, нужен конкретный объект; решение в `validity.rs`). registry validity: scoped v2 token-exchange (oci-distribution) против представительного образа из матчащегося AppRafter Application. On-change + каждые 60s (1/min — в пределах GitHub rate-limit). Консервативный mapping: Valid только на 2xx/success, Invalid только на явный auth-reject (401/403 / auth-failure), всё неоднозначное → Unverified.
+- [x] Egress-blocked → `Unverified` (не `Invalid`) — network-error никогда не даёт Invalid. `GitValid`/`RegistryValid` + `status.lastValidated` пишутся. Нет матчащегося app → тоже `Unverified` (нечего пробить).
+- [x] Coverage-gate конфигурируем `present` | `confirmed` (`app add --coverage-gate`, ValueEnum, default `present`): `present` — warn-only post-registration по наличию prefix (как было); `confirmed` — pre-flight БЛОКИРУЕТ регистрацию приватного (`https`) репо, пока покрывающий `SourceCredential` не в `GitValid=True` (pure `valid_credential_covers` читает `.status.conditions`). Egress-restricted → дефолт `present` (validity остаётся `Unverified`). [ADR 0039 §Validation and status]
 
 #### Поставка — CLI front-end refactor (`repo creds` → `SourceCredential`)
 - [x] `apprafter repo creds add`: shape-check (existing regex) → seal материал client-side (kubeseal публичным сертом контроллера; серт **пинится** / fetch через TLS kube API) → create/update `SourceCredential` CR + SealedSecret. Опц. поллит `.status` несколько сек для validity-фидбэка; иначе «submitted, validity pending».

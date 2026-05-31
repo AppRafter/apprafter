@@ -117,6 +117,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 namespace,
                 remote,
                 no_ping,
+                coverage_gate,
                 no_interactive,
                 scaffold,
             } => commands::app::add(
@@ -128,6 +129,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 &namespace,
                 &remote,
                 no_ping,
+                coverage_gate,
                 no_interactive,
                 scaffold,
             )?,

@@ -63,6 +63,23 @@ struct AppRow {
     health: String,
 }
 
+/// Credential coverage gate for `app add` (1.79c S5 / ADR 0039).
+/// Mirrors the `--no-ping` philosophy: advisory by default, strict
+/// on opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CoverageGate {
+    /// Only warn (post-registration) when no `SourceCredential`
+    /// declares a covering prefix. The default — egress-restricted
+    /// clusters keep this since validity stays `Unverified`.
+    #[default]
+    Present,
+    /// Pre-flight-block registration of a private (`https`) repo
+    /// unless a `SourceCredential` whose status reports
+    /// `GitValid=True` covers it. Fail-fast for clusters whose
+    /// operator has egress to validate.
+    Confirmed,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     git_url: Option<String>,
@@ -73,6 +90,7 @@ pub fn add(
     namespace: &str,
     remote: &str,
     no_ping: bool,
+    coverage_gate: CoverageGate,
     no_interactive: bool,
     scaffold_flag: bool,
 ) -> Result<()> {
@@ -148,6 +166,7 @@ pub fn add(
             &effective_namespace,
             remote,
             no_ping,
+            coverage_gate,
         );
     }
 
@@ -188,6 +207,13 @@ pub fn add(
         )));
     }
 
+    // Coverage gate (confirmed): fail-fast before registering when no
+    // validated credential covers a private repo. `present` (default)
+    // only warns post-registration, below.
+    if matches!(coverage_gate, CoverageGate::Confirmed) {
+        enforce_confirmed_coverage(&repo_url, kc.path())?;
+    }
+
     let manifest = build_application_manifest(
         &derived_name,
         &repo_url,
@@ -208,6 +234,34 @@ pub fn add(
     println!("Argo CD will sync the workload within a reconcile cycle. State:");
     println!("  apprafter app status {derived_name}");
     Ok(())
+}
+
+/// Confirmed-mode coverage gate (1.79c S5). Refuse to register a
+/// private (`https`) repo unless a `SourceCredential` whose status
+/// reports `GitValid=True` covers its URL. Non-`https` repos (SSH)
+/// are not gated — Argo CD uses a different cred shape we don't
+/// probe. Unlike the `present`-mode warn (best-effort), a failure to
+/// fetch credentials surfaces as an error here: confirmed mode is an
+/// explicit "I want this verified before proceeding".
+fn enforce_confirmed_coverage(repo_url: &str, kubeconfig_path: &Path) -> Result<()> {
+    if !repo_url.starts_with("https://") {
+        return Ok(());
+    }
+    let creds = crate::commands::repo_creds::fetch_source_credentials_public(kubeconfig_path)?;
+    if crate::commands::repo_creds::valid_credential_covers(&creds, repo_url) {
+        return Ok(());
+    }
+    let detail = if crate::commands::repo_creds::any_credential_covers(&creds, repo_url) {
+        "a SourceCredential covers it but its status is not GitValid=True \
+         (Unverified or Invalid). Validate the credential, or rerun with \
+         `--coverage-gate present` (the default) if the cluster has no egress to validate"
+    } else {
+        "no SourceCredential covers it. Register one with `apprafter repo creds add`, \
+         or rerun with `--coverage-gate present` (the default) if the repo is public"
+    };
+    Err(CliError::Other(format!(
+        "coverage gate (confirmed): {repo_url} not admitted — {detail}."
+    )))
 }
 
 /// Post-register cred check (walk-fix #1 + #2 post-Part-3b).
@@ -337,6 +391,7 @@ fn add_via_wizard(
     namespace: &str,
     remote: &str,
     no_ping: bool,
+    coverage_gate: CoverageGate,
 ) -> Result<()> {
     let detected_origin = crate::commands::app_wizard::detect_git_origin(remote);
     let detected_branch = crate::commands::app_wizard::detect_git_branch();
@@ -362,6 +417,7 @@ fn add_via_wizard(
         &out.namespace,
         remote,
         no_ping,
+        coverage_gate,
         true, // no_interactive — prevent recursion into the wizard.
         false, // scaffold_flag — step 0 already ran in the outer call;
               // by here `<cwd>/apprafter/Application.cue` exists и
