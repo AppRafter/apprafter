@@ -116,8 +116,8 @@ rules:
   # (in app namespaces). Cluster-scoped because the material,
   # repo-cred, and pull-secret live in different namespaces; the
   # operator is the only holder of derived credential material
-  # (ADR 0024 Layer 2). No `delete` yet — derived-Secret GC on
-  # coverage removal is gated by MigrationPlan (S5).
+  # (ADR 0024 Layer 2). `patch`/`update` on `sourcecredentials`
+  # also writes the cleanup finalizer (S5).
   - apiGroups:
       - apprafter.io
     resources:
@@ -129,6 +129,10 @@ rules:
       - watch
       - patch
       - update
+  # `delete` (S5): the derived-Secret GC finalizer removes the
+  # cross-namespace Argo `repo-creds` + canonical
+  # `dockerconfigjson` on SourceCredential deletion (no
+  # ownerReference cascade is possible across namespaces).
   - apiGroups:
       - ""
     resources:
@@ -140,6 +144,7 @@ rules:
       - create
       - update
       - patch
+      - delete
   - apiGroups:
       - gateway.networking.k8s.io
     resources:

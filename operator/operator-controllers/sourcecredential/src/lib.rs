@@ -32,11 +32,17 @@
 //! state the `present` coverage gate accepts by design (ADR 0039
 //! §Validation and status). See `validity.rs`.
 //!
-//! Known limitations (deferred, tracked for S5): derived `repo-creds`
-//! Secrets are not garbage-collected when a `repoPrefix` is removed or
-//! the SourceCredential is deleted — cross-namespace ownerReferences are
-//! disallowed by Kubernetes, so cleanup needs a finalizer. Coverage
-//! removal is the destructive change the MigrationPlan gate handles.
+//! Derived Secrets are garbage-collected on delete via a finalizer
+//! (`apprafter.io/derived-secrets-cleanup`): cross-namespace
+//! ownerReferences are disallowed by Kubernetes, so the controller GCs
+//! the Argo `repo-creds` (in `argocd`) and the canonical
+//! `dockerconfigjson` (selected by the `apprafter.io/source-credential`
+//! label) itself before releasing the finalizer. Per-workload
+//! pull-secret copies are owned by the Application controller (Seam A)
+//! and cascade with their app. (Reclaiming a single derived Secret when
+//! only one `repoPrefix` is *removed* — coverage narrowing, distinct
+//! from full deletion — is the destructive change the MigrationPlan gate
+//! classifies; see `operator-controllers-migration`.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +51,7 @@ use base64::Engine;
 use chrono::Utc;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
@@ -70,6 +76,15 @@ pub const FIELD_MANAGER: &str = "apprafter-sourcecredential";
 
 /// Namespace Argo CD reads `repo-creds` Secrets from.
 const ARGOCD_NAMESPACE: &str = "argocd";
+
+/// Finalizer that blocks SourceCredential deletion until the derived
+/// Secrets (cross-namespace, so no ownerReference cascade is possible)
+/// are garbage-collected.
+const DERIVED_SECRETS_FINALIZER: &str = "apprafter.io/derived-secrets-cleanup";
+
+/// Label every derived Secret carries, keyed to the owning
+/// SourceCredential — the GC selector and the human "who made this".
+const SOURCE_CREDENTIAL_LABEL: &str = "apprafter.io/source-credential";
 
 /// Keys in the unsealed material Secret.
 const MATERIAL_USERNAME_KEY: &str = "username";
@@ -129,6 +144,31 @@ pub async fn reconcile(
         .start_timer();
 
     info!(%name, %namespace, "reconciling SourceCredential");
+
+    // Finalizer-gated cleanup: derived Secrets live in other namespaces
+    // (argocd repo-creds, apprafter-system dockerconfigjson), so a
+    // cross-namespace ownerReference cascade is impossible (k8s forbids
+    // it). A finalizer lets this controller GC them on delete instead.
+    let finalizers = cred.metadata.finalizers.clone().unwrap_or_default();
+    if cred.metadata.deletion_timestamp.is_some() {
+        gc_derived_secrets(&ctx.client, &namespace, &name).await?;
+        if finalizers.iter().any(|f| f == DERIVED_SECRETS_FINALIZER) {
+            set_finalizers(
+                &ctx.client,
+                &namespace,
+                &name,
+                without_finalizer(&finalizers),
+            )
+            .await?;
+        }
+        info!(%name, %namespace, "SourceCredential derived Secrets garbage-collected");
+        return Ok(Action::await_change());
+    }
+    if !finalizers.iter().any(|f| f == DERIVED_SECRETS_FINALIZER) {
+        set_finalizers(&ctx.client, &namespace, &name, with_finalizer(&finalizers)).await?;
+        // The patch re-triggers reconcile; derivation proceeds below
+        // anyway so the first pass is not wasted.
+    }
 
     let previous = cred
         .status
@@ -326,6 +366,70 @@ pub fn error_policy(
         .with_label_values(&[KIND])
         .inc();
     Action::requeue(Duration::from_secs(30))
+}
+
+/// Delete every derived Secret owned by this SourceCredential across
+/// the namespaces it writes to (Argo `repo-creds` in `argocd`, the
+/// canonical `dockerconfigjson` in the credential's own namespace),
+/// selected by the `apprafter.io/source-credential` label. Per-workload
+/// pull-secret copies are owned by the Application controller (Seam A)
+/// and cascade with their app, so they are not GC'd here. Idempotent:
+/// a missing Secret is not an error.
+async fn gc_derived_secrets(
+    client: &Client,
+    cred_namespace: &str,
+    name: &str,
+) -> Result<(), ReconcileError> {
+    let selector = format!("{SOURCE_CREDENTIAL_LABEL}={name}");
+    let mut namespaces = vec![ARGOCD_NAMESPACE];
+    if cred_namespace != ARGOCD_NAMESPACE {
+        namespaces.push(cred_namespace);
+    }
+    for ns in namespaces {
+        let api: Api<Secret> = Api::namespaced(client.clone(), ns);
+        let lp = ListParams::default().labels(&selector);
+        for secret in api.list(&lp).await? {
+            if let Some(secret_name) = secret.metadata.name {
+                // ignore "already gone" so re-runs after a partial
+                // delete still converge
+                let _ = api.delete(&secret_name, &DeleteParams::default()).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merge-patch the SourceCredential's `metadata.finalizers` to `list`.
+async fn set_finalizers(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    list: Vec<String>,
+) -> Result<(), ReconcileError> {
+    let api: Api<SourceCredential> = Api::namespaced(client.clone(), namespace);
+    let patch = json!({ "metadata": { "finalizers": list } });
+    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+/// `current` with our finalizer appended (idempotent — caller checks
+/// absence first, but kept pure for testing).
+fn with_finalizer(current: &[String]) -> Vec<String> {
+    let mut out = current.to_vec();
+    if !out.iter().any(|f| f == DERIVED_SECRETS_FINALIZER) {
+        out.push(DERIVED_SECRETS_FINALIZER.to_string());
+    }
+    out
+}
+
+/// `current` without our finalizer.
+fn without_finalizer(current: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|f| *f != DERIVED_SECRETS_FINALIZER)
+        .cloned()
+        .collect()
 }
 
 /// Read `(username, password)` from the unsealed material Secret.
@@ -619,6 +723,39 @@ mod tests {
         assert_eq!(s.covered_repo_prefixes.unwrap(), vec!["github.com/acme/"]);
         assert_eq!(s.covered_hosts.unwrap(), vec!["ghcr.io/acme/"]);
         assert!(s.last_validated.is_some());
+    }
+
+    #[test]
+    fn finalizer_add_is_idempotent_and_preserves_others() {
+        let none: Vec<String> = vec![];
+        assert_eq!(
+            with_finalizer(&none),
+            vec![DERIVED_SECRETS_FINALIZER.to_string()]
+        );
+        // already present → unchanged (no duplicate)
+        let present = vec![DERIVED_SECRETS_FINALIZER.to_string()];
+        assert_eq!(with_finalizer(&present), present);
+        // foreign finalizers are preserved
+        let mixed = vec!["other.io/keep".to_string()];
+        let added = with_finalizer(&mixed);
+        assert_eq!(
+            added,
+            vec![
+                "other.io/keep".to_string(),
+                DERIVED_SECRETS_FINALIZER.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn finalizer_remove_drops_only_ours() {
+        let list = vec![
+            "other.io/keep".to_string(),
+            DERIVED_SECRETS_FINALIZER.to_string(),
+        ];
+        assert_eq!(without_finalizer(&list), vec!["other.io/keep".to_string()]);
+        let only_ours = vec![DERIVED_SECRETS_FINALIZER.to_string()];
+        assert!(without_finalizer(&only_ours).is_empty());
     }
 
     #[test]
