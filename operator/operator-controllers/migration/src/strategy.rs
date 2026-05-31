@@ -33,7 +33,8 @@ use tracing::info;
 use operator_core::{
     Application, ApplicationSpec, DestructiveChange, MigrationApplicationRef,
     MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope,
-    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, StepOutcome,
+    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, SourceCredentialSpec,
+    StepOutcome,
 };
 
 /// SSA field manager used by the strategies' reject path when
@@ -381,6 +382,115 @@ fn plan_name_for_error(plan: &MigrationPlan) -> String {
         .unwrap_or_else(|| "(unnamed)".to_string())
 }
 
+/// SourceCredential-scope strategy (1.79c / ADR 0039). Classifies
+/// credential-coverage changes so a destructive one (removing a
+/// covered `repoPrefix` / registry `host`, dropping a half, or
+/// narrowing scope) can be gated through a MigrationPlan —
+/// actor-agnostically, catching a human `kubectl edit` and the CLI
+/// alike (ADR 0039 §"Gating").
+///
+/// **Maturity (parity with `ApplicationMigrationStrategy`).** The
+/// concrete classifier `detect_destructive` ships and is unit-tested
+/// here; the *live* wiring — a reconcile-time call that snapshots the
+/// prior spec, builds the MigrationPlan, and pauses derivation until
+/// approval — is **deliberately co-deferred** with the application-scope
+/// live wiring (the "one call site" the Application controller leaves
+/// commented for B.1.77). That deferred commit also adds the
+/// `create_plan_for` helper plus a `sourcecredential` variant to the
+/// MigrationPlan CRD scope (kube-rs + OpenAPI + CUE + admission) in one
+/// coordinated change, so no half-wired CRD scope ships ahead of a
+/// producer. `execute_step` / `reject` are no-ops: the destructive
+/// change is config (a coverage removal), so reject = the operator
+/// keeps the prior wider coverage derived and the user re-widens the
+/// spec; there is no controller-side state to roll back (ADR 0027).
+#[derive(Debug, Default, Clone)]
+pub struct SourceCredentialMigrationStrategy;
+
+#[async_trait]
+impl MigrationStrategy for SourceCredentialMigrationStrategy {
+    async fn execute_step(
+        &self,
+        _plan: &MigrationPlan,
+        _step: &MigrationStep,
+    ) -> Result<StepOutcome, MigrationError> {
+        Ok(StepOutcome::Succeeded)
+    }
+
+    async fn reject(&self, _plan: &MigrationPlan) -> Result<(), MigrationError> {
+        // The destructive change is a coverage REMOVAL on a config
+        // object. Reject = the operator keeps the prior (wider)
+        // coverage derived and the user re-widens the spec; there is
+        // no controller-side state to revert. No-op, like the
+        // application scope (ADR 0027).
+        Ok(())
+    }
+}
+
+impl SourceCredentialMigrationStrategy {
+    /// Decide whether `old` → `new` is a destructive coverage change.
+    ///
+    /// Per ADR 0039: **removing** a covered `repoPrefix` or registry
+    /// `host` (including dropping a whole `git`/`registry` half, or
+    /// narrowing scope) is destructive — applications matching the
+    /// removed coverage lose git-clone / image-pull access, so it must
+    /// be gated. Creation (`old = None`), adding coverage (widening),
+    /// and rotating the sealed material (the spec is unchanged — the
+    /// material lives in the SealedSecret, not here) are all
+    /// non-destructive → `None`.
+    pub fn detect_destructive(
+        old: Option<&SourceCredentialSpec>,
+        new: &SourceCredentialSpec,
+    ) -> Option<DestructiveChange> {
+        let old = old?;
+
+        let removed_prefixes = removed(&repo_prefixes(old), &repo_prefixes(new));
+        let removed_hosts = removed(&registry_hosts(old), &registry_hosts(new));
+
+        if removed_prefixes.is_empty() && removed_hosts.is_empty() {
+            return None;
+        }
+
+        let field = match (removed_prefixes.is_empty(), removed_hosts.is_empty()) {
+            (false, true) => "spec.git.repoPrefixes",
+            (true, false) => "spec.registry.hosts",
+            _ => "spec.git.repoPrefixes,spec.registry.hosts",
+        };
+
+        Some(DestructiveChange {
+            trigger_type: "coverage-removal".to_string(),
+            field: field.to_string(),
+            from: Some(json!({
+                "removedRepoPrefixes": removed_prefixes,
+                "removedHosts": removed_hosts,
+            })),
+            to: Some(json!({
+                "repoPrefixes": repo_prefixes(new),
+                "hosts": registry_hosts(new),
+            })),
+            classification: "breaking".to_string(),
+        })
+    }
+}
+
+fn repo_prefixes(spec: &SourceCredentialSpec) -> Vec<String> {
+    spec.git
+        .as_ref()
+        .map(|g| g.repo_prefixes.clone())
+        .unwrap_or_default()
+}
+
+fn registry_hosts(spec: &SourceCredentialSpec) -> Vec<String> {
+    spec.registry
+        .as_ref()
+        .map(|r| r.hosts.clone())
+        .unwrap_or_default()
+}
+
+/// Entries present in `old` but absent from `new`.
+fn removed(old: &[String], new: &[String]) -> Vec<String> {
+    old.iter().filter(|x| !new.contains(x)).cloned().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +679,122 @@ mod tests {
         // Missing field also distinct from a concrete string.
         assert!(!pins_equal(None, Some(&s)));
         assert!(!pins_equal(Some(&s), None));
+    }
+}
+
+#[cfg(test)]
+mod sourcecredential_strategy_tests {
+    use super::*;
+    use operator_core::{SealedSecretRef, SourceBackend, SourceGit, SourceRegistry};
+
+    fn backend() -> SourceBackend {
+        SourceBackend {
+            sealed_secret_ref: Some(SealedSecretRef {
+                name: "srccred-acme-material".to_string(),
+                namespace: None,
+            }),
+            open_bao_path: None,
+        }
+    }
+
+    fn spec(prefixes: &[&str], hosts: &[&str]) -> SourceCredentialSpec {
+        SourceCredentialSpec {
+            git: if prefixes.is_empty() {
+                None
+            } else {
+                Some(SourceGit {
+                    backend: backend(),
+                    repo_prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+                })
+            },
+            registry: if hosts.is_empty() {
+                None
+            } else {
+                Some(SourceRegistry {
+                    backend: backend(),
+                    hosts: hosts.iter().map(|s| s.to_string()).collect(),
+                })
+            },
+        }
+    }
+
+    #[test]
+    fn creation_is_not_destructive() {
+        let new = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        assert!(SourceCredentialMigrationStrategy::detect_destructive(None, &new).is_none());
+    }
+
+    #[test]
+    fn unchanged_spec_is_not_destructive() {
+        // A material rotation does not touch the spec (the secret lives
+        // in the SealedSecret), so old == new here → None.
+        let s = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        assert!(SourceCredentialMigrationStrategy::detect_destructive(Some(&s), &s).is_none());
+    }
+
+    #[test]
+    fn widening_coverage_is_not_destructive() {
+        let old = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let new = spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/", "ghcr.io/acme-labs/"],
+        );
+        assert!(SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).is_none());
+    }
+
+    #[test]
+    fn removing_a_repo_prefix_is_destructive() {
+        let old = spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let change =
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
+        assert_eq!(change.trigger_type, "coverage-removal");
+        assert_eq!(change.field, "spec.git.repoPrefixes");
+        assert_eq!(change.classification, "breaking");
+        assert_eq!(
+            change.from.unwrap()["removedRepoPrefixes"],
+            serde_json::json!(["github.com/acme-labs/"])
+        );
+    }
+
+    #[test]
+    fn removing_a_registry_host_is_destructive() {
+        let old = spec(
+            &["github.com/acme/"],
+            &["ghcr.io/acme/", "ghcr.io/acme-labs/"],
+        );
+        let new = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let change =
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
+        assert_eq!(change.field, "spec.registry.hosts");
+        assert_eq!(
+            change.from.unwrap()["removedHosts"],
+            serde_json::json!(["ghcr.io/acme-labs/"])
+        );
+    }
+
+    #[test]
+    fn dropping_a_whole_half_is_destructive() {
+        // Removing the registry half entirely = removing every host.
+        let old = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let new = spec(&["github.com/acme/"], &[]);
+        let change =
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
+        assert_eq!(change.field, "spec.registry.hosts");
+    }
+
+    #[test]
+    fn removing_from_both_halves_reports_combined_field() {
+        let old = spec(
+            &["github.com/acme/", "github.com/x/"],
+            &["ghcr.io/acme/", "ghcr.io/x/"],
+        );
+        let new = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let change =
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
+        assert_eq!(change.field, "spec.git.repoPrefixes,spec.registry.hosts");
     }
 }

@@ -28,4 +28,6 @@ pub mod reconcile;
 pub mod strategy;
 
 pub use reconcile::{run, FIELD_MANAGER};
-pub use strategy::{ApplicationMigrationStrategy, PlatformMigrationStrategy};
+pub use strategy::{
+    ApplicationMigrationStrategy, PlatformMigrationStrategy, SourceCredentialMigrationStrategy,
+};
