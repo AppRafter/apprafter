@@ -1698,6 +1698,35 @@ compatibility: "0.1.23": {
 // re-registering. cue-cmp image v0.1.5 → v0.1.6 (entrypoint
 // .sh change baked into the image), chart pin follows via
 // the `argocdcuecmp.version` CUE import.
+compatibility: "0.1.51": {
+	change:          "safe"
+	operatorVersion: "v0.1.137"
+	notes: """
+		1.79c S5 — SourceCredential operator-side closure.
+		Additive + behavioural, no values reshaped, no data
+		migration:
+
+		  * live validity probe — for each covered prefix the
+		    operator finds a representative repo/image from a
+		    matching Argo / AppRafter Application and probes it
+		    (git smart-HTTP / scoped registry v2 token exchange);
+		    GitValid/RegistryValid + lastValidated now reflect it.
+		    Conservative mapping — a blocked egress reports
+		    Unverified, never Invalid;
+		  * derived-Secret GC finalizer — on SourceCredential
+		    delete the operator GCs the cross-namespace Argo
+		    repo-creds + canonical dockerconfigjson, then releases
+		    the finalizer (no ownerReference cascade is possible
+		    across namespaces). RBAC gains `delete` on secrets;
+		  * scoped CLI credential-author Role seed (unbound);
+		  * SourceCredentialMigrationStrategy.detect_destructive
+		    classifier (live plan-creation wiring co-deferred with
+		    application-scope B.1.77).
+
+		Operator image v0.1.136 → v0.1.137 — safe to auto-sync.
+		"""
+	references: ["plan.md 1.79c"]
+}
 compatibility: "0.1.50": {
 	change:          "safe"
 	operatorVersion: "v0.1.136"
