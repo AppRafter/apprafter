@@ -114,7 +114,18 @@ pub const COND_GIT_PRESENT: &str = "GitPresent";
 pub const COND_GIT_VALID: &str = "GitValid";
 pub const COND_REGISTRY_PRESENT: &str = "RegistryPresent";
 pub const COND_REGISTRY_VALID: &str = "RegistryValid";
+/// `status: "Unknown"` — the host could not be reached to validate
+/// (restricted egress / air-gapped), OR no application references the
+/// covered prefix yet so there is nothing concrete to probe. The
+/// `present` coverage gate accepts this state by design (ADR 0039).
 pub const REASON_UNVERIFIED: &str = "Unverified";
+/// `status: "True"` — a representative repo / image covered by this
+/// half was reached and the credential authenticated (1.79c S5 live
+/// validity probe).
+pub const REASON_REACHABLE: &str = "Reachable";
+/// `status: "False"` — the host actively rejected the credential
+/// (HTTP 401/403 on git, auth failure on the registry token exchange).
+pub const REASON_AUTH_REJECTED: &str = "AuthRejected";
 
 /// k8s-style condition (mirrors `meta/v1.Condition`).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]

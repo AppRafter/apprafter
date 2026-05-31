@@ -29,5 +29,6 @@ pub use platform_stack::{
 pub use sourcecredential::{
     SealedSecretRef, SourceBackend, SourceCredential, SourceCredentialCondition,
     SourceCredentialSpec, SourceCredentialStatus, SourceGit, SourceRegistry, COND_GIT_PRESENT,
-    COND_GIT_VALID, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID, REASON_UNVERIFIED,
+    COND_GIT_VALID, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID, REASON_AUTH_REJECTED,
+    REASON_REACHABLE, REASON_UNVERIFIED,
 };

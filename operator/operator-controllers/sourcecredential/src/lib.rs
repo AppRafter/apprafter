@@ -21,11 +21,16 @@
 //! private key unseals, and that already happened by the time this
 //! reconcile reads the materialised Secret.
 //!
-//! Validity (a live `git ls-remote` / registry probe) is NOT performed
-//! yet: the git half is reported `GitPresent=True` + `GitValid=Unknown`
-//! (reason `Unverified`). This is exactly the restricted-egress state
-//! the coverage gate's `present` default is designed for (ADR 0039
-//! §Validation and status); the live probe is a defined follow-on.
+//! Validity is probed live (S5): for each covered prefix the controller
+//! finds a representative object actually in use — a git repo from a
+//! matching Argo CD `Application`, an image from a matching AppRafter
+//! `Application` — and probes it (git smart-HTTP / a scoped registry v2
+//! token exchange). The verdict lands in `GitValid` / `RegistryValid`
+//! (`True` Reachable / `False` AuthRejected / `Unknown` Unverified) with
+//! `status.lastValidated`. When no application references a covered
+//! prefix yet, or egress is blocked, the half stays `Unverified` — the
+//! state the `present` coverage gate accepts by design (ADR 0039
+//! §Validation and status). See `validity.rs`.
 //!
 //! Known limitations (deferred, tracked for S5): derived `repo-creds`
 //! Secrets are not garbage-collected when a `repoPrefix` is removed or
@@ -52,6 +57,9 @@ use operator_core::{
     Metrics, SourceCredential, SourceCredentialCondition, SourceCredentialStatus, COND_GIT_PRESENT,
     COND_GIT_VALID, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID, REASON_UNVERIFIED,
 };
+
+mod validity;
+use validity::Validity;
 
 const KIND: &str = "SourceCredential";
 
@@ -131,6 +139,7 @@ pub async fn reconcile(
     let mut conditions: Vec<SourceCredentialCondition> = Vec::new();
     let mut covered_prefixes: Vec<String> = Vec::new();
     let mut covered_hosts: Vec<String> = Vec::new();
+    let mut last_validated: Option<String> = None;
     let mut pending = false;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
 
@@ -179,13 +188,30 @@ pub async fn reconcile(
                             "Argo repo-creds Secret(s) derived from sealed material",
                             previous,
                         ));
-                        // Live reachability probe not implemented — report
-                        // Unverified, which the `present` gate accepts.
+                        // Live reachability probe (S5): find a representative
+                        // repo covered by each prefix (from a matching Argo
+                        // Application) and probe it over git smart-HTTP.
+                        let normalized: Vec<String> = git
+                            .repo_prefixes
+                            .iter()
+                            .map(|p| normalize_repo_url(p))
+                            .collect();
+                        let (verdict, message) = validity::probe_git_half(
+                            &ctx.client,
+                            &normalized,
+                            &username,
+                            &password,
+                        )
+                        .await;
+                        if verdict != Validity::Unverified {
+                            last_validated = Some(Utc::now().to_rfc3339());
+                        }
+                        let (status, reason) = verdict.condition_parts();
                         conditions.push(condition(
                             COND_GIT_VALID,
-                            "Unknown",
-                            REASON_UNVERIFIED,
-                            "validity probe not yet implemented; coverage gated by presence",
+                            status,
+                            reason,
+                            &message,
                             previous,
                         ));
                     }
@@ -236,11 +262,26 @@ pub async fn reconcile(
                             "dockerconfigjson pull-secret derived from sealed material",
                             previous,
                         ));
+                        // Live reachability probe (S5): find a representative
+                        // image covered by each host (from a matching
+                        // AppRafter Application) and probe it via a scoped
+                        // registry v2 token exchange.
+                        let (verdict, message) = validity::probe_registry_half(
+                            &ctx.client,
+                            &registry.hosts,
+                            &username,
+                            &password,
+                        )
+                        .await;
+                        if verdict != Validity::Unverified {
+                            last_validated = Some(Utc::now().to_rfc3339());
+                        }
+                        let (status, reason) = verdict.condition_parts();
                         conditions.push(condition(
                             COND_REGISTRY_VALID,
-                            "Unknown",
-                            REASON_UNVERIFIED,
-                            "validity probe not yet implemented; coverage gated by presence",
+                            status,
+                            reason,
+                            &message,
                             previous,
                         ));
                     }
@@ -253,7 +294,7 @@ pub async fn reconcile(
         &ctx.client,
         &namespace,
         &name,
-        &build_status(conditions, covered_prefixes, covered_hosts),
+        &build_status(conditions, covered_prefixes, covered_hosts, last_validated),
     )
     .await?;
     let outcome = if pending { "pending" } else { "ok" };
@@ -435,6 +476,7 @@ fn build_status(
     conditions: Vec<SourceCredentialCondition>,
     covered_prefixes: Vec<String>,
     covered_hosts: Vec<String>,
+    last_validated: Option<String>,
 ) -> SourceCredentialStatus {
     SourceCredentialStatus {
         conditions: Some(conditions),
@@ -448,7 +490,7 @@ fn build_status(
         } else {
             Some(covered_hosts)
         },
-        last_validated: None,
+        last_validated,
     }
 }
 
@@ -564,16 +606,19 @@ mod tests {
 
     #[test]
     fn build_status_omits_empty_covered_lists() {
-        let s = build_status(vec![], vec![], vec![]);
+        let s = build_status(vec![], vec![], vec![], None);
         assert!(s.covered_repo_prefixes.is_none());
         assert!(s.covered_hosts.is_none());
+        assert!(s.last_validated.is_none());
         let s = build_status(
             vec![],
             vec!["github.com/acme/".to_string()],
             vec!["ghcr.io/acme/".to_string()],
+            Some("2026-05-31T00:00:00+00:00".to_string()),
         );
         assert_eq!(s.covered_repo_prefixes.unwrap(), vec!["github.com/acme/"]);
         assert_eq!(s.covered_hosts.unwrap(), vec!["ghcr.io/acme/"]);
+        assert!(s.last_validated.is_some());
     }
 
     #[test]
