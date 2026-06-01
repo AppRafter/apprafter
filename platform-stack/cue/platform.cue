@@ -119,18 +119,18 @@ package platformstack
 	// Argo CD AppProject this component's Application belongs
 	// to. Defaults to `"platform"` per Track B.1.79a — all
 	// chart-managed components are platform-internal. Tier
-	// overlays и ServiceProvider charts могут override на
-	// `"platform-providers"` (например, когда Phase 2-ы CNPG /
-	// Dragonfly / NATS компоненты лендятся в umbrella). User-
-	// app Applications проходят через `apprafter app add` и
-	// получают `project: "apps"` напрямую, не через #Component.
+	// overlays and ServiceProvider charts may override to
+	// `"platform-providers"` (for example, when Phase 2 CNPG /
+	// Dragonfly / NATS components land in the umbrella). User-
+	// app Applications go through `apprafter app add` and
+	// get `project: "apps"` directly, not via #Component.
 	//
-	// AppProject'ы (`platform`, `platform-providers`, `apps`,
-	// + legacy `default`) объявлены в
-	// `_loaderValues.argocd.values.configs.projects`, что
-	// гарантирует их создание initial Argo CD install'ом
-	// до того как первый component'ный Application
-	// засинкается.
+	// AppProjects (`platform`, `platform-providers`, `apps`,
+	// + legacy `default`) are declared in
+	// `_loaderValues.argocd.values.configs.projects`, which
+	// guarantees their creation by the initial Argo CD install
+	// before the first component Application
+	// syncs.
 	project: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$" | *"platform"
 
 	// Argo CD sync-wave for the rendered Application. Argo CD
@@ -267,12 +267,12 @@ package platformstack
 	// applied before wave -15 finishes when Argo CD does NOT
 	// strictly serialise inter-Application sync-waves on the
 	// app-of-applications pattern. Result: walk-found bug —
-	// `Unable к refresh admission-webhook: app is not allowed
+	// `Unable to refresh admission-webhook: app is not allowed
 	// in project "platform", or the project does not exist`.
 	//
 	// Fix: the umbrella chart itself emits AppProject CRs at
 	// sync-wave -30 (earliest possible — before Cilium at -20).
-	// configs.projects in argocd subchart stays для initial
+	// configs.projects in argocd subchart stays for initial
 	// loader install (when there's no umbrella yet). Once the
 	// umbrella adopts on first sync, the umbrella-managed
 	// AppProjects take ownership — Argo CD's reconciler treats

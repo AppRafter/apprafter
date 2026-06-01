@@ -68,8 +68,8 @@ RUN delgroup ping \
 # `bash` — entrypoint.sh shebang.
 # `jq` — walk-fix #5 post-B.1.79a (cue-cmp v0.1.2):
 # entrypoint.sh emits one k8s manifest per top-level value
-# из `cue export --out json`; needs jq for enumerating keys
-# и round-tripping each value individually back through `cue
+# from `cue export --out json`; needs jq for enumerating keys
+# and round-tripping each value individually back through `cue
 # export -e <key> --out yaml` so Argo CD receives a clean
 # YAML stream of unwrapped manifests instead of one nested
 # JSON object.

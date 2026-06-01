@@ -96,8 +96,8 @@ failure, so crashes don't leave servers idling.
 
 ### Closure criterion (plan.md §1.12)
 
-> Acceptance: nightly зелёный 5 раз подряд; ручной прогон по docs
-> работает у нового человека.
+> Acceptance: nightly green 5 times in a row; a manual run per docs
+> works for a new person.
 
 Operators flip the §1.12 ✅ box once five consecutive nightly runs
 are green and one new operator has walked the manual quickstart

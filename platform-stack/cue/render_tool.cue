@@ -123,7 +123,7 @@ _chartYaml: """
 // template that Helm will execute at install time, so we keep
 // the `{{ }}` literal. CUE happily ships this verbatim.
 // `_appProjectsTemplate` — emits one `kind: AppProject` per
-// entry в `.Values.appProjects`. All projects render at
+// entry in `.Values.appProjects`. All projects render at
 // sync-wave -30 — earlier than even Cilium (-20) so the
 // projects exist before any Application referencing them is
 // applied by Argo CD. Walk-fix #2 post-B.1.79a; see

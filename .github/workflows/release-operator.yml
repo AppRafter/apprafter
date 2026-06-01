@@ -8,13 +8,13 @@ name: release-operator
 #
 # ## Trigger discipline
 #
-# Walk-fix post-v0.1.156 (operator question: "почему сейчас я
-# сделал пуш и запустились 5 воркфлоу, они все нужны были
-# разве?"): until now the workflow triggered on every `v0.*` /
+# Walk-fix post-v0.1.156 (operator question: "why did a single
+# push just kick off 5 workflows — were they all really
+# needed?"): until now the workflow triggered on every `v0.*` /
 # `v1.*` tag push — the canonical CLI tag stream — even when
 # the operator binary itself hadn't changed since the last
 # release. Every CLI release silently rebuilt and re-pushed
-# identical operator + webhook images under а new tag,
+# identical operator + webhook images under a new tag,
 # burning CI minutes and ghcr.io storage without producing
 # any consumer-visible delta (the chart's
 # `RELEASED_OPERATOR_VERSION` constant stayed pinned at the
@@ -37,10 +37,10 @@ name: release-operator
 # operator chart's `Chart.yaml` and is the SoT for the image
 # tag. Bumping the chart's appVersion is the operator-side
 # equivalent of bumping `cli/Cargo.toml` `workspace.package.
-# version` for а CLI release.
+# version` for a CLI release.
 #
 # The publish job creates the `operator/v<appVersion>` git
-# tag itself via `gh release create` at the end of а
+# tag itself via `gh release create` at the end of a
 # successful run — operators must NOT pre-emptively `git tag`
 # the value locally (that would trip the "tag exists" gate
 # and skip publish — see `argocd-cue-cmp-publish.yml`'s
@@ -58,16 +58,16 @@ name: release-operator
 #
 # BOTH must be present to skip publish. Either being absent
 # triggers the build — recovers from the walk-found scenario
-# where а tag was created without а matching image push (or
+# where a tag was created without a matching image push (or
 # vice versa).
 #
 # ## First push of each package
 #
 # First push creates the ghcr package as private. Operators
-# wanting а no-imagePullSecret pull (the tier-1 default that
+# wanting a no-imagePullSecret pull (the tier-1 default that
 # `cluster-bootstrap` assumes) flip visibility to public via
 # the GitHub UI once: Packages → <package> → Settings →
-# Change visibility → Public. This is а one-shot UI action;
+# Change visibility → Public. This is a one-shot UI action;
 # subsequent runs update the existing public package.
 #
 # ## Security
@@ -75,7 +75,7 @@ name: release-operator
 # Every dynamic value (`github.repository_owner`,
 # `github.actor`) is consumed only as an input to
 # docker/login-action / docker/build-push-action — never
-# interpolated into а shell `run:` command. The detect job's
+# interpolated into a shell `run:` command. The detect job's
 # shell step consumes inputs via `env:` bindings rather than
 # direct expression substitution, which is the documented
 # anti-injection pattern.
@@ -145,9 +145,9 @@ jobs:
           # Two-axis gate (mirrors argocd-cue-cmp-publish.yml
           # walk-fix v0.1.154): the published version requires
           # BOTH the git tag AND the operator + webhook images
-          # on ghcr.io. Tag-alone is insufficient — а manually
+          # on ghcr.io. Tag-alone is insufficient — a manually
           # pushed tag without a build leaves the chart pinning
-          # а phantom image. Default к "publish" on any
+          # a phantom image. Default to "publish" on any
           # uncertainty.
           tag_exists=false
           if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
@@ -278,8 +278,8 @@ jobs:
     #
     # The chart's `version` field (not `appVersion`) comes
     # from Chart.yaml. The platform-stack chart pins each
-    # operator chart to а specific version (e.g. v0.1.115).
-    # Bumping the chart version is а separate, intentional
+    # operator chart to a specific version (e.g. v0.1.115).
+    # Bumping the chart version is a separate, intentional
     # edit alongside the appVersion bump.
 
     steps:
@@ -366,13 +366,13 @@ jobs:
           Source: [\`operator/\`](https://github.com/${REPO}/tree/${TAG}/operator).
           EOF
           # Recovery path: if the git tag already exists on
-          # origin without а matching release (operator pushed
-          # а local tag eagerly before the workflow ran, gate
+          # origin without a matching release (operator pushed
+          # a local tag eagerly before the workflow ran, gate
           # saw the tag and skipped, the workflow was re-triggered
           # by another path), reset the release entry cleanly.
           # `gh release create --target $SHA` errors when the
           # tag already exists; drop `--target` in that case so
-          # gh anchors the release к the existing tag's SHA.
+          # gh anchors the release to the existing tag's SHA.
           release_args=()
           if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "::notice::Tag ${TAG} already on origin — recovering via release re-create."

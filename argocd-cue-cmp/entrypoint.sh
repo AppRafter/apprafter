@@ -27,7 +27,7 @@
 # would treat that as ONE invalid manifest (no `apiVersion`
 # at the top level). To produce a valid YAML stream the
 # entrypoint enumerates the top-level keys via
-# `cue export --out json | jq` и re-exports each one
+# `cue export --out json | jq` and re-exports each one
 # individually via `cue export -e <key> --out yaml`. This is
 # walk-fix #5 post-B.1.79a (cue-cmp v0.1.2).
 #
@@ -35,7 +35,7 @@
 # (`apiVersion` + `kind` present) are emitted. Helper values
 # the user might declare at the top level (e.g. shared
 # constants) are silently skipped — they're imported by the
-# real manifests anyway, so не need to land on stdout.
+# real manifests anyway, so no need to land on stdout.
 #
 # Error handling
 # --------------
@@ -130,7 +130,7 @@ fi
 #      ```
 #
 #   B) **Named wrapper(s)**: each top-level field is a
-#      complete manifest under а readable name. Required
+#      complete manifest under a readable name. Required
 #      for multi-resource files (a single CUE file declares
 #      `landingWeb: …`, `landingWebPreview: …` side-by-side).
 #
@@ -140,9 +140,9 @@ fi
 #      landingWebPreview: v1alpha1.#Application & { ... }
 #      ```
 #
-# `cue export` emits style A as а bare `{apiVersion, kind,
+# `cue export` emits style A as a bare `{apiVersion, kind,
 # metadata, spec}` JSON object. Style B emits the same with
-# the manifest nested under а field key. We dispatch on
+# the manifest nested under a field key. We dispatch on
 # whether the top-level JSON itself carries `apiVersion`
 # + `kind`.
 is_top_level_manifest=$(jq -r '
@@ -160,13 +160,13 @@ if [ "$is_top_level_manifest" = "yes" ]; then
     exit 0
 fi
 
-# Style B — enumerate top-level keys whose value is а k8s-
+# Style B — enumerate top-level keys whose value is a k8s-
 # shaped object (`apiVersion` + `kind` set). Unsorted
 # iteration preserves CUE's declaration order, which
 # matches operator expectations when scanning the rendered
 # manifest stream.
 #
-# `--raw-output` strips JSON quoting so each line is а bare
+# `--raw-output` strips JSON quoting so each line is a bare
 # key the `for` loop reads cleanly.
 keys=$(jq --raw-output \
     'to_entries[]
@@ -177,7 +177,7 @@ if [ -z "$keys" ]; then
     # No k8s manifests in the source. Argo CD treats empty
     # output as "no resources to sync" — the right behaviour
     # when the user's path doesn't carry any AppRafter /
-    # Argo CD resources (e.g. they pointed `path` at а
+    # Argo CD resources (e.g. they pointed `path` at a
     # directory that only has supporting CUE).
     exit 0
 fi
@@ -194,7 +194,7 @@ echo "$keys" | while IFS= read -r key; do
     [ -z "$key" ] && continue
     echo "---"
     if ! cue export ./... -e "$key" --out yaml 2>"$err_out"; then
-        # Surface the per-key error к stderr so operators can
+        # Surface the per-key error to stderr so operators can
         # locate the failing manifest. Single-manifest failure
         # aborts the whole sync — keeping stricter "all or
         # nothing" semantics is safer than partial application.

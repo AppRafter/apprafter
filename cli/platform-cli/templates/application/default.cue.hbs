@@ -1,12 +1,12 @@
 // AppRafter Application manifest scaffolded by `apprafter
 // app scaffold` (runtime preset: {{runtime_display}}).
 //
-// This is your code under your license — feel free к add
+// This is your code under your license — feel free to add
 // your own SPDX-License-Identifier header on top. The CMP
 // plugin renders this file at sync time; `cue vet ./apprafter/
 // ...` catches typos locally before you push (the AppRafter
 // v1alpha1 schemas are vendored under `apprafter/cue.mod/pkg/`,
-// so neither а network call nor а `cue mod tidy` step is
+// so neither a network call nor a `cue mod tidy` step is
 // needed). Argo CD's apiserver validates the rendered CR
 // against the AppRafter CRD on apply.
 
@@ -16,7 +16,7 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 
 {{app_name_camel}}: v1alpha1.#Application & {
 	metadata: {
-		// DNS-1123 lowercase. Free к rename — the scaffold
+		// DNS-1123 lowercase. Free to rename — the scaffold
 		// pulls this from the directory you ran `apprafter
 		// app scaffold` in.
 		name: "{{app_name}}"
@@ -25,7 +25,7 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 		// where Argo CD applies the rendered Deployment +
 		// Service. Matches the default `apprafter app add
 		// --namespace` value; override if you've carved
-		// out а tenant-specific namespace.
+		// out a tenant-specific namespace.
 		namespace: "{{namespace}}"
 
 		labels: {
@@ -38,21 +38,21 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 		{{image_comment}}
 		image: "{{image_placeholder}}"
 
-		// Start с а single replica; scale once you have
+		// Start with a single replica; scale once you have
 		// observed load. The operator handles rolling
 		// updates automatically.
 		replicas: 1
 
 		expose: {
 			// Container port the {{runtime_display}} app
-			// listens on. Defaults к {{primary_port}} for
+			// listens on. Defaults to {{primary_port}} for
 			// {{runtime_display}} apps; override if your
 			// process binds elsewhere.
 			port: {{primary_port}}
 
-			// Internal-only until you're ready к expose
-			// publicly. Flip к `true` + uncomment
-			// `network: "public"` below + add а `hostname`
+			// Internal-only until you're ready to expose
+			// publicly. Flip to `true` + uncomment
+			// `network: "public"` below + add a `hostname`
 			// label on metadata when ready; the Gateway
 			// API HTTPRoute is rendered by the operator
 			// automatically once those three line up.
@@ -61,8 +61,8 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 			// network: "public"  // also accepts "internal" / "vpn"
 		}
 
-		// Literal env values only в v1alpha1. Secret /
-		// ConfigMap references land в 4.x with OpenBao and
+		// Literal env values only in v1alpha1. Secret /
+		// ConfigMap references land in 4.x with OpenBao and
 		// 2.x with ResourceClaim respectively. Uncomment
 		// and replace placeholders when needed:
 		//
@@ -75,7 +75,7 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 	// Per-environment overrides — CUE unification merges the
 	// chosen environment onto `spec.base` at render time
 	// (`APPRAFTER_ENV=dev` / `=prod`). Uncomment and tune as
-	// you grow beyond а single environment:
+	// you grow beyond a single environment:
 	//
 	// spec: environments: {
 	//     dev: {

@@ -276,10 +276,10 @@ describe('Application manifests — prod + preview pair', () => {
   // the landing-promote-to-prod.yml + landing-preview-build.yml
   // workflows haven't yet seeded :prod / :preview tags in
   // ghcr. The registry currently carries only :latest +
-  // landing-vX.Y.Z, so pinning к :prod / :preview produces
+  // landing-vX.Y.Z, so pinning to :prod / :preview produces
   // ImagePullBackOff on real clusters. Revisit once the
   // promotion workflows fire and the manifests can flip back
-  // к their proper rolling-tag conventions.
+  // to their proper rolling-tag conventions.
   test('Application.cue (prod) pins landing-web image + carries apprafter.dev hostname label', () => {
     const m = readFileSync(join(ROOT, 'apprafter/Application.cue'), 'utf8');
     expect(m).toContain('name:      "landing-web"');

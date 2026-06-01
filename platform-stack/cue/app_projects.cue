@@ -102,14 +102,14 @@ _appProjects: {
 	// wizard-generated syncOptions can create destination
 	// namespaces; nothing else is cluster-scoped that user
 	// apps should touch), namespace-scoped resource whitelist
-	// constrained к Application / ConfigMap / Secret /
-	// HTTPRoute. RBAC enforcement через AppProject is not
-	// active в M1.5 — Phase 4 materialises that through
+	// constrained to Application / ConfigMap / Secret /
+	// HTTPRoute. RBAC enforcement via AppProject is not
+	// active in M1.5 — Phase 4 materialises that through
 	// AccessGrant. The tightening here is structural
 	// foundation rather than runtime enforcement.
 	//
 	// Walk-fix #11 post-B.1.79a (chart 0.1.47): `Namespace`
-	// added к `clusterResourceWhitelist`. Before this, an
+	// added to `clusterResourceWhitelist`. Before this, an
 	// empty list blocked the synthetic `Namespace` resource
 	// Argo CD generates from `CreateNamespace=true` for any
 	// user app whose destination namespace doesn't exist

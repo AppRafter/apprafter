@@ -97,19 +97,19 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           # Two-axis gate (walk-fix post-v0.1.153): a published
-          # version requires BOTH а git tag AND the image on
+          # version requires BOTH a git tag AND the image on
           # ghcr.io. Tag-alone is insufficient — operators may
-          # accidentally push а manually-created tag (e.g. via
+          # accidentally push a manually-created tag (e.g. via
           # `git tag` locally + `git push --tags`) before the
           # workflow has had a chance to build and push. The
-          # old gate skipped в that case и left the chart
-          # pinning а phantom image tag, breaking Argo CD's
+          # old gate skipped in that case and left the chart
+          # pinning a phantom image tag, breaking Argo CD's
           # argocd-repo-server pull.
           #
-          # Default к "publish" on any uncertainty (manifest
+          # Default to "publish" on any uncertainty (manifest
           # lookup error, transient ghcr 5xx) — re-publishing
           # the same digest is idempotent on ghcr.io, but
-          # skipping а needed publish leaves the cluster
+          # skipping a needed publish leaves the cluster
           # broken.
           tag_exists=false
           if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
@@ -276,14 +276,14 @@ jobs:
           Source: [\`argocd-cue-cmp/\`](https://github.com/${REPO}/tree/${TAG}/argocd-cue-cmp).
           EOF
           # Recovery path: the git tag may already exist on
-          # origin without а matching ghcr image (operator
-          # pushed а local tag eagerly before the workflow
+          # origin without a matching ghcr image (operator
+          # pushed a local tag eagerly before the workflow
           # ran, gate v1 saw the tag and skipped, the image
           # never landed). We just built and pushed the image
           # in this run; now finalise the release. `gh release
           # create --target` only works for non-existent tags
           # — drop it when the tag is already there and let
-          # gh anchor the release к the existing tag's SHA.
+          # gh anchor the release to the existing tag's SHA.
           # Also drop any pre-existing release entry so the
           # re-publish overwrites cleanly.
           release_args=()

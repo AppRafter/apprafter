@@ -2,17 +2,17 @@
 name: lint
 
 # Per-stack lint gating. Each stack's job is gated on a
-# `dorny/paths-filter` flag so а CLI-only push doesn't run
-# CUE vet, а CUE-only push doesn't run rust clippy, и а
+# `dorny/paths-filter` flag so a CLI-only push doesn't run
+# CUE vet, a CUE-only push doesn't run rust clippy, and a
 # landing TypeScript change doesn't run anything else.
 #
-# Walk-fix post-v0.1.156: operator pointed out а single push
-# triggered five separate workflows и all three lint
+# Walk-fix post-v0.1.156: operator pointed out a single push
+# triggered five separate workflows and all three lint
 # sub-jobs (cue / rust / bun) regardless of what actually
-# changed. Now the workflow always fires on push к master
-# and on every PR, но the per-stack jobs each opt in via
+# changed. Now the workflow always fires on push to master
+# and on every PR, but the per-stack jobs each opt in via
 # their path filter — fast-path runs to ~10-30 seconds when
-# nothing in а given stack changed.
+# nothing in a given stack changed.
 
 on:
   pull_request:

@@ -2,14 +2,14 @@
 // app scaffold` (blank template — runtime auto-detection
 // surfaced no markers).
 //
-// This is your code under your license — feel free к add
+// This is your code under your license — feel free to add
 // your own SPDX-License-Identifier header on top. Every
-// field below carries а TODO; fill them in before
+// field below carries a TODO; fill them in before
 // committing. The CMP plugin renders this file at sync
-// time, и `cue vet ./apprafter/...` catches typos locally
+// time, and `cue vet ./apprafter/...` catches typos locally
 // before you push (the AppRafter v1alpha1 schemas are
-// vendored under `apprafter/cue.mod/pkg/`, so neither а
-// network call nor а `cue mod tidy` step is needed).
+// vendored under `apprafter/cue.mod/pkg/`, so neither a
+// network call nor a `cue mod tidy` step is needed).
 
 package apprafter
 
@@ -17,12 +17,12 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 
 {{app_name_camel}}: v1alpha1.#Application & {
 	metadata: {
-		// TODO: DNS-1123 lowercase name. Free к rename.
+		// TODO: DNS-1123 lowercase name. Free to rename.
 		name: "{{app_name}}"
 
 		// TODO: namespace the AppRafter operator watches.
 		// Match `apprafter app add --namespace` (default
-		// `apprafter`) unless you've carved out а tenant-
+		// `apprafter`) unless you've carved out a tenant-
 		// specific namespace.
 		namespace: "{{namespace}}"
 
@@ -35,7 +35,7 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 		{{image_comment}}
 		image: "{{image_placeholder}}"
 
-		// TODO: replica count. Start с 1; scale once you
+		// TODO: replica count. Start with 1; scale once you
 		// have observed load.
 		replicas: 1
 
@@ -43,8 +43,8 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 			// TODO: container port your app listens on.
 			port: {{primary_port}}
 
-			// TODO: flip к `true` and add а `hostname`
-			// label on metadata when ready к expose
+			// TODO: flip to `true` and add a `hostname`
+			// label on metadata when ready to expose
 			// publicly.
 			public: false
 		}

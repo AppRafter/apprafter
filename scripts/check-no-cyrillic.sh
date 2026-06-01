@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
-# Fail if any tracked Rust source carries Cyrillic characters.
+# Fail if Cyrillic characters appear in code or public-facing docs.
 #
-# The AppRafter codebase is English-only (see CLAUDE.md repository
-# conventions). Cyrillic in source is contamination — homoglyph letters
-# (Cyrillic а/е/с masquerading as Latin) or stray Russian/Ukrainian
-# function words leaking into comments, doc-comments, or — worse —
-# user-facing strings. Such text renders as garbage to operators and
-# breaks the English-only norm.
+# The AppRafter codebase is English-only for everything that ships or is
+# read by outsiders. Cyrillic there is contamination — homoglyph letters
+# (Cyrillic a/e/c masquerading as Latin) or stray Russian words leaking
+# into comments, doc-comments, scaffold templates, CI, or — worst —
+# user-facing strings, where they render as garbage to operators.
 #
-# Scope is deliberately limited to CODE (Rust today). Root working docs
-# (plan.md, speedrun-plan.md, *_CHECKLIST.md, ...) are allowed Russian
-# and are NOT scanned. Extend the `git ls-files` glob as more languages
-# come online.
+# Scope (allowlist, so intentional Russian never trips a false positive):
+#   * Code:        *.rs *.cue *.hbs *.sh *.ts/.tsx *.js/.jsx *.toml
+#                  *.yml/.yaml, Dockerfile*
+#   * Public docs: README* / CONTRIBUTING* / CODE_OF_CONDUCT* (.md),
+#                  spec.md, docs/**/*.md
+#
+# NOT scanned (Russian is allowed): root-level working markdown notes
+# (plan.md, speedrun-plan.md, *_CHECKLIST.md, refactor-plan.md,
+# marketing-strategy.md, idiomatic-rust-audit.md, ...) and other internal
+# working .md files. Public-named docs (README/CONTRIBUTING/...) are NOT
+# working notes and ARE scanned, wherever they live.
 #
 # Engine is python3 (reliable Unicode matching across environments);
 # CI runners and the dev shell both provide it.
@@ -31,13 +37,37 @@ import re
 import subprocess
 import sys
 
-# Cyrillic + Cyrillic Supplement blocks.
-CYRILLIC = re.compile(r"[Ѐ-ӿԀ-ԯ]")
+# Cyrillic + Cyrillic Supplement blocks (escapes, so this script is
+# itself Cyrillic-free and passes its own check).
+CYRILLIC = re.compile("[\\u0400-\\u04FF\\u0500-\\u052F]")
 
-files = subprocess.run(
-    ["git", "ls-files", "*.rs"],
+CODE_SUFFIXES = (
+    ".rs", ".cue", ".hbs", ".sh", ".ts", ".tsx", ".js", ".jsx",
+    ".toml", ".yml", ".yaml",
+)
+PUBLIC_DOC_PREFIXES = ("README", "CONTRIBUTING", "CODE_OF_CONDUCT")
+
+
+def is_checked(path):
+    base = path.rsplit("/", 1)[-1]
+    if path.endswith(CODE_SUFFIXES):
+        return True
+    if base.startswith("Dockerfile"):
+        return True
+    if base.endswith(".md") and base.startswith(PUBLIC_DOC_PREFIXES):
+        return True
+    if path == "spec.md":
+        return True
+    if path.startswith("docs/") and path.endswith(".md"):
+        return True
+    return False
+
+
+tracked = subprocess.run(
+    ["git", "ls-files"],
     capture_output=True, text=True, check=True,
 ).stdout.split()
+files = [p for p in tracked if is_checked(p)]
 
 fail = False
 for path in files:
@@ -47,17 +77,18 @@ for path in files:
                 if CYRILLIC.search(line):
                     fail = True
                     print(f"{path}:{lineno}: {line.rstrip()}", file=sys.stderr)
-    except (OSError, UnicodeDecodeError) as exc:
-        print(f"{path}: cannot read: {exc}", file=sys.stderr)
-        fail = True
+    except (OSError, UnicodeDecodeError):
+        # Binary or unreadable file under a scanned suffix — skip quietly.
+        continue
 
 if fail:
     print(
-        "\nERROR: Cyrillic characters found in Rust source. The codebase is "
-        "English-only.\nReplace each with the intended ASCII English.",
+        "\nERROR: Cyrillic found in code / public docs. These must be "
+        "English-only.\nReplace each with the intended ASCII English. "
+        "(Russian is allowed in root working .md notes only.)",
         file=sys.stderr,
     )
     sys.exit(1)
 
-print("==> no Cyrillic in Rust source")
+print(f"==> no Cyrillic in {len(files)} scanned code/public-doc files")
 PYEOF

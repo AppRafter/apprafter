@@ -4,12 +4,12 @@ package platformstack
 
 // Change classification per published version. Operators
 // upgrading platform-stack consult the entry for their target
-// version к understand what's safe к upgrade automatically
+// version to understand what's safe to upgrade automatically
 // and what requires manual intervention.
 //
 // The categories mirror the Rust `ChangeClass` enum
 // (`operator-controllers/platform-stack/src/compatibility.rs`)
-// и the MigrationPlan CRD's `spec.risks.classification` enum
+// and the MigrationPlan CRD's `spec.risks.classification` enum
 // (`schemas/v1alpha1/migrationplan.cue`). All three must
 // agree on the same vocabulary, otherwise the operator's
 // fail-closed default (`Breaking`) fires on legitimate
@@ -1588,7 +1588,7 @@ compatibility: "0.1.22": {
 //      their workloads). Surfaces alongside the other four
 //      conditions in `kubectl describe platformstack default`.
 //
-// Skipped (per plan.md "Размер: S" + YAGNI per CLAUDE.md):
+// Skipped (per plan.md "Size: S" + YAGNI per CLAUDE.md):
 //   * ETag-aware OCI requests — the existing throttle
 //     (`MIN_OCI_POLL_INTERVAL_SECS=60`) + cached availableVersion
 //     reuse already saturate the bandwidth concern; an ETag
@@ -1769,12 +1769,12 @@ compatibility: "0.1.48": {
 		runs `cue export` from inside the `apprafter/`
 		package directory (cue-cmp v0.1.6).
 
-		**Symptom.** Operator scaffolded а user app
+		**Symptom.** Operator scaffolded a user app
 		(`apprafter app scaffold`), which now vendors the
-		AppRafter v1alpha1 schemas as а `cue.mod/` INSIDE
+		AppRafter v1alpha1 schemas as a `cue.mod/` INSIDE
 		`apprafter/` (walk-fix #5 post-Part-3b — typed CUE
 		without external module setup). After pushing the
-		manifest и hard-refreshing, Argo CD surfaced:
+		manifest and hard-refreshing, Argo CD surfaced:
 
 			```
 			plugin sidecar failed. error generating manifests
@@ -1783,11 +1783,11 @@ compatibility: "0.1.48": {
 			failed: cue: "./..." matched no packages
 			```
 
-		**Root cause.** А nested `cue.mod/` defines а CUE
+		**Root cause.** A nested `cue.mod/` defines a CUE
 		MODULE BOUNDARY. Argo CD sets the CMP working
-		directory к the Application's `spec.source.path`
-		(repo-root-relative). For а scaffolded repo with the
-		manifest at `apprafter/Application.cue` и
+		directory to the Application's `spec.source.path`
+		(repo-root-relative). For a scaffolded repo with the
+		manifest at `apprafter/Application.cue` and
 		`source.path` = repo root, the entrypoint ran
 		`cue export ./...` from the repo root — which does
 		NOT descend into the nested `apprafter/` module,
@@ -1813,19 +1813,19 @@ compatibility: "0.1.48": {
 		manifests, `spec.source.path` = `landing/web`). The
 		`cue.mod/pkg/` dependency cache is excluded from
 		`./...`, so the vendored schema package is never
-		emitted as а manifest.
+		emitted as a manifest.
 
 		**Self-healing.** Existing registrations work after
-		the image upgrade без re-registering, regardless of
+		the image upgrade without re-registering, regardless of
 		the `spec.source.path` they were created with —
 		`apprafter platform upgrade --to 0.1.48` +
 		`kubectl rollout restart deployment/argocd-repo-server
 		-n argocd` + hard-refresh the affected apps.
 
 		**Regression guard.** `argocd-cue-cmp-check.yml`
-		gains а second entrypoint smoke that builds the exact
+		gains a second entrypoint smoke that builds the exact
 		scaffold layout (apprafter/ + nested cue.mod with
-		vendored schemas + а typed manifest that `import`s
+		vendored schemas + a typed manifest that `import`s
 		`apprafter.io/schemas/v1alpha1`), runs the entrypoint
 		with cwd = the PARENT, and asserts it cds in and
 		renders the typed manifest. Before this fix the new
@@ -1846,13 +1846,13 @@ compatibility: "0.1.48": {
 }
 
 // Walk-fix #11 post-B.1.79a — `Namespace` cluster resource
-// added к `apps` AppProject's `clusterResourceWhitelist`.
+// added to `apps` AppProject's `clusterResourceWhitelist`.
 // Wizard-generated user apps carry `syncOptions:
 // CreateNamespace=true`, so Argo CD generates a synthetic
 // `Namespace` resource for the destination namespace; the
 // previous empty whitelist blocked it with `SyncFailed:
 // resource :Namespace is not permitted in project apps`.
-// Permission narrows к `Namespace` only — everything else
+// Permission narrows to `Namespace` only — everything else
 // cluster-scoped stays denied (Phase 4 AccessGrant will
 // layer real RBAC on top later).
 compatibility: "0.1.47": {
@@ -1903,7 +1903,7 @@ compatibility: "0.1.47": {
 		runtime RBAC on top of this structural foundation.
 
 		**Caveat — orphan destination namespace.** The
-		wizard's defaulting of `destination.namespace` к
+		wizard's defaulting of `destination.namespace` to
 		the app name (`apprafter-landing-web`) is mismatch'ed
 		with the manifest's actual `metadata.namespace`
 		(typically `apprafter` for landing apps). After this
@@ -1914,7 +1914,7 @@ compatibility: "0.1.47": {
 		  2. Applies the Application CR to its manifest
 		     namespace (`apprafter`).
 		  3. AppRafter operator reconciles, lays down
-		     Deployment + Service в `apprafter`.
+		     Deployment + Service in `apprafter`.
 
 		Result: `apprafter-landing-web` namespace exists
 		but is empty. Harmless but ugly — wizard polish
@@ -1924,7 +1924,7 @@ compatibility: "0.1.47": {
 
 		**Rendered chart vs 0.1.46.** Only the `apps`
 		AppProject's `clusterResourceWhitelist` flips from
-		`[]` к `[{group: "", kind: "Namespace"}]`. No other
+		`[]` to `[{group: "", kind: "Namespace"}]`. No other
 		structural changes.
 		"""
 	references: [
@@ -1936,8 +1936,8 @@ compatibility: "0.1.47": {
 // Walk-fix #10 post-B.1.79a — discover stdout fix in CMP
 // plugin.yaml. v0.1.4's snippet exited 0 on match but printed
 // nothing (`| grep -q .` swallowed find's output). Argo CD's
-// MatchRepository requires non-empty stdout к claim the repo,
-// so the cue plugin never engaged; landing apps fell back к
+// MatchRepository requires non-empty stdout to claim the repo,
+// so the cue plugin never engaged; landing apps fell back to
 // directory mode and choked on `package.json` exactly as in
 // walk-fix #8. Drop `| grep -q .`, let `find -print -quit`
 // speak for itself. Image bumps v0.1.4 → v0.1.5; chart pulls
@@ -2095,7 +2095,7 @@ compatibility: "0.1.45": {
 // Application.cue`, Argo CD fell back to default directory
 // mode, choked on `package.json`. New shape: command-based
 // discovery using `find` with an inline shell snippet,
-// supports both path-is-parent-of-apprafter и
+// supports both path-is-parent-of-apprafter and
 // path-is-apprafter-itself conventions, no doublestar
 // dependency.
 //
@@ -2136,7 +2136,7 @@ compatibility: "0.1.44": {
 		has no "explicit no-match" log entry, only "matched"
 		activity downstream).
 
-		**Fix.** Switch `discover.find.glob` к `discover.
+		**Fix.** Switch `discover.find.glob` to `discover.
 		find.command`. The command runs from the path's
 		directory; exit 0 means match, non-zero means no
 		match. Inline shell handles both convention shapes
@@ -2158,25 +2158,25 @@ compatibility: "0.1.44": {
 		  directly at convention dir) → match any `.cue`
 		  file at depth 1.
 		* otherwise → match any `.cue` file inside an
-		  `apprafter/` subdirectory OR with а filename
+		  `apprafter/` subdirectory OR with a filename
 		  starting `apprafter`. Covers both path = parent
-		  (`landing/cms`) и filename-prefix (`apprafter-
+		  (`landing/cms`) and filename-prefix (`apprafter-
 		  web.cue`) conventions.
 
 		`-print -quit | grep -q .` short-circuits after the
-		first match — discovery doesn't need а full scan,
-		just а yes/no signal.
+		first match — discovery doesn't need a full scan,
+		just a yes/no signal.
 
 		**Image unchanged.** cue-cmp Docker image stays at
 		v0.1.3; the entire fix lives in the chart-managed
 		`cue-cmp-plugin-config` ConfigMap content. Upgrading
-		the chart к 0.1.44 + restarting `argocd-repo-server`
-		deployment is sufficient к pick up the new
+		the chart to 0.1.44 + restarting `argocd-repo-server`
+		deployment is sufficient to pick up the new
 		discovery rule.
 
 		**Wizard polish bundled.** `apprafter app add`
 		wizard's `detect_path_relative_to_repo_root` now
-		strips а trailing `apprafter` segment from the
+		strips a trailing `apprafter` segment from the
 		suggested path — operator running the command from
 		inside `landing/cms/apprafter/` gets default
 		`landing/cms`. (CMP would handle either case with
@@ -2215,23 +2215,23 @@ compatibility: "0.1.44": {
 // For style A the top-level JSON itself IS the manifest;
 // the v0.1.2 entrypoint's key-enumeration logic skipped
 // it because `apiVersion` / `kind` themselves aren't
-// objects-with-`apiVersion`+`kind` — fell through к the
-// "no manifests" branch, smoke test failed с
+// objects-with-`apiVersion`+`kind` — fell through to the
+// "no manifests" branch, smoke test failed with
 // `entrypoint did not render Application kind`.
 //
 // Fix: dispatch on whether the top-level JSON object
 // carries `apiVersion` + `kind`. Style A — emit `cue
 // export ./... --out yaml` verbatim. Style B — fall
-// through к the existing per-key enumeration logic.
+// through to the existing per-key enumeration logic.
 //
-// argocd-cue-cmp v0.1.2 → v0.1.3. Chart pin tracks через
+// argocd-cue-cmp v0.1.2 → v0.1.3. Chart pin tracks via
 // the CUE import.
 compatibility: "0.1.43": {
 	change:          "safe"
 	operatorVersion: "v0.1.134"
 	notes: """
 		Walk-fix #5b — entrypoint accepts both unwrapped
-		и named-wrapper CUE source layouts.
+		and named-wrapper CUE source layouts.
 
 		**Symptom.** v0.1.42 chart + cue-cmp v0.1.2 CI
 		`argocd-cue-cmp-check` smoke test failed:
@@ -2248,7 +2248,7 @@ compatibility: "0.1.43": {
 		`to_entries[]` looking for nested objects-with-
 		apiVersion+kind; `apiVersion` and `kind` themselves
 		weren't objects, so the filter rejected everything
-		и the loop exited без emitting anything.
+		and the loop exited without emitting anything.
 
 		**Fix.** Dispatch before enumeration:
 
@@ -2268,9 +2268,9 @@ compatibility: "0.1.43": {
 		Style A — single manifest, emit verbatim. Style B
 		(`landingWeb: …`) — existing per-key logic. Both
 		verified locally against `/tmp/cue-smoke/apprafter/
-		Application.cue` (style A) и
+		Application.cue` (style A) and
 		`landing/web/apprafter/` (style B); each emits
-		well-formed YAML stream с `apiVersion:` at the top
+		well-formed YAML stream with `apiVersion:` at the top
 		level of every doc.
 
 		**Image bump.** `argocd-cue-cmp/version.cue` v0.1.2
@@ -2288,11 +2288,11 @@ compatibility: "0.1.43": {
 
 // Walk-fix #5 post-B.1.79a — argocd-cue-cmp emits flat k8s
 // manifest stream. Chart 0.1.41 shipped the cue-cmp sidecar
-// embedded в the argocd subchart, but the sidecar's
+// embedded in the argocd subchart, but the sidecar's
 // entrypoint script ran `cue export ./... --out yaml` raw —
 // which for typical apprafter manifests (`landingWeb:
-// v1alpha1.#Application & { ... }`) outputs а nested YAML
-// document с the manifest under the field key, not the flat
+// v1alpha1.#Application & { ... }`) outputs a nested YAML
+// document with the manifest under the field key, not the flat
 // document Argo CD expects. Plus the discovery glob
 // (`**/apprafter*.cue`) only matched files starting with
 // "apprafter", missing the `apprafter/<resource>.cue`
@@ -2301,18 +2301,18 @@ compatibility: "0.1.43": {
 //
 // Fix lands across three artefacts:
 //   * `argocd-cue-cmp/entrypoint.sh` — enumerates top-level
-//     k8s-shaped values (objects с `apiVersion` + `kind`)
+//     k8s-shaped values (objects with `apiVersion` + `kind`)
 //     via `cue export --out json | jq`, re-exports each via
-//     `cue export -e <key> --out yaml`, separates each с
+//     `cue export -e <key> --out yaml`, separates each with
 //     `---`.
-//   * `argocd-cue-cmp/Dockerfile` — adds `jq` к the image
+//   * `argocd-cue-cmp/Dockerfile` — adds `jq` to the image
 //     for the key enumeration step (~600 KiB).
 //   * `argocd-cue-cmp/plugin.yaml` (and the chart's embed
-//     of the same в `component_argocd.cue`'s extraObjects)
-//     — extends glob к `{**/apprafter*.cue,**/apprafter/**/*.cue}` via doublestar v4 brace alternation.
+//     of the same in `component_argocd.cue`'s extraObjects)
+//     — extends glob to `{**/apprafter*.cue,**/apprafter/**/*.cue}` via doublestar v4 brace alternation.
 //
 // argocd-cue-cmp image bumps v0.1.1 → v0.1.2. Chart points
-// `_components.argocd-cue-cmp.values.image.tag` к the new
+// `_components.argocd-cue-cmp.values.image.tag` to the new
 // version through `argocd-cue-cmp/version.cue` (single SoT
 // for the image tag — chart pin tracks automatically).
 compatibility: "0.1.42": {
@@ -2330,14 +2330,14 @@ compatibility: "0.1.42": {
 
 		  1. CMP discovery glob `**/apprafter*.cue` doesn't
 		     match the file (basename is `Application.cue`).
-		     Argo CD falls through к default raw-YAML
+		     Argo CD falls through to default raw-YAML
 		     handling, finds nothing, syncs the Application
 		     with zero rendered manifests.
 
-		  2. Even with а matching filename (e.g.
+		  2. Even with a matching filename (e.g.
 		     `apprafter-web.cue` workaround), the entrypoint's
 		     `cue export ./... --out yaml` emits the
-		     manifest nested under а top-level field name
+		     manifest nested under a top-level field name
 		     (`landingWeb: …`). Argo CD treats that as ONE
 		     invalid document — no `apiVersion` at the top
 		     level → sync fails.
@@ -2351,20 +2351,20 @@ compatibility: "0.1.42": {
 
 		**Fix.** Three coordinated artefact updates:
 
-		  * `argocd-cue-cmp/entrypoint.sh` rewritten к
+		  * `argocd-cue-cmp/entrypoint.sh` rewritten to
 		    enumerate top-level k8s-shaped values via `cue
 		    export --out json | jq`, re-export each via `cue
-		    export -e <key> --out yaml`, emit а `---`
+		    export -e <key> --out yaml`, emit a `---`
 		    separator per doc. Filter: only values whose JSON
-		    is an object и has both `apiVersion` и `kind`
+		    is an object and has both `apiVersion` and `kind`
 		    fields — helper top-level values (shared
 		    constants, library defs) are silently skipped.
 
-		  * `argocd-cue-cmp/Dockerfile` adds `jq` к the
+		  * `argocd-cue-cmp/Dockerfile` adds `jq` to the
 		    Alpine base layer (~600 KiB) for the enumeration
 		    step.
 
-		  * `argocd-cue-cmp/plugin.yaml` extends glob к
+		  * `argocd-cue-cmp/plugin.yaml` extends glob to
 		    `{**/apprafter*.cue,**/apprafter/**/*.cue}` via
 		    doublestar v4 brace alternation. Now matches both
 		    filename-prefix convention (`apprafter-web.cue`)
@@ -2373,18 +2373,18 @@ compatibility: "0.1.42": {
 
 		  * `platform-stack/cue/component_argocd.cue` mirrors
 		    the new glob inside the embedded `plugin.yaml`
-		    `extraObjects` ConfigMap that the chart applies к
+		    `extraObjects` ConfigMap that the chart applies to
 		    the argocd-repo-server sidecar.
 
 		**Image bump.** `argocd-cue-cmp/version.cue` v0.1.1
 		→ v0.1.2; chart's
 		`_components.argocd-cue-cmp.values.image.tag` follows
-		automatically через the CUE import.
+		automatically via the CUE import.
 
 		**Verification.** Local `bash argocd-cue-cmp/entrypoint.sh` against `landing/web/apprafter/` emits two
 		well-formed YAML docs (landing-web + landing-web-
 		preview), each with `apiVersion: apprafter.io/v1alpha1`
-		at the top level и а `---` separator between them.
+		at the top level and a `---` separator between them.
 
 		Rendered chart vs 0.1.41: the embedded plugin.yaml
 		ConfigMap's `data."plugin.yaml"` string changed; the
@@ -2407,18 +2407,18 @@ compatibility: "0.1.42": {
 // apprafter-operator, etc.) reference `spec.project: platform`
 // but Argo CD does NOT strictly serialise sync-waves across
 // Applications in the app-of-applications pattern — these
-// children sometimes try к apply before wave -15 finishes,
-// triggering `Unable к refresh admission-webhook: app is not
+// children sometimes try to apply before wave -15 finishes,
+// triggering `Unable to refresh admission-webhook: app is not
 // allowed in project "platform", or the project does not exist`.
 //
 // Fix: the umbrella chart itself emits AppProject CRs at sync-
-// wave -30 — before Cilium at -20 — via а new
+// wave -30 — before Cilium at -20 — via a new
 // `templates/appprojects.yaml` template iterating
 // `.Values.appProjects`. `configs.projects` in the argocd
-// subchart stays для initial loader install (when no umbrella
+// subchart stays for initial loader install (when no umbrella
 // exists yet). Both sites consume the new shared `_appProjects`
 // map (`app_projects.cue`), so definitions are byte-identical
-// и idempotent — Argo CD's reconciler treats both as the same
+// and idempotent — Argo CD's reconciler treats both as the same
 // logical resource.
 compatibility: "0.1.41": {
 	change:          "safe"
@@ -2445,9 +2445,9 @@ compatibility: "0.1.41": {
 		AppProject CRs only when it syncs at sync-wave -15.
 		Argo CD's app-of-applications model does NOT strictly
 		serialise sync-waves between separate Applications —
-		only within а single Application's child-resource
+		only within a single Application's child-resource
 		sync. Result: admission-webhook (wave 0) and argocd
-		(wave -15) race; the former sometimes tries к refresh
+		(wave -15) race; the former sometimes tries to refresh
 		before the AppProject `platform` has landed.
 
 		**Fix.** Ship AppProject manifests as part of the
@@ -2459,7 +2459,7 @@ compatibility: "0.1.41": {
 		`app_projects.cue` is consumed by both the loader
 		(`_loaderValues.argocd.values.configs.projects`) and
 		the umbrella template — definitions are byte-identical
-		и idempotent. Argo CD's reconciler treats the two
+		and idempotent. Argo CD's reconciler treats the two
 		render sites as the same resource (same
 		group/kind/name/namespace).
 
@@ -2469,18 +2469,18 @@ compatibility: "0.1.41": {
 		has run. The umbrella's manifest renderer covers every
 		subsequent sync. Removing the loader path would mean
 		an initial cluster has no AppProjects until the first
-		umbrella sync completes — а regression vs 0.1.40.
+		umbrella sync completes — a regression vs 0.1.40.
 
 		**Workaround for 0.1.40 operators (not needed on
 		0.1.41+).** Apply the four AppProjects manually with
 		`kubectl apply -f` — Argo CD picks them up immediately
-		и the refresh-error condition clears on the next
+		and the refresh-error condition clears on the next
 		reconcile.
 
 		Rendered chart vs 0.1.40: new `templates/appprojects.
 		yaml` template (additive — no existing template
-		changed). values.yaml grows а new top-level
-		`appProjects` map (4 entries, byte-identical к
+		changed). values.yaml grows a new top-level
+		`appProjects` map (4 entries, byte-identical to
 		`configs.projects` in the argocd subchart values).
 		Operator binary unchanged.
 		"""
@@ -2498,10 +2498,10 @@ compatibility: "0.1.41": {
 // components), `platform-providers` (Phase 2+ ServiceProviders),
 // `apps` (user Applications via `apprafter app add`). All
 // existing components transition `spec.project: default → platform`
-// при следующем sync'е; CLI loader's root platform
-// Application также переезжает на `platform`. **Safe class** —
-// AppProject change на existing Application is а metadata-only
-// drift handled by Argo CD as а normal sync (no pod restart,
+// on the next sync; CLI loader's root platform
+// Application also moves to `platform`. **Safe class** —
+// AppProject change on existing Application is a metadata-only
+// drift handled by Argo CD as a normal sync (no pod restart,
 // no resource churn).
 compatibility: "0.1.40": {
 	change:          "safe"
@@ -2517,8 +2517,8 @@ compatibility: "0.1.40": {
 		  `platform-providers`, `apps`. Existing `default`
 		  retained as legacy + ad-hoc fallback. All four
 		  projects ship in the initial Argo CD install so
-		  они существуют до того как любой Application
-		  ссылающийся на них впервые засинкается.
+		  they exist before any Application
+		  that references them syncs for the first time.
 
 		* `#Component.project: string | *"platform"` (new
 		  optional field with default). render_tool.cue
@@ -2534,8 +2534,8 @@ compatibility: "0.1.40": {
 		* `cluster_bootstrap::render_root_application` —
 		  bootstrap "platform" Application teraz writes
 		  `spec.project: platform` instead of `default`.
-		  Safe потому что AppProject ships в initial
-		  Argo CD install (см. выше).
+		  Safe because AppProject ships in the initial
+		  Argo CD install (see above).
 
 		Upgrade impact: existing operators upgrading
 		0.1.39 → 0.1.40 see every chart-managed
@@ -2543,19 +2543,19 @@ compatibility: "0.1.40": {
 		to `platform`. Argo CD reconciles via the normal
 		sync path; pod-level workload unaffected. The
 		root platform Application also drifts (CLI loader
-		re-renders на next `apprafter cluster-bootstrap`
-		или `bootstrap-all` invocation).
+		re-renders on next `apprafter cluster-bootstrap`
+		or `bootstrap-all` invocation).
 
-		RBAC и AccessGrant enforcement через AppProject
-		не активируется в M1.5 — Phase 4 материализует
-		через AccessGrant CRD. Projects сейчас выполняют
-		визуальную роль (UI selector в Argo CD группирует
-		Applications по project), плюс кладут структурный
-		фундамент для будущего enforcement'а.
+		RBAC and AccessGrant enforcement via AppProject
+		is not activated in M1.5 — Phase 4 materialises it
+		via the AccessGrant CRD. Projects currently serve
+		a visual role (the UI selector in Argo CD groups
+		Applications by project), plus lay the structural
+		foundation for future enforcement.
 
 		Rendered chart vs 0.1.39: only `values.yaml`
 		`configs.projects` map grows from 1 → 4 entries;
-		`templates/applications.yaml` template gains а
+		`templates/applications.yaml` template gains a
 		`{{ default "platform" $component.project | quote }}`
 		render. Operator + webhook binaries unchanged.
 		"""
@@ -2570,9 +2570,9 @@ compatibility: "0.1.40": {
 // Track B.1.79 — CLI thin wrappers + Argo CD MigrationPlan
 // Lua action. Operator binary unchanged (still v0.1.134); CLI
 // `apprafter` binary gains `platform`/`migration`/`open argocd`
-// subcommands и а npm-style newer-release courtesy banner.
-// Chart delta is a single Lua resource-action block для the
-// MigrationPlan CR в `configs.cm` — Argo CD's UI Approve /
+// subcommands and a npm-style newer-release courtesy banner.
+// Chart delta is a single Lua resource-action block for the
+// MigrationPlan CR in `configs.cm` — Argo CD's UI Approve /
 // Reject buttons mirror the CLI verbs (ADR 0027 webhook
 // denial of application-scope rejects surfaces in the UI
 // the same way it does on the CLI).
@@ -2586,27 +2586,27 @@ compatibility: "0.1.39": {
 		CLI surface (out-of-chart, binary v0.1.135):
 
 		* `apprafter platform status` — reads
-		  `PlatformStack/default` через kubectl shellout,
+		  `PlatformStack/default` via kubectl shellout,
 		  prints channel / pin / autoUpgrade / current /
 		  target / available versions + conditions table +
 		  recent versionHistory (last 5).
 		* `apprafter platform upgrade --to <v>` — merge-
-		  patches `spec.pin: <v>`. Без `--to` — clears pin
-		  и flips autoUpgrade=true (channel-following).
+		  patches `spec.pin: <v>`. Without `--to` — clears pin
+		  and flips autoUpgrade=true (channel-following).
 		* `apprafter migration list` — table of
-		  MigrationPlans в apprafter-system (name / scope /
+		  MigrationPlans in apprafter-system (name / scope /
 		  classification / phase).
 		* `apprafter migration approve <name>` /
-		  `reject <name>` — patches `status.phase` через
+		  `reject <name>` — patches `status.phase` via
 		  the `status` subresource. Application-scope
 		  rejects denied by the existing webhook (ADR 0027)
-		  с the verbatim apiserver message.
+		  with the verbatim apiserver message.
 		* `apprafter open argocd` — spawns kubectl port-
-		  forward к `svc/argocd-server -n argocd 8080:443`,
+		  forward to `svc/argocd-server -n argocd 8080:443`,
 		  prints credentials, opens default browser (xdg-
 		  open / open / cmd), blocks until Ctrl+C.
 		* Every invocation runs a fail-quiet npm-style
-		  newer-release check (24h cache в
+		  newer-release check (24h cache in
 		  `~/.cache/apprafter/version-check.json`).
 
 		Chart surface (this entry):
@@ -2616,10 +2616,10 @@ compatibility: "0.1.39": {
 		  resource-action block. Discovery disables
 		  Approve / Reject once `status.phase` leaves
 		  `pending-approval`; action bodies mutate
-		  `status.phase` к `approved` / `rejected`. Argo
-		  CD routes the mutation через the status
+		  `status.phase` to `approved` / `rejected`. Argo
+		  CD routes the mutation via the status
 		  subresource automatically; webhook denial of
-		  application-scope rejects surfaces в the UI
+		  application-scope rejects surfaces in the UI
 		  verbatim.
 
 		Rendered chart vs 0.1.38: a single new entry
@@ -2637,10 +2637,10 @@ compatibility: "0.1.39": {
 // classification was per-target-version (single record's
 // `change` field), not per-transition. Version jumps that
 // span an intermediate destructive version silently bypassed
-// the gate если the target itself was safe. Fix: replace
-// `fetch_change_class(url, target)` с
+// the gate if the target itself was safe. Fix: replace
+// `fetch_change_class(url, target)` with
 // `fetch_path_max_change_class(url, from, to)` — pulls the
-// compat doc and reduces к the MOST DESTRUCTIVE class в the
+// compat doc and reduces to the MOST DESTRUCTIVE class in the
 // half-open range `(from, to]`. Operator-binary change → image
 // v0.1.133 → v0.1.134 via standard chart appVersion lockstep.
 compatibility: "0.1.38": {
@@ -2653,25 +2653,25 @@ compatibility: "0.1.38": {
 		**Symptom (theoretical, demonstrated via reasoning
 		on 2026-05-23 walk).** Cluster on 0.1.35 with
 		walk-platform-1's `platform-0-1-35-to-0-1-36`
-		MigrationPlan в rejected phase. Chart 0.1.37
+		MigrationPlan in rejected phase. Chart 0.1.37
 		published as `safe`. autoUpgrade detects channel-
-		latest=0.1.37 и tries bump 0.1.35 → 0.1.37.
+		latest=0.1.37 and tries bump 0.1.35 → 0.1.37.
 		Plan name `platform-0-1-35-to-0-1-37` doesn't
 		exist (different pair). `fetch_change_class`
-		returns Safe для 0.1.37's single record. Straight
-		bump к 0.1.37 — silently jumping over 0.1.36's
-		breaking content и bypassing operator's reject
+		returns Safe for 0.1.37's single record. Straight
+		bump to 0.1.37 — silently jumping over 0.1.36's
+		breaking content and bypassing operator's reject
 		decision.
 
 		**Root cause.** Classification was per-target-
 		version, not per-transition. spec.md §3.11
-		semantics implied path-aware ("any path к 0.1.37
+		semantics implied path-aware ("any path to 0.1.37
 		must respect the strictest class encountered"),
 		but code looked up only the destination record.
 
 		**Fix.** New `fetch_path_max_change_class(url,
 		from, to)` reads the compat doc at `to`'s tarball
-		and reduces the records in `(from, to]` к their
+		and reduces the records in `(from, to]` to their
 		strictest class via `path_max_change_class(doc,
 		from, to)` pure helper. Reconcile body's
 		destructive check replaces single-target call.
@@ -2683,8 +2683,8 @@ compatibility: "0.1.38": {
 		  address downgrade destructiveness; conservative
 		  default. Future work can extend semantics if a
 		  real use case surfaces.
-		* Unparseable version key in doc → skipped без
-		  affecting other entries' contribution к the
+		* Unparseable version key in doc → skipped without
+		  affecting other entries' contribution to the
 		  max.
 
 		Classification ordering (Safe < RequiresRestart <
@@ -2692,7 +2692,7 @@ compatibility: "0.1.38": {
 		via `class_order` helper rather than exposed on
 		`ChangeClass` itself — only path_max needs it.
 
-		**Tests.** +8 unit tests в
+		**Tests.** +8 unit tests in
 		`operator-controllers/platform-stack/compatibility.rs`:
 		* `path_max_change_class_picks_strictest_in_range`
 		* `_excludes_from_version`
@@ -2709,7 +2709,7 @@ compatibility: "0.1.38": {
 		cluster carrying a rejected
 		`platform-0-1-35-to-0-1-36` plan (snapshot.pin=
 		null) and pinning autoUpgrade=true should NOT
-		auto-bump к 0.1.37 once 0.1.37 publishes. New
+		auto-bump to 0.1.37 once 0.1.37 publishes. New
 		path-max classification surfaces 0.1.36's
 		Breaking → PlatformController creates a fresh
 		`platform-0-1-35-to-0-1-37` plan and blocks the
@@ -2734,9 +2734,9 @@ compatibility: "0.1.38": {
 // string: "null"`), error_policy retried forever, walk-fix #3
 // sealing (`status.rejectedAt` write) never ran. Fix: read
 // PlatformStack first; if current pin already matches snapshot
-// pin (both string-equal или both null/missing), no-op return
-// Ok. Otherwise, set-к-string uses SSA force=true (existing
-// path); clear-к-null uses JSON merge-patch (RFC 7396 — null
+// pin (both string-equal or both null/missing), no-op return
+// Ok. Otherwise, set-to-string uses SSA force=true (existing
+// path); clear-to-null uses JSON merge-patch (RFC 7396 — null
 // means "delete this field", works regardless of CRD
 // `nullable`). Operator-binary change only → image v0.1.132 →
 // v0.1.133 via standard chart appVersion lockstep.
@@ -2745,7 +2745,7 @@ compatibility: "0.1.37": {
 	operatorVersion: "v0.1.133"
 	notes: """
 		Walk-fix #7 post-B.1.78 —
-		`PlatformMigrationStrategy.reject` fix для
+		`PlatformMigrationStrategy.reject` fix for
 		channel-following clusters (`snapshot.pin = null`).
 
 		**Symptom.** Walk Phase B.1.78 reject test on
@@ -2753,17 +2753,17 @@ compatibility: "0.1.37": {
 		application-scope reject denial earlier (walk-fix
 		#2 + #6 OK), but platform-scope reject on
 		`platform-0-1-35-to-0-1-36` (cluster channel-
-		following, snapshot.pin=null) loop'нул:
+		following, snapshot.pin=null) looped:
 		`PlatformStack.apprafter.io "default" is invalid:
 		spec.pin: Invalid value: "null": spec.pin in body
 		must be of type string`. Error_policy retried
 		every 15s; walk-fix #3 sealing's
-		`status.rejectedAt` write never landed → плагин
-		не sealed → infinite retry loop.
+		`status.rejectedAt` write never landed → plugin
+		not sealed → infinite retry loop.
 
 		**Root cause.** Original strategy.reject ALWAYS
-		built SSA-apply body с `spec.pin: <snapshot_pin
-		или null>`. When snapshot.pin=null, body was
+		built SSA-apply body with `spec.pin: <snapshot_pin
+		or null>`. When snapshot.pin=null, body was
 		`{"spec":{"pin":null}}`. CRD's PlatformStack
 		schema:
 		```yaml
@@ -2771,11 +2771,11 @@ compatibility: "0.1.37": {
 		  type: string
 		  pattern: "..."
 		```
-		— `type: string` без `nullable: true` → apiserver
+		— `type: string` without `nullable: true` → apiserver
 		rejects explicit `null` value as schema
 		violation.
 
-		**Fix.** Three-branch dispatch в
+		**Fix.** Three-branch dispatch in
 		`PlatformMigrationStrategy.reject`:
 
 		1. Read current PlatformStack via Api::get.
@@ -2784,10 +2784,10 @@ compatibility: "0.1.37": {
 		   explicit null / both as equivalent).
 		3. Dispatch:
 		   * Pins equal → no-op return Ok (idempotent;
-		     no patch к apiserver). Sealing write fires.
-		   * snapshot.pin = Some(String) и pin differs
-		     → SSA-apply с force=true (existing path).
-		   * snapshot.pin = None / Null и pin is set →
+		     no patch to apiserver). Sealing write fires.
+		   * snapshot.pin = Some(String) and pin differs
+		     → SSA-apply with force=true (existing path).
+		   * snapshot.pin = None / Null and pin is set →
 		     JSON merge-patch `{"spec":{"pin":null}}`.
 		     RFC 7396 semantics: `null` in merge-patch
 		     deletes the field. Works regardless of
@@ -2808,11 +2808,11 @@ compatibility: "0.1.37": {
 		Total migration crate: 14 → 18.
 
 		**Sealing side-effect.** With the strategy.reject
-		now returning Ok cleanly для null-snapshot
+		now returning Ok cleanly for null-snapshot
 		clusters, the walk-fix #3 sealing path
-		(`status.rejectedAt` write) runs к completion.
-		Subsequent reconciles see the marker и skip
-		strategy.reject — confirmed-fix к the original
+		(`status.rejectedAt` write) runs to completion.
+		Subsequent reconciles see the marker and skip
+		strategy.reject — confirmed-fix to the original
 		B.1.76 walk-fix #3 logic that was masked by this
 		bug.
 
@@ -2827,18 +2827,18 @@ compatibility: "0.1.37": {
 }
 
 // B.1.78 acceptance walk reject-flow fixture — chart 0.1.36
-// classified `breaking` к exercise PlatformController auto-
+// classified `breaking` to exercise PlatformController auto-
 // create → operator-reject → rejected-plan-blocks-retry
 // chain end-to-end. No operator-binary change; same image
 // v0.1.132 pinned by chart components 0.1.113. Reject flow
 // reads `previousSpecSnapshot.pin` (null since channel-
-// following) and SSA-patches `PlatformStack.spec.pin` к it
+// following) and SSA-patches `PlatformStack.spec.pin` to it
 // (no-op when already null). Walk-fix #3 sealing sets
 // `status.rejectedAt` so subsequent operator pod restarts
 // don't re-invoke `strategy.reject`. Next PlatformController
 // reconcile sees the rejected plan by name + blocks the
 // same transition forever; operator clears by deleting
-// plan or pinning к explicit version.
+// plan or pinning to explicit version.
 compatibility: "0.1.36": {
 	change:          "breaking"
 	operatorVersion: "v0.1.132"
@@ -2846,7 +2846,7 @@ compatibility: "0.1.36": {
 		Walk fixture — synthetic `breaking` classification
 		to exercise B.1.78's reject flow end-to-end.
 		Same operator + webhook image (v0.1.132) as
-		0.1.34 / 0.1.35; chart content и templates
+		0.1.34 / 0.1.35; chart content and templates
 		byte-equivalent. Classification difference is
 		the only test surface.
 
@@ -2856,7 +2856,7 @@ compatibility: "0.1.36": {
 		* PlatformController OCI poll sees channel-
 		  latest=0.1.36.
 		* `fetch_change_class` returns ChangeClass::Breaking.
-		* Plan name synthesizes к
+		* Plan name synthesizes to
 		  `platform-0-1-35-to-0-1-36`.
 		* 404 → SSA-create plan with classification=
 		  breaking, previousSpecSnapshot.pin=null.
@@ -2884,10 +2884,10 @@ compatibility: "0.1.36": {
 		blocks the same transition → MigrationPending=
 		True/breaking + UpgradeAvailable=True/
 		BlockedByMigrationPlan persist; cluster stays
-		на 0.1.35. To clear, operator either deletes the
+		on 0.1.35. To clear, operator either deletes the
 		plan (re-triggers same destructive transition,
 		creates fresh plan in pending-approval) or pins
-		к an explicit version different from 0.1.36.
+		to an explicit version different from 0.1.36.
 
 		Rendered chart vs 0.1.35: byte-equivalent
 		templates. ONLY classification differs in
@@ -2900,7 +2900,7 @@ compatibility: "0.1.36": {
 }
 
 // B.1.78 acceptance walk fixture — chart 0.1.35 classified
-// as `requires-restart` к exercise PlatformController's
+// as `requires-restart` to exercise PlatformController's
 // destructive-transition gate end-to-end against a real
 // cluster. No operator-binary change; same image v0.1.132
 // pinned by chart components. PlatformController sees
@@ -2916,10 +2916,10 @@ compatibility: "0.1.35": {
 	operatorVersion: "v0.1.132"
 	notes: """
 		Walk fixture — synthetic `requires-restart`
-		classification к exercise the B.1.78
+		classification to exercise the B.1.78
 		destructive-transition gate end-to-end. Same
 		operator + webhook image (v0.1.132) as 0.1.34;
-		chart content и templates byte-equivalent.
+		chart content and templates byte-equivalent.
 		Classification difference is the only test
 		surface.
 
@@ -2928,22 +2928,22 @@ compatibility: "0.1.35": {
 		triggers MigrationPlan creation; classification
 		== safe → auto-bump.
 
-		Expected walk behavior на cluster running chart
-		0.1.34 (или any 0.1.x с autoUpgrade=true):
+		Expected walk behavior on cluster running chart
+		0.1.34 (or any 0.1.x with autoUpgrade=true):
 
 		* PlatformController's next OCI poll sees
 		  channel-latest=0.1.35.
 		* `fetch_change_class` returns
 		  ChangeClass::RequiresRestart.
-		* Plan name synthesizes к
+		* Plan name synthesizes to
 		  `platform-<current>-to-0-1-35`.
 		* `Api::get` of plan in apprafter-system returns
 		  404 → create branch fires.
 		* SSA-create plan with scope.type=platform,
 		  scope.platform.components=[platform-stack],
-		  trigger=platform-classification на spec.pin,
+		  trigger=platform-classification on spec.pin,
 		  classification=requires-restart, previousSpecSnapshot.pin
-		  = current spec.pin (или JSON null).
+		  = current spec.pin (or JSON null).
 		* `target_for_patch = current_target` (no bump).
 		* Conditions:
 		  UpgradeAvailable=True/BlockedByMigrationPlan
@@ -2960,23 +2960,23 @@ compatibility: "0.1.35": {
 		MigrationController transitions through
 		executing → completed → next PlatformController
 		reconcile sees plan completed → proceeds with
-		bump → parent App's targetRevision к 0.1.35 →
-		Argo CD reconciles → operator pod stays на
+		bump → parent App's targetRevision to 0.1.35 →
+		Argo CD reconciles → operator pod stays on
 		v0.1.132 (no image change since chart 0.1.34 +
 		0.1.35 both pin v0.1.132).
 
 		Reject flow not exercised by this fixture alone —
 		`PlatformMigrationStrategy.reject` (B.1.76)
-		reverts `spec.pin` к snapshot. If snapshot.pin
+		reverts `spec.pin` to snapshot. If snapshot.pin
 		is null (cluster was channel-following), pin
 		stays null and rejected plan's name blocks
 		future same-transition attempts; operator
-		deletes plan or pins к specific version к retry.
+		deletes plan or pins to specific version to retry.
 
 		Rendered chart vs 0.1.34: byte-equivalent
 		templates (components, values, RBAC unchanged).
 		ONLY classification differs in
-		compatibility.yaml. Safe к downgrade back via
+		compatibility.yaml. Safe to downgrade back via
 		`kubectl patch platformstack default --type=merge
 		-p '{"spec":{"pin":"0.1.34"}}'` once acceptance
 		walk completes.
@@ -2989,18 +2989,18 @@ compatibility: "0.1.35": {
 
 // Track B.1.78 closure — PlatformController MigrationPlan
 // integration per spec.md §3.11 + ADR 0027. PlatformController
-// reconcile loop теперь:
+// reconcile loop now:
 //
-//   * Pre-checks по deterministic `platform-<from>-to-<to>`
+//   * Pre-checks by deterministic `platform-<from>-to-<to>`
 //     plan name. If plan exists and phase != `completed`,
 //     block bump + surface MigrationPending=True/<class> +
 //     UpgradeAvailable=True/BlockedByMigrationPlan
 //     conditions with `apprafter-system/<plan-name>` in the
 //     message. If plan exists and phase == completed,
-//     proceed с bump (operator approved + ran the migration).
+//     proceed with bump (operator approved + ran the migration).
 //   * No existing plan + classification destructive
 //     (`breaking | data-migration | requires-restart` per
-//     spec.md §3.11) — CREATE a MigrationPlan CR в
+//     spec.md §3.11) — CREATE a MigrationPlan CR in
 //     `apprafter-system` namespace, block bump, surface
 //     conditions.
 //   * No existing plan + safe classification — bump as
@@ -3013,7 +3013,7 @@ compatibility: "0.1.35": {
 //
 // Removed: PolicyHooks trait + NoOpHooks. Was a placeholder
 // from B.1.73 that never had a real impl; replaced by inline
-// plan creation в the reconcile body. operator-controllers/
+// plan creation in the reconcile body. operator-controllers/
 // platform-stack/src/policy.rs deleted.
 //
 // RBAC: ClusterRole's migrationplans rule gains `create`
@@ -3035,7 +3035,7 @@ compatibility: "0.1.34": {
 
 		1. Synthesizes a deterministic plan name from
 		   `(from, to)` pair: `platform-<from>-to-<to>`
-		   with dots → dashes для DNS-1123.
+		   with dots → dashes for DNS-1123.
 		2. GETs the named plan in `apprafter-system`.
 		   * Exists + `phase=completed` → proceed bump
 		     (operator approved + ran the migration).
@@ -3055,7 +3055,7 @@ compatibility: "0.1.34": {
 		4. No existing plan + class is `safe` → bump
 		   as before.
 
-		Conditions surface plan name к the operator:
+		Conditions surface plan name to the operator:
 
 		* `UpgradeAvailable=True/BlockedByMigrationPlan`
 		  with message `... blocked by MigrationPlan
@@ -3068,7 +3068,7 @@ compatibility: "0.1.34": {
 		on the same transition safe — they find the
 		existing plan via GET and don't create a duplicate.
 		Rejected plans block the same transition forever
-		(operator's explicit decision); transitioning к
+		(operator's explicit decision); transitioning to
 		a different target produces a different name +
 		fresh plan.
 
@@ -3114,16 +3114,16 @@ compatibility: "0.1.34": {
 		     -p '{"status":{"phase":"approved"}}'` →
 		     MigrationController executes → plan reaches
 		     `completed` → next PlatformController
-		     reconcile proceeds с bump.
+		     reconcile proceeds with bump.
 		   * Reject (platform-scope only per ADR 0027)
 		     → strategy.reject reverts spec.pin → next
 		     reconcile sees the rejected plan name
 		     blocking same transition; operator must
-		     delete plan or pin к a different target к
+		     delete plan or pin to a different target to
 		     retry.
 
 		Rendered chart vs 0.1.33: byte-equivalent
-		templates. Operator-binary change только;
+		templates. Operator-binary change only;
 		chart appVersion lockstep propagates new image.
 		"""
 	references: [
@@ -3136,13 +3136,13 @@ compatibility: "0.1.34": {
 // Walk-fix #6 post-B.1.77 — webhook config missing
 // `migrationplans/status` resource. Walk-fix #2 added the
 // validator's ADR 0027 app-scope reject guard, but
-// ValidatingWebhookConfiguration rule listed только
+// ValidatingWebhookConfiguration rule listed only
 // `resources: [migrationplans]`. `kubectl patch
 // --subresource=status -p '{"status":{"phase":"rejected"}}'`
-// routes через separate `/status` endpoint, bypassing
+// routes via separate `/status` endpoint, bypassing
 // webhook entirely → ADR 0027 guard never invoked → app-
-// scope plans transitioned к rejected без admission check.
-// Fix: add `migrationplans/status` к rules.resources list.
+// scope plans transitioned to rejected without admission check.
+// Fix: add `migrationplans/status` to rules.resources list.
 // Operator binary unchanged (no Rust code change); image
 // stays at v0.1.130 binary content tagged v0.1.131 via
 // lockstep chart appVersion bump.
@@ -3155,48 +3155,48 @@ compatibility: "0.1.33": {
 
 		**Symptom (walk Phase 3.4 retest):** an
 		application-scope MigrationPlan applied + patched
-		с `kubectl patch --subresource=status --type=merge
+		with `kubectl patch --subresource=status --type=merge
 		-p '{"status":{"phase":"rejected"}}'`. Webhook
 		should have denied per ADR 0027 (walk-fix #2
 		validator logic). Actual: patch succeeded, plan
-		transitioned к `phase=rejected` без admission
+		transitioned to `phase=rejected` without admission
 		check.
 
 		**Root cause:** ValidatingWebhookConfiguration's
 		`migrationplans.apprafter.io` webhook listed
 		`resources: [migrationplans]`. `kubectl patch
-		--subresource=status` routes через the apiserver's
+		--subresource=status` routes via the apiserver's
 		`/status` SUB-resource endpoint, which is a
 		separate path from the main resource endpoint.
 		Webhook configs must explicitly list
-		`<resource>/status` к intercept status-subresource
+		`<resource>/status` to intercept status-subresource
 		writes. Without it, status patches bypass the
 		webhook entirely.
 
-		**Fix:** add `migrationplans/status` к rules.resources
+		**Fix:** add `migrationplans/status` to rules.resources
 		alongside `migrationplans`. Validator code
 		(walk-fix #2 ADR 0027 guard, phase transition FSM)
-		unchanged — was correct, just never invoked для
+		unchanged — was correct, just never invoked for
 		status patches.
 
 		**No Rust code change.** Operator + webhook
-		binaries identical к v0.1.130. Image tag bumped
-		к v0.1.131 via standard chart lockstep
+		binaries identical to v0.1.130. Image tag bumped
+		to v0.1.131 via standard chart lockstep
 		(appVersion bump propagates new tag, same binary
 		content).
 
 		**Bonus benefit:** chart 0.1.33 pins same image
 		v0.1.131 as the operator on a v0.1.130 cluster
-		uses after pulling 0.1.32. Pin'ing к 0.1.33
+		uses after pulling 0.1.32. Pin'ing to 0.1.33
 		triggers no pod restart (identical image),
-		enabling clean isolation testing для walk-fix #5
-		(versionHistory SSA ownership merge) на stable
-		pod без chart-upgrade pod-cycle artifacts.
+		enabling clean isolation testing for walk-fix #5
+		(versionHistory SSA ownership merge) on stable
+		pod without chart-upgrade pod-cycle artifacts.
 
 		Rendered chart vs 0.1.32: byte-equivalent for
 		operator-chart's templates + values; webhook
 		chart's `templates/validatingwebhookconfiguration.yaml`
-		gains `migrationplans/status` к the migrationplans
+		gains `migrationplans/status` to the migrationplans
 		webhook's resources list.
 		"""
 	references: [
@@ -3208,8 +3208,8 @@ compatibility: "0.1.33": {
 
 // Walk-fix #5 post-B.1.77 — versionHistory SSA ownership-
 // release bug. Walk-fix #7 (v0.1.122) introduced "omit
-// versionHistory from SSA patch когда не append'ил this
-// cycle" к prevent cache-stale-overwrite race. SSA Apply
+// versionHistory from SSA patch when it did not append this
+// cycle" to prevent cache-stale-overwrite race. SSA Apply
 // semantics (per Kubernetes docs): when manager re-applies
 // without a previously-owned field, ownership relinquished;
 // if no other manager owns, **apiserver removes field**.
@@ -3220,8 +3220,8 @@ compatibility: "0.1.33": {
 // observability confirmed `include_version_history=false`
 // every settled reconcile.
 // Fix: read server's authoritative `versionHistory` BEFORE
-// each SSA-apply; merge с local entries; ALWAYS include
-// field в patch body. `merge_version_history` helper dedupes
+// each SSA-apply; merge with local entries; ALWAYS include
+// field in patch body. `merge_version_history` helper dedupes
 // by `(version, appliedAt)` pair, preserves cap. Extra
 // `Api::get_status` round-trip per write; settled cycles
 // skip via existing `write_status_if_changed` shortcut.
@@ -3243,10 +3243,10 @@ compatibility: "0.1.32": {
 		— ownership released ~30s after every bump.
 
 		**Root cause.** Walk-fix #7 (v0.1.122) introduced
-		conditional `versionHistory` stripping в SSA
+		conditional `versionHistory` stripping in SSA
 		patch body: when reconcile cycle did not append a
 		new entry (settled state, `appended_history=false`),
-		field removed from patch к "preserve server-side
+		field removed from patch to "preserve server-side
 		value across cache-stale-overwrite races". Per
 		Kubernetes SSA spec:
 
@@ -3261,7 +3261,7 @@ compatibility: "0.1.32": {
 		other manager owned → apiserver deleted field.
 
 		**Fix.** Drop "omit field" pattern. Always include
-		`versionHistory` в SSA body. Race protection
+		`versionHistory` in SSA body. Race protection
 		via server-state read + merge:
 
 		1. Before each `patch_status`, `Api::get_status`
@@ -3294,7 +3294,7 @@ compatibility: "0.1.32": {
 		server state, not cache.
 
 		Rendered chart vs 0.1.31: byte-equivalent
-		templates. Operator-binary change только.
+		templates. Operator-binary change only.
 		"""
 	references: [
 		"plan.md",
@@ -3306,14 +3306,14 @@ compatibility: "0.1.32": {
 // rejected plans via `status.rejectedAt` marker — prior code
 // re-invoked `strategy.reject()` on every reconcile (cold-
 // start cache replay → reject re-applied → PlatformStack.spec.pin
-// re-patched к snapshot value, overriding any subsequent
+// re-patched to snapshot value, overriding any subsequent
 // operator pin patches). #4: PlatformController bump-cycle
 // observability logs (`target_changed`, `appended_history`,
-// `target_for_patch`, `current_target`, history lengths) к
-// help diagnose missing versionHistory entries в future walks.
-// MigrationPlan CRD schema + CUE schema extended с optional
+// `target_for_patch`, `current_target`, history lengths) to
+// help diagnose missing versionHistory entries in future walks.
+// MigrationPlan CRD schema + CUE schema extended with optional
 // `status.rejectedAt: string format=date-time`. Operator-binary
-// change только; image v0.1.128 → v0.1.129 via standard chart
+// change only; image v0.1.128 → v0.1.129 via standard chart
 // appVersion lockstep.
 compatibility: "0.1.31": {
 	change:          "safe"
@@ -3327,7 +3327,7 @@ compatibility: "0.1.31": {
 		of B.1.74→B.1.77): user's `kubectl patch
 		platformstack default --type=merge -p
 		'{"spec":{"pin":null}}'` was silently overridden
-		— PlatformController kept landing на
+		— PlatformController kept landing on
 		`spec.pin="0.1.25"` (the snapshot value of a
 		previously-rejected platform-scope plan). Logs
 		showed `PlatformMigrationStrategy.reject —
@@ -3341,7 +3341,7 @@ compatibility: "0.1.31": {
 		trigger cold-start cache replay → watcher fires
 		on every existing MigrationPlan → rejected plans
 		get re-rejected. For platform scope this means
-		`spec.pin` reverts к the plan's snapshot pin
+		`spec.pin` reverts to the plan's snapshot pin
 		value every restart, locking the cluster on that
 		version.
 
@@ -3353,7 +3353,7 @@ compatibility: "0.1.31": {
 		call, await_change.
 
 		CRD schema (operator chart + CUE source): adds
-		`status.rejectedAt: string format=date-time` к
+		`status.rejectedAt: string format=date-time` to
 		MigrationPlanStatus. Rust type
 		(`operator_core::MigrationPlanStatus`) gains
 		corresponding `rejected_at: Option<String>`.
@@ -3367,7 +3367,7 @@ compatibility: "0.1.31": {
 		Walk Phase 6 (artificial pin downgrade + upgrade)
 		uncovered that `status.versionHistory` stays empty
 		across multiple successful targetRevision bumps —
-		expected к have entries для every flip. Diagnosis
+		expected to have entries for every flip. Diagnosis
 		from logs alone was inconclusive (logs showed only
 		generic "reconcile fired"/"reconcile completed").
 
@@ -3400,13 +3400,13 @@ compatibility: "0.1.31": {
 
 // Walk-fix #2 post-B.1.77 — webhook FSM permitted app-scope
 // rejected via first-write fast-path, bypassing ADR 0027.
-// On a fresh MigrationPlan CR без status, `kubectl patch
+// On a fresh MigrationPlan CR without status, `kubectl patch
 // --subresource=status -p '{"status":{"phase":"rejected"}}'`
 // slipped through the FSM's permissive `old_phase.is_empty()`
-// branch — webhook accepted, controller silently no-op'нул
+// branch — webhook accepted, controller silently no-op'd
 // reject (ApplicationMigrationStrategy::reject returns Ok per
 // design), but the ADR 0027 intent ("application-scope plans
-// cannot be rejected") was violated в audit terms. Fix: scope
+// cannot be rejected") was violated in audit terms. Fix: scope
 // guard `new_phase=="rejected" && scope=="application" → false`
 // applied BEFORE the empty-old-phase fast-path. +3 regression
 // tests (first-write to rejected on app-scope blocked; same
@@ -3429,8 +3429,8 @@ compatibility: "0.1.30": {
 		per ADR 0027.
 
 		Root cause: `is_allowed_phase_transition`'s
-		first-write branch (matched когда
-		`oldObject.status.phase == ""` — fresh CR без
+		first-write branch (matched when
+		`oldObject.status.phase == ""` — fresh CR without
 		status) returned `true` for any plausible target
 		phase including `rejected`, REGARDLESS of scope.
 		The ADR 0027 scope check applied only in the
@@ -3442,13 +3442,13 @@ compatibility: "0.1.30": {
 		scope_type=="application" → false` covers any
 		path to `rejected` on app-scope:
 
-		* fresh CR + patch к rejected — blocked.
+		* fresh CR + patch to rejected — blocked.
 		* pending-approval → rejected — blocked.
 		* approved → rejected (defensive) — blocked.
 		* executing → rejected (defensive) — blocked.
 
 		Error message extended to reference ADR 0027 for
-		any new_phase=rejected на app-scope (was only the
+		any new_phase=rejected on app-scope (was only the
 		`pending-approval → rejected` case).
 
 		+3 regression unit tests:
@@ -3461,9 +3461,9 @@ compatibility: "0.1.30": {
 		No code damage from the slipped reject — the
 		controller's `ApplicationMigrationStrategy.reject`
 		is Ok-no-op per ADR 0027 design (defensive belt-
-		and-braces от B.1.76). User who walked through 3.4
+		and-braces from B.1.76). User who walked through 3.4
 		of the runbook saw the plan transition to phase=
-		rejected без any side-effect; semantically just
+		rejected without any side-effect; semantically just
 		an audit-trail violation.
 
 		Rendered chart vs 0.1.29: byte-equivalent
