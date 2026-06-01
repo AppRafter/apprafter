@@ -122,10 +122,18 @@ k3d_up() {
     # defined"), and the IPv6 subnet gives the node an IPv6 address so
     # k3s enables dual-stack. Provide both an IPv4 and an IPv6 subnet.
     local net="k3d-${cluster_name}-net"
+    docker network rm "$net" >/dev/null 2>&1 || true
+    # Explicit --gateway for BOTH families: k3d reads the network's
+    # IPv4 gateway and fails ("no gateway defined") if it is unset.
+    # Output is left visible + inspected so a create failure or a
+    # missing gateway is diagnosable straight from the CI log.
     docker network create --ipv6 \
-        --subnet "172.45.0.0/16" \
-        --subnet "fd00:dead:42::/64" \
-        "$net" >/dev/null 2>&1 || true
+        --subnet "172.45.0.0/16" --gateway "172.45.0.1" \
+        --subnet "fd00:dead:42::/64" --gateway "fd00:dead:42::1" \
+        "$net" || true
+    docker network inspect "$net" \
+        --format 'k3d net {{.Name}}: {{range .IPAM.Config}}{{.Subnet}} gw={{.Gateway}} {{end}}' \
+        2>&1 || true
     # shellcheck disable=SC2086
     $k3d_bin cluster create "$cluster_name" \
         --network "$net" \
