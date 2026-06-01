@@ -1698,6 +1698,22 @@ compatibility: "0.1.23": {
 // re-registering. cue-cmp image v0.1.5 → v0.1.6 (entrypoint
 // .sh change baked into the image), chart pin follows via
 // the `argocdcuecmp.version` CUE import.
+compatibility: "0.1.52": {
+	change:          "safe"
+	operatorVersion: "v0.1.137"
+	notes: """
+		English-only cleanup — purge Cyrillic from chart/sidecar
+		source. Comment / doc-string only across platform-stack
+		CUE (homoglyph letters + a few translated Russian
+		comments) plus the argocd-cue-cmp image bumped 0.1.6 ->
+		0.1.7 (entrypoint/Dockerfile comment cleanup only — a
+		functionally identical rebuild). No rendered k8s resources
+		reshaped beyond the sidecar image tag, no values reshaped,
+		no data migration, classification vocabulary unchanged.
+		Operator image unchanged (v0.1.137) — safe to auto-sync.
+		"""
+	references: ["plan.md 1.79c"]
+}
 compatibility: "0.1.51": {
 	change:          "safe"
 	operatorVersion: "v0.1.137"
