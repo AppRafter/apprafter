@@ -100,11 +100,15 @@ jobs:
         # ip6table_mangle ...` loads ONLY the first module and treats
         # the rest as parameters, so ip6table_mangle stayed unloaded
         # and the agent still crashed on it.
+        # nat + xt_socket are also needed (the agent logged non-fatal
+        # "could not load module iptable_nat / xt_socket" warnings —
+        # Cilium masquerade + socket-LB use them); load them too.
         run: |
           sudo modprobe -a \
-            ip_tables iptable_mangle iptable_raw iptable_filter \
-            ip6_tables ip6table_mangle ip6table_raw ip6table_filter
-          lsmod | grep -E 'ip6?table' || true
+            ip_tables iptable_mangle iptable_raw iptable_filter iptable_nat \
+            ip6_tables ip6table_mangle ip6table_raw ip6table_filter ip6table_nat \
+            nf_nat xt_socket || true
+          lsmod | grep -E 'ip6?table|nf_nat|xt_socket' || true
 
       - name: Install just
         # `just e2e` is the suite entrypoint (single source of truth,
