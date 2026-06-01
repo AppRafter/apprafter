@@ -31,7 +31,7 @@ cd cli
 cargo run --bin apprafter -- init \
     --provider hetzner-cloud --tier solo --region nbg1
 cargo run --bin apprafter -- apply
-# ↳ provisions a CX22 with cloud-init k3s. ~3-5 min.
+# ↳ provisions a CPX22 with cloud-init k3s. ~3-5 min.
 
 cargo run --bin apprafter -- kubeconfig | tee /tmp/kc
 KUBECONFIG=/tmp/kc kubectl get nodes

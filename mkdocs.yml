@@ -74,9 +74,14 @@ nav:
       - Quickstart: operator-guide/quickstart.md
       - Target store: operator-guide/target-store.md
       - GitOps walk: operator-guide/gitops-walk.md
+      - Platform management: operator-guide/platform-management.md
+      - Migration plans: operator-guide/migration-plans.md
       - Troubleshooting: operator-guide/troubleshooting.md
       - Recovery: operator-guide/recovery.md
-  - Developer Guide: dev-guide/index.md
+  - Developer Guide:
+      - Overview: dev-guide/index.md
+      - Quickstart: dev-guide/quickstart.md
+      - Writing Application.cue: dev-guide/application-cue.md
   - Reference:
       - Overview: reference/index.md
       - CLI: reference/cli.md

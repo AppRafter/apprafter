@@ -1,24 +1,31 @@
 # Operator quickstart
 
 You are a cluster operator standing up AppRafter on Hetzner Cloud.
-This walks the manual flow that `e2e/mvp.sh` automates.
+This page covers the **three-step CLI flow** that gets you from a
+blank Hetzner account to a self-managing cluster in one session.
 
-For the developer perspective ("I want to scaffold a new app"),
+For the developer perspective ("I want to deploy my first app"),
 see [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md).
 
-## What you'll build
+## What you will build
 
-| Component         | Tier-1 baseline                                                      |
-| ----------------- | -------------------------------------------------------------------- |
-| Substrate         | One Hetzner CPX22 (2 vCPU / 4 GB / 40 GB) in `nbg1` (or your region).|
-| Network           | Hetzner private network 10.0.0.0/16, subnet 10.0.0.0/24.             |
-| Firewall          | TCP 22 (SSH) + 6443 (kube API) + 80/443 (HTTP/S) + UDP 51820 (WG).   |
-| Kubernetes        | k3s single-node (traefik + servicelb disabled).                      |
-| CNI               | Cilium 1.16.5 (kube-proxy replacement, IPAM kubernetes).             |
-| Gateway           | Gateway API CRDs + Cilium gateway.                                   |
-| GitOps            | Argo CD 7.7.7 (single replicas, Dex off).                            |
-| TLS               | cert-manager 1.16.2 + self-signed `apprafter-selfsigned` issuer.     |
-| Application CRD   | `apprafter.io/v1alpha1.Application` (admission-validated).           |
+| Component         | Tier-1 baseline                                                        |
+| ----------------- | ---------------------------------------------------------------------- |
+| Substrate         | One Hetzner CPX22 (2 vCPU / 4 GB / 40 GB) in `nbg1` (or your region). |
+| Network           | Hetzner private network 10.0.0.0/16, subnet 10.0.0.0/24.              |
+| Firewall          | TCP 22 (SSH) + 6443 (kube API) + 80/443 (HTTP/S) + UDP 51820 (WG).    |
+| Kubernetes        | k3s single-node (traefik + servicelb disabled).                        |
+| CNI               | Cilium 1.16.5 (kube-proxy replacement, IPAM kubernetes).               |
+| Gateway           | Gateway API CRDs + Cilium gateway.                                     |
+| GitOps            | Argo CD 7.7.7 (single replicas, Dex off).                              |
+| TLS               | cert-manager 1.16.2 + self-signed `apprafter-selfsigned` issuer.       |
+| Application CRD   | `apprafter.io/v1alpha1.Application` (admission-validated).             |
+
+**Important:** the platform does not stop at Argo CD installation. After
+`bootstrap-all` completes, Argo CD adopts the platform stack itself — Cilium,
+cert-manager, the AppRafter operator, the admission webhook — and reconciles it
+from a versioned OCI chart. You do not install the operator by hand; the
+platform installs and upgrades itself through GitOps.
 
 ## Prerequisites
 
@@ -28,17 +35,17 @@ nix develop                              # ships cargo, kubectl, helm, cue, ...
 cargo install --path cli/platform-cli    # puts `apprafter` on PATH
 ```
 
-You'll also need:
+You will also need:
 
 - A Hetzner Cloud API token with Read+Write access.
-- An SSH key whose **public** half you'll hand to the provider for
+- An SSH key whose **public** half you will hand to the provider for
   the new node. The CLI never touches the private half.
 
-The rest of this page assumes `apprafter` is on PATH. If it's not,
+The rest of this page assumes `apprafter` is on PATH. If it is not,
 substitute `cargo run --bin apprafter -- <subcommand>` everywhere
 and run the commands from `cli/`.
 
-## 1. Configure a target
+## Step 1 — Configure a target
 
 A **target** bundles `(provider, region, credentials, defaults)`
 under a name. One command saves it; future commands reuse it.
@@ -55,52 +62,46 @@ apprafter target add prod \
 The wizard auto-fills any flag you skip. On a TTY without
 `--no-interactive` you can run `apprafter target add prod` alone
 and answer the prompts; the wizard validates the token against
-`GET /v1/locations` before saving.
+the Hetzner API before saving.
 
-First target on a fresh store is auto-activated. To check:
+The first target on a fresh store is auto-activated. To check:
 
 ```sh
-apprafter target list           # or `apprafter t ls`
-apprafter target show           # or `apprafter t info`
+apprafter target list           # (alias: apprafter t ls)
+apprafter target show           # (alias: apprafter t info)
 apprafter whoami                # one-line identity + active target
 ```
 
-Stored under `~/.config/apprafter/targets/prod/`:
+Credentials are stored in `~/.config/apprafter/targets/prod/` at
+mode 0600. The CLI never echoes the token value in `show`/`whoami`
+output. See [`target-store.md`](./target-store.md) for the full
+file layout and the credential resolution chain (flag → env → store).
 
-- `config.yaml` — provider, region, tier, cluster_name, ssh_key_path.
-- `credentials.yaml` — the API token. **Mode 0600**. The CLI never
-  echoes the value in `show`/`whoami` output; read the file
-  directly if you need the raw bytes.
+## Step 2 — Bring the cluster up
 
-See [`target-store.md`](./target-store.md) for the full file
-layout and the credential resolution chain (flag → env → store).
-
-## 2. One-command provisioning
-
-Bring the entire tier-1 stack up in one shot:
+Run one command to provision and bootstrap the entire tier-1 stack:
 
 ```sh
-apprafter bootstrap-all         # or `apprafter up`
+apprafter bootstrap-all         # (alias: apprafter up)
 ```
 
-This runs three phases under a unified progress UX:
+This runs three phases under a unified progress display:
 
 1. **`apply`** — provisions the SSH key, private network, firewall,
    the CPX22 server, and a `#cloud-config` user-data block that
-   installs fail2ban + k3s. ~30 s on the Hetzner side; cloud-init
-   needs another 90–180 s after that.
+   installs fail2ban + k3s. Around 30 s on the Hetzner side;
+   cloud-init needs another 90–180 s after that.
 2. **`k3s-ready` (poll)** — waits for cloud-init + k3s to finish
-   on the new node, then retrieves the kubeconfig.
-   Implementation: `ssh root@<node> cat /etc/rancher/k3s/k3s.yaml`
-   with `ConnectTimeout=5`, retried every 10 s for up to 5
-   minutes; the YAML lands age-encrypted in
-   `.apprafter/state.json`. Typical Phase-2 duration on Hetzner
-   `cpx22` + Ubuntu 24.04 is 20–40 s — most of it is the cluster
-   booting, not the kubeconfig copy.
-3. **`cluster-bootstrap`** — installs Cilium + Gateway API CRDs +
-   the AppRafter Application CRD + default-deny NetworkPolicy +
-   Argo CD + cert-manager + the self-signed ClusterIssuer +
-   apprafter-operator + admission-webhook.
+   on the new node, then retrieves the kubeconfig over SSH.
+   The kubeconfig lands age-encrypted in `.apprafter/state.json`.
+3. **`cluster-bootstrap`** — installs Argo CD (the bootstrap
+   loader), then applies a root Argo CD `Application` that points
+   at the platform-stack OCI chart. Argo CD reconciles all remaining
+   platform components — Cilium, Gateway API CRDs, the AppRafter
+   Application CRD, default-deny NetworkPolicy, cert-manager,
+   self-signed ClusterIssuer, apprafter-operator, and the
+   admission webhook — from that chart without further CLI
+   intervention.
 
 Preview before spending a Hetzner cent:
 
@@ -109,29 +110,21 @@ apprafter up --dry-run
 ```
 
 The dry-run prints the resolved target name, every field from
-`config.yaml`, and the three-phase plan with budgets. No provider
-calls, safe in any directory.
+`config.yaml`, and the three-phase plan. No provider calls.
 
-Each phase still has its own subcommand for partial re-runs:
+Each phase also has its own subcommand for partial re-runs:
 
 ```sh
 apprafter apply                 # Phase 1 alone
-apprafter kubeconfig --refresh  # Phase 2 alone (force re-fetch)
-apprafter cluster-bootstrap     # Phase 3 alone (re-runs `helm upgrade --install`)
+apprafter kubeconfig --refresh  # Phase 2 alone (force re-fetch over SSH)
+apprafter cluster-bootstrap     # Phase 3 alone (re-runs the loader)
 apprafter cb                    # alias for cluster-bootstrap
 ```
 
-## 3. Verify
+## Step 3 — Verify
 
 ```sh
 apprafter doctor                # self-diagnostic, exits 1 on FAIL
-
-apprafter kubeconfig | tee /tmp/kc
-KUBECONFIG=/tmp/kc kubectl get nodes
-# ↳ <hostname>   Ready   control-plane,master   <age>   v1.31.x+k3s
-
-KUBECONFIG=/tmp/kc kubectl get applications.apprafter.io -A
-KUBECONFIG=/tmp/kc kubectl -n argocd get pods
 ```
 
 `doctor` walks the active target's stored config, credentials, and
@@ -139,42 +132,61 @@ reachability checks plus the surrounding shell environment
 (`kubectl`, `helm`, `ssh`, DNS). Each check reports PASS / WARN /
 FAIL with a hint pointing at the right next command.
 
-## 4. Day-2 ops
-
-| Task                          | Command                                                |
-| ----------------------------- | ------------------------------------------------------ |
-| List Applications             | `kubectl get applications.apprafter.io -A`             |
-| Argo CD admin password        | `apprafter argocd-password`                            |
-| Re-fetch kubeconfig over SSH  | `apprafter kubeconfig --refresh`  (alias: `apprafter kc --refresh`) |
-| Rebuild local state           | `apprafter import`  (live Hetzner → state.json)        |
-| Switch active target          | `apprafter target use <name>`  (alias: `apprafter t use`) |
-| Rotate the Hetzner token      | `apprafter target add <name> --renew --token <new>`    |
-| Inspect target config         | `apprafter target show`  (alias: `apprafter t info`)   |
-| Tear down                     | `apprafter destroy --yes`                              |
-
-The credential resolution chain (flag → env → target store) means
-all of the above work without an explicit `HCLOUD_TOKEN` export
-once the target is configured. CI keeps the env-var path working
-unchanged.
-
-## 5. Use the Application CRD
-
-From v0.1.64 onwards the AppRafter operator and admission-webhook
-are installed by `apprafter cluster-bootstrap` (and therefore
-`apprafter up`) by default. Apply an Application CR and the
-operator reconciles it into a Deployment + Service via SSA, writes
-status (`phase=Ready`, `endpointURL=...`), and the
-admission-webhook gates the create/update payload.
+Export the kubeconfig and check the cluster:
 
 ```sh
-KUBECONFIG=/tmp/kc kubectl apply -f manifests/tier-1/application/example-app.yaml
-KUBECONFIG=/tmp/kc kubectl get applications.apprafter.io parser -n default \
-    -o jsonpath='{.status.phase}'   # → Ready
-KUBECONFIG=/tmp/kc kubectl get deployment parser -n default
+apprafter kubeconfig | tee /tmp/kc
+export KUBECONFIG=/tmp/kc
+
+kubectl get nodes
+# <hostname>   Ready   control-plane,master   <age>   v1.31.x+k3s
+
+kubectl -n argocd get pods
+# argocd-server-...   Running
+
+kubectl get applications.apprafter.io -A
+# (empty until you deploy your first Application)
 ```
 
-To skip either component, opt out in your `Infrastructure.cue`
-manifest:
+### Open the Argo CD UI
+
+```sh
+apprafter open argocd
+```
+
+This command starts a local port-forward to Argo CD, prints the
+admin username and password, and opens your default browser at
+`https://localhost:8080`. No separate `kubectl port-forward` or
+`apprafter argocd-password` dance is needed.
+
+In the UI you will see the platform-stack Argo CD `Application`
+and its child components. Each should be **Synced** and **Healthy**
+within a few minutes of `cluster-bootstrap` completing.
+
+### Smoke: apply your first Application CR
+
+The AppRafter operator and admission webhook are installed by
+`cluster-bootstrap` as part of the platform stack. Verify the
+end-to-end path by applying an `Application` CR:
+
+```sh
+kubectl apply -f manifests/tier-1/application/example-app.yaml
+
+kubectl get applications.apprafter.io parser -n default \
+    -o jsonpath='{.status.phase}'
+# → Ready
+
+kubectl get deployment parser -n default
+# parser   1/1   1   ...
+```
+
+The operator reconciles the `Application` CR into a Deployment and
+Service via server-side apply. The status field `phase=Ready` and
+`endpointURL` are written by the operator after a successful
+reconcile. The admission webhook validates the create and update
+payloads against the CRD schema and cross-field invariants.
+
+To opt out of the operator or webhook in a custom `Infrastructure.cue`:
 
 ```cue
 spec: {
@@ -183,52 +195,44 @@ spec: {
 }
 ```
 
-For fork / dev builds, override the images:
+## Day-2 operations
 
-```cue
-spec: {
-    operator?: {
-        image: "ghcr.io/my-fork/apprafter-operator"
-        tag:   "dev"
-    }
-}
-```
+| Task                          | Command                                                  |
+| ----------------------------- | -------------------------------------------------------- |
+| Open Argo CD UI               | `apprafter open argocd`                                  |
+| List Applications             | `kubectl get applications.apprafter.io -A`               |
+| Argo CD admin password only   | `apprafter argocd-password`                              |
+| Re-fetch kubeconfig           | `apprafter kubeconfig --refresh` (alias: `apprafter kc --refresh`) |
+| Rebuild local state           | `apprafter import` (live Hetzner → state.json)           |
+| Switch active target          | `apprafter target use <name>` (alias: `apprafter t use`) |
+| Rotate the Hetzner token      | `apprafter target add <name> --renew --token <new>`      |
+| Inspect target config         | `apprafter target show` (alias: `apprafter t info`)      |
+| Platform version / status     | `apprafter platform status`                              |
+| Upgrade platform              | `apprafter platform upgrade --to <version>`              |
+| Tear down                     | `apprafter destroy --yes`                                |
 
-See [`schemas/v1alpha1/infrastructure.cue`](https://github.com/apprafter/apprafter/blob/main/schemas/v1alpha1/infrastructure.cue)
-for the full block reference and
-[`gitops-walk.md`](./gitops-walk.md) for the Argo CD + repo-creds
-walk.
+The credential resolution chain (flag → env → target store) means
+all of the above work without an explicit `HCLOUD_TOKEN` export
+once the target is configured. CI keeps the env-var path working
+unchanged.
 
-## 6. When things go wrong
+## When things go wrong
 
 Each error renders with a stable `apprafter::<area>::<reason>`
-diagnostic code and a multi-line `help:` block pointing at the
-next-step command. Examples:
+diagnostic code and a multi-line `help:` block. Examples:
 
 ```text
 Error: apprafter::target::not_found
   × target `ghost` not found (available: prod)
-  help: Either the `--target` flag was given a name that's not
+  help: Either the `--target` flag was given a name that is not
         in the store, or no target has been created yet. List
         existing targets with `apprafter target list`; create a
         new one with `apprafter target add <name> --provider
-        hetzner-cloud …`.
+        hetzner-cloud ...`.
 ```
 
-```text
-Error: apprafter::target::token_rejected
-  × provider `hetzner-cloud` rejected the supplied token
-  ╰─▶ apprafter::provider::hetzner_api_error
-        × hetzner-cloud GET /v1/locations failed (status 401): …
-        help: …  (401 / 403 / 429 / 5xx breakdown)
-  help: …  (rotation flow: --renew, --no-ping)
-```
-
-See [`troubleshooting.md`](./troubleshooting.md) for the full
-diagnostic-code catalogue.
-
-For `NO_COLOR` / CI consumers: set `NO_COLOR=1`. Output stays
-byte-identical to v0.1.85's pre-colour baseline.
+Set `NO_COLOR=1` for CI / pipe consumers. Output stays
+byte-identical to the pre-colour baseline.
 
 ## Where to look next
 
@@ -236,11 +240,13 @@ byte-identical to v0.1.85's pre-colour baseline.
   credential resolution chain reference.
 - [`troubleshooting.md`](./troubleshooting.md) — diagnostic-code
   catalogue, common failures, recovery commands.
+- [`gitops-walk.md`](./gitops-walk.md) — wiring Argo CD to a Git
+  repository for GitOps deployment of your applications.
+- [`platform-management.md`](./platform-management.md) — platform
+  version lifecycle, release channels, upgrade and freeze.
 - [`docs/reference/cli.md`](../reference/cli.md) — full subcommand
   reference with every flag + alias.
 - [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md) —
-  scaffold a new Application from the bun-http template.
-- [`operator/README.md`](https://github.com/apprafter/apprafter/blob/main/operator/README.md) — operator
-  reconcile loop + leader-election + per-environment expansion.
-- [`schemas/v1alpha1/`](https://github.com/apprafter/apprafter/tree/main/schemas/v1alpha1/) — the CRD CUE
-  schemas that admission validates against.
+  scaffold and deploy a first Application.
+- `schemas/v1alpha1/` — the CRD CUE schemas that admission validates
+  against.
