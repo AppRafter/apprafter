@@ -198,5 +198,16 @@ dump_diagnostics() {
     kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
     printf '\n--- helm releases ---\n' >&2
     (command -v helm >/dev/null 2>&1 && helm list -A >&2 2>&1) || true
+    # Argo CD Applications + why each is not Synced/Healthy — the
+    # operationState message carries chart-pull / render errors (e.g.
+    # an unpublished OCI version or a CMP failure).
+    printf '\n--- argo applications ---\n' >&2
+    kubectl get applications.argoproj.io -A >&2 2>&1 || true
+    for app in $(kubectl -n argocd get applications.argoproj.io -o name 2>/dev/null); do
+        printf '\n=== %s ===\n' "$app" >&2
+        kubectl -n argocd get "$app" -o jsonpath=\
+'sync={.status.sync.status} health={.status.health.status}{"\n"}conditions={range .status.conditions[*]}[{.type}: {.message}]{end}{"\n"}op={.status.operationState.phase}: {.status.operationState.message}{"\n"}' \
+            >&2 2>&1 || true
+    done
     printf '%s\n' '----- end diagnostics -----' >&2
 }
