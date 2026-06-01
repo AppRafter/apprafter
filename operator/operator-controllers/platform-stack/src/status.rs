@@ -321,9 +321,9 @@ mod tests {
     #[test]
     fn merge_version_history_dedupes_by_version_and_applied_at() {
         // Same (version, appliedAt) pair from both sides
-        // dedupes к one entry. Same version + DIFFERENT
+        // dedupes to one entry. Same version + DIFFERENT
         // appliedAt is treated as separate transitions
-        // (rollback к prior version still gets its own audit
+        // (rollback to prior version still gets its own audit
         // entry).
         let ts_a = "2026-05-22T22:00:00+00:00";
         let ts_b = "2026-05-22T22:30:00+00:00";

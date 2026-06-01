@@ -486,7 +486,7 @@ fn platform_stack_repo() -> String {
 /// release just to keep fresh installs current. New flow
 /// fetches the latest `platform-stack/v*` tag from the
 /// upstream GitHub Releases API at bootstrap time and uses
-/// that; the baked constant survives as а fallback for
+/// that; the baked constant survives as a fallback for
 /// air-gapped / firewalled / network-broken installs.
 ///
 /// See `cli_providers::k8s::channel_latest` for the resolver.

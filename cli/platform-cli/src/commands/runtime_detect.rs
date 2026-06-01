@@ -3,45 +3,45 @@
 //! B.1.79b Part 2.
 //!
 //! Pure helpers consumed by Part 3's `apprafter app scaffold`
-//! и the wizard step в `apprafter app add` that asks
-//! «No `apprafter/Application.cue` found — generate one?».
+//! and the wizard step in `apprafter app add` that asks
+//! "No `apprafter/Application.cue` found — generate one?".
 //! Detection here is filesystem-only (no shell-out, no
-//! network), so tests drive every branch с `tempfile::tempdir`
+//! network), so tests drive every branch with `tempfile::tempdir`
 //! fixtures.
 //!
 //! Marker → runtime mapping per plan.md §1.79b table; the
 //! `Confidence` axis tells the caller how to render the prompt:
 //!
 //!   * `High` — lockfile present, runtime+pin-source both
-//!     evident. Auto-select в non-interactive mode unless
+//!     evident. Auto-select in non-interactive mode unless
 //!     multiple Highs collide (then prompt for choice).
-//!   * `Medium` — primary marker present но no lockfile (e.g.
-//!     bare `package.json` или `requirements.txt`). Still
-//!     prompt for confirmation в TTY.
-//!   * `Low` — only а weak signal (Dockerfile alone), used as
-//!     а last-resort runtime hint before falling back к
+//!   * `Medium` — primary marker present but no lockfile (e.g.
+//!     bare `package.json` or `requirements.txt`). Still
+//!     prompt for confirmation in TTY.
+//!   * `Low` — only a weak signal (Dockerfile alone), used as
+//!     a last-resort runtime hint before falling back to
 //!     blank.
 //!   * `Fallback` — no markers at all. `Blank` template is the
 //!     only candidate.
 //!
 //! `detect_runtimes(dir)` returns the full list of matches in
-//! marker-evaluation order. Multi-stack monorepos (e.g. а
-//! `landing/` директория с bun.lock alongside а sibling
-//! `apprafter-operator/` с Cargo.toml when operator runs from
+//! marker-evaluation order. Multi-stack monorepos (e.g. a
+//! `landing/` directory with bun.lock alongside a sibling
+//! `apprafter-operator/` with Cargo.toml when operator runs from
 //! repo root) get all matches surfaced; the caller's prompt
 //! shows them and picks default alphabetically per plan.md.
 //!
 //! Part 3 (`app_scaffold` module + `apprafter app scaffold`
-//! command) is now the primary consumer; the wizard step в
-//! `apprafter app add` lands в Part 3b. Module-level
+//! command) is now the primary consumer; the wizard step in
+//! `apprafter app add` lands in Part 3b. Module-level
 //! `#![allow(dead_code)]` removed at Part 3 landing — every
-//! exported item now has а real call-site.
+//! exported item now has a real call-site.
 
 use std::path::Path;
 
 /// One of the runtime presets the scaffold can target. Slug
 /// matches the template filename in `cli/templates/
-/// application/<slug>.cue.hbs` (delivered в Part 3).
+/// application/<slug>.cue.hbs` (delivered in Part 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Runtime {
     Bun,
@@ -90,8 +90,8 @@ pub enum Confidence {
 
 /// One detected runtime candidate. `marker` carries the
 /// filename (or content excerpt for [tool.X] cases) that
-/// triggered the match so the prompt can render «detected via
-/// `bun.lock`» — operator skimming the wizard sees why this
+/// triggered the match so the prompt can render "detected via
+/// `bun.lock`" — operator skimming the wizard sees why this
 /// runtime is suggested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
@@ -104,11 +104,11 @@ pub struct Detection {
 /// Order is stable: bun → pnpm → yarn → npm-lock → bare
 /// package.json → poetry → uv → pipenv → bare requirements
 /// → rust → go → docker → blank. Multi-stack monorepos
-/// return multiple entries; empty dirs return а single
+/// return multiple entries; empty dirs return a single
 /// `Blank/Fallback`.
 ///
 /// Pure: never shells out, doesn't write anything. Tests
-/// drive с `tempdir()` fixtures.
+/// drive with `tempdir()` fixtures.
 pub fn detect_runtimes(dir: &Path) -> Vec<Detection> {
     let mut matches = Vec::new();
 
@@ -144,8 +144,8 @@ pub fn detect_runtimes(dir: &Path) -> Vec<Detection> {
         });
     } else if file_exists(dir, "package.json") {
         // Bare package.json — runtime known, package manager
-        // not pinned. plan.md routes this к `node-npm`
-        // (cheapest path) с Medium confidence so the wizard
+        // not pinned. plan.md routes this to `node-npm`
+        // (cheapest path) with Medium confidence so the wizard
         // confirms.
         matches.push(Detection {
             runtime: Runtime::NodeNpm,
@@ -157,7 +157,7 @@ pub fn detect_runtimes(dir: &Path) -> Vec<Detection> {
     // ── Python ────────────────────────────────────────────
     // pyproject.toml content drives the manager selection.
     // We text-grep for the [tool.X] section header rather than
-    // pulling in а TOML parser for these two tokens.
+    // pulling in a TOML parser for these two tokens.
     let pyproject_content = read_file_to_string(dir, "pyproject.toml");
     if let Some(content) = pyproject_content.as_deref() {
         if content.contains("[tool.poetry]") {
@@ -191,7 +191,7 @@ pub fn detect_runtimes(dir: &Path) -> Vec<Detection> {
 
     // Bare requirements.txt qualifies as PythonPip ONLY when
     // no stronger Python marker fired. Operators with full
-    // poetry / uv / pipenv setups often keep а requirements.
+    // poetry / uv / pipenv setups often keep a requirements.
     // txt for CI side-effects; we don't want to misclassify
     // those as bare-pip.
     let stronger_python_seen = matches.iter().any(|d| {
@@ -225,7 +225,7 @@ pub fn detect_runtimes(dir: &Path) -> Vec<Detection> {
     }
 
     // ── Docker (Low) ──────────────────────────────────────
-    // Dockerfile alone is а weak signal — typical of polyglot
+    // Dockerfile alone is a weak signal — typical of polyglot
     // projects where the runtime is opaque to apprafter and
     // the operator wants the docker build-only template.
     // Strictly Low so the wizard always asks even when nothing
@@ -264,7 +264,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    /// Helper — create one or more empty files in а tempdir.
+    /// Helper — create one or more empty files in a tempdir.
     fn fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempdir().expect("tempdir");
         for (name, content) in files {
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn slug_is_kebab_case_for_every_variant() {
         // Load-bearing — Part 3's templates are named
-        // `<slug>.cue.hbs`. If а variant slugs to something
+        // `<slug>.cue.hbs`. If a variant slugs to something
         // weird, the template lookup breaks silently.
         for r in [
             Runtime::Bun,
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn detects_python_uv_from_lockfile_when_pyproject_lacks_marker() {
         // uv.lock present but pyproject.toml says nothing
-        // about uv — still а strong signal (uv only writes
+        // about uv — still a strong signal (uv only writes
         // its lockfile when it's the manager). Prefer the
         // lockfile-based marker.
         let pyproject = "[project]\nname = \"foo\"\n";
@@ -419,9 +419,9 @@ mod tests {
 
     #[test]
     fn requirements_txt_skipped_when_poetry_already_matched() {
-        // Common CI pattern: poetry-managed project but а
-        // `requirements.txt` shipped alongside для tools that
-        // don't grok poetry. Detection must NOT add а bogus
+        // Common CI pattern: poetry-managed project but a
+        // `requirements.txt` shipped alongside for tools that
+        // don't grok poetry. Detection must NOT add a bogus
         // python-pip alongside python-poetry.
         let pyproject = "[tool.poetry]\nname = \"foo\"\n";
         let d = fixture(&[
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn detects_docker_only_as_last_resort_when_alone() {
-        // Bare Dockerfile с nothing else — Low confidence.
+        // Bare Dockerfile with nothing else — Low confidence.
         let d = fixture(&[("Dockerfile", "FROM alpine\n")]);
         let r = detect_runtimes(d.path());
         assert_eq!(r[0].runtime, Runtime::Docker);
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn dockerfile_alongside_lockfile_does_not_add_docker_entry() {
-        // Operator с bun + Dockerfile (containerised bun app)
+        // Operator with bun + Dockerfile (containerised bun app)
         // gets bun detection only; Dockerfile is implementation
         // detail, not the runtime signal here.
         let d = fixture(&[
@@ -487,10 +487,10 @@ mod tests {
 
     #[test]
     fn multi_stack_monorepo_surfaces_all_matches() {
-        // Operator runs `apprafter app add` from а dir
-        // carrying both bun.lock (frontend) и Cargo.toml
+        // Operator runs `apprafter app add` from a dir
+        // carrying both bun.lock (frontend) and Cargo.toml
         // (backend) — both Highs surface; caller's prompt
-        // shows the list, defaults к first alphabetically.
+        // shows the list, defaults to first alphabetically.
         let d = fixture(&[
             ("bun.lock", ""),
             ("package.json", "{}"),
@@ -507,11 +507,11 @@ mod tests {
 
     #[test]
     fn ignores_directories_named_like_markers() {
-        // Edge case: а directory called `Dockerfile/` или
+        // Edge case: a directory called `Dockerfile/` or
         // `package.json/` (rare but possible — generated
         // build output). `file_exists` uses `is_file()` so
         // these are skipped. Defensive guard so we don't
-        // misclassify а build-artefact dir as а runtime.
+        // misclassify a build-artefact dir as a runtime.
         let d = tempdir().unwrap();
         fs::create_dir(d.path().join("Dockerfile")).unwrap();
         fs::create_dir(d.path().join("package.json")).unwrap();

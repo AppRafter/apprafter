@@ -267,12 +267,12 @@ impl MigrationStrategy for PlatformMigrationStrategy {
         //    `PlatformStack.spec.pin` already matches the
         //    snapshot (both same string, or both
         //    absent/null), the patch is a no-op and we return
-        //    success without sending к the apiserver.
+        //    success without sending to the apiserver.
         //
         //    Walk-fix #7 post-B.1.78: without this no-op
         //    short-circuit, channel-following clusters
         //    (`spec.pin == null + snapshot.pin == null`)
-        //    forced an SSA-apply с `spec.pin: null` body,
+        //    forced an SSA-apply with `spec.pin: null` body,
         //    which the apiserver rejects 422 ("spec.pin must
         //    be of type string"). MigrationController's
         //    reconcile errored, walk-fix #3 sealing
@@ -297,9 +297,9 @@ impl MigrationStrategy for PlatformMigrationStrategy {
         }
 
         // 3. Patch shape depends on whether we're SETTING
-        //    pin к a value or CLEARING it.
+        //    pin to a value or CLEARING it.
         //
-        //    Setting (snapshot.pin = "0.1.X"): SSA-apply с
+        //    Setting (snapshot.pin = "0.1.X"): SSA-apply with
         //    force=true so we win against a stale user
         //    write. Field manager
         //    `migration-controller-strategy` distinguishes
@@ -307,7 +307,7 @@ impl MigrationStrategy for PlatformMigrationStrategy {
         //    `platform-controller`.
         //
         //    Clearing (snapshot.pin = null / absent): SSA
-        //    cannot represent field-deletion cleanly когда
+        //    cannot represent field-deletion cleanly when
         //    the CRD field is `type: string` without
         //    `nullable: true` — a `null` value fails
         //    schema validation. JSON merge-patch (RFC 7396)
@@ -361,7 +361,7 @@ impl MigrationStrategy for PlatformMigrationStrategy {
 ///   * Both are the same string.
 ///
 /// Helper extracted so unit tests can exercise the equality
-/// rules без a running cluster.
+/// rules without a running cluster.
 fn pins_equal(current: Option<&Value>, snapshot: Option<&Value>) -> bool {
     fn normalise(v: Option<&Value>) -> Option<&str> {
         v.and_then(|x| x.as_str())
@@ -637,8 +637,8 @@ mod tests {
     #[test]
     fn pins_equal_treats_missing_and_null_and_explicit_null_as_equivalent() {
         // Channel-following state can be represented three
-        // ways в JSON: field absent, field=null, или missing
-        // entirely from the snapshot. All collapse к "no pin
+        // ways in JSON: field absent, field=null, or missing
+        // entirely from the snapshot. All collapse to "no pin
         // is set". `pins_equal` must treat them as one state
         // — without that, the reject no-op short-circuit
         // wouldn't fire and the strategy would send an

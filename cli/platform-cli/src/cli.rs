@@ -507,11 +507,11 @@ pub enum AppCommand {
         #[arg(long = "no-interactive", default_value_t = false)]
         no_interactive: bool,
         /// Auto-scaffold `<cwd>/apprafter/Application.cue` when
-        /// missing, before registering. In а TTY the step-0
+        /// missing, before registering. In a TTY the step-0
         /// wizard fires regardless of this flag; the flag only
         /// matters in `--no-interactive` mode where it gates
         /// silent scaffold (without the flag, the command
-        /// refuses с pointer to `apprafter app scaffold`).
+        /// refuses with a pointer to `apprafter app scaffold`).
         /// Walk-fix-able non-interactive convenience for CI
         /// scripts that want one-shot scaffold + register.
         #[arg(long, default_value_t = false)]
@@ -556,7 +556,7 @@ pub enum AppCommand {
         /// Application name (as listed via `apprafter app list`).
         name: String,
         /// Show child workload state — Argo CD's
-        /// `status.resources[]` plus pods в the destination
+        /// `status.resources[]` plus pods in the destination
         /// namespace matching `app.kubernetes.io/name=<inner-
         /// app-name>` (the AppRafter operator's label). Walk-fix
         /// #3 post-B.1.79b closure of §1.79a line 2257.
@@ -612,15 +612,15 @@ pub enum AppCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
-    /// Generate а starter `apprafter/Application.cue` based
+    /// Generate a starter `apprafter/Application.cue` based
     /// on the cwd's runtime markers (bun.lock / Cargo.toml /
     /// pyproject.toml / etc.). Writes to `<--path>/apprafter/
-    /// Application.cue` and appends `.apprafter/local/` к the
-    /// repo's `.gitignore` when present. Refuses к overwrite
+    /// Application.cue` and appends `.apprafter/local/` to the
+    /// repo's `.gitignore` when present. Refuses to overwrite
     /// an existing manifest without `--force`. Track B.1.79b
     /// Part 3.
     Scaffold {
-        /// Force-pick а runtime instead of detecting from
+        /// Force-pick a runtime instead of detecting from
         /// cwd. Slugs: bun, node-pnpm, node-yarn, node-npm,
         /// python-poetry, python-uv, python-pipenv, python-
         /// pip, rust, go, docker, blank.
@@ -630,7 +630,7 @@ pub enum AppCommand {
         /// cwd basename.
         #[arg(long)]
         name: Option<String>,
-        /// Destination namespace для `metadata.namespace`.
+        /// Destination namespace for `metadata.namespace`.
         /// Default `apprafter` matches `app add --namespace`.
         #[arg(long = "namespace")]
         namespace: Option<String>,
@@ -643,12 +643,12 @@ pub enum AppCommand {
         force: bool,
     },
     /// Port-forward the app's primary Service to localhost and
-    /// open it in а browser. Wraps `kubectl port-forward` with
+    /// open it in a browser. Wraps `kubectl port-forward` with
     /// AppRafter-aware resolution: Application name → Argo CD
     /// CR → `spec.destination.namespace` → child Service via
     /// the `app.kubernetes.io/instance=<name>` label →
     /// container port (Service.spec.ports[0] OR
-    /// `--container-port` override). Picks а free local port
+    /// `--container-port` override). Picks a free local port
     /// starting at 8080 with auto-increment to 8090 if busy.
     /// Blocks on Ctrl+C — the port-forward dies with the
     /// command. Walk-fix #1 post-B.1.79 (Go SIGPIPE drainer
@@ -656,19 +656,19 @@ pub enum AppCommand {
     Open {
         /// Application name (as listed via `apprafter app list`).
         name: String,
-        /// Local port к bind. Defaults to 8080; if busy, the
+        /// Local port to bind. Defaults to 8080; if busy, the
         /// command probes 8081…8090 before giving up.
         #[arg(long)]
         port: Option<u16>,
-        /// Container port к forward к. Defaults к the
+        /// Container port to forward to. Defaults to the
         /// Service's first declared `spec.ports[]` entry.
         /// Required when the Service declares no ports or when
-        /// the operator wants а secondary port.
+        /// the operator wants a secondary port.
         #[arg(long = "container-port")]
         container_port: Option<u16>,
         /// Skip opening the browser; just print the URL and
         /// block on the port-forward. Useful for CI / scripts
-        /// that want to forward в the background.
+        /// that want to forward in the background.
         #[arg(long = "no-browser", default_value_t = false)]
         no_browser: bool,
     },

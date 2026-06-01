@@ -297,7 +297,7 @@ mod tests {
     fn pick_canonical_cli_tag_returns_none_when_no_canonical_in_window() {
         // Pathological case: every recent release is a
         // platform-stack or landing tag (CLI hasn't shipped
-        // anything new in а while). Resolver returns None,
+        // anything new in a while). Resolver returns None,
         // banner stays silent — same as before fix, no
         // surprise.
         let releases = json!([
@@ -326,9 +326,9 @@ mod tests {
 
     #[test]
     fn pick_canonical_cli_tag_returns_none_for_non_array() {
-        // Pre-fix-#4 endpoint returned а single object
+        // Pre-fix-#4 endpoint returned a single object
         // (the latest release). Defensive: the new endpoint
-        // returns an array, but if а future schema change
+        // returns an array, but if a future schema change
         // breaks that contract the resolver fails quiet.
         let single_object = json!({ "tag_name": "v0.1.150" });
         assert_eq!(pick_canonical_cli_tag(&single_object), None);

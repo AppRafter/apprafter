@@ -99,11 +99,11 @@ pub fn add(
     let use_wizard =
         crate::commands::app_wizard::should_use_wizard(no_interactive, stdin_is_tty, stdout_is_tty);
 
-    // Step 0 (Track B.1.79b Part 3b) — bridge from а fresh
-    // repo to а registered app. Check `<cwd>/apprafter/
+    // Step 0 (Track B.1.79b Part 3b) — bridge from a fresh
+    // repo to a registered app. Check `<cwd>/apprafter/
     // Application.cue`; missing → scaffold interactively
-    // (TTY) или per `--scaffold` flag (non-TTY), or refuse
-    // с pointer to standalone `apprafter app scaffold`.
+    // (TTY) or per `--scaffold` flag (non-TTY), or refuse
+    // with a pointer to standalone `apprafter app scaffold`.
     // After this block, `<cwd>/apprafter/Application.cue` is
     // guaranteed to exist for the wizard / non-interactive
     // flow below.
@@ -114,9 +114,9 @@ pub fn add(
         use_wizard,
         scaffold_flag,
     );
-    // Step 0 may settle а namespace ≠ clap's `--namespace`
-    // default. Carry it forward к the outer wizard so the
-    // operator doesn't double-enter и end up с the scaffold's
+    // Step 0 may settle a namespace ≠ clap's `--namespace`
+    // default. Carry it forward to the outer wizard so the
+    // operator doesn't double-enter and end up with the scaffold's
     // `metadata.namespace` mismatched against Argo CD's
     // `destination.namespace` (walk-fix post-Part-3b — the
     // procvue/apprafter mismatch operator reported).
@@ -133,10 +133,10 @@ pub fn add(
             effective_namespace = out.namespace;
         }
         crate::commands::scaffold_wizard::ScaffoldDecision::NonInteractive => {
-            // `--no-interactive --scaffold`: auto-detect и
+            // `--no-interactive --scaffold`: auto-detect and
             // generate. Pass the clap `--namespace` value
-            // through к scaffold so both layers agree (walk-fix
-            // post-Part-3b — was hard-defaulting к "apprafter"
+            // through to scaffold so both layers agree (walk-fix
+            // post-Part-3b — was hard-defaulting to "apprafter"
             // regardless of operator's flag).
             crate::commands::app_scaffold::scaffold(crate::commands::app_scaffold::ScaffoldOpts {
                 runtime: None,
@@ -266,20 +266,20 @@ fn enforce_confirmed_coverage(repo_url: &str, kubeconfig_path: &Path) -> Result<
 
 /// Post-register cred check (walk-fix #1 + #2 post-Part-3b).
 /// `git ls-remote` succeeds locally on private repos when the
-/// operator's user-side git is authenticated, но Argo CD's
+/// operator's user-side git is authenticated, but Argo CD's
 /// repo-server has its own credential store; an unmatched
-/// private repo lands в а sync failure later. Walk-fix #2
+/// private repo lands in a sync failure later. Walk-fix #2
 /// adds auto-derived defaults (cred name, URL prefix at org
-/// level) и а PAT-creation URL для GitHub / GitLab so the
-/// operator doesn't hunt для it.
+/// level) and a PAT-creation URL for GitHub / GitLab so the
+/// operator doesn't hunt for it.
 ///
-/// Best-effort — failure к fetch secrets prints nothing, не
+/// Best-effort — failure to fetch secrets prints nothing, does not
 /// fail the command.
 fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
     if !repo_url.starts_with("https://") {
         // Only HTTPS triggers the warning — git@ / ssh://
         // shapes typically use SSH keys which Argo CD picks
-        // up via а different cred entry shape we don't probe.
+        // up via a different cred entry shape we don't probe.
         return;
     }
     let creds = match crate::commands::repo_creds::fetch_source_credentials_public(kubeconfig_path)
@@ -299,11 +299,11 @@ fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
 
     if let Some(ref s) = suggestion {
         if let Some(ref pat_url) = s.pat_creation_url {
-            println!("    1. Generate а PAT here:");
+            println!("    1. Generate a PAT here:");
             println!("       {pat_url}");
             println!("       Required scopes: `repo` for code; add `read:packages`");
-            println!("       if your CI publishes container images к the same provider.");
-            println!("    2. Register it с AppRafter:");
+            println!("       if your CI publishes container images to the same provider.");
+            println!("    2. Register it with AppRafter:");
             println!(
                 "       apprafter repo creds add {} --url-prefix {} --token <paste-the-pat>",
                 s.suggested_name, s.url_prefix
@@ -321,25 +321,25 @@ fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
 }
 
 /// Surface for the walk-fix #2 hint — auto-derived defaults
-/// from а Git HTTPS URL. Pure-fn tests cover every supported
+/// from a Git HTTPS URL. Pure-fn tests cover every supported
 /// provider shape, plus the generic fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CredsSuggestion {
     /// Suggested cred-secret name — DNS-1123. e.g.
     /// `github-procvue`, `gitlab-acme`.
     pub suggested_name: String,
-    /// URL prefix the operator should pass к `--url-prefix`.
-    /// Org-level so one PAT covers every repo в the org.
+    /// URL prefix the operator should pass to `--url-prefix`.
+    /// Org-level so one PAT covers every repo in the org.
     pub url_prefix: String,
     /// Pre-filled PAT-creation URL (provider-specific). None
-    /// для unknown providers — operator still gets the
-    /// `repo creds add` template, just без the link.
+    /// for unknown providers — operator still gets the
+    /// `repo creds add` template, just without the link.
     pub pat_creation_url: Option<String>,
 }
 
-/// Derive cred-add hint values from а repo URL. Recognises
-/// `github.com` и `gitlab.com`; everything else falls
-/// through к а generic «host-org» name + org-level prefix
+/// Derive cred-add hint values from a repo URL. Recognises
+/// `github.com` and `gitlab.com`; everything else falls
+/// through to a generic "host-org" name + org-level prefix
 /// heuristic.
 pub(crate) fn derive_creds_suggestion(repo_url: &str) -> Option<CredsSuggestion> {
     let rest = repo_url.strip_prefix("https://")?;
@@ -420,7 +420,7 @@ fn add_via_wizard(
         coverage_gate,
         true, // no_interactive — prevent recursion into the wizard.
         false, // scaffold_flag — step 0 already ran in the outer call;
-              // by here `<cwd>/apprafter/Application.cue` exists и
+              // by here `<cwd>/apprafter/Application.cue` exists and
               // `decide_scaffold_step` will return Skip on re-entry.
     )
 }
@@ -429,7 +429,7 @@ fn add_via_wizard(
 /// `acme_app` → `acme-app`, leading/trailing non-`[a-z0-9]`
 /// characters trimmed; empty result falls back to `"app"`.
 /// Used for step 0's suggested name default; operators see this
-/// in the wizard's «name» prompt and can override.
+/// in the wizard's "name" prompt and can override.
 fn sanitise_for_dns_1123(raw: &str) -> String {
     let mut out: String = raw
         .chars()
@@ -543,11 +543,11 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
 
     if show_resources {
         print_argocd_resources(&app);
-        // Fetch pods из destination ns using the inner
+        // Fetch pods from destination ns using the inner
         // AppRafter Application name (operator's label value)
         // resolved via `app_open::find_apprafter_app_name`.
-        // Best-effort: errors during pod fetch surface as а
-        // warning, not а hard failure — the operator already
+        // Best-effort: errors during pod fetch surface as a
+        // warning, not a hard failure — the operator already
         // has the basic status they came for.
         if let Some(inner_name) = crate::commands::app_open::find_apprafter_app_name(&app) {
             if let Some(dest_ns) = app
@@ -574,7 +574,7 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
 
 /// Pod state snapshot rendered into the `--resources` table.
 /// Public(crate) so tests can drive `print_pod_summaries`
-/// без spawning kubectl.
+/// without spawning kubectl.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PodSummary {
     pub name: String,
@@ -602,7 +602,7 @@ pub(crate) struct TrackedResource {
     pub health: String,
 }
 
-/// Shell out к `kubectl get pods` filtered к the AppRafter
+/// Shell out to `kubectl get pods` filtered to the AppRafter
 /// operator's label. Mirrors `app_open::list_services_for_
 /// apprafter_app` shape.
 fn list_pods_for_apprafter_app(
@@ -636,7 +636,7 @@ fn list_pods_for_apprafter_app(
 }
 
 /// Pure helper — parse `kubectl get pods -o json` items into
-/// `PodSummary` rows. `now` injected so tests can pin а
+/// `PodSummary` rows. `now` injected so tests can pin a
 /// deterministic clock when computing ages.
 pub(crate) fn parse_pod_summaries(
     payload: &Value,
@@ -680,7 +680,7 @@ fn summarise_pod(pod: &Value, now: &chrono::DateTime<chrono::Utc>) -> PodSummary
     if total_count == 0 {
         // Pod has not been admitted yet, or has init containers
         // only. Use spec.containers length as the denominator
-        // so the column reads sensibly («0/N» — none yet).
+        // so the column reads sensibly ("0/N" — none yet).
         total_count = pod
             .pointer("/spec/containers")
             .and_then(Value::as_array)
@@ -710,11 +710,11 @@ fn summarise_pod(pod: &Value, now: &chrono::DateTime<chrono::Utc>) -> PodSummary
     }
 }
 
-/// Pure helper — format а duration from `since` к `now` using
-/// kubectl-style shorthand: `s` under а minute, `m` under an
-/// hour, `<h>h<m>m` under а day, `<d>d<h>h` beyond. Returns
+/// Pure helper — format a duration from `since` to `now` using
+/// kubectl-style shorthand: `s` under a minute, `m` under an
+/// hour, `<h>h<m>m` under a day, `<d>d<h>h` beyond. Returns
 /// the original timestamp string when parsing fails (defensive
-/// против Argo CD shape drift).
+/// against Argo CD shape drift).
 pub(crate) fn format_pod_age(timestamp: &str, now: &chrono::DateTime<chrono::Utc>) -> String {
     let Ok(t) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
         return timestamp.to_string();
@@ -746,7 +746,7 @@ pub(crate) fn format_pod_age(timestamp: &str, now: &chrono::DateTime<chrono::Utc
     }
 }
 
-/// Pure helper — extract `status.resources[]` entries из the
+/// Pure helper — extract `status.resources[]` entries from the
 /// Argo CD Application CR JSON.
 pub(crate) fn extract_tracked_resources(app: &Value) -> Vec<TrackedResource> {
     let arr = app.pointer("/status/resources").and_then(Value::as_array);
@@ -1437,12 +1437,12 @@ pub(crate) fn build_application_manifest(
 
 /// Pure helper — translate AppRafter-side path conventions
 /// (`/`, empty, leading `/`) to Argo CD's `spec.source.path`
-/// shape (relative-к-repo-root). Walk-fix #2 post-Part-3b:
-/// our wizard documented `/` as the «whole repo» idiom, but
-/// Argo CD's apiserver validates `spec.source.path` as а
-/// relative path и rejects absolute values with `app path is
+/// shape (relative-to-repo-root). Walk-fix #2 post-Part-3b:
+/// our wizard documented `/` as the "whole repo" idiom, but
+/// Argo CD's apiserver validates `spec.source.path` as a
+/// relative path and rejects absolute values with `app path is
 /// absolute`. Map at the boundary so the wizard UX stays
-/// familiar и the stored CR remains valid.
+/// familiar and the stored CR remains valid.
 pub(crate) fn normalise_argocd_source_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "/" {
@@ -1669,8 +1669,8 @@ mod tests {
     #[test]
     fn sanitise_for_dns_1123_lowercases_and_replaces_specials() {
         // Walk-fix Part 3b — cwd basename → DNS-1123-safe
-        // suggestion for step 0's «name» default. Operators
-        // see this в the wizard's name prompt; должно быть
+        // suggestion for step 0's "name" default. Operators
+        // see this in the wizard's name prompt; should be
         // valid DNS-1123 already so the wizard's prefill
         // doesn't fail validation.
         assert_eq!(sanitise_for_dns_1123("MyProject"), "myproject");
@@ -1697,7 +1697,7 @@ mod tests {
 
     #[test]
     fn sanitise_for_dns_1123_empty_input_falls_back_to_app() {
-        // operator's cwd is `/` или а garbage-only name —
+        // operator's cwd is `/` or a garbage-only name —
         // suggestion must still be valid DNS-1123 so the
         // wizard prefill doesn't fail.
         assert_eq!(sanitise_for_dns_1123(""), "app");
@@ -1707,7 +1707,7 @@ mod tests {
 
     #[test]
     fn sanitise_for_dns_1123_truncates_at_63_characters() {
-        // DNS-1123 length limit. Trim trailing dash после
+        // DNS-1123 length limit. Trim trailing dash after
         // cut to avoid landing on an invalid suffix.
         let long = "a".repeat(70);
         let out = sanitise_for_dns_1123(&long);
@@ -1717,9 +1717,9 @@ mod tests {
 
     #[test]
     fn normalise_argocd_source_path_translates_slash_to_dot() {
-        // Walk-fix #2 post-Part-3b — Argo CD rejects «/»
+        // Walk-fix #2 post-Part-3b — Argo CD rejects "/"
         // (absolute) but the wizard's documented default is
-        // «/». Map at the manifest-build boundary.
+        // "/". Map at the manifest-build boundary.
         assert_eq!(normalise_argocd_source_path("/"), ".");
         assert_eq!(normalise_argocd_source_path(""), ".");
         assert_eq!(normalise_argocd_source_path("   "), ".");
@@ -1727,8 +1727,8 @@ mod tests {
 
     #[test]
     fn normalise_argocd_source_path_strips_leading_slash() {
-        // Operator typing `--path /landing/web` is а common
-        // muscle-memory shape; translate к relative-form
+        // Operator typing `--path /landing/web` is a common
+        // muscle-memory shape; translate to relative-form
         // automatically.
         assert_eq!(normalise_argocd_source_path("/landing/web"), "landing/web");
         assert_eq!(normalise_argocd_source_path("landing/web"), "landing/web");
@@ -1743,11 +1743,11 @@ mod tests {
 
     #[test]
     fn build_application_manifest_normalises_slash_path_to_dot() {
-        // Regression guard для the walk-fix — the operator's
+        // Regression guard for the walk-fix — the operator's
         // procvue-landing CR had `path: "/"` and Argo CD
-        // surfaced «app path is absolute». build_application_
-        // manifest must emit «.» whenever the wizard hands us
-        // «/».
+        // surfaced "app path is absolute". build_application_
+        // manifest must emit "." whenever the wizard hands us
+        // "/".
         let m = build_application_manifest(
             "test-app",
             "https://github.com/foo/bar",
@@ -1765,10 +1765,10 @@ mod tests {
     #[test]
     fn derive_creds_suggestion_github_full_shape() {
         // Walk-fix #2: GitHub URL → org-level prefix, kebab
-        // cred name, и pre-filled PAT-creation URL с the
+        // cred name, and pre-filled PAT-creation URL with the
         // required scopes.
         let s = derive_creds_suggestion("https://github.com/ProcVue/landing")
-            .expect("github URL must yield а suggestion");
+            .expect("github URL must yield a suggestion");
         assert_eq!(s.suggested_name, "github-procvue");
         assert_eq!(s.url_prefix, "https://github.com/ProcVue");
         let pat_url = s.pat_creation_url.expect("github PAT URL");
@@ -1780,7 +1780,7 @@ mod tests {
     #[test]
     fn derive_creds_suggestion_gitlab_full_shape() {
         let s = derive_creds_suggestion("https://gitlab.com/acme/app")
-            .expect("gitlab URL must yield а suggestion");
+            .expect("gitlab URL must yield a suggestion");
         assert_eq!(s.suggested_name, "gitlab-acme");
         assert_eq!(s.url_prefix, "https://gitlab.com/acme");
         let pat_url = s.pat_creation_url.expect("gitlab PAT URL");
@@ -1796,10 +1796,10 @@ mod tests {
     fn derive_creds_suggestion_unknown_provider_omits_pat_url() {
         // Self-hosted Gitea / Forgejo / etc. — we don't know
         // their PAT pages. Suggestion still carries name +
-        // prefix; pat_creation_url is None так hint falls
-        // back к the one-liner.
+        // prefix; pat_creation_url is None so hint falls
+        // back to the one-liner.
         let s = derive_creds_suggestion("https://gitea.example.com/team/app")
-            .expect("known shape must yield а suggestion");
+            .expect("known shape must yield a suggestion");
         assert_eq!(s.suggested_name, "gitea-team");
         assert_eq!(s.url_prefix, "https://gitea.example.com/team");
         assert!(s.pat_creation_url.is_none());
@@ -1815,7 +1815,7 @@ mod tests {
 
     #[test]
     fn derive_creds_suggestion_rejects_malformed_urls() {
-        // No org segment, или empty fields after the scheme.
+        // No org segment, or empty fields after the scheme.
         assert!(derive_creds_suggestion("https://github.com").is_none());
         assert!(derive_creds_suggestion("https://github.com/").is_none());
         assert!(derive_creds_suggestion("https://").is_none());
@@ -1926,8 +1926,8 @@ mod tests {
             Some("v")
         );
         // Walk-fix #2: `build_application_manifest` strips
-        // leading `/` к keep Argo CD's `spec.source.path`
-        // relative; «/p» → «p».
+        // leading `/` to keep Argo CD's `spec.source.path`
+        // relative; "/p" → "p".
         assert_eq!(
             m.pointer("/spec/source/path").and_then(Value::as_str),
             Some("p")
@@ -2204,13 +2204,13 @@ mod tests {
         // Defensive against Argo CD shape drift — must not
         // panic, just echo whatever was passed.
         let now = chrono::Utc::now();
-        assert_eq!(format_pod_age("not-а-timestamp", &now), "not-а-timestamp");
+        assert_eq!(format_pod_age("not-a-timestamp", &now), "not-a-timestamp");
     }
 
     #[test]
     fn extract_tracked_resources_happy_multi_entry() {
         // Walk-fix #3 regression guard. status.resources[]
-        // entries come back с the fields kubectl + Argo CD
+        // entries come back with the fields kubectl + Argo CD
         // both populate; health.status sits one level deep.
         let app = serde_json::json!({
             "status": {

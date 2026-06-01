@@ -31,18 +31,18 @@ use std::time::Duration;
 
 use cli_core::{CliError, Result};
 
-/// Cap on captured stderr lines в `spawn_capturing_drainer`.
+/// Cap on captured stderr lines in `spawn_capturing_drainer`.
 /// kubectl typically emits 1–3 stderr lines on the failure
 /// paths we care about (no Endpoints, unauthorized,
-/// unreachable kubeconfig); а small buffer keeps memory
-/// bounded for long-running success paths где stderr might
+/// unreachable kubeconfig); a small buffer keeps memory
+/// bounded for long-running success paths where stderr might
 /// stream forever.
 const STDERR_CAPTURE_LIMIT: usize = 20;
 
 /// Brief wait after `rx.recv()` resolves Err — gives the
 /// stderr drainer thread time to push its last line into the
 /// shared buffer before we read it. kubectl is already
-/// exiting когда we get the Err, the drainer is just finishing
+/// exiting when we get the Err, the drainer is just finishing
 /// its read syscall. 100ms is plenty in practice.
 const STDERR_FLUSH_GRACE_MS: u64 = 100;
 
@@ -115,11 +115,11 @@ pub fn wait_ready(child: &mut Child) -> Result<()> {
     }
 }
 
-/// Pure helper — render the «kubectl exited early» error
-/// message, attaching captured stderr lines когда available.
+/// Pure helper — render the "kubectl exited early" error
+/// message, attaching captured stderr lines when available.
 /// Walk-fix #2 post-B.1.79b: previous silent drainer
 /// swallowed kubectl's diagnostic stderr, leaving operators
-/// staring at а generic «exited before binding local port»
+/// staring at a generic "exited before binding local port"
 /// with no clue why (image pull error? RBAC? no Endpoints?).
 fn format_early_exit_error(stderr_buf: &Arc<Mutex<Vec<String>>>) -> CliError {
     let captured = stderr_buf.lock().unwrap();
@@ -161,17 +161,17 @@ fn spawn_ready_drainer<R: Read + Send + 'static>(reader: R) -> mpsc::Receiver<()
     rx
 }
 
-/// Spawn а thread that drains а pipe to EOF AND captures
-/// the last `STDERR_CAPTURE_LIMIT` lines in а shared buffer.
+/// Spawn a thread that drains a pipe to EOF AND captures
+/// the last `STDERR_CAPTURE_LIMIT` lines in a shared buffer.
 /// Walk-fix #2 post-B.1.79b — replaced the silent drainer
-/// whose only job was «keep the pipe alive»; we now also
+/// whose only job was "keep the pipe alive"; we now also
 /// remember what was on it, so `wait_ready` can surface
 /// kubectl's actual error when the ready banner never lands.
 ///
-/// The buffer is bounded by а ring-eviction rule: when full,
+/// The buffer is bounded by a ring-eviction rule: when full,
 /// the oldest line is dropped on each new push. Practical
 /// memory ceiling: `STDERR_CAPTURE_LIMIT × longest-stderr-
-/// line ≈ 20 × 256 bytes = 5 KiB`. Effectively zero для а
+/// line ≈ 20 × 256 bytes = 5 KiB`. Effectively zero for a
 /// command that spends most of its time blocked on
 /// `child.wait()`.
 fn spawn_capturing_drainer<R: Read + Send + 'static>(reader: R) -> Arc<Mutex<Vec<String>>> {
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn capturing_drainer_records_all_lines_under_limit() {
         // Three lines, well under STDERR_CAPTURE_LIMIT (20).
-        // Buffer must end up with all three в order.
+        // Buffer must end up with all three in order.
         let stream = b"error: foo\nerror: bar\nerror: baz\n".to_vec();
         let buf = spawn_capturing_drainer(Cursor::new(stream));
 
@@ -326,7 +326,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         // Drainer may briefly hold more than limit during
-        // push-then-evict; give it а moment to settle.
+        // push-then-evict; give it a moment to settle.
         thread::sleep(Duration::from_millis(50));
 
         let captured = buf.lock().unwrap().clone();
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn format_early_exit_error_uses_no_output_message_when_buffer_empty() {
         // No stderr captured — operator sees the generic
-        // hint pointing к manual port-forward. Walk-fix #2
+        // hint pointing to manual port-forward. Walk-fix #2
         // covers the case where the buffer carries content;
         // this test pins the empty path so future refactors
         // don't conflate it.
@@ -385,7 +385,7 @@ mod tests {
             "captured second stderr line must appear in error; got: {msg}"
         );
         // Indented continuation lines are easier to scan when
-        // the error renders в multi-line `miette` format.
+        // the error renders in multi-line `miette` format.
         assert!(
             msg.contains("\n  "),
             "multi-line error should indent continuation lines for readability; \

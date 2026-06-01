@@ -147,26 +147,26 @@ pub async fn fetch_change_class(
     Ok(parse_change_class(record.change.as_deref()))
 }
 
-/// Classify a transition path from `from_version` к
+/// Classify a transition path from `from_version` to
 /// `to_version` based on the MOST DESTRUCTIVE classification
 /// encountered in the (from, to] range. Pulls the
 /// compatibility doc at `to_version`'s tarball (which contains
-/// records for every prior published version up к to_version)
-/// и walks each record whose semver lies in the half-open
+/// records for every prior published version up to to_version)
+/// and walks each record whose semver lies in the half-open
 /// range.
 ///
-/// Why path-max и not just the target's class — walk-fix #8
+/// Why path-max and not just the target's class — walk-fix #8
 /// post-B.1.78: with single-target-class semantics, jumping
-/// from 0.1.A directly к 0.1.C silently bypasses any
+/// from 0.1.A directly to 0.1.C silently bypasses any
 /// destructive transitions in 0.1.B (or any version strictly
-/// between A и C). Operator-approved/rejected decisions on
-/// those intermediate versions don't carry forward к the
+/// between A and C). Operator-approved/rejected decisions on
+/// those intermediate versions don't carry forward to the
 /// new pair, but the destructive content does. Path-max
 /// guarantees the strictest classification along the way
 /// governs the transition.
 ///
 /// Downgrade (`from > to`) returns Safe — no destructive
-/// transitions on the way back unless каждый интервалс
+/// transitions on the way back unless each interval's
 /// `compatibility.yaml` separately records destructive
 /// downgrade semantics (which they don't today). spec.md
 /// doesn't address downgrade direction; conservative
@@ -180,8 +180,8 @@ pub async fn fetch_path_max_change_class(
     Ok(path_max_change_class(&doc, from_version, to_version))
 }
 
-/// Pure path-max computation. Pulled out так что unit tests
-/// can exercise the range walk без a kube cluster.
+/// Pure path-max computation. Pulled out so that unit tests
+/// can exercise the range walk without a kube cluster.
 pub fn path_max_change_class(
     doc: &CompatibilityDoc,
     from_version: &str,
@@ -193,7 +193,7 @@ pub fn path_max_change_class(
         (Some(f), Some(t)) => (f, t),
         _ => return ChangeClass::Breaking, // unparseable — fail-closed
     };
-    // Downgrade or no-op transition — no path к gate.
+    // Downgrade or no-op transition — no path to gate.
     if from >= to {
         return ChangeClass::Safe;
     }
@@ -216,7 +216,7 @@ pub fn path_max_change_class(
 /// Strict ordering on `ChangeClass` (Safe < RequiresRestart <
 /// DataMigration < Breaking) so `path_max_change_class` can
 /// reduce the range to a single value. Not exposed as `Ord`
-/// on the enum itself к keep the type's public surface
+/// on the enum itself to keep the type's public surface
 /// minimal — only this module needs the ordering.
 fn class_order(c: ChangeClass) -> u8 {
     match c {
@@ -487,8 +487,8 @@ mod tests {
         // Half-open range (from, to] — `from`'s own class
         // doesn't count (operator already accepted it, by
         // definition: it's the current state). Only versions
-        // strictly greater than `from`, up к и including
-        // `to`, participate в the max.
+        // strictly greater than `from`, up to and including
+        // `to`, participate in the max.
         let mut doc = BTreeMap::new();
         doc.insert("0.1.35".to_string(), record("breaking")); // <- excluded
         doc.insert("0.1.36".to_string(), record("safe"));
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn path_max_change_class_skips_unparseable_version_keys() {
         // Garbage version strings in the doc don't break the
-        // walk — they're ignored, и valid entries still get
+        // walk — they're ignored, and valid entries still get
         // classified.
         let mut doc = BTreeMap::new();
         doc.insert("0.1.36".to_string(), record("breaking"));

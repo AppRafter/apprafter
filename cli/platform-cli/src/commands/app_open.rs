@@ -6,12 +6,12 @@
 //! Resolves chain:
 //!
 //!   1. Argo CD Application CR `<name>` in `argocd` namespace
-//!      (load-bearing — refuses if missing с pointer к
+//!      (load-bearing — refuses if missing with a pointer to
 //!      `apprafter app list`).
 //!   2. `spec.destination.namespace` = the namespace where
 //!      Argo CD lays down children.
 //!   3. AppRafter Application name through Argo CD's
-//!      `status.resources[]` — first entry с `group:
+//!      `status.resources[]` — first entry with `group:
 //!      "apprafter.io", kind: "Application"`. Walk-fix #1
 //!      post-B.1.79b: Argo CD only stamps the standard
 //!      `app.kubernetes.io/instance=<argocd-app-name>` label
@@ -26,12 +26,12 @@
 //!      name.
 //!   4. Service in destination namespace via
 //!      `app.kubernetes.io/name=<apprafter-app-name>`.
-//!      Single-result is happy path; multi-match errors с
+//!      Single-result is happy path; multi-match errors with
 //!      candidate enumeration.
 //!   5. Container port: `--container-port` override >
 //!      Service's first `spec.ports[].port`.
 //!   6. Local port: `--port` override > 8080 with auto-
-//!      increment к 8090 if busy (probe via TcpListener::bind
+//!      increment to 8090 if busy (probe via TcpListener::bind
 //!      on 127.0.0.1).
 //!
 //! Once the forward is bound, prints a banner + opens the
@@ -58,7 +58,7 @@ const LOCAL_PORT_MAX_PROBES: u16 = 10;
 
 /// Resolved service surface returned by the kubectl listing.
 /// Pulled out so tests can exercise selection and port
-/// resolution against fixture JSON без cluster.
+/// resolution against fixture JSON without cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServiceInfo {
     pub name: String,
@@ -156,9 +156,9 @@ pub fn open(
 
 /// Argo CD Application's `status.sync.status` + `status.
 /// health.status`. If health is anything other than `Healthy`,
-/// warn + prompt. Operator may legitimately want к forward
-/// against а Progressing app (debugging а stuck rollout), so
-/// we ask rather than refuse — но print the actual state so
+/// warn + prompt. Operator may legitimately want to forward
+/// against a Progressing app (debugging a stuck rollout), so
+/// we ask rather than refuse — but print the actual state so
 /// they know what they're getting.
 fn confirm_or_proceed_on_unhealthy(app: &Value, name: &str) -> Result<()> {
     let sync_state = app
@@ -176,7 +176,7 @@ fn confirm_or_proceed_on_unhealthy(app: &Value, name: &str) -> Result<()> {
 
     eprintln!(
         "⚠ Application '{name}' is sync={sync_state}, health={health_state}. \
-         Port-forward may fail or hit а partial deployment."
+         Port-forward may fail or hit a partial deployment."
     );
 
     match Confirm::new("Continue anyway?")
@@ -185,9 +185,9 @@ fn confirm_or_proceed_on_unhealthy(app: &Value, name: &str) -> Result<()> {
     {
         Ok(true) => Ok(()),
         Ok(false) => Err(CliError::Other("aborted by operator".into())),
-        // Non-interactive shell или Ctrl+C at the prompt — refuse safely.
+        // Non-interactive shell or Ctrl+C at the prompt — refuse safely.
         Err(_) => Err(CliError::Other(
-            "Application is not Healthy; rerun in а TTY to confirm, or pass \
+            "Application is not Healthy; rerun in a TTY to confirm, or pass \
              a healthy app name."
                 .into(),
         )),
@@ -197,17 +197,17 @@ fn confirm_or_proceed_on_unhealthy(app: &Value, name: &str) -> Result<()> {
 /// Pure helper — walk Argo CD's `status.resources[]` to find
 /// the AppRafter Application CR it owns. Returns the inner
 /// `metadata.name` (which is the value the operator uses for
-/// `app.kubernetes.io/name` labels на rendered Service +
+/// `app.kubernetes.io/name` labels on rendered Service +
 /// Deployment) or `None` if no `apprafter.io/Application`
-/// entry exists в the array (raw-helm/kustomize apps без а
+/// entry exists in the array (raw-helm/kustomize apps without a
 /// CMP-rendered AppRafter CR).
 ///
 /// Walk-fix #1 post-B.1.79b: original v0.1.161 implementation
 /// keyed off Argo CD's standard `app.kubernetes.io/instance`
 /// label, but Argo CD only stamps that on resources it
-/// directly applies — operator-rendered children carry а
+/// directly applies — operator-rendered children carry a
 /// different label set. This helper bridges from outer (Argo
-/// CD) к inner (AppRafter) naming.
+/// CD) to inner (AppRafter) naming.
 pub(crate) fn find_apprafter_app_name(argocd_app: &Value) -> Option<String> {
     let resources = argocd_app.pointer("/status/resources")?.as_array()?;
     for r in resources {
@@ -220,7 +220,7 @@ pub(crate) fn find_apprafter_app_name(argocd_app: &Value) -> Option<String> {
     None
 }
 
-/// Shell out к `kubectl get svc -n <ns> -l app.kubernetes.io/
+/// Shell out to `kubectl get svc -n <ns> -l app.kubernetes.io/
 /// name=<apprafter-app-name> -o json`. The label is stamped
 /// by `operator-rendering::make_labels`; its value is the
 /// AppRafter Application CR's `metadata.name` (NOT the Argo
@@ -256,7 +256,7 @@ fn list_services_for_apprafter_app(
     Ok(parse_services(&parsed))
 }
 
-/// Pure helper — extract `ServiceInfo` entries from а `kubectl
+/// Pure helper — extract `ServiceInfo` entries from a `kubectl
 /// get svc -o json` payload. Tests drive this directly with
 /// fixture JSON.
 pub(crate) fn parse_services(payload: &Value) -> Vec<ServiceInfo> {
@@ -286,8 +286,8 @@ pub(crate) fn parse_services(payload: &Value) -> Vec<ServiceInfo> {
 
 /// Pick the Service to forward. Plan §1.79b says the wizard
 /// uses Argo CD's instance label; if exactly one Service
-/// matches, we're done. Zero matches → fall through к а direct
-/// `svc/<app-name>` lookup in а follow-up walk-fix (for now —
+/// matches, we're done. Zero matches → fall through to a direct
+/// `svc/<app-name>` lookup in a follow-up walk-fix (for now —
 /// error with hint). Multi-match → error with names listed.
 pub(crate) fn select_service(
     services: &[ServiceInfo],
@@ -304,7 +304,7 @@ pub(crate) fn select_service(
              `kubectl logs -n apprafter-system deployment/apprafter-operator`; \
              (b) the Application CR's `spec.expose` block is omitted, so no \
              Service is rendered (Deployment-only flow — no port-forward \
-             target); (c) the label was overridden by а manifest's \
+             target); (c) the label was overridden by a manifest's \
              `metadata.labels` block on the AppRafter CR."
         ))),
         1 => Ok(services[0].clone()),
@@ -313,7 +313,7 @@ pub(crate) fn select_service(
             Err(CliError::Other(format!(
                 "Multiple Services match label `app.kubernetes.io/name=\
                  {apprafter_app_name}`: {}. Disambiguation by Service name is \
-                 а future walk-fix; for now, port-forward manually: \
+                 a future walk-fix; for now, port-forward manually: \
                  `kubectl port-forward svc/<name> -n <ns> 8080:<port>`.",
                 names.join(", ")
             )))
@@ -321,10 +321,10 @@ pub(crate) fn select_service(
     }
 }
 
-/// Pure helper — resolve the container port к target. Operator
+/// Pure helper — resolve the container port to target. Operator
 /// override wins; otherwise first declared port on the
 /// Service. Empty `ports` (Service declares none) is rejected
-/// with а clear hint.
+/// with a clear hint.
 pub(crate) fn resolve_container_port(
     override_port: Option<u16>,
     service: &ServiceInfo,
@@ -341,7 +341,7 @@ pub(crate) fn resolve_container_port(
     })
 }
 
-/// Probe-bind а TcpListener to 127.0.0.1:port; if it binds,
+/// Probe-bind a TcpListener to 127.0.0.1:port; if it binds,
 /// the port is free (we drop the listener immediately).
 /// kubectl's actual bind happens shortly after, so the
 /// EADDRINUSE race window is tiny but non-zero; if it loses
@@ -356,7 +356,7 @@ fn pick_local_port(start: u16) -> Result<u16> {
     }
     Err(CliError::Other(format!(
         "No free local port between {start} and {}. Pass `--port <N>` to \
-         specify а different starting point.",
+         specify a different starting point.",
         start.saturating_add(LOCAL_PORT_MAX_PROBES.saturating_sub(1))
     )))
 }
@@ -429,7 +429,7 @@ mod tests {
         });
         let svcs = parse_services(&payload);
         let names: Vec<&str> = svcs.iter().map(|s| s.name.as_str()).collect();
-        // "noports" + "stringport" present но с empty ports;
+        // "noports" + "stringport" present but with empty ports;
         // "no name" entry dropped entirely.
         assert!(names.contains(&"noports"));
         assert!(names.contains(&"stringport"));
@@ -480,11 +480,11 @@ mod tests {
 
     #[test]
     fn find_apprafter_app_name_returns_none_for_raw_yaml_apps() {
-        // App registered с raw helm / kustomize content
-        // (no AppRafter Application CR в the rendered
-        // manifests). `app open` errors with а clear
+        // App registered with raw helm / kustomize content
+        // (no AppRafter Application CR in the rendered
+        // manifests). `app open` errors with a clear
         // diagnostic; this test pins that the helper
-        // returns None rather than misidentifying е.g. а
+        // returns None rather than misidentifying e.g. a
         // Deployment as the inner app name.
         let app = json!({
             "status": {
@@ -509,15 +509,15 @@ mod tests {
 
     #[test]
     fn find_apprafter_app_name_returns_none_when_status_missing() {
-        // Fresh Application CR без а status block yet —
-        // Argo CD не ещё reconciled. Helper must not panic.
+        // Fresh Application CR without a status block yet —
+        // Argo CD not yet reconciled. Helper must not panic.
         let app = json!({ "spec": { "destination": { "namespace": "x" } } });
         assert_eq!(find_apprafter_app_name(&app), None);
     }
 
     #[test]
     fn find_apprafter_app_name_picks_first_when_multiple_apprafter_applications() {
-        // Defensive — if а manifest somehow renders two
+        // Defensive — if a manifest somehow renders two
         // apprafter.io/Application CRs, the helper picks
         // the first. Walk-fix #2 post-B.1.79b territory if
         // operators actually do this; for now, take the
@@ -613,9 +613,9 @@ mod tests {
     fn resolve_container_port_errors_when_service_has_no_ports_and_no_override() {
         // Walk regression: AppRafter operator skips the
         // Service entirely when `spec.expose` is omitted —
-        // discovered Service might exist (e.g. from а
+        // discovered Service might exist (e.g. from a
         // sidecar) but declare zero ports for the user app's
-        // traffic. Don't silently pick а random port.
+        // traffic. Don't silently pick a random port.
         let svc = ServiceInfo {
             name: "headless".into(),
             ports: vec![],
@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn is_port_free_returns_false_when_port_is_bound() {
-        // Bind а listener ourselves, hold it, ask the prober
+        // Bind a listener ourselves, hold it, ask the prober
         // — must report false. Then drop and ask again —
         // must report true. Race window between drop and
         // re-probe is microseconds; safe enough for this
@@ -635,27 +635,27 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         assert!(!is_port_free(port), "bound port must report not free");
         drop(listener);
-        // After drop, the kernel may take а moment к release;
+        // After drop, the kernel may take a moment to release;
         // re-probing immediately would test kernel timing,
         // not our logic. Leaving the second assertion out —
         // the "bound port reports busy" check is what guards
-        // against а false-positive `pick_local_port` returning
-        // а port that kubectl can't actually bind.
+        // against a false-positive `pick_local_port` returning
+        // a port that kubectl can't actually bind.
     }
 
     #[test]
     fn pick_local_port_returns_starting_port_when_free() {
-        // Bind а listener on an ephemeral port to keep the
+        // Bind a listener on an ephemeral port to keep the
         // probe deterministic, then call pick_local_port
-        // starting from а different ephemeral port. We can't
+        // starting from a different ephemeral port. We can't
         // hard-code 8080 — CI runners may have it bound.
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
         let busy_port = listener.local_addr().unwrap().port();
 
         // Start from busy_port — first probe should land on
         // busy_port+1 (assuming +1 is free, which is virtually
-        // always the case for а freshly-allocated ephemeral).
-        let picked = pick_local_port(busy_port).expect("must find а free port");
+        // always the case for a freshly-allocated ephemeral).
+        let picked = pick_local_port(busy_port).expect("must find a free port");
         assert_ne!(picked, busy_port, "must skip the bound port");
         assert!(
             picked >= busy_port && picked < busy_port + LOCAL_PORT_MAX_PROBES,

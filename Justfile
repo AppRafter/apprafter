@@ -27,6 +27,7 @@ lint:
     set -euo pipefail
     ./scripts/lint-cue.sh
     ./scripts/check-spdx-headers.sh
+    ./scripts/check-no-cyrillic.sh
     if find . -name Cargo.toml -not -path './target/*' -not -path '*/node_modules/*' | head -1 | grep -q .; then
         cargo fmt --all -- --check
         cargo clippy --all-targets --all-features -- -D warnings

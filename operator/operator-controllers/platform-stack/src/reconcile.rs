@@ -398,7 +398,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                 .and_then(|s| s.phase.as_deref())
                 .unwrap_or("pending-approval");
             if phase == "completed" {
-                // Approved + executed — proceed с bump.
+                // Approved + executed — proceed with bump.
                 info!(
                     plan = %plan_name,
                     "platform MigrationPlan completed — proceeding with bump"
@@ -410,9 +410,9 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                 // the operator explicitly declined, and
                 // `PlatformMigrationStrategy.reject` (B.1.76)
                 // reverted `spec.pin`; subsequent reconciles
-                // that find this rejected plan continue к
+                // that find this rejected plan continue to
                 // skip the same transition. Operator clears
-                // it by deleting the plan or pinning к a
+                // it by deleting the plan or pinning to a
                 // different target.
                 info!(
                     plan = %plan_name,
@@ -428,7 +428,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             }
         } else {
             // No existing plan — classify the full transition
-            // path и either create a plan (destructive) or
+            // path and either create a plan (destructive) or
             // bump (safe). Walk-fix #8 post-B.1.78: use
             // `fetch_path_max_change_class` instead of single-
             // target `fetch_change_class` so jumps that span
@@ -451,7 +451,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                     classification = ?class,
                     from = %current_target,
                     to = %desired.target_revision,
-                    "creating platform MigrationPlan для destructive transition"
+                    "creating platform MigrationPlan for destructive transition"
                 );
                 create_platform_migration_plan(
                     &plan_api,
@@ -1027,10 +1027,10 @@ async fn write_status(
     ));
 
     // SSA REQUIRES apiVersion + kind + metadata.name in the
-    // patch body — the apiserver uses them к look up the
+    // patch body — the apiserver uses them to look up the
     // resource's OpenAPI schema before merging. Walk-found
     // bug v0.1.115 → v0.1.116: a `{"status": {...}}` patch
-    // alone hits the apiserver с `invalid object type: /,
+    // alone hits the apiserver with `invalid object type: /,
     // Kind=` (empty GroupVersion, empty Kind).
     //
     // Always include `versionHistory` in the SSA body
@@ -1183,7 +1183,7 @@ fn synthesize_platform_plan_name(from_version: &str, to_version: &str) -> String
     )
 }
 
-/// Convert the internal `ChangeClass` enum к the string token
+/// Convert the internal `ChangeClass` enum to the string token
 /// the MigrationPlan's `spec.risks.classification` schema
 /// accepts. Mirrors the `compatibility.cue` change-class
 /// vocabulary.
@@ -1196,11 +1196,11 @@ fn change_class_to_string(class: ChangeClass) -> &'static str {
     }
 }
 
-/// Extract the classification field из an existing
-/// `MigrationPlan`. Returns `None` когда the field is absent
+/// Extract the classification field from an existing
+/// `MigrationPlan`. Returns `None` when the field is absent
 /// (e.g. the plan was created manually without
-/// `spec.risks.classification`). Used к surface the existing
-/// plan's classification on subsequent reconciles так что the
+/// `spec.risks.classification`). Used to surface the existing
+/// plan's classification on subsequent reconciles so that the
 /// operator's `kubectl describe` output stays consistent
 /// across reconciles even when the controller doesn't
 /// re-classify.
@@ -1214,7 +1214,7 @@ fn plan_classification(plan: &MigrationPlan) -> Option<String> {
 /// Caller guarantees the plan does NOT already exist (404
 /// path in the reconcile body); concurrent creates from
 /// other operators are protected by name uniqueness — the
-/// apiserver returns 409 Conflict that propagates up к
+/// apiserver returns 409 Conflict that propagates up to
 /// reconcile's error_policy, which requeues 60s. The next
 /// reconcile sees the existing plan via the GET path and
 /// blocks the bump.
@@ -1232,7 +1232,7 @@ async fn create_platform_migration_plan(
     Ok(())
 }
 
-/// Pure builder для a platform-scope `MigrationPlan` CR.
+/// Pure builder for a platform-scope `MigrationPlan` CR.
 /// Pulled out so unit tests can pin the resulting shape
 /// without a kube client.
 fn build_platform_migration_plan_cr(
@@ -1259,8 +1259,8 @@ fn build_platform_migration_plan_cr(
             platform: Some(MigrationPlatformScope {
                 // 1.78 simplification: list the entire stack
                 // as the affected component. Future work can
-                // narrow по diff'ing component-level chart
-                // values между the two chart versions.
+                // narrow by diff'ing component-level chart
+                // values between the two chart versions.
                 components: vec!["platform-stack".into()],
             }),
         },
@@ -1785,7 +1785,7 @@ mod tests {
 
     #[test]
     fn synthesize_platform_plan_name_replaces_dots_with_dashes() {
-        // DNS-1123 names disallow dots — replace с dashes so
+        // DNS-1123 names disallow dots — replace with dashes so
         // the synthesized plan name is a valid Kubernetes
         // resource name.
         assert_eq!(
@@ -1828,7 +1828,7 @@ mod tests {
 
     #[test]
     fn build_platform_migration_plan_cr_shape_matches_crd_schema() {
-        // Pin every required field of MigrationPlanSpec против
+        // Pin every required field of MigrationPlanSpec against
         // CRD validation rules. CRD requires scope.type,
         // scope.platform.components non-empty (for platform
         // type), trigger.type + field, risks.classification.
@@ -1871,7 +1871,7 @@ mod tests {
         let risks = mp.spec.risks.as_ref().expect("risks set");
         assert_eq!(risks.classification, "breaking");
 
-        // Previous spec snapshot — pin verbatim для reject flow.
+        // Previous spec snapshot — pin verbatim for reject flow.
         let snapshot = mp
             .spec
             .previous_spec_snapshot

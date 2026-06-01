@@ -352,7 +352,7 @@ fn humanise_relative(delta: chrono::Duration) -> String {
 ///      so it can be absent on steady state.
 ///   2. **Argo CD `Application argocd/<component>.spec.source.
 ///      targetRevision`** — the version Argo CD is actively
-///      reconciling against. Always present for а chart-managed
+///      reconciling against. Always present for a chart-managed
 ///      component, since the umbrella's `templates/applications.
 ///      yaml` template emits it. This is the new fallback.
 ///   3. Hard error pointing the operator at `--version <v>`.
@@ -409,7 +409,7 @@ pub fn freeze(component: &str, version: Option<&str>) -> Result<()> {
 
 /// Resolve the effective pin for `component` through the
 /// PlatformStack-then-Argo-CD fallback chain. Pure fn — tests
-/// drive every branch with fixture JSON instead of needing а
+/// drive every branch with fixture JSON instead of needing a
 /// live cluster.
 ///
 /// Returns the rendered string verbatim. Caller threads it
@@ -669,7 +669,7 @@ mod tests {
     fn resolve_effective_pin_prefers_platformstack_status() {
         // Both sources present — PlatformStack status wins
         // because it's the operator's canonical version dial
-        // and the Argo CD targetRevision may lag during а
+        // and the Argo CD targetRevision may lag during a
         // bump cycle (in-flight reconcile shows the OLD
         // version on app.spec.source.targetRevision until
         // the umbrella patches it).
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn resolve_effective_pin_falls_back_to_argocd_target_revision() {
-        // Operator hits `freeze` on а cluster where the
+        // Operator hits `freeze` on a cluster where the
         // operator binary doesn't (yet) write
         // componentVersions — this is the M1.5 default state.
         // The Argo CD Application's targetRevision is THE
@@ -703,8 +703,8 @@ mod tests {
     #[test]
     fn resolve_effective_pin_errors_when_both_sources_empty() {
         // Neither PlatformStack.status nor Argo CD Application
-        // carries а version — likely an unknown component
-        // name OR а half-bootstrapped cluster. Error message
+        // carries a version — likely an unknown component
+        // name OR a half-bootstrapped cluster. Error message
         // must point operators at the `--version <v>` escape
         // hatch and `platform status` for the canonical
         // component list.
