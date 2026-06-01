@@ -22,7 +22,7 @@ AppRafter fills the gap between a hosted PaaS and vanilla Kubernetes:
 
 - **Hosted PaaS** — easy to start, but tied to one vendor, costly at scale, and not self-hostable.
 - **Vanilla Kubernetes** — portable and scalable, but the cognitive load is high and the ecosystem is fragmented.
-- **AppRafter** — one `Application` manifest, four hardware tiers, GitOps as the only control surface, and no vendor lock-in at any layer. Deploy via Argo CD and the `apprafter` CLI, with destructive operations gated by a `MigrationPlan` CRD rather than an unguarded `kubectl delete`. (An MCP interface - letting an AI agent can drive deploys through the same gate - is on the roadmap.)
+- **AppRafter** — one `Application` manifest, four hardware tiers, GitOps as the only control surface, and no vendor lock-in at any layer. Deploy via Argo CD and the `apprafter` CLI, with destructive operations gated by a `MigrationPlan` CRD rather than an unguarded `kubectl delete`. (An MCP interface — letting an AI agent drive deploys through the same gate — is on the roadmap.)
 
 The platform is deliberately **opinionated** — one proven component per slot (e.g. Cilium for networking, Argo CD for GitOps) — so there is a single, well-trodden path instead of an assembly project.
 
