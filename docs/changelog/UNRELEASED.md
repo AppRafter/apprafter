@@ -13,6 +13,27 @@ _No entries yet — Phase 2 (M2) opens with v0.2.0._
 
 ## Phase 1.5 — Self-managing platform rethink (in progress)
 
+## CLI v0.1.185 — English-only cleanup: purge Cyrillic from source, templates, and docs (2026-06-01)
+
+### Changed
+
+- Purged Cyrillic contamination — homoglyph letters (e.g. U+0430 / U+0435 in
+  place of Latin `a` / `e`) and stray Russian/Ukrainian function words, plus a
+  few genuine Russian comments translated by hand — from CLI and operator
+  Rust source, the `apprafter app scaffold` templates (which ship into user
+  repos), the platform-stack CUE package, CI workflows, the argocd-cue-cmp
+  entrypoint/Dockerfile, the landing smoke test, and public docs. User-facing
+  CLI output (`app add` PAT hints, `app scaffold` / `app open` errors)
+  previously rendered stray Cyrillic; it is now clean ASCII English.
+
+### Added
+
+- `scripts/check-no-cyrillic.sh` — a lint guard wired into `just lint` and
+  the lefthook pre-commit hook. It fails on Cyrillic in code (`*.rs`, `*.cue`,
+  `*.hbs`, `*.sh`, `*.ts`/`*.js`, `*.toml`, `*.yml`, `Dockerfile*`) and public
+  docs (`README*`, `CONTRIBUTING*`, `docs/**`, `spec.md`); root working `.md`
+  notes remain Russian-allowed.
+
 ## platform-stack 0.1.48 + argocd-cue-cmp v0.1.6 — M1.5 walk-fix #11 post-B.1.79b-Part-3b — CMP entrypoint cds into package dir (2026-05-29)
 
 ### Symptom
