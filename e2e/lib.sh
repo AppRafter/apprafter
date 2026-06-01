@@ -152,6 +152,28 @@ k3d_up() {
 }
 
 # ---------------------------------------------------------------
+# bootstrap_with_retry
+#   `apprafter cluster-bootstrap` installs Cilium first, then Argo CD.
+#   On k3d-in-CI Cilium is slow to become Ready (~5 min), and until it
+#   is, the kube API ClusterIP (10.43.0.1) has no service routing
+#   (kube-proxy is disabled), so Argo CD's pods time out reaching the
+#   API and `helm --wait argocd` expires. cluster-bootstrap is
+#   idempotent, so: run it once; if it fails, wait for the Cilium
+#   DaemonSet to be Ready, clear the half-installed Argo CD release,
+#   and run it again — the second pass finds Cilium Ready and Argo CD
+#   comes up. Requires $KUBECONFIG to be exported (kubectl/helm).
+# ---------------------------------------------------------------
+bootstrap_with_retry() {
+    if apprafter cluster-bootstrap; then
+        return 0
+    fi
+    printf '  first cluster-bootstrap failed; waiting for Cilium, then retrying\n' >&2
+    kubectl -n kube-system rollout status ds/cilium --timeout=8m || true
+    helm -n argocd uninstall argocd >/dev/null 2>&1 || true
+    apprafter cluster-bootstrap
+}
+
+# ---------------------------------------------------------------
 # k3d_down <cluster-name>
 #   Delete a k3d cluster. Safe (no-op) when the cluster does not
 #   exist.

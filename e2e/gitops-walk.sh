@@ -308,7 +308,7 @@ export APPRAFTER_CONFIG_DIR
 printf '  APPRAFTER_CONFIG_DIR=%s\n' "$APPRAFTER_CONFIG_DIR"
 printf '  Running cluster-bootstrap (installs Cilium, Argo CD, platform-stack)...\n'
 
-apprafter cluster-bootstrap
+bootstrap_with_retry
 
 printf '  cluster-bootstrap complete\n'
 
