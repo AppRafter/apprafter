@@ -135,3 +135,31 @@ k3d_down() {
 apprafter() {
     (cd "${REPO_ROOT}/cli" && cargo run --quiet --bin apprafter -- "$@")
 }
+
+# ---------------------------------------------------------------
+# dump_diagnostics
+#   Best-effort cluster-state dump for CI debugging. Call this on
+#   failure BEFORE tearing the cluster down — otherwise the evidence
+#   (stuck pods, events, helm-hook state) is destroyed with it.
+#   No-op + never fails if KUBECONFIG/kubectl are unavailable.
+# ---------------------------------------------------------------
+dump_diagnostics() {
+    command -v kubectl >/dev/null 2>&1 || return 0
+    [ -n "${KUBECONFIG:-}" ] || return 0
+    printf '\n----- cluster diagnostics (failure) -----\n' >&2
+    kubectl get nodes -o wide >&2 2>&1 || true
+    printf '\n--- pods (all namespaces) ---\n' >&2
+    kubectl get pods -A -o wide >&2 2>&1 || true
+    printf '\n--- non-Running/!Ready pods (describe) ---\n' >&2
+    kubectl get pods -A --no-headers 2>/dev/null \
+        | awk '$4 != "Running" && $4 != "Completed" {print $1, $2}' \
+        | while read -r ns pod; do
+            printf '\n=== describe %s/%s ===\n' "$ns" "$pod" >&2
+            kubectl -n "$ns" describe pod "$pod" >&2 2>&1 || true
+        done
+    printf '\n--- recent events ---\n' >&2
+    kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
+    printf '\n--- helm releases ---\n' >&2
+    (command -v helm >/dev/null 2>&1 && helm list -A >&2 2>&1) || true
+    printf '%s\n' '----- end diagnostics -----' >&2
+}

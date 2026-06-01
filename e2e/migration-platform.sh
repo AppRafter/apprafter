@@ -123,6 +123,7 @@ cleanup() {
     if [ "$exit_code" -ne 0 ]; then
         printf '\n!!! migration-platform FAILED at %s (exit %d) !!!\n' \
             "$(elapsed)" "$exit_code" >&2
+        dump_diagnostics
         printf 'Tearing down k3d cluster (set APPRAFTER_E2E_SKIP_DESTROY=1 to keep).\n' >&2
     fi
 

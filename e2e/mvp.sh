@@ -63,13 +63,15 @@ cleanup_on_failure() {
     fi
     exit "$exit_code"
 }
-trap cleanup_on_failure EXIT
-
 # ---------------------------------------------------------------
-# Preconditions
+# Preconditions — checked BEFORE arming the destroy trap so a missing
+# secret (e.g. HCLOUD_TOKEN not configured) exits cleanly with code 2
+# instead of triggering a pointless `apprafter destroy` on a cluster
+# that was never provisioned (which itself errors "no active target").
 # ---------------------------------------------------------------
-
 require_env HCLOUD_TOKEN APPRAFTER_SSH_PUBLIC_KEY
+
+trap cleanup_on_failure EXIT
 
 REGION="${APPRAFTER_E2E_REGION:-nbg1}"
 _KUBECONFIG_FILE=$(mktemp)
