@@ -98,11 +98,25 @@ k3d_up() {
     else
         k3d_bin="nix run nixpkgs#k3d --"
     fi
+    # The k3s flags MUST mirror the real Tier-1 cluster's k3s install
+    # (cli-providers/.../user_data.rs) so Cilium can take over the CNI:
+    #   --flannel-backend=none  — k3s flannel-vxlan otherwise claims
+    #     UDP 8472, the same port Cilium's cilium_vxlan needs; without
+    #     it the cilium-agent crash-loops on "address already in use".
+    #   --disable-network-policy — k3s kube-router conflicts with
+    #     Cilium's own NetworkPolicy enforcement (dueling iptables).
+    #   --disable-kube-proxy — Cilium's eBPF kubeProxyReplacement
+    #     (k8sServiceHost 127.0.0.1:6443 reaches the node-local API)
+    #     takes over service routing.
+    # traefik + servicelb are replaced by Gateway API / Cilium L2.
     # shellcheck disable=SC2086
     $k3d_bin cluster create "$cluster_name" \
         --servers 1 --agents 0 \
         --port "8080:80@loadbalancer" \
         --port "8443:443@loadbalancer" \
+        --k3s-arg "--flannel-backend=none@server:0" \
+        --k3s-arg "--disable-network-policy@server:0" \
+        --k3s-arg "--disable-kube-proxy@server:0" \
         --k3s-arg "--disable=traefik@server:0" \
         --k3s-arg "--disable=servicelb@server:0"
     printf '  k3d cluster %s is ready. kubectl context: k3d-%s\n' \
@@ -150,12 +164,22 @@ dump_diagnostics() {
     kubectl get nodes -o wide >&2 2>&1 || true
     printf '\n--- pods (all namespaces) ---\n' >&2
     kubectl get pods -A -o wide >&2 2>&1 || true
-    printf '\n--- non-Running/!Ready pods (describe) ---\n' >&2
+    printf '\n--- not-Ready pods (describe + logs) ---\n' >&2
+    # Catch pods that are not-Running/Completed AND Running-but-not-
+    # fully-ready (e.g. a crash-looping `0/1 Running` cilium-agent —
+    # READY ratio r[1] != r[2]). For each, dump describe + current and
+    # previous-instance container logs (the crash reason lives there).
     kubectl get pods -A --no-headers 2>/dev/null \
-        | awk '$4 != "Running" && $4 != "Completed" {print $1, $2}' \
+        | awk '{split($3, r, "/");
+                if ($4 != "Running" && $4 != "Completed") print $1, $2;
+                else if (r[1] != r[2]) print $1, $2}' \
         | while read -r ns pod; do
             printf '\n=== describe %s/%s ===\n' "$ns" "$pod" >&2
             kubectl -n "$ns" describe pod "$pod" >&2 2>&1 || true
+            printf '\n--- logs %s/%s (current) ---\n' "$ns" "$pod" >&2
+            kubectl -n "$ns" logs "$pod" --all-containers --tail=60 >&2 2>&1 || true
+            printf '\n--- logs %s/%s (previous instance) ---\n' "$ns" "$pod" >&2
+            kubectl -n "$ns" logs "$pod" --all-containers --previous --tail=60 >&2 2>&1 || true
         done
     printf '\n--- recent events ---\n' >&2
     kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
