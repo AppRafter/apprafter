@@ -117,9 +117,15 @@ k3d_up() {
     # from user_data.rs CLUSTER_CIDR_DUAL_STACK / SERVICE_CIDR_DUAL_STACK)
     # AND (b) the node itself has an IPv6 address — so k3d runs on a
     # pre-created IPv6-enabled docker network.
+    # The network must be DUAL-stack: k3d needs an IPv4 gateway (an
+    # IPv6-only network fails cluster creation with "no gateway
+    # defined"), and the IPv6 subnet gives the node an IPv6 address so
+    # k3s enables dual-stack. Provide both an IPv4 and an IPv6 subnet.
     local net="k3d-${cluster_name}-net"
-    docker network create --ipv6 --subnet "fd00:dead:42::/64" "$net" \
-        >/dev/null 2>&1 || true
+    docker network create --ipv6 \
+        --subnet "172.45.0.0/16" \
+        --subnet "fd00:dead:42::/64" \
+        "$net" >/dev/null 2>&1 || true
     # shellcheck disable=SC2086
     $k3d_bin cluster create "$cluster_name" \
         --network "$net" \
