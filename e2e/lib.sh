@@ -110,33 +110,16 @@ k3d_up() {
     #     takes over service routing.
     # traefik + servicelb are replaced by Gateway API / Cilium L2.
     #
-    # Dual-stack (ADR 0017): the production Cilium config enables IPv6,
-    # so the cilium-agent blocks on "required IPv6 PodCIDR not available"
-    # until the node carries one. k3s only allocates an IPv6 PodCIDR
-    # when (a) cluster-cidr/service-cidr are dual-stack (the exact pair
-    # from user_data.rs CLUSTER_CIDR_DUAL_STACK / SERVICE_CIDR_DUAL_STACK)
-    # AND (b) the node itself has an IPv6 address — so k3d runs on a
-    # pre-created IPv6-enabled docker network.
-    # The network must be DUAL-stack: k3d needs an IPv4 gateway (an
-    # IPv6-only network fails cluster creation with "no gateway
-    # defined"), and the IPv6 subnet gives the node an IPv6 address so
-    # k3s enables dual-stack. Provide both an IPv4 and an IPv6 subnet.
-    local net="k3d-${cluster_name}-net"
-    docker network rm "$net" >/dev/null 2>&1 || true
-    # Explicit --gateway for BOTH families: k3d reads the network's
-    # IPv4 gateway and fails ("no gateway defined") if it is unset.
-    # Output is left visible + inspected so a create failure or a
-    # missing gateway is diagnosable straight from the CI log.
-    docker network create --ipv6 \
-        --subnet "172.45.0.0/16" --gateway "172.45.0.1" \
-        --subnet "fd00:dead:42::/64" --gateway "fd00:dead:42::1" \
-        "$net" || true
-    docker network inspect "$net" \
-        --format 'k3d net {{.Name}}: {{range .IPAM.Config}}{{.Subnet}} gw={{.Gateway}} {{end}}' \
-        2>&1 || true
+    # SINGLE-STACK (IPv4-only). Production Tier-1 is dual-stack (ADR
+    # 0017), but k3d-in-CI cannot provide real IPv6 — its ULA IPv6 does
+    # not route, which makes Cilium's dual-stack eBPF datapath converge
+    # pathologically slowly (~10 min vs ~1 min). So the e2e runs
+    # single-stack and passes APPRAFTER_CILIUM_IPV4_ONLY to
+    # cluster-bootstrap (which sets ipv6.enabled=false on Cilium in both
+    # the loader and the adopted platform-stack chart). Dual-stack is
+    # validated on real hardware by the nightly Hetzner e2e/mvp.sh.
     # shellcheck disable=SC2086
     $k3d_bin cluster create "$cluster_name" \
-        --network "$net" \
         --servers 1 --agents 0 \
         --port "8080:80@loadbalancer" \
         --port "8443:443@loadbalancer" \
@@ -144,31 +127,28 @@ k3d_up() {
         --k3s-arg "--disable-network-policy@server:0" \
         --k3s-arg "--disable-kube-proxy@server:0" \
         --k3s-arg "--disable=traefik@server:0" \
-        --k3s-arg "--disable=servicelb@server:0" \
-        --k3s-arg "--cluster-cidr=10.42.0.0/16,fd00:42::/64@server:0" \
-        --k3s-arg "--service-cidr=10.43.0.0/16,fd00:43::/112@server:0"
+        --k3s-arg "--disable=servicelb@server:0"
     printf '  k3d cluster %s is ready. kubectl context: k3d-%s\n' \
         "$cluster_name" "$cluster_name"
 }
 
 # ---------------------------------------------------------------
 # bootstrap_with_retry
-#   `apprafter cluster-bootstrap` installs Cilium first, then Argo CD.
-#   On k3d-in-CI Cilium is slow to become Ready (~5 min), and until it
-#   is, the kube API ClusterIP (10.43.0.1) has no service routing
-#   (kube-proxy is disabled), so Argo CD's pods time out reaching the
-#   API and `helm --wait argocd` expires. cluster-bootstrap is
-#   idempotent, so: run it once; if it fails, wait for the Cilium
-#   DaemonSet to be Ready, clear the half-installed Argo CD release,
-#   and run it again — the second pass finds Cilium Ready and Argo CD
-#   comes up. Requires $KUBECONFIG to be exported (kubectl/helm).
+#   Runs `apprafter cluster-bootstrap` single-stack (IPv4-only) — see
+#   k3d_up for why. With single-stack Cilium converges in ~1 min, so
+#   the first attempt normally succeeds. The retry is a cheap safety
+#   net: cluster-bootstrap is idempotent, so on failure wait for the
+#   Cilium pod to be Ready, clear any half-installed Argo CD release,
+#   and run again. Requires $KUBECONFIG exported (kubectl/helm).
 # ---------------------------------------------------------------
 bootstrap_with_retry() {
+    export APPRAFTER_CILIUM_IPV4_ONLY=1
     if apprafter cluster-bootstrap; then
         return 0
     fi
     printf '  first cluster-bootstrap failed; waiting for Cilium, then retrying\n' >&2
-    kubectl -n kube-system rollout status ds/cilium --timeout=8m || true
+    kubectl -n kube-system wait --for=condition=Ready pod \
+        -l k8s-app=cilium --timeout=8m || true
     helm -n argocd uninstall argocd >/dev/null 2>&1 || true
     apprafter cluster-bootstrap
 }
@@ -189,9 +169,6 @@ k3d_down() {
     # `k3d cluster delete` exits 0 even when the cluster is absent.
     # shellcheck disable=SC2086
     $k3d_bin cluster delete "$cluster_name" || true
-    # Remove the IPv6 network k3d_up created (k3d only deletes networks
-    # it created itself, not a pre-existing `--network`).
-    docker network rm "k3d-${cluster_name}-net" >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------------------------------

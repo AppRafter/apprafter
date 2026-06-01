@@ -19,6 +19,11 @@ pub struct HelmUpgradeArgs {
     pub namespace: String,
     pub values_path: PathBuf,
     pub kubeconfig_path: PathBuf,
+    /// Extra `--set key=value` overrides applied on top of
+    /// `values_path`. Used by `cluster-bootstrap` to flip
+    /// `ipv6.enabled=false` on Cilium for single-stack (IPv4-only)
+    /// clusters. Empty for the common case.
+    pub set_values: Vec<String>,
 }
 
 pub trait HelmRunner {
@@ -56,6 +61,9 @@ impl HelmCli {
             .arg(&args.values_path)
             .arg("--wait")
             .env("KUBECONFIG", &args.kubeconfig_path);
+        for kv in &args.set_values {
+            c.arg("--set").arg(kv);
+        }
         c
     }
 }
@@ -124,6 +132,7 @@ mod tests {
             namespace: "kube-system".into(),
             values_path: "/tmp/values.yaml".into(),
             kubeconfig_path: "/tmp/kubeconfig".into(),
+            set_values: Vec::new(),
         });
         let args = argv(&cmd);
         for required in [
@@ -146,6 +155,25 @@ mod tests {
             );
         }
         assert!(!args.iter().any(|a| a == "KUBECONFIG"), "{args:?}");
+        // No `--set` when set_values is empty.
+        assert!(!args.iter().any(|a| a == "--set"), "{args:?}");
+    }
+
+    #[test]
+    fn upgrade_install_command_appends_set_overrides() {
+        let cmd = HelmCli::build_upgrade_install_command(&HelmUpgradeArgs {
+            release: "cilium".into(),
+            chart: "cilium/cilium".into(),
+            version: Some("1.16.5".into()),
+            namespace: "kube-system".into(),
+            values_path: "/tmp/values.yaml".into(),
+            kubeconfig_path: "/tmp/kubeconfig".into(),
+            set_values: vec!["ipv6.enabled=false".into()],
+        });
+        let args = argv(&cmd);
+        let set_idx = args.iter().position(|a| a == "--set");
+        assert!(set_idx.is_some(), "expected --set: {args:?}");
+        assert_eq!(args[set_idx.unwrap() + 1], "ipv6.enabled=false", "{args:?}");
     }
 
     #[test]
@@ -157,6 +185,7 @@ mod tests {
             namespace: "apprafter-system".into(),
             values_path: "/tmp/operator-values.yaml".into(),
             kubeconfig_path: "/tmp/kubeconfig".into(),
+            set_values: Vec::new(),
         });
         let args = argv(&cmd);
         assert!(!args.iter().any(|a| a == "--version"), "{args:?}");

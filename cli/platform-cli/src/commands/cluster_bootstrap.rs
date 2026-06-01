@@ -227,6 +227,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         namespace: "kube-system".into(),
         values_path: cilium_values_file.path().to_path_buf(),
         kubeconfig_path: kubeconfig_path.to_path_buf(),
+        set_values: cilium_set_overrides(),
     })?;
 
     // 0b. Node MUST reach Ready before step 1 — otherwise the
@@ -259,6 +260,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         namespace: "argocd".into(),
         values_path: argocd_values_file.path().to_path_buf(),
         kubeconfig_path: kubeconfig_path.to_path_buf(),
+        set_values: Vec::new(),
     })?;
 
     // 2. Wait for argocd-server Deployment to become Available
@@ -381,6 +383,32 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
 }
 
 /// Render the root `Application` CR YAML the CLI hands Argo CD.
+/// Is `APPRAFTER_CILIUM_IPV4_ONLY` set to a truthy value? When it is,
+/// `cluster-bootstrap` installs Cilium **single-stack (IPv4-only)** by
+/// disabling IPv6 in BOTH places Cilium is configured: the loader
+/// `helm install` (a `--set ipv6.enabled=false`) and the platform-stack
+/// chart that Argo CD adopts (a `valuesObject` override in the root
+/// Application). Production Tier-1 stays dual-stack (ADR 0017); this
+/// fires only when the env var is explicitly set — its purpose is the
+/// k3d e2e, where the node has no real IPv6 (k3d's ULA IPv6 doesn't
+/// route, making Cilium's dual-stack eBPF datapath pathologically slow
+/// to converge). Dual-stack is validated on real hardware via the
+/// nightly Hetzner `e2e/mvp.sh`.
+fn cilium_ipv4_only() -> bool {
+    std::env::var("APPRAFTER_CILIUM_IPV4_ONLY")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Loader-Cilium `--set` overrides (see [`cilium_ipv4_only`]).
+fn cilium_set_overrides() -> Vec<String> {
+    if cilium_ipv4_only() {
+        vec!["ipv6.enabled=false".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// One CR, no templating engine — the input space (repo + version)
 /// is two strings; string interpolation is clearer than dragging
 /// in `serde_yaml` for an 18-line document.
@@ -392,6 +420,15 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
 /// the Argo CD child Application — Argo CD doesn't self-prune,
 /// preventing the chicken-and-egg foot-gun.
 pub(crate) fn render_root_application(repo_url: &str, chart_version: &str) -> String {
+    // Single-stack (IPv4-only) override for the Argo-CD-adopted
+    // platform-stack chart — disables IPv6 on its Cilium component so a
+    // later sync does not revert the loader's single-stack Cilium back
+    // to dual-stack. Mirrors the loader `--set` (see `cilium_ipv4_only`).
+    let helm_block = if cilium_ipv4_only() {
+        "\n    helm:\n      valuesObject:\n        components:\n          cilium:\n            values:\n              ipv6:\n                enabled: false"
+    } else {
+        ""
+    };
     format!(
         r#"# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Rendered by `apprafter cluster-bootstrap`. The CLI generates
@@ -415,7 +452,7 @@ spec:
   source:
     repoURL: "{repo_url}"
     chart: {chart_name}
-    targetRevision: "{chart_version}"
+    targetRevision: "{chart_version}"{helm_block}
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
@@ -428,6 +465,7 @@ spec:
       - ServerSideApply=true
 "#,
         chart_name = APPRAFTER_PLATFORM_STACK_CHART_NAME,
+        helm_block = helm_block,
     )
 }
 
