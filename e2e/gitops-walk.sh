@@ -345,13 +345,21 @@ phase "Phase 3: git daemon — fixture repo"
 
 setup_git_server
 
-HOST_GW="$(detect_host_gateway_ip)"
-GIT_REPO_URL="git://${HOST_GW}:${GIT_DAEMON_PORT}/gitops-app"
-printf '  fixture repo URL: %s\n' "$GIT_REPO_URL"
+# The repoURL Argo CD (running inside k3d) uses to clone the fixture
+# is `host.k3d.internal` — k3d's built-in host alias, injected into
+# the cluster CoreDNS, that pods resolve to the host. This is more
+# portable than a dynamically-detected Docker bridge gateway IP, which
+# is not reliably routable from pods on GitHub Actions runners
+# (`detect_host_gateway_ip` is kept as a documented fallback only).
+GIT_REPO_URL="git://host.k3d.internal:${GIT_DAEMON_PORT}/gitops-app"
+# The host itself cannot resolve `host.k3d.internal`, so the host-side
+# liveness check targets the loopback (the git daemon binds 0.0.0.0).
+GIT_REPO_URL_HOST="git://127.0.0.1:${GIT_DAEMON_PORT}/gitops-app"
+printf '  fixture repo URL (in-cluster): %s\n' "$GIT_REPO_URL"
 
 # Sanity-check: the git daemon should be reachable from the host
 printf '  verifying git daemon is up (local clone check)...\n'
-retry 6 5 -- git ls-remote "$GIT_REPO_URL" >/dev/null
+retry 6 5 -- git ls-remote "$GIT_REPO_URL_HOST" >/dev/null
 printf '  git daemon is reachable\n'
 
 # ---------------------------------------------------------------

@@ -203,12 +203,19 @@ STATE
 build_and_push_fixture_chart() {
     local version="$1"
     local change_class="$2"
-    local src_chart="${REPO_ROOT}/platform-stack/dist/platform-stack-0.1.50"
+    # Discover the rendered dist chart dynamically — `make -C
+    # platform-stack render-only` first `rm -rf dist` then renders
+    # exactly one `dist/platform-stack-<currentVersion>` dir, so the
+    # version must not be hardcoded (it tracks platform.cue's
+    # currentVersion and bumps with every release).
+    local src_chart
+    src_chart="$(find "${REPO_ROOT}/platform-stack/dist" -maxdepth 1 -type d \
+        -name 'platform-stack-*' 2>/dev/null | sort | tail -1)"
     local build_dir="${CHART_BUILD_DIR}/${version}"
 
-    if [ ! -d "$src_chart" ]; then
-        printf 'ERROR: source chart not found at %s\n' "$src_chart" >&2
-        printf "       Run 'make render' in platform-stack/ to produce it.\n" >&2
+    if [ -z "$src_chart" ] || [ ! -d "$src_chart" ]; then
+        printf 'ERROR: no rendered dist chart under %s\n' "${REPO_ROOT}/platform-stack/dist" >&2
+        printf "       Run 'make -C platform-stack render-only' to produce it.\n" >&2
         exit 1
     fi
 

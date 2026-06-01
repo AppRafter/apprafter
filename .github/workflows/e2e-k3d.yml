@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 name: e2e-k3d
 
-# PR-triggered k3d end-to-end gate. Runs the two local e2e suites
-# (gitops-walk + migration-platform) on every pull request.
+# Push/PR-triggered k3d end-to-end gate. Runs the two local e2e
+# suites (gitops-walk + migration-platform) on master pushes and
+# pull requests touching the relevant paths.
 #
 # These tests exercise the full GitOps loop (CMP -> Argo CD ->
 # operator -> Deployment) and the platform-scope MigrationPlan gate
@@ -17,6 +18,18 @@ name: e2e-k3d
 # platform-stack-check.yml and nightly.yml.
 
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'e2e/**'
+      - 'cli/**'
+      - 'operator/**'
+      - 'platform-stack/**'
+      - 'manifests/**'
+      - 'schemas/**'
+      - 'Justfile'
+      - '.github/workflows/e2e-k3d.yml'
   pull_request:
     paths:
       - 'e2e/**'
@@ -75,6 +88,15 @@ jobs:
         run: |
           curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
           k3d version
+
+      - name: Install just
+        # `just e2e` is the suite entrypoint (single source of truth,
+        # matches local `just e2e`). `just` is not on ubuntu-latest by
+        # default, so install it to /usr/local/bin and verify.
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+            | bash -s -- --to /usr/local/bin
+          just --version
 
       - name: Render platform-stack dist chart
         # migration-platform.sh builds its fixture charts from the
