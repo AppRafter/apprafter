@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: e2e-k3d
+
+# PR-triggered k3d end-to-end gate. Runs the two local e2e suites
+# (gitops-walk + migration-platform) on every pull request.
+#
+# These tests exercise the full GitOps loop (CMP -> Argo CD ->
+# operator -> Deployment) and the platform-scope MigrationPlan gate
+# (PlatformStack pin -> breaking -> approve/reject) on a local k3d
+# cluster -- no cloud spend, no external secrets required.
+#
+# e2e/mvp.sh (real Hetzner provision smoke, costs money) is
+# intentionally excluded and continues to live in nightly.yml only.
+#
+# Security note: no secrets are consumed here. All dynamic values
+# come from env: bindings following the same pattern as
+# platform-stack-check.yml and nightly.yml.
+
+on:
+  pull_request:
+    paths:
+      - 'e2e/**'
+      - 'cli/**'
+      - 'operator/**'
+      - 'platform-stack/**'
+      - 'manifests/**'
+      - 'schemas/**'
+      - 'Justfile'
+      - '.github/workflows/e2e-k3d.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-k3d:
+    name: k3d e2e (gitops + migration-platform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('cli/**/Cargo.lock', 'cli/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Render platform-stack dist chart
+        # migration-platform.sh builds its fixture charts from the
+        # rendered dist/ tree. This must run before just e2e.
+        # make -C platform-stack render-only is the same command
+        # used by platform-stack-check.yml and just platform-stack-render.
+        run: make -C platform-stack render-only
+
+      - name: Warm the CLI build cache
+        working-directory: cli
+        # The e2e scripts invoke the CLI via `cargo run` (lib.sh's
+        # `apprafter()` shell function), so a debug build of the
+        # `apprafter` binary here just warms the cache for the timed
+        # script runs below — no PATH binary is consumed.
+        run: cargo build --bin apprafter
+
+      - name: Run k3d e2e suite
+        run: just e2e

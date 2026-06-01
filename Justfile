@@ -68,6 +68,24 @@ test:
         echo "==> no package.json — skipping bun test"
     fi
 
+# Run the GitOps-walk k3d e2e (CMP → Argo CD → operator loop).
+# Requires a running Docker daemon and k3d on PATH.
+e2e-gitops:
+    bash e2e/gitops-walk.sh
+
+# Run the platform-migration k3d e2e (PlatformStack pin → breaking
+# version → MigrationPlan → approve/reject).
+# Requires `just platform-stack-render` to have been run first so
+# that `platform-stack/dist/` is populated with the fixture chart.
+e2e-migration-platform:
+    bash e2e/migration-platform.sh
+
+# Run all local k3d e2e suites (gitops-walk + migration-platform).
+# NOTE: e2e/mvp.sh (real Hetzner provision smoke, costs money) is
+# intentionally excluded here — it runs via the nightly CI workflow
+# only (.github/workflows/nightly.yml, 04:00 UTC).
+e2e: e2e-gitops e2e-migration-platform
+
 # Spin up a local k3d cluster suitable for end-to-end work.
 e2e-up:
     k3d cluster create apprafter-dev \
