@@ -217,21 +217,34 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //    until a CNI installs. Cilium DaemonSet tolerates the
     //    not-ready taint so it schedules on the not-ready
     //    node and flips it to Ready.
-    helm.repo_add("cilium", "https://helm.cilium.io/")?;
-    let cilium_values_file =
-        write_tempfile_with("apprafter-cilium-loader-values-", CILIUM_VALUES_YAML)?;
-    helm.upgrade_install(&HelmUpgradeArgs {
-        release: "cilium".into(),
-        chart: "cilium/cilium".into(),
-        version: Some(CILIUM_CHART_VERSION.into()),
-        namespace: "kube-system".into(),
-        values_path: cilium_values_file.path().to_path_buf(),
-        kubeconfig_path: kubeconfig_path.to_path_buf(),
-        set_values: cilium_set_overrides(),
-    })?;
+    // `APPRAFTER_BOOTSTRAP_SKIP_CILIUM` leaves the cluster's existing
+    // CNI in place instead of installing Cilium (and disables the
+    // platform-stack chart's Cilium component too — see
+    // `render_root_application`). Used by the k3d e2e: Cilium's eBPF
+    // datapath converges pathologically slowly on k3d-in-CI (~10 min,
+    // independent of single/dual-stack), so the e2e runs on k3d's
+    // default flannel + kube-proxy to exercise the GitOps + migration
+    // logic fast. Cilium itself is validated on real hardware by the
+    // nightly Hetzner e2e/mvp.sh. NEVER set on a real cluster — the
+    // platform expects Cilium (kube-proxy replacement, L2, NetworkPolicy).
+    if !bootstrap_skip_cilium() {
+        helm.repo_add("cilium", "https://helm.cilium.io/")?;
+        let cilium_values_file =
+            write_tempfile_with("apprafter-cilium-loader-values-", CILIUM_VALUES_YAML)?;
+        helm.upgrade_install(&HelmUpgradeArgs {
+            release: "cilium".into(),
+            chart: "cilium/cilium".into(),
+            version: Some(CILIUM_CHART_VERSION.into()),
+            namespace: "kube-system".into(),
+            values_path: cilium_values_file.path().to_path_buf(),
+            kubeconfig_path: kubeconfig_path.to_path_buf(),
+            set_values: cilium_set_overrides(),
+        })?;
+    }
 
     // 0b. Node MUST reach Ready before step 1 — otherwise the
-    //     Argo CD pre-install hook would still be Pending.
+    //     Argo CD pre-install hook would still be Pending. (With
+    //     skip-Cilium the existing CNI keeps the node Ready already.)
     kubectl.wait_for_condition(
         "node --all",
         None,
@@ -409,6 +422,16 @@ fn cilium_set_overrides() -> Vec<String> {
     }
 }
 
+/// Is `APPRAFTER_BOOTSTRAP_SKIP_CILIUM` set? When it is, the bootstrap
+/// leaves the cluster's existing CNI in place (no loader Cilium
+/// install) and disables the platform-stack chart's Cilium component.
+/// k3d-e2e-only — see the call site for the rationale.
+fn bootstrap_skip_cilium() -> bool {
+    std::env::var("APPRAFTER_BOOTSTRAP_SKIP_CILIUM")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
 /// One CR, no templating engine — the input space (repo + version)
 /// is two strings; string interpolation is clearer than dragging
 /// in `serde_yaml` for an 18-line document.
@@ -420,11 +443,15 @@ fn cilium_set_overrides() -> Vec<String> {
 /// the Argo CD child Application — Argo CD doesn't self-prune,
 /// preventing the chicken-and-egg foot-gun.
 pub(crate) fn render_root_application(repo_url: &str, chart_version: &str) -> String {
-    // Single-stack (IPv4-only) override for the Argo-CD-adopted
-    // platform-stack chart — disables IPv6 on its Cilium component so a
-    // later sync does not revert the loader's single-stack Cilium back
-    // to dual-stack. Mirrors the loader `--set` (see `cilium_ipv4_only`).
-    let helm_block = if cilium_ipv4_only() {
+    // Override for the Argo-CD-adopted platform-stack chart, mirroring
+    // the loader knobs so a later chart sync does not undo them:
+    //   - skip-Cilium  → disable the chart's Cilium component entirely
+    //     (the cluster keeps its existing CNI);
+    //   - IPv4-only    → set ipv6.enabled=false on the chart's Cilium
+    //     so it is not reverted to dual-stack.
+    let helm_block = if bootstrap_skip_cilium() {
+        "\n    helm:\n      valuesObject:\n        components:\n          cilium:\n            enabled: false"
+    } else if cilium_ipv4_only() {
         "\n    helm:\n      valuesObject:\n        components:\n          cilium:\n            values:\n              ipv6:\n                enabled: false"
     } else {
         ""

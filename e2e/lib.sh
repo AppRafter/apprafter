@@ -98,57 +98,40 @@ k3d_up() {
     else
         k3d_bin="nix run nixpkgs#k3d --"
     fi
-    # The k3s flags MUST mirror the real Tier-1 cluster's k3s install
-    # (cli-providers/.../user_data.rs) so Cilium can take over the CNI:
-    #   --flannel-backend=none  — k3s flannel-vxlan otherwise claims
-    #     UDP 8472, the same port Cilium's cilium_vxlan needs; without
-    #     it the cilium-agent crash-loops on "address already in use".
-    #   --disable-network-policy — k3s kube-router conflicts with
-    #     Cilium's own NetworkPolicy enforcement (dueling iptables).
-    #   --disable-kube-proxy — Cilium's eBPF kubeProxyReplacement
-    #     (k8sServiceHost 127.0.0.1:6443 reaches the node-local API)
-    #     takes over service routing.
-    # traefik + servicelb are replaced by Gateway API / Cilium L2.
-    #
-    # SINGLE-STACK (IPv4-only). Production Tier-1 is dual-stack (ADR
-    # 0017), but k3d-in-CI cannot provide real IPv6 — its ULA IPv6 does
-    # not route, which makes Cilium's dual-stack eBPF datapath converge
-    # pathologically slowly (~10 min vs ~1 min). So the e2e runs
-    # single-stack and passes APPRAFTER_CILIUM_IPV4_ONLY to
-    # cluster-bootstrap (which sets ipv6.enabled=false on Cilium in both
-    # the loader and the adopted platform-stack chart). Dual-stack is
+    # Default CNI (flannel + kube-proxy), NOT Cilium. Cilium's eBPF
+    # datapath converges pathologically slowly on k3d-in-CI (~10 min,
+    # independent of single/dual-stack), so the e2e runs cluster-bootstrap
+    # with APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 (see bootstrap_with_retry):
+    # the GitOps + migration logic the e2e actually exercises needs only
+    # a working CNI, and k3d's default flannel + kube-proxy is fast and
+    # reliable. Cilium itself (kube-proxy replacement, dual-stack, L2) is
     # validated on real hardware by the nightly Hetzner e2e/mvp.sh.
+    # Only traefik is disabled — it would clash with the platform's
+    # Gateway API on ports 80/443; flannel, kube-proxy and servicelb stay.
     # shellcheck disable=SC2086
     $k3d_bin cluster create "$cluster_name" \
         --servers 1 --agents 0 \
         --port "8080:80@loadbalancer" \
         --port "8443:443@loadbalancer" \
-        --k3s-arg "--flannel-backend=none@server:0" \
-        --k3s-arg "--disable-network-policy@server:0" \
-        --k3s-arg "--disable-kube-proxy@server:0" \
-        --k3s-arg "--disable=traefik@server:0" \
-        --k3s-arg "--disable=servicelb@server:0"
+        --k3s-arg "--disable=traefik@server:0"
     printf '  k3d cluster %s is ready. kubectl context: k3d-%s\n' \
         "$cluster_name" "$cluster_name"
 }
 
 # ---------------------------------------------------------------
 # bootstrap_with_retry
-#   Runs `apprafter cluster-bootstrap` single-stack (IPv4-only) — see
-#   k3d_up for why. With single-stack Cilium converges in ~1 min, so
-#   the first attempt normally succeeds. The retry is a cheap safety
-#   net: cluster-bootstrap is idempotent, so on failure wait for the
-#   Cilium pod to be Ready, clear any half-installed Argo CD release,
-#   and run again. Requires $KUBECONFIG exported (kubectl/helm).
+#   Runs `apprafter cluster-bootstrap` with APPRAFTER_BOOTSTRAP_SKIP_CILIUM
+#   so it leaves k3d's default CNI in place (see k3d_up for why). That
+#   makes the bootstrap fast + reliable, so the retry is just a cheap
+#   safety net (cluster-bootstrap is idempotent). Requires $KUBECONFIG
+#   exported (kubectl/helm).
 # ---------------------------------------------------------------
 bootstrap_with_retry() {
-    export APPRAFTER_CILIUM_IPV4_ONLY=1
+    export APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1
     if apprafter cluster-bootstrap; then
         return 0
     fi
-    printf '  first cluster-bootstrap failed; waiting for Cilium, then retrying\n' >&2
-    kubectl -n kube-system wait --for=condition=Ready pod \
-        -l k8s-app=cilium --timeout=8m || true
+    printf '  cluster-bootstrap failed; clearing any partial argocd release and retrying\n' >&2
     helm -n argocd uninstall argocd >/dev/null 2>&1 || true
     apprafter cluster-bootstrap
 }
