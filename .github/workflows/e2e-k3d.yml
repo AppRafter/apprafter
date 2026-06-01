@@ -96,9 +96,15 @@ jobs:
         # the ip6tables modules by default, so the cilium-agent
         # crash-loops with "could not load module ip6_tables". Load
         # them on the host so they are available inside the k3d nodes.
+        # NOTE: `modprobe -a` — without it, `modprobe ip6_tables
+        # ip6table_mangle ...` loads ONLY the first module and treats
+        # the rest as parameters, so ip6table_mangle stayed unloaded
+        # and the agent still crashed on it.
         run: |
-          sudo modprobe ip_tables iptable_mangle iptable_raw iptable_filter
-          sudo modprobe ip6_tables ip6table_mangle ip6table_raw ip6table_filter
+          sudo modprobe -a \
+            ip_tables iptable_mangle iptable_raw iptable_filter \
+            ip6_tables ip6table_mangle ip6table_raw ip6table_filter
+          lsmod | grep -E 'ip6?table' || true
 
       - name: Install just
         # `just e2e` is the suite entrypoint (single source of truth,
