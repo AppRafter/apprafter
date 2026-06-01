@@ -109,8 +109,20 @@ k3d_up() {
     #     (k8sServiceHost 127.0.0.1:6443 reaches the node-local API)
     #     takes over service routing.
     # traefik + servicelb are replaced by Gateway API / Cilium L2.
+    #
+    # Dual-stack (ADR 0017): the production Cilium config enables IPv6,
+    # so the cilium-agent blocks on "required IPv6 PodCIDR not available"
+    # until the node carries one. k3s only allocates an IPv6 PodCIDR
+    # when (a) cluster-cidr/service-cidr are dual-stack (the exact pair
+    # from user_data.rs CLUSTER_CIDR_DUAL_STACK / SERVICE_CIDR_DUAL_STACK)
+    # AND (b) the node itself has an IPv6 address — so k3d runs on a
+    # pre-created IPv6-enabled docker network.
+    local net="k3d-${cluster_name}-net"
+    docker network create --ipv6 --subnet "fd00:dead:42::/64" "$net" \
+        >/dev/null 2>&1 || true
     # shellcheck disable=SC2086
     $k3d_bin cluster create "$cluster_name" \
+        --network "$net" \
         --servers 1 --agents 0 \
         --port "8080:80@loadbalancer" \
         --port "8443:443@loadbalancer" \
@@ -118,7 +130,9 @@ k3d_up() {
         --k3s-arg "--disable-network-policy@server:0" \
         --k3s-arg "--disable-kube-proxy@server:0" \
         --k3s-arg "--disable=traefik@server:0" \
-        --k3s-arg "--disable=servicelb@server:0"
+        --k3s-arg "--disable=servicelb@server:0" \
+        --k3s-arg "--cluster-cidr=10.42.0.0/16,fd00:42::/64@server:0" \
+        --k3s-arg "--service-cidr=10.43.0.0/16,fd00:43::/112@server:0"
     printf '  k3d cluster %s is ready. kubectl context: k3d-%s\n' \
         "$cluster_name" "$cluster_name"
 }
@@ -139,6 +153,9 @@ k3d_down() {
     # `k3d cluster delete` exits 0 even when the cluster is absent.
     # shellcheck disable=SC2086
     $k3d_bin cluster delete "$cluster_name" || true
+    # Remove the IPv6 network k3d_up created (k3d only deletes networks
+    # it created itself, not a pre-existing `--network`).
+    docker network rm "k3d-${cluster_name}-net" >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------------------------------
