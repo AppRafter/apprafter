@@ -89,6 +89,17 @@ jobs:
           curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
           k3d version
 
+      - name: Load iptables kernel modules for Cilium
+        # Cilium's datapath sets up IPv4 + IPv6 iptables rules (the
+        # production config is dual-stack, ADR 0017). The k3d nodes
+        # share the runner's kernel, but ubuntu-latest does not load
+        # the ip6tables modules by default, so the cilium-agent
+        # crash-loops with "could not load module ip6_tables". Load
+        # them on the host so they are available inside the k3d nodes.
+        run: |
+          sudo modprobe ip_tables iptable_mangle iptable_raw iptable_filter
+          sudo modprobe ip6_tables ip6table_mangle ip6table_raw ip6table_filter
+
       - name: Install just
         # `just e2e` is the suite entrypoint (single source of truth,
         # matches local `just e2e`). `just` is not on ubuntu-latest by
