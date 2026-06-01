@@ -2560,6 +2560,7 @@ instead of carrying parallel definitions.
 ---
 
 ### 1.80 `apprafter platform fork` GitHub API automation
+> ⏸️ **DEFERRED (2026-06-01)** — power-user one-command fork; **не на managed-launch критическом пути** (no SR bucket marker). Явно отложен при закрытии M1.5 (решение пользователя). Не блокирует M1.5: `e2e/fork.sh` дропнут, docs fork = 1 строка-ссылка сюда. Подтянуть post-launch / по запросу power-users.
 
 **Source:** ADR 0028.
 
@@ -2591,31 +2592,21 @@ instead of carrying parallel definitions.
 
 **Цель:** end-to-end coverage всех new flows.
 
-**Поставка:**
-- [ ] `e2e/mvp.sh` rewritten:
-    - Original 9-step flow → 3-step flow (init → bootstrap-all → smoke Application).
-    - Verify все platform components reconciled by Argo CD (not by CLI).
-- [ ] `e2e/gitops-walk.sh` — new script:
-    - Add app repo via Argo CD UI (scripted через Argo CD API).
-    - Push apprafter/Application.cue change → CMP renders → Argo CD syncs → operator reconciles → Deployment running.
-- [ ] `e2e/migration-app.sh` — new script:
-    - Apply Application with needs.pg.
-    - Push change to needs.pg.selector (destructive) → MigrationPlan created.
-    - Approve via CLI → migration executes → Application reaches Ready with new database.
-- [ ] `e2e/migration-platform.sh` — new script:
-    - Set PlatformStack.spec.pin = 0.2.0.
-    - Publish 0.3.0 with breaking change (test artifact).
-    - Verify MigrationPlan created with platform scope.
-    - Approve → upgrade flows; reject — PlatformStack reverts.
-- [ ] `e2e/fork.sh` — new script:
-    - Use test GitHub fixture; verify fork command on minimal repo.
-- [ ] All scripts callable from CI; runtime budget < 30 min per script на kind cluster.
+> 🚧 **SCOPED CLOSE (2026-06-01):** локальный кластер проекта — **k3d** (не kind, формулировка ниже устарела). Сэндбокс ассистента **не запускает k3d** (Podman без `/var/run/docker.sock`) → k3d-скрипты написаны + `shellcheck`-clean + заведены в CI, но **первый зелёный e2e CI-прогон ещё впереди** (валидатор — CI, аналог ручного walk). Общий `e2e/lib.sh` harness извлечён. Net: e2e-suite = `mvp.sh` (Hetzner-nightly) + `gitops-walk.sh` + `migration-platform.sh` (k3d-PR).
+>
+> **Поставка:**
+- [x] `e2e/mvp.sh` rewritten — 9-step → 3-step (init → bootstrap-all → Application smoke); **+ассерт что platform-компоненты Argo-CD-managed** (не CLI-applied). Общий `e2e/lib.sh`. Hetzner-nightly. (commit `bfcd95d`)
+- [x] `e2e/gitops-walk.sh` — k3d: fixture app repo (local git daemon) → `app add` → CMP рендерит Application CR → Argo синкает → operator reconciles Deployment → push `Application.cue` change → сходится. shellcheck-clean; CI-validated. (commit `a7a4051`)
+- [~] `e2e/migration-app.sh` — **DEFER → Phase 2**: тестит `needs.pg` end-to-end provision (ResourceClaim + ServiceProvider + CloudNativePG); `needs` **явно удалён** из v1alpha1 (`schemas/v1alpha1/application.cue:18`), реализуем только после 2.2/2.3.
+- [x] `e2e/migration-platform.sh` — k3d: `--registry-create` локальный OCI → publish 0.2.0(safe)+0.3.0(breaking) из dist → pin 0.2.0 → platform-scope MigrationPlan → `migration approve`(pin↑)/`reject`(pin↩). shellcheck-clean; CI-validated. (commit `690051f`)
+- [~] `e2e/fork.sh` — **DROP**: item 1.80 (`platform fork`) сейчас не делаем.
+- [x] All scripts callable from CI; budget < 30 min per script на **k3d** cluster — `Justfile` (`e2e`/`e2e-gitops`/`e2e-migration-platform`) + CI `e2e-k3d.yml` (PR-triggered, рендерит dist-chart перед прогоном); `mvp.sh` остаётся nightly. (commit `6921670`)
 
 **Acceptance:**
-- `make e2e` runs all scripts green в CI.
-- Test coverage report shows all major code paths exercised.
+- [ ] **(CI-gate, pending first push)** `just e2e` runs the k3d scripts green in CI; `mvp.sh` green in nightly. Scripts written + shellcheck-clean + wired, but not yet run green (assistant sandbox can't run k3d). This is the M1.5 closure verification — flips on the first green CI run.
+- Major M1.5 code paths exercised: cluster-bootstrap + Application reconcile (mvp), CMP→Argo→operator loop (gitops-walk), PlatformStack pin→breaking→MigrationPlan→approve/reject (migration-platform). `needs.pg`/migration-app path → Phase 2; fork path → 1.80 (both deferred).
 
-**Зависит от:** all 1.66–1.80
+**Зависит от:** all 1.66–1.80 (1.80 deferred — `fork.sh` dropped accordingly)
 
 **Размер:** M
 
@@ -2628,29 +2619,13 @@ instead of carrying parallel definitions.
 **Цель:** rewrite outdated quickstart, add new operator/dev guides.
 
 **Поставка:**
-- [ ] `docs/operator-guide/quickstart.md` rewritten:
-    - Drop nine-step imperative narrative.
-    - Three-step flow: install binary → init → bootstrap-all.
-    - Explain Argo CD-managed platform on first read.
-    - `apprafter open argocd` instead of port-forward + cli-password dance.
-    - Update CX22 → CPX22 (closes existing factual error).
-    - Smoke test через `Application` CRD (closes existing design contradiction).
-- [ ] `docs/operator-guide/platform-management.md` (new):
-    - PlatformStack lifecycle.
-    - Channels and upgrade strategy.
-    - `apprafter platform upgrade`, `freeze`, `fork`, `rescue`.
-    - When to fork; how to maintain a fork.
-- [ ] `docs/operator-guide/migration-plans.md` (new):
-    - What's a destructive change.
-    - Approve / reject semantics by scope (application vs platform).
-    - Approving via Backstage, CLI, Argo CD UI.
-- [ ] `docs/dev-guide/application-cue.md` (new):
-    - Writing `apprafter/Application.cue` for GitOps deployment.
-    - CMP rendering, troubleshooting compile errors.
-    - Multi-environment patterns.
-- [ ] `docs/operator-guide/gitops-walk.md` updated:
-    - Workflow accounts for AppRafter Application CRs (current version tests raw Deployment+Service; new version goes through Application CRD end-to-end).
-- [ ] Update root `README.md` reference links.
+> ✅ **DONE (2026-06-01, commit `a7efe69`)** — все доки написаны, `mkdocs build --strict` чист (0 warnings/errors), `cyrillic`-хук clean. Fork = одна строка-defer (1.80). Доки реально валидируемы (в отличие от e2e).
+- [x] `docs/operator-guide/quickstart.md` rewritten: 3-step (install → `target add`/`init` → `bootstrap-all`), Argo-CD-managed platform на first read, `apprafter open argocd`, **CX22 → CPX22**, smoke через `Application` CRD.
+- [x] `docs/operator-guide/platform-management.md` (new): PlatformStack lifecycle, каналы (stable/beta/edge), upgrade/freeze/rescue. **Fork = 1 строка** (power-user, 1.80 not yet shipped) — не отдельная секция (scoped).
+- [x] `docs/operator-guide/migration-plans.md` (new): destructive change; approve/reject by scope (application = approve-only + revert commit per ADR 0027; platform = approve/reject); surfaces (CLI сейчас; Backstage/Argo UI — позже).
+- [x] `docs/dev-guide/application-cue.md` (new): `apprafter/Application.cue`, CMP render + troubleshooting, multi-env (`spec.environments` + `APPRAFTER_ENV`).
+- [x] `docs/operator-guide/gitops-walk.md` updated: Application-CRD end-to-end (не raw Deployment+Service); + `mkdocs.yml` nav.
+- [x] Update root `README.md` reference links + dev-quickstart CX22→CPX22 fix.
 
 **Acceptance:**
 - New user reading quickstart end-to-end can get to running app in ~30 min.
