@@ -3,7 +3,7 @@
 
 # AppRafter
 
-**An opinionated, vertically-integrated Platform-as-a-Service on Kubernetes.**
+**An opinionated, vertically integrated Platform-as-a-Service on Kubernetes.**
 
 **One `Application` manifest, designed to run unchanged from a €5 VDS to multi-node production — an open-source core, with an optional managed cloud on top.**
 
@@ -22,7 +22,7 @@ AppRafter fills the gap between a hosted PaaS and vanilla Kubernetes:
 
 - **Hosted PaaS** — easy to start, but tied to one vendor, costly at scale, and not self-hostable.
 - **Vanilla Kubernetes** — portable and scalable, but the cognitive load is high and the ecosystem is fragmented.
-- **AppRafter** — one `Application` manifest, four hardware tiers, GitOps as the only control surface, and no vendor lock-in at any layer. Deploy via Argo CD and the `apprafter` CLI, with destructive operations gated by a `MigrationPlan` CRD rather than an unguarded `kubectl delete`. (An MCP interface, so an AI agent can drive deploys through the same gate, is on the roadmap.)
+- **AppRafter** — one `Application` manifest, four hardware tiers, GitOps as the only control surface, and no vendor lock-in at any layer. Deploy via Argo CD and the `apprafter` CLI, with destructive operations gated by a `MigrationPlan` CRD rather than an unguarded `kubectl delete`. (An MCP interface - letting an AI agent can drive deploys through the same gate - is on the roadmap.)
 
 The platform is deliberately **opinionated** — one proven component per slot (e.g. Cilium for networking, Argo CD for GitOps) — so there is a single, well-trodden path instead of an assembly project.
 
@@ -44,7 +44,7 @@ For teams who would rather not run the ops themselves, a managed cloud is in dev
 
 Two properties follow directly from that architecture:
 
-- **Anti-vendor-lock by design.** Because the cluster will be a standalone open-source install on your own infrastructure, cancelling the subscription is designed to leave it running — you lose only the hosted convenience layer, with no migration required.
+- **Anti-vendor-lock by design.** Because the cluster will be a standalone open-source install on your own infrastructure, canceling the subscription leaves it running by design — you lose only the hosted convenience layer, with no migration required.
 - **Minimal Data Exposure.** The managed services are designed to see only metadata — manifests applied, status and audit events — never the data in your databases or your secret values.
 
 The managed cloud is planned at three levels of increasing scope — **Hosted Services** (the launch plan) → **Managed Operations** → **Turnkey Cloud** — billed per cluster. A waitlist opens at launch.
