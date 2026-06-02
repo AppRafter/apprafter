@@ -327,8 +327,11 @@ package platformstack
 	namespace: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$" | *"apprafter-system"
 
 	// `metadata.labels` of the rendered CR. The scheduler matches
-	// `claim.spec.selector` ⊆ these. Must be non-empty for the
-	// launch pg provider (carries `tier: integrated`).
+	// `claim.spec.selector` ⊆ these. Must be non-empty: beyond the
+	// scheduler needing `tier: integrated` to match, the template
+	// appends static `apprafter.io/*` labels after
+	// `{{ toYaml $sp.labels }}`, so an empty map would emit a flow
+	// `{}` followed by block keys — invalid YAML.
 	labels: [string]: string
 
 	// `spec.type` — a built-in platform-service type.

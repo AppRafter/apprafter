@@ -345,6 +345,11 @@ _valuesSchema: {
 			}
 			additionalProperties: false
 		}
+		// Unlike `appProjects` (deliberately omitted from this
+		// schema — it's umbrella-internal data), the seed shape IS
+		// validated at Helm-install time: operators may hand-author
+		// extra providers via `--set`/values, so a malformed entry
+		// should fail install rather than render a broken CR.
 		serviceProviders: {
 			type: "object"
 			patternProperties: {

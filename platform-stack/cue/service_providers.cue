@@ -28,6 +28,13 @@ _serviceProviders: {
 		config: {
 			// Coordinates of the shared CNPG Cluster the 2.4c
 			// provisioner creates lazily + owns. Not seeded here.
+			// `config` is open ({...}), so 2.4c can extend this
+			// without a schema change — it will likely add a
+			// `storageClass` (relying on the cluster-default class is
+			// a cross-tier foot-gun) and a pinned Postgres major
+			// version (CNPG pins the data-plane major via
+			// imageName/imageCatalogRef; an unpinned default drifts
+			// it across chart bumps).
 			cluster:   "platform-postgres"
 			namespace: "cnpg-system"
 			instances: int | *1
