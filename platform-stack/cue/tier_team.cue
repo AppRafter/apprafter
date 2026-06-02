@@ -31,6 +31,10 @@ tier2: #PlatformValues & {
 	tier:        2
 	channel:     "stable"
 	appProjects: _appProjects
+	serviceProviders: _serviceProviders & {
+		// Team tier runs a 3-instance HA Postgres cluster.
+		"pg-integrated": config: instances: 3
+	}
 	components: _components & {
 		cilium: values: hubble: {
 			enabled: true
