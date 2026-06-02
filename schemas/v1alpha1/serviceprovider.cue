@@ -4,10 +4,14 @@ package v1alpha1
 
 // ServiceProvider declares a backend implementation for a platform-
 // service type (spec §3.2). Multiple providers may coexist; a
-// ResourceClaim selects among them by matching `spec.selector`
-// against `metadata.labels` (the 2.3 scheduler). Namespaced — the
-// platform's providers live in `apprafter-system`; the scheduler
+// `ResourceClaim`'s `spec.selector` is matched against each
+// ServiceProvider's `metadata.labels` (the 2.3 scheduler). Namespaced
+// — the platform's providers live in `apprafter-system`; the scheduler
 // matches claims from app namespaces against them cross-namespace.
+//
+// There is intentionally no spec-level label bag: selector matching
+// uses the provider's `metadata.labels` directly — do not add a
+// `spec.labels` field.
 //
 // `config` is backend-defined and intentionally untyped here — the
 // CRD declares `x-kubernetes-preserve-unknown-fields: true` on it.
