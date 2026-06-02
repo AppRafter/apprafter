@@ -2721,18 +2721,29 @@ instead of carrying parallel definitions.
 ### 2.4 needs.pg → CloudNativePG
 > 🏁 SR: A · order 3 (Phase-2 minimum) — needs.pg, the launch database
 
-**Поставка:**
-- [ ] Установка CloudNativePG operator как platform-service.
-- [ ] `pg-integrated` ServiceProvider управляет одним shared CNPG-кластером.
-- [ ] На каждый ResourceClaim: создание DB + role + secret с DSN.
-- [ ] `Application` с `needs.pg` → оператор генерирует ResourceClaim → DSN в env.
-- [ ] Удаление Application → grace-period 7 дней → удаление DB (через Soft-delete CRD `RetainedClaim`).
+**Первая user-facing фича Фазы 2** — закрывается подробным ручным walk'ом на реальном Tier-1 (2.4g, см. [[feedback_phase_closure_validation]] / [[feedback_walk_ux_coverage]]). NOTE: 2.4 ≠ закрытие Фазы 2 — НЕ флипать §6 M2 на 2.4g (M2 закрывается после 2.5/2.6/2.10–2.12).
+
+**Сквозной поток:** `Application.spec.base.needs.pg {selector?, size?}` → Application-контроллер генерирует дочерний `ResourceClaim` (type pg, ownerRef, дефолтный selector `{tier:integrated}` инжектится контроллером) + ставит app в новую фазу-паузу `AwaitingResourceClaim` (зеркало AwaitingMigrationApproval) → scheduler 2.3 (переиспользуется) матчит → `status.provider=pg-integrated` + `Scheduled=True` → новый 6-й контроллер `resourceclaim-provisioner` провижинит per-claim CNPG Database+role+Secret и пишет `status.ready`+`connectionSecretRef`+`Ready` под СВОИМ field manager → operator-rendering инжектит DSN (`DATABASE_URL` через secretKeyRef) в Deployment env → app коннектится. На delete: finalizer снапшотит в `RetainedClaim` (retainUntil=now+7d) → GC дропает DB+Secret после истечения.
+
+**Зафиксированные решения (с пользователем, 2026-06-02):**
+- **CNPG footprint на Tier-1 = оператор always-on, shared-кластер LAZY.** platform-stack ставит CNPG-оператор (always-on, лёгкий) + `pg-integrated` ServiceProvider CR, но НЕ сидит shared Cluster. `resourceclaim-provisioner` создаёт shared `platform-postgres` CNPG Cluster **лениво + идемпотентно на первом матченном claim'е** (единоличный owner — нет гонки контроллеров). Solo-кластеры без pg-приложений не платят за Postgres-под. Первый pg-claim имеет повышенную латентность (boot кластера ~30–60с) — её закрывает пауза-гейт `AwaitingResourceClaim`. Кластер НЕ сносится при опустошении claim'ов.
+- **Provisioner = НОВЫЙ generic-крейт `operator-controllers/resourceclaim-provisioner`** (6-й контроллер), свой field manager — НЕ расширение scheduler'а (сохраняет чистый SSA-split: scheduler владеет `status.provider`+`Scheduled`, provisioner — `ready`+`connectionSecretRef`+`Ready`). Generic, чтобы 2.5 jetstream / 2.6 redis переиспользовали крейт (dispatch по типу/backend claim'а).
+- **`needs.pg` = объект `{selector?, size?}`** на тип сервиса (закрытый enum), пере-добавляется в 4 зеркала (CUE application.cue + kube-rs ApplicationBaseSpec + OpenAPI v3 crd-application.yaml + admission webhook). `needs` был удалён на f81e350; CUE — пермиссивно, non-empty-selector / size-enum / reserved-`DATABASE_URL` → CRD+webhook.
+
+**Декомпозиция (порядок сборки):**
+- [ ] **2.4a** — CNPG-оператор как platform-stack component (`component_cloudnative-pg.cue`, ns cnpg-system, sync-wave -5, project platform-providers, tier-gating) + сид `pg-integrated` ServiceProvider (raw-manifest `source.path`). **platform-stack-only** → bump `currentVersion` 0.2.4→0.2.5 + compatibility; БЕЗ operator appVersion bump, БЕЗ cli bump, БЕЗ monorepo-тега (см. [[project_release_version_chain]]). **БЕЗ сида Cluster CR** (lazy).
+- [ ] **2.4b** — пере-добавить `needs` (4 зеркала + webhook). Чистая схема, без поведения контроллера. (CRD-изменение оператора → operator appVersion bump.)
+- [ ] **2.4c** — `resourceclaim-provisioner` контроллер: лениво создаёт+владеет shared CNPG Cluster, провижинит per-claim Database+role+Secret, пишет status.ready/connectionSecretRef. **Глубочайший unknown к дизайну 2.4c:** точный декларативный CNPG API для per-claim role+grant (CNPG `Database` CRD + managed-roles в appVersion чарта vs one-shot psql Job) — подтвердить ДО сборки.
+- [ ] **2.4d** — генерация claim'а Application'ом + пауза-гейт `AwaitingResourceClaim` (зеркало MigrationPlan-гейта). Подтвердить, что смена `needs.pg.selector` не триггерит ADR-0027 MigrationPlan-гейт на dev→prod свопе селектора (либо явно маршрутизировать через него).
+- [ ] **2.4e** — инъекция DSN в Deployment env через operator-rendering (узко под claim-backed needs.pg; НЕ полный 2.12 `claim.*`/`secret()` reference-engine).
+- [ ] **2.4f** — `RetainedClaim` CRD + finalizer-снапшот + 7-дневный grace GC-контроллер (CRD+finalizer — независимо поставляемый floor; GC — split-точка под давлением; 7-дневный таймер un-e2e-able → unit-тест retainUntil-сравнения с инжектированными часами).
+- [ ] **2.4g** — `e2e/needs-pg-walk.sh` (k3d) + **подробный ручной walk** на реальном Tier-1 + plan.md/plan-history/UNRELEASED + координированный operator+platform-stack release bump.
 
 **Acceptance:** манифест из §3.1 (parser) с `needs.pg` поднимается, в pg-кластере появляется DB, приложение коннектится.
 
 **Зависит от:** 2.3
 
-**Размер:** L
+**Размер:** L (декомпозирован в 2.4a–g; полный дизайн — память `project_2_4_needs_pg`)
 
 ---
 
