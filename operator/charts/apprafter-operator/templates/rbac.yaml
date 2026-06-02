@@ -150,6 +150,32 @@ rules:
       - watch
       - patch
       - update
+  # Phase 2.4c resourceclaim-provisioner: provisions each
+  # Scheduled pg ResourceClaim into the shared CloudNativePG
+  # cluster. It lazily SSA-applies the `platform-postgres`
+  # CNPG `Cluster` (created on the first matched pg claim),
+  # read-modify-writes the Cluster's unkeyed
+  # `spec.managed.roles` list to add a per-claim login role,
+  # and applies a declarative CNPG `Database` CR. The CNPG
+  # CRDs are installed at runtime by the `cloudnative-pg`
+  # component (plan.md 2.4a); without these verbs the
+  # provisioner 403s on its first Cluster apply and every pg
+  # claim stalls Pending. Per-claim basic-auth password
+  # Secrets (CNPG namespace) and the per-claim connection
+  # Secret (claim namespace) are covered by the cluster-wide
+  # secrets rule below.
+  - apiGroups:
+      - postgresql.cnpg.io
+    resources:
+      - clusters
+      - databases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
   # `delete` (S5): the derived-Secret GC finalizer removes the
   # cross-namespace Argo `repo-creds` + canonical
   # `dockerconfigjson` on SourceCredential deletion (no
