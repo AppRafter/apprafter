@@ -302,6 +302,24 @@ _valuesSchema: {
 			}
 			additionalProperties: false
 		}
+		serviceProviders: {
+			type: "object"
+			patternProperties: {
+				"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$": {
+					type: "object"
+					required: ["labels", "type", "backend", "config"]
+					properties: {
+						namespace: {type: "string"}
+						labels: {type: "object"}
+						type: {type: "string"}
+						backend: {type: "string"}
+						config: {type: "object"}
+						syncWave: {type: "integer"}
+					}
+				}
+			}
+			additionalProperties: false
+		}
 	}
 }
 

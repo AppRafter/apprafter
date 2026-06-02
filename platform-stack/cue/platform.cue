@@ -280,6 +280,13 @@ package platformstack
 	// name/namespace), so this is byte-equivalent on steady
 	// state, deterministically-ordered on first sync.
 	appProjects: [string]: #AppProjectSpec
+
+	// ServiceProvider CRs seeded by the umbrella so a fresh
+	// cluster has at least the launch-default backends declared.
+	// Iterated by `templates/serviceproviders.yaml` into one
+	// `kind: ServiceProvider` per entry. Empty by default; tiers
+	// set `serviceProviders: _serviceProviders`.
+	serviceProviders: [string]: #ServiceProviderSeed
 }
 
 // `#AppProjectSpec` — the small shape `templates/appprojects.
@@ -300,6 +307,46 @@ package platformstack
 		group: string
 		kind:  string
 	}]
+}
+
+// `#ServiceProviderSeed` — the small shape
+// `templates/serviceproviders.yaml` iterates. The umbrella seeds
+// one `kind: ServiceProvider` (apprafter.io/v1alpha1) per entry so
+// the 2.3 scheduler has a provider to match claims against on a
+// fresh cluster. Namespaced into `apprafter-system` (the operator's
+// namespace, where platform providers live). `labels` become the
+// CR's `metadata.labels` — the scheduler matches a claim's selector
+// as a subset of these, so the launch pg provider carries
+// `tier: integrated`. `config` is opaque (the CNPG cluster
+// coordinates the 2.4c provisioner reads); `type` mirrors the
+// closed `#PlatformServiceType` enum but is kept a plain string
+// here because the umbrella does not import the schemas module.
+#ServiceProviderSeed: {
+	// Namespace the CR lands in. Defaults to the operator's
+	// namespace; the scheduler lists providers cluster-wide.
+	namespace: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$" | *"apprafter-system"
+
+	// `metadata.labels` of the rendered CR. The scheduler matches
+	// `claim.spec.selector` ⊆ these. Must be non-empty for the
+	// launch pg provider (carries `tier: integrated`).
+	labels: [string]: string
+
+	// `spec.type` — a built-in platform-service type.
+	type: string
+
+	// `spec.backend` — implementation identifier (e.g.
+	// "cloudnative-pg").
+	backend: string
+
+	// `spec.config` — backend-specific, opaque to the umbrella.
+	config: {...}
+
+	// Argo CD sync-wave. Positive so the CR applies after the
+	// apprafter-operator child Application (wave 0) has installed
+	// the ServiceProvider CRD; paired with
+	// SkipDryRunOnMissingResource in the template for CRD-race
+	// resilience.
+	syncWave: int | *5
 }
 
 // `currentVersion` is THE single source of truth for the chart
