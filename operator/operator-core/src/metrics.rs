@@ -22,6 +22,7 @@ pub struct Metrics {
     pub reconcile_duration: HistogramVec,
     pub reconcile_errors: CounterVec,
     pub claim_unmatched_total: CounterVec,
+    pub claim_provisioned_total: CounterVec,
 }
 
 impl Default for Metrics {
@@ -70,6 +71,15 @@ impl Metrics {
         )
         .expect("CounterVec must build with a non-empty name");
 
+        let claim_provisioned_total = CounterVec::new(
+            opts!(
+                "apprafter_claim_provisioned_total",
+                "ResourceClaims provisioned to a backend"
+            ),
+            &["backend", "namespace"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
         registry
             .register(Box::new(reconcile_total.clone()))
             .expect("reconcile_total registers cleanly");
@@ -82,6 +92,9 @@ impl Metrics {
         registry
             .register(Box::new(claim_unmatched_total.clone()))
             .expect("claim_unmatched_total registers cleanly");
+        registry
+            .register(Box::new(claim_provisioned_total.clone()))
+            .expect("claim_provisioned_total registers cleanly");
 
         Self {
             registry,
@@ -89,6 +102,7 @@ impl Metrics {
             reconcile_duration,
             reconcile_errors,
             claim_unmatched_total,
+            claim_provisioned_total,
         }
     }
 
@@ -125,6 +139,9 @@ mod tests {
         m.claim_unmatched_total
             .with_label_values(&["ResourceClaim", "demo", "no_matching_provider"])
             .inc();
+        m.claim_provisioned_total
+            .with_label_values(&["cloudnative-pg", "demo"])
+            .inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -133,6 +150,7 @@ mod tests {
         );
         assert!(body.contains("apprafter_reconcile_errors_total"), "{body}");
         assert!(body.contains("apprafter_claim_unmatched_total"), "{body}");
+        assert!(body.contains("apprafter_claim_provisioned_total"), "{body}");
     }
 
     #[test]
