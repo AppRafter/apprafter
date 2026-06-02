@@ -5,6 +5,7 @@ pub mod server;
 pub mod validator;
 pub mod validator_migrationplan;
 pub mod validator_platformstack;
+pub mod validator_serviceprovider;
 pub mod validator_sourcecredential;
 
 pub use server::build_router;
