@@ -1701,6 +1701,23 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.7": {
+	change:          "safe"
+	operatorVersion: "v0.2.7"
+	notes: """
+		2.4c — resourceclaim-provisioner controller. Additive: a 6th
+		in-cluster controller that provisions each Scheduled pg
+		ResourceClaim into the shared CloudNativePG cluster
+		(created lazily on the first claim) — per-claim role + database
+		+ a connection Secret with DATABASE_URL — and writes
+		status.ready / connectionSecretRef / Ready under its own field
+		manager. New RBAC: postgresql.cnpg.io clusters+databases CRUD,
+		secrets create/update. No CRD change, no data migration — safe
+		to auto-sync. The Application still does not generate claims
+		until 2.4d, so the provisioner is a no-op on a fresh cluster.
+		"""
+	references: ["plan.md 2.4c"]
+}
 compatibility: "0.2.6": {
 	change:          "safe"
 	operatorVersion: "v0.2.6"
