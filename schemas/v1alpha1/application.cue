@@ -15,9 +15,9 @@ package v1alpha1
 //   - environments — per-environment overrides via CUE unification;
 //                see spec.md §3.1 and ADR 0004.
 //
-// Fields removed from the v1alpha1 surface: `needs`, `autoscale`,
-// `confidential`. They re-appear in their owning subphases (2.x for
-// ResourceClaim wiring, 4.x for confidential workloads).
+// Fields removed from the v1alpha1 surface: `autoscale`,
+// `confidential`. They re-appear in their owning subphases (4.x
+// for confidential workloads; autoscale with KEDA in 2.6a).
 #Application: {
 	#TypeMeta
 	kind:     "Application"
@@ -57,4 +57,35 @@ package v1alpha1
 
 	// Literal string values only — no secret refs in v1alpha1.
 	env?: [string]: string
+
+	// Declared platform-service dependencies, keyed by service
+	// type. Each entry becomes a `ResourceClaim` of that type —
+	// the Application controller generates the claims (2.4d wires
+	// pg; 2.5 jetstream; 2.6 redis). Settable on `base` and
+	// overridable per `environments[*]` (spec §3.1: dev vs prod
+	// may select different providers). `needs: {pg: {}}` is valid
+	// — tier-aware platform defaults supply selector + size.
+	//
+	// The key map is permissive in CUE (a non-enum key is allowed
+	// here but rejected by the admission webhook), per the
+	// CRD/webhook-owns-enforcement split. Matching keys' VALUES
+	// are constrained to `#ServiceNeed`.
+	needs?: [#PlatformServiceType]: #ServiceNeed
+}
+
+// #ServiceNeed — one declared platform-service dependency under
+// `Application.spec.*.needs`. The 2.4d controller turns each entry
+// into a `ResourceClaim` of the keyed type; the 2.3 scheduler
+// routes it to a `ServiceProvider` via `selector`.
+#ServiceNeed: {
+	// Label selector matched against `ServiceProvider.metadata.labels`.
+	// Optional in the manifest — the controller injects a default
+	// `{tier: integrated}` when absent (2.4d). The generated
+	// `ResourceClaim` requires a non-empty selector (CRD
+	// `minProperties: 1`); the injected default guarantees it.
+	selector?: [string]: string
+
+	// Requested size class. Optional — tier-aware platform defaults
+	// fill it when absent (spec §3.1: `needs.pg: {}` → tier sizing).
+	size?: #Size
 }

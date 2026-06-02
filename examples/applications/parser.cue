@@ -23,6 +23,9 @@ parser: v1alpha1.#Application & {
 			env: {
 				LOG_LEVEL: "info"
 			}
+			needs: {
+				pg: {selector: {tier: "integrated"}}
+			}
 		}
 		environments: {
 			dev: {
@@ -34,6 +37,9 @@ parser: v1alpha1.#Application & {
 			}
 			prod: {
 				replicas: 3
+				needs: {
+					pg: {selector: {tier: "integrated"}, size: "small"}
+				}
 			}
 		}
 	}
