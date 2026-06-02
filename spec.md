@@ -4,7 +4,7 @@
 > **Domain:** `apprafter.dev`.
 > **Status:** Phase 1 (Tier 1 single-node MVP) delivered as `v0.1.0-mvp` on 2026-05-08; Phases 2–8 in active design. See `plan.md` for the phase ledger.
 > **Audience:** Architecture decisions, contributors onboarding, design rationale.
-> **Revision:** 9 (SourceCredential CRD for private-repo credentials — ADR 0039: a config-only credential-reference CRD (§3.12) carrying zero secret material, the material sealed (SealedSecrets on Tier 1, OpenBao on Tier 2); the Application Operator derives both the Argo CD git repo-cred and the workload registry pull-secret from one source and reports validity in status; the `repo creds` CLI becomes a thin SourceCredential front-end; destructive credential change is gated via MigrationPlan. Rev 8: Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
+> **Revision:** 10 (M1.5 — Self-managing platform rethink — **closed** 2026-06-02: §6 milestone box flipped after the GitOps loop went green on the k3d e2e gate (CUE CMP render → Argo CD sync → operator reconcile → Deployment, with source-change propagation); `apprafter platform fork` (item 1.80), the Backstage MigrationPlan plugin (M3), and `platform channel` (M2) deferred; platform-scope MigrationPlan gate covered by operator unit + integration tests, real-infra migration e2e a nightly-Hetzner follow-up. No architecture change — the M1.5 design was actualized in Rev 7. Rev 9: SourceCredential CRD for private-repo credentials — ADR 0039: a config-only credential-reference CRD (§3.12) carrying zero secret material, the material sealed (SealedSecrets on Tier 1, OpenBao on Tier 2); the Application Operator derives both the Argo CD git repo-cred and the workload registry pull-secret from one source and reports validity in status; the `repo creds` CLI becomes a thin SourceCredential front-end; destructive credential change is gated via MigrationPlan. Rev 8: Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
 
 ---
 
@@ -1270,27 +1270,29 @@ Subsequent to M1 delivery, ADRs 0025–0029 reframe `cluster-bootstrap` as a min
 - [x] Backstage with minimal Application plugin (status view) (v0.1.18 → v0.1.20 + v0.1.33 → v0.1.36)
 - [x] One golden-path template (Bun HTTP service) (v0.1.37 → v0.1.38, OneBun-based)
 
-### Milestone M1.5 — Self-managing platform rethink
+### Milestone M1.5 — Self-managing platform rethink ✅
 
 **Target:** the platform stack reconciles itself through Argo CD from a versioned OCI chart. `cluster-bootstrap` is a minimal loader. User app repositories sync via Argo CD with a CUE CMP plugin. PlatformStack CRD provides declarative version control. MigrationPlan unified across application and platform scopes.
 
-- [ ] `platform-stack` CUE source in monorepo with CI publishing to `ghcr.io/apprafter/platform-stack` (signed, GitHub Release mirror)
-- [ ] Minimal `cluster-bootstrap`: install Argo CD via Helm, apply root Application
-- [ ] All platform components wrapped as templated Argo CD Applications inside the umbrella chart
-- [ ] Argo CD self-management with `prune: false` and MigrationPlan-gated upgrades
-- [ ] CUE CMP sidecar (`ghcr.io/apprafter/argocd-cue-cmp`) shipped as part of the chart
-- [ ] `PlatformStack` CRD + `PlatformController` (channels, autoUpgrade, overrides, status)
-- [ ] Unified `MigrationPlan` CRD with `scope: application | platform` discriminator
-- [ ] `MigrationController` with strategy dispatch for both scopes
-- [ ] CLI thin wrappers: `apprafter platform {status,upgrade,channel,freeze,fork,rescue}`
-- [ ] CLI thin wrappers: `apprafter migration {list,approve,reject}`
-- [ ] `apprafter open <ui>` for UI access with port-forward + auto-credentials
-- [ ] `apprafter platform fork` for power-user OCI fork bootstrap
-- [ ] Backstage plugin: MigrationPlan queue view (deferred to M3 if needed for timing)
-- [ ] CLI npm-style version check (own version vs upstream releases)
-- [ ] e2e/mvp.sh updated to exercise the new path end to end
+- [x] `platform-stack` CUE source in monorepo with CI publishing to `ghcr.io/apprafter/platform-stack` (signed, GitHub Release mirror)
+- [x] Minimal `cluster-bootstrap`: install Argo CD via Helm, apply root Application
+- [x] All platform components wrapped as templated Argo CD Applications inside the umbrella chart
+- [x] Argo CD self-management with `prune: false` and MigrationPlan-gated upgrades
+- [x] CUE CMP sidecar (`ghcr.io/apprafter/argocd-cue-cmp`) shipped as part of the chart
+- [x] `PlatformStack` CRD + `PlatformController` (channels, autoUpgrade, overrides, status)
+- [x] Unified `MigrationPlan` CRD with `scope: application | platform` discriminator
+- [x] `MigrationController` with strategy dispatch for both scopes
+- [x] CLI thin wrappers: `apprafter platform {status,upgrade,freeze,rescue}` (`channel` deferred to M2 pending stable/edge divergence; `fork` below)
+- [x] CLI thin wrappers: `apprafter migration {list,approve,reject}`
+- [x] `apprafter open <ui>` for UI access with port-forward + auto-credentials
+- [ ] `apprafter platform fork` for power-user OCI fork bootstrap — deferred (power-user path, no launch dependency)
+- [ ] Backstage plugin: MigrationPlan queue view — deferred to M3 (portal track)
+- [x] CLI npm-style version check (own version vs upstream releases)
+- [x] e2e/mvp.sh updated to exercise the new path end to end
 
 **Acceptance:** `apprafter bootstrap-all` on a fresh Hetzner account produces a working Tier 1 cluster with all platform components reconciled by Argo CD. The Argo CD UI shows the umbrella platform Application plus child Applications for each component, all Healthy. `kubectl get platformstack default` shows the resolved version and current status. `apprafter open argocd` opens the UI with credentials filled. Adding a user app repo with `apprafter/Application.cue` via the Argo CD UI deploys the app end to end.
+
+**Closed 2026-06-02.** The GitOps loop is proven green on the k3d e2e gate (`e2e/gitops-walk.sh`, `e2e-k3d` workflow): `cluster-bootstrap` brings up Cilium + Argo CD + the platform-stack umbrella with `PlatformStack/default`, then `apprafter app add` → CUE CMP render → Argo sync → operator reconcile → Deployment Available, and a source change (replicas 1→2) propagates end to end. The fresh-Hetzner-account path runs nightly via `e2e/mvp.sh`. Deferred with rationale: `apprafter platform fork` (item 1.80, power-user OCI fork — no launch dependency), the Backstage MigrationPlan queue plugin (M3 portal track), and `platform channel` (M2). The platform-scope MigrationPlan gate is covered by operator unit + integration tests; a real-infra (HTTPS-registry) migration e2e is a nightly-Hetzner follow-up (the k3d local registry is plain HTTP, which the controller's HTTPS-only OCI client cannot pull).
 
 **Blocks M2** because Phase 2 ServiceProviders, ResourceClaims, and Tenant logic build on the GitOps-managed platform.
 
