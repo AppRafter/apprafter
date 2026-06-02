@@ -93,7 +93,7 @@ spec:
           type: string
           jsonPath: .status.provider
         - name: Ready
-          type: boolean
+          type: string
           jsonPath: .status.ready
         - name: Age
           type: date
