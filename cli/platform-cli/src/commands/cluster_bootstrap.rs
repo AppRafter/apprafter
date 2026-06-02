@@ -288,6 +288,24 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         kubeconfig_path,
     )?;
 
+    // 2b. Apply the AppProjects the root Application references.
+    //     The argo-cd 7.7.7 chart does NOT create AppProjects from
+    //     `configs.projects` (it has no such template — that loader
+    //     value is silently ignored); only the umbrella chart's
+    //     `templates/appprojects.yaml` renders them, and that can't
+    //     run until the root `platform` Application syncs, which needs
+    //     the `platform` project to already exist. So apply them here,
+    //     byte-identical to the umbrella output so Argo CD adopts them
+    //     cleanly on the first sync. Without this the root Application
+    //     fails `Application referencing project platform which does
+    //     not exist` and the whole bootstrap deadlocks.
+    let app_projects_file = write_tempfile_with("apprafter-app-projects-", &render_app_projects())?;
+    kubectl.apply_manifest_server_side(
+        &ManifestSource::Path(app_projects_file.path().to_path_buf()),
+        kubeconfig_path,
+        APPRAFTER_CLI_FIELD_MANAGER,
+    )?;
+
     // 3. Apply the root Application via server-side apply with
     //    field manager `apprafter-cli`. Same SSA convention as
     //    step 5's PlatformStack apply. Walk-found bug v0.1.117
@@ -420,6 +438,65 @@ fn cilium_set_overrides() -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// Render the AppProjects the bootstrap must apply before the root
+/// `platform` Application (see the call site). Byte-mirrors the
+/// umbrella chart's `templates/appprojects.yaml` output (sync-wave
+/// `-30`, the `apprafter.io/managed-by` + `source` labels, and the
+/// permissive specs of `_appProjects` in `platform-stack/cue/
+/// app_projects.cue`) so Argo CD adopts them without an SSA conflict
+/// on the first umbrella sync. Keep in sync with `_appProjects`.
+pub(crate) fn render_app_projects() -> String {
+    // `default` allows any destination server (legacy/ad-hoc);
+    // `platform` + `platform-providers` pin the in-cluster API.
+    let project = |name: &str, description: &str, server: &str| {
+        format!(
+            r#"---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {name}
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-30"
+  labels:
+    apprafter.io/managed-by: apprafter
+    apprafter.io/source: platform-stack
+spec:
+  description: {description}
+  sourceRepos:
+    - '*'
+  destinations:
+    - namespace: '*'
+      server: {server}
+  clusterResourceWhitelist:
+    - group: '*'
+      kind: '*'
+  namespaceResourceWhitelist:
+    - group: '*'
+      kind: '*'
+"#
+        )
+    };
+    format!(
+        "# SPDX-License-Identifier: FSL-1.1-Apache-2.0\n# Applied by `apprafter cluster-bootstrap`.\n{}{}{}",
+        project(
+            "default",
+            "Default project — Argo CD baseline, unrestricted (legacy + ad-hoc fallback).",
+            "'*'",
+        ),
+        project(
+            "platform",
+            "Platform components — umbrella chart payload.",
+            "https://kubernetes.default.svc",
+        ),
+        project(
+            "platform-providers",
+            "Platform service providers (CNPG, Dragonfly, NATS, Kamaji, …).",
+            "https://kubernetes.default.svc",
+        ),
+    )
 }
 
 /// Is `APPRAFTER_BOOTSTRAP_SKIP_CILIUM` set? When it is, the bootstrap
@@ -717,12 +794,15 @@ mod tests {
             "no client-side applies expected, got {applies:?}"
         );
         let ssa = kubectl.ssa_applies.borrow();
-        assert_eq!(ssa.len(), 2, "expected 2 SSA applies, got {ssa:?}");
-        match &ssa[0].0 {
+        // AppProjects (so the root App's project exists), THEN root
+        // Application, THEN PlatformStack default.
+        assert_eq!(ssa.len(), 3, "expected 3 SSA applies, got {ssa:?}");
+        match &ssa[1].0 {
             ManifestSource::Path(p) => assert_eq!(p, &root_app),
-            other => panic!("expected Path root-app at SSA[0], got {other:?}"),
+            other => panic!("expected Path root-app at SSA[1], got {other:?}"),
         }
-        assert_eq!(ssa[0].2, "apprafter-cli");
+        assert_eq!(ssa[1].2, "apprafter-cli");
+        assert_eq!(ssa[0].2, "apprafter-cli", "AppProjects applied as SSA[0]");
 
         // Waits: node Ready first (so step 1 can schedule),
         // argocd-server Available second, root Application
@@ -857,11 +937,9 @@ mod tests {
         );
         // And the SSA applies happen after the waits return; the
         // FakeKubectl records them in `ssa_applies` so the post-
-        // perform_bootstrap snapshot pins the ordering. After
-        // B.1.73 walk-fix #4 the root Application is also SSA-
-        // applied, so the count is 2 (root App then PlatformStack
-        // default).
-        assert_eq!(kubectl.ssa_applies.borrow().len(), 2);
+        // perform_bootstrap snapshot pins the ordering. Count is 3:
+        // AppProjects, root Application, then PlatformStack default.
+        assert_eq!(kubectl.ssa_applies.borrow().len(), 3);
     }
 
     #[test]
@@ -918,6 +996,20 @@ mod tests {
             Some(0),
             "node Ready wait must be the FIRST kubectl call: {waits:?}"
         );
+    }
+
+    #[test]
+    fn render_app_projects_emits_the_three_referenced_projects() {
+        let y = render_app_projects();
+        // Exactly the three projects from `_appProjects`, so the root
+        // `platform` Application's project exists at bootstrap.
+        assert_eq!(y.matches("kind: AppProject").count(), 3, "{y}");
+        assert!(y.contains("name: default"), "{y}");
+        assert!(y.contains("name: platform\n"), "{y}");
+        assert!(y.contains("name: platform-providers"), "{y}");
+        // Adopted by the umbrella on first sync — same wave + labels.
+        assert!(y.contains("argocd.argoproj.io/sync-wave: \"-30\""), "{y}");
+        assert!(y.contains("apprafter.io/managed-by: apprafter"), "{y}");
     }
 
     #[test]
@@ -1020,15 +1112,15 @@ mod tests {
         )
         .unwrap();
 
-        // Step 3 (root App) + step 5 (PlatformStack) BOTH SSA
-        // after walk-fix #4. Step 5 is the SECOND ssa entry.
+        // SSA order: AppProjects (step 2b), root App (step 3),
+        // PlatformStack (step 5). Step 5 is the THIRD ssa entry.
         let ssa = kubectl.ssa_applies.borrow();
-        assert_eq!(ssa.len(), 2);
-        match &ssa[1].0 {
+        assert_eq!(ssa.len(), 3);
+        match &ssa[2].0 {
             ManifestSource::Path(p) => assert_eq!(p, platformstack.path()),
-            other => panic!("expected Path SSA source at [1], got {other:?}"),
+            other => panic!("expected Path SSA source at [2], got {other:?}"),
         }
-        assert_eq!(ssa[1].2, "apprafter-cli");
+        assert_eq!(ssa[2].2, "apprafter-cli");
     }
 
     #[test]
@@ -1056,13 +1148,13 @@ mod tests {
         .unwrap();
 
         let ssa = kubectl.ssa_applies.borrow();
-        assert_eq!(ssa.len(), 2);
-        // First SSA = root Application (step 3).
-        match &ssa[0].0 {
+        assert_eq!(ssa.len(), 3);
+        // SSA[0] = AppProjects (step 2b), SSA[1] = root Application.
+        match &ssa[1].0 {
             ManifestSource::Path(p) => assert_eq!(p, root_app.path()),
-            other => panic!("expected Path root-app at SSA[0], got {other:?}"),
+            other => panic!("expected Path root-app at SSA[1], got {other:?}"),
         }
-        assert_eq!(ssa[0].2, "apprafter-cli");
+        assert_eq!(ssa[1].2, "apprafter-cli");
         // The historical client-side apply path must be empty.
         assert!(
             kubectl.applies.borrow().is_empty(),
