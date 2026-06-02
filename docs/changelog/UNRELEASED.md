@@ -9,6 +9,52 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.7 + platform-stack 0.2.7 — 2.4c resourceclaim-provisioner controller (2026-06-02)
+
+Adds the 6th in-cluster controller — provisions each scheduled pg
+`ResourceClaim` into the shared CloudNativePG cluster.
+
+### Added
+
+- **`resourceclaim-provisioner` controller** (field manager
+  `resourceclaim-provisioner`) — the 6th peer reconciler in the
+  `apprafter-operator` binary. For each `ResourceClaim` the 2.3 scheduler marked
+  `Scheduled=True` with a `cloudnative-pg` provider it lazily SSA-applies the
+  shared `platform-postgres` CNPG `Cluster` (created on the first matched claim,
+  so solo clusters with no pg apps pay no Postgres-pod cost), provisions a
+  per-claim Postgres role + a `kubernetes.io/basic-auth` password Secret (in
+  `cnpg-system`) + a declarative CNPG `Database`, and writes a connection Secret
+  carrying `DATABASE_URL` into the claim's namespace. It writes ONLY
+  `status.ready` / `status.connectionSecretRef` / a `Ready` condition under its
+  own field manager — never `status.provider` / `Scheduled` (scheduler-owned).
+- **`apprafter_claim_provisioned_total{backend, namespace}` metric** — counts
+  claims provisioned to a backend.
+- **RBAC** — `postgresql.cnpg.io` `clusters` + `databases` get/list/watch/create/
+  update/patch (the secrets rule was already cluster-wide).
+
+### Notes
+
+- **Strict SSA field-manager split.** The status patch contains only the
+  provisioner's own keys; the scheduler keeps sole ownership of
+  `status.provider` + the `Scheduled` condition.
+- **`spec.managed.roles` is unkeyed** — the per-claim role is added by a
+  read-modify-write of the whole `Cluster` (GET → merge → replace, retry on 409),
+  not a per-claim SSA merge that would clobber co-owned entries.
+- **External CNPG CRs via `DynamicObject`** — `Cluster` / `Database` are applied
+  with `kube::api::DynamicObject` + `ApiResource::from_gvk` (no compile-time CNPG
+  types; the CRDs are installed at runtime by the 2.4a `cloudnative-pg`
+  component).
+- **Cleanup is a skeleton.** The connection Secret cascades via its
+  `ownerReference`; the role + database are retained on delete (2.4f wires the
+  RetainedClaim snapshot + 7-day grace GC). The provisioner finalizer only logs
+  "role/DB retained pending 2.4f GC" and self-removes.
+- `change: safe` — additive, no CRD change, no data migration. Operator +
+  admission-webhook images rebuild (new controller); `operatorVersion` v0.2.6 →
+  v0.2.7, `currentVersion` 0.2.6 → 0.2.7. `operator/v0.2.7` +
+  `platform-stack/v0.2.7` tags are workflow-made on push. No cli bump, no
+  monorepo `v0.x.y` tag. The `Application` does not generate claims until 2.4d,
+  so the provisioner is a no-op on a fresh cluster.
+
 ## operator v0.2.6 + platform-stack 0.2.6 — 2.4b Application `needs` schema (2026-06-02)
 
 Re-adds `Application.spec.*.needs` — pure schema, no controller behaviour yet.
