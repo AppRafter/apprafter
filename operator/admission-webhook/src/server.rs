@@ -89,6 +89,14 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
     // MigrationPlan validator uses it for spec.scope
     // immutability; other validators ignore it.
     let old_object = request.get("oldObject").cloned();
+    let user_info = request
+        .get("userInfo")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let operation = request
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     let errors = match kind {
         "Application" => {
@@ -104,6 +112,9 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         }
         "SourceCredential" => crate::validator_sourcecredential::validate_sourcecredential(&object),
         "ServiceProvider" => crate::validator_serviceprovider::validate_serviceprovider(&object),
+        "ResourceClaim" => {
+            crate::validator_resourceclaim::validate_resourceclaim(&object, &user_info, operation)
+        }
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The
