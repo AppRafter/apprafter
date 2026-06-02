@@ -75,6 +75,19 @@ spec:
                       type: object
                       additionalProperties:
                         type: string
+                    needs:
+                      type: object
+                      additionalProperties:
+                        type: object
+                        properties:
+                          selector:
+                            type: object
+                            additionalProperties:
+                              type: string
+                            minProperties: 1
+                          size:
+                            type: string
+                            enum: [nano, small, medium, large, xlarge]
                 environments:
                   type: object
                   additionalProperties:
@@ -103,6 +116,19 @@ spec:
                         type: object
                         additionalProperties:
                           type: string
+                      needs:
+                        type: object
+                        additionalProperties:
+                          type: object
+                          properties:
+                            selector:
+                              type: object
+                              additionalProperties:
+                                type: string
+                              minProperties: 1
+                            size:
+                              type: string
+                              enum: [nano, small, medium, large, xlarge]
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
