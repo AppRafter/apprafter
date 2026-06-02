@@ -142,7 +142,11 @@ fn validate_env_keys(
 /// Built-in `#PlatformServiceType` values. The webhook enforces the
 /// `needs` key enum because the structural OpenAPI v3 CRD accepts
 /// any `additionalProperties` key. Keep in sync with
-/// `schemas/v1alpha1/types.cue` and the ResourceClaim CRD enum.
+/// `schemas/v1alpha1/types.cue` (`#PlatformServiceType`) and the
+/// `type` enum in BOTH the ResourceClaim and ServiceProvider CRDs
+/// (`crd-resourceclaim.yaml`, `crd-serviceprovider.yaml`) — there is
+/// no CUE->Rust/CRD generator yet, so adding a service type means
+/// editing all four sites.
 const PLATFORM_SERVICE_TYPES: [&str; 6] = [
     "pg",
     "jetstream",
@@ -393,5 +397,23 @@ mod tests {
             errors[0].field,
             "spec.environments.prod.needs.elasticsearch"
         );
+    }
+
+    #[test]
+    fn reports_every_unknown_needs_key_not_just_the_first() {
+        // The validator does not short-circuit — two bad keys in one
+        // `needs` map must surface two errors (mirrors the env-key
+        // multi-error guarantee).
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "mysql": {}, "mongo": {} }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|e| e.field.starts_with("spec.base.needs.")));
     }
 }

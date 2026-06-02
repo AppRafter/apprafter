@@ -66,10 +66,14 @@ package v1alpha1
 	// may select different providers). `needs: {pg: {}}` is valid
 	// — tier-aware platform defaults supply selector + size.
 	//
-	// The key map is permissive in CUE (a non-enum key is allowed
-	// here but rejected by the admission webhook), per the
-	// CRD/webhook-owns-enforcement split. Matching keys' VALUES
-	// are constrained to `#ServiceNeed`.
+	// CUE constrains both the key set (the closed
+	// `#PlatformServiceType` enum — `#ApplicationSpec` is a closed
+	// definition, so an unknown key is rejected under full
+	// evaluation) and each value (`#ServiceNeed`). Because the
+	// OpenAPI v3 CRD's structural schema is open on map keys
+	// (`additionalProperties` accepts any key), the admission
+	// webhook re-enforces the key enum at the apiserver — that is
+	// the runtime gate.
 	needs?: [#PlatformServiceType]: #ServiceNeed
 }
 
