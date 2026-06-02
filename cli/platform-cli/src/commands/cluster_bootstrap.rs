@@ -137,6 +137,18 @@ const CRD_CREATE_TIMEOUT_SECS: u64 = 600;
 /// to a few seconds after creation; 60s is generous headroom.
 const CRD_ESTABLISHED_TIMEOUT_SECS: u64 = 60;
 
+/// Step 5's PlatformStack apply is gated by the
+/// `platformstacks.apprafter.io` ValidatingWebhook, whose backing
+/// admission-webhook pod needs its cert-manager-issued TLS cert +
+/// Endpoints. Argo CD syncs the CRD and the webhook as separate child
+/// Applications, so the webhook can still be `ContainerCreating` when
+/// the CRD is already Established — the apply then fails with `no
+/// endpoints available for service "admission-webhook"`. Retry with
+/// backoff until the webhook is serving (or, when the admission stack
+/// is disabled, the first apply just succeeds). 30 × 10s = 5 min.
+const PLATFORMSTACK_APPLY_ATTEMPTS: u32 = 30;
+const PLATFORMSTACK_APPLY_BACKOFF_SECS: u64 = 10;
+
 pub fn run() -> Result<()> {
     info!("cluster-bootstrap invoked (GitOps loader)");
 
@@ -404,11 +416,31 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //    manager `apprafter-cli` means a re-bootstrap is idempotent
     //    (managed fields stay with the loader; PlatformController
     //    in B.1.73 will own status under its own field manager).
-    kubectl.apply_manifest_server_side(
-        &ManifestSource::Path(platformstack_default_path.to_path_buf()),
-        kubeconfig_path,
-        APPRAFTER_CLI_FIELD_MANAGER,
-    )?;
+    //    Retry on the admission-webhook race (see
+    //    PLATFORMSTACK_APPLY_ATTEMPTS): the validating webhook's pod
+    //    may not have Endpoints yet even after the CRD is Established.
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match kubectl.apply_manifest_server_side(
+            &ManifestSource::Path(platformstack_default_path.to_path_buf()),
+            kubeconfig_path,
+            APPRAFTER_CLI_FIELD_MANAGER,
+        ) {
+            Ok(()) => break,
+            Err(e) if attempt < PLATFORMSTACK_APPLY_ATTEMPTS => {
+                info!(
+                    attempt,
+                    error = %e,
+                    "PlatformStack apply failed (admission webhook likely not ready yet); retrying"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(
+                    PLATFORMSTACK_APPLY_BACKOFF_SECS,
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     Ok(())
 }

@@ -128,12 +128,16 @@ k3d_up() {
 # ---------------------------------------------------------------
 bootstrap_with_retry() {
     export APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1
-    if apprafter cluster-bootstrap; then
-        return 0
-    fi
-    printf '  cluster-bootstrap failed; clearing any partial argocd release and retrying\n' >&2
-    helm -n argocd uninstall argocd >/dev/null 2>&1 || true
-    apprafter cluster-bootstrap
+    # cluster-bootstrap is idempotent (helm upgrade --install + SSA),
+    # so a plain re-run is the safety net — do NOT `helm uninstall`
+    # anything (that orphans argocd-server, so the next install fails
+    # to adopt it). The webhook-readiness race at step 5 is handled
+    # inside cluster-bootstrap now, so this rarely fires.
+    apprafter cluster-bootstrap || {
+        printf '  cluster-bootstrap failed; retrying once (idempotent)\n' >&2
+        sleep 15
+        apprafter cluster-bootstrap
+    }
 }
 
 # ---------------------------------------------------------------
