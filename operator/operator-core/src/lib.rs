@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod migration;
 pub mod migration_plan;
 pub mod platform_stack;
+pub mod serviceprovider;
 pub mod sourcecredential;
 
 pub use application::{
@@ -26,6 +27,7 @@ pub use platform_stack::{
     PlatformStackSource, PlatformStackSpec, PlatformStackStatus, PlatformStackValues,
     PlatformStackVersionHistoryEntry,
 };
+pub use serviceprovider::{ServiceProvider, ServiceProviderSpec, ServiceProviderStatus};
 pub use sourcecredential::{
     SealedSecretRef, SourceBackend, SourceCredential, SourceCredentialCondition,
     SourceCredentialSpec, SourceCredentialStatus, SourceGit, SourceRegistry, COND_GIT_PRESENT,
