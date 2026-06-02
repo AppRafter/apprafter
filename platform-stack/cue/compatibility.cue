@@ -1701,6 +1701,26 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.4": {
+	change:          "safe"
+	operatorVersion: "v0.2.4"
+	notes: """
+		2.3 — ResourceClaim scheduler controller. Additive: a new
+		in-cluster controller (resourceclaim-scheduler, a fifth peer
+		reconciler in the apprafter-operator binary) that matches each
+		ResourceClaim to a ServiceProvider by service-type equality +
+		label-superset and records the winner in status.provider plus a
+		Scheduled=True condition. No match -> Scheduled=False + a
+		NoMatchingServiceProvider Warning event + the new
+		apprafter_claim_unmatched_total metric. New ClusterRole rules
+		(serviceproviders read; resourceclaims + /status write). No
+		existing resource or values reshaped, no data migration — safe
+		to auto-sync. Nothing creates ResourceClaims until 2.4, so the
+		scheduler is a no-op on a fresh cluster. status.ready /
+		connectionSecretRef and actual provisioning are 2.4.
+		"""
+	references: ["plan.md 2.3"]
+}
 compatibility: "0.2.3": {
 	change:          "safe"
 	operatorVersion: "v0.2.3"

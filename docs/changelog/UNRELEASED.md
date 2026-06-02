@@ -9,6 +9,31 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.4 + platform-stack 0.2.4 — 2.3 ResourceClaim scheduler (2026-06-02)
+
+### Added
+
+- `operator-controllers-resourceclaim-scheduler` — the first Phase-2
+  controller (a fifth peer reconciler in `apprafter-operator`). It matches
+  each `ResourceClaim` to a `ServiceProvider` by **service-type equality +
+  label-superset** (Kubernetes set-inclusion; the provider may carry extra
+  labels), with a deterministic **alphabetically-first** tie-break, listing
+  providers cluster-wide. On a match it records `status.provider` and a
+  `Scheduled=True` condition; on no match it sets `Scheduled=False`, emits a
+  `NoMatchingServiceProvider` Warning event, and increments the new
+  `apprafter_claim_unmatched_total{kind,namespace,reason}` metric. New
+  operator ClusterRole grants: read `serviceproviders`, read+write
+  `resourceclaims` / `resourceclaims/status`.
+
+### Notes
+
+- Nothing creates `ResourceClaim`s until 2.4 (the Application → claim
+  generator), so the scheduler is a no-op on a fresh cluster. `status.ready`,
+  `status.connectionSecretRef`, and actual provisioning are 2.4's domain — the
+  scheduler never writes them. Provider-health-aware selection is deferred
+  (Phase 3+). A late-arriving provider rescues a `Pending` claim on the 300 s
+  requeue (a ServiceProvider watch needs a reflector store — future work).
+
 ## operator v0.2.3 + platform-stack 0.2.3 — 2.2 ResourceClaim CRD (2026-06-02)
 
 ### Added

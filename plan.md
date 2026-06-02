@@ -2699,14 +2699,15 @@ instead of carrying parallel definitions.
 
 ### 2.3 Selector matching и provider scheduler
 > 🏁 SR: A · order 3 (Phase-2 minimum)
+> v0.2.4 — 2.3 shipped: ResourceClaim scheduler controller (operator-controllers-resourceclaim-scheduler, 5th controller). Type-equal + selector-superset match, cluster-wide provider listing, alphabetical tie-break; on match writes status.provider + Scheduled=True; no-match -> Scheduled=False + NoMatchingServiceProvider event + apprafter_claim_unmatched_total. Pending claims re-evaluate on a 300s requeue (a ServiceProvider watch needs a reflector Store — deferred). ready/connectionSecretRef + provisioning deferred to 2.4.
 
 **Цель:** Reconcile ResourceClaim → matching ServiceProvider по labels.
 
 **Поставка:**
-- [ ] Лог matching-логики: точное соответствие labels, default `tier: integrated`.
-- [ ] При нескольких подходящих — детерминированный выбор (alphabetical `name`).
-- [ ] При отсутствии подходящего — Status `Pending`, событие.
-- [ ] Метрики: `claim_unmatched_total`.
+- [x] Лог matching-логики: точное соответствие labels, default `tier: integrated`.
+- [x] При нескольких подходящих — детерминированный выбор (alphabetical `name`).
+- [x] При отсутствии подходящего — Status `Pending`, событие.
+- [x] Метрики: `claim_unmatched_total`.
 
 **Зависит от:** 2.2
 
