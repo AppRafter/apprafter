@@ -233,6 +233,31 @@ mod tests {
         })
     }
 
+    /// Like `admission_review_for_kind` but also sets `request.userInfo`
+    /// and `request.operation` — required for the ResourceClaim identity gate.
+    fn admission_review_with_user(
+        kind: &str,
+        object: serde_json::Value,
+        username: &str,
+        groups: &[&str],
+        operation: &str,
+    ) -> serde_json::Value {
+        json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "deadbeef",
+                "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": kind },
+                "object": object,
+                "operation": operation,
+                "userInfo": {
+                    "username": username,
+                    "groups": groups,
+                },
+            }
+        })
+    }
+
     #[tokio::test]
     async fn rejects_platformstack_with_wrong_name() {
         let router = build_router();
@@ -394,5 +419,164 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["response"]["allowed"], json!(true));
+    }
+
+    // ── ResourceClaim identity-gate end-to-end tests ──────────────────────
+
+    fn valid_claim_object() -> serde_json::Value {
+        json!({
+            "metadata": { "name": "demo-web-pg", "namespace": "demo" },
+            "spec": { "type": "pg", "selector": { "tier": "integrated" } }
+        })
+    }
+
+    #[tokio::test]
+    async fn allows_resourceclaim_create_from_operator_sa() {
+        let router = build_router();
+        let body = admission_review_with_user(
+            "ResourceClaim",
+            valid_claim_object(),
+            "system:serviceaccount:apprafter-system:apprafter-operator",
+            &["system:serviceaccounts"],
+            "CREATE",
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn rejects_resourceclaim_create_from_user() {
+        let router = build_router();
+        let body = admission_review_with_user(
+            "ResourceClaim",
+            valid_claim_object(),
+            "alice",
+            &["system:authenticated"],
+            "CREATE",
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(false));
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("ResourceClaim is invalid: "),
+            "expected prefix 'ResourceClaim is invalid: ', got {msg:?}"
+        );
+        assert!(
+            msg.contains("apprafter-operator"),
+            "expected 'apprafter-operator' in message, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_resourceclaim_update_from_user() {
+        let router = build_router();
+        let body = admission_review_with_user(
+            "ResourceClaim",
+            valid_claim_object(),
+            "alice",
+            &["system:authenticated"],
+            "UPDATE",
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(true),
+            "UPDATE should not be identity-gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_resourceclaim_create_from_operator_with_bad_type() {
+        let router = build_router();
+        let bad_claim = json!({
+            "metadata": { "name": "demo-web-kafka", "namespace": "demo" },
+            "spec": { "type": "kafka", "selector": { "tier": "integrated" } }
+        });
+        let body = admission_review_with_user(
+            "ResourceClaim",
+            bad_claim,
+            "system:serviceaccount:apprafter-system:apprafter-operator",
+            &["system:serviceaccounts"],
+            "CREATE",
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(false));
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("ResourceClaim is invalid: "),
+            "expected prefix 'ResourceClaim is invalid: ', got {msg:?}"
+        );
+        assert!(
+            msg.contains("spec.type"),
+            "expected 'spec.type' in message, got {msg:?}"
+        );
     }
 }
