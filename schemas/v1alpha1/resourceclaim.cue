@@ -6,9 +6,11 @@ package v1alpha1
 // Application declares a `need`. It is routed to a matching
 // ServiceProvider via labels.
 //
-// Operator-only resource: admission rejects user-created claims.
-// Full status (provider, connectionSecretRef, conditions) lands in
-// phase 2.2.
+// Operator-only resource: admission rejects user-created claims
+// (the operator generates them in 2.4). `status` (provider,
+// connectionSecretRef, ready, conditions) is the controller's report
+// surface — schema only here; the reconciler that writes it lands
+// in 2.3.
 #ResourceClaim: {
 	#TypeMeta
 	kind:     "ResourceClaim"
