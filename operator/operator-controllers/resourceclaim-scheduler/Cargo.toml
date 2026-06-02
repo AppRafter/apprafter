@@ -13,3 +13,14 @@ repository.workspace   = true
 path = "src/lib.rs"
 
 [dependencies]
+operator-core = { path = "../../operator-core" }
+
+kube        = { workspace = true }
+k8s-openapi = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+futures     = { workspace = true }
+tokio       = { workspace = true }
+chrono      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
