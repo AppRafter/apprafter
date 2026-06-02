@@ -142,12 +142,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // ResourceClaimScheduler — fifth controller (Phase 2.3). Matches
+    // each ResourceClaim to a ServiceProvider by type + label superset
+    // and records the winner in status.provider. Provisioning is 2.4.
+    let resourceclaim_scheduler_handle = tokio::spawn({
+        let client = client.clone();
+        let metrics = metrics.clone();
+        async move {
+            if let Err(err) =
+                operator_controllers_resourceclaim_scheduler::run(client, metrics).await
+            {
+                error!(%err, "ResourceClaimScheduler controller error");
+            }
+        }
+    });
+
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
         _ = platform_controller_handle => warn!("PlatformController exited"),
         _ = migration_controller_handle => warn!("MigrationController exited"),
         _ = sourcecred_controller_handle => warn!("SourceCredentialController exited"),
+        _ = resourceclaim_scheduler_handle => warn!("ResourceClaimScheduler controller exited"),
         _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }

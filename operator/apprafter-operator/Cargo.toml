@@ -21,7 +21,8 @@ operator-core                          = { path = "../operator-core" }
 operator-controllers-application       = { path = "../operator-controllers/application" }
 operator-controllers-migration         = { path = "../operator-controllers/migration" }
 operator-controllers-platform-stack    = { path = "../operator-controllers/platform-stack" }
-operator-controllers-sourcecredential  = { path = "../operator-controllers/sourcecredential" }
+operator-controllers-sourcecredential         = { path = "../operator-controllers/sourcecredential" }
+operator-controllers-resourceclaim-scheduler  = { path = "../operator-controllers/resourceclaim-scheduler" }
 
 axum               = { workspace = true }
 tokio              = { workspace = true }
