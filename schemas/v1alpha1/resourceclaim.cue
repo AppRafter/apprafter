@@ -23,5 +23,17 @@ package v1alpha1
 		provider?:            string
 		connectionSecretRef?: string
 		ready?:               bool
+		// Controller-reported conditions. Read-only schema in 2.2;
+		// the reconciler that writes them lands in 2.3. Mirrors the
+		// condition shape used by the other CRDs.
+		conditions?: [...#ResourceClaimCondition]
 	}
+}
+
+#ResourceClaimCondition: {
+	type:               string
+	status:             "True" | "False" | "Unknown"
+	reason?:            string
+	message?:           string
+	lastTransitionTime: string
 }
