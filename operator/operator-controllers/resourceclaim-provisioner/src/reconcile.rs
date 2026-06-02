@@ -223,11 +223,15 @@ async fn provision_cloudnativepg(
         .patch(&cluster, &apply_params(), &Patch::Apply(&cluster_body))
         .await?;
 
-    // 2. Derive a deterministic role/db name + a fresh password.
+    // 2. Derive Postgres identifiers (role/db — `_` is valid inside
+    //    Postgres) AND a DNS-1123 Kubernetes object name (`-` — for the
+    //    Database CR + password Secret `metadata.name`, which the
+    //    apiserver validates and would reject with `_`) + a fresh password.
     let role = cnpg::pg_identifier(ns, name);
     let db = role.clone();
+    let object_name = cnpg::k8s_name(ns, name);
     let password = generate_password();
-    let pw_secret_name = format!("{role}-pw");
+    let pw_secret_name = format!("{object_name}-pw");
 
     // 3. Apply the basic-auth password Secret in the CNPG namespace.
     let secret_api: Api<DynamicObject> =
@@ -244,9 +248,9 @@ async fn provision_cloudnativepg(
     //    owner role materialises.
     let db_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &cnpg_ns, &database_ar());
-    let db_body = cnpg::database_object(&role, &cnpg_ns, &cluster, &db, &role);
+    let db_body = cnpg::database_object(&object_name, &cnpg_ns, &cluster, &db, &role);
     db_api
-        .patch(&role, &apply_params(), &Patch::Apply(&db_body))
+        .patch(&object_name, &apply_params(), &Patch::Apply(&db_body))
         .await?;
 
     // 6. Apply the connection Secret in the claim's namespace, owned by
@@ -295,6 +299,18 @@ async fn provision_cloudnativepg(
 /// Read-modify-write the shared Cluster's `spec.managed.roles`. The list
 /// is unkeyed under SSA, so we GET the whole Cluster, `merge_role`, and
 /// replace it — retrying on a 409 conflict from a racing provisioner.
+///
+/// Why `replace` (PUT) and not `Patch::Apply` here, when step 1's lazy
+/// Cluster create IS an SSA apply: an SSA apply of an unkeyed list takes
+/// ownership of the WHOLE list, so applying our one role would strip every
+/// foreign entry (CNPG-seeded roles, other claims' roles). `merge_role`
+/// preserves them and the PUT writes the full object back. The interaction
+/// with step 1 is safe: that apply body deliberately omits `spec.managed`
+/// (see `cnpg::cluster_object`), so this manager never owns `roles` via its
+/// Apply entry — it owns them via this PUT's Update entry, and a later
+/// apply that omits `roles` does not strip a field held by an Update entry.
+/// (First live validation is the 2.4g manual walk: confirm a second claim's
+/// role survives the first claim's next reconcile.)
 async fn upsert_managed_role(
     ctx: &Arc<Context>,
     cnpg_ns: &str,

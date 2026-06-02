@@ -159,7 +159,9 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
         "connection Secret must carry DATABASE_URL"
     );
 
-    // 6. A CNPG Database CR appears in cnpg-system for the claim's role.
+    // 6. A CNPG Database CR appears in cnpg-system for the claim. Its
+    //    metadata.name is the DNS-1123 object name (`claim-...`, dashes) —
+    //    NOT the underscore Postgres identifier used inside Postgres.
     let db_ar = ApiResource::from_gvk(&GroupVersionKind::gvk(
         "postgresql.cnpg.io",
         "v1",
@@ -175,7 +177,7 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
             .metadata
             .name
             .as_deref()
-            .map(|n| n.starts_with("claim_"))
+            .map(|n| n.starts_with("claim-"))
             .unwrap_or(false)),
         "a CNPG Database for the claim must be applied"
     );

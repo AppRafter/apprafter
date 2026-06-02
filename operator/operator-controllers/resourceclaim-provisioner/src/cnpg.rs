@@ -23,6 +23,16 @@ const PG_IDENT_MAX: usize = 63;
 /// The same claim always derives the same identifier — provisioning is
 /// idempotent: a re-reconcile of an already-provisioned claim targets the
 /// same role + database.
+///
+/// Use this ONLY for Postgres-internal names (the role, the database, the
+/// `Database.spec.owner`). The Kubernetes object names (`Database` CR and
+/// password `Secret` `metadata.name`) use [`k8s_name`] instead — `_` is a
+/// valid Postgres identifier char but not a valid DNS-1123 name char.
+///
+/// TODO(2.x, collision-safety): the fold is not injective (`(ns="a_b",
+/// name="c")` and `(ns="a", name="b_c")` both map to `claim_a_b_c`), and
+/// 63-byte truncation collides long names. Add a hash suffix before
+/// multi-tenant GA.
 pub fn pg_identifier(namespace: &str, name: &str) -> String {
     let mut out = String::with_capacity(PG_IDENT_MAX);
     out.push_str("claim_");
@@ -35,6 +45,36 @@ pub fn pg_identifier(namespace: &str, name: &str) -> String {
         out.push(mapped);
     }
     out.truncate(PG_IDENT_MAX);
+    out
+}
+
+/// Derive a deterministic, DNS-1123-safe Kubernetes object name for a
+/// claim's CNPG `Database` CR and password `Secret` from its
+/// `(namespace, name)`.
+///
+/// Distinct from [`pg_identifier`]: a Kubernetes `metadata.name` must be a
+/// DNS-1123 label (`[a-z0-9-]`, start + end alphanumeric), so
+/// non-alphanumerics fold to `-` (NOT `_`), and any trailing `-` left by
+/// the fold or the 63-byte truncation is trimmed. The `claim-` prefix
+/// guarantees a leading letter; trimming guarantees a trailing
+/// alphanumeric.
+///
+/// TODO(2.x, collision-safety): same non-injectivity as [`pg_identifier`]
+/// — add a hash suffix before multi-tenant GA.
+pub fn k8s_name(namespace: &str, name: &str) -> String {
+    let mut out = String::with_capacity(PG_IDENT_MAX);
+    out.push_str("claim-");
+    for ch in format!("{namespace}-{name}").chars() {
+        out.push(if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        });
+    }
+    out.truncate(PG_IDENT_MAX);
+    while out.ends_with('-') {
+        out.pop();
+    }
     out
 }
 
@@ -174,6 +214,40 @@ mod tests {
             "id was {id}"
         );
         assert_eq!(id, "claim_my_app_web_db");
+    }
+
+    // --- k8s_name() — DNS-1123 object names (distinct from pg_identifier) ---
+
+    #[test]
+    fn k8s_name_is_dns1123_safe_with_no_underscores() {
+        // The bug this guards: pg_identifier (underscores) must NOT be used
+        // as a Kubernetes object name — the apiserver rejects `_`.
+        let n = k8s_name("My.App", "Web/DB");
+        assert_eq!(n, "claim-my-app-web-db");
+        assert!(!n.contains('_'), "k8s name must not contain '_': {n}");
+        assert!(
+            n.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "k8s name not DNS-1123: {n}"
+        );
+        assert!(n.chars().next().unwrap().is_ascii_alphanumeric());
+        assert!(n.chars().last().unwrap().is_ascii_alphanumeric());
+    }
+
+    #[test]
+    fn k8s_name_trims_trailing_dash_after_truncation() {
+        let long_ns = "a".repeat(80);
+        let n = k8s_name(&long_ns, "x");
+        assert!(n.len() <= 63, "len was {}", n.len());
+        assert!(!n.ends_with('-'), "trailing dash not trimmed: {n}");
+        assert!(n.starts_with("claim-a"));
+    }
+
+    #[test]
+    fn k8s_name_handles_leading_digit_via_prefix() {
+        let n = k8s_name("9ns", "0name");
+        assert_eq!(n, "claim-9ns-0name");
+        assert!(n.chars().next().unwrap().is_ascii_alphabetic());
     }
 
     // --- dsn() ---
