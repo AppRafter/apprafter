@@ -1558,7 +1558,6 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "operator-core",
- "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
