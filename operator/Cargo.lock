@@ -72,6 +72,7 @@ dependencies = [
  "operator-controllers-application",
  "operator-controllers-migration",
  "operator-controllers-platform-stack",
+ "operator-controllers-resourceclaim-provisioner",
  "operator-controllers-resourceclaim-scheduler",
  "operator-controllers-sourcecredential",
  "operator-core",
@@ -1544,6 +1545,22 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tar",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "operator-controllers-resourceclaim-provisioner"
+version = "0.1.2"
+dependencies = [
+ "chrono",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "operator-core",
+ "rand 0.8.6",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

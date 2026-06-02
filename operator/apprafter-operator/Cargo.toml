@@ -23,6 +23,7 @@ operator-controllers-migration         = { path = "../operator-controllers/migra
 operator-controllers-platform-stack    = { path = "../operator-controllers/platform-stack" }
 operator-controllers-sourcecredential         = { path = "../operator-controllers/sourcecredential" }
 operator-controllers-resourceclaim-scheduler  = { path = "../operator-controllers/resourceclaim-scheduler" }
+operator-controllers-resourceclaim-provisioner = { path = "../operator-controllers/resourceclaim-provisioner" }
 
 axum               = { workspace = true }
 tokio              = { workspace = true }
