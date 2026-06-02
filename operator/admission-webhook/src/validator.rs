@@ -6,7 +6,8 @@
 //! every `environments[*].image` (cross-field; CUE itself accepts
 //! any string for `image`, so non-empty is enforced here plus by
 //! the CRD's `pattern: "^.+$"`), environment names are DNS-1123
-//! labels, and env keys match `^[A-Z_][A-Z0-9_]*$`.
+//! labels, env keys match `^[A-Z_][A-Z0-9_]*$`, and `needs` keys
+//! are known platform-service types.
 //!
 //! No `kube` types are pulled in — the validator works directly on
 //! `serde_json::Value`. The HTTP layer (`server.rs`) extracts the
@@ -93,6 +94,9 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         if let Some(env) = base_obj.get("env").and_then(|v| v.as_object()) {
             validate_env_keys("spec.base.env", env, &mut errors);
         }
+        if let Some(needs) = base_obj.get("needs").and_then(|v| v.as_object()) {
+            validate_needs_keys("spec.base.needs", needs, &mut errors);
+        }
     }
     if let Some(envs_obj) = envs {
         for (name, val) in envs_obj {
@@ -102,6 +106,17 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
                 .and_then(|v| v.as_object())
             {
                 validate_env_keys(&format!("spec.environments.{name}.env"), env, &mut errors);
+            }
+            if let Some(needs) = val
+                .as_object()
+                .and_then(|o| o.get("needs"))
+                .and_then(|v| v.as_object())
+            {
+                validate_needs_keys(
+                    &format!("spec.environments.{name}.needs"),
+                    needs,
+                    &mut errors,
+                );
             }
         }
     }
@@ -119,6 +134,41 @@ fn validate_env_keys(
             errors.push(ValidationError::new(
                 format!("{path}.{key}"),
                 format!("env key {key:?} must match ^[A-Z_][A-Z0-9_]*$"),
+            ));
+        }
+    }
+}
+
+/// Built-in `#PlatformServiceType` values. The webhook enforces the
+/// `needs` key enum because the structural OpenAPI v3 CRD accepts
+/// any `additionalProperties` key. Keep in sync with
+/// `schemas/v1alpha1/types.cue` and the ResourceClaim CRD enum.
+const PLATFORM_SERVICE_TYPES: [&str; 6] = [
+    "pg",
+    "jetstream",
+    "clickhouse",
+    "redis",
+    "s3",
+    "notifications",
+];
+
+fn is_platform_service_type(s: &str) -> bool {
+    PLATFORM_SERVICE_TYPES.contains(&s)
+}
+
+fn validate_needs_keys(
+    path: &str,
+    needs: &serde_json::Map<String, Value>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for key in needs.keys() {
+        if !is_platform_service_type(key) {
+            errors.push(ValidationError::new(
+                format!("{path}.{key}"),
+                format!(
+                    "needs key {key:?} is not a known platform-service type ({})",
+                    PLATFORM_SERVICE_TYPES.join(", ")
+                ),
             ));
         }
     }
@@ -300,5 +350,48 @@ mod tests {
         let errors = validate_application_spec(&spec);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].field, "spec.environments.dev.env.BAD-KEY");
+    }
+
+    #[test]
+    fn accepts_known_needs_keys_in_base_and_environments() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": { "selector": { "tier": "integrated" } } }
+            },
+            "environments": {
+                "prod": { "needs": { "redis": {} } }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_needs_key_in_base() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "mysql": { "selector": { "tier": "integrated" } } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.mysql");
+    }
+
+    #[test]
+    fn rejects_unknown_needs_key_under_environment_override() {
+        let spec = json!({
+            "base": { "image": "ghcr.io/acme/web:1.0" },
+            "environments": {
+                "prod": { "needs": { "elasticsearch": {} } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].field,
+            "spec.environments.prod.needs.elasticsearch"
+        );
     }
 }
