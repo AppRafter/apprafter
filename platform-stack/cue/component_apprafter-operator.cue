@@ -23,12 +23,23 @@ _components: "apprafter-operator": #Component & {
 		// OCI registry — without the `oci://` scheme prefix.
 		// Argo CD identifies OCI vs HTTPS chart repos from the
 		// `Secret(argocd.argoproj.io/secret-type: repository)`
-		// + `enableOCI: "true"` registration in
-		// `component_argocd.cue`, not from the URL scheme.
-		repoURL: "ghcr.io/apprafter"
+		// + `enableOCI: "true"` registration in `loader_values.cue`,
+		// not from the URL scheme.
+		//
+		// The chart lives under the `/charts` sub-namespace —
+		// NOT the org root — because the operator container image
+		// occupies `ghcr.io/apprafter/apprafter-operator:<tag>` and
+		// an OCI Helm chart pushed to the same repo path with a tag
+		// equal to the image tag silently OVERWRITES the image with
+		// the chart .tgz (the image then crash-loops `exec: no such
+		// file`). Separating charts into `ghcr.io/apprafter/charts`
+		// lets chart version == appVersion safely. The matching
+		// `repositories: "apprafter-charts"` enableOCI registration
+		// lives in `loader_values.cue`.
+		repoURL: "ghcr.io/apprafter/charts"
 		chart:   "apprafter-operator"
 	}
-	version: "v0.2.1"
+	version: "v0.2.2"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-operator"

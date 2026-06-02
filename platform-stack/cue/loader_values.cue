@@ -76,6 +76,24 @@ _loaderValues: {
 					type:      "helm"
 					enableOCI: "true"
 				}
+				// Second OCI repo for the operator + admission-webhook
+				// Helm charts, kept OUT of the org root. The charts
+				// share a name with their container images
+				// (`apprafter-operator`, `apprafter-admission-webhook`);
+				// pushing a chart to `ghcr.io/apprafter/<name>:<ver>`
+				// with `<ver>` equal to the image tag overwrites the
+				// image with the chart .tgz (the pod then crash-loops
+				// `exec: "/<name>": no such file`). Charts therefore
+				// publish to `ghcr.io/apprafter/charts/<name>` and the
+				// components point their `repoURL` here. Argo CD
+				// matches the repository by exact `repoURL`, so this
+				// dedicated registration is required for the
+				// `enableOCI` treatment on the sub-path.
+				repositories: "apprafter-charts": {
+					url:       "ghcr.io/apprafter/charts"
+					type:      "helm"
+					enableOCI: "true"
+				}
 				// `_appProjects` — shared source of truth between
 				// the loader install (this block) and the
 				// umbrella's `templates/appprojects.yaml`

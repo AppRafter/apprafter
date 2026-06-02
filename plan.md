@@ -2666,6 +2666,7 @@ instead of carrying parallel definitions.
 ### 2.1 ServiceProvider CRD
 > 🏁 SR: A · order 3 (Phase-2 minimum)
 > v0.2.1 — 2.1 shipped: ServiceProvider CRD (CUE schema + OpenAPI v3 CRD + kube-rs type + admission validator/dispatch/webhook + cue-vet example + tests). Namespaced. Tier-aware defaults deferred to 2.4–2.6.
+> v0.2.2 — 2.1 re-release (release-pipeline fix): the v0.2.1 operator+webhook images were clobbered on ghcr by their own Helm charts (chart and image share the repo path `ghcr.io/apprafter/apprafter-operator`; uniform chartVersion==appVersion let the chart push overwrite the image tag → pods crash-looped `exec: no such file`). Fix: charts now publish to the `ghcr.io/apprafter/charts` OCI sub-namespace (new `apprafter-charts` enableOCI registration in loader_values.cue; components' repoURL points there). v0.2.1 abandoned.
 
 **Поставка:**
 - [x] CUE-схема + admission webhook.

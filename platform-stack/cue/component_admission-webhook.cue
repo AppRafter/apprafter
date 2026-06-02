@@ -18,12 +18,17 @@ _components: "admission-webhook": #Component & {
 	namespace: "apprafter-system"
 	source: {
 		// OCI registry — without the `oci://` scheme prefix.
-		// Argo CD reads the OCI flag from the repository
-		// Secret registered by `component_argocd.cue`.
-		repoURL: "ghcr.io/apprafter"
+		// Argo CD reads the OCI flag from the `apprafter-charts`
+		// repository Secret registered by `loader_values.cue`.
+		// Charts live under `/charts` (not the org root) so a
+		// chart tag never collides with the same-named container
+		// image at `ghcr.io/apprafter/apprafter-admission-webhook`
+		// — see `component_apprafter-operator.cue` for the full
+		// rationale.
+		repoURL: "ghcr.io/apprafter/charts"
 		chart:   "apprafter-admission-webhook"
 	}
-	version: "v0.2.1"
+	version: "v0.2.2"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-admission-webhook"

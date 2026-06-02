@@ -1701,6 +1701,27 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.2": {
+	change:          "safe"
+	operatorVersion: "v0.2.2"
+	notes: """
+		2.1 re-release — fixes the v0.2.1 publish defect. The
+		ServiceProvider CRD payload is unchanged from 0.2.1
+		(additive, safe). The fix is in the release pipeline:
+		the operator + admission-webhook Helm charts now publish
+		to the `ghcr.io/apprafter/charts` OCI sub-namespace
+		instead of the org root. In 0.2.1 the chart and the
+		container image shared the repo path
+		(`ghcr.io/apprafter/apprafter-operator`) and, with chart
+		version == appVersion, the chart push OVERWROTE the
+		image tag with the chart .tgz — the operator + webhook
+		pods crash-looped `exec: "/<bin>": no such file`. With
+		charts under `/charts`, chart version == appVersion is
+		safe. 0.2.1 is abandoned (its operator/webhook image
+		tags are poisoned); upgrade straight to 0.2.2.
+		"""
+	references: ["plan.md 2.1"]
+}
 compatibility: "0.2.1": {
 	change:          "safe"
 	operatorVersion: "v0.2.1"

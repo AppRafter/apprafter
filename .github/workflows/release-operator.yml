@@ -290,8 +290,20 @@ jobs:
         env:
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
+          # Charts publish under the `/charts` sub-namespace, NOT the
+          # org root. The operator + admission-webhook charts share a
+          # name with their container images (`apprafter-operator`,
+          # `apprafter-admission-webhook`); pushing a chart to
+          # `ghcr.io/<owner>/<name>:<ver>` with `<ver>` equal to the
+          # image tag overwrites the image with the chart .tgz and the
+          # pod crash-loops `exec: "/<name>": no such file` (the v0.2.1
+          # publish defect). `/charts` keeps the two apart so chart
+          # version == appVersion is safe. The matching
+          # `repositories: "apprafter-charts"` enableOCI registration
+          # lives in platform-stack/cue/loader_values.cue; the
+          # components' repoURL points here.
           owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
-          echo "oci=oci://ghcr.io/${owner_lc}" >> "$GITHUB_OUTPUT"
+          echo "oci=oci://ghcr.io/${owner_lc}/charts" >> "$GITHUB_OUTPUT"
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
