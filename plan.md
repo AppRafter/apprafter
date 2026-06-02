@@ -2684,11 +2684,12 @@ instead of carrying parallel definitions.
 
 ### 2.2 ResourceClaim CRD
 > 🏁 SR: A · order 3 (Phase-2 minimum)
+> v0.2.3 — 2.2 shipped: ResourceClaim CRD (CUE schema +status.conditions + OpenAPI v3 CRD + kube-rs type + operator-only admission validator/dispatch/webhook + cue-vet example + tests). Namespaced. Operator-only CREATE (operator SA OR system:masters); UPDATE ungated. status.conditions schema-only (writer in 2.3); no creator until 2.4.
 
 **Поставка:**
-- [ ] CUE-схема + admission webhook.
-- [ ] Поля: `type`, `selector`, `spec` (size, etc.), `status.{provider, connectionSecretRef, ready, conditions}`.
-- [ ] Создаётся **только** оператором, юзер-create запрещён admission.
+- [x] CUE-схема + admission webhook.
+- [x] Поля: `type`, `selector`, `spec` (size, etc.), `status.{provider, connectionSecretRef, ready, conditions}`.
+- [x] Создаётся **только** оператором, юзер-create запрещён admission.
 
 **Зависит от:** 2.1
 

@@ -1701,6 +1701,23 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.3": {
+	change:          "safe"
+	operatorVersion: "v0.2.3"
+	notes: """
+		2.2 — ResourceClaim CRD. Additive: a new namespaced
+		v1alpha1 ResourceClaim CRD (CUE schema + hand-rolled
+		OpenAPI v3 CRD at sync-wave -5 + kube-rs type) plus a new
+		validating-webhook entry enforcing operator-only CREATE
+		(rejects user-authored claims; UPDATE ungated). No
+		existing resource or values reshaped, no data migration —
+		safe to auto-sync. status.conditions ships schema-only (no
+		writer until 2.3); nothing creates ResourceClaims yet (the
+		Application->claim generator lands in 2.4), so the
+		operator-only rule is a forward-looking guard.
+		"""
+	references: ["plan.md 2.2"]
+}
 compatibility: "0.2.2": {
 	change:          "safe"
 	operatorVersion: "v0.2.2"
