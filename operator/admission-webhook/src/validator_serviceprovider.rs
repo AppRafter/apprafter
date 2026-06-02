@@ -111,7 +111,9 @@ mod tests {
         let mut obj = valid_object();
         obj["spec"]["type"] = json!("kafka");
         let errors = validate_serviceprovider(&obj);
-        assert!(errors.iter().any(|e| e.field == "spec.type"));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.type" && e.message.contains("kafka")));
     }
 
     #[test]
@@ -119,7 +121,9 @@ mod tests {
         let mut obj = valid_object();
         obj["spec"].as_object_mut().unwrap().remove("type");
         let errors = validate_serviceprovider(&obj);
-        assert!(errors.iter().any(|e| e.field == "spec.type"));
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.type" && e.message.contains("required")));
     }
 
     #[test]
@@ -153,5 +157,7 @@ mod tests {
         });
         let errors = validate_serviceprovider(&obj);
         assert!(errors.len() >= 2);
+        assert!(errors.iter().any(|e| e.field == "spec.type"));
+        assert!(errors.iter().any(|e| e.field == "spec.backend"));
     }
 }
