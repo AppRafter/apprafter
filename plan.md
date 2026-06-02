@@ -2709,6 +2709,9 @@ instead of carrying parallel definitions.
 - [x] При отсутствии подходящего — Status `Pending`, событие.
 - [x] Метрики: `claim_unmatched_total`.
 
+**Deferred (tracked follow-up, not debt-blocking):**
+- [ ] `Controller.watches(ServiceProvider)` for **immediate** self-heal of `Pending` claims. 2.3 shipped a **300s requeue** fallback instead — a late-arriving provider rescues a Pending claim within ≤5 min, not instantly. Deferred because the event→claims mapper needs a `reflector::Store<ResourceClaim>` (cross-resource fan-out), out of the 2.3 MVP scope and moot until claims exist. Revisit in/after **2.4** (once the Application operator generates claims) or when claim volume/latency warrants; mind the O(claims×providers) fan-out at scale.
+
 **Зависит от:** 2.2
 
 **Размер:** S
