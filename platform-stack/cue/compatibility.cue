@@ -1701,6 +1701,27 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.5": {
+	change:          "safe"
+	operatorVersion: "v0.2.4"
+	notes: """
+		2.4a — CloudNativePG operator + pg-integrated ServiceProvider
+		seed. Additive: a new always-on `cloudnative-pg` component
+		(CNPG operator chart 0.28.2, namespace cnpg-system, project
+		platform-providers, sync-wave -5) plus a new data-driven
+		`templates/serviceproviders.yaml` that seeds one
+		`pg-integrated` ServiceProvider CR (type pg, backend
+		cloudnative-pg, label tier=integrated) into apprafter-system.
+		NO shared Postgres Cluster is seeded — the 2.4c provisioner
+		creates `platform-postgres` lazily on the first matched pg
+		claim, so solo clusters with no pg apps pay no Postgres-pod
+		cost. operatorVersion unchanged (v0.2.4): no operator image
+		bump. No existing resource or values reshaped, no data
+		migration — safe to auto-sync. Nothing creates pg claims
+		until 2.4d, so the seed is inert on a fresh cluster.
+		"""
+	references: ["plan.md 2.4a"]
+}
 compatibility: "0.2.4": {
 	change:          "safe"
 	operatorVersion: "v0.2.4"
