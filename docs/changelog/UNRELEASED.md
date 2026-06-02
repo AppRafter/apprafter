@@ -9,6 +9,39 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.6 + platform-stack 0.2.6 — 2.4b Application `needs` schema (2026-06-02)
+
+Re-adds `Application.spec.*.needs` — pure schema, no controller behaviour yet.
+
+### Added
+
+- **`Application.spec.base.needs` + per-environment `needs`** — a typed map
+  keyed by platform-service type (`{pg|jetstream|clickhouse|redis|s3|notifications}:
+  {selector?, size?}`), re-added across all three hand-rolled CRD mirrors: the
+  CUE schema (`#ServiceNeed` + `needs?: [#PlatformServiceType]: #ServiceNeed`),
+  the kube-rs `operator-core` type (`ServiceNeed` + `needs` on
+  `ApplicationBaseSpec`), and the OpenAPI v3 CRD (under both `spec.base` and
+  `spec.environments[*]`; `selector` `minProperties: 1`, `size` enum). Each
+  entry will become a `ResourceClaim` (2.4d wires pg).
+- **Admission-webhook rule** — rejects `needs` keys that are not a known
+  platform-service type, in `base` and every environment override. The
+  structural OpenAPI v3 CRD is open on map keys, so the webhook is the runtime
+  enforcer of the key enum.
+
+### Notes
+
+- **Pure schema.** No controller generates claims from `needs` yet (the
+  `Application` → `ResourceClaim` generation + the `AwaitingResourceClaim`
+  pause gate land in 2.4d; DSN injection + the reserved-`DATABASE_URL`
+  cross-field guard in 2.4e). `needs` is inert on a fresh cluster.
+- `change: safe` — additive, no field reshaped, no data migration. Operator +
+  admission-webhook images rebuild; `operatorVersion` v0.2.4 → v0.2.6
+  (re-aligned with the platform-stack stream after the platform-stack-only 2.4a
+  at 0.2.5). `currentVersion` 0.2.5 → 0.2.6. `operator/v0.2.6` +
+  `platform-stack/v0.2.6` tags are workflow-made on push. No cli bump, no
+  monorepo `v0.x.y` tag (the Application CRD ships from the operator chart, not
+  the CLI).
+
 ## platform-stack 0.2.5 — 2.4a CloudNativePG operator + pg-integrated seed (2026-06-02)
 
 Platform-stack-only release (no operator image change — `operatorVersion`
