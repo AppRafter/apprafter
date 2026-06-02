@@ -144,7 +144,8 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
     // 4. Poll until provisioned (scheduler + provisioner; CNPG cluster
     //    creation + first-instance bootstrap dominates — allow 5 min).
     let secret_ref = poll_claim_ready(&claim_api, "pg-claim", Duration::from_secs(300)).await;
-    let secret_ref = secret_ref.expect("claim must flip status.ready=true with a connectionSecretRef");
+    let secret_ref =
+        secret_ref.expect("claim must flip status.ready=true with a connectionSecretRef");
 
     // 5. The connection Secret carries DATABASE_URL.
     let secret_api: Api<Secret> = Api::namespaced(client.clone(), ns_name);
@@ -159,9 +160,12 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
     );
 
     // 6. A CNPG Database CR appears in cnpg-system for the claim's role.
-    let db_ar = ApiResource::from_gvk(&GroupVersionKind::gvk("postgresql.cnpg.io", "v1", "Database"));
-    let db_api: Api<DynamicObject> =
-        Api::namespaced_with(client.clone(), "cnpg-system", &db_ar);
+    let db_ar = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "postgresql.cnpg.io",
+        "v1",
+        "Database",
+    ));
+    let db_api: Api<DynamicObject> = Api::namespaced_with(client.clone(), "cnpg-system", &db_ar);
     let databases = db_api
         .list(&Default::default())
         .await

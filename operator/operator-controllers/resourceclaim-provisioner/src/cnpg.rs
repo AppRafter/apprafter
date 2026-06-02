@@ -180,7 +180,13 @@ mod tests {
 
     #[test]
     fn dsn_renders_the_cnpg_rw_endpoint() {
-        let got = dsn("role1", "secretpw", "db1", "platform-postgres", "cnpg-system");
+        let got = dsn(
+            "role1",
+            "secretpw",
+            "db1",
+            "platform-postgres",
+            "cnpg-system",
+        );
         assert_eq!(
             got,
             "postgresql://role1:secretpw@platform-postgres-rw.cnpg-system.svc:5432/db1"
@@ -204,7 +210,13 @@ mod tests {
 
     #[test]
     fn database_object_has_the_cnpg_apply_shape() {
-        let d = database_object("claim-db", "cnpg-system", "platform-postgres", "appdb", "approle");
+        let d = database_object(
+            "claim-db",
+            "cnpg-system",
+            "platform-postgres",
+            "appdb",
+            "approle",
+        );
         assert_eq!(d["apiVersion"], "postgresql.cnpg.io/v1");
         assert_eq!(d["kind"], "Database");
         assert_eq!(d["metadata"]["name"], "claim-db");

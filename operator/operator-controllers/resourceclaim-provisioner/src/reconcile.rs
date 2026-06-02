@@ -202,7 +202,10 @@ async fn provision_cloudnativepg(
         .and_then(Value::as_str)
         .unwrap_or("cnpg-system")
         .to_string();
-    let instances = cfg.pointer("/instances").and_then(Value::as_i64).unwrap_or(1);
+    let instances = cfg
+        .pointer("/instances")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
     let storage = cfg
         .pointer("/storage")
         .and_then(Value::as_str)
@@ -252,10 +255,13 @@ async fn provision_cloudnativepg(
     let dsn = cnpg::dsn(&role, &password, &db, &cluster, &cnpg_ns);
     let owner_uid = claim.metadata.uid.clone().unwrap_or_default();
     let conn_secret = connection_secret_object(&conn_secret_name, ns, &dsn, &owner_uid, name);
-    let conn_api: Api<DynamicObject> =
-        Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
+    let conn_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
     conn_api
-        .patch(&conn_secret_name, &apply_params(), &Patch::Apply(&conn_secret))
+        .patch(
+            &conn_secret_name,
+            &apply_params(),
+            &Patch::Apply(&conn_secret),
+        )
         .await?;
 
     // 7. Write status — ONLY ready / connectionSecretRef / Ready
@@ -296,8 +302,7 @@ async fn upsert_managed_role(
     role: &str,
     pw_secret_name: &str,
 ) -> Result<(), ReconcileError> {
-    let api: Api<DynamicObject> =
-        Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
+    let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
     let entry = cnpg::managed_role_entry(role, pw_secret_name);
 
     for attempt in 0..ROLE_RMW_RETRIES {
@@ -324,15 +329,14 @@ async fn upsert_managed_role(
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .ok_or_else(|| {
-                ReconcileError::Provisioning(format!("Cluster {cluster} spec.managed not an object"))
+                ReconcileError::Provisioning(format!(
+                    "Cluster {cluster} spec.managed not an object"
+                ))
             })?;
         managed.insert("roles".to_string(), Value::Array(merged));
 
         let replaced: DynamicObject = serde_json::from_value(current_json)?;
-        match api
-            .replace(cluster, &Default::default(), &replaced)
-            .await
-        {
+        match api.replace(cluster, &Default::default(), &replaced).await {
             Ok(_) => return Ok(()),
             Err(kube::Error::Api(err)) if err.code == 409 => {
                 warn!(
@@ -354,11 +358,19 @@ async fn upsert_managed_role(
 // ---------------------------------------------------------------------------
 
 fn cluster_ar() -> ApiResource {
-    ApiResource::from_gvk(&GroupVersionKind::gvk("postgresql.cnpg.io", "v1", "Cluster"))
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "postgresql.cnpg.io",
+        "v1",
+        "Cluster",
+    ))
 }
 
 fn database_ar() -> ApiResource {
-    ApiResource::from_gvk(&GroupVersionKind::gvk("postgresql.cnpg.io", "v1", "Database"))
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "postgresql.cnpg.io",
+        "v1",
+        "Database",
+    ))
 }
 
 fn secret_ar() -> ApiResource {
@@ -545,7 +557,9 @@ async fn find_provider(
         .list(&Default::default())
         .await?
         .items;
-    Ok(providers.into_iter().find(|p| p.name_any() == provider_name))
+    Ok(providers
+        .into_iter()
+        .find(|p| p.name_any() == provider_name))
 }
 
 #[cfg(test)]
@@ -614,7 +628,10 @@ mod tests {
 
     #[test]
     fn backend_maps_cloudnative_pg() {
-        assert_eq!(Backend::from_spec_backend("cloudnative-pg"), Some(Backend::Cloudnativepg));
+        assert_eq!(
+            Backend::from_spec_backend("cloudnative-pg"),
+            Some(Backend::Cloudnativepg)
+        );
     }
 
     #[test]
