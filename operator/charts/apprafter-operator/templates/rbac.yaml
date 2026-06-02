@@ -129,6 +129,27 @@ rules:
       - watch
       - patch
       - update
+  # Phase 2.3 ResourceClaim scheduler: read ServiceProviders
+  # cluster-wide to match claims; read + write ResourceClaim status.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - serviceproviders
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - resourceclaims
+      - resourceclaims/status
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
   # `delete` (S5): the derived-Secret GC finalizer removes the
   # cross-namespace Argo `repo-creds` + canonical
   # `dockerconfigjson` on SourceCredential deletion (no
