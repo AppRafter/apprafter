@@ -7,6 +7,7 @@ pub mod metrics;
 pub mod migration;
 pub mod migration_plan;
 pub mod platform_stack;
+pub mod resourceclaim;
 pub mod serviceprovider;
 pub mod sourcecredential;
 
@@ -26,6 +27,9 @@ pub use platform_stack::{
     PlatformStack, PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,
     PlatformStackSource, PlatformStackSpec, PlatformStackStatus, PlatformStackValues,
     PlatformStackVersionHistoryEntry,
+};
+pub use resourceclaim::{
+    ResourceClaim, ResourceClaimCondition, ResourceClaimSpec, ResourceClaimStatus,
 };
 pub use serviceprovider::{ServiceProvider, ServiceProviderSpec, ServiceProviderStatus};
 pub use sourcecredential::{
