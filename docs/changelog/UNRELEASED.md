@@ -9,6 +9,47 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## platform-stack 0.2.5 — 2.4a CloudNativePG operator + pg-integrated seed (2026-06-02)
+
+Platform-stack-only release (no operator image change — `operatorVersion`
+stays `v0.2.4`). First sub-subphase of 2.4 (`needs.pg` → CloudNativePG).
+
+### Added
+
+- **`cloudnative-pg` component** — the CloudNativePG operator now ships as an
+  always-on platform-stack component (chart `cloudnative-pg` 0.28.2, bundling
+  operator appVersion 1.29.1), namespace `cnpg-system`, Argo CD project
+  `platform-providers`, sync-wave `-5`, `crds.create: true`, `replicaCount: 1`.
+  The operator is a single small Deployment; **no shared Postgres `Cluster` is
+  seeded** — the 2.4c provisioner creates `platform-postgres` lazily on the
+  first matched claim, so solo clusters with no pg apps pay no Postgres-pod
+  cost.
+- **`pg-integrated` ServiceProvider seed** — a new data-driven umbrella
+  template `templates/serviceproviders.yaml` (mirroring the existing
+  `appProjects` mechanism: `#ServiceProviderSeed` shape + `_serviceProviders`
+  map + render task + `values.schema.json` entry) seeds one `pg-integrated`
+  ServiceProvider CR (`type: pg`, `backend: cloudnative-pg`, `metadata.labels`
+  `tier: integrated`, namespace `apprafter-system`) so the 2.3 scheduler has a
+  provider to match pg claims against on a fresh cluster. Tier-aware
+  `config.instances` (tier-1 = 1, tier-2 = 3). The CR carries
+  `SkipDryRunOnMissingResource=true` + a positive sync-wave so Argo CD
+  tolerates the window before the operator chart installs the ServiceProvider
+  CRD.
+
+### Changed
+
+- `examples/serviceproviders/pg-integrated.cue` cue-vet fixture aligned to the
+  real seed `config` shape (`cluster`/`namespace`/`instances`/`storage`).
+- `platform-stack-check.yml` CI smoke now asserts the `cloudnative-pg`
+  Application and the rendered `pg-integrated` ServiceProvider CR.
+
+### Notes
+
+- Inert on a fresh cluster until 2.4d wires `Application` → `ResourceClaim`.
+- `change: safe` — purely additive, Argo CD auto-syncs without a MigrationPlan
+  gate. `currentVersion` 0.2.4 → 0.2.5; `platform-stack/v0.2.5` tag is
+  workflow-made on push. No operator/cli bump, no monorepo `v0.x.y` tag.
+
 ## operator v0.2.4 + platform-stack 0.2.4 — 2.3 ResourceClaim scheduler (2026-06-02)
 
 ### Added
