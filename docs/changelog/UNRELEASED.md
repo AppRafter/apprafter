@@ -9,9 +9,80 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
-_No entries yet — Phase 2 (M2) opens with v0.2.0._
+## operator v0.2.3 + platform-stack 0.2.3 — 2.2 ResourceClaim CRD (2026-06-02)
 
-## Phase 1.5 — Self-managing platform rethink (in progress)
+### Added
+
+- `ResourceClaim` v1alpha1 CRD (`apprafter.io`, namespaced, short name `rc`):
+  the operator-generated routing record that links an Application `need` to a
+  matching `ServiceProvider`. Spec carries `type` (the built-in service-type
+  enum), a `selector` label map, and an optional `size`; `status` carries
+  `provider`, `connectionSecretRef`, `ready`, and `conditions`. Shipped across
+  all layers in lockstep — CUE schema, hand-rolled OpenAPI v3 CRD (operator
+  chart, sync-wave -5), and the kube-rs type in `operator-core`.
+- **Operator-only admission gate**: the validating webhook rejects a
+  `ResourceClaim` **CREATE** unless the requester is the operator
+  ServiceAccount (`system:serviceaccount:apprafter-system:apprafter-operator`)
+  or a `system:masters` member (cluster-admin break-glass). It fails closed on
+  missing requester identity. `UPDATE` is not identity-gated (so the upcoming
+  scheduler/controllers can patch claims); field validation runs on every
+  operation. The webhook server now threads `request.userInfo` +
+  `request.operation` for this kind.
+
+### Notes
+
+- `status.conditions` ships schema-only; the reconciler that writes status
+  lands in 2.3, and nothing creates `ResourceClaim`s until 2.4 (the
+  Application → claim generator). The operator-only rule is a forward-looking
+  guard.
+
+## operator v0.2.2 + platform-stack 0.2.2 — 2.1 ServiceProvider CRD (working re-release) + chart-namespace fix (2026-06-02)
+
+### Added
+
+- `ServiceProvider` v1alpha1 CRD (`apprafter.io`, namespaced, short name `sp`):
+  declares a backend implementation for a platform-service type. Spec carries
+  `type` (closed built-in enum: `pg | jetstream | clickhouse | redis | s3 |
+  notifications`), a `backend` identifier, and opaque `config`; `status.health`
+  is the report surface. CUE schema + OpenAPI v3 CRD (operator chart) + kube-rs
+  type + a validating webhook (unknown `type` / empty `backend` rejected).
+  _(Introduced in v0.2.1; first installable in v0.2.2 — see Fixed.)_
+
+### Fixed
+
+- Operator and admission-webhook **Helm charts now publish to the
+  `ghcr.io/apprafter/charts` OCI sub-namespace** instead of the registry root.
+  Previously a chart and its like-named container image
+  (`ghcr.io/apprafter/apprafter-operator`, `…/apprafter-admission-webhook`)
+  shared one repository path; once a chart version equalled the image tag
+  (`appVersion`), the chart push overwrote the image with the chart `.tgz`, and
+  the operator/webhook pods crash-looped `exec: "/apprafter-operator": no such
+  file`. Separating charts into `/charts` lets chart version equal `appVersion`
+  safely. The `apprafter-charts` OCI repository is registered (with
+  `enableOCI`) for both the bootstrap loader's Argo CD and the umbrella.
+
+### Yanked
+
+- **v0.2.1** — the 2.1 ServiceProvider release shipped broken operator and
+  admission-webhook images (the chart/image tag collision above). Superseded
+  by v0.2.2; do not deploy v0.2.1.
+
+## Phase 1.5 — Self-managing platform rethink (closed at v0.2.0)
+
+## v0.2.0 — M1.5 closed: self-managing platform rethink (2026-06-02)
+
+### Changed
+
+- **Milestone M1.5 closed.** The platform stack reconciles itself through
+  Argo CD from a versioned OCI chart; `cluster-bootstrap` is a minimal loader;
+  user app repositories sync via a CUE Config Management Plugin; `PlatformStack`
+  + `MigrationPlan` provide declarative version control and destructive-change
+  gating. Proven end-to-end on the k3d e2e gate (CUE CMP render → Argo CD sync
+  → operator reconcile → Deployment, with source-change propagation) and the
+  nightly real-Hetzner harness. The CLI `workspace.package.version` is baselined
+  to `0.2.0`, opening the 0.2.x series. `apprafter platform fork` (item 1.80),
+  the Backstage MigrationPlan queue plugin (M3), and `platform channel` (M2)
+  are deferred.
 
 ## CLI v0.1.185 — English-only cleanup: purge Cyrillic from source, templates, and docs (2026-06-01)
 
