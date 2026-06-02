@@ -105,9 +105,13 @@ pub fn validate_resourceclaim(
     if let Some(size) = spec.get("size") {
         match size.as_str() {
             Some(s) if SIZES.contains(&s) => {}
-            _ => errors.push(ValidationError::new(
+            Some(s) => errors.push(ValidationError::new(
                 "spec.size",
-                format!("size must be one of {} (got {size})", SIZES.join("|")),
+                format!("size must be one of {} (got {s:?})", SIZES.join("|")),
+            )),
+            None => errors.push(ValidationError::new(
+                "spec.size",
+                format!("size must be a string, one of {}", SIZES.join("|")),
             )),
         }
     }
@@ -221,5 +225,28 @@ mod tests {
         let obj = json!({ "metadata": { "name": "x", "namespace": "demo" } });
         let errors = validate_resourceclaim(&obj, &operator_user(), "CREATE");
         assert!(errors.iter().any(|e| e.field == "spec"));
+    }
+
+    #[test]
+    fn accepts_every_builtin_type_for_operator() {
+        for t in BUILTIN_TYPES {
+            let mut c = claim();
+            c["spec"]["type"] = json!(t);
+            assert!(
+                validate_resourceclaim(&c, &operator_user(), "CREATE").is_empty(),
+                "builtin type {t} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn update_skips_identity_but_still_field_validates() {
+        let mut c = claim();
+        c["spec"]["type"] = json!("kafka");
+        let errors = validate_resourceclaim(&c, &normal_user(), "UPDATE");
+        // No identity error on UPDATE...
+        assert!(!errors.iter().any(|e| e.field == "metadata"));
+        // ...but the bad type is still caught.
+        assert!(errors.iter().any(|e| e.field == "spec.type"));
     }
 }
