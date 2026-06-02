@@ -17,8 +17,10 @@ serviceProviderPgIntegrated: v1alpha1.#ServiceProvider & {
 		type:    "pg"
 		backend: "cloudnative-pg"
 		config: {
-			cluster: "platform-postgres"
-			nodes:   3
+			cluster:   "platform-postgres"
+			namespace: "cnpg-system"
+			instances: 1
+			storage:   "10Gi"
 		}
 	}
 }

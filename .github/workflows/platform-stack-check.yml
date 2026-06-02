@@ -136,12 +136,20 @@ jobs:
         run: |
           helm template platform "platform-stack/dist/platform-stack-${VERSION}" \
             > /tmp/rendered-tier1.yaml
-          for app in admission-webhook apprafter-operator argocd cert-manager cilium network-policies; do
+          for app in admission-webhook apprafter-operator argocd cert-manager cilium cloudnative-pg network-policies; do
             if ! grep -q "name: \"${app}\"" /tmp/rendered-tier1.yaml; then
               echo "::error::tier-1 render missing expected Argo CD Application: ${app}"
               exit 1
             fi
           done
+          if ! grep -q 'kind: ServiceProvider' /tmp/rendered-tier1.yaml; then
+            echo "::error::tier-1 render missing the pg-integrated ServiceProvider seed"
+            exit 1
+          fi
+          if ! grep -q 'name: "pg-integrated"' /tmp/rendered-tier1.yaml; then
+            echo "::error::tier-1 render missing ServiceProvider name pg-integrated"
+            exit 1
+          fi
           helm template platform "platform-stack/dist/platform-stack-${VERSION}" \
             --values "platform-stack/dist/platform-stack-${VERSION}/examples/values.team.yaml" \
             > /tmp/rendered-tier2.yaml
