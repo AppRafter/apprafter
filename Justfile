@@ -73,18 +73,19 @@ test:
 e2e-gitops:
     bash e2e/gitops-walk.sh
 
-# Run the platform-migration k3d e2e (PlatformStack pin → breaking
-# version → MigrationPlan → approve/reject).
-# Requires `just platform-stack-render` to have been run first so
-# that `platform-stack/dist/` is populated with the fixture chart.
-e2e-migration-platform:
-    bash e2e/migration-platform.sh
-
-# Run all local k3d e2e suites (gitops-walk + migration-platform).
+# Run the local k3d e2e gate (currently just gitops-walk).
 # NOTE: e2e/mvp.sh (real Hetzner provision smoke, costs money) is
 # intentionally excluded here — it runs via the nightly CI workflow
 # only (.github/workflows/nightly.yml, 04:00 UTC).
-e2e: e2e-gitops e2e-migration-platform
+#
+# The platform-migration walk is NOT part of the k3d gate: the
+# PlatformController's OCI client is HTTPS-only (oci-distribution
+# ClientConfig::default()), while k3d's local registry is plain
+# HTTP, so the controller cannot pull fixture compat-docs in-cluster.
+# The MigrationPlan gate is covered by operator unit + integration
+# tests; a real-infra (HTTPS-registry) migration walk is a tracked
+# follow-up for the nightly Hetzner harness. See plan.md §1.81.
+e2e: e2e-gitops
 
 # Spin up a local k3d cluster suitable for end-to-end work.
 e2e-up:
