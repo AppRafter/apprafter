@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: MIT
+# v1alpha1 ResourceClaim CRD. Hand-rolled OpenAPI v3 mirror of
+# schemas/v1alpha1/resourceclaim.cue. Operator-generated, Namespaced;
+# the admission webhook enforces operator-only CREATE (OpenAPI v3
+# can't express requester identity). `status.conditions` schema ships
+# read-only in 2.2; the reconciler that writes them lands in 2.3.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: resourceclaims.apprafter.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+    argocd.argoproj.io/sync-options: ServerSideApply=true
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+spec:
+  group: apprafter.io
+  scope: Namespaced
+  names:
+    plural: resourceclaims
+    singular: resourceclaim
+    kind: ResourceClaim
+    listKind: ResourceClaimList
+    shortNames:
+      - rc
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required: [type, selector]
+              properties:
+                type:
+                  type: string
+                  enum: [pg, jetstream, clickhouse, redis, s3, notifications]
+                selector:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  minProperties: 1
+                size:
+                  type: string
+                  enum: [nano, small, medium, large, xlarge]
+            status:
+              type: object
+              properties:
+                provider:
+                  type: string
+                connectionSecretRef:
+                  type: string
+                ready:
+                  type: boolean
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status, lastTransitionTime]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Type
+          type: string
+          jsonPath: .spec.type
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+        - name: Provider
+          type: string
+          jsonPath: .status.provider
+        - name: Ready
+          type: boolean
+          jsonPath: .status.ready
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
