@@ -1698,6 +1698,25 @@ compatibility: "0.1.23": {
 // re-registering. cue-cmp image v0.1.5 → v0.1.6 (entrypoint
 // .sh change baked into the image), chart pin follows via
 // the `argocdcuecmp.version` CUE import.
+// 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
+// 2.1). First 0.2-series platform-stack release; operator +
+// admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.1": {
+	change:          "safe"
+	operatorVersion: "v0.2.1"
+	notes: """
+		2.1 — ServiceProvider CRD. Additive: a new namespaced
+		v1alpha1 ServiceProvider CRD (CUE schema + hand-rolled
+		OpenAPI v3 CRD at sync-wave -5 + kube-rs type) plus a new
+		validating-webhook entry for it (closed built-in type
+		enum pg|jetstream|clickhouse|redis|s3|notifications,
+		non-empty backend). No existing resource or values
+		reshaped, no data migration — safe to auto-sync. First
+		0.2-series platform-stack release; operator + admission
+		webhook images move to v0.2.1.
+		"""
+	references: ["plan.md 2.1"]
+}
 compatibility: "0.1.52": {
 	change:          "safe"
 	operatorVersion: "v0.1.137"

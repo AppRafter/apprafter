@@ -2665,12 +2665,13 @@ instead of carrying parallel definitions.
 
 ### 2.1 ServiceProvider CRD
 > 🏁 SR: A · order 3 (Phase-2 minimum)
+> v0.2.1 — 2.1 shipped: ServiceProvider CRD (CUE schema + OpenAPI v3 CRD + kube-rs type + admission validator/dispatch/webhook + cue-vet example + tests). Namespaced. Tier-aware defaults deferred to 2.4–2.6.
 
 **Поставка:**
-- [ ] CUE-схема + admission webhook.
-- [ ] Поля: `type`, `backend`, `labels`, `config` (raw map), `status.health`.
-- [ ] Built-in типы (закрытый enum в v1alpha1): `pg`, `jetstream`, `clickhouse`, `redis`, `s3`, `notifications`.
-- [ ] Tier-aware defaults в схеме (через `if tier == 1 ...`).
+- [x] CUE-схема + admission webhook.
+- [x] Поля: `type`, `backend`, `labels`, `config` (raw map), `status.health`.
+- [x] Built-in типы (закрытый enum в v1alpha1): `pg`, `jetstream`, `clickhouse`, `redis`, `s3`, `notifications`.
+- [ ] Tier-aware defaults в схеме (через `if tier == 1 ...`). — **deferred to 2.4–2.6** (concrete tier-default provider instances land with the actual providers; 2.1 ships schema + admission only)
 
 **Acceptance:** ServiceProvider валидируется; неизвестный `type` без плагина — ошибка admission.
 
