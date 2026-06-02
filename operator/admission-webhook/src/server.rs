@@ -103,6 +103,7 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
             crate::validator_migrationplan::validate_migrationplan(&object, old_object.as_ref())
         }
         "SourceCredential" => crate::validator_sourcecredential::validate_sourcecredential(&object),
+        "ServiceProvider" => crate::validator_serviceprovider::validate_serviceprovider(&object),
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The
@@ -297,6 +298,69 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["response"]["allowed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_serviceprovider() {
+        let router = build_router();
+        let body = admission_review_for_kind(
+            "ServiceProvider",
+            json!({
+                "metadata": { "name": "pg-integrated", "namespace": "apprafter-system" },
+                "spec": { "type": "pg", "backend": "cloudnative-pg" }
+            }),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn rejects_serviceprovider_with_unknown_type() {
+        let router = build_router();
+        let body = admission_review_for_kind(
+            "ServiceProvider",
+            json!({
+                "metadata": { "name": "kafka-provider", "namespace": "apprafter-system" },
+                "spec": { "type": "kafka", "backend": "strimzi" }
+            }),
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["response"]["allowed"], json!(false));
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("ServiceProvider is invalid: "));
     }
 
     #[tokio::test]
