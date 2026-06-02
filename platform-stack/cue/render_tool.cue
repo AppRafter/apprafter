@@ -166,6 +166,49 @@ _appProjectsTemplate: """
 
 	"""
 
+// `_serviceProvidersTemplate` — emits one `kind: ServiceProvider`
+// (apprafter.io/v1alpha1) per entry in `.Values.serviceProviders`.
+// Seeds the launch-default backends so the 2.3 scheduler has a
+// provider to match on a fresh cluster. Carries
+// `SkipDryRunOnMissingResource=true` so Argo CD tolerates the
+// window before the apprafter-operator child Application installs
+// the ServiceProvider CRD, retrying until it exists; the positive
+// per-entry sync-wave keeps the CR after that child Application's
+// wave-0 sync.
+//
+// Note the double-curly braces: this string is itself a Go
+// template Helm executes at install time, so we keep the `{{ }}`
+// literal. CUE ships it verbatim.
+_serviceProvidersTemplate: """
+	{{/*
+	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
+	  Rendered by `cue cmd render`. Do not edit.
+	  Iterates over .Values.serviceProviders and emits one
+	  kind: ServiceProvider per entry.
+	*/}}
+	{{- range $name, $sp := .Values.serviceProviders }}
+	---
+	apiVersion: apprafter.io/v1alpha1
+	kind: ServiceProvider
+	metadata:
+	  name: {{ $name | quote }}
+	  namespace: {{ $sp.namespace | quote }}
+	  annotations:
+	    argocd.argoproj.io/sync-wave: {{ $sp.syncWave | quote }}
+	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+	  labels:
+	{{ toYaml $sp.labels | indent 4 }}
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	spec:
+	  type: {{ $sp.type | quote }}
+	  backend: {{ $sp.backend | quote }}
+	  config:
+	{{ toYaml $sp.config | indent 4 }}
+	{{- end }}
+
+	"""
+
 _applicationsTemplate: """
 	{{/*
 	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
@@ -421,6 +464,12 @@ command: render: {
 	appProjectsTemplate: file.Create & {
 		filename: "\(_distDir)/templates/appprojects.yaml"
 		contents: _appProjectsTemplate
+		$dep:     mktemplates.$done
+	}
+
+	serviceProvidersTemplate: file.Create & {
+		filename: "\(_distDir)/templates/serviceproviders.yaml"
+		contents: _serviceProvidersTemplate
 		$dep:     mktemplates.$done
 	}
 
