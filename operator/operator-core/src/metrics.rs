@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Prometheus metrics for the AppRafter operator.
 //!
-//! Three signal-grade metrics:
+//! Four signal-grade metrics:
 //!   - apprafter_reconcile_total{kind,namespace,result} — every
 //!     reconcile call increments one of {ok, error}.
 //!   - apprafter_reconcile_duration_seconds{kind} — histogram of
 //!     wall-time per reconcile.
 //!   - apprafter_reconcile_errors_total{kind} — error-only counter
 //!     for quick "errors per minute" alerts.
+//!   - apprafter_claim_unmatched_total{kind,namespace,reason} —
+//!     ResourceClaims with no matching ServiceProvider.
 //!
 //! Metrics are registered into a single `Registry` that the HTTP
 //! `/metrics` handler in `apprafter-operator` encodes.
@@ -19,6 +21,7 @@ pub struct Metrics {
     pub reconcile_total: CounterVec,
     pub reconcile_duration: HistogramVec,
     pub reconcile_errors: CounterVec,
+    pub claim_unmatched_total: CounterVec,
 }
 
 impl Default for Metrics {
@@ -58,6 +61,15 @@ impl Metrics {
         )
         .expect("CounterVec must build with a non-empty name");
 
+        let claim_unmatched_total = CounterVec::new(
+            opts!(
+                "apprafter_claim_unmatched_total",
+                "ResourceClaims with no matching ServiceProvider, by kind, namespace, and reason"
+            ),
+            &["kind", "namespace", "reason"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
         registry
             .register(Box::new(reconcile_total.clone()))
             .expect("reconcile_total registers cleanly");
@@ -67,12 +79,16 @@ impl Metrics {
         registry
             .register(Box::new(reconcile_errors.clone()))
             .expect("reconcile_errors registers cleanly");
+        registry
+            .register(Box::new(claim_unmatched_total.clone()))
+            .expect("claim_unmatched_total registers cleanly");
 
         Self {
             registry,
             reconcile_total,
             reconcile_duration,
             reconcile_errors,
+            claim_unmatched_total,
         }
     }
 
@@ -93,7 +109,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metrics_registry_lists_all_three_metric_families() {
+    fn metrics_registry_lists_all_metric_families() {
         // Prometheus' TextEncoder skips empty metric families, so
         // we drive each counter once (to emit at least one sample
         // per family) and then verify the family names appear in
@@ -106,6 +122,9 @@ mod tests {
             .with_label_values(&["Application"])
             .observe(0.0);
         m.reconcile_errors.with_label_values(&["Application"]).inc();
+        m.claim_unmatched_total
+            .with_label_values(&["ResourceClaim", "demo", "no_matching_provider"])
+            .inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -113,6 +132,7 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("apprafter_reconcile_errors_total"), "{body}");
+        assert!(body.contains("apprafter_claim_unmatched_total"), "{body}");
     }
 
     #[test]
