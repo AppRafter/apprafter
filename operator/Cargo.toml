@@ -8,6 +8,7 @@ members = [
     "operator-controllers/migration",
     "operator-controllers/platform-stack",
     "operator-controllers/sourcecredential",
+    "operator-controllers/resourceclaim-scheduler",
     "operator-core",
     "operator-rendering",
 ]

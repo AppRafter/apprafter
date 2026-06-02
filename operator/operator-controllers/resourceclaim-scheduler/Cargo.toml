@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "operator-controllers-resourceclaim-scheduler"
+description = "kube-rs Controller for v1alpha1 ResourceClaim — schedules claims to ServiceProviders (Phase 2.3)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
