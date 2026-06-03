@@ -1701,6 +1701,21 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.10": {
+	change:          "safe"
+	operatorVersion: "v0.2.10"
+	notes: """
+		2.4f — RetainedClaim CRD + 7-day grace GC. A deleted pg
+		ResourceClaim is snapshotted into a new immutable RetainedClaim
+		(apprafter-system) by the provisioner finalizer; a new GC
+		controller drops the Postgres role + database (ensure:absent) +
+		password Secret after retainUntil, then deletes the snapshot.
+		Closes the 2.4c cleanup skeleton (role/DB no longer leak on
+		delete). New operator-only RetainedClaim CRD (immutable spec),
+		RBAC, and a 7th controller. Safe to auto-sync.
+		"""
+	references: ["plan.md 2.4f"]
+}
 compatibility: "0.2.9": {
 	change:          "safe"
 	operatorVersion: "v0.2.9"
