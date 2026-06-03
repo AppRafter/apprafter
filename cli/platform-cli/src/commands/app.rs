@@ -541,32 +541,84 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
 
     print_status(&app);
 
-    if show_resources {
-        print_argocd_resources(&app);
-        // Fetch pods from destination ns using the inner
-        // AppRafter Application name (operator's label value)
-        // resolved via `app_open::find_apprafter_app_name`.
-        // Best-effort: errors during pod fetch surface as a
-        // warning, not a hard failure — the operator already
-        // has the basic status they came for.
-        if let Some(inner_name) = crate::commands::app_open::find_apprafter_app_name(&app) {
-            if let Some(dest_ns) = app
-                .pointer("/spec/destination/namespace")
-                .and_then(Value::as_str)
-            {
-                match list_pods_for_apprafter_app(&inner_name, dest_ns, kc.path()) {
-                    Ok(pods) => print_pod_summaries(&pods, &inner_name, dest_ns),
-                    Err(e) => {
-                        eprintln!();
-                        eprintln!(
-                            "⚠ Could not fetch workload pod state ({e}). \
-                             Argo CD's view (above) is still authoritative \
-                             for sync/health from the apiserver perspective."
-                        );
+    // Resolve the INNER workload name + destination namespace
+    // once — all four default-path fetches key off them. The
+    // inner name is the operator's `app.kubernetes.io/name`
+    // label value (the AppRafter Application CR's metadata.name,
+    // which can differ from the Argo CD parent); dest_ns is
+    // where Argo CD lays down children. Both come from
+    // `status.resources[]` / `spec.destination.namespace`, so a
+    // not-yet-synced app yields `None` for either — in which
+    // case the workload detail is simply unavailable yet.
+    let inner = crate::commands::app_open::find_apprafter_app_name(&app);
+    let dest_ns = app
+        .pointer("/spec/destination/namespace")
+        .and_then(Value::as_str);
+
+    match (inner.as_deref(), dest_ns) {
+        (Some(inner_name), Some(dest_ns)) => {
+            // 1. AppRafter Application phase (group-qualified
+            //    apprafter.io read). Non-fatal — a missing CR /
+            //    absent phase simply skips the line.
+            match kubectl_get_json(
+                "application.apprafter.io",
+                Some(inner_name),
+                Some(dest_ns),
+                kc.path(),
+            ) {
+                Ok(Some(cr)) => {
+                    if let Some(phase) = cr.pointer("/status/phase").and_then(Value::as_str) {
+                        println!("AppRafter phase: {phase}");
                     }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!(
+                        "⚠ Could not fetch AppRafter Application phase ({e}). \
+                         Argo CD's view (above) is still authoritative."
+                    );
+                }
+            }
+
+            // 2. Pods (moved out of --resources). Non-fatal.
+            match list_pods_for_apprafter_app(inner_name, dest_ns, kc.path()) {
+                Ok(pods) => print_pod_summaries(&pods, inner_name, dest_ns),
+                Err(e) => {
+                    eprintln!();
+                    eprintln!(
+                        "⚠ Could not fetch workload pod state ({e}). \
+                         Argo CD's view (above) is still authoritative \
+                         for sync/health from the apiserver perspective."
+                    );
+                }
+            }
+
+            // 3. Services. Non-fatal.
+            match list_services_for_apprafter_app(inner_name, dest_ns, kc.path()) {
+                Ok(services) => print_service_summaries(&services, inner_name, dest_ns),
+                Err(e) => {
+                    eprintln!();
+                    eprintln!("⚠ Could not fetch workload service state ({e}).");
+                }
+            }
+
+            // 4. Resource provisioning (ResourceClaims). Non-fatal.
+            match list_resource_claims_for_app(inner_name, dest_ns, kc.path()) {
+                Ok(claims) => print_resource_claims(&claims, dest_ns),
+                Err(e) => {
+                    eprintln!();
+                    eprintln!("⚠ Could not fetch resource-claim state ({e}).");
                 }
             }
         }
+        _ => {
+            println!();
+            println!("(workload detail unavailable — app not synced yet)");
+        }
+    }
+
+    if show_resources {
+        print_argocd_resources(&app);
     }
 
     Ok(())
@@ -589,6 +641,44 @@ pub(crate) struct PodSummary {
     /// Human-readable age computed at print time. Format
     /// mirrors `kubectl get pods` (`s`, `m`, `h`, `d` units).
     pub age: String,
+}
+
+/// Service surface rendered into the default `app status`
+/// services table. Mirrors `PodSummary` — public(crate) so
+/// tests can drive `print_service_summaries` without spawning
+/// kubectl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceSummary {
+    pub name: String,
+    /// `spec.type` (e.g. `ClusterIP`, `LoadBalancer`); default
+    /// `ClusterIP` when omitted, matching the k8s API default.
+    pub type_: String,
+    /// `spec.clusterIP`; `-` when omitted (e.g. headless or
+    /// not-yet-assigned).
+    pub cluster_ip: String,
+    /// Compact `<port>/<protocol>` join over `spec.ports[]`
+    /// (e.g. `3000/TCP`, comma-separated for multi-port).
+    pub ports: String,
+}
+
+/// ResourceClaim provisioning snapshot rendered into the
+/// default `app status` claims table. public(crate) so tests
+/// drive `print_resource_claims` without a cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResourceClaimSummary {
+    pub name: String,
+    /// `status.provider`; `—` when the provisioner has not yet
+    /// bound a provider.
+    pub provider: String,
+    /// `status.ready`; false when absent (fresh claim).
+    pub ready: bool,
+    /// `status.connectionSecretRef` — the Secret holding the
+    /// connection material. None until the claim is fulfilled.
+    pub secret_ref: Option<String>,
+    /// Whether `status.conditions[]` carries
+    /// `{type: "Scheduled", status: "True"}` — the provisioner
+    /// has placed the claim on a backing cluster.
+    pub scheduled: bool,
 }
 
 /// Argo CD resource entry rendered into the tracked-
@@ -879,6 +969,286 @@ fn print_pod_summaries(pods: &[PodSummary], inner_name: &str, namespace: &str) {
             p.age,
             name_w = name_w,
             status_w = status_w,
+        );
+    }
+}
+
+/// Shell out to `kubectl get services` filtered to the
+/// AppRafter operator's `app.kubernetes.io/name` label.
+/// Mirrors `list_pods_for_apprafter_app` / `app_open::
+/// list_services_for_apprafter_app` shape.
+fn list_services_for_apprafter_app(
+    apprafter_app_name: &str,
+    namespace: &str,
+    kubeconfig: &Path,
+) -> Result<Vec<ServiceSummary>> {
+    let selector = format!("app.kubernetes.io/name={apprafter_app_name}");
+    let out = Command::new("kubectl")
+        .arg("get")
+        .arg("services")
+        .arg("-n")
+        .arg(namespace)
+        .arg("-l")
+        .arg(&selector)
+        .arg("-o")
+        .arg("json")
+        .env("KUBECONFIG", kubeconfig)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl get services: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl get services failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let parsed: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
+    Ok(parse_service_summaries(&parsed))
+}
+
+/// Pure helper — parse `kubectl get services -o json` items
+/// into `ServiceSummary` rows. Defensive against shape drift:
+/// missing fields fall back to sensible defaults.
+pub(crate) fn parse_service_summaries(payload: &Value) -> Vec<ServiceSummary> {
+    let items = payload.get("items").and_then(Value::as_array);
+    let Some(items) = items else { return vec![] };
+    items
+        .iter()
+        .filter_map(|svc| {
+            let name = svc
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)?
+                .to_string();
+            let type_ = svc
+                .pointer("/spec/type")
+                .and_then(Value::as_str)
+                .unwrap_or("ClusterIP")
+                .to_string();
+            let cluster_ip = svc
+                .pointer("/spec/clusterIP")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string();
+            let ports = svc
+                .pointer("/spec/ports")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| {
+                            let port = p.get("port").and_then(Value::as_i64)?;
+                            let proto = p.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+                            Some(format!("{port}/{proto}"))
+                        })
+                        .collect::<Vec<String>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            Some(ServiceSummary {
+                name,
+                type_,
+                cluster_ip,
+                ports,
+            })
+        })
+        .collect()
+}
+
+fn print_service_summaries(services: &[ServiceSummary], inner_name: &str, namespace: &str) {
+    println!();
+    println!("Workload services ({namespace}, app.kubernetes.io/name={inner_name}):");
+    if services.is_empty() {
+        println!(
+            "  (none — the AppRafter Application's `spec.expose` may be omitted \
+             so the operator renders no Service)"
+        );
+        return;
+    }
+    let name_w = services
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let type_w = services
+        .iter()
+        .map(|s| s.type_.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let ip_w = services
+        .iter()
+        .map(|s| s.cluster_ip.len())
+        .max()
+        .unwrap_or(10)
+        .max(10);
+    println!(
+        "  {:<name_w$}  {:<type_w$}  {:<ip_w$}  PORTS",
+        "NAME",
+        "TYPE",
+        "CLUSTER-IP",
+        name_w = name_w,
+        type_w = type_w,
+        ip_w = ip_w,
+    );
+    for s in services {
+        println!(
+            "  {:<name_w$}  {:<type_w$}  {:<ip_w$}  {}",
+            s.name,
+            s.type_,
+            s.cluster_ip,
+            s.ports,
+            name_w = name_w,
+            type_w = type_w,
+            ip_w = ip_w,
+        );
+    }
+}
+
+/// Shell out to `kubectl get resourceclaim.apprafter.io`
+/// (GROUP-QUALIFIED — bare `resourceclaim` collides with the
+/// k8s 1.32+ DRA `resourceclaims.resource.k8s.io`). Returns
+/// only the claims owned by `owner` (the inner AppRafter
+/// Application), filtered in `parse_resource_claim_summaries`.
+fn list_resource_claims_for_app(
+    owner: &str,
+    namespace: &str,
+    kubeconfig: &Path,
+) -> Result<Vec<ResourceClaimSummary>> {
+    let out = Command::new("kubectl")
+        .arg("get")
+        .arg("resourceclaim.apprafter.io")
+        .arg("-n")
+        .arg(namespace)
+        .arg("-o")
+        .arg("json")
+        .env("KUBECONFIG", kubeconfig)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl get resourceclaim: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl get resourceclaim.apprafter.io failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let parsed: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
+    Ok(parse_resource_claim_summaries(&parsed, owner))
+}
+
+/// Pure helper — parse `kubectl get resourceclaim.apprafter.io
+/// -o json` items into `ResourceClaimSummary` rows, FILTERED to
+/// claims whose `metadata.ownerReferences[]` carries an entry
+/// with `kind == "Application"` and `name == owner`. The inner
+/// app owns the claims its `needs.*` block generates, so a
+/// namespace-wide list is narrowed to just this app's claims.
+pub(crate) fn parse_resource_claim_summaries(
+    payload: &Value,
+    owner: &str,
+) -> Vec<ResourceClaimSummary> {
+    let items = payload.get("items").and_then(Value::as_array);
+    let Some(items) = items else { return vec![] };
+    items
+        .iter()
+        .filter(|claim| claim_owned_by(claim, owner))
+        .map(summarise_resource_claim)
+        .collect()
+}
+
+/// Does the claim's `metadata.ownerReferences[]` carry an
+/// `Application`-kind entry naming `owner`?
+fn claim_owned_by(claim: &Value, owner: &str) -> bool {
+    claim
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .map(|refs| {
+            refs.iter().any(|r| {
+                r.get("kind").and_then(Value::as_str) == Some("Application")
+                    && r.get("name").and_then(Value::as_str) == Some(owner)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn summarise_resource_claim(claim: &Value) -> ResourceClaimSummary {
+    let name = claim
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    let provider = claim
+        .pointer("/status/provider")
+        .and_then(Value::as_str)
+        .unwrap_or("—")
+        .to_string();
+    let ready = claim
+        .pointer("/status/ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `connectionSecretRef` is a plain string in this CRD; fall
+    // back to `.name` if a future shape makes it an object.
+    let secret_ref = claim.pointer("/status/connectionSecretRef").and_then(|v| {
+        v.as_str()
+            .map(String::from)
+            .or_else(|| v.get("name").and_then(Value::as_str).map(String::from))
+    });
+    let scheduled = claim
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some("Scheduled")
+                    && c.get("status").and_then(Value::as_str) == Some("True")
+            })
+        })
+        .unwrap_or(false);
+    ResourceClaimSummary {
+        name,
+        provider,
+        ready,
+        secret_ref,
+        scheduled,
+    }
+}
+
+fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
+    println!();
+    println!("Resource provisioning ({namespace}):");
+    if claims.is_empty() {
+        println!("  (none — the AppRafter Application declares no `needs.*` resources)");
+        return;
+    }
+    let name_w = claims
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let provider_w = claims
+        .iter()
+        .map(|c| c.provider.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    println!(
+        "  {:<name_w$}  {:<provider_w$}  READY  SCHEDULED  SECRET",
+        "NAME",
+        "PROVIDER",
+        name_w = name_w,
+        provider_w = provider_w,
+    );
+    for c in claims {
+        let secret = c.secret_ref.as_deref().unwrap_or("-");
+        println!(
+            "  {:<name_w$}  {:<provider_w$}  {:<5}  {:<9}  {}",
+            c.name,
+            c.provider,
+            if c.ready { "true" } else { "false" },
+            if c.scheduled { "true" } else { "false" },
+            secret,
+            name_w = name_w,
+            provider_w = provider_w,
         );
     }
 }
@@ -2298,5 +2668,152 @@ mod tests {
         let rs = extract_tracked_resources(&app);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].name, "ok");
+    }
+
+    #[test]
+    fn parse_service_summaries_happy_two_service_list() {
+        // 2.4g default-path services table. One ClusterIP with a
+        // single port, one LoadBalancer with two ports — exercise
+        // type/clusterIP defaults absent and the compact
+        // <port>/<protocol> join (multi-port comma-separated).
+        let payload = serde_json::json!({
+            "items": [
+                {
+                    "metadata": { "name": "landing-web" },
+                    "spec": {
+                        "type": "ClusterIP",
+                        "clusterIP": "10.43.0.10",
+                        "ports": [{ "port": 3000, "protocol": "TCP" }]
+                    }
+                },
+                {
+                    "metadata": { "name": "landing-lb" },
+                    "spec": {
+                        "type": "LoadBalancer",
+                        "clusterIP": "10.43.0.20",
+                        "ports": [
+                            { "port": 80, "protocol": "TCP" },
+                            { "port": 443, "protocol": "TCP" }
+                        ]
+                    }
+                }
+            ]
+        });
+        let svcs = parse_service_summaries(&payload);
+        assert_eq!(svcs.len(), 2);
+        assert_eq!(svcs[0].name, "landing-web");
+        assert_eq!(svcs[0].type_, "ClusterIP");
+        assert_eq!(svcs[0].cluster_ip, "10.43.0.10");
+        assert_eq!(svcs[0].ports, "3000/TCP");
+        assert_eq!(svcs[1].type_, "LoadBalancer");
+        assert_eq!(svcs[1].ports, "80/TCP,443/TCP");
+    }
+
+    #[test]
+    fn parse_service_summaries_defaults_type_and_clusterip() {
+        // Missing `spec.type` defaults to ClusterIP (k8s API
+        // default); missing `spec.clusterIP` → `-`; missing
+        // protocol on a port defaults to TCP.
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": { "name": "bare" },
+                "spec": { "ports": [{ "port": 8080 }] }
+            }]
+        });
+        let svcs = parse_service_summaries(&payload);
+        assert_eq!(svcs.len(), 1);
+        assert_eq!(svcs[0].type_, "ClusterIP");
+        assert_eq!(svcs[0].cluster_ip, "-");
+        assert_eq!(svcs[0].ports, "8080/TCP");
+    }
+
+    #[test]
+    fn parse_service_summaries_empty_or_missing_items_returns_empty() {
+        assert!(parse_service_summaries(&serde_json::json!({ "items": [] })).is_empty());
+        assert!(parse_service_summaries(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_resource_claim_summaries_owned_claim_full_status() {
+        // A claim owned by the target Application, fully
+        // provisioned: provider bound, ready=true, secretRef set,
+        // and a Scheduled=True condition.
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "payments-pg",
+                    "ownerReferences": [
+                        { "kind": "Application", "name": "payments" }
+                    ]
+                },
+                "status": {
+                    "provider": "cnpg",
+                    "ready": true,
+                    "connectionSecretRef": "payments-pg-conn",
+                    "conditions": [
+                        { "type": "Scheduled", "status": "True" }
+                    ]
+                }
+            }]
+        });
+        let claims = parse_resource_claim_summaries(&payload, "payments");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].name, "payments-pg");
+        assert_eq!(claims[0].provider, "cnpg");
+        assert!(claims[0].ready);
+        assert_eq!(claims[0].secret_ref.as_deref(), Some("payments-pg-conn"));
+        assert!(claims[0].scheduled);
+    }
+
+    #[test]
+    fn parse_resource_claim_summaries_filters_out_other_owners() {
+        // A claim owned by a DIFFERENT Application must not leak
+        // into this app's status — the namespace-wide list is
+        // narrowed by ownerReference.
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "other-pg",
+                    "ownerReferences": [
+                        { "kind": "Application", "name": "billing" }
+                    ]
+                },
+                "status": { "provider": "cnpg", "ready": true }
+            }]
+        });
+        let claims = parse_resource_claim_summaries(&payload, "payments");
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn parse_resource_claim_summaries_fresh_claim_no_status() {
+        // A just-created claim owned by the target with NO
+        // `.status` block yet — defaults: ready=false,
+        // provider=`—`, scheduled=false, secret_ref=None.
+        let payload = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "payments-pg",
+                    "ownerReferences": [
+                        { "kind": "Application", "name": "payments" }
+                    ]
+                }
+            }]
+        });
+        let claims = parse_resource_claim_summaries(&payload, "payments");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].name, "payments-pg");
+        assert_eq!(claims[0].provider, "—");
+        assert!(!claims[0].ready);
+        assert!(!claims[0].scheduled);
+        assert!(claims[0].secret_ref.is_none());
+    }
+
+    #[test]
+    fn parse_resource_claim_summaries_empty_or_missing_items_returns_empty() {
+        assert!(
+            parse_resource_claim_summaries(&serde_json::json!({ "items": [] }), "x").is_empty()
+        );
+        assert!(parse_resource_claim_summaries(&serde_json::json!({}), "x").is_empty());
     }
 }
