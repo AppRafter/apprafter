@@ -89,6 +89,16 @@ pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationB
         }
         effective.env = Some(merged);
     }
+    // 2.4d S0: per-key whole-object replace for `needs` — the env
+    // entry replaces the base entry wholesale per key (mirrors how
+    // `expose` replaces wholesale); base-only need keys survive.
+    if let Some(env_needs) = &env_override.needs {
+        let mut merged = effective.needs.unwrap_or_default();
+        for (k, v) in env_needs {
+            merged.insert(k.clone(), v.clone());
+        }
+        effective.needs = Some(merged);
+    }
     effective
 }
 
@@ -618,6 +628,72 @@ mod tests {
         assert_eq!(env.get("REGION").map(String::as_str), Some("eu"));
         // override-only:
         assert_eq!(env.get("PROD_FLAG").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn effective_spec_env_override_replaces_needs_per_key_and_keeps_base_only_needs() {
+        // 2.4d S0: env-scoped `needs` must merge per-key (the env
+        // entry replaces the base entry WHOLESALE for that key —
+        // mirrors how `expose` replaces), and base-only need keys
+        // survive when the env omits them.
+        use operator_core::application::ServiceNeed;
+        let mut base_needs = BTreeMap::new();
+        base_needs.insert(
+            "pg".to_string(),
+            ServiceNeed {
+                selector: None,
+                size: Some("small".into()),
+            },
+        );
+        base_needs.insert(
+            "redis".to_string(),
+            ServiceNeed {
+                selector: None,
+                size: Some("nano".into()),
+            },
+        );
+        let mut prod_needs = BTreeMap::new();
+        prod_needs.insert(
+            "pg".to_string(),
+            ServiceNeed {
+                selector: Some(BTreeMap::from([(
+                    "tier".to_string(),
+                    "managed-aws".to_string(),
+                )])),
+                size: None,
+            },
+        );
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                needs: Some(prod_needs),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("x".into()),
+                needs: Some(base_needs),
+                ..Default::default()
+            },
+            envs,
+        );
+        let s = effective_spec(&app, Some("prod"));
+        let needs = s.needs.expect("needs merged");
+        // pg replaced wholesale: env selector wins, base size DROPPED.
+        let pg = needs.get("pg").expect("pg need");
+        assert_eq!(
+            pg.selector
+                .as_ref()
+                .and_then(|m| m.get("tier"))
+                .map(String::as_str),
+            Some("managed-aws")
+        );
+        assert_eq!(pg.size, None, "base size must be dropped on env replace");
+        // base-only redis survives.
+        let redis = needs.get("redis").expect("base-only redis survives");
+        assert_eq!(redis.size.as_deref(), Some("nano"));
     }
 
     #[test]
