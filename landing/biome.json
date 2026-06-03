@@ -21,7 +21,8 @@
       "**/*.lock",
       "**/bun.lockb",
       "cms/payload-types.ts",
-      "cms/src/app/(payload)/admin/importMap.js"
+      "cms/src/app/(payload)/admin/importMap.js",
+      "cms/src/migrations"
     ]
   },
   "linter": {

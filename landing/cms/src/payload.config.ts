@@ -25,6 +25,7 @@ import { TierLadder } from './globals/TierLadder';
 import { ValueProps } from './globals/ValueProps';
 import { WaitlistFormCopy } from './globals/WaitlistFormCopy';
 import { withRebuildHook } from './lib/withRebuildHook';
+import { migrations } from './migrations';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -54,6 +55,14 @@ export default buildConfig({
   secret: process.env.PAYLOAD_SECRET ?? '',
   db: postgresAdapter({
     pool: { connectionString: process.env.DATABASE_URL ?? '' },
+    // The standalone runtime forces NODE_ENV=production, which disables
+    // Drizzle `push` (and push pulls in drizzle-kit, which withPayload
+    // strips from the standalone trace). So ship versioned migrations:
+    // the adapter runs any pending `prodMigrations` on connect at boot,
+    // creating/updating the schema with no CLI and no drizzle-kit at
+    // runtime. After changing collections/globals, regenerate with
+    // `bun run payload migrate:create` and commit src/migrations/.
+    prodMigrations: migrations,
   }),
   editor: lexicalEditor(),
   collections: [Users, WaitlistSignups],
