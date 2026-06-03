@@ -34,10 +34,17 @@ use crate::validator::ValidationError;
 /// the current per-validator style (matches `validator_resourceclaim.rs`).
 const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
 
-/// `spec` string fields that must be non-empty.
-const REQUIRED_STRING_FIELDS: [&str; 7] = [
-    "provider",
-    "backend",
+/// `spec` string fields that must be non-empty — the GC-load-bearing set.
+///
+/// `provider` and `backend` are DELIBERATELY excluded: they are best-effort
+/// lineage/audit fields, and the provisioner finalizer legitimately writes
+/// them empty when the claim was never scheduled or its ServiceProvider was
+/// deleted before teardown. Requiring them non-empty would make the
+/// operator's own snapshot CREATE fail the webhook (failurePolicy: Fail),
+/// wedging the finalizer and leaking the role/DB it was trying to retain —
+/// the opposite of this feature's purpose. The GC consumes only the fields
+/// below (all derived deterministically with fallbacks, so never empty).
+const REQUIRED_STRING_FIELDS: [&str; 5] = [
     "cnpgCluster",
     "cnpgNamespace",
     "role",
@@ -209,6 +216,19 @@ mod tests {
     #[test]
     fn allows_operator_create() {
         assert!(validate_retainedclaim(&retained(), None, &operator_user(), "CREATE").is_empty());
+    }
+
+    #[test]
+    fn allows_operator_create_with_empty_provider_and_backend() {
+        // Leak-wedge guard: when a claim was never scheduled (or its
+        // ServiceProvider was deleted before teardown), the finalizer
+        // snapshots with empty provider/backend. The webhook MUST accept it
+        // (failurePolicy: Fail) — otherwise the operator's own snapshot
+        // CREATE is rejected, the finalizer wedges, and the role/DB leak.
+        let mut c = retained();
+        c["spec"]["provider"] = json!("");
+        c["spec"]["backend"] = json!("");
+        assert!(validate_retainedclaim(&c, None, &operator_user(), "CREATE").is_empty());
     }
 
     #[test]

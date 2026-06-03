@@ -232,12 +232,19 @@ async fn remove_database(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<(), R
     let db_object = &rc.spec.database_object_name;
     let cnpg_ns = &rc.spec.cnpg_namespace;
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &database_ar());
-    let body = json!({
-        "apiVersion": "postgresql.cnpg.io/v1",
-        "kind": "Database",
-        "metadata": { "name": db_object, "namespace": cnpg_ns },
-        "spec": { "ensure": "absent" },
-    });
+    // Re-send the FULL Database body with `ensure: absent`. A partial SSA
+    // apply (spec.ensure only) under this same field manager would STRIP the
+    // cluster/name/owner this manager previously owned, leaving an incomplete
+    // spec the apiserver rejects / CNPG cannot drop. Reconstruct from the
+    // snapshot so ownership is preserved and the drop actually happens.
+    let body = cnpg::database_object(
+        db_object,
+        cnpg_ns,
+        &rc.spec.cnpg_cluster,
+        &rc.spec.database,
+        &rc.spec.role,
+        "absent",
+    );
     match api
         .patch(db_object, &apply_params(), &Patch::Apply(&body))
         .await

@@ -272,7 +272,7 @@ async fn provision_cloudnativepg(
     //    owner role materialises.
     let db_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &cnpg_ns, &database_ar());
-    let db_body = cnpg::database_object(&object_name, &cnpg_ns, &cluster, &db, &role);
+    let db_body = cnpg::database_object(&object_name, &cnpg_ns, &cluster, &db, &role, "present");
     db_api
         .patch(&object_name, &apply_params(), &Patch::Apply(&db_body))
         .await?;

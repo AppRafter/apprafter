@@ -108,7 +108,14 @@ pub fn cluster_object(name: &str, ns: &str, instances: i64, storage: &str) -> Va
 /// Build the CNPG `Database` SSA apply body. `owner` must reference an
 /// existing managed role — create the role first; CNPG retries the
 /// Database until the owner exists.
-pub fn database_object(name: &str, ns: &str, cluster: &str, db: &str, owner: &str) -> Value {
+pub fn database_object(
+    name: &str,
+    ns: &str,
+    cluster: &str,
+    db: &str,
+    owner: &str,
+    ensure: &str,
+) -> Value {
     json!({
         "apiVersion": "postgresql.cnpg.io/v1",
         "kind": "Database",
@@ -120,7 +127,11 @@ pub fn database_object(name: &str, ns: &str, cluster: &str, db: &str, owner: &st
             "cluster": { "name": cluster },
             "name": db,
             "owner": owner,
-            "ensure": "present",
+            // `present` (provision) or `absent` (GC drop). The GC re-sends
+            // the FULL body with `ensure: absent` — NOT a partial SSA apply,
+            // which would strip cluster/name/owner that this same field
+            // manager owns and break the drop.
+            "ensure": ensure,
         },
     })
 }
@@ -301,6 +312,7 @@ mod tests {
             "platform-postgres",
             "appdb",
             "approle",
+            "present",
         );
         assert_eq!(d["apiVersion"], "postgresql.cnpg.io/v1");
         assert_eq!(d["kind"], "Database");
@@ -310,6 +322,25 @@ mod tests {
         assert_eq!(d["spec"]["name"], "appdb");
         assert_eq!(d["spec"]["owner"], "approle");
         assert_eq!(d["spec"]["ensure"], "present");
+    }
+
+    #[test]
+    fn database_object_ensure_absent_keeps_the_full_spec_for_the_gc_drop() {
+        // The GC re-sends the FULL body with ensure:absent (NOT a partial
+        // SSA apply) so cluster/name/owner are preserved and CNPG drops the
+        // DB instead of the apiserver rejecting an incomplete spec.
+        let d = database_object(
+            "claim-db",
+            "cnpg-system",
+            "platform-postgres",
+            "appdb",
+            "approle",
+            "absent",
+        );
+        assert_eq!(d["spec"]["ensure"], "absent");
+        assert_eq!(d["spec"]["cluster"]["name"], "platform-postgres");
+        assert_eq!(d["spec"]["name"], "appdb");
+        assert_eq!(d["spec"]["owner"], "approle");
     }
 
     // --- basic_auth_secret() ---
