@@ -9,6 +9,58 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.10 + platform-stack 0.2.10 — 2.4f RetainedClaim CRD + 7-day grace GC (2026-06-03)
+
+Closes the 2.4c cleanup skeleton: a deleted `needs.pg` `ResourceClaim` is
+snapshotted into a new immutable `RetainedClaim` by the provisioner finalizer,
+and a new GC controller drops the Postgres role + database + password Secret
+after a 7-day grace — the role/DB/Secret no longer leak on delete.
+
+### Added
+
+- **`RetainedClaim` CRD.** A new immutable, namespaced `apprafter.io/v1alpha1`
+  CRD (5 hand-rolled mirrors: CUE schema + cue-vet example, OpenAPI v3 CRD with an
+  `x-kubernetes-validations` CEL `self == oldSelf` rule on `spec` and NO `status`
+  subresource, kube-rs `operator-core` type, admission validator + dispatch + a VWC
+  entry). The webhook gates CREATE to the operator SA / cluster-admin and rejects any
+  `spec` mutation on UPDATE (operator-only + immutable).
+- **Finalizer snapshot.** On a deleting pg `ResourceClaim` the
+  `resourceclaim-provisioner` finalizer snapshots it into a `RetainedClaim` in
+  **`apprafter-system`** (a platform namespace that outlives tenant namespaces, so
+  the GC always fires even if the app's namespace is torn down; lineage preserved in
+  `spec.claimRef`, `metadata.name = k8s_name(claim_ns, claim_name)`,
+  `retainUntil = deletionTimestamp + 7d`) **BEFORE** removing its finalizer. The SSA
+  apply is idempotent + crash-safe (a crash mid-way re-applies the byte-identical
+  snapshot, then un-finalizes). The finalizer only CREATES the `RetainedClaim` (its
+  own object) — it never writes `ResourceClaim` status (the SSA split is preserved).
+- **GC controller (7th controller).** A new `gc.rs` controller (same crate — no new
+  workspace member) watches `RetainedClaim` cluster-wide and, once `retainUntil`
+  passes, drops in order (each step idempotent + 404-tolerant): the per-claim role
+  (RMW the shared Cluster's unkeyed `spec.managed.roles` via the new pure
+  `cnpg::remove_role` + 409-retry), the database via `spec.ensure: absent` SSA-patch
+  (**NOT** a CR delete — the Postgres reclaim default is `retain`, so deleting the CR
+  would not drop the DB; `ensure: absent` is the correct drop), the password Secret,
+  then the `RetainedClaim` itself. New `apprafter_claim_gc_total{result,namespace}`
+  metric.
+- **Injected-clock grace math.** The un-e2e-able 7-day timer is factored into pure
+  `grace.rs` fns (`compute_retain_until` / `should_gc` / `remaining_grace`) taking an
+  injected `now: DateTime<Utc>` — production passes `Utc::now()`; unit tests pass
+  FIXED instants (no real wait, no env-gated silent skip). A malformed `retainUntil`
+  logs + requeues, never panics.
+- **RBAC.** New `retainedclaims` rule (get/list/watch/create/patch/delete) + `delete`
+  added to the `postgresql.cnpg.io` clusters/databases verbs.
+
+### Notes
+
+- **Scope held.** pg-only (jetstream/redis cleanup is 2.5/2.6); the GC drops the DB
+  via `ensure: absent` and never deletes the `Database` CR; the grace is a hardcoded
+  7-day const (a configurable PlatformStack knob is deferred to UX polish).
+- `change: safe` — additive CRD + controller + RBAC, no data migration.
+  `operatorVersion` v0.2.9 → v0.2.10, `currentVersion` 0.2.9 → 0.2.10.
+  `operator/v0.2.10` + `platform-stack/v0.2.10` tags are workflow-made on push. No
+  cli bump, no monorepo `v0.x.y` tag. The delete → snapshot → GC loop (asserting the
+  DB is actually DROPPED, not just the CR) is exercised by the 2.4g real-cluster walk.
+
 ## operator v0.2.9 + platform-stack 0.2.9 — 2.4e DATABASE_URL DSN injection into the needs.pg Deployment (2026-06-03)
 
 A `needs.pg` Application, once its `ResourceClaim` is provisioned and the app
