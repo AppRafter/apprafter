@@ -34,6 +34,29 @@ COPY cms cms
 # workspace root as the tracing base (set in next.config.mjs).
 RUN cd cms && bun run build
 
+# Next's file-tracer (nft) does not reliably copy a handful of
+# Payload's runtime deps into the standalone tree: they are required
+# only from lazily-loaded Payload code paths (upload SSRF guard →
+# undici, realtime → ws, schema validation → ajv) that nft cannot
+# follow through Bun's symlinked `.bun` store. They survive a glibc
+# build but are dropped on this Alpine/musl one, 500ing the admin
+# with MODULE_NOT_FOUND. Stage each one — plus its dependency
+# closure — as a fully-dereferenced (cp -L), self-contained tree
+# straight from Bun's store; the runtime stage drops them onto the
+# admin bundle's module-resolution path. Sourcing from the store by
+# name keeps this version-agnostic and covers transitive-only deps
+# (ws, ajv are not direct dependencies). `@builder.io/partytown` is
+# intentionally skipped — it is an optional Next dep, never installed
+# nor executed by the admin.
+RUN set -eu; mkdir -p /landing/runtime-deps; \
+    for p in undici ws ajv; do \
+      cp -RL /landing/node_modules/.bun/"$p"@*/node_modules/. /landing/runtime-deps/; \
+    done; \
+    for p in undici ws ajv; do \
+      test -d "/landing/runtime-deps/$p" \
+        || { echo "FATAL: runtime-dep '$p' missing after staging"; exit 1; }; \
+    done
+
 # -----------------------------------------------------------------
 # Stage 2: minimal Node runtime
 # -----------------------------------------------------------------
@@ -64,6 +87,12 @@ COPY --from=builder /landing/cms/.next/standalone /app
 # landing/cms/public/robots.txt is the floor.
 COPY --from=builder /landing/cms/.next/static /app/cms/.next/static
 COPY --from=builder /landing/cms/public /app/cms/public
+# Payload runtime deps nft drops from the Alpine standalone build
+# (see builder stage), staged with their dependency closures so
+# `require('undici'|'ws'|'ajv')` from the admin bundle resolves —
+# /app/cms/.next/server/... walks up to /app/cms/node_modules. Merges
+# alongside the standalone's own next/react/pg/graphql symlinks.
+COPY --from=builder /landing/runtime-deps /app/cms/node_modules
 
 EXPOSE 3000
 
