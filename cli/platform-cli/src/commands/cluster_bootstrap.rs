@@ -343,8 +343,17 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //     `Healthy` (trivially, no resources to fail) while
     //     `Sync=Unknown` (chart pull errored). Walk-found bug
     //     v0.1.99 → v0.1.100 was this exact false-positive.
+    //
+    //     The resource is **group-qualified** (`applications.argoproj.io`,
+    //     not the bare `application`): once the operator chart installs
+    //     the `applications.apprafter.io` CRD (which also claims the
+    //     `app`/`apps` short names), a bare `application/platform` is
+    //     ambiguous and kubectl resolves it to `applications.apprafter.io`
+    //     (alphabetically first) → `NotFound`. This only bites on a
+    //     RE-RUN (the idempotency path), where the CRD is already present
+    //     at wait time — walk-found bug at v0.2.10.
     kubectl.wait_for_condition(
-        "application/platform",
+        "applications.argoproj.io/platform",
         Some("argocd"),
         "jsonpath={.status.sync.status}=Synced",
         PLATFORM_RECONCILE_TIMEOUT_SECS,
@@ -355,7 +364,7 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     //     Applications exist; Healthy means their workloads
     //     reached the chart's health-check thresholds.
     kubectl.wait_for_condition(
-        "application/platform",
+        "applications.argoproj.io/platform",
         Some("argocd"),
         "jsonpath={.status.health.status}=Healthy",
         PLATFORM_RECONCILE_TIMEOUT_SECS,
@@ -864,7 +873,7 @@ mod tests {
         assert_eq!(waits[1].condition_expr, "condition=Available");
         assert_eq!(waits[1].timeout_seconds, ARGOCD_DEPLOYMENT_TIMEOUT_SECS);
 
-        assert_eq!(waits[2].resource_ref, "application/platform");
+        assert_eq!(waits[2].resource_ref, "applications.argoproj.io/platform");
         assert_eq!(waits[2].namespace, Some("argocd".to_string()));
         assert_eq!(
             waits[2].condition_expr,
@@ -872,13 +881,27 @@ mod tests {
         );
         assert_eq!(waits[2].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
 
-        assert_eq!(waits[3].resource_ref, "application/platform");
+        assert_eq!(waits[3].resource_ref, "applications.argoproj.io/platform");
         assert_eq!(waits[3].namespace, Some("argocd".to_string()));
         assert_eq!(
             waits[3].condition_expr,
             "jsonpath={.status.health.status}=Healthy"
         );
         assert_eq!(waits[3].timeout_seconds, PLATFORM_RECONCILE_TIMEOUT_SECS);
+
+        // Regression guard (walk-found at v0.2.10): every Argo CD
+        // Application wait MUST be group-qualified
+        // (`applications.argoproj.io/...`). A bare `application/...` is
+        // ambiguous once the operator chart installs the
+        // `applications.apprafter.io` CRD (the re-run / idempotency
+        // path); kubectl mis-resolves it to `applications.apprafter.io`
+        // and the wait fails `NotFound`.
+        assert!(
+            waits
+                .iter()
+                .all(|w| !w.resource_ref.starts_with("application/")),
+            "Argo CD Application waits must be group-qualified, not the ambiguous bare `application/` form: {waits:?}"
+        );
 
         assert_eq!(waits[4].resource_ref, "crd/applications.apprafter.io");
         assert_eq!(waits[4].namespace, None);
