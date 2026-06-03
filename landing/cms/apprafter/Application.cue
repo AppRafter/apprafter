@@ -58,7 +58,12 @@ landingCms: v1alpha1.#Application & {
 				public:  true
 				network: "public"
 			}
+			needs: {
+				pg: {},
+			},
 			env: {
+				// DATABASE_URL auto-injected via needs.pg claim
+
 				// Server URL Payload reports back in admin links,
 				// password-reset emails, etc.
 				PAYLOAD_PUBLIC_SERVER_URL: "https://cms.apprafter.dev"

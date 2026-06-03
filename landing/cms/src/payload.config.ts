@@ -53,7 +53,7 @@ export default buildConfig({
   serverURL,
   secret: process.env.PAYLOAD_SECRET ?? '',
   db: postgresAdapter({
-    pool: { connectionString: process.env.DATABASE_URI ?? '' },
+    pool: { connectionString: process.env.DATABASE_URL ?? '' },
   }),
   editor: lexicalEditor(),
   collections: [Users, WaitlistSignups],
