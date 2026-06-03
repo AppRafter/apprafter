@@ -183,6 +183,15 @@ rules:
   # Secrets (CNPG namespace) and the per-claim connection
   # Secret (claim namespace) are covered by the cluster-wide
   # secrets rule below.
+  #
+  # 2.4f extension: the RetainedClaim GC also RMW-removes the
+  # per-claim role from the same Cluster (get + update) and
+  # SSA-patches the Database CR to `spec.ensure: absent`
+  # (patch). It does NOT delete the Database CR (the Postgres
+  # reclaim default is `retain`; ensure:absent is the drop),
+  # so `delete` is not strictly needed for the GC path — but it
+  # is granted here so a future hard-cleanup or operator
+  # break-glass can remove a stale CNPG CR without an RBAC edit.
   - apiGroups:
       - postgresql.cnpg.io
     resources:
@@ -195,6 +204,26 @@ rules:
       - create
       - update
       - patch
+      - delete
+  # Phase 2.4f RetainedClaim CRD — written by the provisioner
+  # finalizer (the deletion snapshot: create/patch via SSA) and
+  # consumed + deleted by the RetainedClaim GC controller (the
+  # 7th controller). The snapshot lives in apprafter-system but
+  # the GC watches cluster-wide, so the rule is part of the
+  # ClusterRole. The per-claim role/DB/password-Secret drops
+  # the GC performs are covered by the postgresql.cnpg.io rule
+  # above and the cluster-wide secrets rule below.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - retainedclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+      - delete
   # `delete` (S5): the derived-Secret GC finalizer removes the
   # cross-namespace Argo `repo-creds` + canonical
   # `dockerconfigjson` on SourceCredential deletion (no
