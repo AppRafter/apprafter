@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # landing-cms image — Payload 3 + Next 15 in standalone output
-# mode. Runtime is Node 22 Alpine; Sharp's musl native binary
+# mode. Runtime is Node 24 Alpine; Sharp's musl native binary
 # ships with @img/sharp-libvips-linuxmusl-x64.
 #
 # Build context: the workspace root `landing/` (same as
@@ -49,19 +49,25 @@ ENV HOSTNAME=0.0.0.0
 RUN apk add --no-cache libc6-compat
 
 # Next standalone with outputFileTracingRoot=landing/ emits the
-# server tree under landing/cms/. Flatten into /app so the
-# Dockerfile doesn't need to know the depth.
-COPY --from=builder /landing/cms/.next/standalone/cms /app
-COPY --from=builder /landing/cms/.next/standalone/node_modules /app/node_modules
-COPY --from=builder /landing/cms/.next/static /app/.next/static
-# Next standalone explicitly excludes public/ — copy it
-# manually. The directory MUST exist in the source tree;
+# server tree under standalone/cms/ next to a sibling
+# standalone/node_modules/ store. Each package symlink inside
+# standalone/cms/node_modules points at `../../node_modules/.bun/…`
+# (Bun's hoisted store), which only resolves while cms/ and
+# node_modules/ remain siblings. So copy the WHOLE standalone tree
+# verbatim and launch cms/server.js from the root — do NOT flatten
+# cms/ into /app, or those `../../` symlinks overshoot to
+# /node_modules and `require('next')` fails at runtime.
+COPY --from=builder /landing/cms/.next/standalone /app
+# Next standalone deliberately omits static/ and public/. server.js
+# does process.chdir(__dirname), so they must sit under the app
+# subdir. The public/ directory MUST exist in the source tree;
 # landing/cms/public/robots.txt is the floor.
-COPY --from=builder /landing/cms/public /app/public
+COPY --from=builder /landing/cms/.next/static /app/cms/.next/static
+COPY --from=builder /landing/cms/public /app/cms/public
 
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -q -O /dev/null http://localhost:${PORT}/admin || exit 1
 
-CMD ["node", "server.js"]
+CMD ["node", "cms/server.js"]
