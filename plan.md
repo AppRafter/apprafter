@@ -2747,6 +2747,36 @@ instead of carrying parallel definitions.
 
 ---
 
+### 2.4h — Image tag→digest resolution & auto-rollout (ADR 0040)
+> 🏁 SR: A — push→deploy на мутабельном теге; launch-critical UX, притянут через 2.4g walk; **закрыть ДО 2.6**
+
+**Контекст:** re-push образа под тем же тегом (`:latest`) сейчас НЕ катит workload — fake-consistency (Git=`latest`, кластер=`latest`, но разные байты; «что в Git, то в кластере» молча нарушено). Клиентский CI тегает `:latest` из протектед-ветки = деплой (индустриальная практика) → платформа берёт pull-половину push-pull → push-and-it-deploys. Полный дизайн + альтернативы (A / Image-Updater / annotation-вариант) + риски — **ADR 0040**.
+
+**Сквозной поток:** контроллер Application на reconcile резолвит `spec.base.image` (тег) → текущий registry-digest (OCI manifest HEAD, auth через `pick_pull_credential`/`dockerconfigjson` из ADR 0039, публичные — анонимно) → рендерит Deployment запиненным на `repo@sha256:<digest>` → пишет `status.image.{tag,resolved,resolvedAt}` → сдвинулся тег → новый digest → обычный rolling update. Requeue ~60с (существующий цикл, conditional). Рендерер ОСТАЁТСЯ ЧИСТЫМ (I/O в контроллере, digest приходит строкой). Argo не трогаем (зона манифестов vs зона образов). Graceful-fallback на verbatim-тег + condition `ImageResolved=False`, резолв НИКОГДА не блокирует rollout.
+
+**Решения/инварианты:**
+- **Opt-out** `spec.base.imagePolicy.resolve: "digest"|"off"` (дефолт `digest`, **все тиры**; `off` = verbatim ref, digest писать не заставляет, registry НЕ опрашивается).
+- **Pin в `image:`** (не annotation-триггер) — под бежит ровно резолвнутый digest, без TOCTOU.
+- **Гейта НЕТ** (ни авто, ни pinned) — авто-апдейт с паузой сломал бы UX; Regulated несёт свой регламент.
+- **Приватные реестры в scope** — переиспользуем `SourceCredential.registry` (ADR 0039), новой cred-инфры нет.
+- **Status = правда** (`status.image.resolved` = running digest) → аудируемость, `app status` показывает.
+
+**Декомпозиция:**
+- [ ] **2.4h-a** — OCI-registry-клиент (новый модуль): manifest HEAD/GET → `Docker-Content-Digest`, Bearer-token-флоу (`WWW-Authenticate` realm/service/scope для ghcr/dockerhub), auth из `dockerconfigjson`, анонимный путь. Pure-парсеры + мокнутый HTTP. Основная масса.
+- [ ] **2.4h-b** — схема: `spec.base.imagePolicy.resolve` + `status.image.{tag,resolved,resolvedAt}` + condition `ImageResolved` в 4 зеркала (CUE `application.cue` + kube-rs `operator-core` + OpenAPI `crd-application.yaml` + webhook). cue-vet пример.
+- [ ] **2.4h-c** — `operator-rendering`: принимает резолвнутый digest-параметр, рендерит `image:` как digest (или verbatim при `off`/fallback). Остаётся чистой функцией.
+- [ ] **2.4h-d** — интеграция в контроллер application: resolve (2.4h-a + `pick_pull_credential`) → requeue ~60с conditional → status-write (свой field-manager, SSA-split) → render-with-digest → graceful-fallback + `ImageResolved=False`. Метрика `apprafter_image_resolve_total{result}`; image-change мимо MigrationPlan.
+- [ ] **2.4h-e** — `apprafter app status` показывает running-digest (`status.image.resolved` + tag + resolvedAt-age).
+- [ ] **2.4h-f** — dev-guide про цикл итерации (push→auto-deploy, opt-out, escape-hatch `rollout restart`); shipped-пример + CMS-манифест с явным `imagePolicy`. Координированный operator+platform-stack release bump.
+
+**Acceptance:** re-push того же тега → в пределах reconcile-интервала Deployment катится на новый digest без правки манифеста в Git; `app status` показывает running-digest; `imagePolicy.resolve: off` → resolve не происходит, ref verbatim; приватный образ с covering `SourceCredential` резолвится, без креда — graceful-fallback на тег + `ImageResolved=False`.
+
+**Зависит от:** 2.4 (рабочий Application-reconcile), ADR 0039 (pull-creds), ADR 0040
+
+**Размер:** L (OCI-клиент + контроллер-интеграция — основная масса). Закрыть ДО 2.6.
+
+---
+
 ### 2.5 needs.jetstream → NATS account/stream
 > 🏁 SR: D — needs.jetstream dropped; reactivate on 2+ explicit requests
 
