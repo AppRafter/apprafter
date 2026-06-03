@@ -889,11 +889,13 @@ fn print_pod_summaries(pods: &[PodSummary], inner_name: &str, namespace: &str) {
 /// namespace (read from the Application CR's
 /// `spec.destination.namespace`).
 ///
-/// Without `--pod`: aggregate via `-l <selector>` — Argo CD
-/// stamps `app.kubernetes.io/instance: <app-name>` on every
-/// child resource it manages (the documented standard label
-/// the kubectl + helm + argo ecosystem agrees on), so
-/// `-l app.kubernetes.io/instance=<name>` reaches all pods.
+/// Without `--pod`: aggregate via `-l <selector>` — the
+/// AppRafter operator stamps `app.kubernetes.io/name: <inner
+/// workload name>` on the Deployment it renders (the same label
+/// `app status` selects workload pods by). That inner name comes
+/// from the repo's `Application.cue` metadata.name and can differ
+/// from the Argo CD parent name typed at `app add`, so we resolve
+/// it from `status.resources[]` before building the selector.
 /// `--pod` overrides the selector with a direct pod name.
 pub fn logs(
     name: &str,
@@ -928,7 +930,15 @@ pub fn logs(
             ))
         })?;
 
-    let target = build_kubectl_logs_target(name, pod.as_deref());
+    // The workload pods carry the INNER AppRafter app name
+    // (operator's `app.kubernetes.io/name`), which is the
+    // `Application.cue` metadata.name and can differ from the Argo
+    // CD parent name typed at `app add`. Resolve it from
+    // status.resources[]; fall back to the Argo name for raw-YAML
+    // apps that carry no AppRafter Application CR.
+    let inner = crate::commands::app_open::find_apprafter_app_name(&app)
+        .unwrap_or_else(|| name.to_string());
+    let target = build_kubectl_logs_target(&inner, pod.as_deref());
     let args = build_kubectl_logs_args(&target, workload_ns, follow, tail, container.as_deref());
 
     let status = Command::new("kubectl")
@@ -1325,13 +1335,15 @@ pub(crate) enum KubectlLogsTarget {
     Selector(String),
 }
 
-/// Resolve the `kubectl logs` target. Without `--pod` — label
-/// selector via Argo CD's standard `app.kubernetes.io/instance:
-/// <app-name>` label (stamped on every resource it syncs).
+/// Resolve the `kubectl logs` target. Without `--pod` — a label
+/// selector via the AppRafter operator's `app.kubernetes.io/name:
+/// <inner workload name>` label (the same label `app status`
+/// selects workload pods by). `app_name` is the already-resolved
+/// INNER name, not the Argo CD parent.
 pub(crate) fn build_kubectl_logs_target(app_name: &str, pod: Option<&str>) -> KubectlLogsTarget {
     match pod {
         Some(name) => KubectlLogsTarget::Pod(name.to_string()),
-        None => KubectlLogsTarget::Selector(format!("app.kubernetes.io/instance={app_name}")),
+        None => KubectlLogsTarget::Selector(format!("app.kubernetes.io/name={app_name}")),
     }
 }
 
@@ -1939,7 +1951,30 @@ mod tests {
         let target = build_kubectl_logs_target("payments", None);
         assert_eq!(
             target,
-            KubectlLogsTarget::Selector("app.kubernetes.io/instance=payments".to_string())
+            KubectlLogsTarget::Selector("app.kubernetes.io/name=payments".to_string())
+        );
+    }
+
+    #[test]
+    fn logs_target_resolves_inner_workload_name_from_status_resources() {
+        // 2.4g walk bug: Argo CD app "cms" renders an AppRafter
+        // Application "landing-cms"; the workload pods carry the
+        // operator's `app.kubernetes.io/name=landing-cms` label, NOT
+        // the Argo parent name. `app logs cms` must select by the
+        // resolved inner name, or it finds no pods.
+        let app = serde_json::json!({
+            "metadata": { "name": "cms" },
+            "status": { "resources": [
+                { "group": "apprafter.io", "kind": "Application", "name": "landing-cms" }
+            ] }
+        });
+        let inner = crate::commands::app_open::find_apprafter_app_name(&app)
+            .unwrap_or_else(|| "cms".to_string());
+        assert_eq!(inner, "landing-cms");
+        let target = build_kubectl_logs_target(&inner, None);
+        assert_eq!(
+            target,
+            KubectlLogsTarget::Selector("app.kubernetes.io/name=landing-cms".to_string())
         );
     }
 
@@ -1959,14 +1994,14 @@ mod tests {
         // and --max-log-requests to cap fan-out. Both are
         // load-bearing for real usability on multi-pod apps.
         let args = build_kubectl_logs_args(
-            &KubectlLogsTarget::Selector("app.kubernetes.io/instance=payments".to_string()),
+            &KubectlLogsTarget::Selector("app.kubernetes.io/name=payments".to_string()),
             "payments",
             false,
             -1,
             None,
         );
         assert!(args.contains(&"-l".to_string()));
-        assert!(args.contains(&"app.kubernetes.io/instance=payments".to_string()));
+        assert!(args.contains(&"app.kubernetes.io/name=payments".to_string()));
         assert!(args.contains(&"-n".to_string()));
         assert!(args.contains(&"payments".to_string()));
         assert!(args.contains(&"--prefix=true".to_string()));
