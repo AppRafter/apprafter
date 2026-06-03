@@ -1475,4 +1475,87 @@ mod tests {
         assert_ne!(next.last_transition_time, "2026-06-01T12:00:00+00:00");
         assert_eq!(next.status, "True");
     }
+
+    /// Rebuild a ResourceClaim from a generated apply payload so the
+    /// generate → re-fetch → readiness → pause composition can be
+    /// exercised purely (no kube Client). Mirrors what the apiserver
+    /// would hand back, plus the provisioner-written status.
+    fn claim_from_payload(payload: &Value, status: Option<ResourceClaimStatus>) -> ResourceClaim {
+        let name = payload["metadata"]["name"].as_str().unwrap().to_string();
+        let type_ = payload["spec"]["type"].as_str().unwrap().to_string();
+        let selector: BTreeMap<String, String> =
+            serde_json::from_value(payload["spec"]["selector"].clone()).unwrap();
+        let mut c = ResourceClaim::new(
+            &name,
+            ResourceClaimSpec {
+                type_,
+                selector,
+                size: None,
+            },
+        );
+        c.metadata.namespace = Some("demo".into());
+        c.status = status;
+        c
+    }
+
+    #[test]
+    fn generated_unready_claim_composes_into_pause_status_with_name_in_message() {
+        // 2.4d gate composition: generate a claim, simulate the
+        // apiserver handing it back WITHOUT provisioner status
+        // (status.ready unset), prove the readiness predicate flags
+        // it unready and the resulting pause status carries the
+        // AwaitingResourceClaim phase + the claim name in the
+        // pending-condition message. The full generate → provision →
+        // resume loop is the 2.4g real-cluster walk, not a unit.
+        let mut needs = BTreeMap::new();
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-1", "demo");
+        assert_eq!(payloads.len(), 1);
+
+        // SSA-split guard, re-asserted at the gate-composition layer:
+        // the apply payload must never carry a status key.
+        assert!(
+            payloads[0].1.get("status").is_none(),
+            "claim apply payload must not write status"
+        );
+
+        // Fresh claim, no provisioner status yet → unready.
+        let fresh = vec![claim_from_payload(&payloads[0].1, None)];
+        let unready = unready_claim_names(&fresh);
+        assert_eq!(unready, vec!["parser-pg".to_string()]);
+
+        let app = Application::new("parser", ApplicationSpec::default());
+        let status = build_resource_claim_paused_status(&app, &unready);
+        assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));
+        let pending = status
+            .conditions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|c| c.type_ == COND_RESOURCE_CLAIM_PENDING)
+            .expect("pending condition");
+        assert!(pending.message.contains("parser-pg"));
+    }
+
+    #[test]
+    fn generated_ready_claim_clears_the_gate() {
+        // The resume half: a claim the provisioner flipped ready
+        // (status.ready==true AND connectionSecretRef set) drops out
+        // of the unready set, so the gate would NOT pause.
+        let mut needs = BTreeMap::new();
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-1", "demo");
+        let provisioned = vec![claim_from_payload(
+            &payloads[0].1,
+            Some(ResourceClaimStatus {
+                provider: Some("pg-integrated".into()),
+                connection_secret_ref: Some("parser-pg-conn".into()),
+                ready: Some(true),
+                conditions: None,
+            }),
+        )];
+        assert!(unready_claim_names(&provisioned).is_empty());
+    }
 }
