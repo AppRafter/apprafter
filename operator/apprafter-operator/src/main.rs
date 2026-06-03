@@ -177,6 +177,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // ResourceClaimGC — seventh controller (Phase 2.4f). Watches
+    // RetainedClaim snapshots cluster-wide (the provisioner finalizer
+    // writes one into apprafter-system when a pg ResourceClaim is
+    // deleted) and, once `spec.retainUntil` (deletion + 7-day grace)
+    // passes, drops the per-claim Postgres role (RMW the shared
+    // Cluster's spec.managed.roles), the Database (spec.ensure:absent —
+    // CNPG drops the DB), the password Secret, and the snapshot. Every
+    // step idempotent + 404-tolerant. Lives in the same crate as the
+    // provisioner — no Cargo.toml member edit.
+    let resourceclaim_gc_handle = tokio::spawn({
+        let client = client.clone();
+        let metrics = metrics.clone();
+        async move {
+            if let Err(err) =
+                operator_controllers_resourceclaim_provisioner::gc::run(client, metrics).await
+            {
+                error!(%err, "ResourceClaimGC controller error");
+            }
+        }
+    });
+
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
@@ -185,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = sourcecred_controller_handle => warn!("SourceCredentialController exited"),
         _ = resourceclaim_scheduler_handle => warn!("ResourceClaimScheduler controller exited"),
         _ = resourceclaim_provisioner_handle => warn!("ResourceClaimProvisioner controller exited"),
+        _ = resourceclaim_gc_handle => warn!("ResourceClaimGC controller exited"),
         _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }

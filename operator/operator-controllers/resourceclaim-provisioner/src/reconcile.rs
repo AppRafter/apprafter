@@ -495,7 +495,7 @@ async fn snapshot_retained_claim(
 // Dynamic ApiResources for the externally-installed CNPG CRDs + Secrets
 // ---------------------------------------------------------------------------
 
-fn cluster_ar() -> ApiResource {
+pub(crate) fn cluster_ar() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind::gvk(
         "postgresql.cnpg.io",
         "v1",
@@ -503,7 +503,7 @@ fn cluster_ar() -> ApiResource {
     ))
 }
 
-fn database_ar() -> ApiResource {
+pub(crate) fn database_ar() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind::gvk(
         "postgresql.cnpg.io",
         "v1",
@@ -511,13 +511,17 @@ fn database_ar() -> ApiResource {
     ))
 }
 
-fn secret_ar() -> ApiResource {
+pub(crate) fn secret_ar() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind::gvk("", "v1", "Secret"))
 }
 
-fn apply_params() -> PatchParams {
+pub(crate) fn apply_params() -> PatchParams {
     PatchParams::apply(FIELD_MANAGER).force()
 }
+
+/// Retry budget for the GC's `spec.managed.roles` read-modify-write
+/// (mirrors the provisioner's [`ROLE_RMW_RETRIES`]).
+pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
 
 // ---------------------------------------------------------------------------
 // Status + finalizer I/O

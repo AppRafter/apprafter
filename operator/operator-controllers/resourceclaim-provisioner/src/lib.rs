@@ -29,16 +29,22 @@
 //! the scheduler over the same fields. The status patch this controller
 //! sends therefore contains ONLY the provisioner's own keys.
 //!
-//! ## Cleanup scope (SKELETON — 2.4f grafts the real GC)
+//! ## Cleanup scope (2.4f — RetainedClaim snapshot + 7-day grace GC)
 //!
 //! The connection Secret in the claim's namespace carries an
 //! `ownerReference` to the `ResourceClaim`, so it cascades on claim
 //! delete with no finalizer logic of its own. The per-claim role +
-//! database in the shared cluster are NOT dropped on delete — they are
-//! retained until 2.4f wires the RetainedClaim snapshot + 7-day grace
-//! GC. The provisioner finalizer this controller installs only logs
-//! "role/DB retained pending 2.4f GC" on delete and removes itself,
-//! establishing the wiring 2.4f grafts onto.
+//! database + password Secret in the shared cluster are NOT dropped
+//! immediately: on delete the provisioner finalizer ([`reconcile`])
+//! snapshots the claim into an immutable `RetainedClaim` in
+//! `apprafter-system` (`retainUntil = deletion + 7d`) BEFORE removing
+//! itself, and the [`gc`] Controller (the 7th controller) drops the
+//! role (RMW `spec.managed.roles` via `cnpg::remove_role`), the
+//! database (`spec.ensure: absent` — CNPG drops it; deleting the CR
+//! would not, because the Postgres reclaim default is `retain`), the
+//! password Secret, and finally the snapshot once `retainUntil` passes.
+//! The 7-day timer is exercised via injected-clock unit tests
+//! ([`grace`]) — no real wait.
 
 use std::sync::Arc;
 
@@ -53,6 +59,7 @@ use tracing::{info, warn};
 use operator_core::{Metrics, ResourceClaim};
 
 pub mod cnpg;
+pub mod gc;
 pub mod grace;
 pub mod reconcile;
 
