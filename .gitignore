@@ -53,3 +53,17 @@ tmp/
 # Local apprafter state (.apprafter/) — never commit raw, only age-encrypted blobs
 **/.apprafter/*
 !**/.apprafter/*.age
+
+# Root-level Markdown: allowlist only. Internal working / strategy notes
+# (marketing-strategy.md, speedrun-plan.md, *-task.md, *_CHECKLIST.md,
+# refactor-plan.md, idiomatic-rust-audit.md, …) stay local-only and must
+# never be committed. To publish a new root doc, add an explicit negation.
+# (CLAUDE.md stays ignored via the per-user entry above.)
+/*.md
+!/README.md
+!/CONTRIBUTING.md
+!/CODE_OF_CONDUCT.md
+!/GOVERNANCE.md
+!/SECURITY.md
+!/spec.md
+!/plan.md
