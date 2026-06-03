@@ -139,15 +139,34 @@ rules:
       - get
       - list
       - watch
+  # 2.4d Application controller: generates child ResourceClaims from
+  # `spec.*.needs` via SSA (the `create` verb — SSA-apply that
+  # creates the object requires it) and watches them through the
+  # `.owns(ResourceClaim)` wiring to resume the AwaitingResourceClaim
+  # pause. `resourceclaims/status` is split into its own rule below
+  # WITHOUT `create` — the Application controller must never write
+  # claim status (the scheduler owns status.provider/Scheduled, the
+  # provisioner owns status.ready/connectionSecretRef/Ready).
   - apiGroups:
       - apprafter.io
     resources:
       - resourceclaims
-      - resourceclaims/status
     verbs:
       - get
       - list
       - watch
+      - create
+      - patch
+      - update
+  # ResourceClaim status — written by the 2.3 scheduler and the
+  # 2.4c provisioner only (NOT the Application controller). No
+  # `create` here.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - resourceclaims/status
+    verbs:
+      - get
       - patch
       - update
   # Phase 2.4c resourceclaim-provisioner: provisions each
