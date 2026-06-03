@@ -6,6 +6,7 @@
 //! `apprafter-operator` and updates the Application's `status`
 //! subresource (phase, observedGeneration, conditions, endpointURL).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,8 +27,9 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
-    Application, ApplicationCondition, ApplicationStatus, Metrics, MigrationPlan, SourceCredential,
-    COND_MIGRATION_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
+    Application, ApplicationBaseSpec, ApplicationCondition, ApplicationStatus, Metrics,
+    MigrationPlan, ResourceClaim, SourceCredential, COND_MIGRATION_PENDING,
+    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
 // dep so future Phase 2 commits can flip on detection +
@@ -580,6 +582,169 @@ fn migration_pending_condition(
     }
 }
 
+// ---- 2.4d: pure ResourceClaim generation + pause helpers ----
+
+/// Derive a DNS-1123-safe `metadata.name` for a child ResourceClaim
+/// from the owning Application name + the need's service type:
+/// `{app}-{type}`, non-alphanumerics folded to `-`, lowercased,
+/// truncated to 63 bytes, trailing `-` trimmed. Mirrors
+/// `resourceclaim-provisioner::cnpg::k8s_name`'s fold (without the
+/// `claim-` prefix — the `{app}-` prefix already guarantees a
+/// leading alphanumeric for any valid Application name).
+fn claim_name(app: &str, service_type: &str) -> String {
+    let raw = format!("{app}-{service_type}");
+    let mut out = String::with_capacity(raw.len().min(63));
+    for ch in raw.chars() {
+        out.push(if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        });
+    }
+    out.truncate(63);
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Default selector injected into a generated ResourceClaim when the
+/// need omits one — the integrated (in-cluster) tier. The 2.3
+/// scheduler matches this against `ServiceProvider.metadata.labels`.
+fn default_integrated_selector() -> BTreeMap<String, String> {
+    BTreeMap::from([("tier".to_string(), "integrated".to_string())])
+}
+
+/// Build one SSA apply payload per `needs` entry of the effective
+/// spec. Returns `(claim_name, apply_payload)` pairs in deterministic
+/// (BTreeMap) order. The payload carries spec + metadata only —
+/// **never `status`** — because the scheduler owns
+/// `status.provider`/`Scheduled` and the provisioner owns
+/// `status.ready`/`connectionSecretRef`/`Ready` (SSA split under the
+/// `apprafter-operator` field manager). A default
+/// `{tier: integrated}` selector is injected when the need omits one;
+/// `size` is emitted only when present.
+fn generate_resource_claims(
+    spec: &ApplicationBaseSpec,
+    app_name: &str,
+    app_uid: &str,
+    namespace: &str,
+) -> Vec<(String, Value)> {
+    let Some(needs) = spec.needs.as_ref() else {
+        return Vec::new();
+    };
+    needs
+        .iter()
+        .map(|(service_type, need)| {
+            let name = claim_name(app_name, service_type);
+            let selector = need
+                .selector
+                .clone()
+                .unwrap_or_else(default_integrated_selector);
+            let mut claim_spec = json!({
+                "type": service_type,
+                "selector": selector,
+            });
+            if let Some(size) = &need.size {
+                claim_spec["size"] = json!(size);
+            }
+            let payload = json!({
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "ResourceClaim",
+                "metadata": {
+                    "name": name,
+                    "namespace": namespace,
+                    "ownerReferences": [{
+                        "apiVersion": "apprafter.io/v1alpha1",
+                        "kind": "Application",
+                        "name": app_name,
+                        "uid": app_uid,
+                        "controller": true,
+                        "blockOwnerDeletion": true,
+                    }],
+                },
+                "spec": claim_spec,
+            });
+            (name, payload)
+        })
+        .collect()
+}
+
+/// Names of claims that are NOT yet ready. A claim is ready only when
+/// `status.ready == Some(true)` AND `status.connectionSecretRef`
+/// is set — the provisioner writes both together (2.4c), so the
+/// AND closes the half-ready resume race at zero cost. Returns the
+/// unready names in the claims' iteration order.
+fn unready_claim_names(claims: &[ResourceClaim]) -> Vec<String> {
+    claims
+        .iter()
+        .filter(|c| {
+            let ready = c
+                .status
+                .as_ref()
+                .map(|s| s.ready == Some(true) && s.connection_secret_ref.is_some())
+                .unwrap_or(false);
+            !ready
+        })
+        .map(|c| c.name_any())
+        .collect()
+}
+
+/// Build the Application status payload for the ResourceClaim pause
+/// path. Mirrors [`build_paused_status`]: preserves
+/// `observedGeneration` + `endpointURL`, flips `phase` to
+/// `AwaitingResourceClaim`, and emits two conditions —
+/// `Ready=False/ResourceClaimPending` plus a positive
+/// `ResourceClaimPending=True` naming the unready claim(s).
+fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> ApplicationStatus {
+    let previous_conditions = app
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let previous_endpoint = app.status.as_ref().and_then(|s| s.endpoint_url.clone());
+
+    let ready = ready_condition(
+        "False",
+        "ResourceClaimPending",
+        &format!(
+            "paused awaiting ResourceClaim provisioning: {}",
+            unready.join(", ")
+        ),
+        previous_conditions,
+    );
+    let pending = resource_claim_pending_condition(unready, previous_conditions);
+
+    ApplicationStatus {
+        phase: Some(PHASE_AWAITING_RESOURCE_CLAIM.to_string()),
+        observed_generation: app.metadata.generation,
+        conditions: Some(vec![ready, pending]),
+        endpoint_url: previous_endpoint,
+    }
+}
+
+/// The `ResourceClaimPending=True` condition. `lastTransitionTime`
+/// is preserved when the prior `ResourceClaimPending` was already
+/// `True` (mirror [`migration_pending_condition`]), bumped otherwise.
+fn resource_claim_pending_condition(
+    unready: &[String],
+    previous: &[ApplicationCondition],
+) -> ApplicationCondition {
+    let last_transition_time = previous
+        .iter()
+        .find(|c| c.type_ == COND_RESOURCE_CLAIM_PENDING && c.status == "True")
+        .map(|c| c.last_transition_time.clone())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    ApplicationCondition {
+        type_: COND_RESOURCE_CLAIM_PENDING.to_string(),
+        status: "True".to_string(),
+        last_transition_time,
+        reason: "ResourceClaimPending".to_string(),
+        message: format!("awaiting ResourceClaim(s): {}", unready.join(", ")),
+        observed_generation: None,
+    }
+}
+
 fn ready_condition(
     status: &str,
     reason: &str,
@@ -612,9 +777,10 @@ fn ready_condition(
 mod tests {
     use super::*;
     use operator_core::{
-        ApplicationSpec, MigrationApplicationRef, MigrationApplicationScope, MigrationPlanScope,
-        MigrationPlanSpec, MigrationPlanStatus, MigrationTrigger,
+        ApplicationBaseSpec, ApplicationSpec, MigrationApplicationRef, MigrationApplicationScope,
+        MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus, MigrationTrigger,
     };
+    use std::collections::BTreeMap;
 
     fn app_plan(
         name: &str,
@@ -1040,5 +1206,220 @@ mod tests {
         assert!(!is_deletion_marked(&app));
         app.metadata.deletion_timestamp = Some(Time(Utc::now()));
         assert!(is_deletion_marked(&app));
+    }
+
+    // ---- 2.4d: pure ResourceClaim generation + pause helpers ----
+
+    use operator_core::{
+        ResourceClaim, ResourceClaimSpec, ResourceClaimStatus, ServiceNeed,
+        COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_RESOURCE_CLAIM,
+    };
+
+    fn base_with_needs(needs: BTreeMap<String, ServiceNeed>) -> ApplicationBaseSpec {
+        ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(needs),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claim_name_joins_app_and_type_and_is_dns1123_safe() {
+        assert_eq!(claim_name("parser", "pg"), "parser-pg");
+        // Non-alphanumerics fold to `-`, lowercase, trailing `-` trimmed.
+        let n = claim_name("My_App.", "Redis_Cache_");
+        assert_eq!(n, "my-app--redis-cache");
+        // DNS-1123 validity: lowercased, no `_`, start/end alphanumeric.
+        assert!(!n.contains('_'));
+        assert_eq!(n, n.to_lowercase());
+        assert!(n.chars().next().unwrap().is_ascii_alphanumeric());
+        assert!(n.chars().last().unwrap().is_ascii_alphanumeric());
+        // Truncates to 63 bytes.
+        let long = claim_name(&"a".repeat(80), &"b".repeat(80));
+        assert!(long.len() <= 63, "len was {}", long.len());
+        assert!(long.chars().last().unwrap().is_ascii_alphanumeric());
+    }
+
+    #[test]
+    fn default_integrated_selector_is_tier_integrated() {
+        let sel = default_integrated_selector();
+        assert_eq!(sel.get("tier").map(String::as_str), Some("integrated"));
+        assert_eq!(sel.len(), 1);
+    }
+
+    #[test]
+    fn generate_resource_claims_injects_default_selector_and_owner_ref_no_status() {
+        let mut needs = BTreeMap::new();
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-123", "demo");
+        assert_eq!(payloads.len(), 1);
+        let (name, payload) = &payloads[0];
+        assert_eq!(name, "parser-pg");
+        assert_eq!(payload["metadata"]["name"], json!("parser-pg"));
+        assert_eq!(payload["metadata"]["namespace"], json!("demo"));
+        assert_eq!(payload["apiVersion"], json!("apprafter.io/v1alpha1"));
+        assert_eq!(payload["kind"], json!("ResourceClaim"));
+        assert_eq!(payload["spec"]["type"], json!("pg"));
+        // Default selector injected when the need omits it.
+        assert_eq!(payload["spec"]["selector"], json!({ "tier": "integrated" }));
+        // No size key when absent.
+        assert!(payload["spec"].get("size").is_none());
+        // ownerRef → Application, controller + blockOwnerDeletion.
+        let owner = &payload["metadata"]["ownerReferences"][0];
+        assert_eq!(owner["apiVersion"], json!("apprafter.io/v1alpha1"));
+        assert_eq!(owner["kind"], json!("Application"));
+        assert_eq!(owner["name"], json!("parser"));
+        assert_eq!(owner["uid"], json!("uid-123"));
+        assert_eq!(owner["controller"], json!(true));
+        assert_eq!(owner["blockOwnerDeletion"], json!(true));
+        // SSA split guard: the apply payload must carry NO status key.
+        assert!(
+            payload.get("status").is_none(),
+            "claim apply payload must not write status (scheduler/provisioner own it)"
+        );
+    }
+
+    #[test]
+    fn generate_resource_claims_passes_through_selector_and_size() {
+        let mut needs = BTreeMap::new();
+        needs.insert(
+            "pg".to_string(),
+            ServiceNeed {
+                selector: Some(BTreeMap::from([(
+                    "tier".to_string(),
+                    "managed".to_string(),
+                )])),
+                size: Some("small".into()),
+            },
+        );
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-1", "demo");
+        let (_, payload) = &payloads[0];
+        assert_eq!(payload["spec"]["selector"], json!({ "tier": "managed" }));
+        assert_eq!(payload["spec"]["size"], json!("small"));
+    }
+
+    #[test]
+    fn generate_resource_claims_yields_one_payload_per_need_in_deterministic_order() {
+        let mut needs = BTreeMap::new();
+        needs.insert("redis".to_string(), ServiceNeed::default());
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "app", "u", "ns");
+        assert_eq!(payloads.len(), 2);
+        // BTreeMap iteration → deterministic: pg before redis.
+        assert_eq!(payloads[0].0, "app-pg");
+        assert_eq!(payloads[1].0, "app-redis");
+    }
+
+    fn ready_claim(name: &str, ready: Option<bool>, secret: Option<&str>) -> ResourceClaim {
+        let mut c = ResourceClaim::new(
+            name,
+            ResourceClaimSpec {
+                type_: "pg".into(),
+                selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
+                size: None,
+            },
+        );
+        c.metadata.namespace = Some("demo".into());
+        c.status = Some(ResourceClaimStatus {
+            provider: None,
+            connection_secret_ref: secret.map(String::from),
+            ready,
+            conditions: None,
+        });
+        c
+    }
+
+    #[test]
+    fn unready_claim_names_requires_ready_true_and_connection_secret() {
+        // ready + secret → ready (absent from unready list).
+        let ready = vec![ready_claim("a-pg", Some(true), Some("a-pg-conn"))];
+        assert!(unready_claim_names(&ready).is_empty());
+        // ready but no secret → unready (half-ready resume race).
+        let half = vec![ready_claim("a-pg", Some(true), None)];
+        assert_eq!(unready_claim_names(&half), vec!["a-pg".to_string()]);
+        // not ready (with secret) → unready.
+        let not_ready = vec![ready_claim("a-pg", Some(false), Some("a-pg-conn"))];
+        assert_eq!(unready_claim_names(&not_ready), vec!["a-pg".to_string()]);
+        // status missing entirely → unready.
+        let no_status = vec![ready_claim("a-pg", None, None)];
+        assert_eq!(unready_claim_names(&no_status), vec!["a-pg".to_string()]);
+        // multi-claim partial → returns only the unready name(s).
+        let partial = vec![
+            ready_claim("a-pg", Some(true), Some("a-pg-conn")),
+            ready_claim("a-redis", Some(false), None),
+        ];
+        assert_eq!(unready_claim_names(&partial), vec!["a-redis".to_string()]);
+    }
+
+    #[test]
+    fn build_resource_claim_paused_status_sets_phase_and_conditions() {
+        let mut app = Application::new("parser", ApplicationSpec::default());
+        app.metadata.generation = Some(4);
+        app.status = Some(ApplicationStatus {
+            phase: Some("Ready".into()),
+            observed_generation: Some(3),
+            conditions: None,
+            endpoint_url: Some("http://parser.demo.svc.cluster.local:80".into()),
+        });
+        let status = build_resource_claim_paused_status(&app, &["parser-pg".to_string()]);
+        assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));
+        // observedGeneration + endpointURL preserved (mirror migration gate).
+        assert_eq!(status.observed_generation, Some(4));
+        assert_eq!(
+            status.endpoint_url.as_deref(),
+            Some("http://parser.demo.svc.cluster.local:80")
+        );
+        let conds = status.conditions.as_ref().expect("conditions");
+        let ready = conds.iter().find(|c| c.type_ == "Ready").expect("ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "ResourceClaimPending");
+        let pending = conds
+            .iter()
+            .find(|c| c.type_ == COND_RESOURCE_CLAIM_PENDING)
+            .expect("resource claim pending");
+        assert_eq!(pending.status, "True");
+        assert!(pending.message.contains("parser-pg"));
+    }
+
+    #[test]
+    fn build_resource_claim_paused_status_preserves_endpoint_when_status_absent() {
+        let app = Application::new("parser", ApplicationSpec::default());
+        let status = build_resource_claim_paused_status(&app, &["parser-pg".to_string()]);
+        assert!(status.endpoint_url.is_none());
+        assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));
+    }
+
+    #[test]
+    fn resource_claim_pending_condition_preserves_transition_time_when_already_true() {
+        let prior = vec![ApplicationCondition {
+            type_: COND_RESOURCE_CLAIM_PENDING.into(),
+            status: "True".into(),
+            last_transition_time: "2026-06-01T12:00:00+00:00".into(),
+            reason: "ResourceClaimPending".into(),
+            message: "old".into(),
+            observed_generation: None,
+        }];
+        let next = resource_claim_pending_condition(&["parser-pg".to_string()], &prior);
+        assert_eq!(next.last_transition_time, "2026-06-01T12:00:00+00:00");
+        assert!(next.message.contains("parser-pg"));
+    }
+
+    #[test]
+    fn resource_claim_pending_condition_bumps_transition_time_when_status_changes() {
+        // Prior condition was False (or absent) → fresh timestamp.
+        let prior = vec![ApplicationCondition {
+            type_: COND_RESOURCE_CLAIM_PENDING.into(),
+            status: "False".into(),
+            last_transition_time: "2026-06-01T12:00:00+00:00".into(),
+            reason: "ResourceClaimPending".into(),
+            message: "old".into(),
+            observed_generation: None,
+        }];
+        let next = resource_claim_pending_condition(&["parser-pg".to_string()], &prior);
+        assert_ne!(next.last_transition_time, "2026-06-01T12:00:00+00:00");
+        assert_eq!(next.status, "True");
     }
 }
