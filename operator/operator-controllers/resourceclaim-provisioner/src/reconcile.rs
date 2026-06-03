@@ -29,14 +29,28 @@ use rand::Rng;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use operator_core::{ResourceClaim, ResourceClaimCondition, ServiceProvider};
+use operator_core::{ResourceClaim, ResourceClaimCondition, RetainedClaim, ServiceProvider};
 
 use crate::cnpg;
+use crate::grace;
 use crate::{Context, ReconcileError, FIELD_MANAGER, KIND, PROVISIONER_FINALIZER};
 
 /// Condition type this controller owns. The scheduler owns `Scheduled`;
 /// this controller owns ONLY `Ready`.
 const COND_READY: &str = "Ready";
+
+/// Namespace the finalizer snapshots a deleted claim's `RetainedClaim`
+/// into. A platform namespace that outlives tenant namespaces, so the
+/// 7-day-grace GC always fires even if the app's own namespace is torn
+/// down (Phase 2.4f, decision 1). The lineage is preserved in
+/// `spec.claimRef`.
+const RETAINED_CLAIM_NAMESPACE: &str = "apprafter-system";
+
+/// CNPG cluster + namespace the finalizer snapshot falls back to when
+/// the matched provider config is missing them. Mirrors the
+/// provisioning defaults so a snapshot never stalls on a config miss.
+const DEFAULT_CNPG_CLUSTER: &str = "platform-postgres";
+const DEFAULT_CNPG_NAMESPACE: &str = "cnpg-system";
 
 /// Condition type the scheduler writes — read-only here.
 const COND_SCHEDULED: &str = "Scheduled";
@@ -78,9 +92,11 @@ impl Backend {
 
 /// Reconcile a single `ResourceClaim`:
 ///
-/// 1. On delete (`deletion_timestamp` set) → finalizer SKELETON: log
-///    "role/DB retained pending 2.4f GC", drop the provisioner finalizer,
-///    await change. The connection Secret cascades via its ownerRef.
+/// 1. On delete (`deletion_timestamp` set) → snapshot the claim into an
+///    immutable `RetainedClaim` in `apprafter-system` (retainUntil =
+///    deletion + 7d) BEFORE dropping the provisioner finalizer, then
+///    await change. The 7-day-grace GC controller drops the role/DB/
+///    Secret later. The connection Secret cascades via its ownerRef.
 /// 2. Ensure the provisioner finalizer is present so deletes are seen.
 /// 3. If the scheduler hasn't marked the claim `Scheduled=True` with a
 ///    provider yet (or it's already `ready`) → requeue 60s.
@@ -101,13 +117,21 @@ pub async fn reconcile(
         .with_label_values(&[KIND])
         .start_timer();
 
-    // 1. Deletion → finalizer skeleton.
+    // 1. Deletion → snapshot a RetainedClaim, THEN un-finalize (2.4f).
     let finalizers = claim.metadata.finalizers.clone().unwrap_or_default();
     if claim.metadata.deletion_timestamp.is_some() {
         if finalizers.iter().any(|f| f == PROVISIONER_FINALIZER) {
+            // Crash-safe order: snapshot FIRST (an idempotent SSA-apply
+            // of a deterministic-named object — a crash before
+            // un-finalizing simply re-applies the byte-identical
+            // RetainedClaim on the next reconcile), THEN drop the
+            // finalizer. The snapshot is the GC's only handle on the
+            // retained role/DB/Secret, so it MUST exist before the
+            // finalizer (and thus the only delete observation) is gone.
+            snapshot_retained_claim(&ctx, &claim, &ns, &name).await?;
             info!(
                 %name, %ns,
-                "ResourceClaim deleted — role/DB retained pending 2.4f GC; releasing finalizer"
+                "ResourceClaim deleted — snapshotted RetainedClaim for 2.4f GC; releasing finalizer"
             );
             set_finalizers(&ctx.client, &ns, &name, without_finalizer(&finalizers)).await?;
         }
@@ -369,6 +393,104 @@ async fn upsert_managed_role(
     )))
 }
 
+/// Snapshot a deleting `ResourceClaim` into an immutable `RetainedClaim`
+/// in `apprafter-system` (Phase 2.4f). Idempotent SSA-apply: the
+/// snapshot name is deterministic and the body is byte-stable, so a
+/// crash before the finalizer is dropped re-applies the same object.
+///
+/// The finalizer ONLY creates the RetainedClaim (its own object) — it
+/// never writes `ResourceClaim` status here (SSA split preserved). A
+/// missing provider / config never stalls the finalizer: the CNPG
+/// cluster + namespace fall back to the provisioning defaults with a
+/// `warn!`, and an absent deletion timestamp falls back to `Utc::now()`.
+async fn snapshot_retained_claim(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+) -> Result<(), ReconcileError> {
+    // Re-derive the same identifiers the provisioner used (deterministic
+    // from the claim's (namespace, name)).
+    let role = cnpg::pg_identifier(ns, name);
+    let db = role.clone();
+    let object_name = cnpg::k8s_name(ns, name);
+    let pw_secret_name = format!("{object_name}-pw");
+
+    // Provider lineage + CNPG target. status.provider may be absent if
+    // the claim never got scheduled — snapshot anyway with empty
+    // provider/backend and the default CNPG target (the GC tolerates a
+    // missing role/DB/Secret 404).
+    let provider_name = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.provider.clone())
+        .unwrap_or_default();
+    let (backend, cluster, cnpg_ns) = match find_provider(&ctx.client, &provider_name).await? {
+        Some(p) => {
+            let cfg = p.spec.config.clone().unwrap_or_else(|| json!({}));
+            let cluster = cfg
+                .pointer("/cluster")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_CNPG_CLUSTER)
+                .to_string();
+            let cnpg_ns = cfg
+                .pointer("/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_CNPG_NAMESPACE)
+                .to_string();
+            (p.spec.backend.clone(), cluster, cnpg_ns)
+        }
+        None => {
+            warn!(
+                %name, %ns, provider = %provider_name,
+                "matched ServiceProvider not found on delete — snapshotting RetainedClaim with default CNPG target"
+            );
+            (
+                String::new(),
+                DEFAULT_CNPG_CLUSTER.to_string(),
+                DEFAULT_CNPG_NAMESPACE.to_string(),
+            )
+        }
+    };
+
+    // retainUntil = deletionTimestamp + 7-day grace. The injected clock
+    // is the deletion instant; `Utc::now()` is the fallback only if the
+    // apiserver somehow omitted the timestamp (it never does on a
+    // delete, but the finalizer must never stall).
+    let deletion = claim
+        .metadata
+        .deletion_timestamp
+        .as_ref()
+        .map(|t| t.0)
+        .unwrap_or_else(Utc::now);
+    let retain_until = grace::compute_retain_until(deletion, grace::GRACE_PERIOD).to_rfc3339();
+
+    let payload = retained_claim_object(
+        &object_name,
+        name,
+        ns,
+        &provider_name,
+        &backend,
+        &cluster,
+        &cnpg_ns,
+        &role,
+        &db,
+        &object_name,
+        &pw_secret_name,
+        &retain_until,
+    );
+
+    let api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
+    api.patch(&object_name, &apply_params(), &Patch::Apply(&payload))
+        .await?;
+
+    info!(
+        %name, %ns, snapshot = %object_name, %retain_until,
+        "RetainedClaim snapshot applied"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic ApiResources for the externally-installed CNPG CRDs + Secrets
 // ---------------------------------------------------------------------------
@@ -531,6 +653,56 @@ pub fn connection_secret_object(
         "type": "Opaque",
         "stringData": {
             "DATABASE_URL": dsn,
+        },
+    })
+}
+
+/// Build the flat `apprafter.io/v1alpha1` `RetainedClaim` SSA-apply body
+/// the finalizer snapshots into `apprafter-system` before un-finalizing
+/// a deleted claim (Phase 2.4f).
+///
+/// `snapshot_name` is `cnpg::k8s_name(claim_ns, claim_name)` — a
+/// deterministic, DNS-1123-safe name that encodes the claim origin, so
+/// every claim maps to a unique RetainedClaim in the single
+/// `apprafter-system` namespace and a crash-then-retry re-applies the
+/// byte-identical object (idempotent SSA). The original
+/// `(claim_name, claim_ns)` lineage is preserved in `spec.claimRef`.
+#[allow(clippy::too_many_arguments)]
+pub fn retained_claim_object(
+    snapshot_name: &str,
+    claim_name: &str,
+    claim_ns: &str,
+    provider: &str,
+    backend: &str,
+    cnpg_cluster: &str,
+    cnpg_namespace: &str,
+    role: &str,
+    database: &str,
+    database_object_name: &str,
+    password_secret_name: &str,
+    retain_until: &str,
+) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "RetainedClaim",
+        "metadata": {
+            "name": snapshot_name,
+            "namespace": RETAINED_CLAIM_NAMESPACE,
+        },
+        "spec": {
+            "claimRef": {
+                "name": claim_name,
+                "namespace": claim_ns,
+            },
+            "provider": provider,
+            "backend": backend,
+            "cnpgCluster": cnpg_cluster,
+            "cnpgNamespace": cnpg_namespace,
+            "role": role,
+            "database": database,
+            "databaseObjectName": database_object_name,
+            "passwordSecretName": password_secret_name,
+            "retainUntil": retain_until,
         },
     })
 }
@@ -708,5 +880,76 @@ mod tests {
     #[test]
     fn connection_secret_name_is_deterministic() {
         assert_eq!(connection_secret_name("demo-web-pg"), "demo-web-pg-conn");
+    }
+
+    // --- retained_claim_object() (2.4f finalizer snapshot) ---
+
+    #[test]
+    fn retained_claim_object_is_a_flat_apprafter_snapshot_in_apprafter_system() {
+        let snapshot_name = cnpg::k8s_name("demo", "demo-web-pg");
+        let rc = retained_claim_object(
+            &snapshot_name,
+            "demo-web-pg",
+            "demo",
+            "pg-integrated",
+            "cloudnative-pg",
+            "platform-postgres",
+            "cnpg-system",
+            "claim_demo_demo_web_pg",
+            "claim_demo_demo_web_pg",
+            &snapshot_name,
+            &format!("{snapshot_name}-pw"),
+            "2026-06-10T00:00:00+00:00",
+        );
+        assert_eq!(rc["apiVersion"], "apprafter.io/v1alpha1");
+        assert_eq!(rc["kind"], "RetainedClaim");
+        // Deterministic name = k8s_name(claim_ns, claim_name); always in
+        // apprafter-system, never the claim's own namespace.
+        assert_eq!(rc["metadata"]["name"], snapshot_name);
+        assert_eq!(rc["metadata"]["namespace"], "apprafter-system");
+        // Lineage preserved in spec.claimRef.
+        assert_eq!(rc["spec"]["claimRef"]["name"], "demo-web-pg");
+        assert_eq!(rc["spec"]["claimRef"]["namespace"], "demo");
+        // Every flat spec field carries through.
+        assert_eq!(rc["spec"]["provider"], "pg-integrated");
+        assert_eq!(rc["spec"]["backend"], "cloudnative-pg");
+        assert_eq!(rc["spec"]["cnpgCluster"], "platform-postgres");
+        assert_eq!(rc["spec"]["cnpgNamespace"], "cnpg-system");
+        assert_eq!(rc["spec"]["role"], "claim_demo_demo_web_pg");
+        assert_eq!(rc["spec"]["database"], "claim_demo_demo_web_pg");
+        assert_eq!(rc["spec"]["databaseObjectName"], snapshot_name);
+        assert_eq!(
+            rc["spec"]["passwordSecretName"],
+            format!("{snapshot_name}-pw")
+        );
+        assert_eq!(rc["spec"]["retainUntil"], "2026-06-10T00:00:00+00:00");
+    }
+
+    #[test]
+    fn retained_claim_object_name_encodes_origin_and_is_dns1123() {
+        // The snapshot name must be the DNS-1123-safe k8s_name (NOT the
+        // underscore pg_identifier — the apiserver rejects `_` in a
+        // metadata.name).
+        let snapshot_name = cnpg::k8s_name("my.ns", "my/claim");
+        let rc = retained_claim_object(
+            &snapshot_name,
+            "my/claim",
+            "my.ns",
+            "p",
+            "b",
+            "c",
+            "n",
+            "r",
+            "d",
+            &snapshot_name,
+            "pw",
+            "2026-06-10T00:00:00+00:00",
+        );
+        let name = rc["metadata"]["name"].as_str().unwrap();
+        assert!(
+            !name.contains('_'),
+            "snapshot name must be DNS-1123: {name}"
+        );
+        assert!(name.starts_with("claim-"));
     }
 }
