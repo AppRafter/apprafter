@@ -641,6 +641,10 @@ pub enum AppCommand {
         /// Overwrite an existing `apprafter/Application.cue`.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Declare a workload dependency to scaffold (repeatable). Currently only `pg`
+        /// (Postgres via needs.pg). Emits a `needs:` block in the generated Application.cue.
+        #[arg(long = "needs")]
+        needs: Vec<String>,
     },
     /// Port-forward the app's primary Service to localhost and
     /// open it in a browser. Wraps `kubectl port-forward` with

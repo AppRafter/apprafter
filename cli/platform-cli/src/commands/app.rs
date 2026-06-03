@@ -144,6 +144,7 @@ pub fn add(
                 namespace: Some(effective_namespace.clone()),
                 path: cwd.clone(),
                 force: false,
+                needs: Vec::new(),
             })?;
         }
         crate::commands::scaffold_wizard::ScaffoldDecision::Refuse => {

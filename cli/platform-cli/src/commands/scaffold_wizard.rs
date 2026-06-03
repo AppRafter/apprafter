@@ -238,6 +238,7 @@ pub fn run_step_zero(cwd: &Path, suggested_name: &str) -> Result<StepZeroOutput>
         namespace: Some(namespace.clone()),
         path: cwd.to_path_buf(),
         force: false,
+        needs: Vec::new(),
     };
     scaffold(opts)?;
     eprintln!();

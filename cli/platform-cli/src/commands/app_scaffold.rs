@@ -390,22 +390,87 @@ fn image_comment(derived: bool) -> String {
     lines.join("\n\t\t")
 }
 
+/// The closed launch set of `--needs <type>` service kinds.
+/// Today only `pg` (Postgres via `needs.pg`, shipped in 2.4)
+/// is wired; the set widens as further ServiceProviders land.
+const KNOWN_NEEDS: &[&str] = &["pg"];
+
+/// Build the `spec.base.needs` CUE block for the scaffolded
+/// Application from the requested service types. Returns an
+/// empty string when no needs are requested (the template
+/// placeholder then collapses to nothing). Errors on an
+/// unknown type — the closed launch set is just `pg` today.
+///
+/// The emitted block carries its own leading blank line and
+/// two-tab indentation so it drops in directly after the
+/// `expose { … }` block under `spec: base:` (the template
+/// places `{{needs_block}}` flush against `expose`'s closing
+/// brace, so the empty case leaves no stray line). Verified
+/// idempotent under `cue fmt`.
+pub fn needs_block(needs: &[String]) -> Result<String> {
+    if needs.is_empty() {
+        return Ok(String::new());
+    }
+
+    // De-dup while preserving first-seen order, validating
+    // each entry against the closed launch set.
+    let mut seen: Vec<&str> = Vec::new();
+    for n in needs {
+        let n = n.as_str();
+        if !KNOWN_NEEDS.contains(&n) {
+            return Err(CliError::Other(format!(
+                "unknown --needs type '{n}'. Supported service types: {}.",
+                KNOWN_NEEDS.join(", ")
+            )));
+        }
+        if !seen.contains(&n) {
+            seen.push(n);
+        }
+    }
+
+    // One entry line per requested type, three-tab indented to
+    // sit under `needs: {` (which is itself two-tab indented).
+    let mut entries = String::new();
+    for n in &seen {
+        match *n {
+            "pg" => entries
+                .push_str("\t\t\tpg: { selector: { tier: \"integrated\" }, size: \"small\" }\n"),
+            // Unreachable — validated against KNOWN_NEEDS above.
+            other => {
+                return Err(CliError::Other(format!(
+                    "unknown --needs type '{other}'. Supported service types: {}.",
+                    KNOWN_NEEDS.join(", ")
+                )))
+            }
+        }
+    }
+
+    // Leading "\n\n" separates the block from `expose`'s closing
+    // brace (the template plants the placeholder flush against
+    // it); the closing "\t\t}" aligns `}` under `needs:`.
+    Ok(format!("\n\n\t\tneeds: {{\n{entries}\t\t}}"))
+}
+
 /// Pure helper — render a complete Application.cue body for
 /// the given `runtime`/`app_name`/`namespace`/`git_origin`.
 /// `git_origin` is the detected `remote.origin.url` (or `None`
 /// when undetectable) used to derive the image reference; the
 /// detection itself lives in the IO-bearing `scaffold` caller
-/// so this fn stays pure and string-testable.
+/// so this fn stays pure and string-testable. `needs` is the
+/// validated `--needs <type>` list rendered into the
+/// `spec.base.needs` block.
 pub fn render_application(
     runtime: Runtime,
     app_name: &str,
     namespace: &str,
     git_origin: Option<&str>,
+    needs: &[String],
 ) -> Result<String> {
     let defaults = defaults_for(runtime);
     let camel = kebab_to_camel(app_name);
     let image = derive_image_ref(git_origin, app_name);
     let port = defaults.primary_port.to_string();
+    let needs_cue = needs_block(needs)?;
 
     let mut vars: BTreeMap<&str, String> = BTreeMap::new();
     vars.insert("app_name", app_name.to_string());
@@ -416,6 +481,7 @@ pub fn render_application(
     vars.insert("runtime_slug", defaults.slug.to_string());
     vars.insert("image_placeholder", image.value().to_string());
     vars.insert("image_comment", image_comment(image.is_derived()));
+    vars.insert("needs_block", needs_cue);
 
     let template = if runtime == Runtime::Blank {
         BLANK_TEMPLATE
@@ -472,6 +538,11 @@ pub struct ScaffoldOpts {
     /// Overwrite an existing `apprafter/Application.cue`
     /// (without — refuse and exit error).
     pub force: bool,
+
+    /// Workload dependencies to scaffold (repeatable
+    /// `--needs <type>`). Closed launch set: `pg`. Rendered
+    /// into the `spec.base.needs` block; empty → no block.
+    pub needs: Vec<String>,
 }
 
 /// Resolve runtime from explicit override OR detection.
@@ -620,7 +691,13 @@ pub fn scaffold(opts: ScaffoldOpts) -> Result<()> {
 
     let git_origin = detect_git_origin_in(&opts.path, "origin");
     let image_derived = derive_image_ref(git_origin.as_deref(), &name).is_derived();
-    let rendered = render_application(runtime, &name, &namespace, git_origin.as_deref())?;
+    let rendered = render_application(
+        runtime,
+        &name,
+        &namespace,
+        git_origin.as_deref(),
+        &opts.needs,
+    )?;
     std::fs::write(&target_file, &rendered)
         .map_err(|e| CliError::Other(format!("write {}: {e}", target_file.display())))?;
 
@@ -861,7 +938,7 @@ mod tests {
             Runtime::Blank,
         ];
         for r in runtimes {
-            let out = render_application(r, "my-app", "apprafter", None)
+            let out = render_application(r, "my-app", "apprafter", None, &[])
                 .unwrap_or_else(|e| panic!("render failed for {r:?}: {e}"));
             assert!(out.contains("\"my-app\""), "{r:?}: missing app name");
             assert!(
@@ -884,7 +961,7 @@ mod tests {
 
     #[test]
     fn render_application_blank_uses_blank_template() {
-        let out = render_application(Runtime::Blank, "x", "apprafter", None).unwrap();
+        let out = render_application(Runtime::Blank, "x", "apprafter", None, &[]).unwrap();
         assert!(
             out.contains("blank template"),
             "Blank runtime should pick BLANK_TEMPLATE which mentions 'blank template'"
@@ -893,7 +970,7 @@ mod tests {
 
     #[test]
     fn render_application_default_template_has_runtime_display() {
-        let out = render_application(Runtime::Bun, "x", "apprafter", None).unwrap();
+        let out = render_application(Runtime::Bun, "x", "apprafter", None, &[]).unwrap();
         assert!(
             out.contains("Bun"),
             "default template should carry runtime display name; got:\n{out}"
@@ -904,7 +981,7 @@ mod tests {
     fn render_application_without_origin_emits_placeholder_image_and_todo() {
         // No git origin → REPLACE-ME placeholder + the "replace
         // REPLACE-ME" TODO comment, not the "verify derived" one.
-        let out = render_application(Runtime::Rust, "my-app", "apprafter", None).unwrap();
+        let out = render_application(Runtime::Rust, "my-app", "apprafter", None, &[]).unwrap();
         assert!(out.contains("ghcr.io/REPLACE-ME/my-app:latest"));
         assert!(
             out.contains("replace `REPLACE-ME`"),
@@ -925,6 +1002,7 @@ mod tests {
             "landing",
             "procvue",
             Some("https://github.com/ProcVue/landing"),
+            &[],
         )
         .unwrap();
         assert!(
@@ -1133,6 +1211,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         };
         scaffold(opts).unwrap();
 
@@ -1166,6 +1245,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         })
         .unwrap();
 
@@ -1212,6 +1292,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         })
         .unwrap();
 
@@ -1251,6 +1332,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         };
         let err = scaffold(opts).unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -1277,6 +1359,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: true,
+            needs: Vec::new(),
         };
         scaffold(opts).unwrap();
         let content =
@@ -1297,6 +1380,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         };
         scaffold(opts).unwrap();
         let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
@@ -1325,6 +1409,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         };
         scaffold(opts).unwrap();
         let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
@@ -1344,6 +1429,7 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         };
         let err = scaffold(opts).unwrap_err();
         let msg = err.to_string();
@@ -1367,11 +1453,67 @@ mod tests {
             namespace: None,
             path: dir.path().to_path_buf(),
             force: false,
+            needs: Vec::new(),
         };
         let err = scaffold(opts).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Multiple runtimes"), "error: {msg}");
         assert!(msg.contains("bun"));
         assert!(msg.contains("rust"));
+    }
+
+    // ── --needs scaffold block (2.4g) ─────────────────────────
+
+    #[test]
+    fn render_application_with_needs_pg_emits_block() {
+        let out =
+            render_application(Runtime::Bun, "parser", "demo", None, &["pg".to_string()]).unwrap();
+        assert!(out.contains("needs: {"), "missing needs block; got:\n{out}");
+        assert!(out.contains("pg:"), "missing pg entry; got:\n{out}");
+        assert!(
+            out.contains("tier: \"integrated\""),
+            "missing tier selector; got:\n{out}"
+        );
+        assert!(out.contains("size: \"small\""), "missing size; got:\n{out}");
+        assert!(!out.contains("{{"), "unsubstituted placeholder leaked");
+    }
+
+    #[test]
+    fn render_application_without_needs_omits_block() {
+        let out = render_application(Runtime::Bun, "parser", "demo", None, &[]).unwrap();
+        assert!(
+            !out.contains("needs:"),
+            "empty needs must not emit a needs block; got:\n{out}"
+        );
+        assert!(!out.contains("{{"), "unsubstituted placeholder leaked");
+    }
+
+    #[test]
+    fn needs_block_rejects_unknown_type() {
+        let err = needs_block(&["mysql".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mysql"),
+            "error must name the bad value; got: {msg}"
+        );
+        assert!(
+            msg.contains("pg"),
+            "error must list the allowed set; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn needs_block_dedups_and_accepts_pg() {
+        let out = needs_block(&["pg".to_string(), "pg".to_string()]).unwrap();
+        assert_eq!(
+            out.matches("pg:").count(),
+            1,
+            "repeated `pg` must de-dup to a single entry; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn needs_block_empty_is_empty_string() {
+        assert_eq!(needs_block(&[]).unwrap(), String::new());
     }
 }

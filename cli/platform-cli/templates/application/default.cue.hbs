@@ -59,7 +59,7 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 			public: false
 
 			// network: "public"  // also accepts "internal" / "vpn"
-		}
+		}{{needs_block}}
 
 		// Literal env values only in v1alpha1. Secret /
 		// ConfigMap references land in 4.x with OpenBao and

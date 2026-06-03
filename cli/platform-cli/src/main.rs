@@ -159,6 +159,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 namespace,
                 path,
                 force,
+                needs,
             } => {
                 let resolved_runtime = match runtime {
                     Some(slug) => Some(
@@ -178,6 +179,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                     namespace,
                     path,
                     force,
+                    needs,
                 })?
             }
             AppCommand::Remove {
