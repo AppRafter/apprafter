@@ -82,6 +82,13 @@ APP="parser"                        # Application name
 CLAIM="parser-pg"                   # generated ResourceClaim name
 CONN_SECRET="parser-pg-conn"        # connection Secret (app ns)
 
+# Group-qualify the two collision-prone kinds so kubectl never resolves
+# to the wrong API group: bare `application` also matches Argo CD's
+# argoproj.io Application, and bare `resourceclaim` matches the k8s 1.32+
+# DRA resource.k8s.io ResourceClaim. Always address the apprafter.io CRs.
+APP_RES="application.apprafter.io"
+CLAIM_RES="resourceclaim.apprafter.io"
+
 PG_ROLE="claim_demo_parser_pg"      # pg_identifier(demo, parser-pg)
 DB_OBJECT="claim-demo-parser-pg"    # k8s_name(demo, parser-pg)
 PW_SECRET="claim-demo-parser-pg-pw" # {DB_OBJECT}-pw
@@ -387,20 +394,20 @@ YAML
 
 phase "Phase 4: generate — ResourceClaim created, Application gated"
 
-wait_jsonpath resourceclaim "$APP_NS" "$CLAIM" '{.spec.type}' pg 180
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.spec.type}' pg 180
 
-claim_tier=$(jp resourceclaim "$APP_NS" "$CLAIM" '{.spec.selector.tier}')
+claim_tier=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.spec.selector.tier}')
 assert_eq "ResourceClaim selector.tier" "$claim_tier" "integrated"
-claim_size=$(jp resourceclaim "$APP_NS" "$CLAIM" '{.spec.size}')
+claim_size=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.spec.size}')
 assert_eq "ResourceClaim size" "$claim_size" "small"
-claim_owner_kind=$(jp resourceclaim "$APP_NS" "$CLAIM" \
+claim_owner_kind=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" \
     '{.metadata.ownerReferences[0].kind}')
 assert_eq "ResourceClaim ownerRef Kind" "$claim_owner_kind" "Application"
 
 # The Application is paused awaiting the claim (2.4d gate).
-wait_jsonpath application "$APP_NS" "$APP" '{.status.phase}' \
+wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' \
     AwaitingResourceClaim 120
-gate_cond=$(cond_status application "$APP_NS" "$APP" ResourceClaimPending)
+gate_cond=$(cond_status "$APP_RES" "$APP_NS" "$APP" ResourceClaimPending)
 assert_eq "Application ResourceClaimPending condition" "$gate_cond" "True"
 
 # ===============================================================
@@ -409,9 +416,9 @@ assert_eq "Application ResourceClaimPending condition" "$gate_cond" "True"
 
 phase "Phase 5: schedule — provider matched, Scheduled=True"
 
-wait_jsonpath resourceclaim "$APP_NS" "$CLAIM" '{.status.provider}' \
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.provider}' \
     "$PROVIDER" 120
-sched_cond=$(cond_status resourceclaim "$APP_NS" "$CLAIM" Scheduled)
+sched_cond=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM" Scheduled)
 assert_eq "ResourceClaim Scheduled condition" "$sched_cond" "True"
 
 # ===============================================================
@@ -421,7 +428,7 @@ assert_eq "ResourceClaim Scheduled condition" "$sched_cond" "True"
 phase "Phase 6: provision — lazy CNPG Cluster, role, Database, Secrets"
 
 # Lazy Cluster boot is the slow step (CNPG instance comes up).
-wait_jsonpath resourceclaim "$APP_NS" "$CLAIM" '{.status.ready}' true 300
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.ready}' true 300
 
 # Exactly ONE CNPG Cluster — the lazy-create is idempotent across claims.
 cluster_count=$(kubectl -n "$CNPG_NS" get cluster.postgresql.cnpg.io \
@@ -449,7 +456,7 @@ role_present=$(kubectl -n "$CNPG_NS" get cluster.postgresql.cnpg.io \
 assert_eq "managed role in Cluster spec.managed.roles" "$role_present" "$PG_ROLE"
 
 # Connection Secret: status ref, DATABASE_URL key, ownerRef cascade.
-conn_ref=$(jp resourceclaim "$APP_NS" "$CLAIM" '{.status.connectionSecretRef}')
+conn_ref=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.connectionSecretRef}')
 assert_eq "status.connectionSecretRef" "$conn_ref" "$CONN_SECRET"
 conn_key=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.DATABASE_URL}')
 if [ -z "$conn_key" ]; then
@@ -464,7 +471,7 @@ assert_eq "connection Secret ownerRef Kind" "$conn_owner_kind" "ResourceClaim"
 # SSA-split guard: the provisioner's status write (ready /
 # connectionSecretRef / Ready) must NOT have clobbered the scheduler's
 # Scheduled=True. Re-assert it after provisioning.
-sched_after=$(cond_status resourceclaim "$APP_NS" "$CLAIM" Scheduled)
+sched_after=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM" Scheduled)
 assert_eq "Scheduled still True after provision (SSA split)" "$sched_after" "True"
 
 # ===============================================================
@@ -473,7 +480,7 @@ assert_eq "Scheduled still True after provision (SSA split)" "$sched_after" "Tru
 
 phase "Phase 7: resume — Application Ready, DATABASE_URL injected"
 
-wait_jsonpath application "$APP_NS" "$APP" '{.status.phase}' Ready 180
+wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 180
 
 env_secret=$(kubectl -n "$APP_NS" get deployment "$APP" \
     -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"DATABASE_URL\")].valueFrom.secretKeyRef.name}" \
@@ -494,7 +501,7 @@ printf '  Deployment %s -> Available\n' "$APP"
 
 phase "Phase 8: delete claim — RetainedClaim snapshot + 7-day grace floor"
 
-kubectl delete resourceclaim "$CLAIM" -n "$APP_NS" --wait=true
+kubectl delete "$CLAIM_RES" "$CLAIM" -n "$APP_NS" --wait=true
 
 # The finalizer snapshots a RetainedClaim into apprafter-system.
 wait_jsonpath retainedclaim "$RETAINED_NS" "$RETAINED" \

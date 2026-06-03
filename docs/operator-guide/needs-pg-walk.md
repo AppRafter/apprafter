@@ -138,17 +138,31 @@ CLI surface; the constants (`demo` namespace, `parser` app,
 `claim-demo-parser-pg`) are derived deterministically from the claim's
 `(namespace, name)`.
 
+> **Naming — the `parser` you query is the apprafter.io `metadata.name`,
+> not the `apprafter app add` name.** The steps address
+> `application.apprafter.io parser` and `resourceclaim.apprafter.io
+> parser-pg`: the kinds are group-qualified on purpose, because bare
+> `application` also matches Argo CD's `argoproj.io` Application and bare
+> `resourceclaim` matches the k8s 1.32+ DRA `resource.k8s.io`
+> ResourceClaim. The `parser` name is the apprafter.io Application's
+> `metadata.name` from the repo's `apprafter/Application.cue` — also the
+> rendered Deployment name — and it can legitimately **differ** from the
+> name you passed to `apprafter app add` (which names the *Argo CD*
+> Application). If `kubectl get application.apprafter.io <name>` returns
+> "not found", you likely used the `app add` name; use the
+> `Application.cue` `metadata.name` instead.
+
 **1. The Application carries the dependency.**
 
 ```sh
-kubectl -n demo get application parser \
+kubectl -n demo get application.apprafter.io parser \
   -o jsonpath='{.spec.base.needs.pg.selector.tier}{"\n"}'   # -> integrated
 ```
 
 **2. The operator generated a ResourceClaim.**
 
 ```sh
-kubectl -n demo get resourceclaim parser-pg \
+kubectl -n demo get resourceclaim.apprafter.io parser-pg \
   -o jsonpath='type={.spec.type} tier={.spec.selector.tier} size={.spec.size}{"\n"}'
 # -> type=pg tier=integrated size=small
 ```
@@ -156,9 +170,9 @@ kubectl -n demo get resourceclaim parser-pg \
 **3. The Application is gated.**
 
 ```sh
-kubectl -n demo get application parser -o jsonpath='{.status.phase}{"\n"}'
+kubectl -n demo get application.apprafter.io parser -o jsonpath='{.status.phase}{"\n"}'
 # -> AwaitingResourceClaim
-kubectl -n demo get application parser -o \
+kubectl -n demo get application.apprafter.io parser -o \
   jsonpath='{.status.conditions[?(@.type=="ResourceClaimPending")].status}{"\n"}'
 # -> True
 ```
@@ -166,9 +180,9 @@ kubectl -n demo get application parser -o \
 **4. The scheduler matched a provider.**
 
 ```sh
-kubectl -n demo get resourceclaim parser-pg \
+kubectl -n demo get resourceclaim.apprafter.io parser-pg \
   -o jsonpath='{.status.provider}{"\n"}'                    # -> pg-integrated
-kubectl -n demo get resourceclaim parser-pg -o \
+kubectl -n demo get resourceclaim.apprafter.io parser-pg -o \
   jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
 ```
 
@@ -184,7 +198,7 @@ kubectl -n cnpg-system get cluster.postgresql.cnpg.io
 slow step.)
 
 ```sh
-kubectl -n demo get resourceclaim parser-pg -o jsonpath='{.status.ready}{"\n"}'
+kubectl -n demo get resourceclaim.apprafter.io parser-pg -o jsonpath='{.status.ready}{"\n"}'
 # -> true
 kubectl -n cnpg-system get database.postgresql.cnpg.io claim-demo-parser-pg \
   -o jsonpath='ensure={.spec.ensure} owner={.spec.owner}{"\n"}'
@@ -199,7 +213,7 @@ kubectl -n cnpg-system get secret claim-demo-parser-pg-pw \
 **7. The connection Secret carries the DSN.**
 
 ```sh
-kubectl -n demo get resourceclaim parser-pg \
+kubectl -n demo get resourceclaim.apprafter.io parser-pg \
   -o jsonpath='{.status.connectionSecretRef}{"\n"}'         # -> parser-pg-conn
 kubectl -n demo get secret parser-pg-conn \
   -o jsonpath='{.data.DATABASE_URL}' | base64 -d; echo
@@ -213,14 +227,14 @@ the scheduler's verdict — `Scheduled` is still `True` after
 provisioning:
 
 ```sh
-kubectl -n demo get resourceclaim parser-pg -o \
+kubectl -n demo get resourceclaim.apprafter.io parser-pg -o \
   jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
 ```
 
 **8. The Application resumed.**
 
 ```sh
-kubectl -n demo get application parser -o jsonpath='{.status.phase}{"\n"}'
+kubectl -n demo get application.apprafter.io parser -o jsonpath='{.status.phase}{"\n"}'
 # -> Ready
 ```
 
@@ -256,7 +270,7 @@ apprafter app logs parser --tail 50
 > (e.g. the app sitting at `AwaitingResourceClaim`), fall back to:
 >
 > ```sh
-> kubectl -n demo get resourceclaim parser-pg
+> kubectl -n demo get resourceclaim.apprafter.io parser-pg
 > ```
 
 **12. Delete the dependency — the claim is retained.** Removing the
@@ -264,7 +278,7 @@ apprafter app logs parser --tail 50
 check:
 
 ```sh
-kubectl -n demo delete resourceclaim parser-pg
+kubectl -n demo delete resourceclaim.apprafter.io parser-pg
 kubectl -n apprafter-system get retainedclaim claim-demo-parser-pg -o \
   jsonpath='claim={.spec.claimRef.name} role={.spec.role} until={.spec.retainUntil}{"\n"}'
 # -> claim=parser-pg role=claim_demo_parser_pg until=<RFC3339, ~7 days out>
@@ -389,7 +403,7 @@ The walk must exercise both shipped surfaces. Check every box.
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | Claim stuck `Scheduled` absent / Application stuck `AwaitingResourceClaim` | `needs.pg.selector` does not match any provider's `metadata.labels` | Confirm `selector.tier=integrated` and that `pg-integrated` carries `tier=integrated`: `kubectl get serviceprovider pg-integrated -n apprafter-system -o yaml`. |
-| `status.ready` never `true` | shared CNPG Cluster not Ready, or a provisioner error | `kubectl -n cnpg-system get cluster platform-postgres`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
+| `status.ready` never `true` | shared CNPG Cluster not Ready, or a provisioner error | `kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
 | `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key, or a literal `DATABASE_URL` colliding with the injected one | Use only the closed `needs` key set (`pg`); do not declare a literal `env.DATABASE_URL` alongside `needs.pg`. |
 | Database still present after the GC | CloudNativePG has not reconciled `ensure: absent` yet | Re-run the psql query after a short wait; check the CNPG operator logs in `cnpg-system`. If it persists, this is a closure-blocking bug. |
 
