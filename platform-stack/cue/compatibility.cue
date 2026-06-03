@@ -1701,6 +1701,21 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.9": {
+	change:          "safe"
+	operatorVersion: "v0.2.9"
+	notes: """
+		2.4e — needs.pg DSN injection. The Application controller now
+		injects DATABASE_URL into a needs.pg workload's Deployment via
+		valueFrom.secretKeyRef pointing at the provisioned connection
+		Secret (key DATABASE_URL), once the claim is ready. The admission
+		webhook now rejects an Application that declares needs.pg AND sets
+		a literal env DATABASE_URL (reserved — hard reject; revisit at UX
+		polish). pg-only (jetstream/redis are 2.5/2.6); not the full 2.12
+		claim.* reference engine. No CRD schema change. Safe to auto-sync.
+		"""
+	references: ["plan.md 2.4e"]
+}
 compatibility: "0.2.8": {
 	change:          "safe"
 	operatorVersion: "v0.2.8"
