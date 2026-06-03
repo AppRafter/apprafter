@@ -274,8 +274,11 @@ fn enforce_confirmed_coverage(repo_url: &str, kubeconfig_path: &Path) -> Result<
 /// level) and a PAT-creation URL for GitHub / GitLab so the
 /// operator doesn't hunt for it.
 ///
-/// Best-effort — failure to fetch secrets prints nothing, does not
-/// fail the command.
+/// Gated on anonymous publicness: a credential-less probe of the
+/// repo's smart-HTTP advert decides whether Argo CD's repo-server
+/// could clone it without creds — public repos stay quiet, only
+/// genuinely private ones get the notice. Best-effort — failure to
+/// fetch secrets or probe prints nothing, does not fail the command.
 fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
     if !repo_url.starts_with("https://") {
         // Only HTTPS triggers the warning — git@ / ssh://
@@ -292,11 +295,21 @@ fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
         return;
     }
 
+    // No matching creds — but a credential-less Argo CD repo-server
+    // can clone a PUBLIC repo just fine, so the PAT notice would be
+    // noise there. The creds check above is cheap and already done;
+    // only NOW (the notice-eligible case) pay for the network probe.
+    // A 200 from the anonymous smart-HTTP advert → public → suppress.
+    if is_git_repo_anonymously_public(repo_url) {
+        return;
+    }
+
     let suggestion = derive_creds_suggestion(repo_url);
 
     println!();
-    println!("ℹ Repo has no matching credentials in Argo CD.");
-    println!("  If {repo_url} is private:");
+    println!("ℹ {repo_url} is private (no anonymous Git access) and has no");
+    println!("  matching credentials in Argo CD — register one so the repo-server");
+    println!("  can clone it:");
 
     if let Some(ref s) = suggestion {
         if let Some(ref pat_url) = s.pat_creation_url {
@@ -318,7 +331,35 @@ fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
     } else {
         println!("    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>");
     }
-    println!("  Public repos can ignore this.");
+}
+
+/// Map a git smart-HTTP probe status to a publicness verdict.
+/// `true` = anonymously public (suppress the cred notice): the
+/// credential-less probe returned 200, so a credential-less client
+/// like Argo CD's repo-server can clone it too. 401/403 = auth
+/// required → private. Anything else, or a transport error
+/// (`None`), is treated conservatively as NOT public, so the
+/// operator still sees the credential guidance.
+fn git_probe_verdict(status: Option<u16>) -> bool {
+    matches!(status, Some(200))
+}
+
+/// Anonymously probe a Git HTTPS repo's smart-HTTP advertisement
+/// (`<url>/info/refs?service=git-upload-pack`) with NO auth header
+/// — the exact view a credential-less Argo CD repo-server has. A
+/// 200 means the repo is publicly cloneable; 401/403 means private.
+/// 5s timeout; any transport error is treated as not-public.
+fn is_git_repo_anonymously_public(repo_url: &str) -> bool {
+    let probe = format!("{repo_url}/info/refs?service=git-upload-pack");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let status = match agent.get(&probe).call() {
+        Ok(resp) => Some(resp.status()),
+        Err(ureq::Error::Status(code, _)) => Some(code),
+        Err(ureq::Error::Transport(_)) => None,
+    };
+    git_probe_verdict(status)
 }
 
 /// Surface for the walk-fix #2 hint — auto-derived defaults
@@ -2202,6 +2243,21 @@ mod tests {
         assert!(derive_creds_suggestion("https://github.com").is_none());
         assert!(derive_creds_suggestion("https://github.com/").is_none());
         assert!(derive_creds_suggestion("https://").is_none());
+    }
+
+    #[test]
+    fn git_probe_verdict_only_200_is_public() {
+        // 2.4g: the anonymous smart-HTTP probe gates the PAT notice.
+        // 200 = credential-less clone works → public → suppress the
+        // notice. 401/403 = auth required → private. 404 / other /
+        // transport error (None) → conservatively NOT public, so the
+        // operator still gets the credential guidance.
+        assert!(git_probe_verdict(Some(200)));
+        assert!(!git_probe_verdict(Some(401)));
+        assert!(!git_probe_verdict(Some(403)));
+        assert!(!git_probe_verdict(Some(404)));
+        assert!(!git_probe_verdict(Some(500)));
+        assert!(!git_probe_verdict(None));
     }
 
     #[test]
