@@ -66,6 +66,39 @@ cd cli && cargo run --bin apprafter -- destroy --yes
 whatever's tagged `apprafter=true` regardless of the local state
 file.
 
+## needs-pg-walk.sh
+
+Local-k3d smoke for the full Phase-2.4 `needs.pg` ResourceClaim chain
+(no cloud spend, no secrets). It bootstraps the platform stack —
+including the always-on CloudNativePG operator and the seeded
+`pg-integrated` ServiceProvider — then walks:
+
+```
+generate -> schedule -> provision -> resume + DSN inject ->
+delete + RetainedClaim snapshot -> force-GC -> psql DROP proof
+```
+
+The final phase execs the CloudNativePG primary and asserts the
+per-claim database + role are **physically dropped from Postgres**
+(`pg_database` / `pg_roles` empty), not merely that the `Database` CR
+reports `ensure: absent`.
+
+### Usage
+
+```sh
+APPRAFTER_E2E_SKIP_DESTROY=1 bash e2e/needs-pg-walk.sh   # keep the cluster for inspection
+```
+
+Without `APPRAFTER_E2E_SKIP_DESTROY` the script tears the k3d cluster
+down on both success and failure (diagnostics are dumped before
+teardown on failure). It is the **pre-manual-walk gate** for the
+Tier-1 [`needs.pg manual walk`](../docs/operator-guide/needs-pg-walk.md)
+and runs nightly via
+[`.github/workflows/e2e-pg-nightly.yml`](../.github/workflows/e2e-pg-nightly.yml)
+(cron 05:00 UTC, `workflow_dispatch`). It is deliberately **not** part
+of the per-push `e2e-k3d.yml` gate (booting a Postgres pod is heavier)
+and is not a dependency of `just e2e`.
+
 ## Nightly CI
 
 `.github/workflows/nightly.yml` runs this script every night at

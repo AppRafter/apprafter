@@ -41,6 +41,8 @@ Canonical references:
   resolution chain.
 - [`troubleshooting.md`](troubleshooting.md) — diagnostic codes.
 - [`gitops-walk.md`](gitops-walk.md) — Argo CD + repo-creds walk.
+- [`needs-pg-walk.md`](needs-pg-walk.md) — `needs.pg` Postgres
+  provisioning + GC walk.
 - [`recovery.md`](recovery.md) — Hetzner rescue-mode runbook.
 - [`docs/reference/cli.md`](../reference/cli.md) — every
   subcommand + flag.

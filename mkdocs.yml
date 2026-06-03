@@ -74,6 +74,7 @@ nav:
       - Quickstart: operator-guide/quickstart.md
       - Target store: operator-guide/target-store.md
       - GitOps walk: operator-guide/gitops-walk.md
+      - needs.pg walk: operator-guide/needs-pg-walk.md
       - Platform management: operator-guide/platform-management.md
       - Migration plans: operator-guide/migration-plans.md
       - Troubleshooting: operator-guide/troubleshooting.md
