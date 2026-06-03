@@ -175,6 +175,17 @@ pub fn merge_role(existing: Vec<Value>, entry: Value) -> Vec<Value> {
     out
 }
 
+/// Inverse of [`merge_role`] (Phase 2.4f GC): drop the entry whose
+/// `name` == `role_name`, preserving every foreign / CNPG-seeded entry.
+/// Pure, idempotent — a no-op when the role is already absent, so the
+/// GC reconcile can be re-driven safely after a crash.
+pub fn remove_role(existing: Vec<Value>, role_name: &str) -> Vec<Value> {
+    existing
+        .into_iter()
+        .filter(|r| r.get("name").and_then(Value::as_str) != Some(role_name))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +371,41 @@ mod tests {
         let out = merge_role(vec![foreign], managed_role_entry("a", "a-pw"));
         assert_eq!(out.len(), 2);
         assert!(out.iter().any(|r: &Value| r["name"] == "keep-me"));
+    }
+
+    // --- remove_role() (2.4f GC inverse of merge_role) ---
+
+    #[test]
+    fn remove_role_drops_the_named_entry() {
+        let existing = vec![managed_role_entry("a", "a-pw")];
+        let out = remove_role(existing, "a");
+        assert!(out.is_empty(), "the named role must be dropped");
+    }
+
+    #[test]
+    fn remove_role_preserves_foreign_entries() {
+        let foreign = json!({ "name": "keep-me", "login": false });
+        let existing = vec![managed_role_entry("a", "a-pw"), foreign];
+        let out = remove_role(existing, "a");
+        assert_eq!(out.len(), 1, "only the named role is removed");
+        assert_eq!(out[0]["name"], "keep-me");
+    }
+
+    #[test]
+    fn remove_role_is_a_noop_when_role_absent() {
+        let existing = vec![managed_role_entry("b", "b-pw")];
+        let out = remove_role(existing, "a");
+        assert_eq!(
+            out.len(),
+            1,
+            "removing an absent role keeps the list intact"
+        );
+        assert_eq!(out[0]["name"], "b");
+    }
+
+    #[test]
+    fn remove_role_empty_in_empty_out() {
+        let out = remove_role(vec![], "a");
+        assert!(out.is_empty());
     }
 }
