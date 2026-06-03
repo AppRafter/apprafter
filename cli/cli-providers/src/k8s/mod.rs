@@ -13,7 +13,7 @@ pub mod loader_values;
 pub mod sealing;
 
 pub use channel_latest::resolve_latest_platform_stack_version;
-pub use helm::{HelmCli, HelmRunner, HelmUpgradeArgs};
+pub use helm::{loader_fingerprint, HelmCli, HelmRunner, HelmUpgradeArgs};
 pub use image_ref::{
     resolve_image_ref, APPRAFTER_ADMISSION_WEBHOOK_DEFAULT_IMAGE, APPRAFTER_OPERATOR_DEFAULT_IMAGE,
     APPRAFTER_PLATFORM_STACK_CHART_NAME, APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
