@@ -137,8 +137,12 @@ describe('landing/cms scaffold', () => {
     const df = readFileSync(dfPath, 'utf8');
     expect(df).toMatch(/FROM oven\/bun.*AS builder/);
     expect(df).toMatch(/FROM node.*AS runtime/);
-    // standalone copy paths.
-    expect(df).toContain('.next/standalone/cms');
+    // standalone copy: the WHOLE tree is copied verbatim (NOT
+    // flattened into /app), so Bun's `../../node_modules/.bun`
+    // symlinks under cms/node_modules keep resolving; the server
+    // launches from the cms/ subdir.
+    expect(df).toContain('/landing/cms/.next/standalone /app');
+    expect(df).toContain('cms/server.js');
     expect(df).toContain('.next/static');
     // public/ must exist in the source tree for the runtime COPY
     // to succeed — Next standalone explicitly excludes it.
