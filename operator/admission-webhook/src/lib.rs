@@ -6,6 +6,7 @@ pub mod validator;
 pub mod validator_migrationplan;
 pub mod validator_platformstack;
 pub mod validator_resourceclaim;
+pub mod validator_retainedclaim;
 pub mod validator_serviceprovider;
 pub mod validator_sourcecredential;
 

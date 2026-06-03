@@ -135,3 +135,29 @@ webhooks:
         resources:
           - resourceclaims
         scope: Namespaced
+  - name: retainedclaims.apprafter.io
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    admissionReviewVersions:
+      - v1
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    clientConfig:
+      service:
+        name: {{ include "apprafter-admission-webhook.fullname" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate
+        port: 443
+    rules:
+      # 2.4f RetainedClaim — operator-only CREATE + spec immutability on
+      # UPDATE (the validator reads oldObject for the immutability check,
+      # so both CREATE and UPDATE must reach the webhook).
+      - apiGroups:
+          - apprafter.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - retainedclaims
+        scope: Namespaced

@@ -115,6 +115,12 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         "ResourceClaim" => {
             crate::validator_resourceclaim::validate_resourceclaim(&object, &user_info, operation)
         }
+        "RetainedClaim" => crate::validator_retainedclaim::validate_retainedclaim(
+            &object,
+            old_object.as_ref(),
+            &user_info,
+            operation,
+        ),
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The
