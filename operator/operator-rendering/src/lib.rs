@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec, SecretKeySelector,
+    Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -27,19 +28,47 @@ pub struct RenderedApplication {
     pub service: Option<Service>,
 }
 
+/// The Secret key the provisioner writes the DSN under (2.4c). The
+/// connection Secret carries exactly this one `stringData` key for a
+/// `pg` claim; the injected EnvVar's `secretKeyRef.key` points at it.
+const CONNECTION_SECRET_KEY: &str = "DATABASE_URL";
+
+/// needs-type → injected env-var name. 2.4e ships `pg` only;
+/// jetstream/redis land in 2.5/2.6. The Secret key is always
+/// `DATABASE_URL` (the provisioner writes exactly that one key).
+/// KEEP IN SYNC with the admission webhook's reserved-env guard.
+const NEEDS_ENV_VAR_NAME: &[(&str, &str)] = &[("pg", "DATABASE_URL")];
+
+fn needs_env_var_name(service_type: &str) -> Option<&'static str> {
+    NEEDS_ENV_VAR_NAME
+        .iter()
+        .find(|(k, _)| *k == service_type)
+        .map(|(_, v)| *v)
+}
+
 /// Render the Application's `base` block (no environment override
 /// applied). v0.1.30 entry point — keeps the simple call-site
 /// shape; new code should prefer [`render_application_for_env`]
 /// when the operator knows which environment it represents.
 pub fn render_application(app: &Application) -> RenderedApplication {
-    render_application_for_env(app, None)
+    render_application_for_env(app, None, None)
 }
 
 /// Render the Application using the merged base + environment
 /// override (when `env_name` is `Some(...)` and the override exists).
+///
+/// `needs_secrets` maps a `needs` service type (e.g. `"pg"`) to the
+/// name of its provisioned connection Secret (the ready claim's
+/// `status.connectionSecretRef`). When threaded in (the reconcile
+/// builds it from the SAME ready claims the 2.4d gate validated,
+/// AFTER the gate), the renderer appends a `valueFrom.secretKeyRef`
+/// EnvVar per known need. `None` (pre-gate / claims unready) renders
+/// the workload WITHOUT the DSN. Keeping the map a threaded param
+/// preserves the renderer's purity — no kube client here.
 pub fn render_application_for_env(
     app: &Application,
     env_name: Option<&str>,
+    needs_secrets: Option<&BTreeMap<String, String>>,
 ) -> RenderedApplication {
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
@@ -47,7 +76,14 @@ pub fn render_application_for_env(
     let labels = make_labels(&name);
     let effective = effective_spec(app, env_name);
 
-    let deployment = render_deployment(&name, namespace.as_deref(), &owner, &labels, &effective);
+    let deployment = render_deployment(
+        &name,
+        namespace.as_deref(),
+        &owner,
+        &labels,
+        &effective,
+        needs_secrets,
+    );
     let service = effective
         .expose
         .as_ref()
@@ -130,6 +166,7 @@ fn render_deployment(
     owner: &OwnerReference,
     labels: &BTreeMap<String, String>,
     spec: &ApplicationBaseSpec,
+    needs_secrets: Option<&BTreeMap<String, String>>,
 ) -> Deployment {
     let replicas = spec.replicas.unwrap_or(1);
     let image = spec.image.clone().unwrap_or_default();
@@ -139,7 +176,7 @@ fn render_deployment(
         ..Default::default()
     });
 
-    let env_vars: Vec<EnvVar> = spec
+    let mut env_vars: Vec<EnvVar> = spec
         .env
         .as_ref()
         .map(|env| {
@@ -152,6 +189,35 @@ fn render_deployment(
                 .collect()
         })
         .unwrap_or_default();
+
+    // 2.4e: append a `valueFrom.secretKeyRef` DSN EnvVar per known
+    // need whose claim has a resolved connection Secret. Iterating
+    // `needs.keys()` (BTreeMap) keeps the appended order deterministic
+    // so the rendered Deployment is byte-stable across reconciles
+    // (SSA no-op; non-deterministic order would spin the operator).
+    // Appended AFTER the literal env so a (rejected-by-webhook, but
+    // defensively) colliding literal would never silently win.
+    if let (Some(needs), Some(secrets)) = (spec.needs.as_ref(), needs_secrets) {
+        for service_type in needs.keys() {
+            let (Some(var_name), Some(secret_name)) =
+                (needs_env_var_name(service_type), secrets.get(service_type))
+            else {
+                continue;
+            };
+            env_vars.push(EnvVar {
+                name: var_name.to_string(),
+                value: None,
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: secret_name.clone(),
+                        key: CONNECTION_SECRET_KEY.to_string(),
+                        optional: Some(false),
+                    }),
+                    ..Default::default()
+                }),
+            });
+        }
+    }
 
     let container = Container {
         name: name.to_string(),
@@ -713,7 +779,7 @@ mod tests {
             },
             envs,
         );
-        let r = render_application_for_env(&app, Some("prod"));
+        let r = render_application_for_env(&app, Some("prod"), None);
         assert_eq!(
             r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
                 .image
@@ -745,6 +811,149 @@ mod tests {
                 .image
                 .as_deref(),
             Some("ghcr.io/acme/web:dev")
+        );
+    }
+
+    // ---- 2.4e: DATABASE_URL DSN injection ----
+
+    use operator_core::ServiceNeed;
+
+    /// Helper: build a base with a single named need (no selector/size).
+    fn base_with_need(image: &str, need_type: &str) -> ApplicationBaseSpec {
+        let mut needs = BTreeMap::new();
+        needs.insert(need_type.to_string(), ServiceNeed::default());
+        ApplicationBaseSpec {
+            image: Some(image.to_string()),
+            needs: Some(needs),
+            ..Default::default()
+        }
+    }
+
+    /// Helper: extract the rendered container's env vars (or None).
+    fn container_env(r: &RenderedApplication) -> Option<Vec<EnvVar>> {
+        r.deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .env
+            .clone()
+    }
+
+    #[test]
+    fn pg_need_injects_database_url_secret_key_ref() {
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
+                environments: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
+        let r = render_application_for_env(&app, None, Some(&secrets));
+        let envs = container_env(&r).expect("env present");
+        let dsn = envs
+            .iter()
+            .find(|e| e.name == "DATABASE_URL")
+            .expect("DATABASE_URL injected");
+        assert_eq!(dsn.value, None);
+        let source = dsn.value_from.as_ref().expect("value_from set");
+        let key_ref = source.secret_key_ref.as_ref().expect("secret_key_ref set");
+        assert_eq!(key_ref.name, "parser-pg-conn");
+        assert_eq!(key_ref.key, "DATABASE_URL");
+        assert_eq!(key_ref.optional, Some(false));
+    }
+
+    #[test]
+    fn needs_present_but_no_secrets_map_skips_injection() {
+        // The 2.4d "resumes WITHOUT DATABASE_URL" contract: a need is
+        // declared but no resolved secret map is threaded in (claims not
+        // ready / pre-gate) → no DATABASE_URL env.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
+                environments: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let r = render_application_for_env(&app, None, None);
+        let envs = container_env(&r);
+        // No literal env + no injected DSN → env stays None.
+        assert!(envs.is_none(), "no DATABASE_URL when secrets map is None");
+    }
+
+    #[test]
+    fn empty_env_plus_dsn_yields_some_env_of_len_one() {
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
+                environments: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
+        let r = render_application_for_env(&app, None, Some(&secrets));
+        let envs = container_env(&r).expect("env present (DSN injected)");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].name, "DATABASE_URL");
+    }
+
+    #[test]
+    fn literal_env_coexists_with_dsn_appended_after() {
+        let mut base = base_with_need("ghcr.io/acme/web:1.0", "pg");
+        base.env = Some(BTreeMap::from([(
+            "LOG_LEVEL".to_string(),
+            "info".to_string(),
+        )]));
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base),
+                environments: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
+        let r = render_application_for_env(&app, None, Some(&secrets));
+        let envs = container_env(&r).expect("env present");
+        assert_eq!(envs.len(), 2);
+        // Literal env first, DSN appended AFTER.
+        assert_eq!(envs[0].name, "LOG_LEVEL");
+        assert_eq!(envs[0].value.as_deref(), Some("info"));
+        assert_eq!(envs[1].name, "DATABASE_URL");
+        assert!(envs[1].value_from.is_some());
+    }
+
+    #[test]
+    fn non_pg_need_in_secrets_map_is_not_injected() {
+        // pg-only table: a redis entry in the secrets map must NOT
+        // produce an env var (jetstream/redis injection is 2.5/2.6).
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
+                environments: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([("redis".to_string(), "parser-redis-conn".to_string())]);
+        let r = render_application_for_env(&app, None, Some(&secrets));
+        let envs = container_env(&r);
+        assert!(
+            envs.is_none(),
+            "redis need must not inject any env (pg-only)"
         );
     }
 }
