@@ -9,6 +9,55 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.8 + platform-stack 0.2.8 — 2.4d Application claim generation + AwaitingResourceClaim pause gate (2026-06-03)
+
+The `Application` controller now turns `needs.*` into child `ResourceClaim`s
+and pauses until each is provisioned, resuming via an owns-watch.
+
+### Added
+
+- **Application → ResourceClaim generation.** For each `needs` entry on the
+  effective spec the Application controller SSA-applies one child `ResourceClaim`
+  named `{app}-{type}` (DNS-1123-folded), with `{tier: integrated}` injected as
+  the default selector when the need omits one, `size` passed through when
+  present, and an `ownerReference` → the Application (`controller: true` /
+  `blockOwnerDeletion: true`) for cascade. The apply payload carries **spec +
+  metadata only — never `status`**: the 2.3 scheduler owns
+  `status.provider`/`Scheduled` and the 2.4c provisioner owns
+  `status.ready`/`connectionSecretRef`/`Ready` (a strict SSA split under the
+  `apprafter-operator` field manager).
+- **`AwaitingResourceClaim` phase + `ResourceClaimPending` condition.** The
+  reconcile pauses (mirroring the ADR-0027 `AwaitingMigrationApproval` gate) until
+  every generated claim reports `status.ready == true` **and**
+  `connectionSecretRef` (BOTH — closes the half-ready resume race). The pause
+  status preserves `observedGeneration` + `endpointURL` and the condition's
+  `lastTransitionTime` (k8s convention).
+- **`.owns(ResourceClaim)` watch** — the provisioner flipping a claim ready
+  re-enqueues the owning Application immediately, so resume is event-driven.
+- **RBAC** — the `resourceclaims` rule gains `create` (an SSA-apply that creates
+  the object requires it); split from `resourceclaims/status` so the Application
+  controller never receives `create` on claim status.
+
+### Fixed
+
+- **`effective_spec` now merges `needs` on env override** (latent 2.4b gap) —
+  per-key whole-object replace mirroring `expose`. Env-scoped needs were
+  previously dropped silently.
+
+### Notes
+
+- **Reversible decisions.** `needs.*.selector` changes are treated as
+  **non-destructive** in 2.4d (no MigrationPlan gate; revisit in 2.5+). Readiness
+  predicate is `ready AND connectionSecretRef`.
+- **Scope held.** No DSN / `DATABASE_URL` injection into the Deployment yet — that
+  is 2.4e, so a `needs.pg` app resumes WITHOUT `DATABASE_URL` until then. No
+  Application-side finalizer / GC (2.4f).
+- `change: safe` — no CRD schema change, no data migration. `operatorVersion`
+  v0.2.7 → v0.2.8, `currentVersion` 0.2.7 → 0.2.8. `operator/v0.2.8` +
+  `platform-stack/v0.2.8` tags are workflow-made on push. No cli bump, no monorepo
+  `v0.x.y` tag. The full generate → provision → resume loop is exercised by the
+  2.4g real-cluster walk.
+
 ## operator v0.2.7 + platform-stack 0.2.7 — 2.4c resourceclaim-provisioner controller (2026-06-02)
 
 Adds the 6th in-cluster controller — provisions each scheduled pg
