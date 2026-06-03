@@ -121,7 +121,70 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         }
     }
 
+    validate_reserved_env_collision(base, envs, &mut errors);
+
     errors
+}
+
+/// The env-var name reserved when `needs.pg` is declared. The
+/// Application controller injects the PostgreSQL DSN under this name
+/// via `valueFrom.secretKeyRef` (2.4e); a user-set literal would
+/// collide. KEEP IN SYNC with operator-rendering NEEDS_ENV_VAR_NAME
+/// (pg→DATABASE_URL).
+const PG_RESERVED_ENV: &str = "DATABASE_URL";
+
+/// 2.4e: reject an Application that declares `needs.pg` AND sets a
+/// literal `env.DATABASE_URL` (collision with the injected DSN). The
+/// reservation is GLOBAL/cross-scope: pg declared in base OR ANY
+/// environment reserves `DATABASE_URL` everywhere (base + every
+/// environment env block). Hard reject (not warn), multi-error (one
+/// per offending field, no short-circuit) — matches the validator
+/// contract.
+fn validate_reserved_env_collision(
+    base: Option<&serde_json::Map<String, Value>>,
+    envs: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let needs_pg = |obj: Option<&serde_json::Map<String, Value>>| -> bool {
+        obj.and_then(|o| o.get("needs"))
+            .and_then(|v| v.as_object())
+            .is_some_and(|n| n.contains_key("pg"))
+    };
+
+    let pg_declared = needs_pg(base)
+        || envs.is_some_and(|envs_obj| envs_obj.values().any(|val| needs_pg(val.as_object())));
+
+    if !pg_declared {
+        return;
+    }
+
+    let has_database_url = |obj: Option<&serde_json::Map<String, Value>>| -> bool {
+        obj.and_then(|o| o.get("env"))
+            .and_then(|v| v.as_object())
+            .is_some_and(|env| env.contains_key(PG_RESERVED_ENV))
+    };
+
+    if has_database_url(base) {
+        errors.push(ValidationError::new(
+            format!("spec.base.env.{PG_RESERVED_ENV}"),
+            format!(
+                "{PG_RESERVED_ENV} is reserved for the PostgreSQL connection injected by needs.pg; remove it from spec.base.env"
+            ),
+        ));
+    }
+
+    if let Some(envs_obj) = envs {
+        for (name, val) in envs_obj {
+            if has_database_url(val.as_object()) {
+                errors.push(ValidationError::new(
+                    format!("spec.environments.{name}.env.{PG_RESERVED_ENV}"),
+                    format!(
+                        "{PG_RESERVED_ENV} is reserved for the PostgreSQL connection injected by needs.pg; remove it from spec.environments.{name}.env"
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 fn validate_env_keys(
@@ -415,5 +478,102 @@ mod tests {
         assert!(errors
             .iter()
             .all(|e| e.field.starts_with("spec.base.needs.")));
+    }
+
+    // ---- 2.4e: DATABASE_URL is reserved when needs.pg is declared ----
+
+    #[test]
+    fn rejects_database_url_in_base_env_when_base_needs_pg() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "DATABASE_URL": "postgres://override" }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL");
+    }
+
+    #[test]
+    fn rejects_database_url_in_environment_env_when_base_needs_pg() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} }
+            },
+            "environments": {
+                "prod": { "env": { "DATABASE_URL": "postgres://override" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.environments.prod.env.DATABASE_URL");
+    }
+
+    #[test]
+    fn rejects_database_url_in_base_env_when_environment_needs_pg_cross_scope() {
+        // The reservation is GLOBAL/cross-scope: pg declared in an
+        // environment reserves DATABASE_URL everywhere, including base.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "DATABASE_URL": "postgres://override" }
+            },
+            "environments": {
+                "prod": { "needs": { "pg": {} } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL");
+    }
+
+    #[test]
+    fn accepts_needs_pg_without_database_url_literal() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "LOG_LEVEL": "info" }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn accepts_database_url_literal_when_no_needs_pg() {
+        // DATABASE_URL is reserved ONLY under needs.pg. With no pg
+        // need, a literal DATABASE_URL is a normal env var.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "DATABASE_URL": "postgres://my-own-db" }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn reports_database_url_collision_in_both_base_and_environment() {
+        // Multi-error contract: a DATABASE_URL literal in BOTH base and
+        // an environment under needs.pg surfaces two errors (one per
+        // offending field), no short-circuit.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "DATABASE_URL": "postgres://a" }
+            },
+            "environments": {
+                "prod": { "env": { "DATABASE_URL": "postgres://b" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 2);
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert!(fields.contains(&"spec.base.env.DATABASE_URL"));
+        assert!(fields.contains(&"spec.environments.prod.env.DATABASE_URL"));
     }
 }
