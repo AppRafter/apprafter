@@ -12,16 +12,6 @@
 //   ghcr.io/apprafter/landing-cms:landing-v0.1.0   (pinned, prod)
 //   ghcr.io/apprafter/landing-cms:latest           (head, dev)
 //
-// Postgres dependency is NOT declared here per the operator's
-// 2026-05-22 request — `spec.base.needs.pg` ships with v2.x of
-// the platform API once ResourceClaim lands. Until then the
-// DATABASE_URI is provided externally:
-//   - dev:  docker-compose Postgres on the host's 5432 (see
-//           landing/docker-compose.yml).
-//   - prod: standalone Postgres container on the deploy host
-//           (see landing/DEPLOY.md), URL injected via the
-//           systemd EnvironmentFile at /etc/apprafter-cms.env.
-//
 // Same channel injects PAYLOAD_SECRET + SMTP_* secrets. v1alpha1
 // `env` only accepts string literals; secret-ref support lands
 // with ResourceClaim (2.x) and OpenBao (4.x). Until then, the
@@ -63,6 +53,7 @@ landingCms: v1alpha1.#Application & {
 			},
 			env: {
 				// DATABASE_URL auto-injected via needs.pg claim
+				PAYLOAD_SECRET: "ZiZn1bW3IHmAGj8g72CSHZsvWERDDrEXWGU+kxnLCqsWfOBB3O9EJ3R8RBPOvddS"
 
 				// Server URL Payload reports back in admin links,
 				// password-reset emails, etc.
