@@ -64,8 +64,8 @@ use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_cre
 use cli_core::target::load_active_target_config;
 use cli_core::{CliError, Result};
 use cli_providers::k8s::{
-    HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner, ManifestSource,
-    APPRAFTER_CLI_FIELD_MANAGER, APPRAFTER_PLATFORM_STACK_CHART_NAME,
+    loader_fingerprint, HelmCli, HelmRunner, HelmUpgradeArgs, KubectlCli, KubectlRunner,
+    ManifestSource, APPRAFTER_CLI_FIELD_MANAGER, APPRAFTER_PLATFORM_STACK_CHART_NAME,
     APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, ARGOCD_CHART_VERSION, ARGOCD_LOADER_VALUES_YAML,
     CILIUM_CHART_VERSION, CILIUM_VALUES_YAML,
 };
@@ -243,15 +243,19 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         helm.repo_add("cilium", "https://helm.cilium.io/")?;
         let cilium_values_file =
             write_tempfile_with("apprafter-cilium-loader-values-", CILIUM_VALUES_YAML)?;
-        helm.upgrade_install(&HelmUpgradeArgs {
-            release: "cilium".into(),
-            chart: "cilium/cilium".into(),
-            version: Some(CILIUM_CHART_VERSION.into()),
-            namespace: "kube-system".into(),
-            values_path: cilium_values_file.path().to_path_buf(),
-            kubeconfig_path: kubeconfig_path.to_path_buf(),
-            set_values: cilium_set_overrides(),
-        })?;
+        upgrade_unless_current(
+            helm,
+            HelmUpgradeArgs {
+                release: "cilium".into(),
+                chart: "cilium/cilium".into(),
+                version: Some(CILIUM_CHART_VERSION.into()),
+                namespace: "kube-system".into(),
+                values_path: cilium_values_file.path().to_path_buf(),
+                kubeconfig_path: kubeconfig_path.to_path_buf(),
+                set_values: cilium_set_overrides(),
+                fingerprint: None,
+            },
+        )?;
     }
 
     // 0b. Node MUST reach Ready before step 1 — otherwise the
@@ -278,15 +282,19 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     // sidecar + tier-2 replica counts when it reconciles.
     let argocd_values_file =
         write_tempfile_with("apprafter-argocd-loader-values-", ARGOCD_LOADER_VALUES_YAML)?;
-    helm.upgrade_install(&HelmUpgradeArgs {
-        release: "argocd".into(),
-        chart: "argo/argo-cd".into(),
-        version: Some(ARGOCD_CHART_VERSION.into()),
-        namespace: "argocd".into(),
-        values_path: argocd_values_file.path().to_path_buf(),
-        kubeconfig_path: kubeconfig_path.to_path_buf(),
-        set_values: Vec::new(),
-    })?;
+    upgrade_unless_current(
+        helm,
+        HelmUpgradeArgs {
+            release: "argocd".into(),
+            chart: "argo/argo-cd".into(),
+            version: Some(ARGOCD_CHART_VERSION.into()),
+            namespace: "argocd".into(),
+            values_path: argocd_values_file.path().to_path_buf(),
+            kubeconfig_path: kubeconfig_path.to_path_buf(),
+            set_values: Vec::new(),
+            fingerprint: None,
+        },
+    )?;
 
     // 2. Wait for argocd-server Deployment to become Available
     //    before applying the root Application — otherwise the
@@ -452,6 +460,32 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
     }
 
     Ok(())
+}
+
+/// `helm upgrade --install` the release UNLESS it is already deployed at
+/// the desired fingerprint (a true-no-op re-run). Logs the skip.
+///
+/// Walk-found idempotency wart (2.4g): the unconditional
+/// `helm upgrade --install` bumped the Cilium/Argo CD helm revision
+/// (1→2…) on every `cluster-bootstrap` re-run even when nothing
+/// changed. We compute a [`loader_fingerprint`] over the chart, version,
+/// values-file content, and `--set` overrides; if the release is already
+/// `deployed` at exactly that fingerprint we skip the upgrade. A CLI
+/// upgrade that changes any of those inputs flips the fingerprint and
+/// the upgrade runs — safety preserved. The fingerprint is injected as
+/// `--set apprafterLoaderHash=<fp>` only on the real upgrade so helm
+/// records it for the next run to read back.
+fn upgrade_unless_current(helm: &impl HelmRunner, mut args: HelmUpgradeArgs) -> Result<()> {
+    let fp = loader_fingerprint(&args)?;
+    if helm.release_is_current(&args.release, &args.namespace, &args.kubeconfig_path, &fp)? {
+        info!(
+            release = %args.release,
+            "already current — skipping helm upgrade (no revision bump)"
+        );
+        return Ok(());
+    }
+    args.fingerprint = Some(fp);
+    helm.upgrade_install(&args)
 }
 
 /// Render the root `Application` CR YAML the CLI hands Argo CD.
@@ -713,6 +747,12 @@ mod tests {
     struct FakeHelm {
         repos: RefCell<Vec<(String, String)>>,
         installs: RefCell<Vec<HelmUpgradeArgs>>,
+        /// Configurable answer for `release_is_current`. Default
+        /// `false` so the existing tests still exercise the upgrade
+        /// path; the skip-path test flips it to `true`. Records the
+        /// fingerprints it was queried with for assertions.
+        current: bool,
+        current_queries: RefCell<Vec<(String, String)>>,
     }
 
     impl HelmRunner for FakeHelm {
@@ -723,6 +763,18 @@ mod tests {
         fn upgrade_install(&self, args: &HelmUpgradeArgs) -> Result<()> {
             self.installs.borrow_mut().push(args.clone());
             Ok(())
+        }
+        fn release_is_current(
+            &self,
+            release: &str,
+            _namespace: &str,
+            _kubeconfig: &Path,
+            fingerprint: &str,
+        ) -> Result<bool> {
+            self.current_queries
+                .borrow_mut()
+                .push((release.to_string(), fingerprint.to_string()));
+            Ok(self.current)
         }
     }
 
@@ -1240,5 +1292,86 @@ mod tests {
     fn render_platformstack_default_uses_apprafter_oci_repo() {
         let yaml = render_platformstack_default(1, None);
         assert!(yaml.contains("oci://ghcr.io/apprafter/platform-stack"));
+    }
+
+    #[test]
+    fn skip_path_does_not_upgrade_but_still_applies_platform_and_waits() {
+        // 2.4g: when both Cilium + Argo CD report `release_is_current`,
+        // `perform_bootstrap` MUST skip the helm upgrade (no revision
+        // bump) yet still proceed through the node-Ready / Argo-CD
+        // Available waits, the SSA applies, and the CRD waits — a true
+        // no-op re-run, not a half-bootstrap.
+        let helm = FakeHelm {
+            current: true,
+            ..Default::default()
+        };
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let root_app = PathBuf::from("/tmp/root-app.yaml");
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
+
+        perform_bootstrap(&helm, &kubectl, &kc, &root_app, platformstack.path())
+            .expect("bootstrap");
+
+        // No upgrade_install for EITHER release — both were current.
+        let installs = helm.installs.borrow();
+        assert!(
+            installs.is_empty(),
+            "expected zero helm upgrades on the current-release skip path, got {installs:?}"
+        );
+        // Both releases were nonetheless QUERIED with their fingerprint.
+        let queries = helm.current_queries.borrow();
+        assert_eq!(queries.len(), 2, "{queries:?}");
+        assert!(queries
+            .iter()
+            .any(|(r, fp)| r == "cilium" && !fp.is_empty()));
+        assert!(queries
+            .iter()
+            .any(|(r, fp)| r == "argocd" && !fp.is_empty()));
+
+        // The bootstrap still drives the platform forward: SSA applies
+        // (AppProjects, root App, PlatformStack) and the full wait
+        // sequence run regardless of the helm skip.
+        assert_eq!(kubectl.ssa_applies.borrow().len(), 3);
+        assert_eq!(kubectl.waits.borrow().len(), 10);
+    }
+
+    #[test]
+    fn upgrade_path_injects_fingerprint_into_helm_args() {
+        // 2.4g: when releases are NOT current (default fake → false),
+        // each upgrade runs WITH a computed fingerprint set, so helm
+        // records `apprafterLoaderHash` for the next run to read back.
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let root_app = PathBuf::from("/tmp/root-app.yaml");
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
+
+        perform_bootstrap(&helm, &kubectl, &kc, &root_app, platformstack.path())
+            .expect("bootstrap");
+
+        let installs = helm.installs.borrow();
+        assert_eq!(installs.len(), 2, "{installs:?}");
+        for inst in installs.iter() {
+            assert!(
+                inst.fingerprint.is_some(),
+                "every upgraded release must carry a fingerprint: {inst:?}"
+            );
+        }
+        // The fingerprint queried matches the one injected on upgrade
+        // (same args → same `loader_fingerprint`).
+        let queries = helm.current_queries.borrow();
+        for inst in installs.iter() {
+            let queried_fp = queries
+                .iter()
+                .find(|(r, _)| r == &inst.release)
+                .map(|(_, fp)| fp.clone());
+            assert_eq!(
+                queried_fp.as_deref(),
+                inst.fingerprint.as_deref(),
+                "queried fingerprint must equal injected fingerprint for {}",
+                inst.release
+            );
+        }
     }
 }
