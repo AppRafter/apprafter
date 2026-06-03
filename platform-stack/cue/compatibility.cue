@@ -1701,6 +1701,23 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.8": {
+	change:          "safe"
+	operatorVersion: "v0.2.8"
+	notes: """
+		2.4d — Application generates child ResourceClaims from
+		`spec.*.needs` and pauses in a new AwaitingResourceClaim phase
+		until each claim is provisioned (status.ready +
+		connectionSecretRef), resuming via an owns-watch. Also fixes a
+		2.4b gap: effective_spec now merges `needs` on env override.
+		needs.*.selector changes are treated as non-destructive (no
+		MigrationPlan gate) in 2.4d — revisit in 2.5+. New operator RBAC:
+		create/patch/watch resourceclaims. No CRD schema change. DSN
+		injection into the Deployment is 2.4e — a needs.pg app resumes
+		WITHOUT DATABASE_URL until then. Safe to auto-sync.
+		"""
+	references: ["plan.md 2.4d"]
+}
 compatibility: "0.2.7": {
 	change:          "safe"
 	operatorVersion: "v0.2.7"

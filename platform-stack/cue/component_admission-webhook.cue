@@ -28,7 +28,7 @@ _components: "admission-webhook": #Component & {
 		repoURL: "ghcr.io/apprafter/charts"
 		chart:   "apprafter-admission-webhook"
 	}
-	version: "v0.2.7"
+	version: "v0.2.8"
 	values: {
 		image: {
 			repository: string | *"ghcr.io/apprafter/apprafter-admission-webhook"
