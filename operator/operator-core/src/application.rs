@@ -103,6 +103,15 @@ pub const PHASE_AWAITING_MIGRATION_APPROVAL: &str = "AwaitingMigrationApproval";
 /// describe` straight from the Application status.
 pub const COND_MIGRATION_PENDING: &str = "MigrationPending";
 
+/// Reserved phase: the Application reconciler is paused awaiting a
+/// generated `ResourceClaim` (from `spec.*.needs`) to be provisioned
+/// (`status.ready` + `connectionSecretRef`). Phase 2.4d.
+pub const PHASE_AWAITING_RESOURCE_CLAIM: &str = "AwaitingResourceClaim";
+
+/// Condition emitted alongside `AwaitingResourceClaim`; `message`
+/// carries the unready claim name(s). Phase 2.4d.
+pub const COND_RESOURCE_CLAIM_PENDING: &str = "ResourceClaimPending";
+
 /// k8s-style condition (mirrors `meta/v1.Condition`). Operator
 /// emits `Ready` of `True` after a successful reconcile.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]

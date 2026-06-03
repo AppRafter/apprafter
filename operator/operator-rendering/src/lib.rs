@@ -636,7 +636,7 @@ mod tests {
         // entry replaces the base entry WHOLESALE for that key —
         // mirrors how `expose` replaces), and base-only need keys
         // survive when the env omits them.
-        use operator_core::application::ServiceNeed;
+        use operator_core::ServiceNeed;
         let mut base_needs = BTreeMap::new();
         base_needs.insert(
             "pg".to_string(),

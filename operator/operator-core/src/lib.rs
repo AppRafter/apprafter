@@ -13,7 +13,8 @@ pub mod sourcecredential;
 
 pub use application::{
     Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose, ApplicationSpec,
-    ApplicationStatus, COND_MIGRATION_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
+    ApplicationStatus, ServiceNeed, COND_MIGRATION_PENDING, COND_RESOURCE_CLAIM_PENDING,
+    PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use metrics::Metrics;
