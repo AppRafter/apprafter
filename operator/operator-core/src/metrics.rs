@@ -10,6 +10,9 @@
 //!     for quick "errors per minute" alerts.
 //!   - apprafter_claim_unmatched_total{kind,namespace,reason} —
 //!     ResourceClaims with no matching ServiceProvider.
+//!   - apprafter_claim_gc_total{result,namespace} — RetainedClaim
+//!     GC sweeps (role/DB/Secret drop after the 7-day grace), by
+//!     result {success, error}.
 //!
 //! Metrics are registered into a single `Registry` that the HTTP
 //! `/metrics` handler in `apprafter-operator` encodes.
@@ -23,6 +26,7 @@ pub struct Metrics {
     pub reconcile_errors: CounterVec,
     pub claim_unmatched_total: CounterVec,
     pub claim_provisioned_total: CounterVec,
+    pub claim_gc_total: CounterVec,
 }
 
 impl Default for Metrics {
@@ -80,6 +84,15 @@ impl Metrics {
         )
         .expect("CounterVec must build with a non-empty name");
 
+        let claim_gc_total = CounterVec::new(
+            opts!(
+                "apprafter_claim_gc_total",
+                "RetainedClaim GC sweeps (role/DB/Secret drop after the 7-day grace), by result and namespace"
+            ),
+            &["result", "namespace"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
         registry
             .register(Box::new(reconcile_total.clone()))
             .expect("reconcile_total registers cleanly");
@@ -95,6 +108,9 @@ impl Metrics {
         registry
             .register(Box::new(claim_provisioned_total.clone()))
             .expect("claim_provisioned_total registers cleanly");
+        registry
+            .register(Box::new(claim_gc_total.clone()))
+            .expect("claim_gc_total registers cleanly");
 
         Self {
             registry,
@@ -103,6 +119,7 @@ impl Metrics {
             reconcile_errors,
             claim_unmatched_total,
             claim_provisioned_total,
+            claim_gc_total,
         }
     }
 
@@ -142,6 +159,9 @@ mod tests {
         m.claim_provisioned_total
             .with_label_values(&["cloudnative-pg", "demo"])
             .inc();
+        m.claim_gc_total
+            .with_label_values(&["success", "apprafter-system"])
+            .inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -151,6 +171,7 @@ mod tests {
         assert!(body.contains("apprafter_reconcile_errors_total"), "{body}");
         assert!(body.contains("apprafter_claim_unmatched_total"), "{body}");
         assert!(body.contains("apprafter_claim_provisioned_total"), "{body}");
+        assert!(body.contains("apprafter_claim_gc_total"), "{body}");
     }
 
     #[test]

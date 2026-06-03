@@ -8,6 +8,7 @@ pub mod migration;
 pub mod migration_plan;
 pub mod platform_stack;
 pub mod resourceclaim;
+pub mod retainedclaim;
 pub mod serviceprovider;
 pub mod sourcecredential;
 
@@ -32,6 +33,7 @@ pub use platform_stack::{
 pub use resourceclaim::{
     ResourceClaim, ResourceClaimCondition, ResourceClaimSpec, ResourceClaimStatus,
 };
+pub use retainedclaim::{ClaimRef, RetainedClaim, RetainedClaimSpec};
 pub use serviceprovider::{ServiceProvider, ServiceProviderSpec, ServiceProviderStatus};
 pub use sourcecredential::{
     SealedSecretRef, SourceBackend, SourceCredential, SourceCredentialCondition,
