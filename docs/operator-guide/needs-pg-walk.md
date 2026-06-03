@@ -76,33 +76,27 @@ machine state behind each CLI surface.
 | Provision | `apprafter bootstrap-all` (then re-run `apprafter cluster-bootstrap` once to prove idempotency) |
 | Cluster access | `apprafter kubeconfig --refresh`, `apprafter argocd-password` |
 | Cluster + platform health | `apprafter status`, `apprafter platform status` |
-| Author the manifest | `apprafter app scaffold` (see **Known gap** below) |
+| Author the manifest | `apprafter app scaffold --needs pg` |
 | Register the app | `apprafter app add` (public repo); `apprafter repo creds add/list/show` for the private-repo variant |
-| Inspect the app | `apprafter app status` (see **Known gap** below), `apprafter app logs` |
+| Inspect the app | `apprafter app status`, `apprafter app logs` |
 | Portal | `apprafter open argocd` |
 | Cleanup | `apprafter app remove --keep-data`, `apprafter destroy --yes` |
 
 ### Author the manifest with `apprafter app scaffold`
 
 ```sh
-apprafter app scaffold --name parser --namespace demo
+apprafter app scaffold --name parser --namespace demo --needs pg
 ```
 
-> **Known gap → Phase 2.5.** The scaffold template emits
-> `spec.base.{image,replicas,expose}` but **no `needs` block** — there
-> is no `--needs pg` flag yet. Until Phase 2.5 ships scaffold support
-> for declared dependencies, hand-add the block under `spec: base:` in
-> the generated `apprafter/Application.cue`:
+> The repeatable `--needs pg` flag emits the `spec.base.needs` block for
+> you (closed launch set: `pg`); an unknown type is a clear error.
+> The generated `apprafter/Application.cue` carries:
 >
 > ```cue
 > spec: base: {
->     // ... image / replicas / expose left as scaffolded ...
->
+>     // ... image / replicas / expose ...
 >     needs: {
->         pg: {
->             selector: tier: "integrated"
->             size: "small"
->         }
+>         pg: { selector: { tier: "integrated" }, size: "small" }
 >     }
 > }
 > ```
@@ -264,10 +258,12 @@ apprafter app status parser
 apprafter app logs parser --tail 50
 ```
 
-> **Known gap → Phase 2.5.** `apprafter app status` reports Argo CD
-> sync / health and workload pods, but does **not** surface
-> ResourceClaim / provisioning state. While the chain is in flight
-> (e.g. the app sitting at `AwaitingResourceClaim`), fall back to:
+> `apprafter app status parser` now surfaces, by default, the AppRafter
+> phase, the workload Pods and Services with live status, and the
+> ResourceClaim provisioning state (provider / ready / Scheduled /
+> connection Secret); add `--resources` for the full Argo CD resource
+> tree. While the chain is in flight the claim shows `ready=false` until
+> the provisioner finishes. The raw view is still:
 >
 > ```sh
 > kubectl -n demo get resourceclaim.apprafter.io parser-pg
