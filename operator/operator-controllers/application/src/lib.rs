@@ -198,6 +198,12 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // watch re-enqueues this Application the moment the provisioner
     // flips one ready. DSN injection into the Deployment is 2.4e — on
     // resume the Deployment renders WITHOUT DATABASE_URL until then.
+    // 2.4e: resolved `needs-type → connectionSecretRef` map, threaded
+    // into the render so a ready needs.pg workload gets DATABASE_URL
+    // injected. Built from the SAME `current` ready claims the gate
+    // below validated, AFTER the gate passes — so it is empty unless
+    // execution falls through to the render (all claims ready).
+    let mut needs_secrets: BTreeMap<String, String> = BTreeMap::new();
     let effective = effective_spec(&app, ctx.env_name.as_deref());
     let has_needs = effective.needs.as_ref().is_some_and(|n| !n.is_empty());
     if has_needs {
@@ -231,9 +237,20 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                 .inc();
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
+        // Gate passed — every claim is ready with a connection Secret.
+        // Resolve the SAME `current` claims into the DSN map for render.
+        needs_secrets = resolve_needs_secrets(&current);
     }
 
-    let mut rendered = render_application_for_env(&app, ctx.env_name.as_deref());
+    let mut rendered = render_application_for_env(
+        &app,
+        ctx.env_name.as_deref(),
+        if needs_secrets.is_empty() {
+            None
+        } else {
+            Some(&needs_secrets)
+        },
+    );
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
     // registry, project its derived pull-secret into the workload
@@ -741,6 +758,29 @@ fn unready_claim_names(claims: &[ResourceClaim]) -> Vec<String> {
         })
         .map(|c| c.name_any())
         .collect()
+}
+
+/// Resolve ready claims into a `needs-type → connectionSecretRef`
+/// map for the renderer's 2.4e DSN injection. Keyed on
+/// `spec.type_` (the need key), valued by `status.connectionSecretRef`;
+/// claims without a resolved connection Secret are skipped (defensive
+/// — post-gate every claim has one). Pure: the operator only READS
+/// provisioner-owned claim status here, never writes it (the SSA
+/// split is preserved). The caller threads the result into
+/// `render_application_for_env` AFTER the 2.4d readiness gate passes,
+/// building it from the SAME `current` claims the gate validated.
+fn resolve_needs_secrets(claims: &[ResourceClaim]) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for claim in claims {
+        if let Some(secret) = claim
+            .status
+            .as_ref()
+            .and_then(|s| s.connection_secret_ref.clone())
+        {
+            map.insert(claim.spec.type_.clone(), secret);
+        }
+    }
+    map
 }
 
 /// Build the Application status payload for the ResourceClaim pause
@@ -1557,5 +1597,34 @@ mod tests {
             }),
         )];
         assert!(unready_claim_names(&provisioned).is_empty());
+    }
+
+    // ---- 2.4e: resolve ready claims → needs-type → connectionSecretRef ----
+
+    #[test]
+    fn resolve_needs_secrets_maps_type_to_connection_secret_ref() {
+        // A ready pg claim with a connection secret resolves to
+        // {"pg":"parser-pg-conn"}; the map key is `spec.type_`, the
+        // value is `status.connectionSecretRef`.
+        let claims = vec![ready_claim("parser-pg", Some(true), Some("parser-pg-conn"))];
+        let map = resolve_needs_secrets(&claims);
+        assert_eq!(map.get("pg").map(String::as_str), Some("parser-pg-conn"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn resolve_needs_secrets_skips_claim_without_connection_secret_ref() {
+        // A claim with no connectionSecretRef (status absent or
+        // half-ready) must NOT appear in the map — render then skips
+        // its injection. (Post-gate this should not happen, but the
+        // resolver stays defensive + pure.)
+        let claims = vec![
+            ready_claim("parser-pg", Some(true), Some("parser-pg-conn")),
+            ready_claim("parser-redis", Some(true), None),
+        ];
+        let map = resolve_needs_secrets(&claims);
+        assert_eq!(map.get("pg").map(String::as_str), Some("parser-pg-conn"));
+        assert!(!map.contains_key("redis"));
+        assert_eq!(map.len(), 1);
     }
 }
