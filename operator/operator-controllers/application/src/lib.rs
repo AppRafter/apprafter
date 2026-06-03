@@ -39,7 +39,7 @@ use operator_core::{
 // `operator-controllers-migration` (B.1.77). The unused-import
 // guard turns the dep into a "feature flag" — Phase 2 simply
 // uncomments the `use` line.
-use operator_rendering::render_application_for_env;
+use operator_rendering::{effective_spec, render_application_for_env};
 
 /// Resource kind label used for every metric tagged with `kind`.
 const KIND: &str = "Application";
@@ -79,6 +79,11 @@ pub async fn run(
     env_name: Option<String>,
 ) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
+    // 2.4d: watch child ResourceClaims so the provisioner flipping a
+    // claim ready re-enqueues the owning Application immediately
+    // (resume from the AwaitingResourceClaim pause). Clone the client
+    // BEFORE it moves into Context.
+    let claims: Api<ResourceClaim> = Api::all(client.clone());
     let context = Arc::new(Context {
         client,
         metrics,
@@ -86,6 +91,7 @@ pub async fn run(
     });
 
     Controller::new(apps, watcher::Config::default())
+        .owns(claims, watcher::Config::default())
         .run(reconcile, error_policy, context)
         .for_each(|res| async move {
             match res {
@@ -179,8 +185,55 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
-    let mut rendered = render_application_for_env(&app, ctx.env_name.as_deref());
     let pp = PatchParams::apply(FIELD_MANAGER).force();
+
+    // ---- 2.4d: generate ResourceClaims for needs, pause until ready ----
+    // Runs AFTER the migration gate, BEFORE the render. Generates one
+    // child ResourceClaim per `needs` entry (SSA, owner-ref → this
+    // Application for cascade) writing spec+metadata only — never
+    // status (the scheduler owns status.provider/Scheduled, the
+    // provisioner owns status.ready/connectionSecretRef/Ready). Pauses
+    // in `AwaitingResourceClaim` until every claim reports
+    // status.ready + connectionSecretRef; the `.owns(ResourceClaim)`
+    // watch re-enqueues this Application the moment the provisioner
+    // flips one ready. DSN injection into the Deployment is 2.4e — on
+    // resume the Deployment renders WITHOUT DATABASE_URL until then.
+    let effective = effective_spec(&app, ctx.env_name.as_deref());
+    let has_needs = effective.needs.as_ref().is_some_and(|n| !n.is_empty());
+    if has_needs {
+        let app_uid = app.metadata.uid.clone().unwrap_or_default();
+        let payloads = generate_resource_claims(&effective, &name, &app_uid, &namespace);
+        let claim_api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), &namespace);
+        for (claim_name, payload) in &payloads {
+            claim_api
+                .patch(claim_name, &pp, &Patch::Apply(payload))
+                .await?;
+        }
+        // Re-fetch to read provisioner-written status.
+        let mut current = Vec::with_capacity(payloads.len());
+        for (claim_name, _) in &payloads {
+            if let Ok(c) = claim_api.get(claim_name).await {
+                current.push(c);
+            }
+        }
+        let unready = unready_claim_names(&current);
+        if !unready.is_empty() || current.len() != payloads.len() {
+            let names = if unready.is_empty() {
+                payloads.iter().map(|(n, _)| n.clone()).collect()
+            } else {
+                unready
+            };
+            let status = build_resource_claim_paused_status(&app, &names);
+            apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+    }
+
+    let mut rendered = render_application_for_env(&app, ctx.env_name.as_deref());
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
     // registry, project its derived pull-secret into the workload
