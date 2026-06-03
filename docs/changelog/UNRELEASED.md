@@ -9,6 +9,43 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.9 + platform-stack 0.2.9 — 2.4e DATABASE_URL DSN injection into the needs.pg Deployment (2026-06-03)
+
+A `needs.pg` Application, once its `ResourceClaim` is provisioned and the app
+resumes, gets a `DATABASE_URL` env var injected into its Deployment container,
+sourced from the provisioned connection Secret.
+
+### Added
+
+- **`DATABASE_URL` DSN injection.** After the 2.4d readiness gate passes, the
+  Application controller resolves the ready claims into a `needs-type →
+  connectionSecretRef` map and threads it into the renderer, which appends a
+  `valueFrom.secretKeyRef{name: <connectionSecretRef>, key: "DATABASE_URL",
+  optional: false}` EnvVar to the workload container — appended AFTER any literal
+  `env`, iterated over `needs.keys()` (BTreeMap) so the rendered Deployment is
+  byte-stable across reconciles (SSA no-op). **pg-only** (jetstream/redis injection
+  is 2.5/2.6). The renderer stays a PURE function — no kube client; the claim→secret
+  map is a threaded `Option<&BTreeMap<String, String>>` param built by the reconcile
+  from the SAME ready claims the gate validated (the operator only READS
+  provisioner-owned claim status here, never writes it — the SSA split is preserved).
+- **Reserved-env webhook guard.** The admission webhook now rejects an Application
+  that declares `needs.pg` AND sets a literal `env.DATABASE_URL` (collision with the
+  injected DSN). Hard reject (not warn — consistent with the platform's current
+  hard-enforce posture; revisit at UX polish), GLOBAL/cross-scope (pg declared in
+  base OR any environment reserves `DATABASE_URL` everywhere), multi-error (one per
+  offending field, no short-circuit — matches the validator contract).
+
+### Notes
+
+- **Scope held.** pg-only — not the full 2.12 `claim.*` / `secret()` reference
+  engine; no cross-namespace logic; no CRD / CUE / operator-core schema change. The
+  2.4d readiness AND-gate is NOT loosened; injection happens strictly post-gate.
+- `change: safe` — no CRD schema change, no data migration. `operatorVersion`
+  v0.2.8 → v0.2.9, `currentVersion` 0.2.8 → 0.2.9. `operator/v0.2.9` +
+  `platform-stack/v0.2.9` tags are workflow-made on push. No cli bump, no monorepo
+  `v0.x.y` tag. The full generate → provision → resume → DSN-injected loop is
+  exercised by the 2.4g real-cluster walk.
+
 ## operator v0.2.8 + platform-stack 0.2.8 — 2.4d Application claim generation + AwaitingResourceClaim pause gate (2026-06-03)
 
 The `Application` controller now turns `needs.*` into child `ResourceClaim`s
