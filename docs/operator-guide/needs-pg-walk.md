@@ -47,7 +47,7 @@ the password Secret, and removes the snapshot.
   kubectl -n cnpg-system rollout status \
     deploy -l app.kubernetes.io/name=cloudnative-pg        # -> available
   kubectl -n apprafter-system rollout status \
-    deploy apprafter-admission-webhook                     # -> available
+    deploy admission-webhook                               # -> available
   ```
 
 ## Step 0 — run the k3d e2e first (cheap gate)

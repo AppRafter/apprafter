@@ -117,22 +117,36 @@ TMPDIR_WORK="$(mktemp -d)"
 APPRAFTER_CONFIG_DIR="${TMPDIR_WORK}/apprafter-config"
 KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 
+# Set to 1 only after the k3d cluster is up AND $KUBECONFIG points at it
+# (Phase 0). Until then, dump_diagnostics / k3d_down must NOT run — on a
+# k3d-up failure (e.g. no docker in this shell) $KUBECONFIG still points
+# at the operator's ambient cluster, and an e2e must never touch a
+# non-test cluster.
+K3D_CREATED=0
+
 cleanup() {
     local exit_code=$?
 
     if [ "$exit_code" -ne 0 ]; then
         printf '\n!!! needs-pg-walk FAILED at %s (exit %d) !!!\n' \
             "$(elapsed)" "$exit_code" >&2
-        dump_diagnostics
-        printf 'Tearing down k3d cluster (set APPRAFTER_E2E_SKIP_DESTROY=1 to keep).\n' >&2
+        if [ "$K3D_CREATED" -eq 1 ]; then
+            dump_diagnostics
+            printf 'Tearing down k3d cluster (set APPRAFTER_E2E_SKIP_DESTROY=1 to keep).\n' >&2
+        else
+            printf 'k3d cluster %s was never created (k3d/docker unavailable in this shell?) — skipping diagnostics + teardown; your ambient KUBECONFIG was NOT touched.\n' \
+                "$CLUSTER_NAME" >&2
+        fi
     fi
 
-    if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
-        k3d_down "$CLUSTER_NAME" || true
-    else
-        printf '\nAPPRAFTER_E2E_SKIP_DESTROY set — leaving k3d cluster %s up.\n' \
-            "$CLUSTER_NAME"
-        printf 'Run: k3d cluster delete %s\n' "$CLUSTER_NAME"
+    if [ "$K3D_CREATED" -eq 1 ]; then
+        if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
+            k3d_down "$CLUSTER_NAME" || true
+        else
+            printf '\nAPPRAFTER_E2E_SKIP_DESTROY set — leaving k3d cluster %s up.\n' \
+                "$CLUSTER_NAME"
+            printf 'Run: k3d cluster delete %s\n' "$CLUSTER_NAME"
+        fi
     fi
 
     rm -rf "$TMPDIR_WORK"
@@ -276,6 +290,9 @@ command -v k3d >/dev/null 2>&1 || k3d_bin="nix run nixpkgs#k3d --"
 # shellcheck disable=SC2086
 $k3d_bin kubeconfig write "$CLUSTER_NAME" --output "$KUBECONFIG_FILE"
 export KUBECONFIG="$KUBECONFIG_FILE"
+# The k3d cluster exists and $KUBECONFIG now points at it — cleanup may
+# safely diagnose/tear it down (and only it).
+K3D_CREATED=1
 printf '  KUBECONFIG=%s\n' "$KUBECONFIG_FILE"
 
 # ===============================================================
@@ -331,7 +348,7 @@ assert_eq "ServiceProvider ${PROVIDER} label tier" "$sp_tier" "integrated"
 # needs.pg Application (it validates the CR on CREATE).
 printf '  waiting for the admission-webhook Deployment ...\n'
 retry 30 10 -- kubectl -n "$RETAINED_NS" rollout status \
-    deploy apprafter-admission-webhook --timeout=60s
+    deploy admission-webhook --timeout=60s
 
 # ===============================================================
 # Phase 3: apply the needs.pg Application
