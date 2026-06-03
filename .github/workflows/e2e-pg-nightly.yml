@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: e2e-pg-nightly
+
+# Standalone nightly k3d gate for the Phase-2.4 needs.pg ResourceClaim
+# chain (e2e/needs-pg-walk.sh): generate -> schedule -> provision ->
+# resume + DSN inject -> delete + RetainedClaim snapshot -> force-GC ->
+# psql DROP proof.
+#
+# Why a separate workflow (NOT folded into e2e-k3d.yml):
+#   - It boots a real Postgres pod (the shared CloudNativePG Cluster),
+#     so it is heavier than the gitops-walk gate and multiplies the
+#     known Argo CD restart flake -- keep it off the per-push critical
+#     path.
+#   - It is decoupled from the Hetzner-cost nightly.yml so the free-k3d
+#     failure domain stays independent (no cloud spend, no secrets).
+#
+# Security note: no secrets are consumed here. Everything runs on a
+# local k3d cluster; the only outbound traffic is public image /
+# chart pulls. `permissions: contents: read` is the minimum. No
+# `github.event.*` input is interpolated into any run: block.
+
+on:
+  schedule:
+    # 05:00 UTC -- staggered after nightly.yml (04:00 UTC) so the two
+    # nightly gates don't contend for the runner pool.
+    - cron: '0 5 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-pg-nightly:
+    name: k3d e2e (needs.pg nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('cli/**/Cargo.lock', 'cli/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Load iptables kernel modules for Cilium
+        # Mirrors e2e-k3d.yml: cluster-bootstrap skips Cilium on k3d
+        # (APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 in lib.sh) so these are a
+        # belt-and-braces no-op here, kept for parity in case a future
+        # walk re-enables the eBPF datapath.
+        run: |
+          sudo modprobe -a \
+            ip_tables iptable_mangle iptable_raw iptable_filter iptable_nat \
+            ip6_tables ip6table_mangle ip6table_raw ip6table_filter ip6table_nat \
+            nf_nat xt_socket || true
+          lsmod | grep -E 'ip6?table|nf_nat|xt_socket' || true
+
+      - name: Warm the CLI build cache
+        working-directory: cli
+        # The e2e script invokes the CLI via `cargo run` (lib.sh's
+        # `apprafter()` shell function), so a debug build here warms the
+        # cache for the timed script run below -- no PATH binary is used.
+        run: cargo build --bin apprafter
+
+      - name: Run the needs.pg k3d walk
+        run: bash e2e/needs-pg-walk.sh

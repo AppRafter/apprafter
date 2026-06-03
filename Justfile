@@ -87,6 +87,14 @@ e2e-gitops:
 # follow-up for the nightly Hetzner harness. See plan.md §1.81.
 e2e: e2e-gitops
 
+# Run the needs.pg ResourceClaim-chain k3d walk (generate -> schedule
+# -> provision -> resume + DSN -> delete + RetainedClaim -> force-GC ->
+# psql DROP proof). Deliberately NOT a dependency of `e2e`: it boots a
+# Postgres pod (heavier) and runs on its own nightly cadence via
+# .github/workflows/e2e-pg-nightly.yml. Requires Docker + k3d on PATH.
+e2e-pg:
+    bash e2e/needs-pg-walk.sh
+
 # Spin up a local k3d cluster suitable for end-to-end work.
 e2e-up:
     k3d cluster create apprafter-dev \
