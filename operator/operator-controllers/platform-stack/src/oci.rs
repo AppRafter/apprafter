@@ -3,14 +3,31 @@
 //! filter to semver-valid + channel-matching, return the latest.
 //!
 //! Anonymous reads against ghcr.io's OCI Distribution Spec
-//! endpoint. The `oci-distribution` crate handles auth handshake
-//! and pagination behind a single `list_tags` call.
+//! endpoint. The `oci-distribution` crate handles the auth
+//! handshake, but it does NOT auto-follow the registry's `Link`
+//! pagination cursor — a single `list_tags` call returns only one
+//! page. We therefore drive pagination ourselves via the OCI
+//! `last` cursor (see `collect_all_tags`), accumulating every page
+//! before sorting, so versions published on later pages stay
+//! visible.
+
+use std::future::Future;
 
 use oci_distribution::client::ClientConfig;
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
 use semver::Version;
 use thiserror::Error;
+
+/// Page size requested per `list_tags` call (`n` query param).
+/// Registries may cap or ignore this; the pagination loop tolerates
+/// short pages and a registry that returns more than requested.
+const PAGE_SIZE: usize = 100;
+
+/// Hard ceiling on pages walked, bounding a misbehaving registry
+/// that never signals exhaustion. At `PAGE_SIZE` tags per page this
+/// is far above any realistic platform-stack tag count.
+const MAX_PAGES: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -88,16 +105,68 @@ pub async fn tags_in_channel(
     })?;
 
     let client = Client::new(ClientConfig::default());
-    let tag_response = client
-        .list_tags(&reference, &RegistryAuth::Anonymous, None, None)
-        .await
-        .map_err(|e| OciError::Registry(e.to_string()))?;
+    let all_tags = collect_all_tags(|last| {
+        let client = &client;
+        let reference = &reference;
+        async move {
+            client
+                .list_tags(
+                    reference,
+                    &RegistryAuth::Anonymous,
+                    Some(PAGE_SIZE),
+                    last.as_deref(),
+                )
+                .await
+                .map(|r| r.tags)
+                .map_err(|e| OciError::Registry(e.to_string()))
+        }
+    })
+    .await?;
 
-    let versions = sort_tags_descending(tag_response.tags, channel);
+    let versions = sort_tags_descending(all_tags, channel);
     if versions.is_empty() {
         return Err(OciError::NoVersions(upstream_url.to_string()));
     }
     Ok(versions)
+}
+
+/// Walk OCI tag pages via the `last` cursor and accumulate every
+/// tag (unsorted). `fetch(last)` returns one page given the cursor
+/// of the previous page's final tag (`None` on the first call).
+///
+/// Termination is triple-guarded:
+/// 1. an empty page ends the walk (the registry's exhaustion signal),
+/// 2. a NO-PROGRESS guard ends it when the new cursor equals the
+///    previous one — i.e. the registry ignored `last` and re-served
+///    the same page (which would otherwise loop forever), and
+/// 3. a `MAX_PAGES` ceiling bounds any other misbehavior.
+///
+/// Extracted behind this fetcher seam so the pagination/termination
+/// logic is unit-tested with canned pages and no network.
+async fn collect_all_tags<F, Fut>(mut fetch: F) -> Result<Vec<String>, OciError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Vec<String>, OciError>>,
+{
+    let mut acc: Vec<String> = Vec::new();
+    let mut last: Option<String> = None;
+
+    for _ in 0..MAX_PAGES {
+        let page = fetch(last.clone()).await?;
+        if page.is_empty() {
+            break;
+        }
+        let new_last = page.last().cloned();
+        acc.extend(page);
+        // Registry ignored `last` and re-served the same page:
+        // the cursor didn't advance, so stop rather than spin.
+        if new_last == last {
+            break;
+        }
+        last = new_last;
+    }
+
+    Ok(acc)
 }
 
 /// Pure helper for `tags_in_channel`'s sort/filter logic.
@@ -220,5 +289,143 @@ mod tests {
         let tags = vec!["v0.1.0-rc.1".to_string(), "0.1.0-rc.2".to_string()];
         let sorted = sort_tags_descending(tags, Channel::Stable);
         assert!(sorted.is_empty());
+    }
+
+    use std::cell::RefCell;
+
+    /// A canned-page fetcher: serves the supplied pages in order and
+    /// records every `last` cursor it was called with. Implements the
+    /// `FnMut(Option<String>) -> impl Future` shape `collect_all_tags`
+    /// expects via its `fetch` method.
+    struct PagedFetcher {
+        pages: Vec<Vec<&'static str>>,
+        idx: usize,
+        calls: Vec<Option<String>>,
+    }
+
+    impl PagedFetcher {
+        fn new(pages: Vec<Vec<&'static str>>) -> Self {
+            Self {
+                pages,
+                idx: 0,
+                calls: Vec::new(),
+            }
+        }
+
+        fn fetch(
+            &mut self,
+            last: Option<String>,
+        ) -> std::future::Ready<Result<Vec<String>, OciError>> {
+            self.calls.push(last);
+            let page = self
+                .pages
+                .get(self.idx)
+                .map(|p| p.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default();
+            self.idx += 1;
+            std::future::ready(Ok(page))
+        }
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        // Pure, no-IO futures here; a minimal executor avoids pulling
+        // a runtime into these unit tests.
+        futures::executor::block_on(fut)
+    }
+
+    #[test]
+    fn collect_all_tags_accumulates_across_pages_following_last_cursor() {
+        // page1=[a,b,c], page2=[d,e], page3=[] (exhausted).
+        let fetcher = RefCell::new(PagedFetcher::new(vec![
+            vec!["a", "b", "c"],
+            vec!["d", "e"],
+            vec![],
+        ]));
+        let tags = block_on(collect_all_tags(|last| fetcher.borrow_mut().fetch(last))).unwrap();
+
+        assert_eq!(tags, vec!["a", "b", "c", "d", "e"]);
+        // First call cursor None, then last tag of each prior page.
+        assert_eq!(
+            fetcher.borrow().calls,
+            vec![None, Some("c".to_string()), Some("e".to_string())]
+        );
+    }
+
+    #[test]
+    fn collect_all_tags_handles_single_short_page() {
+        // A page shorter than PAGE_SIZE still requires the empty
+        // follow-up page to confirm exhaustion.
+        let fetcher = RefCell::new(PagedFetcher::new(vec![vec!["a"], vec![]]));
+        let tags = block_on(collect_all_tags(|last| fetcher.borrow_mut().fetch(last))).unwrap();
+
+        assert_eq!(tags, vec!["a"]);
+        assert_eq!(fetcher.borrow().calls, vec![None, Some("a".to_string())]);
+    }
+
+    #[test]
+    fn collect_all_tags_no_progress_guard_terminates() {
+        // A registry that ignores `last` and always re-serves the
+        // same non-empty page must NOT infinite-loop. The first page
+        // advances the cursor from None→"b"; the second fetch returns
+        // the same page so the cursor stays "b" — the no-progress
+        // guard then breaks. The walk must therefore make exactly two
+        // fetches (well under MAX_PAGES) and terminate.
+        let same_page: Vec<&'static str> = vec!["a", "b"];
+        let count = RefCell::new(0usize);
+        let tags = block_on(collect_all_tags(|_last| {
+            *count.borrow_mut() += 1;
+            assert!(
+                *count.borrow() <= MAX_PAGES,
+                "no-progress guard did not fire; walk hit MAX_PAGES"
+            );
+            let page: Vec<String> = same_page.iter().map(|s| s.to_string()).collect();
+            std::future::ready(Ok::<_, OciError>(page))
+        }))
+        .unwrap();
+        // Terminated after exactly two fetches (the second is the
+        // no-progress repeat that trips the guard), not an infinite
+        // loop. Both fetched pages were accumulated as-is.
+        assert_eq!(*count.borrow(), 2);
+        assert_eq!(tags, vec!["a", "b", "a", "b"]);
+    }
+
+    #[test]
+    fn collect_all_tags_respects_max_pages_ceiling() {
+        // A registry that advances the cursor every time (so the
+        // no-progress guard never fires) and never returns an empty
+        // page is bounded by MAX_PAGES.
+        let counter = RefCell::new(0usize);
+        let fetcher = |_last: Option<String>| {
+            let mut c = counter.borrow_mut();
+            *c += 1;
+            // Unique tag per page → cursor always advances.
+            let tag = format!("t{c}");
+            std::future::ready(Ok::<_, OciError>(vec![tag]))
+        };
+        let tags = block_on(collect_all_tags(fetcher)).unwrap();
+        assert_eq!(tags.len(), MAX_PAGES);
+    }
+
+    #[test]
+    fn later_page_tag_is_included_in_final_sorted_result() {
+        // Regression for the available=0.2.2 / invisible-0.2.11 bug:
+        // the newest version arrives on a LATER page. With the old
+        // single-page read it was dropped and the resolver reported a
+        // stale first-page max. Pagination must surface it as the max.
+        let fetcher = RefCell::new(PagedFetcher::new(vec![
+            vec!["0.2.0", "0.2.1", "0.2.2"], // first page (old code stopped here)
+            vec!["0.2.10", "0.2.11"],        // later page
+            vec![],
+        ]));
+        let all = block_on(collect_all_tags(|last| fetcher.borrow_mut().fetch(last))).unwrap();
+        let sorted = sort_tags_descending(all, Channel::Stable);
+        assert_eq!(
+            sorted.first().map(|v| v.to_string()),
+            Some("0.2.11".to_string())
+        );
+        assert!(
+            sorted.iter().any(|v| v.to_string() == "0.2.11"),
+            "0.2.11 from a later page must be present"
+        );
     }
 }
