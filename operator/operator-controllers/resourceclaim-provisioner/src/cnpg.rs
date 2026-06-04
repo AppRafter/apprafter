@@ -172,6 +172,25 @@ pub fn managed_role_entry(role: &str, secret_name: &str) -> Value {
     })
 }
 
+/// Build one `spec.managed.roles[]` entry that declares the role
+/// ABSENT (Phase 2.4f GC role-drop). CNPG drops a managed role only via
+/// an `ensure: absent` entry — pruning the entry merely un-manages it
+/// (the role-leak bug B). The entry carries ONLY `name` + `ensure:
+/// absent`: no `login` / `superuser` / `passwordSecret`, since CNPG
+/// ignores them for a drop and the password Secret is GC'd separately.
+///
+/// CNPG cannot drop a role that owns a database (it records
+/// `cannotReconcile: owner of database …`), so the GC declares the
+/// Database `ensure: absent` FIRST, then upserts this entry, then waits
+/// until the role appears in `status.managedRolesStatus.byStatus.reconciled`
+/// (drop confirmed) before pruning the entry with [`remove_role`].
+pub fn managed_role_entry_absent(role: &str) -> Value {
+    json!({
+        "name": role,
+        "ensure": "absent",
+    })
+}
+
 /// Idempotent read-modify-write helper for the unkeyed
 /// `spec.managed.roles` list: replace the entry whose `name` matches
 /// `entry`'s, else append it. Foreign entries (other claims' roles, or
@@ -370,6 +389,27 @@ mod tests {
         assert_eq!(e["passwordSecret"]["name"], "approle-pw");
     }
 
+    // --- managed_role_entry_absent() (2.4f GC role-drop) ---
+
+    #[test]
+    fn managed_role_entry_absent_is_name_plus_ensure_absent_only() {
+        let e = managed_role_entry_absent("approle");
+        assert_eq!(e["name"], "approle");
+        assert_eq!(e["ensure"], "absent");
+        // A drop entry carries ONLY name + ensure:absent — no login /
+        // superuser / passwordSecret (CNPG ignores them for a drop, and
+        // the password Secret is GC'd separately).
+        assert!(e.get("login").is_none(), "absent entry must not set login");
+        assert!(
+            e.get("superuser").is_none(),
+            "absent entry must not set superuser"
+        );
+        assert!(
+            e.get("passwordSecret").is_none(),
+            "absent entry must not reference a passwordSecret"
+        );
+    }
+
     // --- merge_role() ---
 
     #[test]
@@ -402,6 +442,27 @@ mod tests {
         let out = merge_role(vec![foreign], managed_role_entry("a", "a-pw"));
         assert_eq!(out.len(), 2);
         assert!(out.iter().any(|r: &Value| r["name"] == "keep-me"));
+    }
+
+    #[test]
+    fn merge_role_replaces_present_entry_with_an_absent_drop_entry() {
+        // 2.4f GC Phase 1: upserting an ensure:absent entry over the
+        // existing ensure:present entry REPLACES it in-place (same name)
+        // — the role flips to "declared absent", NOT pruned (pruning only
+        // un-manages, the role-leak bug). One entry, ensure == "absent".
+        let existing = vec![managed_role_entry("r", "r-pw")];
+        let out = merge_role(existing, managed_role_entry_absent("r"));
+        assert_eq!(
+            out.len(),
+            1,
+            "the absent entry must REPLACE the present one"
+        );
+        assert_eq!(out[0]["name"], "r");
+        assert_eq!(out[0]["ensure"], "absent");
+        assert!(
+            out[0].get("passwordSecret").is_none(),
+            "the present entry's passwordSecret must be gone after the absent upsert"
+        );
     }
 
     // --- remove_role() (2.4f GC inverse of merge_role) ---

@@ -305,3 +305,99 @@ async fn delete_retained_claim(
         Err(e) => Err(e.into()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pure decision helpers (unit-tested without a cluster)
+// ---------------------------------------------------------------------------
+
+/// True iff `role` is reported DROPPED by CNPG — i.e. it appears in
+/// `managed_roles_status.byStatus.reconciled` (Phase 2.4f Fix B2).
+///
+/// `managed_roles_status` is the `Cluster` `status.managedRolesStatus`
+/// object. CNPG's declarative-role reconciler reports each managed role
+/// under `byStatus.<status>` where `<status>` is one of `reconciled` /
+/// `pending-reconciliation` / `not-managed` / `reserved` (arrays of role
+/// names), plus a `cannotReconcile` map keyed by role name with error
+/// strings. For an `ensure: absent` entry, "reconciled" means the
+/// database state matches spec — i.e. the role is DROPPED.
+///
+/// The GC declares the role absent, then requeues until this returns
+/// `true`, THEN prunes the entry. Pruning before `reconciled` would
+/// merely un-manage a still-present role (the role-leak bug B). A role
+/// stuck under `pending-reconciliation` (DB not yet dropped) or
+/// `cannotReconcile` (e.g. still owns a database) returns `false`, so the
+/// GC keeps waiting rather than leaking.
+pub fn role_is_dropped(managed_roles_status: &Value, role: &str) -> bool {
+    managed_roles_status
+        .pointer("/byStatus/reconciled")
+        .and_then(Value::as_array)
+        .map(|roles| roles.iter().any(|r| r.as_str() == Some(role)))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- role_is_dropped() (2.4f Fix B2 drop-confirmation) ---
+
+    #[test]
+    fn role_is_dropped_true_when_role_in_reconciled() {
+        let status = json!({
+            "byStatus": {
+                "reconciled": ["claim_demo_web", "other-role"],
+                "pending-reconciliation": [],
+            },
+        });
+        assert!(role_is_dropped(&status, "claim_demo_web"));
+    }
+
+    #[test]
+    fn role_is_dropped_false_when_pending_reconciliation() {
+        // The DB hasn't been dropped yet — the role is still mid-flight.
+        let status = json!({
+            "byStatus": {
+                "reconciled": [],
+                "pending-reconciliation": ["claim_demo_web"],
+            },
+        });
+        assert!(!role_is_dropped(&status, "claim_demo_web"));
+    }
+
+    #[test]
+    fn role_is_dropped_false_when_cannot_reconcile_owns_database() {
+        // CNPG cannot drop a role that still owns a database — it lands in
+        // `cannotReconcile` (a map keyed by role), NOT `reconciled`.
+        let status = json!({
+            "byStatus": { "reconciled": [] },
+            "cannotReconcile": {
+                "claim_demo_web": ["could not perform DELETE on role claim_demo_web: owner of database claim_demo_web"],
+            },
+        });
+        assert!(!role_is_dropped(&status, "claim_demo_web"));
+    }
+
+    #[test]
+    fn role_is_dropped_false_when_absent_from_all_buckets() {
+        let status = json!({
+            "byStatus": {
+                "reconciled": ["unrelated"],
+                "reserved": ["postgres", "streaming_replica"],
+            },
+        });
+        assert!(!role_is_dropped(&status, "claim_demo_web"));
+    }
+
+    #[test]
+    fn role_is_dropped_false_when_status_missing_or_empty() {
+        // No managedRolesStatus yet (CNPG hasn't reconciled the spec) →
+        // never report a drop, so the GC keeps waiting.
+        assert!(!role_is_dropped(&json!({}), "claim_demo_web"));
+        assert!(!role_is_dropped(&json!(null), "claim_demo_web"));
+        assert!(!role_is_dropped(
+            &json!({ "byStatus": {} }),
+            "claim_demo_web"
+        ));
+    }
+}
