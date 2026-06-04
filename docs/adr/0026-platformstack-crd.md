@@ -4,6 +4,14 @@
 
 Draft.
 
+## Amendment (2026-06-04): Tier-1 bootstrapped default is `autoUpgrade: true`
+
+The original decision below sets `autoUpgrade: false` as the default and treats `true` as opt-in. That remains the **bare-schema default** for raw or non-bootstrap creation (and for any tier other than Tier 1). However, the value `cluster-bootstrap` **emits into the bootstrapped Tier-1 `PlatformStack` is now `autoUpgrade: true` (opt-out)**.
+
+Rationale: the MigrationPlan gate (see "Safe auto-upgrade" below and ADR 0027) ensures that only diffs classified as `safe` auto-advance; any `requires-restart` / `data-migration` / `breaking` diff is gated behind a MigrationPlan rather than applied automatically. On a Tier-1 single-VPS deployment this makes unattended auto-advance safe, and it gives the push-and-it-converges UX that matches the platform's converge-by-default posture. An operator opts out explicitly with `spec.autoUpgrade: false`.
+
+Scope: this affects only what the bootstrapper writes for Tier 1. The CUE/CRD schema default stays `false` (safe for raw creation and for currently-unwired higher tiers).
+
 ## Context
 
 ADR 0025 establishes that the platform stack is managed via Argo CD `Application` CRs in the cluster. This leaves an open question: how does the user manage the **version** of the platform — bumping Cilium, applying security patches, opting in to a new tier feature?
