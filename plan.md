@@ -2950,21 +2950,24 @@ Tests:
 ---
 
 ### 2.9 Per-environment overrides через CUE unification
-> 🏁 SR: D — dev mode dropped from launch
+> 🏁 SR: A — multi-env на ОДНОМ кластере по namespace'ам (dev+staging / dev+prod для T1); un-dropped из launch (был D) 2026-06-04, естественный порядок, рано НЕ притягиваем
 
-**Цель:** реализовать §3.1 пример (dev/staging/prod в одном файле).
+**Цель:** реализовать §3.1 пример (dev/staging/prod в одном файле) — несколько окружений **со-резидентно на одном кластере**, каждое в своём namespace.
+
+**Контекст (находка 2.4g walk 2026-06-04):** shipped `APPRAFTER_ENV` (1.9c) — **кластер-wide overlay БЕЗ конфиг-поверхности**: ни values в чарте оператора, ни проброса в platform-stack, ни CLI, нигде не surfaced, + Argo откатит ручной `kubectl set env` self-heal'ом → механизм есть, но env **выбрать нельзя**, фича инертна (всегда рендерится `base`). 2.9 **заменяет** кластер-wide-модель на namespace-per-env (модельная цель пользователя: dev+staging или dev+prod на одном кластере) + даёт реальную конфиг/selection-поверхность. Сейчас landing/cms катается как `base` (= prod-конфиг), а его блок `environments.dev` мёртв.
 
 **Поставка:**
 - [ ] Renderer Application учитывает `environments.<env>` как unification с `base`.
-- [ ] Каждое env разворачивается в свой namespace с суффиксом `-<env>`.
+- [ ] Каждое env разворачивается в свой namespace с суффиксом `-<env>` — **несколько env со-резидентно на одном кластере** (заменяет cluster-wide `APPRAFTER_ENV`).
+- [ ] **Конфиг/selection-поверхность:** пользователь декларирует, какие env материализовать (манифест/CLI, НЕ скрытый operator-env-var), активный/материализованные env **видны** (`app status` / лейбл на Deployment). Закрывает gap инертного `APPRAFTER_ENV`.
 - [ ] Selector ServiceProvider'а различен по env (например, dev → `tier: integrated`, prod → `tier: managed-aws`).
 - [ ] Backstage показывает вкладки по env'ам.
 
-**Acceptance:** один Application файл с тремя env'ами создаёт три namespace с разными ресурсами; CUE-валидация ловит конфликт типов между base и env override.
+**Acceptance:** один Application файл с тремя env'ами создаёт три namespace с разными ресурсами на ОДНОМ кластере; активный/материализованные env видны пользователю; CUE-валидация ловит конфликт типов между base и env override.
 
 **Зависит от:** 1.9, 2.4
 
-**Размер:** M
+**Размер:** M (+конфиг/selection-поверхность — пересмотреть при дизайне)
 
 ---
 
