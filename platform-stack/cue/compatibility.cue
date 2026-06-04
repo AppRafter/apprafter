@@ -1701,6 +1701,22 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.11": {
+	change:          "safe"
+	operatorVersion: "v0.2.11"
+	notes: """
+		2.4f GC correctness fix (operator-only, no CRD change). Fix A:
+		re-provisioning a claim now cancels its pending RetainedClaim and
+		the GC controller guards against dropping a role/DB still bound to
+		a live claim — closes a recovery time-bomb that dropped a
+		re-attached claim's database. Fix B: GC now drops the Postgres
+		role via ensure:absent (remove-from-managed-roles alone left the
+		role behind) so roles no longer leak after the grace window. Both
+		are reconcile-loop fixes over the 0.2.10 RetainedClaim machinery;
+		same CRDs, RBAC, and controller set. Safe to auto-sync.
+		"""
+	references: ["plan.md 2.4f"]
+}
 compatibility: "0.2.10": {
 	change:          "safe"
 	operatorVersion: "v0.2.10"
