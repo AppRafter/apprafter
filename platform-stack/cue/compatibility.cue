@@ -1701,6 +1701,22 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.12": {
+	change:          "safe"
+	operatorVersion: "v0.2.12"
+	notes: """
+		Operator-only OCI version-resolver pagination fix (no CRD
+		change). The PlatformStack version resolver now paginates all
+		OCI tag pages (following the last-cursor / next-page link)
+		instead of reading only the first page, so newly-published
+		platform versions that land on a later tag page are seen —
+		fixes the stale availableVersion symptom (available=0.2.2 while
+		a newer version had already been published to GHCR). Pure
+		reconcile-loop / OCI-client fix over the 0.2.11 controller set;
+		same CRDs, RBAC, and components. Safe to auto-sync.
+		"""
+	references: ["operator/operator-controllers/platform-stack/src/oci.rs"]
+}
 compatibility: "0.2.11": {
 	change:          "safe"
 	operatorVersion: "v0.2.11"
