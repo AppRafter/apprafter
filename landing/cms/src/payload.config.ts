@@ -26,6 +26,7 @@ import { ValueProps } from './globals/ValueProps';
 import { WaitlistFormCopy } from './globals/WaitlistFormCopy';
 import { withRebuildHook } from './lib/withRebuildHook';
 import { migrations } from './migrations';
+import { seedGlobals } from './seed/seedGlobals';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -103,5 +104,29 @@ export default buildConfig({
     meta: {
       titleSuffix: '— AppRafter CMS',
     },
+  },
+  // Bootstrap content: on every boot (after migrations) seed any global
+  // never written yet, so a fresh deploy lands the fallback content with
+  // no manual step. if-empty → redeploys never overwrite editor edits.
+  // The apprafter Application CRD only renders Deployment+Service, so
+  // this in-process hook (mirroring prodMigrations) replaces a seed Job.
+  // The CLI seeder (bun run seed / node cms/seed.mjs) sets SEED_SKIP_ONINIT
+  // to drive the seed itself. Fallback JSONs come from $SEED_FALLBACK_DIR
+  // (baked to /app/cms/seed-data in the image) or the workspace source in
+  // local dev. Best-effort — a failure never blocks startup.
+  onInit: async (payload) => {
+    if (process.env.SEED_SKIP_ONINIT === '1') {
+      return;
+    }
+    try {
+      const fallbackDir =
+        process.env.SEED_FALLBACK_DIR ?? path.resolve(dirname, '../../web/src/data/fallback');
+      const res = await seedGlobals(payload, { fallbackDir, ifEmpty: true });
+      if (res.seeded > 0) {
+        payload.logger.info(`[seed] onInit seeded ${res.seeded} empty global(s)`);
+      }
+    } catch (err) {
+      payload.logger.error({ err }, '[seed] onInit auto-seed failed (non-fatal)');
+    }
   },
 });

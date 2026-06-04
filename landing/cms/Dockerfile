@@ -34,6 +34,18 @@ COPY cms cms
 # workspace root as the tracing base (set in next.config.mjs).
 RUN cd cms && bun run build
 
+# Bundle the content-seed script into one self-contained ESM file the
+# runtime image runs with plain node (no bun, no payload CLI). ESM
+# (not CJS) because Payload's lexical richtext uses top-level await.
+# Native deps (sharp, pg) stay external — they resolve from the
+# standalone node_modules at runtime. NODE_ENV=production is set so
+# bun inlines it into the bundle (it inlines process.env.NODE_ENV at
+# build time); otherwise the Payload adapter takes the dev branch and
+# tries to `pushDevSchema` via drizzle-kit, which is absent at runtime.
+# The post-deploy Job runs this once as `node cms/seed.mjs` (SEED_IF_EMPTY=1).
+RUN cd cms && NODE_ENV=production bun build src/seed/seed.ts --target=node --format=esm \
+      --external sharp --external pg --outfile /landing/seed.mjs
+
 # Next's file-tracer (nft) does not reliably copy a handful of
 # Payload's runtime deps into the standalone tree: they are required
 # only from lazily-loaded Payload code paths (upload SSRF guard →
@@ -93,6 +105,15 @@ COPY --from=builder /landing/cms/public /app/cms/public
 # /app/cms/.next/server/... walks up to /app/cms/node_modules. Merges
 # alongside the standalone's own next/react/pg/graphql symlinks.
 COPY --from=builder /landing/runtime-deps /app/cms/node_modules
+
+# Content-seed artifact (see builder stage): the bundled seed script +
+# the fallback JSONs it reads. The post-deploy Job runs it once:
+#   node cms/seed.mjs        (SEED_IF_EMPTY=1 → never clobbers edits)
+# SEED_FALLBACK_DIR is baked because the bundle can't resolve its own
+# runtime path; the CMS server itself ignores this env.
+ENV SEED_FALLBACK_DIR=/app/cms/seed-data
+COPY --from=builder /landing/seed.mjs /app/cms/seed.mjs
+COPY web/src/data/fallback /app/cms/seed-data
 
 EXPOSE 3000
 

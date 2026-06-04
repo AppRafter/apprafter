@@ -2,60 +2,46 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
 /**
- * Seed every Payload global from the corresponding JSON file in
- * landing/web/src/data/fallback/. Idempotent — runs `updateGlobal`
- * which upserts. Safe to re-run after edits to the JSONs (overwrites
- * whatever's in the admin).
+ * CLI content seeder. Overwrites (or, with --if-empty / SEED_IF_EMPTY=1,
+ * only fills empty) Payload globals from the fallback JSONs. Two ways
+ * to run it:
  *
- * Run from landing/cms: `bun run seed`.
+ *   - local dev:   `bun run seed`
+ *   - in the image: `node cms/seed.mjs` (bundled by the Dockerfile)
+ *
+ * The server seeds itself on boot via payload.config `onInit`; this CLI
+ * exists for an explicit overwrite that mirrors edited JSONs back into
+ * the admin. SEED_SKIP_ONINIT disables that onInit pass while this CLI
+ * is the one driving the seed (set before getPayload so init reads it).
+ *
+ * Fallback JSONs come from $SEED_FALLBACK_DIR (the image bakes it to the
+ * seed-data/ dir beside the bundle) or ../../../web/src/data/fallback.
  */
 
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getPayload } from 'payload';
 
 import config from '../payload.config';
+import { seedGlobals } from './seedGlobals';
+
+// Disable the payload.config onInit auto-seed for this CLI process —
+// the CLI drives the seed itself below. Set before getPayload() (which
+// runs onInit) reads it. Imports above only define the config; onInit
+// fires later, during getPayload().
+process.env.SEED_SKIP_ONINIT = '1';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const FALLBACK_DIR = path.resolve(here, '../../../web/src/data/fallback');
-
-/** Map JSON filename (sans extension) to Payload global slug. */
-const MAP: Record<string, string> = {
-  siteSettings: 'site-settings',
-  landingHero: 'landing-hero',
-  valueProps: 'value-props',
-  scalingJourney: 'scaling-journey',
-  tierLadder: 'tier-ladder',
-  comparison: 'comparison',
-  transparency: 'landing-transparency',
-  boringTech: 'boring-tech',
-  advantages: 'advantages',
-  roadmap: 'roadmap',
-  bootstrapStrip: 'bootstrap-strip',
-  footer: 'footer-content',
-  waitlistCopy: 'waitlist-form-copy',
-};
+const fallbackDir =
+  process.env.SEED_FALLBACK_DIR ?? path.resolve(here, '../../../web/src/data/fallback');
+const ifEmpty = process.env.SEED_IF_EMPTY === '1' || process.argv.includes('--if-empty');
 
 async function main() {
   const payload = await getPayload({ config });
-
-  for (const [file, slug] of Object.entries(MAP)) {
-    const filepath = path.join(FALLBACK_DIR, `${file}.json`);
-    try {
-      const data = JSON.parse(await fs.readFile(filepath, 'utf8'));
-      await payload.updateGlobal({
-        slug: slug as Parameters<typeof payload.updateGlobal>[0]['slug'],
-        data,
-      });
-      console.log(`✓ seeded ${slug.padEnd(22)} from ${file}.json`);
-    } catch (err) {
-      console.error(`✗ failed to seed ${slug} from ${file}.json:`, err);
-      process.exitCode = 1;
-    }
-  }
-
-  process.exit(process.exitCode ?? 0);
+  console.log(`seeding from ${fallbackDir}${ifEmpty ? ' (if-empty mode)' : ''}`);
+  const res = await seedGlobals(payload, { fallbackDir, ifEmpty, log: (m) => console.log(m) });
+  console.log(`done — ${res.seeded} seeded, ${res.skipped} skipped, ${res.failed} failed`);
+  process.exit(res.failed > 0 ? 1 : 0);
 }
 
 main().catch((err) => {

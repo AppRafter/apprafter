@@ -30,7 +30,14 @@ type EditLogEntry = { at: string; global: string; editor?: string };
 
 const EDIT_LOG_CAP = 20;
 
-export const notifyRebuild: GlobalAfterChangeHook = async ({ doc, global, req }) => {
+export const notifyRebuild: GlobalAfterChangeHook = async ({ context, doc, global, req }) => {
+  // Bulk content seeding (server onInit + `bun run seed`) sets this so
+  // importing the fallback globals neither spams preview rebuilds nor
+  // pollutes the Publishing edit log.
+  if (context?.skipRebuild) {
+    return doc;
+  }
+
   // Step 1 — Publishing tracker (best-effort, doesn't block dispatch).
   const now = new Date().toISOString();
   try {
