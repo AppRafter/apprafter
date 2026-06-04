@@ -45,7 +45,7 @@ use kube::{Client, ResourceExt};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use operator_core::{Metrics, RetainedClaim};
+use operator_core::{Metrics, ResourceClaim, RetainedClaim};
 
 use crate::cnpg;
 use crate::grace;
@@ -122,6 +122,27 @@ pub async fn reconcile(
         role = %rc.spec.role, database = %rc.spec.database_object_name,
         "RetainedClaim grace elapsed — dropping role/DB/Secret"
     );
+
+    // 2.4f Fix A live-guard: if the original ResourceClaim is back (a
+    // recovery re-claim), this RetainedClaim is stale — never drop a live
+    // claim's role/DB. Delete the snapshot and stop (the provisioner's
+    // cancel is primary; this is the belt-and-suspenders GC side).
+    let claim_api: Api<ResourceClaim> =
+        Api::namespaced(ctx.client.clone(), &rc.spec.claim_ref.namespace);
+    if let Ok(Some(c)) = claim_api.get_opt(&rc.spec.claim_ref.name).await {
+        if claim_is_live(&c) {
+            info!(
+                retained = %rc_name, claim = %rc.spec.claim_ref.name,
+                "live ResourceClaim present (recovery) — deleting stale RetainedClaim, skipping drop"
+            );
+            delete_retained_claim(&ctx.client, &rc_ns, &rc_name).await?;
+            ctx.metrics
+                .claim_gc_total
+                .with_label_values(&["skipped-live", &rc_ns])
+                .inc();
+            return Ok(Action::await_change());
+        }
+    }
 
     // Each step idempotent + 404-tolerant, in order.
     remove_managed_role(&ctx, &rc).await?;
@@ -310,6 +331,20 @@ async fn delete_retained_claim(
 // Pure decision helpers (unit-tested without a cluster)
 // ---------------------------------------------------------------------------
 
+/// True iff the fetched `ResourceClaim` is LIVE — present with no
+/// `deletion_timestamp` (Phase 2.4f Fix A live-guard).
+///
+/// When the GC finds the original claim back at this name with no
+/// pending deletion, the user re-claimed (recovery) within the grace
+/// window: the snapshot's role/DB now back the LIVE claim, so the GC
+/// must NOT drop them — it deletes the stale RetainedClaim instead. A
+/// claim that is itself mid-deletion (`deletion_timestamp` set) is NOT
+/// live: it will produce its own fresh RetainedClaim, so this older one
+/// may still be GC'd.
+pub fn claim_is_live(claim: &ResourceClaim) -> bool {
+    claim.metadata.deletion_timestamp.is_none()
+}
+
 /// True iff `role` is reported DROPPED by CNPG — i.e. it appears in
 /// `managed_roles_status.byStatus.reconciled` (Phase 2.4f Fix B2).
 ///
@@ -338,7 +373,28 @@ pub fn role_is_dropped(managed_roles_status: &Value, role: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use operator_core::ResourceClaimSpec;
     use serde_json::json;
+
+    // --- claim_is_live() (2.4f Fix A live-guard) ---
+
+    #[test]
+    fn claim_is_live_true_when_no_deletion_timestamp() {
+        // A claim back at the same name with no pending deletion is a
+        // recovery re-claim — the snapshot is stale and must NOT be GC'd.
+        let claim = ResourceClaim::new("demo-web-pg", ResourceClaimSpec::default());
+        assert!(claim_is_live(&claim));
+    }
+
+    #[test]
+    fn claim_is_live_false_when_deletion_timestamp_set() {
+        // A claim that is itself mid-deletion will produce its OWN fresh
+        // RetainedClaim, so this older snapshot is not protected by it.
+        let mut claim = ResourceClaim::new("demo-web-pg", ResourceClaimSpec::default());
+        claim.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        assert!(!claim_is_live(&claim));
+    }
 
     // --- role_is_dropped() (2.4f Fix B2 drop-confirmation) ---
 

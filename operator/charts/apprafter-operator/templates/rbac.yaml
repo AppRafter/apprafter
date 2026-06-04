@@ -147,6 +147,12 @@ rules:
   # WITHOUT `create` — the Application controller must never write
   # claim status (the scheduler owns status.provider/Scheduled, the
   # provisioner owns status.ready/connectionSecretRef/Ready).
+  #
+  # 2.4f Fix A extension: the RetainedClaim GC controller GETs the
+  # original ResourceClaim by `spec.claimRef` after the grace window
+  # elapses — if it is back (a recovery re-claim) the GC deletes the
+  # stale snapshot instead of dropping a now-live claim's role/DB. The
+  # `get` verb already granted here covers that read (no new verb).
   - apiGroups:
       - apprafter.io
     resources:

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
 use kube::{Client, ResourceExt};
@@ -316,6 +316,18 @@ async fn provision_cloudnativepg(
         .with_label_values(&[KIND, ns, "ok"])
         .inc();
     info!(%name, %ns, %role, %db, "ResourceClaim provisioned");
+
+    // Recovery (2.4f Fix A): the claim is (re)provisioned, so any
+    // RetainedClaim from a prior deletion is stale — cancel it so its
+    // grace-GC can never drop this now-live claim's role/DB. The snapshot
+    // name is deterministic (`cnpg::k8s_name(ns, name)` == `object_name`),
+    // so this targets exactly the matching RetainedClaim. 404-tolerant.
+    let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
+    if let Err(e) = rc_api.delete(&object_name, &DeleteParams::default()).await {
+        if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
+            warn!(%object_name, error=%e, "could not cancel stale RetainedClaim on re-provision");
+        }
+    }
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }
@@ -927,6 +939,36 @@ mod tests {
             format!("{snapshot_name}-pw")
         );
         assert_eq!(rc["spec"]["retainUntil"], "2026-06-10T00:00:00+00:00");
+    }
+
+    #[test]
+    fn reprovision_cancels_the_matching_retained_claim_by_deterministic_name() {
+        // 2.4f Fix A: on (re)provision the tail deletes the RetainedClaim
+        // named `cnpg::k8s_name(ns, name)` — the SAME deterministic name
+        // the finalizer snapshots under (`object_name` in the provision
+        // body) and the same name encoded in the snapshot's metadata.name.
+        // If these ever diverged, the cancel would 404 forever and the
+        // recovery time-bomb would survive. Pin the equality.
+        let ns = "demo";
+        let name = "demo-web-pg";
+        let object_name = cnpg::k8s_name(ns, name);
+        // The cancel target (object_name) == the snapshot's metadata.name.
+        let snapshot = retained_claim_object(
+            &object_name,
+            name,
+            ns,
+            "p",
+            "b",
+            "c",
+            "n",
+            "r",
+            "d",
+            &object_name,
+            "pw",
+            "2026-06-10T00:00:00+00:00",
+        );
+        assert_eq!(snapshot["metadata"]["name"], object_name);
+        assert_eq!(object_name, "claim-demo-demo-web-pg");
     }
 
     #[test]
