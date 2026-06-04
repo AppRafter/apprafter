@@ -148,10 +148,17 @@ pub async fn reconcile(
     // recovery re-claim), this RetainedClaim is stale — never drop a live
     // claim's role/DB. Delete the snapshot and stop (the provisioner's
     // cancel is primary; this is the belt-and-suspenders GC side).
+    // The live-guard MUST fail CLOSED. `get_opt` errors on any non-404
+    // (apiserver 503 / throttle / network blip); the `?` propagates that
+    // to error_policy → requeue → re-check on a healthy apiserver, rather
+    // than silently treating it as "no live claim" and FALLING THROUGH to
+    // the destructive drop (which would drop a LIVE re-attached claim's DB).
+    // We drop ONLY on a confirmed `Ok(None)` (claim genuinely gone) or a
+    // claim that is itself mid-deletion.
     let claim_api: Api<ResourceClaim> =
         Api::namespaced(ctx.client.clone(), &rc.spec.claim_ref.namespace);
-    if let Ok(Some(c)) = claim_api.get_opt(&rc.spec.claim_ref.name).await {
-        if claim_is_live(&c) {
+    match claim_api.get_opt(&rc.spec.claim_ref.name).await? {
+        Some(c) if claim_is_live(&c) => {
             info!(
                 retained = %rc_name, claim = %rc.spec.claim_ref.name,
                 "live ResourceClaim present (recovery) — deleting stale RetainedClaim, skipping drop"
@@ -163,6 +170,10 @@ pub async fn reconcile(
                 .inc();
             return Ok(Action::await_change());
         }
+        // Ok(None) = claim genuinely gone (safe to drop); Some(mid-deletion)
+        // = it will produce its own fresh RetainedClaim, so this stale one
+        // is GC-able.
+        _ => {}
     }
 
     // Phased role drop (2.4f Fix B2). CNPG drops a managed role ONLY via
@@ -174,41 +185,69 @@ pub async fn reconcile(
     // requeues between phases (crash-safe — a re-entry recomputes the
     // phase from live state).
 
-    // Phase 1 — declare absent: the Database (`ensure: absent`, existing)
-    // THEN the role (`ensure: absent`, upsert — kept, NOT pruned). Order
-    // matters: CNPG drops the DB first, which unblocks the role drop.
+    // Phase 1a — Database `ensure: absent` (idempotent; ordered FIRST so the
+    // owner-role can ever be dropped: CNPG cannot drop a role that owns a DB).
     remove_database(&ctx, &rc).await?;
-    if !set_role_absent(&ctx, &rc).await? {
-        // The shared Cluster is already gone → no role/DB to drop. Skip
-        // straight to finalize (Phase 3 steps are all 404-tolerant).
-        return finalize_drop(&ctx, &rc, &rc_ns, &rc_name).await;
+
+    // GET the shared Cluster ONCE (spec + status, consistent snapshot).
+    // 404 → Cluster gone → role/DB went with it → finalize. A transient
+    // error PROPAGATES (fail-closed via `?`) → error_policy requeues.
+    let cluster = match get_cluster(&ctx, &rc).await? {
+        None => return finalize_drop(&ctx, &rc, &rc_ns, &rc_name).await,
+        Some(c) => c,
+    };
+
+    let role = rc.spec.role.clone();
+    if role_entry_ensure(&cluster, &role) != Some("absent") {
+        // PASS 1 — the entry is still `ensure: present` (or missing). Declare
+        // it absent, then WAIT one CNPG reconcile cycle before trusting status:
+        // `byStatus.reconciled` is stale-true right after the PUT (it still
+        // reflects the prior present-and-matching state), and pruning on that
+        // stale read is the role-leak bug. Re-entry next pass sees the entry
+        // already-absent and proceeds to confirm.
+        if !set_role_absent(&ctx, &rc).await? {
+            // Cluster vanished mid-RMW → nothing to drop.
+            return finalize_drop(&ctx, &rc, &rc_ns, &rc_name).await;
+        }
+        info!(
+            retained = %rc_name, %role,
+            "role declared ensure:absent — waiting one CNPG reconcile before confirming the drop"
+        );
+        return Ok(Action::requeue(ROLE_DROP_REQUEUE));
     }
 
-    // Phase 2 — confirm the role is dropped. GET the Cluster status; until
-    // the role appears in `byStatus.reconciled` (drop confirmed), requeue
-    // and come back. A 404 here means the Cluster vanished mid-drop →
-    // nothing left to prune, proceed to finalize.
-    let cluster_status = cluster_managed_roles_status(&ctx, &rc).await?;
-    match next_drop_decision(cluster_status.as_ref(), &rc.spec.role) {
-        DropDecision::WaitForDrop => {
-            info!(
-                retained = %rc_name, role = %rc.spec.role,
-                "role drop pending (DB/role not yet reconciled by CNPG) — requeueing"
+    // PASS 2+ — the entry is ALREADY `ensure: absent` (declared on a prior
+    // pass; CNPG has reconciled it), so `byStatus` now reflects the absent
+    // spec and is trustworthy.
+    let status = cluster
+        .pointer("/status/managedRolesStatus")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if role_is_dropped(&status, &role) {
+        info!(retained = %rc_name, %role, "CNPG confirms the role is dropped — finalizing");
+        finalize_drop(&ctx, &rc, &rc_ns, &rc_name).await
+    } else {
+        // Still dropping, or STUCK (e.g. cannotReconcile: owns a DB that has
+        // live connections). Observability so a permanent wedge is visible
+        // (finding #4 — no silent forever-loop).
+        if let Some(reason) = role_cannot_reconcile_reason(&status, &role) {
+            warn!(
+                retained = %rc_name, %role, %reason,
+                "role drop BLOCKED (CNPG cannotReconcile) — retrying; needs attention if persistent"
             );
-            return Ok(Action::requeue(ROLE_DROP_REQUEUE));
+            ctx.metrics
+                .claim_gc_total
+                .with_label_values(&["blocked", &rc_ns])
+                .inc();
+        } else {
+            info!(retained = %rc_name, %role, "role drop pending CNPG reconcile — requeueing");
+            ctx.metrics
+                .claim_gc_total
+                .with_label_values(&["waiting", &rc_ns])
+                .inc();
         }
-        DropDecision::Finalize => {
-            info!(
-                retained = %rc_name, role = %rc.spec.role,
-                "role drop confirmed (or Cluster gone) — finalizing"
-            );
-        }
+        Ok(Action::requeue(ROLE_DROP_REQUEUE))
     }
-
-    // Phase 3 — finalize: NOW that CNPG has dropped the role, prune the
-    // `ensure: absent` entry (so the shared Cluster spec accumulates no
-    // absent tombstones), delete the password Secret, delete the snapshot.
-    finalize_drop(&ctx, &rc, &rc_ns, &rc_name).await
 }
 
 /// Phase 3 of the 2.4f drop: the role is confirmed dropped (or the
@@ -331,6 +370,13 @@ where
     )))
 }
 
+/// The pure managed-roles transform [`set_role_absent`] applies: UPSERT
+/// the role to `ensure: absent` (KEEP the entry). Named + pure so a
+/// regression to pruning (the role-leak bug) is unit-catchable.
+pub fn role_absent_upsert(existing: Vec<Value>, role: &str) -> Vec<Value> {
+    cnpg::merge_role(existing, cnpg::managed_role_entry_absent(role))
+}
+
 /// Phase 1 (2.4f Fix B2): UPSERT the per-claim role to `ensure: absent`
 /// in the shared Cluster's `spec.managed.roles` — CNPG then drops the
 /// role (after the DB is dropped). The entry is KEPT, not pruned: pruning
@@ -339,10 +385,7 @@ where
 /// 404-tolerant via [`rmw_managed_roles`].
 async fn set_role_absent(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<bool, ReconcileError> {
     let role = rc.spec.role.clone();
-    let landed = rmw_managed_roles(ctx, rc, |existing| {
-        cnpg::merge_role(existing, cnpg::managed_role_entry_absent(&role))
-    })
-    .await?;
+    let landed = rmw_managed_roles(ctx, rc, |existing| role_absent_upsert(existing, &role)).await?;
     if landed {
         info!(role = %rc.spec.role, "role declared ensure:absent (CNPG drops it after the DB)");
     }
@@ -359,11 +402,12 @@ async fn remove_managed_role(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<(
     Ok(())
 }
 
-/// Phase 2 (2.4f Fix B2): GET the shared Cluster and return its
-/// `status.managedRolesStatus` object (`None` if the Cluster is gone).
-/// The reconcile feeds it to [`role_is_dropped`] to decide whether CNPG
-/// has finished dropping the `ensure: absent` role before pruning.
-async fn cluster_managed_roles_status(
+/// Phase 2 (2.4f Fix B2): GET the shared CNPG Cluster as JSON (spec +
+/// status, one consistent snapshot). `None` if the Cluster is gone (404).
+/// A transient (non-404) error PROPAGATES — the GC must fail closed
+/// (error_policy requeues), never silently treat a flaky GET as
+/// "Cluster gone" and finalize a half-done drop.
+async fn get_cluster(
     ctx: &Arc<Context>,
     rc: &RetainedClaim,
 ) -> Result<Option<Value>, ReconcileError> {
@@ -371,14 +415,7 @@ async fn cluster_managed_roles_status(
     let cnpg_ns = &rc.spec.cnpg_namespace;
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
     match api.get(cluster).await {
-        Ok(c) => {
-            let json = serde_json::to_value(&c)?;
-            Ok(Some(
-                json.pointer("/status/managedRolesStatus")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            ))
-        }
+        Ok(c) => Ok(Some(serde_json::to_value(&c)?)),
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -511,33 +548,42 @@ pub fn role_is_dropped(managed_roles_status: &Value, role: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Phase-2 verdict of the 2.4f Fix B2 drop state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DropDecision {
-    /// CNPG confirms the role is dropped (in `byStatus.reconciled`) OR the
-    /// shared Cluster is gone — proceed to Phase 3 (prune + finalize).
-    Finalize,
-    /// CNPG has not yet dropped the role — requeue and re-check.
-    WaitForDrop,
+/// The `ensure` value of the named role's entry in the Cluster's
+/// `spec.managed.roles` (`None` if the entry is absent or carries no
+/// `ensure`). Drives the 2.4f Fix B2 "already-declared-absent" gate: only
+/// once OUR entry reads `ensure: absent` (a PRIOR pass set it, so CNPG has
+/// had >=1 requeue [`ROLE_DROP_REQUEUE`] to reconcile it) do we trust
+/// `byStatus` — avoiding the stale-status premature-prune that re-leaks
+/// the role. Right after the `ensure: absent` PUT, `byStatus.reconciled`
+/// still reflects the prior `present`-and-matching state; pruning on that
+/// stale read is the role-leak bug, relocated.
+pub fn role_entry_ensure<'a>(cluster: &'a Value, role: &str) -> Option<&'a str> {
+    cluster
+        .pointer("/spec/managed/roles")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|r| r.get("name").and_then(Value::as_str) == Some(role))
+        .and_then(|r| r.get("ensure").and_then(Value::as_str))
 }
 
-/// Pure Phase-2 decision: given the Cluster's `managedRolesStatus`
-/// (`None` if the Cluster is gone) and the role name, decide whether to
-/// finalize the drop or keep waiting.
-///
-/// - Cluster gone (`None`) → [`DropDecision::Finalize`]: nothing left to
-///   prune, the role/DB went with the Cluster.
-/// - role in `byStatus.reconciled` → [`DropDecision::Finalize`]: CNPG
-///   confirmed the drop; now safe to prune the `ensure: absent` entry.
-/// - otherwise → [`DropDecision::WaitForDrop`]: still pending (DB not yet
-///   dropped, role still owns the DB, or status not yet populated). NEVER
-///   prune here — pruning before `reconciled` un-manages a live role (the
-///   role-leak bug B).
-pub fn next_drop_decision(managed_roles_status: Option<&Value>, role: &str) -> DropDecision {
-    match managed_roles_status {
-        None => DropDecision::Finalize,
-        Some(status) if role_is_dropped(status, role) => DropDecision::Finalize,
-        Some(_) => DropDecision::WaitForDrop,
+/// The CNPG `cannotReconcile` error reason(s) for a role (joined with
+/// `; `), if any — used to surface a WEDGED drop (e.g. the role still
+/// owns a database with live connections) instead of looping silently
+/// forever (finding #4). `None` when the role has no `cannotReconcile`
+/// entry, or its entry is an empty array.
+pub fn role_cannot_reconcile_reason(managed_roles_status: &Value, role: &str) -> Option<String> {
+    let arr = managed_roles_status
+        .pointer(&format!("/cannotReconcile/{role}"))
+        .and_then(Value::as_array)?;
+    let joined = arr
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
     }
 }
 
@@ -628,66 +674,119 @@ mod tests {
         ));
     }
 
-    // --- next_drop_decision() (2.4f Fix B2 Phase-2 verdict) ---
+    // --- role_entry_ensure() (2.4f Fix B2 already-declared-absent gate) ---
+
+    /// Build a Cluster JSON whose `spec.managed.roles` carries the given
+    /// `(name, ensure)` entries.
+    fn cluster_with_roles(roles: &[(&str, &str)]) -> Value {
+        let entries: Vec<Value> = roles
+            .iter()
+            .map(|(name, ensure)| json!({ "name": name, "ensure": ensure }))
+            .collect();
+        json!({ "spec": { "managed": { "roles": entries } } })
+    }
 
     #[test]
-    fn next_drop_decision_finalize_when_cluster_gone() {
-        // Cluster vanished mid-drop → nothing left to prune.
+    fn role_entry_ensure_present_when_entry_present() {
+        let cluster = cluster_with_roles(&[("claim_demo_web", "present"), ("other", "present")]);
         assert_eq!(
-            next_drop_decision(None, "claim_demo_web"),
-            DropDecision::Finalize
+            role_entry_ensure(&cluster, "claim_demo_web"),
+            Some("present")
         );
     }
 
     #[test]
-    fn next_drop_decision_finalize_when_role_reconciled() {
-        // CNPG confirmed the drop → safe to prune the absent entry.
-        let status = json!({ "byStatus": { "reconciled": ["claim_demo_web"] } });
+    fn role_entry_ensure_absent_when_entry_absent() {
+        let cluster = cluster_with_roles(&[("claim_demo_web", "absent")]);
         assert_eq!(
-            next_drop_decision(Some(&status), "claim_demo_web"),
-            DropDecision::Finalize
+            role_entry_ensure(&cluster, "claim_demo_web"),
+            Some("absent")
         );
     }
 
     #[test]
-    fn next_drop_decision_wait_when_pending_or_cannot_reconcile() {
-        // Still pending (DB not yet dropped) → keep waiting, NEVER prune.
-        let pending = json!({ "byStatus": { "pending-reconciliation": ["claim_demo_web"] } });
-        assert_eq!(
-            next_drop_decision(Some(&pending), "claim_demo_web"),
-            DropDecision::WaitForDrop
-        );
-        // Owns a database → cannotReconcile → keep waiting (the DB-absent
-        // declaration unblocks it on a later pass).
-        let cannot = json!({
-            "byStatus": { "reconciled": [] },
-            "cannotReconcile": { "claim_demo_web": ["owner of database claim_demo_web"] },
+    fn role_entry_ensure_none_when_entry_missing() {
+        // Our role has no entry at all → the gate treats it as "not yet
+        // declared absent" → declare + wait.
+        let cluster = cluster_with_roles(&[("someone-else", "present")]);
+        assert_eq!(role_entry_ensure(&cluster, "claim_demo_web"), None);
+    }
+
+    #[test]
+    fn role_entry_ensure_none_when_entry_has_no_ensure() {
+        // An entry without an `ensure` field (CNPG defaults present) reads
+        // as None → the gate forces the declare+wait branch, never trusting
+        // status prematurely.
+        let cluster = json!({
+            "spec": { "managed": { "roles": [{ "name": "claim_demo_web", "login": true }] } }
         });
+        assert_eq!(role_entry_ensure(&cluster, "claim_demo_web"), None);
+    }
+
+    #[test]
+    fn role_entry_ensure_none_when_no_roles_array() {
+        assert_eq!(role_entry_ensure(&json!({}), "claim_demo_web"), None);
         assert_eq!(
-            next_drop_decision(Some(&cannot), "claim_demo_web"),
-            DropDecision::WaitForDrop
-        );
-        // Status not yet populated → wait, never prematurely prune.
-        assert_eq!(
-            next_drop_decision(Some(&json!({})), "claim_demo_web"),
-            DropDecision::WaitForDrop
+            role_entry_ensure(&json!({ "spec": { "managed": {} } }), "claim_demo_web"),
+            None
         );
     }
 
-    // --- set_role_absent transform correctness (the RMW closure) ---
+    // --- the stale-`reconciled` premature-prune temporal regression ---
 
     #[test]
-    fn set_role_absent_transform_upserts_present_entry_to_absent() {
-        // The closure `set_role_absent` feeds `rmw_managed_roles` is
-        // `merge_role(existing, managed_role_entry_absent(role))`. Confirm
-        // it REPLACES the present entry in-place with an ensure:absent one
-        // (CNPG drops the role) and preserves foreign entries — NOT a
-        // prune (which would only un-manage it, the role-leak bug).
+    fn entry_ensure_gate_holds_prune_while_reconciled_is_stale() {
+        // THE critical guard for 2.4f Fix B2 finding #2. Right after the
+        // `ensure: absent` PUT, CNPG has NOT reconciled the new spec yet, so
+        // `status.managedRolesStatus.byStatus.reconciled` STILL lists the
+        // role (left over from its prior `ensure: present` state). If the GC
+        // trusted that read it would prune on pass 1 and the Postgres role
+        // would NEVER be dropped — the role-leak bug B, relocated.
+        //
+        // reconcile is async, so we assert at the decision seam: the
+        // entry-ensure gate must read `present` (forcing the declare+wait
+        // branch) EVEN THOUGH `role_is_dropped` reads true off the stale
+        // status. The gate, not the status, holds the prune.
+        let cluster = json!({
+            "spec": { "managed": { "roles": [
+                { "name": "claim_demo_web", "ensure": "present" }
+            ] } },
+            "status": { "managedRolesStatus": {
+                "byStatus": { "reconciled": ["claim_demo_web"] }
+            } },
+        });
+        let status = cluster
+            .pointer("/status/managedRolesStatus")
+            .cloned()
+            .unwrap();
+
+        // Stale `reconciled` would say "dropped" — the trap.
+        assert!(
+            role_is_dropped(&status, "claim_demo_web"),
+            "fixture: status is stale-true (the trap the gate must resist)"
+        );
+        // But the spec entry is still `present`, so the gate forces the
+        // declare+wait branch — the prune is held until a LATER pass sees
+        // the entry already-absent (CNPG has had >=1 requeue to reconcile).
+        assert_eq!(
+            role_entry_ensure(&cluster, "claim_demo_web"),
+            Some("present"),
+            "the gate must hold the prune until the entry reads ensure:absent"
+        );
+    }
+
+    // --- role_absent_upsert() (pinned set_role_absent transform) ---
+
+    #[test]
+    fn role_absent_upsert_replaces_present_with_absent() {
+        // Pins the exact transform `set_role_absent` applies. A regression
+        // to `remove_role` (prune) — the role-leak bug — is unit-catchable
+        // here: the target must SURVIVE as `ensure: absent`, not vanish.
         let existing = vec![
-            cnpg::managed_role_entry("claim_demo_web", "claim-demo-web-pw"),
+            cnpg::managed_role_entry("r", "r-pw"),
             json!({ "name": "keep-me", "login": false }),
         ];
-        let out = cnpg::merge_role(existing, cnpg::managed_role_entry_absent("claim_demo_web"));
+        let out = role_absent_upsert(existing, "r");
         assert_eq!(
             out.len(),
             2,
@@ -695,9 +794,58 @@ mod tests {
         );
         let target = out
             .iter()
-            .find(|r| r["name"] == "claim_demo_web")
+            .find(|e| e["name"] == "r")
             .expect("target role still present (declared absent, not pruned)");
         assert_eq!(target["ensure"], "absent");
-        assert!(out.iter().any(|r| r["name"] == "keep-me"));
+        assert!(
+            out.iter().any(|e| e["name"] == "keep-me"),
+            "foreign role preserved"
+        );
+    }
+
+    // --- role_cannot_reconcile_reason() (wedged-drop observability) ---
+
+    #[test]
+    fn role_cannot_reconcile_reason_present_joins_messages() {
+        let status = json!({
+            "cannotReconcile": {
+                "claim_demo_web": [
+                    "could not perform DELETE on role: owner of database claim_demo_web",
+                    "second reason",
+                ],
+            },
+        });
+        assert_eq!(
+            role_cannot_reconcile_reason(&status, "claim_demo_web").as_deref(),
+            Some(
+                "could not perform DELETE on role: owner of database claim_demo_web; second reason"
+            )
+        );
+    }
+
+    #[test]
+    fn role_cannot_reconcile_reason_none_when_role_absent() {
+        let status = json!({
+            "cannotReconcile": { "some-other-role": ["nope"] },
+        });
+        assert_eq!(
+            role_cannot_reconcile_reason(&status, "claim_demo_web"),
+            None
+        );
+        // No cannotReconcile map at all.
+        assert_eq!(
+            role_cannot_reconcile_reason(&json!({}), "claim_demo_web"),
+            None
+        );
+    }
+
+    #[test]
+    fn role_cannot_reconcile_reason_none_when_empty_array() {
+        // An empty reason array is not a wedge — treat as None.
+        let status = json!({ "cannotReconcile": { "claim_demo_web": [] } });
+        assert_eq!(
+            role_cannot_reconcile_reason(&status, "claim_demo_web"),
+            None
+        );
     }
 }

@@ -322,19 +322,44 @@ spec:
 YAML
 ```
 
-The GC fires immediately:
+The GC fires immediately, but the drop is **phased** — it is no longer
+single-shot. CloudNativePG drops a managed role only via an
+`ensure: absent` entry, and it cannot drop a role that still owns a
+database, so the GC drains in ordered stages across a few
+`ROLE_DROP_REQUEUE` (~15s) cycles:
+
+1. the `Database` CR flips to `ensure: absent` and the role entry flips
+   to `ensure: absent` (kept, **not** pruned) — the `RetainedClaim`
+   **persists** here;
+2. CloudNativePG drops the database, then the role, reporting the role
+   in `status.managedRolesStatus.byStatus.reconciled`;
+3. only after CloudNativePG confirms the role is dropped does the GC
+   prune the entry, delete the password Secret, and delete the snapshot.
+
+So **poll** these across a few ~15s cycles rather than expecting the
+final pruned / `NotFound` state immediately:
 
 ```sh
-# role dropped from the shared Cluster:
-kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres -o \
-  jsonpath='{.spec.managed.roles[?(@.name=="claim_demo_parser_pg")].name}{"\n"}'   # -> (empty)
-# Database flipped to absent (CNPG drops it):
+# Stage 1 (within the first cycle) — both flip to absent; the role entry
+# is KEPT as ensure:absent (CNPG drops it), and the snapshot PERSISTS:
 kubectl -n cnpg-system get database.postgresql.cnpg.io claim-demo-parser-pg \
   -o jsonpath='{.spec.ensure}{"\n"}'               # -> absent
-# password Secret + the snapshot gone:
+kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres -o \
+  jsonpath='{.spec.managed.roles[?(@.name=="claim_demo_parser_pg")].ensure}{"\n"}' # -> absent
+
+# Stage 3 (after a few ~15s cycles, once CNPG confirms the drop) — the
+# entry is pruned, the password Secret and the snapshot are gone:
+kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres -o \
+  jsonpath='{.spec.managed.roles[?(@.name=="claim_demo_parser_pg")].name}{"\n"}'   # -> (empty)
 kubectl -n cnpg-system get secret claim-demo-parser-pg-pw           # -> NotFound
 kubectl -n apprafter-system get retainedclaim claim-demo-parser-pg  # -> NotFound
 ```
+
+If the entry is still `ensure: absent` and the snapshot is still present,
+that is expected mid-drain — give it a few more ~15s cycles. (A drop that
+stays wedged for many cycles is surfaced in the operator logs as a
+`role drop BLOCKED (CNPG cannotReconcile)` warning, e.g. the role still
+owns a database with live connections.)
 
 ## MANDATORY: psql DROP assertion
 
@@ -363,10 +388,12 @@ kubectl exec "$PRIMARY" -n cnpg-system -- \
 # -> (EMPTY — the role is dropped too)
 ```
 
-CloudNativePG's `ensure: absent` reconcile lags the CR patch, so give
-it a few retries. **If the row is present after the GC, CloudNativePG
-did NOT honor `ensure: absent` — STOP, this is a closure-blocking
-bug.**
+CloudNativePG's `ensure: absent` reconcile lags the CR patch, and the GC
+drains the DB then the role over a few ~15s cycles (see the phased drop
+above), so give these queries a few reconcile cycles before trusting the
+result — the database row clears first, then the role row. **If a row is
+still present after several cycles, CloudNativePG did NOT honor
+`ensure: absent` — STOP, this is a closure-blocking bug.**
 
 ## DoD checklist
 
