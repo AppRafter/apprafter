@@ -1701,6 +1701,34 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.13": {
+	change:          "safe"
+	operatorVersion: "v0.2.13"
+	notes: """
+		Operator-only OCI version-resolver upgrade to the ADR-0041
+		channel-tag fast path (no CRD change). The PlatformStack
+		resolver reads the channel-latest in O(1) from the moving
+		`<repo>:<channel>` compatibility doc, with the paginated tag
+		listing kept only as the pre-contract fallback. Manifest
+		not-found is now classified structurally off the OCI error
+		code (not Display text), so a blob-pull error can no longer be
+		swallowed into the fallback; a phantom compat-doc key above the
+		published channel-latest is capped out via the chart's own
+		`org.opencontainers.image.version` annotation. The publish
+		workflow moves the channel tags with `oras tag` (a Helm-OCI
+		image-manifest carbon-copy), not `docker buildx imagetools
+		create` (which would re-wrap it in an image index the resolver
+		rejects). Pure reconcile-loop / OCI-client fix over the 0.2.12
+		controller set; same CRDs, RBAC, and components. Safe to
+		auto-sync.
+		"""
+	references: [
+		"operator/operator-controllers/platform-stack/src/compatibility.rs",
+		"operator/operator-controllers/platform-stack/src/reconcile.rs",
+		".github/workflows/platform-stack-publish.yml",
+		"docs/adr/0041-channel-tag-version-resolution.md",
+	]
+}
 compatibility: "0.2.12": {
 	change:          "safe"
 	operatorVersion: "v0.2.12"
