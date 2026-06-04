@@ -103,8 +103,8 @@ describe('landing/cms scaffold', () => {
     }
   });
 
-  test('seed script maps every fallback JSON to a global slug', () => {
-    const seed = readFileSync(join(ROOT, 'src/seed/seed.ts'), 'utf8');
+  test('seed core (seedGlobals) maps every fallback JSON to a global slug', () => {
+    const seed = readFileSync(join(ROOT, 'src/seed/seedGlobals.ts'), 'utf8');
     const mappings: [string, string][] = [
       ['siteSettings', 'site-settings'],
       ['landingHero', 'landing-hero'],
@@ -123,6 +123,33 @@ describe('landing/cms scaffold', () => {
     for (const [file, slug] of mappings) {
       expect(seed).toContain(`${file}: '${slug}'`);
     }
+  });
+
+  test('content seeding: onInit auto-seed (if-empty) + bundled seed.mjs + rebuild suppression', () => {
+    // Shared seed core: if-empty mode + suppresses notifyRebuild on bulk load.
+    const core = readFileSync(join(ROOT, 'src/seed/seedGlobals.ts'), 'utf8');
+    expect(core).toContain('ifEmpty');
+    expect(core).toContain('skipRebuild');
+
+    // Server self-seeds empty globals on boot (onInit) — replaces a Job,
+    // since the apprafter Application CRD renders only Deployment+Service.
+    const cfg = readFileSync(join(ROOT, 'src/payload.config.ts'), 'utf8');
+    expect(cfg).toContain('onInit');
+    expect(cfg).toContain('seedGlobals');
+    // CLI seeder disables that onInit so it doesn't double-run.
+    expect(cfg).toContain('SEED_SKIP_ONINIT');
+    const cli = readFileSync(join(ROOT, 'src/seed/seed.ts'), 'utf8');
+    expect(cli).toContain('SEED_SKIP_ONINIT');
+
+    // notifyRebuild honours the skip flag (no preview rebuilds on seed).
+    const nr = readFileSync(join(ROOT, 'src/hooks/notifyRebuild.ts'), 'utf8');
+    expect(nr).toContain('context?.skipRebuild');
+
+    // Dockerfile bundles the standalone seed artifact + its fallback data.
+    const df = readFileSync(join(ROOT, 'Dockerfile'), 'utf8');
+    expect(df).toContain('seed.mjs');
+    expect(df).toContain('/app/cms/seed-data');
+    expect(df).toContain('SEED_FALLBACK_DIR');
   });
 
   test('Next standalone output enabled for Docker build', () => {
