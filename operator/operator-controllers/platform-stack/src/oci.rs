@@ -45,6 +45,19 @@ impl Channel {
             _ => None,
         }
     }
+
+    /// The moving OCI tag this channel points at (ADR 0041). The
+    /// publish workflow moves `<repo>:<tag>` onto the latest
+    /// member of the channel after each release, so a single
+    /// `fetch_compatibility_doc(&upstream, channel.as_tag())`
+    /// resolves the channel-latest in `O(1)` — no tag listing.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+            Self::Edge => "edge",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -286,6 +299,21 @@ mod tests {
         assert_eq!(Channel::parse("beta"), Some(Channel::Beta));
         assert_eq!(Channel::parse("edge"), Some(Channel::Edge));
         assert_eq!(Channel::parse("nightly"), None);
+    }
+
+    #[test]
+    fn channel_as_tag_matches_publish_contract() {
+        // ADR 0041: the operator fetches the compat doc from the
+        // moving `<repo>:<channel>` tag the publish workflow
+        // maintains. The tag string MUST match the channel name
+        // the publish workflow moves (`stable`/`beta`/`edge`) and
+        // round-trip through `Channel::parse`.
+        assert_eq!(Channel::Stable.as_tag(), "stable");
+        assert_eq!(Channel::Beta.as_tag(), "beta");
+        assert_eq!(Channel::Edge.as_tag(), "edge");
+        for ch in [Channel::Stable, Channel::Beta, Channel::Edge] {
+            assert_eq!(Channel::parse(ch.as_tag()), Some(ch));
+        }
     }
 
     #[test]
