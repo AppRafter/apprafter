@@ -38,6 +38,16 @@ describe('landing/cms scaffold', () => {
     expect(cfg).toContain('postgresAdapter');
   });
 
+  test('CSRF allowlist is configurable so non-serverURL admin origins can save', () => {
+    // Payload defaults csrf to [serverURL] and strips cookie auth on
+    // mutations from any other Origin — admin edits via a port-forward
+    // (http://localhost:8080 vs the public serverURL) 403 every save.
+    // serverURL stays trusted; LANDING_CMS_CSRF_ORIGINS adds more hosts.
+    const cfg = readFileSync(join(ROOT, 'src/payload.config.ts'), 'utf8');
+    expect(cfg).toContain('csrf:');
+    expect(cfg).toContain('LANDING_CMS_CSRF_ORIGINS');
+  });
+
   test('Users collection (default-auth admin) registered', () => {
     const usersPath = join(ROOT, 'src/collections/Users.ts');
     expect(existsSync(usersPath)).toBe(true);

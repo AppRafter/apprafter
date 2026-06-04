@@ -51,6 +51,24 @@ const corsOrigins = (
   .map((s) => s.trim())
   .filter(Boolean);
 
+// CSRF allowlist for cookie-auth on mutations. Payload defaults this to
+// just [serverURL] and silently drops the auth cookie whenever a
+// request's Origin is not on the list. So editing the admin from any
+// other origin — e.g. a `kubectl port-forward` to http://localhost:8080
+// while serverURL is the public https host — strips req.user and 403s
+// every save with "You are not allowed to perform this action" (reads
+// still work, so the admin looks logged in). serverURL is always
+// trusted; LANDING_CMS_CSRF_ORIGINS (comma-separated) adds extra hosts
+// (port-forward, preview) without re-pointing serverURL, which also
+// drives the admin + email absolute URLs.
+const csrfOrigins = [
+  serverURL,
+  ...(process.env.LANDING_CMS_CSRF_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+];
+
 export default buildConfig({
   serverURL,
   secret: process.env.PAYLOAD_SECRET ?? '',
@@ -99,6 +117,7 @@ export default buildConfig({
     fallback: true,
   },
   cors: corsOrigins,
+  csrf: csrfOrigins,
   admin: {
     user: Users.slug,
     meta: {

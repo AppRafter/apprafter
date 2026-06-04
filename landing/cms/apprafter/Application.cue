@@ -53,7 +53,8 @@ landingCms: v1alpha1.#Application & {
 			},
 			env: {
 				// DATABASE_URL auto-injected via needs.pg claim
-				PAYLOAD_SECRET: "ZiZn1bW3IHmAGj8g72CSHZsvWERDDrEXWGU+kxnLCqsWfOBB3O9EJ3R8RBPOvddS"
+				PAYLOAD_SECRET: "ZiZn1bW3IHmAGj8g72CSHZsvWERDDrEXWGU+kxnLCqsWfOBB3O9EJ3R8RBPOvddS" // fixme
+				LANDING_CMS_CSRF_ORIGINS: "http://localhost:8080" // fixme: for tests only
 
 				// Server URL Payload reports back in admin links,
 				// password-reset emails, etc.
