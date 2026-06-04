@@ -105,11 +105,11 @@ pub async fn tags_in_channel(
     })?;
 
     let client = Client::new(ClientConfig::default());
-    let all_tags = collect_all_tags(|last| {
+    let all_tags = collect_all_tags(PAGE_SIZE, |last| {
         let client = &client;
         let reference = &reference;
         async move {
-            client
+            match client
                 .list_tags(
                     reference,
                     &RegistryAuth::Anonymous,
@@ -117,8 +117,16 @@ pub async fn tags_in_channel(
                     last.as_deref(),
                 )
                 .await
-                .map(|r| r.tags)
-                .map_err(|e| OciError::Registry(e.to_string()))
+            {
+                Ok(r) => Ok(r.tags),
+                // ghcr answers a past-the-end `last` query with
+                // `{"tags": null}` (not `[]`); oci-distribution cannot
+                // deserialize null into Vec<String>. Treat that single
+                // error as exhaustion so the walk ends cleanly instead of
+                // failing the whole reconcile.
+                Err(e) if is_tag_exhaustion_error(&e.to_string()) => Ok(Vec::new()),
+                Err(e) => Err(OciError::Registry(e.to_string())),
+            }
         }
     })
     .await?;
@@ -130,20 +138,37 @@ pub async fn tags_in_channel(
     Ok(versions)
 }
 
+/// ghcr answers a tag-list query whose `last` cursor is at/after the
+/// final tag with `{"tags": null}` (not `{"tags": []}`); the
+/// `oci-distribution` `TagResponse` deserialize then fails with
+/// `invalid type: null, expected a sequence`. Recognise THAT specific
+/// error so the pagination walk treats it as exhaustion instead of
+/// failing the whole reconcile (the v0.2.12 resolver crash). Any other
+/// registry error still propagates.
+fn is_tag_exhaustion_error(msg: &str) -> bool {
+    msg.contains("invalid type: null")
+}
+
 /// Walk OCI tag pages via the `last` cursor and accumulate every
 /// tag (unsorted). `fetch(last)` returns one page given the cursor
-/// of the previous page's final tag (`None` on the first call).
+/// of the previous page's final tag (`None` on the first call);
+/// `page_size` is the `n` requested per call.
 ///
-/// Termination is triple-guarded:
-/// 1. an empty page ends the walk (the registry's exhaustion signal),
-/// 2. a NO-PROGRESS guard ends it when the new cursor equals the
-///    previous one — i.e. the registry ignored `last` and re-served
-///    the same page (which would otherwise loop forever), and
-/// 3. a `MAX_PAGES` ceiling bounds any other misbehavior.
+/// Termination is guarded four ways:
+/// 1. a SHORT page (`len < page_size`) is the last one per the OCI
+///    spec — stop WITHOUT fetching past it (a past-the-end fetch makes
+///    ghcr return `{"tags": null}`, which the fetcher maps to an empty
+///    page as a backstop for the exact-multiple case),
+/// 2. an empty page ends the walk (registry exhaustion / the null
+///    backstop),
+/// 3. a NO-PROGRESS guard ends it when the cursor doesn't advance — a
+///    registry that ignored `last` and re-served the same page (which
+///    would otherwise loop forever), and
+/// 4. a `MAX_PAGES` ceiling bounds any other misbehavior.
 ///
 /// Extracted behind this fetcher seam so the pagination/termination
 /// logic is unit-tested with canned pages and no network.
-async fn collect_all_tags<F, Fut>(mut fetch: F) -> Result<Vec<String>, OciError>
+async fn collect_all_tags<F, Fut>(page_size: usize, mut fetch: F) -> Result<Vec<String>, OciError>
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: Future<Output = Result<Vec<String>, OciError>>,
@@ -156,8 +181,15 @@ where
         if page.is_empty() {
             break;
         }
+        let short = page.len() < page_size;
         let new_last = page.last().cloned();
         acc.extend(page);
+        // A page shorter than `page_size` is the last page (OCI spec):
+        // stop here so we never fetch past the end (ghcr answers a
+        // past-the-end query with `{"tags": null}`).
+        if short {
+            break;
+        }
         // Registry ignored `last` and re-served the same page:
         // the cursor didn't advance, so stop rather than spin.
         if new_last == last {
@@ -334,45 +366,60 @@ mod tests {
     }
 
     #[test]
-    fn collect_all_tags_accumulates_across_pages_following_last_cursor() {
-        // page1=[a,b,c], page2=[d,e], page3=[] (exhausted).
+    fn collect_all_tags_accumulates_full_pages_until_empty() {
+        // Full pages (len == page_size) keep the walk going; an empty
+        // page is the exhaustion signal. page_size=2.
         let fetcher = RefCell::new(PagedFetcher::new(vec![
-            vec!["a", "b", "c"],
-            vec!["d", "e"],
+            vec!["a", "b"],
+            vec!["c", "d"],
             vec![],
         ]));
-        let tags = block_on(collect_all_tags(|last| fetcher.borrow_mut().fetch(last))).unwrap();
+        let tags = block_on(collect_all_tags(2, |last| fetcher.borrow_mut().fetch(last))).unwrap();
 
-        assert_eq!(tags, vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(tags, vec!["a", "b", "c", "d"]);
         // First call cursor None, then last tag of each prior page.
         assert_eq!(
             fetcher.borrow().calls,
-            vec![None, Some("c".to_string()), Some("e".to_string())]
+            vec![None, Some("b".to_string()), Some("d".to_string())]
         );
     }
 
     #[test]
-    fn collect_all_tags_handles_single_short_page() {
-        // A page shorter than PAGE_SIZE still requires the empty
-        // follow-up page to confirm exhaustion.
-        let fetcher = RefCell::new(PagedFetcher::new(vec![vec!["a"], vec![]]));
-        let tags = block_on(collect_all_tags(|last| fetcher.borrow_mut().fetch(last))).unwrap();
+    fn collect_all_tags_stops_on_short_page_without_a_past_end_fetch() {
+        // THE regression for the v0.2.12 resolver crash: ghcr answers a
+        // query whose `last` is at/after the final tag with `{"tags":
+        // null}`, which oci-distribution cannot deserialize, so the
+        // reconcile errored every cycle and `availableVersion` froze. A
+        // page SHORTER than page_size is the last page (OCI spec), so the
+        // walk must STOP there and never issue that past-the-end fetch.
+        // page_size=3: [a,b,c] is full, [d,e] is short → stop after
+        // exactly two fetches (the third page must NOT be requested).
+        let fetcher = RefCell::new(PagedFetcher::new(vec![
+            vec!["a", "b", "c"],
+            vec!["d", "e"],
+            vec!["MUST-NOT-BE-FETCHED"],
+        ]));
+        let tags = block_on(collect_all_tags(3, |last| fetcher.borrow_mut().fetch(last))).unwrap();
 
-        assert_eq!(tags, vec!["a"]);
-        assert_eq!(fetcher.borrow().calls, vec![None, Some("a".to_string())]);
+        assert_eq!(tags, vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(
+            fetcher.borrow().calls,
+            vec![None, Some("c".to_string())],
+            "must stop on the short last page, never fetch past the end"
+        );
     }
 
     #[test]
     fn collect_all_tags_no_progress_guard_terminates() {
-        // A registry that ignores `last` and always re-serves the
-        // same non-empty page must NOT infinite-loop. The first page
-        // advances the cursor from None→"b"; the second fetch returns
-        // the same page so the cursor stays "b" — the no-progress
-        // guard then breaks. The walk must therefore make exactly two
-        // fetches (well under MAX_PAGES) and terminate.
+        // A registry that ignores `last` and always re-serves the same
+        // FULL page (len == page_size, so the short-page guard does not
+        // fire) must NOT infinite-loop. The first page advances the
+        // cursor None→"b"; the second fetch returns the same page so the
+        // cursor stays "b" — the no-progress guard breaks. Exactly two
+        // fetches, well under MAX_PAGES.
         let same_page: Vec<&'static str> = vec!["a", "b"];
         let count = RefCell::new(0usize);
-        let tags = block_on(collect_all_tags(|_last| {
+        let tags = block_on(collect_all_tags(2, |_last| {
             *count.borrow_mut() += 1;
             assert!(
                 *count.borrow() <= MAX_PAGES,
@@ -382,18 +429,15 @@ mod tests {
             std::future::ready(Ok::<_, OciError>(page))
         }))
         .unwrap();
-        // Terminated after exactly two fetches (the second is the
-        // no-progress repeat that trips the guard), not an infinite
-        // loop. Both fetched pages were accumulated as-is.
         assert_eq!(*count.borrow(), 2);
         assert_eq!(tags, vec!["a", "b", "a", "b"]);
     }
 
     #[test]
     fn collect_all_tags_respects_max_pages_ceiling() {
-        // A registry that advances the cursor every time (so the
-        // no-progress guard never fires) and never returns an empty
-        // page is bounded by MAX_PAGES.
+        // Cursor advances every page and each page is full (len 1 ==
+        // page_size 1) so neither the short-page nor the no-progress
+        // guard fires → bounded by MAX_PAGES.
         let counter = RefCell::new(0usize);
         let fetcher = |_last: Option<String>| {
             let mut c = counter.borrow_mut();
@@ -402,7 +446,7 @@ mod tests {
             let tag = format!("t{c}");
             std::future::ready(Ok::<_, OciError>(vec![tag]))
         };
-        let tags = block_on(collect_all_tags(fetcher)).unwrap();
+        let tags = block_on(collect_all_tags(1, fetcher)).unwrap();
         assert_eq!(tags.len(), MAX_PAGES);
     }
 
@@ -411,13 +455,13 @@ mod tests {
         // Regression for the available=0.2.2 / invisible-0.2.11 bug:
         // the newest version arrives on a LATER page. With the old
         // single-page read it was dropped and the resolver reported a
-        // stale first-page max. Pagination must surface it as the max.
+        // stale first-page max. page_size=3: [0.2.0,0.2.1,0.2.2] is
+        // full, [0.2.10,0.2.11] is the short last page; both accumulate.
         let fetcher = RefCell::new(PagedFetcher::new(vec![
-            vec!["0.2.0", "0.2.1", "0.2.2"], // first page (old code stopped here)
-            vec!["0.2.10", "0.2.11"],        // later page
-            vec![],
+            vec!["0.2.0", "0.2.1", "0.2.2"],
+            vec!["0.2.10", "0.2.11"],
         ]));
-        let all = block_on(collect_all_tags(|last| fetcher.borrow_mut().fetch(last))).unwrap();
+        let all = block_on(collect_all_tags(3, |last| fetcher.borrow_mut().fetch(last))).unwrap();
         let sorted = sort_tags_descending(all, Channel::Stable);
         assert_eq!(
             sorted.first().map(|v| v.to_string()),
@@ -427,5 +471,17 @@ mod tests {
             sorted.iter().any(|v| v.to_string() == "0.2.11"),
             "0.2.11 from a later page must be present"
         );
+    }
+
+    #[test]
+    fn is_tag_exhaustion_error_matches_ghcr_null_tags_only() {
+        // ghcr's past-the-end `{"tags": null}` surfaces as this serde
+        // message and MUST be treated as exhaustion (→ empty page); any
+        // other registry error must propagate (not be swallowed).
+        assert!(is_tag_exhaustion_error(
+            "registry IO: invalid type: null, expected a sequence at line 1 column 46"
+        ));
+        assert!(!is_tag_exhaustion_error("registry IO: connection refused"));
+        assert!(!is_tag_exhaustion_error("registry IO: 401 Unauthorized"));
     }
 }
