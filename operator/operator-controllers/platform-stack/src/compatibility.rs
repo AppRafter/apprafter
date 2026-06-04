@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use oci_distribution::client::ClientConfig;
+use oci_distribution::errors::{OciDistributionError, OciErrorCode};
 use oci_distribution::manifest::OciManifest;
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
@@ -35,12 +36,52 @@ pub enum CompatError {
     InvalidReference(String, String),
     #[error("registry IO: {0}")]
     Registry(String),
+    /// The requested OCI tag (typically a `:<channel>` pointer)
+    /// has no manifest in the registry — a structurally-typed
+    /// not-found signal, NOT derived from message-text scraping.
+    /// ADR 0041's resolver fast path keys its fallback decision
+    /// off THIS variant: only a genuinely-absent channel tag
+    /// (`MANIFEST_UNKNOWN` / `NAME_UNKNOWN` / a 404 manifest
+    /// pull) routes to the paginated tag-listing backstop; every
+    /// other registry error (`Registry`) propagates so a real
+    /// failure can't hide behind the listing. Carries the
+    /// `<repo>:<tag>` reference for logging.
+    #[error("manifest not found: {0}")]
+    ManifestNotFound(String),
     #[error("chart tarball missing compatibility.yaml")]
     MissingFile,
     #[error("parse compatibility.yaml: {0}")]
     Parse(String),
     #[error("version {0:?} not declared in compatibility.yaml")]
     UnknownVersion(String),
+}
+
+/// Structurally classify an `OciDistributionError` raised by a
+/// **manifest** pull as a manifest-not-found. Keys off the OCI
+/// error *code* (`ManifestUnknown` / `NameUnknown`) and the
+/// dedicated `ImageManifestNotFoundError` / a bare 404
+/// `ServerError`, NEVER the free-form Display/message text —
+/// ghcr may return an empty `message` with a populated `code`,
+/// and a 5xx body or a blob digest could otherwise contain
+/// "404"/"not found" and be misclassified. Only ever applied to
+/// the manifest pull; blob-pull failures keep their own
+/// `Registry` variant and propagate.
+fn oci_err_is_manifest_not_found(err: &OciDistributionError) -> bool {
+    match err {
+        OciDistributionError::RegistryError { envelope, .. } => envelope.errors.iter().any(|e| {
+            matches!(
+                e.code,
+                OciErrorCode::ManifestUnknown | OciErrorCode::NameUnknown
+            )
+        }),
+        OciDistributionError::ImageManifestNotFoundError(_) => true,
+        // Defensive: a registry that answers a missing manifest
+        // with a bare 404 (no OCI envelope) rather than a
+        // structured `RegistryError`. ghcr uses the envelope, but
+        // this keeps the not-found signal registry-agnostic.
+        OciDistributionError::ServerError { code: 404, .. } => true,
+        _ => false,
+    }
 }
 
 /// The rendered `compatibility.yaml` shape that
@@ -89,6 +130,34 @@ pub async fn fetch_compatibility_doc(
     upstream_url: &str,
     version_tag: &str,
 ) -> Result<CompatibilityDoc, CompatError> {
+    Ok(
+        fetch_compatibility_doc_with_self_version(upstream_url, version_tag)
+            .await?
+            .0,
+    )
+}
+
+/// As [`fetch_compatibility_doc`], but also returns the chart's
+/// own version — the `org.opencontainers.image.version` OCI
+/// manifest annotation that `helm push` stamps onto every
+/// platform-stack release (verified present on live ghcr
+/// charts). `None` when the annotation is absent or unparseable.
+///
+/// ADR 0041's fast path uses this as a **phantom-version cap**:
+/// the `:<channel>` tag points at the channel-latest chart, so
+/// the legitimate channel-latest is exactly that chart's own
+/// version. The cumulative `compatibility.yaml` could declare a
+/// HIGHER version than the chart that carries it (e.g. an author
+/// prepping the next release's compatibility record before its
+/// chart is published) — such a key has no published chart and
+/// would resolve `availableVersion` to a tag Argo CD can't pull.
+/// Capping the resolved max at the chart's self-version drops
+/// those phantom entries while leaving the tag-anchored fallback
+/// untouched. The blob pull mirrors `fetch_compatibility_doc`.
+pub async fn fetch_compatibility_doc_with_self_version(
+    upstream_url: &str,
+    version_tag: &str,
+) -> Result<(CompatibilityDoc, Option<semver::Version>), CompatError> {
     let bare = upstream_url.strip_prefix("oci://").unwrap_or(upstream_url);
     let with_tag = format!("{bare}:{version_tag}");
     let reference: Reference = with_tag
@@ -98,10 +167,23 @@ pub async fn fetch_compatibility_doc(
         })?;
 
     let client = Client::new(ClientConfig::default());
+    // Classify the MANIFEST pull's error structurally: a missing
+    // `:<channel>` tag (`MANIFEST_UNKNOWN` / 404) becomes the
+    // typed `ManifestNotFound` so ADR 0041's resolver can fall
+    // back to the tag listing; every other failure stays
+    // `Registry` and propagates. The blob pull below keeps a
+    // plain `Registry` map — a blob 404 / integrity error is a
+    // real failure, never a not-found.
     let (manifest, _digest) = client
         .pull_manifest(&reference, &RegistryAuth::Anonymous)
         .await
-        .map_err(|e| CompatError::Registry(e.to_string()))?;
+        .map_err(|e| {
+            if oci_err_is_manifest_not_found(&e) {
+                CompatError::ManifestNotFound(with_tag.clone())
+            } else {
+                CompatError::Registry(e.to_string())
+            }
+        })?;
     let manifest = match manifest {
         OciManifest::Image(m) => m,
         OciManifest::ImageIndex(_) => {
@@ -110,6 +192,15 @@ pub async fn fetch_compatibility_doc(
             ))
         }
     };
+
+    // The chart's self-declared version (phantom-version cap, see
+    // doc comment). `helm push` stamps it as
+    // `org.opencontainers.image.version`.
+    let self_version = manifest
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get("org.opencontainers.image.version"))
+        .and_then(|s| semver::Version::parse(s).ok());
 
     // Helm charts publish a single layer of mediaType
     // `application/vnd.cncf.helm.chart.content.v1.tar+gzip`
@@ -126,7 +217,7 @@ pub async fn fetch_compatibility_doc(
         if let Ok(yaml_bytes) = extract_compatibility_yaml(&blob) {
             let doc: CompatibilityDoc = serde_yaml::from_slice(&yaml_bytes)
                 .map_err(|e| CompatError::Parse(e.to_string()))?;
-            return Ok(doc);
+            return Ok((doc, self_version));
         }
     }
     Err(CompatError::MissingFile)
@@ -560,5 +651,120 @@ mod tests {
         doc.insert("not-a-version".to_string(), record("data-migration"));
         let class = path_max_change_class(&doc, "0.1.35", "0.1.37");
         assert!(matches!(class, ChangeClass::Breaking));
+    }
+
+    // --- ADR 0041 structural not-found classification ---
+    // These build REAL `OciDistributionError` values (not
+    // hand-written Display strings), so a crate-side error-format
+    // drift fails the test instead of silently regressing the
+    // not-found → fallback decision.
+
+    use oci_distribution::errors::{OciEnvelope, OciError, OciErrorCode};
+
+    fn registry_err(code: OciErrorCode, message: &str) -> OciDistributionError {
+        OciDistributionError::RegistryError {
+            envelope: OciEnvelope {
+                errors: vec![OciError {
+                    code,
+                    message: message.to_string(),
+                    detail: serde_json::Value::Null,
+                }],
+            },
+            url: "https://ghcr.io/v2/apprafter/platform-stack/manifests/stable".to_string(),
+        }
+    }
+
+    #[test]
+    fn manifest_unknown_envelope_is_not_found() {
+        // ghcr's 404 for a missing `:<channel>` tag.
+        assert!(oci_err_is_manifest_not_found(&registry_err(
+            OciErrorCode::ManifestUnknown,
+            "manifest unknown"
+        )));
+    }
+
+    #[test]
+    fn manifest_unknown_with_empty_message_is_still_not_found() {
+        // Finding #2/#7: `OciError.message` is `#[serde(default)]`
+        // — a populated `code` with a BLANK message must still be
+        // recognised. Keying off the structured code (not the
+        // Display text) makes this work where substring-scanning
+        // would have returned false and wrongly propagated.
+        assert!(oci_err_is_manifest_not_found(&registry_err(
+            OciErrorCode::ManifestUnknown,
+            ""
+        )));
+    }
+
+    #[test]
+    fn name_unknown_envelope_is_not_found() {
+        // A never-published repo/channel answers with NAME_UNKNOWN.
+        assert!(oci_err_is_manifest_not_found(&registry_err(
+            OciErrorCode::NameUnknown,
+            ""
+        )));
+    }
+
+    #[test]
+    fn image_manifest_not_found_error_is_not_found() {
+        assert!(oci_err_is_manifest_not_found(
+            &OciDistributionError::ImageManifestNotFoundError("manifest unknown".to_string())
+        ));
+    }
+
+    #[test]
+    fn bare_404_server_error_is_not_found() {
+        assert!(oci_err_is_manifest_not_found(
+            &OciDistributionError::ServerError {
+                code: 404,
+                url: "https://ghcr.io/v2/x/manifests/stable".to_string(),
+                message: String::new(),
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_failure_is_not_a_not_found() {
+        // A real auth error must propagate, never fall back.
+        assert!(!oci_err_is_manifest_not_found(&registry_err(
+            OciErrorCode::Unauthorized,
+            "authentication required"
+        )));
+    }
+
+    #[test]
+    fn five_xx_whose_message_says_not_found_is_not_a_not_found() {
+        // Finding #4: a 5xx whose body text happens to contain
+        // "not found" must NOT be misclassified. The old
+        // whole-Display substring matcher would have swallowed
+        // this; the structured classifier keys off the 404/500
+        // code, not the message.
+        assert!(!oci_err_is_manifest_not_found(
+            &OciDistributionError::ServerError {
+                code: 500,
+                url: "https://ghcr.io/v2/x/manifests/stable".to_string(),
+                message: "upstream says: object not found (404) in cache".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn generic_transport_error_is_not_a_not_found() {
+        // Finding #3: a blob/transport failure (here a generic
+        // error whose text mentions 404/not-found) must propagate.
+        assert!(!oci_err_is_manifest_not_found(
+            &OciDistributionError::GenericError(Some(
+                "connection reset reading blob sha256:...404...".to_string()
+            ))
+        ));
+    }
+
+    #[test]
+    fn manifest_not_found_compat_error_carries_the_reference() {
+        // The typed variant the resolver matches on round-trips a
+        // human-readable reference for logging.
+        let e =
+            CompatError::ManifestNotFound("ghcr.io/apprafter/platform-stack:stable".to_string());
+        assert!(matches!(e, CompatError::ManifestNotFound(ref r) if r.contains(":stable")));
     }
 }

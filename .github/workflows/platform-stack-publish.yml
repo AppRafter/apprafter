@@ -279,11 +279,17 @@ jobs:
             --destination platform-stack/dist
           echo "tgz=platform-stack/dist/platform-stack-${VERSION}.tgz" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Docker Buildx
-        # Needed by the channel-tag move below
-        # (`docker buildx imagetools create`). Same invocation
-        # style as `landing-promote-to-prod.yml`.
-        uses: docker/setup-buildx-action@v3
+      - name: Set up oras
+        # Needed by the channel-tag move below (`oras tag`) and
+        # the `:latest` retag. oras carbon-copies the Helm OCI
+        # *image manifest* under a new tag; `docker buildx
+        # imagetools create` would instead wrap it in an image
+        # INDEX, which the operator's ADR-0041 fast path rejects
+        # (`expected image manifest, got image index`) — breaking
+        # channel-latest resolution on every release. Pinning the
+        # action also makes the `:latest` step's runtime guard a
+        # belt-and-braces check rather than the sole guarantee.
+        uses: oras-project/setup-oras@v1
 
       - name: Log in to ghcr.io
         uses: docker/login-action@v3
@@ -329,13 +335,25 @@ jobs:
         #   stable (no pre-release segment) -> stable, beta, edge
         #   rc.* / beta.*                    -> beta, edge
         #   any other pre-release            -> edge
-        # This step is REQUIRED — a failed `imagetools create`
-        # fails the job. A missed channel tag must be visible;
-        # the operator's absent-tag fallback covers a genuinely
+        # This step is REQUIRED — a failed `oras tag` fails the
+        # job. A missed channel tag must be visible; the
+        # operator's absent-tag fallback covers a genuinely
         # missing tag, but a silent move-failure must not pass.
         # We are already inside the publish path (the whole
         # `publish` job is gated on should_publish == 'true'),
         # so this only runs when actually publishing.
+        #
+        # `oras tag` (NOT `docker buildx imagetools create`):
+        # carbon-copies the Helm OCI image manifest under the
+        # channel tag. buildx would re-wrap it in an image index
+        # the operator's fast path rejects — see the `Set up oras`
+        # step. The membership regex MUST mirror the operator's
+        # `channel_matches` exactly: `^(rc|beta)(\.|$)` (dot or
+        # end-of-string — bare `rc`/`beta` and `rc.`/`beta.`).
+        # A hyphen form like `rc-1` is `#Version`-legal but
+        # edge-only on both sides; keeping the two identical
+        # prevents a `:beta` tag pointing at a chart the operator
+        # treats as edge.
         env:
           REPO: ${{ steps.owner.outputs.image }}
           VER: ${{ steps.version.outputs.version }}
@@ -344,20 +362,20 @@ jobs:
           ver="$VER"
           repo="$REPO"
           # Channel membership (ADR 0041): stable(no pre) -> all
-          # three; rc/beta -> beta,edge; other pre -> edge.
+          # three; rc./beta. (or bare rc/beta) -> beta,edge; other
+          # pre -> edge.
           pre="${ver#*-}"
           [ "$pre" = "$ver" ] && pre=""
           if [ -z "$pre" ]; then
             channels="stable beta edge"
-          elif printf '%s' "$pre" | grep -qE '^(rc|beta)([.-]|$)'; then
+          elif printf '%s' "$pre" | grep -qE '^(rc|beta)(\.|$)'; then
             channels="beta edge"
           else
             channels="edge"
           fi
-          for ch in $channels; do
-            echo "::notice::moving channel tag ${repo}:${ch} -> :${ver}"
-            docker buildx imagetools create -t "${repo}:${ch}" "${repo}:${ver}"
-          done
+          echo "::notice::moving channel tags [${channels}] -> ${repo}:${ver}"
+          # shellcheck disable=SC2086 # word-splitting $channels is intentional
+          oras tag "${repo}:${ver}" $channels
 
       - name: cosign sign (keyless via OIDC)
         env:

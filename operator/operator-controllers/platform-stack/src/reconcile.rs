@@ -35,7 +35,8 @@ use operator_core::{
 };
 
 use crate::compatibility::{
-    fetch_compatibility_doc, fetch_path_max_change_class, ChangeClass, CompatibilityDoc,
+    fetch_compatibility_doc, fetch_compatibility_doc_with_self_version,
+    fetch_path_max_change_class, ChangeClass, CompatError, CompatibilityDoc,
 };
 use crate::desired::{build as build_desired, DesiredSource};
 use crate::oci::{channel_matches, tags_in_channel, Channel};
@@ -285,53 +286,66 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     //
     // FALLBACK: a pre-contract chart (or a channel never
     // published) has no `:<channel>` tag, so the manifest pull
-    // 404s (`compat_err_is_not_found`). In that case — and when
-    // the channel doc parses but declares no usable version — we
-    // fall back to the prior paginated path: `tags_in_channel` →
-    // top tag → `resolve_non_yanked_latest`. Any OTHER fetch
-    // error (network, auth, parse) PROPAGATES rather than
-    // silently masking a real failure behind the listing.
+    // 404s — surfaced as the typed `CompatError::ManifestNotFound`
+    // (classified off the OCI error *code*, not message text). In
+    // that case — and when the channel doc parses but declares no
+    // usable version — we fall back to the prior paginated path:
+    // `tags_in_channel` → top tag → `resolve_non_yanked_latest`.
+    // Any OTHER fetch error (network, auth, parse, a blob 404)
+    // PROPAGATES rather than silently masking a real failure
+    // behind the listing.
+    //
+    // The fetch also returns the chart's own version (the
+    // `org.opencontainers.image.version` annotation); it caps the
+    // fast-path resolution so a compat-doc key ABOVE the published
+    // channel-latest chart (a not-yet-published / phantom entry)
+    // can never be reported as `availableVersion`.
     //
     // Bounded by the 60s throttle (`MIN_OCI_POLL_INTERVAL_SECS`).
     let (channel_latest_str, did_poll_oci, compat_doc) = if should_poll_oci {
         let channel_tag = channel.as_tag();
-        match fetch_compatibility_doc(&spec.source.upstream, channel_tag).await {
-            Ok(doc) => match latest_non_yanked_in_compat(&doc, channel) {
-                Some(v) => {
-                    info!(
-                        channel = %spec.channel,
-                        channel_tag,
-                        resolved = %v,
-                        "resolved channel-latest from :<channel> compat doc (ADR 0041 fast path)"
-                    );
-                    (v.to_string(), true, Some(doc))
+        match fetch_compatibility_doc_with_self_version(&spec.source.upstream, channel_tag).await {
+            Ok((doc, self_version)) => {
+                match latest_non_yanked_in_compat(&doc, channel, self_version.as_ref()) {
+                    Some(v) => {
+                        info!(
+                            channel = %spec.channel,
+                            channel_tag,
+                            resolved = %v,
+                            "resolved channel-latest from :<channel> compat doc (ADR 0041 fast path)"
+                        );
+                        (v.to_string(), true, Some(doc))
+                    }
+                    None => {
+                        // The channel doc exists but yields no
+                        // usable version (all yanked /
+                        // channel-filtered out / empty / above the
+                        // self-version cap). Fall back to the
+                        // listing.
+                        warn!(
+                            channel = %spec.channel,
+                            channel_tag,
+                            "channel-tag compat doc declared no usable version; \
+                             falling back to tag listing"
+                        );
+                        resolve_via_tag_listing(&spec.source.upstream, channel).await?
+                    }
                 }
-                None => {
-                    // The channel doc exists but yields no usable
-                    // version (all yanked / channel-filtered out /
-                    // empty). Fall back to the listing.
-                    warn!(
-                        channel = %spec.channel,
-                        channel_tag,
-                        "channel-tag compat doc declared no usable version; \
-                         falling back to tag listing"
-                    );
-                    resolve_via_tag_listing(&spec.source.upstream, channel).await?
-                }
-            },
-            Err(e) if compat_err_is_not_found(&e) => {
-                // Pre-contract chart: no `:<channel>` tag (404).
-                // Fall back to the paginated tag listing.
+            }
+            Err(CompatError::ManifestNotFound(reference)) => {
+                // Pre-contract chart: no `:<channel>` tag (404 /
+                // MANIFEST_UNKNOWN). Fall back to the paginated tag
+                // listing.
                 info!(
                     channel = %spec.channel,
                     channel_tag,
-                    error = %e,
+                    reference,
                     "no :<channel> tag (pre-contract chart); falling back to tag listing"
                 );
                 resolve_via_tag_listing(&spec.source.upstream, channel).await?
             }
-            // Network / auth / parse / missing-file — a real
-            // failure. Propagate so it surfaces instead of
+            // Network / auth / parse / missing-file / blob 404 — a
+            // real failure. Propagate so it surfaces instead of
             // resolving off a stale listing.
             Err(e) => return Err(Error::from(e)),
         }
@@ -903,16 +917,30 @@ fn resolve_non_yanked_latest(candidates_desc: &[Version], doc: &CompatibilityDoc
 /// (read exactly as `resolve_non_yanked_latest` does:
 /// `record.yanked`), and return the semver-max.
 ///
+/// `cap` (the chart's own `org.opencontainers.image.version`,
+/// when known) bounds the result: any key STRICTLY GREATER than
+/// the channel-latest chart's own version is a phantom entry — a
+/// compat record for a version whose chart hasn't been published
+/// — and is dropped, so `availableVersion` can never point at a
+/// tag Argo CD cannot pull. `None` cap = no bound (older charts
+/// without the annotation; documented degrade to prior
+/// behaviour).
+///
 /// Returns `None` when the doc declares no usable version for
 /// the channel (every candidate yanked, channel-filtered out,
-/// or the doc empty / all keys unparseable). The reconcile loop
-/// treats `None` as a signal to fall back to the paginated tag
-/// listing.
-fn latest_non_yanked_in_compat(doc: &CompatibilityDoc, channel: Channel) -> Option<Version> {
+/// above the cap, or the doc empty / all keys unparseable). The
+/// reconcile loop treats `None` as a signal to fall back to the
+/// paginated tag listing.
+fn latest_non_yanked_in_compat(
+    doc: &CompatibilityDoc,
+    channel: Channel,
+    cap: Option<&Version>,
+) -> Option<Version> {
     doc.iter()
         .filter(|(_, record)| !record.yanked)
         .filter_map(|(key, _)| Version::parse(key).ok())
         .filter(|v| channel_matches(v, channel))
+        .filter(|v| cap.is_none_or(|c| v <= c))
         .max()
 }
 
@@ -947,41 +975,6 @@ async fn resolve_via_tag_listing(
         None => top_tag,
     };
     Ok((resolved, true, doc))
-}
-
-/// ADR 0041 FALLBACK DECISION. The fast path fetches the compat
-/// doc from `<repo>:<channel>`; a pre-contract chart (or a
-/// channel never published) has no such tag, so ghcr answers the
-/// manifest pull with a 404 / `MANIFEST_UNKNOWN`, which
-/// `fetch_compatibility_doc` surfaces as
-/// `CompatError::Registry(<message>)`. Recognise ONLY that
-/// not-found shape so the resolver can fall back to the
-/// paginated tag listing.
-///
-/// Any other error (network, auth, parse, missing-file inside an
-/// otherwise-present tarball) is a real failure and must
-/// propagate — silently falling back would mask it and the
-/// channel-latest would resolve off a stale listing while the
-/// genuine problem stayed invisible.
-fn compat_err_is_not_found(err: &crate::compatibility::CompatError) -> bool {
-    use crate::compatibility::CompatError;
-    match err {
-        // ghcr's 404 for a missing tag arrives as a
-        // `RegistryError` whose Display carries the OCI envelope
-        // message (e.g. "manifest unknown" / "MANIFEST_UNKNOWN"),
-        // stringified into `CompatError::Registry`. Match the
-        // not-found markers case-insensitively; leave every other
-        // registry message (auth, rate-limit, connection) to
-        // propagate.
-        CompatError::Registry(msg) => {
-            let m = msg.to_ascii_lowercase();
-            m.contains("manifest unknown")
-                || m.contains("manifest_unknown")
-                || m.contains("not found")
-                || m.contains("404")
-        }
-        _ => false,
-    }
 }
 
 /// Has PlatformController already taken SSA ownership of any
@@ -1801,12 +1794,12 @@ mod tests {
         doc.insert("0.1.21".to_string(), compat_record(false));
         doc.insert("0.1.22-rc.1".to_string(), compat_record(false));
         assert_eq!(
-            latest_non_yanked_in_compat(&doc, Channel::Stable),
+            latest_non_yanked_in_compat(&doc, Channel::Stable, None),
             Some(Version::parse("0.1.21").unwrap())
         );
         // Beta accepts the rc, which is the semver-max overall.
         assert_eq!(
-            latest_non_yanked_in_compat(&doc, Channel::Beta),
+            latest_non_yanked_in_compat(&doc, Channel::Beta, None),
             Some(Version::parse("0.1.22-rc.1").unwrap())
         );
     }
@@ -1821,7 +1814,7 @@ mod tests {
         doc.insert("0.1.21".to_string(), compat_record(false));
         doc.insert("0.1.22".to_string(), compat_record(true)); // yanked top
         assert_eq!(
-            latest_non_yanked_in_compat(&doc, Channel::Stable),
+            latest_non_yanked_in_compat(&doc, Channel::Stable, None),
             Some(Version::parse("0.1.21").unwrap())
         );
     }
@@ -1833,7 +1826,10 @@ mod tests {
         let mut doc = std::collections::BTreeMap::new();
         doc.insert("0.1.21".to_string(), compat_record(true));
         doc.insert("0.1.22".to_string(), compat_record(true));
-        assert_eq!(latest_non_yanked_in_compat(&doc, Channel::Stable), None);
+        assert_eq!(
+            latest_non_yanked_in_compat(&doc, Channel::Stable, None),
+            None
+        );
     }
 
     #[test]
@@ -1842,10 +1838,13 @@ mod tests {
         let mut doc = std::collections::BTreeMap::new();
         doc.insert("0.1.22-rc.1".to_string(), compat_record(false));
         doc.insert("0.1.22-rc.2".to_string(), compat_record(false));
-        assert_eq!(latest_non_yanked_in_compat(&doc, Channel::Stable), None);
+        assert_eq!(
+            latest_non_yanked_in_compat(&doc, Channel::Stable, None),
+            None
+        );
         // ...but Edge accepts the rc and returns the max.
         assert_eq!(
-            latest_non_yanked_in_compat(&doc, Channel::Edge),
+            latest_non_yanked_in_compat(&doc, Channel::Edge, None),
             Some(Version::parse("0.1.22-rc.2").unwrap())
         );
     }
@@ -1858,42 +1857,52 @@ mod tests {
         doc.insert("not-a-version".to_string(), compat_record(false));
         doc.insert("0.1.21".to_string(), compat_record(false));
         assert_eq!(
-            latest_non_yanked_in_compat(&doc, Channel::Stable),
+            latest_non_yanked_in_compat(&doc, Channel::Stable, None),
             Some(Version::parse("0.1.21").unwrap())
         );
     }
 
     #[test]
-    fn compat_err_is_not_found_only_for_manifest_unknown_404() {
-        use crate::compatibility::CompatError;
-        // ghcr's 404 for a missing `:<channel>` tag surfaces as a
-        // RegistryError whose envelope carries "manifest unknown".
-        // ONLY this not-found shape triggers the fallback.
-        assert!(compat_err_is_not_found(&CompatError::Registry(
-            "Registry error: url https://ghcr.io/v2/x/manifests/stable, \
-             envelope: OCI API errors: [OCI API error: manifest unknown]"
-                .to_string()
-        )));
-        assert!(compat_err_is_not_found(&CompatError::Registry(
-            "Server error: url https://ghcr.io/..., code: 404, message: not found".to_string()
-        )));
-        // Real failures MUST NOT be treated as not-found (they
-        // would otherwise be silently masked behind the listing).
-        assert!(!compat_err_is_not_found(&CompatError::Registry(
-            "Not authorized: url https://ghcr.io/...".to_string()
-        )));
-        assert!(!compat_err_is_not_found(&CompatError::Registry(
-            "error sending request: connection refused".to_string()
-        )));
-        assert!(!compat_err_is_not_found(&CompatError::Registry(
-            "OCI API error: pull request limit exceeded".to_string()
-        )));
-        // Non-Registry CompatError variants are never not-found —
-        // a present tarball missing the file is a real failure.
-        assert!(!compat_err_is_not_found(&CompatError::MissingFile));
-        assert!(!compat_err_is_not_found(&CompatError::Parse(
-            "bad yaml".to_string()
-        )));
+    fn latest_non_yanked_in_compat_caps_at_self_version() {
+        // Finding #1: the cumulative compat doc declares a version
+        // (0.2.13) ABOVE the channel-latest chart that carries it
+        // (self-version 0.2.12) — e.g. an author prepped the next
+        // release's record early. Without the cap the fast path
+        // would report 0.2.13 as `availableVersion` and Argo CD
+        // would fail to pull a non-existent chart. The cap drops
+        // the phantom and resolves to the real published latest.
+        let mut doc = std::collections::BTreeMap::new();
+        doc.insert("0.2.11".to_string(), compat_record(false));
+        doc.insert("0.2.12".to_string(), compat_record(false));
+        doc.insert("0.2.13".to_string(), compat_record(false)); // phantom: no chart yet
+        let cap = Version::parse("0.2.12").unwrap();
+        assert_eq!(
+            latest_non_yanked_in_compat(&doc, Channel::Stable, Some(&cap)),
+            Some(Version::parse("0.2.12").unwrap())
+        );
+        // Without the cap (older chart, no annotation) the doc is
+        // trusted as-is — the documented degrade to prior
+        // behaviour.
+        assert_eq!(
+            latest_non_yanked_in_compat(&doc, Channel::Stable, None),
+            Some(Version::parse("0.2.13").unwrap())
+        );
+    }
+
+    #[test]
+    fn latest_non_yanked_in_compat_cap_keeps_equal_self_version() {
+        // The normal case: the doc's max key EQUALS the chart's
+        // own version (the channel-latest's own record). The cap
+        // is inclusive (`<=`), so the channel-latest resolves
+        // unchanged.
+        let mut doc = std::collections::BTreeMap::new();
+        doc.insert("0.2.11".to_string(), compat_record(false));
+        doc.insert("0.2.12".to_string(), compat_record(false));
+        let cap = Version::parse("0.2.12").unwrap();
+        assert_eq!(
+            latest_non_yanked_in_compat(&doc, Channel::Stable, Some(&cap)),
+            Some(Version::parse("0.2.12").unwrap())
+        );
     }
 
     #[test]
