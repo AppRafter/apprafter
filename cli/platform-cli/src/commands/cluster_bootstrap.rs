@@ -661,6 +661,15 @@ pub(crate) fn render_platformstack_default(tier: u8, domain: Option<&str>) -> St
         Some(d) => format!("    domain: \"{d}\"\n"),
         None => String::new(),
     };
+    // Tier-1 auto-upgrade is the OPT-OUT default at bootstrap because
+    // non-safe platform diffs become a MigrationPlan (ADR 0026) — so
+    // auto-advance is safe and matches the converge-by-default UX; an
+    // operator opts OUT with `spec.autoUpgrade: false`. The bare
+    // CUE/CRD schema default stays `false` (safe for raw/non-bootstrap
+    // creation) and is intentionally NOT changed here. Tier 1 is the
+    // only wired tier today; other tiers fall back to the schema-safe
+    // `false`.
+    let auto_upgrade = matches!(tier, 1);
     format!(
         r#"# SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Rendered by `apprafter cluster-bootstrap` (Track B.1.72).
@@ -675,7 +684,7 @@ metadata:
   namespace: apprafter-system
 spec:
   channel: stable
-  autoUpgrade: false
+  autoUpgrade: {auto_upgrade}
   source:
     upstream: "oci://{repo}/{chart}"
     repoURL: "oci://{repo}/{chart}"
@@ -683,6 +692,7 @@ spec:
   values:
     tier: {tier}
 {domain_line}"#,
+        auto_upgrade = auto_upgrade,
         repo = APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
         chart = APPRAFTER_PLATFORM_STACK_CHART_NAME,
         tier = tier,
@@ -1279,6 +1289,8 @@ mod tests {
         assert!(yaml.contains("tier: 2"));
         assert!(yaml.contains("domain: \"example.com\""));
         assert!(yaml.contains("checkInterval: 6h"));
+        // Non-T1 tiers fall back to the schema-safe `false` at bootstrap.
+        assert!(yaml.contains("autoUpgrade: false"));
     }
 
     #[test]
@@ -1286,6 +1298,15 @@ mod tests {
         let yaml = render_platformstack_default(1, None);
         assert!(yaml.contains("tier: 1"));
         assert!(!yaml.contains("domain:"));
+    }
+
+    #[test]
+    fn render_platformstack_default_tier1_auto_upgrade_is_opt_out() {
+        // Tier-1 bootstrap default is opt-out auto-upgrade (true): the
+        // MigrationPlan gate makes auto-advance safe (ADR 0026).
+        let yaml = render_platformstack_default(1, None);
+        assert!(yaml.contains("autoUpgrade: true"));
+        assert!(!yaml.contains("autoUpgrade: false"));
     }
 
     #[test]
