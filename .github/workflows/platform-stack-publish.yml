@@ -279,6 +279,12 @@ jobs:
             --destination platform-stack/dist
           echo "tgz=platform-stack/dist/platform-stack-${VERSION}.tgz" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Docker Buildx
+        # Needed by the channel-tag move below
+        # (`docker buildx imagetools create`). Same invocation
+        # style as `landing-promote-to-prod.yml`.
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to ghcr.io
         uses: docker/login-action@v3
         with:
@@ -314,6 +320,44 @@ jobs:
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "::notice::Resolved OCI digest: ${digest}"
+
+      - name: Move channel tags (:stable / :beta / :edge)
+        # ADR 0041: after the immutable `:<version>` chart is
+        # pushed, MOVE the rolling channel tag(s) the version
+        # belongs to so they point at this release. Channel
+        # membership:
+        #   stable (no pre-release segment) -> stable, beta, edge
+        #   rc.* / beta.*                    -> beta, edge
+        #   any other pre-release            -> edge
+        # This step is REQUIRED — a failed `imagetools create`
+        # fails the job. A missed channel tag must be visible;
+        # the operator's absent-tag fallback covers a genuinely
+        # missing tag, but a silent move-failure must not pass.
+        # We are already inside the publish path (the whole
+        # `publish` job is gated on should_publish == 'true'),
+        # so this only runs when actually publishing.
+        env:
+          REPO: ${{ steps.owner.outputs.image }}
+          VER: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$VER"
+          repo="$REPO"
+          # Channel membership (ADR 0041): stable(no pre) -> all
+          # three; rc/beta -> beta,edge; other pre -> edge.
+          pre="${ver#*-}"
+          [ "$pre" = "$ver" ] && pre=""
+          if [ -z "$pre" ]; then
+            channels="stable beta edge"
+          elif printf '%s' "$pre" | grep -qE '^(rc|beta)([.-]|$)'; then
+            channels="beta edge"
+          else
+            channels="edge"
+          fi
+          for ch in $channels; do
+            echo "::notice::moving channel tag ${repo}:${ch} -> :${ver}"
+            docker buildx imagetools create -t "${repo}:${ch}" "${repo}:${ver}"
+          done
 
       - name: cosign sign (keyless via OIDC)
         env:
