@@ -59,7 +59,9 @@ const CNPG_REQUIRED_STRING_FIELDS: [&str; 6] = [
 /// Dragonfly-backend `spec` string fields that must be non-empty — the
 /// GC-load-bearing set for a `dragonfly` snapshot (ADR 0042). The GC reads
 /// these to `FLUSHDB` the numbered DB + `ACL DELUSER` the per-claim user.
-/// `dbnum` is validated separately (an integer, 0 is valid).
+/// `dbnum` is intentionally excluded from this set — it is an integer
+/// (0 is a valid DB), so the non-empty-string check does not apply; its
+/// 0..1023 range is enforced by the CRD, not the webhook.
 const DRAGONFLY_REQUIRED_STRING_FIELDS: [&str; 4] = [
     "instance",
     "aclUser",
