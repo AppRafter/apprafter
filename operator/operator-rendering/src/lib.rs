@@ -126,6 +126,9 @@ pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationB
     if env_override.expose.is_some() {
         effective.expose = env_override.expose.clone();
     }
+    if env_override.image_policy.is_some() {
+        effective.image_policy = env_override.image_policy.clone();
+    }
     if let Some(env_env) = &env_override.env {
         let mut merged = effective.env.unwrap_or_default();
         for (k, v) in env_env {
@@ -671,6 +674,40 @@ mod tests {
         assert_eq!(expose.port, 9000);
         assert_eq!(expose.public, Some(true));
         assert_eq!(expose.network.as_deref(), Some("public"));
+    }
+
+    #[test]
+    fn effective_spec_env_override_replaces_image_policy() {
+        use operator_core::ImagePolicy;
+        // 2.4h Fix A: a per-environment `imagePolicy.resolve` override
+        // must replace the base policy (REPLACEMENT semantics, like
+        // image/replicas/expose) — otherwise an env-scoped opt-out is
+        // silently ignored.
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                image_policy: Some(ImagePolicy {
+                    resolve: Some("off".into()),
+                }),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("base".into()),
+                image_policy: Some(ImagePolicy {
+                    resolve: Some("digest".into()),
+                }),
+                ..Default::default()
+            },
+            envs,
+        );
+        let s = effective_spec(&app, Some("prod"));
+        assert_eq!(
+            s.image_policy.and_then(|p| p.resolve).as_deref(),
+            Some("off")
+        );
     }
 
     #[test]
