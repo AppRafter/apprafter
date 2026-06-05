@@ -518,6 +518,7 @@ fn build_status(
         observed_generation: app.metadata.generation,
         conditions: Some(conditions),
         endpoint_url,
+        image: None,
     }
 }
 
@@ -629,6 +630,7 @@ fn build_paused_status(app: &Application, plan_name: &str) -> ApplicationStatus 
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, pending]),
         endpoint_url: previous_endpoint,
+        image: None,
     }
 }
 
@@ -814,6 +816,7 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, pending]),
         endpoint_url: previous_endpoint,
+        image: None,
     }
 }
 
@@ -1101,6 +1104,7 @@ mod tests {
             observed_generation: Some(6),
             conditions: None,
             endpoint_url: Some("http://web.demo.svc.cluster.local:80".into()),
+            image: None,
         });
         let status = build_paused_status(&app, "web-prod-migration-1");
 
@@ -1457,6 +1461,7 @@ mod tests {
             observed_generation: Some(3),
             conditions: None,
             endpoint_url: Some("http://parser.demo.svc.cluster.local:80".into()),
+            image: None,
         });
         let status = build_resource_claim_paused_status(&app, &["parser-pg".to_string()]);
         assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));
