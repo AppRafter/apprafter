@@ -27,6 +27,7 @@ pub struct Metrics {
     pub claim_unmatched_total: CounterVec,
     pub claim_provisioned_total: CounterVec,
     pub claim_gc_total: CounterVec,
+    pub image_resolve_total: CounterVec,
 }
 
 impl Default for Metrics {
@@ -93,6 +94,15 @@ impl Metrics {
         )
         .expect("CounterVec must build with a non-empty name");
 
+        let image_resolve_total = CounterVec::new(
+            opts!(
+                "apprafter_image_resolve_total",
+                "Application image tag->digest resolutions (ADR 0040), by result (ok|cached|failed)"
+            ),
+            &["result"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
         registry
             .register(Box::new(reconcile_total.clone()))
             .expect("reconcile_total registers cleanly");
@@ -111,6 +121,9 @@ impl Metrics {
         registry
             .register(Box::new(claim_gc_total.clone()))
             .expect("claim_gc_total registers cleanly");
+        registry
+            .register(Box::new(image_resolve_total.clone()))
+            .expect("image_resolve_total registers cleanly");
 
         Self {
             registry,
@@ -120,6 +133,7 @@ impl Metrics {
             claim_unmatched_total,
             claim_provisioned_total,
             claim_gc_total,
+            image_resolve_total,
         }
     }
 
@@ -162,6 +176,7 @@ mod tests {
         m.claim_gc_total
             .with_label_values(&["success", "apprafter-system"])
             .inc();
+        m.image_resolve_total.with_label_values(&["ok"]).inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -172,6 +187,7 @@ mod tests {
         assert!(body.contains("apprafter_claim_unmatched_total"), "{body}");
         assert!(body.contains("apprafter_claim_provisioned_total"), "{body}");
         assert!(body.contains("apprafter_claim_gc_total"), "{body}");
+        assert!(body.contains("apprafter_image_resolve_total"), "{body}");
     }
 
     #[test]

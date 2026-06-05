@@ -295,6 +295,10 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                 let prior = prior_image.expect("should_resolve_image=false implies Some(prior)");
                 image_status = Some(prior.clone());
                 image_resolved_cond = Some((true, "Resolved".into()));
+                ctx.metrics
+                    .image_resolve_total
+                    .with_label_values(&["cached"])
+                    .inc();
                 prior.resolved.clone()
             } else {
                 let auth = match pick_pull_credential(tag, &source_creds) {
@@ -309,6 +313,10 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                             resolved_at: Some(Utc::now().to_rfc3339()),
                         });
                         image_resolved_cond = Some((true, "Resolved".into()));
+                        ctx.metrics
+                            .image_resolve_total
+                            .with_label_values(&["ok"])
+                            .inc();
                         Some(resolved)
                     }
                     Err(e) => {
@@ -322,6 +330,10 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                             resolved_at: None,
                         });
                         image_resolved_cond = Some((false, format!("ResolveFailed: {e}")));
+                        ctx.metrics
+                            .image_resolve_total
+                            .with_label_values(&["failed"])
+                            .inc();
                         None // fall back to verbatim tag — rollout proceeds
                     }
                 }
