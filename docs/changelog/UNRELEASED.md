@@ -9,6 +9,47 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.18 + platform-stack 0.2.18/0.2.19 — 2.6 needs.redis → Dragonfly (ADR 0042) (2026-06-05)
+
+### Added
+
+- **`needs.redis` provisions an isolated Redis-compatible connection.** An
+  `Application` declaring `spec.base.needs.redis` (or per-environment) gets a
+  `REDIS_URL` pinned to its own numbered logical DB on a shared Dragonfly instance,
+  plus a `REDIS_CHANNEL_PREFIX` for pub/sub — provisioned through the same
+  generate → schedule → provision → DSN-inject → snapshot → GC machinery as
+  `needs.pg`. Apps use **ordinary key names** (the `$N` ACL pins the user to one DB);
+  only pub/sub channel names need the prefix.
+- **Lazy pool of shared Dragonfly instances.** The always-on `dragonfly-operator`
+  component (platform-stack 0.2.18, `dragonfly-system`, sync-wave -5) ships with every
+  cluster, but no `Dragonfly` instance is created until the first matched claim — a
+  solo cluster with no redis apps pays no Dragonfly-pod cost. Each persistence class
+  (ephemeral / `persistent: true` → snapshot-to-PVC) gets its own instance; the
+  provisioner allocates each claim the lowest-free numbered DB (`--dbnum=1024`,
+  `--num_shards=1`, both tier-tunable on the `redis-integrated` seed).
+- **Per-claim `$N`-pinned ACL user** created imperatively over the Redis protocol —
+  hard per-DB keyspace isolation (a cross-DB `SELECT` returns `NOPERM`), pub/sub
+  confined to the claim's channel prefix, admin/dangerous commands blocked. A reconcile
+  loop re-asserts these users after an instance restart (runtime ACL state is otherwise
+  lost on pod reload). The 7-day-grace GC reclaims via `FLUSHDB` + `ACL DELUSER`.
+- **`persistent?` on the needs schema** + `status.{instance,dbnum}` allocation fields
+  on ResourceClaim + a relaxed RetainedClaim (new optional dragonfly fields; CNPG
+  fields made optional). All CRD changes are **additive and backward-compatible** —
+  existing claims are unaffected. Validated against a real apiserver.
+- **`e2e/needs-redis-walk.sh`** (`just e2e-redis`, nightly via `e2e-redis-nightly.yml`)
+  and the `needs.redis` manual walk (`operator-guide/needs-redis-walk.md`).
+
+### Changed
+
+- The renderer's needs→env mapping is now a list of (env-var, secret-key) pairs
+  (`pg` → `DATABASE_URL`; `redis` → `REDIS_URL` + `REDIS_CHANNEL_PREFIX`), and the
+  admission webhook's reserved-env guard rejects literal `REDIS_URL` /
+  `REDIS_CHANNEL_PREFIX` under `needs.redis` (mirrors the `DATABASE_URL`/`needs.pg`
+  guard).
+- Operator + admission-webhook images move v0.2.16 → v0.2.18, re-syncing the
+  operator/platform-stack lockstep the 0.2.17 platform-stack-only yank broke;
+  platform-stack `currentVersion` → 0.2.19. The CLI is unchanged. `change: safe`.
+
 ## platform-stack 0.2.17 — publish the 0.2.15 yank (2026-06-05)
 
 Platform-stack-only metadata release (same operator + components as 0.2.16). Marks

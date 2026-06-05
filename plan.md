@@ -2813,14 +2813,14 @@ instead of carrying parallel definitions.
 **Измерено (2026-06-05, Dragonfly v1.38.1, подтверждено исходниками):** dbnum max=1024; пустой dbnum бесплатен (ленивый DashTable); активная БД ≈ **280 кБ × num_shards** (floor, независим от ключей); dbnum immutable. → 1-shard Tier-1 инстанс держит полные 1024 tenant'а за ~287 МБ структур. Детали + Pre-merge #3–6 (cross-DB containment, in-script ACL, client-lib init, restart-durability/recycle — на in-cluster walk) — в ADR 0042.
 
 **Декомпозиция (порядок сборки).** Метки `2.6-N`, а не `2.6a–f`: `2.6a` (KEDA) / `2.6b` (needs.disk) — намеренные insert-соседи на уровне `### 2.6` (устоявшийся паттерн вставки доп. пунктов), не дети redis; отдельная нумерация снимает коллизию и даёт стабильные кросс-ссылки.
-- [ ] **2.6-1** — dragonfly-operator как platform-stack component + сид `redis-integrated` ServiceProvider + шаблон pool-инстанса (`spec.args`: `--dbnum=1024` + `--num_shards=1` дефолт все тиры, override-knob на seed/platform values, классы ephemeral/persistent). **platform-stack-only** (как 2.4a).
-- [ ] **2.6-2** — схема: `persistent?: bool` на `#ServiceNeed` (4 зеркала) + поля аллокации `status.{instance,dbnum}` на `ResourceClaim` (kube-rs + CRD). Чистая схема.
-- [ ] **2.6-3** — provisioner `Backend::Dragonfly`: ленивое создание pool-инстанса (по persistence) + аллокатор claim→`(instance,dbnum)` (free/used индекс из живых claim-статусов, `FLUSHDB`-on-allocation recycle-safety, `InsufficientCapacity`).
-- [ ] **2.6-4** — per-claim `$N` ACL-user (императивный redis-клиент, новая dep) + connection-Secret (`REDIS_URL` с `/N` + `REDIS_CHANNEL_PREFIX`).
-- [ ] **2.6-5** — ACL-reconcile loop: re-pin всех живых claim'ов инстанса на (ре)старте + periodic resync.
-- [ ] **2.6-6** — DSN-инъекция: рендерер needs→env до списка пар (`REDIS_URL`+`REDIS_CHANNEL_PREFIX`) + webhook reserved-env guard.
-- [ ] **2.6-7** — GC: dragonfly-путь (`SELECT N; FLUSHDB`; `DELUSER`; вернуть N; Secret) в 2.4f GC-контроллер.
-- [ ] **2.6-8** — `e2e/needs-redis-walk.sh` + подробный ручной walk (incl. Pre-merge #3–6 in-cluster) + dev-guide + координированный operator+platform-stack release.
+- [x] **2.6-1** — dragonfly-operator как platform-stack component + сид `redis-integrated` ServiceProvider + шаблон pool-инстанса (`spec.args`: `--dbnum=1024` + `--num_shards=1` дефолт все тиры, override-knob на seed/platform values, классы ephemeral/persistent). **platform-stack-only** (как 2.4a).
+- [x] **2.6-2** — схема: `persistent?: bool` на `#ServiceNeed` (4 зеркала) + поля аллокации `status.{instance,dbnum}` на `ResourceClaim` (kube-rs + CRD). Чистая схема.
+- [x] **2.6-3** — provisioner `Backend::Dragonfly`: ленивое создание pool-инстанса (по persistence) + аллокатор claim→`(instance,dbnum)` (free/used индекс из живых claim-статусов, `FLUSHDB`-on-allocation recycle-safety, `InsufficientCapacity`).
+- [x] **2.6-4** — per-claim `$N` ACL-user (императивный redis-клиент, новая dep) + connection-Secret (`REDIS_URL` с `/N` + `REDIS_CHANNEL_PREFIX`).
+- [x] **2.6-5** — ACL-reconcile loop: re-pin всех живых claim'ов инстанса на (ре)старте + periodic resync.
+- [x] **2.6-6** — DSN-инъекция: рендерер needs→env до списка пар (`REDIS_URL`+`REDIS_CHANNEL_PREFIX`) + webhook reserved-env guard.
+- [x] **2.6-7** — GC: dragonfly-путь (`SELECT N; FLUSHDB`; `DELUSER`; вернуть N; Secret) в 2.4f GC-контроллер.
+- [x] **2.6-8** — `e2e/needs-redis-walk.sh` + подробный ручной walk (incl. Pre-merge #3–6 in-cluster) + dev-guide + координированный operator+platform-stack release.
 
 **Acceptance:** Application с `needs.redis` получает рабочий `REDIS_URL` (DB-pinned, ключи без prefix) + `REDIS_CHANNEL_PREFIX`; два claim'а изолированы (claim B `SELECT`/`SCAN` не видит БД A → NOPERM); `persistent: true` переживает рестарт пода; per-claim юзер переживает рестарт инстанса (reconcile loop).
 

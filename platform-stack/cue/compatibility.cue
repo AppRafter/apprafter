@@ -1705,6 +1705,44 @@ compatibility: "0.1.23": {
 // component + the redis-integrated ServiceProvider so a fresh cluster
 // has the Redis stack ready for the 2.6-3 provisioner. Platform-stack-
 // only — no operator binary change (operator stays v0.2.16).
+// 0.2.19 — Phase 2.6 (needs.redis) close: the coordinated operator
+// release carrying the Dragonfly backend (lazy pool + $N per-DB
+// isolation + FLUSHDB GC) and the CRD-additive schema fields. Re-syncs
+// the operator/platform-stack lockstep the 0.2.17 platform-stack-only
+// yank broke — operator + admission-webhook images move to v0.2.18.
+compatibility: "0.2.19": {
+	change:          "safe"
+	operatorVersion: "v0.2.18"
+	notes: """
+		Phase 2.6 (needs.redis → Dragonfly, ADR 0042) close — the
+		coordinated operator + chart release. The provisioner gains a
+		`Backend::Dragonfly` arm: it lazily creates a shared Dragonfly
+		instance per persistence class, allocates each claim its own
+		numbered logical DB, drives a `$N`-pinned ACL user over the Redis
+		protocol (hard per-DB keyspace isolation), and writes a connection
+		Secret carrying REDIS_URL + REDIS_CHANNEL_PREFIX. A reconcile loop
+		re-pins claim users after an instance restart; the 7-day-grace GC
+		reclaims via FLUSHDB + ACL DELUSER.
+
+		CRD changes are additive and backward-compatible — existing claims
+		are unaffected: `persistent?` on the needs schema, `status.{instance,
+		dbnum}` allocation fields on ResourceClaim, and a relaxed
+		RetainedClaim (CNPG-specific fields made optional + new optional
+		dragonfly allocation fields; the `required` list narrows to
+		[claimRef, provider, backend, retainUntil]).
+
+		Re-syncs the operator/platform-stack lockstep the 0.2.17
+		platform-stack-only yank broke: operator + admission-webhook images
+		move to v0.2.18. The CLI is unchanged (redis claims surface via the
+		generic 2.4g `app status` claims display) — no cli/Cargo.toml bump,
+		no monorepo tag.
+		"""
+	references: [
+		"docs/superpowers/plans/2026-06-05-2.6-needs-redis-dragonfly.md",
+		"docs/adr/0042-needs-redis-dragonfly.md",
+		"plan.md#2.6-8",
+	]
+}
 compatibility: "0.2.18": {
 	change:          "safe"
 	operatorVersion: "v0.2.16" // operator binary unchanged in 2.6-1

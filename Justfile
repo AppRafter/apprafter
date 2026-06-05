@@ -118,6 +118,15 @@ e2e: e2e-gitops
 e2e-pg:
     bash e2e/needs-pg-walk.sh
 
+# Run the needs.redis ResourceClaim-chain k3d walk (generate -> schedule
+# -> provision -> resume + DSN -> $N-ACL isolation proof -> delete +
+# RetainedClaim -> force-GC -> FLUSHDB/DELUSER proof). Like e2e-pg it is
+# NOT a dependency of `e2e`: it boots a Dragonfly pod and runs on its own
+# nightly cadence via .github/workflows/e2e-redis-nightly.yml. Requires
+# Docker + k3d on PATH.
+e2e-redis:
+    bash e2e/needs-redis-walk.sh
+
 # Spin up a local k3d cluster suitable for end-to-end work.
 e2e-up:
     k3d cluster create apprafter-dev \
