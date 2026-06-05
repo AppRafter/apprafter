@@ -73,6 +73,99 @@ pub fn parse_image_ref(image: &str) -> Result<ImageRef, OciResolveError> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BearerChallenge {
+    pub realm: String,
+    pub service: Option<String>,
+    pub scope: Option<String>,
+}
+
+impl BearerChallenge {
+    /// `realm?service=<svc>&scope=<scope>` with the values percent-encoded.
+    pub fn token_url(&self) -> String {
+        let mut params: Vec<String> = Vec::new();
+        if let Some(s) = &self.service {
+            params.push(format!("service={}", urlencode(s)));
+        }
+        if let Some(s) = &self.scope {
+            params.push(format!("scope={}", urlencode(s)));
+        }
+        if params.is_empty() {
+            self.realm.clone()
+        } else {
+            format!("{}?{}", self.realm, params.join("&"))
+        }
+    }
+}
+
+/// Parse a `WWW-Authenticate: Bearer realm=...,service=...,scope=...`
+/// header. Returns `None` for non-Bearer schemes (e.g. Basic).
+pub fn parse_www_authenticate(header: &str) -> Option<BearerChallenge> {
+    let rest = header.strip_prefix("Bearer ")?;
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = None;
+    for part in split_auth_params(rest) {
+        let (k, v) = part.split_once('=')?;
+        let v = v.trim().trim_matches('"').to_string();
+        match k.trim() {
+            "realm" => realm = Some(v),
+            "service" => service = Some(v),
+            "scope" => scope = Some(v),
+            _ => {}
+        }
+    }
+    Some(BearerChallenge {
+        realm: realm?,
+        service,
+        scope,
+    })
+}
+
+/// Split `k="v",k2="v2"` on commas that are NOT inside quotes.
+fn split_auth_params(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut in_q = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                in_q = !in_q;
+                buf.push(ch);
+            }
+            ',' if !in_q => {
+                out.push(std::mem::take(&mut buf));
+            }
+            _ => buf.push(ch),
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+/// Minimal percent-encoding for the token query values (`:` `/` and
+/// space are the only chars our scopes/services contain that need it).
+fn urlencode(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u32),
+        })
+        .collect()
+}
+
+pub fn parse_token_response(body: &[u8]) -> Result<String, OciResolveError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| OciResolveError::Auth(e.to_string()))?;
+    v.get("token")
+        .or_else(|| v.get("access_token"))
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .ok_or_else(|| OciResolveError::Auth("token response had no token".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +230,42 @@ mod tests {
     #[test]
     fn parse_image_ref_empty_is_error() {
         assert!(parse_image_ref("").is_err());
+    }
+
+    #[test]
+    fn parse_www_authenticate_bearer_challenge() {
+        let h = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:acme/web:pull""#;
+        let c = parse_www_authenticate(h).unwrap();
+        assert_eq!(c.realm, "https://ghcr.io/token");
+        assert_eq!(c.service.as_deref(), Some("ghcr.io"));
+        assert_eq!(c.scope.as_deref(), Some("repository:acme/web:pull"));
+    }
+
+    #[test]
+    fn parse_www_authenticate_non_bearer_is_none() {
+        assert!(parse_www_authenticate("Basic realm=\"x\"").is_none());
+    }
+
+    #[test]
+    fn token_url_builds_query_from_challenge() {
+        let c = BearerChallenge {
+            realm: "https://ghcr.io/token".into(),
+            service: Some("ghcr.io".into()),
+            scope: Some("repository:acme/web:pull".into()),
+        };
+        let url = c.token_url();
+        assert!(url.starts_with("https://ghcr.io/token?"));
+        assert!(url.contains("service=ghcr.io"));
+        assert!(url.contains("scope=repository%3Aacme%2Fweb%3Apull"));
+    }
+
+    #[test]
+    fn parse_token_response_accepts_token_and_access_token() {
+        assert_eq!(parse_token_response(br#"{"token":"abc"}"#).unwrap(), "abc");
+        assert_eq!(
+            parse_token_response(br#"{"access_token":"xyz"}"#).unwrap(),
+            "xyz"
+        );
+        assert!(parse_token_response(br#"{}"#).is_err());
     }
 }
