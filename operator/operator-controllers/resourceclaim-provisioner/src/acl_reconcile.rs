@@ -324,7 +324,12 @@ pub async fn reconcile_instance_acls(
 /// ServiceProvider config, falling back to the well-known default. Mirrors
 /// `provision_dragonfly`'s `config.namespace` read so the loop targets the
 /// same namespace the provisioner created the instance in.
-async fn redis_namespace(ctx: &Arc<Context>) -> Result<String, ReconcileError> {
+///
+/// `pub(crate)` so the GC (`gc.rs`) resolves the dragonfly namespace the
+/// SAME way when reclaiming a snapshot — the RetainedClaim carries the
+/// instance NAME but not its namespace, so both readers derive it from the
+/// seeded ServiceProvider config (one source of truth).
+pub(crate) async fn redis_namespace(ctx: &Arc<Context>) -> Result<String, ReconcileError> {
     let providers: Vec<operator_core::ServiceProvider> =
         Api::<operator_core::ServiceProvider>::all(ctx.client.clone())
             .list(&Default::default())
@@ -344,7 +349,10 @@ async fn redis_namespace(ctx: &Arc<Context>) -> Result<String, ReconcileError> {
 /// UTF-8 string. (Secrets created with `stringData` come back base64 under
 /// `data` on read.) Errors if the Secret or key is missing / not base64 /
 /// not UTF-8.
-async fn read_secret_key(
+///
+/// `pub(crate)` so the GC reads a pool instance's admin password the same
+/// way (the `{instance}-admin` Secret's `password` key).
+pub(crate) async fn read_secret_key(
     ctx: &Arc<Context>,
     ns: &str,
     secret_name: &str,

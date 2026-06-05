@@ -61,7 +61,9 @@ use tracing::{info, warn};
 
 use operator_core::{Metrics, ResourceClaim, RetainedClaim};
 
+use crate::acl_reconcile::{read_secret_key, redis_namespace};
 use crate::cnpg;
+use crate::dragonfly;
 use crate::grace;
 use crate::reconcile::{apply_params, cluster_ar, database_ar, secret_ar, GC_ROLE_RMW_RETRIES};
 use crate::{Context, ReconcileError};
@@ -177,6 +179,16 @@ pub async fn reconcile(
         _ => {}
     }
 
+    // Backend dispatch (2.6-7). The live-guard above is backend-agnostic
+    // (it protects ANY recovery re-claim from a destructive drop). Past it,
+    // the reclaim mechanics diverge: dragonfly is `FLUSHDB` + `ACL DELUSER`
+    // + connection-Secret delete + snapshot delete; CNPG is the 2.4f phased
+    // role/DB drop below. A legacy / empty backend defaults to CNPG.
+    match gc_backend(&rc.spec.backend) {
+        GcBackend::Dragonfly => return gc_drop_dragonfly(&ctx, &rc, &rc_ns, &rc_name).await,
+        GcBackend::Cnpg => { /* fall through to the phased CNPG drop */ }
+    }
+
     // Phased role drop (2.4f Fix B2). CNPG drops a managed role ONLY via
     // an `ensure: absent` entry (pruning the entry merely un-manages it —
     // the role-leak bug), and it CANNOT drop a role that still owns a
@@ -272,6 +284,132 @@ async fn finalize_drop(
     info!(retained = %rc_name, "RetainedClaim GC complete");
 
     Ok(Action::requeue(REQUEUE_AFTER))
+}
+
+/// Dragonfly reclaim (2.6-7, ADR 0042 §8). The live-guard has already run
+/// (shared with the CNPG path), so we are past the grace window with the
+/// claim confirmed gone. Reclaim the per-claim allocation imperatively over
+/// the Redis admin seam, then delete the connection Secret + the snapshot.
+///
+/// Order: `FLUSHDB` the numbered DB (wipe the claim's data so a future
+/// dbnum reuse starts empty — belt-and-suspenders, the provisioner also
+/// flushes on allocate), then `ACL DELUSER` the `$N`-pinned user (revoke
+/// access). The freed `dbnum` returns to the pool implicitly — the next
+/// allocation scan reads only LIVE claims' `status.dbnum`, and this claim
+/// is gone, so its number is free again with no explicit release.
+///
+/// Idempotent + failure-tolerant by design: a snapshot with no allocation
+/// (`instance`/`dbnum`/`aclUser` absent — a claim deleted before it was
+/// ever provisioned) skips the Redis ops entirely; a Redis op against a
+/// torn-down instance (the whole pool instance was deleted, e.g. a tier
+/// teardown) is logged and tolerated rather than wedging the GC forever on
+/// an unreachable host — there is nothing left to leak in that case. The
+/// connection Secret usually already cascaded on the original claim delete
+/// (it is owner-ref'd to the claim); the delete here is belt-and-suspenders
+/// for the recovery path and is 404-tolerant.
+async fn gc_drop_dragonfly(
+    ctx: &Arc<Context>,
+    rc: &RetainedClaim,
+    rc_ns: &str,
+    rc_name: &str,
+) -> Result<Action, ReconcileError> {
+    // Reclaim the DB + revoke the user only when there IS a complete
+    // allocation. A claim deleted before it was ever provisioned snapshots
+    // with no instance/user, so there is nothing on a Dragonfly instance to
+    // drop — skip straight to the Secret + snapshot cleanup.
+    if let Some(target) = dragonfly_reclaim_target(rc) {
+        let DragonflyReclaim {
+            instance,
+            dbnum,
+            acl_user,
+        } = target;
+        // The snapshot carries the instance NAME but not its namespace;
+        // resolve it the SAME way the provisioner + ACL loop do (the seeded
+        // `redis-integrated` ServiceProvider config, default `dragonfly-system`).
+        let df_ns = redis_namespace(ctx).await?;
+        let addr = dragonfly::instance_addr(&instance, &df_ns);
+        let admin_secret = dragonfly::admin_secret_name(&instance);
+
+        // Reading the admin password is itself tolerated-on-failure: if the
+        // instance (and its admin Secret) is already gone, there is nothing
+        // left to reclaim on it, so we log and proceed to the local cleanup
+        // rather than failing the whole GC closed on an unreachable host.
+        match read_secret_key(ctx, &df_ns, &admin_secret, "password").await {
+            Ok(admin_pw) => {
+                if let Some(dbnum) = dbnum {
+                    if let Err(err) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
+                        warn!(
+                            retained = %rc_name, %instance, dbnum, %err,
+                            "dragonfly FLUSHDB failed during GC — tolerating (instance may be gone)"
+                        );
+                    }
+                }
+                if let Err(err) = ctx.redis.acl_deluser(&addr, &admin_pw, &acl_user).await {
+                    warn!(
+                        retained = %rc_name, %instance, user = %acl_user, %err,
+                        "dragonfly ACL DELUSER failed during GC — tolerating (instance may be gone)"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    retained = %rc_name, %instance, %err,
+                    "dragonfly admin Secret unreadable during GC (instance likely torn down) — \
+                     skipping FLUSHDB/DELUSER, proceeding to Secret + snapshot cleanup"
+                );
+            }
+        }
+    } else {
+        info!(
+            retained = %rc_name,
+            "dragonfly snapshot has no allocation (claim deleted pre-provision) — \
+             nothing to reclaim on an instance"
+        );
+    }
+
+    // Delete the connection Secret in the claim's origin namespace
+    // (belt-and-suspenders — it usually cascaded on the original claim
+    // delete via its ownerRef; 404-tolerant for the case it did not).
+    delete_connection_secret(ctx, rc).await?;
+
+    // Terminal step: drop the snapshot.
+    delete_retained_claim(&ctx.client, rc_ns, rc_name).await?;
+
+    ctx.metrics
+        .claim_gc_total
+        .with_label_values(&["success", rc_ns])
+        .inc();
+    info!(retained = %rc_name, "dragonfly RetainedClaim GC complete");
+
+    Ok(Action::requeue(REQUEUE_AFTER))
+}
+
+/// Delete the dragonfly connection Secret in the claim's origin namespace.
+/// Swallows a 404 (it normally cascaded already via its ownerRef on the
+/// original claim delete; this is the recovery-path belt-and-suspenders).
+/// A snapshot missing the ref/namespace (a pre-provision delete) is a no-op.
+async fn delete_connection_secret(
+    ctx: &Arc<Context>,
+    rc: &RetainedClaim,
+) -> Result<(), ReconcileError> {
+    let (Some(secret), Some(ns)) = (
+        rc.spec.connection_secret_ref.as_deref(),
+        rc.spec.connection_secret_namespace.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
+    match api.delete(secret, &DeleteParams::default()).await {
+        Ok(_) => {
+            info!(secret = %secret, %ns, "dragonfly connection Secret deleted");
+            Ok(())
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            info!(secret = %secret, "dragonfly connection Secret already gone — delete no-op");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Error policy: increment the GC error counter + requeue after 30s
@@ -517,6 +655,62 @@ async fn delete_retained_claim(
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without a cluster)
 // ---------------------------------------------------------------------------
+
+/// Which backend's reclaim path a `RetainedClaim` routes to (2.6-7). The
+/// snapshot's `spec.backend` mirrors the matched provider's `spec.backend`
+/// (`cloudnative-pg` / `dragonfly`). Pure so the dispatch is unit-pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcBackend {
+    /// The 2.4f phased CNPG drop (DB `ensure: absent` → role drop → prune).
+    Cnpg,
+    /// The 2.6 dragonfly drop (`FLUSHDB` + `ACL DELUSER` + Secret delete).
+    Dragonfly,
+}
+
+/// Route a snapshot's `spec.backend` to its reclaim path. Only `dragonfly`
+/// selects the dragonfly drop; EVERYTHING else (including the empty string
+/// on legacy pre-2.6 snapshots that predate the multi-backend split, and
+/// the `cloudnative-pg` value) defaults to the CNPG path — matching the
+/// snapshot writer's default and never mis-routing a CNPG snapshot to the
+/// dragonfly path (which would no-op on the absent dragonfly fields).
+pub fn gc_backend(backend: &str) -> GcBackend {
+    match backend {
+        "dragonfly" => GcBackend::Dragonfly,
+        _ => GcBackend::Cnpg,
+    }
+}
+
+/// The per-claim Dragonfly allocation a snapshot points at, when the claim
+/// was actually provisioned. `None` for a snapshot with no instance/user
+/// (a claim deleted before it ever reached an instance), which the GC
+/// treats as "nothing to reclaim on a Dragonfly host".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragonflyReclaim {
+    /// The shared pool instance the claim's DB lived on.
+    pub instance: String,
+    /// The numbered logical DB to `FLUSHDB` (`None` only if the snapshot is
+    /// malformed — has an instance + user but no dbnum; the user is still
+    /// `DELUSER`'d, the flush is skipped).
+    pub dbnum: Option<u16>,
+    /// The `$N`-pinned ACL username to `DELUSER`.
+    pub acl_user: String,
+}
+
+/// Pure: what the dragonfly GC must reclaim on an instance for this
+/// snapshot, or `None` when there is nothing on a Dragonfly host to drop
+/// (the claim was deleted before it was ever provisioned, so the snapshot
+/// carries no `instance`/`aclUser`). Pinned so the "pre-provision delete →
+/// skip the Redis ops" tolerance is a unit-catchable regression guard
+/// (mirrors the snapshot writer's pre-allocation branch).
+pub fn dragonfly_reclaim_target(rc: &RetainedClaim) -> Option<DragonflyReclaim> {
+    let instance = rc.spec.instance.clone().filter(|s| !s.is_empty())?;
+    let acl_user = rc.spec.acl_user.clone().filter(|s| !s.is_empty())?;
+    Some(DragonflyReclaim {
+        instance,
+        dbnum: rc.spec.dbnum,
+        acl_user,
+    })
+}
 
 /// True iff the fetched `ResourceClaim` is LIVE — present with no
 /// `deletion_timestamp` (Phase 2.4f Fix A live-guard).
@@ -854,6 +1048,96 @@ mod tests {
         let status = json!({ "cannotReconcile": { "claim_demo_web": [] } });
         assert_eq!(
             role_cannot_reconcile_reason(&status, "claim_demo_web"),
+            None
+        );
+    }
+
+    // --- gc_backend() (2.6-7 backend dispatch) ---
+
+    #[test]
+    fn gc_dispatch_selects_backend() {
+        assert_eq!(gc_backend("dragonfly"), GcBackend::Dragonfly);
+        assert_eq!(gc_backend("cloudnative-pg"), GcBackend::Cnpg);
+        // Legacy / empty snapshots predate the multi-backend split and
+        // carry the CNPG shape — default to the CNPG drop so they are never
+        // mis-routed to the (no-op-on-CNPG-fields) dragonfly path.
+        assert_eq!(gc_backend(""), GcBackend::Cnpg);
+        assert_eq!(gc_backend("redis"), GcBackend::Cnpg); // type, not backend
+    }
+
+    // --- dragonfly_reclaim_target() (2.6-7 pre-provision-delete tolerance) ---
+
+    /// Build a dragonfly-shaped `RetainedClaim` with the given allocation.
+    fn dragonfly_snapshot(
+        instance: Option<&str>,
+        dbnum: Option<u16>,
+        acl_user: Option<&str>,
+    ) -> RetainedClaim {
+        RetainedClaim::new(
+            "claim-demo-web-redis",
+            operator_core::RetainedClaimSpec {
+                claim_ref: operator_core::retainedclaim::ClaimRef {
+                    name: "web-redis".into(),
+                    namespace: "demo".into(),
+                },
+                provider: "redis-integrated".into(),
+                backend: "dragonfly".into(),
+                instance: instance.map(str::to_owned),
+                dbnum,
+                acl_user: acl_user.map(str::to_owned),
+                connection_secret_ref: Some("web-redis-conn".into()),
+                connection_secret_namespace: Some("demo".into()),
+                retain_until: "2026-06-12T00:00:00+00:00".into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn dragonfly_reclaim_target_present_for_a_provisioned_claim() {
+        let rc = dragonfly_snapshot(
+            Some("platform-redis-ephemeral-000"),
+            Some(7),
+            Some("claim_demo_web-redis_redis"),
+        );
+        assert_eq!(
+            dragonfly_reclaim_target(&rc),
+            Some(DragonflyReclaim {
+                instance: "platform-redis-ephemeral-000".into(),
+                dbnum: Some(7),
+                acl_user: "claim_demo_web-redis_redis".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn dragonfly_reclaim_target_none_when_no_allocation() {
+        // A claim deleted BEFORE it was ever provisioned: the snapshot
+        // carries no instance/user, so there is nothing on a Dragonfly host
+        // to reclaim — the GC must skip the Redis ops (and not blow up
+        // trying to reach an instance that never existed). The Secret +
+        // snapshot cleanup still runs.
+        assert_eq!(
+            dragonfly_reclaim_target(&dragonfly_snapshot(None, None, None)),
+            None
+        );
+        // Partial snapshots (instance but no user, or vice versa) are also
+        // treated as "nothing to reclaim" — both are required to act.
+        assert_eq!(
+            dragonfly_reclaim_target(&dragonfly_snapshot(
+                Some("platform-redis-ephemeral-000"),
+                Some(7),
+                None
+            )),
+            None
+        );
+        assert_eq!(
+            dragonfly_reclaim_target(&dragonfly_snapshot(None, Some(7), Some("u"))),
+            None
+        );
+        // An empty-string instance/user is equivalent to absent.
+        assert_eq!(
+            dragonfly_reclaim_target(&dragonfly_snapshot(Some(""), Some(7), Some("u"))),
             None
         );
     }
