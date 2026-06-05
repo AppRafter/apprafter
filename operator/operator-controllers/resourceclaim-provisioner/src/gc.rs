@@ -87,7 +87,7 @@ const ROLE_DROP_REQUEUE: Duration = Duration::from_secs(15);
 /// Spawn the RetainedClaim GC Controller (7th controller).
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
     let retained: Api<RetainedClaim> = Api::all(client.clone());
-    let ctx = Arc::new(Context { client, metrics });
+    let ctx = Arc::new(Context::new(client, metrics));
     info!("RetainedClaimGC starting");
     Controller::new(retained, watcher::Config::default())
         .run(reconcile, error_policy, ctx)

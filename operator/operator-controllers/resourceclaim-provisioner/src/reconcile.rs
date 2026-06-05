@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use chrono::Utc;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
@@ -454,12 +455,67 @@ async fn provision_dragonfly(
         }
     };
 
-    // 3. Persist the allocation (instance + dbnum) so a later reconcile
-    //    (and Task 4's ACL path) reads it back. This patch does NOT set
-    //    `ready` — Task 4 flips that once the ACL user + connection Secret
-    //    exist. Under our own field manager (the SSA split stays intact:
-    //    instance/dbnum are provisioner-owned, never scheduler fields).
+    // 3. Persist the allocation (instance + dbnum) so a crash between here
+    //    and the ACL apply re-reads it back idempotently (the
+    //    `existing_alloc` short-circuit above), and a later reconcile / the
+    //    re-pin loop (2.6-5) reads it. Under our own field manager (the SSA
+    //    split stays intact: instance/dbnum are provisioner-owned, never
+    //    scheduler fields). This patch does NOT set `ready` — step 6 does,
+    //    only after the ACL user + connection Secret exist.
     patch_allocation(&ctx.client, ns, name, &instance, dbnum).await?;
+
+    // 4. Drive the per-claim `$N` ACL user imperatively (it is runtime
+    //    state, not declarable on the CR). Read the instance admin
+    //    password, FLUSHDB the target DB FIRST (recycle-safety: a reused
+    //    dbnum must start empty — ADR 0042 §3), then ACL SETUSER the
+    //    `$N`-pinned, keyspace-isolated user with a fresh password.
+    let addr = dragonfly::instance_addr(&instance, &df_ns);
+    let admin_pw = read_admin_password(ctx, &df_ns, &admin_secret_name).await?;
+    let user = dragonfly::acl_user(ns, name);
+    let claim_pw = generate_password();
+
+    ctx.redis
+        .flushdb(&addr, &admin_pw, dbnum)
+        .await
+        .map_err(|e| ReconcileError::Provisioning(format!("dragonfly FLUSHDB: {e}")))?;
+    let setuser_args = dragonfly::acl_setuser_args(&user, &claim_pw, dbnum);
+    ctx.redis
+        .acl_setuser(&addr, &admin_pw, &setuser_args)
+        .await
+        .map_err(|e| ReconcileError::Provisioning(format!("dragonfly ACL SETUSER: {e}")))?;
+
+    // 5. Apply the connection Secret in the claim's namespace, owner-ref'd
+    //    to the claim so it cascades on delete. Two keys: the `$N`-pinned
+    //    DSN + the pub/sub channel prefix the `&{user}:*` ACL enforces.
+    let conn_secret_name = connection_secret_name(name);
+    let dsn = dragonfly::redis_dsn(&user, &claim_pw, &instance, &df_ns, dbnum);
+    let prefix = dragonfly::channel_prefix(&user);
+    let owner_uid = claim.metadata.uid.clone().unwrap_or_default();
+    let conn_secret =
+        redis_connection_secret_object(&conn_secret_name, ns, &dsn, &prefix, &owner_uid, name);
+    let conn_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
+    conn_api
+        .patch(
+            &conn_secret_name,
+            &apply_params(),
+            &Patch::Apply(&conn_secret),
+        )
+        .await?;
+
+    // 6. Write status — ready / connectionSecretRef / Ready condition,
+    //    under our own field manager.
+    let prior: Vec<ResourceClaimCondition> = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let cond = ready_condition(
+        "True",
+        "Provisioned",
+        &format!("provisioned into {instance} ({df_ns}) DB {dbnum}"),
+        &prior,
+    );
+    patch_status(&ctx.client, ns, name, &conn_secret_name, cond).await?;
 
     ctx.metrics
         .claim_provisioned_total
@@ -469,11 +525,58 @@ async fn provision_dragonfly(
         .reconcile_total
         .with_label_values(&[KIND, ns, "ok"])
         .inc();
-    info!(%name, %ns, %instance, dbnum, "dragonfly claim allocated — awaiting ACL (Task 4)");
+    info!(%name, %ns, %instance, dbnum, %user, "dragonfly claim provisioned");
 
-    // Requeue so Task 4's path completes the claim once wired. Short
-    // requeue keeps the gap small in the interim.
-    Ok(Action::requeue(Duration::from_secs(30)))
+    // Recovery (2.4f Fix A, mirrored for dragonfly): the claim is now
+    // (re)provisioned, so any RetainedClaim from a prior deletion is stale
+    // — cancel it so its grace-GC can never FLUSHDB/DELUSER this now-live
+    // claim's DB/user. Deterministic name (`cnpg::k8s_name(ns, name)` ==
+    // `object_name`), 404-tolerant.
+    let object_name = cnpg::k8s_name(ns, name);
+    let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
+    if let Err(e) = rc_api.delete(&object_name, &DeleteParams::default()).await {
+        if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
+            warn!(%object_name, error=%e, "could not cancel stale RetainedClaim on dragonfly re-provision");
+        }
+    }
+
+    // Re-poll on the standard cadence; the ACL user is re-asserted by the
+    // 2.6-5 reconcile loop after an instance restart.
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Read the `password` key from a pool instance's admin Secret. The
+/// Secret is created with `stringData`, so on read the value comes back
+/// base64-encoded under `data.password`.
+async fn read_admin_password(
+    ctx: &Arc<Context>,
+    df_ns: &str,
+    admin_secret_name: &str,
+) -> Result<String, ReconcileError> {
+    let secret_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), df_ns, &secret_ar());
+    let secret = secret_api.get(admin_secret_name).await?;
+    let raw = secret
+        .data
+        .pointer("/data/password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ReconcileError::Provisioning(format!(
+                "Dragonfly admin Secret {admin_secret_name} missing data.password"
+            ))
+        })?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| {
+            ReconcileError::Provisioning(format!(
+                "Dragonfly admin Secret {admin_secret_name} password not base64: {e}"
+            ))
+        })?;
+    String::from_utf8(decoded).map_err(|e| {
+        ReconcileError::Provisioning(format!(
+            "Dragonfly admin Secret {admin_secret_name} password not UTF-8: {e}"
+        ))
+    })
 }
 
 /// SSA-patch ONLY the dragonfly allocation fields (`status.instance` /
@@ -647,20 +750,60 @@ async fn snapshot_retained_claim(
         .unwrap_or_else(Utc::now);
     let retain_until = grace::compute_retain_until(deletion, grace::GRACE_PERIOD).to_rfc3339();
 
-    let payload = retained_claim_object(
-        &object_name,
-        name,
-        ns,
-        &provider_name,
-        &backend,
-        &cluster,
-        &cnpg_ns,
-        &role,
-        &db,
-        &object_name,
-        &pw_secret_name,
-        &retain_until,
-    );
+    // Backend-dispatch the snapshot shape. A dragonfly claim carries its
+    // allocation (`status.instance` / `status.dbnum`) — snapshot that +
+    // the deterministic ACL user + connection-Secret ref so the GC
+    // (2.6-7) can FLUSHDB + DELUSER. Everything else stays the CNPG shape.
+    let payload = match Backend::from_spec_backend(&backend) {
+        Some(Backend::Dragonfly) => {
+            let (instance, dbnum) = claim
+                .status
+                .as_ref()
+                .and_then(|s| Some((s.instance.clone()?, s.dbnum?)))
+                .unwrap_or_default();
+            if instance.is_empty() {
+                // A dragonfly claim deleted before it was ever allocated:
+                // no DB/ACL exists, so there is nothing for the GC to drop.
+                // Snapshot it anyway (the GC tolerates the missing
+                // allocation) so the 7-day RetainedClaim lifecycle is
+                // uniform — the dragonfly GC path 404-tolerates everything.
+                warn!(
+                    %name, %ns,
+                    "dragonfly claim deleted before allocation — snapshotting without instance/dbnum"
+                );
+            }
+            let acl_user = dragonfly::acl_user(ns, name);
+            let conn_secret_name = connection_secret_name(name);
+            retained_claim_dragonfly_object(
+                &object_name,
+                name,
+                ns,
+                &provider_name,
+                &instance,
+                dbnum,
+                &acl_user,
+                &conn_secret_name,
+                ns,
+                &retain_until,
+            )
+        }
+        // CNPG (or an unknown/empty backend — legacy snapshots default to
+        // the CNPG shape, matching the GC's `gc_backend("")` default).
+        _ => retained_claim_object(
+            &object_name,
+            name,
+            ns,
+            &provider_name,
+            &backend,
+            &cluster,
+            &cnpg_ns,
+            &role,
+            &db,
+            &object_name,
+            &pw_secret_name,
+            &retain_until,
+        ),
+    };
 
     let api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
     api.patch(&object_name, &apply_params(), &Patch::Apply(&payload))
@@ -853,6 +996,46 @@ pub fn connection_secret_object(
     })
 }
 
+/// Build the dragonfly connection Secret apply body: an `Opaque` Secret
+/// carrying BOTH `REDIS_URL` (the `$N`-pinned DSN) and
+/// `REDIS_CHANNEL_PREFIX` (the pub/sub prefix the app must apply),
+/// owner-ref'd to the `ResourceClaim` so it cascades on claim delete.
+/// The renderer (2.6-6) injects both keys; KEEP THE KEYS in sync with
+/// `operator-rendering`'s `NEEDS_ENV_BINDINGS` and the webhook guard.
+pub fn redis_connection_secret_object(
+    name: &str,
+    ns: &str,
+    dsn: &str,
+    channel_prefix: &str,
+    owner_uid: &str,
+    owner_name: &str,
+) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+            "ownerReferences": [{
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "ResourceClaim",
+                "name": owner_name,
+                "uid": owner_uid,
+                "controller": true,
+                "blockOwnerDeletion": true,
+            }],
+        },
+        "type": "Opaque",
+        "stringData": {
+            "REDIS_URL": dsn,
+            "REDIS_CHANNEL_PREFIX": channel_prefix,
+        },
+    })
+}
+
 /// Build the flat `apprafter.io/v1alpha1` `RetainedClaim` SSA-apply body
 /// the finalizer snapshots into `apprafter-system` before un-finalizing
 /// a deleted claim (Phase 2.4f).
@@ -898,6 +1081,50 @@ pub fn retained_claim_object(
             "database": database,
             "databaseObjectName": database_object_name,
             "passwordSecretName": password_secret_name,
+            "retainUntil": retain_until,
+        },
+    })
+}
+
+/// Build the flat `RetainedClaim` SSA-apply body for a DRAGONFLY claim
+/// (2.6-4). Carries the allocation (`instance` / `dbnum`), the `$N` ACL
+/// username, and the connection-Secret ref/namespace — everything the GC
+/// (2.6-7) needs to `FLUSHDB` + `ACL DELUSER` + drop the Secret once
+/// `retainUntil` passes. No CNPG fields are set (the GC backend-dispatches
+/// on `spec.backend`). Same deterministic `snapshot_name` /
+/// `apprafter-system` placement / `claimRef` lineage as the CNPG path.
+#[allow(clippy::too_many_arguments)]
+pub fn retained_claim_dragonfly_object(
+    snapshot_name: &str,
+    claim_name: &str,
+    claim_ns: &str,
+    provider: &str,
+    instance: &str,
+    dbnum: u16,
+    acl_user: &str,
+    connection_secret_ref: &str,
+    connection_secret_namespace: &str,
+    retain_until: &str,
+) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "RetainedClaim",
+        "metadata": {
+            "name": snapshot_name,
+            "namespace": RETAINED_CLAIM_NAMESPACE,
+        },
+        "spec": {
+            "claimRef": {
+                "name": claim_name,
+                "namespace": claim_ns,
+            },
+            "provider": provider,
+            "backend": "dragonfly",
+            "instance": instance,
+            "dbnum": dbnum,
+            "aclUser": acl_user,
+            "connectionSecretRef": connection_secret_ref,
+            "connectionSecretNamespace": connection_secret_namespace,
             "retainUntil": retain_until,
         },
     })
@@ -1157,6 +1384,79 @@ mod tests {
         );
         assert_eq!(snapshot["metadata"]["name"], object_name);
         assert_eq!(object_name, "claim-demo-demo-web-pg");
+    }
+
+    // --- redis_connection_secret_object() (2.6-4) ---
+
+    #[test]
+    fn redis_connection_secret_carries_both_keys_and_owner_ref_cascade() {
+        let s = redis_connection_secret_object(
+            "web-redis-conn",
+            "demo",
+            "redis://claim_demo_web_redis:p@platform-redis-ephemeral-000.dragonfly-system.svc:6379/7",
+            "claim_demo_web_redis:",
+            "uid-123",
+            "web-redis",
+        );
+        assert_eq!(s["apiVersion"], "v1");
+        assert_eq!(s["kind"], "Secret");
+        assert_eq!(s["metadata"]["name"], "web-redis-conn");
+        assert_eq!(s["metadata"]["namespace"], "demo");
+        assert_eq!(s["type"], "Opaque");
+        // Both env keys land in the connection Secret.
+        assert_eq!(
+            s["stringData"]["REDIS_URL"],
+            "redis://claim_demo_web_redis:p@platform-redis-ephemeral-000.dragonfly-system.svc:6379/7"
+        );
+        assert_eq!(
+            s["stringData"]["REDIS_CHANNEL_PREFIX"],
+            "claim_demo_web_redis:"
+        );
+        // ownerReference → ResourceClaim cascade (same as the pg path).
+        let owner = &s["metadata"]["ownerReferences"][0];
+        assert_eq!(owner["apiVersion"], "apprafter.io/v1alpha1");
+        assert_eq!(owner["kind"], "ResourceClaim");
+        assert_eq!(owner["name"], "web-redis");
+        assert_eq!(owner["uid"], "uid-123");
+        assert_eq!(owner["controller"], true);
+        assert_eq!(owner["blockOwnerDeletion"], true);
+    }
+
+    // --- retained_claim_dragonfly_object() (2.6-4 finalizer snapshot) ---
+
+    #[test]
+    fn retained_claim_dragonfly_object_carries_allocation_and_no_cnpg_fields() {
+        let snapshot_name = cnpg::k8s_name("demo", "web-redis");
+        let rc = retained_claim_dragonfly_object(
+            &snapshot_name,
+            "web-redis",
+            "demo",
+            "redis-integrated",
+            "platform-redis-ephemeral-000",
+            7,
+            "claim_demo_web-redis_redis",
+            "web-redis-conn",
+            "demo",
+            "2026-06-12T00:00:00+00:00",
+        );
+        assert_eq!(rc["apiVersion"], "apprafter.io/v1alpha1");
+        assert_eq!(rc["kind"], "RetainedClaim");
+        assert_eq!(rc["metadata"]["name"], snapshot_name);
+        assert_eq!(rc["metadata"]["namespace"], "apprafter-system");
+        assert_eq!(rc["spec"]["claimRef"]["name"], "web-redis");
+        assert_eq!(rc["spec"]["claimRef"]["namespace"], "demo");
+        assert_eq!(rc["spec"]["provider"], "redis-integrated");
+        assert_eq!(rc["spec"]["backend"], "dragonfly");
+        assert_eq!(rc["spec"]["instance"], "platform-redis-ephemeral-000");
+        assert_eq!(rc["spec"]["dbnum"], 7);
+        assert_eq!(rc["spec"]["aclUser"], "claim_demo_web-redis_redis");
+        assert_eq!(rc["spec"]["connectionSecretRef"], "web-redis-conn");
+        assert_eq!(rc["spec"]["connectionSecretNamespace"], "demo");
+        assert_eq!(rc["spec"]["retainUntil"], "2026-06-12T00:00:00+00:00");
+        // No CNPG fields leak onto a dragonfly snapshot.
+        assert!(rc["spec"].get("cnpgCluster").is_none());
+        assert!(rc["spec"].get("role").is_none());
+        assert!(rc["spec"].get("databaseObjectName").is_none());
     }
 
     #[test]

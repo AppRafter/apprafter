@@ -63,6 +63,9 @@ pub mod dragonfly;
 pub mod gc;
 pub mod grace;
 pub mod reconcile;
+pub mod redis_client;
+
+use redis_client::{RedisAdmin, RedisClient};
 
 pub(crate) const KIND: &str = "ResourceClaim";
 
@@ -82,6 +85,24 @@ pub(crate) const PROVISIONER_FINALIZER: &str = "apprafter.io/resourceclaim-provi
 pub struct Context {
     pub client: Client,
     pub metrics: Arc<Metrics>,
+    /// Imperative Redis admin seam for the dragonfly backend (per-claim
+    /// `$N` ACL users + `FLUSHDB`). Injected so the reconcile + GC logic
+    /// is testable with a fake; production is [`RedisClient`]. Unused by
+    /// the CNPG path. ADR 0042 §2/§4.
+    pub redis: Arc<dyn RedisAdmin>,
+}
+
+impl Context {
+    /// Construct a [`Context`] with the production [`RedisClient`] seam.
+    /// Both controllers ([`run`] + [`gc::run`]) share this so the redis
+    /// admin path is wired identically.
+    pub fn new(client: Client, metrics: Arc<Metrics>) -> Self {
+        Self {
+            client,
+            metrics,
+            redis: Arc::new(RedisClient),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -108,7 +129,7 @@ pub enum ReconcileError {
 /// `Cluster` / `Database` CRs. A proper watch is future work.
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
     let claims: Api<ResourceClaim> = Api::all(client.clone());
-    let ctx = Arc::new(Context { client, metrics });
+    let ctx = Arc::new(Context::new(client, metrics));
     info!(
         field_manager = FIELD_MANAGER,
         "ResourceClaimProvisioner starting"

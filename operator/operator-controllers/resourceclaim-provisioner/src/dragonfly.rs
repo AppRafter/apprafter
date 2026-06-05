@@ -50,6 +50,52 @@ pub fn instance_addr(instance: &str, ns: &str) -> String {
     format!("{instance}.{ns}.svc:6379")
 }
 
+/// `ACL SETUSER` argument vector for a `$N`-pinned, keyspace-isolated
+/// claim user (ADR 0042 §2). Hard DB boundary via `$N`; ordinary key
+/// names via `~*` (scoped to DB N by the pin); pub/sub confined to the
+/// claim's channel prefix; admin/dangerous blocked, safe introspection
+/// re-granted. Scripting (`@scripting`) is retained (the `+@all` grant
+/// keeps it; declared-keys default + the `$N` pin confine any script to
+/// the claim's DB). Driven over the Redis client (`redis_client.rs`), not
+/// the CR. `resetkeys` / `resetchannels` clear any inherited grants
+/// before re-applying, so a re-pin (instance restart) is idempotent.
+pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
+    vec![
+        user.to_string(),
+        "on".into(),
+        format!(">{password}"),
+        format!("${dbnum}"),
+        "resetkeys".into(),
+        "~*".into(),
+        "resetchannels".into(),
+        format!("&{user}:*"),
+        "+@all".into(),
+        "-@admin".into(),
+        "-@dangerous".into(),
+        "+info".into(),
+        "+sort_ro".into(),
+        "+client|setname".into(),
+        "+client|setinfo".into(),
+        "+client|getname".into(),
+        "+client|id".into(),
+    ]
+}
+
+/// DB-pinned connection URL. The `/N` selects DB N; the `$N` ACL pins the
+/// user there, so the app uses ordinary key names (no prefix). The host
+/// is the pool instance's in-cluster Service.
+pub fn redis_dsn(user: &str, password: &str, instance: &str, ns: &str, dbnum: u16) -> String {
+    format!("redis://{user}:{password}@{instance}.{ns}.svc:6379/{dbnum}")
+}
+
+/// Pub/sub channel name prefix the app must apply (the `&{user}:*` ACL
+/// enforces it). Keys need no prefix — only channels are not DB-scoped,
+/// so the channel namespace is shared across DBs on one instance and must
+/// be partitioned by the user prefix.
+pub fn channel_prefix(user: &str) -> String {
+    format!("{user}:")
+}
+
 /// Build a shared Dragonfly CR body for SSA apply. `persistent` adds a
 /// snapshot→PVC block (whole-instance durability; ADR 0042 §6). The
 /// provisioner creates a per-instance admin-password Secret separately
@@ -309,5 +355,53 @@ mod tests {
         )];
         let used = used_dbnums_on_instance(&claims, "platform-redis-ephemeral-000");
         assert!(used.is_empty());
+    }
+
+    // --- acl_setuser_args() ---
+
+    #[test]
+    fn acl_setuser_args_pin_db_and_keyspace() {
+        let args = acl_setuser_args("claim_demo_web_redis", "s3cr3t", 7);
+        // ACL SETUSER <user> on >pw $7 resetkeys ~* resetchannels
+        //   &claim_demo_web_redis:* +@all -@admin -@dangerous +info +sort_ro ...
+        assert_eq!(args[0], "claim_demo_web_redis");
+        assert!(args.iter().any(|a| a == "on"));
+        assert!(args.iter().any(|a| a == ">s3cr3t"));
+        assert!(args.iter().any(|a| a == "$7"));
+        assert!(args.iter().any(|a| a == "resetkeys"));
+        assert!(args.iter().any(|a| a == "~*"));
+        assert!(args.iter().any(|a| a == "resetchannels"));
+        assert!(args.iter().any(|a| a == "&claim_demo_web_redis:*"));
+        assert!(args.iter().any(|a| a == "+@all"));
+        assert!(args.iter().any(|a| a == "-@admin"));
+        assert!(args.iter().any(|a| a == "-@dangerous"));
+        assert!(args.iter().any(|a| a == "+info"));
+    }
+
+    // --- redis_dsn() ---
+
+    #[test]
+    fn redis_dsn_pins_db_number() {
+        let dsn = redis_dsn(
+            "claim_demo_web_redis",
+            "s3cr3t",
+            "platform-redis-ephemeral-000",
+            "dragonfly-system",
+            7,
+        );
+        assert_eq!(
+            dsn,
+            "redis://claim_demo_web_redis:s3cr3t@platform-redis-ephemeral-000.dragonfly-system.svc:6379/7"
+        );
+    }
+
+    // --- channel_prefix() ---
+
+    #[test]
+    fn channel_prefix_matches_acl() {
+        assert_eq!(
+            channel_prefix("claim_demo_web_redis"),
+            "claim_demo_web_redis:"
+        );
     }
 }
