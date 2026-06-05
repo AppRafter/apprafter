@@ -612,6 +612,13 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
                     if let Some(phase) = cr.pointer("/status/phase").and_then(Value::as_str) {
                         println!("AppRafter phase: {phase}");
                     }
+                    // ADR 0040: surface the running image digest the
+                    // operator resolved from base.image's tag. Omitted
+                    // when status.image is absent (resolve: off, or
+                    // pre-first-resolve).
+                    if let Some(image_line) = format_image_line(&cr, &chrono::Utc::now()) {
+                        println!("{image_line}");
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -2010,6 +2017,53 @@ fn print_status(app: &Value) {
     }
 }
 
+/// Pure helper — render the AppRafter Application CR's
+/// `status.image.{tag,resolved,resolvedAt}` (ADR 0040 image
+/// tag→digest resolution) into a single status line, e.g.:
+///
+/// ```text
+///   image:         ghcr.io/acme/web:latest -> @sha256:abc (resolved 5m ago)
+/// ```
+///
+/// Returns `None` when `status.image` is absent (resolution
+/// opted out via `imagePolicy.resolve: off`, or the operator
+/// has not yet completed a first resolution) — the caller then
+/// omits the line entirely. `now` is injected so the relative
+/// "resolved <age> ago" suffix is deterministic in tests,
+/// mirroring `format_pod_age`'s clock seam. The age suffix is
+/// dropped when `resolvedAt` is missing or unparseable.
+pub(crate) fn format_image_line(cr: &Value, now: &chrono::DateTime<chrono::Utc>) -> Option<String> {
+    let image = cr.pointer("/status/image")?;
+    let tag = image.get("tag").and_then(Value::as_str).unwrap_or("?");
+    let resolved = image.get("resolved").and_then(Value::as_str);
+    let resolved_at = image.get("resolvedAt").and_then(Value::as_str);
+
+    // Show only the `@sha256:…` digest portion of the resolved
+    // reference — the repo prefix duplicates the tag's, so the
+    // line reads `tag -> @sha256:…`.
+    let digest_suffix = resolved.map(|r| match r.split_once('@') {
+        Some((_, digest)) => format!("@{digest}"),
+        None => r.to_string(),
+    });
+
+    let mut line = match digest_suffix {
+        Some(digest) => format!("  image:         {tag} -> {digest}"),
+        None => format!("  image:         {tag}"),
+    };
+
+    if let Some(ts) = resolved_at {
+        // `format_pod_age` echoes the input verbatim on a parse
+        // failure; only append the "(resolved … ago)" suffix when
+        // the timestamp actually parsed to an age.
+        if chrono::DateTime::parse_from_rfc3339(ts).is_ok() {
+            let age = format_pod_age(ts, now);
+            line.push_str(&format!(" (resolved {age} ago)"));
+        }
+    }
+
+    Some(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2667,6 +2721,61 @@ mod tests {
         // panic, just echo whatever was passed.
         let now = chrono::Utc::now();
         assert_eq!(format_pod_age("not-a-timestamp", &now), "not-a-timestamp");
+    }
+
+    #[test]
+    fn format_image_line_shows_resolved_digest_and_age() {
+        // 2.4h-e (ADR 0040). status.image carries the tag, the
+        // resolved repo@sha256:… digest, and the resolution time.
+        // The line shows the tag, the bare @sha256:… suffix, and a
+        // deterministic relative age via the injected `now` seam.
+        let cr = serde_json::json!({
+            "status": {
+                "image": {
+                    "tag": "ghcr.io/acme/web:latest",
+                    "resolved": "ghcr.io/acme/web@sha256:abc",
+                    "resolvedAt": "2026-06-05T00:00:00Z"
+                }
+            }
+        });
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-05T00:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let line = format_image_line(&cr, &now).expect("status.image present");
+        assert!(line.contains("ghcr.io/acme/web:latest"));
+        assert!(line.contains("@sha256:abc"));
+        assert!(line.contains("5m"));
+        assert!(line.contains("resolved"));
+    }
+
+    #[test]
+    fn format_image_line_absent_when_no_status_image() {
+        let now = chrono::Utc::now();
+        assert_eq!(format_image_line(&serde_json::json!({}), &now), None);
+        assert_eq!(
+            format_image_line(&serde_json::json!({ "status": {} }), &now),
+            None
+        );
+    }
+
+    #[test]
+    fn format_image_line_without_resolved_at_drops_age_suffix() {
+        // Pre-first-resolve / unparseable timestamp: the line still
+        // renders the tag + digest but omits the "(resolved … ago)"
+        // suffix rather than echoing a bad timestamp.
+        let now = chrono::Utc::now();
+        let cr = serde_json::json!({
+            "status": {
+                "image": {
+                    "tag": "ghcr.io/acme/web:1.0",
+                    "resolved": "ghcr.io/acme/web@sha256:def"
+                }
+            }
+        });
+        let line = format_image_line(&cr, &now).expect("status.image present");
+        assert!(line.contains("ghcr.io/acme/web:1.0"));
+        assert!(line.contains("@sha256:def"));
+        assert!(!line.contains("resolved"));
     }
 
     #[test]
