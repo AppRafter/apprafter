@@ -12,13 +12,72 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use operator_core::ResourceClaim;
+use operator_core::{ResourceClaim, RetainedClaim};
 
 /// Lowest free DB number `< max` not in `used`, or None if the instance
 /// is full (the signal to grow the pool — ADR 0042 §3). DB 0 is
 /// allocatable; the platform reserves nothing there for redis.
 pub fn allocate_dbnum(used: &BTreeSet<u16>, max: u16) -> Option<u16> {
     (0..max).find(|n| !used.contains(n))
+}
+
+/// The outcome of resolving a dragonfly claim's DB allocation (ADR 0042
+/// §8). Pure, so the reattach-vs-fresh decision is unit-pinned away from
+/// the I/O path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// An existing `RetainedClaim` for THIS claim is still within grace —
+    /// reattach to its original `(instance, dbnum)` rather than allocating
+    /// fresh, recovering the retained data (ADR 0042 §8). `skip_flush` is
+    /// `true` on a persistent instance (the snapshot preserved real data we
+    /// must keep) and `false` on an ephemeral instance (it holds nothing,
+    /// so flushing is harmless and keeps the recycle-safety invariant).
+    Reattach {
+        instance: String,
+        dbnum: u16,
+        skip_flush: bool,
+    },
+    /// No retained snapshot for this claim — allocate a fresh DB. The
+    /// provision path FLUSHDBs it (recycle-safety, ADR 0042 §3).
+    Fresh { dbnum: u16 },
+    /// No retained snapshot AND the instance is full — grow the pool.
+    Insufficient,
+}
+
+/// Decide a dragonfly claim's DB allocation (ADR 0042 §8).
+///
+/// `existing` is the `(instance, dbnum)` of a `RetainedClaim` snapshotted
+/// for THIS claim under its deterministic name, if one is still pending
+/// (i.e. the claim was deleted and re-created within the 7-day grace).
+/// `persistent` is the claim's persistence class.
+///
+///   - `existing = Some((i, n))` → `Reattach { i, n, skip_flush =
+///     persistent }`. Reusing the same DB on a PERSISTENT instance recovers
+///     the retained data (don't flush); on an EPHEMERAL instance there is no
+///     data to recover, so flush as usual.
+///   - `existing = None` → `Fresh` with the lowest free DB, or
+///     `Insufficient` when the instance is full.
+///
+/// The provision path, on `Reattach`, reuses `(instance, dbnum)`, flushes
+/// only when NOT `skip_flush`, and DELETEs the now-stale `RetainedClaim`
+/// (404-tolerant) so the GC can never reclaim the re-attached, live claim.
+pub fn resolve_allocation(
+    existing: Option<(String, u16)>,
+    persistent: bool,
+    used: &BTreeSet<u16>,
+    max: u16,
+) -> Resolution {
+    match existing {
+        Some((instance, dbnum)) => Resolution::Reattach {
+            instance,
+            dbnum,
+            skip_flush: persistent,
+        },
+        None => match allocate_dbnum(used, max) {
+            Some(dbnum) => Resolution::Fresh { dbnum },
+            None => Resolution::Insufficient,
+        },
+    }
 }
 
 /// Per-persistence-class pool instance name, zero-padded index.
@@ -59,6 +118,13 @@ pub fn instance_addr(instance: &str, ns: &str) -> String {
 /// the claim's DB). Driven over the Redis client (`redis_client.rs`), not
 /// the CR. `resetkeys` / `resetchannels` clear any inherited grants
 /// before re-applying, so a re-pin (instance restart) is idempotent.
+///
+/// `MOVE` and `COPY` name a DESTINATION DB index as a command argument and
+/// are NOT members of `@admin` or `@dangerous` (only `SWAPDB` is in
+/// `@dangerous`), so `+@all -@admin -@dangerous` would leave them GRANTED —
+/// a cross-DB escape past the `$N` pin. Deny both explicitly; queue / cache
+/// / pub-sub workloads never need them. `SWAPDB` stays denied via
+/// `@dangerous`.
 pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
     vec![
         user.to_string(),
@@ -182,10 +248,43 @@ pub fn used_dbnums_on_instance(claims: &[ResourceClaim], instance: &str) -> BTre
         .collect()
 }
 
+/// The set of DB numbers RESERVED on `instance` — the union of (a) every
+/// LIVE `ResourceClaim`'s `status.dbnum` whose `status.instance` matches
+/// (the existing live source of truth) and (b) every `RetainedClaim`'s
+/// `spec.dbnum` whose `spec.instance` matches (the ADR 0042 §8 reservation
+/// of freed-but-still-in-grace DBs).
+///
+/// Why retained DBs MUST be reserved (data-loss bug otherwise): when a
+/// claim is deleted its DB is snapshotted into a `RetainedClaim` and held
+/// for the 7-day grace. If the allocator looked at LIVE claims only, that
+/// freed dbnum would be reusable immediately — and the snapshot's grace-GC
+/// later runs `FLUSHDB` on the number, wiping whichever NEW tenant recycled
+/// it (cross-tenant data loss) while a stale credential could still reach
+/// the new tenant. Every *existing* `RetainedClaim` is within grace by
+/// definition (the GC deletes it the moment grace elapses), so reserving
+/// all of them implements the §8 reservation without a per-snapshot
+/// deadline check here. The provision path LISTs `RetainedClaim`s in
+/// `apprafter-system` and passes them in.
+pub fn used_dbnums(
+    live: &[ResourceClaim],
+    retained: &[RetainedClaim],
+    instance: &str,
+) -> BTreeSet<u16> {
+    let mut used = used_dbnums_on_instance(live, instance);
+    used.extend(retained.iter().filter_map(|r| {
+        if r.spec.instance.as_deref() == Some(instance) {
+            r.spec.dbnum
+        } else {
+            None
+        }
+    }));
+    used
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use operator_core::ResourceClaimStatus;
+    use operator_core::{ResourceClaimStatus, RetainedClaim};
     use std::collections::BTreeSet;
 
     // --- allocate_dbnum() ---
@@ -355,6 +454,125 @@ mod tests {
         )];
         let used = used_dbnums_on_instance(&claims, "platform-redis-ephemeral-000");
         assert!(used.is_empty());
+    }
+
+    // --- used_dbnums() (live + retained union; ADR 0042 §8 reservation) ---
+
+    fn retained_with_alloc(name: &str, instance: &str, dbnum: u16) -> RetainedClaim {
+        RetainedClaim::new(
+            name,
+            operator_core::RetainedClaimSpec {
+                claim_ref: operator_core::retainedclaim::ClaimRef {
+                    name: name.into(),
+                    namespace: "demo".into(),
+                },
+                provider: "redis-integrated".into(),
+                backend: "dragonfly".into(),
+                instance: Some(instance.to_owned()),
+                dbnum: Some(dbnum),
+                retain_until: "2026-06-12T00:00:00+00:00".into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn used_dbnums_unions_live_and_retained_on_instance() {
+        let live = vec![
+            claim_with_alloc("a", Some("platform-redis-ephemeral-000"), Some(0)),
+            claim_with_alloc("b", Some("platform-redis-ephemeral-000"), Some(2)),
+        ];
+        let retained = vec![
+            // A freed dbnum still within its 7-day grace — MUST be reserved so
+            // the snapshot grace-GC never FLUSHDBs a recycled, now-live DB.
+            retained_with_alloc("ret-a", "platform-redis-ephemeral-000", 5),
+            // A retained dbnum on a DIFFERENT instance — must NOT be reserved.
+            retained_with_alloc("ret-b", "platform-redis-ephemeral-001", 9),
+        ];
+        let used = used_dbnums(&live, &retained, "platform-redis-ephemeral-000");
+        assert_eq!(used, [0u16, 2, 5].into_iter().collect());
+    }
+
+    #[test]
+    fn used_dbnums_reserves_retained_even_with_no_live_claims() {
+        let retained = vec![retained_with_alloc(
+            "ret-a",
+            "platform-redis-ephemeral-000",
+            3,
+        )];
+        let used = used_dbnums(&[], &retained, "platform-redis-ephemeral-000");
+        assert_eq!(used, [3u16].into_iter().collect());
+    }
+
+    #[test]
+    fn used_dbnums_excludes_retained_on_other_instance() {
+        let retained = vec![retained_with_alloc(
+            "ret-b",
+            "platform-redis-ephemeral-001",
+            9,
+        )];
+        let used = used_dbnums(&[], &retained, "platform-redis-ephemeral-000");
+        assert!(used.is_empty());
+    }
+
+    // --- resolve_allocation() (ADR 0042 §8 reattach vs fresh) ---
+
+    #[test]
+    fn resolve_allocation_reattaches_persistent_without_flush() {
+        // A persistent instance keeps the retained data, so reattach reuses
+        // the SAME (instance, dbnum) and must NOT flush.
+        let used: BTreeSet<u16> = [0u16, 1].into_iter().collect();
+        let r = resolve_allocation(
+            Some(("platform-redis-persistent-000".into(), 4)),
+            true,
+            &used,
+            1024,
+        );
+        assert_eq!(
+            r,
+            Resolution::Reattach {
+                instance: "platform-redis-persistent-000".into(),
+                dbnum: 4,
+                skip_flush: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_allocation_reattaches_ephemeral_with_flush() {
+        // An ephemeral instance holds no retained data, so reattach reuses
+        // the (instance, dbnum) but DOES flush (skip_flush = false).
+        let used: BTreeSet<u16> = BTreeSet::new();
+        let r = resolve_allocation(
+            Some(("platform-redis-ephemeral-000".into(), 7)),
+            false,
+            &used,
+            1024,
+        );
+        assert_eq!(
+            r,
+            Resolution::Reattach {
+                instance: "platform-redis-ephemeral-000".into(),
+                dbnum: 7,
+                skip_flush: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_allocation_fresh_when_no_existing_retained_claim() {
+        // No retained snapshot for this claim → allocate the lowest free DB.
+        let used: BTreeSet<u16> = [0u16, 1, 3].into_iter().collect();
+        let r = resolve_allocation(None, false, &used, 1024);
+        assert_eq!(r, Resolution::Fresh { dbnum: 2 });
+    }
+
+    #[test]
+    fn resolve_allocation_insufficient_when_instance_full() {
+        // No existing snapshot AND the instance is full → grow the pool.
+        let used: BTreeSet<u16> = (0u16..8).collect();
+        let r = resolve_allocation(None, true, &used, 8);
+        assert_eq!(r, Resolution::Insufficient);
     }
 
     // --- acl_setuser_args() ---

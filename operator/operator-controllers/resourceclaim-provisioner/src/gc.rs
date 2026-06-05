@@ -330,6 +330,20 @@ async fn gc_drop_dragonfly(
         let addr = dragonfly::instance_addr(&instance, &df_ns);
         let admin_secret = dragonfly::admin_secret_name(&instance);
 
+        // 2.6 Fix #2b defensive live-guard: if a DIFFERENT live claim has
+        // recycled this snapshot's (instance, dbnum) before the grace
+        // elapsed, FLUSHDB would wipe THAT tenant's data (cross-tenant loss).
+        // List live ResourceClaims and decide per `dragonfly_flushdb_is_safe`.
+        // The allocator now RESERVES retained dbnums so a recycle should never
+        // happen, but this guard makes the destructive flush fail-safe. When
+        // unsafe we SKIP the FLUSHDB but STILL ACL DELUSER (per-claim
+        // usernames differ, so dropping the dead user is always safe) + the
+        // Secret/snapshot delete below.
+        let live_claims: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
+            .list(&Default::default())
+            .await?
+            .items;
+
         // Reading the admin password is itself tolerated-on-failure: if the
         // instance (and its admin Secret) is already gone, there is nothing
         // left to reclaim on it, so we log and proceed to the local cleanup
@@ -337,10 +351,25 @@ async fn gc_drop_dragonfly(
         match read_secret_key(ctx, &df_ns, &admin_secret, "password").await {
             Ok(admin_pw) => {
                 if let Some(dbnum) = dbnum {
-                    if let Err(err) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
+                    if dragonfly_flushdb_is_safe(
+                        &live_claims,
+                        &instance,
+                        dbnum,
+                        &rc.spec.claim_ref.name,
+                        &rc.spec.claim_ref.namespace,
+                    ) {
+                        if let Err(err) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
+                            warn!(
+                                retained = %rc_name, %instance, dbnum, %err,
+                                "dragonfly FLUSHDB failed during GC — tolerating (instance may be gone)"
+                            );
+                        }
+                    } else {
                         warn!(
-                            retained = %rc_name, %instance, dbnum, %err,
-                            "dragonfly FLUSHDB failed during GC — tolerating (instance may be gone)"
+                            retained = %rc_name, %instance, dbnum,
+                            "dragonfly GC live-guard: a different live claim holds this \
+                             (instance, dbnum) — SKIPPING FLUSHDB to avoid cross-tenant data loss; \
+                             still revoking the dead ACL user"
                         );
                     }
                 }
@@ -709,6 +738,44 @@ pub fn dragonfly_reclaim_target(rc: &RetainedClaim) -> Option<DragonflyReclaim> 
         instance,
         dbnum: rc.spec.dbnum,
         acl_user,
+    })
+}
+
+/// Defensive live-guard for the dragonfly grace-GC `FLUSHDB` (2.6 Fix #2b,
+/// ADR 0042 §8). Returns `false` (SKIP the destructive flush) iff some
+/// OTHER live `ResourceClaim` currently holds the SAME `(instance, dbnum)`
+/// the snapshot points at — i.e. the freed dbnum was recycled to a new
+/// tenant before this snapshot's grace elapsed. Flushing then would wipe
+/// the new tenant's data (cross-tenant loss).
+///
+/// "Other" means `(name, namespace) != (snap_claim_name, snap_claim_ns)`:
+/// the snapshot's OWN origin claim being back is a recovery the
+/// reconcile-level live-guard already handles, and its data IS the
+/// snapshot's data, so that case is `true` (safe). Any DIFFERENT claim on
+/// the same `(instance, dbnum)` is the recycle hazard → `false`.
+///
+/// This is belt-and-suspenders: the allocator now RESERVES retained dbnums
+/// ([`dragonfly::used_dbnums`]), so a recycle should not happen — but if a
+/// snapshot were ever mis-created or the reservation regressed, this guard
+/// prevents the data-loss flush. The caller still runs `ACL DELUSER` + the
+/// Secret/snapshot delete when this returns `false` (per-claim usernames
+/// differ, so dropping the dead user is always safe).
+pub fn dragonfly_flushdb_is_safe(
+    live: &[ResourceClaim],
+    snap_instance: &str,
+    snap_dbnum: u16,
+    snap_claim_name: &str,
+    snap_claim_ns: &str,
+) -> bool {
+    !live.iter().any(|c| {
+        let st = match c.status.as_ref() {
+            Some(st) => st,
+            None => return false,
+        };
+        st.instance.as_deref() == Some(snap_instance)
+            && st.dbnum == Some(snap_dbnum)
+            && (c.name_any().as_str() != snap_claim_name
+                || c.namespace().as_deref() != Some(snap_claim_ns))
     })
 }
 
@@ -1140,5 +1207,98 @@ mod tests {
             dragonfly_reclaim_target(&dragonfly_snapshot(Some(""), Some(7), Some("u"))),
             None
         );
+    }
+
+    // --- dragonfly_flushdb_is_safe() (2.6 Fix #2b GC live-guard) ---
+
+    fn live_redis_claim(name: &str, ns: &str, instance: &str, dbnum: u16) -> ResourceClaim {
+        let mut c = ResourceClaim::new(name, ResourceClaimSpec::default());
+        c.metadata.namespace = Some(ns.to_owned());
+        c.status = Some(operator_core::ResourceClaimStatus {
+            instance: Some(instance.to_owned()),
+            dbnum: Some(dbnum),
+            ..Default::default()
+        });
+        c
+    }
+
+    #[test]
+    fn flushdb_safe_when_no_live_claim_on_dbnum() {
+        // No live claim holds this (instance, dbnum) — the snapshot owns it,
+        // so FLUSHDB is safe.
+        let live = vec![live_redis_claim(
+            "other",
+            "demo",
+            "platform-redis-ephemeral-000",
+            3,
+        )];
+        assert!(dragonfly_flushdb_is_safe(
+            &live,
+            "platform-redis-ephemeral-000",
+            7,
+            "web-redis",
+            "demo",
+        ));
+    }
+
+    #[test]
+    fn flushdb_safe_when_owner_is_the_snapshots_own_claim() {
+        // The only live claim on (instance, dbnum) is the snapshot's OWN
+        // origin claim (same name+ns) — a recovery the live-guard already
+        // handles; the flush decision itself treats it as safe (it is the
+        // snapshot's own data). The reconcile-level live-guard is what skips
+        // the destructive drop in that case.
+        let live = vec![live_redis_claim(
+            "web-redis",
+            "demo",
+            "platform-redis-ephemeral-000",
+            7,
+        )];
+        assert!(dragonfly_flushdb_is_safe(
+            &live,
+            "platform-redis-ephemeral-000",
+            7,
+            "web-redis",
+            "demo",
+        ));
+    }
+
+    #[test]
+    fn flushdb_not_safe_when_different_claim_recycled_the_dbnum() {
+        // A DIFFERENT live tenant now holds the same (instance, dbnum) — the
+        // freed number was recycled. FLUSHDB here would wipe the new tenant's
+        // data (cross-tenant data loss). The guard must return false.
+        let live = vec![live_redis_claim(
+            "new-tenant",
+            "other-ns",
+            "platform-redis-ephemeral-000",
+            7,
+        )];
+        assert!(!dragonfly_flushdb_is_safe(
+            &live,
+            "platform-redis-ephemeral-000",
+            7,
+            "web-redis",
+            "demo",
+        ));
+    }
+
+    #[test]
+    fn flushdb_safe_when_recycler_is_on_a_different_instance() {
+        // Same dbnum but a DIFFERENT instance is a different DB — not a
+        // conflict.
+        let live = vec![live_redis_claim(
+            "new-tenant",
+            "other-ns",
+            "platform-redis-ephemeral-001",
+            7,
+        )];
+        assert!(dragonfly_flushdb_is_safe(
+            &live,
+            "platform-redis-ephemeral-000",
+            7,
+            "web-redis",
+            "demo",
+        ));
     }
 }

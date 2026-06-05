@@ -433,11 +433,21 @@ async fn provision_dragonfly(
         .patch(&instance, &apply_params(), &Patch::Apply(&df_body))
         .await?;
 
-    // 2. Allocate a numbered logical DB off the LIVE claim source of truth.
-    //    If this claim already holds an allocation on this instance (a
-    //    re-reconcile after the status landed but before the ACL/Secret
-    //    steps (4-6) finished), keep it — `used_dbnums_on_instance` excludes
-    //    nothing, so we look up our own first to stay idempotent.
+    // 2. Allocate a numbered logical DB.
+    //
+    //    (a) Own-status idempotency: if THIS claim already holds an
+    //        allocation on this instance (a re-reconcile after the status
+    //        landed but before the ACL/Secret steps finished), keep it. No
+    //        committed data exists yet (the claim is not `ready`), so the
+    //        recycle-safety FLUSHDB below is harmless.
+    //    (b) Otherwise resolve via `resolve_allocation` (ADR 0042 §8): if a
+    //        `RetainedClaim` snapshot for THIS claim is still within grace
+    //        (deleted + re-created), REATTACH to its original (instance,
+    //        dbnum) — recovering retained data on a persistent instance
+    //        (skip_flush) — and cancel the now-stale snapshot after. Else
+    //        allocate a FRESH dbnum off the reserved set (live claims UNION
+    //        every pending RetainedClaim, so a freed-but-in-grace dbnum is
+    //        never recycled out from under its snapshot's grace-GC).
     let existing_alloc =
         claim
             .status
@@ -446,17 +456,53 @@ async fn provision_dragonfly(
                 (Some(i), Some(n)) if i == instance => Some(n),
                 _ => None,
             });
-    let dbnum = match existing_alloc {
-        Some(n) => n,
+    // Deterministic snapshot name for THIS claim (the SAME name
+    // `snapshot_retained_claim` emits, and `cnpg::k8s_name` is the shared
+    // derivation). Used both to look up a reattach target and to cancel the
+    // snapshot after a successful (re)provision.
+    let object_name = cnpg::k8s_name(ns, name);
+    let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
+
+    let (dbnum, skip_flush, reattached) = match existing_alloc {
+        Some(n) => (n, false, false),
         None => {
-            let claims: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
+            // List live claims AND retained snapshots so the used-set
+            // reserves both (Fix #2a) and we can detect a reattach.
+            let live: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
                 .list(&Default::default())
                 .await?
                 .items;
-            let used = dragonfly::used_dbnums_on_instance(&claims, &instance);
-            match dragonfly::allocate_dbnum(&used, dbnum_max) {
-                Some(n) => n,
-                None => {
+            let retained: Vec<RetainedClaim> = rc_api.list(&Default::default()).await?.items;
+            // Reattach only to a snapshot on THIS class's instance. Step 1 has
+            // already committed the admin Secret + `Dragonfly` CR for the
+            // class-derived `instance`; a snapshot on a different instance (a
+            // persistence-class flip across delete→recreate, an edge case) is
+            // left for its OWN grace-GC and we allocate fresh here — its dbnum
+            // is still reserved by `used_dbnums` on its instance, so no
+            // cross-instance recycle. In the normal (same-class) case the
+            // snapshot's instance equals `instance`.
+            let existing_snapshot = retained
+                .iter()
+                .find(|r| {
+                    r.name_any() == object_name && r.spec.instance.as_deref() == Some(&instance)
+                })
+                .and_then(|r| Some((r.spec.instance.clone()?, r.spec.dbnum?)));
+            let used = dragonfly::used_dbnums(&live, &retained, &instance);
+            match dragonfly::resolve_allocation(existing_snapshot, persistent, &used, dbnum_max) {
+                dragonfly::Resolution::Reattach {
+                    instance: ri,
+                    dbnum: rn,
+                    skip_flush,
+                } => {
+                    info!(
+                        %name, %ns, instance = %ri, dbnum = rn, skip_flush,
+                        "reattaching dragonfly claim to its retained allocation (ADR 0042 §8)"
+                    );
+                    debug_assert_eq!(ri, instance, "reattach instance must match the class");
+                    (rn, skip_flush, true)
+                }
+                dragonfly::Resolution::Fresh { dbnum } => (dbnum, false, false),
+                dragonfly::Resolution::Insufficient => {
                     warn!(
                         %name, %ns, %instance, dbnum_max,
                         "dragonfly pool instance full — grow the pool (ADR 0042 §3); requeue"
@@ -473,23 +519,34 @@ async fn provision_dragonfly(
     //    re-pin loop (2.6-5) reads it. Under our own field manager (the SSA
     //    split stays intact: instance/dbnum are provisioner-owned, never
     //    scheduler fields). This patch does NOT set `ready` — step 6 does,
-    //    only after the ACL user + connection Secret exist.
+    //    only after the ACL user + connection Secret exist. The TERMINAL
+    //    status apply (step 6) re-sends instance+dbnum so SSA does not prune
+    //    this checkpoint (2.6 Fix #1).
     patch_allocation(&ctx.client, ns, name, &instance, dbnum).await?;
 
     // 4. Drive the per-claim `$N` ACL user imperatively (it is runtime
     //    state, not declarable on the CR). Read the instance admin
     //    password, FLUSHDB the target DB FIRST (recycle-safety: a reused
-    //    dbnum must start empty — ADR 0042 §3), then ACL SETUSER the
-    //    `$N`-pinned, keyspace-isolated user with a fresh password.
+    //    dbnum must start empty — ADR 0042 §3) UNLESS we reattached to a
+    //    persistent instance (skip_flush — flushing would wipe the retained
+    //    data we are recovering), then ACL SETUSER the `$N`-pinned,
+    //    keyspace-isolated user with a fresh password.
     let addr = dragonfly::instance_addr(&instance, &df_ns);
     let admin_pw = read_admin_password(ctx, &df_ns, &admin_secret_name).await?;
     let user = dragonfly::acl_user(ns, name);
     let claim_pw = generate_password();
 
-    ctx.redis
-        .flushdb(&addr, &admin_pw, dbnum)
-        .await
-        .map_err(|e| ReconcileError::Provisioning(format!("dragonfly FLUSHDB: {e}")))?;
+    if skip_flush {
+        info!(
+            %name, %ns, %instance, dbnum,
+            "skipping FLUSHDB — reattaching to retained data on a persistent instance"
+        );
+    } else {
+        ctx.redis
+            .flushdb(&addr, &admin_pw, dbnum)
+            .await
+            .map_err(|e| ReconcileError::Provisioning(format!("dragonfly FLUSHDB: {e}")))?;
+    }
     let setuser_args = dragonfly::acl_setuser_args(&user, &claim_pw, dbnum);
     ctx.redis
         .acl_setuser(&addr, &admin_pw, &setuser_args)
@@ -549,16 +606,15 @@ async fn provision_dragonfly(
         .inc();
     info!(%name, %ns, %instance, dbnum, %user, "dragonfly claim provisioned");
 
-    // Recovery (2.4f Fix A, mirrored for dragonfly): the claim is now
-    // (re)provisioned, so any RetainedClaim from a prior deletion is stale
-    // — cancel it so its grace-GC can never FLUSHDB/DELUSER this now-live
-    // claim's DB/user. Deterministic name (`cnpg::k8s_name(ns, name)` ==
-    // `object_name`), 404-tolerant.
-    let object_name = cnpg::k8s_name(ns, name);
-    let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
+    // Cancel the matching RetainedClaim (2.4f Fix A, mirrored for dragonfly +
+    // ADR 0042 §8 reattach): the claim is now (re)provisioned and LIVE, so its
+    // snapshot — whether we reattached to it (recovering its data) or it is a
+    // stale leftover — MUST be deleted so the grace-GC can never reclaim this
+    // live claim's DB/user. Deterministic name (`object_name`), 404-tolerant.
+    // Idempotent: a crash here re-enters and re-deletes (no-op on 404).
     if let Err(e) = rc_api.delete(&object_name, &DeleteParams::default()).await {
         if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
-            warn!(%object_name, error=%e, "could not cancel stale RetainedClaim on dragonfly re-provision");
+            warn!(%object_name, reattached, error=%e, "could not cancel RetainedClaim on dragonfly (re)provision");
         }
     }
 
