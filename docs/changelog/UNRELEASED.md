@@ -9,6 +9,30 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.16 + platform-stack 0.2.16 — 2.4h hotfix: valid Application CRD (2026-06-05)
+
+### Fixed
+
+- **The v0.2.15 `Application` CRD was rejected by the apiserver.** `imagePolicy`
+  (base + per-env) and `status.image` shipped with both `properties` and
+  `additionalProperties: false`, which apiextensions forbids ("additionalProperties
+  and properties are mutual exclusive"). The CRD apply failed server-side, so the
+  operator never rolled to the 2.4h code and image resolution silently did nothing
+  (the Deployment kept the verbatim tag, `status.image` was absent). Removed the
+  three invalid lines — closed CRD objects rely on structural-schema pruning. Same
+  operator code as v0.2.15; chart-only fix. A cluster stuck on the failed v0.2.15
+  sync recovers automatically once v0.2.16 is the channel-latest.
+
+### Added
+
+- **`just crd-validate`** (`scripts/validate-crds.sh`) — an ephemeral `kind` cluster
+  applies every rendered CRD and asserts each reaches `Established`, the real-apiserver
+  gate to run before CRD-changing releases (`helm lint` does not validate structural
+  schemas). Plus `scripts/check-crd-structural.sh` (wired into `just lint`) that fails
+  on `additionalProperties: false` in any CRD template — the cheap regression guard.
+
+- `change: safe`.
+
 ## operator v0.2.15 + platform-stack 0.2.15 — 2.4h image tag→digest resolution & auto-rollout (ADR 0040) (2026-06-05)
 
 The Application controller now resolves `spec.base.image`'s mutable tag to its

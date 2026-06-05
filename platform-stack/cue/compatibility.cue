@@ -1701,6 +1701,29 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.16": {
+	change:          "safe"
+	operatorVersion: "v0.2.16"
+	notes: """
+		Hotfix for v0.2.15: the 2.4h `Application` CRD shipped
+		`imagePolicy` (base + per-env) and `status.image` with both
+		`properties` and `additionalProperties: false`, which the
+		apiserver rejects ("additionalProperties and properties are
+		mutual exclusive") — so the v0.2.15 CRD apply failed
+		server-side, the operator child app never synced, and image
+		resolution silently did nothing (verbatim tag, no
+		`status.image`). Removes the three invalid lines (closed CRD
+		objects rely on structural-schema pruning). Validated against a
+		real apiserver (`just crd-validate`). Same operator code as
+		v0.2.15; chart-only CRD fix. A cluster stuck on the failed
+		v0.2.15 sync recovers automatically once v0.2.16 is the
+		channel-latest (or pin/upgrade to it). Safe to auto-sync.
+		"""
+	references: [
+		"operator/charts/apprafter-operator/templates/crd-application.yaml",
+		"scripts/validate-crds.sh",
+	]
+}
 compatibility: "0.2.15": {
 	change:          "safe"
 	operatorVersion: "v0.2.15"
