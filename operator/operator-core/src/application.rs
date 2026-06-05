@@ -41,6 +41,15 @@ pub struct ApplicationBaseSpec {
     pub env: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs: Option<BTreeMap<String, ServiceNeed>>,
+    /// Image resolution policy (ADR 0040). Absent => default `digest`
+    /// (the controller resolves the tag to a registry digest each
+    /// reconcile). Mirrors `#ImagePolicy` in application.cue + the CRD.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "imagePolicy"
+    )]
+    pub image_policy: Option<ImagePolicy>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -72,6 +81,40 @@ pub struct ServiceNeed {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ImagePolicy {
+    /// `"digest"` (default) resolves the tag to `repo@sha256:…`; `"off"`
+    /// renders the reference verbatim and performs no registry poll.
+    /// Enforced as an enum by the CRD; a plain `String` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve: Option<String>,
+}
+
+/// `status.image` — the resolved-image truth (ADR 0040). `tag` is the
+/// reference as written in `spec`; `resolved` is `repo@sha256:…`
+/// actually rendered into the Deployment; `resolvedAt` is the RFC3339
+/// time of the last successful resolution.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct StatusImage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "resolvedAt"
+    )]
+    pub resolved_at: Option<String>,
+}
+
+/// `ImageResolved=False` when tag→digest resolution failed this cycle
+/// (registry unreachable, no covering credential for a private image,
+/// malformed reference) — the Deployment falls back to the verbatim
+/// tag; resolution NEVER blocks the rollout (ADR 0040). `True` after a
+/// successful resolution; absent when `imagePolicy.resolve: off`.
+pub const COND_IMAGE_RESOLVED: &str = "ImageResolved";
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct ApplicationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -89,6 +132,8 @@ pub struct ApplicationStatus {
         rename = "endpointURL"
     )]
     pub endpoint_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<StatusImage>,
 }
 
 /// Reserved phase: Application reconciler is paused awaiting
@@ -238,6 +283,40 @@ mod tests {
         let serialized = serde_json::to_value(&app).unwrap();
         let deserialized: Application = serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized.spec, app.spec);
+    }
+
+    #[test]
+    fn image_policy_and_status_image_round_trip() {
+        let json_obj = json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": { "base": {
+                "image": "ghcr.io/acme/web:latest",
+                "imagePolicy": { "resolve": "off" }
+            }},
+            "status": {
+                "image": {
+                    "tag": "ghcr.io/acme/web:latest",
+                    "resolved": "ghcr.io/acme/web@sha256:abc",
+                    "resolvedAt": "2026-06-05T00:00:00Z"
+                }
+            }
+        });
+        let app: Application = serde_json::from_value(json_obj).unwrap();
+        assert_eq!(
+            app.spec
+                .base
+                .unwrap()
+                .image_policy
+                .unwrap()
+                .resolve
+                .as_deref(),
+            Some("off")
+        );
+        let img = app.status.unwrap().image.unwrap();
+        assert_eq!(img.resolved.as_deref(), Some("ghcr.io/acme/web@sha256:abc"));
+        assert_eq!(img.tag.as_deref(), Some("ghcr.io/acme/web:latest"));
     }
 
     #[test]
