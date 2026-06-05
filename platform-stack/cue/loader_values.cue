@@ -94,6 +94,22 @@ _loaderValues: {
 					type:      "helm"
 					enableOCI: "true"
 				}
+				// Dragonfly operator chart (`component_dragonfly-operator.cue`,
+				// plan.md 2.6-1) is an OCI Helm chart at
+				// `ghcr.io/dragonflydb/dragonfly-operator/helm`. Argo CD
+				// does NOT infer OCI from the URL scheme — without this
+				// `enableOCI: "true"` registration the `dragonfly-operator`
+				// Application's `helm pull` is malformed for an OCI registry
+				// and fails at runtime (same class as the apprafter charts
+				// above). Registered here so it flows to BOTH the CLI loader
+				// install (`build.rs` lifts `_loaderValues.argocd.values`)
+				// and the steady-state umbrella sync (`component_argocd.cue`
+				// unifies the same block into `argocd-cm`).
+				repositories: "dragonfly-operator": {
+					url:       "ghcr.io/dragonflydb/dragonfly-operator/helm"
+					type:      "helm"
+					enableOCI: "true"
+				}
 				// `_appProjects` — shared source of truth between
 				// the loader install (this block) and the
 				// umbrella's `templates/appprojects.yaml`
