@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{LocalObjectReference, Secret, Service};
@@ -50,6 +50,15 @@ const KIND: &str = "Application";
 /// owns under this name, so future controllers (e.g. operators
 /// extending Applications) can co-own without conflicts.
 pub const FIELD_MANAGER: &str = "apprafter-operator";
+
+/// Minimum interval between registry HEAD probes for the SAME tag
+/// (2.4h Fix 1 / ADR 0040). The controller reconciles on a 60s requeue
+/// AND on `.owns(ResourceClaim)` / `.owns(Deployment)` watch events, so
+/// without this throttle it would issue a registry HEAD on every step.
+/// Mirrors `MIN_OCI_POLL_INTERVAL_SECS` in the PlatformController. A tag
+/// change or an elapsed interval re-arms resolution; intermediate
+/// reconciles reuse the cached `status.image.resolved`.
+const MIN_IMAGE_RESOLVE_INTERVAL_SECS: i64 = 60;
 
 /// Per-controller reconcile context.
 pub struct Context {
@@ -255,31 +264,66 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // renders the verbatim tag + sets ImageResolved=False and NEVER blocks
     // the rollout. `imagePolicy.resolve: "off"` skips the poll entirely —
     // no I/O, no ImageResolved condition.
+    //
+    // 2.4h Fix 1 (C): list SourceCredentials ONCE here and thread the
+    // result into both the resolution auth-pick AND `attach_pull_secret`
+    // below — the old code listed twice per reconcile. Best-effort
+    // (`unwrap_or_default`): a cred-list failure must not break resolution
+    // nor block the rollout, so it degrades to an empty list (anonymous
+    // resolve + no pull-secret attach, retried next reconcile).
+    let source_creds = list_source_credentials(&ctx.client)
+        .await
+        .unwrap_or_default();
+
     let mut image_status: Option<StatusImage> = None;
     let mut image_resolved_cond: Option<(bool, String)> = None; // (ok, reason/msg)
     let resolved_image: Option<String> = match effective.image.as_deref() {
         Some(tag) if image_resolution_enabled(&effective) => {
-            let creds = list_source_credentials(&ctx.client)
-                .await
-                .unwrap_or_default();
-            let auth = match pick_pull_credential(tag, &creds) {
-                Some(cred) => read_cred_auth(&ctx.client, cred, tag).await,
-                None => oci_resolve::RegistryAuth::Anonymous,
-            };
-            match oci_resolve::resolve_digest(&ctx.oci_http, tag, &auth).await {
-                Ok(resolved) => {
-                    image_status = Some(StatusImage {
-                        tag: Some(tag.to_string()),
-                        resolved: Some(resolved.clone()),
-                        resolved_at: Some(Utc::now().to_rfc3339()),
-                    });
-                    image_resolved_cond = Some((true, "Resolved".into()));
-                    Some(resolved)
-                }
-                Err(e) => {
-                    warn!(image = tag, error = %e, "image digest resolution failed; rendering verbatim tag");
-                    image_resolved_cond = Some((false, format!("ResolveFailed: {e}")));
-                    None // fall back to verbatim tag — rollout proceeds
+            // 2.4h Fix 1 (A): throttle the registry HEAD. The controller
+            // reconciles on a 60s requeue AND on child-watch events, so a
+            // HEAD per reconcile would hammer the registry. Skip the poll
+            // when the prior status.image already resolved THIS tag within
+            // the throttle window — reuse the cached digest and carry the
+            // prior status (resolvedAt) forward unchanged.
+            let prior_image = app.status.as_ref().and_then(|s| s.image.as_ref());
+            if !should_resolve_image(
+                prior_image,
+                tag,
+                Utc::now(),
+                MIN_IMAGE_RESOLVE_INTERVAL_SECS,
+            ) {
+                let prior = prior_image.expect("should_resolve_image=false implies Some(prior)");
+                image_status = Some(prior.clone());
+                image_resolved_cond = Some((true, "Resolved".into()));
+                prior.resolved.clone()
+            } else {
+                let auth = match pick_pull_credential(tag, &source_creds) {
+                    Some(cred) => read_cred_auth(&ctx.client, cred, tag).await,
+                    None => oci_resolve::RegistryAuth::Anonymous,
+                };
+                match oci_resolve::resolve_digest(&ctx.oci_http, tag, &auth).await {
+                    Ok(resolved) => {
+                        image_status = Some(StatusImage {
+                            tag: Some(tag.to_string()),
+                            resolved: Some(resolved.clone()),
+                            resolved_at: Some(Utc::now().to_rfc3339()),
+                        });
+                        image_resolved_cond = Some((true, "Resolved".into()));
+                        Some(resolved)
+                    }
+                    Err(e) => {
+                        warn!(image = tag, error = %e, "image digest resolution failed; rendering verbatim tag");
+                        // 2.4h Fix 1 (B): record the attempted tag (with no
+                        // resolved digest) for auditability per ADR 0040 —
+                        // status.image surfaces WHAT we tried even on failure.
+                        image_status = Some(StatusImage {
+                            tag: Some(tag.to_string()),
+                            resolved: None,
+                            resolved_at: None,
+                        });
+                        image_resolved_cond = Some((false, format!("ResolveFailed: {e}")));
+                        None // fall back to verbatim tag — rollout proceeds
+                    }
                 }
             }
         }
@@ -302,7 +346,15 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // Seam A (1.79c S3): if a SourceCredential covers this image's
     // registry, project its derived pull-secret into the workload
     // namespace and attach it to the Deployment's imagePullSecrets.
-    attach_pull_secret(&ctx.client, &namespace, &mut rendered.deployment, &pp).await?;
+    // Threads the single hoisted `source_creds` list (Fix 1 (C)).
+    attach_pull_secret(
+        &ctx.client,
+        &namespace,
+        &mut rendered.deployment,
+        &source_creds,
+        &pp,
+    )
+    .await?;
 
     apply_deployment(&ctx.client, &namespace, &rendered.deployment, &pp).await?;
 
@@ -428,17 +480,21 @@ fn deployment_image(deployment: &Deployment) -> Option<String> {
 /// the Deployment's `imagePullSecrets`. A no-op (leaves the Deployment
 /// untouched) when the image is public or no covering credential's
 /// pull-secret has been derived yet — the next reconcile retries.
+///
+/// 2.4h Fix 1 (C): takes the pre-listed `creds` slice (the reconcile loop
+/// lists SourceCredentials once and threads it here and into the image
+/// resolution above) rather than re-listing the API internally.
 async fn attach_pull_secret(
     client: &Client,
     namespace: &str,
     deployment: &mut Deployment,
+    creds: &[SourceCredential],
     pp: &PatchParams,
 ) -> Result<(), ReconcileError> {
     let Some(image) = deployment_image(deployment) else {
         return Ok(());
     };
-    let creds = list_source_credentials(client).await?;
-    let Some(cred) = pick_pull_credential(&image, &creds) else {
+    let Some(cred) = pick_pull_credential(&image, creds) else {
         return Ok(());
     };
     let cred_name = cred.name_any();
@@ -920,6 +976,49 @@ fn resource_claim_pending_condition(
         message: format!("awaiting ResourceClaim(s): {}", unready.join(", ")),
         observed_generation: None,
     }
+}
+
+/// Whether this reconcile should issue a registry HEAD to resolve the
+/// current `tag` → digest, or reuse the prior `status.image.resolved`
+/// (2.4h Fix 1 (A); mirrors the PlatformController OCI-poll throttle).
+///
+/// Returns `false` (SKIP the HEAD, reuse cache) **only** when ALL hold:
+///
+///   * a prior `status.image` exists, AND
+///   * its `tag` equals the current spec tag (a moved tag re-arms), AND
+///   * it carries a `resolved` digest (a recorded-but-failed attempt —
+///     `resolved: None`, Fix 1 (B) — re-arms), AND
+///   * `resolvedAt` parses as RFC3339 AND is within the throttle window
+///     (`now - resolvedAt < min_interval`; an unparseable or stale
+///     timestamp re-arms).
+///
+/// Otherwise returns `true` (resolve this cycle). Throttle-only: it never
+/// blocks the rollout — the caller still renders the verbatim tag on any
+/// resolution failure.
+fn should_resolve_image(
+    prior: Option<&StatusImage>,
+    current_tag: &str,
+    now: DateTime<Utc>,
+    min_interval_secs: i64,
+) -> bool {
+    let Some(prior) = prior else {
+        return true;
+    };
+    if prior.tag.as_deref() != Some(current_tag) {
+        return true;
+    }
+    if prior.resolved.is_none() {
+        return true;
+    }
+    let Some(resolved_at) = prior
+        .resolved_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc))
+    else {
+        return true;
+    };
+    (now - resolved_at).num_seconds() >= min_interval_secs
 }
 
 /// Whether the controller should resolve `base.image` to a registry
@@ -1841,5 +1940,121 @@ mod tests {
         let next = image_resolved_condition(false, "ResolveFailed: timeout", &prior);
         assert_eq!(next.status, "False");
         assert_ne!(next.last_transition_time, "2026-06-05T10:00:00+00:00");
+    }
+
+    // ---- 2.4h Fix 1 (A): registry HEAD throttle (should_resolve_image) ----
+
+    fn status_image(tag: Option<&str>, resolved: Option<&str>, at: Option<&str>) -> StatusImage {
+        StatusImage {
+            tag: tag.map(String::from),
+            resolved: resolved.map(String::from),
+            resolved_at: at.map(String::from),
+        }
+    }
+
+    #[test]
+    fn should_resolve_image_when_no_prior_status() {
+        // First reconcile — no prior status.image → must resolve.
+        let now = Utc::now();
+        assert!(should_resolve_image(
+            None,
+            "ghcr.io/acme/web:1.0",
+            now,
+            MIN_IMAGE_RESOLVE_INTERVAL_SECS
+        ));
+    }
+
+    #[test]
+    fn should_resolve_image_when_tag_changed() {
+        // The spec tag moved (1.0 → 2.0) since the last resolution —
+        // the cached digest is for the old tag, so we MUST re-resolve
+        // even if the interval has not elapsed.
+        let now = Utc::now();
+        let prior = status_image(
+            Some("ghcr.io/acme/web:1.0"),
+            Some("ghcr.io/acme/web@sha256:aaa"),
+            Some(&now.to_rfc3339()),
+        );
+        assert!(should_resolve_image(
+            Some(&prior),
+            "ghcr.io/acme/web:2.0",
+            now,
+            MIN_IMAGE_RESOLVE_INTERVAL_SECS
+        ));
+    }
+
+    #[test]
+    fn should_resolve_image_when_resolved_at_is_stale() {
+        // Same tag, already resolved, but the last resolution is older
+        // than the throttle interval → re-resolve (a moved tag would be
+        // missed otherwise).
+        let now = Utc::now();
+        let stale =
+            (now - chrono::Duration::seconds(MIN_IMAGE_RESOLVE_INTERVAL_SECS + 5)).to_rfc3339();
+        let prior = status_image(
+            Some("ghcr.io/acme/web:1.0"),
+            Some("ghcr.io/acme/web@sha256:aaa"),
+            Some(&stale),
+        );
+        assert!(should_resolve_image(
+            Some(&prior),
+            "ghcr.io/acme/web:1.0",
+            now,
+            MIN_IMAGE_RESOLVE_INTERVAL_SECS
+        ));
+    }
+
+    #[test]
+    fn should_skip_resolution_when_recent_same_tag_resolved() {
+        // The hot-path guard: same tag, already resolved, within the
+        // throttle window → SKIP the registry HEAD (reuse the cached
+        // digest). This is what stops a HEAD on every 60s requeue /
+        // every child-watch event.
+        let now = Utc::now();
+        let recent = (now - chrono::Duration::seconds(5)).to_rfc3339();
+        let prior = status_image(
+            Some("ghcr.io/acme/web:1.0"),
+            Some("ghcr.io/acme/web@sha256:aaa"),
+            Some(&recent),
+        );
+        assert!(!should_resolve_image(
+            Some(&prior),
+            "ghcr.io/acme/web:1.0",
+            now,
+            MIN_IMAGE_RESOLVE_INTERVAL_SECS
+        ));
+    }
+
+    #[test]
+    fn should_resolve_image_when_prior_never_resolved() {
+        // Prior status recorded the attempted tag but resolution failed
+        // (resolved=None, resolvedAt=None — Fix 1 (B)). The next
+        // reconcile must retry, not skip.
+        let now = Utc::now();
+        let prior = status_image(Some("ghcr.io/acme/web:1.0"), None, None);
+        assert!(should_resolve_image(
+            Some(&prior),
+            "ghcr.io/acme/web:1.0",
+            now,
+            MIN_IMAGE_RESOLVE_INTERVAL_SECS
+        ));
+    }
+
+    #[test]
+    fn should_resolve_image_when_resolved_at_unparseable() {
+        // Defensive: a corrupt/non-RFC3339 resolvedAt can't be aged →
+        // treat as stale and re-resolve.
+        let now = Utc::now();
+        let prior = status_image(
+            Some("ghcr.io/acme/web:1.0"),
+            Some("ghcr.io/acme/web@sha256:aaa"),
+            Some("not-a-timestamp"),
+        );
+        assert!(should_resolve_image(
+            Some(&prior),
+            "ghcr.io/acme/web:1.0",
+            now,
+            MIN_IMAGE_RESOLVE_INTERVAL_SECS
+        ));
     }
 }
