@@ -28,22 +28,31 @@ pub struct RenderedApplication {
     pub service: Option<Service>,
 }
 
-/// The Secret key the provisioner writes the DSN under (2.4c). The
-/// connection Secret carries exactly this one `stringData` key for a
-/// `pg` claim; the injected EnvVar's `secretKeyRef.key` points at it.
-const CONNECTION_SECRET_KEY: &str = "DATABASE_URL";
+/// needs-type → the env vars to inject, each as (env-var-name,
+/// secret-key). The provisioner writes exactly these keys into the
+/// connection Secret; the injected EnvVar's `secretKeyRef.key` points
+/// at the secret-key. `pg` ships one DSN key (2.4e); `redis` (2.6)
+/// ships two — the DSN plus the pub/sub channel prefix.
+///
+/// KEEP IN SYNC with the admission webhook's reserved-env guard
+/// (`RESERVED_ENV`) and the provisioner's connection-Secret builders.
+const NEEDS_ENV_BINDINGS: &[(&str, &[(&str, &str)])] = &[
+    ("pg", &[("DATABASE_URL", "DATABASE_URL")]),
+    (
+        "redis",
+        &[
+            ("REDIS_URL", "REDIS_URL"),
+            ("REDIS_CHANNEL_PREFIX", "REDIS_CHANNEL_PREFIX"),
+        ],
+    ),
+];
 
-/// needs-type → injected env-var name. 2.4e ships `pg` only;
-/// jetstream/redis land in 2.5/2.6. The Secret key is always
-/// `DATABASE_URL` (the provisioner writes exactly that one key).
-/// KEEP IN SYNC with the admission webhook's reserved-env guard.
-const NEEDS_ENV_VAR_NAME: &[(&str, &str)] = &[("pg", "DATABASE_URL")];
-
-fn needs_env_var_name(service_type: &str) -> Option<&'static str> {
-    NEEDS_ENV_VAR_NAME
+fn needs_env_bindings(service_type: &str) -> &'static [(&'static str, &'static str)] {
+    NEEDS_ENV_BINDINGS
         .iter()
         .find(|(k, _)| *k == service_type)
         .map(|(_, v)| *v)
+        .unwrap_or(&[])
 }
 
 /// Render the Application's `base` block (no environment override
@@ -204,32 +213,34 @@ fn render_deployment(
         })
         .unwrap_or_default();
 
-    // 2.4e: append a `valueFrom.secretKeyRef` DSN EnvVar per known
-    // need whose claim has a resolved connection Secret. Iterating
-    // `needs.keys()` (BTreeMap) keeps the appended order deterministic
-    // so the rendered Deployment is byte-stable across reconciles
-    // (SSA no-op; non-deterministic order would spin the operator).
-    // Appended AFTER the literal env so a (rejected-by-webhook, but
-    // defensively) colliding literal would never silently win.
+    // 2.4e/2.6: append a `valueFrom.secretKeyRef` EnvVar per known
+    // need whose claim has a resolved connection Secret. A need may
+    // inject more than one var (redis: REDIS_URL + REDIS_CHANNEL_PREFIX)
+    // — the bindings slice is fixed-order. Iterating `needs.keys()`
+    // (BTreeMap) keeps the appended order deterministic so the rendered
+    // Deployment is byte-stable across reconciles (SSA no-op;
+    // non-deterministic order would spin the operator). Appended AFTER
+    // the literal env so a (rejected-by-webhook, but defensively)
+    // colliding literal would never silently win.
     if let (Some(needs), Some(secrets)) = (spec.needs.as_ref(), needs_secrets) {
         for service_type in needs.keys() {
-            let (Some(var_name), Some(secret_name)) =
-                (needs_env_var_name(service_type), secrets.get(service_type))
-            else {
+            let Some(secret_name) = secrets.get(service_type) else {
                 continue;
             };
-            env_vars.push(EnvVar {
-                name: var_name.to_string(),
-                value: None,
-                value_from: Some(EnvVarSource {
-                    secret_key_ref: Some(SecretKeySelector {
-                        name: secret_name.clone(),
-                        key: CONNECTION_SECRET_KEY.to_string(),
-                        optional: Some(false),
+            for (var_name, secret_key) in needs_env_bindings(service_type) {
+                env_vars.push(EnvVar {
+                    name: var_name.to_string(),
+                    value: None,
+                    value_from: Some(EnvVarSource {
+                        secret_key_ref: Some(SecretKeySelector {
+                            name: secret_name.clone(),
+                            key: secret_key.to_string(),
+                            optional: Some(false),
+                        }),
+                        ..Default::default()
                     }),
-                    ..Default::default()
-                }),
-            });
+                });
+            }
         }
     }
 
@@ -987,25 +998,116 @@ mod tests {
     }
 
     #[test]
-    fn non_pg_need_in_secrets_map_is_not_injected() {
-        // pg-only table: a redis entry in the secrets map must NOT
-        // produce an env var (jetstream/redis injection is 2.5/2.6).
+    fn unknown_need_in_secrets_map_is_not_injected() {
+        // The bindings table is closed: an unknown need type (no entry
+        // in NEEDS_ENV_BINDINGS) must NOT produce any env var, even when
+        // a secret name is threaded in for it.
         let app = make_app_with_uid(
             ApplicationSpec {
-                base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "clickhouse")),
                 environments: None,
             },
             "parser",
             "demo",
             "uid-1",
         );
-        let secrets = BTreeMap::from([("redis".to_string(), "parser-redis-conn".to_string())]);
+        let secrets = BTreeMap::from([(
+            "clickhouse".to_string(),
+            "parser-clickhouse-conn".to_string(),
+        )]);
         let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r);
         assert!(
             envs.is_none(),
-            "redis need must not inject any env (pg-only)"
+            "unknown need must not inject any env (closed bindings table)"
         );
+    }
+
+    // ---- 2.6-6: redis injects REDIS_URL + REDIS_CHANNEL_PREFIX ----
+
+    #[test]
+    fn redis_need_injects_url_and_channel_prefix() {
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
+                environments: None,
+            },
+            "web",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([("redis".to_string(), "web-redis-conn".to_string())]);
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let envs = container_env(&r).expect("env present");
+        let url = envs
+            .iter()
+            .find(|e| e.name == "REDIS_URL")
+            .expect("REDIS_URL injected");
+        assert_eq!(
+            url.value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .key,
+            "REDIS_URL"
+        );
+        assert_eq!(
+            url.value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .name,
+            "web-redis-conn"
+        );
+        let pfx = envs
+            .iter()
+            .find(|e| e.name == "REDIS_CHANNEL_PREFIX")
+            .expect("REDIS_CHANNEL_PREFIX injected");
+        assert_eq!(
+            pfx.value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .name,
+            "web-redis-conn"
+        );
+        assert_eq!(
+            pfx.value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .key,
+            "REDIS_CHANNEL_PREFIX"
+        );
+    }
+
+    #[test]
+    fn redis_injection_is_deterministic_two_vars() {
+        // Both redis env vars present, fixed binding-slice order
+        // (REDIS_URL then REDIS_CHANNEL_PREFIX), no literal env.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
+                environments: None,
+            },
+            "web",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([("redis".to_string(), "web-redis-conn".to_string())]);
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let envs = container_env(&r).expect("env present");
+        assert_eq!(envs.len(), 2);
+        assert_eq!(envs[0].name, "REDIS_URL");
+        assert_eq!(envs[1].name, "REDIS_CHANNEL_PREFIX");
     }
 
     // ---- 2.4h-c: resolved-digest threading ----

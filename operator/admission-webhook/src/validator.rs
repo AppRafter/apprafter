@@ -126,62 +126,69 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     errors
 }
 
-/// The env-var name reserved when `needs.pg` is declared. The
-/// Application controller injects the PostgreSQL DSN under this name
-/// via `valueFrom.secretKeyRef` (2.4e); a user-set literal would
-/// collide. KEEP IN SYNC with operator-rendering NEEDS_ENV_VAR_NAME
-/// (pg→DATABASE_URL).
-const PG_RESERVED_ENV: &str = "DATABASE_URL";
+/// needs-type → the env var names reserved (injected by the
+/// provisioner/renderer via `valueFrom.secretKeyRef`) when that need
+/// is declared. A user-set literal of any of these would collide with
+/// the injected value. KEEP IN SYNC with operator-rendering
+/// `NEEDS_ENV_BINDINGS` (pg→DATABASE_URL; redis→REDIS_URL,
+/// REDIS_CHANNEL_PREFIX).
+const RESERVED_ENV: &[(&str, &[&str])] = &[
+    ("pg", &["DATABASE_URL"]),
+    ("redis", &["REDIS_URL", "REDIS_CHANNEL_PREFIX"]),
+];
 
-/// 2.4e: reject an Application that declares `needs.pg` AND sets a
-/// literal `env.DATABASE_URL` (collision with the injected DSN). The
-/// reservation is GLOBAL/cross-scope: pg declared in base OR ANY
-/// environment reserves `DATABASE_URL` everywhere (base + every
-/// environment env block). Hard reject (not warn), multi-error (one
-/// per offending field, no short-circuit) — matches the validator
-/// contract.
+/// 2.4e/2.6: reject an Application that declares a `needs.<type>` AND
+/// sets a literal `env` var reserved for that need's injected
+/// connection. The reservation is GLOBAL/cross-scope: a need declared
+/// in base OR ANY environment reserves its env names everywhere across
+/// the base env block and every environment env block. Hard reject
+/// rather than warn, and multi-error with one error per offending
+/// field and no short-circuit, matching the validator contract.
 fn validate_reserved_env_collision(
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let needs_pg = |obj: Option<&serde_json::Map<String, Value>>| -> bool {
-        obj.and_then(|o| o.get("needs"))
-            .and_then(|v| v.as_object())
-            .is_some_and(|n| n.contains_key("pg"))
+    let need_declared = |need: &str| -> bool {
+        let declares = |obj: Option<&serde_json::Map<String, Value>>| -> bool {
+            obj.and_then(|o| o.get("needs"))
+                .and_then(|v| v.as_object())
+                .is_some_and(|n| n.contains_key(need))
+        };
+        declares(base)
+            || envs.is_some_and(|envs_obj| envs_obj.values().any(|val| declares(val.as_object())))
     };
 
-    let pg_declared = needs_pg(base)
-        || envs.is_some_and(|envs_obj| envs_obj.values().any(|val| needs_pg(val.as_object())));
-
-    if !pg_declared {
-        return;
-    }
-
-    let has_database_url = |obj: Option<&serde_json::Map<String, Value>>| -> bool {
+    let env_has_key = |obj: Option<&serde_json::Map<String, Value>>, key: &str| -> bool {
         obj.and_then(|o| o.get("env"))
             .and_then(|v| v.as_object())
-            .is_some_and(|env| env.contains_key(PG_RESERVED_ENV))
+            .is_some_and(|env| env.contains_key(key))
     };
 
-    if has_database_url(base) {
-        errors.push(ValidationError::new(
-            format!("spec.base.env.{PG_RESERVED_ENV}"),
-            format!(
-                "{PG_RESERVED_ENV} is reserved for the PostgreSQL connection injected by needs.pg; remove it from spec.base.env"
-            ),
-        ));
-    }
-
-    if let Some(envs_obj) = envs {
-        for (name, val) in envs_obj {
-            if has_database_url(val.as_object()) {
+    for (need, reserved_names) in RESERVED_ENV {
+        if !need_declared(need) {
+            continue;
+        }
+        for name in *reserved_names {
+            if env_has_key(base, name) {
                 errors.push(ValidationError::new(
-                    format!("spec.environments.{name}.env.{PG_RESERVED_ENV}"),
+                    format!("spec.base.env.{name}"),
                     format!(
-                        "{PG_RESERVED_ENV} is reserved for the PostgreSQL connection injected by needs.pg; remove it from spec.environments.{name}.env"
+                        "{name} is reserved for the connection injected by needs.{need}; remove it from spec.base.env"
                     ),
                 ));
+            }
+            if let Some(envs_obj) = envs {
+                for (env_name, val) in envs_obj {
+                    if env_has_key(val.as_object(), name) {
+                        errors.push(ValidationError::new(
+                            format!("spec.environments.{env_name}.env.{name}"),
+                            format!(
+                                "{name} is reserved for the connection injected by needs.{need}; remove it from spec.environments.{env_name}.env"
+                            ),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -575,6 +582,76 @@ mod tests {
         let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
         assert!(fields.contains(&"spec.base.env.DATABASE_URL"));
         assert!(fields.contains(&"spec.environments.prod.env.DATABASE_URL"));
+    }
+
+    // ---- 2.6-6: REDIS_URL/REDIS_CHANNEL_PREFIX reserved under needs.redis ----
+
+    #[test]
+    fn rejects_redis_reserved_env_when_needs_redis() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "redis": {} },
+                "env": { "REDIS_URL": "redis://x", "REDIS_CHANNEL_PREFIX": "p:" }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert!(fields.contains(&"spec.base.env.REDIS_URL"));
+        assert!(fields.contains(&"spec.base.env.REDIS_CHANNEL_PREFIX"));
+    }
+
+    #[test]
+    fn rejects_redis_reserved_env_under_environment_when_base_needs_redis() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "redis": {} }
+            },
+            "environments": {
+                "prod": { "env": { "REDIS_CHANNEL_PREFIX": "override:" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].field,
+            "spec.environments.prod.env.REDIS_CHANNEL_PREFIX"
+        );
+    }
+
+    #[test]
+    fn accepts_redis_reserved_env_literal_when_no_needs_redis() {
+        // REDIS_URL/REDIS_CHANNEL_PREFIX are reserved ONLY under
+        // needs.redis. Without the need, they are normal env vars.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "REDIS_URL": "redis://my-own", "REDIS_CHANNEL_PREFIX": "p:" }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn pg_and_redis_reservations_coexist() {
+        // Declaring both needs reserves all three names; a collision on
+        // each surfaces independently (no cross-contamination).
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {}, "redis": {} },
+                "env": {
+                    "DATABASE_URL": "postgres://x",
+                    "REDIS_URL": "redis://y"
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert!(fields.contains(&"spec.base.env.DATABASE_URL"));
+        assert!(fields.contains(&"spec.base.env.REDIS_URL"));
+        assert_eq!(errors.len(), 2);
     }
 
     // ---- 2.4h-b: imagePolicy is a CRD-enforced pass-through ----
