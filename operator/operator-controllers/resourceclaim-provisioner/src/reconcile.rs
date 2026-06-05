@@ -19,7 +19,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
 use chrono::Utc;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
@@ -625,36 +624,15 @@ async fn provision_dragonfly(
 
 /// Read the `password` key from a pool instance's admin Secret. The
 /// Secret is created with `stringData`, so on read the value comes back
-/// base64-encoded under `data.password`.
+/// base64-encoded under `data.password`. Thin wrapper over the
+/// parameterised [`acl_reconcile::read_secret_key`] (the `password`-keyed
+/// special case) so there is one Secret-read implementation in the crate.
 async fn read_admin_password(
     ctx: &Arc<Context>,
     df_ns: &str,
     admin_secret_name: &str,
 ) -> Result<String, ReconcileError> {
-    let secret_api: Api<DynamicObject> =
-        Api::namespaced_with(ctx.client.clone(), df_ns, &secret_ar());
-    let secret = secret_api.get(admin_secret_name).await?;
-    let raw = secret
-        .data
-        .pointer("/data/password")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            ReconcileError::Provisioning(format!(
-                "Dragonfly admin Secret {admin_secret_name} missing data.password"
-            ))
-        })?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(raw)
-        .map_err(|e| {
-            ReconcileError::Provisioning(format!(
-                "Dragonfly admin Secret {admin_secret_name} password not base64: {e}"
-            ))
-        })?;
-    String::from_utf8(decoded).map_err(|e| {
-        ReconcileError::Provisioning(format!(
-            "Dragonfly admin Secret {admin_secret_name} password not UTF-8: {e}"
-        ))
-    })
+    crate::acl_reconcile::read_secret_key(ctx, df_ns, admin_secret_name, "password").await
 }
 
 /// SSA-patch ONLY the dragonfly allocation fields (`status.instance` /
