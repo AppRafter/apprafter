@@ -251,6 +251,10 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         } else {
             Some(&needs_secrets)
         },
+        // 2.4h-c: resolved digest threads in here. Task 9 (2.4h-d)
+        // replaces this `None` with the controller-resolved digest;
+        // until then the renderer pins the verbatim tag.
+        None,
     );
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's

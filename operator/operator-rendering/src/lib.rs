@@ -51,7 +51,7 @@ fn needs_env_var_name(service_type: &str) -> Option<&'static str> {
 /// shape; new code should prefer [`render_application_for_env`]
 /// when the operator knows which environment it represents.
 pub fn render_application(app: &Application) -> RenderedApplication {
-    render_application_for_env(app, None, None)
+    render_application_for_env(app, None, None, None)
 }
 
 /// Render the Application using the merged base + environment
@@ -65,10 +65,17 @@ pub fn render_application(app: &Application) -> RenderedApplication {
 /// EnvVar per known need. `None` (pre-gate / claims unready) renders
 /// the workload WITHOUT the DSN. Keeping the map a threaded param
 /// preserves the renderer's purity — no kube client here.
+///
+/// `resolved_image` (2.4h-c) pins the container image to a resolved
+/// `repo@sha256:...` digest when `Some(...)`; `None` renders the
+/// effective spec's image verbatim (the tag/ref as authored). The
+/// controller resolves the digest out-of-band and threads it in,
+/// keeping this function pure (no registry calls here).
 pub fn render_application_for_env(
     app: &Application,
     env_name: Option<&str>,
     needs_secrets: Option<&BTreeMap<String, String>>,
+    resolved_image: Option<&str>,
 ) -> RenderedApplication {
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
@@ -83,6 +90,7 @@ pub fn render_application_for_env(
         &labels,
         &effective,
         needs_secrets,
+        resolved_image,
     );
     let service = effective
         .expose
@@ -167,9 +175,12 @@ fn render_deployment(
     labels: &BTreeMap<String, String>,
     spec: &ApplicationBaseSpec,
     needs_secrets: Option<&BTreeMap<String, String>>,
+    resolved_image: Option<&str>,
 ) -> Deployment {
     let replicas = spec.replicas.unwrap_or(1);
-    let image = spec.image.clone().unwrap_or_default();
+    let image = resolved_image
+        .map(String::from)
+        .unwrap_or_else(|| spec.image.clone().unwrap_or_default());
     let container_port = spec.expose.as_ref().map(|e| ContainerPort {
         container_port: e.port,
         protocol: Some("TCP".to_string()),
@@ -779,7 +790,7 @@ mod tests {
             },
             envs,
         );
-        let r = render_application_for_env(&app, Some("prod"), None);
+        let r = render_application_for_env(&app, Some("prod"), None, None);
         assert_eq!(
             r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
                 .image
@@ -856,7 +867,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets));
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present");
         let dsn = envs
             .iter()
@@ -884,7 +895,7 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let r = render_application_for_env(&app, None, None);
+        let r = render_application_for_env(&app, None, None, None);
         let envs = container_env(&r);
         // No literal env + no injected DSN → env stays None.
         assert!(envs.is_none(), "no DATABASE_URL when secrets map is None");
@@ -902,7 +913,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets));
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present (DSN injected)");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "DATABASE_URL");
@@ -925,7 +936,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets));
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 2);
         // Literal env first, DSN appended AFTER.
@@ -949,11 +960,60 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([("redis".to_string(), "parser-redis-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets));
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r);
         assert!(
             envs.is_none(),
             "redis need must not inject any env (pg-only)"
         );
+    }
+
+    // ---- 2.4h-c: resolved-digest threading ----
+
+    /// Helper: build an Application whose `base.image` is `image`.
+    fn app_with_image(image: &str) -> Application {
+        make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some(image.to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+            },
+            "web",
+            "default",
+            "uid",
+        )
+    }
+
+    #[test]
+    fn deployment_uses_resolved_digest_when_provided() {
+        let app = app_with_image("ghcr.io/acme/web:1.0");
+        let rendered =
+            render_application_for_env(&app, None, None, Some("ghcr.io/acme/web@sha256:abc"));
+        let c = &rendered
+            .deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0];
+        assert_eq!(c.image.as_deref(), Some("ghcr.io/acme/web@sha256:abc"));
+    }
+
+    #[test]
+    fn deployment_uses_verbatim_tag_when_resolved_is_none() {
+        let app = app_with_image("ghcr.io/acme/web:1.0");
+        let rendered = render_application_for_env(&app, None, None, None);
+        let c = &rendered
+            .deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0];
+        assert_eq!(c.image.as_deref(), Some("ghcr.io/acme/web:1.0"));
     }
 }
