@@ -1701,6 +1701,30 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.14": {
+	change:          "safe"
+	operatorVersion: "v0.2.14"
+	notes: """
+		Operator-only PlatformController resilience fix (no CRD
+		change). Version DETECTION (resolving the channel-latest /
+		availableVersion from the OCI upstream) is decoupled from
+		ENFORCEMENT (deploying the policy target): a resolver failure
+		no longer aborts the reconcile, so a pinned stack still
+		converges to its pin and an unpinned one keeps its last-known
+		target, instead of crash-looping before the pin is applied
+		(the 2.4g-walk deadlock that froze every status condition at
+		its last-good value). The transition-classification fetch
+		fails closed (holds current, never bumps unclassified), and a
+		new UpstreamReachable condition surfaces a degraded poll in
+		`apprafter platform status`. Pure reconcile-loop fix over the
+		0.2.13 controller set; same CRDs, RBAC, and components. Safe
+		to auto-sync.
+		"""
+	references: [
+		"operator/operator-controllers/platform-stack/src/reconcile.rs",
+		"operator/operator-controllers/platform-stack/src/status.rs",
+	]
+}
 compatibility: "0.2.13": {
 	change:          "safe"
 	operatorVersion: "v0.2.13"
