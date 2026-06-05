@@ -2799,14 +2799,26 @@ instead of carrying parallel definitions.
 ### 2.6 needs.redis → Dragonfly
 > 🏁 SR: A · order 3 — needs.redis; pulled C→A (closes 2/6 platform services)
 
-**Поставка:**
-- [ ] Dragonfly как platform-service (single instance Tier 1).
-- [ ] `redis-integrated` ServiceProvider: DB-namespace per claim.
-- [ ] `requirepass` per-claim, в Secret.
+**Полный дизайн + альтернативы + риски — ADR 0042.** Зеркалит 2.4 (needs.pg→CNPG), ПЕРЕИСПОЛЬЗУЯ generic-машинерию: `resourceclaim-provisioner` (dispatch по `ServiceProvider.spec.backend` — `dragonfly`-арм сейчас возвращает `None`), генерацию claim'а Application'ом + гейт `AwaitingResourceClaim` (2.4d), DSN-инъекцию (2.4e), `RetainedClaim` 7-дневный GC (2.4f), scheduler (2.3).
 
-**Acceptance:** Application с `needs.redis` получает рабочий DSN, два claim'а изолированы по DB-номеру.
+**Зафиксированные решения (с пользователем, 2026-06-05; ADR 0042):**
+- **Deployment = dragonfly-operator always-on + shared-инстансы LAZY** (как CNPG). platform-stack ставит dragonfly-operator (always-on) + сид `redis-integrated` ServiceProvider (`type: redis`, `backend: dragonfly`). Provisioner лениво создаёт ДО ДВУХ shared `Dragonfly` CR в `dragonfly-system`: `platform-redis` (ephemeral) + `platform-redis-persistent` (snapshot→PVC, PVC ленивый). Claim роутится по флагу persistence. Solo без redis-приложений не платит за Dragonfly-под.
+- **Изоляция = per-claim ACL-user с keyspace-prefix** (НЕ requirepass — он server-global; НЕ logical-DB — `SELECT` не граница). Provisioner ИМПЕРАТИВНО (новый redis-клиент, admin-кред инстанса) создаёт ACL-user `claim_<ns>_<app>_redis` с `~claim_<ns>_<app>_redis:* +@all -@dangerous -@admin -@scripting` (жёсткая keyspace-граница на shared-инстансе). **Tradeoff (принят):** приложение ОБЯЗАНО использовать свой key-prefix (unprefixed-ключи → NOPERM).
+- **Persistence = per-claim opt-in.** `#ServiceNeed` получает `persistent?: bool` (дефолт false) → 4 зеркала (CUE / kube-rs / OpenAPI CRD / webhook), проброшен в `ResourceClaim`. `needs.redis: {}` → ephemeral; `{persistent: true}` → persistent-инстанс.
+- **DSN = ДВА ключа.** connection-Secret несёт `REDIS_URL = redis://claim_x:<pass>@<instance>.dragonfly-system.svc:6379/0` + `REDIS_PREFIX = claim_x:`. Таблица needs→env рендерера (2.4e) обобщается с одного env-var до СПИСКА пар `(env-var, secret-key)` на need: pg→[(DATABASE_URL,DATABASE_URL)]; redis→[(REDIS_URL,REDIS_URL),(REDIS_PREFIX,REDIS_PREFIX)]. webhook reserved-env guard отклоняет литеральные `REDIS_URL`/`REDIS_PREFIX` при `needs.redis` (зеркало `DATABASE_URL`).
+- **GC = императивная очистка.** Dragonfly-путь в 2.4f GC: после grace — `ACL DELUSER claim_x` + `SCAN MATCH claim_x:* | UNLINK` (shared-инстанс нельзя FLUSHDB) + удалить connection-Secret. Shared-инстансы остаются (как shared CNPG Cluster).
 
-**Зависит от:** 2.3
+**Декомпозиция (порядок сборки).** Метки `2.6-N`, а не `2.6a–f`: `2.6a` (KEDA) / `2.6b` (needs.disk) — намеренные insert-соседи на уровне `### 2.6` (устоявшийся паттерн вставки доп. пунктов), не дети redis; отдельная нумерация снимает коллизию и даёт стабильные кросс-ссылки.
+- [ ] **2.6-1** — dragonfly-operator как platform-stack component + сид `redis-integrated` ServiceProvider (`type: redis`, `backend: dragonfly`). **platform-stack-only** (как 2.4a).
+- [ ] **2.6-2** — `persistent?: bool` на `#ServiceNeed` → 4 зеркала + проброс в `ResourceClaim`. Чистая схема.
+- [ ] **2.6-3** — provisioner `Backend::Dragonfly`: ленивый shared `Dragonfly` CR (по persistence) + императивный ACL-user через redis-клиент (новая dep) + connection-Secret (REDIS_URL+REDIS_PREFIX).
+- [ ] **2.6-4** — DSN-инъекция: рендерер needs→env обобщается до списка пар + webhook reserved-env guard для REDIS_URL/REDIS_PREFIX.
+- [ ] **2.6-5** — GC: dragonfly-путь (DELUSER + SCAN/UNLINK + Secret) в 2.4f GC-контроллер.
+- [ ] **2.6-6** — `e2e/needs-redis-walk.sh` + подробный ручной walk + dev-guide + координированный operator+platform-stack release.
+
+**Acceptance:** Application с `needs.redis` получает рабочий `REDIS_URL` + `REDIS_PREFIX`; два claim'а изолированы (claim B не видит ключи claim A; unprefixed → NOPERM); `persistent: true` переживает рестарт пода.
+
+**Зависит от:** 2.3, 2.4 (вся переиспользуемая машинерия), ADR 0042
 
 **Размер:** M
 
