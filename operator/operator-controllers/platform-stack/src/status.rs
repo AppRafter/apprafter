@@ -31,6 +31,22 @@ pub const COND_READY: &str = "Ready";
 /// Track B.1.74a.
 pub const COND_YANKED_VERSION: &str = "YankedVersion";
 
+/// `UpstreamReachable=False` when the channel-latest could not be
+/// resolved from the OCI upstream this poll cycle (registry
+/// unreachable, a `tags: null` / parse quirk, auth, etc.).
+/// Informational — version DETECTION is degraded (`availableVersion`
+/// is stale), but ENFORCEMENT is unaffected: a pinned stack still
+/// converges to its pin and an unpinned one keeps its last-known
+/// target. Without this signal a resolver failure used to abort the
+/// whole reconcile, so the operator crash-looped and EVERY other
+/// condition froze at its last-good value (e.g. `UpgradeAvailable=
+/// UpToDate`) while nothing actually progressed — the exact
+/// confusion behind the v0.2.12 `invalid type: null` deadlock.
+/// `condition.message` carries the verbatim resolver error.
+/// Surfaces in `kubectl describe platformstack default` +
+/// `apprafter platform status`.
+pub const COND_UPSTREAM_REACHABLE: &str = "UpstreamReachable";
+
 /// Maximum entries kept in `PlatformStack.status.versionHistory`.
 /// Ring-buffer behaviour: oldest entry drops when this cap is
 /// exceeded. Per spec.md §3.11 ("recent N transitions"); 10 is

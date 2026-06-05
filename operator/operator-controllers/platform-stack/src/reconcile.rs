@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use kube::api::PostParams;
 use operator_core::{
     Metrics, MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationPlatformScope,
-    MigrationRisks, MigrationTrigger, PlatformStack, PlatformStackStatus,
+    MigrationRisks, MigrationTrigger, PlatformStack, PlatformStackCondition, PlatformStackStatus,
     PlatformStackVersionHistoryEntry,
 };
 
@@ -43,7 +43,7 @@ use crate::oci::{channel_matches, tags_in_channel, Channel};
 use crate::status::{
     append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING, COND_READY,
     COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
-    COND_YANKED_VERSION,
+    COND_UPSTREAM_REACHABLE, COND_YANKED_VERSION,
 };
 use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
@@ -302,52 +302,41 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // can never be reported as `availableVersion`.
     //
     // Bounded by the 60s throttle (`MIN_OCI_POLL_INTERVAL_SECS`).
+    //
+    // DETECTION vs ENFORCEMENT. Resolving the channel-latest is
+    // DETECTION (drives `availableVersion` + `UpgradeAvailable`).
+    // It is ORTHOGONAL to ENFORCEMENT (deploying the policy
+    // target). A resolver failure must NOT abort the reconcile:
+    // doing so wedged the v0.2.12 operator — its OCI poll crashed
+    // on a `tags: null` quirk every cycle, BEFORE the pin was ever
+    // applied, so a pinned stack never converged and (because the
+    // crashing reconcile never wrote status) every condition froze
+    // at its last-good value. Instead we DEGRADE: a pinned stack
+    // still enforces its pin, an unpinned stack keeps its
+    // last-known target, and `UpstreamReachable=False` makes the
+    // degraded detection visible. Only an unpinned stack that has
+    // NEVER resolved a version has no target at all — that alone
+    // propagates.
+    let mut upstream_poll_error: Option<String> = None;
     let (channel_latest_str, did_poll_oci, compat_doc) = if should_poll_oci {
-        let channel_tag = channel.as_tag();
-        match fetch_compatibility_doc_with_self_version(&spec.source.upstream, channel_tag).await {
-            Ok((doc, self_version)) => {
-                match latest_non_yanked_in_compat(&doc, channel, self_version.as_ref()) {
-                    Some(v) => {
-                        info!(
-                            channel = %spec.channel,
-                            channel_tag,
-                            resolved = %v,
-                            "resolved channel-latest from :<channel> compat doc (ADR 0041 fast path)"
-                        );
-                        (v.to_string(), true, Some(doc))
-                    }
-                    None => {
-                        // The channel doc exists but yields no
-                        // usable version (all yanked /
-                        // channel-filtered out / empty / above the
-                        // self-version cap). Fall back to the
-                        // listing.
-                        warn!(
-                            channel = %spec.channel,
-                            channel_tag,
-                            "channel-tag compat doc declared no usable version; \
-                             falling back to tag listing"
-                        );
-                        resolve_via_tag_listing(&spec.source.upstream, channel).await?
-                    }
+        match resolve_channel_latest(&spec.source.upstream, channel, &spec.channel).await {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(
+                    error = %msg,
+                    pinned = spec.pin.is_some(),
+                    "channel-latest resolution failed; degrading (pin / last-known target preserved)"
+                );
+                upstream_poll_error = Some(msg);
+                match degrade_on_resolution_failure(spec.pin.is_some(), prior_available.as_deref())
+                {
+                    Some(tuple) => tuple,
+                    // Unpinned AND never resolved a version — no
+                    // target to deploy. Genuinely fatal; propagate.
+                    None => return Err(e),
                 }
             }
-            Err(CompatError::ManifestNotFound(reference)) => {
-                // Pre-contract chart: no `:<channel>` tag (404 /
-                // MANIFEST_UNKNOWN). Fall back to the paginated tag
-                // listing.
-                info!(
-                    channel = %spec.channel,
-                    channel_tag,
-                    reference,
-                    "no :<channel> tag (pre-contract chart); falling back to tag listing"
-                );
-                resolve_via_tag_listing(&spec.source.upstream, channel).await?
-            }
-            // Network / auth / parse / missing-file / blob 404 — a
-            // real failure. Propagate so it surfaces instead of
-            // resolving off a stale listing.
-            Err(e) => return Err(Error::from(e)),
         }
     } else {
         // SAFETY: when `should_poll_oci` is false we've already
@@ -394,6 +383,20 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         new_status.last_upstream_check = Some(now.to_rfc3339());
         new_status.available_version = Some(channel_latest_str.clone());
     }
+    // Surface the upstream-poll outcome BEFORE the in-flight
+    // early-return below, so an in-flight cycle that also degraded
+    // doesn't persist a stale `UpstreamReachable=True`. At this
+    // point only the resolution-stage error is known — which is
+    // exactly right for the in-flight path (the transition-
+    // classification fetch is post-in-flight). The normal path
+    // re-runs this after classification (which may add its own
+    // error) just before the final write.
+    set_upstream_reachable(
+        &mut new_status,
+        should_poll_oci,
+        upstream_poll_error.as_deref(),
+        &prior_conds,
+    );
 
     // 6. In-flight gating. We do NOT fight an in-progress sync —
     //    Argo CD's app-controller is mid-apply; another patch
@@ -490,39 +493,65 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             // 0.1.C where 0.1.B was breaking) don't silently
             // bypass the gate via classification of the C
             // record alone.
-            let class = fetch_path_max_change_class(
+            // SECOND degrade point: classifying the transition pulls
+            // the compatibility doc from the SAME upstream. If that
+            // is unreachable we must NOT abort (aborting crash-loops
+            // and freezes status, the very wedge we are fixing) and
+            // must NOT bump blind (a destructive change without a
+            // MigrationPlan gate). Fail CLOSED: hold at current_target
+            // this cycle (the reconcile continues normally — writes
+            // status with UpstreamReachable=False, then requeues) and
+            // the pin applies once the upstream recovers and the
+            // transition can be classified.
+            match fetch_path_max_change_class(
                 &spec.source.upstream,
                 &current_target,
                 &desired.target_revision,
             )
-            .await?;
-            if matches!(
-                class,
-                ChangeClass::Breaking | ChangeClass::DataMigration | ChangeClass::RequiresRestart
-            ) {
-                info!(
-                    plan = %plan_name,
-                    classification = ?class,
-                    from = %current_target,
-                    to = %desired.target_revision,
-                    "creating platform MigrationPlan for destructive transition"
-                );
-                create_platform_migration_plan(
-                    &plan_api,
-                    &plan_name,
-                    &current_target,
-                    &desired.target_revision,
-                    class,
-                    spec.pin.as_deref(),
-                )
-                .await?;
-                migration_pending = Some(MigrationPendingState {
-                    classification: change_class_to_string(class).to_string(),
-                    plan_name: Some(plan_name.clone()),
-                });
-                current_target.clone()
-            } else {
-                desired.target_revision.clone()
+            .await
+            {
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        from = %current_target,
+                        to = %desired.target_revision,
+                        "cannot classify transition (upstream unreachable); holding current target"
+                    );
+                    upstream_poll_error.get_or_insert(e.to_string());
+                    current_target.clone()
+                }
+                Ok(class)
+                    if matches!(
+                        class,
+                        ChangeClass::Breaking
+                            | ChangeClass::DataMigration
+                            | ChangeClass::RequiresRestart
+                    ) =>
+                {
+                    info!(
+                        plan = %plan_name,
+                        classification = ?class,
+                        from = %current_target,
+                        to = %desired.target_revision,
+                        "creating platform MigrationPlan for destructive transition"
+                    );
+                    create_platform_migration_plan(
+                        &plan_api,
+                        &plan_name,
+                        &current_target,
+                        &desired.target_revision,
+                        class,
+                        spec.pin.as_deref(),
+                    )
+                    .await?;
+                    migration_pending = Some(MigrationPendingState {
+                        classification: change_class_to_string(class).to_string(),
+                        plan_name: Some(plan_name.clone()),
+                    });
+                    current_target.clone()
+                }
+                // Safe transition — bump to the desired target.
+                Ok(_) => desired.target_revision.clone(),
             }
         }
     } else {
@@ -668,6 +697,21 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         )
     };
     upsert_condition(&mut new_status, cond_upgrade);
+
+    // UpstreamReachable — re-evaluated here so the NORMAL (non-in-
+    // flight) write captures a transition-classification failure
+    // (`upstream_poll_error` may have been set after the early call
+    // above, which runs before the in-flight gate). Same truthful
+    // semantics: False on any upstream error this cycle, True on a
+    // successful poll, prior carried forward on a throttled-no-error
+    // cycle. A failed poll never advances `lastUpstreamCheck`, so a
+    // throttled cycle always follows a SUCCESS — True is correct.
+    set_upstream_reachable(
+        &mut new_status,
+        should_poll_oci,
+        upstream_poll_error.as_deref(),
+        &prior_conds,
+    );
 
     let cond_migration = match &migration_pending {
         Some(state) => {
@@ -942,6 +986,130 @@ fn latest_non_yanked_in_compat(
         .filter(|v| channel_matches(v, channel))
         .filter(|v| cap.is_none_or(|c| v <= c))
         .max()
+}
+
+/// Decide how to DEGRADE when channel-latest resolution fails,
+/// keeping DETECTION failures from blocking ENFORCEMENT. Returns
+/// the `(channel_latest, did_poll_oci=false, compat_doc=None)`
+/// tuple to use, or `None` when there is genuinely no target to
+/// deploy (unpinned AND no prior-resolved version) — the caller
+/// propagates the error in that case.
+///
+/// - pinned: always `Some` — the pin is the target; `available`
+///   degrades to the best-known prior (empty string if none).
+/// - unpinned with a prior: `Some(prior)` — keep the last-known
+///   target rather than regress a healthy deploy on a blip.
+/// - unpinned with no prior: `None` — nothing to deploy.
+fn degrade_on_resolution_failure(
+    pinned: bool,
+    prior_available: Option<&str>,
+) -> Option<(String, bool, Option<CompatibilityDoc>)> {
+    match (pinned, prior_available) {
+        (true, prior) => Some((prior.unwrap_or_default().to_string(), false, None)),
+        (false, Some(prior)) => Some((prior.to_string(), false, None)),
+        (false, None) => None,
+    }
+}
+
+/// Upsert the `UpstreamReachable` condition reflecting THIS
+/// cycle's upstream outcome. Set only when we have a definitive
+/// signal — we attempted a poll (`should_poll`) or a later
+/// upstream fetch failed (`poll_error` is `Some`); otherwise a
+/// throttled-no-error cycle leaves the prior value in place
+/// (already cloned into `new_status`). Factored out so BOTH the
+/// in-flight early-return path AND the normal status write surface
+/// the same truthful signal — without it, an in-flight cycle that
+/// also degraded would persist a stale `UpstreamReachable=True`.
+fn set_upstream_reachable(
+    new_status: &mut PlatformStackStatus,
+    should_poll: bool,
+    poll_error: Option<&str>,
+    prior: &[PlatformStackCondition],
+) {
+    if !(should_poll || poll_error.is_some()) {
+        return;
+    }
+    let c = match poll_error {
+        Some(err) => condition(
+            COND_UPSTREAM_REACHABLE,
+            "False",
+            "PollFailed",
+            &format!(
+                "could not resolve channel-latest from upstream ({err}); availableVersion is \
+                 stale — pinned / last-known target still enforced"
+            ),
+            prior,
+        ),
+        None => condition(
+            COND_UPSTREAM_REACHABLE,
+            "True",
+            "Reachable",
+            "channel-latest resolved from the OCI upstream",
+            prior,
+        ),
+    };
+    upsert_condition(new_status, c);
+}
+
+/// Resolve the channel-latest: ADR 0041 fast path (the moving
+/// `:<channel>` compat doc) → paginated tag-listing fallback.
+/// Returns the `(channel_latest, did_poll_oci=true, compat_doc)`
+/// tuple the reconcile body consumes, or an `Err` when BOTH the
+/// fast path and the fallback fail. Pulled out of the reconcile so
+/// the caller can DEGRADE on `Err` (enforce the pin / keep the
+/// last-known target) instead of aborting — see the "DETECTION vs
+/// ENFORCEMENT" note at the call site. `channel_label` is the raw
+/// `spec.channel` string, for logging only.
+async fn resolve_channel_latest(
+    upstream: &str,
+    channel: Channel,
+    channel_label: &str,
+) -> Result<(String, bool, Option<CompatibilityDoc>), Error> {
+    let channel_tag = channel.as_tag();
+    match fetch_compatibility_doc_with_self_version(upstream, channel_tag).await {
+        Ok((doc, self_version)) => {
+            match latest_non_yanked_in_compat(&doc, channel, self_version.as_ref()) {
+                Some(v) => {
+                    info!(
+                        channel = %channel_label,
+                        channel_tag,
+                        resolved = %v,
+                        "resolved channel-latest from :<channel> compat doc (ADR 0041 fast path)"
+                    );
+                    Ok((v.to_string(), true, Some(doc)))
+                }
+                None => {
+                    // The channel doc exists but yields no usable
+                    // version (all yanked / channel-filtered out /
+                    // empty / above the self-version cap). Fall back
+                    // to the listing.
+                    warn!(
+                        channel = %channel_label,
+                        channel_tag,
+                        "channel-tag compat doc declared no usable version; \
+                         falling back to tag listing"
+                    );
+                    resolve_via_tag_listing(upstream, channel).await
+                }
+            }
+        }
+        Err(CompatError::ManifestNotFound(reference)) => {
+            // Pre-contract chart: no `:<channel>` tag (404 /
+            // MANIFEST_UNKNOWN). Fall back to the paginated tag
+            // listing.
+            info!(
+                channel = %channel_label,
+                channel_tag,
+                reference,
+                "no :<channel> tag (pre-contract chart); falling back to tag listing"
+            );
+            resolve_via_tag_listing(upstream, channel).await
+        }
+        // Network / auth / parse / missing-file / blob 404 — a real
+        // failure. Surface it to the caller, which decides whether
+        // to degrade (pinned / last-known) or propagate.
+        Err(e) => Err(Error::from(e)),
+    }
 }
 
 /// ADR 0041 FALLBACK path: resolve the channel-latest via the
@@ -1887,6 +2055,94 @@ mod tests {
             latest_non_yanked_in_compat(&doc, Channel::Stable, None),
             Some(Version::parse("0.2.13").unwrap())
         );
+    }
+
+    #[test]
+    fn degrade_pinned_enforces_pin_even_with_prior_available() {
+        // The deadlock fix: a poll failure must NOT block a pinned
+        // stack. degrade returns Some (reconcile proceeds to apply
+        // the pin); `available` degrades to the best-known prior.
+        let (available, did_poll, doc) =
+            degrade_on_resolution_failure(true, Some("0.2.2")).expect("pinned always degrades");
+        assert_eq!(available, "0.2.2");
+        assert!(!did_poll); // no successful poll this cycle
+        assert!(doc.is_none());
+    }
+
+    #[test]
+    fn degrade_pinned_with_no_prior_available_still_enforces() {
+        // Fresh pinned install whose very first poll fails: still
+        // Some (the pin gets enforced); `available` is empty
+        // (truly unknown) rather than wedging.
+        let (available, _, _) =
+            degrade_on_resolution_failure(true, None).expect("pinned degrades even with no prior");
+        assert_eq!(available, "");
+    }
+
+    #[test]
+    fn degrade_unpinned_keeps_last_known_target() {
+        // Unpinned but previously healthy: keep the last-known
+        // target — don't regress a working deploy on a transient
+        // resolver blip.
+        let (available, _, _) = degrade_on_resolution_failure(false, Some("0.2.11"))
+            .expect("unpinned-with-prior degrades to last-known");
+        assert_eq!(available, "0.2.11");
+    }
+
+    fn upstream_cond(status: &PlatformStackStatus) -> Option<&PlatformStackCondition> {
+        status
+            .conditions
+            .as_ref()
+            .and_then(|cs| cs.iter().find(|c| c.type_ == COND_UPSTREAM_REACHABLE))
+    }
+
+    #[test]
+    fn set_upstream_reachable_marks_false_on_poll_error() {
+        let mut s = PlatformStackStatus::default();
+        set_upstream_reachable(&mut s, true, Some("registry IO: invalid type: null"), &[]);
+        let c = upstream_cond(&s).expect("condition written");
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason.as_deref(), Some("PollFailed"));
+        assert!(c.message.as_deref().unwrap().contains("invalid type: null"));
+    }
+
+    #[test]
+    fn set_upstream_reachable_marks_true_on_clean_poll() {
+        let mut s = PlatformStackStatus::default();
+        set_upstream_reachable(&mut s, true, None, &[]);
+        let c = upstream_cond(&s).expect("condition written");
+        assert_eq!(c.status, "True");
+        assert_eq!(c.reason.as_deref(), Some("Reachable"));
+    }
+
+    #[test]
+    fn set_upstream_reachable_is_noop_on_throttled_clean_cycle() {
+        // No poll attempted (throttled) and no error — leave the
+        // prior value untouched (carry forward), don't assert True.
+        let mut s = PlatformStackStatus::default();
+        set_upstream_reachable(&mut s, false, None, &[]);
+        assert!(
+            upstream_cond(&s).is_none(),
+            "throttled clean cycle must not write the condition"
+        );
+    }
+
+    #[test]
+    fn set_upstream_reachable_marks_false_even_when_throttled_if_error() {
+        // The transition-classification failure path: should_poll is
+        // false but an upstream error was recorded — must surface.
+        let mut s = PlatformStackStatus::default();
+        set_upstream_reachable(&mut s, false, Some("connection refused"), &[]);
+        let c = upstream_cond(&s).expect("condition written on error even when throttled");
+        assert_eq!(c.status, "False");
+    }
+
+    #[test]
+    fn degrade_unpinned_with_no_prior_propagates() {
+        // Unpinned AND never resolved: no target to deploy. None
+        // signals the caller to propagate the error (genuinely
+        // fatal — there is nothing to enforce).
+        assert!(degrade_on_resolution_failure(false, None).is_none());
     }
 
     #[test]
