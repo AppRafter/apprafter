@@ -9,6 +9,48 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator v0.2.15 + platform-stack 0.2.15 — 2.4h image tag→digest resolution & auto-rollout (ADR 0040) (2026-06-05)
+
+The Application controller now resolves `spec.base.image`'s mutable tag to its
+current registry digest each reconcile and pins the Deployment to
+`repo@sha256:<digest>`, so re-pushing the same tag auto-rolls the workload
+(push→deploy). The platform owns the pull half of push-pull.
+
+### Added
+
+- **Tag→digest resolution.** A hand-rolled OCI resolver (manifest `HEAD` reading
+  `Docker-Content-Digest`; anonymous, or authed via a covering `SourceCredential`'s
+  `dockerconfigjson` per ADR 0039) resolves the tag the image points at — including
+  multi-arch image indexes — over an injected, unit-testable HTTP seam.
+- **`spec.base.imagePolicy.resolve: digest|off`** (default `digest`, all tiers) — the
+  opt-out renders the verbatim reference and performs no registry poll.
+- **`status.image.{tag,resolved,resolvedAt}`** + an **`ImageResolved`** condition record
+  the running digest; `apprafter app status` surfaces it.
+- **`apprafter_image_resolve_total{result}`** metric (`ok`/`cached`/`failed`).
+
+### Notes
+
+- **Default-ON, all tiers.** After this upgrade every Application with a mutable tag
+  begins resolving on its next reconcile — a workload whose tag had moved rolls once to
+  the current digest. Opt out per-app with `imagePolicy.resolve: off`.
+- **Never blocks.** Resolution is best-effort and throttled to ~60s (mirrors the
+  PlatformController OCI throttle); any failure renders the verbatim tag +
+  `ImageResolved=False` and the rollout proceeds. Argo CD is untouched (the operator
+  patches its own child Deployment out-of-band).
+- **No migration gate** on an image change (an auto-deploy that paused on every push
+  would break the UX); regulated workloads opt out and carry their own change control.
+- `change: safe` — the `Application` CRD gains only optional, additive fields
+  (`imagePolicy` + `status.image`); no breaking schema change, no data migration.
+
+## platform-cli v0.2.6 — 2.4h-e: app status surfaces the running image digest (2026-06-05)
+
+### Added
+
+- **`apprafter app status`** prints the resolved image line — the written tag, the
+  running `@sha256:<digest>`, and the resolved-age — from `status.image` (ADR 0040). The
+  line is omitted when resolution is off or hasn't run; on a resolution failure it shows
+  the attempted tag only.
+
 ## platform-cli v0.2.5 — 2.4g closure: needs.pg walk-fixes + app-UX (2026-06-05)
 
 The accumulated CLI walk-fixes from the 2.4 needs.pg real-Tier-1 walk, released as

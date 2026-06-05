@@ -1701,6 +1701,35 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.15": {
+	change:          "safe"
+	operatorVersion: "v0.2.15"
+	notes: """
+		Image tag→digest resolution & auto-rollout (ADR 0040). The
+		Application CRD gains two OPTIONAL, additive fields
+		(`spec.base.imagePolicy.resolve: digest|off` and
+		`status.image.{tag,resolved,resolvedAt}`) plus an
+		`ImageResolved` condition — no breaking schema change, no data
+		migration. The Application controller now resolves
+		`spec.base.image`'s tag to its current registry digest each
+		reconcile (throttled to ~60s, anonymous or via a covering
+		`SourceCredential`) and pins the Deployment to
+		`repo@sha256:<digest>`, so a moved tag auto-rolls the workload
+		(push→deploy). **Default-ON, all tiers:** after this upgrade,
+		every Application with a mutable tag begins resolving on its
+		next reconcile — a workload that had a moved tag will roll once
+		to the current digest. Opt out per-app with
+		`imagePolicy.resolve: off` (renders the verbatim reference, no
+		registry poll). Resolution is best-effort and NEVER blocks the
+		rollout (failure → verbatim tag + `ImageResolved=False`). Safe
+		to auto-sync.
+		"""
+	references: [
+		"docs/adr/0040-image-digest-resolution.md",
+		"operator/operator-controllers/application/src/oci_resolve.rs",
+		"operator/operator-controllers/application/src/lib.rs",
+	]
+}
 compatibility: "0.2.14": {
 	change:          "safe"
 	operatorVersion: "v0.2.14"
