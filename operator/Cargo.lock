@@ -1497,6 +1497,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "operator-controllers-application"
 version = "0.1.2"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "futures",
  "k8s-openapi",

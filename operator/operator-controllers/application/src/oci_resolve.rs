@@ -166,9 +166,90 @@ pub fn parse_token_response(body: &[u8]) -> Result<String, OciResolveError> {
         .ok_or_else(|| OciResolveError::Auth("token response had no token".into()))
 }
 
+/// Canonical Docker Hub manifest host that `parse_image_ref` (via
+/// `Reference::resolve_registry()`) emits for the `docker.io` alias.
+const DOCKER_HUB_HOST: &str = "index.docker.io";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryAuth {
+    Anonymous,
+    Basic(String, String),
+}
+
+/// Extract Basic auth for `host` from a kubelet `dockerconfigjson`
+/// (`{"auths":{"<host>":{"auth":"<base64 user:pass>"}}}`). Falls back
+/// to `Anonymous` when the host has no entry (public image with an
+/// unrelated covering credential). `docker.io`/`index.docker.io`
+/// aliases map to the canonical registry host.
+pub fn auth_from_dockerconfigjson(dcj: &[u8], host: &str) -> Result<RegistryAuth, OciResolveError> {
+    use base64::Engine;
+    let v: serde_json::Value =
+        serde_json::from_slice(dcj).map_err(|e| OciResolveError::Auth(e.to_string()))?;
+    let auths = match v.get("auths").and_then(|a| a.as_object()) {
+        Some(a) => a,
+        None => return Ok(RegistryAuth::Anonymous),
+    };
+    let candidates = dockerhub_aliases(host);
+    let entry = auths
+        .iter()
+        .find(|(k, _)| candidates.iter().any(|c| c == *k))
+        .map(|(_, e)| e);
+    let Some(entry) = entry else {
+        return Ok(RegistryAuth::Anonymous);
+    };
+    let Some(b64) = entry.get("auth").and_then(|a| a.as_str()) else {
+        return Ok(RegistryAuth::Anonymous);
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| OciResolveError::Auth(e.to_string()))?;
+    let decoded = String::from_utf8(decoded).map_err(|e| OciResolveError::Auth(e.to_string()))?;
+    match decoded.split_once(':') {
+        Some((u, p)) => Ok(RegistryAuth::Basic(u.to_string(), p.to_string())),
+        None => Ok(RegistryAuth::Anonymous),
+    }
+}
+
+fn dockerhub_aliases(host: &str) -> Vec<String> {
+    if host == DOCKER_HUB_HOST || host == "docker.io" || host == "index.docker.io" {
+        vec![
+            DOCKER_HUB_HOST.to_string(),
+            "docker.io".to_string(),
+            "index.docker.io".to_string(),
+            "https://index.docker.io/v1/".to_string(),
+        ]
+    } else {
+        vec![host.to_string()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(test)]
+    fn base64_std(s: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    #[test]
+    fn auth_from_dockerconfigjson_matches_host() {
+        // {"auths":{"ghcr.io":{"auth":"<base64 user:pass>"}}}
+        let b64 = base64_std("alice:s3cret");
+        let dcj = format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{b64}"}}}}}}"#);
+        let a = auth_from_dockerconfigjson(dcj.as_bytes(), "ghcr.io").unwrap();
+        assert_eq!(a, RegistryAuth::Basic("alice".into(), "s3cret".into()));
+    }
+
+    #[test]
+    fn auth_from_dockerconfigjson_no_match_is_anonymous() {
+        let dcj = r#"{"auths":{"ghcr.io":{"auth":"eA=="}}}"#;
+        assert_eq!(
+            auth_from_dockerconfigjson(dcj.as_bytes(), "docker.io").unwrap(),
+            RegistryAuth::Anonymous
+        );
+    }
 
     #[test]
     fn parse_image_ref_ghcr_with_tag() {
