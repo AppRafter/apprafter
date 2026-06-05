@@ -9,6 +9,14 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## platform-stack 0.2.17 — publish the 0.2.15 yank (2026-06-05)
+
+Platform-stack-only metadata release (same operator + components as 0.2.16). Marks
+`0.2.15` `yanked: true` in the cumulative compatibility doc so the resolver skips
+the broken release. A `compatibility.cue` edit (incl. a yank) changes the chart
+source and so must ride a `currentVersion` bump — a standalone yank commit trips the
+platform-stack drift guard. `change: safe`.
+
 ## operator v0.2.16 + platform-stack 0.2.16 — 2.4h hotfix: valid Application CRD (2026-06-05)
 
 ### Fixed

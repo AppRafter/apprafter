@@ -1701,6 +1701,20 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+compatibility: "0.2.17": {
+	change:          "safe"
+	operatorVersion: "v0.2.16"
+	notes: """
+		Platform-stack metadata release: publishes the `0.2.15` yank
+		(that release shipped an apiserver-invalid Application CRD) in
+		the cumulative compatibility doc. Same operator + components as
+		0.2.16 — no code change. A `compatibility.cue` edit (incl. a
+		yank) changes the chart source, so it must ride a
+		`currentVersion` bump; the platform-stack drift guard enforces
+		this. Safe to auto-sync.
+		"""
+	references: ["platform-stack/cue/compatibility.cue"]
+}
 compatibility: "0.2.16": {
 	change:          "safe"
 	operatorVersion: "v0.2.16"
