@@ -576,4 +576,33 @@ mod tests {
         assert!(fields.contains(&"spec.base.env.DATABASE_URL"));
         assert!(fields.contains(&"spec.environments.prod.env.DATABASE_URL"));
     }
+
+    // ---- 2.4h-b: imagePolicy is a CRD-enforced pass-through ----
+
+    #[test]
+    fn application_with_image_policy_is_accepted() {
+        // `imagePolicy.resolve` is an enum the OpenAPI v3 CRD enforces;
+        // there is no cross-field invariant, so the webhook has no rule
+        // for it and must accept an Application that declares it.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:latest",
+                "imagePolicy": { "resolve": "off" }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn application_with_per_env_image_policy_is_accepted() {
+        // The per-environment mirror of `imagePolicy` is likewise a pure
+        // pass-through for the webhook.
+        let spec = json!({
+            "base": { "image": "ghcr.io/acme/web:latest" },
+            "environments": {
+                "prod": { "imagePolicy": { "resolve": "digest" } }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
 }

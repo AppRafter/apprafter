@@ -88,6 +88,13 @@ spec:
                           size:
                             type: string
                             enum: [nano, small, medium, large, xlarge]
+                    imagePolicy:
+                      type: object
+                      properties:
+                        resolve:
+                          type: string
+                          enum: ["digest", "off"]
+                      additionalProperties: false
                 environments:
                   type: object
                   additionalProperties:
@@ -129,9 +136,24 @@ spec:
                             size:
                               type: string
                               enum: [nano, small, medium, large, xlarge]
+                      imagePolicy:
+                        type: object
+                        properties:
+                          resolve:
+                            type: string
+                            enum: ["digest", "off"]
+                        additionalProperties: false
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
+              properties:
+                image:
+                  type: object
+                  properties:
+                    tag: { type: string }
+                    resolved: { type: string }
+                    resolvedAt: { type: string }
+                  additionalProperties: false
       subresources:
         status: {}
       additionalPrinterColumns:
