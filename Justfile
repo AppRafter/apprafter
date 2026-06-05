@@ -69,6 +69,14 @@ test:
         echo "==> no package.json — skipping bun test"
     fi
 
+# Validate every hand-rolled CRD against a REAL apiserver (ephemeral kind
+# cluster). `helm lint` does NOT catch CRD structural-schema errors — only
+# the apiserver does — so run this before any CRD-changing release. Fast
+# (~30s) focused CRD gate; `just e2e` is the comprehensive backstop.
+# Requires kind + a working docker/podman.
+crd-validate:
+    bash scripts/validate-crds.sh
+
 # Run the GitOps-walk k3d e2e (CMP → Argo CD → operator loop).
 # Requires a running Docker daemon and k3d on PATH.
 e2e-gitops:
