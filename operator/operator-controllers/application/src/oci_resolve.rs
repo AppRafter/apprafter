@@ -36,8 +36,27 @@ pub enum OciResolveError {
     Status { status: u16, url: String },
     #[error("registry response missing Docker-Content-Digest")]
     NoDigestHeader,
+    #[error("registry returned a malformed Docker-Content-Digest")]
+    InvalidDigest(String),
     #[error("could not authenticate to registry: {0}")]
     Auth(String),
+}
+
+/// A registry-returned `Docker-Content-Digest` must be a canonical
+/// `sha256:<64 lowercase-hex>` string before we splice it into a pinned
+/// `repo@<digest>` reference. This also rejects the empty string the
+/// `ReqwestHttp` seam yields for a non-UTF-8 header value (which would
+/// otherwise render a broken `repo@` ref).
+fn is_valid_sha256_digest(digest: &str) -> bool {
+    match digest.strip_prefix("sha256:") {
+        Some(hex) => {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
 }
 
 /// Split an image string into host / repository / reference by
@@ -203,10 +222,14 @@ pub fn auth_from_dockerconfigjson(dcj: &[u8], host: &str) -> Result<RegistryAuth
     let Some(b64) = entry.get("auth").and_then(|a| a.as_str()) else {
         return Ok(RegistryAuth::Anonymous);
     };
+    // Use a generic message for both decode failures: the underlying
+    // error text is credential-adjacent and must not leak into the
+    // user-visible ImageResolved condition (2.4h Fix 2 (B)).
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(b64)
-        .map_err(|e| OciResolveError::Auth(e.to_string()))?;
-    let decoded = String::from_utf8(decoded).map_err(|e| OciResolveError::Auth(e.to_string()))?;
+        .map_err(|_| OciResolveError::Auth("malformed auth field in credential".into()))?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| OciResolveError::Auth("malformed auth field in credential".into()))?;
     match decoded.split_once(':') {
         Some((u, p)) => Ok(RegistryAuth::Basic(u.to_string(), p.to_string())),
         None => Ok(RegistryAuth::Anonymous),
@@ -334,6 +357,9 @@ pub async fn resolve_digest(
         .headers
         .get("docker-content-digest")
         .ok_or(OciResolveError::NoDigestHeader)?;
+    if !is_valid_sha256_digest(digest) {
+        return Err(OciResolveError::InvalidDigest(digest.clone()));
+    }
     Ok(format!("{}/{}@{}", r.host, r.repository, digest))
 }
 
@@ -561,19 +587,20 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_digest_public_200_returns_digest() {
+        let digest = format!("sha256:{}", "d".repeat(64));
         let url = "https://ghcr.io/v2/acme/web/manifests/1.0";
         let http = FakeHttp {
             responses: vec![(
                 format!("HEAD {url} bearer=false"),
                 200,
-                vec![("docker-content-digest".into(), "sha256:deadbeef".into())],
+                vec![("docker-content-digest".into(), digest.clone())],
                 vec![],
             )],
         };
         let got = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
             .await
             .unwrap();
-        assert_eq!(got, "ghcr.io/acme/web@sha256:deadbeef");
+        assert_eq!(got, format!("ghcr.io/acme/web@{digest}"));
     }
 
     #[tokio::test]
@@ -595,7 +622,7 @@ mod tests {
                 (
                     format!("HEAD {m} bearer=true"),
                     200,
-                    vec![("docker-content-digest".into(), "sha256:cafe".into())],
+                    vec![("docker-content-digest".into(), format!("sha256:{}", "c".repeat(64)))],
                     vec![],
                 ),
             ],
@@ -603,7 +630,7 @@ mod tests {
         let got = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
             .await
             .unwrap();
-        assert_eq!(got, "ghcr.io/acme/web@sha256:cafe");
+        assert_eq!(got, format!("ghcr.io/acme/web@sha256:{}", "c".repeat(64)));
     }
 
     #[tokio::test]
@@ -631,5 +658,197 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, OciResolveError::Status { status: 404, .. }));
+    }
+
+    // ---- 2.4h Fix 2 (C): resolve_digest error-path coverage ----
+
+    #[tokio::test]
+    async fn resolve_digest_401_without_challenge_is_auth_err() {
+        // A 401 with no www-authenticate header cannot start a token
+        // exchange — surface an Auth error (graceful fallback in the
+        // controller).
+        let url = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let http = FakeHttp {
+            responses: vec![(format!("HEAD {url} bearer=false"), 401, vec![], vec![])],
+        };
+        let e = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, OciResolveError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_token_endpoint_non_200_is_auth_err() {
+        let m = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let tok = "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aacme%2Fweb%3Apull";
+        let http = FakeHttp {
+            responses: vec![
+                (
+                    format!("HEAD {m} bearer=false"),
+                    401,
+                    vec![(
+                        "www-authenticate".into(),
+                        r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:acme/web:pull""#.into(),
+                    )],
+                    vec![],
+                ),
+                (format!("GET {tok} bearer=false"), 403, vec![], vec![]),
+            ],
+        };
+        let e = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, OciResolveError::Auth(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_second_head_non_200_is_status_err() {
+        // Bearer obtained, but the authenticated HEAD still fails — a
+        // registry Status error, not an Auth error.
+        let m = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let tok = "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aacme%2Fweb%3Apull";
+        let http = FakeHttp {
+            responses: vec![
+                (
+                    format!("HEAD {m} bearer=false"),
+                    401,
+                    vec![(
+                        "www-authenticate".into(),
+                        r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:acme/web:pull""#.into(),
+                    )],
+                    vec![],
+                ),
+                (format!("GET {tok} bearer=false"), 200, vec![], br#"{"token":"T"}"#.to_vec()),
+                (format!("HEAD {m} bearer=true"), 500, vec![], vec![]),
+            ],
+        };
+        let e = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, OciResolveError::Status { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_missing_digest_header_is_err() {
+        let url = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let http = FakeHttp {
+            responses: vec![(format!("HEAD {url} bearer=false"), 200, vec![], vec![])],
+        };
+        let e = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, OciResolveError::NoDigestHeader));
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_invalid_digest_header_is_err() {
+        // A 200 carrying a syntactically invalid digest must NOT be turned
+        // into a broken `repo@sha256:zzz` reference — reject it so the
+        // controller falls back to the verbatim tag.
+        let url = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let http = FakeHttp {
+            responses: vec![(
+                format!("HEAD {url} bearer=false"),
+                200,
+                vec![("docker-content-digest".into(), "sha256:zzz".into())],
+                vec![],
+            )],
+        };
+        let e = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, OciResolveError::InvalidDigest(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_empty_digest_header_is_err() {
+        // The ReqwestHttp seam lowercases headers and falls back to "" on a
+        // non-UTF-8 value — an empty digest must be rejected, not rendered
+        // as a malformed `repo@` ref.
+        let url = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let http = FakeHttp {
+            responses: vec![(
+                format!("HEAD {url} bearer=false"),
+                200,
+                vec![("docker-content-digest".into(), "".into())],
+                vec![],
+            )],
+        };
+        let e = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, OciResolveError::InvalidDigest(_)));
+    }
+
+    // ---- 2.4h Fix 2 (B): sanitized auth-decode errors ----
+
+    #[test]
+    fn auth_from_dockerconfigjson_bad_base64_is_generic_auth_err() {
+        // The decode failure message must not echo decoder internals into
+        // the user-visible ImageResolved condition.
+        let dcj = r#"{"auths":{"ghcr.io":{"auth":"!!!not base64!!!"}}}"#;
+        let e = auth_from_dockerconfigjson(dcj.as_bytes(), "ghcr.io").unwrap_err();
+        match e {
+            OciResolveError::Auth(msg) => {
+                assert_eq!(msg, "malformed auth field in credential");
+            }
+            other => panic!("expected Auth err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_from_dockerconfigjson_non_utf8_is_generic_auth_err() {
+        use base64::Engine;
+        // Valid base64 that decodes to invalid UTF-8 bytes.
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe, 0xfd]);
+        let dcj = format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{b64}"}}}}}}"#);
+        let e = auth_from_dockerconfigjson(dcj.as_bytes(), "ghcr.io").unwrap_err();
+        match e {
+            OciResolveError::Auth(msg) => {
+                assert_eq!(msg, "malformed auth field in credential");
+            }
+            other => panic!("expected Auth err, got {other:?}"),
+        }
+    }
+
+    // ---- 2.4h Fix 2 (D): split_auth_params + urlencode helpers ----
+
+    #[test]
+    fn split_auth_params_quoted_values() {
+        let parts = split_auth_params(r#"realm="https://x/token",service="reg""#);
+        assert_eq!(
+            parts,
+            vec![r#"realm="https://x/token""#, r#"service="reg""#]
+        );
+    }
+
+    #[test]
+    fn split_auth_params_comma_inside_quotes_is_not_a_separator() {
+        let parts = split_auth_params(r#"scope="repo:a,b:pull",service="reg""#);
+        assert_eq!(parts, vec![r#"scope="repo:a,b:pull""#, r#"service="reg""#]);
+    }
+
+    #[test]
+    fn split_auth_params_unbalanced_quote_keeps_remainder_whole() {
+        // An unterminated quote keeps the rest of the string in one field
+        // (commas after it are treated as in-quote).
+        let parts = split_auth_params(r#"realm="x,service="reg"#);
+        assert_eq!(parts, vec![r#"realm="x,service="reg"#]);
+    }
+
+    #[test]
+    fn split_auth_params_empty_input_is_empty() {
+        assert!(split_auth_params("").is_empty());
+    }
+
+    #[test]
+    fn urlencode_encodes_colon_slash_and_space() {
+        assert_eq!(
+            urlencode("repository:acme/web:pull"),
+            "repository%3Aacme%2Fweb%3Apull"
+        );
+        assert_eq!(urlencode("a b"), "a%20b");
+        // Unreserved chars pass through untouched.
+        assert_eq!(urlencode("ghcr.io-_~"), "ghcr.io-_~");
     }
 }
