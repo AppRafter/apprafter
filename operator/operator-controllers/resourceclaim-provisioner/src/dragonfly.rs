@@ -138,6 +138,8 @@ pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
         "+@all".into(),
         "-@admin".into(),
         "-@dangerous".into(),
+        "-move".into(),
+        "-copy".into(),
         "+info".into(),
         "+sort_ro".into(),
         "+client|setname".into(),
@@ -594,6 +596,17 @@ mod tests {
         assert!(args.iter().any(|a| a == "-@admin"));
         assert!(args.iter().any(|a| a == "-@dangerous"));
         assert!(args.iter().any(|a| a == "+info"));
+        // Cross-DB escape commands (MOVE/COPY) name a DESTINATION DB outside
+        // the `$N` pin and are NOT in @admin/@dangerous (only SWAPDB is), so
+        // they must be denied explicitly. SWAPDB stays denied via @dangerous.
+        assert!(
+            args.iter().any(|a| a == "-move"),
+            "MOVE escapes the $N pin — must be denied"
+        );
+        assert!(
+            args.iter().any(|a| a == "-copy"),
+            "COPY escapes the $N pin — must be denied"
+        );
     }
 
     // --- redis_dsn() ---
