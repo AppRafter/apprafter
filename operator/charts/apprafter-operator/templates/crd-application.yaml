@@ -94,7 +94,6 @@ spec:
                         resolve:
                           type: string
                           enum: ["digest", "off"]
-                      additionalProperties: false
                 environments:
                   type: object
                   additionalProperties:
@@ -142,7 +141,6 @@ spec:
                           resolve:
                             type: string
                             enum: ["digest", "off"]
-                        additionalProperties: false
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
@@ -153,7 +151,6 @@ spec:
                     tag: { type: string }
                     resolved: { type: string }
                     resolvedAt: { type: string }
-                  additionalProperties: false
       subresources:
         status: {}
       additionalPrinterColumns:
