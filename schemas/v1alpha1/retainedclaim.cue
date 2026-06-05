@@ -30,22 +30,35 @@ package v1alpha1
 		}
 		// ServiceProvider name the deleted claim was matched to.
 		provider: string
-		// Provider spec.backend (e.g. "cloudnative-pg").
+		// Provider spec.backend (e.g. "cloudnative-pg" or "dragonfly").
 		backend: string
+
+		// --- CNPG-backend allocation (optional; absent for dragonfly) ---
 		// Shared CNPG Cluster + its namespace (also the password Secret
 		// namespace).
-		cnpgCluster:   string
-		cnpgNamespace: string
+		cnpgCluster?:   string
+		cnpgNamespace?: string
 		// Postgres role + database name (the same identifier).
-		role:     string
-		database: string
+		role?:     string
+		database?: string
 		// DNS-1123 metadata.name of the CNPG Database CR.
-		databaseObjectName: string
+		databaseObjectName?: string
 		// metadata.name of the basic-auth password Secret in the CNPG
 		// namespace.
-		passwordSecretName: string
-		// RFC3339 instant after which the GC drops the role + database +
-		// password Secret (deletion + 7-day grace).
+		passwordSecretName?: string
+
+		// --- Dragonfly-backend allocation (optional; absent for CNPG; ADR 0042) ---
+		// The shared pool instance + numbered logical DB ($N) the claim held,
+		// the $N-pinned ACL username, and the connection Secret coordinates
+		// the GC FLUSHDBs + DELUSERs + deletes.
+		instance?:                  string
+		dbnum?:                     int & >=0 & <1024
+		aclUser?:                   string
+		connectionSecretRef?:       string
+		connectionSecretNamespace?: string
+
+		// RFC3339 instant after which the GC drops the backend resources +
+		// password/connection Secret (deletion + 7-day grace).
 		retainUntil: string
 	}
 }

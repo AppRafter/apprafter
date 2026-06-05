@@ -98,6 +98,11 @@ package v1alpha1
 	// Requested size class. Optional — tier-aware platform defaults
 	// fill it when absent (spec §3.1: `needs.pg: {}` → tier sizing).
 	size?: #Size
+
+	// Persist the provisioned resource across Application deletion
+	// (default false). redis: routes to a persistent pool instance
+	// (snapshot→PVC) instead of an ephemeral one (ADR 0042).
+	persistent?: bool
 }
 
 // #ImagePolicy — image-reference resolution policy under

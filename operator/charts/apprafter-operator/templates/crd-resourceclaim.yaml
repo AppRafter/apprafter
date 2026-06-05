@@ -53,6 +53,8 @@ spec:
                 size:
                   type: string
                   enum: [nano, small, medium, large, xlarge]
+                persistent:
+                  type: boolean
             status:
               type: object
               properties:
@@ -80,6 +82,12 @@ spec:
                       lastTransitionTime:
                         type: string
                         format: date-time
+                instance:
+                  type: string
+                dbnum:
+                  type: integer
+                  minimum: 0
+                  maximum: 1023
       subresources:
         status: {}
       additionalPrinterColumns:

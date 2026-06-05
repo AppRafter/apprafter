@@ -31,6 +31,12 @@ pub struct ResourceClaimSpec {
     /// Requested size (closed set; see `#Size`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    /// Persist the provisioned resource across the claim's deletion
+    /// (default false). Copied from the originating `needs.<type>.persistent`
+    /// by the Application controller (2.4d); the dragonfly provisioner reads
+    /// it to route to a persistent vs ephemeral pool instance (ADR 0042).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -47,6 +53,14 @@ pub struct ResourceClaimStatus {
     pub ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<ResourceClaimCondition>>,
+    /// Dragonfly allocation: the shared pool instance this claim's DB
+    /// lives on (ADR 0042). None for non-pooled backends (e.g. CNPG).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// Dragonfly allocation: the numbered logical DB (`$N`) assigned to
+    /// this claim on `instance` (0..1023). None for non-pooled backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbnum: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -89,10 +103,36 @@ mod tests {
             type_: "redis".into(),
             selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
             size: None,
+            persistent: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v.get("type"), Some(&json!("redis")));
         assert!(v.get("size").is_none());
+        assert!(v.get("persistent").is_none());
+    }
+
+    #[test]
+    fn spec_persistent_round_trips() {
+        let spec: ResourceClaimSpec = serde_json::from_value(json!({
+            "type": "redis",
+            "selector": { "tier": "integrated" },
+            "persistent": true
+        }))
+        .expect("valid spec");
+        assert_eq!(spec.persistent, Some(true));
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v.get("persistent"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn resource_claim_status_carries_allocation() {
+        let st: ResourceClaimStatus = serde_json::from_value(json!({
+            "instance": "platform-redis-ephemeral-000",
+            "dbnum": 7
+        }))
+        .unwrap();
+        assert_eq!(st.instance.as_deref(), Some("platform-redis-ephemeral-000"));
+        assert_eq!(st.dbnum, Some(7));
     }
 
     #[test]

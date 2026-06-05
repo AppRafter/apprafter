@@ -869,6 +869,12 @@ fn generate_resource_claims(
             if let Some(size) = &need.size {
                 claim_spec["size"] = json!(size);
             }
+            // Persistence passthrough (ADR 0042): the dragonfly provisioner
+            // reads `spec.persistent` to route the claim to a persistent vs
+            // ephemeral pool instance. Mirrors the `size` passthrough.
+            if let Some(persistent) = need.persistent {
+                claim_spec["persistent"] = json!(persistent);
+            }
             let payload = json!({
                 "apiVersion": "apprafter.io/v1alpha1",
                 "kind": "ResourceClaim",
@@ -1627,6 +1633,7 @@ mod tests {
                     "managed".to_string(),
                 )])),
                 size: Some("small".into()),
+                persistent: None,
             },
         );
         let spec = base_with_needs(needs);
@@ -1634,6 +1641,34 @@ mod tests {
         let (_, payload) = &payloads[0];
         assert_eq!(payload["spec"]["selector"], json!({ "tier": "managed" }));
         assert_eq!(payload["spec"]["size"], json!("small"));
+    }
+
+    #[test]
+    fn generate_resource_claims_passes_through_persistent() {
+        // ADR 0042: `needs.<type>.persistent` is copied onto the generated
+        // claim's spec so the dragonfly provisioner can route persistent vs
+        // ephemeral. Mirrors the `size` passthrough.
+        let mut needs = BTreeMap::new();
+        needs.insert(
+            "redis".to_string(),
+            ServiceNeed {
+                selector: None,
+                size: None,
+                persistent: Some(true),
+            },
+        );
+        // A second need WITHOUT persistent must omit the key entirely.
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-1", "demo");
+        // BTreeMap order: pg, redis.
+        let pg = &payloads[0].1;
+        let redis = &payloads[1].1;
+        assert_eq!(redis["spec"]["persistent"], json!(true));
+        assert!(
+            pg["spec"].get("persistent").is_none(),
+            "absent persistent must not emit the key"
+        );
     }
 
     #[test]
@@ -1656,6 +1691,7 @@ mod tests {
                 type_: "pg".into(),
                 selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
                 size: None,
+                persistent: None,
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -1664,6 +1700,7 @@ mod tests {
             connection_secret_ref: secret.map(String::from),
             ready,
             conditions: None,
+            ..Default::default()
         });
         c
     }
@@ -1775,6 +1812,7 @@ mod tests {
                 type_,
                 selector,
                 size: None,
+                persistent: None,
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -1838,6 +1876,7 @@ mod tests {
                 connection_secret_ref: Some("parser-pg-conn".into()),
                 ready: Some(true),
                 conditions: None,
+                ..Default::default()
             }),
         )];
         assert!(unready_claim_names(&provisioned).is_empty());

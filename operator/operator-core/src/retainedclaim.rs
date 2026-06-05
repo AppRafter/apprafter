@@ -41,28 +41,76 @@ pub struct RetainedClaimSpec {
     pub claim_ref: ClaimRef,
     /// `ServiceProvider` name the deleted claim was matched to.
     pub provider: String,
-    /// Provider `spec.backend` (e.g. `cloudnative-pg`).
+    /// Provider `spec.backend` (e.g. `cloudnative-pg` or `dragonfly`).
     pub backend: String,
     /// Shared CNPG `Cluster` name the role + database live in.
-    #[serde(rename = "cnpgCluster")]
-    pub cnpg_cluster: String,
+    /// CNPG-only (None for dragonfly snapshots).
+    #[serde(
+        rename = "cnpgCluster",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cnpg_cluster: Option<String>,
     /// Namespace of the shared CNPG `Cluster` (and the password Secret).
-    #[serde(rename = "cnpgNamespace")]
-    pub cnpg_namespace: String,
-    /// Postgres role name (`cnpg::pg_identifier`).
-    pub role: String,
-    /// Postgres database name (same identifier as the role).
-    pub database: String,
+    /// CNPG-only (None for dragonfly snapshots).
+    #[serde(
+        rename = "cnpgNamespace",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cnpg_namespace: Option<String>,
+    /// Postgres role name (`cnpg::pg_identifier`). CNPG-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Postgres database name (same identifier as the role). CNPG-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
     /// DNS-1123 `metadata.name` of the CNPG `Database` CR
-    /// (`cnpg::k8s_name`).
-    #[serde(rename = "databaseObjectName")]
-    pub database_object_name: String,
+    /// (`cnpg::k8s_name`). CNPG-only.
+    #[serde(
+        rename = "databaseObjectName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub database_object_name: Option<String>,
     /// `metadata.name` of the basic-auth password Secret in the CNPG
-    /// namespace (`{databaseObjectName}-pw`).
-    #[serde(rename = "passwordSecretName")]
-    pub password_secret_name: String,
-    /// RFC3339 instant after which the GC drops the role + database +
-    /// password Secret (deletion + 7-day grace).
+    /// namespace (`{databaseObjectName}-pw`). CNPG-only.
+    #[serde(
+        rename = "passwordSecretName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub password_secret_name: Option<String>,
+
+    /// Dragonfly allocation: the shared pool instance this claim's DB
+    /// lived on (ADR 0042). None for CNPG snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// Dragonfly allocation: the numbered logical DB (`$N`) the claim
+    /// held on `instance`. None for CNPG snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbnum: Option<u16>,
+    /// Dragonfly per-claim `$N`-pinned ACL username. None for CNPG.
+    #[serde(rename = "aclUser", default, skip_serializing_if = "Option::is_none")]
+    pub acl_user: Option<String>,
+    /// `metadata.name` of the connection Secret in the claim namespace
+    /// (`REDIS_URL` / `REDIS_CHANNEL_PREFIX`). None for CNPG.
+    #[serde(
+        rename = "connectionSecretRef",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub connection_secret_ref: Option<String>,
+    /// Namespace of the connection Secret (the claim's origin namespace).
+    /// None for CNPG.
+    #[serde(
+        rename = "connectionSecretNamespace",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub connection_secret_namespace: Option<String>,
+    /// RFC3339 instant after which the GC drops the backend resources +
+    /// password/connection Secret (deletion + 7-day grace).
     #[serde(rename = "retainUntil")]
     pub retain_until: String,
 }
@@ -95,11 +143,49 @@ mod tests {
         .expect("valid spec");
         assert_eq!(spec.claim_ref.name, "demo-web-pg");
         assert_eq!(spec.claim_ref.namespace, "demo");
-        assert_eq!(spec.cnpg_cluster, "platform-postgres");
-        assert_eq!(spec.cnpg_namespace, "cnpg-system");
-        assert_eq!(spec.database_object_name, "claim-demo-demo-web-pg");
-        assert_eq!(spec.password_secret_name, "claim-demo-demo-web-pg-pw");
+        assert_eq!(spec.cnpg_cluster.as_deref(), Some("platform-postgres"));
+        assert_eq!(spec.cnpg_namespace.as_deref(), Some("cnpg-system"));
+        assert_eq!(
+            spec.database_object_name.as_deref(),
+            Some("claim-demo-demo-web-pg")
+        );
+        assert_eq!(
+            spec.password_secret_name.as_deref(),
+            Some("claim-demo-demo-web-pg-pw")
+        );
         assert_eq!(spec.retain_until, "2026-06-10T00:00:00+00:00");
+        // Dragonfly fields absent on a CNPG snapshot.
+        assert!(spec.instance.is_none());
+        assert!(spec.dbnum.is_none());
+    }
+
+    #[test]
+    fn retained_claim_supports_dragonfly_snapshot() {
+        let rc: RetainedClaimSpec = serde_json::from_value(json!({
+            "claimRef": {"name": "web-redis", "namespace": "demo"},
+            "provider": "redis-integrated",
+            "backend": "dragonfly",
+            "retainUntil": "2026-06-12T00:00:00Z",
+            "instance": "platform-redis-persistent-000",
+            "dbnum": 7,
+            "aclUser": "claim_demo_web_redis",
+            "connectionSecretRef": "web-redis-conn",
+            "connectionSecretNamespace": "demo"
+        }))
+        .unwrap();
+        assert_eq!(rc.backend, "dragonfly");
+        assert_eq!(rc.dbnum, Some(7));
+        assert_eq!(
+            rc.instance.as_deref(),
+            Some("platform-redis-persistent-000")
+        );
+        assert_eq!(rc.acl_user.as_deref(), Some("claim_demo_web_redis"));
+        assert_eq!(rc.connection_secret_ref.as_deref(), Some("web-redis-conn"));
+        assert_eq!(rc.connection_secret_namespace.as_deref(), Some("demo"));
+        // CNPG fields are absent on a dragonfly snapshot.
+        assert!(rc.cnpg_cluster.is_none());
+        assert!(rc.role.is_none());
+        assert!(rc.database_object_name.is_none());
     }
 
     #[test]
@@ -111,12 +197,17 @@ mod tests {
             },
             provider: "pg-integrated".into(),
             backend: "cloudnative-pg".into(),
-            cnpg_cluster: "platform-postgres".into(),
-            cnpg_namespace: "cnpg-system".into(),
-            role: "claim_demo_demo_web_pg".into(),
-            database: "claim_demo_demo_web_pg".into(),
-            database_object_name: "claim-demo-demo-web-pg".into(),
-            password_secret_name: "claim-demo-demo-web-pg-pw".into(),
+            cnpg_cluster: Some("platform-postgres".into()),
+            cnpg_namespace: Some("cnpg-system".into()),
+            role: Some("claim_demo_demo_web_pg".into()),
+            database: Some("claim_demo_demo_web_pg".into()),
+            database_object_name: Some("claim-demo-demo-web-pg".into()),
+            password_secret_name: Some("claim-demo-demo-web-pg-pw".into()),
+            instance: None,
+            dbnum: None,
+            acl_user: None,
+            connection_secret_ref: None,
+            connection_secret_namespace: None,
             retain_until: "2026-06-10T00:00:00+00:00".into(),
         };
         let v = serde_json::to_value(&spec).unwrap();

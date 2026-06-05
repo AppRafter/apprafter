@@ -17,9 +17,11 @@
 //!      patches finalizers etc. under its own SA; the immutability guard
 //!      is what protects the spec).
 //!   3. **Field validation** (always, regardless of identity / op):
-//!      `claimRef.{name,namespace}` + role / database /
-//!      databaseObjectName / passwordSecretName / cnpgCluster /
-//!      cnpgNamespace non-empty; `retainUntil` parses as RFC3339.
+//!      `claimRef.{name,namespace}` non-empty + a BACKEND-CONDITIONAL
+//!      GC-load-bearing set (CNPG: role / database / databaseObjectName /
+//!      passwordSecretName / cnpgCluster / cnpgNamespace; dragonfly:
+//!      instance / aclUser / connectionSecretRef / connectionSecretNamespace
+//!      — ADR 0042) non-empty; `retainUntil` parses as RFC3339.
 //!
 //! Like `validator_resourceclaim.rs` it needs `request.userInfo` +
 //! `request.operation` (+ `oldObject` for the immutability check), which
@@ -34,7 +36,8 @@ use crate::validator::ValidationError;
 /// the current per-validator style (matches `validator_resourceclaim.rs`).
 const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
 
-/// `spec` string fields that must be non-empty — the GC-load-bearing set.
+/// CNPG-backend `spec` string fields that must be non-empty — the
+/// GC-load-bearing set for a `cloudnative-pg` snapshot.
 ///
 /// `provider` and `backend` are DELIBERATELY excluded: they are best-effort
 /// lineage/audit fields, and the provisioner finalizer legitimately writes
@@ -44,12 +47,24 @@ const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-oper
 /// wedging the finalizer and leaking the role/DB it was trying to retain —
 /// the opposite of this feature's purpose. The GC consumes only the fields
 /// below (all derived deterministically with fallbacks, so never empty).
-const REQUIRED_STRING_FIELDS: [&str; 5] = [
+const CNPG_REQUIRED_STRING_FIELDS: [&str; 6] = [
     "cnpgCluster",
     "cnpgNamespace",
     "role",
     "database",
     "databaseObjectName",
+    "passwordSecretName",
+];
+
+/// Dragonfly-backend `spec` string fields that must be non-empty — the
+/// GC-load-bearing set for a `dragonfly` snapshot (ADR 0042). The GC reads
+/// these to `FLUSHDB` the numbered DB + `ACL DELUSER` the per-claim user.
+/// `dbnum` is validated separately (an integer, 0 is valid).
+const DRAGONFLY_REQUIRED_STRING_FIELDS: [&str; 4] = [
+    "instance",
+    "aclUser",
+    "connectionSecretRef",
+    "connectionSecretNamespace",
 ];
 
 /// Validate a RetainedClaim AdmissionReview. `object` is the request's
@@ -127,10 +142,23 @@ pub fn validate_retainedclaim(
         )),
     }
 
-    // Non-empty string fields.
-    for field in REQUIRED_STRING_FIELDS {
+    // Backend-conditional non-empty string fields. The required set
+    // depends on `spec.backend`: a CNPG snapshot carries role/database/
+    // cnpg* (none of the dragonfly fields); a dragonfly snapshot carries
+    // instance/aclUser/connectionSecret* (none of the cnpg fields). An
+    // absent/empty backend defaults to CNPG — legacy snapshots predate the
+    // dragonfly arm and are always CNPG-shaped. Validating only the
+    // matching set keeps the operator's own snapshot CREATE from being
+    // rejected (failurePolicy: Fail → finalizer wedge → leak). ADR 0042.
+    let backend = spec.get("backend").and_then(Value::as_str).unwrap_or("");
+    let required_fields: &[&str] = if backend == "dragonfly" {
+        &DRAGONFLY_REQUIRED_STRING_FIELDS
+    } else {
+        &CNPG_REQUIRED_STRING_FIELDS
+    };
+    for field in required_fields {
         if spec
-            .get(field)
+            .get(*field)
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
         {
@@ -139,18 +167,6 @@ pub fn validate_retainedclaim(
                 format!("spec.{field} is required"),
             ));
         }
-    }
-
-    // passwordSecretName non-empty.
-    if spec
-        .get("passwordSecretName")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-    {
-        errors.push(ValidationError::new(
-            "spec.passwordSecretName",
-            "spec.passwordSecretName is required",
-        ));
     }
 
     // retainUntil must parse as RFC3339.
@@ -324,6 +340,51 @@ mod tests {
             .remove("passwordSecretName");
         let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
         assert!(errors.iter().any(|e| e.field == "spec.passwordSecretName"));
+    }
+
+    fn retained_dragonfly() -> Value {
+        json!({
+            "metadata": { "name": "web-redis", "namespace": "apprafter-system" },
+            "spec": {
+                "claimRef": { "name": "web-redis", "namespace": "demo" },
+                "provider": "redis-integrated",
+                "backend": "dragonfly",
+                "instance": "platform-redis-persistent-000",
+                "dbnum": 7,
+                "aclUser": "claim_demo_web_redis",
+                "connectionSecretRef": "web-redis-conn",
+                "connectionSecretNamespace": "demo",
+                "retainUntil": "2026-06-12T00:00:00+00:00"
+            }
+        })
+    }
+
+    #[test]
+    fn allows_operator_create_dragonfly_snapshot_without_cnpg_fields() {
+        // A dragonfly snapshot carries NONE of the cnpg-required fields
+        // (role/database/cnpgCluster/...). The webhook MUST accept it
+        // (failurePolicy: Fail) — otherwise the operator's own dragonfly
+        // snapshot CREATE is rejected, the finalizer wedges, and the
+        // Dragonfly DB + ACL user leak (the same leak-wedge guard as for
+        // empty provider/backend, generalised by backend). ADR 0042.
+        let errors =
+            validate_retainedclaim(&retained_dragonfly(), None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "dragonfly snapshot must pass the webhook; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_dragonfly_snapshot_missing_allocation_fields() {
+        // A dragonfly snapshot must still carry its own GC-load-bearing
+        // fields (instance + aclUser); the GC needs them to FLUSHDB + DELUSER.
+        let mut c = retained_dragonfly();
+        c["spec"].as_object_mut().unwrap().remove("instance");
+        c["spec"].as_object_mut().unwrap().remove("aclUser");
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(errors.iter().any(|e| e.field == "spec.instance"));
+        assert!(errors.iter().any(|e| e.field == "spec.aclUser"));
     }
 
     #[test]

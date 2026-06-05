@@ -78,6 +78,11 @@ pub struct ServiceNeed {
     /// CRD; a plain `String` here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
+    /// Persist the provisioned resource across Application deletion
+    /// (default false). For redis: routes the claim to a *persistent*
+    /// pool instance (snapshot→PVC) instead of an ephemeral one (ADR 0042).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -283,6 +288,18 @@ mod tests {
         let serialized = serde_json::to_value(&app).unwrap();
         let deserialized: Application = serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized.spec, app.spec);
+    }
+
+    #[test]
+    fn service_need_persistent_round_trips() {
+        let sn: ServiceNeed = serde_json::from_value(serde_json::json!({
+            "persistent": true
+        }))
+        .unwrap();
+        assert_eq!(sn.persistent, Some(true));
+        // Absent → None (default false at the platform layer).
+        let empty: ServiceNeed = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.persistent, None);
     }
 
     #[test]

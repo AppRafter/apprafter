@@ -757,6 +757,7 @@ mod tests {
             ServiceNeed {
                 selector: None,
                 size: Some("small".into()),
+                persistent: None,
             },
         );
         base_needs.insert(
@@ -764,6 +765,7 @@ mod tests {
             ServiceNeed {
                 selector: None,
                 size: Some("nano".into()),
+                persistent: None,
             },
         );
         let mut prod_needs = BTreeMap::new();
@@ -775,6 +777,7 @@ mod tests {
                     "managed-aws".to_string(),
                 )])),
                 size: None,
+                persistent: None,
             },
         );
         let mut envs = BTreeMap::new();

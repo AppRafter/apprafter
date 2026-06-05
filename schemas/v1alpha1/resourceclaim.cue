@@ -19,6 +19,12 @@ package v1alpha1
 		type: #PlatformServiceType
 		selector: [string]: string
 		size?: #Size
+		// Persist the provisioned resource across the claim's deletion
+		// (default false). Copied from the originating
+		// `needs.<type>.persistent` by the Application controller (2.4d);
+		// the dragonfly provisioner reads it to pick a persistent vs
+		// ephemeral pool instance (ADR 0042).
+		persistent?: bool
 	}
 
 	status?: {
@@ -29,6 +35,11 @@ package v1alpha1
 		// the reconciler that writes them lands in 2.3. Mirrors the
 		// condition shape used by the other CRDs.
 		conditions?: [...#ResourceClaimCondition]
+		// Dragonfly allocation (ADR 0042): the shared pool instance this
+		// claim's DB lives on, and the numbered logical DB ($N). Absent
+		// for non-pooled backends (e.g. CNPG).
+		instance?: string
+		dbnum?:    int & >=0 & <1024
 	}
 }
 

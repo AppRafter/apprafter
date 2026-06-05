@@ -140,7 +140,8 @@ pub async fn reconcile(
 
     info!(
         retained = %rc_name, retain_until = %rc.spec.retain_until,
-        role = %rc.spec.role, database = %rc.spec.database_object_name,
+        role = rc.spec.role.as_deref().unwrap_or_default(),
+        database = rc.spec.database_object_name.as_deref().unwrap_or_default(),
         "RetainedClaim grace elapsed — dropping role/DB/Secret"
     );
 
@@ -197,7 +198,7 @@ pub async fn reconcile(
         Some(c) => c,
     };
 
-    let role = rc.spec.role.clone();
+    let role = rc.spec.role.clone().unwrap_or_default();
     if role_entry_ensure(&cluster, &role) != Some("absent") {
         // PASS 1 — the entry is still `ensure: present` (or missing). Declare
         // it absent, then WAIT one CNPG reconcile cycle before trusting status:
@@ -309,8 +310,10 @@ async fn rmw_managed_roles<F>(
 where
     F: Fn(Vec<Value>) -> Vec<Value>,
 {
-    let cluster = &rc.spec.cnpg_cluster;
-    let cnpg_ns = &rc.spec.cnpg_namespace;
+    let cluster = rc.spec.cnpg_cluster.clone().unwrap_or_default();
+    let cnpg_ns = rc.spec.cnpg_namespace.clone().unwrap_or_default();
+    let cluster = cluster.as_str();
+    let cnpg_ns = cnpg_ns.as_str();
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
 
     for attempt in 0..GC_ROLE_RMW_RETRIES {
@@ -384,10 +387,10 @@ pub fn role_absent_upsert(existing: Vec<Value>, role: &str) -> Vec<Value> {
 /// Cluster is gone (caller skips straight to finalize). 409-retried,
 /// 404-tolerant via [`rmw_managed_roles`].
 async fn set_role_absent(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<bool, ReconcileError> {
-    let role = rc.spec.role.clone();
+    let role = rc.spec.role.clone().unwrap_or_default();
     let landed = rmw_managed_roles(ctx, rc, |existing| role_absent_upsert(existing, &role)).await?;
     if landed {
-        info!(role = %rc.spec.role, "role declared ensure:absent (CNPG drops it after the DB)");
+        info!(%role, "role declared ensure:absent (CNPG drops it after the DB)");
     }
     Ok(landed)
 }
@@ -397,7 +400,7 @@ async fn set_role_absent(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<bool,
 /// the drop (the role is in `byStatus.reconciled`), so the shared spec
 /// accumulates no `ensure: absent` tombstones. 409-retried, 404-tolerant.
 async fn remove_managed_role(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<(), ReconcileError> {
-    let role = rc.spec.role.clone();
+    let role = rc.spec.role.clone().unwrap_or_default();
     rmw_managed_roles(ctx, rc, |existing| cnpg::remove_role(existing, &role)).await?;
     Ok(())
 }
@@ -411,8 +414,10 @@ async fn get_cluster(
     ctx: &Arc<Context>,
     rc: &RetainedClaim,
 ) -> Result<Option<Value>, ReconcileError> {
-    let cluster = &rc.spec.cnpg_cluster;
-    let cnpg_ns = &rc.spec.cnpg_namespace;
+    let cluster = rc.spec.cnpg_cluster.clone().unwrap_or_default();
+    let cnpg_ns = rc.spec.cnpg_namespace.clone().unwrap_or_default();
+    let cluster = cluster.as_str();
+    let cnpg_ns = cnpg_ns.as_str();
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
     match api.get(cluster).await {
         Ok(c) => Ok(Some(serde_json::to_value(&c)?)),
@@ -428,8 +433,10 @@ async fn get_cluster(
 /// correct drop, and the ~1 KB tombstone self-heals if the app comes
 /// back (decision 2). Swallows a 404 if the Database is already gone.
 async fn remove_database(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<(), ReconcileError> {
-    let db_object = &rc.spec.database_object_name;
-    let cnpg_ns = &rc.spec.cnpg_namespace;
+    let db_object = rc.spec.database_object_name.clone().unwrap_or_default();
+    let cnpg_ns = rc.spec.cnpg_namespace.clone().unwrap_or_default();
+    let db_object = db_object.as_str();
+    let cnpg_ns = cnpg_ns.as_str();
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &database_ar());
     // Re-send the FULL Database body with `ensure: absent`. A partial SSA
     // apply (spec.ensure only) under this same field manager would STRIP the
@@ -439,9 +446,9 @@ async fn remove_database(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<(), R
     let body = cnpg::database_object(
         db_object,
         cnpg_ns,
-        &rc.spec.cnpg_cluster,
-        &rc.spec.database,
-        &rc.spec.role,
+        rc.spec.cnpg_cluster.as_deref().unwrap_or_default(),
+        rc.spec.database.as_deref().unwrap_or_default(),
+        rc.spec.role.as_deref().unwrap_or_default(),
         "absent",
     );
     match api
@@ -468,8 +475,10 @@ async fn delete_password_secret(
     ctx: &Arc<Context>,
     rc: &RetainedClaim,
 ) -> Result<(), ReconcileError> {
-    let secret = &rc.spec.password_secret_name;
-    let cnpg_ns = &rc.spec.cnpg_namespace;
+    let secret = rc.spec.password_secret_name.clone().unwrap_or_default();
+    let cnpg_ns = rc.spec.cnpg_namespace.clone().unwrap_or_default();
+    let secret = secret.as_str();
+    let cnpg_ns = cnpg_ns.as_str();
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &secret_ar());
     match api.delete(secret, &DeleteParams::default()).await {
         Ok(_) => {

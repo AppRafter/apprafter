@@ -167,6 +167,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
             type_: "pg".to_string(),
             selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
             size: None,
+            persistent: None,
         },
         status: None,
     };
@@ -212,6 +213,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
             type_: "pg".to_string(),
             selector: BTreeMap::from([("tier".to_string(), "nonexistent".to_string())]),
             size: None,
+            persistent: None,
         },
         status: None,
     };

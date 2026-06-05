@@ -88,6 +88,8 @@ spec:
                           size:
                             type: string
                             enum: [nano, small, medium, large, xlarge]
+                          persistent:
+                            type: boolean
                     imagePolicy:
                       type: object
                       properties:
@@ -135,6 +137,8 @@ spec:
                             size:
                               type: string
                               enum: [nano, small, medium, large, xlarge]
+                            persistent:
+                              type: boolean
                       imagePolicy:
                         type: object
                         properties:

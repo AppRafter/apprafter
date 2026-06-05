@@ -47,16 +47,15 @@ spec:
               type: object
             spec:
               type: object
+              # Only the backend-agnostic lineage fields are universally
+              # required. The CNPG-specific fields (cnpgCluster/role/...) and
+              # the dragonfly-specific fields (instance/aclUser/...) are each
+              # optional at the CRD layer; the admission webhook enforces the
+              # correct GC-load-bearing set per `spec.backend` (ADR 0042).
               required:
                 - claimRef
                 - provider
                 - backend
-                - cnpgCluster
-                - cnpgNamespace
-                - role
-                - database
-                - databaseObjectName
-                - passwordSecretName
                 - retainUntil
               # Immutable after creation — the snapshot is a fixed
               # record of a deleted claim; nothing legitimately mutates
@@ -88,6 +87,18 @@ spec:
                 databaseObjectName:
                   type: string
                 passwordSecretName:
+                  type: string
+                instance:
+                  type: string
+                dbnum:
+                  type: integer
+                  minimum: 0
+                  maximum: 1023
+                aclUser:
+                  type: string
+                connectionSecretRef:
+                  type: string
+                connectionSecretNamespace:
                   type: string
                 retainUntil:
                   type: string
