@@ -41,4 +41,26 @@ _serviceProviders: {
 			storage:   string | *"10Gi"
 		}
 	}
+	"redis-integrated": #ServiceProviderSeed & {
+		namespace: "apprafter-system"
+		labels: {
+			tier:     "integrated"
+			location: "in-cluster"
+		}
+		type:    "redis"
+		backend: "dragonfly"
+		config: {
+			// Dragonfly pool coordinates the 2.6-3 provisioner reads.
+			// `config` is open ({...}) so this needs no ServiceProvider
+			// schema change. The shared instances are NOT seeded here —
+			// the provisioner creates them lazily per persistence class.
+			namespace: "dragonfly-system"
+			// Pool-instance flags (ADR 0042 Pre-merge #1/#2 measured):
+			// dbnum=1024 is the hard max and free at idle; num_shards=1
+			// default on ALL tiers (per-active-DB memory = 280kB×shards),
+			// operator-tunable here for throughput without a code change.
+			dbnum:     int | *1024
+			numShards: int | *1
+		}
+	}
 }

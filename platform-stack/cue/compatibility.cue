@@ -1701,6 +1701,23 @@ compatibility: "0.1.23": {
 // 0.2.1 — Phase 2 opens with the ServiceProvider CRD (plan.md
 // 2.1). First 0.2-series platform-stack release; operator +
 // admission-webhook images move to v0.2.1 in lockstep.
+// 0.2.18 — Phase 2.6 (needs.redis) seed: adds the dragonfly-operator
+// component + the redis-integrated ServiceProvider so a fresh cluster
+// has the Redis stack ready for the 2.6-3 provisioner. Platform-stack-
+// only — no operator binary change (operator stays v0.2.16).
+compatibility: "0.2.18": {
+	change:          "safe"
+	operatorVersion: "v0.2.16" // operator binary unchanged in 2.6-1
+	notes: """
+		dragonfly-operator component (always-on, dragonfly-system, sync-wave -5)
+		+ redis-integrated ServiceProvider seed (backend dragonfly, dbnum=1024 /
+		num_shards=1 tier-tunable knobs). Platform-stack-only; no operator binary
+		change. Seeds the Redis stack so fresh clusters are ready for the 2.6-3
+		provisioner. No shared Dragonfly instance is created until the first
+		needs.redis claim (lazy).
+		"""
+	references: ["plan.md#2.6-1", "docs/adr/0042-needs-redis-dragonfly.md"]
+}
 compatibility: "0.2.17": {
 	change:          "safe"
 	operatorVersion: "v0.2.16"
