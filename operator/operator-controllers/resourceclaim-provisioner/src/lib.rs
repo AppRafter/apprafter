@@ -58,6 +58,7 @@ use tracing::{info, warn};
 
 use operator_core::{Metrics, ResourceClaim};
 
+pub mod acl_reconcile;
 pub mod cnpg;
 pub mod dragonfly;
 pub mod gc;
@@ -145,4 +146,23 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
         .await;
     info!("ResourceClaimProvisioner stream ended");
     Ok(())
+}
+
+/// Spawn the dragonfly ACL re-pin loop (Phase 2.6-5, ADR 0042 §4).
+///
+/// Per-claim `$N` ACL users are runtime state on a Dragonfly instance —
+/// wiped on a pod restart. This loop periodically re-asserts every live
+/// ready dragonfly claim's user (idempotent `ACL SETUSER`, password
+/// recovered from the claim's connection-Secret DSN) so an app reconnects
+/// without `WRONGPASS`/`NOPERM` after the instance churns. Shares the
+/// production [`RedisClient`] seam via [`Context::new`], identical to the
+/// provisioner + GC controllers. Unlike them it is NOT a kube-rs
+/// `Controller` (there is no clean per-object trigger for "the instance
+/// restarted"); it is a simple interval task in the same crate.
+pub async fn run_acl_reconcile(
+    client: Client,
+    metrics: Arc<Metrics>,
+) -> Result<(), ReconcileError> {
+    let ctx = Arc::new(Context::new(client, metrics));
+    acl_reconcile::run(ctx).await
 }

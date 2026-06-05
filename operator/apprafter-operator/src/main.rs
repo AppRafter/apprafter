@@ -198,6 +198,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // DragonflyAclReconcile — periodic re-pin loop (Phase 2.6-5). Per-claim
+    // `$N` ACL users are runtime state on a Dragonfly instance, wiped on a
+    // pod restart; this loop re-asserts every live ready dragonfly claim's
+    // user on a 300s tick (idempotent ACL SETUSER, password recovered from
+    // the claim's connection-Secret DSN) so an app reconnects without
+    // WRONGPASS/NOPERM after the instance churns. Same crate as the
+    // provisioner — no Cargo.toml member edit.
+    let dragonfly_acl_handle = tokio::spawn({
+        let client = client.clone();
+        let metrics = metrics.clone();
+        async move {
+            if let Err(err) =
+                operator_controllers_resourceclaim_provisioner::run_acl_reconcile(client, metrics)
+                    .await
+            {
+                error!(%err, "DragonflyAclReconcile loop error");
+            }
+        }
+    });
+
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
@@ -207,6 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = resourceclaim_scheduler_handle => warn!("ResourceClaimScheduler controller exited"),
         _ = resourceclaim_provisioner_handle => warn!("ResourceClaimProvisioner controller exited"),
         _ = resourceclaim_gc_handle => warn!("ResourceClaimGC controller exited"),
+        _ = dragonfly_acl_handle => warn!("DragonflyAclReconcile loop exited"),
         _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }
