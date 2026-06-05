@@ -29,8 +29,9 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
     Application, ApplicationBaseSpec, ApplicationCondition, ApplicationStatus, Metrics,
-    MigrationPlan, ResourceClaim, SourceCredential, COND_MIGRATION_PENDING,
-    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
+    MigrationPlan, ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED,
+    COND_MIGRATION_PENDING, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
+    PHASE_AWAITING_RESOURCE_CLAIM,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
 // dep so future Phase 2 commits can flip on detection +
@@ -59,6 +60,10 @@ pub struct Context {
     /// on top of `spec.base`. Sourced from `APPRAFTER_ENV` env var
     /// in the binary; `None` falls back to `spec.base` only.
     pub env_name: Option<String>,
+    /// HTTP seam for the 2.4h OCI tag→digest resolution. A single
+    /// `ReqwestHttp` built at startup and reused — its inner
+    /// `reqwest::Client` pools connections across reconciles.
+    pub oci_http: oci_resolve::ReqwestHttp,
 }
 
 #[derive(Debug, Error)]
@@ -89,6 +94,7 @@ pub async fn run(
         client,
         metrics,
         env_name,
+        oci_http: oci_resolve::ReqwestHttp::new(),
     });
 
     Controller::new(apps, watcher::Config::default())
@@ -243,6 +249,45 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         needs_secrets = resolve_needs_secrets(&current);
     }
 
+    // ---- 2.4h-d (ADR 0040): resolve base.image's tag → registry digest ----
+    // so a moved tag auto-rolls the Deployment. Best-effort: ANY failure
+    // (registry unreachable, missing credential, malformed reference)
+    // renders the verbatim tag + sets ImageResolved=False and NEVER blocks
+    // the rollout. `imagePolicy.resolve: "off"` skips the poll entirely —
+    // no I/O, no ImageResolved condition.
+    let mut image_status: Option<StatusImage> = None;
+    let mut image_resolved_cond: Option<(bool, String)> = None; // (ok, reason/msg)
+    let resolved_image: Option<String> = match effective.image.as_deref() {
+        Some(tag) if image_resolution_enabled(&effective) => {
+            let creds = list_source_credentials(&ctx.client)
+                .await
+                .unwrap_or_default();
+            let auth = match pick_pull_credential(tag, &creds) {
+                Some(cred) => read_cred_auth(&ctx.client, cred, tag).await,
+                None => oci_resolve::RegistryAuth::Anonymous,
+            };
+            match oci_resolve::resolve_digest(&ctx.oci_http, tag, &auth).await {
+                Ok(resolved) => {
+                    image_status = Some(StatusImage {
+                        tag: Some(tag.to_string()),
+                        resolved: Some(resolved.clone()),
+                        resolved_at: Some(Utc::now().to_rfc3339()),
+                    });
+                    image_resolved_cond = Some((true, "Resolved".into()));
+                    Some(resolved)
+                }
+                Err(e) => {
+                    warn!(image = tag, error = %e, "image digest resolution failed; rendering verbatim tag");
+                    image_resolved_cond = Some((false, format!("ResolveFailed: {e}")));
+                    None // fall back to verbatim tag — rollout proceeds
+                }
+            }
+        }
+        // No image, or `resolve: off` — render the verbatim reference,
+        // emit no ImageResolved condition.
+        _ => None,
+    };
+
     let mut rendered = render_application_for_env(
         &app,
         ctx.env_name.as_deref(),
@@ -251,10 +296,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         } else {
             Some(&needs_secrets)
         },
-        // 2.4h-c: resolved digest threads in here. Task 9 (2.4h-d)
-        // replaces this `None` with the controller-resolved digest;
-        // until then the renderer pins the verbatim tag.
-        None,
+        resolved_image.as_deref(),
     );
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
@@ -285,13 +327,21 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         .as_ref()
         .and_then(|s| s.conditions.as_deref())
         .unwrap_or(&[]);
-    let conditions = vec![ready_condition(
+    let mut conditions = vec![ready_condition(
         "True",
         "ReconcileSucceeded",
         "Reconcile completed; child Deployment and Service applied.",
         previous_conditions,
     )];
-    let status = build_status(&app, "Ready", conditions, endpoint_url);
+    // 2.4h-d: emit ImageResolved only when resolution actually ran
+    // (`imagePolicy.resolve` != "off" and an image is set). `resolve: off`
+    // leaves both `image_resolved_cond` and `image_status` None → no
+    // condition, no status.image.
+    if let Some((ok, reason)) = &image_resolved_cond {
+        conditions.push(image_resolved_condition(*ok, reason, previous_conditions));
+    }
+    let mut status = build_status(&app, "Ready", conditions, endpoint_url);
+    status.image = image_status;
     apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
 
     ctx.metrics
@@ -431,6 +481,32 @@ async fn read_dockercfgjson(
         .and_then(|d| d.get(".dockerconfigjson"))
         .map(|b| String::from_utf8_lossy(&b.0).into_owned());
     Ok(value)
+}
+
+/// Load the registry `RegistryAuth` for `image` from a covering
+/// SourceCredential's derived `dockerconfigjson` (the canonical
+/// `pull_secret_name(cred)` Secret in `apprafter-system`). Best-effort:
+/// if the Secret has not been derived yet, can't be read, or has no
+/// matching host entry, falls back to `Anonymous` so the resolve still
+/// attempts an unauthenticated HEAD (public-image path). Never errors —
+/// 2.4h-d treats resolution as non-blocking.
+async fn read_cred_auth(
+    client: &Client,
+    cred: &SourceCredential,
+    image: &str,
+) -> oci_resolve::RegistryAuth {
+    let cred_name = cred.name_any();
+    let canonical = pull_secret_name(&cred_name);
+    let dcj = match read_dockercfgjson(client, SOURCECRED_NAMESPACE, &canonical).await {
+        Ok(Some(dcj)) => dcj,
+        _ => return oci_resolve::RegistryAuth::Anonymous,
+    };
+    let host = match oci_resolve::parse_image_ref(image) {
+        Ok(r) => r.host,
+        Err(_) => return oci_resolve::RegistryAuth::Anonymous,
+    };
+    oci_resolve::auth_from_dockerconfigjson(dcj.as_bytes(), &host)
+        .unwrap_or(oci_resolve::RegistryAuth::Anonymous)
 }
 
 /// SSA-apply a per-workload copy of the derived pull-secret.
@@ -842,6 +918,53 @@ fn resource_claim_pending_condition(
         last_transition_time,
         reason: "ResourceClaimPending".to_string(),
         message: format!("awaiting ResourceClaim(s): {}", unready.join(", ")),
+        observed_generation: None,
+    }
+}
+
+/// Whether the controller should resolve `base.image` to a registry
+/// digest this reconcile (ADR 0040). Default — absent `imagePolicy` or
+/// `resolve: "digest"` — is yes; only `resolve: "off"` disables it
+/// (verbatim tag, no registry poll, no ImageResolved condition).
+fn image_resolution_enabled(spec: &ApplicationBaseSpec) -> bool {
+    let resolve = spec
+        .image_policy
+        .as_ref()
+        .and_then(|p| p.resolve.as_deref());
+    !matches!(resolve, Some("off"))
+}
+
+/// Build the `ImageResolved` condition (2.4h-d). `ok` maps to
+/// `status=True/reason=Resolved` after a successful tag→digest lookup,
+/// or `status=False/reason=ResolveFailed` on a failure that fell back to
+/// the verbatim tag. `lastTransitionTime` follows the same k8s
+/// convention as `ready_condition` — preserved when the prior
+/// `ImageResolved` already carried the same `status`, bumped on a flip.
+fn image_resolved_condition(
+    ok: bool,
+    reason: &str,
+    previous: &[ApplicationCondition],
+) -> ApplicationCondition {
+    let status = if ok { "True" } else { "False" };
+    let last_transition_time = previous
+        .iter()
+        .find(|c| c.type_ == COND_IMAGE_RESOLVED && c.status == status)
+        .map(|c| c.last_transition_time.clone())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    let (reason_field, message) = if ok {
+        (
+            "Resolved".to_string(),
+            "image tag resolved to a registry digest".to_string(),
+        )
+    } else {
+        ("ResolveFailed".to_string(), reason.to_string())
+    };
+    ApplicationCondition {
+        type_: COND_IMAGE_RESOLVED.to_string(),
+        status: status.to_string(),
+        last_transition_time,
+        reason: reason_field,
+        message,
         observed_generation: None,
     }
 }
@@ -1636,5 +1759,87 @@ mod tests {
         assert_eq!(map.get("pg").map(String::as_str), Some("parser-pg-conn"));
         assert!(!map.contains_key("redis"));
         assert_eq!(map.len(), 1);
+    }
+
+    // ---- 2.4h-d: image-resolution policy gate + ImageResolved condition ----
+
+    use operator_core::ImagePolicy;
+
+    fn base_spec(resolve: Option<&str>) -> ApplicationBaseSpec {
+        ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            image_policy: resolve.map(|r| ImagePolicy {
+                resolve: Some(r.to_string()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_is_enabled_default_and_off() {
+        // Absent imagePolicy => resolution ON (default digest, ADR 0040).
+        assert!(image_resolution_enabled(&base_spec(None)));
+        // resolve: "digest" => ON.
+        assert!(image_resolution_enabled(&base_spec(Some("digest"))));
+        // resolve: "off" => OFF (verbatim tag, no registry poll).
+        assert!(!image_resolution_enabled(&base_spec(Some("off"))));
+        // An empty/unknown policy object (resolve unset) defaults ON.
+        let mut spec = base_spec(None);
+        spec.image_policy = Some(ImagePolicy { resolve: None });
+        assert!(image_resolution_enabled(&spec));
+    }
+
+    #[test]
+    fn image_resolved_condition_ok_is_true_resolved() {
+        let c = image_resolved_condition(true, "Resolved", &[]);
+        assert_eq!(c.type_, COND_IMAGE_RESOLVED);
+        assert_eq!(c.status, "True");
+        assert_eq!(c.reason, "Resolved");
+    }
+
+    #[test]
+    fn image_resolved_condition_failure_is_false_with_message() {
+        // The failure path carries the error string into `message` so
+        // `kubectl describe` surfaces WHY the verbatim tag was rendered.
+        let c = image_resolved_condition(false, "ResolveFailed: registry returned status 404", &[]);
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, "ResolveFailed");
+        assert!(c.message.contains("404"));
+    }
+
+    #[test]
+    fn image_resolved_condition_preserves_transition_time_when_status_unchanged() {
+        // Same k8s convention as ready_condition: timestamp moves only
+        // when `status` flips. A second resolve that still succeeds must
+        // NOT bump the timestamp (else the operator hot-loops on its own
+        // status write).
+        let prior = vec![ApplicationCondition {
+            type_: COND_IMAGE_RESOLVED.into(),
+            status: "True".into(),
+            last_transition_time: "2026-06-05T10:00:00+00:00".into(),
+            reason: "Resolved".into(),
+            message: "old".into(),
+            observed_generation: None,
+        }];
+        let next = image_resolved_condition(true, "Resolved", &prior);
+        assert_eq!(next.last_transition_time, "2026-06-05T10:00:00+00:00");
+    }
+
+    #[test]
+    fn image_resolved_condition_bumps_transition_time_when_status_flips() {
+        // True (resolved) → False (registry went down this cycle): the
+        // transition timestamp MUST advance so downstream tooling sees a
+        // real event.
+        let prior = vec![ApplicationCondition {
+            type_: COND_IMAGE_RESOLVED.into(),
+            status: "True".into(),
+            last_transition_time: "2026-06-05T10:00:00+00:00".into(),
+            reason: "Resolved".into(),
+            message: "ok".into(),
+            observed_generation: None,
+        }];
+        let next = image_resolved_condition(false, "ResolveFailed: timeout", &prior);
+        assert_eq!(next.status, "False");
+        assert_ne!(next.last_transition_time, "2026-06-05T10:00:00+00:00");
     }
 }

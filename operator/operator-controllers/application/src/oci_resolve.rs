@@ -5,9 +5,11 @@
 //! (`RegistryHttp`) so the bearer-token flow is unit-testable
 //! without a live registry — the I/O lives in the controller.
 
-// The parsers + error type are wired into the controller's resolve
-// flow in the following 2.4h-a/2.4h-d tasks; the whole module reads as
-// dead code until those call sites land.
+// The resolve flow (`resolve_digest`, `ReqwestHttp`, `RegistryAuth`,
+// `parse_image_ref`, `auth_from_dockerconfigjson`) is consumed by the
+// 2.4h-d controller wiring in `lib.rs`. A few internal-only items
+// (e.g. unused `OciResolveError` variants on paths the controller does
+// not branch on) remain dead-code-allowed.
 #![allow(dead_code)]
 
 use oci_distribution::Reference;
