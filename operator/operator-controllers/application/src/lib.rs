@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{info, warn};
 
+mod oci_resolve;
 mod pull_secret;
 use pull_secret::{app_pull_secret_name, pick_pull_credential};
 
