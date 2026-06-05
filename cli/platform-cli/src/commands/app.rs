@@ -2779,6 +2779,28 @@ mod tests {
     }
 
     #[test]
+    fn format_image_line_tag_only_on_resolve_failure() {
+        // 2.4h Fix 1(B) seam: when the controller fails to resolve a
+        // tag to a digest it now writes status.image = { tag } with
+        // resolved/resolvedAt left absent (None). The line then shows
+        // ONLY the tag — no "-> @sha256:…" digest, no "(resolved …
+        // ago)" age suffix. This guards the now-reachable branch.
+        let now = chrono::Utc::now();
+        let cr = serde_json::json!({
+            "status": {
+                "image": {
+                    "tag": "ghcr.io/acme/web:latest"
+                }
+            }
+        });
+        let line = format_image_line(&cr, &now).expect("status.image present");
+        assert!(line.contains("ghcr.io/acme/web:latest"));
+        assert!(!line.contains("@sha256"));
+        assert!(!line.contains("->"));
+        assert!(!line.contains("resolved"));
+    }
+
+    #[test]
     fn extract_tracked_resources_happy_multi_entry() {
         // Walk-fix #3 regression guard. status.resources[]
         // entries come back with the fields kubectl + Argo CD
