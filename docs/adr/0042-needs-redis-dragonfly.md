@@ -42,7 +42,7 @@ ACL SETUSER claim_<ns>_<app>_redis \
   on >\<generated-password\> \
   $<N> \
   resetkeys ~* \
-  resetchannels &claim_<ns>_<app>:* \
+  resetchannels &claim_<ns>_<app>_redis:* \
   +@all -@admin -@dangerous \
   +info \
   +client|setname +client|setinfo +client|getname +client|id \
@@ -51,7 +51,7 @@ ACL SETUSER claim_<ns>_<app>_redis \
 
 - `$<N>` pins the user to DB N — `SELECT` of any other DB is `NOPERM`. This is the hard keyspace boundary.
 - `~*` then means "all keys **in DB N**" — the claim owns its whole DB, **with no key prefix on the app side**. `SCAN`/`RANDOMKEY` are confined to DB N, so the cross-tenant key-name enumeration leak that key-prefix isolation suffers does not exist here.
-- `&claim_<ns>_<app>:*` — pub/sub channel isolation (channels are not DB-scoped, so they still need an explicit prefix). `resetchannels` first, since the default is no channels.
+- `&claim_<ns>_<app>_redis:*` — pub/sub channel isolation (channels are not DB-scoped, so they still need an explicit prefix). `resetchannels` first, since the default is no channels.
 - `+@all -@admin -@dangerous` — blocks server-wide / admin / data-destroying commands on the shared instance (`FLUSHALL`, `SWAPDB`, `CONFIG`, `KEYS`, `DEBUG`, `REPLICAOF`, `SHUTDOWN`, `MIGRATE`, `RESTORE`, `CLIENT KILL/LIST/NO-EVICT`, …). `+info` and the safe `CLIENT` subcommands are re-granted (otherwise `-@dangerous` strips them and breaks client init / pool health checks); `+sort_ro` restores read-only `SORT`. Scripting (`@scripting`) is intentionally retained (§5).
 - **Optional self-service knob:** because `$N` confines the user to DB N, it is *safe* to re-grant `+flushdb` — the user's `FLUSHDB` can only ever clear DB N. This lets an app "clear my own cache", which key-prefix isolation can never allow (there `FLUSHDB` would wipe the shared DB 0). Off by default; enable per-tier if wanted.
 
@@ -90,7 +90,7 @@ Persistence in Dragonfly is **instance-scoped**: an RDB snapshot captures the wh
 
 The per-claim connection Secret (claim namespace, owner-ref'd → cascades on delete) carries:
 - `REDIS_URL = redis://claim_<ns>_<app>_redis:\<pass\>@\<instance\>.dragonfly-system.svc:6379/<N>` — the `/<N>` selects the claim's DB; combined with the `$N` ACL the app is hard-pinned to DB N and uses **ordinary key names, no prefix**.
-- `REDIS_CHANNEL_PREFIX = claim_<ns>_<app>:` — applies to **pub/sub channel names only** (the `&` ACL enforces it); apps not using pub/sub ignore it. Keys need no prefix.
+- `REDIS_CHANNEL_PREFIX = claim_<ns>_<app>_redis:` — applies to **pub/sub channel names only** (the `&` ACL enforces it); apps not using pub/sub ignore it. Keys need no prefix.
 
 The renderer's needs→env table (2.4e) generalises to a list of `(env-var, secret-key)` pairs: `pg → [(DATABASE_URL, DATABASE_URL)]`; `redis → [(REDIS_URL, REDIS_URL), (REDIS_CHANNEL_PREFIX, REDIS_CHANNEL_PREFIX)]`. The webhook's reserved-env guard rejects an app literally setting `REDIS_URL`/`REDIS_CHANNEL_PREFIX` when `needs.redis` is present (mirrors the `DATABASE_URL` guard).
 

@@ -196,8 +196,8 @@ impl RedisAdmin for RedisClient {
 /// Test double for [`RedisAdmin`] that records every call instead of
 /// touching a real instance. Lets the reconcile + GC dragonfly paths be
 /// driven in unit tests without a live Dragonfly (the trait-seam payoff;
-/// mirrors how `oci_resolve` is tested with a fake `RegistryHttp`). Made
-/// available to integration tests via the crate's test scope.
+/// mirrors how `oci_resolve` is tested with a fake `RegistryHttp`).
+/// `#[cfg(test)]` — compiled only for this crate's own unit tests.
 #[cfg(test)]
 #[derive(Default)]
 pub struct FakeRedis {
