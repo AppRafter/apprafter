@@ -18,10 +18,11 @@ operator-controllers-migration        = { path = "../migration" }
 operator-controllers-sourcecredential = { path = "../sourcecredential" }
 operator-rendering                    = { path = "../../operator-rendering" }
 
-kube         = { workspace = true }
-k8s-openapi  = { workspace = true }
-tracing      = { workspace = true }
-thiserror    = { workspace = true }
+kube             = { workspace = true }
+k8s-openapi      = { workspace = true }
+oci-distribution = { workspace = true }
+tracing          = { workspace = true }
+thiserror        = { workspace = true }
 futures      = { workspace = true }
 tokio        = { workspace = true }
 chrono       = { workspace = true }

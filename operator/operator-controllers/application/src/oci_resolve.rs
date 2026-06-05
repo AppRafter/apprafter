@@ -10,6 +10,7 @@
 // dead code until those call sites land.
 #![allow(dead_code)]
 
+use oci_distribution::Reference;
 use thiserror::Error;
 
 /// Registry host + repository path + reference (tag or digest)
@@ -36,55 +37,40 @@ pub enum OciResolveError {
     Auth(String),
 }
 
-const DOCKER_HUB_HOST: &str = "registry-1.docker.io";
-
-/// Split an image string into host / repository / reference. A
-/// component before the first `/` is the host iff it contains `.` or
-/// `:` or equals `localhost` (the Docker reference grammar); else the
-/// host is Docker Hub and a single-segment name gets the `library/`
-/// prefix. A missing tag defaults to `latest`.
+/// Split an image string into host / repository / reference by
+/// delegating to `oci_distribution::Reference`, the same validated
+/// parser `platform-stack::oci` uses — so the OCI reference grammar
+/// (lowercase repo names, `sha256:` digest format/length, `host:port`
+/// vs tag disambiguation, the `library/` Docker-Hub default) is
+/// enforced in exactly one place rather than re-derived here (and
+/// rather than re-using `pull_secret::image_repo_path`, which is a
+/// looser host/tag-split heuristic only meant to strip a tag).
+///
+/// `host` is `Reference::resolve_registry()`, which maps the
+/// `docker.io` alias to the canonical `index.docker.io` manifest
+/// endpoint the registry HEAD wants. The reference is a digest when
+/// `digest()` is present, else the tag (the crate defaults a missing
+/// tag to `latest`). A malformed input — e.g. `repo@sha256:abc` with a
+/// too-short digest, or an uppercase repo name — is rejected here.
 pub fn parse_image_ref(image: &str) -> Result<ImageRef, OciResolveError> {
     let image = image.trim();
-    if image.is_empty() {
-        return Err(OciResolveError::InvalidReference(image.to_string()));
-    }
-    let (host, remainder) = match image.split_once('/') {
-        Some((first, rest))
-            if first.contains('.') || first.contains(':') || first == "localhost" =>
-        {
-            (first.to_string(), rest.to_string())
-        }
-        _ => (DOCKER_HUB_HOST.to_string(), image.to_string()),
-    };
-    // Digest form: repo@sha256:...
-    if let Some((repo, digest)) = remainder.split_once('@') {
-        return Ok(ImageRef {
-            host: host.clone(),
-            repository: normalize_repo(&host, repo),
-            reference: digest.to_string(),
-            is_digest: true,
-        });
-    }
-    // Tag form: split on the LAST ':' that is in the final path segment
-    // (so a host:port already consumed above can't be mistaken for a tag).
-    let (repo, tag) = match remainder.rsplit_once(':') {
-        Some((r, t)) if !t.contains('/') => (r.to_string(), t.to_string()),
-        _ => (remainder.clone(), "latest".to_string()),
+    let reference: Reference = image
+        .parse()
+        .map_err(|_| OciResolveError::InvalidReference(image.to_string()))?;
+    let (text, is_digest) = match (reference.digest(), reference.tag()) {
+        (Some(digest), _) => (digest.to_string(), true),
+        (None, Some(tag)) => (tag.to_string(), false),
+        // `Reference` parsing guarantees one of tag/digest is set
+        // (a bare name is defaulted to `:latest`), so this is
+        // unreachable; fall back defensively rather than panic.
+        (None, None) => ("latest".to_string(), false),
     };
     Ok(ImageRef {
-        host: host.clone(),
-        repository: normalize_repo(&host, &repo),
-        reference: tag,
-        is_digest: false,
+        host: reference.resolve_registry().to_string(),
+        repository: reference.repository().to_string(),
+        reference: text,
+        is_digest,
     })
-}
-
-fn normalize_repo(host: &str, repo: &str) -> String {
-    if host == DOCKER_HUB_HOST && !repo.contains('/') {
-        format!("library/{repo}")
-    } else {
-        repo.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -103,8 +89,10 @@ mod tests {
     #[test]
     fn parse_image_ref_dockerhub_official_library_default_tag() {
         // No host => Docker Hub; single name => library/<name>; no tag => latest.
+        // `resolve_registry()` maps the docker.io alias to its canonical
+        // manifest endpoint.
         let r = parse_image_ref("nginx").unwrap();
-        assert_eq!(r.host, "registry-1.docker.io");
+        assert_eq!(r.host, "index.docker.io");
         assert_eq!(r.repository, "library/nginx");
         assert_eq!(r.reference, "latest");
     }
@@ -112,16 +100,31 @@ mod tests {
     #[test]
     fn parse_image_ref_dockerhub_namespaced() {
         let r = parse_image_ref("bitnami/redis:7").unwrap();
-        assert_eq!(r.host, "registry-1.docker.io");
+        assert_eq!(r.host, "index.docker.io");
         assert_eq!(r.repository, "bitnami/redis");
         assert_eq!(r.reference, "7");
     }
 
     #[test]
     fn parse_image_ref_already_digest_is_flagged() {
-        let r = parse_image_ref("ghcr.io/acme/web@sha256:abc").unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let r = parse_image_ref(&format!("ghcr.io/acme/web@{digest}")).unwrap();
         assert!(r.is_digest);
-        assert_eq!(r.reference, "sha256:abc");
+        assert_eq!(r.reference, digest);
+    }
+
+    #[test]
+    fn parse_image_ref_malformed_digest_is_rejected() {
+        // The hand-rolled splitter silently accepted a 3-char digest;
+        // delegating to oci_distribution validates the sha256 length.
+        assert!(parse_image_ref("repo@sha256:abc").is_err());
+    }
+
+    #[test]
+    fn parse_image_ref_uppercase_repo_is_rejected() {
+        // OCI repository names must be lowercase — the validated parser
+        // enforces this where the hand-rolled one did not.
+        assert!(parse_image_ref("ghcr.io/Acme/Web:1.0").is_err());
     }
 
     #[test]
