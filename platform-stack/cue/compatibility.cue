@@ -1709,10 +1709,10 @@ compatibility: "0.1.23": {
 // release carrying the Dragonfly backend (lazy pool + $N per-DB
 // isolation + FLUSHDB GC) and the CRD-additive schema fields. Re-syncs
 // the operator/platform-stack lockstep the 0.2.17 platform-stack-only
-// yank broke — operator + admission-webhook images move to v0.2.18.
+// yank broke — operator + admission-webhook images move to v0.2.19.
 compatibility: "0.2.19": {
 	change:          "safe"
-	operatorVersion: "v0.2.18"
+	operatorVersion: "v0.2.19"
 	notes: """
 		Phase 2.6 (needs.redis → Dragonfly, ADR 0042) close — the
 		coordinated operator + chart release. The provisioner gains a
@@ -1733,7 +1733,7 @@ compatibility: "0.2.19": {
 
 		Re-syncs the operator/platform-stack lockstep the 0.2.17
 		platform-stack-only yank broke: operator + admission-webhook images
-		move to v0.2.18. The CLI is unchanged (redis claims surface via the
+		move to v0.2.19. The CLI is unchanged (redis claims surface via the
 		generic 2.4g `app status` claims display) — no cli/Cargo.toml bump,
 		no monorepo tag.
 		"""
