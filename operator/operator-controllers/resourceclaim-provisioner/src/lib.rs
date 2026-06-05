@@ -59,6 +59,7 @@ use tracing::{info, warn};
 use operator_core::{Metrics, ResourceClaim};
 
 pub mod cnpg;
+pub mod dragonfly;
 pub mod gc;
 pub mod grace;
 pub mod reconcile;

@@ -211,6 +211,28 @@ rules:
       - update
       - patch
       - delete
+  # Phase 2.6 dragonfly arm: the provisioner lazily SSA-applies the
+  # shared `Dragonfly` pool instances (plural `dragonflies`, group
+  # `dragonflydb.io`) the first matched redis claim creates, and the
+  # GC may delete a stale instance on hard cleanup. The dragonfly-
+  # operator CRD is installed at runtime by the `dragonfly-operator`
+  # component (plan.md 2.6-1); without these verbs the provisioner
+  # 403s on its first `Dragonfly` apply and every redis claim stalls
+  # Pending. The per-instance admin-password Secret (dragonfly-system)
+  # and the per-claim connection Secret (claim namespace) are covered
+  # by the cluster-wide secrets rule below.
+  - apiGroups:
+      - dragonflydb.io
+    resources:
+      - dragonflies
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
   # Phase 2.4f RetainedClaim CRD — written by the provisioner
   # finalizer (the deletion snapshot: create/patch via SSA) and
   # consumed + deleted by the RetainedClaim GC controller (the

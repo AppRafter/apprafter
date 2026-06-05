@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use operator_core::{ResourceClaim, ResourceClaimCondition, RetainedClaim, ServiceProvider};
 
 use crate::cnpg;
+use crate::dragonfly;
 use crate::grace;
 use crate::{Context, ReconcileError, FIELD_MANAGER, KIND, PROVISIONER_FINALIZER};
 
@@ -67,11 +68,13 @@ const ROLE_RMW_RETRIES: usize = 5;
 // Backend dispatch
 // ---------------------------------------------------------------------------
 
-/// The provisioning backends this controller knows how to drive. Only
-/// `cloudnative-pg` is wired today; 2.5/2.6 add jetstream / redis.
+/// The provisioning backends this controller knows how to drive.
+/// `cloudnative-pg` (2.4) and `dragonfly` (2.6) are wired; 2.5 adds
+/// jetstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cloudnativepg,
+    Dragonfly,
 }
 
 impl Backend {
@@ -81,6 +84,7 @@ impl Backend {
     pub fn from_spec_backend(backend: &str) -> Option<Self> {
         match backend {
             "cloudnative-pg" => Some(Backend::Cloudnativepg),
+            "dragonfly" => Some(Backend::Dragonfly),
             _ => None,
         }
     }
@@ -177,6 +181,7 @@ pub async fn reconcile(
         Some(Backend::Cloudnativepg) => {
             provision_cloudnativepg(&ctx, &claim, &ns, &name, &provider).await
         }
+        Some(Backend::Dragonfly) => provision_dragonfly(&ctx, &claim, &ns, &name, &provider).await,
         None => {
             warn!(
                 %name, %ns, backend = %provider.spec.backend,
@@ -330,6 +335,171 @@ async fn provision_cloudnativepg(
     }
 
     Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+// ---------------------------------------------------------------------------
+// Dragonfly provisioning (I/O orchestration)
+// ---------------------------------------------------------------------------
+
+/// Index of the single shared pool instance per persistence class. The
+/// 2.6 baseline runs one ephemeral + one persistent instance and grows
+/// the pool horizontally (a new index) only when the current instance's
+/// 1024-DB ceiling is hit (ADR 0042 §3). Spreading claims across multiple
+/// instances is future work; today the allocator always targets index 0
+/// and surfaces a "pool full → grow" error when it fills.
+const POOL_INSTANCE_INDEX: u32 = 0;
+
+/// Provision a `dragonfly` claim into a lazily-created shared Dragonfly
+/// pool instance.
+///
+/// Task 3 scope: resolve the persistence class from the claim, lazily
+/// SSA-apply the per-instance admin Secret + the shared `Dragonfly` CR,
+/// allocate the claim a numbered logical DB off the live-claim source of
+/// truth, and persist `status.{instance,dbnum}` — but leave the claim
+/// NOT-ready (no `$N` ACL user, no connection Secret yet). Task 4 reads
+/// that allocation back, drives the imperative ACL user + connection
+/// Secret, and flips `Ready=True`. The split keeps each task independently
+/// testable; a claim parked here simply requeues until Task 4's path runs.
+async fn provision_dragonfly(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+    provider: &ServiceProvider,
+) -> Result<Action, ReconcileError> {
+    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
+    let df_ns = cfg
+        .pointer("/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("dragonfly-system")
+        .to_string();
+    let dbnum_max = cfg
+        .pointer("/dbnum")
+        .and_then(Value::as_u64)
+        .unwrap_or(1024) as u16;
+    let num_shards = cfg
+        .pointer("/numShards")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as u16;
+
+    // Persistence class is carried on the claim (the Application controller
+    // copies `needs.<type>.persistent` onto the generated claim spec, 2.4d).
+    let persistent = claim.spec.persistent.unwrap_or(false);
+    let instance = dragonfly::pool_instance_name(persistent, POOL_INSTANCE_INDEX);
+
+    info!(%name, %ns, %instance, %df_ns, persistent, "provisioning dragonfly claim");
+
+    // 1. Lazily SSA-apply the per-instance admin Secret then the shared
+    //    `Dragonfly` CR. First claim of a class creates both; later claims
+    //    no-op the apply. The admin password is deterministic-per-apply
+    //    only on first create — a re-apply preserves the existing Secret's
+    //    value (SSA does not regenerate stringData we did not change),
+    //    BUT since we always send a fresh random password we must NOT
+    //    clobber an existing one. Read-or-create: only create the admin
+    //    Secret when it is absent.
+    let admin_secret_name = dragonfly::admin_secret_name(&instance);
+    let secret_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &df_ns, &secret_ar());
+    if secret_api.get_opt(&admin_secret_name).await?.is_none() {
+        let admin_pw = generate_password();
+        let admin_secret = dragonfly::admin_secret_object(&admin_secret_name, &df_ns, &admin_pw);
+        secret_api
+            .patch(
+                &admin_secret_name,
+                &apply_params(),
+                &Patch::Apply(&admin_secret),
+            )
+            .await?;
+        info!(%instance, %df_ns, "created Dragonfly admin password Secret");
+    }
+
+    let df_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
+    let df_body = dragonfly::dragonfly_object(&instance, &df_ns, dbnum_max, num_shards, persistent);
+    df_api
+        .patch(&instance, &apply_params(), &Patch::Apply(&df_body))
+        .await?;
+
+    // 2. Allocate a numbered logical DB off the LIVE claim source of truth.
+    //    If this claim already holds an allocation on this instance (a
+    //    re-reconcile after the status landed but before Task 4 finished),
+    //    keep it — `used_dbnums_on_instance` excludes nothing, so we look
+    //    up our own first to stay idempotent.
+    let existing_alloc =
+        claim
+            .status
+            .as_ref()
+            .and_then(|s| match (s.instance.as_deref(), s.dbnum) {
+                (Some(i), Some(n)) if i == instance => Some(n),
+                _ => None,
+            });
+    let dbnum = match existing_alloc {
+        Some(n) => n,
+        None => {
+            let claims: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
+                .list(&Default::default())
+                .await?
+                .items;
+            let used = dragonfly::used_dbnums_on_instance(&claims, &instance);
+            match dragonfly::allocate_dbnum(&used, dbnum_max) {
+                Some(n) => n,
+                None => {
+                    warn!(
+                        %name, %ns, %instance, dbnum_max,
+                        "dragonfly pool instance full — grow the pool (ADR 0042 §3); requeue"
+                    );
+                    return Ok(Action::requeue(Duration::from_secs(60)));
+                }
+            }
+        }
+    };
+
+    // 3. Persist the allocation (instance + dbnum) so a later reconcile
+    //    (and Task 4's ACL path) reads it back. This patch does NOT set
+    //    `ready` — Task 4 flips that once the ACL user + connection Secret
+    //    exist. Under our own field manager (the SSA split stays intact:
+    //    instance/dbnum are provisioner-owned, never scheduler fields).
+    patch_allocation(&ctx.client, ns, name, &instance, dbnum).await?;
+
+    ctx.metrics
+        .claim_provisioned_total
+        .with_label_values(&["dragonfly", ns])
+        .inc();
+    ctx.metrics
+        .reconcile_total
+        .with_label_values(&[KIND, ns, "ok"])
+        .inc();
+    info!(%name, %ns, %instance, dbnum, "dragonfly claim allocated — awaiting ACL (Task 4)");
+
+    // Requeue so Task 4's path completes the claim once wired. Short
+    // requeue keeps the gap small in the interim.
+    Ok(Action::requeue(Duration::from_secs(30)))
+}
+
+/// SSA-patch ONLY the dragonfly allocation fields (`status.instance` /
+/// `status.dbnum`) under the provisioner field manager. Never touches
+/// `ready` / `connectionSecretRef` (Task 4) or the scheduler's
+/// `provider` / `Scheduled` (the SSA split).
+async fn patch_allocation(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    instance: &str,
+    dbnum: u16,
+) -> Result<(), ReconcileError> {
+    let api: Api<ResourceClaim> = Api::namespaced(client.clone(), ns);
+    let body = json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "ResourceClaim",
+        "metadata": { "name": name },
+        "status": {
+            "instance": instance,
+            "dbnum": dbnum,
+        },
+    });
+    api.patch_status(name, &apply_params(), &Patch::Apply(&body))
+        .await?;
+    Ok(())
 }
 
 /// Read-modify-write the shared Cluster's `spec.managed.roles`. The list
@@ -525,6 +695,16 @@ pub(crate) fn database_ar() -> ApiResource {
 
 pub(crate) fn secret_ar() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind::gvk("", "v1", "Secret"))
+}
+
+/// ApiResource for the externally-installed dragonfly-operator
+/// `Dragonfly` CRD (plan.md 2.6-1 component; group `dragonflydb.io`).
+pub(crate) fn dragonfly_cluster_ar() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "dragonflydb.io",
+        "v1alpha1",
+        "Dragonfly",
+    ))
 }
 
 pub(crate) fn apply_params() -> PatchParams {
@@ -839,8 +1019,16 @@ mod tests {
     }
 
     #[test]
+    fn backend_maps_dragonfly() {
+        assert_eq!(
+            Backend::from_spec_backend("dragonfly"),
+            Some(Backend::Dragonfly)
+        );
+    }
+
+    #[test]
     fn backend_unknown_is_none() {
-        assert_eq!(Backend::from_spec_backend("dragonfly"), None);
+        assert_eq!(Backend::from_spec_backend("redis"), None); // type, not backend
         assert_eq!(Backend::from_spec_backend(""), None);
     }
 
