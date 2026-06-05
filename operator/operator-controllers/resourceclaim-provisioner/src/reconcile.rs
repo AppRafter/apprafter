@@ -311,7 +311,8 @@ async fn provision_cloudnativepg(
         &format!("provisioned into {cluster} ({cnpg_ns})"),
         &prior,
     );
-    patch_status(&ctx.client, ns, name, &conn_secret_name, cond).await?;
+    // CNPG owns no instance/dbnum on the claim status → thread None.
+    patch_status(&ctx.client, ns, name, &conn_secret_name, cond, None).await?;
 
     ctx.metrics
         .claim_provisioned_total
@@ -526,7 +527,17 @@ async fn provision_dragonfly(
         &format!("provisioned into {instance} ({df_ns}) DB {dbnum}"),
         &prior,
     );
-    patch_status(&ctx.client, ns, name, &conn_secret_name, cond).await?;
+    // 2.6 Fix #1: re-send instance + dbnum in the TERMINAL apply so SSA does
+    // not prune the allocation patch_allocation wrote (same field manager).
+    patch_status(
+        &ctx.client,
+        ns,
+        name,
+        &conn_secret_name,
+        cond,
+        Some((&instance, dbnum)),
+    )
+    .await?;
 
     ctx.metrics
         .claim_provisioned_total
@@ -873,26 +884,63 @@ pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
 // Status + finalizer I/O
 // ---------------------------------------------------------------------------
 
-/// SSA-patch the claim status with ONLY `ready` / `connectionSecretRef` /
-/// the `Ready` condition. Never touches `provider` or `Scheduled`.
+/// Build the terminal status SSA-apply body. Always carries `ready` /
+/// `connectionSecretRef` / the `Ready` condition; when an `allocation`
+/// `(instance, dbnum)` is threaded (the dragonfly path), it ALSO re-sends
+/// `status.instance` + `status.dbnum`.
+///
+/// ## Why the allocation MUST ride this terminal body (2.6 Fix #1)
+///
+/// Server-side apply REPLACES (does not accumulate) a field manager's owned
+/// field-set on each apply. The dragonfly path writes status in two applies
+/// under the SAME manager: `patch_allocation` writes ONLY instance+dbnum (a
+/// crash-recovery checkpoint), then THIS terminal apply runs. If the
+/// terminal body omitted instance+dbnum, this apply's field-set would no
+/// longer include them and SSA would PRUNE the allocation — handing the same
+/// dbnum to a new claim (isolation breach), breaking the ACL re-pin loop
+/// (WRONGPASS after a pod restart), and snapshotting an empty allocation
+/// into the GC (leaked ACL user). Re-sending the full provisioner-owned
+/// status in the terminal apply keeps all four fields owned — the same
+/// full-body re-send the crate uses in `cnpg.rs` / `gc.rs`. The CNPG path
+/// threads `None` (it owns no instance/dbnum) and is unaffected.
+fn status_apply_body(
+    name: &str,
+    conn_secret_name: &str,
+    cond: ResourceClaimCondition,
+    allocation: Option<(&str, u16)>,
+) -> Value {
+    let mut status = json!({
+        "ready": true,
+        "connectionSecretRef": conn_secret_name,
+        "conditions": [cond],
+    });
+    if let Some((instance, dbnum)) = allocation {
+        status["instance"] = json!(instance);
+        status["dbnum"] = json!(dbnum);
+    }
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "ResourceClaim",
+        "metadata": { "name": name },
+        "status": status,
+    })
+}
+
+/// SSA-patch the claim status with `ready` / `connectionSecretRef` / the
+/// `Ready` condition, plus (when threaded) the provisioner-owned
+/// `instance` / `dbnum` allocation. Never touches `provider` or
+/// `Scheduled`. See [`status_apply_body`] for why the allocation MUST ride
+/// the terminal apply.
 async fn patch_status(
     client: &Client,
     ns: &str,
     name: &str,
     conn_secret_name: &str,
     cond: ResourceClaimCondition,
+    allocation: Option<(&str, u16)>,
 ) -> Result<(), ReconcileError> {
     let api: Api<ResourceClaim> = Api::namespaced(client.clone(), ns);
-    let body = json!({
-        "apiVersion": "apprafter.io/v1alpha1",
-        "kind": "ResourceClaim",
-        "metadata": { "name": name },
-        "status": {
-            "ready": true,
-            "connectionSecretRef": conn_secret_name,
-            "conditions": [cond],
-        },
-    });
+    let body = status_apply_body(name, conn_secret_name, cond, allocation);
     api.patch_status(name, &apply_params(), &Patch::Apply(&body))
         .await?;
     Ok(())
@@ -1395,6 +1443,44 @@ mod tests {
         );
         assert_eq!(snapshot["metadata"]["name"], object_name);
         assert_eq!(object_name, "claim-demo-demo-web-pg");
+    }
+
+    // --- status_apply_body() (2.6 Fix #1: terminal apply owns all 4 fields) ---
+
+    #[test]
+    fn terminal_status_body_keeps_instance_and_dbnum_alongside_ready() {
+        // 2.6 Fix #1: provision_dragonfly writes status in TWO SSA applies
+        // under the SAME field manager. SSA REPLACES a manager's field set on
+        // each apply, so the TERMINAL apply must re-send instance + dbnum or
+        // it PRUNES the allocation patch_allocation wrote (isolation breach +
+        // ACL re-pin failure + leaked ACL user). Assert all four provisioner-
+        // owned status fields ride the terminal body together.
+        let cond = ready_condition("True", "Provisioned", "ok", &[]);
+        let body = status_apply_body(
+            "web-redis",
+            "web-redis-conn",
+            cond,
+            Some(("platform-redis-ephemeral-000", 7)),
+        );
+        assert_eq!(body["status"]["ready"], true);
+        assert_eq!(body["status"]["connectionSecretRef"], "web-redis-conn");
+        assert_eq!(body["status"]["instance"], "platform-redis-ephemeral-000");
+        assert_eq!(body["status"]["dbnum"], 7);
+        assert!(body["status"]["conditions"].is_array());
+        assert_eq!(body["metadata"]["name"], "web-redis");
+    }
+
+    #[test]
+    fn terminal_status_body_omits_allocation_when_none() {
+        // The CNPG path threads None (it has no instance/dbnum) — the body
+        // then carries only ready / connectionSecretRef / conditions, exactly
+        // as before, so the pg path is unaffected.
+        let cond = ready_condition("True", "Provisioned", "ok", &[]);
+        let body = status_apply_body("demo-web-pg", "demo-web-pg-conn", cond, None);
+        assert_eq!(body["status"]["ready"], true);
+        assert_eq!(body["status"]["connectionSecretRef"], "demo-web-pg-conn");
+        assert!(body["status"].get("instance").is_none());
+        assert!(body["status"].get("dbnum").is_none());
     }
 
     // --- redis_connection_secret_object() (2.6-4) ---
