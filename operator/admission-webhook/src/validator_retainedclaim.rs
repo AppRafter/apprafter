@@ -21,7 +21,10 @@
 //!      GC-load-bearing set (CNPG: role / database / databaseObjectName /
 //!      passwordSecretName / cnpgCluster / cnpgNamespace; dragonfly:
 //!      instance / aclUser / connectionSecretRef / connectionSecretNamespace
-//!      — ADR 0042) non-empty; `retainUntil` parses as RFC3339.
+//!      — ADR 0042) non-empty; `retainUntil` parses as RFC3339. The dragonfly
+//!      set is enforced only once `instance` is present + non-empty — a
+//!      pre-allocation snapshot (claim deleted before provisioning) carries no
+//!      allocation and the GC reclaims nothing, so it needs only the base set.
 //!
 //! Like `validator_resourceclaim.rs` it needs `request.userInfo` +
 //! `request.operation` (+ `oldObject` for the immutability check), which
@@ -57,11 +60,20 @@ const CNPG_REQUIRED_STRING_FIELDS: [&str; 6] = [
 ];
 
 /// Dragonfly-backend `spec` string fields that must be non-empty — the
-/// GC-load-bearing set for a `dragonfly` snapshot (ADR 0042). The GC reads
-/// these to `FLUSHDB` the numbered DB + `ACL DELUSER` the per-claim user.
-/// `dbnum` is intentionally excluded from this set — it is an integer
-/// (0 is a valid DB), so the non-empty-string check does not apply; its
-/// 0..1023 range is enforced by the CRD, not the webhook.
+/// GC-load-bearing set for a `dragonfly` snapshot WITH an allocation
+/// (ADR 0042). The GC reads these to `FLUSHDB` the numbered DB + `ACL
+/// DELUSER` the per-claim user. `dbnum` is intentionally excluded from this
+/// set — it is an integer (0 is a valid DB), so the non-empty-string check
+/// does not apply; its 0..1023 range is enforced by the CRD, not the webhook.
+///
+/// This set is only enforced once `instance` is present and non-empty (see
+/// the `validate_retainedclaim` carve-out): a dragonfly claim deleted BEFORE
+/// the provisioner wrote `status.instance`/`dbnum` snapshots with `instance`
+/// empty, and the GC reclaims nothing for it (`dragonfly_reclaim_target`
+/// returns `None` for an empty instance). Requiring the set unconditionally
+/// would reject the operator's own pre-allocation snapshot CREATE
+/// (failurePolicy: Fail → finalizer wedge → leak) — the mirror of the empty
+/// provider/backend CNPG carve-out. ADR 0042 Pre-merge #5/#6.
 const DRAGONFLY_REQUIRED_STRING_FIELDS: [&str; 4] = [
     "instance",
     "aclUser",
@@ -153,8 +165,25 @@ pub fn validate_retainedclaim(
     // matching set keeps the operator's own snapshot CREATE from being
     // rejected (failurePolicy: Fail → finalizer wedge → leak). ADR 0042.
     let backend = spec.get("backend").and_then(Value::as_str).unwrap_or("");
+    // A dragonfly snapshot's GC-load-bearing set (instance/aclUser/conn*) only
+    // exists once the claim was actually allocated. A claim deleted before the
+    // provisioner wrote `status.instance` snapshots with `instance` empty/absent
+    // (dbnum 0); the GC reclaims nothing for it. Enforce the dragonfly set only
+    // when `instance` is present + non-empty — otherwise fall through to the
+    // base set (claimRef/provider/backend/retainUntil), mirroring the empty
+    // provider/backend CNPG carve-out so the operator's own pre-allocation
+    // snapshot CREATE is not rejected (failurePolicy: Fail → wedge → leak).
+    // ADR 0042 Pre-merge #5/#6.
+    let dragonfly_allocated = spec
+        .get("instance")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
     let required_fields: &[&str] = if backend == "dragonfly" {
-        &DRAGONFLY_REQUIRED_STRING_FIELDS
+        if dragonfly_allocated {
+            &DRAGONFLY_REQUIRED_STRING_FIELDS
+        } else {
+            &[]
+        }
     } else {
         &CNPG_REQUIRED_STRING_FIELDS
     };
@@ -379,14 +408,55 @@ mod tests {
 
     #[test]
     fn rejects_dragonfly_snapshot_missing_allocation_fields() {
-        // A dragonfly snapshot must still carry its own GC-load-bearing
-        // fields (instance + aclUser); the GC needs them to FLUSHDB + DELUSER.
+        // A dragonfly snapshot WITH an allocation (non-empty instance) must
+        // still carry its own GC-load-bearing fields (instance + aclUser);
+        // the GC needs them to FLUSHDB + DELUSER. Once `instance` is present
+        // the full set is enforced, so a missing `aclUser` is still rejected.
         let mut c = retained_dragonfly();
-        c["spec"].as_object_mut().unwrap().remove("instance");
         c["spec"].as_object_mut().unwrap().remove("aclUser");
         let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
-        assert!(errors.iter().any(|e| e.field == "spec.instance"));
-        assert!(errors.iter().any(|e| e.field == "spec.aclUser"));
+        assert!(
+            errors.iter().any(|e| e.field == "spec.aclUser"),
+            "an allocated dragonfly snapshot missing aclUser must be rejected; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn allows_dragonfly_pre_allocation_snapshot_with_empty_instance() {
+        // 2.6 Fix #5/#6: a dragonfly claim deleted BEFORE the provisioner
+        // wrote `status.instance`/`dbnum` snapshots with `instance` empty
+        // (and `dbnum` 0). The snapshot writer ALWAYS sets aclUser /
+        // connectionSecretRef / connectionSecretNamespace, but `instance` is
+        // empty — there is no allocation, so the GC reclaims nothing
+        // (`dragonfly_reclaim_target` returns None for an empty instance).
+        // The webhook (failurePolicy: Fail) MUST accept it — otherwise the
+        // operator's own snapshot CREATE is rejected, the finalizer wedges,
+        // and the claim leaks. With no allocation only the BASE set is
+        // required (claimRef / provider / backend / retainUntil). ADR 0042.
+        let mut c = retained_dragonfly();
+        c["spec"]["instance"] = json!("");
+        c["spec"]["dbnum"] = json!(0);
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "pre-allocation dragonfly snapshot (empty instance) must pass; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn allows_dragonfly_pre_allocation_snapshot_with_absent_allocation() {
+        // Same pre-allocation case, but with the allocation keys ABSENT
+        // (not just empty-string) — also accepted, base set only.
+        let mut c = retained_dragonfly();
+        let spec = c["spec"].as_object_mut().unwrap();
+        spec.remove("instance");
+        spec.remove("dbnum");
+        spec.remove("aclUser");
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "pre-allocation dragonfly snapshot (absent allocation) must pass; got {errors:?}"
+        );
     }
 
     #[test]
