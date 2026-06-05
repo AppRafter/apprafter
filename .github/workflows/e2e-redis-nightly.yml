@@ -3,8 +3,12 @@ name: e2e-redis-nightly
 
 # Standalone nightly k3d gate for the Phase-2.6 needs.redis ResourceClaim
 # chain (e2e/needs-redis-walk.sh): generate -> schedule -> provision ->
-# resume + DSN inject -> $N-ACL cross-DB isolation proof -> delete +
-# RetainedClaim snapshot -> force-GC -> FLUSHDB/DELUSER proof.
+# resume + DSN inject -> $N-ACL cross-DB isolation proof (NOPERM SELECT +
+# MOVE/COPY/SWAPDB escape DENIED) -> scripting/client-init/restart-repin
+# (EVAL confinement, ioredis/BullMQ client init, pod-restart ACL re-pin) ->
+# persistent variant (separate PVC-backed pool instance, restart-durable
+# data) -> delete + RetainedClaim snapshot -> force-GC -> FLUSHDB/DELUSER
+# proof.
 #
 # Why a separate workflow (NOT folded into e2e-k3d.yml or e2e-pg-nightly):
 #   - It boots a real Dragonfly pod (the shared in-cluster Redis-compatible

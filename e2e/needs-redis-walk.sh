@@ -33,7 +33,9 @@
 #   5. ASSERT the Application resumes to Ready and the rendered
 #      Deployment injects REDIS_URL + REDIS_CHANNEL_PREFIX from the Secret.
 #   6. Isolation proof (ADR 0042 Pre-merge #3): a SECOND claim's ACL user
-#      gets NOPERM when it tries to SELECT the first claim's DB.
+#      gets NOPERM when it tries to SELECT the first claim's DB, AND its
+#      cross-DB escape attempts (MOVE / COPY ... DB / SWAPDB aimed at the
+#      first claim's DB) are each DENIED.
 #   7. Scripting + client-init + restart re-pin (ADR 0042 Pre-merge #4/#5/#6):
 #      an in-script EVAL cannot escape DB N (declared-keys + $N pin); an
 #      ioredis/BullMQ-style client init (CLIENT SETNAME/SETINFO, PING,
@@ -672,6 +674,36 @@ case "$cross" in
     *NOPERM*) printf '  ok: api user NOPERM on web DB %s (%s)\n' "$claim_dbnum" "$cross" ;;
     *) printf 'ERROR: api user was NOT denied web DB %s — isolation breach: %q\n' "$claim_dbnum" "$cross" >&2; exit 1 ;;
 esac
+
+# ---- Cross-DB escape probe (ADR 0042 Pre-merge #3): MOVE / COPY ... DB /
+#      SWAPDB name a DESTINATION DB index as an argument and would smuggle
+#      data across the $N pin if granted. The ACL denies MOVE/COPY explicitly
+#      (-move -copy) and SWAPDB via @dangerous, so EACH must return a NOPERM /
+#      permission error. The api user, pinned to its own DB, aims them at the
+#      web user's DB (claim_dbnum). Any SUCCESS is an isolation breach → fail.
+# First, seed a key in the api user's OWN DB so MOVE/COPY have a real source
+# (a denial must come from the ACL, not from a missing key).
+seed=$(redis_as "$ACL_USER2" "$PW2" -n "$claim2_dbnum" SET escape-probe v)
+assert_eq "api seeds a key in its own DB (escape-probe source)" "$seed" "OK"
+# assert_denied <label> <command-output> — fail the walk unless the reply is a
+# NOPERM / permission / generic error (the command was DENIED, not executed).
+assert_denied() {
+    local label="$1" out="$2"
+    case "$out" in
+        *NOPERM*|*"not allowed"*|*"has no permissions"*|*error*|*ERR*)
+            printf '  ok: %s denied (%s)\n' "$label" "$out" ;;
+        *)
+            printf 'ERROR: %s was NOT denied — cross-DB escape breach: %q\n' "$label" "$out" >&2
+            exit 1 ;;
+    esac
+}
+move_out=$(redis_as "$ACL_USER2" "$PW2" -n "$claim2_dbnum" MOVE escape-probe "$claim_dbnum")
+assert_denied "MOVE escape-probe -> web DB $claim_dbnum" "$move_out"
+copy_out=$(redis_as "$ACL_USER2" "$PW2" -n "$claim2_dbnum" \
+    COPY escape-probe escape-probe2 DB "$claim_dbnum")
+assert_denied "COPY escape-probe DB $claim_dbnum" "$copy_out"
+swapdb_out=$(redis_as "$ACL_USER2" "$PW2" -n "$claim2_dbnum" SWAPDB "$claim2_dbnum" "$claim_dbnum")
+assert_denied "SWAPDB $claim2_dbnum <-> $claim_dbnum" "$swapdb_out"
 
 # ===============================================================
 # Phase 9: scripting + client-init + restart re-pin
