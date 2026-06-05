@@ -17,7 +17,13 @@ bunHttpStarter: v1alpha1.#Application & {
 	}
 	spec: {
 		base: {
-			image:    "ghcr.io/your-org/bun-http-starter:0.1.0"
+			image: "ghcr.io/your-org/bun-http-starter:0.1.0"
+			// Hand-pinned, reviewed releases: opt out of tag->digest
+			// resolution so the operator renders this reference
+			// verbatim and never polls the registry (ADR 0040). Drop
+			// this line (or set resolve: "digest") for push->deploy
+			// on a mutable tag.
+			imagePolicy: {resolve: "off"}
 			replicas: 1
 			expose: {
 				port:    3000
