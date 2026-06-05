@@ -29,16 +29,27 @@ lint:
     ./scripts/check-spdx-headers.sh
     ./scripts/check-no-cyrillic.sh
     ./scripts/check-crd-structural.sh
-    if find . -name Cargo.toml -not -path './target/*' -not -path '*/node_modules/*' | head -1 | grep -q .; then
-        cargo fmt --all -- --check
-        cargo clippy --all-targets --all-features -- -D warnings
-    else
-        echo "==> no Cargo.toml — skipping rustfmt/clippy"
-    fi
-    if find . -name package.json -not -path '*/node_modules/*' | head -1 | grep -q .; then
+    # cli/ and operator/ are SEPARATE Cargo workspaces (no top-level
+    # Cargo.toml), so cargo must run from inside each — matching CI
+    # (.github/workflows/lint.yml runs fmt+clippy per workspace). The
+    # `-f` guard keeps this safe from a fresh root before subworkspaces exist.
+    for ws in cli operator; do
+        if [ -f "$ws/Cargo.toml" ]; then
+            echo "==> rustfmt + clippy ($ws)"
+            ( cd "$ws" && cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D warnings )
+        else
+            echo "==> no $ws/Cargo.toml — skipping rustfmt/clippy"
+        fi
+    done
+    # Per-package JS lint (landing/*, backstage-plugins/*) is owned by CI
+    # (.github/workflows/lint.yml iterates each package with its own
+    # bun install). `just lint` only runs a root lint script if one exists;
+    # there is no root package.json, so this skips cleanly rather than
+    # erroring with "Script not found lint" from the repo root.
+    if [ -f package.json ] && grep -q '"lint"' package.json 2>/dev/null; then
         bun run lint
     else
-        echo "==> no package.json — skipping bun lint"
+        echo "==> no root package.json lint script — per-package bun lint runs in CI"
     fi
 
 # Format all code (in-place).
@@ -50,19 +61,22 @@ fmt:
     else
         nix run nixpkgs#cue -- fmt ./schemas/... ./examples/...
     fi
-    if find . -name Cargo.toml -not -path './target/*' -not -path '*/node_modules/*' | head -1 | grep -q .; then
-        cargo fmt --all
-    fi
+    # Per-workspace (no top-level Cargo.toml) — cargo must run from inside each.
+    for ws in cli operator; do
+        if [ -f "$ws/Cargo.toml" ]; then ( cd "$ws" && cargo fmt --all ); fi
+    done
 
 # Run all tests, conditional on workspace presence.
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    if find . -name Cargo.toml -not -path './target/*' -not -path '*/node_modules/*' | head -1 | grep -q .; then
-        cargo test --all --all-features
-    else
-        echo "==> no Cargo.toml — skipping cargo test"
-    fi
+    # Per-workspace (no top-level Cargo.toml) — cargo must run from inside each.
+    for ws in cli operator; do
+        if [ -f "$ws/Cargo.toml" ]; then
+            echo "==> cargo test ($ws)"
+            ( cd "$ws" && cargo test --all --all-features )
+        fi
+    done
     if find . -name package.json -not -path '*/node_modules/*' | head -1 | grep -q .; then
         bun test
     else
