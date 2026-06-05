@@ -1727,6 +1727,8 @@ compatibility: "0.2.16": {
 compatibility: "0.2.15": {
 	change:          "safe"
 	operatorVersion: "v0.2.15"
+	yanked:          true
+	yankedReason:    "Invalid Application CRD (imagePolicy/status.image set additionalProperties alongside properties) — the apiserver rejects the CRD apply, so the operator never rolls to this version. Superseded by 0.2.16."
 	notes: """
 		Image tag→digest resolution & auto-rollout (ADR 0040). The
 		Application CRD gains two OPTIONAL, additive fields
