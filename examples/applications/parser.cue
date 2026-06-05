@@ -14,7 +14,8 @@ parser: v1alpha1.#Application & {
 	}
 	spec: {
 		base: {
-			image:    "ghcr.io/example/parser:latest"
+			image: "ghcr.io/example/parser:latest"
+			imagePolicy: {resolve: "digest"}
 			replicas: 3
 			expose: {
 				port:   8080

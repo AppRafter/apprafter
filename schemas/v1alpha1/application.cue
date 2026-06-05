@@ -41,6 +41,12 @@ package v1alpha1
 	// shape lands with the renderer + webhook in 1.7c.
 	image?: string
 
+	// Image resolution policy (ADR 0040). Default behaviour (absent or
+	// resolve: "digest") = the operator resolves base.image's tag to its
+	// current registry digest each reconcile (push->deploy). "off" =
+	// render the reference verbatim, no registry poll.
+	imagePolicy?: #ImagePolicy
+
 	// Replica count. Zero is valid (scale-to-zero); negative is
 	// rejected by CUE.
 	replicas?: int & >=0
@@ -92,4 +98,14 @@ package v1alpha1
 	// Requested size class. Optional — tier-aware platform defaults
 	// fill it when absent (spec §3.1: `needs.pg: {}` → tier sizing).
 	size?: #Size
+}
+
+// #ImagePolicy — image-reference resolution policy under
+// `Application.spec.base.imagePolicy` (ADR 0040).
+#ImagePolicy: {
+	// "digest" (default when absent) = the operator resolves
+	// `base.image`'s tag to its current registry digest each
+	// reconcile (push->deploy). "off" = render the reference
+	// verbatim, no registry poll.
+	resolve?: "digest" | "off"
 }
