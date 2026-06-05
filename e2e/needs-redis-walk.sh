@@ -10,6 +10,8 @@
 #
 #   generate (2.4d) -> schedule (2.3) -> provision (2.6-3/2.6-4) ->
 #   resume + DSN inject (2.4d/2.4e/2.6-6) -> isolation proof ($N ACL) ->
+#   scripting/client-init/restart-repin (2.6-5, Pre-merge #4/#5/#6) ->
+#   persistent variant + restart-durable data (2.6-2/2.6-3, §6) ->
 #   delete + snapshot (2.4f/2.6-4) -> force-GC (2.6-7) ->
 #   redis-cli ACL/FLUSHDB proof
 #
@@ -32,10 +34,19 @@
 #      Deployment injects REDIS_URL + REDIS_CHANNEL_PREFIX from the Secret.
 #   6. Isolation proof (ADR 0042 Pre-merge #3): a SECOND claim's ACL user
 #      gets NOPERM when it tries to SELECT the first claim's DB.
-#   7. Delete the ResourceClaim; ASSERT the finalizer snapshots a
+#   7. Scripting + client-init + restart re-pin (ADR 0042 Pre-merge #4/#5/#6):
+#      an in-script EVAL cannot escape DB N (declared-keys + $N pin); an
+#      ioredis/BullMQ-style client init (CLIENT SETNAME/SETINFO, PING,
+#      BLPOP) passes under the ACL while CONFIG GET stays denied; and after
+#      a `kubectl delete pod` of the instance the reconcile loop re-pins the
+#      user so the app reconnects without NOPERM.
+#   8. Persistent variant (ADR 0042 §6): a `needs.redis: {persistent: true}`
+#      claim routes to a SEPARATE persistent pool instance (snapshot->PVC),
+#      and a key written there survives a pod restart.
+#   9. Delete the ResourceClaim; ASSERT the finalizer snapshots a
 #      RetainedClaim (backend=dragonfly, 7-day grace) and the connection
 #      Secret cascades.
-#   8. Force GC by deleting + re-creating the RetainedClaim with a past
+#  10. Force GC by deleting + re-creating the RetainedClaim with a past
 #      retainUntil; ASSERT FLUSHDB + ACL DELUSER ran (the ACL user is
 #      gone, the DB is empty), and the snapshot is removed.
 #
@@ -93,6 +104,14 @@ APP2="api"
 CLAIM2="api-redis"
 CONN_SECRET2="api-redis-conn"
 
+# A THIRD app declares `needs.redis: {persistent: true}` (ADR 0042 §6) —
+# it routes to a SEPARATE persistent pool instance (snapshot->PVC), so its
+# data survives a pod restart. Used by the persistence + restart-durability
+# phase (Pre-merge #6's snapshot half).
+APP3="worker"
+CLAIM3="worker-redis"
+CONN_SECRET3="worker-redis-conn"
+
 # Group-qualify the two collision-prone kinds so kubectl never resolves
 # to the wrong API group: bare `application` also matches Argo CD's
 # argoproj.io Application, and bare `resourceclaim` matches the k8s 1.32+
@@ -100,9 +119,10 @@ CONN_SECRET2="api-redis-conn"
 APP_RES="application.apprafter.io"
 CLAIM_RES="resourceclaim.apprafter.io"
 
-# acl_user(demo, web-redis) / acl_user(demo, api-redis).
+# acl_user(demo, web-redis) / acl_user(demo, api-redis) / acl_user(demo, worker-redis).
 ACL_USER="claim_demo_web-redis_redis"
 ACL_USER2="claim_demo_api-redis_redis"
+ACL_USER3="claim_demo_worker-redis_redis"
 # RetainedClaim name = cnpg::k8s_name(demo, web-redis).
 RETAINED="claim-demo-web-redis"
 
@@ -111,6 +131,11 @@ DF_NS="dragonfly-system"            # shared Dragonfly instance namespace
 # lands on (pool_instance_name(false, 0)).
 DF_INSTANCE="platform-redis-ephemeral-000"
 DF_ADMIN_SECRET="platform-redis-ephemeral-000-admin"
+# The persistent pool instance (index 0) the `persistent: true` claim
+# lands on (pool_instance_name(true, 0)) — a SEPARATE Dragonfly CR with a
+# snapshot->PVC block; its admin Secret is keyed by its own name.
+DF_INSTANCE_P="platform-redis-persistent-000"
+DF_ADMIN_SECRET_P="platform-redis-persistent-000-admin"
 RETAINED_NS="apprafter-system"      # RetainedClaim namespace
 PROVIDER="redis-integrated"         # seeded ServiceProvider
 
@@ -308,18 +333,34 @@ cond_status() {
 # Echoes redis-cli stdout; returns redis-cli's exit code.
 # ---------------------------------------------------------------
 redis_admin() {
+    redis_admin_on "$DF_INSTANCE" "$DF_ADMIN_SECRET" "$@"
+}
+
+# redis_admin_on <instance> <admin-secret> <args...> — the same, but
+# against an EXPLICIT pool instance (used for the persistent-instance
+# assertions, which run on $DF_INSTANCE_P, not the ephemeral default).
+redis_admin_on() {
+    local instance="$1" admin_secret="$2"; shift 2
     local admin_pw
-    admin_pw=$(kubectl -n "$DF_NS" get secret "$DF_ADMIN_SECRET" \
+    admin_pw=$(kubectl -n "$DF_NS" get secret "$admin_secret" \
         -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
-    kubectl -n "$DF_NS" exec "deploy/${DF_INSTANCE}" -- \
+    kubectl -n "$DF_NS" exec "deploy/${instance}" -- \
         redis-cli -a "$admin_pw" --no-auth-warning "$@" 2>/dev/null
 }
 
 # redis_as <user> <password> <args...> — run redis-cli AS a per-claim
-# ACL user (proves the user's grants directly).
+# ACL user (proves the user's grants directly) against the ephemeral
+# instance. redis_as_on parameterises the instance for the persistent path.
 redis_as() {
-    local user="$1" pw="$2"; shift 2
-    kubectl -n "$DF_NS" exec "deploy/${DF_INSTANCE}" -- \
+    redis_as_on "$DF_INSTANCE" "$@"
+}
+
+# redis_as_on <instance> <user> <password> <args...> — as above, against
+# an explicit pool instance. Output goes to stdout (stderr folded in) so a
+# NOPERM/WRONGPASS reply is greppable; redis-cli's own exit is swallowed.
+redis_as_on() {
+    local instance="$1" user="$2" pw="$3"; shift 3
+    kubectl -n "$DF_NS" exec "deploy/${instance}" -- \
         redis-cli -u "redis://${user}:${pw}@127.0.0.1:6379" \
         --no-auth-warning "$@" 2>&1 || true
 }
@@ -440,7 +481,7 @@ spec:
 YAML
 
 # A second app — same ephemeral pool instance, a DIFFERENT numbered DB.
-# Used in Phase 6 for the cross-DB isolation proof (ADR 0042 #3).
+# Used in Phase 8 for the cross-DB isolation proof (ADR 0042 #3).
 kubectl apply -f - <<YAML
 apiVersion: apprafter.io/v1alpha1
 kind: Application
@@ -458,6 +499,31 @@ spec:
       public: false
     needs:
       redis:
+        selector:
+          tier: integrated
+YAML
+
+# A third app declares the `persistent: true` variant (ADR 0042 §6). It
+# routes to a SEPARATE persistent pool instance (snapshot->PVC), exercised
+# in Phase 10 (placement + restart durability).
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP3}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+      public: false
+    needs:
+      redis:
+        persistent: true
         selector:
           tier: integrated
 YAML
@@ -608,10 +674,244 @@ case "$cross" in
 esac
 
 # ===============================================================
-# Phase 9: delete + snapshot (2.4f/2.6-4) — RetainedClaim (dragonfly), cascade
+# Phase 9: scripting + client-init + restart re-pin
+#          (ADR 0042 Pre-merge #4 / #5 / #6) — all on the ephemeral
+#          instance's `web` user (its DSN password recovered once).
 # ===============================================================
 
-phase "Phase 9: delete claim — RetainedClaim snapshot + cascade"
+phase "Phase 9: Pre-merge #4/#5/#6 — EVAL confinement, client init, restart re-pin"
+
+PW=$(claim_password "$APP_NS" "$CONN_SECRET")
+if [ -z "$PW" ]; then
+    printf 'ERROR: could not recover web claim password from %s REDIS_URL\n' "$CONN_SECRET" >&2
+    exit 1
+fi
+
+# ---- Pre-merge #4: in-script EVAL cannot escape DB N -----------------
+# (a) A declared-key EVAL inside DB N works — scripting (@scripting) is
+#     retained for the claim user, confined to its own DB by the $N pin.
+eval_ok=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" \
+    EVAL "redis.call('SET', KEYS[1], 'v'); return redis.call('GET', KEYS[1])" \
+    1 eval-probe)
+assert_eq "web EVAL SET/GET a DECLARED key in its own DB" "$eval_ok" "v"
+
+# (b) A script that tries to SELECT another DB is denied: the $N pin makes
+#     SELECT of any DB but N a NOPERM, and the embedded interpreter runs
+#     under the SAME ACL. The whole EVAL must error (not silently cross over).
+eval_cross=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" \
+    EVAL "return redis.call('SELECT', ARGV[1])" 0 "$claim2_dbnum")
+case "$eval_cross" in
+    *NOPERM*|*"not allowed"*|*"has no permissions"*|*error*|*ERR*)
+        printf '  ok: in-script SELECT of DB %s denied for web (%s)\n' "$claim2_dbnum" "$eval_cross" ;;
+    *)
+        printf 'ERROR: in-script SELECT of DB %s was NOT denied — EVAL escaped DB %s: %q\n' \
+            "$claim2_dbnum" "$claim_dbnum" "$eval_cross" >&2
+        exit 1 ;;
+esac
+
+# (c) A script that reaches a key OUTSIDE its declared KEYS[] is rejected
+#     (declared-keys default; `allow-undeclared-keys` stays unset — §5
+#     invariant). The EVAL declares zero keys but touches one → error.
+eval_undeclared=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" \
+    EVAL "return redis.call('GET', 'undeclared-key')" 0)
+case "$eval_undeclared" in
+    *error*|*ERR*|*"not been declared"*|*"undeclared"*|*"Lua redis lib"*)
+        printf '  ok: in-script undeclared-key access rejected (%s)\n' "$eval_undeclared" ;;
+    *)
+        printf 'ERROR: in-script undeclared-key access was NOT rejected: %q\n' "$eval_undeclared" >&2
+        exit 1 ;;
+esac
+
+# ---- Pre-merge #5: ioredis / BullMQ-style client init under the ACL ---
+# A real client (ioredis/node-redis) on connect issues a CLIENT SETNAME /
+# SETINFO handshake and a health PING, and a BullMQ queue leans on
+# blocking-list + scripting primitives. All of these must pass under the
+# per-claim ACL (the args re-grant the safe CLIENT subcommands + retain
+# @scripting). We DO NOT assert `CONFIG GET maxmemory-policy` succeeds:
+# CONFIG is under -@admin/-@dangerous by design (ADR 0042 §5 — do not widen
+# to +@dangerous); a well-behaved client tolerates that probe failing.
+init_setname=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" CLIENT SETNAME bullmq-probe)
+assert_eq "client CLIENT SETNAME (handshake)" "$init_setname" "OK"
+init_setinfo=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" \
+    CLIENT SETINFO lib-name ioredis)
+assert_eq "client CLIENT SETINFO (handshake)" "$init_setinfo" "OK"
+init_ping=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" PING)
+assert_eq "client health PING" "$init_ping" "PONG"
+# BullMQ-style queue ops: a blocking pop with a 0.1s timeout returns nil on
+# an empty list (not NOPERM) — proves @list (incl. blocking) is granted.
+init_blpop=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" BLPOP bull:probe 0.1)
+case "$init_blpop" in
+    *NOPERM*)
+        printf 'ERROR: BLPOP denied under the ACL — queue workloads broken: %q\n' "$init_blpop" >&2
+        exit 1 ;;
+    *) printf '  ok: BLPOP permitted (empty-list nil reply: %q)\n' "$init_blpop" ;;
+esac
+# CONFIG GET is intentionally NOT granted — assert it IS denied (proves we
+# did not over-widen the ACL to satisfy a client probe).
+init_config=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" CONFIG GET maxmemory-policy)
+case "$init_config" in
+    *NOPERM*) printf '  ok: CONFIG GET stays denied (ACL not widened — §5)\n' ;;
+    *) printf 'ERROR: CONFIG GET was permitted — ACL over-widened past §5: %q\n' "$init_config" >&2; exit 1 ;;
+esac
+
+# ---- Pre-merge #6: kill the Dragonfly pod -> reconcile loop re-pins the
+#      user -> the app reconnects without NOPERM ------------------------
+# Per-claim ACL users live in the running process, not on the CR, so a pod
+# restart wipes them. The connection Secret's DSN is unchanged, but the
+# user no longer exists on the fresh pod, so the app's login fails
+# (WRONGPASS/NOPERM) until the acl_reconcile loop (300s resync) re-asserts
+# it. We poll the web user's login until it PINGs again — proving the
+# reconcile loop re-pinned the user and the app reconnects without NOPERM
+# (the transient failure window between Ready and re-pin is racy, so we do
+# not assert it; eventual recovery is the acceptance criterion).
+redis_admin -n "$claim_dbnum" SET repin-marker present >/dev/null || true
+
+printf '  killing the ephemeral Dragonfly pod (wipes runtime ACL users) ...\n'
+kubectl -n "$DF_NS" delete pod \
+    -l "app=${DF_INSTANCE},app.kubernetes.io/part-of=dragonfly" \
+    --ignore-not-found --wait=false 2>/dev/null || true
+# Fall back to a label-agnostic delete if the operator's pod labels differ
+# (the dragonfly-operator owns the StatefulSet; match the instance name).
+kubectl -n "$DF_NS" delete pod -l "app=${DF_INSTANCE}" \
+    --ignore-not-found --wait=false 2>/dev/null || true
+
+# Wait for the instance to come back Ready (a fresh pod, empty ACL table).
+printf '  waiting for the ephemeral instance to roll back to Ready ...\n'
+retry 40 10 -- kubectl -n "$DF_NS" rollout status \
+    "deploy/${DF_INSTANCE}" --timeout=60s 2>/dev/null \
+    || retry 40 10 -- kubectl -n "$DF_NS" rollout status \
+        "statefulset/${DF_INSTANCE}" --timeout=60s
+
+# The reconcile loop re-pins within ~one RESYNC_INTERVAL (300s). Poll the
+# web user's login until it succeeds again (no WRONGPASS/NOPERM). Budget a
+# little over one interval for the resync to fire + ACL SETUSER to land.
+printf '  waiting for the reconcile loop to re-pin the web ACL user ...\n'
+deadline=$(( $(date +%s) + 420 ))
+repinned=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    got=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" PING)
+    if [ "$got" = "PONG" ]; then
+        repinned="ok"
+        break
+    fi
+    printf '    %s: web login not re-pinned yet (got=%q)\n' "$(date +%H:%M:%S)" "$got"
+    sleep 10
+done
+if [ "$repinned" != "ok" ]; then
+    printf 'ERROR: web ACL user was NOT re-pinned after the pod restart — reconcile loop did not recover the user\n' >&2
+    redis_admin ACL LIST >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: web user re-pinned by the reconcile loop — app reconnects without NOPERM\n'
+
+# And the re-pinned user is still confined to its own DB (the re-pin is the
+# SAME $N-scoped grant, not a widened one).
+recross=$(redis_as "$ACL_USER" "$PW" SELECT "$claim2_dbnum")
+case "$recross" in
+    *NOPERM*) printf '  ok: re-pinned web user still NOPERM on DB %s (pin preserved)\n' "$claim2_dbnum" ;;
+    *) printf 'ERROR: re-pinned web user is NOT confined to its DB — re-pin widened the grant: %q\n' "$recross" >&2; exit 1 ;;
+esac
+
+# ===============================================================
+# Phase 10: persistent variant (ADR 0042 §6) — separate persistent pool
+#           instance + data survives a pod restart (snapshot->PVC)
+# ===============================================================
+
+phase "Phase 10: persistent variant — separate instance + restart-durable data"
+
+# The `worker` claim (needs.redis: {persistent: true}) provisions onto the
+# PERSISTENT pool instance, not the ephemeral one.
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.status.ready}' true 300
+claim3_instance=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.status.instance}')
+assert_eq "persistent claim lands on the persistent instance" \
+    "$claim3_instance" "$DF_INSTANCE_P"
+claim3_dbnum=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.status.dbnum}')
+case "$claim3_dbnum" in
+    [0-9]*) printf '  ok: persistent claim status.dbnum = %s\n' "$claim3_dbnum" ;;
+    *) printf 'ERROR: persistent claim status.dbnum not an integer: %q\n' "$claim3_dbnum" >&2; exit 1 ;;
+esac
+
+# The persistent Dragonfly CR exists AND carries a snapshot->PVC block
+# (whole-instance durability) — the ephemeral one does not.
+df_p_count=$(kubectl -n "$DF_NS" get dragonfly.dragonflydb.io \
+    "$DF_INSTANCE_P" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "persistent Dragonfly instance present (separate from ephemeral)" \
+    "$df_p_count" "1"
+df_p_pvc=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE_P" \
+    '{.spec.snapshot.persistentVolumeClaimSpec.accessModes[0]}')
+assert_eq "persistent Dragonfly CR has a snapshot->PVC block" "$df_p_pvc" "ReadWriteOnce"
+df_e_pvc=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE" \
+    '{.spec.snapshot.persistentVolumeClaimSpec}')
+if [ -n "$df_e_pvc" ]; then
+    printf 'ERROR: the EPHEMERAL instance unexpectedly carries a snapshot->PVC block: %q\n' "$df_e_pvc" >&2
+    exit 1
+fi
+printf '  ok: ephemeral instance has no snapshot block (class split holds)\n'
+
+# Its own admin Secret + $N ACL user exist on the persistent instance.
+admin_p_present=$(jp secret "$DF_NS" "$DF_ADMIN_SECRET_P" '{.metadata.name}')
+assert_eq "persistent-instance admin Secret present" "$admin_p_present" "$DF_ADMIN_SECRET_P"
+acl_p_line=$(redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" ACL GETUSER "$ACL_USER3" || true)
+if [ -z "$acl_p_line" ]; then
+    printf 'ERROR: ACL user %s not found on the persistent instance %s\n' "$ACL_USER3" "$DF_INSTANCE_P" >&2
+    redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" ACL LIST >&2 || true
+    exit 1
+fi
+printf '  ok: ACL user %s exists on the persistent instance\n' "$ACL_USER3"
+
+# ---- restart-durability: persistent: true survives a pod restart -------
+# Write a durable key into the worker DB, force a snapshot (SAVE), then kill
+# the persistent pod. The dragonfly-operator restores from the snapshot
+# PVC, so the key survives — the acceptance criterion for `persistent`.
+PW3=$(claim_password "$APP_NS" "$CONN_SECRET3")
+if [ -z "$PW3" ]; then
+    printf 'ERROR: could not recover worker claim password from %s\n' "$CONN_SECRET3" >&2
+    exit 1
+fi
+worker_set=$(redis_as_on "$DF_INSTANCE_P" "$ACL_USER3" "$PW3" -n "$claim3_dbnum" \
+    SET durable-key survives-restart)
+assert_eq "worker SET a durable key in its own DB" "$worker_set" "OK"
+# Force a snapshot to disk so the restart restores it (admin SAVE — the
+# claim user lacks @admin; this is the platform proving durability).
+redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" SAVE >/dev/null 2>&1 || true
+
+printf '  killing the persistent Dragonfly pod (data must survive) ...\n'
+kubectl -n "$DF_NS" delete pod -l "app=${DF_INSTANCE_P}" \
+    --ignore-not-found --wait=false 2>/dev/null || true
+
+printf '  waiting for the persistent instance to roll back to Ready ...\n'
+retry 40 10 -- kubectl -n "$DF_NS" rollout status \
+    "deploy/${DF_INSTANCE_P}" --timeout=60s 2>/dev/null \
+    || retry 40 10 -- kubectl -n "$DF_NS" rollout status \
+        "statefulset/${DF_INSTANCE_P}" --timeout=60s
+
+# The reconcile loop re-pins the worker user, then the durable key is still
+# there (snapshot->PVC restore). Poll login first (re-pin), then read.
+printf '  waiting for the worker ACL user re-pin, then reading the durable key ...\n'
+deadline=$(( $(date +%s) + 420 ))
+survived=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    got=$(redis_as_on "$DF_INSTANCE_P" "$ACL_USER3" "$PW3" -n "$claim3_dbnum" \
+        GET durable-key)
+    case "$got" in
+        survives-restart) survived="ok"; break ;;
+        *NOPERM*|*WRONGPASS*) : ;; # user not re-pinned yet — keep polling
+        *) : ;;
+    esac
+    printf '    %s: durable-key not readable yet (got=%q)\n' "$(date +%H:%M:%S)" "$got"
+    sleep 10
+done
+if [ "$survived" != "ok" ]; then
+    printf 'ERROR: durable-key did NOT survive the persistent pod restart — persistence broken\n' >&2
+    exit 1
+fi
+printf '  ok: persistent: true data survived a pod restart (snapshot->PVC restore)\n'
+
+# ===============================================================
+# Phase 11: delete + snapshot (2.4f/2.6-4) — RetainedClaim (dragonfly), cascade
+# ===============================================================
+
+phase "Phase 11: delete claim — RetainedClaim snapshot + cascade"
 
 kubectl delete "$CLAIM_RES" "$CLAIM" -n "$APP_NS" --wait=true
 
@@ -644,11 +944,11 @@ fi
 printf '  ok: ACL user %s STILL present during grace\n' "$ACL_USER"
 
 # ===============================================================
-# Phase 10: force GC (2.6-7) — re-create RetainedClaim with a past
+# Phase 12: force GC (2.6-7) — re-create RetainedClaim with a past
 #           retainUntil; the GC runs FLUSHDB + ACL DELUSER
 # ===============================================================
 
-phase "Phase 10: force GC — past retainUntil drops the ACL user + flushes the DB"
+phase "Phase 12: force GC — past retainUntil drops the ACL user + flushes the DB"
 
 # Seed a key into the web DB as the admin so we can prove FLUSHDB later.
 redis_admin -n "$claim_dbnum" SET gc-probe present >/dev/null || true
@@ -730,4 +1030,4 @@ fi
 rm -rf "$TMPDIR_WORK"
 
 printf '\nneeds-redis-walk GREEN in %s\n' "$(elapsed)"
-printf 'Chain proven: generate -> schedule -> provision -> resume + DSN -> isolation -> delete + snapshot -> GC -> FLUSHDB/DELUSER\n'
+printf 'Chain proven: generate -> schedule -> provision -> resume + DSN -> isolation -> EVAL-confinement/client-init/restart-repin -> persistent variant + restart-durable -> delete + snapshot -> GC -> FLUSHDB/DELUSER\n'
