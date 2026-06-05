@@ -351,16 +351,27 @@ async fn provision_cloudnativepg(
 const POOL_INSTANCE_INDEX: u32 = 0;
 
 /// Provision a `dragonfly` claim into a lazily-created shared Dragonfly
-/// pool instance.
+/// pool instance — a single-pass provision that lands the claim `Ready`.
 ///
-/// Task 3 scope: resolve the persistence class from the claim, lazily
-/// SSA-apply the per-instance admin Secret + the shared `Dragonfly` CR,
-/// allocate the claim a numbered logical DB off the live-claim source of
-/// truth, and persist `status.{instance,dbnum}` — but leave the claim
-/// NOT-ready (no `$N` ACL user, no connection Secret yet). Task 4 reads
-/// that allocation back, drives the imperative ACL user + connection
-/// Secret, and flips `Ready=True`. The split keeps each task independently
-/// testable; a claim parked here simply requeues until Task 4's path runs.
+/// One reconcile drives the whole sequence:
+/// 1. resolve the persistence class from the claim and lazily SSA-apply
+///    the per-instance admin Secret (read-or-create, so an established
+///    password survives re-reconciles) + the shared `Dragonfly` CR;
+/// 2. allocate the claim a numbered logical DB off the live-claim source
+///    of truth (idempotent: an existing `status.{instance,dbnum}` on this
+///    instance is reused rather than re-allocated);
+/// 3. persist `status.{instance,dbnum}` under the provisioner field
+///    manager so a crash before the ACL apply re-reads it back;
+/// 4. read the admin password, `FLUSHDB` the target DB first
+///    (recycle-safety — a reused dbnum must start empty, ADR 0042 §3),
+///    then `ACL SETUSER` the per-claim `$N`-pinned, keyspace-isolated user;
+/// 5. SSA-apply the owner-ref'd connection Secret (`$N`-pinned DSN +
+///    pub/sub channel prefix) in the claim's namespace;
+/// 6. patch `status` with `connectionSecretRef` + `Ready=True`.
+///
+/// Every step is idempotent so a crash anywhere requeues and replays
+/// cleanly. (Tasks 2.6-3 and 2.6-4 once split this between allocation and
+/// the ACL/Secret path; 2.6-4 folded both halves into this one function.)
 async fn provision_dragonfly(
     ctx: &Arc<Context>,
     claim: &Arc<ResourceClaim>,
