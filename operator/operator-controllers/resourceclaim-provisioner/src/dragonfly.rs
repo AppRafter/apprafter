@@ -583,7 +583,8 @@ mod tests {
     fn acl_setuser_args_pin_db_and_keyspace() {
         let args = acl_setuser_args("claim_demo_web_redis", "s3cr3t", 7);
         // ACL SETUSER <user> on >pw $7 resetkeys ~* resetchannels
-        //   &claim_demo_web_redis:* +@all -@admin -@dangerous +info +sort_ro ...
+        //   &claim_demo_web_redis:* +@all -@admin -@dangerous -move -copy
+        //   +info +sort_ro ...
         assert_eq!(args[0], "claim_demo_web_redis");
         assert!(args.iter().any(|a| a == "on"));
         assert!(args.iter().any(|a| a == ">s3cr3t"));

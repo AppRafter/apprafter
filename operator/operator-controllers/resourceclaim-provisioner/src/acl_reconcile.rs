@@ -320,10 +320,15 @@ pub async fn reconcile_instance_acls(
     Ok(())
 }
 
-/// Resolve the dragonfly namespace from the `redis-integrated`
-/// ServiceProvider config, falling back to the well-known default. Mirrors
-/// `provision_dragonfly`'s `config.namespace` read so the loop targets the
-/// same namespace the provisioner created the instance in.
+/// Resolve the dragonfly namespace from the FIRST `ServiceProvider` whose
+/// `spec.backend == "dragonfly"`, reading its `config.namespace`, falling
+/// back to the well-known default. This is equivalent to
+/// `provision_dragonfly`'s `config.namespace` read ONLY under the
+/// single-dragonfly-provider assumption the loop below already documents —
+/// `provision_dragonfly` reads the namespace off the claim's MATCHED
+/// provider, whereas this picks the first dragonfly provider it finds. With
+/// one dragonfly provider (the seeded `redis-integrated`) they are the same
+/// namespace; with several they could differ.
 ///
 /// `pub(crate)` so the GC (`gc.rs`) resolves the dragonfly namespace the
 /// SAME way when reclaiming a snapshot — the RetainedClaim carries the

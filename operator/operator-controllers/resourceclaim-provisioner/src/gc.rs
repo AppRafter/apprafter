@@ -299,8 +299,11 @@ async fn finalize_drop(
 /// is gone, so its number is free again with no explicit release.
 ///
 /// Idempotent + failure-tolerant by design: a snapshot with no allocation
-/// (`instance`/`dbnum`/`aclUser` absent — a claim deleted before it was
-/// ever provisioned) skips the Redis ops entirely; a Redis op against a
+/// (empty `instance` — a claim deleted before the provisioner wrote
+/// `status.instance`/`dbnum`; the snapshot still carries the deterministic
+/// `aclUser` + connection-Secret refs, but `instance` is the field that
+/// gates reclaim, and there is no DB to reach) skips the Redis ops entirely;
+/// a Redis op against a
 /// torn-down instance (the whole pool instance was deleted, e.g. a tier
 /// teardown) is logged and tolerated rather than wedging the GC forever on
 /// an unreachable host — there is nothing left to leak in that case. The
@@ -313,10 +316,11 @@ async fn gc_drop_dragonfly(
     rc_ns: &str,
     rc_name: &str,
 ) -> Result<Action, ReconcileError> {
-    // Reclaim the DB + revoke the user only when there IS a complete
-    // allocation. A claim deleted before it was ever provisioned snapshots
-    // with no instance/user, so there is nothing on a Dragonfly instance to
-    // drop — skip straight to the Secret + snapshot cleanup.
+    // Reclaim the DB + revoke the user only when there IS an allocation.
+    // A claim deleted before it was ever provisioned snapshots with an empty
+    // `instance` (dbnum 0) — the deterministic `aclUser` is still set, but no
+    // DB/user was ever created on an instance, so there is nothing to reach.
+    // Skip straight to the Secret + snapshot cleanup.
     if let Some(target) = dragonfly_reclaim_target(rc) {
         let DragonflyReclaim {
             instance,
@@ -391,8 +395,8 @@ async fn gc_drop_dragonfly(
     } else {
         info!(
             retained = %rc_name,
-            "dragonfly snapshot has no allocation (claim deleted pre-provision) — \
-             nothing to reclaim on an instance"
+            "dragonfly snapshot has no instance (claim deleted pre-provision) — \
+             no DB to reach on an instance; nothing to reclaim"
         );
     }
 
@@ -726,11 +730,14 @@ pub struct DragonflyReclaim {
 }
 
 /// Pure: what the dragonfly GC must reclaim on an instance for this
-/// snapshot, or `None` when there is nothing on a Dragonfly host to drop
-/// (the claim was deleted before it was ever provisioned, so the snapshot
-/// carries no `instance`/`aclUser`). Pinned so the "pre-provision delete →
-/// skip the Redis ops" tolerance is a unit-catchable regression guard
-/// (mirrors the snapshot writer's pre-allocation branch).
+/// snapshot, or `None` when there is no instance to reach (the claim was
+/// deleted before the provisioner wrote `status.instance`, so the snapshot's
+/// `instance` is empty — no DB/user was ever created on a host). The snapshot
+/// writer always sets the deterministic `aclUser` + connection-Secret refs,
+/// so `instance` is the gating field; the `acl_user` guard below is
+/// belt-and-suspenders for a malformed snapshot. Pinned so the "pre-provision
+/// delete → skip the Redis ops" tolerance is a unit-catchable regression
+/// guard (mirrors the snapshot writer's pre-allocation branch).
 pub fn dragonfly_reclaim_target(rc: &RetainedClaim) -> Option<DragonflyReclaim> {
     let instance = rc.spec.instance.clone().filter(|s| !s.is_empty())?;
     let acl_user = rc.spec.acl_user.clone().filter(|s| !s.is_empty())?;
@@ -1275,6 +1282,26 @@ mod tests {
             7,
         )];
         assert!(!dragonfly_flushdb_is_safe(
+            &live,
+            "platform-redis-ephemeral-000",
+            7,
+            "web-redis",
+            "demo",
+        ));
+    }
+
+    #[test]
+    fn flushdb_safe_when_a_live_claim_has_no_status() {
+        // A live claim with no `status` (None — newly created, not yet
+        // provisioned) carries no (instance, dbnum), so it can NOT be the
+        // recycler of this snapshot's DB. The guard's per-claim closure
+        // returns `false` for it (not-a-conflict), so the FLUSHDB stays safe.
+        // Guards the `None => return false` branch in `dragonfly_flushdb_is_safe`.
+        let mut c = ResourceClaim::new("new-claim", ResourceClaimSpec::default());
+        c.metadata.namespace = Some("demo".to_owned());
+        c.status = None;
+        let live = vec![c];
+        assert!(dragonfly_flushdb_is_safe(
             &live,
             "platform-redis-ephemeral-000",
             7,
