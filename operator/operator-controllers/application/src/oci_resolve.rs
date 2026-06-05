@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use oci_distribution::Reference;
+use std::collections::HashMap;
 use thiserror::Error;
 
 /// Registry host + repository path + reference (tag or digest)
@@ -223,6 +224,183 @@ fn dockerhub_aliases(host: &str) -> Vec<String> {
     }
 }
 
+pub struct HttpReq<'a> {
+    pub method: &'a str, // "HEAD" | "GET"
+    pub url: String,
+    pub accept: Option<&'a str>,
+    pub bearer: Option<String>,
+    pub basic: Option<(String, String)>,
+}
+
+pub struct HttpResp {
+    pub status: u16,
+    pub headers: HashMap<String, String>, // lowercased keys
+    pub body: Vec<u8>,
+}
+
+/// Injected HTTP seam (mirrors grace.rs's injected clock): the flow is
+/// unit-tested with a fake; production uses `ReqwestHttp`.
+#[async_trait::async_trait]
+pub trait RegistryHttp {
+    async fn send(&self, req: HttpReq<'_>) -> Result<HttpResp, OciResolveError>;
+}
+
+const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+application/vnd.oci.image.manifest.v1+json, \
+application/vnd.docker.distribution.manifest.list.v2+json, \
+application/vnd.docker.distribution.manifest.v2+json";
+
+/// Resolve `image` (a tag) to `repo@sha256:<digest>`. An already-digest
+/// reference is returned verbatim (no I/O). On a 401 we run one bearer
+/// token exchange and retry once.
+pub async fn resolve_digest(
+    http: &impl RegistryHttp,
+    image: &str,
+    auth: &RegistryAuth,
+) -> Result<String, OciResolveError> {
+    let r = parse_image_ref(image)?;
+    if r.is_digest {
+        return Ok(format!("{}/{}@{}", r.host, r.repository, r.reference));
+    }
+    let manifest_url = format!(
+        "https://{}/v2/{}/manifests/{}",
+        r.host, r.repository, r.reference
+    );
+    let basic = match auth {
+        RegistryAuth::Basic(u, p) => Some((u.clone(), p.clone())),
+        RegistryAuth::Anonymous => None,
+    };
+
+    let head = http
+        .send(HttpReq {
+            method: "HEAD",
+            url: manifest_url.clone(),
+            accept: Some(MANIFEST_ACCEPT),
+            bearer: None,
+            basic: basic.clone(),
+        })
+        .await?;
+
+    let resp = match head.status {
+        200 => head,
+        401 => {
+            let challenge = head
+                .headers
+                .get("www-authenticate")
+                .and_then(|h| parse_www_authenticate(h))
+                .ok_or_else(|| OciResolveError::Auth("401 without a Bearer challenge".into()))?;
+            let token_resp = http
+                .send(HttpReq {
+                    method: "GET",
+                    url: challenge.token_url(),
+                    accept: None,
+                    bearer: None,
+                    basic: basic.clone(),
+                })
+                .await?;
+            if token_resp.status != 200 {
+                return Err(OciResolveError::Auth(format!(
+                    "token endpoint returned {}",
+                    token_resp.status
+                )));
+            }
+            let token = parse_token_response(&token_resp.body)?;
+            http.send(HttpReq {
+                method: "HEAD",
+                url: manifest_url.clone(),
+                accept: Some(MANIFEST_ACCEPT),
+                bearer: Some(token),
+                basic: None,
+            })
+            .await?
+        }
+        s => {
+            return Err(OciResolveError::Status {
+                status: s,
+                url: manifest_url,
+            })
+        }
+    };
+
+    if resp.status != 200 {
+        return Err(OciResolveError::Status {
+            status: resp.status,
+            url: manifest_url,
+        });
+    }
+    let digest = resp
+        .headers
+        .get("docker-content-digest")
+        .ok_or(OciResolveError::NoDigestHeader)?;
+    Ok(format!("{}/{}@{}", r.host, r.repository, digest))
+}
+
+pub struct ReqwestHttp {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttp {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client"),
+        }
+    }
+}
+
+impl Default for ReqwestHttp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl RegistryHttp for ReqwestHttp {
+    async fn send(&self, req: HttpReq<'_>) -> Result<HttpResp, OciResolveError> {
+        let method = match req.method {
+            "HEAD" => reqwest::Method::HEAD,
+            _ => reqwest::Method::GET,
+        };
+        let mut rb = self.client.request(method, &req.url);
+        if let Some(a) = req.accept {
+            rb = rb.header(reqwest::header::ACCEPT, a);
+        }
+        if let Some(t) = &req.bearer {
+            rb = rb.bearer_auth(t);
+        }
+        if let Some((u, p)) = &req.basic {
+            rb = rb.basic_auth(u, Some(p));
+        }
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| OciResolveError::Http(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| OciResolveError::Http(e.to_string()))?
+            .to_vec();
+        Ok(HttpResp {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +526,108 @@ mod tests {
             "xyz"
         );
         assert!(parse_token_response(br#"{}"#).is_err());
+    }
+
+    // (scripted-key, status, headers, body) — aliased to keep
+    // clippy::type_complexity quiet on the `FakeHttp.responses` field.
+    type ScriptedResponse = (String, u16, Vec<(String, String)>, Vec<u8>);
+
+    #[derive(Default)]
+    struct FakeHttp {
+        // url -> (status, headers, body), scripted per call sequence is not
+        // needed: keyed by (method, url, has_bearer).
+        responses: Vec<ScriptedResponse>,
+    }
+    #[async_trait::async_trait]
+    impl RegistryHttp for FakeHttp {
+        async fn send(&self, req: HttpReq<'_>) -> Result<HttpResp, OciResolveError> {
+            let key = format!("{} {} bearer={}", req.method, req.url, req.bearer.is_some());
+            for (k, status, headers, body) in &self.responses {
+                if *k == key {
+                    return Ok(HttpResp {
+                        status: *status,
+                        headers: headers.iter().cloned().collect(),
+                        body: body.clone(),
+                    });
+                }
+            }
+            Err(OciResolveError::Http(format!(
+                "no scripted response for {key}"
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_public_200_returns_digest() {
+        let url = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let http = FakeHttp {
+            responses: vec![(
+                format!("HEAD {url} bearer=false"),
+                200,
+                vec![("docker-content-digest".into(), "sha256:deadbeef".into())],
+                vec![],
+            )],
+        };
+        let got = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap();
+        assert_eq!(got, "ghcr.io/acme/web@sha256:deadbeef");
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_401_then_token_then_200() {
+        let m = "https://ghcr.io/v2/acme/web/manifests/1.0";
+        let tok = "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aacme%2Fweb%3Apull";
+        let http = FakeHttp {
+            responses: vec![
+                (
+                    format!("HEAD {m} bearer=false"),
+                    401,
+                    vec![(
+                        "www-authenticate".into(),
+                        r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:acme/web:pull""#.into(),
+                    )],
+                    vec![],
+                ),
+                (format!("GET {tok} bearer=false"), 200, vec![], br#"{"token":"T"}"#.to_vec()),
+                (
+                    format!("HEAD {m} bearer=true"),
+                    200,
+                    vec![("docker-content-digest".into(), "sha256:cafe".into())],
+                    vec![],
+                ),
+            ],
+        };
+        let got = resolve_digest(&http, "ghcr.io/acme/web:1.0", &RegistryAuth::Anonymous)
+            .await
+            .unwrap();
+        assert_eq!(got, "ghcr.io/acme/web@sha256:cafe");
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_passthrough_when_already_digest() {
+        // An already-digest reference needs no lookup. The digest must be a
+        // valid 64-hex sha256 (oci_distribution::Reference enforces this);
+        // resolve_digest parses the ref first, so a malformed digest would
+        // fail resolution rather than pass through.
+        let d = format!("sha256:{}", "a".repeat(64));
+        let image = format!("ghcr.io/acme/web@{d}");
+        let http = FakeHttp::default();
+        let got = resolve_digest(&http, &image, &RegistryAuth::Anonymous)
+            .await
+            .unwrap();
+        assert_eq!(got, format!("ghcr.io/acme/web@{d}"));
+    }
+
+    #[tokio::test]
+    async fn resolve_digest_404_is_error() {
+        let url = "https://ghcr.io/v2/acme/web/manifests/nope";
+        let http = FakeHttp {
+            responses: vec![(format!("HEAD {url} bearer=false"), 404, vec![], vec![])],
+        };
+        let e = resolve_digest(&http, "ghcr.io/acme/web:nope", &RegistryAuth::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, OciResolveError::Status { status: 404, .. }));
     }
 }

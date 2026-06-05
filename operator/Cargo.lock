@@ -1497,6 +1497,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 name = "operator-controllers-application"
 version = "0.1.2"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "futures",
@@ -1507,6 +1508,7 @@ dependencies = [
  "operator-controllers-sourcecredential",
  "operator-core",
  "operator-rendering",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
