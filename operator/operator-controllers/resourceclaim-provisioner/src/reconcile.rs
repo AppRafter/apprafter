@@ -434,9 +434,9 @@ async fn provision_dragonfly(
 
     // 2. Allocate a numbered logical DB off the LIVE claim source of truth.
     //    If this claim already holds an allocation on this instance (a
-    //    re-reconcile after the status landed but before Task 4 finished),
-    //    keep it — `used_dbnums_on_instance` excludes nothing, so we look
-    //    up our own first to stay idempotent.
+    //    re-reconcile after the status landed but before the ACL/Secret
+    //    steps (4-6) finished), keep it — `used_dbnums_on_instance` excludes
+    //    nothing, so we look up our own first to stay idempotent.
     let existing_alloc =
         claim
             .status
@@ -592,7 +592,7 @@ async fn read_admin_password(
 
 /// SSA-patch ONLY the dragonfly allocation fields (`status.instance` /
 /// `status.dbnum`) under the provisioner field manager. Never touches
-/// `ready` / `connectionSecretRef` (Task 4) or the scheduler's
+/// `ready` / `connectionSecretRef` (step 6) or the scheduler's
 /// `provider` / `Scheduled` (the SSA split).
 async fn patch_allocation(
     client: &Client,
