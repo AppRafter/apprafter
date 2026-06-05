@@ -391,12 +391,12 @@ async fn provision_dragonfly(
 
     // 1. Lazily SSA-apply the per-instance admin Secret then the shared
     //    `Dragonfly` CR. First claim of a class creates both; later claims
-    //    no-op the apply. The admin password is deterministic-per-apply
-    //    only on first create — a re-apply preserves the existing Secret's
-    //    value (SSA does not regenerate stringData we did not change),
-    //    BUT since we always send a fresh random password we must NOT
-    //    clobber an existing one. Read-or-create: only create the admin
-    //    Secret when it is absent.
+    //    no-op the apply. `generate_password()` returns a fresh random
+    //    value on every call, so an unconditional `Patch::Apply` would
+    //    clobber any existing `stringData.password` (SSA overwrites whatever
+    //    the field manager sends). Hence read-or-create: only apply the
+    //    admin Secret when it is absent, so an established password survives
+    //    re-reconciles.
     let admin_secret_name = dragonfly::admin_secret_name(&instance);
     let secret_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &df_ns, &secret_ar());

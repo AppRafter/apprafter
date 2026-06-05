@@ -115,9 +115,13 @@ pub fn admin_secret_object(name: &str, ns: &str, password: &str) -> Value {
 /// live `ResourceClaim` source of truth (`status.instance` /
 /// `status.dbnum`). Race-free: allocation always re-scans live claims, so
 /// two concurrent provisions cannot pick the same DB once the first one's
-/// status lands. The claim being provisioned is excluded by name so a
-/// re-reconcile of an already-allocated claim does not see itself as a
-/// conflict.
+/// status lands. This returns **every** matching dbnum, including the one
+/// held by the claim currently being provisioned — there is no
+/// exclude-by-name parameter or exclusion logic. Idempotency is the
+/// caller's responsibility: a re-reconcile must look up its own prior
+/// allocation (`status.dbnum`) and reuse it *before* calling this, or it
+/// would treat its own DB as taken and pick a different one. See the
+/// `existing_alloc` short-circuit in `provision_dragonfly`.
 pub fn used_dbnums_on_instance(claims: &[ResourceClaim], instance: &str) -> BTreeSet<u16> {
     claims
         .iter()
