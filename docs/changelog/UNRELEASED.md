@@ -9,6 +9,120 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## platform-cli v0.2.5 — 2.4g closure: needs.pg walk-fixes + app-UX (2026-06-05)
+
+The accumulated CLI walk-fixes from the 2.4 needs.pg real-Tier-1 walk, released as
+the 2.4g closing patch (monorepo tag `v0.2.5` — the CLI/monorepo tag stream's own
+count, independent of the operator/platform-stack `0.2.11`–`0.2.14` streams).
+
+### Fixed
+
+- **`app logs`** resolves the inner workload name from `status.resources` (was
+  guessing the app name).
+- **`app status`** shows, by default, the AppRafter phase + workload Pods + Services
+  with live status + the ResourceClaim provisioning state; `--resources` still gives
+  the full Argo CD resource tree.
+- **`app add`** probes anonymous publicness before printing the PAT notice.
+- **Argo CD `Application` wait** is group-qualified (`application.apprafter.io` vs
+  `argoproj.io`) to avoid the CRD-kind clash.
+
+### Added
+
+- **`app scaffold --needs pg`** emits a `needs` block in the generated manifest.
+- **`skip-if-current`** — a `cluster-bootstrap` re-run no longer bumps the Helm
+  release revision when the release fingerprint is unchanged (`release_is_current`).
+- **Tier-1 `autoUpgrade` defaults to opt-out (`true`)** at bootstrap (ADR 0026).
+
+## operator v0.2.14 + platform-stack 0.2.14 — PlatformController pin-degrade resilience (2026-06-05)
+
+A resolver/upstream failure no longer wedges a pinned `PlatformStack`. Found on the
+2.4g walk: a pinned stack failed to converge because the OCI poll crashed before the
+reconcile applied the pin, and a crashing reconcile never wrote status — so every
+condition froze green while nothing progressed.
+
+### Fixed
+
+- **Detection decoupled from enforcement.** A channel-latest resolution failure no
+  longer aborts the reconcile: a pinned stack enforces its pin, an unpinned stack
+  keeps its last-known target, and only an unpinned-with-no-prior stack (nothing to
+  deploy) propagates the error.
+- **Transition classification fails closed.** The second upstream fetch
+  (`fetch_path_max_change_class`) holds at the current target on error instead of
+  aborting; the pin applies once the upstream recovers and the transition can be
+  classified.
+
+### Added
+
+- **`UpstreamReachable` condition** (renders in `apprafter platform status`) surfaces
+  a degraded poll, so the operator can never again crash-loop silently behind
+  frozen-green conditions.
+
+### Notes
+
+- `change: safe` — reconcile-loop resilience only; same CRDs, RBAC, components.
+
+## operator v0.2.13 + platform-stack 0.2.13 — ADR-0041 channel-tag version resolver (2026-06-05)
+
+The PlatformController resolves the channel-latest in `O(1)` from a moving
+`<repo>:<channel>` OCI tag instead of paginating the full tag listing (ADR 0041).
+
+### Added
+
+- **Channel-tag fast path.** One compatibility-doc fetch from `oci://…:<channel>`
+  yields the channel-latest; the paginated tag listing is retained only as the
+  pre-contract fallback.
+- **Publish-side channel moves.** `platform-stack-publish.yml` moves the `:stable` /
+  `:beta` / `:edge` tags with `oras tag` (a Helm-OCI image-manifest carbon-copy) —
+  NOT `docker buildx imagetools create`, which would wrap the chart in an image index
+  the resolver rejects.
+
+### Fixed
+
+- **Structural manifest-not-found classification** (keyed off the OCI error code, not
+  the Display text) — a blob 404 or a digest containing "404" can no longer be
+  swallowed into the fallback.
+- **Phantom-version cap** — a compat-doc key above the published channel-latest chart
+  (read via the chart's own `org.opencontainers.image.version`) can no longer be
+  reported as `availableVersion`.
+
+### Notes
+
+- `change: safe`. References ADR 0041.
+
+## operator v0.2.12 + platform-stack 0.2.12 — OCI tag-listing pagination + tags:null fix (2026-06-04)
+
+### Fixed
+
+- **Paginated OCI tag listing.** The version resolver follows the `last`-cursor across
+  all tag pages, so a newly-published version on a later page is seen — fixes the stale
+  `availableVersion` (`available=0.2.2` while a newer version had already been
+  published).
+- **ghcr `tags: null` past-end page** — a short-page terminator + null backstop, so the
+  resolver no longer crashes deserializing ghcr's `{"tags": null}` past-the-end reply.
+
+### Notes
+
+- `change: safe` — reconcile-loop / OCI-client fix only. Superseded as the primary path
+  by the v0.2.13 channel-tag resolver; retained as the fallback.
+
+## operator v0.2.11 + platform-stack 0.2.11 — 2.4f GC hardening: recovery time-bomb + role-leak (2026-06-04)
+
+Two `RetainedClaim`-GC correctness bugs found on the 2.4g walk, fixed as walk-fixes.
+
+### Fixed
+
+- **Recovery time-bomb / data loss.** Re-provisioning a deleted-but-retained claim now
+  cancels its `RetainedClaim`, and a fail-closed GC live-guard skips the drop when a
+  live `ResourceClaim` for the same `(ns, name)` exists — a recovered, live DB is never
+  dropped by a stale snapshot.
+- **GC role-leak.** The GC drops the per-claim role via `ensure: absent` (CNPG drops a
+  managed role only that way; pruning the entry merely un-manages it), ordered after the
+  database drop and pruned only once CNPG confirms — `pg_roles` is empty after a full GC.
+
+### Notes
+
+- `change: safe` — controller correctness only; same CRDs, RBAC, components.
+
 ## operator v0.2.10 + platform-stack 0.2.10 — 2.4f RetainedClaim CRD + 7-day grace GC (2026-06-03)
 
 Closes the 2.4c cleanup skeleton: a deleted `needs.pg` `ResourceClaim` is
