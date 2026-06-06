@@ -2870,9 +2870,11 @@ instead of carrying parallel definitions.
 
 **Декомпозиция (launch, 2.6b-1…2.6b-6):** **1** — схема (обобщённый `needs` скаляр\|массив+name, `#DiskClaim`, `status.volumeClaimRef`; crd-validate); **2** — generalization-движок (claim-gen по (type,name) + env-дизамбигуация `DATABASE_URL_<NAME>` + webhook (type,name)-гарды; acceptance на pg-массиве ДО диска); **3** — provisioner `Backend::Disk` + сид `disk-local`; **4** — disk renderer (mount+Recreate) + disk webhook-гарды; **5** — disk GC (RetainedClaim disk-поля + reattach/cancel); **6** — `needs-disk-walk.sh` + multi-claim walk + ручной walk + dev-guide + координированный release.
 
-**Цель:** declarative persistent block storage для Application через `needs.disk` claim; tier-portable через storage class abstraction; operator под капотом emits StatefulSet + PVC machinery + CSI snapshot scheduling.
+**Цель (launch):** declarative persistent block storage через `needs.disk` (claim-backed PVC, рендерер монтирует в Deployment — **НЕ** StatefulSet на launch), tier-portable через `disk-local.config.storageClass`. Несущая часть фазы — обобщение `needs` до named-multi-claim (type,name) для всех типов. Full-vision (StatefulSet/snapshots/auto-expand/replicated/shared) — в «Отложено» ниже.
 
-**Поставка:**
+**Поставка (launch):** детально — в декомпозиции 2.6b-1…2.6b-6 выше + spec `docs/superpowers/specs/2026-06-06-needs-disk-named-claims-design.md` + ADR 0043; план реализации `docs/superpowers/plans/2026-06-06-2.6b-needs-disk-named-claims.md`.
+
+**Отложено (T2+ / post-launch — full-vision roadmap; НЕ входит в launch-срез, per ADR 0043 §Decision/§Alternatives):**
 
 Schema:
 - [ ] CUE schema `#DiskClaim` в `schemas/v1alpha1/application.cue` под `needs.disk?: #DiskClaim | [...#DiskClaim]` (union scalar | array).
@@ -2923,7 +2925,13 @@ Tests:
 - [ ] Integration test (T2 multi-node): `shareMode: shared` + `class: shared` (с installed Rook-NFS) deploys multi-replica app с shared storage, все replicas видят writes друг друга.
 - [ ] Snapshot test: backup schedule создаёт VolumeSnapshot, retention enforces deletion старых.
 
-**Acceptance:**
+**Acceptance (launch):**
+- `replicas:1` app с `needs.disk.data: {size:"1Gi", mountPath:"/data"}` → файл переживает рестарт пода И delete+redeploy в окне grace (reattach к удержанному PVC); force-GC после grace удаляет PVC.
+- Multi-disk app (массив, два разных `mountPath`) → обе PVC создаются и монтируются.
+- App с `needs.pg`-массивом из двух именованных → две CNPG DB + `DATABASE_URL_<NAME>` для каждой; unnamed-single по-прежнему `DATABASE_URL` (нулевая миграция).
+- `needs.disk` + `replicas>1` → webhook reject с понятным сообщением.
+
+**Acceptance (отложено — full vision, T2+):**
 - SQLite-app deploys через `needs.disk` с `class: local`, single replica → file persists через pod restart, через node reboot.
 - Multi-disk app (массив с двумя `disk` claims разных `mountPath`) deploys корректно, обе PVCs создаются, mounts работают.
 - `shareMode: shared` + RWX class deploys multi-replica app, cross-replica file visibility verified.
@@ -2934,7 +2942,7 @@ Tests:
 - T2 без opt-in → reject с install hint.
 - Quota over → reject с remaining quota info.
 
-**Зависит от:** 1.83 (M1.5 closure), 4.12 (для full backup destination integration — без 4.12 backups landed но локальный CSI snapshot only).
+**Зависит от (launch):** 1.83 (M1.5 closure). (4.12 нужен только для отложенного backup-destination, не для launch.)
 
 **Размер:** L
 
