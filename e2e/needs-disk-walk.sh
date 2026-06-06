@@ -418,6 +418,40 @@ for _crd in applications serviceproviders resourceclaims retainedclaims; do
 done
 printf '  branch CRDs applied + Established\n'
 
+# The released operator ClusterRole predates the 2.6b PVC RBAC (Backend::Disk
+# SSA-applies a PersistentVolumeClaim). Grant it ADDITIVELY via a dedicated
+# ClusterRole — do NOT replace the operator's ClusterRole: a standalone
+# `helm template` of the operator chart renders an INCOMPLETE RBAC (the
+# platform-stack umbrella passes values that gate other rules), so replacing it
+# strips the operator's resourceclaims/retainedclaims/migrationplans watches.
+# Mirrors the persistentvolumeclaims rule the branch adds to
+# operator/charts/apprafter-operator/templates/rbac.yaml. Pre-release-only.
+printf '  granting the operator the 2.6b PVC RBAC (additive) ...\n'
+kubectl apply -f - <<'PVCRBAC'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: apprafter-operator-disk-pvc
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: apprafter-operator-disk-pvc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: apprafter-operator-disk-pvc
+subjects:
+  - kind: ServiceAccount
+    name: apprafter-operator
+    namespace: apprafter-system
+PVCRBAC
+printf '  operator PVC RBAC granted (additive)\n'
+
 # ===============================================================
 # Phase 2: readiness — provider, webhook, CNPG operator, storage class
 # ===============================================================
