@@ -121,10 +121,16 @@ pub fn validate_resourceclaim(
 
 fn is_operator_or_admin(user_info: &Value) -> bool {
     let is_operator = user_info.get("username").and_then(Value::as_str) == Some(OPERATOR_SA);
+    // Cluster-admin break-glass — `system:masters` or, on kubeadm >= 1.29
+    // (k8s 1.35 / kind), `kubeadm:cluster-admins`; either is omnipotent.
     let is_admin = user_info
         .get("groups")
         .and_then(Value::as_array)
-        .is_some_and(|groups| groups.iter().any(|g| g.as_str() == Some("system:masters")));
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                matches!(g.as_str(), Some("system:masters" | "kubeadm:cluster-admins"))
+            })
+        });
     is_operator || is_admin
 }
 

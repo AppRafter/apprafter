@@ -221,10 +221,18 @@ pub fn validate_retainedclaim(
 
 fn is_operator_or_admin(user_info: &Value) -> bool {
     let is_operator = user_info.get("username").and_then(Value::as_str) == Some(OPERATOR_SA);
+    // Cluster-admin break-glass. `system:masters` is the classic admin group;
+    // kubeadm >= 1.29 issues admin.conf under `kubeadm:cluster-admins`
+    // instead (k8s 1.35 nodes, e.g. kind, surface that), so accept both —
+    // either group is already omnipotent on the cluster.
     let is_admin = user_info
         .get("groups")
         .and_then(Value::as_array)
-        .is_some_and(|groups| groups.iter().any(|g| g.as_str() == Some("system:masters")));
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                matches!(g.as_str(), Some("system:masters" | "kubeadm:cluster-admins"))
+            })
+        });
     is_operator || is_admin
 }
 
@@ -281,6 +289,18 @@ mod tests {
     #[test]
     fn allows_system_masters_create() {
         assert!(validate_retainedclaim(&retained(), None, &admin_user(), "CREATE").is_empty());
+    }
+
+    #[test]
+    fn allows_kubeadm_cluster_admins_create() {
+        // kubeadm >= 1.29 (k8s 1.35 / kind) issues admin.conf under
+        // `kubeadm:cluster-admins` rather than `system:masters`; break-glass
+        // CREATE must still work for the actual cluster-admin group.
+        let kubeadm_admin = json!({
+            "username": "kubernetes-admin",
+            "groups": ["kubeadm:cluster-admins", "system:authenticated"]
+        });
+        assert!(validate_retainedclaim(&retained(), None, &kubeadm_admin, "CREATE").is_empty());
     }
 
     #[test]
