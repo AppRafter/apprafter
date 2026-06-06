@@ -302,15 +302,17 @@ fn is_k8s_quantity(s: &str) -> bool {
     suffix_ok(suffix)
 }
 
-/// 2.6b-4 (ADR 0043): one `needs.disk`-bearing scope to validate —
-/// `(field-path prefix, the scope object, effective replicas)`. The
-/// prefix is `spec.base` or `spec.environments.<name>`; the effective
-/// replicas is the env-scoped override else the inherited base value.
-type DiskScope<'a> = (
-    String,
-    Option<&'a serde_json::Map<String, Value>>,
-    Option<i64>,
-);
+/// 2.6b-4 (ADR 0043): the `needs.disk` VALUE a scope literally declares,
+/// if any. `Some(v)` means the scope's `needs.disk` key is present (even
+/// if it is an empty array); `None` means the scope does not declare a
+/// disk at all (so it INHERITS base's disk under the per-key needs merge).
+/// Mirrors the renderer's `if env_needs.disk.is_some()` override pivot.
+fn scope_disk_value(scope: Option<&serde_json::Map<String, Value>>) -> Option<&Value> {
+    scope
+        .and_then(|o| o.get("needs"))
+        .and_then(|v| v.as_object())
+        .and_then(|n| n.get("disk"))
+}
 
 /// 2.6b-4 (ADR 0043): disk-specific value guards, collected across
 /// `spec.base.needs.disk` AND every `spec.environments.*.needs.disk`.
@@ -318,11 +320,20 @@ type DiskScope<'a> = (
 /// label (it becomes part of the PVC name) and unique within disk;
 /// `mountPath` must be absolute AND unique app-wide; `size` must parse as
 /// a Kubernetes quantity; `class` must be `local` (replicated/shared are
-/// T2-deferred). Separately, a non-empty `needs.disk` in a scope whose
-/// EFFECTIVE replicas (env override else base) is > 1 is rejected — a
-/// standalone RWO PVC supports only a single-replica Deployment at launch
-/// (per-replica multi-replica is T2). Multi-error: one message per
-/// offending field, no short-circuit (matching the validator contract).
+/// T2-deferred). These guards run on each scope's LITERAL disk value.
+///
+/// Separately, the replicas invariant runs on the EFFECTIVE-merged view:
+/// a scope's effective disk is its own `needs.disk` if it declares the
+/// key, else base's `needs.disk` inherited under the per-key needs merge;
+/// its effective replicas is the env override else the base value. When
+/// the effective disk is non-empty AND effective replicas > 1 the scope
+/// is rejected on `<scope>.replicas` — a standalone RWO PVC supports only
+/// a single-replica Deployment at launch (per-replica multi-replica is
+/// T2). This catches the bypass where an environment overrides only
+/// `replicas` (no needs block) yet inherits base's disk.
+///
+/// Multi-error: one message per offending field, no short-circuit
+/// (matching the validator contract).
 fn validate_disk_claims(
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
@@ -332,30 +343,71 @@ fn validate_disk_claims(
         .and_then(|b| b.get("replicas"))
         .and_then(|v| v.as_i64());
 
+    // ---- replicas guard on the EFFECTIVE-merged view ----
+    // base's literal disk, inherited by any env that omits the disk key.
+    let base_disk = scope_disk_value(base);
+    let base_disk_nonempty = base_disk.is_some_and(|v| !disk_entries(v).is_empty());
+
+    let mut replicas_scopes: Vec<(String, bool, Option<i64>)> =
+        vec![("spec.base".to_string(), base_disk_nonempty, base_replicas)];
+    if let Some(envs_obj) = envs {
+        for (env_name, val) in envs_obj {
+            let env_obj = val.as_object();
+            // Per-key needs merge: the env's disk wins when its `disk` key
+            // is present (even empty); else it inherits base's disk.
+            let effective_disk = match scope_disk_value(env_obj) {
+                Some(v) => v,
+                None => match base_disk {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+            if disk_entries(effective_disk).is_empty() {
+                continue;
+            }
+            // Env-override replaces base replicas; else inherit base.
+            let effective_replicas = env_obj
+                .and_then(|o| o.get("replicas"))
+                .and_then(|v| v.as_i64())
+                .or(base_replicas);
+            replicas_scopes.push((
+                format!("spec.environments.{env_name}"),
+                true,
+                effective_replicas,
+            ));
+        }
+    }
+
+    for (prefix, disk_nonempty, effective_replicas) in replicas_scopes {
+        if !disk_nonempty {
+            continue;
+        }
+        if let Some(replicas) = effective_replicas {
+            if replicas > 1 {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.replicas"),
+                    "persistent disks currently support single-replica apps; use replicas: 1 (per-replica disks for multi-replica apps are T2)",
+                ));
+            }
+        }
+    }
+
+    // ---- per-scope LITERAL disk value guards (name/mountPath/size/class) ----
     // mountPath uniqueness is app-wide (across base + every environment):
     // collect every seen mountPath, reporting on the second+ occurrence.
     let mut seen_mount_paths: Vec<String> = Vec::new();
 
-    // Each scope: (field-path prefix, the scope object, effective replicas).
-    let mut scopes: Vec<DiskScope> = vec![("spec.base".to_string(), base, base_replicas)];
+    // Each scope's own field-path prefix + the scope object.
+    let mut value_scopes: Vec<(String, Option<&serde_json::Map<String, Value>>)> =
+        vec![("spec.base".to_string(), base)];
     if let Some(envs_obj) = envs {
         for (env_name, val) in envs_obj {
-            let env_obj = val.as_object();
-            // Env-override replaces base replicas; else inherit base.
-            let effective = env_obj
-                .and_then(|o| o.get("replicas"))
-                .and_then(|v| v.as_i64())
-                .or(base_replicas);
-            scopes.push((format!("spec.environments.{env_name}"), env_obj, effective));
+            value_scopes.push((format!("spec.environments.{env_name}"), val.as_object()));
         }
     }
 
-    for (prefix, scope, effective_replicas) in scopes {
-        let Some(value) = scope
-            .and_then(|o| o.get("needs"))
-            .and_then(|v| v.as_object())
-            .and_then(|n| n.get("disk"))
-        else {
+    for (prefix, scope) in value_scopes {
+        let Some(value) = scope_disk_value(scope) else {
             continue;
         };
         let entries = disk_entries(value);
@@ -457,16 +509,6 @@ fn validate_disk_claims(
                         ),
                     ));
                 }
-            }
-        }
-
-        // ---- replicas: a disk needs a single-replica Deployment ----
-        if let Some(replicas) = effective_replicas {
-            if replicas > 1 {
-                errors.push(ValidationError::new(
-                    format!("{prefix}.replicas"),
-                    "persistent disks currently support single-replica apps; use replicas: 1 (per-replica disks for multi-replica apps are T2)",
-                ));
             }
         }
     }
@@ -1515,6 +1557,103 @@ mod tests {
             .collect();
         assert_eq!(replica_errs.len(), 1);
         assert_eq!(replica_errs[0].field, "spec.environments.prod.replicas");
+    }
+
+    #[test]
+    fn rejects_inherited_base_disk_against_env_replicas_override() {
+        // 2.6b-4 BYPASS GUARD: base declares needs.disk + replicas:1; an
+        // environment overrides ONLY replicas (no needs block), so the
+        // effective prod spec INHERITS base's disk and mounts it on 3
+        // replicas. The replicas guard must reject on prod.replicas even
+        // though prod has no literal needs.disk.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 1,
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+            },
+            "environments": {
+                "prod": { "replicas": 3 }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let replica_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("single-replica"))
+            .collect();
+        assert_eq!(replica_errs.len(), 1);
+        assert_eq!(replica_errs[0].field, "spec.environments.prod.replicas");
+    }
+
+    #[test]
+    fn rejects_inherited_base_disk_when_env_redeclares_other_needs_only() {
+        // Per-key needs merge: an env that re-declares `needs` with a
+        // DIFFERENT type (pg) but NO `disk` key still INHERITS base's
+        // disk (the merge is per-key, not whole-block replace). So with
+        // env replicas:2 the effective prod still mounts the inherited
+        // disk on 2 replicas → rejected on prod.replicas.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 1,
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+            },
+            "environments": {
+                "prod": {
+                    "replicas": 2,
+                    "needs": { "pg": {} }
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let replica_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("single-replica"))
+            .collect();
+        assert_eq!(replica_errs.len(), 1);
+        assert_eq!(replica_errs[0].field, "spec.environments.prod.replicas");
+    }
+
+    #[test]
+    fn accepts_inherited_base_disk_with_single_replica_env_override() {
+        // The same base, but prod overrides replicas back to 1 → the
+        // effective prod mounts the inherited disk on a single replica,
+        // which is allowed. (Base replicas:1 already, but the env
+        // explicitly re-pins 1 — both effective views must accept.)
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 1,
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+            },
+            "environments": {
+                "prod": { "replicas": 1 }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn rejects_base_disk_inherited_into_default_env_replicas() {
+        // base.needs.disk with NO base.replicas (default 1) + an env with
+        // replicas:5 and no needs → the inherited disk is rejected against
+        // the env override even though base never set replicas.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+            },
+            "environments": {
+                "staging": { "replicas": 5 }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let replica_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("single-replica"))
+            .collect();
+        assert_eq!(replica_errs.len(), 1);
+        assert_eq!(replica_errs[0].field, "spec.environments.staging.replicas");
     }
 
     #[test]

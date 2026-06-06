@@ -885,17 +885,57 @@ fn generate_resource_claims(
     // a scalar yields one, an array yields N. The unnamed default
     // (`name: None`) keeps `<app>-<type>` (zero migration); a named
     // entry yields `<app>-<type>-<name>` and carries `spec.name` so the
-    // provisioner can disambiguate sibling claims. The disk provisioner
-    // lands in 2.6b-3, so `disk` entries generate no claim here yet (only
-    // the `disk` claim *type* enum is opened in 2.6b-2).
+    // provisioner can disambiguate sibling claims.
+    //
+    // 2.6b-4: `disk` entries now generate a `type: disk` claim too (the
+    // `Backend::Disk` provisioner landed in 2.6b-3). A disk entry carries
+    // `disk = Some(DiskClaim)` / `service = None`; only its `size` (and
+    // the integrated-tier selector matching the seeded `disk-local`
+    // provider) reach the claim — `mountPath`/`readOnly`/`class` stay
+    // render-side. The claim name `<app>-disk[-<name>]` matches what
+    // `resolve_disk_mounts` looks up.
     let mut out: Vec<(String, Value)> = Vec::new();
     for (service_type, entry) in needs.entries() {
-        // Skip disk entries (no provisioner yet — 2.6b-3).
+        let name = claim_name(app_name, &service_type, entry.name.as_deref());
+
+        // A disk entry has `service = None` + `disk = Some(..)`; emit a
+        // minimal `type: disk` claim and skip the service-only fields.
+        if let Some(disk) = entry.disk {
+            let mut claim_spec = json!({
+                "type": service_type,
+                "selector": default_integrated_selector(),
+                "size": disk.size,
+            });
+            if let Some(entry_name) = entry.name.as_deref() {
+                if !entry_name.is_empty() {
+                    claim_spec["name"] = json!(entry_name);
+                }
+            }
+            let payload = json!({
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "ResourceClaim",
+                "metadata": {
+                    "name": name,
+                    "namespace": namespace,
+                    "ownerReferences": [{
+                        "apiVersion": "apprafter.io/v1alpha1",
+                        "kind": "Application",
+                        "name": app_name,
+                        "uid": app_uid,
+                        "controller": true,
+                        "blockOwnerDeletion": true,
+                    }],
+                },
+                "spec": claim_spec,
+            });
+            out.push((name, payload));
+            continue;
+        }
+
         let Some(need) = entry.service else {
             continue;
         };
 
-        let name = claim_name(app_name, &service_type, entry.name.as_deref());
         let selector = need
             .selector
             .clone()
@@ -1921,6 +1961,65 @@ mod tests {
         // BTreeMap iteration → deterministic: pg before redis.
         assert_eq!(payloads[0].0, "app-pg");
         assert_eq!(payloads[1].0, "app-redis");
+    }
+
+    #[test]
+    fn generate_resource_claims_emits_disk_claim_unnamed_default() {
+        // 2.6b-4: a scalar `needs.disk` entry (no explicit name) →
+        // ONE `<app>-disk` claim carrying spec.type=disk + spec.size, the
+        // integrated-tier selector, NO spec.name (unnamed default), and
+        // NO status. The claim name must match what resolve_disk_mounts
+        // looks up (`<app>-disk`).
+        let spec = base_with_disk(None, "/data", None);
+        let payloads = generate_resource_claims(&spec, "demo-app", "uid-1", "demo");
+        assert_eq!(payloads.len(), 1);
+        let (name, payload) = &payloads[0];
+        assert_eq!(name, "demo-app-disk");
+        assert_eq!(payload["metadata"]["name"], json!("demo-app-disk"));
+        assert_eq!(payload["spec"]["type"], json!("disk"));
+        assert_eq!(payload["spec"]["size"], json!("1Gi"));
+        // disk-local provider carries the integrated-tier selector.
+        assert_eq!(payload["spec"]["selector"], json!({ "tier": "integrated" }));
+        // Unnamed default → no spec.name.
+        assert!(
+            payload["spec"].get("name").is_none(),
+            "unnamed default disk claim must not carry spec.name"
+        );
+        // SSA split guard: no status on the apply payload.
+        assert!(payload.get("status").is_none());
+        // ownerRef → Application.
+        let owner = &payload["metadata"]["ownerReferences"][0];
+        assert_eq!(owner["name"], json!("demo-app"));
+        assert_eq!(owner["uid"], json!("uid-1"));
+    }
+
+    #[test]
+    fn generate_resource_claims_emits_named_disk_claim_with_spec_name() {
+        // 2.6b-4: a named disk array entry → `<app>-disk-<name>` carrying
+        // spec.name = the entry name so resolve_disk_mounts (which builds
+        // the same `<app>-disk-<name>`) pairs the claim with the entry.
+        use operator_core::{Needs, OneOrMany};
+        let spec = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(Needs {
+                disk: Some(OneOrMany::Many(vec![DiskClaim {
+                    name: Some("data".into()),
+                    size: "2Gi".into(),
+                    mount_path: "/var/lib/data".into(),
+                    class: None,
+                    read_only: None,
+                }])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let payloads = generate_resource_claims(&spec, "demo-app", "uid-1", "demo");
+        assert_eq!(payloads.len(), 1);
+        let (name, payload) = &payloads[0];
+        assert_eq!(name, "demo-app-disk-data");
+        assert_eq!(payload["spec"]["type"], json!("disk"));
+        assert_eq!(payload["spec"]["name"], json!("data"));
+        assert_eq!(payload["spec"]["size"], json!("2Gi"));
     }
 
     fn ready_claim(name: &str, ready: Option<bool>, secret: Option<&str>) -> ResourceClaim {
