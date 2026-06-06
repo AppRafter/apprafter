@@ -28,7 +28,7 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
-    Application, ApplicationBaseSpec, ApplicationCondition, ApplicationStatus, Metrics,
+    Application, ApplicationBaseSpec, ApplicationCondition, ApplicationStatus, DiskClaim, Metrics,
     MigrationPlan, ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED,
     COND_MIGRATION_PENDING, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
     PHASE_AWAITING_RESOURCE_CLAIM,
@@ -41,7 +41,7 @@ use operator_core::{
 // `operator-controllers-migration` (B.1.77). The unused-import
 // guard turns the dep into a "feature flag" — Phase 2 simply
 // uncomments the `use` line.
-use operator_rendering::{effective_spec, render_application_for_env};
+use operator_rendering::{effective_spec, render_application_for_env, DiskMount};
 
 /// Resource kind label used for every metric tagged with `kind`.
 const KIND: &str = "Application";
@@ -220,6 +220,11 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // below validated, AFTER the gate passes — so it is empty unless
     // execution falls through to the render (all claims ready).
     let mut needs_secrets: BTreeMap<(String, Option<String>), String> = BTreeMap::new();
+    // 2.6b (ADR 0043): ready `needs.disk` claims resolved into renderer
+    // mount input, built from the SAME `current` ready claims the gate
+    // below validated (AFTER the gate) — empty unless execution falls
+    // through to the render with every claim ready.
+    let mut disk_mounts: Vec<DiskMount> = Vec::new();
     let effective = effective_spec(&app, ctx.env_name.as_deref());
     let has_needs = effective.needs.as_ref().is_some_and(|n| !n.is_empty());
     if has_needs {
@@ -256,6 +261,11 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         // Gate passed — every claim is ready with a connection Secret.
         // Resolve the SAME `current` claims into the DSN map for render.
         needs_secrets = resolve_needs_secrets(&current);
+        // 2.6b: resolve ready disk claims into renderer mount input (PVC
+        // name from each claim's status.volumeClaimRef × the entry's
+        // mountPath/readOnly). Disk claims carry no connection Secret, so
+        // this is a parallel resolution off the SAME `current` claims.
+        disk_mounts = resolve_disk_mounts(&effective, &name, &current);
     }
 
     // ---- 2.4h-d (ADR 0040): resolve base.image's tag → registry digest ----
@@ -353,6 +363,11 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
             Some(&needs_secrets)
         },
         resolved_image.as_deref(),
+        if disk_mounts.is_empty() {
+            None
+        } else {
+            Some(&disk_mounts)
+        },
     );
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
@@ -973,6 +988,96 @@ fn resolve_needs_secrets(claims: &[ResourceClaim]) -> BTreeMap<(String, Option<S
         }
     }
     map
+}
+
+/// Derive a `needs.disk` entry's `(disk, name)` identity (2.6b / ADR
+/// 0043): the explicit `name` when set, else the last path segment of
+/// `mountPath` folded to a DNS-1123 label (`/var/lib/uploads` →
+/// `uploads`). It becomes both the `disk-<name>` volume name and the
+/// `<app>-disk-<name>` claim suffix, so it MUST match the webhook's
+/// derivation and `claim_name`'s fold. The webhook guarantees a
+/// non-empty, DNS-1123-valid result; the fold here is defensive (a valid
+/// input passes through unchanged).
+fn disk_identity_name(disk: &DiskClaim) -> String {
+    let raw = match disk.name.as_deref().filter(|n| !n.is_empty()) {
+        Some(explicit) => explicit.to_string(),
+        None => disk
+            .mount_path
+            .rsplit('/')
+            .find(|seg| !seg.is_empty())
+            .unwrap_or("disk")
+            .to_string(),
+    };
+    // Fold to a DNS-1123 label (lowercase alphanumeric + `-`), trimming
+    // leading/trailing `-`. Mirrors `claim_name`'s per-char fold.
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        out.push(if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        });
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "disk".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Resolve ready `needs.disk` claims into renderer [`DiskMount`] input
+/// (2.6b / ADR 0043). For each `needs.disk` entry of the effective spec,
+/// match the ready disk ResourceClaim by its k8s name
+/// (`<app>-disk[-<name>]`, via [`claim_name`]) or `spec.name`, and pair
+/// the entry's `mountPath`/`readOnly`/derived volume name with the
+/// claim's `status.volumeClaimRef` (the provisioned PVC). A disk entry
+/// whose claim is absent / not ready / lacks a `volumeClaimRef` is
+/// skipped (defensive — post-gate every claim is ready). Pure: only READS
+/// claim status, never writes. The caller threads the result into
+/// `render_application_for_env` AFTER the 2.4d readiness gate, building it
+/// from the SAME `current` ready claims the gate validated.
+fn resolve_disk_mounts(
+    spec: &ApplicationBaseSpec,
+    app: &str,
+    claims: &[ResourceClaim],
+) -> Vec<DiskMount> {
+    let Some(needs) = spec.needs.as_ref() else {
+        return Vec::new();
+    };
+    let Some(disks) = needs.disk.as_ref() else {
+        return Vec::new();
+    };
+    let mut mounts: Vec<DiskMount> = Vec::new();
+    for disk in disks.as_slice_vec() {
+        // The VOLUME name uses the derived identity (`disk-<name>`); the
+        // CLAIM name uses the disk entry's RAW name exactly as claim-gen
+        // does (`<app>-disk` for a derived-default entry, `<app>-disk-<n>`
+        // for an explicit name) — so a derived-default entry matches its
+        // `<app>-disk` claim (whose `spec.name` is None).
+        let identity = disk_identity_name(&disk);
+        let want_spec_name = disk.name.as_deref().filter(|n| !n.is_empty());
+        let want_claim_name = claim_name(app, "disk", want_spec_name);
+        // Match by k8s claim name (robust for both named + derived-default
+        // entries) OR by spec.name (the explicit (disk,name) identity).
+        let claim = claims.iter().find(|c| {
+            c.name_any() == want_claim_name
+                || (want_spec_name.is_some() && c.spec.name.as_deref() == want_spec_name)
+        });
+        let Some(pvc_name) = claim
+            .and_then(|c| c.status.as_ref())
+            .and_then(|s| s.volume_claim_ref.clone())
+        else {
+            continue;
+        };
+        mounts.push(DiskMount {
+            volume_name: format!("disk-{identity}"),
+            mount_path: disk.mount_path.clone(),
+            read_only: disk.read_only.unwrap_or(false),
+            pvc_name,
+        });
+    }
+    mounts
 }
 
 /// Build the Application status payload for the ResourceClaim pause
@@ -2078,6 +2183,153 @@ mod tests {
         );
         assert!(!map.contains_key(&("redis".to_string(), None)));
         assert_eq!(map.len(), 1);
+    }
+
+    // ---- 2.6b-4: resolve ready disk claims → DiskMount render input ----
+
+    /// Helper: a ready disk ResourceClaim with a `volumeClaimRef`. `name`
+    /// is the claim's `spec.name` (the `(disk, name)` identity); `vcr` the
+    /// provisioned PVC name in `status.volumeClaimRef`.
+    fn ready_disk_claim(k8s_name: &str, name: Option<&str>, vcr: Option<&str>) -> ResourceClaim {
+        let mut c = ResourceClaim::new(
+            k8s_name,
+            ResourceClaimSpec {
+                type_: "disk".into(),
+                name: name.map(String::from),
+                selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
+                size: Some("1Gi".into()),
+                persistent: None,
+            },
+        );
+        c.metadata.namespace = Some("demo".into());
+        c.status = Some(ResourceClaimStatus {
+            provider: None,
+            connection_secret_ref: None,
+            ready: Some(true),
+            conditions: None,
+            volume_claim_ref: vcr.map(String::from),
+            ..Default::default()
+        });
+        c
+    }
+
+    /// Helper: base spec with a single disk need.
+    fn base_with_disk(
+        name: Option<&str>,
+        mount_path: &str,
+        read_only: Option<bool>,
+    ) -> ApplicationBaseSpec {
+        use operator_core::{Needs, OneOrMany};
+        ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(Needs {
+                disk: Some(OneOrMany::One(DiskClaim {
+                    name: name.map(String::from),
+                    size: "1Gi".into(),
+                    mount_path: mount_path.to_string(),
+                    class: None,
+                    read_only,
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disk_identity_name_explicit_wins_else_mountpath_last_segment() {
+        // Explicit name passes through (folded).
+        assert_eq!(
+            disk_identity_name(&DiskClaim {
+                name: Some("data".into()),
+                size: "1Gi".into(),
+                mount_path: "/var/data".into(),
+                class: None,
+                read_only: None,
+            }),
+            "data"
+        );
+        // No name → last non-empty mountPath segment.
+        assert_eq!(
+            disk_identity_name(&DiskClaim {
+                name: None,
+                size: "1Gi".into(),
+                mount_path: "/var/lib/uploads".into(),
+                class: None,
+                read_only: None,
+            }),
+            "uploads"
+        );
+        // Trailing slash tolerated.
+        assert_eq!(
+            disk_identity_name(&DiskClaim {
+                name: None,
+                size: "1Gi".into(),
+                mount_path: "/data/".into(),
+                class: None,
+                read_only: None,
+            }),
+            "data"
+        );
+    }
+
+    #[test]
+    fn resolve_disk_mounts_pairs_entry_with_ready_claim_volume_claim_ref() {
+        // An app `demo-app` with needs.disk.data {mountPath:/data} + a
+        // ready claim (k8s name demo-app-disk-data, spec.name=data,
+        // volumeClaimRef=claim-demo-app-disk-data) → one DiskMount
+        // disk-data@/data → that PVC, readOnly false.
+        let spec = base_with_disk(Some("data"), "/data", None);
+        let claims = vec![ready_disk_claim(
+            "demo-app-disk-data",
+            Some("data"),
+            Some("claim-demo-app-disk-data"),
+        )];
+        let mounts = resolve_disk_mounts(&spec, "demo-app", &claims);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].volume_name, "disk-data");
+        assert_eq!(mounts[0].mount_path, "/data");
+        assert!(!mounts[0].read_only);
+        assert_eq!(mounts[0].pvc_name, "claim-demo-app-disk-data");
+    }
+
+    #[test]
+    fn resolve_disk_mounts_derives_name_from_mountpath_and_matches_default_claim() {
+        // A disk entry with NO explicit name → derived identity `uploads`,
+        // matched against the default disk claim (k8s name demo-app-disk,
+        // spec.name=None). readOnly true threads through.
+        let spec = base_with_disk(None, "/var/lib/uploads", Some(true));
+        let claims = vec![ready_disk_claim(
+            "demo-app-disk",
+            None,
+            Some("claim-demo-app-disk"),
+        )];
+        let mounts = resolve_disk_mounts(&spec, "demo-app", &claims);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].volume_name, "disk-uploads");
+        assert_eq!(mounts[0].mount_path, "/var/lib/uploads");
+        assert!(mounts[0].read_only);
+        assert_eq!(mounts[0].pvc_name, "claim-demo-app-disk");
+    }
+
+    #[test]
+    fn resolve_disk_mounts_skips_claim_without_volume_claim_ref() {
+        // A disk claim with no volumeClaimRef (not yet provisioned) is
+        // skipped — render then omits the mount. (Post-gate this should
+        // not happen, but the resolver stays defensive.)
+        let spec = base_with_disk(Some("data"), "/data", None);
+        let claims = vec![ready_disk_claim("demo-app-disk-data", Some("data"), None)];
+        assert!(resolve_disk_mounts(&spec, "demo-app", &claims).is_empty());
+    }
+
+    #[test]
+    fn resolve_disk_mounts_empty_when_no_disk_need() {
+        // An app with a non-disk need (pg) yields no disk mounts.
+        let mut needs = BTreeMap::new();
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let claims = vec![ready_claim("demo-app-pg", Some(true), Some("conn"))];
+        assert!(resolve_disk_mounts(&spec, "demo-app", &claims).is_empty());
     }
 
     // ---- 2.4h-d: image-resolution policy gate + ImageResolved condition ----

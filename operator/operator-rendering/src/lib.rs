@@ -10,10 +10,10 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec, SecretKeySelector,
-    Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaimVolumeSource, PodSpec,
+    PodTemplateSpec, SecretKeySelector, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -26,6 +26,30 @@ use operator_core::{Application, ApplicationBaseSpec};
 pub struct RenderedApplication {
     pub deployment: Deployment,
     pub service: Option<Service>,
+}
+
+/// One ready `needs.disk` claim resolved into render input (2.6b /
+/// ADR 0043). The Application controller builds a `Vec<DiskMount>` from
+/// each `needs.disk` entry × the matching ready disk ResourceClaim's
+/// `status.volumeClaimRef`, AFTER the readiness gate, and threads it into
+/// [`render_application_for_env`]. The renderer appends one container
+/// `volumeMount` + one pod `volume{persistentVolumeClaim}` per entry
+/// (deterministic, sorted by `volume_name` → byte-stable SSA) and forces
+/// `strategy: Recreate` when any is present. Keeping this a threaded
+/// input preserves the renderer's purity (no kube client here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskMount {
+    /// The k8s volume name — `disk-<name>`, where `<name>` is the disk
+    /// entry's `name` or its `mountPath`-derived default. Shared by the
+    /// container `volumeMount.name` and the pod `volume.name`; sorted on
+    /// for deterministic ordering.
+    pub volume_name: String,
+    /// Container mount point (the disk entry's `mountPath`).
+    pub mount_path: String,
+    /// Mount the volume read-only (the disk entry's `readOnly`).
+    pub read_only: bool,
+    /// The standalone RWO PVC name (the claim's `status.volumeClaimRef`).
+    pub pvc_name: String,
 }
 
 /// needs-type → the env vars to inject, each as (env-var-name,
@@ -76,7 +100,7 @@ pub fn fold_env_segment(name: &str) -> String {
 /// shape; new code should prefer [`render_application_for_env`]
 /// when the operator knows which environment it represents.
 pub fn render_application(app: &Application) -> RenderedApplication {
-    render_application_for_env(app, None, None, None)
+    render_application_for_env(app, None, None, None, None)
 }
 
 /// Render the Application using the merged base + environment
@@ -100,11 +124,20 @@ pub fn render_application(app: &Application) -> RenderedApplication {
 /// effective spec's image verbatim (the tag/ref as authored). The
 /// controller resolves the digest out-of-band and threads it in,
 /// keeping this function pure (no registry calls here).
+///
+/// `disks` (2.6b / ADR 0043) carries the ready `needs.disk` claims as
+/// render input — one [`DiskMount`] per resolved disk. When non-empty the
+/// renderer appends a container `volumeMount` + a pod
+/// `volume{persistentVolumeClaim}` per entry (sorted by `volume_name` →
+/// byte-stable SSA) and forces `strategy: Recreate` (an RWO PVC cannot be
+/// held by two pods during a RollingUpdate). `None`/empty leaves the
+/// Deployment strategy unchanged from today (unset → apiserver default).
 pub fn render_application_for_env(
     app: &Application,
     env_name: Option<&str>,
     needs_secrets: Option<&BTreeMap<(String, Option<String>), String>>,
     resolved_image: Option<&str>,
+    disks: Option<&[DiskMount]>,
 ) -> RenderedApplication {
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
@@ -120,6 +153,7 @@ pub fn render_application_for_env(
         &effective,
         needs_secrets,
         resolved_image,
+        disks,
     );
     let service = effective
         .expose
@@ -221,6 +255,11 @@ fn make_labels(name: &str) -> BTreeMap<String, String> {
     labels
 }
 
+// The render inputs (env/needs/image/disk) are each an independent,
+// orthogonal threaded param kept separate for the renderer's purity; a
+// bundling struct would only obscure the call site. Mirrors the
+// provisioner's `reconcile.rs` allow.
+#[allow(clippy::too_many_arguments)]
 fn render_deployment(
     name: &str,
     namespace: Option<&str>,
@@ -229,6 +268,7 @@ fn render_deployment(
     spec: &ApplicationBaseSpec,
     needs_secrets: Option<&BTreeMap<(String, Option<String>), String>>,
     resolved_image: Option<&str>,
+    disks: Option<&[DiskMount]>,
 ) -> Deployment {
     let replicas = spec.replicas.unwrap_or(1);
     let image = resolved_image
@@ -310,6 +350,45 @@ fn render_deployment(
         }
     }
 
+    // 2.6b (ADR 0043): mount ready disk claims into the pod. Each
+    // DiskMount contributes a container `volumeMount` + a pod
+    // `volume{persistentVolumeClaim}`, sorted by `volume_name` so the
+    // rendered Deployment is byte-stable across reconciles (SSA no-op).
+    // When ANY disk is present the strategy is forced to `Recreate` — an
+    // RWO PVC cannot be held by the old + new pod simultaneously during a
+    // RollingUpdate; with no disk the strategy stays unset (apiserver
+    // default RollingUpdate), unchanged from today.
+    let mut sorted_disks: Vec<&DiskMount> = disks.unwrap_or(&[]).iter().collect();
+    sorted_disks.sort_by(|a, b| a.volume_name.cmp(&b.volume_name));
+    let volume_mounts: Vec<VolumeMount> = sorted_disks
+        .iter()
+        .map(|d| VolumeMount {
+            name: d.volume_name.clone(),
+            mount_path: d.mount_path.clone(),
+            read_only: Some(d.read_only),
+            ..Default::default()
+        })
+        .collect();
+    let volumes: Vec<Volume> = sorted_disks
+        .iter()
+        .map(|d| Volume {
+            name: d.volume_name.clone(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: d.pvc_name.clone(),
+                read_only: Some(d.read_only),
+            }),
+            ..Default::default()
+        })
+        .collect();
+    let strategy = if sorted_disks.is_empty() {
+        None
+    } else {
+        Some(DeploymentStrategy {
+            type_: Some("Recreate".to_string()),
+            rolling_update: None,
+        })
+    };
+
     let container = Container {
         name: name.to_string(),
         image: Some(image),
@@ -319,6 +398,11 @@ fn render_deployment(
             Some(env_vars)
         },
         ports: container_port.map(|p| vec![p]),
+        volume_mounts: if volume_mounts.is_empty() {
+            None
+        } else {
+            Some(volume_mounts)
+        },
         ..Default::default()
     };
 
@@ -332,6 +416,7 @@ fn render_deployment(
         },
         spec: Some(DeploymentSpec {
             replicas: Some(replicas),
+            strategy,
             selector: LabelSelector {
                 match_labels: Some(labels.clone()),
                 ..Default::default()
@@ -343,6 +428,11 @@ fn render_deployment(
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
+                    volumes: if volumes.is_empty() {
+                        None
+                    } else {
+                        Some(volumes)
+                    },
                     ..Default::default()
                 }),
             },
@@ -908,7 +998,7 @@ mod tests {
             },
             envs,
         );
-        let r = render_application_for_env(&app, Some("prod"), None, None);
+        let r = render_application_for_env(&app, Some("prod"), None, None, None);
         assert_eq!(
             r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
                 .image
@@ -995,7 +1085,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r).expect("env present");
         let dsn = envs
             .iter()
@@ -1023,7 +1113,7 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let r = render_application_for_env(&app, None, None, None);
+        let r = render_application_for_env(&app, None, None, None, None);
         let envs = container_env(&r);
         // No literal env + no injected DSN → env stays None.
         assert!(envs.is_none(), "no DATABASE_URL when secrets map is None");
@@ -1041,7 +1131,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r).expect("env present (DSN injected)");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "DATABASE_URL");
@@ -1064,7 +1154,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 2);
         // Literal env first, DSN appended AFTER.
@@ -1092,7 +1182,7 @@ mod tests {
             ("clickhouse".to_string(), None),
             "parser-clickhouse-conn".to_string(),
         )]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r);
         assert!(
             envs.is_none(),
@@ -1114,7 +1204,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r).expect("env present");
         let url = envs
             .iter()
@@ -1180,7 +1270,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 2);
         assert_eq!(envs[0].name, "REDIS_URL");
@@ -1240,7 +1330,7 @@ mod tests {
                 "parser-pg-analytics-conn".to_string(),
             ),
         ]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r).expect("env present");
 
         let default = envs
@@ -1290,7 +1380,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "DATABASE_URL");
@@ -1318,7 +1408,7 @@ mod tests {
     fn deployment_uses_resolved_digest_when_provided() {
         let app = app_with_image("ghcr.io/acme/web:1.0");
         let rendered =
-            render_application_for_env(&app, None, None, Some("ghcr.io/acme/web@sha256:abc"));
+            render_application_for_env(&app, None, None, Some("ghcr.io/acme/web@sha256:abc"), None);
         let c = &rendered
             .deployment
             .spec
@@ -1333,7 +1423,7 @@ mod tests {
     #[test]
     fn deployment_uses_verbatim_tag_when_resolved_is_none() {
         let app = app_with_image("ghcr.io/acme/web:1.0");
-        let rendered = render_application_for_env(&app, None, None, None);
+        let rendered = render_application_for_env(&app, None, None, None, None);
         let c = &rendered
             .deployment
             .spec
@@ -1343,5 +1433,179 @@ mod tests {
             .unwrap()
             .containers[0];
         assert_eq!(c.image.as_deref(), Some("ghcr.io/acme/web:1.0"));
+    }
+
+    // ---- 2.6b-4: disk mounts + Recreate strategy ----
+
+    /// Helper: extract the rendered container's volumeMounts (or None).
+    fn container_volume_mounts(r: &RenderedApplication) -> Option<Vec<VolumeMount>> {
+        r.deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .volume_mounts
+            .clone()
+    }
+
+    /// Helper: extract the rendered pod spec's volumes (or None).
+    fn pod_volumes(r: &RenderedApplication) -> Option<Vec<Volume>> {
+        r.deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .volumes
+            .clone()
+    }
+
+    #[test]
+    fn disk_claim_renders_volume_mount_volume_and_recreate_strategy() {
+        // An app with needs.disk.data {mountPath:/data,size:1Gi} + a ready
+        // claim (status.volumeClaimRef=claim-demo-app-disk-data) → the
+        // Deployment carries a container volumeMount disk-data@/data, a pod
+        // volume disk-data → that PVC, and spec.strategy.type == Recreate
+        // (an RWO PVC cannot be held by two pods during a RollingUpdate).
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+            },
+            "demo-app",
+            "demo",
+            "uid-1",
+        );
+        let disks = vec![DiskMount {
+            volume_name: "disk-data".to_string(),
+            mount_path: "/data".to_string(),
+            read_only: false,
+            pvc_name: "claim-demo-app-disk-data".to_string(),
+        }];
+        let r = render_application_for_env(&app, None, None, None, Some(&disks));
+
+        let mounts = container_volume_mounts(&r).expect("volumeMounts present");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "disk-data");
+        assert_eq!(mounts[0].mount_path, "/data");
+        assert_eq!(mounts[0].read_only, Some(false));
+
+        let volumes = pod_volumes(&r).expect("volumes present");
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].name, "disk-data");
+        let pvc = volumes[0]
+            .persistent_volume_claim
+            .as_ref()
+            .expect("persistentVolumeClaim source");
+        assert_eq!(pvc.claim_name, "claim-demo-app-disk-data");
+
+        let strategy = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .strategy
+            .as_ref()
+            .expect("strategy set when disk present");
+        assert_eq!(strategy.type_.as_deref(), Some("Recreate"));
+    }
+
+    #[test]
+    fn no_disk_leaves_strategy_unchanged() {
+        // An app with no disk keeps today's strategy (unset → apiserver
+        // default RollingUpdate) and no volumes / volumeMounts.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+            },
+            "demo-app",
+            "demo",
+            "uid-1",
+        );
+        let r = render_application_for_env(&app, None, None, None, None);
+        assert!(
+            r.deployment.spec.as_ref().unwrap().strategy.is_none(),
+            "strategy unchanged (unset) when no disk"
+        );
+        assert!(container_volume_mounts(&r).is_none());
+        assert!(pod_volumes(&r).is_none());
+    }
+
+    #[test]
+    fn empty_disks_slice_leaves_strategy_unchanged() {
+        // A threaded-but-empty disks slice (resolved claims yielded none)
+        // is treated like no disk — no strategy, no volumes.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+            },
+            "demo-app",
+            "demo",
+            "uid-1",
+        );
+        let r = render_application_for_env(&app, None, None, None, Some(&[]));
+        assert!(r.deployment.spec.as_ref().unwrap().strategy.is_none());
+        assert!(container_volume_mounts(&r).is_none());
+        assert!(pod_volumes(&r).is_none());
+    }
+
+    #[test]
+    fn multiple_disks_render_in_deterministic_volume_name_order() {
+        // Two disks given out of sorted order → rendered sorted by
+        // volume_name (byte-stable SSA): disk-a before disk-z, mounts and
+        // volumes aligned.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+            },
+            "demo-app",
+            "demo",
+            "uid-1",
+        );
+        let disks = vec![
+            DiskMount {
+                volume_name: "disk-z".to_string(),
+                mount_path: "/z".to_string(),
+                read_only: true,
+                pvc_name: "claim-demo-app-disk-z".to_string(),
+            },
+            DiskMount {
+                volume_name: "disk-a".to_string(),
+                mount_path: "/a".to_string(),
+                read_only: false,
+                pvc_name: "claim-demo-app-disk-a".to_string(),
+            },
+        ];
+        let r = render_application_for_env(&app, None, None, None, Some(&disks));
+        let mounts = container_volume_mounts(&r).expect("volumeMounts present");
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].name, "disk-a");
+        assert_eq!(mounts[0].read_only, Some(false));
+        assert_eq!(mounts[1].name, "disk-z");
+        assert_eq!(mounts[1].read_only, Some(true));
+        let volumes = pod_volumes(&r).expect("volumes present");
+        assert_eq!(volumes[0].name, "disk-a");
+        assert_eq!(volumes[1].name, "disk-z");
     }
 }
