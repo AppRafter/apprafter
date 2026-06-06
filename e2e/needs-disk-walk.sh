@@ -395,6 +395,29 @@ build_load_restart apprafter-operator apprafter-operator
 build_load_restart admission-webhook admission-webhook
 printf '  apprafter-operator + admission-webhook now running the working-tree build\n'
 
+# The released platform-stack chart this cluster bootstrapped from predates
+# EVERY 2.6b CRD change (the `disk` type enums, ResourceClaim.status.volumeClaimRef,
+# the RetainedClaim disk fields, the generalized `needs` scalar|array schema).
+# Argo CD owns those CRDs via the apprafter-operator Application, so: disable
+# automated sync on the parent + operator apps (else Argo reverts the drift),
+# then apply the BRANCH-rendered CRDs server-side. Same rationale as side-loading
+# the operator image — both are unpublished 2.6b artifacts; this whole walk is
+# LOCAL_OPERATOR-gated (pre-release). Mirrors scripts/validate-crds.sh's render.
+printf '  applying branch operator CRDs (released chart predates 2.6b schema) ...\n'
+for _app in platform apprafter-operator; do
+    kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
+        -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
+done
+_yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-go -- "$@"; fi; }
+helm template apprafter-operator "${REPO_ROOT}/operator/charts/apprafter-operator" \
+    | _yq 'select(.kind == "CustomResourceDefinition")' \
+    | kubectl apply --server-side --force-conflicts -f -
+for _crd in applications serviceproviders resourceclaims retainedclaims; do
+    retry 12 5 -- kubectl wait --for=condition=Established \
+        "crd/${_crd}.apprafter.io" --timeout=30s
+done
+printf '  branch CRDs applied + Established\n'
+
 # ===============================================================
 # Phase 2: readiness — provider, webhook, CNPG operator, storage class
 # ===============================================================
