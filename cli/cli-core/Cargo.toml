@@ -23,3 +23,8 @@ dirs               = { workspace = true }
 # Used both in production (target::atomic_write builds tempfiles in
 # the destination dir for safe replace) and in tests (per-test root).
 tempfile           = { workspace = true }
+
+[dev-dependencies]
+# Integration tests select a specific Application doc by name from a
+# multi-app `cue export` object (order-independent fixture assertions).
+serde_json         = { workspace = true }

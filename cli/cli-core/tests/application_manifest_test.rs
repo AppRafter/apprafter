@@ -26,8 +26,13 @@ fn parse_full_application_fixture() {
     let root = repo_root();
     let path = Path::new("./examples/applications");
 
-    let parsed: ApplicationManifest = match manifest::parse_application(&root, path) {
-        Ok(m) => m,
+    // `examples/applications` is a multi-app CUE package (parser, redisApp, a
+    // needs-array demo, …). Select the `parser` reference app BY NAME rather
+    // than relying on `cue export` key ordering — a new example whose binding
+    // sorts before `parser` must not silently change which doc this asserts on
+    // (the v0.1.109-class drift this test guards against).
+    let value = match cli_core::cue::export_in(&root, path) {
+        Ok(v) => v,
         Err(CliError::CueNotFound) => {
             panic!(
                 "cue must be on PATH for this test — run from \
@@ -36,6 +41,19 @@ fn parse_full_application_fixture() {
         }
         Err(other) => panic!("unexpected: {other}"),
     };
+    let parser_doc = value
+        .as_object()
+        .expect("cue export yields a JSON object")
+        .values()
+        .find(|c| {
+            c.get("kind").and_then(serde_json::Value::as_str) == Some("Application")
+                && c.pointer("/metadata/name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("parser")
+        })
+        .expect("parser Application fixture present in examples/applications");
+    let parsed: ApplicationManifest =
+        serde_json::from_value(parser_doc.clone()).expect("parser fixture decodes");
 
     assert_eq!(parsed.api_version, "apprafter.io/v1alpha1");
     assert_eq!(parsed.kind, "Application");
