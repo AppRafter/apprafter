@@ -67,4 +67,26 @@ _serviceProviders: {
 			replicas: int | *1
 		}
 	}
+	"disk-local": #ServiceProviderSeed & {
+		namespace: "apprafter-system"
+		labels: {
+			tier:     "integrated"
+			location: "in-cluster"
+		}
+		type:    "disk"
+		backend: "disk"
+		config: {
+			// StorageClass the 2.6b-3 `Backend::Disk` provisioner stamps
+			// onto the standalone RWO PVC it creates per disk claim.
+			// `config` is open ({...}) so a per-tier overlay can point
+			// disk at a different class (e.g. a replicated CSI class on
+			// T2+) without a ServiceProvider schema change. Tier-1 uses
+			// `local-path` — the StorageClass that ships on k3s/kind, so
+			// no extra platform-stack component is needed at launch.
+			// `local-path` binds WaitForFirstConsumer, which is why the
+			// provisioner marks the claim ready on PVC-exists (not Bound)
+			// — binding waits for the rendered pod.
+			storageClass: string | *"local-path"
+		}
+	}
 }
