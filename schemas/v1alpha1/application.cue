@@ -67,20 +67,43 @@ package v1alpha1
 	// Declared platform-service dependencies, keyed by service
 	// type. Each entry becomes a `ResourceClaim` of that type —
 	// the Application controller generates the claims (2.4d wires
-	// pg; 2.5 jetstream; 2.6 redis). Settable on `base` and
-	// overridable per `environments[*]` (spec §3.1: dev vs prod
+	// pg; 2.5 jetstream; 2.6 redis; 2.6b disk). Settable on `base`
+	// and overridable per `environments[*]` (spec §3.1: dev vs prod
 	// may select different providers). `needs: {pg: {}}` is valid
 	// — tier-aware platform defaults supply selector + size.
 	//
-	// CUE constrains both the key set (the closed
-	// `#PlatformServiceType` enum — `#ApplicationSpec` is a closed
-	// definition, so an unknown key is rejected under full
-	// evaluation) and each value (`#ServiceNeed`). Because the
-	// OpenAPI v3 CRD's structural schema is open on map keys
-	// (`additionalProperties` accepts any key), the admission
-	// webhook re-enforces the key enum at the apiserver — that is
-	// the runtime gate.
-	needs?: [#PlatformServiceType]: #ServiceNeed
+	// Each service key accepts a SCALAR `#ServiceNeed` (the single,
+	// unnamed default claim — backward-compatible) OR an ARRAY of
+	// named `#ServiceNeed`s. `(type, name)` is the claim identity
+	// (2.6b / ADR 0043): the unnamed default keeps today's claim
+	// name and env var (`<app>-pg` / `DATABASE_URL`); a named entry
+	// gets `<app>-pg-<name>` / `DATABASE_URL_<NAME>`. `disk` is its
+	// own value type (`#DiskClaim`) — claim-backed persistent block
+	// storage mounted into the workload.
+	//
+	// This is an explicit CLOSED struct (was a pattern map keyed by
+	// `#PlatformServiceType`): unknown keys are rejected under full
+	// CUE evaluation. Because the OpenAPI v3 CRD's structural schema
+	// is open on map keys (`additionalProperties` accepts any key),
+	// the admission webhook re-enforces the key enum + the
+	// `(type, name)` uniqueness invariants at the apiserver — that
+	// is the runtime gate.
+	needs?: #Needs
+}
+
+// #Needs — the closed set of declared dependency keys (2.6b /
+// ADR 0043). A definition (closed by default) so an unknown key is
+// rejected under full CUE evaluation. Each service key accepts a
+// scalar `#ServiceNeed` (the unnamed default) or an array of named
+// `#ServiceNeed`s; `disk` carries `#DiskClaim`.
+#Needs: {
+	pg?: #ServiceNeed | [...#ServiceNeed]
+	jetstream?: #ServiceNeed | [...#ServiceNeed]
+	clickhouse?: #ServiceNeed | [...#ServiceNeed]
+	redis?: #ServiceNeed | [...#ServiceNeed]
+	s3?: #ServiceNeed | [...#ServiceNeed]
+	notifications?: #ServiceNeed | [...#ServiceNeed]
+	disk?: #DiskClaim | [...#DiskClaim]
 }
 
 // #ServiceNeed — one declared platform-service dependency under
@@ -88,6 +111,14 @@ package v1alpha1
 // into a `ResourceClaim` of the keyed type; the 2.3 scheduler
 // routes it to a `ServiceProvider` via `selector`.
 #ServiceNeed: {
+	// `(type, name)` claim identity (2.6b / ADR 0043). Omit for the
+	// single, unnamed default claim of this type (backward-compatible
+	// — keeps `<app>-<type>` / `DATABASE_URL`). A named entry yields
+	// `<app>-<type>-<name>` / `DATABASE_URL_<NAME>`. The webhook
+	// validates `name` is env-foldable (a DNS-1123 label) and unique
+	// within a type (at most one unnamed default).
+	name?: string
+
 	// Label selector matched against `ServiceProvider.metadata.labels`.
 	// Optional in the manifest — the controller injects a default
 	// `{tier: integrated}` when absent (2.4d). The generated
@@ -103,6 +134,38 @@ package v1alpha1
 	// (default false). redis: routes to a persistent pool instance
 	// (snapshot→PVC) instead of an ephemeral one (ADR 0042).
 	persistent?: bool
+}
+
+// #DiskClaim — one declared persistent-disk dependency under
+// `Application.spec.*.needs.disk` (2.6b / ADR 0043). Each entry
+// becomes a `ResourceClaim` of `type: disk`; the provisioner creates
+// a standalone RWO PVC (unowned, GC-managed for retention) and the
+// renderer mounts it into the workload Deployment (`replicas: 1`,
+// `strategy: Recreate`). Deferred fields (`shareMode`, `backup`,
+// `autoExpand`, replicated/shared classes) are intentionally absent
+// until implemented — no half-measure CUE stubs.
+#DiskClaim: {
+	// `(type, name)` claim identity. Omit → derived from the last
+	// segment of `mountPath` (`/var/lib/uploads` → `uploads`);
+	// explicit wins. Must be a DNS-1123 label (it becomes part of the
+	// PVC name). The webhook enforces uniqueness within `disk`.
+	name?: string
+
+	// Requested capacity as a Kubernetes quantity (`"10Gi"`).
+	// Required. The webhook validates it parses as a quantity.
+	size: string
+
+	// Absolute in-container mount point (`"/data"`). Required and
+	// unique within the app (webhook-enforced).
+	mountPath: string
+
+	// Storage class abstraction. `local` only at launch (maps to the
+	// matched `disk-local` provider's `config.storageClass`); the
+	// replicated/shared classes are deferred to T2+.
+	class?: "local" | *"local"
+
+	// Mount the volume read-only (default false).
+	readOnly?: bool | *false
 }
 
 // #ImagePolicy — image-reference resolution policy under
