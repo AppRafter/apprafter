@@ -219,7 +219,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // injected. Built from the SAME `current` ready claims the gate
     // below validated, AFTER the gate passes — so it is empty unless
     // execution falls through to the render (all claims ready).
-    let mut needs_secrets: BTreeMap<String, String> = BTreeMap::new();
+    let mut needs_secrets: BTreeMap<(String, Option<String>), String> = BTreeMap::new();
     let effective = effective_spec(&app, ctx.env_name.as_deref());
     let has_needs = effective.needs.as_ref().is_some_and(|n| !n.is_empty());
     if has_needs {
@@ -948,16 +948,19 @@ fn unready_claim_names(claims: &[ResourceClaim]) -> Vec<String> {
         .collect()
 }
 
-/// Resolve ready claims into a `needs-type → connectionSecretRef`
-/// map for the renderer's 2.4e DSN injection. Keyed on
-/// `spec.type_` (the need key), valued by `status.connectionSecretRef`;
-/// claims without a resolved connection Secret are skipped (defensive
-/// — post-gate every claim has one). Pure: the operator only READS
-/// provisioner-owned claim status here, never writes it (the SSA
-/// split is preserved). The caller threads the result into
-/// `render_application_for_env` AFTER the 2.4d readiness gate passes,
-/// building it from the SAME `current` claims the gate validated.
-fn resolve_needs_secrets(claims: &[ResourceClaim]) -> BTreeMap<String, String> {
+/// Resolve ready claims into a `(type, name) → connectionSecretRef`
+/// map for the renderer's DSN injection. Keyed on the `(spec.type_,
+/// spec.name)` claim identity (2.6b / ADR 0043) — `name == None` is the
+/// unnamed/default claim of a type (renders the base env NAME, e.g.
+/// `DATABASE_URL`), `Some(name)` is a named array entry (renders
+/// `<VAR>_<fold(name)>`). Valued by `status.connectionSecretRef`; claims
+/// without a resolved connection Secret are skipped (defensive — post-gate
+/// every claim has one). Pure: the operator only READS provisioner-owned
+/// claim status here, never writes it (the SSA split is preserved). The
+/// caller threads the result into `render_application_for_env` AFTER the
+/// 2.4d readiness gate passes, building it from the SAME `current` claims
+/// the gate validated.
+fn resolve_needs_secrets(claims: &[ResourceClaim]) -> BTreeMap<(String, Option<String>), String> {
     let mut map = BTreeMap::new();
     for claim in claims {
         if let Some(secret) = claim
@@ -965,7 +968,8 @@ fn resolve_needs_secrets(claims: &[ResourceClaim]) -> BTreeMap<String, String> {
             .as_ref()
             .and_then(|s| s.connection_secret_ref.clone())
         {
-            map.insert(claim.spec.type_.clone(), secret);
+            let name = claim.spec.name.clone().filter(|n| !n.is_empty());
+            map.insert((claim.spec.type_.clone(), name), secret);
         }
     }
     map
@@ -2018,13 +2022,43 @@ mod tests {
 
     #[test]
     fn resolve_needs_secrets_maps_type_to_connection_secret_ref() {
-        // A ready pg claim with a connection secret resolves to
-        // {"pg":"parser-pg-conn"}; the map key is `spec.type_`, the
-        // value is `status.connectionSecretRef`.
+        // A ready unnamed pg claim with a connection secret resolves to
+        // {("pg", None): "parser-pg-conn"}; the map key is the
+        // `(spec.type_, spec.name)` identity, the value is
+        // `status.connectionSecretRef`.
         let claims = vec![ready_claim("parser-pg", Some(true), Some("parser-pg-conn"))];
         let map = resolve_needs_secrets(&claims);
-        assert_eq!(map.get("pg").map(String::as_str), Some("parser-pg-conn"));
+        assert_eq!(
+            map.get(&("pg".to_string(), None)).map(String::as_str),
+            Some("parser-pg-conn")
+        );
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn resolve_needs_secrets_keys_named_claim_by_spec_name() {
+        // 2.6b: a ready NAMED pg claim (spec.name = "analytics") resolves
+        // to the `(pg, Some("analytics"))` key so the renderer suffixes
+        // its env NAME (DATABASE_URL_ANALYTICS), while the unnamed sibling
+        // keeps `(pg, None)` → DATABASE_URL.
+        let default = ready_claim("parser-pg", Some(true), Some("parser-pg-conn"));
+        let mut named = ready_claim(
+            "parser-pg-analytics",
+            Some(true),
+            Some("parser-pg-analytics-conn"),
+        );
+        named.spec.name = Some("analytics".to_string());
+        let map = resolve_needs_secrets(&[default, named]);
+        assert_eq!(
+            map.get(&("pg".to_string(), None)).map(String::as_str),
+            Some("parser-pg-conn")
+        );
+        assert_eq!(
+            map.get(&("pg".to_string(), Some("analytics".to_string())))
+                .map(String::as_str),
+            Some("parser-pg-analytics-conn")
+        );
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
@@ -2038,8 +2072,11 @@ mod tests {
             ready_claim("parser-redis", Some(true), None),
         ];
         let map = resolve_needs_secrets(&claims);
-        assert_eq!(map.get("pg").map(String::as_str), Some("parser-pg-conn"));
-        assert!(!map.contains_key("redis"));
+        assert_eq!(
+            map.get(&("pg".to_string(), None)).map(String::as_str),
+            Some("parser-pg-conn")
+        );
+        assert!(!map.contains_key(&("redis".to_string(), None)));
         assert_eq!(map.len(), 1);
     }
 

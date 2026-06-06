@@ -55,6 +55,22 @@ fn needs_env_bindings(service_type: &str) -> &'static [(&'static str, &'static s
         .unwrap_or(&[])
 }
 
+/// Fold a `(type, name)` claim name into a valid env-var-NAME segment
+/// (2.6b / ADR 0043): uppercase every ASCII letter and map `-` → `_`.
+/// A named claim's injected env NAME is `<VAR>_<fold(name)>`
+/// (`my-cache` → `MY_CACHE` → `DATABASE_URL_MY_CACHE`); the Secret KEY
+/// is unchanged (`DATABASE_URL`). The webhook guarantees `name` is a
+/// DNS-1123 label, so the fold always yields a valid `[A-Z_][A-Z0-9_]*`
+/// suffix — no other characters can appear.
+pub fn fold_env_segment(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            '-' => '_',
+            other => other.to_ascii_uppercase(),
+        })
+        .collect()
+}
+
 /// Render the Application's `base` block (no environment override
 /// applied). v0.1.30 entry point — keeps the simple call-site
 /// shape; new code should prefer [`render_application_for_env`]
@@ -66,14 +82,18 @@ pub fn render_application(app: &Application) -> RenderedApplication {
 /// Render the Application using the merged base + environment
 /// override (when `env_name` is `Some(...)` and the override exists).
 ///
-/// `needs_secrets` maps a `needs` service type (e.g. `"pg"`) to the
-/// name of its provisioned connection Secret (the ready claim's
-/// `status.connectionSecretRef`). When threaded in (the reconcile
-/// builds it from the SAME ready claims the 2.4d gate validated,
-/// AFTER the gate), the renderer appends a `valueFrom.secretKeyRef`
-/// EnvVar per known need. `None` (pre-gate / claims unready) renders
-/// the workload WITHOUT the DSN. Keeping the map a threaded param
-/// preserves the renderer's purity — no kube client here.
+/// `needs_secrets` maps a `(type, name)` claim identity to the name of
+/// its provisioned connection Secret (the ready claim's
+/// `status.connectionSecretRef`). The `name` half is `None` for the
+/// unnamed/default claim of a type and `Some(<name>)` for a named array
+/// entry (2.6b / ADR 0043). When threaded in (the reconcile builds it
+/// from the SAME ready claims the 2.4d gate validated, AFTER the gate),
+/// the renderer appends a `valueFrom.secretKeyRef` EnvVar per known
+/// need: the default claim keeps the base env NAME (`DATABASE_URL`),
+/// a named claim gets `<VAR>_<fold(name)>` (the Secret KEY stays
+/// `DATABASE_URL`). `None` (pre-gate / claims unready) renders the
+/// workload WITHOUT the DSN. Keeping the map a threaded param preserves
+/// the renderer's purity — no kube client here.
 ///
 /// `resolved_image` (2.4h-c) pins the container image to a resolved
 /// `repo@sha256:...` digest when `Some(...)`; `None` renders the
@@ -83,7 +103,7 @@ pub fn render_application(app: &Application) -> RenderedApplication {
 pub fn render_application_for_env(
     app: &Application,
     env_name: Option<&str>,
-    needs_secrets: Option<&BTreeMap<String, String>>,
+    needs_secrets: Option<&BTreeMap<(String, Option<String>), String>>,
     resolved_image: Option<&str>,
 ) -> RenderedApplication {
     let name = app.metadata.name.clone().unwrap_or_default();
@@ -207,7 +227,7 @@ fn render_deployment(
     owner: &OwnerReference,
     labels: &BTreeMap<String, String>,
     spec: &ApplicationBaseSpec,
-    needs_secrets: Option<&BTreeMap<String, String>>,
+    needs_secrets: Option<&BTreeMap<(String, Option<String>), String>>,
     resolved_image: Option<&str>,
 ) -> Deployment {
     let replicas = spec.replicas.unwrap_or(1);
@@ -244,27 +264,38 @@ fn render_deployment(
     // AFTER the literal env so a (rejected-by-webhook, but defensively)
     // colliding literal would never silently win.
     //
-    // 2.6b migration: preserve the pre-2.6b single-claim injection — one
-    // Secret per service *type* keyed by `service_type` in `needs_secrets`
-    // (named-claim env disambiguation, `DATABASE_URL_<NAME>`, is a later
-    // task). Distinct types are visited once, in entries() order; disk
+    // 2.6b (ADR 0043): inject one Secret per `(type, name)` claim
+    // identity. `needs_secrets` is keyed by `(service_type, name_opt)` —
+    // `name_opt == None` is the unnamed/default claim (keeps the base env
+    // NAME, e.g. `DATABASE_URL`, backward-compatible), `Some(name)` is a
+    // named array entry (env NAME `<VAR>_<fold(name)>`, e.g.
+    // `DATABASE_URL_ANALYTICS`; the Secret KEY stays `DATABASE_URL`).
+    // Walking `Needs::entries()` (a deterministic key/index order) keeps
+    // the appended order byte-stable across reconciles (SSA no-op).
+    // Appended AFTER the literal env so a (webhook-rejected, but
+    // defensively) colliding literal would never silently win. Disk
     // entries carry no env binding and are skipped here.
     if let (Some(needs), Some(secrets)) = (spec.needs.as_ref(), needs_secrets) {
-        let mut seen_types: Vec<String> = Vec::new();
         for (service_type, entry) in needs.entries() {
             if entry.disk.is_some() {
                 continue;
             }
-            if seen_types.contains(&service_type) {
-                continue;
-            }
-            seen_types.push(service_type.clone());
-            let Some(secret_name) = secrets.get(&service_type) else {
+            let key = (service_type.clone(), entry.name.clone());
+            let Some(secret_name) = secrets.get(&key) else {
                 continue;
             };
+            let suffix = entry
+                .name
+                .as_deref()
+                .filter(|n| !n.is_empty())
+                .map(|n| format!("_{}", fold_env_segment(n)));
             for (var_name, secret_key) in needs_env_bindings(&service_type) {
+                let env_name = match &suffix {
+                    Some(s) => format!("{var_name}{s}"),
+                    None => var_name.to_string(),
+                };
                 env_vars.push(EnvVar {
-                    name: var_name.to_string(),
+                    name: env_name,
                     value: None,
                     value_from: Some(EnvVarSource {
                         secret_key_ref: Some(SecretKeySelector {
@@ -963,7 +994,7 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
+        let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
         let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present");
         let dsn = envs
@@ -1009,7 +1040,7 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
+        let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
         let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present (DSN injected)");
         assert_eq!(envs.len(), 1);
@@ -1032,7 +1063,7 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let secrets = BTreeMap::from([("pg".to_string(), "parser-pg-conn".to_string())]);
+        let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
         let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 2);
@@ -1058,7 +1089,7 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(
-            "clickhouse".to_string(),
+            ("clickhouse".to_string(), None),
             "parser-clickhouse-conn".to_string(),
         )]);
         let r = render_application_for_env(&app, None, Some(&secrets), None);
@@ -1082,7 +1113,7 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let secrets = BTreeMap::from([("redis".to_string(), "web-redis-conn".to_string())]);
+        let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
         let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present");
         let url = envs
@@ -1148,12 +1179,121 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let secrets = BTreeMap::from([("redis".to_string(), "web-redis-conn".to_string())]);
+        let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
         let r = render_application_for_env(&app, None, Some(&secrets), None);
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 2);
         assert_eq!(envs[0].name, "REDIS_URL");
         assert_eq!(envs[1].name, "REDIS_CHANNEL_PREFIX");
+    }
+
+    // ---- 2.6b: env disambiguation DATABASE_URL_<NAME> for named claims ----
+
+    #[test]
+    fn fold_env_segment_uppercases_and_maps_hyphen_to_underscore() {
+        assert_eq!(fold_env_segment("my-cache"), "MY_CACHE");
+        assert_eq!(fold_env_segment("analytics"), "ANALYTICS");
+        assert_eq!(fold_env_segment("read-replica-2"), "READ_REPLICA_2");
+        // already-uppercase / digits pass through.
+        assert_eq!(fold_env_segment("a1b"), "A1B");
+    }
+
+    /// Helper: build a base with TWO pg needs — the unnamed default plus
+    /// a named array entry. Renders to two `(pg, name)` claim identities.
+    fn base_with_two_pg(image: &str, named: &str) -> ApplicationBaseSpec {
+        let needs = Needs {
+            pg: Some(OneOrMany::Many(vec![
+                ServiceNeed::default(),
+                ServiceNeed {
+                    name: Some(named.to_string()),
+                    ..Default::default()
+                },
+            ])),
+            ..Default::default()
+        };
+        ApplicationBaseSpec {
+            image: Some(image.to_string()),
+            needs: Some(needs),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn two_pg_claims_yield_database_url_and_suffixed_named_var() {
+        // Two ready pg claims (default + named "analytics") → the
+        // Deployment carries DATABASE_URL (default) AND
+        // DATABASE_URL_ANALYTICS (named), each a secretKeyRef to its own
+        // per-claim conn Secret with key DATABASE_URL.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_two_pg("ghcr.io/acme/web:1.0", "analytics")),
+                environments: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([
+            (("pg".to_string(), None), "parser-pg-conn".to_string()),
+            (
+                ("pg".to_string(), Some("analytics".to_string())),
+                "parser-pg-analytics-conn".to_string(),
+            ),
+        ]);
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let envs = container_env(&r).expect("env present");
+
+        let default = envs
+            .iter()
+            .find(|e| e.name == "DATABASE_URL")
+            .expect("DATABASE_URL injected for the default claim");
+        let dref = default
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(dref.name, "parser-pg-conn");
+        assert_eq!(dref.key, "DATABASE_URL");
+
+        let named = envs
+            .iter()
+            .find(|e| e.name == "DATABASE_URL_ANALYTICS")
+            .expect("DATABASE_URL_ANALYTICS injected for the named claim");
+        let nref = named
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        // The Secret KEY stays DATABASE_URL — only the env NAME is suffixed.
+        assert_eq!(nref.key, "DATABASE_URL");
+        assert_eq!(nref.name, "parser-pg-analytics-conn");
+
+        // Exactly the two injected DSN vars (no literal env here).
+        assert_eq!(envs.len(), 2);
+    }
+
+    #[test]
+    fn single_unnamed_pg_still_yields_exactly_database_url() {
+        // Backward-compat: a single unnamed pg claim keeps the bare
+        // DATABASE_URL env NAME — no suffix, no migration.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
+                environments: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
+        let r = render_application_for_env(&app, None, Some(&secrets), None);
+        let envs = container_env(&r).expect("env present");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].name, "DATABASE_URL");
     }
 
     // ---- 2.4h-c: resolved-digest threading ----
