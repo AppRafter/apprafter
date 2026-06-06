@@ -143,8 +143,8 @@ pub struct DiskClaim {
     /// Requested capacity (`"10Gi"`) — required. A Kubernetes quantity.
     pub size: String,
     /// Container mount point (`"/data"`) — required. Unique within the
-    /// app (enforced by the webhook).
-    #[serde(rename = "mountPath")]
+    /// app (enforced by the webhook). `rename_all = "camelCase"` already
+    /// yields the `mountPath` wire key.
     pub mount_path: String,
     /// Storage class abstraction — `"local"` only at launch (the matched
     /// `disk-local` provider maps it to a concrete `storageClass`).
@@ -152,8 +152,9 @@ pub struct DiskClaim {
     /// CRD; a plain `String` here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
-    /// Mount the volume read-only (default false).
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "readOnly")]
+    /// Mount the volume read-only (default false). `rename_all =
+    /// "camelCase"` already yields the `readOnly` wire key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
 }
 
@@ -199,6 +200,13 @@ pub struct NeedEntry {
 }
 
 impl Needs {
+    /// True when no `needs` entry is declared (every key absent / every
+    /// array empty). Equivalent to `self.entries().is_empty()` — used by
+    /// the Application controller's claim-gen gate.
+    pub fn is_empty(&self) -> bool {
+        self.entries().is_empty()
+    }
+
     /// Flatten every declared `needs` entry into `(type, NeedEntry)`
     /// pairs in a deterministic order: keys in the fixed order
     /// `pg, jetstream, clickhouse, redis, s3, notifications, disk`, and

@@ -148,10 +148,31 @@ pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationB
     // 2.4d S0: per-key whole-object replace for `needs` — the env
     // entry replaces the base entry wholesale per key (mirrors how
     // `expose` replaces wholesale); base-only need keys survive.
+    // 2.6b: `needs` is now a closed struct, so the per-key merge is an
+    // explicit `Option`-replace per field (override-wins) rather than a
+    // map insert.
     if let Some(env_needs) = &env_override.needs {
         let mut merged = effective.needs.unwrap_or_default();
-        for (k, v) in env_needs {
-            merged.insert(k.clone(), v.clone());
+        if env_needs.pg.is_some() {
+            merged.pg = env_needs.pg.clone();
+        }
+        if env_needs.jetstream.is_some() {
+            merged.jetstream = env_needs.jetstream.clone();
+        }
+        if env_needs.clickhouse.is_some() {
+            merged.clickhouse = env_needs.clickhouse.clone();
+        }
+        if env_needs.redis.is_some() {
+            merged.redis = env_needs.redis.clone();
+        }
+        if env_needs.s3.is_some() {
+            merged.s3 = env_needs.s3.clone();
+        }
+        if env_needs.notifications.is_some() {
+            merged.notifications = env_needs.notifications.clone();
+        }
+        if env_needs.disk.is_some() {
+            merged.disk = env_needs.disk.clone();
         }
         effective.needs = Some(merged);
     }
@@ -216,18 +237,32 @@ fn render_deployment(
     // 2.4e/2.6: append a `valueFrom.secretKeyRef` EnvVar per known
     // need whose claim has a resolved connection Secret. A need may
     // inject more than one var (redis: REDIS_URL + REDIS_CHANNEL_PREFIX)
-    // — the bindings slice is fixed-order. Iterating `needs.keys()`
-    // (BTreeMap) keeps the appended order deterministic so the rendered
-    // Deployment is byte-stable across reconciles (SSA no-op;
-    // non-deterministic order would spin the operator). Appended AFTER
-    // the literal env so a (rejected-by-webhook, but defensively)
+    // — the bindings slice is fixed-order. Walking `Needs::entries()`
+    // (a deterministic key/index order) keeps the appended order stable
+    // so the rendered Deployment is byte-stable across reconciles (SSA
+    // no-op; non-deterministic order would spin the operator). Appended
+    // AFTER the literal env so a (rejected-by-webhook, but defensively)
     // colliding literal would never silently win.
+    //
+    // 2.6b migration: preserve the pre-2.6b single-claim injection — one
+    // Secret per service *type* keyed by `service_type` in `needs_secrets`
+    // (named-claim env disambiguation, `DATABASE_URL_<NAME>`, is a later
+    // task). Distinct types are visited once, in entries() order; disk
+    // entries carry no env binding and are skipped here.
     if let (Some(needs), Some(secrets)) = (spec.needs.as_ref(), needs_secrets) {
-        for service_type in needs.keys() {
-            let Some(secret_name) = secrets.get(service_type) else {
+        let mut seen_types: Vec<String> = Vec::new();
+        for (service_type, entry) in needs.entries() {
+            if entry.disk.is_some() {
+                continue;
+            }
+            if seen_types.contains(&service_type) {
+                continue;
+            }
+            seen_types.push(service_type.clone());
+            let Some(secret_name) = secrets.get(&service_type) else {
                 continue;
             };
-            for (var_name, secret_key) in needs_env_bindings(service_type) {
+            for (var_name, secret_key) in needs_env_bindings(&service_type) {
                 env_vars.push(EnvVar {
                     name: var_name.to_string(),
                     value: None,
@@ -760,37 +795,36 @@ mod tests {
         // 2.4d S0: env-scoped `needs` must merge per-key (the env
         // entry replaces the base entry WHOLESALE for that key —
         // mirrors how `expose` replaces), and base-only need keys
-        // survive when the env omits them.
-        use operator_core::ServiceNeed;
-        let mut base_needs = BTreeMap::new();
-        base_needs.insert(
-            "pg".to_string(),
-            ServiceNeed {
+        // survive when the env omits them. 2.6b: `needs` is a closed
+        // struct, so per-key entries are typed fields.
+        use operator_core::{Needs, OneOrMany, ServiceNeed};
+        let base_needs = Needs {
+            pg: Some(OneOrMany::One(ServiceNeed {
+                name: None,
                 selector: None,
                 size: Some("small".into()),
                 persistent: None,
-            },
-        );
-        base_needs.insert(
-            "redis".to_string(),
-            ServiceNeed {
+            })),
+            redis: Some(OneOrMany::One(ServiceNeed {
+                name: None,
                 selector: None,
                 size: Some("nano".into()),
                 persistent: None,
-            },
-        );
-        let mut prod_needs = BTreeMap::new();
-        prod_needs.insert(
-            "pg".to_string(),
-            ServiceNeed {
+            })),
+            ..Default::default()
+        };
+        let prod_needs = Needs {
+            pg: Some(OneOrMany::One(ServiceNeed {
+                name: None,
                 selector: Some(BTreeMap::from([(
                     "tier".to_string(),
                     "managed-aws".to_string(),
                 )])),
                 size: None,
                 persistent: None,
-            },
-        );
+            })),
+            ..Default::default()
+        };
         let mut envs = BTreeMap::new();
         envs.insert(
             "prod".to_string(),
@@ -810,18 +844,20 @@ mod tests {
         let s = effective_spec(&app, Some("prod"));
         let needs = s.needs.expect("needs merged");
         // pg replaced wholesale: env selector wins, base size DROPPED.
-        let pg = needs.get("pg").expect("pg need");
+        let pg = needs.pg.expect("pg need").into_vec();
+        assert_eq!(pg.len(), 1);
         assert_eq!(
-            pg.selector
+            pg[0]
+                .selector
                 .as_ref()
                 .and_then(|m| m.get("tier"))
                 .map(String::as_str),
             Some("managed-aws")
         );
-        assert_eq!(pg.size, None, "base size must be dropped on env replace");
+        assert_eq!(pg[0].size, None, "base size must be dropped on env replace");
         // base-only redis survives.
-        let redis = needs.get("redis").expect("base-only redis survives");
-        assert_eq!(redis.size.as_deref(), Some("nano"));
+        let redis = needs.redis.expect("base-only redis survives").into_vec();
+        assert_eq!(redis[0].size.as_deref(), Some("nano"));
     }
 
     #[test]
@@ -878,12 +914,22 @@ mod tests {
 
     // ---- 2.4e: DATABASE_URL DSN injection ----
 
-    use operator_core::ServiceNeed;
+    use operator_core::{Needs, OneOrMany, ServiceNeed};
 
-    /// Helper: build a base with a single named need (no selector/size).
+    /// Helper: build a base with a single (unnamed, scalar) need of the
+    /// given type (no selector/size). 2.6b: `needs` is a closed struct.
     fn base_with_need(image: &str, need_type: &str) -> ApplicationBaseSpec {
-        let mut needs = BTreeMap::new();
-        needs.insert(need_type.to_string(), ServiceNeed::default());
+        let one = Some(OneOrMany::One(ServiceNeed::default()));
+        let mut needs = Needs::default();
+        match need_type {
+            "pg" => needs.pg = one,
+            "jetstream" => needs.jetstream = one,
+            "clickhouse" => needs.clickhouse = one,
+            "redis" => needs.redis = one,
+            "s3" => needs.s3 = one,
+            "notifications" => needs.notifications = one,
+            other => panic!("base_with_need: unknown service type {other}"),
+        }
         ApplicationBaseSpec {
             image: Some(image.to_string()),
             needs: Some(needs),

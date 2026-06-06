@@ -89,10 +89,11 @@ spec:
                     # it is a genuine structural-schema limitation, so each
                     # union key uses x-kubernetes-preserve-unknown-fields (the
                     # same escape hatch the MigrationPlan/SourceCredential CRDs
-                    # use for their oneOf shapes). The admission webhook is the
-                    # runtime gate for the real invariants (key enum, scalar|
-                    # array object/array shape, (type,name) uniqueness, disk
-                    # required size/mountPath + class enum).
+                    # use for their oneOf shapes). The admission webhook WILL
+                    # enforce the key-enum / (type,name) / disk-field invariants
+                    # (size/mountPath required, class enum) as the runtime gate
+                    # — those guards land in 2.6b-2 / -4 / -5; today the CRD
+                    # only types `needs` as an object with these known keys.
                     needs:
                       type: object
                       properties:
@@ -148,8 +149,9 @@ spec:
                       # spec.base.needs. Each union key uses x-kubernetes-
                       # preserve-unknown-fields (scalar object | array of
                       # named entries is a heterogeneous-type union a
-                      # structural CRD node cannot type). The webhook is the
-                      # runtime gate.
+                      # structural CRD node cannot type). The webhook WILL
+                      # enforce the key-enum / (type,name) / disk-field
+                      # invariants as the runtime gate (2.6b-2 / -4 / -5).
                       needs:
                         type: object
                         properties:

@@ -854,47 +854,62 @@ fn generate_resource_claims(
     let Some(needs) = spec.needs.as_ref() else {
         return Vec::new();
     };
-    needs
-        .iter()
-        .map(|(service_type, need)| {
-            let name = claim_name(app_name, service_type);
-            let selector = need
-                .selector
-                .clone()
-                .unwrap_or_else(default_integrated_selector);
-            let mut claim_spec = json!({
-                "type": service_type,
-                "selector": selector,
-            });
-            if let Some(size) = &need.size {
-                claim_spec["size"] = json!(size);
-            }
-            // Persistence passthrough (ADR 0042): the dragonfly provisioner
-            // reads `spec.persistent` to route the claim to a persistent vs
-            // ephemeral pool instance. Mirrors the `size` passthrough.
-            if let Some(persistent) = need.persistent {
-                claim_spec["persistent"] = json!(persistent);
-            }
-            let payload = json!({
-                "apiVersion": "apprafter.io/v1alpha1",
-                "kind": "ResourceClaim",
-                "metadata": {
-                    "name": name,
-                    "namespace": namespace,
-                    "ownerReferences": [{
-                        "apiVersion": "apprafter.io/v1alpha1",
-                        "kind": "Application",
-                        "name": app_name,
-                        "uid": app_uid,
-                        "controller": true,
-                        "blockOwnerDeletion": true,
-                    }],
-                },
-                "spec": claim_spec,
-            });
-            (name, payload)
-        })
-        .collect()
+    // 2.6b migration: walk the flattened `Needs::entries()` in its
+    // deterministic order. PRESERVE the pre-2.6b single-claim behavior —
+    // ONE claim per service *type*, named `<app>-<type>` (name=None);
+    // per-(type,name) array claim-gen is a later task (2.6b-2), and the
+    // disk provisioner is 2.6b-3, so disk entries generate no claim here.
+    let mut out: Vec<(String, Value)> = Vec::new();
+    let mut seen_types: Vec<String> = Vec::new();
+    for (service_type, entry) in needs.entries() {
+        // Skip disk entries (no provisioner yet) and any duplicate type
+        // (single-claim behavior — first entry wins).
+        let Some(need) = entry.service else {
+            continue;
+        };
+        if seen_types.contains(&service_type) {
+            continue;
+        }
+        seen_types.push(service_type.clone());
+
+        let name = claim_name(app_name, &service_type);
+        let selector = need
+            .selector
+            .clone()
+            .unwrap_or_else(default_integrated_selector);
+        let mut claim_spec = json!({
+            "type": service_type,
+            "selector": selector,
+        });
+        if let Some(size) = &need.size {
+            claim_spec["size"] = json!(size);
+        }
+        // Persistence passthrough (ADR 0042): the dragonfly provisioner
+        // reads `spec.persistent` to route the claim to a persistent vs
+        // ephemeral pool instance. Mirrors the `size` passthrough.
+        if let Some(persistent) = need.persistent {
+            claim_spec["persistent"] = json!(persistent);
+        }
+        let payload = json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "ResourceClaim",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "ownerReferences": [{
+                    "apiVersion": "apprafter.io/v1alpha1",
+                    "kind": "Application",
+                    "name": app_name,
+                    "uid": app_uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true,
+                }],
+            },
+            "spec": claim_spec,
+        });
+        out.push((name, payload));
+    }
+    out
 }
 
 /// Names of claims that are NOT yet ready. A claim is ready only when
@@ -1557,10 +1572,28 @@ mod tests {
         COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_RESOURCE_CLAIM,
     };
 
+    /// Build an `ApplicationBaseSpec` from a `type → ServiceNeed` map.
+    /// 2.6b: `needs` is a closed struct, so the test-input map is folded
+    /// into a `Needs` (each type → a scalar `OneOrMany::One`). Unknown
+    /// keys panic — tests only use the six service types.
     fn base_with_needs(needs: BTreeMap<String, ServiceNeed>) -> ApplicationBaseSpec {
+        use operator_core::{Needs, OneOrMany};
+        let mut n = Needs::default();
+        for (ty, need) in needs {
+            let one = Some(OneOrMany::One(need));
+            match ty.as_str() {
+                "pg" => n.pg = one,
+                "jetstream" => n.jetstream = one,
+                "clickhouse" => n.clickhouse = one,
+                "redis" => n.redis = one,
+                "s3" => n.s3 = one,
+                "notifications" => n.notifications = one,
+                other => panic!("base_with_needs: unknown service type {other}"),
+            }
+        }
         ApplicationBaseSpec {
             image: Some("ghcr.io/acme/web:1.0".into()),
-            needs: Some(needs),
+            needs: Some(n),
             ..Default::default()
         }
     }
@@ -1628,6 +1661,7 @@ mod tests {
         needs.insert(
             "pg".to_string(),
             ServiceNeed {
+                name: None,
                 selector: Some(BTreeMap::from([(
                     "tier".to_string(),
                     "managed".to_string(),
@@ -1652,6 +1686,7 @@ mod tests {
         needs.insert(
             "redis".to_string(),
             ServiceNeed {
+                name: None,
                 selector: None,
                 size: None,
                 persistent: Some(true),
