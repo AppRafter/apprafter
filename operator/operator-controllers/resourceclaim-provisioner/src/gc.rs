@@ -65,7 +65,9 @@ use crate::acl_reconcile::{read_secret_key, redis_namespace};
 use crate::cnpg;
 use crate::dragonfly;
 use crate::grace;
-use crate::reconcile::{apply_params, cluster_ar, database_ar, secret_ar, GC_ROLE_RMW_RETRIES};
+use crate::reconcile::{
+    apply_params, cluster_ar, database_ar, pvc_ar, secret_ar, GC_ROLE_RMW_RETRIES,
+};
 use crate::{Context, ReconcileError};
 
 /// Kind label for this controller's metrics.
@@ -186,6 +188,7 @@ pub async fn reconcile(
     // role/DB drop below. A legacy / empty backend defaults to CNPG.
     match gc_backend(&rc.spec.backend) {
         GcBackend::Dragonfly => return gc_drop_dragonfly(&ctx, &rc, &rc_ns, &rc_name).await,
+        GcBackend::Disk => return gc_drop_disk(&ctx, &rc, &rc_ns, &rc_name).await,
         GcBackend::Cnpg => { /* fall through to the phased CNPG drop */ }
     }
 
@@ -413,6 +416,60 @@ async fn gc_drop_dragonfly(
         .with_label_values(&["success", rc_ns])
         .inc();
     info!(retained = %rc_name, "dragonfly RetainedClaim GC complete");
+
+    Ok(Action::requeue(REQUEUE_AFTER))
+}
+
+/// Disk reclaim (2.6b-5, ADR 0043). The live-guard has already run (shared
+/// with the CNPG/dragonfly paths), so we are past the grace window with the
+/// source disk claim confirmed gone — a re-deploy within grace would have
+/// cancelled this snapshot (the provisioner's cancel-on-reprovision) and
+/// reattached to the SAME PVC via idempotent SSA, so reaching here means the
+/// app is genuinely gone and the retained data may be reclaimed.
+///
+/// DELETE the unowned RWO PVC named `spec.volumeClaimRef` in
+/// `spec.volumeClaimNamespace` (the PVC has NO ownerRef — the provisioner
+/// created it standalone precisely so an app delete does not cascade it — so
+/// the GC is the ONLY thing that drops it), then delete the snapshot. Both
+/// deletes are idempotent + 404-tolerant: a half-finished sweep (operator
+/// crash between the two deletes) re-runs cleanly, and a snapshot whose PVC
+/// was already removed (or never created — a pre-provision delete) is a
+/// no-op. A snapshot missing `volumeClaimRef`/`volumeClaimNamespace` skips
+/// straight to the snapshot delete.
+async fn gc_drop_disk(
+    ctx: &Arc<Context>,
+    rc: &RetainedClaim,
+    rc_ns: &str,
+    rc_name: &str,
+) -> Result<Action, ReconcileError> {
+    if let (Some(pvc), Some(ns)) = (
+        rc.spec.volume_claim_ref.as_deref(),
+        rc.spec.volume_claim_namespace.as_deref(),
+    ) {
+        let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &pvc_ar());
+        match api.delete(pvc, &DeleteParams::default()).await {
+            Ok(_) => info!(%pvc, %ns, retained = %rc_name, "disk PVC deleted"),
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                info!(%pvc, retained = %rc_name, "disk PVC already gone — delete no-op")
+            }
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        info!(
+            retained = %rc_name,
+            "disk snapshot has no volumeClaimRef (claim deleted pre-provision) — \
+             no PVC to delete; dropping the snapshot"
+        );
+    }
+
+    // Terminal step: drop the snapshot.
+    delete_retained_claim(&ctx.client, rc_ns, rc_name).await?;
+
+    ctx.metrics
+        .claim_gc_total
+        .with_label_values(&["success", rc_ns])
+        .inc();
+    info!(retained = %rc_name, "disk RetainedClaim GC complete");
 
     Ok(Action::requeue(REQUEUE_AFTER))
 }
@@ -698,6 +755,8 @@ pub enum GcBackend {
     Cnpg,
     /// The 2.6 dragonfly drop (`FLUSHDB` + `ACL DELUSER` + Secret delete).
     Dragonfly,
+    /// The 2.6b disk drop (delete the unowned RWO PVC + the snapshot).
+    Disk,
 }
 
 /// Route a snapshot's `spec.backend` to its reclaim path. Only `dragonfly`
@@ -709,6 +768,7 @@ pub enum GcBackend {
 pub fn gc_backend(backend: &str) -> GcBackend {
     match backend {
         "dragonfly" => GcBackend::Dragonfly,
+        "disk" => GcBackend::Disk,
         _ => GcBackend::Cnpg,
     }
 }
@@ -1132,11 +1192,42 @@ mod tests {
     fn gc_dispatch_selects_backend() {
         assert_eq!(gc_backend("dragonfly"), GcBackend::Dragonfly);
         assert_eq!(gc_backend("cloudnative-pg"), GcBackend::Cnpg);
+        // 2.6b: a disk snapshot routes to the disk drop (delete the PVC),
+        // NOT the CNPG phased role/DB drop. Without this arm a disk snapshot
+        // would fall through to CNPG and the PVC would leak forever.
+        assert_eq!(gc_backend("disk"), GcBackend::Disk);
         // Legacy / empty snapshots predate the multi-backend split and
         // carry the CNPG shape — default to the CNPG drop so they are never
         // mis-routed to the (no-op-on-CNPG-fields) dragonfly path.
         assert_eq!(gc_backend(""), GcBackend::Cnpg);
         assert_eq!(gc_backend("redis"), GcBackend::Cnpg); // type, not backend
+    }
+
+    // --- disk GC live-guard (2.6b-5 / 2.4f Fix A) ---
+
+    #[test]
+    fn claim_is_live_guards_a_reprovisioned_disk_claim() {
+        // 2.6b-5: the disk GC drop (delete the PVC) MUST NOT fire when the
+        // source disk claim is back (a re-deploy within grace reattaches to
+        // the SAME PVC via idempotent SSA — disk data survives). The
+        // reconcile-level live-guard (`claim_is_live`) runs BEFORE the
+        // backend dispatch, so it covers disk identically to CNPG/dragonfly:
+        // a live disk claim → the snapshot is stale → delete the snapshot,
+        // never delete the PVC. Pin that a live disk claim reads live (skip
+        // the drop) and a mid-deletion one does not (its own fresh snapshot
+        // will supersede). The live PVC-delete I/O itself is e2e-covered.
+        let live_disk = ResourceClaim::new("web-disk-data", ResourceClaimSpec::default());
+        assert!(
+            claim_is_live(&live_disk),
+            "a re-provisioned disk claim is live — the GC must skip the PVC delete"
+        );
+
+        let mut deleting_disk = ResourceClaim::new("web-disk-data", ResourceClaimSpec::default());
+        deleting_disk.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        assert!(
+            !claim_is_live(&deleting_disk),
+            "a mid-deletion disk claim is not live — it produces its own fresh snapshot"
+        );
     }
 
     // --- dragonfly_reclaim_target() (2.6-7 pre-provision-delete tolerance) ---
