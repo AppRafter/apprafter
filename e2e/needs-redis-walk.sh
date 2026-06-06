@@ -347,7 +347,7 @@ redis_admin_on() {
     local admin_pw
     admin_pw=$(kubectl -n "$DF_NS" get secret "$admin_secret" \
         -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
-    kubectl -n "$DF_NS" exec "deploy/${instance}" -- \
+    kubectl -n "$DF_NS" exec "${instance}-0" -- \
         redis-cli -a "$admin_pw" --no-auth-warning "$@" 2>/dev/null
 }
 
@@ -363,9 +363,13 @@ redis_as() {
 # NOPERM/WRONGPASS reply is greppable; redis-cli's own exit is swallowed.
 redis_as_on() {
     local instance="$1" user="$2" pw="$3"; shift 3
-    kubectl -n "$DF_NS" exec "deploy/${instance}" -- \
-        redis-cli -u "redis://${user}:${pw}@127.0.0.1:6379" \
-        --no-auth-warning "$@" 2>&1 || true
+    # `--user/--pass` (not `-u redis://…`): the Dragonfly image bundles
+    # redis-cli 6.0.16, whose URL parser ignores the userinfo username and
+    # AUTHs as `default` → NOAUTH. The explicit ACL flags work on 6.0.x. The
+    # caller passes the DB via `-n <dbnum>` (the user is $N-pinned, so it can
+    # only SELECT its own N anyway).
+    kubectl -n "$DF_NS" exec "${instance}-0" -- \
+        redis-cli --user "$user" --pass "$pw" --no-auth-warning "$@" 2>&1 || true
 }
 
 # Recover a claim's ACL password from its connection Secret's REDIS_URL
@@ -407,6 +411,30 @@ printf '  APPRAFTER_CONFIG_DIR=%s\n' "$APPRAFTER_CONFIG_DIR"
 bootstrap_with_retry
 
 printf '  cluster-bootstrap complete\n'
+
+# Optional pre-push validation: run the apprafter-operator built from the
+# CURRENT working tree instead of the published image. Build it, tag it as the
+# exact ref the Deployment already references (so imagePullPolicy IfNotPresent
+# serves the side-loaded build and Argo CD does not revert the unchanged ref),
+# side-load it, and restart the Deployment onto it.
+if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
+    phase "Phase 1b: build + load local operator (APPRAFTER_E2E_LOCAL_OPERATOR)"
+    printf '  waiting for the apprafter-operator Deployment to appear ...\n'
+    for _ in $(seq 1 60); do
+        kubectl -n apprafter-system get deploy apprafter-operator >/dev/null 2>&1 && break
+        sleep 5
+    done
+    op_img=$(kubectl -n apprafter-system get deploy apprafter-operator \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+    builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
+    printf '  building %s from the working tree (%s) ...\n' "$op_img" "$builder"
+    "$builder" build -f "${REPO_ROOT}/operator/apprafter-operator/Dockerfile" \
+        -t "$op_img" "${REPO_ROOT}/operator"
+    cluster_load_image "$CLUSTER_NAME" "$op_img"
+    kubectl -n apprafter-system rollout restart deploy/apprafter-operator
+    kubectl -n apprafter-system rollout status deploy/apprafter-operator --timeout=180s
+    printf '  apprafter-operator now running the working-tree build\n'
+fi
 
 # ===============================================================
 # Phase 2: readiness — dragonfly-operator, the seeded provider, the webhook
@@ -807,10 +835,11 @@ kubectl -n "$DF_NS" delete pod -l "app=${DF_INSTANCE}" \
 
 # Wait for the instance to come back Ready (a fresh pod, empty ACL table).
 printf '  waiting for the ephemeral instance to roll back to Ready ...\n'
-retry 40 10 -- kubectl -n "$DF_NS" rollout status \
-    "deploy/${DF_INSTANCE}" --timeout=60s 2>/dev/null \
-    || retry 40 10 -- kubectl -n "$DF_NS" rollout status \
-        "statefulset/${DF_INSTANCE}" --timeout=60s
+# The Dragonfly StatefulSet uses the OnDelete update strategy, so
+# `kubectl rollout status` is unavailable; wait on the pod readiness
+# directly (`retry` rides out the gap while the killed pod recreates).
+retry 40 10 -- kubectl -n "$DF_NS" wait --for=condition=Ready \
+    "pod/${DF_INSTANCE}-0" --timeout=30s
 
 # The reconcile loop re-pins within ~one RESYNC_INTERVAL (300s). Poll the
 # web user's login until it succeeds again (no WRONGPASS/NOPERM). Budget a
@@ -910,10 +939,9 @@ kubectl -n "$DF_NS" delete pod -l "app=${DF_INSTANCE_P}" \
     --ignore-not-found --wait=false 2>/dev/null || true
 
 printf '  waiting for the persistent instance to roll back to Ready ...\n'
-retry 40 10 -- kubectl -n "$DF_NS" rollout status \
-    "deploy/${DF_INSTANCE_P}" --timeout=60s 2>/dev/null \
-    || retry 40 10 -- kubectl -n "$DF_NS" rollout status \
-        "statefulset/${DF_INSTANCE_P}" --timeout=60s
+# OnDelete StatefulSet → wait on the pod directly (see the ephemeral path).
+retry 40 10 -- kubectl -n "$DF_NS" wait --for=condition=Ready \
+    "pod/${DF_INSTANCE_P}-0" --timeout=30s
 
 # The reconcile loop re-pins the worker user, then the durable key is still
 # there (snapshot->PVC restore). Poll login first (re-pin), then read.

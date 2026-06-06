@@ -173,6 +173,25 @@ cluster_kubeconfig_write() {
 }
 
 # ---------------------------------------------------------------
+# cluster_load_image <cluster-name> <image-ref>
+#   Side-load a locally-built image into the cluster's node store
+#   (k3d image import / kind load). Used by the optional local-operator
+#   override (build the operator from source, tag it as the released ref,
+#   side-load it; the node serves it under imagePullPolicy IfNotPresent so
+#   Argo CD does not fight the unchanged image ref).
+# ---------------------------------------------------------------
+cluster_load_image() {
+    local cluster_name="$1" image="$2"
+    if [ "$(cluster_runtime)" = "kind" ]; then
+        # shellcheck disable=SC2086
+        KIND_EXPERIMENTAL_PROVIDER=podman $(_kind_bin) load docker-image "$image" --name "$cluster_name"
+    else
+        # shellcheck disable=SC2086
+        $(_k3d_bin) image import "$image" --cluster "$cluster_name"
+    fi
+}
+
+# ---------------------------------------------------------------
 # bootstrap_with_retry
 #   Runs `apprafter cluster-bootstrap` with APPRAFTER_BOOTSTRAP_SKIP_CILIUM
 #   so it leaves k3d's default CNI in place (see k3d_up for why). That
