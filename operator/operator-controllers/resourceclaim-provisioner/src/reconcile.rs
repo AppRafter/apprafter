@@ -982,6 +982,34 @@ async fn snapshot_retained_claim(
                 &retain_until,
             )
         }
+        Some(Backend::Disk) => {
+            // A disk claim carries the unowned RWO PVC reference in
+            // `status.volumeClaimRef` — snapshot that + its namespace so the
+            // GC (`gc_drop_disk`) can delete the PVC after grace. Without this
+            // arm a deleted disk claim would fall through to the CNPG shape
+            // and the GC would mis-route it to the phased role/DB drop (a
+            // no-op on the absent CNPG fields, but it would never delete the
+            // PVC → leak). Default to the deterministic PVC name (==
+            // `object_name`, the name `provision_disk` applies) if the claim
+            // was deleted before `status.volumeClaimRef` landed — the GC's
+            // PVC delete is 404-tolerant, so a snapshot that points at a PVC
+            // that was never created is harmless.
+            let volume_claim_ref = claim
+                .status
+                .as_ref()
+                .and_then(|s| s.volume_claim_ref.clone())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| object_name.clone());
+            retained_claim_disk_object(
+                &object_name,
+                name,
+                ns,
+                &provider_name,
+                &volume_claim_ref,
+                ns,
+                &retain_until,
+            )
+        }
         // CNPG (or an unknown/empty backend — legacy snapshots default to
         // the CNPG shape, matching the GC's `gc_backend("")` default).
         _ => retained_claim_object(
@@ -1376,6 +1404,45 @@ pub fn retained_claim_dragonfly_object(
             "aclUser": acl_user,
             "connectionSecretRef": connection_secret_ref,
             "connectionSecretNamespace": connection_secret_namespace,
+            "retainUntil": retain_until,
+        },
+    })
+}
+
+/// Build the flat `RetainedClaim` SSA-apply body for a DISK claim
+/// (2.6b-5). Carries the unowned RWO PVC reference (`volumeClaimRef` +
+/// `volumeClaimNamespace`) — everything the GC (`gc_drop_disk`) needs to
+/// delete the PVC once `retainUntil` passes. No CNPG / dragonfly fields
+/// are set (the GC backend-dispatches on `spec.backend`). Same
+/// deterministic `snapshot_name` / `apprafter-system` placement /
+/// `claimRef` lineage as the other backends; the same deterministic name
+/// the provisioner cancels on re-provision (reattach), so a redeploy
+/// within grace keeps the PVC.
+pub fn retained_claim_disk_object(
+    snapshot_name: &str,
+    claim_name: &str,
+    claim_ns: &str,
+    provider: &str,
+    volume_claim_ref: &str,
+    volume_claim_namespace: &str,
+    retain_until: &str,
+) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "RetainedClaim",
+        "metadata": {
+            "name": snapshot_name,
+            "namespace": RETAINED_CLAIM_NAMESPACE,
+        },
+        "spec": {
+            "claimRef": {
+                "name": claim_name,
+                "namespace": claim_ns,
+            },
+            "provider": provider,
+            "backend": "disk",
+            "volumeClaimRef": volume_claim_ref,
+            "volumeClaimNamespace": volume_claim_namespace,
             "retainUntil": retain_until,
         },
     })
@@ -1781,6 +1848,51 @@ mod tests {
         assert!(rc["spec"].get("cnpgCluster").is_none());
         assert!(rc["spec"].get("role").is_none());
         assert!(rc["spec"].get("databaseObjectName").is_none());
+    }
+
+    // --- retained_claim_disk_object() (2.6b-5 finalizer snapshot) ---
+
+    #[test]
+    fn retained_claim_disk_object_carries_volume_claim_and_no_cnpg_or_dragonfly_fields() {
+        // 2.6b-5: a deleted disk claim snapshots `volumeClaimRef` +
+        // `volumeClaimNamespace` (the unowned RWO PVC the GC deletes after
+        // grace) and NONE of the CNPG (role/db/cluster) or dragonfly
+        // (instance/dbnum/aclUser) fields. Same deterministic snapshot_name /
+        // apprafter-system placement / claimRef lineage as the other backends.
+        let snapshot_name = cnpg::k8s_name("demo", "web-disk-data");
+        let rc = retained_claim_disk_object(
+            &snapshot_name,
+            "web-disk-data",
+            "demo",
+            "disk-local",
+            &snapshot_name,
+            "demo",
+            "2026-06-13T00:00:00+00:00",
+        );
+        assert_eq!(rc["apiVersion"], "apprafter.io/v1alpha1");
+        assert_eq!(rc["kind"], "RetainedClaim");
+        assert_eq!(rc["metadata"]["name"], snapshot_name);
+        assert_eq!(rc["metadata"]["namespace"], "apprafter-system");
+        // Lineage preserved in spec.claimRef.
+        assert_eq!(rc["spec"]["claimRef"]["name"], "web-disk-data");
+        assert_eq!(rc["spec"]["claimRef"]["namespace"], "demo");
+        assert_eq!(rc["spec"]["provider"], "disk-local");
+        assert_eq!(rc["spec"]["backend"], "disk");
+        // The disk allocation: the PVC name + its namespace.
+        assert_eq!(rc["spec"]["volumeClaimRef"], snapshot_name);
+        assert_eq!(rc["spec"]["volumeClaimNamespace"], "demo");
+        assert_eq!(rc["spec"]["retainUntil"], "2026-06-13T00:00:00+00:00");
+        // No CNPG fields leak onto a disk snapshot.
+        assert!(rc["spec"].get("cnpgCluster").is_none());
+        assert!(rc["spec"].get("role").is_none());
+        assert!(rc["spec"].get("database").is_none());
+        assert!(rc["spec"].get("databaseObjectName").is_none());
+        assert!(rc["spec"].get("passwordSecretName").is_none());
+        // No dragonfly fields leak onto a disk snapshot.
+        assert!(rc["spec"].get("instance").is_none());
+        assert!(rc["spec"].get("dbnum").is_none());
+        assert!(rc["spec"].get("aclUser").is_none());
+        assert!(rc["spec"].get("connectionSecretRef").is_none());
     }
 
     #[test]
