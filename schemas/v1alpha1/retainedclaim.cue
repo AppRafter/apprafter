@@ -57,6 +57,12 @@ package v1alpha1
 		connectionSecretRef?:       string
 		connectionSecretNamespace?: string
 
+		// --- Disk-backend allocation (optional; absent for CNPG/dragonfly; 2.6b) ---
+		// The unowned RWO PVC the claim provisioned (status.volumeClaimRef)
+		// + its namespace. The GC deletes this PVC once retainUntil passes.
+		volumeClaimRef?:       string
+		volumeClaimNamespace?: string
+
 		// RFC3339 instant after which the GC drops the backend resources +
 		// password/connection Secret (deletion + 7-day grace).
 		retainUntil: string

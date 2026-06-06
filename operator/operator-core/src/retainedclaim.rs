@@ -109,6 +109,26 @@ pub struct RetainedClaimSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub connection_secret_namespace: Option<String>,
+
+    /// Disk allocation (2.6b): the `metadata.name` of the unowned RWO
+    /// PVC the claim provisioned (`status.volumeClaimRef`). The GC
+    /// deletes this PVC once `retainUntil` passes. None for CNPG /
+    /// dragonfly snapshots.
+    #[serde(
+        rename = "volumeClaimRef",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub volume_claim_ref: Option<String>,
+    /// Disk allocation (2.6b): the namespace of the PVC (the claim's
+    /// origin namespace — the PVC is created alongside the workload).
+    /// None for CNPG / dragonfly snapshots.
+    #[serde(
+        rename = "volumeClaimNamespace",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub volume_claim_namespace: Option<String>,
     /// RFC3339 instant after which the GC drops the backend resources +
     /// password/connection Secret (deletion + 7-day grace).
     #[serde(rename = "retainUntil")]
@@ -208,6 +228,8 @@ mod tests {
             acl_user: None,
             connection_secret_ref: None,
             connection_secret_namespace: None,
+            volume_claim_ref: None,
+            volume_claim_namespace: None,
             retain_until: "2026-06-10T00:00:00+00:00".into(),
         };
         let v = serde_json::to_value(&spec).unwrap();
@@ -233,5 +255,44 @@ mod tests {
         // No snake_case keys leak.
         assert!(v.get("claim_ref").is_none());
         assert!(v.get("retain_until").is_none());
+        // Disk fields are skipped when None (CNPG snapshot).
+        assert!(v.get("volumeClaimRef").is_none());
+        assert!(v.get("volumeClaimNamespace").is_none());
+    }
+
+    #[test]
+    fn retained_claim_supports_disk_snapshot() {
+        // 2.6b: a disk-backed RetainedClaim carries `volumeClaimRef` +
+        // `volumeClaimNamespace` (the unowned RWO PVC the GC deletes) and
+        // NONE of the CNPG / dragonfly allocation fields.
+        let rc: RetainedClaimSpec = serde_json::from_value(json!({
+            "claimRef": {"name": "web-disk-data", "namespace": "demo"},
+            "provider": "disk-local",
+            "backend": "disk",
+            "retainUntil": "2026-06-13T00:00:00Z",
+            "volumeClaimRef": "claim-demo-web-disk-data",
+            "volumeClaimNamespace": "demo"
+        }))
+        .unwrap();
+        assert_eq!(rc.backend, "disk");
+        assert_eq!(
+            rc.volume_claim_ref.as_deref(),
+            Some("claim-demo-web-disk-data")
+        );
+        assert_eq!(rc.volume_claim_namespace.as_deref(), Some("demo"));
+        // CNPG + dragonfly fields are absent on a disk snapshot.
+        assert!(rc.cnpg_cluster.is_none());
+        assert!(rc.role.is_none());
+        assert!(rc.instance.is_none());
+        assert!(rc.acl_user.is_none());
+
+        // Round-trips back with the camelCase renames.
+        let v = serde_json::to_value(&rc).unwrap();
+        assert_eq!(
+            v.get("volumeClaimRef"),
+            Some(&json!("claim-demo-web-disk-data"))
+        );
+        assert_eq!(v.get("volumeClaimNamespace"), Some(&json!("demo")));
+        assert!(v.get("volume_claim_ref").is_none());
     }
 }

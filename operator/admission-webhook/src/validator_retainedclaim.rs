@@ -81,6 +81,19 @@ const DRAGONFLY_REQUIRED_STRING_FIELDS: [&str; 4] = [
     "connectionSecretNamespace",
 ];
 
+/// Disk-backend `spec` string fields that must be non-empty — the
+/// GC-load-bearing set for a `disk` snapshot (2.6b). The GC reads these
+/// to delete the unowned RWO PVC the claim provisioned.
+///
+/// Like the dragonfly set this is only enforced once `volumeClaimRef` is
+/// present + non-empty: a disk claim deleted BEFORE the provisioner wrote
+/// `status.volumeClaimRef` (the PVC was never created) snapshots with the
+/// ref empty, and the GC reclaims nothing for it. Requiring the set
+/// unconditionally would reject the operator's own pre-provision snapshot
+/// CREATE (failurePolicy: Fail → finalizer wedge → leak) — the mirror of
+/// the empty-instance dragonfly carve-out.
+const DISK_REQUIRED_STRING_FIELDS: [&str; 2] = ["volumeClaimRef", "volumeClaimNamespace"];
+
 /// Validate a RetainedClaim AdmissionReview. `object` is the request's
 /// `object`; `old_object` is `oldObject` (`None` on CREATE, `Some` on
 /// UPDATE); `user_info` is `request.userInfo`; `operation` is
@@ -178,9 +191,24 @@ pub fn validate_retainedclaim(
         .get("instance")
         .and_then(Value::as_str)
         .is_some_and(|s| !s.is_empty());
+    // A disk snapshot's GC-load-bearing set (volumeClaimRef/Namespace) only
+    // exists once the PVC was actually provisioned. A disk claim deleted
+    // before the provisioner wrote `status.volumeClaimRef` snapshots with the
+    // ref empty; the GC reclaims nothing for it. Enforce the disk set only when
+    // `volumeClaimRef` is present + non-empty (mirror of the dragonfly carve-out).
+    let disk_provisioned = spec
+        .get("volumeClaimRef")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
     let required_fields: &[&str] = if backend == "dragonfly" {
         if dragonfly_allocated {
             &DRAGONFLY_REQUIRED_STRING_FIELDS
+        } else {
+            &[]
+        }
+    } else if backend == "disk" {
+        if disk_provisioned {
+            &DISK_REQUIRED_STRING_FIELDS
         } else {
             &[]
         }
@@ -479,6 +507,85 @@ mod tests {
         assert!(
             errors.is_empty(),
             "pre-allocation dragonfly snapshot (absent allocation) must pass; got {errors:?}"
+        );
+    }
+
+    fn retained_disk() -> Value {
+        json!({
+            "metadata": { "name": "web-disk-data", "namespace": "apprafter-system" },
+            "spec": {
+                "claimRef": { "name": "web-disk-data", "namespace": "demo" },
+                "provider": "disk-local",
+                "backend": "disk",
+                "volumeClaimRef": "claim-demo-web-disk-data",
+                "volumeClaimNamespace": "demo",
+                "retainUntil": "2026-06-13T00:00:00+00:00"
+            }
+        })
+    }
+
+    #[test]
+    fn allows_operator_create_disk_snapshot_without_cnpg_fields() {
+        // 2.6b: a disk snapshot carries NONE of the cnpg-required fields
+        // (role/database/cnpgCluster/...) — only volumeClaimRef/Namespace.
+        // The webhook MUST accept it (failurePolicy: Fail) — otherwise the
+        // operator's own disk snapshot CREATE is rejected, the finalizer
+        // wedges, and the PVC leaks (the leak-wedge guard, generalised by
+        // backend like the dragonfly arm).
+        let errors = validate_retainedclaim(&retained_disk(), None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "disk snapshot must pass the webhook; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_disk_snapshot_missing_volume_claim_namespace() {
+        // A disk snapshot WITH a provisioned PVC (non-empty volumeClaimRef)
+        // must still carry its namespace; the GC needs both to delete the PVC.
+        let mut c = retained_disk();
+        c["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("volumeClaimNamespace");
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "spec.volumeClaimNamespace"),
+            "a provisioned disk snapshot missing volumeClaimNamespace must be rejected; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn allows_disk_pre_provision_snapshot_with_empty_volume_claim_ref() {
+        // A disk claim deleted BEFORE the provisioner created the PVC
+        // snapshots with `volumeClaimRef` empty — there is no PVC, so the GC
+        // reclaims nothing. The webhook (failurePolicy: Fail) MUST accept it;
+        // otherwise the finalizer wedges. With no PVC only the BASE set is
+        // required (claimRef / provider / backend / retainUntil).
+        let mut c = retained_disk();
+        c["spec"]["volumeClaimRef"] = json!("");
+        c["spec"]["volumeClaimNamespace"] = json!("");
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "pre-provision disk snapshot (empty volumeClaimRef) must pass; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn allows_disk_pre_provision_snapshot_with_absent_volume_claim_ref() {
+        // Same pre-provision case, but with the disk keys ABSENT (not just
+        // empty-string) — also accepted, base set only.
+        let mut c = retained_disk();
+        let spec = c["spec"].as_object_mut().unwrap();
+        spec.remove("volumeClaimRef");
+        spec.remove("volumeClaimNamespace");
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "pre-provision disk snapshot (absent volumeClaimRef) must pass; got {errors:?}"
         );
     }
 

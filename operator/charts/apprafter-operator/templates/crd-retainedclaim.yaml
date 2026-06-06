@@ -48,10 +48,11 @@ spec:
             spec:
               type: object
               # Only the backend-agnostic lineage fields are universally
-              # required. The CNPG-specific fields (cnpgCluster/role/...) and
-              # the dragonfly-specific fields (instance/aclUser/...) are each
-              # optional at the CRD layer; the admission webhook enforces the
-              # correct GC-load-bearing set per `spec.backend` (ADR 0042).
+              # required. The CNPG-specific fields (cnpgCluster/role/...), the
+              # dragonfly-specific fields (instance/aclUser/...), and the
+              # disk-specific fields (volumeClaimRef/volumeClaimNamespace) are
+              # each optional at the CRD layer; the admission webhook enforces
+              # the correct GC-load-bearing set per `spec.backend` (ADR 0042).
               required:
                 - claimRef
                 - provider
@@ -99,6 +100,10 @@ spec:
                 connectionSecretRef:
                   type: string
                 connectionSecretNamespace:
+                  type: string
+                volumeClaimRef:
+                  type: string
+                volumeClaimNamespace:
                   type: string
                 retainUntil:
                   type: string
