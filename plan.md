@@ -2864,7 +2864,11 @@ instead of carrying parallel definitions.
 ### 2.6b needs.disk → persistent block storage
 > 🏁 SR: A · order 3 — needs.disk block storage; launch scope (not in earlier speedrun revisions)
 
-**Source:** design session 2026-05-27; ADR TBD before implementation (disk class abstraction, shareMode semantics, tier mapping).
+**Source:** design session 2026-05-27; **ADR 0043** (needs.disk + named multi-claim needs) + design `docs/superpowers/specs/2026-06-06-needs-disk-named-claims-design.md`.
+
+**Дизайн (2026-06-06, ADR 0043) — revised vs набросок «Поставка» ниже:** диск идёт **через ResourceClaim** (`Backend::Disk` создаёт unowned RWO PVC, рендерер монтирует, RetainedClaim GC удерживает→grace→чистит + reattach при redeploy) — НЕ renderer-only StatefulSet. Несущая часть фазы — обобщение `needs` до **(type, name)** (скаляр\|массив + имя, backward-compat `DATABASE_URL`/`_<NAME>`), реализуется для всех типов. Launch = `class: local`, `replicas:1` Deployment (Recreate); StatefulSet/per-replica + всё T2 (replicated/shared/снапшоты/auto-expand) — отложено (набросок ниже = full vision, на launch берём срез).
+
+**Декомпозиция (launch, 2.6b-1…2.6b-6):** **1** — схема (обобщённый `needs` скаляр\|массив+name, `#DiskClaim`, `status.volumeClaimRef`; crd-validate); **2** — generalization-движок (claim-gen по (type,name) + env-дизамбигуация `DATABASE_URL_<NAME>` + webhook (type,name)-гарды; acceptance на pg-массиве ДО диска); **3** — provisioner `Backend::Disk` + сид `disk-local`; **4** — disk renderer (mount+Recreate) + disk webhook-гарды; **5** — disk GC (RetainedClaim disk-поля + reattach/cancel); **6** — `needs-disk-walk.sh` + multi-claim walk + ручной walk + dev-guide + координированный release.
 
 **Цель:** declarative persistent block storage для Application через `needs.disk` claim; tier-portable через storage class abstraction; operator под капотом emits StatefulSet + PVC machinery + CSI snapshot scheduling.
 
