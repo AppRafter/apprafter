@@ -44,7 +44,10 @@ spec:
               properties:
                 type:
                   type: string
-                  enum: [pg, jetstream, clickhouse, redis, s3, notifications]
+                  # 2.6b (ADR 0043): `disk` = persistent block storage.
+                  enum: [pg, jetstream, clickhouse, redis, s3, notifications, disk]
+                name:
+                  type: string
                 selector:
                   type: object
                   additionalProperties:

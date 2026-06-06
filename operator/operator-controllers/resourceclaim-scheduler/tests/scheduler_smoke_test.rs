@@ -165,6 +165,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
         },
         spec: ResourceClaimSpec {
             type_: "pg".to_string(),
+            name: None,
             selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
             size: None,
             persistent: None,
@@ -211,6 +212,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
         },
         spec: ResourceClaimSpec {
             type_: "pg".to_string(),
+            name: None,
             selector: BTreeMap::from([("tier".to_string(), "nonexistent".to_string())]),
             size: None,
             persistent: None,

@@ -806,14 +806,25 @@ fn migration_pending_condition(
 // ---- 2.4d: pure ResourceClaim generation + pause helpers ----
 
 /// Derive a DNS-1123-safe `metadata.name` for a child ResourceClaim
-/// from the owning Application name + the need's service type:
-/// `{app}-{type}`, non-alphanumerics folded to `-`, lowercased,
-/// truncated to 63 bytes, trailing `-` trimmed. Mirrors
+/// from the owning Application name, the need's service type, and the
+/// optional `(type, name)` entry name (2.6b / ADR 0043):
+///
+///   * `name == None` (the unnamed default claim) → `{app}-{type}`
+///     (unchanged — zero migration for pre-2.6b single claims);
+///   * `name == Some(n)` (a named array entry) → `{app}-{type}-{n}`.
+///
+/// The whole join is folded: non-alphanumerics → `-`, lowercased,
+/// truncated to 63 bytes, trailing `-` trimmed. An empty / all-`-`
+/// `name` collapses to the unnamed form (the trailing-`-` trim drops
+/// the dangling separator). Mirrors
 /// `resourceclaim-provisioner::cnpg::k8s_name`'s fold (without the
-/// `claim-` prefix — the `{app}-` prefix already guarantees a
-/// leading alphanumeric for any valid Application name).
-fn claim_name(app: &str, service_type: &str) -> String {
-    let raw = format!("{app}-{service_type}");
+/// `claim-` prefix — the `{app}-` prefix already guarantees a leading
+/// alphanumeric for any valid Application name).
+fn claim_name(app: &str, service_type: &str, name: Option<&str>) -> String {
+    let raw = match name {
+        Some(n) if !n.is_empty() => format!("{app}-{service_type}-{n}"),
+        _ => format!("{app}-{service_type}"),
+    };
     let mut out = String::with_capacity(raw.len().min(63));
     for ch in raw.chars() {
         out.push(if ch.is_ascii_alphanumeric() {
@@ -854,25 +865,22 @@ fn generate_resource_claims(
     let Some(needs) = spec.needs.as_ref() else {
         return Vec::new();
     };
-    // 2.6b migration: walk the flattened `Needs::entries()` in its
-    // deterministic order. PRESERVE the pre-2.6b single-claim behavior —
-    // ONE claim per service *type*, named `<app>-<type>` (name=None);
-    // per-(type,name) array claim-gen is a later task (2.6b-2), and the
-    // disk provisioner is 2.6b-3, so disk entries generate no claim here.
+    // 2.6b (ADR 0043): walk the flattened `Needs::entries()` in its
+    // deterministic order and emit ONE claim per `(type, name)` entry —
+    // a scalar yields one, an array yields N. The unnamed default
+    // (`name: None`) keeps `<app>-<type>` (zero migration); a named
+    // entry yields `<app>-<type>-<name>` and carries `spec.name` so the
+    // provisioner can disambiguate sibling claims. The disk provisioner
+    // lands in 2.6b-3, so `disk` entries generate no claim here yet (only
+    // the `disk` claim *type* enum is opened in 2.6b-2).
     let mut out: Vec<(String, Value)> = Vec::new();
-    let mut seen_types: Vec<String> = Vec::new();
     for (service_type, entry) in needs.entries() {
-        // Skip disk entries (no provisioner yet) and any duplicate type
-        // (single-claim behavior — first entry wins).
+        // Skip disk entries (no provisioner yet — 2.6b-3).
         let Some(need) = entry.service else {
             continue;
         };
-        if seen_types.contains(&service_type) {
-            continue;
-        }
-        seen_types.push(service_type.clone());
 
-        let name = claim_name(app_name, &service_type);
+        let name = claim_name(app_name, &service_type, entry.name.as_deref());
         let selector = need
             .selector
             .clone()
@@ -881,6 +889,14 @@ fn generate_resource_claims(
             "type": service_type,
             "selector": selector,
         });
+        // `(type, name)` identity (2.6b): a named array entry carries
+        // `spec.name` so the provisioner derives distinct DBs/users/secrets
+        // for sibling claims of one app. The unnamed default omits it.
+        if let Some(entry_name) = entry.name.as_deref() {
+            if !entry_name.is_empty() {
+                claim_spec["name"] = json!(entry_name);
+            }
+        }
         if let Some(size) = &need.size {
             claim_spec["size"] = json!(size);
         }
@@ -1600,9 +1616,10 @@ mod tests {
 
     #[test]
     fn claim_name_joins_app_and_type_and_is_dns1123_safe() {
-        assert_eq!(claim_name("parser", "pg"), "parser-pg");
+        // Unnamed default (name=None): unchanged `<app>-<type>`.
+        assert_eq!(claim_name("parser", "pg", None), "parser-pg");
         // Non-alphanumerics fold to `-`, lowercase, trailing `-` trimmed.
-        let n = claim_name("My_App.", "Redis_Cache_");
+        let n = claim_name("My_App.", "Redis_Cache_", None);
         assert_eq!(n, "my-app--redis-cache");
         // DNS-1123 validity: lowercased, no `_`, start/end alphanumeric.
         assert!(!n.contains('_'));
@@ -1610,8 +1627,29 @@ mod tests {
         assert!(n.chars().next().unwrap().is_ascii_alphanumeric());
         assert!(n.chars().last().unwrap().is_ascii_alphanumeric());
         // Truncates to 63 bytes.
-        let long = claim_name(&"a".repeat(80), &"b".repeat(80));
+        let long = claim_name(&"a".repeat(80), &"b".repeat(80), None);
         assert!(long.len() <= 63, "len was {}", long.len());
+        assert!(long.chars().last().unwrap().is_ascii_alphanumeric());
+    }
+
+    #[test]
+    fn claim_name_appends_folded_name_when_present() {
+        // 2.6b: a named entry yields `<app>-<type>-<fold(name)>`.
+        assert_eq!(
+            claim_name("parser", "pg", Some("analytics")),
+            "parser-pg-analytics"
+        );
+        // The name is DNS-1123-folded too (uppercase + `_`/`.` → `-`).
+        assert_eq!(
+            claim_name("parser", "pg", Some("Analytics_DB")),
+            "parser-pg-analytics-db"
+        );
+        // An empty name behaves like None (no trailing `-`).
+        assert_eq!(claim_name("parser", "pg", Some("")), "parser-pg");
+        // Still DNS-1123-safe + truncated to 63 bytes even with a long name.
+        let long = claim_name(&"a".repeat(40), "pg", Some(&"b".repeat(40)));
+        assert!(long.len() <= 63, "len was {}", long.len());
+        assert!(!long.contains('_'));
         assert!(long.chars().last().unwrap().is_ascii_alphanumeric());
     }
 
@@ -1707,6 +1745,63 @@ mod tests {
     }
 
     #[test]
+    fn generate_resource_claims_emits_one_claim_per_named_array_entry() {
+        // 2.6b: a `needs.pg` array of two named entries → two claims
+        // `app-pg-a` + `app-pg-b`, each carrying `spec.type=pg`,
+        // `spec.name=<entry name>`, ownerRef → app.
+        use operator_core::{Needs, OneOrMany};
+        let n = Needs {
+            pg: Some(OneOrMany::Many(vec![
+                ServiceNeed {
+                    name: Some("a".into()),
+                    ..Default::default()
+                },
+                ServiceNeed {
+                    name: Some("b".into()),
+                    ..Default::default()
+                },
+            ])),
+            ..Default::default()
+        };
+        let spec = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(n),
+            ..Default::default()
+        };
+        let payloads = generate_resource_claims(&spec, "app", "uid-1", "demo");
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].0, "app-pg-a");
+        assert_eq!(payloads[1].0, "app-pg-b");
+        // Each claim carries spec.type=pg and spec.name = the entry name so
+        // the provisioner can disambiguate sibling claims of one app.
+        for (idx, expected_name) in ["a", "b"].iter().enumerate() {
+            let payload = &payloads[idx].1;
+            assert_eq!(payload["spec"]["type"], json!("pg"));
+            assert_eq!(payload["spec"]["name"], json!(expected_name));
+            let owner = &payload["metadata"]["ownerReferences"][0];
+            assert_eq!(owner["name"], json!("app"));
+            assert_eq!(owner["uid"], json!("uid-1"));
+        }
+    }
+
+    #[test]
+    fn generate_resource_claims_scalar_unnamed_omits_spec_name() {
+        // The scalar (unnamed default) form is unchanged: ONE `app-pg`
+        // claim, and `spec.name` must NOT be emitted (only named array
+        // entries carry it).
+        let mut needs = BTreeMap::new();
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "app", "uid-1", "demo");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].0, "app-pg");
+        assert!(
+            payloads[0].1["spec"].get("name").is_none(),
+            "unnamed default claim must not carry spec.name"
+        );
+    }
+
+    #[test]
     fn generate_resource_claims_yields_one_payload_per_need_in_deterministic_order() {
         let mut needs = BTreeMap::new();
         needs.insert("redis".to_string(), ServiceNeed::default());
@@ -1724,6 +1819,7 @@ mod tests {
             name,
             ResourceClaimSpec {
                 type_: "pg".into(),
+                name: None,
                 selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
                 size: None,
                 persistent: None,
@@ -1845,6 +1941,7 @@ mod tests {
             &name,
             ResourceClaimSpec {
                 type_,
+                name: None,
                 selector,
                 size: None,
                 persistent: None,

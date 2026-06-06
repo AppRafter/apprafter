@@ -17,6 +17,12 @@ package v1alpha1
 	metadata: #ObjectMeta
 	spec: {
 		type: #PlatformServiceType
+		// `(type, name)` claim identity (2.6b / ADR 0043). Set by the
+		// Application controller from a named `needs.<type>[].name`
+		// entry so the provisioner derives distinct DBs/users/
+		// connection-Secrets for sibling claims of one app. Absent for
+		// the unnamed default claim.
+		name?: string
 		selector: [string]: string
 		size?: #Size
 		// Persist the provisioned resource across the claim's deletion

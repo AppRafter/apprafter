@@ -442,6 +442,7 @@ mod tests {
             name,
             operator_core::ResourceClaimSpec {
                 type_: "redis".into(),
+                name: None,
                 selector: Default::default(),
                 size: None,
                 persistent: None,

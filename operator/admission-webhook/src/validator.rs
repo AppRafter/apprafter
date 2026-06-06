@@ -217,13 +217,17 @@ fn validate_env_keys(
 /// (`crd-resourceclaim.yaml`, `crd-serviceprovider.yaml`) — there is
 /// no CUE->Rust/CRD generator yet, so adding a service type means
 /// editing all four sites.
-const PLATFORM_SERVICE_TYPES: [&str; 6] = [
+const PLATFORM_SERVICE_TYPES: [&str; 7] = [
     "pg",
     "jetstream",
     "clickhouse",
     "redis",
     "s3",
     "notifications",
+    // 2.6b (ADR 0043): persistent block storage. A `needs.disk` entry
+    // generates a `type: disk` ResourceClaim; the disk-specific value
+    // guards (mountPath/size/class/replicas) land in 2.6b-4.
+    "disk",
 ];
 
 fn is_platform_service_type(s: &str) -> bool {
@@ -435,6 +439,20 @@ mod tests {
             },
             "environments": {
                 "prod": { "needs": { "redis": {} } }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn accepts_disk_needs_key() {
+        // 2.6b (ADR 0043): `disk` is a known platform-service type, so a
+        // `needs.disk` entry must be accepted (the disk value shape is
+        // validated by the disk-specific guards in 2.6b-4).
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "size": "1Gi", "mountPath": "/data" } }
             }
         });
         assert!(validate_application_spec(&spec).is_empty());

@@ -131,6 +131,7 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
         },
         spec: ResourceClaimSpec {
             type_: "pg".to_string(),
+            name: None,
             selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
             size: None,
             persistent: None,

@@ -25,6 +25,12 @@ pub struct ResourceClaimSpec {
     /// Built-in service type (closed enum; see `schemas/v1alpha1`).
     #[serde(rename = "type")]
     pub type_: String,
+    /// `(type, name)` claim identity (2.6b / ADR 0043). Set by the
+    /// Application controller from a named `needs.<type>[].name` entry so
+    /// the provisioner derives distinct DBs/users/connection-Secrets for
+    /// sibling claims of one app. Absent for the unnamed default claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Label selector matched against ServiceProvider `metadata.labels`
     /// by the 2.3 scheduler.
     pub selector: BTreeMap<String, String>,
@@ -110,6 +116,7 @@ mod tests {
     fn size_is_optional_and_type_serializes_back() {
         let spec = ResourceClaimSpec {
             type_: "redis".into(),
+            name: None,
             selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
             size: None,
             persistent: None,
@@ -118,6 +125,29 @@ mod tests {
         assert_eq!(v.get("type"), Some(&json!("redis")));
         assert!(v.get("size").is_none());
         assert!(v.get("persistent").is_none());
+    }
+
+    #[test]
+    fn spec_name_round_trips_and_is_optional() {
+        // 2.6b: a named array claim carries `spec.name`.
+        let spec: ResourceClaimSpec = serde_json::from_value(json!({
+            "type": "pg",
+            "name": "analytics",
+            "selector": { "tier": "integrated" }
+        }))
+        .expect("valid spec");
+        assert_eq!(spec.name.as_deref(), Some("analytics"));
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v.get("name"), Some(&json!("analytics")));
+        // Absent → omitted (the unnamed default claim).
+        let unnamed: ResourceClaimSpec = serde_json::from_value(json!({
+            "type": "pg",
+            "selector": { "tier": "integrated" }
+        }))
+        .expect("valid spec");
+        assert!(unnamed.name.is_none());
+        let uv = serde_json::to_value(&unnamed).unwrap();
+        assert!(uv.get("name").is_none());
     }
 
     #[test]

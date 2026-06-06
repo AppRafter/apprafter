@@ -401,6 +401,7 @@ mod tests {
             name,
             ResourceClaimSpec {
                 type_: "redis".into(),
+                name: None,
                 selector: BTreeMap::new(),
                 size: None,
                 persistent: None,
@@ -499,6 +500,7 @@ mod tests {
             "web-pg",
             ResourceClaimSpec {
                 type_: "pg".into(),
+                name: None,
                 selector: BTreeMap::new(),
                 size: None,
                 persistent: None,

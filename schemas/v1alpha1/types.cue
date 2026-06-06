@@ -27,13 +27,18 @@ package v1alpha1
 
 // Built-in platform-service types. ServiceProviderPlugin may extend
 // this set at runtime by registering additional types.
+//
+// `disk` (2.6b / ADR 0043) is persistent block storage: a `needs.disk`
+// entry generates a `type: disk` ResourceClaim that the `Backend::Disk`
+// provisioner backs with a standalone RWO PVC.
 #PlatformServiceType:
 	"pg" |
 	"jetstream" |
 	"clickhouse" |
 	"redis" |
 	"s3" |
-	"notifications"
+	"notifications" |
+	"disk"
 
 #Size: "nano" | "small" | "medium" | "large" | "xlarge"
 
