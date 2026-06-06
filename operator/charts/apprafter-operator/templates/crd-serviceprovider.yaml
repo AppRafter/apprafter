@@ -44,7 +44,11 @@ spec:
               properties:
                 type:
                   type: string
-                  enum: [pg, jetstream, clickhouse, redis, s3, notifications]
+                  # 2.6b (ADR 0043): `disk` = persistent block storage; the
+                  # `disk-local` ServiceProvider seed advertises type/backend
+                  # `disk`. Keep in sync with #PlatformServiceType (CUE) +
+                  # crd-resourceclaim.yaml's type enum.
+                  enum: [pg, jetstream, clickhouse, redis, s3, notifications, disk]
                 backend:
                   type: string
                   minLength: 1
