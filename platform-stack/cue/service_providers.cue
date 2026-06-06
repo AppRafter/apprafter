@@ -61,6 +61,10 @@ _serviceProviders: {
 			// operator-tunable here for throughput without a code change.
 			dbnum:     int | *1024
 			numShards: int | *1
+			// Instances per shared pool member. MUST be >= 1 — the
+			// dragonfly-operator does not default replicas, so 0 means no
+			// instance pod. Tier-1 = 1; HA tiers raise it via a tier overlay.
+			replicas: int | *1
 		}
 	}
 }

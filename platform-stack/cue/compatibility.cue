@@ -1710,6 +1710,34 @@ compatibility: "0.1.23": {
 // isolation + FLUSHDB GC) and the CRD-additive schema fields. Re-syncs
 // the operator/platform-stack lockstep the 0.2.17 platform-stack-only
 // yank broke — operator + admission-webhook images move to v0.2.19.
+// 0.2.20 — Phase 2.6 walk-fix release. The full needs.redis -> Dragonfly
+// chain is validated end-to-end on a live cluster for the first time
+// (kind/podman walk green): provision -> $N isolation -> EVAL confinement ->
+// client-init/queues -> restart re-pin -> persistent restart-durable ->
+// snapshot -> GC FLUSHDB/DELUSER. Five operator/webhook bugs the live walk
+// surfaced (none caught by unit/CRD gates): Dragonfly CR `spec.replicas`
+// (omitted -> 0-replica StatefulSet -> no instance pod); the bogus
+// `--maxmemory_policy` arg Dragonfly rejects (-> crashloop); invalid
+// `+client|subcommand` ACL grants Dragonfly rejects; the dbnum allocator race
+// under concurrent provisioning (-> two tenants on one DB, an isolation
+// breach) fixed by serializing reconciles; and the operator-only-CREATE
+// webhooks now accept `kubeadm:cluster-admins` break-glass (k8s 1.35).
+// CRD-compatible with 0.2.19; existing claims keep their allocation.
+compatibility: "0.2.20": {
+	change:          "safe"
+	operatorVersion: "v0.2.20"
+	notes: """
+		Phase 2.6 walk-fix release — the needs.redis -> Dragonfly chain is now
+		validated live (kind/podman walk green). Operator fixes: Dragonfly CR
+		sets spec.replicas (was 0 -> no pod); drops the bogus --maxmemory_policy
+		arg (crashloop); valid ACL grant (no +client|subcommand); serialized
+		provisioner reconciles so concurrent claims never collide on a dbnum
+		(was an isolation breach); webhook break-glass accepts
+		kubeadm:cluster-admins. CRD-compatible with 0.2.19.
+		"""
+	references: ["plan.md#2.6", "docs/adr/0042-needs-redis-dragonfly.md"]
+}
+
 compatibility: "0.2.19": {
 	change:          "safe"
 	operatorVersion: "v0.2.19"
