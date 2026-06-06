@@ -121,9 +121,113 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         }
     }
 
+    validate_needs_names(base, envs, &mut errors);
     validate_reserved_env_collision(base, envs, &mut errors);
 
     errors
+}
+
+/// 2.6b (ADR 0043): a `needs.<type>` value is either a scalar entry
+/// (object) or an array of entries. Return the optional `name` of each
+/// entry, in declaration order. A scalar object yields exactly one
+/// entry; an array yields one per element. A non-object/non-array value
+/// yields no entries (its shape is rejected by the CRD layer). An entry
+/// with no `name` (or an empty `name`) is the unnamed default.
+fn needs_entry_names(value: &Value) -> Vec<Option<&str>> {
+    fn entry_name(v: &Value) -> Option<&str> {
+        v.as_object()
+            .and_then(|o| o.get("name"))
+            .and_then(|n| n.as_str())
+            .filter(|n| !n.is_empty())
+    }
+    match value {
+        Value::Array(items) => items.iter().map(entry_name).collect(),
+        Value::Object(_) => vec![entry_name(value)],
+        _ => Vec::new(),
+    }
+}
+
+/// 2.6b (ADR 0043): validate the `(type, name)` identity rules within
+/// each `needs.<type>` value, in BOTH base and every environment. Each
+/// explicit `name` must be env-foldable (a DNS-1123 label, so the fold
+/// `-` → `_` + uppercase yields a valid `[A-Z_][A-Z0-9_]*` env-var
+/// suffix); names must be unique within a single (scope, type) value;
+/// and at most one unnamed default is allowed per (scope, type) value.
+/// Multi-error: one error per offending `needs.<type>` field, no
+/// short-circuit (matching the validator contract).
+fn validate_needs_names(
+    base: Option<&serde_json::Map<String, Value>>,
+    envs: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let check_scope = |path: &str,
+                       obj: Option<&serde_json::Map<String, Value>>,
+                       errors: &mut Vec<ValidationError>| {
+        let Some(needs) = obj.and_then(|o| o.get("needs")).and_then(|v| v.as_object()) else {
+            return;
+        };
+        for (service_type, value) in needs {
+            let entries = needs_entry_names(value);
+            let mut seen: Vec<&str> = Vec::new();
+            let mut unnamed = 0usize;
+            for name in &entries {
+                match name {
+                    None => unnamed += 1,
+                    Some(n) => {
+                        if !is_dns_1123_label(n) {
+                            errors.push(ValidationError::new(
+                                format!("{path}.{service_type}"),
+                                format!(
+                                    "needs.{service_type} entry name {n:?} must be a DNS-1123 label (lowercase alphanumeric + '-', start and end alphanumeric) so it folds to a valid [A-Z_][A-Z0-9_]* env-var suffix"
+                                ),
+                            ));
+                        } else if seen.contains(n) {
+                            errors.push(ValidationError::new(
+                                format!("{path}.{service_type}"),
+                                format!(
+                                    "needs.{service_type} has a duplicate entry name {n:?}; names must be unique within a type"
+                                ),
+                            ));
+                        } else {
+                            seen.push(n);
+                        }
+                    }
+                }
+            }
+            if unnamed > 1 {
+                errors.push(ValidationError::new(
+                    format!("{path}.{service_type}"),
+                    format!(
+                        "needs.{service_type} declares {unnamed} unnamed entries; at most one unnamed default per type is allowed (give the others a name)"
+                    ),
+                ));
+            }
+        }
+    };
+
+    check_scope("spec.base.needs", base, errors);
+    if let Some(envs_obj) = envs {
+        for (env_name, val) in envs_obj {
+            check_scope(
+                &format!("spec.environments.{env_name}.needs"),
+                val.as_object(),
+                errors,
+            );
+        }
+    }
+}
+
+/// 2.6b (ADR 0043): fold a `(type, name)` entry name into a valid
+/// env-var-NAME segment — uppercase ASCII letters and map `-` → `_`.
+/// KEEP IN SYNC with operator-rendering `fold_env_segment`. The
+/// reserved env NAME of a named service claim is `<VAR>_<fold(name)>`.
+fn fold_env_segment(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            '-' => '_',
+            other => other.to_ascii_uppercase(),
+        })
+        .collect()
 }
 
 /// needs-type → the env var names reserved (injected by the
@@ -165,28 +269,66 @@ fn validate_reserved_env_collision(
             .is_some_and(|env| env.contains_key(key))
     };
 
+    // The set of distinct env-NAME suffixes a need declares across all
+    // scopes. The unnamed default contributes `None` (no suffix → the
+    // base `<VAR>`); a named entry contributes `Some("_<FOLD(name)>")`
+    // (→ `<VAR>_<FOLD(name)>`). 2.6b (ADR 0043): a literal env var of any
+    // reserved name (default OR suffixed) collides with the injected
+    // connection and is rejected.
+    let need_suffixes = |need: &str| -> Vec<Option<String>> {
+        let mut suffixes: Vec<Option<String>> = Vec::new();
+        let mut push_from = |obj: Option<&serde_json::Map<String, Value>>| {
+            if let Some(value) = obj
+                .and_then(|o| o.get("needs"))
+                .and_then(|v| v.as_object())
+                .and_then(|n| n.get(need))
+            {
+                for name in needs_entry_names(value) {
+                    let suffix = name.map(|n| format!("_{}", fold_env_segment(n)));
+                    if !suffixes.contains(&suffix) {
+                        suffixes.push(suffix);
+                    }
+                }
+            }
+        };
+        push_from(base);
+        if let Some(envs_obj) = envs {
+            for val in envs_obj.values() {
+                push_from(val.as_object());
+            }
+        }
+        suffixes
+    };
+
     for (need, reserved_names) in RESERVED_ENV {
         if !need_declared(need) {
             continue;
         }
-        for name in *reserved_names {
-            if env_has_key(base, name) {
-                errors.push(ValidationError::new(
-                    format!("spec.base.env.{name}"),
-                    format!(
-                        "{name} is reserved for the connection injected by needs.{need}; remove it from spec.base.env"
-                    ),
-                ));
-            }
-            if let Some(envs_obj) = envs {
-                for (env_name, val) in envs_obj {
-                    if env_has_key(val.as_object(), name) {
-                        errors.push(ValidationError::new(
-                            format!("spec.environments.{env_name}.env.{name}"),
-                            format!(
-                                "{name} is reserved for the connection injected by needs.{need}; remove it from spec.environments.{env_name}.env"
-                            ),
-                        ));
+        let suffixes = need_suffixes(need);
+        for base_name in *reserved_names {
+            for suffix in &suffixes {
+                let reserved = match suffix {
+                    Some(s) => format!("{base_name}{s}"),
+                    None => base_name.to_string(),
+                };
+                if env_has_key(base, &reserved) {
+                    errors.push(ValidationError::new(
+                        format!("spec.base.env.{reserved}"),
+                        format!(
+                            "{reserved} is reserved for the connection injected by needs.{need}; remove it from spec.base.env"
+                        ),
+                    ));
+                }
+                if let Some(envs_obj) = envs {
+                    for (env_name, val) in envs_obj {
+                        if env_has_key(val.as_object(), &reserved) {
+                            errors.push(ValidationError::new(
+                                format!("spec.environments.{env_name}.env.{reserved}"),
+                                format!(
+                                    "{reserved} is reserved for the connection injected by needs.{need}; remove it from spec.environments.{env_name}.env"
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -670,6 +812,200 @@ mod tests {
         assert!(fields.contains(&"spec.base.env.DATABASE_URL"));
         assert!(fields.contains(&"spec.base.env.REDIS_URL"));
         assert_eq!(errors.len(), 2);
+    }
+
+    // ---- 2.6b-2: (type, name) uniqueness + foldability + reserved-env suffix ----
+
+    #[test]
+    fn accepts_named_pg_array_with_distinct_names() {
+        // An array of named pg entries with distinct, env-foldable names
+        // is valid (each yields a distinct DATABASE_URL_<NAME>).
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "primary" }, { "name": "analytics" }] }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn accepts_one_unnamed_default_plus_named_siblings() {
+        // At most one unnamed default per type is allowed; an unnamed
+        // default coexisting with named siblings is valid.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{}, { "name": "analytics" }] }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_name_within_a_type() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "a" }, { "name": "a" }] }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.pg");
+        assert!(errors[0].message.contains("duplicate"));
+    }
+
+    #[test]
+    fn rejects_more_than_one_unnamed_entry_in_one_type() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{}, {}] }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.pg");
+        assert!(errors[0].message.contains("unnamed"));
+    }
+
+    #[test]
+    fn rejects_non_foldable_name_with_underscore() {
+        // `name` must be a DNS-1123 label so the fold yields a valid
+        // [A-Z_][A-Z0-9_]* env suffix; an underscore is not allowed.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "read_replica" }] }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.pg");
+        assert!(errors[0].message.contains("DNS-1123"));
+    }
+
+    #[test]
+    fn rejects_non_foldable_name_uppercase() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "Analytics" }] }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.pg");
+        assert!(errors[0].message.contains("DNS-1123"));
+    }
+
+    #[test]
+    fn rejects_literal_env_colliding_with_named_pg_reserved_suffix() {
+        // A named pg claim `analytics` reserves DATABASE_URL_ANALYTICS;
+        // a literal env of that name collides and is rejected.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "analytics" }] },
+                "env": { "DATABASE_URL_ANALYTICS": "postgres://override" }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL_ANALYTICS");
+    }
+
+    #[test]
+    fn rejects_literal_env_colliding_with_named_redis_reserved_suffix() {
+        // redis injects two vars; a named claim reserves BOTH suffixed
+        // names (REDIS_URL_CACHE, REDIS_CHANNEL_PREFIX_CACHE).
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "redis": [{ "name": "cache" }] },
+                "env": {
+                    "REDIS_URL_CACHE": "redis://x",
+                    "REDIS_CHANNEL_PREFIX_CACHE": "p:"
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert!(fields.contains(&"spec.base.env.REDIS_URL_CACHE"));
+        assert!(fields.contains(&"spec.base.env.REDIS_CHANNEL_PREFIX_CACHE"));
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn named_reserved_suffix_collision_is_cross_scope() {
+        // A pg claim named `analytics` declared in an environment
+        // reserves DATABASE_URL_ANALYTICS everywhere, including base.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "DATABASE_URL_ANALYTICS": "postgres://override" }
+            },
+            "environments": {
+                "prod": { "needs": { "pg": [{ "name": "analytics" }] } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL_ANALYTICS");
+    }
+
+    #[test]
+    fn unnamed_default_does_not_reserve_a_suffix() {
+        // The unnamed default reserves only the base var (DATABASE_URL),
+        // never a suffixed name; a literal DATABASE_URL_FOO is free when
+        // no claim is named `foo`.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "DATABASE_URL_FOO": "postgres://my-own" }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn collects_names_across_base_and_environments_for_duplicate_check() {
+        // A name declared once in base and once in an environment for the
+        // SAME type is the SAME claim identity in different scopes and is
+        // not a duplicate within either scope's array — but two entries
+        // with the same name in a single array is a duplicate. This test
+        // pins the per-(scope,type) array duplicate semantics.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "a" }, { "name": "b" }] }
+            },
+            "environments": {
+                "prod": { "needs": { "pg": [{ "name": "a" }, { "name": "a" }] } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.environments.prod.needs.pg");
+        assert!(errors[0].message.contains("duplicate"));
+    }
+
+    #[test]
+    fn scalar_named_entry_validates_its_name() {
+        // The scalar form may also carry a name; a non-foldable scalar
+        // name is rejected just like an array entry.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": { "name": "BAD_NAME" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.pg");
+        assert!(errors[0].message.contains("DNS-1123"));
     }
 
     // ---- 2.4h-b: imagePolicy is a CRD-enforced pass-through ----
