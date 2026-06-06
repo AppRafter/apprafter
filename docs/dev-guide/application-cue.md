@@ -84,6 +84,62 @@ cross-field rule (image must be reachable through `spec.base.image`
 or every `spec.environments[*].image`). The CRD OpenAPI schema
 rejects negative replicas and out-of-range port numbers.
 
+### Declaring dependencies — the `needs` block
+
+`spec.base.needs` declares the backing services and storage your
+workload requires. The operator provisions each on demand (a
+`ResourceClaim` per entry), pauses the Application until they are
+ready, and injects the connection details into your container.
+
+```cue
+spec: base: {
+    image:    "ghcr.io/my-org/api:1.0.0"
+    replicas: 1
+    needs: {
+        pg:    { selector: { tier: "integrated" }, size: "small" }
+        redis: { selector: { tier: "integrated" } }
+        disk:  { size: "1Gi", mountPath: "/data" }
+    }
+}
+```
+
+| Need | What you get | Injected as |
+| ---- | ------------ | ----------- |
+| `pg` | A Postgres database + role (CloudNativePG). | `DATABASE_URL` env-var (from a Secret). |
+| `redis` | An isolated Redis-compatible logical DB (Dragonfly). | `REDIS_URL` + `REDIS_CHANNEL_PREFIX` env-vars. |
+| `disk` | A persistent `ReadWriteOnce` volume. | Mounted at `mountPath` (pins `replicas: 1`, `strategy: Recreate`). |
+
+**Named, multiple dependencies.** Each key accepts a single entry
+(above) **or an array of named entries**. A named entry provisions
+its own claim and — for service needs — disambiguates the injected
+env-var with an `UPPER_SNAKE` suffix:
+
+```cue
+needs: {
+    pg: [
+        { name: "primary",   selector: { tier: "integrated" } },
+        { name: "analytics", selector: { tier: "integrated" } },
+    ]
+    disk: [
+        { name: "uploads", size: "5Gi", mountPath: "/var/uploads" },
+        { name: "cache",   size: "1Gi", mountPath: "/var/cache" },
+    ]
+}
+```
+
+Here the two databases inject `DATABASE_URL_PRIMARY` and
+`DATABASE_URL_ANALYTICS` (an unnamed single `pg` stays plain
+`DATABASE_URL`). Each disk mounts at its own path. Within a type,
+every `name` (or, for an unnamed disk, the last `mountPath` segment)
+must be unique, and at most one entry per type may be unnamed.
+
+`apprafter app scaffold --needs <pg|redis|disk>` (repeatable) emits
+a starter `needs` block for you. The full operational walks —
+provisioning, isolation, retention, and GC — live in the operator
+guide: [needs.pg](../operator-guide/needs-pg-walk.md),
+[needs.redis](../operator-guide/needs-redis-walk.md),
+[needs.disk](../operator-guide/needs-disk-walk.md).
+
 ## Multi-environment patterns
 
 `spec.environments` holds per-environment overrides. The operator
@@ -220,9 +276,9 @@ unless you are also supplying a `cue.mod/module.cue` with
 
 The CUE schema uses `close()` semantics in some contexts. Check
 that you are only writing fields declared in `#ApplicationSpec`.
-Fields from future spec versions (`needs`, `autoscale`,
-`confidential`) are not yet in v1alpha1 and will produce this
-error.
+`needs` is supported (see *Declaring dependencies* above); fields
+from future spec versions (`autoscale`, `confidential`) are not yet
+in v1alpha1 and will produce this error.
 
 **`conflicting values ... (mismatched types)`**
 
