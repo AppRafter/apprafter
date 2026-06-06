@@ -15,6 +15,11 @@ name: platform-stack-check
 #      tag, FAIL the workflow. Forces the maintainer to
 #      either bump `currentVersion` (and add the matching
 #      compatibility entry) or revert the source change.
+#      EXEMPTION: a yank-only edit to compatibility.cue (adding
+#      `yanked:`/`yankedReason:` to an already-published entry,
+#      no other field, no new entry) is allowed WITHOUT a bump —
+#      we mark a release broken the moment we find it, even when
+#      the fix isn't ready yet; the yank rides the next publish.
 #
 # The publish workflow (`platform-stack-publish.yml`) runs on
 # push to master with the same path filter; its `should_publish`
@@ -186,6 +191,29 @@ jobs:
               'platform-stack/Chart.yaml.tmpl'; then
             echo "::notice::No drift vs ${TAG} — chart content unchanged."
             exit 0
+          fi
+          # Exemption: a YANK-ONLY change to compatibility.cue — recording that
+          # an already-published version is broken — does NOT require a
+          # currentVersion bump. The yank is metadata that publishes with the
+          # NEXT release (a fix is not always ready the moment we find a break),
+          # and the publish workflow's should_publish gate keeps the unbumped
+          # currentVersion a no-op until then. It qualifies iff the ONLY
+          # chart-source file changed is compatibility.cue AND every added/
+          # removed line in that diff is a `yanked:` / `yankedReason:` field or
+          # a comment/blank — i.e. no new/removed entry and no other field
+          # touched (a functional change still needs a bump).
+          changed=$(git diff --name-only "${TAG}" HEAD -- \
+            'platform-stack/cue/*.cue' 'platform-stack/Chart.yaml.tmpl')
+          if [ "$changed" = "platform-stack/cue/compatibility.cue" ]; then
+            non_yank=$(git diff "${TAG}" HEAD -- 'platform-stack/cue/compatibility.cue' \
+              | grep -E '^[+-]' \
+              | grep -vE '^(\+\+\+|---)' \
+              | grep -vE '^[+-][[:space:]]*(yanked:|yankedReason:|//)' \
+              | grep -vE '^[+-][[:space:]]*$' || true)
+            if [ -z "$non_yank" ]; then
+              echo "::notice::Yank-only change to compatibility.cue vs ${TAG} — recording a broken-version yank; it publishes with the next version bump. No currentVersion bump required."
+              exit 0
+            fi
           fi
           echo "::error::Chart source under platform-stack/cue/ or Chart.yaml.tmpl changed since ${TAG} was published, but currentVersion is still ${VERSION}."
           echo "::error::Either bump currentVersion in platform-stack/cue/platform.cue (and add the matching compatibility.cue entry), or revert the source changes."

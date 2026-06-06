@@ -1741,6 +1741,8 @@ compatibility: "0.2.20": {
 compatibility: "0.2.19": {
 	change:          "safe"
 	operatorVersion: "v0.2.19"
+	yanked:          true
+	yankedReason:    "Dragonfly CR omitted spec.replicas → 0-replica StatefulSet → no instance pod → needs.redis never provisions (the dragonfly-operator wires replicas with no default). Found on the first live needs-redis walk; fixed in v0.2.20."
 	notes: """
 		Phase 2.6 (needs.redis → Dragonfly, ADR 0042) close — the
 		coordinated operator + chart release. The provisioner gains a
