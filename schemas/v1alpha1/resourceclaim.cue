@@ -40,6 +40,11 @@ package v1alpha1
 		// for non-pooled backends (e.g. CNPG).
 		instance?: string
 		dbnum?:    int & >=0 & <1024
+		// Disk allocation (2.6b): the standalone RWO PVC name created by
+		// the `Backend::Disk` provisioner. The renderer mounts this PVC
+		// into the workload. Absent for non-disk backends (parallel to
+		// connectionSecretRef).
+		volumeClaimRef?: string
 	}
 }
 

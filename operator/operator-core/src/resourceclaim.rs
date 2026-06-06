@@ -61,6 +61,15 @@ pub struct ResourceClaimStatus {
     /// this claim on `instance` (0..1023). None for non-pooled backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dbnum: Option<u16>,
+    /// Disk allocation (2.6b): the standalone RWO PVC name created by the
+    /// `Backend::Disk` provisioner. The renderer mounts this PVC into the
+    /// workload. None for non-disk backends (parallel to `connectionSecretRef`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "volumeClaimRef"
+    )]
+    pub volume_claim_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -133,6 +142,29 @@ mod tests {
         .unwrap();
         assert_eq!(st.instance.as_deref(), Some("platform-redis-ephemeral-000"));
         assert_eq!(st.dbnum, Some(7));
+    }
+
+    #[test]
+    fn status_volume_claim_ref_round_trips() {
+        let st: ResourceClaimStatus = serde_json::from_value(json!({
+            "volumeClaimRef": "claim-demo-app-disk-data",
+            "ready": true
+        }))
+        .unwrap();
+        assert_eq!(
+            st.volume_claim_ref.as_deref(),
+            Some("claim-demo-app-disk-data")
+        );
+        let v = serde_json::to_value(&st).unwrap();
+        assert_eq!(
+            v.get("volumeClaimRef"),
+            Some(&json!("claim-demo-app-disk-data"))
+        );
+        // Absent → omitted (skip_serializing_if).
+        let empty: ResourceClaimStatus = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.volume_claim_ref.is_none());
+        let ev = serde_json::to_value(&empty).unwrap();
+        assert!(ev.get("volumeClaimRef").is_none());
     }
 
     #[test]
