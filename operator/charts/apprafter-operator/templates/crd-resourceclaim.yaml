@@ -54,8 +54,12 @@ spec:
                     type: string
                   minProperties: 1
                 size:
+                  # `size` is per-type — the admission webhook validates it:
+                  # a t-shirt size (nano|small|medium|large|xlarge) for
+                  # service claims (pg/redis/…), a Kubernetes quantity
+                  # (e.g. 10Gi) for the `disk` claim (2.6b / ADR 0043).
+                  # No CRD enum: it cannot express the per-type split.
                   type: string
-                  enum: [nano, small, medium, large, xlarge]
                 persistent:
                   type: boolean
             status:

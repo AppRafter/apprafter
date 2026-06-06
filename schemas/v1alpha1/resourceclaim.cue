@@ -24,7 +24,12 @@ package v1alpha1
 		// the unnamed default claim.
 		name?: string
 		selector: [string]: string
-		size?: #Size
+		// `size` is per-type — the admission webhook is the gate: a t-shirt
+		// `#Size` for service claims (pg/redis/…), a Kubernetes quantity
+		// (e.g. 10Gi) for the `disk` claim (2.6b / ADR 0043). CUE/CRD stay
+		// a plain string because they cannot express the per-type split;
+		// `#Size` itself (types.cue) is unchanged for its other uses.
+		size?: string
 		// Persist the provisioned resource across the claim's deletion
 		// (default false). Copied from the originating
 		// `needs.<type>.persistent` by the Application controller (2.4d);

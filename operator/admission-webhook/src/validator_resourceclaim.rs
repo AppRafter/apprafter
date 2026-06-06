@@ -12,7 +12,9 @@
 //!      claims, possibly under a different identity.
 //!   2. **Field validation** (always, regardless of identity / op):
 //!      `type` in the closed built-in set, `selector` a non-empty map,
-//!      `size` (if present) in the closed `#Size` set.
+//!      `size` (if present) per-type — a t-shirt `#Size` for service
+//!      claims, a Kubernetes quantity for the `disk` claim (2.6b /
+//!      ADR 0043).
 //!
 //! Unlike the other validators it needs `request.userInfo` +
 //! `request.operation`, which `server.rs` threads in only for this kind.
@@ -104,8 +106,22 @@ pub fn validate_resourceclaim(
         )),
     }
 
+    // `spec.size` is a per-type field (2.6b / ADR 0043): a t-shirt hint
+    // for service claims (pg/redis/…) but a Kubernetes quantity (the
+    // storage capacity) for the `disk` claim. The CRD dropped its t-shirt
+    // enum; the webhook is the per-type gate. The "must be a string" guard
+    // is shared by both branches.
     if let Some(size) = spec.get("size") {
+        let claim_type = spec.get("type").and_then(Value::as_str);
         match size.as_str() {
+            Some(s) if claim_type == Some("disk") => {
+                if !is_k8s_quantity(s) {
+                    errors.push(ValidationError::new(
+                        "spec.size",
+                        format!("disk size must be a Kubernetes quantity (e.g. 10Gi); got {s:?}"),
+                    ));
+                }
+            }
             Some(s) if SIZES.contains(&s) => {}
             Some(s) => errors.push(ValidationError::new(
                 "spec.size",
@@ -113,12 +129,58 @@ pub fn validate_resourceclaim(
             )),
             None => errors.push(ValidationError::new(
                 "spec.size",
-                format!("size must be a string, one of {}", SIZES.join("|")),
+                "size must be a string (a t-shirt size for service claims, a \
+                 Kubernetes quantity for disk)",
             )),
         }
     }
 
     errors
+}
+
+/// 2.6b (ADR 0043): a Kubernetes resource quantity for the disk `size`.
+/// A decimal magnitude with an optional binary (Ei…Ki) or decimal
+/// (E…k, with lower-case `k`) SI suffix.
+/// KEEP IN SYNC with `validator.rs::is_k8s_quantity` (the disk-needs
+/// guard on the Application object uses the same grammar).
+fn is_k8s_quantity(s: &str) -> bool {
+    let suffix_ok = |suffix: &str| -> bool {
+        matches!(
+            suffix,
+            "" | "Ei" | "Pi" | "Ti" | "Gi" | "Mi" | "Ki" | "E" | "P" | "T" | "G" | "M" | "k"
+        )
+    };
+    // Split the leading numeric magnitude (digits, optionally one '.'
+    // followed by digits) from the trailing suffix.
+    let mut chars = s.char_indices().peekable();
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    let mut split = s.len();
+    while let Some(&(i, ch)) = chars.peek() {
+        match ch {
+            '0'..='9' => {
+                seen_digit = true;
+                chars.next();
+            }
+            '.' if !seen_dot => {
+                seen_dot = true;
+                chars.next();
+            }
+            _ => {
+                split = i;
+                break;
+            }
+        }
+    }
+    if !seen_digit {
+        return false;
+    }
+    let (magnitude, suffix) = s.split_at(split);
+    // A trailing '.' with no fractional digits is malformed.
+    if magnitude.ends_with('.') {
+        return false;
+    }
+    suffix_ok(suffix)
 }
 
 fn is_operator_or_admin(user_info: &Value) -> bool {
@@ -222,6 +284,53 @@ mod tests {
         assert!(errors.iter().any(|e| e.field == "spec.size"));
     }
 
+    // 2.6b (ADR 0043): `spec.size` is a per-type field — a t-shirt hint
+    // for service claims (pg/redis/…) but a Kubernetes quantity for the
+    // `disk` claim (the disk's storage capacity). The CRD enum is gone;
+    // the webhook is the per-type gate.
+
+    #[test]
+    fn accepts_disk_quantity_size() {
+        // A disk claim carries a quantity (e.g. "1Gi") as its size.
+        let mut c = claim();
+        c["spec"]["type"] = json!("disk");
+        c["spec"]["size"] = json!("1Gi");
+        assert!(
+            validate_resourceclaim(&c, &operator_user(), "CREATE").is_empty(),
+            "disk claim with a quantity size should be accepted"
+        );
+    }
+
+    #[test]
+    fn rejects_disk_tshirt_size() {
+        // A t-shirt size is not a valid quantity for a disk claim.
+        let mut c = claim();
+        c["spec"]["type"] = json!("disk");
+        c["spec"]["size"] = json!("small");
+        let errors = validate_resourceclaim(&c, &operator_user(), "CREATE");
+        assert!(errors.iter().any(|e| e.field == "spec.size"));
+    }
+
+    #[test]
+    fn rejects_service_quantity_size() {
+        // A quantity is not a valid t-shirt size for a service claim.
+        let mut c = claim(); // type pg
+        c["spec"]["size"] = json!("1Gi");
+        let errors = validate_resourceclaim(&c, &operator_user(), "CREATE");
+        assert!(errors.iter().any(|e| e.field == "spec.size"));
+    }
+
+    #[test]
+    fn accepts_service_tshirt_size() {
+        // The historical t-shirt path is unchanged for service claims.
+        let mut c = claim(); // type pg
+        c["spec"]["size"] = json!("small");
+        assert!(
+            validate_resourceclaim(&c, &operator_user(), "CREATE").is_empty(),
+            "pg claim with a t-shirt size should be accepted"
+        );
+    }
+
     #[test]
     fn user_create_with_bad_fields_reports_both_identity_and_field() {
         let mut c = claim();
@@ -243,6 +352,10 @@ mod tests {
         for t in BUILTIN_TYPES {
             let mut c = claim();
             c["spec"]["type"] = json!(t);
+            // `size` is per-type: a quantity for disk, a t-shirt otherwise.
+            if t == "disk" {
+                c["spec"]["size"] = json!("1Gi");
+            }
             assert!(
                 validate_resourceclaim(&c, &operator_user(), "CREATE").is_empty(),
                 "builtin type {t} should be accepted"
@@ -254,9 +367,11 @@ mod tests {
     fn accepts_disk_type_for_operator() {
         // 2.6b (ADR 0043): the `disk` claim type is generated by the
         // Application controller for a `needs.disk` entry and must be
-        // accepted (the disk provisioner lands in 2.6b-3).
+        // accepted (the disk provisioner lands in 2.6b-3). Its `size` is
+        // a Kubernetes quantity, not a t-shirt.
         let mut c = claim();
         c["spec"]["type"] = json!("disk");
+        c["spec"]["size"] = json!("1Gi");
         assert!(
             validate_resourceclaim(&c, &operator_user(), "CREATE").is_empty(),
             "disk claim type should be accepted"
