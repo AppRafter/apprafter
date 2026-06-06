@@ -142,10 +142,12 @@ pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
         "-copy".into(),
         "+info".into(),
         "+sort_ro".into(),
-        "+client|setname".into(),
-        "+client|setinfo".into(),
-        "+client|getname".into(),
-        "+client|id".into(),
+        // No per-subcommand `+client|setname` grants: Dragonfly's ACL parser
+        // rejects the `command|subcommand` form ("Unrecognized parameter
+        // +CLIENT|SETNAME"), and they are unnecessary — `+@all -@dangerous`
+        // already leaves CLIENT SETNAME/SETINFO/GETNAME/ID available, so a
+        // client library's connection init works (verified on Dragonfly
+        // v1.37.0). EVAL and the `$N` keyspace pin are likewise retained.
     ]
 }
 
@@ -173,13 +175,24 @@ pub fn dragonfly_object(
     ns: &str,
     dbnum: u16,
     num_shards: u16,
+    replicas: u16,
     persistent: bool,
 ) -> Value {
+    // `replicas` is MANDATORY: the dragonfly-operator sets
+    // `StatefulSet.spec.replicas = &df.Spec.Replicas` with NO default, so an
+    // omitted/zero value yields a 0-replica StatefulSet (no instance pod), and
+    // the provisioner can never reach the instance to create the ACL user.
+    //
+    // No `--maxmemory_policy` arg: that is a Redis-ism Dragonfly does NOT
+    // accept (the binary exits "Unknown command line flag 'maxmemory_policy'").
+    // Dragonfly does not evict by default (`--cache_mode=false`) — which IS the
+    // noeviction behaviour queue/lock libraries need — so omitting it is the
+    // fix, not a gap.
     let mut spec = json!({
+        "replicas": replicas,
         "args": [
             format!("--dbnum={dbnum}"),
             format!("--num_shards={num_shards}"),
-            "--maxmemory_policy=noeviction",
         ],
         "authentication": {
             "passwordFromSecret": { "name": admin_secret_name(name), "key": "password" }
@@ -361,16 +374,22 @@ mod tests {
             "dragonfly-system",
             1024,
             1,
+            1,
             true,
         );
         assert_eq!(cr["apiVersion"], "dragonflydb.io/v1alpha1");
         assert_eq!(cr["kind"], "Dragonfly");
         assert_eq!(cr["metadata"]["name"], "platform-redis-persistent-000");
         assert_eq!(cr["metadata"]["namespace"], "dragonfly-system");
+        // replicas MUST be present and >= 1 — the operator does not default it,
+        // so omitting it yields a 0-replica StatefulSet (no pod).
+        assert_eq!(cr["spec"]["replicas"], 1);
         let args = cr["spec"]["args"].as_array().unwrap();
         assert!(args.iter().any(|a| a == "--dbnum=1024"));
         assert!(args.iter().any(|a| a == "--num_shards=1"));
-        assert!(args.iter().any(|a| a == "--maxmemory_policy=noeviction"));
+        // NO --maxmemory_policy: Dragonfly rejects that flag; noeviction is its
+        // default. Guard against a regression re-adding it.
+        assert!(!args.iter().any(|a| a.as_str().unwrap_or("").contains("maxmemory")));
         // The admin password Secret is referenced by name.
         assert_eq!(
             cr["spec"]["authentication"]["passwordFromSecret"]["name"],
@@ -386,6 +405,7 @@ mod tests {
             "platform-redis-ephemeral-000",
             "dragonfly-system",
             1024,
+            1,
             1,
             false,
         );
@@ -607,6 +627,12 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "-copy"),
             "COPY escapes the $N pin — must be denied"
+        );
+        // Dragonfly's ACL parser rejects the `command|subcommand` form, so no
+        // `+client|setname`-style tokens may be emitted (regression guard).
+        assert!(
+            !args.iter().any(|a| a.contains('|')),
+            "Dragonfly ACL rejects command|subcommand grants"
         );
     }
 

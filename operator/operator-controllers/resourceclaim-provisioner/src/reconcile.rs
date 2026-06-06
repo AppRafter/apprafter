@@ -393,6 +393,14 @@ async fn provision_dragonfly(
         .pointer("/numShards")
         .and_then(Value::as_u64)
         .unwrap_or(1) as u16;
+    // Instance replica count. MUST be >= 1 — the dragonfly-operator does not
+    // default it, so 0 means no instance pod (see dragonfly_object). Tier-1 =
+    // single instance; HA tiers raise it via the provider config `replicas`.
+    let replicas = cfg
+        .pointer("/replicas")
+        .and_then(Value::as_u64)
+        .filter(|n| *n >= 1)
+        .unwrap_or(1) as u16;
 
     // Persistence class is carried on the claim (the Application controller
     // copies `needs.<type>.persistent` onto the generated claim spec, 2.4d).
@@ -427,7 +435,8 @@ async fn provision_dragonfly(
 
     let df_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
-    let df_body = dragonfly::dragonfly_object(&instance, &df_ns, dbnum_max, num_shards, persistent);
+    let df_body =
+        dragonfly::dragonfly_object(&instance, &df_ns, dbnum_max, num_shards, replicas, persistent);
     df_api
         .patch(&instance, &apply_params(), &Patch::Apply(&df_body))
         .await?;
