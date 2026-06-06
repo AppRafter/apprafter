@@ -230,7 +230,10 @@ fn is_operator_or_admin(user_info: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|groups| {
             groups.iter().any(|g| {
-                matches!(g.as_str(), Some("system:masters" | "kubeadm:cluster-admins"))
+                matches!(
+                    g.as_str(),
+                    Some("system:masters" | "kubeadm:cluster-admins")
+                )
             })
         });
     is_operator || is_admin

@@ -435,8 +435,9 @@ async fn provision_dragonfly(
 
     let df_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
-    let df_body =
-        dragonfly::dragonfly_object(&instance, &df_ns, dbnum_max, num_shards, replicas, persistent);
+    let df_body = dragonfly::dragonfly_object(
+        &instance, &df_ns, dbnum_max, num_shards, replicas, persistent,
+    );
     df_api
         .patch(&instance, &apply_params(), &Patch::Apply(&df_body))
         .await?;

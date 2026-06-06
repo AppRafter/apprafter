@@ -389,7 +389,9 @@ mod tests {
         assert!(args.iter().any(|a| a == "--num_shards=1"));
         // NO --maxmemory_policy: Dragonfly rejects that flag; noeviction is its
         // default. Guard against a regression re-adding it.
-        assert!(!args.iter().any(|a| a.as_str().unwrap_or("").contains("maxmemory")));
+        assert!(!args
+            .iter()
+            .any(|a| a.as_str().unwrap_or("").contains("maxmemory")));
         // The admin password Secret is referenced by name.
         assert_eq!(
             cr["spec"]["authentication"]["passwordFromSecret"]["name"],
