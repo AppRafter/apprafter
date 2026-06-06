@@ -123,6 +123,7 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
 
     validate_needs_names(base, envs, &mut errors);
     validate_reserved_env_collision(base, envs, &mut errors);
+    validate_disk_claims(base, envs, &mut errors);
 
     errors
 }
@@ -167,6 +168,13 @@ fn validate_needs_names(
             return;
         };
         for (service_type, value) in needs {
+            // `disk` is not a connection-secret/env-injected service — its
+            // `(name, mountPath)` identity + DNS-1123/uniqueness rules are
+            // validated by `validate_disk_claims` (which also derives a name
+            // from `mountPath`). Skip it here to avoid double-reporting.
+            if service_type == "disk" {
+                continue;
+            }
             let entries = needs_entry_names(value);
             let mut seen: Vec<&str> = Vec::new();
             let mut unnamed = 0usize;
@@ -213,6 +221,253 @@ fn validate_needs_names(
                 val.as_object(),
                 errors,
             );
+        }
+    }
+}
+
+/// 2.6b (ADR 0043): the `needs.disk` value, scalar or array, as a list
+/// of disk-entry objects in declaration order. Non-object array elements
+/// and a non-object/non-array value yield no entries (their shape is
+/// rejected by the CRD layer / the closed `#DiskClaim` schema).
+fn disk_entries(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
+    match value {
+        Value::Array(items) => items.iter().filter_map(|v| v.as_object()).collect(),
+        Value::Object(o) => vec![o],
+        _ => Vec::new(),
+    }
+}
+
+/// 2.6b (ADR 0043): derive a disk claim's name — the explicit `name`,
+/// else the last path segment of `mountPath` (`/var/lib/uploads` →
+/// `uploads`, `/data` → `data`). Returns `None` when neither yields a
+/// non-empty segment (a malformed/relative mountPath; the absolute-path
+/// guard reports that separately).
+fn disk_name(entry: &serde_json::Map<String, Value>) -> Option<String> {
+    if let Some(n) = entry
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|n| !n.is_empty())
+    {
+        return Some(n.to_string());
+    }
+    entry
+        .get("mountPath")
+        .and_then(|v| v.as_str())
+        .and_then(|p| p.rsplit('/').find(|seg| !seg.is_empty()))
+        .map(|seg| seg.to_string())
+}
+
+/// 2.6b (ADR 0043): a Kubernetes resource quantity for the disk `size`.
+/// A decimal magnitude with an optional binary (Ei…Ki) or decimal
+/// (E…k, with lower-case `k`) SI suffix — sufficient for the disk size
+/// surface (no exponent / signed forms, which `#DiskClaim.size` never
+/// needs). KEEP IN SYNC with the design's quantity grammar.
+fn is_k8s_quantity(s: &str) -> bool {
+    let suffix_ok = |suffix: &str| -> bool {
+        matches!(
+            suffix,
+            "" | "Ei" | "Pi" | "Ti" | "Gi" | "Mi" | "Ki" | "E" | "P" | "T" | "G" | "M" | "k"
+        )
+    };
+    // Split the leading numeric magnitude (digits, optionally one '.'
+    // followed by digits) from the trailing suffix.
+    let mut chars = s.char_indices().peekable();
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    let mut split = s.len();
+    while let Some(&(i, ch)) = chars.peek() {
+        match ch {
+            '0'..='9' => {
+                seen_digit = true;
+                chars.next();
+            }
+            '.' if !seen_dot => {
+                seen_dot = true;
+                chars.next();
+            }
+            _ => {
+                split = i;
+                break;
+            }
+        }
+    }
+    if !seen_digit {
+        return false;
+    }
+    let (magnitude, suffix) = s.split_at(split);
+    // A trailing '.' with no fractional digits is malformed.
+    if magnitude.ends_with('.') {
+        return false;
+    }
+    suffix_ok(suffix)
+}
+
+/// 2.6b-4 (ADR 0043): one `needs.disk`-bearing scope to validate —
+/// `(field-path prefix, the scope object, effective replicas)`. The
+/// prefix is `spec.base` or `spec.environments.<name>`; the effective
+/// replicas is the env-scoped override else the inherited base value.
+type DiskScope<'a> = (
+    String,
+    Option<&'a serde_json::Map<String, Value>>,
+    Option<i64>,
+);
+
+/// 2.6b-4 (ADR 0043): disk-specific value guards, collected across
+/// `spec.base.needs.disk` AND every `spec.environments.*.needs.disk`.
+/// For each disk entry: the derived/explicit `name` must be a DNS-1123
+/// label (it becomes part of the PVC name) and unique within disk;
+/// `mountPath` must be absolute AND unique app-wide; `size` must parse as
+/// a Kubernetes quantity; `class` must be `local` (replicated/shared are
+/// T2-deferred). Separately, a non-empty `needs.disk` in a scope whose
+/// EFFECTIVE replicas (env override else base) is > 1 is rejected — a
+/// standalone RWO PVC supports only a single-replica Deployment at launch
+/// (per-replica multi-replica is T2). Multi-error: one message per
+/// offending field, no short-circuit (matching the validator contract).
+fn validate_disk_claims(
+    base: Option<&serde_json::Map<String, Value>>,
+    envs: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let base_replicas = base
+        .and_then(|b| b.get("replicas"))
+        .and_then(|v| v.as_i64());
+
+    // mountPath uniqueness is app-wide (across base + every environment):
+    // collect every seen mountPath, reporting on the second+ occurrence.
+    let mut seen_mount_paths: Vec<String> = Vec::new();
+
+    // Each scope: (field-path prefix, the scope object, effective replicas).
+    let mut scopes: Vec<DiskScope> = vec![("spec.base".to_string(), base, base_replicas)];
+    if let Some(envs_obj) = envs {
+        for (env_name, val) in envs_obj {
+            let env_obj = val.as_object();
+            // Env-override replaces base replicas; else inherit base.
+            let effective = env_obj
+                .and_then(|o| o.get("replicas"))
+                .and_then(|v| v.as_i64())
+                .or(base_replicas);
+            scopes.push((format!("spec.environments.{env_name}"), env_obj, effective));
+        }
+    }
+
+    for (prefix, scope, effective_replicas) in scopes {
+        let Some(value) = scope
+            .and_then(|o| o.get("needs"))
+            .and_then(|v| v.as_object())
+            .and_then(|n| n.get("disk"))
+        else {
+            continue;
+        };
+        let entries = disk_entries(value);
+        if entries.is_empty() {
+            continue;
+        }
+        let needs_disk_field = format!("{prefix}.needs.disk");
+
+        // Names unique within this scope's disk value.
+        let mut seen_names: Vec<String> = Vec::new();
+
+        for entry in &entries {
+            // ---- name (explicit or mountPath-derived) ----
+            match disk_name(entry) {
+                Some(name) => {
+                    if !is_dns_1123_label(&name) {
+                        errors.push(ValidationError::new(
+                            &needs_disk_field,
+                            format!(
+                                "needs.disk entry name {name:?} must be a DNS-1123 label (lowercase alphanumeric + '-', start and end alphanumeric) — it becomes part of the PVC name"
+                            ),
+                        ));
+                    } else if seen_names.contains(&name) {
+                        errors.push(ValidationError::new(
+                            &needs_disk_field,
+                            format!(
+                                "needs.disk has a duplicate entry name {name:?}; names must be unique within disk (set an explicit `name` to disambiguate)"
+                            ),
+                        ));
+                    } else {
+                        seen_names.push(name);
+                    }
+                }
+                None => {
+                    // No explicit name and no usable mountPath segment.
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        "needs.disk entry has no `name` and no usable `mountPath` to derive one from",
+                    ));
+                }
+            }
+
+            // ---- mountPath: absolute + app-wide unique ----
+            match entry.get("mountPath").and_then(|v| v.as_str()) {
+                Some(mp) if mp.starts_with('/') => {
+                    if seen_mount_paths.iter().any(|p| p == mp) {
+                        errors.push(ValidationError::new(
+                            &needs_disk_field,
+                            format!(
+                                "needs.disk mountPath {mp:?} is declared more than once; each disk mountPath must be unique within the app"
+                            ),
+                        ));
+                    } else {
+                        seen_mount_paths.push(mp.to_string());
+                    }
+                }
+                Some(mp) => {
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        format!(
+                            "needs.disk mountPath {mp:?} must be an absolute path (start with '/')"
+                        ),
+                    ));
+                }
+                None => {
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        "needs.disk entry is missing the required `mountPath`",
+                    ));
+                }
+            }
+
+            // ---- size: a Kubernetes quantity ----
+            match entry.get("size").and_then(|v| v.as_str()) {
+                Some(size) if is_k8s_quantity(size) => {}
+                Some(size) => {
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        format!(
+                            "needs.disk size {size:?} must be a Kubernetes quantity (e.g. \"10Gi\", \"500Mi\", \"1G\")"
+                        ),
+                    ));
+                }
+                None => {
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        "needs.disk entry is missing the required `size`",
+                    ));
+                }
+            }
+
+            // ---- class: local only at launch ----
+            if let Some(class) = entry.get("class").and_then(|v| v.as_str()) {
+                if class != "local" {
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        format!(
+                            "needs.disk class {class:?} is not supported; only `local` is available at launch (replicated/shared classes are T2, deferred)"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // ---- replicas: a disk needs a single-replica Deployment ----
+        if let Some(replicas) = effective_replicas {
+            if replicas > 1 {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.replicas"),
+                    "persistent disks currently support single-replica apps; use replicas: 1 (per-replica disks for multi-replica apps are T2)",
+                ));
+            }
         }
     }
 }
@@ -1006,6 +1261,323 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].field, "spec.base.needs.pg");
         assert!(errors[0].message.contains("DNS-1123"));
+    }
+
+    // ---- 2.6b-4: disk value guards (name/mountPath/size/class/replicas) ----
+
+    #[test]
+    fn accepts_valid_single_replica_local_disk() {
+        // The happy path: a single-replica app with a well-formed
+        // `needs.disk` (valid quantity, absolute mountPath, class local,
+        // mountPath-derived name) is accepted.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 1,
+                "needs": { "disk": { "size": "1Gi", "mountPath": "/var/lib/uploads" } }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn accepts_disk_with_explicit_name_and_array_form() {
+        // An array of two disks with distinct explicit names and distinct
+        // absolute mountPaths is valid.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": {
+                    "disk": [
+                        { "name": "data", "size": "1Gi", "mountPath": "/data" },
+                        { "name": "cache", "size": "500Mi", "mountPath": "/cache" }
+                    ]
+                }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn rejects_duplicate_disk_mount_path() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": {
+                    "disk": [
+                        { "name": "a", "size": "1Gi", "mountPath": "/data" },
+                        { "name": "b", "size": "1Gi", "mountPath": "/data" }
+                    ]
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.disk");
+        assert!(errors[0].message.contains("mountPath"));
+        assert!(errors[0].message.contains("/data"));
+    }
+
+    #[test]
+    fn rejects_duplicate_derived_disk_name() {
+        // Two disks whose derived names collide (same last mountPath
+        // segment) are rejected — the name becomes part of the PVC name.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": {
+                    "disk": [
+                        { "size": "1Gi", "mountPath": "/var/lib/data" },
+                        { "size": "1Gi", "mountPath": "/srv/data" }
+                    ]
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        // mountPaths are distinct, but both derive name "data".
+        let name_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("duplicate") && e.message.contains("name"))
+            .collect();
+        assert_eq!(name_errs.len(), 1);
+        assert_eq!(name_errs[0].field, "spec.base.needs.disk");
+        assert!(name_errs[0].message.contains("data"));
+    }
+
+    #[test]
+    fn rejects_disk_name_not_dns_1123() {
+        // An explicit disk name that is not a DNS-1123 label is rejected
+        // (it becomes part of the PVC name).
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "name": "Bad_Name", "size": "1Gi", "mountPath": "/data" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.disk");
+        assert!(errors[0].message.contains("DNS-1123"));
+    }
+
+    #[test]
+    fn rejects_disk_derived_name_not_dns_1123() {
+        // The mountPath-derived name must also be a valid DNS-1123 label;
+        // a last segment that is not (uppercase) is rejected.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "size": "1Gi", "mountPath": "/var/Uploads" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.disk");
+        assert!(errors[0].message.contains("DNS-1123"));
+    }
+
+    #[test]
+    fn rejects_relative_disk_mount_path() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "data" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.disk");
+        assert!(errors[0].message.contains("absolute"));
+    }
+
+    #[test]
+    fn rejects_disk_size_not_a_quantity() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "name": "data", "size": "notaquantity", "mountPath": "/data" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.disk");
+        assert!(errors[0].message.contains("quantity"));
+    }
+
+    #[test]
+    fn accepts_disk_decimal_and_plain_quantities() {
+        // `1.5Gi`, a plain `1000000`, and lower-k `512k` are valid
+        // Kubernetes quantities.
+        for size in ["1.5Gi", "1000000", "512k", "10G", "256Mi"] {
+            let spec = json!({
+                "base": {
+                    "image": "ghcr.io/acme/web:1.0",
+                    "needs": { "disk": { "name": "data", "size": size, "mountPath": "/data" } }
+                }
+            });
+            assert!(
+                validate_application_spec(&spec).is_empty(),
+                "size {size:?} should be a valid quantity"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_disk_class_replicated_with_t2_hint() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data", "class": "replicated" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.needs.disk");
+        assert!(errors[0].message.contains("local"));
+        assert!(errors[0].message.contains("T2"));
+    }
+
+    #[test]
+    fn accepts_disk_class_local_explicit() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data", "class": "local" } }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn rejects_disk_with_base_replicas_greater_than_one() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 2,
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let replica_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("single-replica"))
+            .collect();
+        assert_eq!(replica_errs.len(), 1);
+        assert_eq!(replica_errs[0].field, "spec.base.replicas");
+        assert!(replica_errs[0].message.contains("replicas: 1"));
+        assert!(replica_errs[0].message.contains("T2"));
+    }
+
+    #[test]
+    fn rejects_disk_with_env_override_replicas_greater_than_one() {
+        // A per-environment replicas override > 1 with disk present in
+        // that environment is rejected against the effective replicas.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 1
+            },
+            "environments": {
+                "prod": {
+                    "replicas": 3,
+                    "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let replica_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("single-replica"))
+            .collect();
+        assert_eq!(replica_errs.len(), 1);
+        assert_eq!(replica_errs[0].field, "spec.environments.prod.replicas");
+    }
+
+    #[test]
+    fn rejects_env_disk_against_inherited_base_replicas() {
+        // A disk declared in an environment with no env-scoped replicas
+        // override inherits the base replicas; base > 1 is rejected.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 4
+            },
+            "environments": {
+                "prod": {
+                    "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let replica_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("single-replica"))
+            .collect();
+        assert_eq!(replica_errs.len(), 1);
+        assert_eq!(replica_errs[0].field, "spec.environments.prod.replicas");
+    }
+
+    #[test]
+    fn accepts_multi_replica_app_with_no_disk() {
+        // The replicas guard fires ONLY when a disk is present; a
+        // disk-less app may have replicas > 1.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "replicas": 5
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn disk_mount_path_uniqueness_is_app_wide_across_scopes() {
+        // mountPath must be unique within the app: the same mountPath in
+        // base and in an environment collides.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "name": "data", "size": "1Gi", "mountPath": "/data" } }
+            },
+            "environments": {
+                "prod": {
+                    "needs": { "disk": { "name": "other", "size": "1Gi", "mountPath": "/data" } }
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let mp_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.message.contains("mountPath") && e.message.contains("/data"))
+            .collect();
+        assert_eq!(mp_errs.len(), 1);
+        assert!(mp_errs[0].message.contains("/data"));
+    }
+
+    #[test]
+    fn reports_every_disk_violation_no_short_circuit() {
+        // Multi-error: a bad size, a bad class, and a relative mountPath
+        // in one disk array each surface (one message per offending
+        // field). Distinct mountPaths/names so only these three fire.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": {
+                    "disk": [
+                        { "name": "a", "size": "nope", "mountPath": "/a" },
+                        { "name": "b", "size": "1Gi", "mountPath": "/b", "class": "shared" },
+                        { "name": "c", "size": "1Gi", "mountPath": "rel" }
+                    ]
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert!(errors.iter().any(|e| e.message.contains("quantity")));
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("local") && e.message.contains("T2")));
+        assert!(errors.iter().any(|e| e.message.contains("absolute")));
+        assert_eq!(errors.len(), 3);
     }
 
     // ---- 2.4h-b: imagePolicy is a CRD-enforced pass-through ----
