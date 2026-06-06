@@ -984,10 +984,13 @@ fn generate_resource_claims(
 }
 
 /// Names of claims that are NOT yet ready. A claim is ready only when
-/// `status.ready == Some(true)` AND `status.connectionSecretRef`
-/// is set — the provisioner writes both together (2.4c), so the
-/// AND closes the half-ready resume race at zero cost. Returns the
-/// unready names in the claims' iteration order.
+/// `status.ready == Some(true)` AND it carries its backend OUTPUT ref —
+/// `connectionSecretRef` for a service claim (pg/redis/…; the renderer
+/// injects its env) OR `volumeClaimRef` for a `disk` claim (2.6b /
+/// ADR 0043; the renderer mounts that PVC, there is no connection
+/// Secret). The provisioner writes `ready` + the output ref together,
+/// so the AND closes the half-ready resume race at zero cost. Returns
+/// the unready names in the claims' iteration order.
 fn unready_claim_names(claims: &[ResourceClaim]) -> Vec<String> {
     claims
         .iter()
@@ -995,7 +998,10 @@ fn unready_claim_names(claims: &[ResourceClaim]) -> Vec<String> {
             let ready = c
                 .status
                 .as_ref()
-                .map(|s| s.ready == Some(true) && s.connection_secret_ref.is_some())
+                .map(|s| {
+                    s.ready == Some(true)
+                        && (s.connection_secret_ref.is_some() || s.volume_claim_ref.is_some())
+                })
                 .unwrap_or(false);
             !ready
         })
@@ -2064,6 +2070,55 @@ mod tests {
             ready_claim("a-redis", Some(false), None),
         ];
         assert_eq!(unready_claim_names(&partial), vec!["a-redis".to_string()]);
+    }
+
+    /// Build a disk-backed ResourceClaim status (no connectionSecretRef;
+    /// its output ref is volumeClaimRef — 2.6b / ADR 0043).
+    fn disk_claim(name: &str, ready: Option<bool>, vcr: Option<&str>) -> ResourceClaim {
+        let mut c = ResourceClaim::new(
+            name,
+            ResourceClaimSpec {
+                type_: "disk".into(),
+                name: None,
+                selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
+                size: Some("1Gi".into()),
+                persistent: None,
+            },
+        );
+        c.metadata.namespace = Some("demo".into());
+        c.status = Some(ResourceClaimStatus {
+            provider: None,
+            connection_secret_ref: None,
+            volume_claim_ref: vcr.map(String::from),
+            ready,
+            conditions: None,
+            ..Default::default()
+        });
+        c
+    }
+
+    #[test]
+    fn unready_claim_names_disk_ready_via_volume_claim_ref() {
+        // A disk claim has NO connectionSecretRef — readiness is gated on
+        // volumeClaimRef instead (the renderer mounts that PVC).
+        let ready = vec![disk_claim(
+            "app-disk",
+            Some(true),
+            Some("claim-demo-app-disk"),
+        )];
+        assert!(
+            unready_claim_names(&ready).is_empty(),
+            "ready disk claim with volumeClaimRef must count as ready"
+        );
+        // ready but no volumeClaimRef (and no secret) → still unready.
+        let half = vec![disk_claim("app-disk", Some(true), None)];
+        assert_eq!(unready_claim_names(&half), vec!["app-disk".to_string()]);
+        // a disk + a pg claim, both ready via their own output refs → empty.
+        let mixed = vec![
+            disk_claim("app-disk", Some(true), Some("claim-demo-app-disk")),
+            ready_claim("app-pg", Some(true), Some("app-pg-conn")),
+        ];
+        assert!(unready_claim_names(&mixed).is_empty());
     }
 
     #[test]

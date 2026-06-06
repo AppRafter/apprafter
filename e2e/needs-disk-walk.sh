@@ -393,6 +393,20 @@ build_load_restart() { # <deployment> <operator-subdir>
 }
 build_load_restart apprafter-operator apprafter-operator
 build_load_restart admission-webhook admission-webhook
+# `rollout status` returns once the NEW webhook pod is Ready, but the OLD
+# (released) pod lingers Terminating for its grace period — and during that
+# window a branch CR apply (the Phase 2 `disk-local` ServiceProvider seed) can
+# still route to the old webhook, whose released BUILTIN_TYPES lacks `disk`
+# (spurious "spec.type must be one of pg|...|notifications (got disk)"). Wait
+# until ONLY the branch webhook serves before any branch-typed apply.
+printf '  waiting for the old (released) webhook pod to fully terminate ...\n'
+_wh_deadline=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$_wh_deadline" ]; do
+    [ "$(kubectl -n apprafter-system get pods \
+        -l app.kubernetes.io/name=admission-webhook --no-headers 2>/dev/null \
+        | wc -l)" -le 1 ] && break
+    sleep 3
+done
 printf '  apprafter-operator + admission-webhook now running the working-tree build\n'
 
 # The released platform-stack chart this cluster bootstrapped from predates
