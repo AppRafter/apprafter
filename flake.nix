@@ -41,6 +41,7 @@
             k9s
             kubernetes-helm
             k3d
+            kind # local e2e cluster on podman (rootless) — k3d needs docker
             argocd
             cilium-cli
 

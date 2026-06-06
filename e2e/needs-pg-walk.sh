@@ -110,9 +110,10 @@ for tool in cargo kubectl; do
     fi
 done
 
-# docker or podman (podman is typically aliased to docker in CI)
-if ! command -v docker >/dev/null 2>&1; then
-    printf 'ERROR: "docker" (or podman aliased as docker) not found on PATH\n' >&2
+# A container runtime: docker (→ k3d) or podman (→ kind). cluster_runtime
+# in lib.sh picks the backend; here we only assert one of them exists.
+if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
+    printf 'ERROR: neither "docker" nor "podman" found on PATH\n' >&2
     exit 2
 fi
 
@@ -292,10 +293,7 @@ phase "Phase 0: k3d_up ${CLUSTER_NAME}"
 
 k3d_up "$CLUSTER_NAME"
 
-k3d_bin="k3d"
-command -v k3d >/dev/null 2>&1 || k3d_bin="nix run nixpkgs#k3d --"
-# shellcheck disable=SC2086
-$k3d_bin kubeconfig write "$CLUSTER_NAME" --output "$KUBECONFIG_FILE"
+cluster_kubeconfig_write "$CLUSTER_NAME" "$KUBECONFIG_FILE"
 export KUBECONFIG="$KUBECONFIG_FILE"
 # The k3d cluster exists and $KUBECONFIG now points at it — cleanup may
 # safely diagnose/tear it down (and only it).

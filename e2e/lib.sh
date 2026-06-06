@@ -85,27 +85,50 @@ retry() {
 }
 
 # ---------------------------------------------------------------
+# cluster_runtime — which local-cluster tool to use.
+#   "k3d"  when a docker daemon is reachable (CI runners use docker).
+#   "kind" otherwise — the nix-dev default is rootless podman, and kind
+#          has first-class podman support (KIND_EXPERIMENTAL_PROVIDER=
+#          podman), whereas k3d's tools node bind-mounts the literal
+#          /var/run/docker.sock, which rootless podman cannot create
+#          (mkdir … permission denied). Override: APPRAFTER_E2E_RUNTIME=
+#          k3d|kind.
+# ---------------------------------------------------------------
+cluster_runtime() {
+    if [ -n "${APPRAFTER_E2E_RUNTIME:-}" ]; then
+        printf '%s' "${APPRAFTER_E2E_RUNTIME}"
+        return 0
+    fi
+    # podman (the rootless nix-dev default) → kind; a real docker daemon →
+    # k3d. Detect podman even when a `docker` shim (podman-docker) is on
+    # PATH: DOCKER_HOST points at a podman socket, or docker version/info
+    # reports podman. Only a genuine docker daemon falls through to k3d.
+    case "${DOCKER_HOST:-}" in *podman*) printf 'kind'; return 0 ;; esac
+    if docker --version 2>/dev/null | grep -qi podman; then printf 'kind'; return 0; fi
+    if docker info 2>/dev/null | grep -qi podman; then printf 'kind'; return 0; fi
+    if docker info >/dev/null 2>&1; then printf 'k3d'; else printf 'kind'; fi
+}
+
+_k3d_bin()  { if command -v k3d  >/dev/null 2>&1; then echo "k3d";  else echo "nix run nixpkgs#k3d --";  fi; }
+_kind_bin() { if command -v kind >/dev/null 2>&1; then echo "kind"; else echo "nix run nixpkgs#kind --"; fi; }
+
+# ---------------------------------------------------------------
 # k3d_up <cluster-name>
-#   Create a local k3d cluster matching the `just e2e-up` target.
-#   Traefik and servicelb are disabled because Cilium replaces them.
-#   Falls back to `nix run nixpkgs#k3d` when k3d is not on PATH.
+#   Bring up a local single-node cluster — k3d (docker) or kind (podman),
+#   per cluster_runtime. Default CNI (k3d flannel / kind kindnet) +
+#   kube-proxy, NOT Cilium: cluster-bootstrap runs with
+#   APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 (see bootstrap_with_retry) because
+#   Cilium's eBPF datapath converges pathologically slowly on a local
+#   cluster; the GitOps/claim logic the e2e exercises needs only a working
+#   CNI. Cilium itself is validated on real hardware by e2e/mvp.sh.
 # ---------------------------------------------------------------
 k3d_up() {
-    local cluster_name="$1"
-    local k3d_bin
-    if command -v k3d >/dev/null 2>&1; then
-        k3d_bin="k3d"
-    else
-        k3d_bin="nix run nixpkgs#k3d --"
-    fi
-    # Default CNI (flannel + kube-proxy), NOT Cilium. Cilium's eBPF
-    # datapath converges pathologically slowly on k3d-in-CI (~10 min,
-    # independent of single/dual-stack), so the e2e runs cluster-bootstrap
-    # with APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 (see bootstrap_with_retry):
-    # the GitOps + migration logic the e2e actually exercises needs only
-    # a working CNI, and k3d's default flannel + kube-proxy is fast and
-    # reliable. Cilium itself (kube-proxy replacement, dual-stack, L2) is
-    # validated on real hardware by the nightly Hetzner e2e/mvp.sh.
+    if [ "$(cluster_runtime)" = "kind" ]; then _kind_up "$1"; else _k3d_up "$1"; fi
+}
+
+_k3d_up() {
+    local cluster_name="$1" k3d_bin
+    k3d_bin="$(_k3d_bin)"
     # Only traefik is disabled — it would clash with the platform's
     # Gateway API on ports 80/443; flannel, kube-proxy and servicelb stay.
     # shellcheck disable=SC2086
@@ -116,6 +139,37 @@ k3d_up() {
         --k3s-arg "--disable=traefik@server:0"
     printf '  k3d cluster %s is ready. kubectl context: k3d-%s\n' \
         "$cluster_name" "$cluster_name"
+}
+
+_kind_up() {
+    local cluster_name="$1" kind_bin
+    kind_bin="$(_kind_bin)"
+    # Bare single-node cluster: kindnet CNI + kube-proxy ship by default
+    # (a working CNI — same role as k3d's flannel), the control-plane node
+    # is schedulable, and kind publishes the API server on a random host
+    # port (in the kubeconfig). Deliberately NO host port-mappings: the
+    # claim/DSN/GC walks are all in-cluster (no ingress), kind has no
+    # servicelb anyway, and binding 80/443 just risks a host-port clash for
+    # no benefit.
+    # shellcheck disable=SC2086
+    KIND_EXPERIMENTAL_PROVIDER=podman $kind_bin create cluster --name "$cluster_name"
+    printf '  kind cluster %s is ready (podman provider). kubectl context: kind-%s\n' \
+        "$cluster_name" "$cluster_name"
+}
+
+# ---------------------------------------------------------------
+# cluster_kubeconfig_write <cluster-name> <output-file>
+#   Write the cluster's kubeconfig (k3d or kind) to <output-file>.
+# ---------------------------------------------------------------
+cluster_kubeconfig_write() {
+    local cluster_name="$1" out="$2"
+    if [ "$(cluster_runtime)" = "kind" ]; then
+        # shellcheck disable=SC2086
+        KIND_EXPERIMENTAL_PROVIDER=podman $(_kind_bin) get kubeconfig --name "$cluster_name" >"$out"
+    else
+        # shellcheck disable=SC2086
+        $(_k3d_bin) kubeconfig write "$cluster_name" --output "$out"
+    fi
 }
 
 # ---------------------------------------------------------------
@@ -142,20 +196,19 @@ bootstrap_with_retry() {
 
 # ---------------------------------------------------------------
 # k3d_down <cluster-name>
-#   Delete a k3d cluster. Safe (no-op) when the cluster does not
-#   exist.
+#   Delete the local cluster (k3d or kind, per cluster_runtime).
+#   Safe (no-op) when the cluster does not exist.
 # ---------------------------------------------------------------
 k3d_down() {
     local cluster_name="$1"
-    local k3d_bin
-    if command -v k3d >/dev/null 2>&1; then
-        k3d_bin="k3d"
+    # `cluster delete` exits 0 even when the cluster is absent.
+    if [ "$(cluster_runtime)" = "kind" ]; then
+        # shellcheck disable=SC2086
+        KIND_EXPERIMENTAL_PROVIDER=podman $(_kind_bin) delete cluster --name "$cluster_name" || true
     else
-        k3d_bin="nix run nixpkgs#k3d --"
+        # shellcheck disable=SC2086
+        $(_k3d_bin) cluster delete "$cluster_name" || true
     fi
-    # `k3d cluster delete` exits 0 even when the cluster is absent.
-    # shellcheck disable=SC2086
-    $k3d_bin cluster delete "$cluster_name" || true
 }
 
 # ---------------------------------------------------------------
