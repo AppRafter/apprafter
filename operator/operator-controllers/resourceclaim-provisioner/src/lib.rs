@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use kube::api::Api;
-use kube::runtime::controller::Controller;
+use kube::runtime::controller::{Config as ControllerConfig, Controller};
 use kube::runtime::watcher;
 use kube::Client;
 use thiserror::Error;
@@ -135,7 +135,18 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
         field_manager = FIELD_MANAGER,
         "ResourceClaimProvisioner starting"
     );
+    // Serialize reconciles (concurrency = 1). The dbnum allocator does a
+    // read-allocate-write (list live claims → pick the lowest free dbnum →
+    // patch status) that is NOT atomic: with the default unbounded
+    // concurrency, two claims provisioning onto the same pool instance at the
+    // same time both list before either writes its dbnum, so both pick the
+    // same number → two tenants pinned to one logical DB (isolation breach).
+    // One in-flight reconcile at a time makes each claim's allocation visible
+    // (a fresh apiserver list) before the next claim allocates. Leader
+    // election already guarantees a single active controller, so this fully
+    // serializes allocation. Throughput is a non-issue at claim volumes.
     Controller::new(claims, watcher::Config::default())
+        .with_config(ControllerConfig::default().concurrency(1))
         .run(reconcile::reconcile, reconcile::error_policy, ctx)
         .for_each(|res| async move {
             match res {
