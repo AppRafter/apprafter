@@ -418,22 +418,29 @@ printf '  cluster-bootstrap complete\n'
 # serves the side-loaded build and Argo CD does not revert the unchanged ref),
 # side-load it, and restart the Deployment onto it.
 if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
-    phase "Phase 1b: build + load local operator (APPRAFTER_E2E_LOCAL_OPERATOR)"
-    printf '  waiting for the apprafter-operator Deployment to appear ...\n'
-    for _ in $(seq 1 60); do
-        kubectl -n apprafter-system get deploy apprafter-operator >/dev/null 2>&1 && break
-        sleep 5
-    done
-    op_img=$(kubectl -n apprafter-system get deploy apprafter-operator \
-        -o jsonpath='{.spec.template.spec.containers[0].image}')
+    phase "Phase 1b: build + load local operator + webhook (APPRAFTER_E2E_LOCAL_OPERATOR)"
     builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
-    printf '  building %s from the working tree (%s) ...\n' "$op_img" "$builder"
-    "$builder" build -f "${REPO_ROOT}/operator/apprafter-operator/Dockerfile" \
-        -t "$op_img" "${REPO_ROOT}/operator"
-    cluster_load_image "$CLUSTER_NAME" "$op_img"
-    kubectl -n apprafter-system rollout restart deploy/apprafter-operator
-    kubectl -n apprafter-system rollout status deploy/apprafter-operator --timeout=180s
-    printf '  apprafter-operator now running the working-tree build\n'
+    # Rebuild each apprafter-owned image from the working tree, tag it as the
+    # ref the Deployment already references, side-load it, and restart onto it.
+    build_load_restart() { # <deployment> <operator-subdir>
+        local dep="$1" sub="$2" img
+        printf '  waiting for the %s Deployment to appear ...\n' "$dep"
+        for _ in $(seq 1 60); do
+            kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 && break
+            sleep 5
+        done
+        img=$(kubectl -n apprafter-system get deploy "$dep" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+        printf '  building %s from the working tree (%s) ...\n' "$img" "$builder"
+        "$builder" build -f "${REPO_ROOT}/operator/${sub}/Dockerfile" \
+            -t "$img" "${REPO_ROOT}/operator"
+        cluster_load_image "$CLUSTER_NAME" "$img"
+        kubectl -n apprafter-system rollout restart "deploy/${dep}"
+        kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=180s
+    }
+    build_load_restart apprafter-operator apprafter-operator
+    build_load_restart admission-webhook admission-webhook
+    printf '  apprafter-operator + admission-webhook now running the working-tree build\n'
 fi
 
 # ===============================================================
