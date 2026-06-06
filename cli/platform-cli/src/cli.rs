@@ -641,8 +641,9 @@ pub enum AppCommand {
         /// Overwrite an existing `apprafter/Application.cue`.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Declare a workload dependency to scaffold (repeatable). Currently only `pg`
-        /// (Postgres via needs.pg). Emits a `needs:` block in the generated Application.cue.
+        /// Declare a workload dependency to scaffold (repeatable). One of `pg`
+        /// (needs.pg), `redis` (needs.redis), `disk` (needs.disk). Emits a
+        /// `needs:` block in the generated Application.cue.
         #[arg(long = "needs")]
         needs: Vec<String>,
     },

@@ -390,10 +390,12 @@ fn image_comment(derived: bool) -> String {
     lines.join("\n\t\t")
 }
 
-/// The closed launch set of `--needs <type>` service kinds.
-/// Today only `pg` (Postgres via `needs.pg`, shipped in 2.4)
-/// is wired; the set widens as further ServiceProviders land.
-const KNOWN_NEEDS: &[&str] = &["pg"];
+/// The closed launch set of `--needs <type>` kinds. `pg` (Postgres via
+/// `needs.pg`, 2.4), `redis` (Redis-compatible via `needs.redis`, 2.6),
+/// and `disk` (persistent block storage via `needs.disk`, 2.6b) are wired;
+/// the set widens as further ServiceProviders / claim types land. Keep in
+/// step with the `needs_block` match arms below.
+const KNOWN_NEEDS: &[&str] = &["pg", "redis", "disk"];
 
 /// Build the `spec.base.needs` CUE block for the scaffolded
 /// Application from the requested service types. Returns an
@@ -435,6 +437,11 @@ pub fn needs_block(needs: &[String]) -> Result<String> {
         match *n {
             "pg" => entries
                 .push_str("\t\t\tpg: { selector: { tier: \"integrated\" }, size: \"small\" }\n"),
+            "redis" => entries.push_str("\t\t\tredis: { selector: { tier: \"integrated\" } }\n"),
+            // A disk need carries no selector/tier — it is sized + mounted.
+            // Emit launch defaults (1Gi at /data, class local); the author
+            // edits `size` / `mountPath` before committing.
+            "disk" => entries.push_str("\t\t\tdisk: { size: \"1Gi\", mountPath: \"/data\" }\n"),
             // Unreachable — validated against KNOWN_NEEDS above.
             other => {
                 return Err(CliError::Other(format!(
@@ -540,8 +547,9 @@ pub struct ScaffoldOpts {
     pub force: bool,
 
     /// Workload dependencies to scaffold (repeatable
-    /// `--needs <type>`). Closed launch set: `pg`. Rendered
-    /// into the `spec.base.needs` block; empty → no block.
+    /// `--needs <type>`). Closed launch set: `pg`, `redis`,
+    /// `disk`. Rendered into the `spec.base.needs` block;
+    /// empty → no block.
     pub needs: Vec<String>,
 }
 
@@ -1515,5 +1523,48 @@ mod tests {
     #[test]
     fn needs_block_empty_is_empty_string() {
         assert_eq!(needs_block(&[]).unwrap(), String::new());
+    }
+
+    #[test]
+    fn needs_block_emits_redis_selector() {
+        let out = needs_block(&["redis".to_string()]).unwrap();
+        assert!(out.contains("redis: {"), "missing redis entry; got:\n{out}");
+        assert!(
+            out.contains("tier: \"integrated\""),
+            "redis must carry the integrated-tier selector; got:\n{out}"
+        );
+        // redis claims are unsized (no t-shirt size, unlike pg).
+        assert!(
+            !out.contains("size:"),
+            "redis must not emit a size; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn needs_block_emits_disk_size_and_mountpath() {
+        let out = needs_block(&["disk".to_string()]).unwrap();
+        assert!(out.contains("disk: {"), "missing disk entry; got:\n{out}");
+        assert!(
+            out.contains("size: \"1Gi\""),
+            "disk must emit a default size; got:\n{out}"
+        );
+        assert!(
+            out.contains("mountPath: \"/data\""),
+            "disk must emit a default mountPath; got:\n{out}"
+        );
+        // a disk need has no tier selector (it is sized + mounted, not matched).
+        assert!(
+            !out.contains("selector:"),
+            "disk must not emit a selector; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn needs_block_accepts_all_three_kinds_one_entry_each() {
+        let out =
+            needs_block(&["pg".to_string(), "redis".to_string(), "disk".to_string()]).unwrap();
+        assert_eq!(out.matches("pg: {").count(), 1, "got:\n{out}");
+        assert_eq!(out.matches("redis: {").count(), 1, "got:\n{out}");
+        assert_eq!(out.matches("disk: {").count(), 1, "got:\n{out}");
     }
 }
