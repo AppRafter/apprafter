@@ -668,8 +668,10 @@ async fn provision_dragonfly(
 ///    **unowned** PVC (`disk::pvc_object`) into the claim's namespace.
 ///    Idempotent reuse: an SSA-apply of a deterministic-named PVC is a
 ///    no-op if it already exists — a redeployed app **reattaches** to the
-///    retained PVC; the PVC is NEVER deleted/recreated here (its drop is
-///    GC-managed via the 2.4f RetainedClaim + grace).
+///    retained PVC; the PVC is NEVER deleted/recreated here. Its drop is
+///    INTENDED to be GC-managed via the 2.4f RetainedClaim + grace; the
+///    disk GC arm (`gc_drop_disk` + the disk snapshot branch) lands in
+///    2.6b-5 and is not wired yet.
 /// 3. SSA-write the terminal status `ready=true` + `volumeClaimRef=<pvc>`
 ///    under the provisioner field manager (the renderer reads the PVC
 ///    name there). NEVER touches `status.provider` / `Scheduled` (the SSA
@@ -745,8 +747,10 @@ async fn provision_disk(
     // Recovery (2.4f Fix A, mirrored for disk): the claim is now
     // (re)provisioned and LIVE, so any RetainedClaim from a prior deletion
     // is stale — cancel it so its grace-GC can never drop this now-live
-    // claim's PVC. The snapshot name is deterministic (== `pvc_name` ==
-    // `cnpg::k8s_name(ns, name)`). 404-tolerant.
+    // claim's PVC once the disk GC arm lands (2.6b-5; `gc_drop_disk` + the
+    // disk snapshot branch are not wired yet). The snapshot name is
+    // deterministic (== `pvc_name` == `cnpg::k8s_name(ns, name)`).
+    // 404-tolerant.
     let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
     if let Err(e) = rc_api.delete(&pvc_name, &DeleteParams::default()).await {
         if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
@@ -1059,8 +1063,11 @@ pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
 // Status + finalizer I/O
 // ---------------------------------------------------------------------------
 
-/// Build the terminal status SSA-apply body. Always carries `ready` /
-/// `connectionSecretRef` / the `Ready` condition; when an `allocation`
+/// Build the terminal status SSA-apply body. Always carries `ready` +
+/// the `Ready` condition. `connectionSecretRef` and `volumeClaimRef` are
+/// mutually-exclusive optionals: the pg/redis backends send
+/// `connectionSecretRef` (a connection Secret), the disk backend sends
+/// `volumeClaimRef` (the PVC name) and no Secret. When an `allocation`
 /// `(instance, dbnum)` is threaded (the dragonfly path), it ALSO re-sends
 /// `status.instance` + `status.dbnum`.
 ///

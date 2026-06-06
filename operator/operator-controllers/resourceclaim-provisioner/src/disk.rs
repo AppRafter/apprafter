@@ -5,8 +5,10 @@
 //! `Backend::Disk` provisioner (`reconcile.rs`) backs with a standalone
 //! `ReadWriteOnce` PersistentVolumeClaim. The PVC is **unowned** — no
 //! `ownerReferences` back to the Application or claim — so it survives an
-//! app delete + redeploy; its lifecycle is GC-managed via the 2.4f
-//! RetainedClaim + grace, exactly like the CNPG role/DB (retention).
+//! app delete + redeploy. Its lifecycle is INTENDED to be GC-managed via
+//! the 2.4f RetainedClaim + grace, exactly like the CNPG role/DB
+//! (retention); the disk GC arm (`gc_drop_disk` + the disk snapshot
+//! branch) lands in 2.6b-5 and is not wired yet.
 //!
 //! Every function here is pure (`-> serde_json::Value`), so the whole
 //! module is unit-testable without a cluster. The live SSA-apply +
@@ -24,8 +26,10 @@ use serde_json::{json, Value};
 ///
 /// **NO `ownerReferences`** — the PVC must outlive an app delete so data
 /// survives a delete+redeploy within the RetainedClaim grace window; the
-/// GC drops it after grace (like the pg role/DB). `metadata` carries only
-/// `name` + `namespace` + the inventory label.
+/// intent is for the GC to drop it after grace (like the pg role/DB). The
+/// disk GC arm (`gc_drop_disk` + the disk snapshot branch) lands in
+/// 2.6b-5 and is not wired yet. `metadata` carries only `name` +
+/// `namespace` + the inventory label.
 pub fn pvc_object(name: &str, ns: &str, size: &str, storage_class: &str) -> Value {
     json!({
         "apiVersion": "v1",
@@ -73,8 +77,9 @@ mod tests {
             "apprafter"
         );
         // CRITICAL (retention): the PVC is UNOWNED — no ownerReferences —
-        // so an app delete does NOT cascade-delete it; the 2.4f GC drops
-        // it after the grace window (like the pg role/DB).
+        // so an app delete does NOT cascade-delete it; the 2.4f GC is
+        // INTENDED to drop it after the grace window (like the pg role/DB),
+        // once the disk GC arm lands in 2.6b-5.
         assert!(
             p["metadata"].get("ownerReferences").is_none(),
             "disk PVC must be unowned so it survives an app delete (retention)"

@@ -35,10 +35,11 @@ package v1alpha1
 	// Implementation backend identifier. The wired in-cluster backends
 	// are "cloudnative-pg" (pg), "dragonfly" (redis), and "disk"
 	// (persistent block storage, 2.6b / ADR 0043); an external backend
-	// such as "aws-rds" plugs in here too. Kept an open string at the CUE
-	// layer (community/fork backends); the webhook closes it to the set of
-	// backends with a wired provisioner arm, and the CRD enforces
-	// non-empty. (CRD/webhook may be stricter than CUE — see CLAUDE.md.)
+	// such as "aws-rds" plugs in here too. The backend set is
+	// intentionally OPEN (community/fork backends, gRPC sidecar providers
+	// in Phase 7) — kept an open string at the CUE layer; the CRD +
+	// webhook enforce only non-empty (CRD/webhook may be stricter than
+	// CUE — see CLAUDE.md).
 	backend: string
 
 	// Backend-specific configuration, opaque to the platform.
