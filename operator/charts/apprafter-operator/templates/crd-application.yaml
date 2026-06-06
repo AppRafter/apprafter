@@ -75,21 +75,41 @@ spec:
                       type: object
                       additionalProperties:
                         type: string
+                    # needs (2.6b / ADR 0043): an explicit closed struct.
+                    # Each service key accepts a SCALAR #ServiceNeed object OR
+                    # an ARRAY of named #ServiceNeeds; `disk` carries a
+                    # #DiskClaim (object OR array). A scalar|array union is a
+                    # HETEROGENEOUS-type union (object vs array) — a structural
+                    # CRD node can declare exactly ONE `type`, and a `oneOf`
+                    # spanning two different top-level `type`s is rejected by
+                    # the apiserver's structural-schema requirement ("oneOf[*].
+                    # type: Forbidden: must be empty to be structural" / the
+                    # node "must not be empty for specified object fields").
+                    # This is NOT the 2.4h closed-object regression class —
+                    # it is a genuine structural-schema limitation, so each
+                    # union key uses x-kubernetes-preserve-unknown-fields (the
+                    # same escape hatch the MigrationPlan/SourceCredential CRDs
+                    # use for their oneOf shapes). The admission webhook is the
+                    # runtime gate for the real invariants (key enum, scalar|
+                    # array object/array shape, (type,name) uniqueness, disk
+                    # required size/mountPath + class enum).
                     needs:
                       type: object
-                      additionalProperties:
-                        type: object
-                        properties:
-                          selector:
-                            type: object
-                            additionalProperties:
-                              type: string
-                            minProperties: 1
-                          size:
-                            type: string
-                            enum: [nano, small, medium, large, xlarge]
-                          persistent:
-                            type: boolean
+                      properties:
+                        pg:
+                          x-kubernetes-preserve-unknown-fields: true
+                        jetstream:
+                          x-kubernetes-preserve-unknown-fields: true
+                        clickhouse:
+                          x-kubernetes-preserve-unknown-fields: true
+                        redis:
+                          x-kubernetes-preserve-unknown-fields: true
+                        s3:
+                          x-kubernetes-preserve-unknown-fields: true
+                        notifications:
+                          x-kubernetes-preserve-unknown-fields: true
+                        disk:
+                          x-kubernetes-preserve-unknown-fields: true
                     imagePolicy:
                       type: object
                       properties:
@@ -124,21 +144,29 @@ spec:
                         type: object
                         additionalProperties:
                           type: string
+                      # needs (2.6b / ADR 0043): same closed-struct shape as
+                      # spec.base.needs. Each union key uses x-kubernetes-
+                      # preserve-unknown-fields (scalar object | array of
+                      # named entries is a heterogeneous-type union a
+                      # structural CRD node cannot type). The webhook is the
+                      # runtime gate.
                       needs:
                         type: object
-                        additionalProperties:
-                          type: object
-                          properties:
-                            selector:
-                              type: object
-                              additionalProperties:
-                                type: string
-                              minProperties: 1
-                            size:
-                              type: string
-                              enum: [nano, small, medium, large, xlarge]
-                            persistent:
-                              type: boolean
+                        properties:
+                          pg:
+                            x-kubernetes-preserve-unknown-fields: true
+                          jetstream:
+                            x-kubernetes-preserve-unknown-fields: true
+                          clickhouse:
+                            x-kubernetes-preserve-unknown-fields: true
+                          redis:
+                            x-kubernetes-preserve-unknown-fields: true
+                          s3:
+                            x-kubernetes-preserve-unknown-fields: true
+                          notifications:
+                            x-kubernetes-preserve-unknown-fields: true
+                          disk:
+                            x-kubernetes-preserve-unknown-fields: true
                       imagePolicy:
                         type: object
                         properties:
