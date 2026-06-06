@@ -825,13 +825,12 @@ esac
 redis_admin -n "$claim_dbnum" SET repin-marker present >/dev/null || true
 
 printf '  killing the ephemeral Dragonfly pod (wipes runtime ACL users) ...\n'
-kubectl -n "$DF_NS" delete pod \
-    -l "app=${DF_INSTANCE},app.kubernetes.io/part-of=dragonfly" \
-    --ignore-not-found --wait=false 2>/dev/null || true
-# Fall back to a label-agnostic delete if the operator's pod labels differ
-# (the dragonfly-operator owns the StatefulSet; match the instance name).
-kubectl -n "$DF_NS" delete pod -l "app=${DF_INSTANCE}" \
-    --ignore-not-found --wait=false 2>/dev/null || true
+# Delete the StatefulSet pod by its deterministic name and WAIT for it to
+# fully terminate (default --wait), so the readiness wait below targets the
+# freshly recreated pod instead of racing the old pod's brief
+# Ready-while-Terminating / Succeeded window (which yields "cannot exec into a
+# completed pod" when the re-pin poll execs in).
+kubectl -n "$DF_NS" delete pod "${DF_INSTANCE}-0" --ignore-not-found 2>/dev/null || true
 
 # Wait for the instance to come back Ready (a fresh pod, empty ACL table).
 printf '  waiting for the ephemeral instance to roll back to Ready ...\n'
@@ -935,8 +934,7 @@ assert_eq "worker SET a durable key in its own DB" "$worker_set" "OK"
 redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" SAVE >/dev/null 2>&1 || true
 
 printf '  killing the persistent Dragonfly pod (data must survive) ...\n'
-kubectl -n "$DF_NS" delete pod -l "app=${DF_INSTANCE_P}" \
-    --ignore-not-found --wait=false 2>/dev/null || true
+kubectl -n "$DF_NS" delete pod "${DF_INSTANCE_P}-0" --ignore-not-found 2>/dev/null || true
 
 printf '  waiting for the persistent instance to roll back to Ready ...\n'
 # OnDelete StatefulSet → wait on the pod directly (see the ephemeral path).
@@ -971,7 +969,13 @@ printf '  ok: persistent: true data survived a pod restart (snapshot->PVC restor
 
 phase "Phase 11: delete claim — RetainedClaim snapshot + cascade"
 
-kubectl delete "$CLAIM_RES" "$CLAIM" -n "$APP_NS" --wait=true
+# Delete the APPLICATION, not just the ResourceClaim: the claim is owned by
+# the Application (ownerRef), so deleting the claim alone while the app still
+# declares needs.redis makes the Application controller regenerate it, and the
+# provisioner correctly REATTACHES it to its retained allocation (ADR 0042 §8),
+# cancelling the RetainedClaim — so the snapshot never persists for the GC to
+# act on. Deleting the app cascades to the claim with no regeneration.
+kubectl delete "$APP_RES" "$APP" -n "$APP_NS" --wait=true
 
 # The finalizer snapshots a dragonfly-shaped RetainedClaim.
 wait_jsonpath retainedclaim "$RETAINED_NS" "$RETAINED" \
