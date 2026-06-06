@@ -1723,6 +1723,37 @@ compatibility: "0.1.23": {
 // breach) fixed by serializing reconciles; and the operator-only-CREATE
 // webhooks now accept `kubeadm:cluster-admins` break-glass (k8s 1.35).
 // CRD-compatible with 0.2.19; existing claims keep their allocation.
+compatibility: "0.2.21": {
+	change:          "safe"
+	operatorVersion: "v0.2.21"
+	notes: """
+		Phase 2.6b (needs.disk + named multi-claims, ADR 0043) close — the
+		coordinated operator + chart release. `needs` generalizes to a closed
+		struct of `(type, name)` entries (scalar OR array per type): the
+		Application controller generates one ResourceClaim per entry
+		(`<app>-<type>[-<name>]`) and the renderer disambiguates injected env
+		vars (`DATABASE_URL_<NAME>` for named pg, unnamed stays DATABASE_URL).
+		`needs.disk` provisions an UNOWNED ReadWriteOnce PVC via the new
+		`Backend::Disk` provisioner arm (matched to the seeded `disk-local`
+		ServiceProvider; class local / local-path on T1); the renderer mounts
+		it and pins the Deployment to strategy:Recreate. Deleting the app
+		snapshots a disk-shaped RetainedClaim (volumeClaimRef + namespace) and
+		the unowned PVC survives the 7-day grace; a redeploy reattaches the
+		same PVC (cancel-on-reprovision), and force-GC drops the PVC + the
+		snapshot.
+
+		CRD changes are additive and backward-compatible: the `needs` keys
+		accept scalar-or-array (x-kubernetes-preserve-unknown-fields per key),
+		ResourceClaim gains `status.volumeClaimRef` + a relaxed `spec.size`
+		(quantity for disk, t-shirt for service), the ServiceProvider `type`
+		enum gains `disk`, and RetainedClaim gains optional disk fields
+		(volumeClaimRef / volumeClaimNamespace). The `disk-local`
+		ServiceProvider seed ships in this release. CRD-compatible with
+		0.2.20; existing pg/redis claims are unaffected.
+		"""
+	references: ["plan.md#2.6b", "docs/adr/0043-needs-disk-named-claims.md"]
+}
+
 compatibility: "0.2.20": {
 	change:          "safe"
 	operatorVersion: "v0.2.20"
