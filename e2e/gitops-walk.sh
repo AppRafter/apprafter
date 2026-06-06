@@ -76,9 +76,10 @@ for tool in git cargo kubectl; do
     fi
 done
 
-# docker or podman (podman is typically aliased to docker in CI)
-if ! command -v docker >/dev/null 2>&1; then
-    printf 'ERROR: "docker" (or podman aliased as docker) not found on PATH\n' >&2
+# A container runtime: docker (→ k3d) or podman (→ kind). cluster_runtime
+# dispatches; the gateway/network helpers handle either engine.
+if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
+    printf 'ERROR: neither "docker" nor "podman" found on PATH\n' >&2
     exit 2
 fi
 
@@ -95,10 +96,15 @@ GIT_DAEMON_PID=""
 cleanup() {
     local exit_code=$?
 
-    # Kill the git daemon first so the port is free
+    # Kill the git daemon first so the port is free. `git daemon --detach`
+    # double-forks, so the captured PID is unreliable — also pkill by the
+    # unique port pattern so a detached daemon can't leak and wedge port
+    # 9418 for the next run (a "Connection reset by peer" on the liveness
+    # clone is the tell-tale of a stale daemon serving a deleted base-path).
     if [ -n "$GIT_DAEMON_PID" ] && kill -0 "$GIT_DAEMON_PID" 2>/dev/null; then
         kill "$GIT_DAEMON_PID" 2>/dev/null || true
     fi
+    pkill -f "git[ -]daemon.*${GIT_DAEMON_PORT}" 2>/dev/null || true
 
     if [ "$exit_code" -ne 0 ]; then
         printf '\n!!! gitops-walk FAILED at %s (exit %d) !!!\n' \
@@ -213,6 +219,11 @@ setup_git_server() {
     # Mark as exportable by git-daemon
     touch "${repo_dst}/.git/git-daemon-export-ok"
 
+    # Reap any git daemon leaked by a prior run still holding the port — a
+    # detached daemon survives a botched cleanup and would wedge the bind
+    # (the new daemon silently fails and the old one serves a deleted dir).
+    pkill -f "git[ -]daemon.*${GIT_DAEMON_PORT}" 2>/dev/null || true
+
     # Start git daemon on all interfaces, --base-path lets Argo CD
     # clone as git://HOST:9418/gitops-app (without the full path)
     git daemon \
@@ -224,25 +235,44 @@ setup_git_server() {
         "${GIT_REPOS_DIR}"
 
     # Capture PID for cleanup
-    GIT_DAEMON_PID=$(pgrep -f "git daemon.*${GIT_DAEMON_PORT}" | head -1 || true)
+    GIT_DAEMON_PID=$(pgrep -f "git[ -]daemon.*${GIT_DAEMON_PORT}" | head -1 || true)
     printf '  git daemon started (port %s, base %s)\n' \
         "$GIT_DAEMON_PORT" "$GIT_REPOS_DIR"
 }
 
 # ---------------------------------------------------------------
-# Helper: detect gateway IP of the k3d Docker/Podman network so
-# that pods inside k3d can reach the host git daemon.
+# Helper: the host IP that in-cluster PODS use to reach the host git daemon.
+# Runtime-aware, because the two engines differ fundamentally:
+#   * kind + rootless podman: the bridge gateway lives in the rootless network
+#     namespace and does NOT route to the host (a pod dial to it gets
+#     "connection refused"). Podman instead injects `host.containers.internal`
+#     into every node's /etc/hosts — netavark's link-local host endpoint
+#     (~169.254.x) — which IS routable from pods. Read its IP off the node.
+#   * k3d + docker: the per-cluster bridge gateway IS host-routable; parse the
+#     network JSON with jq (docker schema: .IPAM.Config[].Gateway) and pick
+#     the IPv4 gateway. (k3d also exposes a `host.k3d.internal` DNS alias, so
+#     this branch is only a documented fallback — the repoURL uses the name.)
 # ---------------------------------------------------------------
 detect_host_gateway_ip() {
-    local net_name="k3d-${CLUSTER_NAME}"
-    local gw
-    gw=$(docker network inspect "$net_name" \
-        --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null \
-        | head -1)
+    local gw net_name
+    if [ "$(cluster_runtime)" = "kind" ]; then
+        gw=$(podman exec "${CLUSTER_NAME}-control-plane" \
+            getent hosts host.containers.internal 2>/dev/null | awk '{print $1; exit}')
+        if [ -z "$gw" ]; then
+            printf 'ERROR: could not resolve host.containers.internal on kind node %s-control-plane\n' \
+                "$CLUSTER_NAME" >&2
+            exit 1
+        fi
+        printf '%s' "$gw"
+        return 0
+    fi
+    net_name="k3d-${CLUSTER_NAME}"
+    gw=$(docker network inspect "$net_name" 2>/dev/null \
+        | jq -r '.[0] | ((.subnets // .IPAM.Config // [])[]
+                 | (.gateway // .Gateway // empty))' 2>/dev/null \
+        | grep -E '^[0-9]+\.' | head -1)
     if [ -z "$gw" ]; then
-        printf 'ERROR: could not detect gateway IP of Docker network %s\n' \
-            "$net_name" >&2
-        printf 'Ensure k3d is up and docker network inspect is available.\n' >&2
+        printf 'ERROR: could not detect IPv4 gateway of docker network %s\n' "$net_name" >&2
         exit 1
     fi
     printf '%s' "$gw"
@@ -285,10 +315,10 @@ phase "Phase 0: k3d_up ${CLUSTER_NAME}"
 
 k3d_up "$CLUSTER_NAME"
 
-# Export the k3d kubeconfig so kubectl commands below work
-k3d_bin="k3d"
-command -v k3d >/dev/null 2>&1 || k3d_bin="nix run nixpkgs#k3d --"
-$k3d_bin kubeconfig write "$CLUSTER_NAME" --output "$KUBECONFIG_FILE"
+# Export the cluster kubeconfig so kubectl commands below work. Dispatches
+# k3d (docker) vs kind (rootless podman) per cluster_runtime — a raw
+# `k3d kubeconfig write` against a kind cluster fails ("No nodes found").
+cluster_kubeconfig_write "$CLUSTER_NAME" "$KUBECONFIG_FILE"
 export KUBECONFIG="$KUBECONFIG_FILE"
 printf '  KUBECONFIG=%s\n' "$KUBECONFIG_FILE"
 
@@ -346,13 +376,18 @@ phase "Phase 3: git daemon — fixture repo"
 
 setup_git_server
 
-# The repoURL Argo CD (running inside k3d) uses to clone the fixture
-# is `host.k3d.internal` — k3d's built-in host alias, injected into
-# the cluster CoreDNS, that pods resolve to the host. This is more
-# portable than a dynamically-detected Docker bridge gateway IP, which
-# is not reliably routable from pods on GitHub Actions runners
-# (`detect_host_gateway_ip` is kept as a documented fallback only).
-GIT_REPO_URL="git://host.k3d.internal:${GIT_DAEMON_PORT}/gitops-app"
+# The repoURL Argo CD (in-cluster) uses to clone the fixture depends on the
+# runtime. k3d injects a built-in `host.k3d.internal` alias into the cluster
+# CoreDNS that pods resolve to the host — portable across CI runners. kind has
+# no such alias, so on kind+podman pods reach the host git daemon via the
+# `host.containers.internal` IP that podman injects into the nodes
+# (detect_host_gateway_ip resolves it — the bridge gateway is NOT routable
+# from pods under rootless podman).
+if [ "$(cluster_runtime)" = "kind" ]; then
+    GIT_REPO_URL="git://$(detect_host_gateway_ip):${GIT_DAEMON_PORT}/gitops-app"
+else
+    GIT_REPO_URL="git://host.k3d.internal:${GIT_DAEMON_PORT}/gitops-app"
+fi
 # The host itself cannot resolve `host.k3d.internal`, so the host-side
 # liveness check targets the loopback (the git daemon binds 0.0.0.0).
 GIT_REPO_URL_HOST="git://127.0.0.1:${GIT_DAEMON_PORT}/gitops-app"
