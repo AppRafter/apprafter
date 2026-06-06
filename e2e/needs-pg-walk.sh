@@ -497,9 +497,17 @@ printf '  Deployment %s -> Available\n' "$APP"
 # Phase 8: delete + snapshot (2.4f) — RetainedClaim, cascade, grace floor
 # ===============================================================
 
-phase "Phase 8: delete claim — RetainedClaim snapshot + 7-day grace floor"
+phase "Phase 8: delete Application — RetainedClaim snapshot + 7-day grace floor"
 
-kubectl delete "$CLAIM_RES" "$CLAIM" -n "$APP_NS" --wait=true
+# Delete the APPLICATION, not just the ResourceClaim: the claim is owned by
+# the Application (ownerRef), so deleting the claim alone while the app still
+# declares needs.pg makes the Application controller regenerate it, and the
+# provisioner re-provisions onto the same role/DB — which (2.4f Fix A) CANCELS
+# the just-written RetainedClaim (cancel-on-re-provision + the GC live-claim
+# guard), so the snapshot never persists for the grace/GC assertions below.
+# Deleting the app cascades to the claim with no regeneration. (Mirrors the
+# needs-redis-walk Phase 11 pattern.)
+kubectl delete "$APP_RES" "$APP" -n "$APP_NS" --wait=true
 
 # The finalizer snapshots a RetainedClaim into apprafter-system.
 wait_jsonpath retainedclaim "$RETAINED_NS" "$RETAINED" \
