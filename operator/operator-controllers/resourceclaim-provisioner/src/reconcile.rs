@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use operator_core::{ResourceClaim, ResourceClaimCondition, RetainedClaim, ServiceProvider};
 
 use crate::cnpg;
+use crate::disk;
 use crate::dragonfly;
 use crate::grace;
 use crate::{Context, ReconcileError, FIELD_MANAGER, KIND, PROVISIONER_FINALIZER};
@@ -59,6 +60,11 @@ const COND_SCHEDULED: &str = "Scheduled";
 /// Length of the generated role password (alphanumeric).
 const PASSWORD_LEN: usize = 32;
 
+/// StorageClass the disk backend falls back to when the matched
+/// `disk-local` ServiceProvider config omits `/storageClass`. `local-path`
+/// is the StorageClass that ships on the launch tier (k3s/kind), 2.6b.
+const DEFAULT_DISK_STORAGE_CLASS: &str = "local-path";
+
 /// How many times to retry the read-modify-write of the shared Cluster's
 /// unkeyed `spec.managed.roles` list when the GET→replace races another
 /// claim's provisioner pass (HTTP 409 Conflict).
@@ -69,12 +75,13 @@ const ROLE_RMW_RETRIES: usize = 5;
 // ---------------------------------------------------------------------------
 
 /// The provisioning backends this controller knows how to drive.
-/// `cloudnative-pg` (2.4) and `dragonfly` (2.6) are wired; 2.5 adds
-/// jetstream.
+/// `cloudnative-pg` (2.4), `dragonfly` (2.6), and `disk` (2.6b) are
+/// wired; 2.5 adds jetstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cloudnativepg,
     Dragonfly,
+    Disk,
 }
 
 impl Backend {
@@ -85,6 +92,7 @@ impl Backend {
         match backend {
             "cloudnative-pg" => Some(Backend::Cloudnativepg),
             "dragonfly" => Some(Backend::Dragonfly),
+            "disk" => Some(Backend::Disk),
             _ => None,
         }
     }
@@ -182,6 +190,7 @@ pub async fn reconcile(
             provision_cloudnativepg(&ctx, &claim, &ns, &name, &provider).await
         }
         Some(Backend::Dragonfly) => provision_dragonfly(&ctx, &claim, &ns, &name, &provider).await,
+        Some(Backend::Disk) => provision_disk(&ctx, &claim, &ns, &name, &provider).await,
         None => {
             warn!(
                 %name, %ns, backend = %provider.spec.backend,
@@ -310,8 +319,17 @@ async fn provision_cloudnativepg(
         &format!("provisioned into {cluster} ({cnpg_ns})"),
         &prior,
     );
-    // CNPG owns no instance/dbnum on the claim status → thread None.
-    patch_status(&ctx.client, ns, name, &conn_secret_name, cond, None).await?;
+    // CNPG owns no instance/dbnum (and no volumeClaimRef) → thread None.
+    patch_status(
+        &ctx.client,
+        ns,
+        name,
+        Some(&conn_secret_name),
+        None,
+        cond,
+        None,
+    )
+    .await?;
 
     ctx.metrics
         .claim_provisioned_total
@@ -599,7 +617,8 @@ async fn provision_dragonfly(
         &ctx.client,
         ns,
         name,
-        &conn_secret_name,
+        Some(&conn_secret_name),
+        None,
         cond,
         Some((&instance, dbnum)),
     )
@@ -629,6 +648,112 @@ async fn provision_dragonfly(
 
     // Re-poll on the standard cadence; the ACL user is re-asserted by the
     // 2.6-5 reconcile loop after an instance restart.
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+// ---------------------------------------------------------------------------
+// Disk provisioning (I/O orchestration) — Phase 2.6b / ADR 0043
+// ---------------------------------------------------------------------------
+
+/// Provision a `disk` claim into a standalone `ReadWriteOnce`
+/// PersistentVolumeClaim — a single-pass provision that lands the claim
+/// `Ready`.
+///
+/// 1. Resolve the StorageClass from the matched `disk-local`
+///    ServiceProvider's `config.storageClass` (fallback
+///    [`DEFAULT_DISK_STORAGE_CLASS`]).
+/// 2. Derive the deterministic PVC name `cnpg::k8s_name(ns, claim_name)`
+///    (the SAME DNS-1123 folder the other backends use), read the
+///    requested size from `claim.spec.size`, and SSA-apply the
+///    **unowned** PVC (`disk::pvc_object`) into the claim's namespace.
+///    Idempotent reuse: an SSA-apply of a deterministic-named PVC is a
+///    no-op if it already exists — a redeployed app **reattaches** to the
+///    retained PVC; the PVC is NEVER deleted/recreated here (its drop is
+///    GC-managed via the 2.4f RetainedClaim + grace).
+/// 3. SSA-write the terminal status `ready=true` + `volumeClaimRef=<pvc>`
+///    under the provisioner field manager (the renderer reads the PVC
+///    name there). NEVER touches `status.provider` / `Scheduled` (the SSA
+///    split) and writes NO connection Secret.
+///
+/// `ready` means the PVC EXISTS, not Bound — `local-path` binds
+/// `WaitForFirstConsumer`, so binding waits for the pod (rendered after
+/// the claim is ready); requiring Bound would deadlock claim↔pod.
+async fn provision_disk(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+    provider: &ServiceProvider,
+) -> Result<Action, ReconcileError> {
+    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
+    let storage_class = cfg
+        .pointer("/storageClass")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_DISK_STORAGE_CLASS)
+        .to_string();
+
+    // Size is a Kubernetes quantity string carried on the claim (the
+    // Application controller copies `needs.disk.size` onto the generated
+    // claim spec). A missing size would render an invalid PVC; default to
+    // a small floor with a warning rather than stalling (the webhook
+    // already requires `size` on a disk need, so this is belt-and-braces).
+    let size = claim.spec.size.clone().unwrap_or_else(|| {
+        warn!(%name, %ns, "disk claim missing spec.size — defaulting to 1Gi");
+        "1Gi".to_string()
+    });
+
+    // Deterministic PVC name == the snapshot name the finalizer/GC use, so
+    // a redeploy reattaches to the SAME PVC (idempotent SSA reuse).
+    let pvc_name = cnpg::k8s_name(ns, name);
+
+    info!(%name, %ns, %pvc_name, %storage_class, %size, "provisioning disk claim");
+
+    // 1. SSA-apply the unowned RWO PVC into the claim's namespace.
+    //    Idempotent: re-applying an existing PVC is a no-op (reattach);
+    //    the PVC is never deleted/recreated on this path.
+    let pvc_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &pvc_ar());
+    let pvc_body = disk::pvc_object(&pvc_name, ns, &size, &storage_class);
+    pvc_api
+        .patch(&pvc_name, &apply_params(), &Patch::Apply(&pvc_body))
+        .await?;
+
+    // 2. Write status — ready / volumeClaimRef / Ready condition, under
+    //    our own field manager (no connectionSecretRef, no allocation).
+    let prior: Vec<ResourceClaimCondition> = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let cond = ready_condition(
+        "True",
+        "Provisioned",
+        &format!("provisioned PVC {pvc_name} (class {storage_class})"),
+        &prior,
+    );
+    patch_status(&ctx.client, ns, name, None, Some(&pvc_name), cond, None).await?;
+
+    ctx.metrics
+        .claim_provisioned_total
+        .with_label_values(&["disk", ns])
+        .inc();
+    ctx.metrics
+        .reconcile_total
+        .with_label_values(&[KIND, ns, "ok"])
+        .inc();
+    info!(%name, %ns, %pvc_name, "disk claim provisioned");
+
+    // Recovery (2.4f Fix A, mirrored for disk): the claim is now
+    // (re)provisioned and LIVE, so any RetainedClaim from a prior deletion
+    // is stale — cancel it so its grace-GC can never drop this now-live
+    // claim's PVC. The snapshot name is deterministic (== `pvc_name` ==
+    // `cnpg::k8s_name(ns, name)`). 404-tolerant.
+    let rc_api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
+    if let Err(e) = rc_api.delete(&pvc_name, &DeleteParams::default()).await {
+        if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
+            warn!(%pvc_name, error=%e, "could not cancel stale RetainedClaim on disk (re)provision");
+        }
+    }
+
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
@@ -906,6 +1031,12 @@ pub(crate) fn secret_ar() -> ApiResource {
     ApiResource::from_gvk(&GroupVersionKind::gvk("", "v1", "Secret"))
 }
 
+/// ApiResource for the core `PersistentVolumeClaim` (group "", v1). Used
+/// by the disk backend to SSA-apply a standalone RWO PVC (2.6b).
+pub(crate) fn pvc_ar() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk("", "v1", "PersistentVolumeClaim"))
+}
+
 /// ApiResource for the externally-installed dragonfly-operator
 /// `Dragonfly` CRD (plan.md 2.6-1 component; group `dragonflydb.io`).
 pub(crate) fn dragonfly_cluster_ar() -> ApiResource {
@@ -949,15 +1080,24 @@ pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
 /// threads `None` (it owns no instance/dbnum) and is unaffected.
 fn status_apply_body(
     name: &str,
-    conn_secret_name: &str,
+    conn_secret_name: Option<&str>,
+    volume_claim_ref: Option<&str>,
     cond: ResourceClaimCondition,
     allocation: Option<(&str, u16)>,
 ) -> Value {
     let mut status = json!({
         "ready": true,
-        "connectionSecretRef": conn_secret_name,
         "conditions": [cond],
     });
+    // The CNPG / dragonfly backends publish a `connectionSecretRef`; the
+    // disk backend publishes a `volumeClaimRef` instead (no Secret). Only
+    // the relevant field is sent so SSA never owns an empty placeholder.
+    if let Some(conn) = conn_secret_name {
+        status["connectionSecretRef"] = json!(conn);
+    }
+    if let Some(vcr) = volume_claim_ref {
+        status["volumeClaimRef"] = json!(vcr);
+    }
     if let Some((instance, dbnum)) = allocation {
         status["instance"] = json!(instance);
         status["dbnum"] = json!(dbnum);
@@ -979,12 +1119,13 @@ async fn patch_status(
     client: &Client,
     ns: &str,
     name: &str,
-    conn_secret_name: &str,
+    conn_secret_name: Option<&str>,
+    volume_claim_ref: Option<&str>,
     cond: ResourceClaimCondition,
     allocation: Option<(&str, u16)>,
 ) -> Result<(), ReconcileError> {
     let api: Api<ResourceClaim> = Api::namespaced(client.clone(), ns);
-    let body = status_apply_body(name, conn_secret_name, cond, allocation);
+    let body = status_apply_body(name, conn_secret_name, volume_claim_ref, cond, allocation);
     api.patch_status(name, &apply_params(), &Patch::Apply(&body))
         .await?;
     Ok(())
@@ -1357,6 +1498,11 @@ mod tests {
     }
 
     #[test]
+    fn backend_maps_disk() {
+        assert_eq!(Backend::from_spec_backend("disk"), Some(Backend::Disk));
+    }
+
+    #[test]
     fn backend_unknown_is_none() {
         assert_eq!(Backend::from_spec_backend("redis"), None); // type, not backend
         assert_eq!(Backend::from_spec_backend(""), None);
@@ -1502,7 +1648,8 @@ mod tests {
         let cond = ready_condition("True", "Provisioned", "ok", &[]);
         let body = status_apply_body(
             "web-redis",
-            "web-redis-conn",
+            Some("web-redis-conn"),
+            None,
             cond,
             Some(("platform-redis-ephemeral-000", 7)),
         );
@@ -1520,11 +1667,40 @@ mod tests {
         // then carries only ready / connectionSecretRef / conditions, exactly
         // as before, so the pg path is unaffected.
         let cond = ready_condition("True", "Provisioned", "ok", &[]);
-        let body = status_apply_body("demo-web-pg", "demo-web-pg-conn", cond, None);
+        let body = status_apply_body("demo-web-pg", Some("demo-web-pg-conn"), None, cond, None);
         assert_eq!(body["status"]["ready"], true);
         assert_eq!(body["status"]["connectionSecretRef"], "demo-web-pg-conn");
         assert!(body["status"].get("instance").is_none());
         assert!(body["status"].get("dbnum").is_none());
+        assert!(body["status"].get("volumeClaimRef").is_none());
+    }
+
+    // --- status_apply_body() for the disk backend (2.6b) ---
+
+    #[test]
+    fn terminal_status_body_carries_volume_claim_ref_for_disk() {
+        // The disk path has NO connection Secret — it publishes a
+        // `volumeClaimRef` instead (the renderer reads the PVC name there).
+        // The terminal body must carry `ready` + `volumeClaimRef` and omit
+        // `connectionSecretRef` (no Secret) and the dragonfly allocation.
+        let cond = ready_condition("True", "Provisioned", "ok", &[]);
+        let body = status_apply_body(
+            "claim-demo-app-disk-data",
+            None,
+            Some("claim-demo-app-disk-data"),
+            cond,
+            None,
+        );
+        assert_eq!(body["status"]["ready"], true);
+        assert_eq!(body["status"]["volumeClaimRef"], "claim-demo-app-disk-data");
+        assert!(
+            body["status"].get("connectionSecretRef").is_none(),
+            "disk has no connection Secret"
+        );
+        assert!(body["status"].get("instance").is_none());
+        assert!(body["status"].get("dbnum").is_none());
+        assert!(body["status"]["conditions"].is_array());
+        assert_eq!(body["metadata"]["name"], "claim-demo-app-disk-data");
     }
 
     // --- redis_connection_secret_object() (2.6-4) ---

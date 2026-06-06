@@ -60,6 +60,7 @@ use operator_core::{Metrics, ResourceClaim};
 
 pub mod acl_reconcile;
 pub mod cnpg;
+pub mod disk;
 pub mod dragonfly;
 pub mod gc;
 pub mod grace;

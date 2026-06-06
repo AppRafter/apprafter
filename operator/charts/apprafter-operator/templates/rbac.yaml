@@ -233,6 +233,27 @@ rules:
       - update
       - patch
       - delete
+  # Phase 2.6b disk arm (ADR 0043): the provisioner SSA-applies a
+  # standalone ReadWriteOnce PersistentVolumeClaim (group "", core/v1)
+  # per `type: disk` claim into the app namespace, and the RetainedClaim
+  # GC deletes it after the 7-day grace. The PVC is UNOWNED (no
+  # ownerReference) so it survives an app delete + redeploy (retention);
+  # without these verbs the disk provisioner 403s on its first PVC apply
+  # and every disk claim stalls Pending, and the GC cannot drop the PVC
+  # after grace. `delete` covers the GC drop; `get`/`list`/`watch` and
+  # the apply verbs cover provisioning + idempotent reattach.
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
   # Phase 2.4f RetainedClaim CRD — written by the provisioner
   # finalizer (the deletion snapshot: create/patch via SSA) and
   # consumed + deleted by the RetainedClaim GC controller (the

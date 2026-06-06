@@ -5,10 +5,15 @@
 //! deserves a clearer error message:
 //!
 //!   - **`spec.type` is one of the closed built-in set**
-//!     (`pg|jetstream|clickhouse|redis|s3|notifications`). An unknown
-//!     type is rejected — in v1alpha1 there is no plugin registry yet
-//!     (ServiceProviderPlugin lands in Phase 7), so the set is closed.
-//!   - **`spec.backend` is present and non-empty.**
+//!     (`pg|jetstream|clickhouse|redis|s3|notifications|disk`). An
+//!     unknown type is rejected — in v1alpha1 there is no plugin registry
+//!     yet (ServiceProviderPlugin lands in Phase 7), so the set is closed.
+//!   - **`spec.backend` is present, non-empty, and one of the closed set
+//!     of wired provisioner backends**
+//!     (`cloudnative-pg|dragonfly|disk`). A backend with no provisioner
+//!     arm would leave a matched claim stalled forever, so the set is
+//!     closed in v1alpha1 (extended when a backend arm is wired, mirroring
+//!     the closed `type` set).
 //!
 //! No `kube` types — operates on `serde_json::Value` like the other
 //! validators.
@@ -21,14 +26,22 @@ use crate::validator::ValidationError;
 /// `#PlatformServiceType` in `schemas/v1alpha1/types.cue`. Phase 7
 /// `ServiceProviderPlugin` will extend this at runtime; until then a
 /// type outside this set is an admission error.
-const BUILTIN_TYPES: [&str; 6] = [
+const BUILTIN_TYPES: [&str; 7] = [
     "pg",
     "jetstream",
     "clickhouse",
     "redis",
     "s3",
     "notifications",
+    "disk",
 ];
+
+/// The closed set of provisioner backends with a wired arm in the
+/// resourceclaim-provisioner (`Backend::from_spec_backend`). A backend
+/// outside this set has no provisioner, so a matched claim would stall
+/// forever — reject it at admission. Extended when a new backend arm is
+/// wired (e.g. `aws-rds` for an external pg provider).
+const WIRED_BACKENDS: [&str; 3] = ["cloudnative-pg", "dragonfly", "disk"];
 
 /// Validate a ServiceProvider AdmissionReview object. The caller
 /// (server.rs) passes the full `request.object`. Returns every error
@@ -63,10 +76,18 @@ pub fn validate_serviceprovider(object: &Value) -> Vec<ValidationError> {
     }
 
     match spec.get("backend").and_then(Value::as_str) {
-        Some(b) if !b.is_empty() => {}
-        Some(_) => errors.push(ValidationError::new(
+        Some(b) if WIRED_BACKENDS.contains(&b) => {}
+        Some("") => errors.push(ValidationError::new(
             "spec.backend",
             "spec.backend must not be empty",
+        )),
+        Some(b) => errors.push(ValidationError::new(
+            "spec.backend",
+            format!(
+                "backend must be one of {} (got {b:?}); no provisioner \
+                 arm is wired for this backend",
+                WIRED_BACKENDS.join("|")
+            ),
         )),
         None => errors.push(ValidationError::new(
             "spec.backend",
@@ -140,6 +161,37 @@ mod tests {
         obj["spec"].as_object_mut().unwrap().remove("backend");
         let errors = validate_serviceprovider(&obj);
         assert!(errors.iter().any(|e| e.field == "spec.backend"));
+    }
+
+    #[test]
+    fn accepts_every_wired_backend() {
+        for b in WIRED_BACKENDS {
+            let mut obj = valid_object();
+            obj["spec"]["backend"] = json!(b);
+            assert!(
+                validate_serviceprovider(&obj).is_empty(),
+                "wired backend {b} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_disk_backend() {
+        // The 2.6b `disk-local` seed declares `backend: disk`.
+        let mut obj = valid_object();
+        obj["spec"]["type"] = json!("disk");
+        obj["spec"]["backend"] = json!("disk");
+        assert!(validate_serviceprovider(&obj).is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_backend() {
+        let mut obj = valid_object();
+        obj["spec"]["backend"] = json!("aws-rds");
+        let errors = validate_serviceprovider(&obj);
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.backend" && e.message.contains("aws-rds")));
     }
 
     #[test]
