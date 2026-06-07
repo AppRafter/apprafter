@@ -99,6 +99,21 @@ fi
 # is unset the manifest is emitted unchanged (base-only) — the
 # pre-2.9 behaviour is byte-for-byte preserved.
 #
+# Argo CD env-var prefix (CRITICAL): a CMP plugin does NOT see
+# `spec.source.plugin.env` vars under their bare names. Since
+# Argo CD v2.4 the repo-server's CMP server exposes every
+# user-declared plugin env var to the generate command PREFIXED
+# with `ARGOCD_ENV_` (a deliberate hardening so a repo cannot
+# silently override a sidecar's own environment). So the var the
+# CLI sets as `APPRAFTER_APP_ENV` arrives here as
+# `ARGOCD_ENV_APPRAFTER_APP_ENV`. We resolve the prefixed form
+# first and fall back to the bare name — the bare name still
+# works for direct invocation (the host regression test
+# `test-inject.sh`, or an operator running entrypoint.sh by
+# hand). Reading ONLY the bare name made the in-cluster injection
+# silently inert (the e2e per-env walk caught this).
+APPRAFTER_APP_ENV="${ARGOCD_ENV_APPRAFTER_APP_ENV:-${APPRAFTER_APP_ENV:-}}"
+#
 # Mechanism: round-trip ONE rendered YAML document through
 # `cue export yaml: - --out json | jq | cue export json: -
 # --out yaml`. cue reads stdin when the input argument is `-`,

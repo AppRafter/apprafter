@@ -110,12 +110,27 @@ assert_count() {
 # entrypoint.sh cd's into ./apprafter itself, so run it from the
 # fixture ROOT (the parent of apprafter/), matching how Argo CD's
 # repo-server invokes it when source.path points at the repo root.
-run_entrypoint() {  # $1 fixture root, $2 value for APPRAFTER_APP_ENV ("" = unset)
-    local root=$1 env_val=$2
+#
+# $3 selects which env-var NAME carries the value:
+#   "bare"   → APPRAFTER_APP_ENV (direct invocation; an operator
+#              running entrypoint.sh by hand).
+#   "argocd" → ARGOCD_ENV_APPRAFTER_APP_ENV — the ONLY form a real
+#              Argo CD repo-server passes a `spec.source.plugin.env`
+#              var under (CMP vars are exposed PREFIXED with
+#              `ARGOCD_ENV_` since Argo CD v2.4). The entrypoint MUST
+#              honour this form or the in-cluster injection is inert
+#              (the e2e per-env walk caught exactly that regression).
+# Default "bare" keeps existing call sites unchanged.
+run_entrypoint() {  # $1 fixture root, $2 env value ("" = unset), $3 var style (bare|argocd)
+    local root=$1 env_val=$2 style=${3:-bare}
     if [[ -z "$env_val" ]]; then
-        ( cd "$root" && unset APPRAFTER_APP_ENV && bash "$entrypoint" )
+        ( cd "$root" && unset APPRAFTER_APP_ENV ARGOCD_ENV_APPRAFTER_APP_ENV && bash "$entrypoint" )
+    elif [[ "$style" == "argocd" ]]; then
+        ( cd "$root" && unset APPRAFTER_APP_ENV \
+            && ARGOCD_ENV_APPRAFTER_APP_ENV="$env_val" bash "$entrypoint" )
     else
-        ( cd "$root" && APPRAFTER_APP_ENV="$env_val" bash "$entrypoint" )
+        ( cd "$root" && unset ARGOCD_ENV_APPRAFTER_APP_ENV \
+            && APPRAFTER_APP_ENV="$env_val" bash "$entrypoint" )
     fi
 }
 
@@ -129,6 +144,18 @@ assert_contains "$out" "apprafter.io/environment: dev" "Style A: apprafter.io/en
 # The base manifest must survive the round-trip intact.
 assert_contains "$out" "name: inject-fixture" "Style A: base metadata.name preserved through injection"
 assert_contains "$out" "image: nginxdemos/hello:plain-text" "Style A: base spec.base.image preserved through injection"
+
+# ── Style A, Argo CD PREFIXED var SET → injection present ──
+# Argo CD's repo-server passes a `spec.source.plugin.env` var named
+# APPRAFTER_APP_ENV to the generate command as
+# ARGOCD_ENV_APPRAFTER_APP_ENV (the v2.4+ CMP hardening). This is the
+# form that ACTUALLY reaches the entrypoint in-cluster — the bare
+# APPRAFTER_APP_ENV is never set by Argo. Reading only the bare name
+# made the in-cluster injection silently inert; this case is the
+# regression guard for that (e2e per-env walk found, 2.9).
+out_argocd=$(run_entrypoint "$style_a" "dev" "argocd")
+assert_contains "$out_argocd" "environment: dev" "Style A: spec.environment injected when ARGOCD_ENV_APPRAFTER_APP_ENV=dev (Argo CD prefixed form)"
+assert_contains "$out_argocd" "apprafter.io/environment: dev" "Style A: env label injected when ARGOCD_ENV_APPRAFTER_APP_ENV=dev (Argo CD prefixed form)"
 
 # ── Style A, var UNSET → manifest unchanged ────────────────
 out_base=$(run_entrypoint "$style_a" "")
