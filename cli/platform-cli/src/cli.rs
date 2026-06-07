@@ -588,6 +588,12 @@ pub enum AppCommand {
     Logs {
         /// Application name.
         name: String,
+        /// Select the env-deployment `<name>-<env>` (ADR 0044 / 2.9).
+        /// Omit for a base/single-env app; if the app is deployed
+        /// per-env and `--env` is omitted, the command errors with the
+        /// available environments.
+        #[arg(long)]
+        env: Option<String>,
         /// Stream new log lines as they appear (`kubectl logs
         /// -f`).
         #[arg(short = 'f', long, default_value_t = false)]
@@ -617,6 +623,12 @@ pub enum AppCommand {
     Rollback {
         /// Application name.
         name: String,
+        /// Select the env-deployment `<name>-<env>` (ADR 0044 / 2.9).
+        /// Omit for a base/single-env app; if the app is deployed
+        /// per-env and `--env` is omitted, the command errors with the
+        /// available environments.
+        #[arg(long)]
+        env: Option<String>,
         /// Explicit revision (commit SHA / tag / branch).
         /// Without the flag: previous entry in `status.history`.
         #[arg(long = "to")]

@@ -1604,11 +1604,87 @@ fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
     }
 }
 
+/// Resolve the Argo CD Application for a per-env-aware command
+/// (`logs`, `rollback`): `<name>-<env>` when `--env` is given, else the
+/// bare `<name>`. On a not-found where `--env` was omitted, if the app
+/// is actually deployed per-env (apps match the
+/// `apprafter.io/application=<name>` label) return a helpful error
+/// listing the env-deployments and pointing at `--env` — mirroring the
+/// per-env aggregation `status` / `remove` already do.
+///
+/// Returns `(application_json, argo_name)` — pass `argo_name` to any
+/// later kubectl call that targets the Argo app's `metadata.name`
+/// (e.g. rollback's patch target), NOT the bare `name`.
+/// Pure helper — the Argo CD `metadata.name` a per-env-aware command
+/// targets: `<name>-<env>` when `--env` is given, else the bare
+/// `<name>`. The same `<name>-<env>` shape `add` / `remove` stamp.
+fn argo_app_name_for(name: &str, env: Option<&str>) -> String {
+    match env {
+        Some(e) => format!("{name}-{e}"),
+        None => name.to_string(),
+    }
+}
+
+/// Pure helper — the "deployed per environment" guidance message shown
+/// when `--env` was omitted but the app only exists as `<name>-<env>`
+/// deployments. `envs` is the list of resolved environment labels;
+/// empty ⇒ a generic "multiple".
+fn per_env_guidance_message(name: &str, envs: &[String]) -> String {
+    format!(
+        "'{name}' is deployed per environment ({}). Pass `--env <env>` to target one.",
+        if envs.is_empty() {
+            "multiple".to_string()
+        } else {
+            envs.join(", ")
+        }
+    )
+}
+
+fn resolve_app_for_command(name: &str, env: Option<&str>, kc: &Path) -> Result<(Value, String)> {
+    let argo_name = argo_app_name_for(name, env);
+    if let Some(app) = kubectl_get_json(
+        "application.argoproj.io",
+        Some(&argo_name),
+        Some(ARGOCD_NAMESPACE),
+        kc,
+    )? {
+        return Ok((app, argo_name));
+    }
+    // Not found directly. If no `--env` and the app is deployed
+    // per-env, guide the user to pass `--env <env>`.
+    if env.is_none() {
+        let grouped = kubectl_get_json_by_selector(
+            "application.argoproj.io",
+            &format!("apprafter.io/application={name}"),
+            Some(ARGOCD_NAMESPACE),
+            kc,
+        )
+        .unwrap_or_default();
+        if !grouped.is_empty() {
+            let envs: Vec<String> = grouped
+                .iter()
+                .filter_map(|a| {
+                    a.pointer("/metadata/labels/apprafter.io~1environment")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .collect();
+            return Err(CliError::Other(per_env_guidance_message(name, &envs)));
+        }
+    }
+    Err(CliError::Other(format!(
+        "Application '{argo_name}' not found in namespace {ARGOCD_NAMESPACE}. Run \
+         `apprafter app list`."
+    )))
+}
+
 /// `apprafter app logs <name>` — stream logs from the
 /// workload pods of an apprafter-managed Application. Pure
 /// shell-out to `kubectl logs`, scoped to the app's destination
 /// namespace (read from the Application CR's
-/// `spec.destination.namespace`).
+/// `spec.destination.namespace`). ADR 0044 (2.9): `--env <env>`
+/// selects the per-env deployment `<name>-<env>`; omit for a
+/// base/single-env app.
 ///
 /// Without `--pod`: aggregate via `-l <selector>` — the
 /// AppRafter operator stamps `app.kubernetes.io/name: <inner
@@ -1620,6 +1696,7 @@ fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
 /// `--pod` overrides the selector with a direct pod name.
 pub fn logs(
     name: &str,
+    env: Option<String>,
     follow: bool,
     tail: i64,
     container: Option<String>,
@@ -1627,25 +1704,14 @@ pub fn logs(
 ) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
-    let app = kubectl_get_json(
-        "application.argoproj.io",
-        Some(name),
-        Some(ARGOCD_NAMESPACE),
-        kc.path(),
-    )?
-    .ok_or_else(|| {
-        CliError::Other(format!(
-            "Application '{name}' not found in namespace {ARGOCD_NAMESPACE}. Run \
-             `apprafter app list` for the registered applications."
-        ))
-    })?;
+    let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
 
     let workload_ns = app
         .pointer("/spec/destination/namespace")
         .and_then(Value::as_str)
         .ok_or_else(|| {
             CliError::Other(format!(
-                "Application '{name}' does not carry `spec.destination.namespace` — no \
+                "Application '{argo_name}' does not carry `spec.destination.namespace` — no \
                  namespace to point kubectl logs at. The CR may have been created outside \
                  `apprafter app add`."
             ))
@@ -1655,10 +1721,11 @@ pub fn logs(
     // (operator's `app.kubernetes.io/name`), which is the
     // `Application.cue` metadata.name and can differ from the Argo
     // CD parent name typed at `app add`. Resolve it from
-    // status.resources[]; fall back to the Argo name for raw-YAML
-    // apps that carry no AppRafter Application CR.
+    // status.resources[]; fall back to the resolved Argo name
+    // (`<name>-<env>` for an env deploy) for raw-YAML apps that carry
+    // no AppRafter Application CR.
     let inner = crate::commands::app_open::find_apprafter_app_name(&app)
-        .unwrap_or_else(|| name.to_string());
+        .unwrap_or_else(|| argo_name.clone());
     let target = build_kubectl_logs_target(&inner, pod.as_deref());
     let args = build_kubectl_logs_args(&target, workload_ns, follow, tail, container.as_deref());
 
@@ -1681,19 +1748,9 @@ pub fn logs(
 /// the previous entry in `status.history` when `--to` is
 /// omitted). Argo CD's automated sync picks up the change on
 /// the next reconcile and rolls back the workload.
-pub fn rollback(name: &str, to: Option<String>, yes: bool) -> Result<()> {
+pub fn rollback(name: &str, env: Option<String>, to: Option<String>, yes: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let app = kubectl_get_json(
-        "application.argoproj.io",
-        Some(name),
-        Some(ARGOCD_NAMESPACE),
-        kc.path(),
-    )?
-    .ok_or_else(|| {
-        CliError::Other(format!(
-            "Application '{name}' not found in namespace {ARGOCD_NAMESPACE}."
-        ))
-    })?;
+    let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
 
     let current_revision = app
         .pointer("/spec/source/targetRevision")
@@ -1720,7 +1777,7 @@ pub fn rollback(name: &str, to: Option<String>, yes: bool) -> Result<()> {
             ));
         }
         println!(
-            "Roll back Application '{name}' from revision '{current_revision}' to \
+            "Roll back Application '{argo_name}' from revision '{current_revision}' to \
              '{target_revision}'?"
         );
         let confirmed = inquire::Confirm::new("Confirm?")
@@ -1734,9 +1791,12 @@ pub fn rollback(name: &str, to: Option<String>, yes: bool) -> Result<()> {
     }
 
     let body = format!(r#"{{"spec":{{"source":{{"targetRevision":"{target_revision}"}}}}}}"#);
+    // Patch the RESOLVED Argo CD object (`<name>-<env>` for an env
+    // deploy), NOT the bare logical name — otherwise a per-env rollback
+    // would target a non-existent `<name>` Application.
     kubectl_merge_patch(
         "application.argoproj.io",
-        name,
+        &argo_name,
         Some(ARGOCD_NAMESPACE),
         None,
         &body,
@@ -1744,7 +1804,7 @@ pub fn rollback(name: &str, to: Option<String>, yes: bool) -> Result<()> {
     )?;
 
     println!(
-        "✓ Application '{name}' rolled back to revision '{target_revision}'. Argo CD will \
+        "✓ Application '{argo_name}' rolled back to revision '{target_revision}'. Argo CD will \
          sync the workload within a reconcile cycle."
     );
     Ok(())
@@ -2577,6 +2637,28 @@ mod tests {
         assert!(validate_dns_1123("foo_bar").is_err());
         assert!(validate_dns_1123("dev").is_ok());
         assert!(validate_dns_1123("prod").is_ok());
+    }
+
+    #[test]
+    fn argo_app_name_for_resolves_per_env_vs_base() {
+        // ADR 0044 (2.9): per-env-aware `logs` / `rollback` target
+        // `<name>-<env>` with `--env`, else the bare `<name>` — matching
+        // the `<name>-<env>` shape `add` / `remove` stamp.
+        assert_eq!(argo_app_name_for("web", Some("dev")), "web-dev");
+        assert_eq!(argo_app_name_for("web", Some("prod")), "web-prod");
+        assert_eq!(argo_app_name_for("web", None), "web");
+    }
+
+    #[test]
+    fn per_env_guidance_message_lists_envs_and_points_at_flag() {
+        // The no-`--env`-but-deployed-per-env guidance lists the available
+        // environments and points the user at `--env`.
+        let msg = per_env_guidance_message("web", &["dev".into(), "prod".into()]);
+        assert!(msg.contains("'web' is deployed per environment (dev, prod)"));
+        assert!(msg.contains("Pass `--env <env>` to target one."));
+        // Empty env list (labels absent) falls back to "multiple".
+        let generic = per_env_guidance_message("web", &[]);
+        assert!(generic.contains("(multiple)"));
     }
 
     #[test]

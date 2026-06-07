@@ -143,12 +143,15 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             AppCommand::Status { name, resources } => commands::app::status(&name, resources)?,
             AppCommand::Logs {
                 name,
+                env,
                 follow,
                 tail,
                 container,
                 pod,
-            } => commands::app::logs(&name, follow, tail, container, pod)?,
-            AppCommand::Rollback { name, to, yes } => commands::app::rollback(&name, to, yes)?,
+            } => commands::app::logs(&name, env, follow, tail, container, pod)?,
+            AppCommand::Rollback { name, env, to, yes } => {
+                commands::app::rollback(&name, env, to, yes)?
+            }
             AppCommand::Open {
                 name,
                 port,
