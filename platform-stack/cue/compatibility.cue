@@ -1723,6 +1723,44 @@ compatibility: "0.1.23": {
 // breach) fixed by serializing reconciles; and the operator-only-CREATE
 // webhooks now accept `kubeadm:cluster-admins` break-glass (k8s 1.35).
 // CRD-compatible with 0.2.19; existing claims keep their allocation.
+compatibility: "0.2.22": {
+	change:          "safe"
+	operatorVersion: "v0.2.22"
+	notes: """
+		Phase 2.9 (per-environment deploy, ADR 0044) close — the coordinated
+		operator + cue-cmp release. Environment selection becomes a
+		DEPLOY-TIME, per-Application property: a new optional
+		`Application.spec.environment` (injected by the cue-cmp from the Argo
+		Application's APPRAFTER_APP_ENV plugin env) selects which
+		`environments.<env>` override unifies onto base; the inert cluster-wide
+		`APPRAFTER_ENV` operator var is removed. The operator reads the per-CR
+		field via `effective_spec`, stamps the existing
+		`apprafter.io/application` + `apprafter.io/environment` labels on
+		children + surfaces `status.environment`, and the application-scoped
+		MigrationPlan gate now matches the per-CR env. A new optional
+		`PlatformStack.spec.defaultEnvironment` is the CLI's soft default. The
+		admission webhook rejects a `spec.environment` not in
+		`spec.environments`.
+
+		**cue-cmp bumped to v0.1.8** (CRITICAL): the in-cluster injection was
+		inert before — Argo CD exposes `spec.source.plugin.env` vars prefixed
+		with `ARGOCD_ENV_`, so the sidecar read the bare name and never
+		injected `spec.environment` (every deploy rendered base, `--env`
+		silently ignored). v0.1.8 resolves the `ARGOCD_ENV_`-prefixed form.
+		platform-stack derives the cue-cmp image tag from
+		`argocd-cue-cmp/version.cue`, so this stack ships v0.1.8.
+
+		CRD changes are additive (optional `Application.spec.environment` +
+		`status.environment`, optional `PlatformStack.spec.defaultEnvironment`)
+		— CRD-compatible with 0.2.21; existing deployments (no
+		`spec.environment`) render base, unchanged. CLI surface:
+		`app add --env` (one Argo app `<name>-<env>` per env-deployment) +
+		interactive env/namespace pickers + `app status`/`remove` aggregate by
+		`apprafter.io/application`.
+		"""
+	references: ["plan.md#2.9", "docs/adr/0044-per-environment-deploy.md"]
+}
+
 compatibility: "0.2.21": {
 	change:          "safe"
 	operatorVersion: "v0.2.21"
