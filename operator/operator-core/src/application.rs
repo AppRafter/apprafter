@@ -631,9 +631,13 @@ mod tests {
         let bare: ApplicationSpec =
             serde_json::from_value(serde_json::json!({ "base": { "image": "x" } })).unwrap();
         assert!(bare.environment.is_none());
-        assert!(serde_json::to_value(&bare).unwrap().get("environment").is_none());
+        assert!(serde_json::to_value(&bare)
+            .unwrap()
+            .get("environment")
+            .is_none());
         let status: ApplicationStatus =
-            serde_json::from_value(serde_json::json!({ "phase": "Ready", "environment": "dev" })).unwrap();
+            serde_json::from_value(serde_json::json!({ "phase": "Ready", "environment": "dev" }))
+                .unwrap();
         assert_eq!(status.environment.as_deref(), Some("dev"));
     }
 }

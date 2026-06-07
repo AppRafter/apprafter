@@ -172,14 +172,13 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // B.1.77 pause gate. Must run BEFORE child patches —
     // otherwise we'd race the user's "I just pushed a
     // destructive change, please pause" flow.
-    if let Some(plan) =
-        find_blocking_migration_plan(
-            &ctx.client,
-            &name,
-            &namespace,
-            app.spec.environment.as_deref(),
-        )
-        .await?
+    if let Some(plan) = find_blocking_migration_plan(
+        &ctx.client,
+        &name,
+        &namespace,
+        app.spec.environment.as_deref(),
+    )
+    .await?
     {
         let plan_name = plan.name_any();
         info!(

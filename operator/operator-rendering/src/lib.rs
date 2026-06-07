@@ -771,7 +771,12 @@ mod tests {
             ..Default::default()
         });
         let rendered = render_application_for_env(&app, Some("dev"), None, None, None);
-        let labels = rendered.deployment.metadata.labels.clone().unwrap_or_default();
+        let labels = rendered
+            .deployment
+            .metadata
+            .labels
+            .clone()
+            .unwrap_or_default();
         assert_eq!(
             labels.get("apprafter.io/application").map(String::as_str),
             Some("web")
@@ -785,7 +790,9 @@ mod tests {
         let base = render_application_for_env(&app, None, None, None, None);
         let base_labels = base.deployment.metadata.labels.clone().unwrap_or_default();
         assert_eq!(
-            base_labels.get("apprafter.io/application").map(String::as_str),
+            base_labels
+                .get("apprafter.io/application")
+                .map(String::as_str),
             Some("web")
         );
         assert!(!base_labels.contains_key("apprafter.io/environment"));
