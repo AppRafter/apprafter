@@ -28,6 +28,8 @@ pub struct PlatformStackSpec {
     pub pin: Option<String>,
     #[serde(default, rename = "autoUpgrade")]
     pub auto_upgrade: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "defaultEnvironment")]
+    pub default_environment: Option<String>,
     pub source: PlatformStackSource,
     pub values: PlatformStackValues,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,4 +145,26 @@ pub struct PlatformStackCondition {
     pub message: Option<String>,
     #[serde(rename = "lastTransitionTime")]
     pub last_transition_time: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_environment_round_trips_camel_case() {
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 },
+            "defaultEnvironment": "prod"
+        }))
+        .unwrap();
+        assert_eq!(spec.default_environment.as_deref(), Some("prod"));
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v.get("defaultEnvironment").and_then(|x| x.as_str()), Some("prod"));
+    }
 }

@@ -45,6 +45,10 @@ package v1alpha1
 	// surface as MigrationPlan instead.
 	autoUpgrade: bool | *false
 
+	// Soft per-cluster default environment (ADR 0044) — a CLI pre-selection
+	// convenience for `app add`, never a hard gate.
+	defaultEnvironment?: string
+
 	// Chart pull source. Defaults match the canonical AppRafter
 	// upstream; fork installs override `repoURL` while leaving
 	// `upstream` pointing at canonical for availability

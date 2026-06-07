@@ -58,6 +58,8 @@ spec:
                 autoUpgrade:
                   type: boolean
                   default: false
+                defaultEnvironment:
+                  type: string
                 source:
                   type: object
                   required: [upstream, repoURL, checkInterval]
