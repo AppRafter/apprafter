@@ -91,6 +91,16 @@ jobs:
         # (plain CUE repos getting intercepted).
         run: bash argocd-cue-cmp/test-discover.sh
 
+      - name: Inject script regression test
+        # 2.9 (ADR 0044) — asserts entrypoint.sh injects
+        # `spec.environment` + the `apprafter.io/environment` label
+        # from the APPRAFTER_APP_ENV plugin env (Style A single-doc
+        # + Style B multi-doc), and emits the manifest UNCHANGED when
+        # the var is unset. Same stdout-only discipline as discover:
+        # Argo reads stdout, so a botched injection that pollutes or
+        # empties stdout must fail here, not in a live sync.
+        run: bash argocd-cue-cmp/test-inject.sh
+
       - name: Entrypoint smoke (cue export of a tiny fixture)
         run: |
           mkdir -p /tmp/cue-smoke/apprafter
