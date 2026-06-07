@@ -24,10 +24,11 @@
 # user (uid 65532). The musl-built binary is fully static so it
 # needs no libc / dynamic-linker support in the runtime layer.
 
-# Base image pinned + cargo-chef installed as pre-built binary
+# Base image pinned + cargo-chef installed as pre-built binary,
+# registry fully qualified to avoid podman's short-name prompt
 # — see `operator/apprafter-operator/Dockerfile` for full
 # rationale.
-FROM rust:1.88-alpine3.21 AS chef
+FROM docker.io/library/rust:1.88-alpine3.21 AS chef
 ARG CARGO_CHEF_VERSION=0.1.71
 RUN apk add --no-cache musl-dev curl tar \
  && curl --proto '=https' --tlsv1.2 -fsSL \

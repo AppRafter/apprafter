@@ -60,7 +60,14 @@
 # cargo-chef installed as a pre-built binary, not via
 # `cargo install --locked`. The latter compiles cargo-chef
 # from source (~1-2 min); the binary is ~10s.
-FROM rust:1.88-alpine3.21 AS chef
+#
+# Registry is fully qualified (`docker.io/library/...`) on
+# purpose: a bare short name (`rust:...`) makes podman with
+# multiple `unqualified-search-registries` (docker.io + quay.io)
+# PROMPT interactively for the registry, which hangs the LOCAL_
+# OPERATOR e2e build (`e2e/needs-disk-walk.sh`). Docker buildx
+# resolves the qualified form identically, so CI is unaffected.
+FROM docker.io/library/rust:1.88-alpine3.21 AS chef
 ARG CARGO_CHEF_VERSION=0.1.71
 RUN apk add --no-cache musl-dev curl tar \
  && curl --proto '=https' --tlsv1.2 -fsSL \
