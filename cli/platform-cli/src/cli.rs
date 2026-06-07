@@ -560,7 +560,14 @@ pub enum AppCommand {
     /// when the operator marks the CR `phase=Ready` before pods
     /// reach Running.
     Status {
-        /// Application name (as listed via `apprafter app list`).
+        /// LOGICAL application name (as passed to `apprafter app add`,
+        /// listed via `apprafter app list`). ADR 0044 (2.9): the same
+        /// app is deployed per environment as separate Argo CD
+        /// Applications named `<name>-<env>`; `status` aggregates ALL of
+        /// them, grouped by the `apprafter.io/application=<name>` label,
+        /// and renders a per-environment section for each. A pre-2.9 /
+        /// base-only app (one Application named exactly `<name>`) still
+        /// resolves via the no-label fallback.
         name: String,
         /// Show child workload state — Argo CD's
         /// `status.resources[]` plus pods in the destination
@@ -687,10 +694,15 @@ pub enum AppCommand {
     /// Delete an Application and cascade-remove the Argo CD CR
     /// (which Argo CD then tears down child resources for).
     /// Interactive: prompts for confirmation; non-interactive
-    /// requires `--yes` to skip the prompt.
+    /// requires `--yes` to skip the prompt. ADR 0044 (2.9):
+    /// `--env <env>` removes ONE per-environment deployment
+    /// (`<name>-<env>`); without `--env`, ALL environment
+    /// deployments grouped under `apprafter.io/application=<name>`
+    /// are removed (a single confirmation covers the batch).
     #[command(alias = "rm")]
     Remove {
-        /// Application name.
+        /// LOGICAL application name. Without `--env` this removes every
+        /// environment deployment of the app; with `--env` just the one.
         name: String,
         /// Skip confirmation prompt. Required in non-interactive
         /// shells (no TTY) — there's no silent destruction
@@ -705,11 +717,12 @@ pub enum AppCommand {
         /// operator wants to re-attach the data later.
         #[arg(long = "keep-data", default_value_t = false)]
         keep_data: bool,
-        /// Environment to remove (ADR 0044). Targets the Argo
-        /// Application named `<name>-<env>` — the single
-        /// per-environment deployment registered by `app add
-        /// --env <env>`. Omit to remove the base-only `<name>`
-        /// Application.
+        /// Environment to remove (ADR 0044). Selects ONE per-environment
+        /// deployment — the Argo Application named `<name>-<env>`
+        /// registered by `app add --env <env>`. Omit to remove ALL
+        /// environment deployments of `<name>` (grouped by the
+        /// `apprafter.io/application` label); a pre-2.9 / base-only app
+        /// with no env label resolves to the single `<name>` Application.
         #[arg(long)]
         env: Option<String>,
     },

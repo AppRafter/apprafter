@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use tabled::{Table, Tabled};
 
 use crate::commands::k8s_helpers::{
-    ensure_kubeconfig_tempfile, kubectl_get_json, kubectl_merge_patch,
+    ensure_kubeconfig_tempfile, kubectl_get_json, kubectl_get_json_by_selector, kubectl_merge_patch,
 };
 
 const ARGOCD_NAMESPACE: &str = "argocd";
@@ -309,11 +309,19 @@ pub fn add(
         kc.path(),
     )?;
     if existing.is_some() {
+        // Post-2.9 UX: `app status` aggregates ALL env-deployments of one
+        // logical app, and `app remove --env` targets a single one — so
+        // suggest the LOGICAL name (+ env), not the `<name>-<env>` Argo
+        // name. A base-only collision (env: None) drops the `--env` hint.
+        let remove_hint = match env.as_deref() {
+            Some(e) => format!("apprafter app remove {derived_name} --env {e}"),
+            None => format!("apprafter app remove {derived_name}"),
+        };
         return Err(CliError::Other(format!(
             "Application '{argo_app_name}' is already registered in namespace \
-             {ARGOCD_NAMESPACE}. Run `apprafter app status {argo_app_name}` to inspect its \
-             current state, `apprafter app remove {argo_app_name}` to cascade-delete it, \
-             or pass a different `--name` / `--env`."
+             {ARGOCD_NAMESPACE}. Run `apprafter app status {derived_name}` to inspect all \
+             environment deployments of this app, `{remove_hint}` to cascade-delete this \
+             one, or pass a different `--name` / `--env`."
         )));
     }
 
@@ -725,20 +733,75 @@ pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> 
 
 pub fn status(name: &str, show_resources: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let app = kubectl_get_json(
+
+    // ADR 0044 (2.9): `name` is the LOGICAL app name. The same app is
+    // deployed per environment as SEPARATE Argo CD Applications named
+    // `<name>-<env>`, grouped by the `apprafter.io/application=<name>`
+    // label the operator + `app add` both stamp. Aggregate across them.
+    let mut apps = kubectl_get_json_by_selector(
         "application.argoproj.io",
-        Some(name),
+        &format!("apprafter.io/application={name}"),
         Some(ARGOCD_NAMESPACE),
         kc.path(),
-    )?
-    .ok_or_else(|| {
-        CliError::Other(format!(
-            "Application '{name}' not found in namespace {ARGOCD_NAMESPACE}. Check \
-             `apprafter app list` for the registered applications."
-        ))
-    })?;
+    )?;
 
-    print_status(&app);
+    // Backward-compat: a pre-2.9 app was registered as a single Argo CD
+    // Application named exactly `<name>` with NO `apprafter.io/application`
+    // label, so the selector matches nothing. Fall back to the old
+    // single-name lookup; if that's also absent, the not-found error.
+    if apps.is_empty() {
+        let app = kubectl_get_json(
+            "application.argoproj.io",
+            Some(name),
+            Some(ARGOCD_NAMESPACE),
+            kc.path(),
+        )?
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "Application '{name}' not found in namespace {ARGOCD_NAMESPACE}. Check \
+                 `apprafter app list` for the registered applications."
+            ))
+        })?;
+        apps.push(app);
+    }
+
+    // Deterministic ordering — by environment then Argo name — so the
+    // per-env sections render the same way every run.
+    let summaries = summarize_deployments(&apps);
+    if summaries.len() > 1 {
+        println!(
+            "Application '{name}' — {} environment deployments:",
+            summaries.len()
+        );
+        for s in &summaries {
+            println!("  • {} ({})", s.argo_name, s.environment);
+        }
+        println!();
+    }
+
+    let mut sorted: Vec<&Value> = apps.iter().collect();
+    sorted.sort_by_key(|a| deployment_sort_key(a));
+
+    let last = sorted.len().saturating_sub(1);
+    for (idx, app) in sorted.iter().enumerate() {
+        print_app_detail(app, show_resources, kc.path());
+        if idx != last {
+            println!();
+            println!("{}", "─".repeat(40));
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+/// Render ONE Argo CD Application's full status block — the Argo CD
+/// summary (`print_status`) plus the inner AppRafter CR phase, pods,
+/// services, and resource claims (each a best-effort kubectl read).
+/// Factored out of `status` so the per-environment aggregation loop
+/// reuses the identical single-app rendering for every `<name>-<env>`.
+fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
+    print_status(app);
 
     // Resolve the INNER workload name + destination namespace
     // once — all four default-path fetches key off them. The
@@ -749,7 +812,7 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
     // `status.resources[]` / `spec.destination.namespace`, so a
     // not-yet-synced app yields `None` for either — in which
     // case the workload detail is simply unavailable yet.
-    let inner = crate::commands::app_open::find_apprafter_app_name(&app);
+    let inner = crate::commands::app_open::find_apprafter_app_name(app);
     let dest_ns = app
         .pointer("/spec/destination/namespace")
         .and_then(Value::as_str);
@@ -763,7 +826,7 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
                 "application.apprafter.io",
                 Some(inner_name),
                 Some(dest_ns),
-                kc.path(),
+                kubeconfig_path,
             ) {
                 Ok(Some(cr)) => {
                     if let Some(phase) = cr.pointer("/status/phase").and_then(Value::as_str) {
@@ -787,7 +850,7 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
             }
 
             // 2. Pods (moved out of --resources). Non-fatal.
-            match list_pods_for_apprafter_app(inner_name, dest_ns, kc.path()) {
+            match list_pods_for_apprafter_app(inner_name, dest_ns, kubeconfig_path) {
                 Ok(pods) => print_pod_summaries(&pods, inner_name, dest_ns),
                 Err(e) => {
                     eprintln!();
@@ -800,7 +863,7 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
             }
 
             // 3. Services. Non-fatal.
-            match list_services_for_apprafter_app(inner_name, dest_ns, kc.path()) {
+            match list_services_for_apprafter_app(inner_name, dest_ns, kubeconfig_path) {
                 Ok(services) => print_service_summaries(&services, inner_name, dest_ns),
                 Err(e) => {
                     eprintln!();
@@ -809,7 +872,7 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
             }
 
             // 4. Resource provisioning (ResourceClaims). Non-fatal.
-            match list_resource_claims_for_app(inner_name, dest_ns, kc.path()) {
+            match list_resource_claims_for_app(inner_name, dest_ns, kubeconfig_path) {
                 Ok(claims) => print_resource_claims(&claims, dest_ns),
                 Err(e) => {
                     eprintln!();
@@ -824,10 +887,85 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
     }
 
     if show_resources {
-        print_argocd_resources(&app);
+        print_argocd_resources(app);
     }
+}
 
-    Ok(())
+/// One per-environment deployment row, summarised from an Argo CD
+/// `Application` JSON. Pure — the formatter / aggregation loop drives
+/// it without a cluster. `environment` resolves from the
+/// `apprafter.io/environment` label first, then `status.environment`,
+/// then `(base)` for a pre-2.9 / base-only deploy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeploymentSummary {
+    /// Argo CD `metadata.name` — `<logical>-<env>` for an env deploy,
+    /// or `<logical>` for a base-only one.
+    pub argo_name: String,
+    /// Resolved environment label (or `(base)` when none).
+    pub environment: String,
+    pub destination_namespace: String,
+    pub sync: String,
+    pub health: String,
+}
+
+/// Pure helper — resolve an Argo CD Application's environment from
+/// `metadata.labels."apprafter.io/environment"`, falling back to
+/// `status.environment`, then `(base)`.
+pub(crate) fn deployment_environment(app: &Value) -> String {
+    app.pointer("/metadata/labels/apprafter.io~1environment")
+        .and_then(Value::as_str)
+        .or_else(|| app.pointer("/status/environment").and_then(Value::as_str))
+        .unwrap_or("(base)")
+        .to_string()
+}
+
+/// Sort key for deterministic per-env section ordering: environment
+/// name then Argo `metadata.name`.
+fn deployment_sort_key(app: &Value) -> (String, String) {
+    let env = deployment_environment(app);
+    let name = app
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    (env, name)
+}
+
+/// Pure helper — summarise a slice of Argo CD `Application` JSON values
+/// into per-environment rows, sorted by (environment, argo name) for a
+/// stable render. Tests drive it from fake Argo-app Values.
+pub(crate) fn summarize_deployments(apps: &[Value]) -> Vec<DeploymentSummary> {
+    let mut rows: Vec<DeploymentSummary> = apps
+        .iter()
+        .map(|app| DeploymentSummary {
+            argo_name: app
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            environment: deployment_environment(app),
+            destination_namespace: app
+                .pointer("/spec/destination/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            sync: app
+                .pointer("/status/sync/status")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string(),
+            health: app
+                .pointer("/status/health/status")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string(),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        (a.environment.as_str(), a.argo_name.as_str())
+            .cmp(&(b.environment.as_str(), b.argo_name.as_str()))
+    });
+    rows
 }
 
 /// Pod state snapshot rendered into the `--resources` table.
@@ -1608,24 +1746,100 @@ pub fn rollback(name: &str, to: Option<String>, yes: bool) -> Result<()> {
 pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
-    // ADR 0044 (2.9): a per-environment deploy registers the Argo CD
-    // Application as `<name>-<env>`. Resolve the target name so
-    // `app remove <name> --env <env>` deletes the right one; a
-    // base-only deploy stays `<name>`.
-    let argo_app_name = match &env {
-        Some(e) => format!("{name}-{e}"),
-        None => name.to_string(),
-    };
+    // ADR 0044 (2.9): `--env <env>` targets the ONE per-environment
+    // deployment registered as `<name>-<env>`. Without `--env`, remove
+    // is logical — it tears down EVERY env-deployment grouped under the
+    // `apprafter.io/application=<name>` label.
+    if let Some(e) = &env {
+        let argo_app_name = format!("{name}-{e}");
+        return remove_single_app(&argo_app_name, yes, keep_data, kc.path());
+    }
 
+    // No `--env`: list all env-deployments grouped by the logical-app
+    // label. Multiple matches → confirm once, then delete each.
+    let grouped = kubectl_get_json_by_selector(
+        "application.argoproj.io",
+        &format!("apprafter.io/application={name}"),
+        Some(ARGOCD_NAMESPACE),
+        kc.path(),
+    )?;
+
+    // Backward-compat: a pre-2.9 / base-only app carries no
+    // `apprafter.io/application` label, so the selector matches nothing.
+    // Fall back to deleting the single `<name>` Application. Exactly one
+    // labelled match also routes here (its own Argo name is `<name>` or
+    // `<name>-<env>` — use the actual metadata.name).
+    if grouped.len() <= 1 {
+        let argo_app_name = grouped
+            .first()
+            .and_then(|a| a.pointer("/metadata/name").and_then(Value::as_str))
+            .map(String::from)
+            .unwrap_or_else(|| name.to_string());
+        return remove_single_app(&argo_app_name, yes, keep_data, kc.path());
+    }
+
+    // Multiple env-deployments. Collect their Argo names for the
+    // confirmation prompt + the delete loop.
+    let argo_names: Vec<String> = grouped
+        .iter()
+        .filter_map(|a| {
+            a.pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .collect();
+
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
+            ));
+        }
+        println!(
+            "Delete ALL {} environment deployments of '{name}'?",
+            argo_names.len()
+        );
+        for an in &argo_names {
+            println!("  • {an}");
+        }
+        let confirmed = inquire::Confirm::new("Confirm?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+        if !confirmed {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Loop-delete each env-deployment. `--keep-data` (finalizer strip) is
+    // applied to every one. `yes=true` skips per-app re-prompting — the
+    // operator already confirmed the batch above.
+    for an in &argo_names {
+        remove_single_app(an, true, keep_data, kc.path())?;
+    }
+    Ok(())
+}
+
+/// Delete ONE Argo CD Application by its exact `metadata.name`. Carries
+/// the confirm / finalizer-strip / kubectl-delete / report flow that
+/// both `remove` paths reuse. `--keep-data` strips the cascade finalizer
+/// so the synced AppRafter CR (and its workload) is preserved.
+fn remove_single_app(
+    argo_app_name: &str,
+    yes: bool,
+    keep_data: bool,
+    kubeconfig_path: &Path,
+) -> Result<()> {
     // Pre-flight: ensure the Application exists. Otherwise
     // kubectl delete reports `applications.argoproj.io
     // "<name>" not found` with exit 1 — we can surface this as
     // a cleaner CLI message than raw kubectl output.
     let existing = kubectl_get_json(
         "application.argoproj.io",
-        Some(&argo_app_name),
+        Some(argo_app_name),
         Some(ARGOCD_NAMESPACE),
-        kc.path(),
+        kubeconfig_path,
     )?;
     let app = existing.ok_or_else(|| {
         CliError::Other(format!(
@@ -1670,11 +1884,11 @@ pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Re
         // NOT prune the synced AppRafter CR — the workload is preserved.
         kubectl_merge_patch(
             "application.argoproj.io",
-            &argo_app_name,
+            argo_app_name,
             Some(ARGOCD_NAMESPACE),
             None,
             r#"{"metadata":{"finalizers":[]}}"#,
-            kc.path(),
+            kubeconfig_path,
         )?;
     }
 
@@ -1683,10 +1897,10 @@ pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Re
     let out = Command::new("kubectl")
         .arg("delete")
         .arg("application.argoproj.io")
-        .arg(&argo_app_name)
+        .arg(argo_app_name)
         .arg("-n")
         .arg(ARGOCD_NAMESPACE)
-        .env("KUBECONFIG", kc.path())
+        .env("KUBECONFIG", kubeconfig_path)
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
     if !out.status.success() {
@@ -3279,5 +3493,92 @@ mod tests {
             parse_resource_claim_summaries(&serde_json::json!({ "items": [] }), "x").is_empty()
         );
         assert!(parse_resource_claim_summaries(&serde_json::json!({}), "x").is_empty());
+    }
+
+    #[test]
+    fn summarize_deployments_produces_a_row_per_environment() {
+        // ADR 0044 (2.9): `app status web` aggregates `web-dev` and
+        // `web-prod`, two SEPARATE Argo CD Applications grouped by the
+        // `apprafter.io/application=web` label. Both env rows render,
+        // each resolving its env from the `apprafter.io/environment`
+        // label.
+        let dev = serde_json::json!({
+            "metadata": {
+                "name": "web-dev",
+                "labels": {
+                    "apprafter.io/application": "web",
+                    "apprafter.io/environment": "dev"
+                }
+            },
+            "spec": { "destination": { "namespace": "web-dev" } },
+            "status": {
+                "sync": { "status": "Synced" },
+                "health": { "status": "Healthy" }
+            }
+        });
+        let prod = serde_json::json!({
+            "metadata": {
+                "name": "web-prod",
+                "labels": {
+                    "apprafter.io/application": "web",
+                    "apprafter.io/environment": "prod"
+                }
+            },
+            "spec": { "destination": { "namespace": "web-prod" } },
+            "status": {
+                "sync": { "status": "OutOfSync" },
+                "health": { "status": "Progressing" }
+            }
+        });
+        // Pass prod first to prove the (env, name) sort makes the order
+        // deterministic regardless of input order.
+        let rows = summarize_deployments(&[prod, dev]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].environment, "dev");
+        assert_eq!(rows[0].argo_name, "web-dev");
+        assert_eq!(rows[0].destination_namespace, "web-dev");
+        assert_eq!(rows[0].sync, "Synced");
+        assert_eq!(rows[0].health, "Healthy");
+        assert_eq!(rows[1].environment, "prod");
+        assert_eq!(rows[1].argo_name, "web-prod");
+        assert_eq!(rows[1].sync, "OutOfSync");
+        assert_eq!(rows[1].health, "Progressing");
+    }
+
+    #[test]
+    fn summarize_deployments_falls_back_to_status_environment_then_base() {
+        // No `apprafter.io/environment` label: resolve from
+        // `status.environment`, then `(base)` for a pre-2.9 / base-only
+        // app. Also exercises the Unknown sync/health defaults.
+        let from_status = serde_json::json!({
+            "metadata": { "name": "api-staging" },
+            "status": { "environment": "staging" }
+        });
+        let base_only = serde_json::json!({
+            "metadata": { "name": "legacy" },
+            "spec": { "destination": { "namespace": "apprafter" } }
+        });
+        let rows = summarize_deployments(&[from_status, base_only]);
+        assert_eq!(rows.len(), 2);
+        // Sorted by (env, name): "(base)" sorts before "staging".
+        assert_eq!(rows[0].environment, "(base)");
+        assert_eq!(rows[0].argo_name, "legacy");
+        assert_eq!(rows[0].sync, "Unknown");
+        assert_eq!(rows[0].health, "Unknown");
+        assert_eq!(rows[1].environment, "staging");
+        assert_eq!(rows[1].argo_name, "api-staging");
+    }
+
+    #[test]
+    fn deployment_environment_prefers_label_over_status() {
+        let app = serde_json::json!({
+            "metadata": { "labels": { "apprafter.io/environment": "dev" } },
+            "status": { "environment": "prod" }
+        });
+        assert_eq!(deployment_environment(&app), "dev");
+        let app2 = serde_json::json!({ "status": { "environment": "prod" } });
+        assert_eq!(deployment_environment(&app2), "prod");
+        let app3 = serde_json::json!({ "metadata": { "name": "x" } });
+        assert_eq!(deployment_environment(&app3), "(base)");
     }
 }

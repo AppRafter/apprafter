@@ -114,6 +114,67 @@ pub fn kubectl_get_json(
     Ok(Some(value))
 }
 
+/// Build the args for `kubectl get <resource> -l <selector> -n <ns> -o json`.
+/// Factored out so the arg shape is unit-testable without spawning kubectl.
+/// When `namespace` is `None` the listing is cluster-wide (`-A`).
+pub(crate) fn kubectl_list_args(
+    resource: &str,
+    selector: &str,
+    namespace: Option<&str>,
+) -> Vec<String> {
+    let mut a = vec![
+        "get".to_string(),
+        resource.to_string(),
+        "-l".to_string(),
+        selector.to_string(),
+    ];
+    match namespace {
+        Some(ns) => {
+            a.push("-n".to_string());
+            a.push(ns.to_string());
+        }
+        None => a.push("-A".to_string()),
+    }
+    a.push("-o".to_string());
+    a.push("json".to_string());
+    a
+}
+
+/// `kubectl get <resource> -l <selector> [-n ns | -A] -o json` → the
+/// `.items[]` array. Mirrors `kubectl_get_json`'s spawn/error handling;
+/// returns an empty `Vec` when the listing matches nothing (a successful
+/// list of zero items, NOT a 404 — selector lists never 404).
+pub(crate) fn kubectl_get_json_by_selector(
+    resource: &str,
+    selector: &str,
+    namespace: Option<&str>,
+    kubeconfig_path: &Path,
+) -> Result<Vec<serde_json::Value>> {
+    let mut c = Command::new("kubectl");
+    c.args(kubectl_list_args(resource, selector, namespace))
+        .env("KUBECONFIG", kubeconfig_path);
+
+    let out = c
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(CliError::Other(format!(
+            "kubectl get {resource} -l {selector} failed (exit {:?}): {stderr}",
+            out.status.code()
+        )));
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
+    Ok(value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
 /// Run `kubectl patch ... --type=merge -p <body>` against a
 /// namespaced or cluster-scoped resource. When `subresource`
 /// is `Some(name)` (`status`, `scale`), the patch routes
@@ -152,4 +213,24 @@ pub fn kubectl_merge_patch(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_by_selector_builds_label_args() {
+        let args = kubectl_list_args(
+            "application.argoproj.io",
+            "apprafter.io/application=web",
+            Some("argocd"),
+        );
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-l", "apprafter.io/application=web"]));
+        assert!(args.windows(2).any(|w| w == ["-n", "argocd"]));
+        let all = kubectl_list_args("x", "y=z", None);
+        assert!(all.iter().any(|a| a == "-A"));
+    }
 }
