@@ -121,9 +121,12 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         }
     }
 
+    let app_environment = obj.get("environment").and_then(|v| v.as_str());
+
     validate_needs_names(base, envs, &mut errors);
     validate_reserved_env_collision(base, envs, &mut errors);
     validate_disk_claims(base, envs, &mut errors);
+    validate_spec_environment(app_environment, envs, &mut errors);
 
     errors
 }
@@ -630,6 +633,26 @@ fn validate_reserved_env_collision(
                 }
             }
         }
+    }
+}
+
+/// `spec.environment`, when present and non-empty, must name a declared
+/// `spec.environments` key — you cannot select an env you did not define
+/// (ADR 0044). An empty string is treated as absent (codebase convention).
+fn validate_spec_environment(
+    app_environment: Option<&str>,
+    envs: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(env) = app_environment.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let declared = envs.is_some_and(|m| m.contains_key(env));
+    if !declared {
+        errors.push(ValidationError::new(
+            "spec.environment",
+            format!("'{env}' is not a declared environment; add it under spec.environments or pick an existing one"),
+        ));
     }
 }
 
@@ -1745,6 +1768,36 @@ mod tests {
                 "prod": { "imagePolicy": { "resolve": "digest" } }
             }
         });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    // ---- 2.9: spec.environment must name a declared spec.environments key ----
+
+    #[test]
+    fn rejects_spec_environment_not_in_environments() {
+        let spec = json!({
+            "base": { "image": "x" },
+            "environments": { "dev": {}, "prod": {} },
+            "environment": "staging"
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.environment");
+    }
+
+    #[test]
+    fn accepts_spec_environment_matching_declared_key() {
+        let spec = json!({
+            "base": { "image": "x" },
+            "environments": { "dev": {}, "prod": {} },
+            "environment": "prod"
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn accepts_spec_without_environment_field() {
+        let spec = json!({ "base": { "image": "x" }, "environments": { "dev": {} } });
         assert!(validate_application_spec(&spec).is_empty());
     }
 }
