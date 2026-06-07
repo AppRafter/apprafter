@@ -66,6 +66,11 @@ pub struct WizardInputs {
     /// `None` when cwd isn't inside a git working tree, or git
     /// is unavailable.
     pub detected_path: Option<String>,
+    /// Deploy environment supplied via `--env` (ADR 0044 / 2.9).
+    /// When `Some` in a TTY run the env picker is pre-filled/skipped;
+    /// `None` lets the wizard prompt over the manifest's declared
+    /// environments.
+    pub env: Option<String>,
 }
 
 /// Wizard result — every field filled, ready to flow into
@@ -77,6 +82,10 @@ pub struct WizardOutput {
     pub path: String,
     pub project: String,
     pub namespace: String,
+    /// Chosen deploy environment (ADR 0044 / 2.9). `Some(env)` when the
+    /// manifest declares environments and the operator picked one (or
+    /// supplied `--env`); `None` for a base-only deploy.
+    pub env: Option<String>,
 }
 
 /// Default destination namespace for user apps registered via
@@ -91,7 +100,31 @@ pub const DEFAULT_DESTINATION_NAMESPACE: &str = "apprafter";
 
 const PROJECT_CHOICES: &[&str] = &["apps", "platform", "platform-providers"];
 
-pub fn run(inputs: WizardInputs) -> Result<WizardOutput> {
+/// Sentinel item appended to the namespace `Select`: choosing it
+/// falls through to a free-text `Text` prompt so the operator can
+/// register an app into a namespace that doesn't exist yet (Argo CD
+/// `CreateNamespace=true` then provisions it on first sync).
+const NEW_NAMESPACE_SENTINEL: &str = "+ enter a new namespace";
+
+/// Index to pre-select in the env picker: the platform default when it is a
+/// declared env, else the first declared env; None when nothing is declared.
+pub(crate) fn preselect_env(declared: &[String], platform_default: Option<&str>) -> Option<usize> {
+    if declared.is_empty() {
+        return None;
+    }
+    Some(
+        platform_default
+            .and_then(|d| declared.iter().position(|e| e == d))
+            .unwrap_or(0),
+    )
+}
+
+pub fn run(
+    inputs: WizardInputs,
+    declared_envs: &[String],
+    platform_default: Option<&str>,
+    existing_namespaces: &[String],
+) -> Result<WizardOutput> {
     eprintln!();
     eprintln!("Register a user Application. Fill in the gaps below;");
     eprintln!("press Enter to accept defaults shown in [brackets].");
@@ -138,15 +171,23 @@ pub fn run(inputs: WizardInputs) -> Result<WizardOutput> {
     let project_default = inputs.project.unwrap_or_else(|| "apps".into());
     let project = prompt_project(&project_default)?;
 
+    // Environment picker (ADR 0044 / 2.9). Only prompt when the
+    // manifest declares environments; a base-only app skips it and
+    // produces a base-only deploy (`env: None`). A `--env` flag
+    // supplied in a TTY run pre-fills and skips the prompt.
+    let env = if let Some(e) = inputs.env.filter(|e| !e.is_empty()) {
+        Some(e)
+    } else if declared_envs.is_empty() {
+        None
+    } else {
+        Some(prompt_env(declared_envs, platform_default)?)
+    };
+
     let namespace_default = inputs
         .namespace
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| DEFAULT_DESTINATION_NAMESPACE.into());
-    let namespace = prompt_text(
-        "Destination namespace",
-        &namespace_default,
-        validate_dns_1123_for_namespace,
-    )?;
+    let namespace = prompt_namespace_interactive(existing_namespaces, &namespace_default)?;
 
     Ok(WizardOutput {
         git_url: normalised,
@@ -155,6 +196,7 @@ pub fn run(inputs: WizardInputs) -> Result<WizardOutput> {
         path,
         project,
         namespace,
+        env,
     })
 }
 
@@ -319,6 +361,69 @@ fn prompt_project(default: &str) -> Result<String> {
     }
 }
 
+/// Environment picker over the manifest's declared `spec.environments`
+/// keys (ADR 0044 / 2.9). The starting cursor lands on the cluster's
+/// `PlatformStack.spec.defaultEnvironment` when that env is declared,
+/// else on the first declared env (see `preselect_env`). Caller
+/// guarantees `declared` is non-empty.
+fn prompt_env(declared: &[String], platform_default: Option<&str>) -> Result<String> {
+    let starting_cursor = preselect_env(declared, platform_default).unwrap_or(0);
+    match Select::new("Environment:", declared.to_vec())
+        .with_starting_cursor(starting_cursor)
+        .prompt()
+    {
+        Ok(v) => Ok(v),
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+            Err(CliError::Other("wizard cancelled".into()))
+        }
+        Err(e) => Err(CliError::Other(format!("wizard prompt failed: {e}"))),
+    }
+}
+
+/// Destination-namespace picker. Presents the cluster's existing
+/// namespaces as an `inquire::Select` plus a trailing
+/// `NEW_NAMESPACE_SENTINEL`; picking the sentinel falls through to a
+/// DNS-1123-validated `Text` prompt for a brand-new namespace.
+///
+/// When `existing` is empty — listing namespaces failed (no cluster /
+/// no kubeconfig) or the cluster genuinely has none — the picker is
+/// skipped and the operator drops straight into the plain text prompt,
+/// so the wizard never hard-fails on an unreachable apiserver.
+fn prompt_namespace_interactive(existing: &[String], default: &str) -> Result<String> {
+    if existing.is_empty() {
+        return prompt_text(
+            "Destination namespace",
+            default,
+            validate_dns_1123_for_namespace,
+        );
+    }
+
+    let mut choices: Vec<String> = existing.to_vec();
+    choices.push(NEW_NAMESPACE_SENTINEL.to_string());
+    let starting_cursor = choices.iter().position(|n| n == default).unwrap_or(0);
+
+    let picked = match Select::new("Destination namespace:", choices)
+        .with_starting_cursor(starting_cursor)
+        .prompt()
+    {
+        Ok(v) => v,
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+            return Err(CliError::Other("wizard cancelled".into()));
+        }
+        Err(e) => return Err(CliError::Other(format!("wizard prompt failed: {e}"))),
+    };
+
+    if picked == NEW_NAMESPACE_SENTINEL {
+        prompt_text(
+            "New namespace name",
+            default,
+            validate_dns_1123_for_namespace,
+        )
+    } else {
+        Ok(picked)
+    }
+}
+
 fn validate_non_empty(value: &str) -> std::result::Result<Validation, inquire::CustomUserError> {
     if value.trim().is_empty() {
         Ok(Validation::Invalid("must not be empty".into()))
@@ -364,6 +469,19 @@ fn validate_dns_1123_for_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_preselect_uses_platform_default_only_when_declared() {
+        assert_eq!(
+            preselect_env(&["dev".into(), "prod".into()], Some("prod")),
+            Some(1)
+        );
+        assert_eq!(
+            preselect_env(&["dev".into(), "prod".into()], Some("stage")),
+            Some(0)
+        );
+        assert_eq!(preselect_env(&[], Some("prod")), None);
+    }
 
     #[test]
     fn should_use_wizard_respects_no_interactive_flag() {

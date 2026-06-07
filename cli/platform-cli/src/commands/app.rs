@@ -122,6 +122,31 @@ fn get_manifest_environments(cwd: &std::path::Path) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
+/// List the cluster's namespace names via `kubectl get namespaces`
+/// (ADR 0044 / 2.9). Feeds the wizard's destination-namespace picker.
+/// `Ok(vec![])` when no namespaces are returned; the caller treats a
+/// listing error (no cluster / no kubeconfig) as "no list" and falls
+/// back to a plain text namespace prompt.
+fn list_namespace_names(kubeconfig_path: &std::path::Path) -> Result<Vec<String>> {
+    match kubectl_get_json("namespaces", None, None, kubeconfig_path)? {
+        Some(v) => Ok(v
+            .pointer("/items")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|it| {
+                        it.pointer("/metadata/name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()),
+        None => Ok(Vec::new()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     git_url: Option<String>,
@@ -211,6 +236,7 @@ pub fn add(
             remote,
             no_ping,
             coverage_gate,
+            env,
         );
     }
 
@@ -533,10 +559,31 @@ fn add_via_wizard(
     remote: &str,
     no_ping: bool,
     coverage_gate: CoverageGate,
+    env: Option<String>,
 ) -> Result<()> {
     let detected_origin = crate::commands::app_wizard::detect_git_origin(remote);
     let detected_branch = crate::commands::app_wizard::detect_git_branch();
     let detected_path = crate::commands::app_wizard::detect_path_relative_to_repo_root();
+
+    // ADR 0044 (2.9): gather the wizard's cluster-/manifest-derived
+    // pickers up front, all best-effort so an offline / no-cluster
+    // `app add` still runs the wizard (env picker hidden, namespace
+    // picker degrades to plain text):
+    //   * declared envs — from the cwd manifest's `spec.environments`.
+    //   * platform default env — `PlatformStack.spec.defaultEnvironment`.
+    //   * existing namespaces — `kubectl get namespaces`.
+    // The kubeconfig tempfile is resolved once and reused for both
+    // cluster reads.
+    let cwd = std::env::current_dir().map_err(|e| CliError::Other(format!("cwd: {e}")))?;
+    let declared_envs = get_manifest_environments(&cwd).unwrap_or_default();
+    let (platform_default, existing_namespaces) = match ensure_kubeconfig_tempfile() {
+        Ok(kc) => (
+            fetch_platformstack_default_env(kc.path()).ok().flatten(),
+            list_namespace_names(kc.path()).unwrap_or_default(),
+        ),
+        Err(_) => (None, Vec::new()),
+    };
+
     let inputs = crate::commands::app_wizard::WizardInputs {
         git_url,
         name,
@@ -547,8 +594,16 @@ fn add_via_wizard(
         detected_origin,
         detected_branch,
         detected_path,
+        // A `--env` supplied in a TTY run pre-fills the picker (the wizard
+        // prefers a non-empty `inputs.env`); None ⇒ prompt.
+        env,
     };
-    let out = crate::commands::app_wizard::run(inputs)?;
+    let out = crate::commands::app_wizard::run(
+        inputs,
+        &declared_envs,
+        platform_default.as_deref(),
+        &existing_namespaces,
+    )?;
     add(
         Some(out.git_url),
         Some(out.name),
@@ -559,9 +614,9 @@ fn add_via_wizard(
         remote,
         no_ping,
         coverage_gate,
-        None, // TODO(2.9 T9): wizard env picker — thread the chosen
-              // environment through here once the wizard learns to
-              // prompt for it. Base-only deploy for now.
+        out.env, // ADR 0044 (2.9): the wizard's chosen environment
+        // (None for a base-only deploy when the manifest
+        // declares no environments).
         true, // no_interactive — prevent recursion into the wizard.
         false, // scaffold_flag — step 0 already ran in the outer call;
               // by here `<cwd>/apprafter/Application.cue` exists and
@@ -2477,11 +2532,13 @@ mod tests {
         );
         assert_eq!(m.pointer("/metadata/name").unwrap(), "web-dev");
         assert_eq!(
-            m.pointer("/metadata/labels/apprafter.io~1application").unwrap(),
+            m.pointer("/metadata/labels/apprafter.io~1application")
+                .unwrap(),
             "web"
         );
         assert_eq!(
-            m.pointer("/metadata/labels/apprafter.io~1environment").unwrap(),
+            m.pointer("/metadata/labels/apprafter.io~1environment")
+                .unwrap(),
             "dev"
         );
         let env0 = &m.pointer("/spec/source/plugin/env/0").unwrap();
@@ -2503,10 +2560,13 @@ mod tests {
         );
         assert_eq!(m.pointer("/metadata/name").unwrap(), "web");
         assert_eq!(
-            m.pointer("/metadata/labels/apprafter.io~1application").unwrap(),
+            m.pointer("/metadata/labels/apprafter.io~1application")
+                .unwrap(),
             "web"
         );
-        assert!(m.pointer("/metadata/labels/apprafter.io~1environment").is_none());
+        assert!(m
+            .pointer("/metadata/labels/apprafter.io~1environment")
+            .is_none());
         assert!(m.pointer("/spec/source/plugin").is_none());
     }
 
