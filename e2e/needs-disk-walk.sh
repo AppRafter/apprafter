@@ -54,15 +54,20 @@
 # kubeconfig as kubeconfig_yaml (plaintext) — the same approach
 # needs-pg-walk.sh / needs-redis-walk.sh use.
 #
-# Local-operator mode
-# -------------------
-# The released operator image does NOT carry the 2.6b disk code, so this
-# walk MUST run with APPRAFTER_E2E_LOCAL_OPERATOR=1 to build the operator
-# + admission-webhook from THIS branch and side-load them (Phase 1b).
-# Without it, the disk path under test is not what runs.
+# Local-operator mode (OPTIONAL)
+# ------------------------------
+# By default this walk runs the PUBLISHED operator image (v0.2.21+ ships the
+# 2.6b disk feature, the 2.6b CRDs, the disk-local ServiceProvider seed, and
+# the PVC RBAC), exactly like needs-pg-walk.sh / needs-redis-walk.sh. Set
+# APPRAFTER_E2E_LOCAL_OPERATOR=1 to instead build the operator +
+# admission-webhook from THIS branch, side-load them, and apply the branch
+# CRDs + PVC RBAC (Phase 1b) — use it to validate working-tree disk changes
+# before a release. Both modes need the same tools (the operator build in
+# LOCAL_OPERATOR mode reuses the already-required container runtime).
 #
 # Required: docker (or podman), cargo, kubectl
 #   — all satisfied inside `nix develop` or on a standard CI runner.
+#   (cargo: lib.sh runs the CLI via `cargo run --bin apprafter`.)
 #
 # NOTE: the GC step deletes + RE-CREATES the RetainedClaim with a past
 # retainUntil rather than patching it in place — the RetainedClaim is
@@ -149,15 +154,6 @@ if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; t
     exit 2
 fi
 
-# The disk code under test ships ONLY on this branch, never in the
-# released operator image — refuse to run without local-operator mode so
-# a false green (testing the OLD operator) is impossible.
-if [ -z "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
-    printf 'ERROR: needs-disk-walk requires APPRAFTER_E2E_LOCAL_OPERATOR=1\n' >&2
-    printf '  the 2.6b disk feature is not in the released operator image; the\n' >&2
-    printf '  walk must build + side-load the branch operator to test it.\n' >&2
-    exit 2
-fi
 
 # ---------------------------------------------------------------
 # Temp workspace
@@ -365,16 +361,18 @@ bootstrap_with_retry
 printf '  cluster-bootstrap complete\n'
 
 # ---------------------------------------------------------------
-# Phase 1b: build + side-load the working-tree operator + webhook.
-#
-# The 2.6b disk feature ships only on this branch; the released image
-# does not carry it. Build each apprafter-owned image from the working
-# tree, tag it as the exact ref the Deployment already references (so
-# imagePullPolicy IfNotPresent serves the side-loaded build and Argo CD
-# does not revert the unchanged ref), side-load it, and restart onto it.
-# (Mirrors the needs-redis-walk Phase 1b block.) Required for this walk —
-# the run is refused above without APPRAFTER_E2E_LOCAL_OPERATOR.
+# Phase 1b (OPTIONAL — APPRAFTER_E2E_LOCAL_OPERATOR): build + side-load the
+# working-tree operator + webhook instead of the published image, then apply
+# the branch CRDs + PVC RBAC. SKIPPED by default — the published v0.2.21+
+# operator already ships the 2.6b disk feature, the 2.6b CRDs, the disk-local
+# ServiceProvider seed, and the PVC RBAC, so the default path needs none of
+# this (same as the needs-pg / needs-redis walks). Set the flag only to
+# validate working-tree disk changes before a release. (Mirrors the
+# needs-redis-walk Phase 1b block.)
+# NOTE: the if-body below is intentionally NOT indented — it carries a
+# column-0 heredoc (the PVC-RBAC apply); `fi` closes it just before Phase 2.
 # ---------------------------------------------------------------
+if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
 phase "Phase 1b: build + load local operator + webhook (APPRAFTER_E2E_LOCAL_OPERATOR)"
 builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
 build_load_restart() { # <deployment> <operator-subdir>
@@ -467,6 +465,7 @@ subjects:
     namespace: apprafter-system
 PVCRBAC
 printf '  operator PVC RBAC granted (additive)\n'
+fi  # end APPRAFTER_E2E_LOCAL_OPERATOR (Phase 1b)
 
 # ===============================================================
 # Phase 2: readiness — provider, webhook, CNPG operator, storage class

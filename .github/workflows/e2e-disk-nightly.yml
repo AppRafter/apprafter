@@ -11,14 +11,11 @@ name: e2e-disk-nightly
 # that the (type,name) generalization yields two CNPG DBs +
 # DATABASE_URL_<NAME> for a single Application.
 #
-# LOCAL_OPERATOR: the 2.6b disk code is not in the released operator image
-# yet, so this walk builds + side-loads the working-tree operator +
-# admission-webhook (APPRAFTER_E2E_LOCAL_OPERATOR=1). Two cold in-container
-# Rust image builds dominate the wall-clock here, hence the wider timeout
-# vs the e2e-pg / e2e-redis nightlies (which run the released image). Once
-# 2.6b ships and is channel-latest the LOCAL_OPERATOR build becomes
-# optional, but keeping it self-contained means the gate is correct on any
-# release boundary.
+# Runs the PUBLISHED operator image (v0.2.21+ ships the 2.6b disk feature,
+# CRDs, the disk-local seed, and the PVC RBAC), exactly like the e2e-pg /
+# e2e-redis nightlies. (Set APPRAFTER_E2E_LOCAL_OPERATOR=1 locally to build +
+# side-load the working-tree operator instead — that path is for pre-release
+# validation of disk-code changes, not for this released-artifact gate.)
 #
 # Why a separate workflow (NOT folded into e2e-k3d.yml or the other
 # nightlies):
@@ -48,10 +45,10 @@ jobs:
   e2e-disk-nightly:
     name: k3d e2e (needs.disk nightly)
     runs-on: ubuntu-latest
-    # Wider than the pg/redis nightlies: this walk compiles the operator +
-    # admission-webhook images in-container from a cold cache before the
-    # chain even starts.
-    timeout-minutes: 120
+    # Matches the e2e-pg / e2e-redis nightlies: no in-container operator
+    # build (the published image is pulled), so the CNPG boot + the chain
+    # dominate the wall-clock.
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -108,11 +105,7 @@ jobs:
         # The e2e script invokes the CLI via `cargo run` (lib.sh's
         # `apprafter()` shell function), so a debug build here warms the
         # cache for the timed script run below -- no PATH binary is used.
-        # (The operator + webhook IMAGES are built separately, in-container,
-        # by the walk's LOCAL_OPERATOR path.)
         run: cargo build --bin apprafter
 
       - name: Run the needs.disk k3d walk
-        env:
-          APPRAFTER_E2E_LOCAL_OPERATOR: "1"
         run: bash e2e/needs-disk-walk.sh

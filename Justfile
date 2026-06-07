@@ -130,14 +130,15 @@ e2e-redis:
 # Run the needs.disk ResourceClaim-chain k3d/kind walk (generate ->
 # schedule -> provision (unowned RWO PVC) -> resume + mount -> data
 # durability -> delete + RetainedClaim + reattach -> force-GC -> PVC
-# dropped). MUST run with APPRAFTER_E2E_LOCAL_OPERATOR=1 (the 2.6b disk
-# code is not in the released operator image, so the walk builds +
-# side-loads the branch operator). Like e2e-pg/e2e-redis it is NOT a
-# dependency of `e2e`: it boots a CNPG pod + provisions PVCs and runs on
-# its own cadence. Requires a container runtime (docker→k3d / podman→kind),
-# cargo, kubectl on PATH.
+# dropped). Runs the PUBLISHED operator image (v0.2.21+ ships the 2.6b disk
+# feature, CRDs, the disk-local seed, and the PVC RBAC), exactly like
+# e2e-pg / e2e-redis. Set APPRAFTER_E2E_LOCAL_OPERATOR=1 to build +
+# side-load the working-tree operator instead (pre-release validation of
+# disk-code changes). Like e2e-pg/e2e-redis it is NOT a dependency of
+# `e2e`: it boots a CNPG pod + provisions PVCs and runs on its own cadence.
+# Requires a container runtime (docker→k3d / podman→kind), cargo, kubectl.
 e2e-disk:
-    APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-disk-walk.sh
+    bash e2e/needs-disk-walk.sh
 
 # Spin up a local k3d cluster suitable for end-to-end work.
 e2e-up:
