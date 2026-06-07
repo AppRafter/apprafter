@@ -54,11 +54,19 @@ per-Application**, replacing the cluster-wide `APPRAFTER_ENV`:
    Application's `spec.source.plugin.env`, keeping the source manifest
    env-agnostic; the admission webhook requires the value (when present) to
    be a declared `environments` key. The env-deployments of one logical app
-   are grouped by the **existing** `apprafter.io/application=<name>` +
-   `apprafter.io/environment=<env>` labels (already used by the migration
-   strategy — `operator-controllers/migration/src/strategy.rs`), reused for
-   consistency. The Argo Application is named `<name>-<env>`; the AppRafter
-   CR keeps `<name>` in each namespace.
+   are grouped by the `apprafter.io/application=<name>` +
+   `apprafter.io/environment=<env>` labels. These label **keys are already
+   established** in the codebase — the migration strategy stamps them (plus
+   `apprafter.io/scope`, `apprafter.io/application-namespace`) on the
+   `MigrationPlan` CRs it creates, as discoverability tags
+   (`operator-controllers/migration/src/strategy.rs:163–175`), with the same
+   meaning ("belongs to application X / environment Y"). 2.9 **reuses the
+   same keys on new carriers**: the CLI `app add` writes them on the Argo CD
+   Application, and the operator renderer writes them on the rendered
+   children. (The migration gate itself matches by the
+   `scope.application.ref.{name,namespace}` spec fields, **not** by these
+   labels — they are tags, not the match key.) The Argo Application is named
+   `<name>-<env>`; the AppRafter CR keeps `<name>` in each namespace.
 6. Removing `Context.env_name` (decision 1) also **rewires the
    application-scoped MigrationPlan gate** in the same file
    (`operator-controllers/application/src/lib.rs`): `find_blocking_migration_plan`
