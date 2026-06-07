@@ -54,14 +54,40 @@ per-Application**, replacing the cluster-wide `APPRAFTER_ENV`:
    Application's `spec.source.plugin.env`, keeping the source manifest
    env-agnostic; the admission webhook requires the value (when present) to
    be a declared `environments` key. The env-deployments of one logical app
-   are grouped by an `apprafter.io/app=<name>` label (the Argo Application
-   is named `<name>-<env>`; the AppRafter CR keeps `<name>` in each
-   namespace).
+   are grouped by the **existing** `apprafter.io/application=<name>` +
+   `apprafter.io/environment=<env>` labels (already used by the migration
+   strategy — `operator-controllers/migration/src/strategy.rs`), reused for
+   consistency. The Argo Application is named `<name>-<env>`; the AppRafter
+   CR keeps `<name>` in each namespace.
+6. Removing `Context.env_name` (decision 1) also **rewires the
+   application-scoped MigrationPlan gate** in the same file
+   (`operator-controllers/application/src/lib.rs`): `find_blocking_migration_plan`
+   / `pick_blocking_plan` are fed `app.spec.environment` instead of
+   `ctx.env_name`. The filter's env guard is `if let Some(e) = environment`,
+   so a base-only deployment (`environment = None`) keeps matching purely on
+   `{ref.name, ref.namespace}` — identical to the prior inert default (no
+   regression) — while an env-deployment additionally requires
+   `scope.application.environment == app.spec.environment`. We **keep** the
+   `MigrationPlan.scope.application.environment` field (§3.8): under the
+   scalar model `{name, namespace}` already identifies a deployment, so the
+   field is redundant *for identification*, but dropping it is a breaking
+   CRD change out of this subphase's scope; it is retained as a per-CR env
+   match (a future cleanup may relax it to optional).
 
 In scope for launch: the scalar model, the per-CR field, and the CLI /
 PlatformStack / CMP surface. Out of scope (deferred, not precluded):
 single-CR multi-env fan-out, dev-mode forcing (the 1.9/2.9/3.9 dev slices),
-Backstage env tabs, and a dedicated env-migration command.
+and Backstage env tabs.
+
+**`apprafter promote` (spec §3.1, §"image promote") in the scalar model** is
+cross-CR image copying between two env-deployments of one app — read the
+resolved image of `<name>-<src>` and write it onto `<name>-<dst>` (each is a
+distinct Argo Application / AppRafter CR, so promotion mutates the
+destination CR's image, it does not move a workload). It is **deferred to
+the same fast-follow** as a dedicated env-migration command (changing a
+deployment's env in place) — both are post-launch verbs over the per-CR
+`spec.environment` selector this ADR establishes. They are bundled so the
+spec's promotion contract is not left dangling against the new model.
 
 ## Consequences
 
@@ -82,6 +108,12 @@ Backstage env tabs, and a dedicated env-migration command.
   in the CR.
 - **−** The CMP image, the operator, and the CLI all change ⇒ a coordinated
   release across three publish streams.
+- **±** The application-scoped MigrationPlan gate keeps working — its env
+  operand moves from the (removed) cluster-wide `ctx.env_name` to the per-CR
+  `app.spec.environment` (decision 6). Net behaviour improves: previously the
+  env was inert (always `None`, so the env guard never engaged); now an
+  env-deployment is correctly gated only by a MigrationPlan whose
+  `scope.application.environment` matches its env.
 
 ## Alternatives considered
 
@@ -123,6 +155,17 @@ Backstage env tabs, and a dedicated env-migration command.
   deployment relying on it. *Mitigation:* it is inert today (no config
   surface), so nothing effective depends on it; absent selector = `base`
   (unchanged).
+- **Namespace-distinctness is a CLI-only guarantee — accepted residual.**
+  The "per-env claims are isolated for free" property holds *only* because
+  each env-deployment lives in a distinct namespace; the admission webhook
+  does **not** enforce this (it is a CLI concern — the `app add` flow rejects
+  placing two envs of one app in one namespace). A raw `kubectl`/Argo apply
+  that bypasses the CLI could land two env-deployments' `<name>` CRs in one
+  namespace, colliding them and collapsing the isolation claim. We **accept
+  this residual** for launch (the isolation guarantee is CLI-scoped, not
+  apiserver-enforced); a future webhook/uniqueness check (e.g. an
+  `apprafter.io/application` + namespace uniqueness rule) could harden it if
+  raw-apply multi-env becomes a real path.
 
 ## Owner
 
@@ -137,7 +180,24 @@ into scope — both build directly on this per-CR `spec.environment` selector.
 ## References
 
 - Design: `docs/superpowers/specs/2026-06-07-2.9-per-env-deploy-design.md`
-- `plan.md` §2.9; memory `project_env_model` (the inert `APPRAFTER_ENV`
-  finding).
+- `plan.md` **`### 2.9 Per-environment overrides`** — this ADR's subphase.
+  NB: distinct from the separate, deferred **Dev Mode** phase that also
+  carries a "2.9" label in `plan.md` (its own phase heading + the roadmap
+  table row "2.9 Dev Mode"); every "§2.9" in this ADR means the
+  per-environment-overrides subphase.
+- memory `project_env_model` (the inert `APPRAFTER_ENV` finding).
 - Reuses the rendering pipeline (1.9) and the needs/claim machinery
   (ADR 0042 / ADR 0043) unchanged.
+
+**Spec reconciliation (deferred to Phase-2-close actualization, P2 — the
+spec lags by design).** `spec.md` §3.1 currently predates this ADR and must
+be reconciled when Phase 2's spec is actualized (with the Revision bump):
+(a) "Per-environment overrides via CUE unification" → the merge is
+override-wins **replace** (custom Rust — `image`/`replicas`/`expose` replace,
+`env` merges), not pure CUE unification (it conflicts on `expose.public`);
+(b) "the operator resolves environment placement based on the substrate" →
+under the scalar/T1 model the namespace is **user-chosen at `app add`**
+(substrate-mapping inside a Kamaji TCP is the deferred T2+ path). Leave
+intact: §3.1 "single CUE document" and "each environment → separate
+namespace" (both hold under the scalar model). The `apprafter promote`
+contract (§3.1) is addressed in §Decision above.

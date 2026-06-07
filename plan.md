@@ -2986,7 +2986,7 @@ Tests:
 ### 2.9 Per-environment overrides через CUE unification
 > 🏁 SR: A — multi-env на ОДНОМ кластере по namespace'ам (dev+staging / dev+prod для T1); un-dropped из launch (был D) 2026-06-04, естественный порядок, рано НЕ притягиваем
 
-> 🎨 **Дизайн (2026-06-07, ADR 0044 + spec `docs/superpowers/specs/2026-06-07-2.9-per-env-deploy-design.md`):** env — **deploy-time** селектор per-Application, НЕ cluster-global (инертный `APPRAFTER_ENV` выпиливается). Модель **scalar**: один env-агностичный манифест → **один Argo-апп на env-деплой** (`<name>-<env>`), self-contained в своём namespace (ownerRef-каскад как есть), группировка лейблом `apprafter.io/app`. `Application.spec.environment` (инжектит CMP) выбирает override; `effective_spec(app, spec.environment)` сливает; webhook `env ∈ environments`. Namespace **ортогонален** (выбор юзера на `app add`: existing/new). Мягкий дефолт `PlatformStack.spec.defaultEnvironment` (пред-выбор в CLI, не гейт). Single-CR fan-out (cross-ns ownerRef нельзя), dev-mode форсинг (1.9/2.9/3.9 dev-слайсы), Backstage-вкладки — **отложены** (ADR 0044 §Non-goals). Поставка ниже = доуточняется планом.
+> 🎨 **Дизайн (2026-06-07, ADR 0044 + spec `docs/superpowers/specs/2026-06-07-2.9-per-env-deploy-design.md`):** env — **deploy-time** селектор per-Application, НЕ cluster-global (инертный `APPRAFTER_ENV` выпиливается). Модель **scalar**: один env-агностичный манифест → **один Argo-апп на env-деплой** (`<name>-<env>`), self-contained в своём namespace (ownerRef-каскад как есть), группировка существующими лейблами `apprafter.io/application` + `apprafter.io/environment` (переиспользуем — их уже ставит migration-strategy). `Application.spec.environment` (инжектит CMP) выбирает override; `effective_spec(app, spec.environment)` сливает; webhook `env ∈ environments`. Namespace **ортогонален** (выбор юзера на `app add`: existing/new). Мягкий дефолт `PlatformStack.spec.defaultEnvironment` (пред-выбор в CLI, не гейт). Single-CR fan-out (cross-ns ownerRef нельзя), dev-mode форсинг (1.9/2.9/3.9 dev-слайсы), Backstage-вкладки, `apprafter promote` (= cross-CR копирование image между `<name>-<src>`/`<name>-<dst>`) + env-миграция — **отложены** (ADR 0044 §Decision/§Non-goals). Удаление `Context.env_name` ре-вайрит и MigrationPlan-гейт (`find_blocking_migration_plan` ← `app.spec.environment`). Поставка ниже = доуточняется планом. **NB: `### 2.9 Per-environment overrides` (это) ≠ `## Фаза 2.9 — Dev Mode` (стр. ~3190 + roadmap-таблица «2.9 Dev Mode») — разные 2.9; dev-mode отложен.**
 
 **Цель:** реализовать §3.1 пример (dev/staging/prod в одном файле) — несколько окружений **со-резидентно на одном кластере**, каждое в своём namespace.
 
@@ -2994,12 +2994,12 @@ Tests:
 
 **Поставка:**
 - [ ] Renderer Application учитывает `environments.<env>` как unification с `base`.
-- [ ] Каждое env разворачивается в свой namespace с суффиксом `-<env>` — **несколько env со-резидентно на одном кластере** (заменяет cluster-wide `APPRAFTER_ENV`).
+- [ ] Каждый env-деплой = **отдельный `app add --env <env>`** → один Argo-апп `<name>-<env>` → один namespace (**выбор юзера**, ортогонален env — НЕ авто-суффикс). Несколько env со-резидентно на одном кластере = несколько `app add` в разные (выбранные юзером) namespace'ы; группируются лейблом `apprafter.io/application`. Заменяет cluster-wide `APPRAFTER_ENV` (scalar, ADR 0044 — НЕ operator fan-out).
 - [ ] **Конфиг/selection-поверхность:** пользователь декларирует, какие env материализовать (манифест/CLI, НЕ скрытый operator-env-var), активный/материализованные env **видны** (`app status` / лейбл на Deployment). Закрывает gap инертного `APPRAFTER_ENV`.
 - [ ] Selector ServiceProvider'а различен по env (например, dev → `tier: integrated`, prod → `tier: managed-aws`).
 - [ ] Backstage показывает вкладки по env'ам.
 
-**Acceptance:** один Application файл с тремя env'ами создаёт три namespace с разными ресурсами на ОДНОМ кластере; активный/материализованные env видны пользователю; CUE-валидация ловит конфликт типов между base и env override.
+**Acceptance:** один Application-манифест + три `app add --env {dev,staging,prod}` в три (выбранных юзером) namespace'а на ОДНОМ кластере → три Argo-аппа `<name>-<env>`, каждый со своим override-резолвом (разные ресурсы); все env-деплои видны (`app status <name>` агрегирует по лейблу `apprafter.io/application`); webhook отклоняет `--env` не из `environments`; CUE-валидация ловит конфликт типов base↔env override.
 
 **Зависит от:** 1.9, 2.4
 
@@ -3189,6 +3189,7 @@ Tests:
 
 ## Фаза 2.9 — Dev Mode + Services (Phase 2B из dev-mode-task.md)
 > 🏁 SR: D — dev mode dropped from launch
+> ⚠️ **NB: это НЕ `### 2.9 Per-environment overrides` (per-env deploy, ADR 0044, SR:A, in-launch).** Совпадение «2.9» историческое — это отдельный отложенный dev-mode трек. «§2.9» / «ADR 0044 §2.9» всегда = per-env subphase.
 
 **Цель фазы:** dev mode поддерживает `needs.{pg, jetstream, redis}` end-to-end локально через lightweight in-cluster providers (single-node Postgres pod, embedded NATS, single Redis). Дев-кластер на `dev cluster up` поднимает все ServiceProviders по умолчанию с `--without` opt-out флагом. Helper команда `dev claim status <app>` для диагностики ResourceClaim. Помечается `experimental` (полный DX в Фазе 3.9).
 
