@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: e2e-per-env-nightly
+
+# Standalone nightly k3d/kind gate for the Phase-2.9 per-environment
+# deploy chain (e2e/gitops-walk-per-env.sh, ADR 0044): the SAME app repo
+# deployed per environment yields two self-contained Argo CD Applications
+# in two namespaces, each rendered with its env-resolved spec.
+#
+#   apprafter app add --env dev|prod
+#     -> Argo Application web-<env> (spec.source.plugin.env APPRAFTER_APP_ENV)
+#     -> the argocd-cue-cmp sidecar injects spec.environment + the env label
+#     -> the operator unifies spec.environments[<env>] onto base
+#     -> two Deployments web (replicas 1 vs 2, TIER dev vs prod) in two
+#        namespaces (web-dev / web-prod), both labelled
+#        apprafter.io/application=web
+#     -> `app status web` aggregates both; `app remove web --env dev` is
+#        surgical (web-prod survives).
+#
+# Runs with APPRAFTER_E2E_LOCAL_OPERATOR=1 because 2.9 is UNRELEASED: the
+# walk builds + side-loads the working-tree operator + admission-webhook
+# AND the working-tree argocd-cue-cmp (Approach A -- the per-env injection
+# lives only in the working-tree entrypoint.sh, shipped IN the image), and
+# applies the branch CRDs (the released chart predates the 2.9 schema:
+# spec.environment / spec.environments / status.environment). Flip back to
+# the published-image path once 2.9 ships, exactly like the other walks did.
+#
+# Why a separate workflow (NOT folded into e2e-k3d.yml or the other
+# nightlies):
+#   - It boots Argo CD + a host git daemon and builds three images from the
+#     working tree, so it is heavier than the per-push gate -- keep it off
+#     the critical path.
+#   - It is decoupled from the Hetzner-cost nightly.yml so the free-k3d
+#     failure domain stays independent (no cloud spend, no secrets).
+#
+# Security note: no secrets are consumed here. Everything runs on a local
+# k3d cluster; the only outbound traffic is public image / chart pulls.
+# `permissions: contents: read` is the minimum. No `github.event.*` input
+# is interpolated into any run: block.
+
+on:
+  schedule:
+    # 08:00 UTC -- staggered after nightly.yml (04:00 UTC),
+    # e2e-pg-nightly.yml (05:00 UTC), e2e-redis-nightly.yml (06:00 UTC)
+    # and e2e-disk-nightly.yml (07:00 UTC) so the nightly gates don't
+    # contend for the runner pool.
+    - cron: '0 8 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-per-env-nightly:
+    name: k3d e2e (per-env nightly)
+    runs-on: ubuntu-latest
+    # Includes a working-tree build of the operator + admission-webhook +
+    # cue-cmp images, on top of the Argo CD boot + the two app-add syncs.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('cli/**/Cargo.lock', 'cli/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Load iptables kernel modules for Cilium
+        # cluster-bootstrap skips Cilium on k3d
+        # (APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 in lib.sh) so these are a
+        # belt-and-braces no-op here, kept for parity with the other
+        # nightlies in case a future walk re-enables the eBPF datapath.
+        run: |
+          sudo modprobe -a \
+            ip_tables iptable_mangle iptable_raw iptable_filter iptable_nat \
+            ip6_tables ip6table_mangle ip6table_raw ip6table_filter ip6table_nat \
+            nf_nat xt_socket || true
+          lsmod | grep -E 'ip6?table|nf_nat|xt_socket' || true
+
+      - name: Warm the CLI build cache
+        working-directory: cli
+        # The e2e script invokes the CLI via `cargo run` (lib.sh's
+        # `apprafter()` shell function), so a debug build here warms the
+        # cache for the timed script run below -- no PATH binary is used.
+        run: cargo build --bin apprafter
+
+      - name: Run the per-env k3d walk
+        env:
+          # 2.9 is unreleased: build + side-load the working-tree operator,
+          # admission-webhook and cue-cmp; apply the branch CRDs.
+          APPRAFTER_E2E_LOCAL_OPERATOR: "1"
+        run: bash e2e/gitops-walk-per-env.sh

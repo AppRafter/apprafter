@@ -140,6 +140,23 @@ e2e-redis:
 e2e-disk:
     bash e2e/needs-disk-walk.sh
 
+# Run the per-environment GitOps-walk k3d/kind e2e (2.9, ADR 0044): the
+# SAME repo deployed per env (app add --env dev|prod) -> two Argo
+# Applications web-dev + web-prod -> the argocd-cue-cmp sidecar injects
+# spec.environment -> the operator env-resolves base+environments -> two
+# self-contained Deployments in two namespaces (replicas 1 vs 2, TIER dev
+# vs prod) -> app status aggregates both -> app remove --env is surgical.
+# 2.9 is UNRELEASED, so this RUNS WITH APPRAFTER_E2E_LOCAL_OPERATOR=1: it
+# builds + side-loads the working-tree operator + admission-webhook AND the
+# working-tree cue-cmp (Approach A — the per-env injection lives only in the
+# working-tree entrypoint.sh), and applies the branch CRDs. Like
+# e2e-pg/e2e-redis/e2e-disk it is NOT a dependency of `e2e`: it boots Argo CD
+# + a git daemon and runs on its own nightly cadence via
+# .github/workflows/e2e-per-env-nightly.yml. Requires a container runtime
+# (docker→k3d / podman→kind), git, cargo, kubectl.
+e2e-per-env:
+    APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/gitops-walk-per-env.sh
+
 # Spin up a local k3d cluster suitable for end-to-end work.
 e2e-up:
     k3d cluster create apprafter-dev \
