@@ -87,6 +87,46 @@ if [ "$(basename "$PWD")" != "apprafter" ] \
     cd ./apprafter
 fi
 
+# ── Per-environment injection (subphase 2.9, ADR 0044) ─────
+#
+# When the Argo Application's `spec.source.plugin.env` sets
+# APPRAFTER_APP_ENV (the CLI `apprafter app add --env` does
+# this), every rendered manifest is stamped with
+# `spec.environment` plus an `apprafter.io/environment` label
+# carrying that env name. The operator then unifies
+# `spec.environments[<env>]` onto `spec.base` before rendering
+# (see operator-rendering's APPRAFTER_ENV path). When the var
+# is unset the manifest is emitted unchanged (base-only) — the
+# pre-2.9 behaviour is byte-for-byte preserved.
+#
+# Mechanism: round-trip ONE rendered YAML document through
+# `cue export yaml: - --out json | jq | cue export json: -
+# --out yaml`. cue reads stdin when the input argument is `-`,
+# and the `yaml:` / `json:` filetype prefixes pin the input
+# encoding (bare `-` would otherwise be parsed as CUE). jq
+# sets `.spec.environment` and merges the label into
+# `.metadata.labels` (creating it if absent). All cue/jq
+# stderr is suppressed here — on success it's silent, and the
+# round-trip only runs on already-validated manifests (the
+# earlier `cue export ./...` succeeded), so a failure here is
+# a bug, not user error; we let the non-zero exit propagate
+# under `set -e` rather than emit partial YAML to stdout.
+#
+# Applied identically on the Style-A single-manifest path and
+# inside the Style-B per-key loop, so multi-manifest streams
+# get every document stamped.
+inject_env() {  # stdin: one rendered manifest; stdout: same, injected when APPRAFTER_APP_ENV set
+    if [ -z "${APPRAFTER_APP_ENV:-}" ]; then
+        cat
+        return
+    fi
+    cue export yaml: - --out json 2>/dev/null \
+      | jq --arg e "$APPRAFTER_APP_ENV" \
+          '.spec.environment = $e
+           | .metadata.labels = ((.metadata.labels // {}) + {"apprafter.io/environment": $e})' \
+      | cue export json: - --out yaml
+}
+
 # Use temp files so we can capture both the JSON body and
 # any stderr without merging streams (Argo CD reads stdout
 # for manifests; stderr is the diagnostic surface).
@@ -156,7 +196,7 @@ if [ "$is_top_level_manifest" = "yes" ]; then
     # operators get when they run `cue export ./...` locally;
     # consistent surface beats one fewer subprocess.
     echo "---"
-    cue export ./... --out yaml
+    cue export ./... --out yaml | inject_env
     exit 0
 fi
 
@@ -193,7 +233,14 @@ fi
 echo "$keys" | while IFS= read -r key; do
     [ -z "$key" ] && continue
     echo "---"
-    if ! cue export ./... -e "$key" --out yaml 2>"$err_out"; then
+    # Capture the rendered doc into a variable (rather than
+    # piping `cue export` straight into `inject_env`) so the
+    # export's exit code and stderr are still checked directly
+    # — a pipe would mask cue's failure behind `inject_env`'s
+    # exit. Only on success does the doc flow through the env
+    # injection, so the "all or nothing" abort semantics below
+    # are preserved.
+    if ! doc=$(cue export ./... -e "$key" --out yaml 2>"$err_out"); then
         # Surface the per-key error to stderr so operators can
         # locate the failing manifest. Single-manifest failure
         # aborts the whole sync — keeping stricter "all or
@@ -204,4 +251,5 @@ echo "$keys" | while IFS= read -r key; do
         cat "$err_out" >&2
         exit 1
     fi
+    printf '%s\n' "$doc" | inject_env
 done
