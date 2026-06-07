@@ -142,7 +142,7 @@ pub fn render_application_for_env(
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
     let owner = owner_reference(app);
-    let labels = make_labels(&name);
+    let labels = make_labels(&name, env_name);
     let effective = effective_spec(app, env_name);
 
     let deployment = render_deployment(
@@ -244,7 +244,7 @@ fn owner_reference(app: &Application) -> OwnerReference {
     }
 }
 
-fn make_labels(name: &str) -> BTreeMap<String, String> {
+fn make_labels(name: &str, env_name: Option<&str>) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert("app.kubernetes.io/name".to_string(), name.to_string());
     labels.insert(
@@ -252,6 +252,13 @@ fn make_labels(name: &str) -> BTreeMap<String, String> {
         "apprafter-operator".to_string(),
     );
     labels.insert("apprafter".to_string(), "true".to_string());
+    // 2.9 (ADR 0044): group an app's env-deployments + surface the env.
+    // Reuses the established apprafter.io/application +
+    // apprafter.io/environment keys.
+    labels.insert("apprafter.io/application".to_string(), name.to_string());
+    if let Some(env) = env_name.filter(|s| !s.is_empty()) {
+        labels.insert("apprafter.io/environment".to_string(), env.to_string());
+    }
     labels
 }
 
@@ -499,6 +506,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -518,6 +526,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -536,6 +545,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -569,6 +579,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -610,6 +621,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -642,6 +654,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -665,6 +678,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -694,6 +708,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -722,6 +737,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -742,6 +758,39 @@ mod tests {
         assert_eq!(labels.get("apprafter").map(String::as_str), Some("true"));
     }
 
+    #[test]
+    fn rendered_children_carry_app_and_environment_labels() {
+        // 2.9 (ADR 0044): rendered children carry
+        // `apprafter.io/application` (always) + `apprafter.io/environment`
+        // (only when the render is env-scoped) so an app's per-env
+        // deployments are groupable and the active env is surfaced.
+        let mut app = Application::new("web", ApplicationSpec::default());
+        app.metadata.namespace = Some("web-dev".into());
+        app.spec.base = Some(ApplicationBaseSpec {
+            image: Some("x".into()),
+            ..Default::default()
+        });
+        let rendered = render_application_for_env(&app, Some("dev"), None, None, None);
+        let labels = rendered.deployment.metadata.labels.clone().unwrap_or_default();
+        assert_eq!(
+            labels.get("apprafter.io/application").map(String::as_str),
+            Some("web")
+        );
+        assert_eq!(
+            labels.get("apprafter.io/environment").map(String::as_str),
+            Some("dev")
+        );
+        // Base-only render (env=None) carries the application label but
+        // no environment label.
+        let base = render_application_for_env(&app, None, None, None, None);
+        let base_labels = base.deployment.metadata.labels.clone().unwrap_or_default();
+        assert_eq!(
+            base_labels.get("apprafter.io/application").map(String::as_str),
+            Some("web")
+        );
+        assert!(!base_labels.contains_key("apprafter.io/environment"));
+    }
+
     fn make_app_with_envs(
         base: ApplicationBaseSpec,
         envs: BTreeMap<String, ApplicationBaseSpec>,
@@ -751,6 +800,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base),
                 environments: Some(envs),
+                environment: None,
             },
         );
         app.metadata.namespace = Some("default".to_string());
@@ -1079,6 +1129,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
                 environments: None,
+                environment: None,
             },
             "parser",
             "demo",
@@ -1108,6 +1159,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
                 environments: None,
+                environment: None,
             },
             "parser",
             "demo",
@@ -1125,6 +1177,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
                 environments: None,
+                environment: None,
             },
             "parser",
             "demo",
@@ -1148,6 +1201,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base),
                 environments: None,
+                environment: None,
             },
             "parser",
             "demo",
@@ -1173,6 +1227,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "clickhouse")),
                 environments: None,
+                environment: None,
             },
             "parser",
             "demo",
@@ -1198,6 +1253,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
                 environments: None,
+                environment: None,
             },
             "web",
             "demo",
@@ -1264,6 +1320,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
                 environments: None,
+                environment: None,
             },
             "web",
             "demo",
@@ -1318,6 +1375,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_two_pg("ghcr.io/acme/web:1.0", "analytics")),
                 environments: None,
+                environment: None,
             },
             "parser",
             "demo",
@@ -1374,6 +1432,7 @@ mod tests {
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
                 environments: None,
+                environment: None,
             },
             "parser",
             "demo",
@@ -1397,6 +1456,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "web",
             "default",
@@ -1480,6 +1540,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "demo-app",
             "demo",
@@ -1530,6 +1591,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "demo-app",
             "demo",
@@ -1555,6 +1617,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "demo-app",
             "demo",
@@ -1578,6 +1641,7 @@ mod tests {
                     ..Default::default()
                 }),
                 environments: None,
+                environment: None,
             },
             "demo-app",
             "demo",
