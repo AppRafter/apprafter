@@ -257,6 +257,13 @@ pub fn add(
         None => derived_name.clone(),
     };
     if let Some(e) = env.as_deref() {
+        // `<name>-<e>` becomes the Argo CD Application `metadata.name`, so the
+        // env value has to satisfy DNS-1123 too — validate it FIRST so an
+        // invalid `--env foo_bar` fails fast with a clear message regardless of
+        // whether the manifest renders (on the manifest-unrenderable degrade
+        // path below an invalid env would otherwise reach `kubectl apply` and
+        // surface a cryptic RFC-1123 error).
+        validate_dns_1123(e)?;
         // Validate against the cwd manifest's declared environments.
         // Degrade gracefully when the manifest can't be rendered (e.g.
         // a remote-only `app add <git-url>` from outside the repo) —
@@ -2558,6 +2565,18 @@ mod tests {
         assert!(validate_dns_1123("-leading").is_err());
         assert!(validate_dns_1123("trailing-").is_err());
         assert!(validate_dns_1123("").is_err());
+    }
+
+    #[test]
+    fn rejects_env_with_underscore() {
+        // ADR 0044 (2.9): `app add --env <e>` folds the env into the Argo CD
+        // Application name `<name>-<e>`, so `add()` runs `validate_dns_1123(e)`
+        // before that name reaches `kubectl apply`. Guard the env-value path:
+        // an underscore env must be rejected client-side (clear message)
+        // rather than degrading into a cryptic RFC-1123 apiserver error.
+        assert!(validate_dns_1123("foo_bar").is_err());
+        assert!(validate_dns_1123("dev").is_ok());
+        assert!(validate_dns_1123("prod").is_ok());
     }
 
     #[test]
