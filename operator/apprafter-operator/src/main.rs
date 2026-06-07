@@ -83,16 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("leadership acquired — starting Application controller");
 
-    let env_name = env::var("APPRAFTER_ENV").ok().filter(|v| !v.is_empty());
-    if let Some(name) = &env_name {
-        info!(env = %name, "active environment selected");
-    }
+    // 2.9 (ADR 0044): the active environment is now a PER-CR property
+    // (`Application.spec.environment`), resolved inside the reconcile
+    // loop — there is no cluster-wide `APPRAFTER_ENV` selector anymore.
     let controller_handle = tokio::spawn({
         let client = client.clone();
         let metrics = metrics.clone();
-        let env_name = env_name.clone();
         async move {
-            if let Err(err) = application_controller::run(client, metrics, env_name).await {
+            if let Err(err) = application_controller::run(client, metrics).await {
                 error!(%err, "Application controller error");
             }
         }

@@ -64,11 +64,6 @@ const MIN_IMAGE_RESOLVE_INTERVAL_SECS: i64 = 60;
 pub struct Context {
     pub client: Client,
     pub metrics: Arc<Metrics>,
-    /// Active environment name — when `Some(...)`, reconcile
-    /// applies the matching `spec.environments[env_name]` override
-    /// on top of `spec.base`. Sourced from `APPRAFTER_ENV` env var
-    /// in the binary; `None` falls back to `spec.base` only.
-    pub env_name: Option<String>,
     /// HTTP seam for the 2.4h OCI tag→digest resolution. A single
     /// `ReqwestHttp` built at startup and reused — its inner
     /// `reqwest::Client` pools connections across reconciles.
@@ -88,11 +83,7 @@ pub enum ReconcileError {
 /// `Application` resources cluster-wide and reconciles them through
 /// [`reconcile`]. Errors from individual reconcile calls go through
 /// [`error_policy`].
-pub async fn run(
-    client: Client,
-    metrics: Arc<Metrics>,
-    env_name: Option<String>,
-) -> Result<(), ReconcileError> {
+pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
     // claim ready re-enqueues the owning Application immediately
@@ -102,7 +93,6 @@ pub async fn run(
     let context = Arc::new(Context {
         client,
         metrics,
-        env_name,
         oci_http: oci_resolve::ReqwestHttp::new(),
     });
 
@@ -163,7 +153,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         .with_label_values(&[KIND])
         .start_timer();
 
-    info!(%name, %namespace, env = ?ctx.env_name, "reconciling Application");
+    info!(%name, %namespace, env = ?app.spec.environment, "reconciling Application");
 
     // Deletion gate (1.79c walk-fix #4). Once the Application carries
     // a `deletionTimestamp` (e.g. Argo CD is cascade-deleting it via
@@ -183,8 +173,13 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // otherwise we'd race the user's "I just pushed a
     // destructive change, please pause" flow.
     if let Some(plan) =
-        find_blocking_migration_plan(&ctx.client, &name, &namespace, ctx.env_name.as_deref())
-            .await?
+        find_blocking_migration_plan(
+            &ctx.client,
+            &name,
+            &namespace,
+            app.spec.environment.as_deref(),
+        )
+        .await?
     {
         let plan_name = plan.name_any();
         info!(
@@ -225,7 +220,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // below validated (AFTER the gate) — empty unless execution falls
     // through to the render with every claim ready.
     let mut disk_mounts: Vec<DiskMount> = Vec::new();
-    let effective = effective_spec(&app, ctx.env_name.as_deref());
+    let effective = effective_spec(&app, app.spec.environment.as_deref());
     let has_needs = effective.needs.as_ref().is_some_and(|n| !n.is_empty());
     if has_needs {
         let app_uid = app.metadata.uid.clone().unwrap_or_default();
@@ -356,7 +351,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
 
     let mut rendered = render_application_for_env(
         &app,
-        ctx.env_name.as_deref(),
+        app.spec.environment.as_deref(),
         if needs_secrets.is_empty() {
             None
         } else {
@@ -682,6 +677,9 @@ fn build_status(
         conditions: Some(conditions),
         endpoint_url,
         image: None,
+        // 2.9 (ADR 0044): surface the per-CR active environment so
+        // consumers see which `spec.environment` override resolved.
+        environment: app.spec.environment.clone(),
     }
 }
 
@@ -794,6 +792,7 @@ fn build_paused_status(app: &Application, plan_name: &str) -> ApplicationStatus 
         conditions: Some(vec![ready, pending]),
         endpoint_url: previous_endpoint,
         image: None,
+        environment: app.spec.environment.clone(),
     }
 }
 
@@ -1157,6 +1156,7 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
         conditions: Some(vec![ready, pending]),
         endpoint_url: previous_endpoint,
         image: None,
+        environment: app.spec.environment.clone(),
     }
 }
 
@@ -1507,8 +1507,8 @@ mod tests {
 
     #[test]
     fn pick_blocking_plan_ignores_environment_when_caller_passes_none() {
-        // The reconciler's `APPRAFTER_ENV` may be unset (the
-        // single-env case). Environment becomes a wildcard
+        // The Application's `spec.environment` may be unset (the
+        // base-only / single-env case). Environment becomes a wildcard
         // matcher then — any matching app + namespace blocks.
         let plans = vec![app_plan(
             "parser-pg",
@@ -1535,6 +1535,7 @@ mod tests {
             conditions: None,
             endpoint_url: Some("http://web.demo.svc.cluster.local:80".into()),
             image: None,
+            environment: None,
         });
         let status = build_paused_status(&app, "web-prod-migration-1");
 
@@ -1640,6 +1641,17 @@ mod tests {
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0].type_, "Ready");
         assert_eq!(cs[0].status, "True");
+    }
+
+    #[test]
+    fn build_status_surfaces_spec_environment() {
+        // 2.9 (ADR 0044): the per-CR `spec.environment` is mirrored into
+        // `status.environment` so consumers see which env this
+        // Application resolves against.
+        let mut app = Application::new("web", ApplicationSpec::default());
+        app.spec.environment = Some("prod".into());
+        let st = build_status(&app, "Ready", vec![], None);
+        assert_eq!(st.environment.as_deref(), Some("prod"));
     }
 
     #[test]
@@ -2131,6 +2143,7 @@ mod tests {
             conditions: None,
             endpoint_url: Some("http://parser.demo.svc.cluster.local:80".into()),
             image: None,
+            environment: None,
         });
         let status = build_resource_claim_paused_status(&app, &["parser-pg".to_string()]);
         assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));

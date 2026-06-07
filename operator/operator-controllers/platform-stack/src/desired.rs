@@ -74,6 +74,7 @@ mod tests {
             channel: "stable".into(),
             pin: None,
             auto_upgrade: false,
+            default_environment: None,
             source: PlatformStackSource::default(),
             values: PlatformStackValues {
                 tier: 1,
