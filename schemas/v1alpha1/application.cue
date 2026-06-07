@@ -27,6 +27,17 @@ package v1alpha1
 		base?: #ApplicationSpec
 
 		environments?: [string]: #ApplicationSpec
+
+		// Deploy-time env selector (ADR 0044): injected by the CMP from the
+		// Argo Application's APPRAFTER_APP_ENV plugin env; selects which
+		// `environments.<env>` override unifies onto base. Absent => base
+		// only. Validated `environment in environments` by the webhook.
+		environment?: string
+	}
+
+	status?: {
+		phase?:       string
+		environment?: string
 	}
 }
 

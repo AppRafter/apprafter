@@ -27,6 +27,8 @@ pub struct ApplicationSpec {
     pub base: Option<ApplicationBaseSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environments: Option<BTreeMap<String, ApplicationBaseSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -307,6 +309,8 @@ pub struct ApplicationStatus {
     pub endpoint_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<StatusImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
 /// Reserved phase: Application reconciler is paused awaiting
@@ -613,5 +617,23 @@ mod tests {
         });
         let app: Application = serde_json::from_value(json_obj).unwrap();
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn spec_and_status_environment_round_trip() {
+        let spec: ApplicationSpec = serde_json::from_value(serde_json::json!({
+            "base": { "image": "ghcr.io/acme/web:1.0" },
+            "environments": { "dev": { "replicas": 1 } },
+            "environment": "dev"
+        }))
+        .unwrap();
+        assert_eq!(spec.environment.as_deref(), Some("dev"));
+        let bare: ApplicationSpec =
+            serde_json::from_value(serde_json::json!({ "base": { "image": "x" } })).unwrap();
+        assert!(bare.environment.is_none());
+        assert!(serde_json::to_value(&bare).unwrap().get("environment").is_none());
+        let status: ApplicationStatus =
+            serde_json::from_value(serde_json::json!({ "phase": "Ready", "environment": "dev" })).unwrap();
+        assert_eq!(status.environment.as_deref(), Some("dev"));
     }
 }

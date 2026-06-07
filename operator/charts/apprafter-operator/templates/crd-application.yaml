@@ -175,6 +175,8 @@ spec:
                           resolve:
                             type: string
                             enum: ["digest", "off"]
+                environment:
+                  type: string
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
@@ -185,6 +187,8 @@ spec:
                     tag: { type: string }
                     resolved: { type: string }
                     resolvedAt: { type: string }
+                environment:
+                  type: string
       subresources:
         status: {}
       additionalPrinterColumns:
