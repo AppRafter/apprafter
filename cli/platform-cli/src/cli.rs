@@ -516,6 +516,13 @@ pub enum AppCommand {
         /// scripts that want one-shot scaffold + register.
         #[arg(long, default_value_t = false)]
         scaffold: bool,
+        /// Environment to deploy (ADR 0044). Selects which
+        /// `spec.environments.<env>` override unifies onto base for THIS
+        /// deployment; the Argo Application is named `<name>-<env>`. Must be
+        /// one of the manifest's declared environments. Omit for a base-only
+        /// deployment.
+        #[arg(long)]
+        env: Option<String>,
     },
     /// List Applications scoped to the `apps` AppProject (or
     /// `--project <name>`). Filters to Applications labeled
@@ -698,6 +705,13 @@ pub enum AppCommand {
         /// operator wants to re-attach the data later.
         #[arg(long = "keep-data", default_value_t = false)]
         keep_data: bool,
+        /// Environment to remove (ADR 0044). Targets the Argo
+        /// Application named `<name>-<env>` — the single
+        /// per-environment deployment registered by `app add
+        /// --env <env>`. Omit to remove the base-only `<name>`
+        /// Application.
+        #[arg(long)]
+        env: Option<String>,
     },
 }
 

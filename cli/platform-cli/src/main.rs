@@ -120,6 +120,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 coverage_gate,
                 no_interactive,
                 scaffold,
+                env,
             } => commands::app::add(
                 git_url,
                 name,
@@ -130,6 +131,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 &remote,
                 no_ping,
                 coverage_gate,
+                env,
                 no_interactive,
                 scaffold,
             )?,
@@ -186,7 +188,8 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 name,
                 yes,
                 keep_data,
-            } => commands::app::remove(&name, yes, keep_data)?,
+                env,
+            } => commands::app::remove(&name, yes, keep_data, env)?,
         },
         Commands::Repo { action } => match action {
             RepoCommand::Creds { action } => match action {

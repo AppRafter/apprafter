@@ -80,6 +80,48 @@ pub enum CoverageGate {
     Confirmed,
 }
 
+/// Read `PlatformStack/default.spec.defaultEnvironment` (ADR 0044) —
+/// the cluster's soft default environment. `Ok(None)` when no
+/// PlatformStack is present or the field is unset. Used to surface a
+/// hint when an operator runs `app add` without `--env`.
+fn fetch_platformstack_default_env(kubeconfig_path: &std::path::Path) -> Result<Option<String>> {
+    match kubectl_get_json(
+        "platformstack",
+        Some("default"),
+        Some("apprafter-system"),
+        kubeconfig_path,
+    )? {
+        Some(ps) => Ok(ps
+            .pointer("/spec/defaultEnvironment")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)),
+        None => Ok(None),
+    }
+}
+
+/// Render the cwd's `apprafter/Application.cue` and return its
+/// declared `spec.environments` keys (ADR 0044). Used to validate
+/// `--env <e>` against the manifest's declared environments before
+/// registering the Argo CD Application.
+///
+/// `cue export` of the scaffolded package yields a top-level object
+/// keyed by the binding name (e.g. `{ "web": { kind: "Application",
+/// … } }`), NOT a single `out:` doc — so the Application doc is
+/// selected by `kind == "Application"` via
+/// `cli_core::manifest::parse_application` (the same doc-selection the
+/// manifest parser + its integration tests use), then its
+/// `spec.environments` map keys are returned. An empty vec means the
+/// manifest declares no environments (base-only app).
+fn get_manifest_environments(cwd: &std::path::Path) -> Result<Vec<String>> {
+    let manifest =
+        cli_core::manifest::parse_application(&cwd.join("apprafter"), std::path::Path::new("."))?;
+    Ok(manifest
+        .spec
+        .environments
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     git_url: Option<String>,
@@ -91,6 +133,7 @@ pub fn add(
     remote: &str,
     no_ping: bool,
     coverage_gate: CoverageGate,
+    env: Option<String>,
     no_interactive: bool,
     scaffold_flag: bool,
 ) -> Result<()> {
@@ -179,6 +222,45 @@ pub fn add(
     let derived_name = name.unwrap_or_else(|| derive_app_name(&repo_url));
     validate_dns_1123(&derived_name)?;
 
+    // ADR 0044 (2.9): one `app add --env <env>` produces ONE Argo CD
+    // Application named `<name>-<env>` (or `<name>` for a base-only
+    // deploy). The env (when set) must be one of the manifest's
+    // declared `spec.environments` keys.
+    let argo_app_name = match &env {
+        Some(e) => format!("{derived_name}-{e}"),
+        None => derived_name.clone(),
+    };
+    if let Some(e) = env.as_deref() {
+        // Validate against the cwd manifest's declared environments.
+        // Degrade gracefully when the manifest can't be rendered (e.g.
+        // a remote-only `app add <git-url>` from outside the repo) —
+        // warn rather than hard-fail, so a no-cwd-manifest add still
+        // works (the operator vouches the env exists upstream).
+        match get_manifest_environments(&cwd) {
+            Ok(envs) => {
+                if !envs.iter().any(|d| d == e) {
+                    let declared = if envs.is_empty() {
+                        "(none declared)".to_string()
+                    } else {
+                        envs.join(", ")
+                    };
+                    return Err(CliError::Other(format!(
+                        "environment '{e}' is not declared in this app's manifest. \
+                         Declared environments: {declared}. Add a \
+                         `spec.environments.{e}` block to apprafter/Application.cue, \
+                         or pass one of the declared environments to `--env`."
+                    )));
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "⚠ Could not render apprafter/Application.cue to validate `--env {e}` \
+                     ({err}). Proceeding — ensure `spec.environments.{e}` exists upstream."
+                );
+            }
+        }
+    }
+
     let target_revision = branch.or(derived_branch).unwrap_or_else(|| "main".into());
 
     if !no_ping {
@@ -192,19 +274,20 @@ pub fn add(
     // wouldn't allow a duplicate `metadata.name` anyway, but the
     // kubectl 409 message is cryptic for new users — give a
     // cleaner hint and an explicit pointer to `app status` /
-    // `app remove` instead.
+    // `app remove` instead. Keyed on the env-suffixed Argo name so
+    // `<name>-dev` and `<name>-prod` coexist for one logical app.
     let existing = kubectl_get_json(
         "application.argoproj.io",
-        Some(&derived_name),
+        Some(&argo_app_name),
         Some(ARGOCD_NAMESPACE),
         kc.path(),
     )?;
     if existing.is_some() {
         return Err(CliError::Other(format!(
-            "Application '{derived_name}' is already registered in namespace \
-             {ARGOCD_NAMESPACE}. Run `apprafter app status {derived_name}` to inspect its \
-             current state, `apprafter app remove {derived_name}` to cascade-delete it, \
-             or pass a different `--name`."
+            "Application '{argo_app_name}' is already registered in namespace \
+             {ARGOCD_NAMESPACE}. Run `apprafter app status {argo_app_name}` to inspect its \
+             current state, `apprafter app remove {argo_app_name}` to cascade-delete it, \
+             or pass a different `--name` / `--env`."
         )));
     }
 
@@ -217,23 +300,39 @@ pub fn add(
 
     let manifest = build_application_manifest(
         &derived_name,
+        &argo_app_name,
         &repo_url,
         &target_revision,
         path,
         project,
         &effective_namespace,
+        env.as_deref(),
     );
     apply_application_manifest(&manifest, kc.path())?;
 
-    println!("✓ Application '{derived_name}' registered in AppProject '{project}'.");
+    println!("✓ Application '{argo_app_name}' registered in AppProject '{project}'.");
     println!("  Repo:        {repo_url}");
     println!("  Revision:    {target_revision}");
     println!("  Path:        {path}");
     println!("  Destination: {effective_namespace} (created if missing)");
+    match env.as_deref() {
+        Some(e) => println!("  Environment: {e}"),
+        None => {
+            // Surface the cluster's soft default so the operator knows
+            // which env a base-only deploy renders against. Best-effort —
+            // a missing PlatformStack simply omits the line.
+            if let Ok(Some(default_env)) = fetch_platformstack_default_env(kc.path()) {
+                println!(
+                    "  Environment: (base — cluster default is '{default_env}'; \
+                     pass `--env {default_env}` to pin it)"
+                );
+            }
+        }
+    }
     println!();
     warn_if_no_matching_repo_creds(&repo_url, kc.path());
     println!("Argo CD will sync the workload within a reconcile cycle. State:");
-    println!("  apprafter app status {derived_name}");
+    println!("  apprafter app status {argo_app_name}");
     Ok(())
 }
 
@@ -460,6 +559,9 @@ fn add_via_wizard(
         remote,
         no_ping,
         coverage_gate,
+        None, // TODO(2.9 T9): wizard env picker — thread the chosen
+              // environment through here once the wizard learns to
+              // prompt for it. Base-only deploy for now.
         true, // no_interactive — prevent recursion into the wizard.
         false, // scaffold_flag — step 0 already ran in the outer call;
               // by here `<cwd>/apprafter/Application.cue` exists and
@@ -1448,8 +1550,17 @@ pub fn rollback(name: &str, to: Option<String>, yes: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
+pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+
+    // ADR 0044 (2.9): a per-environment deploy registers the Argo CD
+    // Application as `<name>-<env>`. Resolve the target name so
+    // `app remove <name> --env <env>` deletes the right one; a
+    // base-only deploy stays `<name>`.
+    let argo_app_name = match &env {
+        Some(e) => format!("{name}-{e}"),
+        None => name.to_string(),
+    };
 
     // Pre-flight: ensure the Application exists. Otherwise
     // kubectl delete reports `applications.argoproj.io
@@ -1457,13 +1568,13 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
     // a cleaner CLI message than raw kubectl output.
     let existing = kubectl_get_json(
         "application.argoproj.io",
-        Some(name),
+        Some(&argo_app_name),
         Some(ARGOCD_NAMESPACE),
         kc.path(),
     )?;
     let app = existing.ok_or_else(|| {
         CliError::Other(format!(
-            "Application '{name}' not found in namespace {ARGOCD_NAMESPACE}."
+            "Application '{argo_app_name}' not found in namespace {ARGOCD_NAMESPACE}."
         ))
     })?;
 
@@ -1484,7 +1595,7 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
             .pointer("/spec/source/repoURL")
             .and_then(Value::as_str)
             .unwrap_or("?");
-        println!("Delete Application '{name}' (project: {project}, repo: {repo})?");
+        println!("Delete Application '{argo_app_name}' (project: {project}, repo: {repo})?");
         let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
@@ -1504,7 +1615,7 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
         // NOT prune the synced AppRafter CR — the workload is preserved.
         kubectl_merge_patch(
             "application.argoproj.io",
-            name,
+            &argo_app_name,
             Some(ARGOCD_NAMESPACE),
             None,
             r#"{"metadata":{"finalizers":[]}}"#,
@@ -1517,7 +1628,7 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
     let out = Command::new("kubectl")
         .arg("delete")
         .arg("application.argoproj.io")
-        .arg(name)
+        .arg(&argo_app_name)
         .arg("-n")
         .arg(ARGOCD_NAMESPACE)
         .env("KUBECONFIG", kc.path())
@@ -1533,12 +1644,12 @@ pub fn remove(name: &str, yes: bool, keep_data: bool) -> Result<()> {
 
     if keep_data {
         println!(
-            "✓ Application '{name}' deleted (Argo CD object only). The workload and its \
+            "✓ Application '{argo_app_name}' deleted (Argo CD object only). The workload and its \
              AppRafter Application CR are preserved — re-register to re-adopt."
         );
     } else {
         println!(
-            "✓ Application '{name}' deleted. Argo CD cascade-prunes the synced AppRafter \
+            "✓ Application '{argo_app_name}' deleted. Argo CD cascade-prunes the synced AppRafter \
              resources; the operator then removes the workload."
         );
     }
@@ -1814,23 +1925,43 @@ pub(crate) fn pick_previous_revision(app: &Value) -> Result<&str> {
 /// destination namespace mismatched with the manifest's
 /// `metadata.namespace`); operators now pass `--namespace` (or
 /// accept the `apprafter` default) when registering user apps.
+///
+/// `logical_name` is the user-facing app name (the cwd basename /
+/// `--name`); it is stamped as the `apprafter.io/application` label
+/// so every per-environment deployment of one app shares a common
+/// selector. `argo_app_name` is the Argo CD `Application`'s
+/// `metadata.name` — `<logical_name>-<env>` for an env deploy, or
+/// `<logical_name>` for a base-only deploy (ADR 0044 / 2.9).
+///
+/// When `env` is `Some(e)`, the manifest carries the
+/// `apprafter.io/environment` label and a `spec.source.plugin.env`
+/// entry `{ name: APPRAFTER_APP_ENV, value: e }` — the cue-cmp
+/// sidecar reads `APPRAFTER_APP_ENV` and injects `spec.environment`
+/// into the rendered CR, so the operator unifies the chosen
+/// `spec.environments.<env>` override onto base. A base-only deploy
+/// (`env: None`) omits both, leaving the CMP at its prod-base
+/// default.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_application_manifest(
-    name: &str,
+    logical_name: &str,
+    argo_app_name: &str,
     repo_url: &str,
     target_revision: &str,
     path: &str,
     project: &str,
     destination_namespace: &str,
+    env: Option<&str>,
 ) -> Value {
     let normalised_path = normalise_argocd_source_path(path);
-    json!({
+    let mut manifest = json!({
         "apiVersion": "argoproj.io/v1alpha1",
         "kind": "Application",
         "metadata": {
-            "name": name,
+            "name": argo_app_name,
             "namespace": ARGOCD_NAMESPACE,
             "labels": {
                 "apprafter.io/managed-by": "apprafter",
+                "apprafter.io/application": logical_name,
             },
             "annotations": {
                 APPRAFTER_SOURCE_ANNOTATION: "cli",
@@ -1863,7 +1994,23 @@ pub(crate) fn build_application_manifest(
                 ],
             },
         },
-    })
+    });
+
+    // Per-environment deploy (ADR 0044): label the env + hand the CMP
+    // the env name via a config-management-plugin env var. The cue-cmp
+    // sidecar reads `APPRAFTER_APP_ENV` and stamps `spec.environment`
+    // onto the rendered CR so the operator unifies the matching
+    // `spec.environments.<env>` override onto base.
+    if let Some(e) = env {
+        manifest["metadata"]["labels"]["apprafter.io/environment"] = json!(e);
+        manifest["spec"]["source"]["plugin"] = json!({
+            "env": [
+                { "name": "APPRAFTER_APP_ENV", "value": e },
+            ],
+        });
+    }
+
+    manifest
 }
 
 /// Pure helper — translate AppRafter-side path conventions
@@ -2228,11 +2375,13 @@ mod tests {
         // "/".
         let m = build_application_manifest(
             "test-app",
+            "test-app",
             "https://github.com/foo/bar",
             "main",
             "/",
             "apps",
             "apprafter",
+            None,
         );
         assert_eq!(
             m.pointer("/spec/source/path").and_then(Value::as_str),
@@ -2315,16 +2464,65 @@ mod tests {
     }
 
     #[test]
+    fn manifest_injects_plugin_env_and_labels_when_env_set() {
+        let m = build_application_manifest(
+            "web",
+            "web-dev",
+            "https://x/r.git",
+            "main",
+            "/",
+            "apps",
+            "web-dev",
+            Some("dev"),
+        );
+        assert_eq!(m.pointer("/metadata/name").unwrap(), "web-dev");
+        assert_eq!(
+            m.pointer("/metadata/labels/apprafter.io~1application").unwrap(),
+            "web"
+        );
+        assert_eq!(
+            m.pointer("/metadata/labels/apprafter.io~1environment").unwrap(),
+            "dev"
+        );
+        let env0 = &m.pointer("/spec/source/plugin/env/0").unwrap();
+        assert_eq!(env0.get("name").unwrap(), "APPRAFTER_APP_ENV");
+        assert_eq!(env0.get("value").unwrap(), "dev");
+    }
+
+    #[test]
+    fn manifest_base_only_has_no_plugin_env_or_environment_label() {
+        let m = build_application_manifest(
+            "web",
+            "web",
+            "https://x/r.git",
+            "main",
+            "/",
+            "apps",
+            "apprafter",
+            None,
+        );
+        assert_eq!(m.pointer("/metadata/name").unwrap(), "web");
+        assert_eq!(
+            m.pointer("/metadata/labels/apprafter.io~1application").unwrap(),
+            "web"
+        );
+        assert!(m.pointer("/metadata/labels/apprafter.io~1environment").is_none());
+        assert!(m.pointer("/spec/source/plugin").is_none());
+    }
+
+    #[test]
     fn build_application_manifest_includes_managed_by_label() {
         // Load-bearing — `app list` filters by this label.
         // If a future refactor drops it, `list` shows nothing.
         let m = build_application_manifest(
+            "my-app",
             "my-app",
             "https://github.com/foo/bar",
             "main",
             "/",
             "apps",
             "apprafter",
+            None,
         );
         assert_eq!(
             m.pointer("/metadata/labels/apprafter.io~1managed-by")
@@ -2346,11 +2544,13 @@ mod tests {
         // #3's typo, which Argo ignored, hanging deletion in Terminating).
         let m = build_application_manifest(
             "my-app",
+            "my-app",
             "https://github.com/foo/bar",
             "main",
             "/",
             "apps",
             "apprafter",
+            None,
         );
         let finalizers = m
             .pointer("/metadata/finalizers")
@@ -2371,8 +2571,16 @@ mod tests {
         // convention. `spec.destination.namespace` is now an
         // explicit caller parameter (walk-fix #12 / v0.1.160)
         // — must reflect what's passed, not the app name.
-        let m =
-            build_application_manifest("payments", "https://x/y", "v1.0", "/", "apps", "apprafter");
+        let m = build_application_manifest(
+            "payments",
+            "payments",
+            "https://x/y",
+            "v1.0",
+            "/",
+            "apps",
+            "apprafter",
+            None,
+        );
         assert_eq!(
             m.pointer("/metadata/namespace").and_then(Value::as_str),
             Some("argocd")
@@ -2390,8 +2598,16 @@ mod tests {
         // namespace (e.g. an operator who knows their manifest
         // lives in `tenant-x`) must NOT be silently overridden
         // by the prior `<app-name>` default.
-        let m =
-            build_application_manifest("payments", "https://x/y", "v1.0", "/", "apps", "tenant-x");
+        let m = build_application_manifest(
+            "payments",
+            "payments",
+            "https://x/y",
+            "v1.0",
+            "/",
+            "apps",
+            "tenant-x",
+            None,
+        );
         assert_eq!(
             m.pointer("/spec/destination/namespace")
                 .and_then(Value::as_str),
@@ -2408,7 +2624,7 @@ mod tests {
 
     #[test]
     fn build_application_manifest_carries_project_and_revision() {
-        let m = build_application_manifest("a", "u", "v", "/p", "apps", "apprafter");
+        let m = build_application_manifest("a", "a", "u", "v", "/p", "apps", "apprafter", None);
         assert_eq!(
             m.pointer("/spec/project").and_then(Value::as_str),
             Some("apps")
