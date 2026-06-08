@@ -132,6 +132,13 @@ _kind() {
     fi
 }
 
+# _cilium <args...> / _hubble <args...> — the Cilium / Hubble CLIs, wrapping a
+# `nix run nixpkgs#…` fallback when the bare binary is absent (the project
+# convention — `nix develop` / flake.nix ships `cilium-cli`, a fresh checkout
+# falls back to the pinned nixpkgs build). Used only by the 2.10 egress walk.
+_cilium() { if command -v cilium >/dev/null 2>&1; then cilium "$@"; else nix run nixpkgs#cilium-cli -- "$@"; fi; }
+_hubble() { if command -v hubble >/dev/null 2>&1; then hubble "$@"; else nix run nixpkgs#hubble -- "$@"; fi; }
+
 # ---------------------------------------------------------------
 # k3d_up <cluster-name>
 #   Bring up a local single-node cluster — kind by default (k3d opt-in via
@@ -172,6 +179,65 @@ _kind_up() {
     # no benefit.
     _kind create cluster --name "$cluster_name"
     printf '  kind cluster %s is ready. kubectl context: kind-%s\n' \
+        "$cluster_name" "$cluster_name"
+}
+
+# ---------------------------------------------------------------
+# kind_up_cilium <cluster-name>
+#   Bring up a kind cluster whose datapath is owned by CILIUM (not the
+#   default kindnet CNI + kube-proxy), so the 2.10 egress walk can run real
+#   CiliumNetworkPolicy enforcement + Hubble. The kind config:
+#     networking.disableDefaultCNI: true   — no kindnet; the node stays
+#       NotReady until cluster-bootstrap installs Cilium (Cilium's DaemonSet
+#       tolerates the not-ready taint, same as on k3s).
+#     networking.kubeProxyMode: "none"     — no kube-proxy; Cilium runs as the
+#       kube-proxy replacement (the platform's Cilium values pin
+#       kubeProxyReplacement: true + k8sServiceHost: 127.0.0.1 / k8sServicePort:
+#       6443 — see platform-stack/cue/loader_values.cue).
+#   The apiServerAddress/apiServerPort are pinned to 127.0.0.1:6443 INSIDE the
+#   node so Cilium's k8sServiceHost: 127.0.0.1 / k8sServicePort: 6443 resolve
+#   the apiserver with no kube-proxy. kind always exposes the apiserver on the
+#   node's loopback at the in-config port, so this pin is what makes the
+#   kube-proxy-replacement bootstrap converge.
+#   Cilium-only (k3d does not get a Cilium-on variant): this walk forces
+#   APPRAFTER_E2E_RUNTIME=kind (Cilium's eBPF datapath is pathologically slow
+#   on k3d). The caller asserts `cilium status --wait` before any enforcement.
+# ---------------------------------------------------------------
+kind_up_cilium() {
+    local cluster_name="$1"
+    if [ "$(cluster_runtime)" != "kind" ]; then
+        printf 'ERROR: kind_up_cilium requires the kind runtime (got %s); set APPRAFTER_E2E_RUNTIME=kind\n' \
+            "$(cluster_runtime)" >&2
+        return 2
+    fi
+    # The kind config is fed on stdin (`--config -`). Disable the default CNI
+    # + kube-proxy so Cilium owns L3/L4 and service routing; pin the apiserver
+    # to 127.0.0.1:6443 to match the platform's Cilium k8sServiceHost pin.
+    #
+    # extraMounts /sys/fs/bpf: Cilium's `mount-bpf-fs` init container mounts
+    # the BPF filesystem, which a rootless-podman kind node cannot do itself
+    # (`mount: /sys/fs/bpf: permission denied`); bind-mounting the host bpffs
+    # in lets the init proceed. On CI (rootful Docker) it is a harmless re-bind.
+    # NOTE: even with the mount, a rootless-podman host with a capped memlock
+    # ulimit (e.g. 8 MB) still cannot run the cilium-agent (`failed to set
+    # memlock rlimit: operation not permitted`) — the FULL enforcement run
+    # needs a rootful runtime (CI) or a host memlock raise. The bootstrap +
+    # `cilium status --wait` converge under CI's rootful Docker.
+    _kind create cluster --name "$cluster_name" --config - <<'KINDCFG'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  kubeProxyMode: "none"
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6443
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
+KINDCFG
+    printf '  kind+Cilium cluster %s created (default CNI + kube-proxy disabled). kubectl context: kind-%s\n' \
         "$cluster_name" "$cluster_name"
 }
 
@@ -228,6 +294,38 @@ bootstrap_with_retry() {
         apprafter cluster-bootstrap
     }
 }
+
+# ---------------------------------------------------------------
+# bootstrap_with_cilium
+#   Like bootstrap_with_retry but leaves Cilium ENABLED — it explicitly does
+#   NOT set APPRAFTER_BOOTSTRAP_SKIP_CILIUM, so `apprafter cluster-bootstrap`
+#   installs Cilium (kube-proxy replacement) as step 0 before Argo CD. Required
+#   by the 2.10 egress walk (real CiliumNetworkPolicy enforcement + Hubble) and
+#   ONLY safe on a cluster brought up via kind_up_cilium (default CNI +
+#   kube-proxy disabled). Cilium's eBPF datapath is slower to converge than a
+#   default CNI, so the caller MUST gate any assertion on `cilium status
+#   --wait` (see e2e/needs-networkpolicy-walk.sh). Requires $KUBECONFIG
+#   exported (kubectl/helm).
+# ---------------------------------------------------------------
+bootstrap_with_cilium() {
+    # Defensive: a prior bootstrap_with_retry in the same shell would have
+    # exported the skip flag — unset it so Cilium installs.
+    unset APPRAFTER_BOOTSTRAP_SKIP_CILIUM
+    apprafter cluster-bootstrap || {
+        printf '  cluster-bootstrap (Cilium-on) failed; retrying once (idempotent)\n' >&2
+        sleep 20
+        apprafter cluster-bootstrap
+    }
+}
+
+# ---------------------------------------------------------------
+# cilium_cli <args...> / hubble_cli <args...>
+#   Public wrappers over the Cilium / Hubble CLIs (nix-fallback aware) for
+#   sourcing walks. `cilium status --wait`, `cilium hubble enable`,
+#   `hubble observe …` — see e2e/needs-networkpolicy-walk.sh.
+# ---------------------------------------------------------------
+cilium_cli() { _cilium "$@"; }
+hubble_cli() { _hubble "$@"; }
 
 # ---------------------------------------------------------------
 # k3d_down <cluster-name>

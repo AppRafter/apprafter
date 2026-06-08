@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: e2e-networkpolicy-nightly
+
+# Standalone nightly kind+Cilium gate for the Phase-2.10 egress
+# CiliumNetworkPolicy enforcement chain (e2e/needs-networkpolicy-walk.sh,
+# ADR 0045): the operator derives one per-Application egress CNP from
+# declared needs (pg/redis), gating cross-service in-cluster egress while
+# DNS / same-namespace / internet stay open, under a config-driven
+# PlatformStack.spec.network.egress.profile managed by `apprafter platform
+# egress`.
+#
+#   needs.pg Application `web`  -> web-egress CNP with the pg allow rule
+#                                  -> web pod CAN reach pg (Hubble FORWARDED)
+#   needs-less Application `noproxy` -> noproxy-egress baseline only
+#                                  -> noproxy pod CANNOT reach pg (Hubble DROPPED)
+#   apprafter platform egress set internal -> web-egress loses the `world`
+#                                  rule (external blocked), pg still allowed
+#   apprafter platform egress set strict   -> same-namespace egress also blocked
+#
+# UNLIKE the other e2e nightlies, this one needs REAL Cilium (the feature is
+# a CiliumNetworkPolicy + Hubble verdicts). It therefore:
+#   - brings the kind cluster up with the default CNI + kube-proxy DISABLED
+#     (kind_up_cilium) so Cilium owns the datapath, and
+#   - bootstraps WITH Cilium (bootstrap_with_cilium leaves
+#     APPRAFTER_BOOTSTRAP_SKIP_CILIUM unset), then waits `cilium status --wait`.
+# Cilium converges under the runner's rootful Docker (unlimited memlock); a
+# rootless-podman dev host with a capped memlock ulimit cannot run the
+# cilium-agent, so the FULL enforcement run is gated to this CI nightly.
+#
+# Local-operator mode: 2.10 is UNRELEASED, so the walk ALWAYS builds +
+# side-loads the working-tree operator + admission-webhook and applies the
+# branch CRDs/RBAC (the released chart predates the egress.profile field, the
+# CNP RBAC, and the egress emission). POST-RELEASE, once the operator +
+# platform-stack carry 2.10, flip the walk's Phase 1b to the published image
+# (run the published chart by default, behind APPRAFTER_E2E_LOCAL_OPERATOR
+# only for pre-release validation) — exactly like the e2e-pg / e2e-redis /
+# e2e-disk nightlies did once their feature shipped.
+#
+# Why a separate workflow (NOT folded into e2e-k3d.yml or the other
+# nightlies): it is the only walk that installs + boots Cilium (kube-proxy
+# replacement + Hubble), the heaviest local bring-up, and it provisions a
+# CNPG cluster for the pg target — keep it off the per-push critical path
+# and decoupled from the Hetzner-cost nightly.yml.
+#
+# Security note: no secrets are consumed here. Everything runs on a local
+# kind cluster; the only outbound traffic is public image / chart pulls plus
+# the walk's external-egress probe (1.1.1.1:443 — proving the `internet`
+# profile). `permissions: contents: read` is the minimum. No github.event.*
+# input is interpolated into any run: block.
+
+on:
+  schedule:
+    # 09:00 UTC -- staggered after nightly.yml (04:00 UTC), e2e-pg-nightly.yml
+    # (05:00 UTC), e2e-redis-nightly.yml (06:00 UTC), e2e-disk-nightly.yml
+    # (07:00 UTC) and e2e-per-env-nightly.yml (08:00 UTC) so the nightly gates
+    # don't contend for the runner pool.
+    - cron: '0 9 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-networkpolicy-nightly:
+    name: kind+Cilium e2e (needs.networkpolicy nightly)
+    runs-on: ubuntu-latest
+    # Installs + boots Cilium (kube-proxy replacement) + Hubble, builds the
+    # working-tree operator + webhook (LOCAL_OPERATOR, 2.10 unreleased), and
+    # provisions a CNPG cluster, so it is the heaviest of the nightlies.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('cli/**/Cargo.lock', 'cli/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install kind
+        run: |
+          curl -fsSL -o ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Install the Cilium + Hubble CLIs
+        # The walk reaches the CLIs via lib.sh wrappers (cilium_cli /
+        # hubble_cli), which prefer a bare `cilium` / `hubble` on PATH and
+        # fall back to `nix run nixpkgs#…`. The runner has no nix, so install
+        # the binaries here. Versions track the platform's Cilium 1.16.x.
+        run: |
+          CILIUM_CLI_VERSION=v0.16.20
+          HUBBLE_VERSION=v1.16.5
+          ARCH=amd64
+          curl -fsSL -o cilium.tar.gz \
+            "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${ARCH}.tar.gz"
+          sudo tar -C /usr/local/bin -xzf cilium.tar.gz
+          rm -f cilium.tar.gz
+          curl -fsSL -o hubble.tar.gz \
+            "https://github.com/cilium/hubble/releases/download/${HUBBLE_VERSION}/hubble-linux-${ARCH}.tar.gz"
+          sudo tar -C /usr/local/bin -xzf hubble.tar.gz
+          rm -f hubble.tar.gz
+          cilium version --client
+          hubble version
+
+      - name: Load iptables kernel modules for Cilium
+        # This walk REALLY uses Cilium (kube-proxy replacement), so these
+        # modules are load-bearing here (not the belt-and-braces no-op they
+        # are in the Cilium-skipped nightlies).
+        run: |
+          sudo modprobe -a \
+            ip_tables iptable_mangle iptable_raw iptable_filter iptable_nat \
+            ip6_tables ip6table_mangle ip6table_raw ip6table_filter ip6table_nat \
+            nf_nat xt_socket || true
+          lsmod | grep -E 'ip6?table|nf_nat|xt_socket' || true
+
+      - name: Warm the CLI build cache
+        working-directory: cli
+        # The e2e script invokes the CLI via `cargo run` (lib.sh's
+        # `apprafter()` shell function), so a debug build here warms the
+        # cache for the timed script run below -- no PATH binary is used.
+        run: cargo build --bin apprafter
+
+      - name: Run the needs.networkpolicy kind+Cilium walk
+        # The walk forces APPRAFTER_E2E_RUNTIME=kind (Cilium-only). It builds
+        # the working-tree operator + webhook (2.10 unreleased) via the
+        # runner's Docker and side-loads them with `kind load docker-image`
+        # (kind uses the docker provider on the runner, so the image is
+        # visible — the k3d+podman import limitation does NOT apply).
+        # POST-RELEASE: drop the walk's unconditional Phase 1b and run the
+        # published platform-stack here, like the other nightlies.
+        run: bash e2e/needs-networkpolicy-walk.sh

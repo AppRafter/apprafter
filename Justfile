@@ -157,6 +157,25 @@ e2e-disk:
 e2e-per-env:
     APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/gitops-walk-per-env.sh
 
+# Run the needs.networkpolicy egress-enforcement kind+Cilium walk (2.10, ADR
+# 0045): the operator derives one per-Application egress CiliumNetworkPolicy
+# from declared needs -> a needs.pg app CAN reach pg (Hubble FORWARDED) while
+# a needs-less app CANNOT (Hubble DROPPED) -> `apprafter platform egress set
+# internal|strict` tightens the baseline (external blocked, then same-namespace
+# blocked). UNLIKE the other walks this one needs REAL Cilium: it brings kind
+# up with the default CNI + kube-proxy disabled (kind_up_cilium) and bootstraps
+# WITH Cilium (bootstrap_with_cilium), then asserts `cilium status --wait`. The
+# walk forces the kind runtime + builds the working-tree operator + webhook
+# (2.10 UNRELEASED), so it needs cargo, kubectl, a container runtime, AND the
+# Cilium + Hubble CLIs (nix develop ships cilium-cli; the lib.sh wrappers fall
+# back to `nix run nixpkgs#…`). NOTE: a rootless-podman host with a capped
+# memlock ulimit (8 MB) cannot run the cilium-agent — the full enforcement run
+# needs a rootful runtime (CI) or a host memlock raise; the nightly is
+# .github/workflows/e2e-networkpolicy-nightly.yml. Like the other walk targets
+# it is NOT a dependency of `e2e`.
+e2e-networkpolicy:
+    bash e2e/needs-networkpolicy-walk.sh
+
 # Spin up a local k3d cluster suitable for end-to-end work.
 e2e-up:
     k3d cluster create apprafter-dev \
