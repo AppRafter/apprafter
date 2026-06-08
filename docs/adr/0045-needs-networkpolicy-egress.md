@@ -41,9 +41,13 @@ plain k8s `NetworkPolicy`.** The operator emits one CNP per Application (per-CR,
 not per-need) that selects the app's pods on egress. Cilium **entities**
 (`world`) — unavailable in plain NetworkPolicy — let us express "external
 internet open, in-cluster cross-service egress closed unless declared", which is
-the chosen breadth. There is no kube-rs type for CNP, so we hand-roll a typed
-serde mirror in `operator-core` (consistent with the hand-rolled CRD mirrors)
-rather than using a raw `DynamicObject`.
+the chosen breadth. There is no kube-rs type for CNP; following the established
+external-CR precedent (CNPG, Argo CD, and Dragonfly objects are all built with
+`serde_json::json!` → `DynamicObject` + `ApiResource`), the CNP is built the same
+way, not as a hand-rolled typed mirror. Hand-rolled types are reserved for *our
+own* CRDs (`operator-core`); a typed CNP mirror is deferred (YAGNI) until L7/mTLS
+fields are actually modelled. The rendered structure is asserted by the
+renderer's unit tests.
 
 **2. Breadth = internet open, in-cluster gated by needs (default).** The baseline
 allows DNS → kube-dns, same-namespace, `toEntities: [world]`, and one rule per
@@ -59,10 +63,17 @@ not a hard-coded constant.** An additive optional enum field with three presets 
 `internet` (default: DNS + same-ns + world + needs), `internal` (DNS + same-ns +
 needs), `strict` (DNS + needs; same-namespace also denied) — gates which baseline
 rules the renderer emits. The operator reads the singleton PlatformStack; field
-absent / CR missing → `internet`. The default lives in the infrastructure config
-(operator fallback, optionally baked via `platform-stack` values), is the same on
-all tiers at launch, and pre-positions per-tier hardening and future per-app /
-per-target access control onto the same CNP mechanism.
+absent / CR missing → `internet`. The default lives in the infrastructure
+config: the operator fallback (`internet`) is the documented default, **not in
+git**; baking a non-default via `platform-stack` values is an explicit opt-in
+escape hatch (which makes the field git-managed — see #4). The uniform `internet`
+launch default is a function of **capability, not policy**: apps cannot yet
+declare external destinations. Once app-level egress declaration ships
+(`connects` / ExternalSurface), the Tier-2+ default flips to `internal`
+(DNS + same-ns + needs, `world` closed) while Tier-1 retains `internet` for solo /
+no-infra-repo ergonomics; the profile mechanism already pre-positions this
+per-tier divergence and future per-app / per-target access control onto the same
+CNP.
 
 **4. A first-class CLI surface, `apprafter platform egress` (`show` / `set`),**
 manages the profile so users never hand-edit Kubernetes objects. `set` patches
@@ -70,6 +81,23 @@ PlatformStack via server-side apply with field manager `apprafter-cli`. To
 survive Argo self-heal, the platform-stack chart does **not** declare the field
 by default (so Argo has no diff to revert), and `set` warns if it detects the
 field is git-managed.
+
+This reconciles with the §1.4 GitOps-only principle via a **per-tier
+control-surface model**, not an override. The PlatformStack singleton is **seeded
+by the `apprafter cluster-bootstrap` loader and driven by the operator's
+PlatformController** — it is the declarative control plane, not a chart-templated,
+Argo-reconciled object. On Tier-1 a user may operate without an infrastructure
+repository, so the `apprafter` CLI editing PlatformStack is the intended,
+declarative control surface (§1.5 decl-first — not a `kubectl`-to-prod emergency
+override). Opting in to an infra-repo that declares the field is explicit; that
+makes it git-managed, at which point GitOps becomes authoritative and `set`
+warns. On Tier-2+, manual mutation is gated by AccessGrant (when it ships) and
+remains available to the operator during pre-production setup. Because changing
+the egress posture is security-relevant, the change is auditable — `set` records
+provenance (annotations + a Kubernetes Event) and the active profile is
+observable — lightweight audit in the spirit of §1.4's loud-audit-on-manual-ops. The "live SSA patch survives
+because the field is not git-declared" mechanism is therefore the deliberate
+Tier-1 model, not a temporary gap.
 
 The connection-target catalog (type → namespace + service selector + port) is a
 static table in the operator, namespace-overridable from `ServiceProvider.spec.config`,
@@ -84,14 +112,18 @@ cascading delete) and applied via SSA with field manager `apprafter-operator`.
   DNS, same-namespace, and declared needs remain open under the default profile.
   An app silently relying on an *undeclared* in-cluster service breaks — the
   intended hardening, surfaced via Hubble drops.
-- **CNP, not NetworkPolicy:** the codebase grows a hand-rolled CNP type and the
-  operator gains `ciliumnetworkpolicies` RBAC. Plain-NetworkPolicy type safety
+- **CNP, not NetworkPolicy:** the operator gains `ciliumnetworkpolicies` RBAC and
+  builds the CNP via `serde_json` → `DynamicObject` + `ApiResource` (the
+  external-CR precedent), not a hand-rolled type. Plain-NetworkPolicy type safety
   from `k8s_openapi` is traded for the `world`-entity capability and Cilium
-  alignment.
+  alignment; the rendered structure is covered by unit tests.
 - **Operator reads PlatformStack:** a new cross-CR read on the app reconcile path,
   with a safe `internet` fallback when absent.
-- **GitOps caveat:** `platform egress set` is a live SSA patch that persists only
-  while the field is not git-declared; a fully-GitOps CLI path is future work.
+- **Control surface, not a caveat:** on a Tier-1 cluster with no infra-repo the
+  `apprafter` CLI is the intended surface for the PlatformStack control CR
+  (operator-managed, not git-declared); an infra-repo opt-in (Tier-1) or
+  AccessGrant gating (Tier-2+) restores GitOps authority and `set` warns — see
+  §1.4 and Decision #4.
 - **Release:** coordinated operator + webhook + platform-stack bump
   (`change: safe`, additive optional CRD field) plus a cli bump for the new
   command.
@@ -102,6 +134,10 @@ cascading delete) and applied via SSA with field manager `apprafter-operator`.
   existing default-deny, sufficient for L3/L4 egress-to-service. Rejected: cannot
   express "external internet open, in-cluster closed" (no `world` entity), and
   diverges from the one-way-Cilium commitment / future L7 needs.
+- **Hand-rolled typed `CiliumNetworkPolicy` mirror** in `operator-core`. Rejected:
+  external CRs in this codebase (CNPG, Argo CD, Dragonfly) are uniformly built
+  with `serde_json::json!` → `DynamicObject`; hand-rolled types are reserved for
+  our own CRDs. A typed CNP mirror is YAGNI until L7/mTLS fields are modelled.
 - **Full default-deny egress at launch.** Maximal lockdown, but strands apps that
   make external calls with no declaration mechanism. Deferred behind the `strict`
   profile and future `connects`/ExternalSurface.

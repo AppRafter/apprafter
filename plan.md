@@ -3018,12 +3018,14 @@ Tests:
 ### 2.10 needs → NetworkPolicy auto-derivation
 > 🏁 SR: A · order 3 — needs→NetworkPolicy auto-derivation (free security win)
 
+> 🎨 **Дизайн (2026-06-08, ADR 0045 + spec `docs/superpowers/specs/2026-06-08-2.10-needs-networkpolicy-design.md`):** оператор эмитит **ОДИН `CiliumNetworkPolicy` (cilium.io/v2) на Application** (per-CR; строится `json!`/`DynamicObject` — внешний-CR паттерн, не hand-rolled тип). Baseline = DNS + same-ns + `world` (интернет) + по egress-rule на каждый declared **сетевой** need (pg/redis; `disk` — без сетевой цели, исключён); кросс-сервисный in-cluster egress закрыт → Hubble drop. Постура **config-driven**: новое поле `PlatformStack.spec.network.egress.profile` (`internet`|`internal`|`strict`; дефолт `internet` на всех тирах, оператор fallback'ит на `internet` при отсутствии) + CLI `apprafter platform egress show/set` (SSA, field manager `apprafter-cli`; PlatformStack — CLI-bootstrap-seeded control-plane, не Argo-reconciled → live-set переживает синк, §1.4 per-tier control-surface). Launch = `internet` (интернет открыт — `connects` ещё нет; T2+→`internal` отложено до ExternalSurface). Декомпозиция 2.10-1…5 — в спеке. **NB: 2.10 ≠ закрытие Фазы 2 — §6 M2 НЕ флипать** (M2 после 2.10–2.12).
+
 **Цель:** при `needs.pg` оператор создаёт egress NetworkPolicy к pg-кластеру.
 
 **Поставка:**
 - [ ] Каталог connection-targets для каждого ServiceProvider type (label-selector + порт).
-- [ ] Renderer добавляет CiliumNetworkPolicy egress per declared need.
-- [ ] Default-deny остаётся; всё разрешённое — явно через needs или connects.
+- [ ] Renderer эмитит **ОДИН** CiliumNetworkPolicy на Application (per-CR), с одним egress-rule на каждый declared need внутри (не CNP-на-need).
+- [ ] Launch egress-дефолт = profile `internet` (DNS + same-ns + `world` + needs): интернет открыт (`connects` ещё нет), кросс-ns in-cluster закрыт и гейтится через needs (Hubble drop). `connects`-гейтинг интернета + T2+`internal` — отложено до ExternalSurface (ADR 0045).
 - [ ] Hubble drops на forbidden flows видны в логах.
 
 **Acceptance:** Application без `needs.pg` не может коннектится к pg-кластеру (Hubble drop); с `needs.pg` — может.
@@ -3039,7 +3041,7 @@ Tests:
 
 **Поставка:**
 - [ ] Установка sealed-secrets controller.
-- [ ] CLI helper в `platform-cli`: `platform-cli secret seal --name foo --from-literal=...`.
+- [ ] CLI helper в `apprafter`: `apprafter secret seal --name foo --from-literal=...`.
 - [ ] Public-key экспортируется и публикуется в `manifests/tier-1/sealed-secrets/`.
 - [ ] Backstage UI: «Encrypt secret» wizard для Tier 1.
 - [ ] Прометейный warning в UI: «вы используете SealedSecrets — без ротации, без dynamic. Tier 2+ → OpenBao».
