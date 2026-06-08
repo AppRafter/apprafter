@@ -90,10 +90,12 @@ jobs:
         with:
           version: v3.16.2
 
-      - name: Install k3d
+      - name: Install kind
         run: |
-          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-          k3d version
+          curl -fsSL -o ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
 
       - name: Load iptables kernel modules for Cilium
         # cluster-bootstrap skips Cilium on k3d

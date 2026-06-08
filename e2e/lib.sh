@@ -95,27 +95,47 @@ retry() {
 #          k3d|kind.
 # ---------------------------------------------------------------
 cluster_runtime() {
-    if [ -n "${APPRAFTER_E2E_RUNTIME:-}" ]; then
-        printf '%s' "${APPRAFTER_E2E_RUNTIME}"
-        return 0
-    fi
-    # podman (the rootless nix-dev default) → kind; a real docker daemon →
-    # k3d. Detect podman even when a `docker` shim (podman-docker) is on
-    # PATH: DOCKER_HOST points at a podman socket, or docker version/info
-    # reports podman. Only a genuine docker daemon falls through to k3d.
-    case "${DOCKER_HOST:-}" in *podman*) printf 'kind'; return 0 ;; esac
-    if docker --version 2>/dev/null | grep -qi podman; then printf 'kind'; return 0; fi
-    if docker info 2>/dev/null | grep -qi podman; then printf 'kind'; return 0; fi
-    if docker info >/dev/null 2>&1; then printf 'k3d'; else printf 'kind'; fi
+    # kind is the default everywhere — local nix-dev (rootless podman) AND CI.
+    # It has first-class podman support and, unlike k3d, runs Cilium without
+    # the eBPF-convergence slowdown, so the 2.10 egress walk can enable it.
+    # k3d's tools node also bind-mounts the literal /var/run/docker.sock,
+    # which rootless podman cannot create. k3d stays an opt-in escape hatch
+    # via APPRAFTER_E2E_RUNTIME=k3d.
+    printf '%s' "${APPRAFTER_E2E_RUNTIME:-kind}"
 }
 
 _k3d_bin()  { if command -v k3d  >/dev/null 2>&1; then echo "k3d";  else echo "nix run nixpkgs#k3d --";  fi; }
 _kind_bin() { if command -v kind >/dev/null 2>&1; then echo "kind"; else echo "nix run nixpkgs#kind --"; fi; }
 
+# _kind_uses_podman — true when podman is the container runtime, so kind
+# should run under KIND_EXPERIMENTAL_PROVIDER=podman; false when a real
+# docker daemon answers (kind's default, and the most battle-tested provider
+# on CI runners). The rootless nix-dev shell has neither a docker shim nor
+# DOCKER_HOST but uses podman, so default to podman when no docker responds.
+_kind_uses_podman() {
+    case "${DOCKER_HOST:-}" in *podman*) return 0 ;; esac
+    docker --version 2>/dev/null | grep -qi podman && return 0
+    docker info 2>/dev/null | grep -qi podman && return 0
+    if docker info >/dev/null 2>&1; then return 1; else return 0; fi
+}
+
+# _kind <args...> — run kind, selecting the podman provider when podman is
+# the runtime, else kind's docker default.
+_kind() {
+    local bin; bin="$(_kind_bin)"
+    if _kind_uses_podman; then
+        # shellcheck disable=SC2086
+        KIND_EXPERIMENTAL_PROVIDER=podman $bin "$@"
+    else
+        # shellcheck disable=SC2086
+        $bin "$@"
+    fi
+}
+
 # ---------------------------------------------------------------
 # k3d_up <cluster-name>
-#   Bring up a local single-node cluster — k3d (docker) or kind (podman),
-#   per cluster_runtime. Default CNI (k3d flannel / kind kindnet) +
+#   Bring up a local single-node cluster — kind by default (k3d opt-in via
+#   APPRAFTER_E2E_RUNTIME=k3d). Default CNI (kind kindnet / k3d flannel) +
 #   kube-proxy, NOT Cilium: cluster-bootstrap runs with
 #   APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 (see bootstrap_with_retry) because
 #   Cilium's eBPF datapath converges pathologically slowly on a local
@@ -142,8 +162,7 @@ _k3d_up() {
 }
 
 _kind_up() {
-    local cluster_name="$1" kind_bin
-    kind_bin="$(_kind_bin)"
+    local cluster_name="$1"
     # Bare single-node cluster: kindnet CNI + kube-proxy ship by default
     # (a working CNI — same role as k3d's flannel), the control-plane node
     # is schedulable, and kind publishes the API server on a random host
@@ -151,9 +170,8 @@ _kind_up() {
     # claim/DSN/GC walks are all in-cluster (no ingress), kind has no
     # servicelb anyway, and binding 80/443 just risks a host-port clash for
     # no benefit.
-    # shellcheck disable=SC2086
-    KIND_EXPERIMENTAL_PROVIDER=podman $kind_bin create cluster --name "$cluster_name"
-    printf '  kind cluster %s is ready (podman provider). kubectl context: kind-%s\n' \
+    _kind create cluster --name "$cluster_name"
+    printf '  kind cluster %s is ready. kubectl context: kind-%s\n' \
         "$cluster_name" "$cluster_name"
 }
 
@@ -164,8 +182,7 @@ _kind_up() {
 cluster_kubeconfig_write() {
     local cluster_name="$1" out="$2"
     if [ "$(cluster_runtime)" = "kind" ]; then
-        # shellcheck disable=SC2086
-        KIND_EXPERIMENTAL_PROVIDER=podman $(_kind_bin) get kubeconfig --name "$cluster_name" >"$out"
+        _kind get kubeconfig --name "$cluster_name" >"$out"
     else
         # shellcheck disable=SC2086
         $(_k3d_bin) kubeconfig write "$cluster_name" --output "$out"
@@ -183,8 +200,7 @@ cluster_kubeconfig_write() {
 cluster_load_image() {
     local cluster_name="$1" image="$2"
     if [ "$(cluster_runtime)" = "kind" ]; then
-        # shellcheck disable=SC2086
-        KIND_EXPERIMENTAL_PROVIDER=podman $(_kind_bin) load docker-image "$image" --name "$cluster_name"
+        _kind load docker-image "$image" --name "$cluster_name"
     else
         # shellcheck disable=SC2086
         $(_k3d_bin) image import "$image" --cluster "$cluster_name"
@@ -194,7 +210,7 @@ cluster_load_image() {
 # ---------------------------------------------------------------
 # bootstrap_with_retry
 #   Runs `apprafter cluster-bootstrap` with APPRAFTER_BOOTSTRAP_SKIP_CILIUM
-#   so it leaves k3d's default CNI in place (see k3d_up for why). That
+#   so it leaves the cluster's default CNI in place (see k3d_up for why). That
 #   makes the bootstrap fast + reliable, so the retry is just a cheap
 #   safety net (cluster-bootstrap is idempotent). Requires $KUBECONFIG
 #   exported (kubectl/helm).
@@ -222,8 +238,7 @@ k3d_down() {
     local cluster_name="$1"
     # `cluster delete` exits 0 even when the cluster is absent.
     if [ "$(cluster_runtime)" = "kind" ]; then
-        # shellcheck disable=SC2086
-        KIND_EXPERIMENTAL_PROVIDER=podman $(_kind_bin) delete cluster --name "$cluster_name" || true
+        _kind delete cluster --name "$cluster_name" || true
     else
         # shellcheck disable=SC2086
         $(_k3d_bin) cluster delete "$cluster_name" || true
