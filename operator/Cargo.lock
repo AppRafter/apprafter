@@ -69,6 +69,7 @@ version = "0.1.2"
 dependencies = [
  "axum",
  "http-body-util",
+ "k8s-openapi",
  "kube",
  "operator-controllers-application",
  "operator-controllers-migration",

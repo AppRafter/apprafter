@@ -21,11 +21,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apprafter_operator::{build_router, install_rustls_crypto_provider};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use kube::api::Api;
 use kube::Client;
 use operator_controllers_application as application_controller;
 use operator_core::{LeaderConfig, LeaderElection, Metrics};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Probe whether the `ciliumnetworkpolicies.cilium.io` CRD is served on
+/// this cluster (2.10 / ADR 0045). Run ONCE at startup and threaded into
+/// the Application controller's `Context` so the reconcile loop can gate
+/// the egress-CNP SSA apply: on a non-Cilium cluster (e2e / kindnet) the
+/// CRD is unserved and applying a `CiliumNetworkPolicy` 404s every
+/// reconcile. Best-effort: any read error degrades to `false` (skip the
+/// apply) rather than crash-looping the operator.
+async fn cilium_available(client: &Client) -> bool {
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    api.get_opt("ciliumnetworkpolicies.cilium.io")
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -83,6 +101,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("leadership acquired — starting Application controller");
 
+    // 2.10 (ADR 0045): probe ONCE whether Cilium's CNP CRD is served, and
+    // thread the result into the Application controller. On a non-Cilium
+    // cluster (e2e / kindnet) the operator renders the egress CNP but skips
+    // the apply (it would 404 every reconcile).
+    let cilium = cilium_available(&client).await;
+    info!(
+        cilium_available = cilium,
+        "probed Cilium CNP CRD availability"
+    );
+
     // 2.9 (ADR 0044): the active environment is now a PER-CR property
     // (`Application.spec.environment`), resolved inside the reconcile
     // loop — there is no cluster-wide `APPRAFTER_ENV` selector anymore.
@@ -90,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = client.clone();
         let metrics = metrics.clone();
         async move {
-            if let Err(err) = application_controller::run(client, metrics).await {
+            if let Err(err) = application_controller::run(client, metrics, cilium).await {
                 error!(%err, "Application controller error");
             }
         }

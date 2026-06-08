@@ -301,6 +301,37 @@ rules:
       - update
       - patch
       - delete
+  # Phase 2.10 egress (ADR 0045): the Application controller SSA-applies one
+  # per-Application `CiliumNetworkPolicy` (cilium.io/v2) that makes the app's
+  # pods egress default-deny and allows DNS + same-ns + world (profile-gated)
+  # + one rule per declared network need. Cilium is a bootstrap dependency, so
+  # the CRD is already Established; without these verbs the controller 403s on
+  # its first CNP apply and every Application's egress stays wide open. The
+  # apply is additionally gated at runtime on the CNP CRD being served (the
+  # `customresourcedefinitions get` rule below) so non-Cilium clusters skip it.
+  # `platformstacks` get/list/watch (read the cluster-wide egress profile) is
+  # already granted by the PlatformController rule above.
+  - apiGroups:
+      - cilium.io
+    resources:
+      - ciliumnetworkpolicies
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+      - delete
+  # The operator probes ONCE at startup whether the
+  # `ciliumnetworkpolicies.cilium.io` CRD is served (a single CRD GET) to
+  # decide whether to apply egress CNPs — on a non-Cilium cluster (e2e /
+  # kindnet) applying a CNP would 404 every reconcile.
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
   # Events — operators emit events on Application status changes
   # (legacy core/v1) AND PlatformController emits foreign-writer /
   # source-reverted audit events on PlatformStack

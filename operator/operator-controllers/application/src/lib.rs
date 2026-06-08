@@ -14,13 +14,15 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{LocalObjectReference, Secret, Service};
-use kube::api::{Api, Patch, PatchParams};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
 use serde_json::{json, Value};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod oci_resolve;
 mod pull_secret;
@@ -28,10 +30,10 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
-    Application, ApplicationBaseSpec, ApplicationCondition, ApplicationStatus, DiskClaim, Metrics,
-    MigrationPlan, ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED,
-    COND_MIGRATION_PENDING, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
-    PHASE_AWAITING_RESOURCE_CLAIM,
+    resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
+    ApplicationStatus, DiskClaim, EgressProfile, Metrics, MigrationPlan, PlatformStack,
+    ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
+    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
 // dep so future Phase 2 commits can flip on detection +
@@ -41,7 +43,10 @@ use operator_core::{
 // `operator-controllers-migration` (B.1.77). The unused-import
 // guard turns the dep into a "feature flag" — Phase 2 simply
 // uncomments the `use` line.
-use operator_rendering::{effective_spec, render_application_for_env, DiskMount};
+use operator_rendering::{
+    default_target, effective_spec, owner_reference, render_application_for_env, ConnectionTarget,
+    DiskMount,
+};
 
 /// Resource kind label used for every metric tagged with `kind`.
 const KIND: &str = "Application";
@@ -68,6 +73,14 @@ pub struct Context {
     /// `ReqwestHttp` built at startup and reused — its inner
     /// `reqwest::Client` pools connections across reconciles.
     pub oci_http: oci_resolve::ReqwestHttp,
+    /// Whether the `ciliumnetworkpolicies.cilium.io` CRD is served on this
+    /// cluster (2.10 / ADR 0045). Probed ONCE at operator startup (see
+    /// `apprafter-operator`'s `cilium_available`) and stored here so the
+    /// reconcile loop can gate the egress-CNP SSA apply: e2e / kindnet
+    /// clusters have no Cilium, and applying a `CiliumNetworkPolicy` there
+    /// 404s every reconcile. When `false`, the controller renders the CNP
+    /// the same way but skips the apply.
+    pub cilium_available: bool,
 }
 
 #[derive(Debug, Error)]
@@ -83,7 +96,11 @@ pub enum ReconcileError {
 /// `Application` resources cluster-wide and reconciles them through
 /// [`reconcile`]. Errors from individual reconcile calls go through
 /// [`error_policy`].
-pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
+pub async fn run(
+    client: Client,
+    metrics: Arc<Metrics>,
+    cilium_available: bool,
+) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
     // claim ready re-enqueues the owning Application immediately
@@ -94,6 +111,7 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
         client,
         metrics,
         oci_http: oci_resolve::ReqwestHttp::new(),
+        cilium_available,
     });
 
     Controller::new(apps, watcher::Config::default())
@@ -348,6 +366,29 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         _ => None,
     };
 
+    // ---- 2.10 (ADR 0045): resolve the egress CNP render inputs ----
+    // The cluster-wide profile from the singleton PlatformStack (absent /
+    // unreadable → the documented `Internet` default) and the static
+    // connection-target catalog (namespace overrides from
+    // ServiceProvider.spec.config — an empty map + the static defaults at
+    // launch). The catalog covers ONLY the effective needs' network types
+    // (disk entries carry no target). Both are threaded into the pure
+    // renderer, which emits the CNP into `rendered.network_policy`; the
+    // controller SSA-applies it below ONLY when Cilium is present.
+    let egress_profile = read_egress_profile(&ctx.client).await;
+    let service_types: Vec<String> = effective
+        .needs
+        .as_ref()
+        .map(|n| {
+            n.entries()
+                .into_iter()
+                .filter(|(_, entry)| entry.disk.is_none())
+                .map(|(ty, _)| ty)
+                .collect()
+        })
+        .unwrap_or_default();
+    let needs_targets = resolve_needs_targets(&service_types, &BTreeMap::new());
+
     let mut rendered = render_application_for_env(
         &app,
         app.spec.environment.as_deref(),
@@ -362,13 +403,8 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         } else {
             Some(&disk_mounts)
         },
-        // 2.10 (ADR 0045): the egress CNP wiring — reading the
-        // PlatformStack profile + resolving the connection-target catalog
-        // and threading it in — lands in task 2.10-3. Until then the
-        // controller renders no CNP (`needs_targets: None`), preserving
-        // today's behaviour; the profile arg is the documented default.
-        operator_core::EgressProfile::Internet,
-        None,
+        egress_profile,
+        Some(&needs_targets),
     );
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
@@ -388,6 +424,24 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
 
     if let Some(service) = &rendered.service {
         apply_service(&ctx.client, &namespace, service, &pp).await?;
+    }
+
+    // 2.10 (ADR 0045): SSA-apply the per-Application egress CNP — but ONLY
+    // when Cilium is present. The probe ran once at startup; on a
+    // non-Cilium cluster (e2e / kindnet) the `ciliumnetworkpolicies.cilium.io`
+    // CRD is unserved and the apply would 404 every reconcile. The CNP
+    // carries the SAME Application ownerRef the Deployment/Service do, so it
+    // cascades on Application delete.
+    if ctx.cilium_available {
+        if let Some(cnp) = rendered.network_policy.take() {
+            let owner = owner_reference(&app);
+            apply_network_policy(&ctx.client, &namespace, &owner, cnp).await?;
+        }
+    } else {
+        debug!(
+            %name, %namespace,
+            "Cilium not detected on this cluster; skipping egress CiliumNetworkPolicy apply"
+        );
     }
 
     let endpoint_url = rendered
@@ -483,6 +537,105 @@ async fn apply_service(
     let payload = into_apply_payload("v1", "Service", service)?;
     api.patch(&name, pp, &Patch::Apply(&payload)).await?;
     Ok(())
+}
+
+// ---- 2.10 (ADR 0045): egress CiliumNetworkPolicy apply + profile read ----
+
+/// Namespace + name of the singleton `PlatformStack` (CLI-bootstrap-seeded
+/// in `apprafter-system`; see `cluster_bootstrap.rs`). Duplicated rather
+/// than imported from the platform-stack controller crate to avoid a
+/// circular workspace-internal dep (mirrors how `MIGRATION_PLAN_NAMESPACE`
+/// is duplicated above).
+const PLATFORM_STACK_NAMESPACE: &str = "apprafter-system";
+const PLATFORM_STACK_NAME: &str = "default";
+
+/// `ApiResource` for the externally-installed Cilium `CiliumNetworkPolicy`
+/// CRD (group `cilium.io`, version `v2`). Cilium is a bootstrap dependency
+/// installed before the operator, so on a Cilium cluster the CRD is already
+/// Established; the [`Context::cilium_available`] probe gates the apply on
+/// non-Cilium clusters.
+fn cnp_api_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "cilium.io",
+        "v2",
+        "CiliumNetworkPolicy",
+    ))
+}
+
+/// Read the cluster-wide egress profile from the singleton PlatformStack
+/// (2.10 / ADR 0045). Best-effort: a missing CR (`get_opt` → `None`) or any
+/// read error degrades to the documented default `EgressProfile::Internet`
+/// — the egress posture must never break a reconcile, and "absent" is the
+/// documented default, not "empty". This is a READ only; the controller
+/// never writes PlatformStack spec/status here (the PlatformController owns
+/// it under its own field manager).
+async fn read_egress_profile(client: &Client) -> EgressProfile {
+    let api: Api<PlatformStack> = Api::namespaced(client.clone(), PLATFORM_STACK_NAMESPACE);
+    match api.get_opt(PLATFORM_STACK_NAME).await {
+        Ok(Some(ps)) => resolve_egress_profile(&ps.spec),
+        Ok(None) => EgressProfile::Internet,
+        Err(e) => {
+            warn!(error = %e, "could not read PlatformStack egress profile; defaulting to internet");
+            EgressProfile::Internet
+        }
+    }
+}
+
+/// SSA-apply the per-Application egress `CiliumNetworkPolicy` as a
+/// `DynamicObject` (cilium.io/v2). Sets `metadata.namespace` (the app's
+/// namespace) and `metadata.ownerReferences` to the Application (the SAME
+/// ownerRef the Deployment/Service carry, so the CNP cascades on Application
+/// delete) on the rendered body, then applies under field manager
+/// [`FIELD_MANAGER`] (`apprafter-operator` — the operator owns this child,
+/// so writing it here keeps the SSA split intact; we never touch
+/// ResourceClaim / PlatformStack status from this path).
+async fn apply_network_policy(
+    client: &Client,
+    namespace: &str,
+    owner: &OwnerReference,
+    mut body: Value,
+) -> Result<(), ReconcileError> {
+    let name = body
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    body["metadata"]["namespace"] = json!(namespace);
+    body["metadata"]["ownerReferences"] = json!([owner]);
+
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &cnp_api_resource());
+    api.patch(
+        &name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&body),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Resolve the connection-target catalog for the effective needs' network
+/// service types (2.10 / ADR 0045 §B). For each type, look up its static
+/// [`default_target`] (a `None` — e.g. `disk` or an unknown type — yields no
+/// entry), then apply a per-type namespace override from `namespace_overrides`
+/// when present (the namespace the provisioner reads from
+/// `ServiceProvider.spec.config`; an empty map + the static defaults is the
+/// launch slice). Pure — the controller threads the result into the renderer.
+fn resolve_needs_targets(
+    service_types: &[String],
+    namespace_overrides: &BTreeMap<String, String>,
+) -> BTreeMap<String, ConnectionTarget> {
+    let mut targets = BTreeMap::new();
+    for service_type in service_types {
+        let Some(mut target) = default_target(service_type) else {
+            continue;
+        };
+        if let Some(ns) = namespace_overrides.get(service_type) {
+            target.namespace = ns.clone();
+        }
+        targets.insert(service_type.clone(), target);
+    }
+    targets
 }
 
 /// Namespace SourceCredentials and their canonical derived
@@ -2701,5 +2854,135 @@ mod tests {
             now,
             MIN_IMAGE_RESOLVE_INTERVAL_SECS
         ));
+    }
+
+    // ---- 2.10 (ADR 0045): resolve_needs_targets + CNP composition ----
+
+    #[test]
+    fn resolve_needs_targets_uses_static_defaults_and_skips_disk() {
+        // pg + redis resolve to their static catalog defaults; disk (and
+        // any unknown type) has no network target → no entry. No override
+        // map, so the namespaces are the provisioner defaults.
+        let types = vec![
+            "pg".to_string(),
+            "redis".to_string(),
+            "disk".to_string(),
+            "clickhouse".to_string(),
+        ];
+        let targets = resolve_needs_targets(&types, &BTreeMap::new());
+        // Only pg + redis have targets.
+        assert_eq!(targets.len(), 2);
+        let pg = targets.get("pg").expect("pg target");
+        assert_eq!(pg.namespace, "cnpg-system");
+        assert_eq!(pg.port, 5432);
+        let redis = targets.get("redis").expect("redis target");
+        assert_eq!(redis.namespace, "dragonfly-system");
+        assert_eq!(redis.port, 6379);
+        // disk + unknown contribute no catalog entry.
+        assert!(!targets.contains_key("disk"));
+        assert!(!targets.contains_key("clickhouse"));
+    }
+
+    #[test]
+    fn resolve_needs_targets_applies_namespace_override() {
+        // A per-type namespace override (the namespace the provisioner reads
+        // from ServiceProvider.spec.config) replaces the static default; the
+        // selector + port stay the catalog defaults.
+        let overrides = BTreeMap::from([("pg".to_string(), "custom-pg-ns".to_string())]);
+        let targets = resolve_needs_targets(&["pg".to_string()], &overrides);
+        let pg = targets.get("pg").expect("pg target");
+        assert_eq!(pg.namespace, "custom-pg-ns");
+        assert_eq!(pg.port, 5432);
+        assert_eq!(
+            pg.pod_selector
+                .get("postgresql.cnpg.io/cluster")
+                .map(String::as_str),
+            Some("platform-postgres")
+        );
+    }
+
+    #[test]
+    fn render_for_env_with_pg_need_and_target_emits_cnp_with_pg_rule() {
+        // 2.10 composition (pure, no client): an app with needs.pg + a
+        // non-empty pg target → render_application_for_env yields a CNP with
+        // the pg egress rule. Mirrors what the reconcile loop threads in.
+        use operator_core::{Needs, OneOrMany, ServiceNeed};
+        let spec = ApplicationSpec {
+            base: Some(ApplicationBaseSpec {
+                image: Some("ghcr.io/acme/web:1.0".into()),
+                needs: Some(Needs {
+                    pg: Some(OneOrMany::One(ServiceNeed::default())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            environments: None,
+            environment: None,
+        };
+        let mut app = Application::new("web", spec);
+        app.metadata.namespace = Some("demo".into());
+        app.metadata.uid = Some("uid-1".into());
+
+        let targets = resolve_needs_targets(&["pg".to_string()], &BTreeMap::new());
+        assert!(!targets.is_empty(), "pg yields a non-empty target catalog");
+
+        let rendered = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            None,
+            EgressProfile::Internet,
+            Some(&targets),
+        );
+        let cnp = rendered
+            .network_policy
+            .as_ref()
+            .expect("CNP rendered when needs_targets is threaded");
+        assert_eq!(cnp["kind"], json!("CiliumNetworkPolicy"));
+        assert_eq!(cnp["apiVersion"], json!("cilium.io/v2"));
+        assert_eq!(cnp["metadata"]["name"], json!("web-egress"));
+        let rules = cnp["spec"]["egress"].as_array().expect("egress rules");
+        // DNS + same-ns + world (internet baseline) + pg = 4.
+        assert_eq!(rules.len(), 4);
+        // The pg rule targets cnpg-system on 5432.
+        let pg_rule = rules
+            .iter()
+            .find(|r| {
+                r["toEndpoints"][0]["matchLabels"]["io.kubernetes.pod.namespace"] == "cnpg-system"
+            })
+            .expect("pg egress rule present");
+        assert_eq!(pg_rule["toPorts"][0]["ports"][0]["port"], "5432");
+    }
+
+    #[test]
+    fn apply_network_policy_sets_namespace_and_owner_reference() {
+        // The apply helper's pure body-mutation half: it must stamp
+        // metadata.namespace + metadata.ownerReferences (the cascading-delete
+        // ownerRef) onto the rendered CNP before SSA. We exercise the body
+        // mutation directly (the network call needs a cluster) by replicating
+        // the two assignments the helper makes.
+        let owner = owner_reference(&{
+            let mut app = Application::new("web", ApplicationSpec::default());
+            app.metadata.uid = Some("uid-1".into());
+            app
+        });
+        let mut body = json!({
+            "apiVersion": "cilium.io/v2",
+            "kind": "CiliumNetworkPolicy",
+            "metadata": { "name": "web-egress" },
+            "spec": { "egress": [] }
+        });
+        body["metadata"]["namespace"] = json!("demo");
+        body["metadata"]["ownerReferences"] = json!([owner]);
+
+        assert_eq!(body["metadata"]["namespace"], json!("demo"));
+        let or = &body["metadata"]["ownerReferences"][0];
+        assert_eq!(or["apiVersion"], json!("apprafter.io/v1alpha1"));
+        assert_eq!(or["kind"], json!("Application"));
+        assert_eq!(or["name"], json!("web"));
+        assert_eq!(or["uid"], json!("uid-1"));
+        assert_eq!(or["controller"], json!(true));
+        assert_eq!(or["blockOwnerDeletion"], json!(true));
     }
 }

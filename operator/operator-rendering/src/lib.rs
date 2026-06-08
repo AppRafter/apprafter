@@ -295,7 +295,13 @@ pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationB
     effective
 }
 
-fn owner_reference(app: &Application) -> OwnerReference {
+/// Build the `OwnerReference` back to the owning Application
+/// (`controller: true`, `blockOwnerDeletion: true`) used on every child
+/// the renderer emits (Deployment, Service). Public so the controller can
+/// reuse the exact same shape when SSA-applying the egress CNP (2.10 / ADR
+/// 0045) — the CNP must carry the identical Application ownerRef so it
+/// cascades on Application delete, just like the Deployment/Service.
+pub fn owner_reference(app: &Application) -> OwnerReference {
     OwnerReference {
         api_version: "apprafter.io/v1alpha1".to_string(),
         kind: "Application".to_string(),
