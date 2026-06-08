@@ -39,12 +39,14 @@
 #
 # Local-operator scaffolding
 # --------------------------
-# 2.9 is UNRELEASED, so this walk runs with APPRAFTER_E2E_LOCAL_OPERATOR=1
-# (the e2e-per-env Justfile target sets it): it builds + side-loads the
-# working-tree operator + admission-webhook, applies the branch CRDs, and
-# the branch RBAC, mirroring needs-disk-walk.sh's Phase-1b block. The
-# published operator's status surface predates status.environment (ADR
-# 0044), so the branch CRDs + image are required.
+# By default this walk runs against the PUBLISHED platform-stack (operator +
+# admission-webhook v0.2.22 + argocd-cue-cmp v0.1.8 -- 2.9 shipped, so the
+# released chart carries the spec.environment / status.environment schema and
+# the ARGOCD_ENV_ injection fix). Set APPRAFTER_E2E_LOCAL_OPERATOR=1 (the
+# e2e-per-env Justfile target) to instead build + side-load the working-tree
+# operator + admission-webhook + cue-cmp and apply the branch CRDs/RBAC
+# (Phase-1b, mirroring needs-disk-walk.sh) -- for pre-release validation of an
+# unreleased schema change.
 #
 # Assertions
 # ----------

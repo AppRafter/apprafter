@@ -16,19 +16,19 @@ name: e2e-per-env-nightly
 #     -> `app status web` aggregates both; `app remove web --env dev` is
 #        surgical (web-prod survives).
 #
-# Runs with APPRAFTER_E2E_LOCAL_OPERATOR=1 because 2.9 is UNRELEASED: the
-# walk builds + side-loads the working-tree operator + admission-webhook
-# AND the working-tree argocd-cue-cmp (Approach A -- the per-env injection
-# lives only in the working-tree entrypoint.sh, shipped IN the image), and
-# applies the branch CRDs (the released chart predates the 2.9 schema:
-# spec.environment / spec.environments / status.environment). Flip back to
-# the published-image path once 2.9 ships, exactly like the other walks did.
+# Runs against the PUBLISHED platform-stack (2.9 shipped: operator +
+# admission-webhook v0.2.22 + argocd-cue-cmp v0.1.8 carry the per-env schema
+# spec.environment / spec.environments / status.environment and the
+# ARGOCD_ENV_ injection fix). No working-tree image build -- the walk
+# bootstraps the chart from ghcr, like the other nightlies. Set
+# APPRAFTER_E2E_LOCAL_OPERATOR=1 to side-load the working tree for
+# pre-release validation of an unreleased schema change.
 #
 # Why a separate workflow (NOT folded into e2e-k3d.yml or the other
 # nightlies):
-#   - It boots Argo CD + a host git daemon and builds three images from the
-#     working tree, so it is heavier than the per-push gate -- keep it off
-#     the critical path.
+#   - It boots Argo CD + a host git daemon and runs two full app-add GitOps
+#     syncs, so it is heavier than the per-push gate -- keep it off the
+#     critical path.
 #   - It is decoupled from the Hetzner-cost nightly.yml so the free-k3d
 #     failure domain stays independent (no cloud spend, no secrets).
 #
@@ -53,8 +53,8 @@ jobs:
   e2e-per-env-nightly:
     name: k3d e2e (per-env nightly)
     runs-on: ubuntu-latest
-    # Includes a working-tree build of the operator + admission-webhook +
-    # cue-cmp images, on top of the Argo CD boot + the two app-add syncs.
+    # Boots Argo CD + a host git daemon and runs the two per-env app-add
+    # GitOps syncs against the published platform-stack (no working-tree build).
     timeout-minutes: 90
 
     steps:
@@ -115,8 +115,10 @@ jobs:
         run: cargo build --bin apprafter
 
       - name: Run the per-env k3d walk
-        env:
-          # 2.9 is unreleased: build + side-load the working-tree operator,
-          # admission-webhook and cue-cmp; apply the branch CRDs.
-          APPRAFTER_E2E_LOCAL_OPERATOR: "1"
+        # 2.9 shipped (operator + cue-cmp v0.2.22 / v0.1.8 published), so the
+        # walk bootstraps the published platform-stack from ghcr -- no
+        # working-tree image build (the build's k3d+podman image-import path
+        # does not work on the runner: podman tags the image but `k3d image
+        # import` cannot see it). Set APPRAFTER_E2E_LOCAL_OPERATOR=1 for
+        # pre-release validation of an unreleased schema change.
         run: bash e2e/gitops-walk-per-env.sh
