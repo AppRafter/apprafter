@@ -404,6 +404,31 @@ pub enum PlatformCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Inspect / set the cluster-wide egress posture
+    /// (`PlatformStack.spec.network.egress.profile`). Gates which
+    /// baseline egress allows the operator derives per Application
+    /// (DNS / same-namespace / world / declared needs). 2.10.
+    Egress {
+        #[command(subcommand)]
+        action: EgressCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EgressCommand {
+    /// Print the current egress profile and what each profile
+    /// allows. Reads the singleton PlatformStack; an absent field
+    /// reports the documented default (`internet`).
+    Show,
+    /// Set the cluster-wide egress profile via server-side apply
+    /// (field manager `apprafter-cli`), so the value survives Argo
+    /// CD self-heal on a Tier-1 no-infra-repo cluster.
+    Set {
+        /// One of `internet` (DNS + same-ns + world + needs),
+        /// `internal` (DNS + same-ns + needs), or `strict`
+        /// (DNS + needs; same-namespace also denied).
+        profile: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

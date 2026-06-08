@@ -215,6 +215,59 @@ pub fn kubectl_merge_patch(
     Ok(())
 }
 
+/// Apply a manifest via **server-side apply** with the supplied
+/// field manager, piping the YAML on stdin
+/// (`kubectl apply --server-side --field-manager=<fm>
+/// --force-conflicts -f -`). Unlike `kubectl_merge_patch`, SSA
+/// tracks ownership in `metadata.managedFields`: a field whose
+/// path no co-owner declares (e.g.
+/// `spec.network.egress.profile`, which the platform-stack chart
+/// does not template) persists across Argo CD self-heal because
+/// there is no conflicting owner to revert it. `--force-conflicts`
+/// migrates a pre-existing client-side-owned object cleanly to
+/// the new field manager. Used by `apprafter platform egress set`
+/// (ADR 0045 §Decision #4).
+pub fn kubectl_apply_server_side(
+    manifest_yaml: &str,
+    field_manager: &str,
+    kubeconfig_path: &Path,
+) -> Result<()> {
+    use std::process::Stdio;
+
+    let mut child = Command::new("kubectl")
+        .arg("apply")
+        .arg("--server-side")
+        .arg(format!("--field-manager={field_manager}"))
+        .arg("--force-conflicts")
+        .arg("-f")
+        .arg("-")
+        .env("KUBECONFIG", kubeconfig_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CliError::Other(format!("spawn kubectl apply --server-side: {e}")))?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| CliError::Other("kubectl stdin unavailable".to_string()))?
+        .write_all(manifest_yaml.as_bytes())
+        .map_err(|e| CliError::Other(format!("write manifest to kubectl stdin: {e}")))?;
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| CliError::Other(format!("wait for kubectl apply: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(CliError::Other(format!(
+            "kubectl apply --server-side failed (exit {:?}): {stderr}",
+            out.status.code()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,8 +15,9 @@ use tabled::settings::{object::Columns, Modify, Width};
 use tabled::{Table, Tabled};
 
 use crate::commands::k8s_helpers::{
-    ensure_kubeconfig_tempfile, kubectl_get_json, kubectl_merge_patch,
+    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json, kubectl_merge_patch,
 };
+use cli_providers::k8s::kubectl::APPRAFTER_CLI_FIELD_MANAGER;
 
 const PLATFORMSTACK_NAME: &str = "default";
 const PLATFORMSTACK_NAMESPACE: &str = "apprafter-system";
@@ -524,6 +525,168 @@ pub fn upgrade(to: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The three valid egress profiles, in order of decreasing
+/// breadth. Single source of truth for both the validator and the
+/// `set` error message; mirrors the operator/webhook enum.
+const EGRESS_PROFILES: [&str; 3] = ["internet", "internal", "strict"];
+
+/// Validate an egress profile string against the
+/// `internet|internal|strict` enum. Pure fn — client-side guard so
+/// a typo (`open`) is rejected with a clear message instead of
+/// degrading into an admission-webhook rejection. Mirrors
+/// `validator_platformstack.rs`'s enum (ADR 0045 §Decision #3/#4).
+fn validate_egress_profile(profile: &str) -> Result<()> {
+    if EGRESS_PROFILES.contains(&profile) {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "egress profile '{profile}' is invalid; expected one of internet|internal|strict \
+         (internet = DNS + same-ns + world + needs; internal = DNS + same-ns + needs; \
+         strict = DNS + needs)."
+    )))
+}
+
+/// Pure formatter for `apprafter platform egress show`. Reads
+/// `/spec/network/egress/profile` from the PlatformStack JSON and
+/// renders the active profile plus the three-line legend. An
+/// absent field reports the documented operator default
+/// (`internet`), flagged as unset so it's not mistaken for an
+/// explicit `set`. Pulled out so tests drive it with a fixture
+/// JSON without a cluster (mirrors `print_status`).
+fn format_egress_profile(json: &Value) -> String {
+    let active = json
+        .pointer("/spec/network/egress/profile")
+        .and_then(Value::as_str);
+    let header = match active {
+        Some(p) => format!("Egress profile: {p}"),
+        None => "Egress profile: internet (default — field unset)".to_string(),
+    };
+    format!(
+        "{header}\n\
+         \n\
+         Profiles:\n\
+         \u{2022} internet  DNS + same-namespace + world (external internet) + declared needs\n\
+         \u{2022} internal  DNS + same-namespace + declared needs (no external internet)\n\
+         \u{2022} strict    DNS + declared needs (same-namespace egress also denied)\n\
+         \n\
+         Set with: apprafter platform egress set <internet|internal|strict>"
+    )
+}
+
+/// `apprafter platform egress show` — read the singleton
+/// PlatformStack and print the current egress profile + legend.
+pub fn egress_show() -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let json = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "PlatformStack {PLATFORMSTACK_NAMESPACE}/{PLATFORMSTACK_NAME} not found in cluster — \
+             is `apprafter cluster-bootstrap` complete?"
+        ))
+    })?;
+
+    println!("{}", format_egress_profile(&json));
+    if egress_field_appears_git_managed(&json) {
+        println!(
+            "\n⚠ The egress profile field appears to be managed by Argo CD (an infra-repo \
+             declares spec.network.egress.profile). `apprafter platform egress set` will be \
+             reverted on the next sync — change it in git instead."
+        );
+    }
+    Ok(())
+}
+
+/// `apprafter platform egress set <profile>` — server-side apply
+/// the profile onto the singleton PlatformStack with field manager
+/// `apprafter-cli`. SSA (not merge-patch) so the value survives
+/// Argo CD self-heal: the platform-stack chart does not declare
+/// this field, so there is no conflicting owner to revert it
+/// (ADR 0045 §Decision #4 / design §E).
+pub fn egress_set(profile: &str) -> Result<()> {
+    validate_egress_profile(profile)?;
+    let kc = ensure_kubeconfig_tempfile()?;
+
+    // Best-effort: if an infra-repo already owns the field via
+    // Argo CD, warn that git will win on the next sync. A 404 /
+    // unparseable managedFields is non-fatal — fall through to the
+    // unconditional advisory below.
+    let existing = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?;
+    let git_managed = existing
+        .as_ref()
+        .map(egress_field_appears_git_managed)
+        .unwrap_or(false);
+
+    let manifest = format!(
+        "apiVersion: apprafter.io/v1alpha1\n\
+         kind: PlatformStack\n\
+         metadata:\n\
+        \x20 name: {PLATFORMSTACK_NAME}\n\
+        \x20 namespace: {PLATFORMSTACK_NAMESPACE}\n\
+         spec:\n\
+        \x20 network:\n\
+        \x20   egress:\n\
+        \x20     profile: {profile}\n"
+    );
+    kubectl_apply_server_side(&manifest, APPRAFTER_CLI_FIELD_MANAGER, kc.path())?;
+
+    println!(
+        "✓ Egress profile set to '{profile}' (field manager '{APPRAFTER_CLI_FIELD_MANAGER}')."
+    );
+    println!(
+        "The operator's ApplicationController re-derives each app's egress CiliumNetworkPolicy \
+         on its next reconcile; run `apprafter platform egress show` to confirm."
+    );
+    if git_managed {
+        println!(
+            "⚠ This field appears to be declared in an infra-repo Argo CD reconciles — git \
+             wins on the next sync and this live value will be reverted. Change it in git."
+        );
+    } else {
+        println!(
+            "Note: the platform-stack chart does not declare this field, so this value persists \
+             across Argo CD syncs. If you later opt into an infra-repo that declares \
+             spec.network.egress.profile, git becomes authoritative and wins on the next sync."
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort: does any `metadata.managedFields` entry owned by a
+/// manager OTHER than `apprafter-cli` whose name looks like Argo CD
+/// (`argocd`, `argo-cd-*`, `application-controller`) carry the
+/// `spec.network.egress` subtree? Argo CD's managed-fields entry
+/// records `f:spec → f:network → f:egress` when the field is
+/// git-declared. Conservative: parse failures / absence → `false`
+/// (we then fall back to the unconditional advisory in `set`).
+fn egress_field_appears_git_managed(json: &Value) -> bool {
+    let Some(entries) = json
+        .pointer("/metadata/managedFields")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    entries.iter().any(|e| {
+        let manager = e.get("manager").and_then(Value::as_str).unwrap_or("");
+        let is_argo = manager.contains("argocd")
+            || manager.contains("argo-cd")
+            || manager.contains("application-controller");
+        if !is_argo {
+            return false;
+        }
+        e.pointer("/fieldsV1/f:spec/f:network/f:egress").is_some()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,5 +910,100 @@ mod tests {
         let status = json!({ "versionHistory": entries });
         let rows = collect_history_rows(&status, frozen_now(), 3);
         assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn validate_egress_profile_accepts_three_and_rejects_other() {
+        // 2.10: the only valid presets are internet|internal|strict
+        // (mirrors the webhook enum). Anything else — e.g. "open" —
+        // is rejected client-side with a clear message rather than
+        // degrading into an apiserver/webhook rejection.
+        assert!(validate_egress_profile("internet").is_ok());
+        assert!(validate_egress_profile("internal").is_ok());
+        assert!(validate_egress_profile("strict").is_ok());
+
+        let err = validate_egress_profile("open").unwrap_err().to_string();
+        assert!(err.contains("open"), "must echo the bad value: {err}");
+        assert!(
+            err.contains("internet") && err.contains("internal") && err.contains("strict"),
+            "must list the valid presets: {err}"
+        );
+    }
+
+    #[test]
+    fn format_egress_profile_reports_explicit_value() {
+        let obj = json!({
+            "spec": { "network": { "egress": { "profile": "strict" } } }
+        });
+        let s = format_egress_profile(&obj);
+        assert!(s.contains("strict"), "must surface the set profile: {s}");
+        // The legend lists all three presets regardless of which is active.
+        assert!(s.contains("internet"), "legend must list internet: {s}");
+        assert!(s.contains("internal"), "legend must list internal: {s}");
+        assert!(s.contains("needs"), "legend must mention needs: {s}");
+    }
+
+    #[test]
+    fn format_egress_profile_falls_back_to_internet_default_when_unset() {
+        // Field absent (the common case — CLI-bootstrap-seeded CR
+        // ships without the field) → report the documented operator
+        // default `internet`, flagged as unset so it's not mistaken
+        // for an explicit set.
+        let obj = json!({ "spec": {} });
+        let s = format_egress_profile(&obj);
+        assert!(s.contains("internet"), "must default to internet: {s}");
+        assert!(
+            s.to_lowercase().contains("default") || s.to_lowercase().contains("unset"),
+            "must flag the value as the unset default: {s}"
+        );
+    }
+
+    #[test]
+    fn egress_field_git_managed_detects_argocd_owner() {
+        // Argo CD owns the egress subtree → git-managed.
+        let owned_by_argo = json!({
+            "metadata": {
+                "managedFields": [
+                    {
+                        "manager": "argocd-application-controller",
+                        "fieldsV1": { "f:spec": { "f:network": { "f:egress": {} } } }
+                    }
+                ]
+            }
+        });
+        assert!(egress_field_appears_git_managed(&owned_by_argo));
+    }
+
+    #[test]
+    fn egress_field_git_managed_false_when_only_cli_owns_or_absent() {
+        // apprafter-cli's own SSA ownership must NOT count as
+        // git-managed (else `set` would always warn after the
+        // first run). And a CR with no managedFields at all → false.
+        let owned_by_cli = json!({
+            "metadata": {
+                "managedFields": [
+                    {
+                        "manager": "apprafter-cli",
+                        "fieldsV1": { "f:spec": { "f:network": { "f:egress": {} } } }
+                    }
+                ]
+            }
+        });
+        assert!(!egress_field_appears_git_managed(&owned_by_cli));
+        assert!(!egress_field_appears_git_managed(
+            &json!({ "metadata": {} })
+        ));
+        // Argo CD owns OTHER fields but not egress → false.
+        let argo_other = json!({
+            "metadata": {
+                "managedFields": [
+                    {
+                        "manager": "argocd-application-controller",
+                        "fieldsV1": { "f:spec": { "f:channel": {} } }
+                    }
+                ]
+            }
+        });
+        assert!(!egress_field_appears_git_managed(&argo_other));
     }
 }
