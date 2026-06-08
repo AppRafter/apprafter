@@ -402,11 +402,19 @@ claim_owner_kind=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" \
     '{.metadata.ownerReferences[0].kind}')
 assert_eq "ResourceClaim ownerRef Kind" "$claim_owner_kind" "Application"
 
-# The Application is paused awaiting the claim (2.4d gate).
-wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' \
-    AwaitingResourceClaim 120
-gate_cond=$(cond_status "$APP_RES" "$APP_NS" "$APP" ResourceClaimPending)
-assert_eq "Application ResourceClaimPending condition" "$gate_cond" "True"
+# NOTE — the gate (status.phase=AwaitingResourceClaim, ResourceClaimPending=
+# True until the claim is ready) is deliberately NOT polled here. The shared
+# CNPG cluster is pre-warmed by bootstrap, so pg role/DB creation is near-
+# instant and an Application transitions AwaitingResourceClaim -> Ready in
+# well under a poll interval — making the transient gate phase a coin-flip to
+# observe (a timing artifact of a fast cluster, not a product behaviour to
+# assert). The gate is instead proven DETERMINISTICALLY by (a) claim
+# GENERATION above — the operator emitted a ResourceClaim rather than
+# rendering the Deployment immediately, the gate's load-bearing action — and
+# (b) the Ready + DATABASE_URL injection (Phase 7) assertions: the workload
+# only receives its DSN once the claim is ready. The pause-while-unready logic
+# itself is unit-tested in the operator. (Mirrors the needs-disk-walk note;
+# this poll flaked the e2e-pg nightly when CNPG was warm.)
 
 # ===============================================================
 # Phase 5: schedule (2.3) — the scheduler matches `pg-integrated`
