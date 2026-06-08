@@ -34,6 +34,8 @@ pub struct PlatformStackSpec {
         rename = "defaultEnvironment"
     )]
     pub default_environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkConfig>,
     pub source: PlatformStackSource,
     pub values: PlatformStackValues,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,6 +44,43 @@ pub struct PlatformStackSpec {
 
 fn default_channel() -> String {
     "stable".to_string()
+}
+
+/// Cluster-wide egress posture for app-derived CiliumNetworkPolicies (2.10).
+/// Gates which baseline rules the renderer emits; needs-derived rules are
+/// always emitted regardless of profile. See ADR 0045 §Decision #3.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressProfile {
+    /// DNS + same-ns + `world` + needs — internet open; the documented default.
+    #[default]
+    Internet,
+    /// DNS + same-ns + needs — in-cluster only, no internet.
+    Internal,
+    /// DNS + needs — maximal; even same-namespace egress is denied.
+    Strict,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct NetworkConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct EgressConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<EgressProfile>,
+}
+
+/// Resolve the effective egress profile from a PlatformStack spec. Field
+/// absent (or `network`/`egress` unset) → the documented default `Internet`.
+pub fn resolve_egress_profile(spec: &PlatformStackSpec) -> EgressProfile {
+    spec.network
+        .as_ref()
+        .and_then(|n| n.egress.as_ref())
+        .and_then(|e| e.profile)
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -172,6 +211,62 @@ mod tests {
         assert_eq!(
             v.get("defaultEnvironment").and_then(|x| x.as_str()),
             Some("prod")
+        );
+    }
+
+    #[test]
+    fn egress_profile_resolves_with_internet_default_when_absent() {
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 }
+        }))
+        .unwrap();
+        assert!(spec.network.is_none());
+        assert_eq!(resolve_egress_profile(&spec), EgressProfile::Internet);
+    }
+
+    #[test]
+    fn egress_profile_defaults_to_internet_when_network_present_but_egress_absent() {
+        // `network` object present but `egress` (and thus `profile`) unset →
+        // still resolves to the documented default `Internet`.
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 },
+            "network": {}
+        }))
+        .unwrap();
+        assert!(spec.network.is_some());
+        assert!(spec.network.as_ref().unwrap().egress.is_none());
+        assert_eq!(resolve_egress_profile(&spec), EgressProfile::Internet);
+    }
+
+    #[test]
+    fn egress_profile_reads_explicit_strict() {
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 },
+            "network": { "egress": { "profile": "strict" } }
+        }))
+        .unwrap();
+        assert_eq!(resolve_egress_profile(&spec), EgressProfile::Strict);
+        // round-trips back to camel/lowercase JSON
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            v.pointer("/network/egress/profile")
+                .and_then(|x| x.as_str()),
+            Some("strict")
         );
     }
 }

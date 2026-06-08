@@ -27,7 +27,8 @@ pub use migration_plan::{
     MigrationRisks, MigrationStep, MigrationTrigger,
 };
 pub use platform_stack::{
-    PlatformStack, PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,
+    resolve_egress_profile, EgressConfig, EgressProfile, NetworkConfig, PlatformStack,
+    PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,
     PlatformStackSource, PlatformStackSpec, PlatformStackStatus, PlatformStackValues,
     PlatformStackVersionHistoryEntry,
 };

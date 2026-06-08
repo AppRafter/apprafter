@@ -60,6 +60,15 @@ spec:
                   default: false
                 defaultEnvironment:
                   type: string
+                network:
+                  type: object
+                  properties:
+                    egress:
+                      type: object
+                      properties:
+                        profile:
+                          type: string
+                          enum: [internet, internal, strict]
                 source:
                   type: object
                   required: [upstream, repoURL, checkInterval]

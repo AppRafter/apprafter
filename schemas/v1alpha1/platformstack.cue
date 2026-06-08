@@ -49,6 +49,13 @@ package v1alpha1
 	// convenience for `app add`, never a hard gate.
 	defaultEnvironment?: string
 
+	// Cluster-wide egress posture for app-derived CiliumNetworkPolicies (2.10).
+	network?: {
+		egress?: {
+			profile?: "internet" | "internal" | "strict"
+		}
+	}
+
 	// Chart pull source. Defaults match the canonical AppRafter
 	// upstream; fork installs override `repoURL` while leaving
 	// `upstream` pointing at canonical for availability

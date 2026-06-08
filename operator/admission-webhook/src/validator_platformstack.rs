@@ -11,6 +11,9 @@
 //!     shape, but not a numeric duration comparison.
 //!   - **channel enum.** Mirrored from the OpenAPI v3 schema
 //!     for defence in depth and a better error message.
+//!   - **network.egress.profile enum.** Mirrored from the
+//!     OpenAPI v3 schema (internet|internal|strict, 2.10) for
+//!     defence in depth and a better error message.
 //!   - **pin semver shape.** Mirrored for the same reason.
 //!   - **overrides keys reference declared components.** Advisory
 //!     warning, NOT rejection — pre-declaring an override for a
@@ -80,6 +83,20 @@ pub fn validate_platformstack(object: &Value) -> Vec<ValidationError> {
             errors.push(ValidationError::new(
                 "spec.channel",
                 format!("channel must be one of stable|beta|edge (got {channel:?})"),
+            ));
+        }
+    }
+
+    if let Some(profile) = spec
+        .get("network")
+        .and_then(|n| n.get("egress"))
+        .and_then(|e| e.get("profile"))
+        .and_then(Value::as_str)
+    {
+        if !matches!(profile, "internet" | "internal" | "strict") {
+            errors.push(ValidationError::new(
+                "spec.network.egress.profile",
+                format!("egress profile must be one of internet|internal|strict (got {profile:?})"),
             ));
         }
     }
@@ -306,5 +323,25 @@ mod tests {
         obj["spec"]["pin"] = json!("0.1.15");
         obj["spec"]["channel"] = json!("beta");
         assert!(validate_platformstack(&obj).is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_egress_profile() {
+        let mut obj = valid_object();
+        obj["spec"]["network"]["egress"]["profile"] = json!("wide-open");
+        let errors = validate_platformstack(&obj);
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.network.egress.profile"));
+    }
+
+    #[test]
+    fn accepts_valid_egress_profile_and_absent() {
+        // explicit valid profile
+        let mut obj = valid_object();
+        obj["spec"]["network"]["egress"]["profile"] = json!("strict");
+        assert!(validate_platformstack(&obj).is_empty());
+        // absent network entirely (canonical object) stays valid
+        assert!(validate_platformstack(&valid_object()).is_empty());
     }
 }

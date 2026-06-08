@@ -75,6 +75,7 @@ mod tests {
             pin: None,
             auto_upgrade: false,
             default_environment: None,
+            network: None,
             source: PlatformStackSource::default(),
             values: PlatformStackValues {
                 tier: 1,
