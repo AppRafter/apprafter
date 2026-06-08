@@ -96,25 +96,31 @@ filter follows `RUST_LOG` (e.g. `RUST_LOG=apprafter_operator=debug`).
 
 ### Per-environment overrides
 
-`APPRAFTER_ENV` selects which key of `spec.environments` is
-unified onto `spec.base` before rendering. Empty / unset → render
-from `spec.base` only. Example:
+`spec.environment` on an `Application` selects which key of
+`spec.environments` is unified onto `spec.base` before rendering.
+Empty / unset → render from `spec.base` only. The operator reads the
+field straight off the CR (`effective_spec(app, app.spec.environment)`);
+there is no cluster-wide selector. Example:
 
 ```yaml
 # Application manifest
 spec:
+  environment: prod              # selects spec.environments.prod
   base:
     image: ghcr.io/acme/web:1.0
     replicas: 1
   environments:
     prod:
-      image: ghcr.io/acme/web:1.0  # same baseline
-      replicas: 3                  # but more replicas in prod
+      replicas: 3                # more replicas in prod
 ```
 
-Run the operator with `APPRAFTER_ENV=prod` (or
-`spec.template.spec.containers[].env` in the Helm chart Deployment)
-and the rendered Deployment uses `replicas: 3`. Override semantics:
+The rendered Deployment uses `replicas: 3`. `spec.environment` is
+normally set for you by the platform, not by hand: `apprafter app add
+--env <env>` records it as the Argo `plugin.env APPRAFTER_APP_ENV`, the
+cue-cmp ConfigManagementPlugin injects it onto the CR at sync time
+(one Argo app `<name>-<env>` per environment, see ADR 0044), and the
+admission webhook rejects a `spec.environment` absent from
+`spec.environments`. Override semantics:
 
 - `image`, `replicas`, `expose` — env override replaces base when set.
 - `env` map — env override merges with base, override wins on

@@ -9,6 +9,109 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator + platform-stack v0.2.22 + cli v0.2.8/v0.2.9 + argocd-cue-cmp v0.1.8 — 2.9 per-environment deploy (ADR 0044) (2026-06-07)
+
+### Added
+
+- **Per-CR deploy-time environment selector `Application.spec.environment`.**
+  It picks which key of `spec.environments` is unified onto `spec.base`
+  before rendering — the operator reads it straight off the CR
+  (`effective_spec(app, app.spec.environment)`); `image`/`replicas`/`expose`
+  replace, the `env` map merges override-wins. Replaces the inert
+  cluster-wide `APPRAFTER_ENV` (1.9c), which had no config surface and always
+  rendered `base`.
+- **`apprafter app add --env <env>` → one self-contained Argo app `<name>-<env>`**
+  in a user-chosen namespace (existing or new — namespace is orthogonal to env,
+  not an auto-suffix). Several environments co-reside on one cluster as several
+  `app add` into different namespaces, grouped by the `apprafter.io/application`
+  + `apprafter.io/environment` labels (stamped on both the Argo app and the
+  rendered children — the same discoverability keys migration-strategy already
+  uses on MigrationPlans). The interactive wizard offers the declared envs
+  (default from `PlatformStack.spec.defaultEnvironment`) and an existing/new
+  namespace picker.
+- **`apprafter app status <name>` aggregates** every env-deploy by the
+  `apprafter.io/application` label and surfaces `status.environment`; `app remove
+  --env` is surgical (removes one env-deploy).
+- **`PlatformStack.spec.defaultEnvironment`** — a soft default pre-selected in the
+  CLI (a hint, not a gate).
+- **`app logs` / `app rollback` are per-environment aware** via `--env` (resolve
+  `<name>-<env>`), with a guidance message when `--env` is omitted on a per-env
+  app (cli v0.2.9).
+
+### Changed
+
+- The admission webhook **rejects `spec.environment` not present in
+  `spec.environments`**.
+- The MigrationPlan blocking gate (`find_blocking_migration_plan`) keys off
+  `app.spec.environment` instead of the removed cluster-wide context env.
+- `app add --env` is **validated as DNS-1123** before it becomes part of the Argo
+  app name (cli v0.2.9, fast-fail with a clear message).
+- Operator + admission-webhook images move v0.2.21 → v0.2.22; platform-stack
+  `currentVersion` → 0.2.22; argocd-cue-cmp → v0.1.8. CRD changes are additive;
+  `change: safe`, CRD-compatible with 0.2.21. cli v0.2.7 → v0.2.8 (main per-env
+  release) → v0.2.9 (post-merge review follow-ups); both monorepo-tagged.
+
+### Removed
+
+- Cluster-wide `APPRAFTER_ENV` handling in the operator and the CLI
+  `Context.env_name` threading (the inert 1.9c mechanism).
+
+### Fixed
+
+- **argocd-cue-cmp v0.1.8 (critical, would have been inert in production).**
+  Argo CD v2.4+ exposes `plugin.env` vars PREFIXED with `ARGOCD_ENV_`, so the CMP
+  entrypoint read a bare `$APPRAFTER_APP_ENV` and **never** injected
+  `spec.environment` in-cluster — `--env` was silently ignored and everything
+  rendered `base` (the host-side test masked it; only the live walk caught it).
+  The entrypoint now reads `ARGOCD_ENV_APPRAFTER_APP_ENV` first (falling back to
+  the bare name), with a regression assertion in `test-inject.sh` and a CI gate
+  (`argocd-cue-cmp-check.yml`).
+
+Validated by the `e2e/gitops-walk-per-env.sh` live walk (GREEN end-to-end, 9
+phases, kind+podman): `app add --env` → plugin env → cue-cmp inject → operator
+env-resolve → two namespaces (replicas 1 vs 2, TIER dev/prod) → status aggregate
+→ surgical `remove --env`. Backstage per-env tabs and `apprafter promote` are
+deferred (ADR 0044 §Non-goals).
+
+## operator + platform-stack v0.2.21 + cli v0.2.7 — 2.6b needs.disk + named multi-claims (ADR 0043) (2026-06-06)
+
+### Added
+
+- **`needs.disk` provisions declarative persistent block storage** through a
+  `ResourceClaim`. `Backend::Disk` creates an **unowned** RWO PVC (matched to the
+  `disk-local` seed; StorageClass `local` / `local-path` on Tier-1); the renderer
+  mounts it at `mountPath` and pivots the Deployment to `strategy: Recreate`. The
+  7-day-grace GC snapshots a disk `RetainedClaim` (`volumeClaimRef` + namespace)
+  so the unowned PVC survives grace → reattaches on redeploy (cancel-on-reprovision)
+  → force-GC drops the PVC + snapshot. Launch scope is `class: local`,
+  `replicas: 1`; StatefulSet/replicated/shared/snapshots/auto-expand are deferred
+  (ADR 0043 §Decision).
+- **`needs` generalized to (type, name), scalar | array.** An Application generates
+  one `ResourceClaim` per entry (`<app>-<type>[-<name>]`); the renderer
+  disambiguates injection (`DATABASE_URL_<NAME>` for a named pg claim; an unnamed
+  claim keeps `DATABASE_URL`). Backward-compatible.
+- **`apprafter scaffold --needs` accepts `redis` and `disk`** (closed a pre-existing
+  mismatch — the redis walk doc already documented `--needs redis`).
+- `operator-guide/needs-disk-walk.md` manual Tier-1 walk + `e2e/needs-disk-walk.sh`
+  (`just e2e-disk`, nightly via `e2e-disk-nightly.yml`).
+
+### Changed
+
+- Gate-readiness accepts `volumeClaimRef` (a disk claim carries no
+  `connectionSecretRef`).
+- `ServiceProvider` CRD `type` enum gains `disk`; `ResourceClaim.spec.size` moves
+  from a t-shirt enum to per-type (quantity for disk, t-shirt for service). CRD
+  changes are additive and backward-compatible (`change: safe`, CRD-compatible
+  with 0.2.20; validated against a real apiserver — 7 CRDs Established). cli
+  v0.2.6 → v0.2.7 (binary changed — scaffold).
+
+### Fixed
+
+- (post-release, on master) operator/webhook Dockerfile `FROM rust:` →
+  `docker.io/library/rust:` (a podman short-name prompt was hanging LOCAL builds);
+  `just e2e-disk` / nightly default to the published image, with `LOCAL_OPERATOR`
+  behind an explicit flag for pre-release validation.
+
 ## operator v0.2.18 + platform-stack 0.2.18/0.2.19 — 2.6 needs.redis → Dragonfly (ADR 0042) (2026-06-05)
 
 ### Added
