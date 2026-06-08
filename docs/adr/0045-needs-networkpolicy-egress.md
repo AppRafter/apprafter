@@ -65,8 +65,10 @@ needs), `strict` (DNS + needs; same-namespace also denied) — gates which basel
 rules the renderer emits. The operator reads the singleton PlatformStack; field
 absent / CR missing → `internet`. The default lives in the infrastructure
 config: the operator fallback (`internet`) is the documented default, **not in
-git**; baking a non-default via `platform-stack` values is an explicit opt-in
-escape hatch (which makes the field git-managed — see #4). The uniform `internet`
+git**; a non-default is set via the `apprafter` CLI, still operator-managed. The
+explicit **git-management escape hatch** is declaring the field in an opt-in
+infra-repo that Argo reconciles (then GitOps is authoritative and `set` warns —
+see #4). The uniform `internet`
 launch default is a function of **capability, not policy**: apps cannot yet
 declare external destinations. Once app-level egress declaration ships
 (`connects` / ExternalSurface), the Tier-2+ default flips to `internal`
@@ -86,7 +88,8 @@ This reconciles with the §1.4 GitOps-only principle via a **per-tier
 control-surface model**, not an override. The PlatformStack singleton is **seeded
 by the `apprafter cluster-bootstrap` loader and driven by the operator's
 PlatformController** — it is the declarative control plane, not a chart-templated,
-Argo-reconciled object. On Tier-1 a user may operate without an infrastructure
+Argo-reconciled object **by default** (an infra-repo may opt the field into
+git-management — see #3). On Tier-1 a user may operate without an infrastructure
 repository, so the `apprafter` CLI editing PlatformStack is the intended,
 declarative control surface (§1.5 decl-first — not a `kubectl`-to-prod emergency
 override). Opting in to an infra-repo that declares the field is explicit; that
