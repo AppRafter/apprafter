@@ -362,6 +362,13 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         } else {
             Some(&disk_mounts)
         },
+        // 2.10 (ADR 0045): the egress CNP wiring — reading the
+        // PlatformStack profile + resolving the connection-target catalog
+        // and threading it in — lands in task 2.10-3. Until then the
+        // controller renders no CNP (`needs_targets: None`), preserving
+        // today's behaviour; the profile arg is the documented default.
+        operator_core::EgressProfile::Internet,
+        None,
     );
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's

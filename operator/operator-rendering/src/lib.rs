@@ -10,6 +10,9 @@
 
 use std::collections::BTreeMap;
 
+mod egress;
+pub use egress::{default_target, render_egress_policy, ConnectionTarget};
+
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaimVolumeSource, PodSpec,
@@ -26,6 +29,14 @@ use operator_core::{Application, ApplicationBaseSpec};
 pub struct RenderedApplication {
     pub deployment: Deployment,
     pub service: Option<Service>,
+    /// The per-Application egress `CiliumNetworkPolicy` (2.10 / ADR
+    /// 0045), built via `serde_json::json!` (the external-CR pattern —
+    /// no hand-rolled CNP type). `Some(...)` when the controller threads
+    /// a connection-target catalog in (always at launch on a
+    /// Cilium-bootstrapped cluster); `None` when `needs_targets` is
+    /// absent (e.g. the base `render_application` entry point, or a tier
+    /// without Cilium) → the controller applies no CNP.
+    pub network_policy: Option<serde_json::Value>,
 }
 
 /// One ready `needs.disk` claim resolved into render input (2.6b /
@@ -100,7 +111,15 @@ pub fn fold_env_segment(name: &str) -> String {
 /// shape; new code should prefer [`render_application_for_env`]
 /// when the operator knows which environment it represents.
 pub fn render_application(app: &Application) -> RenderedApplication {
-    render_application_for_env(app, None, None, None, None)
+    render_application_for_env(
+        app,
+        None,
+        None,
+        None,
+        None,
+        operator_core::EgressProfile::Internet,
+        None,
+    )
 }
 
 /// Render the Application using the merged base + environment
@@ -132,12 +151,28 @@ pub fn render_application(app: &Application) -> RenderedApplication {
 /// byte-stable SSA) and forces `strategy: Recreate` (an RWO PVC cannot be
 /// held by two pods during a RollingUpdate). `None`/empty leaves the
 /// Deployment strategy unchanged from today (unset → apiserver default).
+///
+/// `egress_profile` + `needs_targets` (2.10 / ADR 0045) drive the
+/// per-Application egress [`render_egress_policy`]. The controller reads
+/// the cluster-wide profile from the singleton PlatformStack and resolves
+/// the connection-target catalog (namespace overrides from
+/// `ServiceProvider.spec.config`), then threads both in — keeping the
+/// renderer pure (no kube client). `needs_targets: Some(...)` emits the
+/// CNP into `RenderedApplication.network_policy` (always at launch);
+/// `None` emits no CNP (the base entry point / a tier without Cilium).
+/// The CNP selects the app's pods on egress and allows DNS + same-ns +
+/// world (all profile-gated) + one rule per declared network need; disk
+/// needs carry no network target and add no rule. `effective.needs`'
+/// deterministic [`Needs::entries`] order keeps the rule list byte-stable
+/// (SSA no-op).
 pub fn render_application_for_env(
     app: &Application,
     env_name: Option<&str>,
     needs_secrets: Option<&BTreeMap<(String, Option<String>), String>>,
     resolved_image: Option<&str>,
     disks: Option<&[DiskMount]>,
+    egress_profile: operator_core::EgressProfile,
+    needs_targets: Option<&BTreeMap<String, egress::ConnectionTarget>>,
 ) -> RenderedApplication {
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
@@ -160,9 +195,36 @@ pub fn render_application_for_env(
         .as_ref()
         .map(|expose| render_service(&name, namespace.as_deref(), &owner, &labels, expose.port));
 
+    // 2.10 (ADR 0045): one egress CNP per Application, named after the
+    // env-aware Deployment (`deployment.metadata.name`) so per-env
+    // children never collide. Built only when the controller threads a
+    // connection-target catalog in; the rule order follows
+    // `effective.needs.entries()` (deterministic → byte-stable SSA).
+    let rendered_name = deployment
+        .metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| name.clone());
+    let network_policy = needs_targets.map(|targets| {
+        let needs_entries = effective
+            .needs
+            .as_ref()
+            .map(|n| n.entries())
+            .unwrap_or_default();
+        egress::render_egress_policy(
+            &name,
+            &rendered_name,
+            &labels,
+            &needs_entries,
+            egress_profile,
+            targets,
+        )
+    });
+
     RenderedApplication {
         deployment,
         service,
+        network_policy,
     }
 }
 
@@ -770,7 +832,15 @@ mod tests {
             image: Some("x".into()),
             ..Default::default()
         });
-        let rendered = render_application_for_env(&app, Some("dev"), None, None, None);
+        let rendered = render_application_for_env(
+            &app,
+            Some("dev"),
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let labels = rendered
             .deployment
             .metadata
@@ -787,7 +857,15 @@ mod tests {
         );
         // Base-only render (env=None) carries the application label but
         // no environment label.
-        let base = render_application_for_env(&app, None, None, None, None);
+        let base = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let base_labels = base.deployment.metadata.labels.clone().unwrap_or_default();
         assert_eq!(
             base_labels
@@ -1055,7 +1133,15 @@ mod tests {
             },
             envs,
         );
-        let r = render_application_for_env(&app, Some("prod"), None, None, None);
+        let r = render_application_for_env(
+            &app,
+            Some("prod"),
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         assert_eq!(
             r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
                 .image
@@ -1143,7 +1229,15 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r).expect("env present");
         let dsn = envs
             .iter()
@@ -1172,7 +1266,15 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let r = render_application_for_env(&app, None, None, None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r);
         // No literal env + no injected DSN → env stays None.
         assert!(envs.is_none(), "no DATABASE_URL when secrets map is None");
@@ -1191,7 +1293,15 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r).expect("env present (DSN injected)");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "DATABASE_URL");
@@ -1215,7 +1325,15 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 2);
         // Literal env first, DSN appended AFTER.
@@ -1244,7 +1362,15 @@ mod tests {
             ("clickhouse".to_string(), None),
             "parser-clickhouse-conn".to_string(),
         )]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r);
         assert!(
             envs.is_none(),
@@ -1267,7 +1393,15 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r).expect("env present");
         let url = envs
             .iter()
@@ -1334,7 +1468,15 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 2);
         assert_eq!(envs[0].name, "REDIS_URL");
@@ -1395,7 +1537,15 @@ mod tests {
                 "parser-pg-analytics-conn".to_string(),
             ),
         ]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r).expect("env present");
 
         let default = envs
@@ -1446,7 +1596,15 @@ mod tests {
             "uid-1",
         );
         let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(&app, None, Some(&secrets), None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "DATABASE_URL");
@@ -1474,8 +1632,15 @@ mod tests {
     #[test]
     fn deployment_uses_resolved_digest_when_provided() {
         let app = app_with_image("ghcr.io/acme/web:1.0");
-        let rendered =
-            render_application_for_env(&app, None, None, Some("ghcr.io/acme/web@sha256:abc"), None);
+        let rendered = render_application_for_env(
+            &app,
+            None,
+            None,
+            Some("ghcr.io/acme/web@sha256:abc"),
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let c = &rendered
             .deployment
             .spec
@@ -1490,7 +1655,15 @@ mod tests {
     #[test]
     fn deployment_uses_verbatim_tag_when_resolved_is_none() {
         let app = app_with_image("ghcr.io/acme/web:1.0");
-        let rendered = render_application_for_env(&app, None, None, None, None);
+        let rendered = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let c = &rendered
             .deployment
             .spec
@@ -1559,7 +1732,15 @@ mod tests {
             read_only: false,
             pvc_name: "claim-demo-app-disk-data".to_string(),
         }];
-        let r = render_application_for_env(&app, None, None, None, Some(&disks));
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            Some(&disks),
+            operator_core::EgressProfile::Internet,
+            None,
+        );
 
         let mounts = container_volume_mounts(&r).expect("volumeMounts present");
         assert_eq!(mounts.len(), 1);
@@ -1604,7 +1785,15 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let r = render_application_for_env(&app, None, None, None, None);
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         assert!(
             r.deployment.spec.as_ref().unwrap().strategy.is_none(),
             "strategy unchanged (unset) when no disk"
@@ -1630,7 +1819,15 @@ mod tests {
             "demo",
             "uid-1",
         );
-        let r = render_application_for_env(&app, None, None, None, Some(&[]));
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            Some(&[]),
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         assert!(r.deployment.spec.as_ref().unwrap().strategy.is_none());
         assert!(container_volume_mounts(&r).is_none());
         assert!(pod_volumes(&r).is_none());
@@ -1668,7 +1865,15 @@ mod tests {
                 pvc_name: "claim-demo-app-disk-a".to_string(),
             },
         ];
-        let r = render_application_for_env(&app, None, None, None, Some(&disks));
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            Some(&disks),
+            operator_core::EgressProfile::Internet,
+            None,
+        );
         let mounts = container_volume_mounts(&r).expect("volumeMounts present");
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].name, "disk-a");
