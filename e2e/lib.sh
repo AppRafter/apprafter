@@ -210,6 +210,10 @@ kind_up_cilium() {
             "$(cluster_runtime)" >&2
         return 2
     fi
+    # Fail fast (with the exact one-time host remedy) when a rootless-podman host
+    # caps the kind node's memlock below what cilium-agent needs — otherwise the
+    # agent CrashLoopBackOffs ~7 min into the run. No-op on rootful Docker (CI).
+    require_cilium_memlock
     # The kind config is fed on stdin (`--config -`). Disable the default CNI
     # + kube-proxy so Cilium owns L3/L4 and service routing; pin the apiserver
     # to 127.0.0.1:6443 to match the platform's Cilium k8sServiceHost pin.
@@ -218,11 +222,13 @@ kind_up_cilium() {
     # the BPF filesystem, which a rootless-podman kind node cannot do itself
     # (`mount: /sys/fs/bpf: permission denied`); bind-mounting the host bpffs
     # in lets the init proceed. On CI (rootful Docker) it is a harmless re-bind.
-    # NOTE: even with the mount, a rootless-podman host with a capped memlock
-    # ulimit (e.g. 8 MB) still cannot run the cilium-agent (`failed to set
-    # memlock rlimit: operation not permitted`) — the FULL enforcement run
-    # needs a rootful runtime (CI) or a host memlock raise. The bootstrap +
-    # `cilium status --wait` converge under CI's rootful Docker.
+    # NOTE: rootless podman caps the kind node's memlock at the host user's
+    # systemd hard limit (default 8 MB); cilium-agent raises RLIMIT_MEMLOCK to
+    # infinity and Fatals otherwise (`failed to set memlock rlimit`). No
+    # container flag (privileged / CAP_SYS_RESOURCE / --ulimit) bypasses it —
+    # only a one-time root host change does (see require_cilium_memlock, which
+    # fails fast above with the exact fix). Rootful Docker (CI) ships
+    # LimitMEMLOCK=infinity, so CI needs nothing.
     _kind create cluster --name "$cluster_name" --config - <<'KINDCFG'
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -316,6 +322,43 @@ bootstrap_with_cilium() {
         sleep 20
         apprafter cluster-bootstrap
     }
+}
+
+# ---------------------------------------------------------------
+# require_cilium_memlock
+#   cilium-agent raises RLIMIT_MEMLOCK to infinity at startup and Fatals on
+#   failure (`failed to set memlock rlimit: operation not permitted`). Under
+#   rootless podman, the kind node container is capped at the host user's
+#   systemd memlock HARD limit (default 8 MB) and CANNOT exceed it — no
+#   container flag (privileged / CAP_SYS_RESOURCE / --ulimit) helps (the cap is
+#   the host user-manager limit, verified). So fail fast HERE with the exact
+#   one-time root remedy instead of letting the dev watch a ~7-minute
+#   CrashLoopBackOff. Rootful Docker (CI) ships LimitMEMLOCK=infinity, so this
+#   is a no-op there. Other walks use kindnet (no Cilium) and never hit this.
+# ---------------------------------------------------------------
+require_cilium_memlock() {
+    _kind_uses_podman || return 0   # rootful docker node already gets unlimited memlock
+    local hard
+    hard="$(podman run --rm docker.io/library/busybox:latest sh -c 'ulimit -Hl' 2>/dev/null || true)"
+    [ "$hard" = "unlimited" ] && return 0
+    cat >&2 <<EOF
+ERROR: Cilium cannot start on this rootless podman host — the kind node's memlock
+hard limit is ${hard:-too low} KB, but cilium-agent needs it unlimited (it raises
+RLIMIT_MEMLOCK to infinity and Fatals: "failed to set memlock rlimit: operation
+not permitted"). No container flag can exceed the host user's systemd cap.
+
+One-time host fix (root), then re-login:
+  sudo mkdir -p /etc/systemd/system/user@.service.d
+  printf '[Service]\nLimitMEMLOCK=infinity\n' | \\
+    sudo tee /etc/systemd/system/user@.service.d/90-memlock.conf
+  sudo systemctl daemon-reload
+  loginctl terminate-user "\$USER"   # or log out/in (a reboot also works)
+  # verify: podman run --rm busybox sh -c 'ulimit -Hl'   # must print: unlimited
+
+GitHub Actions / rootful Docker need nothing (dockerd runs LimitMEMLOCK=infinity).
+See docs/operator-guide/needs-networkpolicy-walk.md.
+EOF
+    exit 2
 }
 
 # ---------------------------------------------------------------
