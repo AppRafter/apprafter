@@ -140,6 +140,34 @@ guide: [needs.pg](../operator-guide/needs-pg-walk.md),
 [needs.redis](../operator-guide/needs-redis-walk.md),
 [needs.disk](../operator-guide/needs-disk-walk.md).
 
+### Egress profiles — `needs` also gates the network
+
+Declaring a network need does more than wire a connection string: it
+opens the **only** path your pods have to that backend. The operator
+emits one egress `CiliumNetworkPolicy` per Application that selects your
+pods on egress (making them default-deny on egress) and allows DNS,
+same-namespace traffic, the external internet, and exactly the in-cluster
+services you declared. An app with `needs.pg` can reach the shared
+Postgres; an app **without** it cannot — the attempt is dropped at the
+Cilium datapath. So if a workload talks to an in-cluster backend, declare
+it as a need; an undeclared reach is denied by design.
+
+How wide the baseline is depends on a cluster-wide posture, the
+`PlatformStack.spec.network.egress.profile`, which a platform operator
+sets with `apprafter platform egress set <profile>`:
+
+| Profile | Baseline allows (besides your declared needs) |
+| --- | --- |
+| `internet` (default) | DNS + same-namespace + the external internet. |
+| `internal` | DNS + same-namespace (no external internet). |
+| `strict` | DNS only (even same-namespace egress is denied). |
+
+The per-need allow rules are emitted at **every** profile — tightening the
+profile never blocks a declared dependency. `needs.disk` adds no egress
+rule (a mounted volume has no network target). The full walk — observing a
+Hubble drop, flipping the profile — is the operator guide's
+[needs.networkpolicy walk](../operator-guide/needs-networkpolicy-walk.md).
+
 ## Multi-environment patterns
 
 `spec.environments` holds per-environment overrides. The operator
