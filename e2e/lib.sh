@@ -307,6 +307,54 @@ cluster_load_image() {
 }
 
 # ---------------------------------------------------------------
+# detect_host_gateway_ip
+#   The host IP that in-cluster PODS use to reach a service the walk runs on
+#   the HOST (e.g. the gitops `git daemon` on :9418). Runtime-aware, because
+#   the engines differ fundamentally:
+#     * kind + rootless podman: the bridge gateway lives in the rootless
+#       network namespace and does NOT route to the host (a pod dial gets
+#       "connection refused"). Podman injects `host.containers.internal`
+#       (netavark's link-local host endpoint, ~169.254.x) into every node's
+#       /etc/hosts — read its IP off the node.
+#     * kind + docker (CI runners): the node attaches to the FIXED `kind`
+#       docker network whose bridge gateway IS the host and is routable from
+#       pods; `host.containers.internal` is podman-only, so resolve the
+#       gateway from `docker network inspect kind` instead.
+#     * k3d + docker: same idea, per-cluster network `k3d-<name>`.
+#   Echoes the IP on stdout; exits non-zero with a diagnostic otherwise.
+#   (Always called in `$(...)`, so `exit` only unwinds the subshell.)
+# ---------------------------------------------------------------
+detect_host_gateway_ip() {
+    local gw net_name
+    if [ "$(cluster_runtime)" = "kind" ] && _kind_uses_podman; then
+        gw=$(podman exec "${CLUSTER_NAME}-control-plane" \
+            getent hosts host.containers.internal 2>/dev/null | awk '{print $1; exit}')
+        if [ -z "$gw" ]; then
+            printf 'ERROR: could not resolve host.containers.internal on kind node %s-control-plane\n' \
+                "$CLUSTER_NAME" >&2
+            exit 1
+        fi
+        printf '%s' "$gw"
+        return 0
+    fi
+    # docker-backed: kind → the fixed `kind` network; k3d → `k3d-<cluster>`.
+    if [ "$(cluster_runtime)" = "kind" ]; then
+        net_name="kind"
+    else
+        net_name="k3d-${CLUSTER_NAME}"
+    fi
+    gw=$(docker network inspect "$net_name" 2>/dev/null \
+        | jq -r '.[0] | ((.subnets // .IPAM.Config // [])[]
+                 | (.gateway // .Gateway // empty))' 2>/dev/null \
+        | grep -E '^[0-9]+\.' | head -1)
+    if [ -z "$gw" ]; then
+        printf 'ERROR: could not detect IPv4 gateway of docker network %s\n' "$net_name" >&2
+        exit 1
+    fi
+    printf '%s' "$gw"
+}
+
+# ---------------------------------------------------------------
 # bootstrap_with_retry
 #   Runs `apprafter cluster-bootstrap` with APPRAFTER_BOOTSTRAP_SKIP_CILIUM
 #   so it leaves the cluster's default CNI in place (see k3d_up for why). That

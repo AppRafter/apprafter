@@ -259,35 +259,9 @@ setup_git_server() {
         "$GIT_DAEMON_PORT" "$GIT_REPOS_DIR"
 }
 
-# ---------------------------------------------------------------
-# Helper: the host IP that in-cluster PODS use to reach the host git
-# daemon. Runtime-aware (kind+podman vs k3d+docker) — mirrors
-# gitops-walk.sh's detect_host_gateway_ip.
-# ---------------------------------------------------------------
-detect_host_gateway_ip() {
-    local gw net_name
-    if [ "$(cluster_runtime)" = "kind" ]; then
-        gw=$(podman exec "${CLUSTER_NAME}-control-plane" \
-            getent hosts host.containers.internal 2>/dev/null | awk '{print $1; exit}')
-        if [ -z "$gw" ]; then
-            printf 'ERROR: could not resolve host.containers.internal on kind node %s-control-plane\n' \
-                "$CLUSTER_NAME" >&2
-            exit 1
-        fi
-        printf '%s' "$gw"
-        return 0
-    fi
-    net_name="k3d-${CLUSTER_NAME}"
-    gw=$(docker network inspect "$net_name" 2>/dev/null \
-        | jq -r '.[0] | ((.subnets // .IPAM.Config // [])[]
-                 | (.gateway // .Gateway // empty))' 2>/dev/null \
-        | grep -E '^[0-9]+\.' | head -1)
-    if [ -z "$gw" ]; then
-        printf 'ERROR: could not detect IPv4 gateway of docker network %s\n' "$net_name" >&2
-        exit 1
-    fi
-    printf '%s' "$gw"
-}
+# `detect_host_gateway_ip` (the host IP in-cluster pods use to reach the host
+# git daemon — runtime-aware for kind+podman / kind+docker / k3d+docker) lives
+# in e2e/lib.sh so both gitops walks share one copy.
 
 # ---------------------------------------------------------------
 # Helper: wait until the Argo CD Application reaches Synced+Healthy.

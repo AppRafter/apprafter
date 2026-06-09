@@ -240,43 +240,9 @@ setup_git_server() {
         "$GIT_DAEMON_PORT" "$GIT_REPOS_DIR"
 }
 
-# ---------------------------------------------------------------
-# Helper: the host IP that in-cluster PODS use to reach the host git daemon.
-# Runtime-aware, because the two engines differ fundamentally:
-#   * kind + rootless podman: the bridge gateway lives in the rootless network
-#     namespace and does NOT route to the host (a pod dial to it gets
-#     "connection refused"). Podman instead injects `host.containers.internal`
-#     into every node's /etc/hosts — netavark's link-local host endpoint
-#     (~169.254.x) — which IS routable from pods. Read its IP off the node.
-#   * k3d + docker: the per-cluster bridge gateway IS host-routable; parse the
-#     network JSON with jq (docker schema: .IPAM.Config[].Gateway) and pick
-#     the IPv4 gateway. (k3d also exposes a `host.k3d.internal` DNS alias, so
-#     this branch is only a documented fallback — the repoURL uses the name.)
-# ---------------------------------------------------------------
-detect_host_gateway_ip() {
-    local gw net_name
-    if [ "$(cluster_runtime)" = "kind" ]; then
-        gw=$(podman exec "${CLUSTER_NAME}-control-plane" \
-            getent hosts host.containers.internal 2>/dev/null | awk '{print $1; exit}')
-        if [ -z "$gw" ]; then
-            printf 'ERROR: could not resolve host.containers.internal on kind node %s-control-plane\n' \
-                "$CLUSTER_NAME" >&2
-            exit 1
-        fi
-        printf '%s' "$gw"
-        return 0
-    fi
-    net_name="k3d-${CLUSTER_NAME}"
-    gw=$(docker network inspect "$net_name" 2>/dev/null \
-        | jq -r '.[0] | ((.subnets // .IPAM.Config // [])[]
-                 | (.gateway // .Gateway // empty))' 2>/dev/null \
-        | grep -E '^[0-9]+\.' | head -1)
-    if [ -z "$gw" ]; then
-        printf 'ERROR: could not detect IPv4 gateway of docker network %s\n' "$net_name" >&2
-        exit 1
-    fi
-    printf '%s' "$gw"
-}
+# `detect_host_gateway_ip` (the host IP in-cluster pods use to reach the host
+# git daemon — runtime-aware for kind+podman / kind+docker / k3d+docker) lives
+# in e2e/lib.sh so both gitops walks share one copy.
 
 # ---------------------------------------------------------------
 # Helper: wait until the Argo CD Application reaches Synced+Healthy
@@ -379,10 +345,10 @@ setup_git_server
 # The repoURL Argo CD (in-cluster) uses to clone the fixture depends on the
 # runtime. k3d injects a built-in `host.k3d.internal` alias into the cluster
 # CoreDNS that pods resolve to the host — portable across CI runners. kind has
-# no such alias, so on kind+podman pods reach the host git daemon via the
-# `host.containers.internal` IP that podman injects into the nodes
-# (detect_host_gateway_ip resolves it — the bridge gateway is NOT routable
-# from pods under rootless podman).
+# no such alias, so pods reach the host git daemon by its gateway IP, which
+# `detect_host_gateway_ip` resolves per engine: `host.containers.internal`
+# under rootless podman (the bridge gateway is NOT routable there), or the
+# `kind` docker-network gateway under docker (CI runners).
 if [ "$(cluster_runtime)" = "kind" ]; then
     GIT_REPO_URL="git://$(detect_host_gateway_ip):${GIT_DAEMON_PORT}/gitops-app"
 else
