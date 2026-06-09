@@ -33,7 +33,7 @@ pub struct ConnectionTarget {
     /// `io.kubernetes.pod.namespace`).
     pub namespace: String,
     /// Service-level pod label selector (e.g.
-    /// `{postgresql.cnpg.io/cluster: platform-postgres}`). Targets the
+    /// `{cnpg.io/cluster: platform-postgres}`). Targets the
     /// *service*, not the specific shared instance a claim landed on —
     /// per-instance data isolation is enforced at the app layer
     /// (2.4 per-role pg, 2.6 redis `$N` ACL).
@@ -53,8 +53,15 @@ pub fn default_target(service_type: &str) -> Option<ConnectionTarget> {
     match service_type {
         "pg" => Some(ConnectionTarget {
             namespace: "cnpg-system".to_string(),
+            // CloudNativePG labels every cluster pod with `cnpg.io/cluster`
+            // (NOT the deprecated `postgresql.cnpg.io/cluster`) — verified
+            // against the live CNPG 1.29 pods the provisioner creates and the
+            // selector `needs-pg-walk.sh` uses to reach the primary. Cilium's
+            // socket-LB rewrites the `-rw` ClusterIP to the backend pod IP at
+            // connect() time, so this rule MUST match the real pod identity or
+            // every `needs.pg` app's egress to Postgres is silently dropped.
             pod_selector: BTreeMap::from([(
-                "postgresql.cnpg.io/cluster".to_string(),
+                "cnpg.io/cluster".to_string(),
                 "platform-postgres".to_string(),
             )]),
             port: 5432,
@@ -210,9 +217,7 @@ mod tests {
         assert_eq!(pg.namespace, "cnpg-system");
         assert_eq!(pg.port, 5432);
         assert_eq!(
-            pg.pod_selector
-                .get("postgresql.cnpg.io/cluster")
-                .map(String::as_str),
+            pg.pod_selector.get("cnpg.io/cluster").map(String::as_str),
             Some("platform-postgres")
         );
 
@@ -384,7 +389,7 @@ mod tests {
             })
             .expect("pg egress rule present");
         assert_eq!(
-            pg_rule["toEndpoints"][0]["matchLabels"]["postgresql.cnpg.io/cluster"],
+            pg_rule["toEndpoints"][0]["matchLabels"]["cnpg.io/cluster"],
             "platform-postgres"
         );
         assert_eq!(pg_rule["toPorts"][0]["ports"][0]["port"], "5432");

@@ -2894,9 +2894,7 @@ mod tests {
         assert_eq!(pg.namespace, "custom-pg-ns");
         assert_eq!(pg.port, 5432);
         assert_eq!(
-            pg.pod_selector
-                .get("postgresql.cnpg.io/cluster")
-                .map(String::as_str),
+            pg.pod_selector.get("cnpg.io/cluster").map(String::as_str),
             Some("platform-postgres")
         );
     }
