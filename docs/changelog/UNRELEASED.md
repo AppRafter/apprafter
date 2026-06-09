@@ -9,6 +9,50 @@ patch of each phase.
 
 ## Phase 2 — Platform services (in progress)
 
+## operator + admission-webhook + platform-stack v0.2.23 + cli v0.2.10 — 2.10 needs → CiliumNetworkPolicy egress (ADR 0045) (2026-06-09)
+
+### Added
+
+- **Per-Application egress `CiliumNetworkPolicy`, auto-derived from `needs`.**
+  The Application controller emits one `CiliumNetworkPolicy`
+  (`<rendered-name>-egress`, owner-referenced to the Application so it
+  cascades on delete) built via `serde_json::json!` → `DynamicObject` (the
+  external-CR precedent — not a hand-rolled type). The app's pods become
+  egress default-deny and are allowed only: DNS (to kube-dns), the
+  app's own namespace (profile-gated), the external internet (profile-gated),
+  and one rule per declared network `need` — `pg` →
+  `cnpg-system` pods (`cnpg.io/cluster: platform-postgres`) :5432, `redis`
+  → `dragonfly-system` (`app.kubernetes.io/name: dragonfly`) :6379. `disk`
+  has no network surface and is skipped. Undeclared cross-namespace egress
+  (e.g. an app without `needs.pg` reaching Postgres) is dropped.
+- **`PlatformStack.spec.network.egress.profile`** — `internet` (default,
+  all tiers) | `internal` | `strict`, resolved cluster-wide by the
+  controller. `internet` keeps the open-world baseline; `internal` drops the
+  world rule (DNS + same-namespace + needs only); `strict` additionally drops
+  same-namespace egress (DNS + needs only). Absent/unset resolves to
+  `internet`.
+- **`apprafter platform egress show` / `apprafter platform egress set
+  <profile>`** — read and switch the cluster egress profile without raw
+  kubectl. `set` server-side-applies the profile onto the singleton
+  PlatformStack; the controller re-derives every app's CNP on its next
+  reconcile.
+
+### Fixed
+
+- **The egress `pg` connection-target matched the deprecated
+  `postgresql.cnpg.io/cluster` label** instead of the live `cnpg.io/cluster`
+  CloudNativePG applies, so the `needs.pg` egress allow-rule matched zero
+  endpoints and every such app's egress to Postgres was silently dropped
+  (the deny side worked; the allow rule was a no-op). Surfaced by the
+  kind+Cilium enforcement walk; the unit tests had encoded the same wrong
+  literal.
+- **`apprafter platform egress set` reused the bootstrap field manager
+  `apprafter-cli`**, so server-side apply of its partial
+  `{spec.network.egress.profile}` object pruned the REQUIRED `spec.source` /
+  `spec.values` and the apiserver rejected the PlatformStack. It now applies
+  under a dedicated `apprafter-cli-egress` manager that owns only the egress
+  subtree.
+
 ## operator + platform-stack v0.2.22 + cli v0.2.8/v0.2.9 + argocd-cue-cmp v0.1.8 — 2.9 per-environment deploy (ADR 0044) (2026-06-07)
 
 ### Added

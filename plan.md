@@ -3022,11 +3022,13 @@ Tests:
 
 **Цель:** при `needs.pg` оператор создаёт egress NetworkPolicy к pg-кластеру.
 
+> ✅ **ЗАКРЫТО (2026-06-09).** Subagent-driven (T1–T5, ветка `feat/2.10-needs-networkpolicy`). Оператор эмитит **ОДИН** `CiliumNetworkPolicy` (`<rendered-name>-egress`, owner-ref на Application) per-CR через `json!`/`DynamicObject`: default-deny egress + DNS + same-ns + `world` + по правилу на каждый сетевой need (pg→cnpg-system:5432, redis→dragonfly-system:6379; disk исключён). Apply гейтится startup-пробой CRD `ciliumnetworkpolicies.cilium.io` (non-Cilium кластеры рендерят, но не применяют). Постура config-driven: новое `PlatformStack.spec.network.egress.profile` (`internet`(деф)|`internal`|`strict`), CLI `apprafter platform egress show/set`. **Live-walk `e2e/needs-networkpolicy-walk.sh` GREEN end-to-end на kind+Cilium** (8 фаз, sandbox-run rootful microVM): эмиссия CNP → enforcement-контраст (noproxy→pg DROPPED, web→pg FORWARDED) → internet/internal/strict переключение через CLI. **Walk вскрыл 2 продуктовых бага (юнит/CRD/ревью пропустили):** (1) egress pg-селектор был на устаревшем `postgresql.cnpg.io/cluster` вместо `cnpg.io/cluster` → egress к Postgres молча дропался (фикс `8b4b3e1`); (2) `egress set` под bootstrap-овским field-manager `apprafter-cli` прунил REQUIRED `spec.source`/`spec.values` PlatformStack → apiserver reject → выделенный `apprafter-cli-egress` (фикс `0bf309e`). Плюс walk-харнесс: RBAC-рендер без `-n` затирал ClusterRoleBinding subject (`test(e2e)` `3ac1972`). **Релиз:** operator+webhook+platform-stack **0.2.22 → 0.2.23** (оба чарта version+appVersion, component-пины + currentVersion + compatibility change=safe) + cli **0.2.9 → 0.2.10** (monorepo-тег v0.2.10). Гейты зелёные: cargo fmt/clippy -D/test (cli+operator), `just platform-stack-check` (рендерит 0.2.23). **NB: 2.10 ≠ закрытие Фазы 2 — §6 M2 НЕ флипнут** (M2 после 2.11–2.12). spec.md §-актуализация — на закрытии Фазы 2. **Ждёт пуша** (push policy: operator/v0.2.23 + platform-stack/v0.2.23 — workflow-made на пуше; monorepo v0.2.10 — локальный).
+
 **Поставка:**
-- [ ] Каталог connection-targets для каждого ServiceProvider type (label-selector + порт).
-- [ ] Renderer эмитит **ОДИН** CiliumNetworkPolicy на Application (per-CR), с одним egress-rule на каждый declared need внутри (не CNP-на-need).
-- [ ] Launch egress-дефолт = profile `internet` (DNS + same-ns + `world` + needs): интернет открыт (`connects` ещё нет), кросс-ns in-cluster закрыт и гейтится через needs (Hubble drop). `connects`-гейтинг интернета + T2+`internal` — отложено до ExternalSurface (ADR 0045).
-- [ ] Hubble drops на forbidden flows видны в логах.
+- [x] Каталог connection-targets для каждого ServiceProvider type (label-selector + порт).
+- [x] Renderer эмитит **ОДИН** CiliumNetworkPolicy на Application (per-CR), с одним egress-rule на каждый declared need внутри (не CNP-на-need).
+- [x] Launch egress-дефолт = profile `internet` (DNS + same-ns + `world` + needs): интернет открыт (`connects` ещё нет), кросс-ns in-cluster закрыт и гейтится через needs (Hubble drop). `connects`-гейтинг интернета + T2+`internal` — отложено до ExternalSurface (ADR 0045).
+- [x] Hubble drops на forbidden flows видны в логах (Hubble best-effort — tier-1 ships его off, ADR 0020; enforcement в walk доказан connectivity-контрастом web vs noproxy к одному pg-Service).
 
 **Acceptance:** Application без `needs.pg` не может коннектится к pg-кластеру (Hubble drop); с `needs.pg` — может.
 
