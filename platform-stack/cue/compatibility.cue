@@ -1723,6 +1723,42 @@ compatibility: "0.1.23": {
 // breach) fixed by serializing reconciles; and the operator-only-CREATE
 // webhooks now accept `kubeadm:cluster-admins` break-glass (k8s 1.35).
 // CRD-compatible with 0.2.19; existing claims keep their allocation.
+compatibility: "0.2.23": {
+	change:          "safe"
+	operatorVersion: "v0.2.23"
+	notes: """
+		Phase 2.10 (needs → CiliumNetworkPolicy egress auto-derivation,
+		ADR 0045) close. The Application controller now SSA-applies one
+		per-Application `CiliumNetworkPolicy` (`<rendered-name>-egress`,
+		owner-referenced to the Application) that makes the app's pods
+		egress default-deny and allows only: DNS, same-namespace
+		(profile-gated), the external internet (profile-gated), and one
+		rule per declared `needs` entry (pg → cnpg-system:5432, redis →
+		dragonfly-system:6379; disk has no network surface). The apply is
+		gated on the `ciliumnetworkpolicies.cilium.io` CRD being served —
+		a one-time startup probe — so non-Cilium clusters render nothing.
+
+		Breadth is config-driven via a new optional
+		`PlatformStack.spec.network.egress.profile`
+		(`internet` (default) | `internal` | `strict`), resolved cluster-
+		wide by the controller. `internet` keeps the open-world default on
+		every tier; `internal` drops the world rule (DNS + same-ns +
+		needs); `strict` additionally drops same-namespace egress. Managed
+		from the CLI by `apprafter platform egress show` / `set <profile>`
+		(no raw kubectl) — `set` applies under a dedicated field manager so
+		it never prunes the bootstrap-owned `spec.source`/`spec.values`.
+
+		CRD change is additive (optional
+		`PlatformStack.spec.network.egress.profile`) — CRD-compatible with
+		0.2.22; a stack with no profile renders the internet default,
+		unchanged. New operator ClusterRole grants: `ciliumnetworkpolicies`
+		(get/list/watch/create/patch/delete) + `customresourcedefinitions`
+		get (the CRD probe). Operator + webhook binary change; chart
+		appVersion bump propagates the new images.
+		"""
+	references: ["plan.md#2.10", "docs/adr/0045-needs-networkpolicy-egress.md"]
+}
+
 compatibility: "0.2.22": {
 	change:          "safe"
 	operatorVersion: "v0.2.22"
