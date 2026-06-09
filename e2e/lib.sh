@@ -177,6 +177,10 @@ _kind_up() {
     # claim/DSN/GC walks are all in-cluster (no ingress), kind has no
     # servicelb anyway, and binding 80/443 just risks a host-port clash for
     # no benefit.
+    # Writable kubeconfig target (see kind_up_cilium for why) — a read-only cwd
+    # / unset HOME would otherwise fail kind's `mkdir .kube`.
+    KUBECONFIG="$(mktemp -t apprafter-kube.XXXXXX)"
+    export KUBECONFIG
     _kind create cluster --name "$cluster_name"
     printf '  kind cluster %s is ready. kubectl context: kind-%s\n' \
         "$cluster_name" "$cluster_name"
@@ -229,12 +233,23 @@ kind_up_cilium() {
     # only a one-time root host change does (see require_cilium_memlock, which
     # fails fast above with the exact fix). Rootful Docker (CI) ships
     # LimitMEMLOCK=infinity, so CI needs nothing.
+    # kind writes a kubeconfig during `create`; point it at a writable temp so a
+    # read-only cwd / unset HOME (e.g. sandbox-run shares /project read-only)
+    # does not fail with `mkdir .kube: read-only file system`. The walk
+    # re-exports its own KUBECONFIG via cluster_kubeconfig_write afterwards.
+    KUBECONFIG="$(mktemp -t apprafter-kube.XXXXXX)"
+    export KUBECONFIG
     _kind create cluster --name "$cluster_name" --config - <<'KINDCFG'
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 networking:
   disableDefaultCNI: true
   kubeProxyMode: "none"
+  # The platform's Cilium ships ipv6.enabled=true (component_cilium.cue), so the
+  # cluster must be DUAL-STACK or the agent blocks forever on "required IPv6
+  # PodCIDR not available" (it waits for an IPv6 PodCIDR the node never gets on
+  # an IPv4-only kind cluster) and never reaches Ready.
+  ipFamily: dual
   apiServerAddress: "127.0.0.1"
   apiServerPort: 6443
 nodes:
@@ -272,7 +287,19 @@ cluster_kubeconfig_write() {
 cluster_load_image() {
     local cluster_name="$1" image="$2"
     if [ "$(cluster_runtime)" = "kind" ]; then
-        _kind load docker-image "$image" --name "$cluster_name"
+        if _kind_uses_podman; then
+            # `kind load docker-image` cannot reliably resolve a podman-built
+            # image (podman's CLI store vs the DOCKER_HOST socket store —
+            # "image ... not present locally"). Export to a tarball and load
+            # that: provider-agnostic, no runtime store lookup.
+            local _imgtar
+            _imgtar="$(mktemp -t apprafter-img.XXXXXX.tar)"
+            podman save -o "$_imgtar" "$image"
+            _kind load image-archive "$_imgtar" --name "$cluster_name"
+            rm -f "$_imgtar"
+        else
+            _kind load docker-image "$image" --name "$cluster_name"
+        fi
     else
         # shellcheck disable=SC2086
         $(_k3d_bin) image import "$image" --cluster "$cluster_name"
@@ -426,6 +453,29 @@ dump_diagnostics() {
             printf '\n--- logs %s/%s (previous instance) ---\n' "$ns" "$pod" >&2
             kubectl -n "$ns" logs "$pod" --all-containers --previous --tail=60 >&2 2>&1 || true
         done
+    # apprafter-system control-plane logs ALWAYS — the operator and
+    # admission-webhook run 1/1 Ready, so the not-Ready loop above skips
+    # them, yet a reconcile that errors before writing any status (empty
+    # `.status.phase`) leaves its only trace in the operator log. Dump
+    # the full control-plane regardless of Ready state.
+    printf '\n--- apprafter-system control-plane logs ---\n' >&2
+    for dep in apprafter-operator admission-webhook resourceclaim-provisioner resourceclaim-scheduler; do
+        kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 || continue
+        printf '\n=== logs deploy/%s (tail 120) ===\n' "$dep" >&2
+        kubectl -n apprafter-system logs "deploy/$dep" --all-containers --tail=120 >&2 2>&1 || true
+    done
+    # Application + ResourceClaim CRs in the workload namespace — the
+    # full status (phase, conditions) that the wait-loop only sampled.
+    printf '\n--- Application + ResourceClaim CRs (all namespaces) ---\n' >&2
+    kubectl get applications.apprafter.io -A -o wide >&2 2>&1 || true
+    kubectl get resourceclaims.apprafter.io -A -o wide >&2 2>&1 || true
+    for app in $(kubectl get applications.apprafter.io -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+        ns="${app%%/*}"; nm="${app##*/}"
+        printf '\n=== application.apprafter.io/%s (-n %s) status ===\n' "$nm" "$ns" >&2
+        kubectl -n "$ns" get application.apprafter.io "$nm" -o jsonpath=\
+'phase={.status.phase}{"\n"}conditions={range .status.conditions[*]}[{.type}={.status}: {.message}]{end}{"\n"}' \
+            >&2 2>&1 || true
+    done
     printf '\n--- recent events ---\n' >&2
     kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -60 >&2 || true
     printf '\n--- helm releases ---\n' >&2
