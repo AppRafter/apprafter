@@ -17,6 +17,20 @@ pub const GATEWAY_API_VERSION: &str = "v1.2.1";
 /// is clear from `metadata.managedFields`.
 pub const APPRAFTER_CLI_FIELD_MANAGER: &str = "apprafter-cli";
 
+/// Dedicated field manager for `apprafter platform egress set`. Distinct
+/// from [`APPRAFTER_CLI_FIELD_MANAGER`] ON PURPOSE: `cluster-bootstrap`
+/// seeds the singleton PlatformStack (with the REQUIRED `spec.source` and
+/// `spec.values`) under `apprafter-cli`. If `egress set` re-applied its
+/// partial `spec.network.egress.profile` object under that SAME manager,
+/// server-side apply would PRUNE the source/values fields `apprafter-cli`
+/// previously owned but no longer lists, and the apiserver then rejects the
+/// PlatformStack as invalid (`spec.source` / `spec.values` Required value).
+/// A separate manager owns ONLY the egress subtree, so SSA merges it onto
+/// the bootstrap-owned fields instead of pruning them. The name is also
+/// deliberately NOT Argo-CD-shaped, so `egress_field_appears_git_managed`
+/// never mistakes it for a git owner. (Walk-found, 2.10 / ADR 0045.)
+pub const APPRAFTER_CLI_EGRESS_FIELD_MANAGER: &str = "apprafter-cli-egress";
+
 /// URL of the upstream "standard install" YAML — Gateway, HTTPRoute,
 /// GRPCRoute, ReferenceGrant CRDs (the conformance baseline).
 pub fn gateway_api_crds_url() -> String {

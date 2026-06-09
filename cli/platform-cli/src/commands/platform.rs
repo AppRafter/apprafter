@@ -17,7 +17,7 @@ use tabled::{Table, Tabled};
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json, kubectl_merge_patch,
 };
-use cli_providers::k8s::kubectl::APPRAFTER_CLI_FIELD_MANAGER;
+use cli_providers::k8s::kubectl::APPRAFTER_CLI_EGRESS_FIELD_MANAGER;
 
 const PLATFORMSTACK_NAME: &str = "default";
 const PLATFORMSTACK_NAMESPACE: &str = "apprafter-system";
@@ -602,11 +602,17 @@ pub fn egress_show() -> Result<()> {
 }
 
 /// `apprafter platform egress set <profile>` — server-side apply
-/// the profile onto the singleton PlatformStack with field manager
-/// `apprafter-cli`. SSA (not merge-patch) so the value survives
-/// Argo CD self-heal: the platform-stack chart does not declare
-/// this field, so there is no conflicting owner to revert it
+/// the profile onto the singleton PlatformStack under the dedicated
+/// field manager `apprafter-cli-egress`. SSA (not merge-patch) so the
+/// value survives Argo CD self-heal: the platform-stack chart does not
+/// declare this field, so there is no conflicting owner to revert it
 /// (ADR 0045 §Decision #4 / design §E).
+///
+/// The manager is deliberately DISTINCT from `cluster-bootstrap`'s
+/// `apprafter-cli` (which owns the REQUIRED `spec.source` + `spec.values`):
+/// re-applying this partial object under that same manager would make SSA
+/// prune source/values and the apiserver would reject the PlatformStack
+/// (`Required value`). See [`APPRAFTER_CLI_EGRESS_FIELD_MANAGER`].
 pub fn egress_set(profile: &str) -> Result<()> {
     validate_egress_profile(profile)?;
     let kc = ensure_kubeconfig_tempfile()?;
@@ -637,10 +643,10 @@ pub fn egress_set(profile: &str) -> Result<()> {
         \x20   egress:\n\
         \x20     profile: {profile}\n"
     );
-    kubectl_apply_server_side(&manifest, APPRAFTER_CLI_FIELD_MANAGER, kc.path())?;
+    kubectl_apply_server_side(&manifest, APPRAFTER_CLI_EGRESS_FIELD_MANAGER, kc.path())?;
 
     println!(
-        "✓ Egress profile set to '{profile}' (field manager '{APPRAFTER_CLI_FIELD_MANAGER}')."
+        "✓ Egress profile set to '{profile}' (field manager '{APPRAFTER_CLI_EGRESS_FIELD_MANAGER}')."
     );
     println!(
         "The operator's ApplicationController re-derives each app's egress CiliumNetworkPolicy \
@@ -690,6 +696,10 @@ fn egress_field_appears_git_managed(json: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The bootstrap field manager — only referenced from the
+    // distinct-manager regression test below, so it lives here rather than
+    // at module scope (where it would be an unused import in non-test builds).
+    use cli_providers::k8s::kubectl::APPRAFTER_CLI_FIELD_MANAGER;
     use serde_json::json;
 
     use chrono::TimeZone;
@@ -1005,5 +1015,28 @@ mod tests {
             }
         });
         assert!(!egress_field_appears_git_managed(&argo_other));
+    }
+
+    #[test]
+    fn egress_set_field_manager_is_distinct_from_bootstrap_and_not_argo_shaped() {
+        // Walk-found regression (2.10 Phase 7): `cluster-bootstrap` seeds the
+        // singleton PlatformStack (with the REQUIRED spec.source + spec.values)
+        // under APPRAFTER_CLI_FIELD_MANAGER. `egress set` applies ONLY
+        // {spec.network.egress.profile}; if it shared that manager, server-side
+        // apply would PRUNE source/values and the apiserver would reject the CR
+        // ("Required value"). The two managers MUST differ.
+        assert_ne!(
+            APPRAFTER_CLI_EGRESS_FIELD_MANAGER, APPRAFTER_CLI_FIELD_MANAGER,
+            "egress set must not reuse the bootstrap field manager (SSA would prune source/values)"
+        );
+        // And the egress manager must NOT look Argo-CD-shaped, or
+        // egress_field_appears_git_managed would mis-flag it as git-owned and
+        // every `set` would print the spurious "git wins" advisory.
+        for needle in ["argocd", "argo-cd", "application-controller"] {
+            assert!(
+                !APPRAFTER_CLI_EGRESS_FIELD_MANAGER.contains(needle),
+                "egress field manager must not contain Argo-shaped substring {needle:?}"
+            );
+        }
     }
 }
