@@ -3041,14 +3041,16 @@ Tests:
 ### 2.11 SealedSecrets интеграция (Tier 1 секреты)
 > 🏁 SR: A · order 3 — SealedSecrets (default Tier-1 secrets). **Controller + `secret seal` slice carved к фронту order 3 как prereq для 1.79c** (`SourceCredential`, см. `speedrun-plan.md` §4.2); Backstage encrypt-wizard + UI rotation-warning — позже в order 3.
 
-**Поставка:**
-- [ ] Установка sealed-secrets controller.
-- [ ] CLI helper в `apprafter`: `apprafter secret seal --name foo --from-literal=...`.
-- [ ] Public-key экспортируется и публикуется в `manifests/tier-1/sealed-secrets/`.
-- [ ] Backstage UI: «Encrypt secret» wizard для Tier 1.
-- [ ] Прометейный warning в UI: «вы используете SealedSecrets — без ротации, без dynamic. Tier 2+ → OpenBao».
+> ✅ **ЗАКРЫТО (2026-06-09) — launch-scope выполнен; Backstage-UI явно отложен на пост-запуск.** Функциональная возможность шифровать секреты (launch-требование CP2 «secrets management — SealedSecrets», FEATURE_TRACKER) уже зашипана: sealed-secrets controller (платформенный компонент `component_sealed-secrets.cue`, bitnami, `fullnameOverride` пинит имя для cert-fetch) + нативный Rust-seal в `cli-providers::k8s::sealing` + команда `apprafter secret seal` — всё поставлено форвард-слайсом S0 (v0.1.175) как prereq для 1.79c (ADR 0039). CLI приватный ключ не держит: cert фетчится **живьём** из контроллера через kube API service-proxy. Acceptance (CLI шифрует → commit → Argo синкает → в кластере обычный Secret) достижим уже сегодня. **Отложено на пост-запуск (см. ниже #4/#5):** Backstage encrypt-wizard + posture-warning — порталь­ный UI, который НЕ входит в launch-минимум Backstage (launch-checklist §1.1 = Application/ResourceClaim/AccessGrant/Notifications плагины) и едет в **post-launch first bundle (PL1)** рядом с MigrationPlan approval-UI (FEATURE_TRACKER PL1; ADR 0036 «a Backstage approval surface follows in the post-launch bundle»; hosted-portal buildout = CP4). **#3 снят как OBSOLETE** — live cert-fetch вытеснил статический pubkey-файл. Docs-only закрытие (контроллер+seal зашипаны ранее) — без version-bump/тега. **NB: 2.11 ≠ закрытие Фазы 2** — §6 M2 НЕ флипать (закроется после 2.12). Launch-time secret-история продолжается OpenBao + migration-path (launch-checklist §1.1) в Фазе 3+.
 
-**Acceptance:** разработчик через CLI шифрует секрет, коммитит, Argo CD синкает, в кластере появляется обычный Secret.
+**Поставка:**
+- [x] Установка sealed-secrets controller. ✅ S0/v0.1.175 (`component_sealed-secrets.cue`).
+- [x] CLI helper в `apprafter`: `apprafter secret seal --name foo --from-literal=...`. ✅ S0/v0.1.175 (нативный Rust-seal, `secret.rs` + `sealing.rs`).
+- [x] ~~Public-key экспортируется и публикуется в `manifests/tier-1/sealed-secrets/`.~~ **OBSOLETE** — CLI фетчит cert живьём через kube API service-proxy (`fetch_controller_public_key`); статический pubkey-файл не нужен.
+- [ ] Backstage UI: «Encrypt secret» wizard для Tier 1. → **ОТЛОЖЕНО: post-launch portal bundle (PL1)**.
+- [ ] Прометейный warning в UI: «вы используете SealedSecrets — без ротации, без dynamic. Tier 2+ → OpenBao». → **ОТЛОЖЕНО: post-launch portal bundle (PL1)**.
+
+**Acceptance:** разработчик через CLI шифрует секрет, коммитит, Argo CD синкает, в кластере появляется обычный Secret. ✅ достижимо через зашипанный `apprafter secret seal` + контроллер.
 
 **Зависит от:** 1.5
 
