@@ -119,6 +119,13 @@ jobs:
           }
           spec: image: "nginxdemos/hello:plain-text"
           EOF
+          # 2.12f (ADR 0046): the entrypoint now WRITES into the package
+          # dir — cue.mod/ + the generated apprafter_claim_gen.cue sibling
+          # (schema + claim binding injection). Argo CD's real CMP hands
+          # the plugin (uid 999) a writable repo copy; this bind-mounted
+          # fixture is root-owned, so make it writable to match — else the
+          # render dies with "mkdir: .../cue.mod: Permission denied".
+          chmod -R 0777 /tmp/cue-smoke
           out=$(docker run --rm \
               -v /tmp/cue-smoke:/repo \
               -w /repo \
@@ -172,6 +179,9 @@ jobs:
           	}
           }
           EOF
+          # Same writability requirement as the first smoke: uid 999 must
+          # write apprafter_claim_gen.cue and inject-wins into cue.mod/pkg.
+          chmod -R 0777 "$root"
           out=$(docker run --rm \
               -v "$root":/repo \
               -w /repo \
