@@ -9,6 +9,8 @@
 **Status:** `☐` not started · `🚧` in progress · `✅` done
 **Checkpoints:** `CP1` Tier-1 demo · `CP2` Tier-1 demo+ · `CP3` Tier-2 demo (full OSS core) · `CP4` MVP (managed) · `CP5` MVP+ (Tier-1→Tier-2 migration)
 
+> `✅` means delivered **and** verified (a passing live walk / e2e), not merely "code committed." `🚧` means partially landed. Where a capability is delivered but a part of it (e.g. its portal surface) is deferred, the row carries a note. Committed-vs-pushed is not tracked here — the tracker ships in the same push as the code it describes.
+
 ---
 
 ## Baseline — Phase 0–1 (shipped)
@@ -31,7 +33,9 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 | Status | Feature | plan.md | Checkpoint |
 |---|---|---|---|
-| 🚧 | Platform self-updates via GitOps (self-reconcile; substrate for managed updates) | 1.66–1.83 subset | CP1 |
+| ✅ | Platform self-updates via GitOps (self-reconcile; substrate for managed updates) | 1.66–1.83 subset | CP1 |
+
+> Self-update is live — every Phase-2 release lands on test clusters by GitOps convergence, no re-bootstrap. The M1.5 §6 milestone box still awaits the first green e2e CI run (the sandbox can't run k3d); that is bookkeeping, not feature availability.
 
 ---
 
@@ -39,9 +43,9 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 | Status | Feature | plan.md | Checkpoint |
 |---|---|---|---|
-| ☐ | MCP-native safety gate: destructive operations are paused (`MigrationPlan` CRD), approve/reject via CLI | 1.72–1.78 condensed | CP1 |
+| ✅ | MCP-native safety gate: destructive operations are paused (`MigrationPlan` CRD), approve/reject via CLI | 1.72–1.78 condensed | CP1 |
 
-> The hosted MCP endpoint itself is in the managed section. At launch, approval is available via the CLI and Argo CD buttons; a dedicated Backstage MigrationPlan plugin lands post-launch (PL1).
+> Delivered as a full vertical: `MigrationPlan` CRD + reconciler + admission webhook + `apprafter migration list/approve/reject`. The **hosted MCP endpoint** itself is in the managed section. At launch, approval is available via the CLI and Argo CD buttons; a dedicated Backstage MigrationPlan plugin lands post-launch (PL1).
 
 ---
 
@@ -49,14 +53,15 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 | Status | Feature | plan.md | Checkpoint |
 |---|---|---|---|
-| ☐ | On-demand Postgres (`needs.pg`, CloudNativePG) | 2.1–2.4 | CP2 |
-| ☐ | On-demand Redis cache (`needs.redis`, Dragonfly) | 2.6 | CP2 |
-| ☐ | On-demand block storage (`needs.disk`) | 2.6b | CP2 |
-| ☐ | Reference secrets/claims directly in `Application.env` (`secret()` / `claim.*`) | 2.12 | CP2 |
-| ☐ | Secrets management — SealedSecrets (encrypted secrets in Git) | 2.11 | CP2 |
-| ☐ | Deploy from private repos (`SourceCredential`: git + registry credentials from one source) | 1.79c | CP2 |
+| ✅ | On-demand Postgres (`needs.pg`, CloudNativePG) | 2.1–2.4 | CP2 |
+| ✅ | On-demand Redis cache (`needs.redis`, Dragonfly) | 2.6 | CP2 |
+| ✅ | On-demand block storage (`needs.disk`) | 2.6b | CP2 |
+| ✅ | Reference secrets/claims directly in `Application.env` (`secret()` / `claim.*`) | 2.12 | CP2 |
+| ✅ | Secrets management — SealedSecrets (encrypted secrets in Git) | 2.11 | CP2 |
+| 🚧 | Deploy from private repos (`SourceCredential`: git + registry credentials from one source) | 1.79c | CP2 |
 
-> Invisible infrastructure in order 3 (auto-`NetworkPolicy` derivation from `needs`, 2.10) is not a tracker row — it ships alongside `needs.*` as a security default.
+> Invisible infrastructure in order 3 (auto-`NetworkPolicy` derivation from `needs`, 2.10) is not a tracker row — it shipped alongside `needs.*` as a security default.
+> Caveats: **2.11** ships the seal capability + `apprafter secret seal`; the Backstage encrypt-wizard is deferred to PL1. **1.79c** is `🚧` — S0–S4 land the vertical (CRD + controller + webhook + `apprafter repo creds`); S5 + the manual walk remain.
 
 ---
 
