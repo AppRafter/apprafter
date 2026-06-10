@@ -12,6 +12,7 @@ members = [
     "operator-controllers/resourceclaim-provisioner",
     "operator-core",
     "operator-rendering",
+    "crdgen",
 ]
 
 [workspace.package]
@@ -48,6 +49,7 @@ async-trait        = "0.1"
 flate2             = "1.0"
 tar                = "0.4"
 rand               = "0.8"
+anyhow             = "1"
 
 [profile.release]
 lto           = "thin"

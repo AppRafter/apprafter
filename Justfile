@@ -83,9 +83,15 @@ test:
         echo "==> no package.json — skipping bun test"
     fi
 
-# Validate every hand-rolled CRD against a REAL apiserver (ephemeral kind
-# cluster). `helm lint` does NOT catch CRD structural-schema errors — only
-# the apiserver does — so run this before any CRD-changing release. Fast
+# Generate the operator chart CRDs from the v1alpha1 CUE schemas (ADR 0047).
+# CUE is the single source of truth; the crd-*.yaml files are GENERATED and
+# committed. Run after any schema change, then `just crd-check` gates drift.
+gen-crds:
+    cd operator && cargo run -q -p crdgen -- generate
+
+# Validate every CRD against a REAL apiserver (ephemeral kind cluster).
+# `helm lint` does NOT catch CRD structural-schema errors — only the
+# apiserver does — so run this before any CRD-changing release. Fast
 # (~30s) focused CRD gate; `just e2e` is the comprehensive backstop.
 # Requires kind + a working docker/podman.
 crd-validate:

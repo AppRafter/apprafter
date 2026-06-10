@@ -299,3 +299,35 @@ _mkFields: {
 	// verbatim, no registry poll.
 	resolve?: "digest" | "off"
 }
+
+// _crdMetas (ADR 0047): CRD-generation metadata read by `crdgen` via
+// `cue export -e _crdMetas`. Hidden, so it never reaches the OpenAPI
+// schema export. Each schema file contributes its kind's entry to this
+// shared open map; distinct keys unify without conflict.
+_crdMetas: Application: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "applications"
+		singular: "application"
+		kind:     "Application"
+		listKind: "ApplicationList"
+		shortNames: ["app", "apps"]
+	}
+	annotations: {
+		"argocd.argoproj.io/sync-wave":    "-5"
+		"argocd.argoproj.io/sync-options": "ServerSideApply=true"
+	}
+	subresources: status: {}
+	printerColumns: [{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"}]
+
+	// CRD-only constraints kept out of the CUE type (image stays
+	// `string` in cue vet per the validation policy; the non-empty
+	// rule lives in the CRD + webhook). Paths are relative to `spec`;
+	// `[*]` descends into a map's additionalProperties.
+	schemaPatches: {
+		"base.image": {pattern: "^.+$"}
+		"environments[*].image": {pattern: "^.+$"}
+	}
+}

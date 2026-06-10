@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//! crdgen — generate Kubernetes CRDs from the v1alpha1 CUE schemas
+//! (ADR 0047). `generate` writes the operator chart's `crd-*.yaml` from
+//! `schemas/v1alpha1`; `check` (Phase 2) gates CUE↔committed and
+//! Rust↔CUE drift. CUE is the source of truth — this tool is only the
+//! transform engine, like `cli-providers/build.rs`.
+
+mod cue;
+mod envelope;
+mod structural;
+
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+
+/// An in-scope CRD: the `components.schemas` component name (also the
+/// `_crdMetas` key) and the chart file stem.
+struct Crd {
+    component: &'static str,
+    file_stem: &'static str,
+}
+
+/// Phase 1 ships Application; the other six land in Phase 3 (ADR 0047).
+const CRDS: &[Crd] = &[Crd {
+    component: "Application",
+    file_stem: "crd-application",
+}];
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("generate") => generate(),
+        Some("check") => bail!("`crdgen check` lands in Phase 2 (ADR 0047)"),
+        other => bail!("usage: crdgen <generate|check>; got {other:?}"),
+    }
+}
+
+fn find_repo_root() -> Result<PathBuf> {
+    let mut dir = std::env::current_dir()?;
+    loop {
+        if dir.join("cue.mod/module.cue").exists() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            bail!("could not locate repo root (no cue.mod/module.cue above CWD)");
+        }
+    }
+}
+
+fn generate() -> Result<()> {
+    let root = find_repo_root()?;
+    let schemas = cue::export_schemas(&root)?;
+    let metas = cue::export_crd_metas(&root)?;
+    let templates = root.join("operator/charts/apprafter-operator/templates");
+
+    for crd in CRDS {
+        let component = schemas
+            .get(crd.component)
+            .with_context(|| format!("components.schemas missing {}", crd.component))?;
+        let props = component
+            .get("properties")
+            .and_then(Value::as_object)
+            .with_context(|| format!("{} has no properties", crd.component))?;
+
+        let meta = metas
+            .get(crd.component)
+            .with_context(|| format!("_crdMetas missing {}", crd.component))?;
+
+        let spec_in = props
+            .get("spec")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object" }));
+        let mut spec = structural::resolve(&spec_in, &schemas);
+        // CRD-only constraints CUE deliberately keeps out of `cue vet`
+        // (e.g. the image non-empty pattern) are restored here.
+        if let Some(patches) = meta.get("schemaPatches").and_then(Value::as_object) {
+            structural::apply_patches(&mut spec, patches)?;
+        }
+
+        // status is operator-owned: tolerate any shape the operator writes.
+        let status = match props.get("status") {
+            Some(s) => {
+                let mut r = structural::resolve(s, &schemas);
+                if let Some(o) = r.as_object_mut() {
+                    o.insert("x-kubernetes-preserve-unknown-fields".into(), json!(true));
+                }
+                r
+            }
+            None => json!({ "type": "object", "x-kubernetes-preserve-unknown-fields": true }),
+        };
+
+        let crd_obj = envelope::build_crd(meta, spec, status)?;
+        let source = format!("schemas/v1alpha1 ({} via _crdMetas)", crd.component);
+        let text = envelope::render(&source, &crd_obj)?;
+
+        let out = templates.join(format!("{}.yaml", crd.file_stem));
+        std::fs::write(&out, text).with_context(|| format!("write {}", out.display()))?;
+        eprintln!("generated {}", out.display());
+    }
+    Ok(())
+}
