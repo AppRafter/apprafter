@@ -66,3 +66,11 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0036 | [MCP server and agentic-safety model — structural enforcement at the platform boundary](./0036-mcp-agentic-safety.md) | Accepted |
 | 0037 | [Managed control plane infrastructure — dogfooded on AppRafter, rescue-cluster recovery](./0037-managed-control-plane-infrastructure.md) | Accepted |
 | 0038 | [Tier 2 default is an HA substrate only; hard multi-tenancy via Kamaji is opt-in](./0038-tier2-kamaji-opt-in.md) | Accepted |
+| 0039 | [SourceCredential — per-repo image-registry credential binding](./0039-source-credential.md) | Accepted |
+| 0040 | [Image tag-to-digest resolution and automatic rollout](./0040-image-digest-resolution.md) | Accepted |
+| 0041 | [Channel-tag resolver — O(1) fast path for channel-latest version resolution](./0041-channel-tag-version-resolution.md) | Accepted |
+| 0042 | [needs.redis → Dragonfly, per-database isolation, acl_reconcile](./0042-needs-redis-dragonfly.md) | Accepted |
+| 0043 | [needs.disk → persistent block storage, named multi-claim `needs` format](./0043-needs-disk-named-claims.md) | Accepted |
+| 0044 | [Per-environment deploy via a deploy-time, per-Application env selector](./0044-per-environment-deploy.md) | Accepted |
+| 0045 | [needs → CiliumNetworkPolicy egress auto-derivation, config-driven cluster egress profile](./0045-needs-networkpolicy-egress.md) | Accepted |
+| 0046 | [`Application.env` value references — claim and secret sources](./0046-env-value-references.md) | Accepted |
