@@ -124,7 +124,7 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     let app_environment = obj.get("environment").and_then(|v| v.as_str());
 
     validate_needs_names(base, envs, &mut errors);
-    validate_reserved_env_collision(base, envs, &mut errors);
+    validate_env_refs(base, envs, &mut errors);
     validate_disk_claims(base, envs, &mut errors);
     validate_spec_environment(app_environment, envs, &mut errors);
 
@@ -517,123 +517,278 @@ fn validate_disk_claims(
     }
 }
 
-/// 2.6b (ADR 0043): fold a `(type, name)` entry name into a valid
-/// env-var-NAME segment — uppercase ASCII letters and map `-` → `_`.
-/// KEEP IN SYNC with operator-rendering `fold_env_segment`. The
-/// reserved env NAME of a named service claim is `<VAR>_<fold(name)>`.
-fn fold_env_segment(name: &str) -> String {
-    name.chars()
-        .map(|ch| match ch {
-            '-' => '_',
-            other => other.to_ascii_uppercase(),
-        })
-        .collect()
+/// pg connection-Secret field vocabulary (ADR 0046).
+const PG_FIELDS: &[&str] = &["url", "user", "pass", "host", "port", "db"];
+/// redis connection-Secret field vocabulary (ADR 0046).
+const REDIS_FIELDS: &[&str] = &["url", "user", "pass", "host", "port", "db", "channelPrefix"];
+/// Service types that have a connection Secret at launch (ADR 0046).
+/// `disk` and the deferred types (jetstream, clickhouse, s3, notifications)
+/// do NOT have a connection Secret.
+const CLAIM_SUPPORTED_TYPES: &[(&str, &[&str])] = &[("pg", PG_FIELDS), ("redis", REDIS_FIELDS)];
+/// Types that exist in the platform but have no connection Secret — any
+/// `claim.<type>.*` ref to them is rejected at the webhook.
+const CLAIM_UNSUPPORTED_TYPES: &[&str] =
+    &["disk", "jetstream", "clickhouse", "s3", "notifications"];
+
+/// 2.12 (ADR 0046): compute the effective `needs` map for a given scope.
+/// Base scope: just `base.needs`. Per-environment scope: base.needs
+/// merged per-key with environments[name].needs (override-wins per key),
+/// matching the renderer's `effective_spec` logic.
+///
+/// Returns a `serde_json::Map` of `type → value` representing the
+/// merged needs for the scope.  The returned map is constructed from
+/// references so no cloning of the large tree is needed — callers only
+/// read the type keys and their entry shapes.
+fn effective_needs_for_scope<'a>(
+    base: Option<&'a serde_json::Map<String, Value>>,
+    env_scope: Option<&'a serde_json::Map<String, Value>>,
+) -> std::collections::HashMap<&'a str, &'a Value> {
+    let mut merged: std::collections::HashMap<&str, &Value> = std::collections::HashMap::new();
+    // Start from base.
+    if let Some(base_needs) = base
+        .and_then(|b| b.get("needs"))
+        .and_then(|v| v.as_object())
+    {
+        for (k, v) in base_needs {
+            merged.insert(k.as_str(), v);
+        }
+    }
+    // Override per-key with the env scope's needs.
+    if let Some(env_needs) = env_scope
+        .and_then(|e| e.get("needs"))
+        .and_then(|v| v.as_object())
+    {
+        for (k, v) in env_needs {
+            merged.insert(k.as_str(), v);
+        }
+    }
+    merged
 }
 
-/// needs-type → the env var names reserved (injected by the
-/// provisioner/renderer via `valueFrom.secretKeyRef`) when that need
-/// is declared. A user-set literal of any of these would collide with
-/// the injected value. KEEP IN SYNC with operator-rendering
-/// `NEEDS_ENV_BINDINGS` (pg→DATABASE_URL; redis→REDIS_URL,
-/// REDIS_CHANNEL_PREFIX).
-const RESERVED_ENV: &[(&str, &[&str])] = &[
-    ("pg", &["DATABASE_URL"]),
-    ("redis", &["REDIS_URL", "REDIS_CHANNEL_PREFIX"]),
-];
+/// A scope for env-ref validation: (field-path-prefix, env-value-map,
+/// env-scope-needs-obj). The third element is `None` for the base scope
+/// (no extra needs to merge in) and `Some(env_obj)` for a per-environment
+/// scope (its own `needs` override base's per-key).
+type EnvRefScope<'a> = (
+    String,
+    &'a serde_json::Map<String, Value>,
+    Option<&'a serde_json::Map<String, Value>>,
+);
 
-/// 2.4e/2.6: reject an Application that declares a `needs.<type>` AND
-/// sets a literal `env` var reserved for that need's injected
-/// connection. The reservation is GLOBAL/cross-scope: a need declared
-/// in base OR ANY environment reserves its env names everywhere across
-/// the base env block and every environment env block. Hard reject
-/// rather than warn, and multi-error with one error per offending
-/// field and no short-circuit, matching the validator contract.
-fn validate_reserved_env_collision(
+/// 2.12 (ADR 0046): validate env claim/secret refs across `base.env` and
+/// every `environments[*].env`. For each scope the effective needs are
+/// base.needs merged per-key with the scope's own needs (override-wins).
+/// Multi-error, one message per bad ref, no short-circuit.
+fn validate_env_refs(
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let need_declared = |need: &str| -> bool {
-        let declares = |obj: Option<&serde_json::Map<String, Value>>| -> bool {
-            obj.and_then(|o| o.get("needs"))
-                .and_then(|v| v.as_object())
-                .is_some_and(|n| n.contains_key(need))
-        };
-        declares(base)
-            || envs.is_some_and(|envs_obj| envs_obj.values().any(|val| declares(val.as_object())))
-    };
+    // Build the list of (field-path-prefix, env-map, effective-needs-scope-obj)
+    // for every scope we need to check.  For base the effective needs is just
+    // base.needs; for each environment it's base merged with env's own needs.
+    let mut scopes: Vec<EnvRefScope<'_>> = Vec::new();
 
-    let env_has_key = |obj: Option<&serde_json::Map<String, Value>>, key: &str| -> bool {
-        obj.and_then(|o| o.get("env"))
-            .and_then(|v| v.as_object())
-            .is_some_and(|env| env.contains_key(key))
-    };
-
-    // The set of distinct env-NAME suffixes a need declares across all
-    // scopes. The unnamed default contributes `None` (no suffix → the
-    // base `<VAR>`); a named entry contributes `Some("_<FOLD(name)>")`
-    // (→ `<VAR>_<FOLD(name)>`). 2.6b (ADR 0043): a literal env var of any
-    // reserved name (default OR suffixed) collides with the injected
-    // connection and is rejected.
-    let need_suffixes = |need: &str| -> Vec<Option<String>> {
-        let mut suffixes: Vec<Option<String>> = Vec::new();
-        let mut push_from = |obj: Option<&serde_json::Map<String, Value>>| {
-            if let Some(value) = obj
-                .and_then(|o| o.get("needs"))
+    if let Some(base_obj) = base {
+        if let Some(env_map) = base_obj.get("env").and_then(|v| v.as_object()) {
+            scopes.push(("spec.base.env".to_string(), env_map, None));
+        }
+    }
+    if let Some(envs_obj) = envs {
+        for (env_name, val) in envs_obj {
+            if let Some(env_map) = val
+                .as_object()
+                .and_then(|o| o.get("env"))
                 .and_then(|v| v.as_object())
-                .and_then(|n| n.get(need))
             {
-                for name in needs_entry_names(value) {
-                    let suffix = name.map(|n| format!("_{}", fold_env_segment(n)));
-                    if !suffixes.contains(&suffix) {
-                        suffixes.push(suffix);
-                    }
-                }
-            }
-        };
-        push_from(base);
-        if let Some(envs_obj) = envs {
-            for val in envs_obj.values() {
-                push_from(val.as_object());
-            }
-        }
-        suffixes
-    };
-
-    for (need, reserved_names) in RESERVED_ENV {
-        if !need_declared(need) {
-            continue;
-        }
-        let suffixes = need_suffixes(need);
-        for base_name in *reserved_names {
-            for suffix in &suffixes {
-                let reserved = match suffix {
-                    Some(s) => format!("{base_name}{s}"),
-                    None => base_name.to_string(),
-                };
-                if env_has_key(base, &reserved) {
-                    errors.push(ValidationError::new(
-                        format!("spec.base.env.{reserved}"),
-                        format!(
-                            "{reserved} is reserved for the connection injected by needs.{need}; remove it from spec.base.env"
-                        ),
-                    ));
-                }
-                if let Some(envs_obj) = envs {
-                    for (env_name, val) in envs_obj {
-                        if env_has_key(val.as_object(), &reserved) {
-                            errors.push(ValidationError::new(
-                                format!("spec.environments.{env_name}.env.{reserved}"),
-                                format!(
-                                    "{reserved} is reserved for the connection injected by needs.{need}; remove it from spec.environments.{env_name}.env"
-                                ),
-                            ));
-                        }
-                    }
-                }
+                scopes.push((
+                    format!("spec.environments.{env_name}.env"),
+                    env_map,
+                    val.as_object(),
+                ));
             }
         }
     }
+
+    for (prefix, env_map, env_scope) in scopes {
+        let eff_needs = effective_needs_for_scope(base, env_scope);
+
+        for (var_name, val) in env_map {
+            match val {
+                // A plain string → literal; no validation needed.
+                Value::String(_) => {}
+                // An object → must be exactly `{"claim": "..."}` or `{"secret": "..."}`
+                Value::Object(obj) => {
+                    if let Some(claim_path) = obj.get("claim").and_then(|v| v.as_str()) {
+                        validate_claim_ref(
+                            &format!("{prefix}.{var_name}"),
+                            var_name,
+                            claim_path,
+                            &eff_needs,
+                            errors,
+                        );
+                    } else if let Some(secret_path) = obj.get("secret").and_then(|v| v.as_str()) {
+                        validate_secret_ref(
+                            &format!("{prefix}.{var_name}"),
+                            var_name,
+                            secret_path,
+                            errors,
+                        );
+                    }
+                    // Other shapes are rejected by the CRD layer; nothing to add here.
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Validate a `claim` ref string (`"<type>.<field>"` or
+/// `"<type>.<name>.<field>"`). Reports one error for each violation.
+fn validate_claim_ref(
+    field_path: &str,
+    _var_name: &str,
+    path: &str,
+    eff_needs: &std::collections::HashMap<&str, &Value>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let parts: Vec<&str> = path.splitn(4, '.').collect();
+    let (service_type, name_opt, field) = match parts.as_slice() {
+        [t, f] => (*t, None, *f),
+        [t, n, f] => (*t, Some(*n), *f),
+        _ => {
+            errors.push(ValidationError::new(
+                field_path,
+                format!(
+                    "claim ref {path:?} is malformed; expected \"<type>.<field>\" or \"<type>.<name>.<field>\""
+                ),
+            ));
+            return;
+        }
+    };
+
+    // Check if the type is a known-unsupported type (disk + deferred).
+    if CLAIM_UNSUPPORTED_TYPES.contains(&service_type) {
+        errors.push(ValidationError::new(
+            field_path,
+            format!(
+                "claim ref {path:?}: type {service_type:?} has no connection Secret (disk is storage-only; jetstream/clickhouse/s3/notifications are deferred to a future release)"
+            ),
+        ));
+        return;
+    }
+
+    // Check if the type is in the effective needs for this scope.
+    if !eff_needs.contains_key(service_type) {
+        errors.push(ValidationError::new(
+            field_path,
+            format!(
+                "claim ref {path:?}: type {service_type:?} is not declared in needs for this scope; add needs.{service_type} to use a claim ref"
+            ),
+        ));
+        return;
+    }
+
+    // Check if the field is in the type's enum.
+    let type_fields = CLAIM_SUPPORTED_TYPES
+        .iter()
+        .find(|(t, _)| *t == service_type)
+        .map(|(_, fields)| *fields);
+
+    if let Some(fields) = type_fields {
+        if !fields.contains(&field) {
+            errors.push(ValidationError::new(
+                field_path,
+                format!(
+                    "claim ref {path:?}: field {field:?} is not valid for {service_type:?}; valid fields are: {}",
+                    fields.join(", ")
+                ),
+            ));
+            return;
+        }
+    }
+
+    // If a name segment is present, validate the named entry exists.
+    if let Some(name) = name_opt {
+        let need_value = eff_needs[service_type];
+        let entry_names = needs_entry_names(need_value);
+        let named_entries: Vec<&str> = entry_names.iter().filter_map(|n| *n).collect();
+        if !named_entries.contains(&name) {
+            // The need is declared but has no entry by this name.
+            // Check if it's a scalar (no named entries) vs an array lacking the name.
+            let has_any_named = !named_entries.is_empty();
+            if has_any_named {
+                errors.push(ValidationError::new(
+                    field_path,
+                    format!(
+                        "claim ref {path:?}: no entry named {name:?} in needs.{service_type}; declared names are: {}",
+                        named_entries.join(", ")
+                    ),
+                ));
+            } else {
+                errors.push(ValidationError::new(
+                    field_path,
+                    format!(
+                        "claim ref {path:?}: named ref (name={name:?}) used but needs.{service_type} is a scalar (unnamed default); omit the name segment or add a named entry"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// Validate a `secret` ref string (`"<name>/<key>"`). Reports one error
+/// for each violation.
+fn validate_secret_ref(
+    field_path: &str,
+    _var_name: &str,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(slash_pos) = path.find('/') else {
+        errors.push(ValidationError::new(
+            field_path,
+            format!(
+                "secret ref {path:?} is malformed; expected \"<name>/<key>\" (a DNS-1123 Secret name, a '/', then a key matching [-._a-zA-Z0-9]+)"
+            ),
+        ));
+        return;
+    };
+    let (name, rest) = path.split_at(slash_pos);
+    let key = &rest[1..]; // skip leading '/'
+
+    if name.is_empty() {
+        errors.push(ValidationError::new(
+            field_path,
+            format!("secret ref {path:?}: Secret name (before '/') must not be empty"),
+        ));
+    } else if !is_dns_1123_label(name) {
+        errors.push(ValidationError::new(
+            field_path,
+            format!(
+                "secret ref {path:?}: Secret name {name:?} must be a DNS-1123 label (lowercase alphanumeric + '-', start and end alphanumeric, 1..=63 chars)"
+            ),
+        ));
+    }
+
+    if key.is_empty() {
+        errors.push(ValidationError::new(
+            field_path,
+            format!("secret ref {path:?}: key (after '/') must not be empty"),
+        ));
+    } else if !is_secret_key(key) {
+        errors.push(ValidationError::new(
+            field_path,
+            format!("secret ref {path:?}: key {key:?} must match [-._a-zA-Z0-9]+"),
+        ));
+    }
+}
+
+/// Kubernetes Secret key character set: `[-._a-zA-Z0-9]+` (ADR 0046).
+fn is_secret_key(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
 }
 
 /// `spec.environment`, when present and non-empty, must name a declared
@@ -967,10 +1122,12 @@ mod tests {
             .all(|e| e.field.starts_with("spec.base.needs.")));
     }
 
-    // ---- 2.4e: DATABASE_URL is reserved when needs.pg is declared ----
+    // ---- 2.12 (ADR 0046): 2.4e collision guard REMOVED; literal DATABASE_URL is now valid ----
 
     #[test]
-    fn rejects_database_url_in_base_env_when_base_needs_pg() {
+    fn accepts_database_url_literal_under_needs_pg_2_12() {
+        // 2.12: the 2.4e collision guard is removed. A literal DATABASE_URL
+        // under needs.pg is now valid — the user owns every env-var name.
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -978,13 +1135,13 @@ mod tests {
                 "env": { "DATABASE_URL": "postgres://override" }
             }
         });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL");
+        assert!(validate_application_spec(&spec).is_empty());
     }
 
     #[test]
-    fn rejects_database_url_in_environment_env_when_base_needs_pg() {
+    fn accepts_database_url_literal_in_env_scope_under_needs_pg_2_12() {
+        // 2.12: the cross-scope collision guard is removed. A literal
+        // DATABASE_URL in an environment scope under base.needs.pg is valid.
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -994,31 +1151,13 @@ mod tests {
                 "prod": { "env": { "DATABASE_URL": "postgres://override" } }
             }
         });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].field, "spec.environments.prod.env.DATABASE_URL");
-    }
-
-    #[test]
-    fn rejects_database_url_in_base_env_when_environment_needs_pg_cross_scope() {
-        // The reservation is GLOBAL/cross-scope: pg declared in an
-        // environment reserves DATABASE_URL everywhere, including base.
-        let spec = json!({
-            "base": {
-                "image": "ghcr.io/acme/web:1.0",
-                "env": { "DATABASE_URL": "postgres://override" }
-            },
-            "environments": {
-                "prod": { "needs": { "pg": {} } }
-            }
-        });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL");
+        assert!(validate_application_spec(&spec).is_empty());
     }
 
     #[test]
     fn accepts_needs_pg_without_database_url_literal() {
+        // 2.12: literals are unconstrained; a LOG_LEVEL literal alongside
+        // needs.pg is accepted (it was before too, but tested explicitly).
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -1031,8 +1170,8 @@ mod tests {
 
     #[test]
     fn accepts_database_url_literal_when_no_needs_pg() {
-        // DATABASE_URL is reserved ONLY under needs.pg. With no pg
-        // need, a literal DATABASE_URL is a normal env var.
+        // Without needs.pg a literal DATABASE_URL is a normal env var
+        // (unchanged behavior from before 2.4e was ever introduced).
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -1043,67 +1182,9 @@ mod tests {
     }
 
     #[test]
-    fn reports_database_url_collision_in_both_base_and_environment() {
-        // Multi-error contract: a DATABASE_URL literal in BOTH base and
-        // an environment under needs.pg surfaces two errors (one per
-        // offending field), no short-circuit.
-        let spec = json!({
-            "base": {
-                "image": "ghcr.io/acme/web:1.0",
-                "needs": { "pg": {} },
-                "env": { "DATABASE_URL": "postgres://a" }
-            },
-            "environments": {
-                "prod": { "env": { "DATABASE_URL": "postgres://b" } }
-            }
-        });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 2);
-        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
-        assert!(fields.contains(&"spec.base.env.DATABASE_URL"));
-        assert!(fields.contains(&"spec.environments.prod.env.DATABASE_URL"));
-    }
-
-    // ---- 2.6-6: REDIS_URL/REDIS_CHANNEL_PREFIX reserved under needs.redis ----
-
-    #[test]
-    fn rejects_redis_reserved_env_when_needs_redis() {
-        let spec = json!({
-            "base": {
-                "image": "ghcr.io/acme/web:1.0",
-                "needs": { "redis": {} },
-                "env": { "REDIS_URL": "redis://x", "REDIS_CHANNEL_PREFIX": "p:" }
-            }
-        });
-        let errors = validate_application_spec(&spec);
-        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
-        assert!(fields.contains(&"spec.base.env.REDIS_URL"));
-        assert!(fields.contains(&"spec.base.env.REDIS_CHANNEL_PREFIX"));
-    }
-
-    #[test]
-    fn rejects_redis_reserved_env_under_environment_when_base_needs_redis() {
-        let spec = json!({
-            "base": {
-                "image": "ghcr.io/acme/web:1.0",
-                "needs": { "redis": {} }
-            },
-            "environments": {
-                "prod": { "env": { "REDIS_CHANNEL_PREFIX": "override:" } }
-            }
-        });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(
-            errors[0].field,
-            "spec.environments.prod.env.REDIS_CHANNEL_PREFIX"
-        );
-    }
-
-    #[test]
     fn accepts_redis_reserved_env_literal_when_no_needs_redis() {
-        // REDIS_URL/REDIS_CHANNEL_PREFIX are reserved ONLY under
-        // needs.redis. Without the need, they are normal env vars.
+        // Without needs.redis a literal REDIS_URL/REDIS_CHANNEL_PREFIX is
+        // a normal env var (unchanged behavior).
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -1114,27 +1195,20 @@ mod tests {
     }
 
     #[test]
-    fn pg_and_redis_reservations_coexist() {
-        // Declaring both needs reserves all three names; a collision on
-        // each surfaces independently (no cross-contamination).
+    fn accepts_redis_url_literal_under_needs_redis_2_12() {
+        // 2.12: the 2.6 redis collision guard is removed. A literal REDIS_URL
+        // under needs.redis is now valid.
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
-                "needs": { "pg": {}, "redis": {} },
-                "env": {
-                    "DATABASE_URL": "postgres://x",
-                    "REDIS_URL": "redis://y"
-                }
+                "needs": { "redis": {} },
+                "env": { "REDIS_URL": "redis://x", "REDIS_CHANNEL_PREFIX": "p:" }
             }
         });
-        let errors = validate_application_spec(&spec);
-        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
-        assert!(fields.contains(&"spec.base.env.DATABASE_URL"));
-        assert!(fields.contains(&"spec.base.env.REDIS_URL"));
-        assert_eq!(errors.len(), 2);
+        assert!(validate_application_spec(&spec).is_empty());
     }
 
-    // ---- 2.6b-2: (type, name) uniqueness + foldability + reserved-env suffix ----
+    // ---- 2.6b-2: (type, name) uniqueness + foldability (collision guard removed) ----
 
     #[test]
     fn accepts_named_pg_array_with_distinct_names() {
@@ -1221,9 +1295,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_literal_env_colliding_with_named_pg_reserved_suffix() {
-        // A named pg claim `analytics` reserves DATABASE_URL_ANALYTICS;
-        // a literal env of that name collides and is rejected.
+    fn accepts_named_pg_reserved_suffix_as_literal_2_12() {
+        // 2.12: the named-suffix collision guard is removed. A literal
+        // DATABASE_URL_ANALYTICS under needs.pg[name=analytics] is valid.
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -1231,15 +1305,13 @@ mod tests {
                 "env": { "DATABASE_URL_ANALYTICS": "postgres://override" }
             }
         });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL_ANALYTICS");
+        assert!(validate_application_spec(&spec).is_empty());
     }
 
     #[test]
-    fn rejects_literal_env_colliding_with_named_redis_reserved_suffix() {
-        // redis injects two vars; a named claim reserves BOTH suffixed
-        // names (REDIS_URL_CACHE, REDIS_CHANNEL_PREFIX_CACHE).
+    fn accepts_named_redis_reserved_suffix_as_literal_2_12() {
+        // 2.12: the named-suffix collision guard is removed. Literal
+        // REDIS_URL_CACHE / REDIS_CHANNEL_PREFIX_CACHE are valid.
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -1248,43 +1320,6 @@ mod tests {
                     "REDIS_URL_CACHE": "redis://x",
                     "REDIS_CHANNEL_PREFIX_CACHE": "p:"
                 }
-            }
-        });
-        let errors = validate_application_spec(&spec);
-        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
-        assert!(fields.contains(&"spec.base.env.REDIS_URL_CACHE"));
-        assert!(fields.contains(&"spec.base.env.REDIS_CHANNEL_PREFIX_CACHE"));
-        assert_eq!(errors.len(), 2);
-    }
-
-    #[test]
-    fn named_reserved_suffix_collision_is_cross_scope() {
-        // A pg claim named `analytics` declared in an environment
-        // reserves DATABASE_URL_ANALYTICS everywhere, including base.
-        let spec = json!({
-            "base": {
-                "image": "ghcr.io/acme/web:1.0",
-                "env": { "DATABASE_URL_ANALYTICS": "postgres://override" }
-            },
-            "environments": {
-                "prod": { "needs": { "pg": [{ "name": "analytics" }] } }
-            }
-        });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].field, "spec.base.env.DATABASE_URL_ANALYTICS");
-    }
-
-    #[test]
-    fn unnamed_default_does_not_reserve_a_suffix() {
-        // The unnamed default reserves only the base var (DATABASE_URL),
-        // never a suffixed name; a literal DATABASE_URL_FOO is free when
-        // no claim is named `foo`.
-        let spec = json!({
-            "base": {
-                "image": "ghcr.io/acme/web:1.0",
-                "needs": { "pg": {} },
-                "env": { "DATABASE_URL_FOO": "postgres://my-own" }
             }
         });
         assert!(validate_application_spec(&spec).is_empty());
@@ -1799,5 +1834,332 @@ mod tests {
     fn accepts_spec_without_environment_field() {
         let spec = json!({ "base": { "image": "x" }, "environments": { "dev": {} } });
         assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    // ---- 2.12d (ADR 0046): env claim/secret ref validation ----
+
+    #[test]
+    fn rejects_claim_ref_type_not_in_needs() {
+        // (a) `claim.foo.url` where `foo` is NOT in needs → REJECT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "FOO_URL": { "claim": "foo.url" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.FOO_URL");
+        assert!(errors[0].message.contains("foo"));
+        assert!(errors[0].message.contains("not declared in needs"));
+    }
+
+    #[test]
+    fn rejects_claim_ref_bogus_field_for_pg() {
+        // (b) `claim.pg.bogus` — field not in the pg enum → REJECT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "DB_BOGUS": { "claim": "pg.bogus" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.DB_BOGUS");
+        assert!(errors[0].message.contains("bogus"));
+        assert!(errors[0].message.contains("not valid for"));
+    }
+
+    #[test]
+    fn rejects_claim_ref_disk_has_no_connection_secret() {
+        // (c) `claim.disk.url` — disk has no connection Secret → REJECT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "disk": { "size": "1Gi", "mountPath": "/data" } },
+                "env": { "DISK_URL": { "claim": "disk.url" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        // There may be additional errors from the disk validation shape,
+        // but the claim-ref error must be present.
+        let claim_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.env.DISK_URL")
+            .collect();
+        assert_eq!(claim_errs.len(), 1);
+        assert!(claim_errs[0].message.contains("disk"));
+        assert!(claim_errs[0].message.contains("no connection Secret"));
+    }
+
+    #[test]
+    fn rejects_claim_ref_named_on_scalar_need() {
+        // (d) `claim.pg.main.url` where needs.pg is scalar → REJECT (named
+        // ref on scalar). Named ref on array WITH "main" → ACCEPT.
+        let spec_reject = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "DB_MAIN": { "claim": "pg.main.url" } }
+            }
+        });
+        let errors = validate_application_spec(&spec_reject);
+        assert_eq!(errors.len(), 1, "scalar need: named ref must be rejected");
+        assert_eq!(errors[0].field, "spec.base.env.DB_MAIN");
+        assert!(errors[0].message.contains("named ref") || errors[0].message.contains("scalar"));
+
+        // With a named array entry `main` → ACCEPT.
+        let spec_accept = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "main" }] },
+                "env": { "DB_MAIN": { "claim": "pg.main.url" } }
+            }
+        });
+        assert!(
+            validate_application_spec(&spec_accept).is_empty(),
+            "named array entry: named ref must be accepted"
+        );
+    }
+
+    #[test]
+    fn rejects_secret_ref_no_slash() {
+        // (e) `secret: ""` and `secret: "nokey"` (no `/`) → REJECT.
+        let spec_empty = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "KEY": { "secret": "" } }
+            }
+        });
+        let errors = validate_application_spec(&spec_empty);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.KEY");
+        assert!(errors[0].message.contains("malformed"));
+
+        let spec_nokey = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "KEY": { "secret": "nokey" } }
+            }
+        });
+        let errors = validate_application_spec(&spec_nokey);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.KEY");
+        assert!(errors[0].message.contains("malformed"));
+    }
+
+    #[test]
+    fn accepts_literal_database_url_under_needs_pg_2_12_guard_removed() {
+        // (f) a literal `env.DATABASE_URL` under needs.pg → ACCEPT.
+        // The 2.4e collision/reserved guard is removed.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "DATABASE_URL": "postgres://override" }
+            }
+        });
+        assert!(
+            validate_application_spec(&spec).is_empty(),
+            "literal DATABASE_URL under needs.pg must be accepted after 2.4e guard removal"
+        );
+    }
+
+    #[test]
+    fn accepts_fully_valid_app_with_literal_claim_and_secret_refs() {
+        // (g) a fully-valid app: literal + claim.pg.url + claim.pg.pass
+        //     + secret stripe/api-key → ACCEPT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": {
+                    "LOG_LEVEL": "info",
+                    "DATABASE_URL": { "claim": "pg.url" },
+                    "DB_PASS": { "claim": "pg.pass" },
+                    "STRIPE_KEY": { "secret": "stripe/api-key" }
+                }
+            }
+        });
+        assert!(
+            validate_application_spec(&spec).is_empty(),
+            "fully valid app with literal + claim + secret refs must be accepted"
+        );
+    }
+
+    #[test]
+    fn rejects_claim_ref_deferred_type_jetstream() {
+        // A claim ref to a deferred type (jetstream) is rejected even
+        // if declared in needs.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "jetstream": {} },
+                "env": { "JS_URL": { "claim": "jetstream.url" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let claim_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.env.JS_URL")
+            .collect();
+        assert_eq!(claim_errs.len(), 1);
+        assert!(
+            claim_errs[0].message.contains("deferred")
+                || claim_errs[0].message.contains("no connection Secret")
+        );
+    }
+
+    #[test]
+    fn rejects_claim_ref_malformed_too_many_segments() {
+        // More than 3 segments is malformed.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": { "DB": { "claim": "pg.a.b.c" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.DB");
+        assert!(errors[0].message.contains("malformed"));
+    }
+
+    #[test]
+    fn claim_ref_env_scope_uses_effective_needs_not_just_env_needs() {
+        // `environments.prod.env` has a claim.redis.url ref. base.needs.redis
+        // is declared (not prod.needs). The effective needs for prod is
+        // base.needs merged with prod.needs (empty) → redis IS in effective
+        // needs → ACCEPT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "redis": {} }
+            },
+            "environments": {
+                "prod": { "env": { "REDIS_URL": { "claim": "redis.url" } } }
+            }
+        });
+        assert!(
+            validate_application_spec(&spec).is_empty(),
+            "env scope should inherit base needs when checking claim refs"
+        );
+    }
+
+    #[test]
+    fn claim_ref_env_scope_overridden_need_replaces_base() {
+        // prod.needs.pg overrides base.needs.redis (different type, so
+        // base.needs.redis is still in the merged effective).
+        // prod.env has claim.redis.url → redis IS in effective needs → ACCEPT.
+        // prod.env has claim.pg.url → pg IS in effective needs (from prod.needs) → ACCEPT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "redis": {} }
+            },
+            "environments": {
+                "prod": {
+                    "needs": { "pg": {} },
+                    "env": {
+                        "REDIS_CONN": { "claim": "redis.url" },
+                        "DB_URL": { "claim": "pg.url" }
+                    }
+                }
+            }
+        });
+        assert!(
+            validate_application_spec(&spec).is_empty(),
+            "per-key needs merge: both inherited redis and overriding pg should be accessible"
+        );
+    }
+
+    #[test]
+    fn rejects_claim_ref_named_entry_not_found_in_array() {
+        // claim.pg.missing.url where needs.pg has [name=main] but not
+        // name=missing → REJECT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": [{ "name": "main" }] },
+                "env": { "DB": { "claim": "pg.missing.url" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.DB");
+        assert!(
+            errors[0].message.contains("missing") || errors[0].message.contains("no entry named")
+        );
+    }
+
+    #[test]
+    fn accepts_secret_ref_valid_dns_name_and_key() {
+        // A well-formed `secret: "stripe/api-key"` → ACCEPT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "STRIPE_KEY": { "secret": "stripe/api-key" } }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn rejects_secret_ref_bad_dns_name() {
+        // Secret name with uppercase is not DNS-1123 → REJECT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "KEY": { "secret": "BadName/key" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.KEY");
+        assert!(errors[0].message.contains("DNS-1123"));
+    }
+
+    #[test]
+    fn rejects_secret_ref_empty_key() {
+        // `secret: "myname/"` — key is empty → REJECT.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "KEY": { "secret": "myname/" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.env.KEY");
+        assert!(errors[0].message.contains("key"));
+    }
+
+    #[test]
+    fn env_ref_validation_multi_error_no_short_circuit() {
+        // Two bad refs → two errors, no short-circuit.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "pg": {} },
+                "env": {
+                    "DB_BOGUS": { "claim": "pg.bogus" },
+                    "BAD_SEC": { "secret": "nokey" }
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let claim_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.env.DB_BOGUS")
+            .collect();
+        let secret_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.env.BAD_SEC")
+            .collect();
+        assert_eq!(claim_errs.len(), 1);
+        assert_eq!(secret_errs.len(), 1);
     }
 }
