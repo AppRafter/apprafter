@@ -21,12 +21,15 @@ on:
   pull_request:
     paths:
       - 'argocd-cue-cmp/**'
+      # 2.12f: the image bundles schemas/v1alpha1 (ADR 0046).
+      - 'schemas/v1alpha1/**'
       - '.github/workflows/argocd-cue-cmp-check.yml'
       - '.github/workflows/argocd-cue-cmp-publish.yml'
   push:
     branches: [master]
     paths:
       - 'argocd-cue-cmp/**'
+      - 'schemas/v1alpha1/**'
       - '.github/workflows/argocd-cue-cmp-check.yml'
       - '.github/workflows/argocd-cue-cmp-publish.yml'
 
@@ -68,7 +71,9 @@ jobs:
       - name: Image smoke build (no push)
         uses: docker/build-push-action@v5
         with:
-          context: argocd-cue-cmp
+          # Repo-root context (2.12f): the image bundles the AppRafter
+          # CUE schema (schemas/v1alpha1) alongside the sidecar files.
+          context: .
           file: argocd-cue-cmp/Dockerfile
           push: false
           load: true
@@ -194,8 +199,12 @@ jobs:
             echo "::notice::${TAG} not on origin yet — version.cue is in-flight, drift check no-op."
             exit 0
           fi
-          # Pathspec covers ONLY files that affect the built
-          # image — Dockerfile + entrypoint.sh + plugin.yaml.
+          # Pathspec covers files that affect the built image —
+          # Dockerfile + entrypoint.sh + plugin.yaml, PLUS the
+          # bundled AppRafter CUE schema (2.12f / ADR 0046): the
+          # image now COPYs `schemas/v1alpha1/*.cue`, so a schema
+          # change IS an image change and must ride a version bump
+          # (the entrypoint injects the schema it ships with).
           # `version.cue` is metadata (the version itself, not
           # image source); editing it IS the version bump, so
           # the detect job's `cue export -e version` + tag-
@@ -209,11 +218,12 @@ jobs:
           if git diff --quiet "${TAG}" HEAD -- \
               'argocd-cue-cmp/Dockerfile' \
               'argocd-cue-cmp/plugin.yaml' \
-              'argocd-cue-cmp/entrypoint.sh'; then
+              'argocd-cue-cmp/entrypoint.sh' \
+              'schemas/v1alpha1'; then
             echo "::notice::No drift vs ${TAG} — image source unchanged."
             exit 0
           fi
-          echo "::error::Image source under argocd-cue-cmp/ changed since ${TAG} was published, but version.cue is still ${VERSION}."
+          echo "::error::Image source for argocd-cue-cmp (sidecar files or bundled schemas/v1alpha1) changed since ${TAG} was published, but version.cue is still ${VERSION}."
           echo "::error::Either bump argocd-cue-cmp/version.cue, or revert the source changes."
           echo ""
           echo "--- Diff vs ${TAG} (truncated to 80 lines) ---"
@@ -221,5 +231,6 @@ jobs:
             'argocd-cue-cmp/Dockerfile' \
             'argocd-cue-cmp/plugin.yaml' \
             'argocd-cue-cmp/entrypoint.sh' \
+            'schemas/v1alpha1' \
             | head -80 || true
           exit 1

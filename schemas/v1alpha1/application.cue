@@ -113,11 +113,27 @@ package v1alpha1
 // claim payload:  "<type>.<field>"  or  "<type>.<name>.<field>"
 // secret payload: "<name>/<key>"
 
-// The per-network-need field set (keys the provisioner writes into the
-// connection Secret). pg + redis only ship connection Secrets today.
-_pgFieldNames: ["url", "user", "pass", "host", "port", "db"]
-_redisFieldNames: ["url", "user", "pass", "host", "port", "db", "channelPrefix"]
-_fieldsFor: {pg: _pgFieldNames, redis: _redisFieldNames}
+// #ClaimFieldsFor — the per-network-need field set (the keys each
+// provisioner writes into the connection Secret). pg + redis only ship
+// connection Secrets today. This is the SINGLE SOURCE OF TRUTH for the
+// claim field vocabulary, shared by:
+//   - the operator renderer's secretKeyRef key resolution,
+//   - the admission webhook's enum validation,
+//   - the cue-cmp / `apprafter app validate` generated `claim` binding.
+//
+// It is an EXPORTED DEFINITION (`#`), not a hidden field, on purpose: the
+// generated `claim` sibling file lives in the USER'S manifest package and
+// must reference this table ACROSS the `apprafter.io/schemas/v1alpha1`
+// import boundary. Hidden `_`-fields are package-private (invisible to
+// importers); definitions are exported and — like all definitions — never
+// appear in concrete `cue export` output, so the CRD is unaffected.
+#ClaimFieldsFor: {
+	pg: ["url", "user", "pass", "host", "port", "db"]
+	redis: ["url", "user", "pass", "host", "port", "db", "channelPrefix"]
+}
+
+// Hidden mirror for same-package use inside #MkClaim below.
+_fieldsFor: #ClaimFieldsFor
 
 // _mkFields — markers for one (need[,name]) claim. Each field becomes a
 // {claim: "<type>[.<name>].<field>"} marker (string-discriminated).
@@ -129,10 +145,34 @@ _mkFields: {
 	for f in _fields {(f): {claim: "\(_seg).\(f)"}}
 }
 
-// _mkClaim — derive the `claim` binding from an effective `needs` value.
-// A later task (cue-cmp + `apprafter app validate`) injects
-// `claim: _mkClaim & {_needs: <needs>}` so `claim.pg.url` resolves AND a
-// reference to an undeclared need / non-enum field is a `cue` error.
+// #MkClaim — derive a `claim` binding from an effective `needs` value, for
+// SAME-PACKAGE use (e.g. a reference manifest co-located with the schema).
+//
+// CROSS-PACKAGE LIMITATION (de-risked on real cue, 2026-06-09 / 2.12f):
+// CUE does NOT re-evaluate a struct-comprehension that consumes a field
+// supplied via cross-package unification. `v1alpha1.#MkClaim & {_needs: …}`
+// referenced from the user's manifest package yields `{}` — the
+// `for type, n in _needs { … }` loop already ran (over an empty `_needs`)
+// inside this package and unifying a value afterward across the import
+// boundary does not re-trigger it. (Same-package the loop DOES re-run, so
+// #MkClaim is usable from within v1alpha1.) This holds for plain fields,
+// hidden fields, AND definitions — it is comprehension re-evaluation, not
+// visibility, that the boundary blocks.
+//
+// Therefore the cue-cmp (at render) and `apprafter app validate` (locally)
+// do NOT emit `claim: v1alpha1.#MkClaim & {_needs: …}`. They generate a
+// sibling file that runs the comprehension IN the manifest's package,
+// referencing only the exported `#ClaimFieldsFor` table cross-package:
+//
+//	claim: {
+//	    for type, n in <manifest needs> if (v1alpha1.#ClaimFieldsFor[type] != _|_) {
+//	        (type): { …same body as below, with #ClaimFieldsFor[type]… }
+//	    }
+//	}
+//
+// `#MkClaim` keeps that body as the canonical reference shape; the
+// generators inline a structurally-identical comprehension. `#ClaimFieldsFor`
+// is the single cross-package source of truth both depend on.
 //
 // Scalar `needs: {pg: {}}` → `claim.pg.url` (unnamed default).
 // Named-only array `[{name:"main"},{name:"ro"}]` → `claim.pg.main.url` /
@@ -143,7 +183,7 @@ _mkFields: {
 // Array branch uses `let _nm = [if e.name != _|_ {e.name}, ""][0]` to
 // coalesce each entry's name to "" when absent — avoids bottoming on
 // `(e.name)` as a dynamic key for the unnamed-entry case.
-_mkClaim: {
+#MkClaim: {
 	_needs: {...}
 	for type, n in _needs if (_fieldsFor[type] != _|_) {
 		(type): {

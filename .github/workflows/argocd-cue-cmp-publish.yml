@@ -28,6 +28,16 @@ on:
     branches: [master]
     paths:
       - 'argocd-cue-cmp/**'
+      # 2.12f (ADR 0046): the image bundles the AppRafter CUE schema
+      # (`schemas/v1alpha1/`) so the entrypoint can inject the current
+      # schema into the render workspace. A schema change must be able
+      # to ride a cue-cmp version bump out to clusters — but a schema
+      # edit ALONE is a no-op here (the `detect` job's version gate
+      # only publishes when `version.cue` is bumped). Including the
+      # path makes the workflow RUN on schema changes; the gate keeps
+      # it idempotent until version.cue moves (the coordinated release
+      # bumps both together).
+      - 'schemas/v1alpha1/**'
       - '.github/workflows/argocd-cue-cmp-publish.yml'
   workflow_dispatch:
     inputs:
@@ -184,7 +194,12 @@ jobs:
         id: build
         uses: docker/build-push-action@v5
         with:
-          context: argocd-cue-cmp
+          # Context is the REPO ROOT (2.12f): the image bundles both
+          # the sidecar files under `argocd-cue-cmp/` AND the
+          # AppRafter CUE schema under `schemas/v1alpha1/` (ADR 0046
+          # Decision #7). The Dockerfile COPYs are path-qualified
+          # accordingly.
+          context: .
           file: argocd-cue-cmp/Dockerfile
           push: true
           # Image tag carries the `v` prefix to match the git

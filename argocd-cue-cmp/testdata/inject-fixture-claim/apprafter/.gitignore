@@ -1,0 +1,6 @@
+# Injected by entrypoint.sh at render time (2.12f / ADR 0046),
+# ephemeral on a real cluster. test-inject.sh scrubs these after each
+# run; gitignore is a belt-and-suspenders guard so an interrupted run
+# can't leave them staged.
+/cue.mod/
+/apprafter_claim_gen.cue

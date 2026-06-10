@@ -81,13 +81,32 @@ COPY --from=fetcher /tmp/cue /usr/local/bin/cue
 # CMP plugin manifest. Argo CD's repo-server reads this from
 # `/home/argocd/cmp-server/config/plugin.yaml` per the upstream
 # CMP convention.
+#
+# Build context (2.12f): the build context is the REPO ROOT (not
+# `argocd-cue-cmp/`), so the Dockerfile can COPY both the sidecar
+# files (`argocd-cue-cmp/…`) AND the AppRafter CUE schema
+# (`schemas/v1alpha1/…`) — see the publish/check workflows'
+# `context: .`. The schema is bundled into the image so the
+# entrypoint can lay down the CURRENT schema (matching the
+# cue-cmp version) into the ephemeral render workspace, alongside
+# the generated `claim` binding (ADR 0046 Decision #7). This is
+# the inject-wins mechanism that eliminates vendored-schema drift.
 RUN mkdir -p /home/argocd/cmp-server/config \
  && chown -R argocd:argocd /home/argocd
-COPY --chown=argocd:argocd plugin.yaml /home/argocd/cmp-server/config/plugin.yaml
+COPY --chown=argocd:argocd argocd-cue-cmp/plugin.yaml /home/argocd/cmp-server/config/plugin.yaml
 
 # Entrypoint wrapper called by the plugin's `generate` step.
-COPY --chown=argocd:argocd entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chown=argocd:argocd argocd-cue-cmp/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Bundled AppRafter CUE schema (2.12f / ADR 0046 Decision #7).
+# The entrypoint copies these into the render workspace's
+# `cue.mod/pkg/apprafter.io/schemas/v1alpha1/` (inject-wins) so a
+# user's manifest `import "apprafter.io/schemas/v1alpha1"` resolves
+# against the schema this image ships, and the generated `claim`
+# binding can reference `#ClaimFieldsFor`. `*.cue` keeps every
+# schema file in sync (types.cue + application.cue today).
+COPY --chown=argocd:argocd schemas/v1alpha1/*.cue /opt/apprafter/schema/v1alpha1/
 
 # OCI metadata. The version label is set by CI from the
 # `VERSION` file via `--build-arg IMAGE_VERSION=…`; the

@@ -121,16 +121,24 @@ assert_count() {
 #              honour this form or the in-cluster injection is inert
 #              (the e2e per-env walk caught exactly that regression).
 # Default "bare" keeps existing call sites unchanged.
-run_entrypoint() {  # $1 fixture root, $2 env value ("" = unset), $3 var style (bare|argocd)
-    local root=$1 env_val=$2 style=${3:-bare}
+# $4 (optional) — APPRAFTER_SCHEMA_SRC for the entrypoint's 2.12f
+# schema + `claim` binding injection. On a real cluster the schema is
+# bundled at /opt/apprafter/schema/v1alpha1; off-cluster (here) we
+# point it at the repo's schemas/v1alpha1 so the claim/secret path is
+# exercised on the host too (the 2.9 lesson: don't let host tests mask
+# the real injection path). Left empty for the legacy standalone
+# fixtures, whose inject step then no-ops (no schema → early return).
+run_entrypoint() {  # $1 fixture root, $2 env value ("" = unset), $3 var style (bare|argocd), $4 schema_src
+    local root=$1 env_val=$2 style=${3:-bare} schema_src=${4:-}
     if [[ -z "$env_val" ]]; then
-        ( cd "$root" && unset APPRAFTER_APP_ENV ARGOCD_ENV_APPRAFTER_APP_ENV && bash "$entrypoint" )
+        ( cd "$root" && unset APPRAFTER_APP_ENV ARGOCD_ENV_APPRAFTER_APP_ENV \
+            && APPRAFTER_SCHEMA_SRC="$schema_src" bash "$entrypoint" )
     elif [[ "$style" == "argocd" ]]; then
         ( cd "$root" && unset APPRAFTER_APP_ENV \
-            && ARGOCD_ENV_APPRAFTER_APP_ENV="$env_val" bash "$entrypoint" )
+            && APPRAFTER_SCHEMA_SRC="$schema_src" ARGOCD_ENV_APPRAFTER_APP_ENV="$env_val" bash "$entrypoint" )
     else
         ( cd "$root" && unset ARGOCD_ENV_APPRAFTER_APP_ENV \
-            && APPRAFTER_APP_ENV="$env_val" bash "$entrypoint" )
+            && APPRAFTER_SCHEMA_SRC="$schema_src" APPRAFTER_APP_ENV="$env_val" bash "$entrypoint" )
     fi
 }
 
@@ -174,6 +182,87 @@ assert_contains "$out_multi" "name: inject-multi-two" "Style B: second manifest 
 out_multi_base=$(run_entrypoint "$style_b" "")
 assert_absent "$out_multi_base" "apprafter.io/environment" "Style B: no environment label when var unset"
 assert_count "$out_multi_base" "name: inject-multi-" 2 "Style B: both base manifests still emitted when var unset"
+
+# ── 2.12f: claim + external-secret value references (ADR 0046) ──
+#
+# The claim fixture's manifest uses BARE `claim.pg.url` /
+# `claim.pg.host` / `claim.pg.main.url` selectors and the braceless
+# `secret: "stripe/api-key"` form, and vendors NEITHER the schema nor
+# a `claim` binding. The entrypoint must lay down the bundled schema +
+# generate the `claim` binding so these render to {claim: "..."} /
+# {secret: "..."} markers. We point APPRAFTER_SCHEMA_SRC at the repo's
+# schemas/v1alpha1 to mimic the image's /opt bundle off-cluster.
+#
+# CRITICAL (2.9 lesson re-applied): exercise the IN-CLUSTER var form.
+# Argo CD passes plugin env PREFIXED as ARGOCD_ENV_APPRAFTER_APP_ENV,
+# so the per-env assertion uses the "argocd" style — a host test that
+# only set the bare name would mask an in-cluster injection bug.
+schema_src="$(cd "$script_dir/../schemas/v1alpha1" && pwd)"
+claim_fx="$script_dir/testdata/inject-fixture-claim"
+
+# The injection writes a cue.mod/ + apprafter_claim_gen.cue into the
+# fixture (ephemeral on a real cluster; here we must scrub them so the
+# committed fixture stays clean and reruns are deterministic).
+scrub_claim_fixture() {
+    rm -rf "$claim_fx/apprafter/cue.mod" "$claim_fx/apprafter/apprafter_claim_gen.cue"
+}
+trap 'cleanup; scrub_claim_fixture' EXIT
+scrub_claim_fixture
+
+# Base-only (var unset): EVERY env's claim refs must still resolve
+# (the binding unions base + all environments' needs), so the
+# environments.dev.env.REDIS_URL=claim.redis.url marker renders even
+# though redis is declared only in the dev env.
+out_claim_base=$(run_entrypoint "$claim_fx" "" "bare" "$schema_src")
+scrub_claim_fixture
+assert_contains "$out_claim_base" "claim: pg.url"           "2.12f: claim.pg.url -> {claim: pg.url}"
+assert_contains "$out_claim_base" "claim: pg.host"          "2.12f: claim.pg.host -> {claim: pg.host}"
+assert_contains "$out_claim_base" "claim: pg.main.url"      "2.12f: named claim.pg.main.url -> {claim: pg.main.url}"
+assert_contains "$out_claim_base" "secret: stripe/api-key"  "2.12f: secret: \"stripe/api-key\" -> {secret: stripe/api-key}"
+assert_contains "$out_claim_base" "claim: redis.url"        "2.12f: per-env claim.redis.url resolves base-only (env-agnostic union)"
+assert_contains "$out_claim_base" "LOG_LEVEL: info"         "2.12f: literal env value preserved"
+# The generated `claim` binding must NOT leak into the manifest stream.
+assert_absent  "$out_claim_base" "_apprafterClaimState"     "2.12f: generated claim state not emitted as a manifest"
+assert_absent  "$out_claim_base" "_N:"                      "2.12f: pass-1 stub not emitted"
+
+# In-cluster per-env form (ARGOCD_ENV_ prefix): same markers PLUS the
+# env stamp from the 2.9 path — proving the two injections compose.
+out_claim_dev=$(run_entrypoint "$claim_fx" "dev" "argocd" "$schema_src")
+scrub_claim_fixture
+assert_contains "$out_claim_dev" "claim: pg.url"               "2.12f (ARGOCD_ENV_): claim.pg.url resolves"
+assert_contains "$out_claim_dev" "claim: redis.url"            "2.12f (ARGOCD_ENV_): per-env redis claim resolves"
+assert_contains "$out_claim_dev" "secret: stripe/api-key"      "2.12f (ARGOCD_ENV_): secret ref resolves"
+assert_contains "$out_claim_dev" "environment: dev"            "2.12f (ARGOCD_ENV_): 2.9 env stamp composes with claim injection"
+assert_contains "$out_claim_dev" "apprafter.io/environment: dev" "2.12f (ARGOCD_ENV_): env label composes with claim injection"
+
+# ── 2.12f Style-A (unwrapped) claim leak regression ────────
+# For an UNWRAPPED manifest the injected top-level `claim` binding is a
+# SIBLING of apiVersion/kind/spec, so without the Style-A strip it
+# would render INTO the Application as `claim: {…}`. Guard: selectors
+# resolve AND `claim:`/`_apprafterClaimState` never appear as a CR key.
+claima_fx="$script_dir/testdata/inject-fixture-claim-styleA"
+scrub_claima_fixture() {
+    rm -rf "$claima_fx/apprafter/cue.mod" "$claima_fx/apprafter/apprafter_claim_gen.cue"
+}
+trap 'cleanup; scrub_claim_fixture; scrub_claima_fixture' EXIT
+scrub_claima_fixture
+out_claima=$(run_entrypoint "$claima_fx" "" "bare" "$schema_src")
+scrub_claima_fixture
+assert_contains "$out_claima" "claim: pg.url"          "2.12f Style-A: bare claim.pg.url resolves in unwrapped manifest"
+assert_contains "$out_claima" "secret: stripe/api-key" "2.12f Style-A: secret ref resolves in unwrapped manifest"
+assert_contains "$out_claima" "name: style-a-claim"    "2.12f Style-A: manifest still emitted"
+# The leak guard: a top-level `claim:` CR key (2-space indent, value {})
+# must NOT appear. We check the specific leak shape `claim: {}` plus the
+# helper state field.
+assert_absent  "$out_claima" "_apprafterClaimState"    "2.12f Style-A: claim state helper not leaked"
+if printf '%s\n' "$out_claima" | grep -Eq '^claim:'; then
+    echo "FAIL: 2.12f Style-A: top-level claim binding leaked into the Application CR"
+    printf '%s\n' "$out_claima" >&2
+    fail=$((fail + 1))
+else
+    echo "PASS: 2.12f Style-A: top-level claim binding stripped from the CR"
+    pass=$((pass + 1))
+fi
 
 echo ""
 echo "Summary: $pass passed, $fail failed"
