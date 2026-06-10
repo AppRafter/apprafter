@@ -7,7 +7,61 @@ the patch matches the (sub-)subphase. Milestone tags
 (`v0.1.0-mvp`, `v0.2.0-services`, etc.) point at the closing
 patch of each phase.
 
-## Phase 2 — Platform services (in progress)
+## Phase 2 — Platform services (closed 2026-06-10, milestone M2)
+
+## operator + admission-webhook + argocd-cue-cmp + platform-stack v0.2.24 + cli v0.2.11 — 2.12 Application.env value references (ADR 0046) — Phase 2 / M2 close (2026-06-10)
+
+### Added
+
+- **`Application.spec.*.env` value references.** An env value may now be a
+  **literal** string, a **claim reference** (a bare CUE selector
+  `claim.<type>.<field>` — the composed `url` or a decomposed `user` / `pass`
+  / `host` / `port` / `db` / redis `channelPrefix`; a named
+  `claim.<type>.<name>.<field>` for array claims; `pg` + `redis` only at
+  launch), or an **external-secret reference** (the braceless
+  `secret: "<name>/<key>"`, CUE's `a: b: c` shorthand). At the Kubernetes CR
+  level each ref is a string-discriminated marker (`{claim: "pg.url"}` /
+  `{secret: "stripe/api-key"}`); the operator's pure renderer resolves it to a
+  container `EnvVar{valueFrom: secretKeyRef}`.
+- **`apprafter app validate [manifest]`** — local pre-commit validation that
+  runs the same schema + `claim`-binding injection as the cue-cmp and reports
+  errors (undeclared need, non-enum field, bad secret format). Manifest
+  discovery: `<cwd>/apprafter/Application.cue` or a single `*.cue` in the cwd;
+  else an explicit path is required (an explicit path always overrides).
+- **Decomposed connection-Secret keys** written by the provisioner: pg/redis
+  Secrets now carry `url user pass host port db` (+ redis `channelPrefix`).
+
+### Changed
+
+- **The cue-cmp (0.1.8 → 0.1.9)** injects the current schema + a generated
+  `claim` binding into its ephemeral render workspace, so bare `claim.*`
+  selectors in user manifests resolve to markers. The binding's comprehension
+  runs in the manifest's package referencing an exported `#ClaimFieldsFor`
+  table (a cross-package `#MkClaim & {_needs}` does not re-evaluate), via a
+  two-pass needs extraction over an env-agnostic union of base + all
+  environments' needs.
+- **`apprafter app scaffold` no longer vendors the schema** into the user's
+  repo (`cue.mod/pkg/…`); the cue-cmp and `apprafter app validate` inject the
+  current schema at render/validate time (no version drift). A re-run removes a
+  stale pre-2.12 vendored `cue.mod/`.
+- **`acl_reconcile`** reads the connection-Secret `pass` key directly (it
+  previously parsed the password out of the `REDIS_URL` DSN).
+- The admission webhook validates env claim/secret refs; the CRD `env` value
+  node gains `x-kubernetes-preserve-unknown-fields: true` (additive).
+
+### Removed
+
+- **The 2.4e implicit `DATABASE_URL` auto-injection** for `needs.pg` apps — an
+  app now receives a DSN only by an explicit `claim.pg.url` (or any field)
+  reference. The 2.4e literal-`DATABASE_URL`-collision webhook guard is removed
+  too (a literal env of any name is now legal). The composed
+  `DATABASE_URL`/`REDIS_URL`/`REDIS_CHANNEL_PREFIX` connection-Secret keys are
+  dropped in favour of the canonical decomposed keys.
+
+### Migration
+
+- Apps relying on the auto-injected `DATABASE_URL` must add an explicit
+  `DATABASE_URL: claim.pg.url` (a one-line manifest change) before upgrading.
 
 ## operator + admission-webhook + platform-stack v0.2.23 + cli v0.2.10 — 2.10 needs → CiliumNetworkPolicy egress (ADR 0045) (2026-06-09)
 

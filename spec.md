@@ -4,7 +4,7 @@
 > **Domain:** `apprafter.dev`.
 > **Status:** Phase 1 (Tier 1 single-node MVP) delivered as `v0.1.0-mvp` on 2026-05-08; Phases 2–8 in active design. See `plan.md` for the phase ledger.
 > **Audience:** Architecture decisions, contributors onboarding, design rationale.
-> **Revision:** 10 (M1.5 — Self-managing platform rethink — **closed** 2026-06-02: §6 milestone box flipped after the GitOps loop went green on the k3d e2e gate (CUE CMP render → Argo CD sync → operator reconcile → Deployment, with source-change propagation); `apprafter platform fork` (item 1.80), the Backstage MigrationPlan plugin (M3), and `platform channel` (M2) deferred; platform-scope MigrationPlan gate covered by operator unit + integration tests, real-infra migration e2e a nightly-Hetzner follow-up. No architecture change — the M1.5 design was actualized in Rev 7. Rev 9: SourceCredential CRD for private-repo credentials — ADR 0039: a config-only credential-reference CRD (§3.12) carrying zero secret material, the material sealed (SealedSecrets on Tier 1, OpenBao on Tier 2); the Application Operator derives both the Argo CD git repo-cred and the workload registry pull-secret from one source and reports validity in status; the `repo creds` CLI becomes a thin SourceCredential front-end; destructive credential change is gated via MigrationPlan. Rev 8: Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
+> **Revision:** 11 (Phase 2 — Platform Services (M2) — **closed** 2026-06-10: subphases 2.1–2.12 deliver the launch platform-services scope (pg + redis + `needs.disk`, ADR 0034) — ServiceProvider/ResourceClaim machinery, CloudNativePG + Dragonfly providers, per-environment deploy (ADR 0044), needs-derived egress CiliumNetworkPolicy (ADR 0045), and `Application.env` value references (ADR 0046, §3.1: literal / bare `claim.<type>.<field>` / braceless `secret: "<name>/<key>"` → operator-resolved `secretKeyRef`; the 2.4e `DATABASE_URL` auto-injection removed; cue-cmp + `apprafter app validate` inject the schema + a generated `claim` binding so the scaffold no longer vendors the schema). §6 M2 box flipped; JetStream/ClickHouse/S3 providers, SPIRE workload-identity, and the Backstage ResourceClaim view deferred post-launch. Rev 10: M1.5 — Self-managing platform rethink — **closed** 2026-06-02: §6 milestone box flipped after the GitOps loop went green on the k3d e2e gate (CUE CMP render → Argo CD sync → operator reconcile → Deployment, with source-change propagation); `apprafter platform fork` (item 1.80), the Backstage MigrationPlan plugin (M3), and `platform channel` (M2) deferred; platform-scope MigrationPlan gate covered by operator unit + integration tests, real-infra migration e2e a nightly-Hetzner follow-up. No architecture change — the M1.5 design was actualized in Rev 7. Rev 9: SourceCredential CRD for private-repo credentials — ADR 0039: a config-only credential-reference CRD (§3.12) carrying zero secret material, the material sealed (SealedSecrets on Tier 1, OpenBao on Tier 2); the Application Operator derives both the Argo CD git repo-cred and the workload registry pull-secret from one source and reports validity in status; the `repo creds` CLI becomes a thin SourceCredential front-end; destructive credential change is gated via MigrationPlan. Rev 8: Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
 
 ---
 
@@ -184,10 +184,13 @@ spec: {
             redis: {}
         }
         env: {
-            DATABASE_URL: from: claim.pg.uri
-            API_KEY: from: secret("third-party/tron/key")
-            JWT_SECRET: from: secret("self/jwt", rotation: "30d")
+            // literal — a quoted string
             LOG_LEVEL: "info"
+            // claim ref — a bare CUE selector; composed DSN or any decomposed field
+            DATABASE_URL: claim.pg.url
+            DB_HOST: claim.pg.host
+            // external secret ref — braceless "<name>/<key>" (SealedSecrets on Tier 1)
+            API_KEY: secret: "third-party-tron/key"
         }
         connects: {
             egress: {
@@ -1300,13 +1303,15 @@ Subsequent to M1 delivery, ADRs 0025–0029 reframe `cluster-bootstrap` as a min
 
 **Target:** `needs.pg`, `needs.jetstream`, `needs.redis` working with integrated providers.
 
-- [ ] ServiceProvider CRD
-- [ ] ResourceClaim CRD
-- [ ] CloudNativePG integration (pg-integrated provider)
-- [ ] NATS JetStream provider (account/stream allocation)
-- [ ] Dragonfly provider (Redis)
-- [ ] Workload-identity-based credential injection (SPIRE setup)
-- [ ] Backstage plugin for ResourceClaim view
+**Closed 2026-06-10** (Phase 2, subphases 2.1–2.12). The launch platform-services scope (ADR 0034: pg + redis + `needs.disk`) ships end to end: ServiceProvider/ResourceClaim CRDs + scheduler/provisioner/GC, CloudNativePG (`pg-integrated`) and Dragonfly (`redis-integrated`) providers, `needs.disk` (ADR 0043), DSN/decomposed-key + external-secret env references (ADR 0046, the closing subphase), per-environment deploy (ADR 0044), and needs-derived egress CiliumNetworkPolicy (ADR 0045). Deferred with rationale: the **NATS JetStream / ClickHouse / S3 providers** (out of the Hosted-Services launch scope, ADR 0034 — the grammar is ready, the backends follow post-launch), **SPIRE workload-identity credential injection** (Tier 1 uses Secret-backed injection — SealedSecrets material, ADR 0024 Layer 2 — with SPIRE a Tier-2+ item), and the **Backstage ResourceClaim view** (post-launch portal bundle PL1, with the other portal surfaces). Credential injection is delivered via the connection-Secret `secretKeyRef` path (§3.1) rather than SPIRE for the launch.
+
+- [x] ServiceProvider CRD
+- [x] ResourceClaim CRD
+- [x] CloudNativePG integration (pg-integrated provider)
+- [ ] NATS JetStream provider (account/stream allocation) — deferred (post-launch; ADR 0034)
+- [x] Dragonfly provider (Redis)
+- [ ] Workload-identity-based credential injection (SPIRE setup) — deferred (Tier 2+; launch uses Secret-backed `secretKeyRef`)
+- [ ] Backstage plugin for ResourceClaim view — deferred (post-launch portal bundle PL1)
 
 ### Milestone M3 — Multi-node + observability
 

@@ -3061,15 +3061,15 @@ Tests:
 ### 2.12 Application.env: secret() и claim.* references
 > 🏁 SR: A · order 3 — secret()/claim.* refs in Application.env
 
-**Поставка:**
-- [ ] CUE-функции `secret("path/to/key")` и `claim.<need>.<field>` в схеме.
-- [ ] Renderer резолвит:
-  - `secret(...)` → Secret-ref envFrom (для SealedSecrets) либо annotation для Vault Agent (Phase 3).
-  - `claim.pg.uri` → Secret-ref на сгенерированный Secret из ResourceClaim.
-- [ ] Литералы (`LOG_LEVEL: "info"`) — обычный env.
-- [ ] Ошибка resolve — Application Status NotReady с понятной причиной.
+> ✅ **ЗАКРЫТО (2026-06-10) — ПОСЛЕДНИЙ субфейз Фазы 2; §6 M2 флипнут.** Subagent-driven (ADR 0046 + spec `docs/superpowers/specs/2026-06-09-2.12-env-references-design.md`, T0–T8, ветка `feat/2.12-env-references`). `Application.spec.*.env`-значение теперь: **литерал** (строка), **claim-ссылка** (голый CUE-селектор `claim.<type>.<field>`, вкл. разложенные `user|pass|host|port|db` и именованные `claim.<type>.<name>.<field>`; pg+redis), или **secret-ссылка** (braceless `secret: "<name>/<key>"`). На уровне CR — string-discriminated маркеры `{claim:"pg.url"}`/`{secret:"name/key"}`; чистый рендерер резолвит в `EnvVar{valueFrom: secretKeyRef}`. Провижионер пишет канонические разложенные ключи connection-Secret (`url user pass host port db`+redis `channelPrefix`), дропнув композитные `DATABASE_URL`/`REDIS_URL` (`acl_reconcile`→`pass`). **2.4e авто-инъекция `DATABASE_URL` УДАЛЕНА** (это её правильная замена; collision-guard снят). cue-cmp (**v0.1.8→v0.1.9**) инжектит актуальную схему + генерируемый `claim`-биндинг в эфемерный workspace (cross-package: comprehension в пакете манифеста через экспортируемую `#ClaimFieldsFor`; two-pass needs-extraction; env-agnostic union) → голые селекторы рендерятся; **scaffold перестал вендорить схему**, новый `apprafter app validate` гоняет ту же инъекцию локально (parity-verified). Валидация слоями: cue vet (claim) + webhook (формат) + рантайм (нет Secret'а → `Ready=False` reason `EnvSecretMissing`). **Live-walks GREEN на kind+podman:** `needs-env-refs-walk` (3 источника + missing-secret→NotReady→recover; под видит `DATABASE_URL=postgresql://…`/`DB_USER`/`STRIPE_KEY=s3cr3t`), `needs-disk-walk` (именованные `claim.pg.primary.url`/`.analytics.url`), `needs-redis-walk` (`claim.redis.url`/`channelPrefix`); все обновлены под снятый auto-inject. **Ни одного продуктового бага в walk'ах** (юниты их закрыли: rendering/application/webhook/provisioner). Гейты зелёные: cargo fmt/clippy -D/test (cli+operator), `just lint`, `just crd-validate` (CRD-additive), `just platform-stack-check` (рендерит 0.2.24), `test-inject.sh`. **Релиз:** operator+webhook+platform-stack **0.2.23→0.2.24** + cue-cmp **0.1.9** + cli **0.2.10→0.2.11**. spec.md §3.2 (env-value-model) актуализирован, Revision бампнут. **2.12 = закрытие Фазы 2 → §6 M2 ✅.**
 
-**Acceptance:** Application с тремя источниками env (literal, secret, claim) запускается, под видит все три переменные.
+**Поставка:**
+- [x] CUE-функции `secret(...)` и `claim.<type>.<field>` в схеме. ✅ Реализовано как **голый CUE-селектор** `claim.pg.url` (cue-cmp/CLI инжектят `claim`-биндинг из needs через `#ClaimFieldsFor`) + braceless `secret: "name/key"`; CR-маркеры `{claim:"…"}`/`{secret:"…"}` (NB: не CUE-«функции» — у CUE нет call-синтаксиса; claim резолвит cue-cmp в рантайме рендера, не cue-eval). `uri`→`url`.
+- [x] Renderer резолвит: `secret(...)`→`secretKeyRef{name,key}`; `claim.<type>.<field>`→`secretKeyRef{name:<connectionSecretRef>, key:<field>}` (pure `resolve_env`, нитка `(type,name)→connectionSecretRef`). Vault Agent — Phase 3 (отложено).
+- [x] Литералы (`LOG_LEVEL: "info"`) — обычный env.
+- [x] Ошибка resolve — Application Status NotReady с понятной причиной (`EnvSecretMissing`; claim-existence гарантирован 2.4d-гейтом).
+
+**Acceptance:** Application с тремя источниками env (literal, secret, claim) запускается, под видит все три переменные. ✅ live-доказано (`needs-env-refs-walk`).
 
 **Зависит от:** 2.4, 2.11
 
