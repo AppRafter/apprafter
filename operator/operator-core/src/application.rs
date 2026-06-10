@@ -360,6 +360,11 @@ pub const PHASE_AWAITING_RESOURCE_CLAIM: &str = "AwaitingResourceClaim";
 /// carries the unready claim name(s). Phase 2.4d.
 pub const COND_RESOURCE_CLAIM_PENDING: &str = "ResourceClaimPending";
 
+/// Reserved phase: the Application reconciler is blocked because one or more
+/// `env` secret refs point at a Secret / key that does not exist in the app
+/// namespace. 2.12 / ADR 0046 Decision #4.
+pub const PHASE_ENV_SECRET_MISSING: &str = "EnvSecretMissing";
+
 /// k8s-style condition (mirrors `meta/v1.Condition`). Operator
 /// emits `Ready` of `True` after a successful reconcile.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]

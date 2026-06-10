@@ -34,6 +34,7 @@ use operator_core::{
     ApplicationStatus, DiskClaim, EgressProfile, Metrics, MigrationPlan, PlatformStack,
     ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
     COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
+    PHASE_ENV_SECRET_MISSING,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
 // dep so future Phase 2 commits can flip on detection +
@@ -278,6 +279,31 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         // mountPath/readOnly). Disk claims carry no connection Secret, so
         // this is a parallel resolution off the SAME `current` claims.
         disk_mounts = resolve_disk_mounts(&effective, &name, &current);
+    }
+
+    // ---- 2.12e (ADR 0046 Decision #4): env secret-ref existence check ----
+    // After the claim gate (all claim Secrets guaranteed ready), verify every
+    // `env` `secret` ref points at an existing Secret+key in the app namespace.
+    // Claim refs and literals are skipped — they're either gated already or have
+    // no Secret dependency. If any secret ref is unresolvable, set
+    // `Ready=False/EnvSecretMissing` and requeue in 30s. Do NOT render or apply
+    // children in this case — the missing Secret may not exist yet / ever.
+    if let Some(env) = effective.env.as_ref() {
+        let missing = check_env_secret_refs(env, &ctx.client, &namespace).await?;
+        if !missing.is_empty() {
+            info!(
+                %name, %namespace,
+                missing = ?missing,
+                "env secret refs unresolved — setting Ready=False/EnvSecretMissing"
+            );
+            let status = build_env_secret_missing_status(&app, &missing);
+            apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
     }
 
     // ---- 2.4h-d (ADR 0040): resolve base.image's tag → registry digest ----
@@ -744,6 +770,70 @@ async fn read_cred_auth(
     };
     oci_resolve::auth_from_dockerconfigjson(dcj.as_bytes(), &host)
         .unwrap_or(oci_resolve::RegistryAuth::Anonymous)
+}
+
+/// 2.12e (ADR 0046 Decision #4): check every `env` `Secret` ref for existence.
+///
+/// Iterates the env map via [`unresolved_env_secret_refs`] with a real
+/// `Api::<Secret>` lookup: for each `secret` ref `<name>/<key>`, reads the
+/// Secret in the app namespace with `get_opt` and checks that `key` is present
+/// in `.data` or `.string_data`. Returns one message per missing ref in
+/// BTreeMap key order (deterministic). An empty vec means all refs resolve.
+///
+/// `Literal` and `Claim` refs are ignored (see [`unresolved_env_secret_refs`]).
+async fn check_env_secret_refs(
+    env: &std::collections::BTreeMap<String, operator_core::EnvValue>,
+    client: &Client,
+    namespace: &str,
+) -> Result<Vec<String>, ReconcileError> {
+    use operator_core::{EnvRef, EnvValue};
+    // Collect the (var_name, secret_name, key) tuples we need to check.
+    // Same iteration order as unresolved_env_secret_refs (BTreeMap).
+    let mut checks: Vec<(String, String, String)> = Vec::new();
+    for (var_name, value) in env.iter() {
+        let path = match value {
+            EnvValue::Ref(EnvRef::Secret(p)) => p,
+            _ => continue,
+        };
+        let Some(slash) = path.find('/') else {
+            continue; // malformed — webhook already rejected these
+        };
+        checks.push((
+            var_name.clone(),
+            path[..slash].to_string(),
+            path[slash + 1..].to_string(),
+        ));
+    }
+    if checks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let mut missing: Vec<String> = Vec::new();
+    for (var_name, secret_name, key) in &checks {
+        let exists = match api.get_opt(secret_name).await? {
+            Some(secret) => {
+                let in_data = secret
+                    .data
+                    .as_ref()
+                    .map(|d| d.contains_key(key.as_str()))
+                    .unwrap_or(false);
+                let in_string_data = secret
+                    .string_data
+                    .as_ref()
+                    .map(|d| d.contains_key(key.as_str()))
+                    .unwrap_or(false);
+                in_data || in_string_data
+            }
+            None => false,
+        };
+        if !exists {
+            missing.push(format!(
+                "env {} → secret \"{}/{}\": Secret \"{}\" not found or missing key \"{}\"",
+                var_name, secret_name, key, secret_name, key
+            ));
+        }
+    }
+    Ok(missing)
 }
 
 /// SSA-apply a per-workload copy of the derived pull-secret.
@@ -1338,6 +1428,71 @@ fn resource_claim_pending_condition(
         reason: "ResourceClaimPending".to_string(),
         message: format!("awaiting ResourceClaim(s): {}", unready.join(", ")),
         observed_generation: None,
+    }
+}
+
+// ---- 2.12e: env secret-ref existence check (ADR 0046 Decision #4) ----
+
+/// Scan `env` for every `EnvValue::Ref(EnvRef::Secret(…))` entry whose
+/// backing Secret / key is absent (as reported by `secret_has_key`).
+/// Returns one human-readable message per missing ref, in BTreeMap key
+/// order (deterministic). `secret_has_key(name, key) → bool` abstracts
+/// the cluster lookup so the function can be unit-tested without a client.
+///
+/// **Only `Secret` refs are checked here.** `Claim` refs cannot reach this
+/// path — the `AwaitingResourceClaim` gate (2.4d) holds the Application
+/// until all claim Secrets are ready before the render proceeds.
+/// `Literal` values carry no Secret dependency and are skipped.
+pub fn unresolved_env_secret_refs(
+    env: &std::collections::BTreeMap<String, operator_core::EnvValue>,
+    secret_has_key: &dyn Fn(&str, &str) -> bool,
+) -> Vec<String> {
+    use operator_core::{EnvRef, EnvValue};
+    env.iter()
+        .filter_map(|(var_name, value)| {
+            let path = match value {
+                EnvValue::Ref(EnvRef::Secret(p)) => p,
+                _ => return None, // Literal + Claim: skip
+            };
+            // Parse `"<name>/<key>"` on the first `/`.
+            let slash = path.find('/')?; // malformed (no `/`) → skip defensively
+            let secret_name = &path[..slash];
+            let key = &path[slash + 1..];
+            if secret_has_key(secret_name, key) {
+                None
+            } else {
+                Some(format!(
+                    "env {} → secret \"{}\": Secret \"{}\" not found or missing key \"{}\"",
+                    var_name, path, secret_name, key
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Build the Application status payload for the env-secret-missing path
+/// (2.12 / ADR 0046 Decision #4). Mirrors `build_resource_claim_paused_status`:
+/// preserves `observedGeneration` + `endpointURL`, sets `phase` to
+/// `EnvSecretMissing`, and emits a single `Ready=False/EnvSecretMissing`
+/// condition whose `message` carries the joined per-ref diagnostic.
+fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> ApplicationStatus {
+    let previous_conditions = app
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let previous_endpoint = app.status.as_ref().and_then(|s| s.endpoint_url.clone());
+
+    let message = messages.join("; ");
+    let ready = ready_condition("False", "EnvSecretMissing", &message, previous_conditions);
+
+    ApplicationStatus {
+        phase: Some(PHASE_ENV_SECRET_MISSING.to_string()),
+        observed_generation: app.metadata.generation,
+        conditions: Some(vec![ready]),
+        endpoint_url: previous_endpoint,
+        image: None,
+        environment: app.spec.environment.clone(),
     }
 }
 
@@ -2982,5 +3137,211 @@ mod tests {
         assert_eq!(or["uid"], json!("uid-1"));
         assert_eq!(or["controller"], json!(true));
         assert_eq!(or["blockOwnerDeletion"], json!(true));
+    }
+
+    // ---- 2.12e: env secret-ref existence check (pure helper) ----
+
+    use operator_core::{EnvRef, EnvValue};
+
+    #[test]
+    fn flags_missing_env_secret_refs() {
+        // A secret ref whose Secret+key does not exist → flagged.
+        // Literal + Claim refs are never checked here.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "K".to_string(),
+            EnvValue::Ref(EnvRef::Secret("stripe/api-key".into())),
+        );
+        env.insert("LOG".to_string(), EnvValue::Literal("info".into()));
+        // Claim refs are NOT checked (gated by the AwaitingResourceClaim path):
+        env.insert(
+            "DB".to_string(),
+            EnvValue::Ref(EnvRef::Claim("pg.url".into())),
+        );
+
+        // Nothing exists → one missing message (only the secret ref is checked).
+        let missing = unresolved_env_secret_refs(&env, &|_n, _k| false);
+        assert_eq!(missing.len(), 1, "expected 1 missing, got: {:?}", missing);
+        assert!(
+            missing[0].contains("K"),
+            "message should name the env var: {}",
+            missing[0]
+        );
+        assert!(
+            missing[0].contains("stripe/api-key"),
+            "message should include the ref path: {}",
+            missing[0]
+        );
+
+        // Secret exists with the right key → empty (no missing).
+        let ok = unresolved_env_secret_refs(&env, &|n, k| n == "stripe" && k == "api-key");
+        assert!(
+            ok.is_empty(),
+            "all resolved — expected empty, got: {:?}",
+            ok
+        );
+    }
+
+    #[test]
+    fn multiple_secret_refs_all_missing() {
+        // Two secret refs, neither exists → two messages in BTreeMap order.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "A_KEY".to_string(),
+            EnvValue::Ref(EnvRef::Secret("sa/key-a".into())),
+        );
+        env.insert(
+            "B_KEY".to_string(),
+            EnvValue::Ref(EnvRef::Secret("sb/key-b".into())),
+        );
+        let missing = unresolved_env_secret_refs(&env, &|_n, _k| false);
+        assert_eq!(missing.len(), 2);
+        // BTreeMap order: A_KEY before B_KEY.
+        assert!(
+            missing[0].contains("A_KEY"),
+            "first should be A_KEY: {:?}",
+            missing
+        );
+        assert!(
+            missing[1].contains("B_KEY"),
+            "second should be B_KEY: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn partial_secret_refs_one_missing() {
+        // Three secret refs, only the middle one missing.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "A_KEY".to_string(),
+            EnvValue::Ref(EnvRef::Secret("sa/key-a".into())),
+        );
+        env.insert(
+            "B_KEY".to_string(),
+            EnvValue::Ref(EnvRef::Secret("sb/key-b".into())),
+        );
+        env.insert(
+            "C_KEY".to_string(),
+            EnvValue::Ref(EnvRef::Secret("sc/key-c".into())),
+        );
+        // Only B_KEY is missing.
+        let missing = unresolved_env_secret_refs(&env, &|n, _k| n != "sb");
+        assert_eq!(missing.len(), 1);
+        assert!(
+            missing[0].contains("B_KEY"),
+            "only B_KEY missing: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn no_secret_refs_returns_empty() {
+        // Env with only literals + claim refs → no secret check, always empty.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("LOG".to_string(), EnvValue::Literal("debug".into()));
+        env.insert(
+            "DB".to_string(),
+            EnvValue::Ref(EnvRef::Claim("pg.url".into())),
+        );
+        let missing = unresolved_env_secret_refs(&env, &|_n, _k| false);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn empty_env_returns_empty() {
+        let env = std::collections::BTreeMap::new();
+        let missing = unresolved_env_secret_refs(&env, &|_n, _k| false);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn build_env_secret_missing_status_sets_phase_and_ready_false() {
+        // Status builder contract: phase = EnvSecretMissing, Ready=False,
+        // reason = EnvSecretMissing, message contains the diagnostics,
+        // observedGeneration + endpointURL preserved.
+        let mut app = Application::new("web", ApplicationSpec::default());
+        app.metadata.generation = Some(5);
+        app.status = Some(ApplicationStatus {
+            phase: Some("Ready".into()),
+            observed_generation: Some(4),
+            conditions: None,
+            endpoint_url: Some("http://web.demo.svc.cluster.local:80".into()),
+            image: None,
+            environment: None,
+        });
+        let messages = vec![
+            "env STRIPE_KEY → secret \"stripe/api-key\": Secret \"stripe\" not found or missing key \"api-key\"".to_string(),
+        ];
+        let status = build_env_secret_missing_status(&app, &messages);
+
+        assert_eq!(status.phase.as_deref(), Some(PHASE_ENV_SECRET_MISSING));
+        assert_eq!(status.observed_generation, Some(5));
+        assert_eq!(
+            status.endpoint_url.as_deref(),
+            Some("http://web.demo.svc.cluster.local:80")
+        );
+
+        let conds = status.conditions.as_ref().expect("conditions present");
+        assert_eq!(conds.len(), 1, "exactly one condition");
+        let ready = &conds[0];
+        assert_eq!(ready.type_, "Ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "EnvSecretMissing");
+        assert!(
+            ready.message.contains("STRIPE_KEY"),
+            "message should carry the var name: {}",
+            ready.message
+        );
+    }
+
+    #[test]
+    fn build_env_secret_missing_status_preserves_endpoint_when_status_absent() {
+        // First reconcile: app.status is None → endpoint stays None.
+        let app = Application::new("web", ApplicationSpec::default());
+        let status = build_env_secret_missing_status(
+            &app,
+            &["env K → secret \"s/k\": Secret \"s\" not found or missing key \"k\"".to_string()],
+        );
+        assert!(status.endpoint_url.is_none());
+        assert_eq!(status.phase.as_deref(), Some(PHASE_ENV_SECRET_MISSING));
+    }
+
+    #[test]
+    fn build_env_secret_missing_status_preserves_transition_time() {
+        // lastTransitionTime must NOT change when Ready=False was already
+        // set for the same reason (k8s hot-reconcile-prevention convention).
+        let fixed_time = "2026-06-10T12:00:00+00:00".to_string();
+        let mut app = Application::new("web", ApplicationSpec::default());
+        app.status = Some(ApplicationStatus {
+            phase: Some(PHASE_ENV_SECRET_MISSING.into()),
+            observed_generation: None,
+            conditions: Some(vec![ApplicationCondition {
+                type_: "Ready".into(),
+                status: "False".into(),
+                last_transition_time: fixed_time.clone(),
+                reason: "EnvSecretMissing".into(),
+                message: "prior".into(),
+                observed_generation: None,
+            }]),
+            endpoint_url: None,
+            image: None,
+            environment: None,
+        });
+        let status = build_env_secret_missing_status(
+            &app,
+            &["env K → secret \"s/k\": Secret \"s\" not found or missing key \"k\"".to_string()],
+        );
+        let ready = status
+            .conditions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .expect("Ready condition");
+        assert_eq!(
+            ready.last_transition_time, fixed_time,
+            "lastTransitionTime must be preserved when Ready=False is unchanged"
+        );
     }
 }
