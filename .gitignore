@@ -68,3 +68,6 @@ tmp/
 !/spec.md
 !/plan.md
 !/FEATURE_TRACKER.md
+
+# scratch docs accidentally swept by a subagent git add -A (2026-06-10)
+/landing/docs/steps.md
