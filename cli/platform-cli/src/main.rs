@@ -191,6 +191,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                     needs,
                 })?
             }
+            AppCommand::Validate { manifest } => commands::app_validate::run_validate(manifest)?,
             AppCommand::Remove {
                 name,
                 yes,

@@ -4,6 +4,7 @@
 pub mod app;
 pub mod app_open;
 pub mod app_scaffold;
+pub mod app_validate;
 pub mod app_wizard;
 pub mod apply;
 pub mod argocd_password;

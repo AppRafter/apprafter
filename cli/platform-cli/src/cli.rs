@@ -698,6 +698,22 @@ pub enum AppCommand {
         #[arg(long = "needs")]
         needs: Vec<String>,
     },
+    /// Validate an AppRafter `Application.cue` manifest LOCALLY,
+    /// reproducing the cluster's render-time `cue` pipeline (ADR
+    /// 0046, 2.12g). Lays the CLI's bundled schema + a generated
+    /// `claim` binding into a temp workspace and runs `cue vet`,
+    /// so bare `claim.<type>.<field>` selectors and braceless
+    /// `secret: "name/key"` refs resolve EXACTLY as the cue-cmp
+    /// resolves them at sync time — a plain `cue vet` on the repo
+    /// can't (the `claim` binding is never committed). Requires
+    /// `cue` on PATH. Without `[manifest]`: defaults to
+    /// `<cwd>/apprafter/Application.cue`, then a single `*.cue`
+    /// in the cwd; otherwise pass the path explicitly.
+    Validate {
+        /// Manifest file (or directory holding `*.cue`) to
+        /// validate. Omit to auto-discover.
+        manifest: Option<std::path::PathBuf>,
+    },
     /// Port-forward the app's primary Service to localhost and
     /// open it in a browser. Wraps `kubectl port-forward` with
     /// AppRafter-aware resolution: Application name → Argo CD
