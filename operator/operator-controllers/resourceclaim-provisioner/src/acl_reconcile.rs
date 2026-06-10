@@ -28,11 +28,10 @@
 //! ## Password recovery — no separate per-claim password store
 //!
 //! Re-asserting a claim user needs that user's password. It is NOT stored
-//! anywhere separate: the per-claim connection Secret's `REDIS_URL`
-//! already embeds it (`redis://<user>:<password>@host:6379/N`), so the
-//! loop reads the Secret the claim points at (`status.connectionSecretRef`)
-//! and parses the password out of the DSN userinfo
-//! ([`password_from_redis_url`]). This keeps the password in exactly one
+//! anywhere separate: the per-claim connection Secret's `pass` key (2.12
+//! decomposed format, ADR 0046) carries it directly, so the loop reads the
+//! Secret the claim points at (`status.connectionSecretRef`) and reads the
+//! `pass` key ([`read_secret_key`]). This keeps the password in exactly one
 //! place (the connection Secret) — the same value the app uses.
 
 use std::sync::Arc;
@@ -71,7 +70,7 @@ pub struct RepinSpec {
     pub user: String,
     /// The numbered logical DB the user is pinned to.
     pub dbnum: u16,
-    /// The connection Secret (in the claim's namespace) whose `REDIS_URL`
+    /// The connection Secret (in the claim's namespace) whose `pass` key
     /// carries this user's password — the loop reads it back to re-pin.
     pub conn_secret_ref: String,
     /// The claim's namespace (where `conn_secret_ref` lives).
@@ -247,8 +246,8 @@ async fn resync_all(ctx: &Arc<Context>) -> Result<(), ReconcileError> {
 /// Re-assert every live ready claim user on a single pool instance.
 ///
 /// Reads the instance admin password once, then for each claim derived by
-/// [`claims_to_repin`]: reads the claim's connection Secret, recovers the
-/// password from its `REDIS_URL`, and re-runs `ACL SETUSER` (idempotent).
+/// [`claims_to_repin`]: reads the claim's connection Secret `pass` key
+/// (2.12 decomposed format) and re-runs `ACL SETUSER` (idempotent).
 /// A claim whose Secret is missing/unreadable, or whose DSN carries no
 /// password, is logged + skipped (the next tick retries once the Secret
 /// settles) — it never aborts the instance's remaining re-pins.
@@ -281,31 +280,26 @@ pub async fn reconcile_instance_acls(
     );
 
     for spec in to_repin {
-        // Recover this claim's password from its connection Secret's
-        // REDIS_URL. A missing Secret / DSN is non-fatal — skip + retry.
-        let dsn = match read_secret_key(
+        // Recover this claim's password from its connection Secret's `pass`
+        // key (2.12 decomposed format; the Secret is written by
+        // `redis_connection_secret_object`). A missing Secret / key is
+        // non-fatal — skip + retry.
+        let password = match read_secret_key(
             ctx,
             &spec.claim_namespace,
             &spec.conn_secret_ref,
-            "REDIS_URL",
+            "pass",
         )
         .await
         {
-            Ok(d) => d,
+            Ok(p) => p,
             Err(err) => {
                 warn!(
                     user = %spec.user, secret = %spec.conn_secret_ref, %err,
-                    "could not read connection Secret REDIS_URL — skipping re-pin this tick"
+                    "could not read connection Secret `pass` — skipping re-pin this tick"
                 );
                 continue;
             }
-        };
-        let Some(password) = password_from_redis_url(&dsn) else {
-            warn!(
-                user = %spec.user, secret = %spec.conn_secret_ref,
-                "connection Secret REDIS_URL has no password — skipping re-pin"
-            );
-            continue;
         };
 
         let args = dragonfly::acl_setuser_args(&spec.user, &password, spec.dbnum);

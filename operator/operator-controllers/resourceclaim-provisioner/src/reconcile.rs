@@ -294,9 +294,19 @@ async fn provision_cloudnativepg(
     // 6. Apply the connection Secret in the claim's namespace, owned by
     //    the claim so it cascades on delete.
     let conn_secret_name = connection_secret_name(name);
-    let dsn = cnpg::dsn(&role, &password, &db, &cluster, &cnpg_ns);
+    let pg_host = format!("{cluster}-rw.{cnpg_ns}.svc");
     let owner_uid = claim.metadata.uid.clone().unwrap_or_default();
-    let conn_secret = connection_secret_object(&conn_secret_name, ns, &dsn, &owner_uid, name);
+    let conn_secret = connection_secret_object(
+        &conn_secret_name,
+        ns,
+        &role,
+        &password,
+        &pg_host,
+        5432,
+        &db,
+        &owner_uid,
+        name,
+    );
     let conn_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
     conn_api
         .patch(
@@ -581,14 +591,24 @@ async fn provision_dragonfly(
         .map_err(|e| ReconcileError::Provisioning(format!("dragonfly ACL SETUSER: {e}")))?;
 
     // 5. Apply the connection Secret in the claim's namespace, owner-ref'd
-    //    to the claim so it cascades on delete. Two keys: the `$N`-pinned
-    //    DSN + the pub/sub channel prefix the `&{user}:*` ACL enforces.
+    //    to the claim so it cascades on delete. Decomposed keys: url, host,
+    //    port, user, pass, db, channelPrefix (2.12 — ADR 0046 decision #3).
     let conn_secret_name = connection_secret_name(name);
-    let dsn = dragonfly::redis_dsn(&user, &claim_pw, &instance, &df_ns, dbnum);
+    let redis_host = format!("{instance}.{df_ns}.svc");
     let prefix = dragonfly::channel_prefix(&user);
     let owner_uid = claim.metadata.uid.clone().unwrap_or_default();
-    let conn_secret =
-        redis_connection_secret_object(&conn_secret_name, ns, &dsn, &prefix, &owner_uid, name);
+    let conn_secret = redis_connection_secret_object(
+        &conn_secret_name,
+        ns,
+        &user,
+        &claim_pw,
+        &redis_host,
+        6379,
+        dbnum,
+        &prefix,
+        &owner_uid,
+        name,
+    );
     let conn_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
     conn_api
         .patch(
@@ -1241,15 +1261,26 @@ pub fn connection_secret_name(claim_name: &str) -> String {
 }
 
 /// Build the connection Secret apply body: an `Opaque` Secret carrying
-/// `DATABASE_URL`, with an `ownerReference` back to the `ResourceClaim`
-/// so it cascades on claim delete (no finalizer needed for it).
+/// decomposed pg connection keys (`url`, `user`, `pass`, `host`, `port`,
+/// `db`), with an `ownerReference` back to the `ResourceClaim` so it
+/// cascades on claim delete (no finalizer needed for it).
+///
+/// The canonical key names MUST stay in sync with the renderer's
+/// `NEEDS_ENV_BINDINGS` table and the schema enum added in 2.12 — do not
+/// rename without updating those.
+#[allow(clippy::too_many_arguments)]
 pub fn connection_secret_object(
     name: &str,
     ns: &str,
-    dsn: &str,
+    role: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    db: &str,
     owner_uid: &str,
     owner_name: &str,
 ) -> Value {
+    let url = format!("postgresql://{role}:{password}@{host}:{port}/{db}");
     json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -1270,25 +1301,42 @@ pub fn connection_secret_object(
         },
         "type": "Opaque",
         "stringData": {
-            "DATABASE_URL": dsn,
+            "url":  url,
+            "user": role,
+            "pass": password,
+            "host": host,
+            "port": port.to_string(),
+            "db":   db,
         },
     })
 }
 
 /// Build the dragonfly connection Secret apply body: an `Opaque` Secret
-/// carrying BOTH `REDIS_URL` (the `$N`-pinned DSN) and
-/// `REDIS_CHANNEL_PREFIX` (the pub/sub prefix the app must apply),
-/// owner-ref'd to the `ResourceClaim` so it cascades on claim delete.
-/// The renderer (2.6-6) injects both keys; KEEP THE KEYS in sync with
-/// `operator-rendering`'s `NEEDS_ENV_BINDINGS` and the webhook guard.
+/// carrying decomposed redis connection keys (`url`, `host`, `port`, `user`,
+/// `pass`, `db`, `channelPrefix`), owner-ref'd to the `ResourceClaim` so
+/// it cascades on claim delete.
+///
+/// `db` is the `$N`-pinned database index as a string. `channelPrefix` is
+/// the pub/sub prefix (`{user}:`) that the `&{user}:*` ACL enforces.
+///
+/// The canonical key names MUST stay in sync with the renderer's
+/// `NEEDS_ENV_BINDINGS` table and the schema enum added in 2.12 — do not
+/// rename without updating those. The ACL re-pin loop reads `pass`
+/// directly; do not remove it.
+#[allow(clippy::too_many_arguments)]
 pub fn redis_connection_secret_object(
     name: &str,
     ns: &str,
-    dsn: &str,
+    user: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    db: u16,
     channel_prefix: &str,
     owner_uid: &str,
     owner_name: &str,
 ) -> Value {
+    let url = format!("redis://{user}:{password}@{host}:{port}/{db}");
     json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -1309,8 +1357,13 @@ pub fn redis_connection_secret_object(
         },
         "type": "Opaque",
         "stringData": {
-            "REDIS_URL": dsn,
-            "REDIS_CHANNEL_PREFIX": channel_prefix,
+            "url":           url,
+            "host":          host,
+            "port":          port.to_string(),
+            "user":          user,
+            "pass":          password,
+            "db":            db.to_string(),
+            "channelPrefix": channel_prefix,
         },
     })
 }
@@ -1604,11 +1657,15 @@ mod tests {
     // --- connection_secret_object() ---
 
     #[test]
-    fn connection_secret_carries_dsn_and_owner_ref_cascade() {
+    fn connection_secret_carries_decomposed_keys_and_owner_ref_cascade() {
         let s = connection_secret_object(
             "demo-web-pg-conn",
             "demo",
-            "postgresql://r:p@platform-postgres-rw.cnpg-system.svc:5432/db",
+            "r",
+            "p",
+            "platform-postgres-rw.cnpg-system.svc",
+            5432,
+            "db",
             "uid-123",
             "demo-web-pg",
         );
@@ -1618,8 +1675,20 @@ mod tests {
         assert_eq!(s["metadata"]["namespace"], "demo");
         assert_eq!(s["type"], "Opaque");
         assert_eq!(
-            s["stringData"]["DATABASE_URL"],
+            s["stringData"]["url"],
             "postgresql://r:p@platform-postgres-rw.cnpg-system.svc:5432/db"
+        );
+        assert_eq!(s["stringData"]["user"], "r");
+        assert_eq!(s["stringData"]["pass"], "p");
+        assert_eq!(
+            s["stringData"]["host"],
+            "platform-postgres-rw.cnpg-system.svc"
+        );
+        assert_eq!(s["stringData"]["port"], "5432");
+        assert_eq!(s["stringData"]["db"], "db");
+        assert!(
+            s["stringData"].get("DATABASE_URL").is_none(),
+            "legacy key DATABASE_URL must be absent"
         );
         // ownerReference → ResourceClaim cascade.
         let owner = &s["metadata"]["ownerReferences"][0];
@@ -1629,6 +1698,32 @@ mod tests {
         assert_eq!(owner["uid"], "uid-123");
         assert_eq!(owner["controller"], true);
         assert_eq!(owner["blockOwnerDeletion"], true);
+    }
+
+    #[test]
+    fn pg_connection_secret_has_decomposed_keys() {
+        let s = connection_secret_object(
+            "demo-web-pg-conn",
+            "demo",
+            "role1",
+            "secretpw",
+            "platform-postgres-rw.cnpg-system.svc",
+            5432,
+            "db1",
+            "uid-abc",
+            "demo-web-pg",
+        );
+        let sd = &s["stringData"];
+        assert_eq!(
+            sd["url"],
+            "postgresql://role1:secretpw@platform-postgres-rw.cnpg-system.svc:5432/db1"
+        );
+        assert_eq!(sd["user"], "role1");
+        assert_eq!(sd["pass"], "secretpw");
+        assert_eq!(sd["host"], "platform-postgres-rw.cnpg-system.svc");
+        assert_eq!(sd["port"], "5432");
+        assert_eq!(sd["db"], "db1");
+        assert!(sd.get("DATABASE_URL").is_none(), "legacy key dropped");
     }
 
     #[test]
@@ -1777,14 +1872,18 @@ mod tests {
         assert_eq!(body["metadata"]["name"], "claim-demo-app-disk-data");
     }
 
-    // --- redis_connection_secret_object() (2.6-4) ---
+    // --- redis_connection_secret_object() (2.6-4 → 2.12 decomposed keys) ---
 
     #[test]
-    fn redis_connection_secret_carries_both_keys_and_owner_ref_cascade() {
+    fn redis_connection_secret_carries_decomposed_keys_and_owner_ref_cascade() {
         let s = redis_connection_secret_object(
             "web-redis-conn",
             "demo",
-            "redis://claim_demo_web_redis:p@platform-redis-ephemeral-000.dragonfly-system.svc:6379/7",
+            "claim_demo_web_redis",
+            "p",
+            "platform-redis-ephemeral-000.dragonfly-system.svc",
+            6379,
+            7,
             "claim_demo_web_redis:",
             "uid-123",
             "web-redis",
@@ -1794,14 +1893,27 @@ mod tests {
         assert_eq!(s["metadata"]["name"], "web-redis-conn");
         assert_eq!(s["metadata"]["namespace"], "demo");
         assert_eq!(s["type"], "Opaque");
-        // Both env keys land in the connection Secret.
+        // All decomposed keys land in the connection Secret.
         assert_eq!(
-            s["stringData"]["REDIS_URL"],
+            s["stringData"]["url"],
             "redis://claim_demo_web_redis:p@platform-redis-ephemeral-000.dragonfly-system.svc:6379/7"
         );
         assert_eq!(
-            s["stringData"]["REDIS_CHANNEL_PREFIX"],
-            "claim_demo_web_redis:"
+            s["stringData"]["host"],
+            "platform-redis-ephemeral-000.dragonfly-system.svc"
+        );
+        assert_eq!(s["stringData"]["port"], "6379");
+        assert_eq!(s["stringData"]["user"], "claim_demo_web_redis");
+        assert_eq!(s["stringData"]["pass"], "p");
+        assert_eq!(s["stringData"]["db"], "7");
+        assert_eq!(s["stringData"]["channelPrefix"], "claim_demo_web_redis:");
+        assert!(
+            s["stringData"].get("REDIS_URL").is_none(),
+            "legacy key REDIS_URL must be absent"
+        );
+        assert!(
+            s["stringData"].get("REDIS_CHANNEL_PREFIX").is_none(),
+            "legacy key REDIS_CHANNEL_PREFIX must be absent"
         );
         // ownerReference → ResourceClaim cascade (same as the pg path).
         let owner = &s["metadata"]["ownerReferences"][0];
@@ -1811,6 +1923,41 @@ mod tests {
         assert_eq!(owner["uid"], "uid-123");
         assert_eq!(owner["controller"], true);
         assert_eq!(owner["blockOwnerDeletion"], true);
+    }
+
+    #[test]
+    fn redis_connection_secret_has_decomposed_keys() {
+        let s = redis_connection_secret_object(
+            "web-redis-conn",
+            "demo",
+            "claim_demo_web_redis",
+            "secretpw",
+            "platform-redis-ephemeral-000.dragonfly-system.svc",
+            6379,
+            7,
+            "claim_demo_web_redis:",
+            "uid-abc",
+            "web-redis",
+        );
+        let sd = &s["stringData"];
+        assert_eq!(
+            sd["url"],
+            "redis://claim_demo_web_redis:secretpw@platform-redis-ephemeral-000.dragonfly-system.svc:6379/7"
+        );
+        assert_eq!(
+            sd["host"],
+            "platform-redis-ephemeral-000.dragonfly-system.svc"
+        );
+        assert_eq!(sd["port"], "6379");
+        assert_eq!(sd["user"], "claim_demo_web_redis");
+        assert_eq!(sd["pass"], "secretpw");
+        assert_eq!(sd["db"], "7");
+        assert_eq!(sd["channelPrefix"], "claim_demo_web_redis:");
+        assert!(sd.get("REDIS_URL").is_none(), "legacy key dropped");
+        assert!(
+            sd.get("REDIS_CHANNEL_PREFIX").is_none(),
+            "legacy key dropped"
+        );
     }
 
     // --- retained_claim_dragonfly_object() (2.6-4 finalizer snapshot) ---

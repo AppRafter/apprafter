@@ -15,7 +15,8 @@
 //!     so a solo cluster with no pg apps pays no Postgres-pod cost),
 //!     provision a per-claim Postgres role + database + a basic-auth
 //!     password Secret (in the CNPG namespace), and write a connection
-//!     Secret carrying `DATABASE_URL` into the claim's namespace;
+//!     Secret with decomposed keys (`url`/`user`/`pass`/…) into the
+//!     claim's namespace (2.12 — ADR 0046);
 //!   - write `status.ready` + `status.connectionSecretRef` + a `Ready`
 //!     condition under its OWN field manager.
 //!

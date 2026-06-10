@@ -23,7 +23,7 @@
 //! temp namespace. The in-cluster scheduler marks it `Scheduled=True`;
 //! the provisioner then provisions it. Assert the claim flips
 //! `status.ready=true` with a `connectionSecretRef`, the named connection
-//! Secret carries `DATABASE_URL`, and a CNPG `Database` CR appears in the
+//! Secret carries decomposed keys (`url`/`user`/`pass`/…), and a CNPG `Database` CR appears in the
 //! cnpg-system namespace.
 
 use std::collections::BTreeMap;
@@ -149,7 +149,7 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
     let secret_ref =
         secret_ref.expect("claim must flip status.ready=true with a connectionSecretRef");
 
-    // 5. The connection Secret carries DATABASE_URL.
+    // 5. The connection Secret carries decomposed keys (2.12 — ADR 0046).
     let secret_api: Api<Secret> = Api::namespaced(client.clone(), ns_name);
     let secret = secret_api
         .get(&secret_ref)
@@ -157,8 +157,16 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
         .expect("connection Secret must exist");
     let data = secret.data.unwrap_or_default();
     assert!(
-        data.contains_key("DATABASE_URL"),
-        "connection Secret must carry DATABASE_URL"
+        data.contains_key("url"),
+        "connection Secret must carry `url`"
+    );
+    assert!(
+        data.contains_key("user"),
+        "connection Secret must carry `user`"
+    );
+    assert!(
+        data.contains_key("pass"),
+        "connection Secret must carry `pass`"
     );
 
     // 6. A CNPG Database CR appears in cnpg-system for the claim. Its
