@@ -2,9 +2,14 @@
 
 ## Status
 
-Accepted (2026-06-10). ADR-first for Phase 2.12. This is the last Phase-2
-subphase; closing it triggers the `spec.md` §3 actualization and flips the
-§6 M2 milestone box.
+Accepted (2026-06-10). ADR-first for subphase 2.12. 2.12 is the
+platform-services subphase that closes milestone **M2** per the plan's
+2.10–2.12 gate (the higher-numbered Phase-2 items are not M2-functionality
+gating: 2.13–2.16 Notifications are SR:D-dropped from launch; 2.16a per-claim
+password rotation is a launch hardening follow-on, SR:A; 2.17 is the
+M2-spec-checklist housekeeping). Closing it actualizes `spec.md` **§3.1, §4.4,
+§4.5** (the env-value model + the 2.9-deferred unification→override-wins and
+substrate→scalar reconciliation) and flips the §6 M2 box.
 
 ## Context
 
@@ -27,16 +32,25 @@ The 2.4e collision guard (rejecting a literal `DATABASE_URL` under `needs.pg`)
 is a direct symptom: the auto-injection occupies a name the user cannot reclaim.
 
 The 2.6b named-multi-claim format (ADR 0043) introduced `(type, name)` claim
-identity and CUE-validated decomposed connection-Secret keys (pg: `url user
-pass host port db`; redis: `url host port user pass db channelPrefix`), giving
-a rich per-type field vocabulary. The question 2.12 answers is: how does a
-developer bind *any* of those fields, or an external secret, into a named env
-var, without losing type safety or repo hygiene?
+identity and extended the reference grammar to `claim.<type>[.<name>].<field>`.
+The provisioners already derive the individual DSN components (pg
+`user pass host port db`; redis adds `channelPrefix`, ADR 0042 §7) to compose
+`DATABASE_URL`/`REDIS_URL`, but today only the composed DSN is persisted in the
+connection Secret. The question 2.12 answers is how a developer binds any
+component, the composed DSN, or an external secret into a named env var —
+Decision #3 persists the components as discrete Secret keys to make that
+binding resolvable, without losing type safety or repo hygiene.
 
 **Authoring requirements** (shaped by the user during design, 2026-06-09):
 typed + structural, minimal brackets, claim refs cue-vet-validated against
 declared needs, external secrets validated format-at-webhook / existence-at-runtime,
 no boilerplate in the user's repo, local CLI validation that matches the cluster.
+The chosen syntax **deliberately departs** from the earlier `spec.md` §3.1/§4.4
+sketch (`from:`-wrapped values, a `secret("…", rotation:)` function, `claim.pg.uri`):
+that sketch proved hard to implement on real `cue` (no call syntax; conflated the
+ref with the secret's lifecycle). The shipped form (bare `claim.<type>.<field>`,
+braceless `secret: "<name>/<key>"`, lifecycle owned by the secret's source) is
+verified, cleaner, and feasible — those spec sections are actualized at this close.
 
 ## Decision
 
@@ -109,7 +123,11 @@ temp-file-in-ephemeral-workspace approach is the simpler default.
 For **per-env** cases the cue-cmp binds `claim` to the **effective** needs
 of the active environment (`base.needs` ⊗ `environments[<env>].needs`,
 override-wins — the same merge the operator's `effective_spec` uses). The env
-is known at cue-cmp render time via `APPRAFTER_APP_ENV` (2.9 mechanism).
+is known at cue-cmp render time via `APPRAFTER_APP_ENV` (2.9 mechanism) — in
+cluster Argo CD prefixes plugin env vars, so the cue-cmp reads the
+`ARGOCD_ENV_APPRAFTER_APP_ENV` form (fix `f91bdf0`); the bare name is the
+logical reference. (Anyone grepping the code for the bare var: it's the
+prefixed form at runtime.)
 
 This mechanism was de-risked on real `cue` (2026-06-09): a scratch package
 confirmed that needs → comprehension materialises all expected fields, that
@@ -331,5 +349,8 @@ Platform / operator. Implementation: Phase 2.12 (`plan.md` §2.12).
 - ADR 0043 (needs.disk / named multi-claim — `(type, name)` identity and
   named `claim.<type>.<name>.<field>` grammar).
 - ADR 0044 (per-environment deploy — `effective_spec`, per-env needs merge).
-- ADR 0029 (CUE CMP — schema injection, ephemeral workspace).
+- ADR 0029 (CUE CMP — `cue export ./...` over the user's repo). 0046 **extends**
+  0029: the render-time injection of the current schema + a generated `claim`
+  binding (and dropping the scaffold's vendored `cue.mod/pkg`) is a later
+  evolution beyond what 0029 (Draft) describes.
 - `plan.md` §2.12 (`Application.env` value references).

@@ -7,9 +7,9 @@ the patch matches the (sub-)subphase. Milestone tags
 (`v0.1.0-mvp`, `v0.2.0-services`, etc.) point at the closing
 patch of each phase.
 
-## Phase 2 — Platform services (closed 2026-06-10, milestone M2)
+## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## operator + admission-webhook + argocd-cue-cmp + platform-stack v0.2.24 + cli v0.2.11 — 2.12 Application.env value references (ADR 0046) — Phase 2 / M2 close (2026-06-10)
+## operator + admission-webhook + argocd-cue-cmp + platform-stack v0.2.24 + cli v0.2.11 — 2.12 Application.env value references (ADR 0046) — closes the M2 platform-services core (2026-06-10)
 
 ### Added
 
