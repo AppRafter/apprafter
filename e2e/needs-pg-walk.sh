@@ -21,11 +21,14 @@
 #      (status.provider, Scheduled=True).
 #   4. ASSERT the provisioner lazily creates the shared CNPG Cluster,
 #      a managed role, a Database, a password Secret, and a connection
-#      Secret carrying DATABASE_URL — and that the scheduler's
-#      Scheduled=True survives the provisioner's status write (the SSA
-#      field-manager split guard).
-#   5. ASSERT the Application resumes to Ready and the rendered
-#      Deployment injects DATABASE_URL from the connection Secret.
+#      Secret carrying the DECOMPOSED keys (2.12 / ADR 0046 #3: url user
+#      pass host port db — the old composed DATABASE_URL key is dropped) —
+#      and that the scheduler's Scheduled=True survives the provisioner's
+#      status write (the SSA field-manager split guard).
+#   5. ASSERT the Application resumes to Ready and the rendered Deployment
+#      resolves the EXPLICIT `env: {DATABASE_URL: {claim: "pg.url"}}` ref
+#      (2.12 / ADR 0046) into a secretKeyRef on the connection Secret's
+#      `url` key (the 2.4e auto-inject is removed).
 #   6. Delete the ResourceClaim; ASSERT the finalizer snapshots a
 #      RetainedClaim (7-day grace) and the connection Secret cascades,
 #      while the role + Database survive the grace floor.
@@ -114,6 +117,32 @@ done
 # in lib.sh picks the backend; here we only assert one of them exists.
 if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
     printf 'ERROR: neither "docker" nor "podman" found on PATH\n' >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------
+# Precondition: this walk REQUIRES local-operator mode while 2.12 is
+# UNRELEASED. ADR 0046 removed the 2.4e implicit DATABASE_URL injection and
+# the connection-Secret's composed `DATABASE_URL` key — the app now binds the
+# DSN by an EXPLICIT `env: {DATABASE_URL: {claim: "pg.url"}}` ref (Phase 3),
+# which only the branch operator + webhook + CRD render/validate. So this
+# walk builds + side-loads the working-tree operator/webhook and applies the
+# branch CRDs (Phase 1b). The flag is mandatory until 2.12 ships.
+# ---------------------------------------------------------------
+if [ -z "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
+    cat >&2 <<'EOF'
+ERROR: needs-pg-walk requires APPRAFTER_E2E_LOCAL_OPERATOR=1 while 2.12 is unreleased.
+
+ADR 0046 (Phase 2.12) removed the 2.4e implicit DATABASE_URL injection and the
+connection-Secret's composed `DATABASE_URL` key. This walk now declares the DSN
+explicitly (`env: {DATABASE_URL: {claim: "pg.url"}}`), which only the branch
+operator + webhook + CRD render/validate. Run:
+
+  APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-pg-walk.sh
+
+so the walk builds + side-loads the working-tree operator/webhook and applies
+the branch CRDs (Phase 1b). Drop this gate once 2.12 publishes.
+EOF
     exit 2
 fi
 
@@ -315,6 +344,74 @@ bootstrap_with_retry
 
 printf '  cluster-bootstrap complete\n'
 
+# ---------------------------------------------------------------
+# Phase 1b (REQUIRED — APPRAFTER_E2E_LOCAL_OPERATOR): build + side-load the
+# working-tree operator + webhook instead of the published image, then apply
+# the branch CRDs. 2.12 (ADR 0046) drops the 2.4e auto-inject + the composed
+# `DATABASE_URL` connection-Secret key and adds the `env` value node + webhook
+# env-ref rules — all UNRELEASED, so the published image + CRD this cluster
+# bootstrapped from cannot render/validate the explicit DSN ref in Phase 3.
+# Mirrors needs-disk-walk Phase 1b (no extra RBAC — env refs add no new k8s
+# verb; resolve_env only reads Secrets the operator already watches).
+# NOTE: the if-body below is intentionally NOT indented; `fi` closes it just
+# before Phase 2.
+# ---------------------------------------------------------------
+if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
+phase "Phase 1b: build + load local operator + webhook (APPRAFTER_E2E_LOCAL_OPERATOR)"
+builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
+build_load_restart() { # <deployment> <operator-subdir>
+    local dep="$1" sub="$2" img
+    printf '  waiting for the %s Deployment to appear ...\n' "$dep"
+    for _ in $(seq 1 60); do
+        kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 && break
+        sleep 5
+    done
+    img=$(kubectl -n apprafter-system get deploy "$dep" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+    printf '  building %s from the working tree (%s) ...\n' "$img" "$builder"
+    "$builder" build -f "${REPO_ROOT}/operator/${sub}/Dockerfile" \
+        -t "$img" "${REPO_ROOT}/operator"
+    cluster_load_image "$CLUSTER_NAME" "$img"
+    kubectl -n apprafter-system rollout restart "deploy/${dep}"
+    kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=180s
+}
+build_load_restart apprafter-operator apprafter-operator
+build_load_restart admission-webhook admission-webhook
+# Wait until ONLY the branch webhook serves before any branch-typed apply: the
+# OLD (released) webhook pod lingers Terminating for its grace period, and
+# during that window the Phase 3 env-ref apply could route to it — whose
+# released validator lacks the 2.12 env-ref rules.
+printf '  waiting for the old (released) webhook pod to fully terminate ...\n'
+_wh_deadline=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$_wh_deadline" ]; do
+    [ "$(kubectl -n apprafter-system get pods \
+        -l app.kubernetes.io/name=admission-webhook --no-headers 2>/dev/null \
+        | wc -l)" -le 1 ] && break
+    sleep 3
+done
+printf '  apprafter-operator + admission-webhook now running the working-tree build\n'
+
+# The released chart predates the 2.12 CRD change (Application.spec.base.env /
+# environments[*].env now accept a string-OR-object #EnvValue). Argo CD owns
+# those CRDs via the apprafter-operator Application, so disable automated sync
+# on the parent + operator apps (else Argo reverts the drift) then apply the
+# BRANCH-rendered CRDs server-side. Mirrors needs-disk-walk Phase 1b.
+printf '  applying branch operator CRDs (released chart predates 2.12 env node) ...\n'
+for _app in platform apprafter-operator; do
+    kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
+        -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
+done
+_yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-go -- "$@"; fi; }
+helm template apprafter-operator "${REPO_ROOT}/operator/charts/apprafter-operator" \
+    | _yq 'select(.kind == "CustomResourceDefinition")' \
+    | kubectl apply --server-side --force-conflicts -f -
+for _crd in applications serviceproviders resourceclaims retainedclaims; do
+    retry 12 5 -- kubectl wait --for=condition=Established \
+        "crd/${_crd}.apprafter.io" --timeout=30s
+done
+printf '  branch CRDs applied + Established\n'
+fi  # end APPRAFTER_E2E_LOCAL_OPERATOR (Phase 1b)
+
 # ===============================================================
 # Phase 2: readiness — CNPG operator, the seeded provider, the webhook
 # ===============================================================
@@ -359,10 +456,14 @@ retry 30 10 -- kubectl -n "$RETAINED_NS" rollout status \
 # Phase 3: apply the needs.pg Application
 # ===============================================================
 
-phase "Phase 3: apply Application with spec.base.needs.pg"
+phase "Phase 3: apply Application with spec.base.needs.pg + explicit DSN ref"
 
 kubectl create namespace "$APP_NS" 2>/dev/null || true
 
+# 2.12 (ADR 0046 #5): the 2.4e implicit DATABASE_URL injection is removed —
+# the app binds the DSN by an EXPLICIT claim ref. The cue-cmp renders the bare
+# selector `claim.pg.url` → the `{claim: "pg.url"}` marker; we apply that
+# resolved marker form directly (this walk runs raw CRs, not the cue-cmp).
 kubectl apply -f - <<YAML
 apiVersion: apprafter.io/v1alpha1
 kind: Application
@@ -383,6 +484,9 @@ spec:
         selector:
           tier: integrated
         size: small
+    env:
+      DATABASE_URL:
+        claim: "pg.url"
 YAML
 
 # ===============================================================
@@ -461,15 +565,20 @@ role_present=$(kubectl -n "$CNPG_NS" get cluster.postgresql.cnpg.io \
     2>/dev/null || true)
 assert_eq "managed role in Cluster spec.managed.roles" "$role_present" "$PG_ROLE"
 
-# Connection Secret: status ref, DATABASE_URL key, ownerRef cascade.
+# Connection Secret: status ref, DECOMPOSED keys (2.12 / ADR 0046 #3:
+# url user pass host port db — the composed `DATABASE_URL` key is dropped),
+# ownerRef cascade.
 conn_ref=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.connectionSecretRef}')
 assert_eq "status.connectionSecretRef" "$conn_ref" "$CONN_SECRET"
-conn_key=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.DATABASE_URL}')
+conn_key=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.url}')
 if [ -z "$conn_key" ]; then
-    printf 'ERROR: connection Secret %s missing DATABASE_URL key\n' "$CONN_SECRET" >&2
+    printf 'ERROR: connection Secret %s missing decomposed `url` key\n' "$CONN_SECRET" >&2
     exit 1
 fi
-printf '  ok: connection Secret %s carries DATABASE_URL\n' "$CONN_SECRET"
+printf '  ok: connection Secret %s carries the decomposed `url` key\n' "$CONN_SECRET"
+# The old composed key must be GONE (2.4e DATABASE_URL key removed).
+old_key=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.DATABASE_URL}')
+assert_eq "connection Secret has NO DATABASE_URL key (2.4e dropped)" "$old_key" ""
 conn_owner_kind=$(jp secret "$APP_NS" "$CONN_SECRET" \
     '{.metadata.ownerReferences[0].kind}')
 assert_eq "connection Secret ownerRef Kind" "$conn_owner_kind" "ResourceClaim"
@@ -481,13 +590,16 @@ sched_after=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM" Scheduled)
 assert_eq "Scheduled still True after provision (SSA split)" "$sched_after" "True"
 
 # ===============================================================
-# Phase 7: resume + DSN (2.4d/2.4e) — Application Ready, env injected
+# Phase 7: resume + DSN (2.4d / 2.12) — Application Ready, env ref resolved
 # ===============================================================
 
-phase "Phase 7: resume — Application Ready, DATABASE_URL injected"
+phase "Phase 7: resume — Application Ready, DATABASE_URL claim ref resolved"
 
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 180
 
+# 2.12 (ADR 0046 #8): the explicit `{claim: "pg.url"}` ref resolves to a
+# secretKeyRef into the connection Secret, key `url` (the decomposed DSN key,
+# NOT the old composed `DATABASE_URL` key).
 env_secret=$(kubectl -n "$APP_NS" get deployment "$APP" \
     -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"DATABASE_URL\")].valueFrom.secretKeyRef.name}" \
     2>/dev/null || true)
@@ -495,7 +607,7 @@ assert_eq "Deployment env DATABASE_URL secretKeyRef.name" "$env_secret" "$CONN_S
 env_key=$(kubectl -n "$APP_NS" get deployment "$APP" \
     -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"DATABASE_URL\")].valueFrom.secretKeyRef.key}" \
     2>/dev/null || true)
-assert_eq "Deployment env DATABASE_URL secretKeyRef.key" "$env_key" "DATABASE_URL"
+assert_eq "Deployment env DATABASE_URL secretKeyRef.key" "$env_key" "url"
 
 kubectl -n "$APP_NS" wait --for=condition=Available \
     "deployment/${APP}" --timeout=300s

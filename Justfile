@@ -110,13 +110,19 @@ e2e-gitops:
 # follow-up for the nightly Hetzner harness. See plan.md §1.81.
 e2e: e2e-gitops
 
-# Run the needs.pg ResourceClaim-chain k3d walk (generate -> schedule
-# -> provision -> resume + DSN -> delete + RetainedClaim -> force-GC ->
-# psql DROP proof). Deliberately NOT a dependency of `e2e`: it boots a
-# Postgres pod (heavier) and runs on its own nightly cadence via
-# .github/workflows/e2e-pg-nightly.yml. Requires Docker + k3d on PATH.
+# Run the needs.pg ResourceClaim-chain k3d/kind walk (generate -> schedule
+# -> provision -> resume + explicit DSN ref -> delete + RetainedClaim ->
+# force-GC -> psql DROP proof). Since 2.12 (ADR 0046) the app binds its DSN by
+# an explicit `env: {DATABASE_URL: {claim: "pg.url"}}` ref (the 2.4e auto-inject
+# + composed connection-Secret key are removed), so while 2.12 is UNRELEASED
+# this RUNS WITH APPRAFTER_E2E_LOCAL_OPERATOR=1: it builds + side-loads the
+# working-tree operator + admission-webhook and applies the branch CRDs (the
+# published image/CRD predate the `env` value node). Deliberately NOT a
+# dependency of `e2e`: it boots a Postgres pod (heavier) and runs on its own
+# nightly cadence via .github/workflows/e2e-pg-nightly.yml. Requires a container
+# runtime (docker->k3d / podman->kind), cargo, kubectl.
 e2e-pg:
-    bash e2e/needs-pg-walk.sh
+    APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-pg-walk.sh
 
 # Run the needs.redis ResourceClaim-chain k3d walk (generate -> schedule
 # -> provision -> resume + DSN -> $N-ACL isolation proof -> delete +
@@ -139,6 +145,23 @@ e2e-redis:
 # Requires a container runtime (docker→k3d / podman→kind), cargo, kubectl.
 e2e-disk:
     bash e2e/needs-disk-walk.sh
+
+# Run the needs-env-refs k3d/kind walk (2.12, ADR 0046): the operator
+# resolves an `env` map carrying ALL THREE sources (literal + claim ref
+# {claim:"pg.url"} → decomposed connection-Secret keys url/user/pass + external
+# secret ref {secret:"appsecret/token"}) into container EnvVar/secretKeyRef,
+# the pod sees the resolved values, and deleting the external Secret flips the
+# Application to Ready=False/EnvSecretMissing (then recovers on re-create).
+# 2.12 is UNRELEASED, so this RUNS WITH APPRAFTER_E2E_LOCAL_OPERATOR=1: it
+# builds + side-loads the working-tree operator + admission-webhook and applies
+# the branch CRDs (the published image/CRD predate the `env` value node). It
+# takes the DIRECT-CR marker path (the cue-cmp bare-selector rendering is
+# covered by argocd-cue-cmp/test-inject.sh). Like e2e-pg/e2e-redis/e2e-disk it
+# is NOT a dependency of `e2e`: it boots a CNPG pod and runs on its own nightly
+# cadence via .github/workflows/e2e-env-refs-nightly.yml. Requires a container
+# runtime (docker→k3d / podman→kind), cargo, kubectl.
+e2e-env-refs:
+    APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-env-refs-walk.sh
 
 # Run the per-environment GitOps-walk k3d/kind e2e (2.9, ADR 0044): the
 # SAME repo deployed per env (app add --env dev|prod) -> two Argo

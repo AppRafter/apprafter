@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: e2e-env-refs-nightly
+
+# Standalone nightly k3d/kind gate for the Phase-2.12 `Application.env`
+# value-reference chain (e2e/needs-env-refs-walk.sh, ADR 0046): the operator
+# resolves an `env` map carrying all three sources — a literal, claim refs
+# ({claim:"pg.url"} -> the decomposed connection-Secret keys url/user/pass),
+# and an external secret ref ({secret:"appsecret/token"}) — into container
+# EnvVar/secretKeyRef entries; the pod sees the resolved values; deleting the
+# external Secret flips the Application to Ready=False/EnvSecretMissing (then
+# recovers on re-create).
+#
+# Local-operator mode (REQUIRED): Phase 2.12 is UNRELEASED, so this walk runs
+# with APPRAFTER_E2E_LOCAL_OPERATOR=1 — it builds + side-loads the working-tree
+# operator + admission-webhook and applies the branch CRDs (the published
+# image/CRD predate the `env` value node, the webhook env-ref rules, and the
+# decomposed connection-Secret keys). Drop the flag + this note once 2.12
+# publishes. The CI runner uses Docker, so the in-container build's
+# `kind load docker-image` side-load works (unlike the podman path).
+#
+# Why a separate workflow (NOT folded into e2e-k3d.yml or the other
+# nightlies):
+#   - It boots a real CNPG cluster (for the claim refs) AND builds the
+#     working-tree operator image in-container, so it is heavier than the
+#     gitops-walk gate -- keep it off the per-push critical path.
+#   - It is decoupled from the Hetzner-cost nightly.yml so the free-k3d
+#     failure domain stays independent (no cloud spend, no secrets).
+#
+# Security note: no secrets are consumed here. Everything runs on a
+# local kind cluster; the only outbound traffic is public image /
+# chart pulls. `permissions: contents: read` is the minimum. No
+# `github.event.*` input is interpolated into any run: block.
+
+on:
+  schedule:
+    # 10:00 UTC -- staggered after nightly.yml (04:00 UTC),
+    # e2e-pg-nightly.yml (05:00 UTC), e2e-redis-nightly.yml (06:00 UTC),
+    # e2e-disk-nightly.yml (07:00 UTC), e2e-per-env-nightly.yml (08:00 UTC)
+    # and e2e-networkpolicy-nightly.yml (09:00 UTC) so the nightly gates
+    # don't contend for the runner pool.
+    - cron: '0 10 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-env-refs-nightly:
+    name: kind e2e (needs-env-refs nightly)
+    runs-on: ubuntu-latest
+    # Higher than the published-image nightlies: this walk also builds the
+    # working-tree operator + webhook images in-container (2.12 unreleased),
+    # so the operator build + the CNPG boot + the chain dominate wall-clock.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cli/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('cli/**/Cargo.lock', 'cli/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install yq
+        # Phase 1b renders the branch CRDs via `helm template | yq 'select(...)'`.
+        # lib.sh falls back to `nix run nixpkgs#yq-go` when absent, but the CI
+        # runner has no nix, so install yq explicitly.
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Install kind
+        run: |
+          curl -fsSL -o ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Load iptables kernel modules for Cilium
+        # cluster-bootstrap skips Cilium on kind
+        # (APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 in lib.sh) so these are a
+        # belt-and-braces no-op here, kept for parity with the other
+        # nightlies in case a future walk re-enables the eBPF datapath.
+        run: |
+          sudo modprobe -a \
+            ip_tables iptable_mangle iptable_raw iptable_filter iptable_nat \
+            ip6_tables ip6table_mangle ip6table_raw ip6table_filter ip6table_nat \
+            nf_nat xt_socket || true
+          lsmod | grep -E 'ip6?table|nf_nat|xt_socket' || true
+
+      - name: Warm the CLI build cache
+        working-directory: cli
+        # The e2e script invokes the CLI via `cargo run` (lib.sh's
+        # `apprafter()` shell function), so a debug build here warms the
+        # cache for the timed script run below -- no PATH binary is used.
+        run: cargo build --bin apprafter
+
+      - name: Run the needs-env-refs kind walk
+        # 2.12 is UNRELEASED, so build + side-load the working-tree operator +
+        # webhook and apply the branch CRDs (Phase 1b). The CI runner uses
+        # Docker, so `kind load docker-image` resolves the in-container build.
+        run: APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-env-refs-walk.sh

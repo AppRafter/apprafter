@@ -3,7 +3,7 @@ name: e2e-pg-nightly
 
 # Standalone nightly k3d gate for the Phase-2.4 needs.pg ResourceClaim
 # chain (e2e/needs-pg-walk.sh): generate -> schedule -> provision ->
-# resume + DSN inject -> delete + RetainedClaim snapshot -> force-GC ->
+# resume + explicit DSN ref (2.12) -> delete + RetainedClaim snapshot -> force-GC ->
 # psql DROP proof.
 #
 # Why a separate workflow (NOT folded into e2e-k3d.yml):
@@ -33,7 +33,10 @@ jobs:
   e2e-pg-nightly:
     name: k3d e2e (needs.pg nightly)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Higher than a published-image nightly: while 2.12 is unreleased the walk
+    # also builds the working-tree operator + webhook images in-container
+    # (Phase 1b), so the operator build + the CNPG boot dominate wall-clock.
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
@@ -94,5 +97,22 @@ jobs:
         # cache for the timed script run below -- no PATH binary is used.
         run: cargo build --bin apprafter
 
+      - name: Install yq
+        # Phase 1b renders the branch CRDs via `helm template | yq 'select(...)'`.
+        # lib.sh falls back to `nix run nixpkgs#yq-go` when absent, but the CI
+        # runner has no nix, so install yq explicitly.
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
       - name: Run the needs.pg k3d walk
-        run: bash e2e/needs-pg-walk.sh
+        # 2.12 (ADR 0046) removed the 2.4e implicit DATABASE_URL injection +
+        # the composed connection-Secret key; the walk now declares the DSN
+        # explicitly (`env: {DATABASE_URL: {claim: "pg.url"}}`), which only the
+        # branch operator/webhook/CRD render/validate. Until 2.12 publishes,
+        # run with APPRAFTER_E2E_LOCAL_OPERATOR=1 so Phase 1b builds +
+        # side-loads the working-tree images and applies the branch CRDs. The
+        # CI runner uses Docker, so `kind load docker-image` resolves the build.
+        run: APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-pg-walk.sh

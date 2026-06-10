@@ -74,9 +74,18 @@ including the always-on CloudNativePG operator and the seeded
 `pg-integrated` ServiceProvider — then walks:
 
 ```
-generate -> schedule -> provision -> resume + DSN inject ->
+generate -> schedule -> provision -> resume + explicit DSN ref ->
 delete + RetainedClaim snapshot -> force-GC -> psql DROP proof
 ```
+
+Since Phase 2.12 (ADR 0046) the app binds its DSN by an **explicit**
+`env: {DATABASE_URL: {claim: "pg.url"}}` ref — the 2.4e implicit
+`DATABASE_URL` injection and the connection-Secret's composed
+`DATABASE_URL` key are removed (the Secret now carries the decomposed
+keys `url user pass host port db`). While 2.12 is **unreleased** this walk
+therefore **requires `APPRAFTER_E2E_LOCAL_OPERATOR=1`**: it builds +
+side-loads the working-tree operator/webhook and applies the branch CRDs
+(Phase 1b), because the published image/CRD predate the `env` value node.
 
 The final phase execs the CloudNativePG primary and asserts the
 per-claim database + role are **physically dropped from Postgres**
@@ -86,7 +95,9 @@ reports `ensure: absent`.
 ### Usage
 
 ```sh
-APPRAFTER_E2E_SKIP_DESTROY=1 bash e2e/needs-pg-walk.sh   # keep the cluster for inspection
+# 2.12 is unreleased, so build + side-load the working-tree operator (Phase 1b):
+APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-pg-walk.sh
+APPRAFTER_E2E_LOCAL_OPERATOR=1 APPRAFTER_E2E_SKIP_DESTROY=1 bash e2e/needs-pg-walk.sh   # keep the cluster
 ```
 
 Without `APPRAFTER_E2E_SKIP_DESTROY` the script tears the k3d cluster
