@@ -1723,6 +1723,46 @@ compatibility: "0.1.23": {
 // breach) fixed by serializing reconciles; and the operator-only-CREATE
 // webhooks now accept `kubeadm:cluster-admins` break-glass (k8s 1.35).
 // CRD-compatible with 0.2.19; existing claims keep their allocation.
+compatibility: "0.2.24": {
+	change:          "safe"
+	operatorVersion: "v0.2.24"
+	notes: """
+		Phase 2.12 (Application.env value references, ADR 0046) close — the
+		last Phase-2 subphase. `Application.spec.*.env` values may now be a
+		literal string, a claim reference (bare CUE selector `claim.<type>.<field>`
+		or named `claim.<type>.<name>.<field>` — pg/redis only at launch), or an
+		external-secret reference (`secret: "<name>/<key>"`). At the CR level each
+		ref is a string-discriminated marker (`{claim: "pg.url"}` / `{secret:
+		"stripe/api-key"}`); the operator renderer resolves it to a container
+		`EnvVar{valueFrom: secretKeyRef}`. The provisioner now writes CANONICAL
+		decomposed connection-Secret keys (`url user pass host port db` + redis
+		`channelPrefix`) and DROPS the old composed `DATABASE_URL`/`REDIS_URL`/
+		`REDIS_CHANNEL_PREFIX` key names; `acl_reconcile` reads `pass` directly.
+
+		**The 2.4e implicit `DATABASE_URL` auto-injection is REMOVED** — a
+		`needs.pg` app no longer auto-gets `DATABASE_URL`; it must declare it
+		explicitly (`env: {DATABASE_URL: claim.pg.url}`). Apps relying on the
+		auto-injection must add the explicit ref before upgrading (a one-line
+		manifest change). The 2.4e literal-`DATABASE_URL`-collision webhook guard
+		is also gone.
+
+		The cue-cmp (**v0.1.8 → v0.1.9**) now injects the current schema + a
+		generated `claim` binding (from the manifest's effective needs) into its
+		ephemeral render workspace so bare `claim.*` selectors resolve to markers;
+		`apprafter app scaffold` stops vendoring the schema, and a new
+		`apprafter app validate` runs the same injection locally. Validation is
+		layered: `cue vet` (claim refs, undeclared need / non-enum field) +
+		admission webhook (format) + runtime (missing external Secret → Application
+		`Ready=False` reason `EnvSecretMissing`).
+
+		CRD change is additive (the `env` value node gains
+		`x-kubernetes-preserve-unknown-fields: true`) — CRD-compatible with 0.2.23;
+		existing literal-only `env` maps validate unchanged. Operator + webhook +
+		cue-cmp binaries change; chart appVersion bump propagates the new images.
+		"""
+	references: ["plan.md#2.12", "docs/adr/0046-env-value-references.md"]
+}
+
 compatibility: "0.2.23": {
 	change:          "safe"
 	operatorVersion: "v0.2.23"
