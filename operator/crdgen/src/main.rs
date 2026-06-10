@@ -5,6 +5,7 @@
 //! Rust↔CUE drift. CUE is the source of truth — this tool is only the
 //! transform engine, like `cli-providers/build.rs`.
 
+mod check;
 mod cue;
 mod envelope;
 mod structural;
@@ -30,7 +31,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("generate") => generate(),
-        Some("check") => bail!("`crdgen check` lands in Phase 2 (ADR 0047)"),
+        Some("check") => check::check(),
         other => bail!("usage: crdgen <generate|check>; got {other:?}"),
     }
 }
@@ -47,12 +48,16 @@ fn find_repo_root() -> Result<PathBuf> {
     }
 }
 
-fn generate() -> Result<()> {
+/// Render every in-scope CRD to its `(chart path, YAML text)`. Shared by
+/// `generate` (writes them) and `check` (compares them to the committed
+/// files), so both see byte-identical output.
+pub(crate) fn render_all() -> Result<Vec<(PathBuf, String)>> {
     let root = find_repo_root()?;
     let schemas = cue::export_schemas(&root)?;
     let metas = cue::export_crd_metas(&root)?;
     let templates = root.join("operator/charts/apprafter-operator/templates");
 
+    let mut rendered = Vec::new();
     for crd in CRDS {
         let component = schemas
             .get(crd.component)
@@ -93,9 +98,16 @@ fn generate() -> Result<()> {
         let source = format!("schemas/v1alpha1 ({} via _crdMetas)", crd.component);
         let text = envelope::render(&source, &crd_obj)?;
 
-        let out = templates.join(format!("{}.yaml", crd.file_stem));
-        std::fs::write(&out, text).with_context(|| format!("write {}", out.display()))?;
-        eprintln!("generated {}", out.display());
+        let path = templates.join(format!("{}.yaml", crd.file_stem));
+        rendered.push((path, text));
+    }
+    Ok(rendered)
+}
+
+fn generate() -> Result<()> {
+    for (path, text) in render_all()? {
+        std::fs::write(&path, &text).with_context(|| format!("write {}", path.display()))?;
+        eprintln!("generated {}", path.display());
     }
     Ok(())
 }
