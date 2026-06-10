@@ -14,8 +14,10 @@
 #
 # It ALSO proves the 2.6b-2 multi-claim surface in passing: a second
 # Application declares `needs.pg` as a NAMED ARRAY of two entries
-# (primary + analytics), and the resumed Deployment must carry the two
-# disambiguated env vars DATABASE_URL_PRIMARY + DATABASE_URL_ANALYTICS.
+# (primary + analytics) with EXPLICIT env claim refs (2.12 / ADR 0046),
+# and the resumed Deployment must carry the two disambiguated env vars
+# DATABASE_URL_PRIMARY + DATABASE_URL_ANALYTICS resolved to secretKeyRefs
+# into the `url` key of each connection Secret.
 #
 # Concretely, on a cluster bootstrapped with the platform stack
 # (operator + admission-webhook + the always-on CNPG operator + the
@@ -36,7 +38,8 @@
 #      records status.volumeClaimRef, and lands the claim ready.
 #   5. ASSERT the Application resumes to Ready and the rendered
 #      Deployment mounts the PVC at /data with strategy:Recreate; the
-#      multi Deployment carries DATABASE_URL_PRIMARY + _ANALYTICS.
+#      multi Deployment carries DATABASE_URL_PRIMARY + _ANALYTICS resolved
+#      to secretKeyRefs on the `url` key of each connection Secret (2.12).
 #   6. Data durability: exec the pod, write /data/probe, delete the pod,
 #      and ASSERT the file survives the rebind (RWO PVC on one node).
 #   7. Delete the Application; ASSERT a disk RetainedClaim is snapshotted
@@ -54,16 +57,17 @@
 # kubeconfig as kubeconfig_yaml (plaintext) — the same approach
 # needs-pg-walk.sh / needs-redis-walk.sh use.
 #
-# Local-operator mode (OPTIONAL)
-# ------------------------------
-# By default this walk runs the PUBLISHED operator image (v0.2.21+ ships the
-# 2.6b disk feature, the 2.6b CRDs, the disk-local ServiceProvider seed, and
-# the PVC RBAC), exactly like needs-pg-walk.sh / needs-redis-walk.sh. Set
-# APPRAFTER_E2E_LOCAL_OPERATOR=1 to instead build the operator +
-# admission-webhook from THIS branch, side-load them, and apply the branch
-# CRDs + PVC RBAC (Phase 1b) — use it to validate working-tree disk changes
-# before a release. Both modes need the same tools (the operator build in
-# LOCAL_OPERATOR mode reuses the already-required container runtime).
+# Local-operator mode (REQUIRED while 2.12 is unreleased)
+# ---------------------------------------------------------
+# ADR 0046 (Phase 2.12) removed the 2.4e implicit DATABASE_URL_<NAME> injection
+# and the connection-Secret's composed `DATABASE_URL` key. The multi app now
+# binds the DSNs via EXPLICIT claim refs (env: {DATABASE_URL_PRIMARY:
+# {claim: "pg.primary.url"}, DATABASE_URL_ANALYTICS: {claim: "pg.analytics.url"}}),
+# which only the branch operator + webhook + CRD render/validate. So
+# APPRAFTER_E2E_LOCAL_OPERATOR=1 is MANDATORY until 2.12 ships (Phase 1b builds
+# + side-loads the working-tree operator/webhook and applies the branch CRDs +
+# PVC RBAC). Both modes need the same tools (the operator build reuses the
+# already-required container runtime).
 #
 # Required: docker (or podman), cargo, kubectl
 #   — all satisfied inside `nix develop` or on a standard CI runner.
@@ -154,6 +158,32 @@ if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; t
     exit 2
 fi
 
+# ---------------------------------------------------------------
+# Precondition: this walk REQUIRES local-operator mode while 2.12 is
+# UNRELEASED. ADR 0046 removed the 2.4e implicit DATABASE_URL_<NAME>
+# injection and the connection-Secret's composed `DATABASE_URL` key — the
+# multi app now binds the DSNs by EXPLICIT claim refs
+# (`env: {DATABASE_URL_PRIMARY: {claim: "pg.primary.url"}, ...}`), which
+# only the branch operator + webhook + CRD render/validate. The flag is
+# mandatory until 2.12 ships.
+# ---------------------------------------------------------------
+if [ -z "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
+    cat >&2 <<'EOF'
+ERROR: needs-disk-walk requires APPRAFTER_E2E_LOCAL_OPERATOR=1 while 2.12 is unreleased.
+
+ADR 0046 (Phase 2.12) removed the 2.4e implicit DATABASE_URL_<NAME> injection and
+the connection-Secret's composed `DATABASE_URL` key. This walk now declares the DSNs
+explicitly (`env: {DATABASE_URL_PRIMARY: {claim: "pg.primary.url"},
+DATABASE_URL_ANALYTICS: {claim: "pg.analytics.url"}}`), which only the branch
+operator + webhook + CRD render/validate. Run:
+
+  APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-disk-walk.sh
+
+so the walk builds + side-loads the working-tree operator/webhook and applies
+the branch CRDs (Phase 1b). Drop this gate once 2.12 publishes.
+EOF
+    exit 2
+fi
 
 # ---------------------------------------------------------------
 # Temp workspace
@@ -361,14 +391,14 @@ bootstrap_with_retry
 printf '  cluster-bootstrap complete\n'
 
 # ---------------------------------------------------------------
-# Phase 1b (OPTIONAL — APPRAFTER_E2E_LOCAL_OPERATOR): build + side-load the
+# Phase 1b (REQUIRED — APPRAFTER_E2E_LOCAL_OPERATOR): build + side-load the
 # working-tree operator + webhook instead of the published image, then apply
-# the branch CRDs + PVC RBAC. SKIPPED by default — the published v0.2.21+
-# operator already ships the 2.6b disk feature, the 2.6b CRDs, the disk-local
-# ServiceProvider seed, and the PVC RBAC, so the default path needs none of
-# this (same as the needs-pg / needs-redis walks). Set the flag only to
-# validate working-tree disk changes before a release. (Mirrors the
-# needs-redis-walk Phase 1b block.)
+# the branch CRDs + PVC RBAC. 2.12 (ADR 0046) drops the 2.4e auto-inject +
+# the composed `DATABASE_URL` connection-Secret key and adds the `env` value
+# node + webhook env-ref rules — all UNRELEASED, so the published image + CRD
+# this cluster bootstrapped from cannot render/validate the explicit DSN refs
+# in Phase 3. The flag is mandatory until 2.12 ships (the precondition gate
+# above ensures this).
 # NOTE: the if-body below is intentionally NOT indented — it carries a
 # column-0 heredoc (the PVC-RBAC apply); `fi` closes it just before Phase 2.
 # ---------------------------------------------------------------
@@ -410,14 +440,15 @@ done
 printf '  apprafter-operator + admission-webhook now running the working-tree build\n'
 
 # The released platform-stack chart this cluster bootstrapped from predates
-# EVERY 2.6b CRD change (the `disk` type enums, ResourceClaim.status.volumeClaimRef,
-# the RetainedClaim disk fields, the generalized `needs` scalar|array schema).
-# Argo CD owns those CRDs via the apprafter-operator Application, so: disable
-# automated sync on the parent + operator apps (else Argo reverts the drift),
-# then apply the BRANCH-rendered CRDs server-side. Same rationale as side-loading
-# the operator image — both are unpublished 2.6b artifacts; this whole walk is
-# LOCAL_OPERATOR-gated (pre-release). Mirrors scripts/validate-crds.sh's render.
-printf '  applying branch operator CRDs (released chart predates 2.6b schema) ...\n'
+# BOTH the 2.6b CRD changes (the `disk` type enums, ResourceClaim.status.volumeClaimRef,
+# the RetainedClaim disk fields, the generalized `needs` scalar|array schema) AND
+# the 2.12 CRD changes (Application.spec.base.env / environments[*].env now accept
+# a string-OR-object #EnvValue). Argo CD owns those CRDs via the apprafter-operator
+# Application, so: disable automated sync on the parent + operator apps (else Argo
+# reverts the drift), then apply the BRANCH-rendered CRDs server-side. Same rationale
+# as side-loading the operator image — all are unpublished 2.12 artifacts.
+# Mirrors needs-pg-walk Phase 1b + scripts/validate-crds.sh's render.
+printf '  applying branch operator CRDs (released chart predates 2.6b/2.12 schema) ...\n'
 for _app in platform apprafter-operator; do
     kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
         -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
@@ -571,7 +602,7 @@ printf '  ok: StorageClass %s present\n' "$STORAGE_CLASS"
 # Phase 3: apply the needs.disk Application + the multi-pg Application
 # ===============================================================
 
-phase "Phase 3: apply Applications (sqlite needs.disk scalar; multi needs.pg named array)"
+phase "Phase 3: apply Applications (sqlite needs.disk scalar; multi needs.pg named array + explicit DSN refs)"
 
 kubectl create namespace "$APP_NS" 2>/dev/null || true
 
@@ -604,6 +635,10 @@ YAML
 
 # The multi-claim app: needs.pg as a NAMED ARRAY of two entries. Proves
 # the 2.6b-2 per-(type,name) claim-gen + env disambiguation surface.
+# 2.12 (ADR 0046 #5): the 2.4e implicit DATABASE_URL_<NAME> injection is
+# removed — the app binds each DSN by an EXPLICIT named claim ref. The
+# payload for a named claim ref is "<type>.<name>.<field>" so that the
+# operator can route it to the correct (type, name) connection Secret.
 kubectl apply -f - <<YAML
 apiVersion: apprafter.io/v1alpha1
 kind: Application
@@ -627,6 +662,11 @@ spec:
         - name: analytics
           selector:
             tier: integrated
+    env:
+      DATABASE_URL_PRIMARY:
+        claim: "pg.primary.url"
+      DATABASE_URL_ANALYTICS:
+        claim: "pg.analytics.url"
 YAML
 
 # ===============================================================
@@ -666,10 +706,10 @@ assert_eq "multi-pg-analytics spec.name" "$claim2b_name" "analytics"
 # proven DETERMINISTICALLY by (a) claim GENERATION above — the operator
 # emitted a ResourceClaim per need rather than rendering the Deployment
 # immediately, the gate's load-bearing action; and (b) the Ready + mount +
-# strategy:Recreate (Phase 7) and DATABASE_URL_<NAME> (Phase 7) assertions —
-# the workload only receives its volume / DSN once the claim is ready. The
-# pause-while-unready logic itself is unit-tested in the operator
-# (unready_claim_names / build_resource_claim_paused_status).
+# strategy:Recreate (Phase 7) and DATABASE_URL_<NAME> claim ref resolution
+# (Phase 7) assertions — the workload only receives its volume / DSN once the
+# claim is ready. The pause-while-unready logic itself is unit-tested in the
+# operator (unready_claim_names / build_resource_claim_paused_status).
 
 # ===============================================================
 # Phase 5: schedule (2.3) — the scheduler matches `disk-local`
@@ -750,8 +790,11 @@ kubectl -n "$APP_NS" wait --for=condition=Available \
     "deployment/${APP}" --timeout=300s
 printf '  Deployment %s -> Available\n' "$APP"
 
-# ---- multi-pg (2.6b-2): both named pg claims provision + the resumed
-#      Deployment carries the two disambiguated env vars ----------------
+# ---- multi-pg (2.6b-2 / 2.12): both named pg claims provision + the resumed
+#      Deployment resolves the explicit DSN claim refs ----------------
+# 2.12 (ADR 0046 #8): `{claim: "pg.primary.url"}` resolves to a secretKeyRef
+# into the primary connection Secret's `url` key; same for analytics. The old
+# composed `DATABASE_URL` key is gone from the connection Secrets.
 printf '  waiting for the multi-pg claims to provision ...\n'
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM2A" '{.status.ready}' true 360
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM2B" '{.status.ready}' true 360
@@ -762,11 +805,28 @@ env_primary=$(kubectl -n "$APP_NS" get deployment "$APP2" \
     2>/dev/null || true)
 assert_eq "multi Deployment env DATABASE_URL_PRIMARY secretKeyRef.name" \
     "$env_primary" "${CLAIM2A}-conn"
+env_primary_key=$(kubectl -n "$APP_NS" get deployment "$APP2" \
+    -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"DATABASE_URL_PRIMARY\")].valueFrom.secretKeyRef.key}" \
+    2>/dev/null || true)
+assert_eq "multi Deployment env DATABASE_URL_PRIMARY secretKeyRef.key" \
+    "$env_primary_key" "url"
 env_analytics=$(kubectl -n "$APP_NS" get deployment "$APP2" \
     -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"DATABASE_URL_ANALYTICS\")].valueFrom.secretKeyRef.name}" \
     2>/dev/null || true)
 assert_eq "multi Deployment env DATABASE_URL_ANALYTICS secretKeyRef.name" \
     "$env_analytics" "${CLAIM2B}-conn"
+env_analytics_key=$(kubectl -n "$APP_NS" get deployment "$APP2" \
+    -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"DATABASE_URL_ANALYTICS\")].valueFrom.secretKeyRef.key}" \
+    2>/dev/null || true)
+assert_eq "multi Deployment env DATABASE_URL_ANALYTICS secretKeyRef.key" \
+    "$env_analytics_key" "url"
+# The old composed keys must be GONE from each connection Secret (2.4e dropped).
+old_primary=$(kubectl -n "$APP_NS" get secret "${CLAIM2A}-conn" \
+    -o jsonpath='{.data.DATABASE_URL}' 2>/dev/null || true)
+assert_eq "primary conn Secret has NO DATABASE_URL key (2.4e dropped)" "$old_primary" ""
+old_analytics=$(kubectl -n "$APP_NS" get secret "${CLAIM2B}-conn" \
+    -o jsonpath='{.data.DATABASE_URL}' 2>/dev/null || true)
+assert_eq "analytics conn Secret has NO DATABASE_URL key (2.4e dropped)" "$old_analytics" ""
 
 # ===============================================================
 # Phase 8: data durability — write /data/probe, restart the pod, ASSERT

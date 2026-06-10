@@ -9,7 +9,7 @@
 # backend:
 #
 #   generate (2.4d) -> schedule (2.3) -> provision (2.6-3/2.6-4) ->
-#   resume + DSN inject (2.4d/2.4e/2.6-6) -> isolation proof ($N ACL) ->
+#   resume + explicit env refs (2.4d/2.12/2.6-6) -> isolation proof ($N ACL) ->
 #   scripting/client-init/restart-repin (2.6-5, Pre-merge #4/#5/#6) ->
 #   persistent variant + restart-durable data (2.6-2/2.6-3, §6) ->
 #   delete + snapshot (2.4f/2.6-4) -> force-GC (2.6-7) ->
@@ -26,12 +26,16 @@
 #      (status.provider, Scheduled=True).
 #   4. ASSERT the provisioner lazily creates a shared Dragonfly instance,
 #      allocates a numbered logical DB (status.dbnum), creates the $N
-#      ACL user, and writes a connection Secret carrying REDIS_URL +
-#      REDIS_CHANNEL_PREFIX — and that the scheduler's Scheduled=True
-#      survives the provisioner's status write (the SSA field-manager
-#      split guard).
-#   5. ASSERT the Application resumes to Ready and the rendered
-#      Deployment injects REDIS_URL + REDIS_CHANNEL_PREFIX from the Secret.
+#      ACL user, and writes a connection Secret carrying the DECOMPOSED keys
+#      (2.12 / ADR 0046 #3: url user pass host port db channelPrefix — the
+#      old composed REDIS_URL/REDIS_CHANNEL_PREFIX keys are dropped) — and
+#      that the scheduler's Scheduled=True survives the provisioner's status
+#      write (the SSA field-manager split guard).
+#   5. ASSERT the Application resumes to Ready and the rendered Deployment
+#      resolves the EXPLICIT `env: {REDIS_URL: {claim: "redis.url"},
+#      REDIS_CHANNEL_PREFIX: {claim: "redis.channelPrefix"}}` refs
+#      (2.12 / ADR 0046) into secretKeyRefs on the connection Secret's
+#      `url` / `channelPrefix` keys (the 2.4e auto-inject is removed).
 #   6. Isolation proof (ADR 0042 Pre-merge #3): a SECOND claim's ACL user
 #      gets NOPERM when it tries to SELECT the first claim's DB, AND its
 #      cross-DB escape attempts (MOVE / COPY ... DB / SWAPDB aimed at the
@@ -156,6 +160,34 @@ done
 # in lib.sh picks the backend; here we only assert one of them exists.
 if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
     printf 'ERROR: neither "docker" nor "podman" found on PATH\n' >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------
+# Precondition: this walk REQUIRES local-operator mode while 2.12 is
+# UNRELEASED. ADR 0046 removed the 2.4e implicit REDIS_URL/REDIS_CHANNEL_PREFIX
+# injection and the connection-Secret's composed `REDIS_URL`/`REDIS_CHANNEL_PREFIX`
+# keys — the app now binds them by EXPLICIT `env: {REDIS_URL: {claim: "redis.url"},
+# REDIS_CHANNEL_PREFIX: {claim: "redis.channelPrefix"}}` refs (Phase 3), which
+# only the branch operator + webhook + CRD render/validate. So this walk builds +
+# side-loads the working-tree operator/webhook and applies the branch CRDs
+# (Phase 1b). The flag is mandatory until 2.12 ships.
+# ---------------------------------------------------------------
+if [ -z "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
+    cat >&2 <<'EOF'
+ERROR: needs-redis-walk requires APPRAFTER_E2E_LOCAL_OPERATOR=1 while 2.12 is unreleased.
+
+ADR 0046 (Phase 2.12) removed the 2.4e implicit REDIS_URL/REDIS_CHANNEL_PREFIX
+injection and the connection-Secret's composed `REDIS_URL`/`REDIS_CHANNEL_PREFIX`
+keys. This walk now declares them explicitly
+(`env: {REDIS_URL: {claim: "redis.url"}, REDIS_CHANNEL_PREFIX: {claim: "redis.channelPrefix"}}`),
+which only the branch operator + webhook + CRD render/validate. Run:
+
+  APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-redis-walk.sh
+
+so the walk builds + side-loads the working-tree operator/webhook and applies
+the branch CRDs (Phase 1b). Drop this gate once 2.12 publishes.
+EOF
     exit 2
 fi
 
@@ -372,14 +404,14 @@ redis_as_on() {
         redis-cli --user "$user" --pass "$pw" --no-auth-warning "$@" 2>&1 || true
 }
 
-# Recover a claim's ACL password from its connection Secret's REDIS_URL
-# (redis://user:PASSWORD@host:port/db). The provisioner stores no
-# separate password — the DSN is the source of truth.
+# Recover a claim's ACL password from its connection Secret's `pass` key.
+# 2.12 (ADR 0046 #3): the connection Secret carries decomposed keys
+# (url user pass host port db channelPrefix); `pass` is the direct
+# password without DSN parsing.
 claim_password() {
     local conn_ns="$1" conn_name="$2"
     kubectl -n "$conn_ns" get secret "$conn_name" \
-        -o jsonpath='{.data.REDIS_URL}' 2>/dev/null | base64 -d \
-        | sed -E 's#^redis://[^:]+:([^@]+)@.*$#\1#'
+        -o jsonpath='{.data.pass}' 2>/dev/null | base64 -d
 }
 
 # ===============================================================
@@ -412,36 +444,74 @@ bootstrap_with_retry
 
 printf '  cluster-bootstrap complete\n'
 
-# Optional pre-push validation: run the apprafter-operator built from the
-# CURRENT working tree instead of the published image. Build it, tag it as the
-# exact ref the Deployment already references (so imagePullPolicy IfNotPresent
-# serves the side-loaded build and Argo CD does not revert the unchanged ref),
-# side-load it, and restart the Deployment onto it.
+# ---------------------------------------------------------------
+# Phase 1b (REQUIRED — APPRAFTER_E2E_LOCAL_OPERATOR): build + side-load the
+# working-tree operator + webhook instead of the published image, then apply
+# the branch CRDs. 2.12 (ADR 0046) drops the 2.4e auto-inject + the composed
+# `REDIS_URL`/`REDIS_CHANNEL_PREFIX` connection-Secret keys and adds the `env`
+# value node + webhook env-ref rules — all UNRELEASED, so the published image +
+# CRD this cluster bootstrapped from cannot render/validate the explicit DSN
+# refs in Phase 3.
+# Mirrors needs-pg-walk Phase 1b (no extra RBAC — env refs add no new k8s
+# verb; resolve_env only reads Secrets the operator already watches).
+# NOTE: the if-body below is intentionally NOT indented; `fi` closes it just
+# before Phase 2.
+# ---------------------------------------------------------------
 if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
-    phase "Phase 1b: build + load local operator + webhook (APPRAFTER_E2E_LOCAL_OPERATOR)"
-    builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
-    # Rebuild each apprafter-owned image from the working tree, tag it as the
-    # ref the Deployment already references, side-load it, and restart onto it.
-    build_load_restart() { # <deployment> <operator-subdir>
-        local dep="$1" sub="$2" img
-        printf '  waiting for the %s Deployment to appear ...\n' "$dep"
-        for _ in $(seq 1 60); do
-            kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 && break
-            sleep 5
-        done
-        img=$(kubectl -n apprafter-system get deploy "$dep" \
-            -o jsonpath='{.spec.template.spec.containers[0].image}')
-        printf '  building %s from the working tree (%s) ...\n' "$img" "$builder"
-        "$builder" build -f "${REPO_ROOT}/operator/${sub}/Dockerfile" \
-            -t "$img" "${REPO_ROOT}/operator"
-        cluster_load_image "$CLUSTER_NAME" "$img"
-        kubectl -n apprafter-system rollout restart "deploy/${dep}"
-        kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=180s
-    }
-    build_load_restart apprafter-operator apprafter-operator
-    build_load_restart admission-webhook admission-webhook
-    printf '  apprafter-operator + admission-webhook now running the working-tree build\n'
-fi
+phase "Phase 1b: build + load local operator + webhook (APPRAFTER_E2E_LOCAL_OPERATOR)"
+builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
+build_load_restart() { # <deployment> <operator-subdir>
+    local dep="$1" sub="$2" img
+    printf '  waiting for the %s Deployment to appear ...\n' "$dep"
+    for _ in $(seq 1 60); do
+        kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 && break
+        sleep 5
+    done
+    img=$(kubectl -n apprafter-system get deploy "$dep" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+    printf '  building %s from the working tree (%s) ...\n' "$img" "$builder"
+    "$builder" build -f "${REPO_ROOT}/operator/${sub}/Dockerfile" \
+        -t "$img" "${REPO_ROOT}/operator"
+    cluster_load_image "$CLUSTER_NAME" "$img"
+    kubectl -n apprafter-system rollout restart "deploy/${dep}"
+    kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=180s
+}
+build_load_restart apprafter-operator apprafter-operator
+build_load_restart admission-webhook admission-webhook
+# Wait until ONLY the branch webhook serves before any branch-typed apply: the
+# OLD (released) webhook pod lingers Terminating for its grace period, and
+# during that window the Phase 3 env-ref apply could route to it — whose
+# released validator lacks the 2.12 env-ref rules.
+printf '  waiting for the old (released) webhook pod to fully terminate ...\n'
+_wh_deadline=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$_wh_deadline" ]; do
+    [ "$(kubectl -n apprafter-system get pods \
+        -l app.kubernetes.io/name=admission-webhook --no-headers 2>/dev/null \
+        | wc -l)" -le 1 ] && break
+    sleep 3
+done
+printf '  apprafter-operator + admission-webhook now running the working-tree build\n'
+
+# The released chart predates the 2.12 CRD change (Application.spec.base.env /
+# environments[*].env now accept a string-OR-object #EnvValue). Argo CD owns
+# those CRDs via the apprafter-operator Application, so disable automated sync
+# on the parent + operator apps (else Argo reverts the drift) then apply the
+# BRANCH-rendered CRDs server-side. Mirrors needs-pg-walk Phase 1b.
+printf '  applying branch operator CRDs (released chart predates 2.12 env node) ...\n'
+for _app in platform apprafter-operator; do
+    kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
+        -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
+done
+_yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-go -- "$@"; fi; }
+helm template apprafter-operator "${REPO_ROOT}/operator/charts/apprafter-operator" \
+    | _yq 'select(.kind == "CustomResourceDefinition")' \
+    | kubectl apply --server-side --force-conflicts -f -
+for _crd in applications serviceproviders resourceclaims retainedclaims; do
+    retry 12 5 -- kubectl wait --for=condition=Established \
+        "crd/${_crd}.apprafter.io" --timeout=30s
+done
+printf '  branch CRDs applied + Established\n'
+fi  # end APPRAFTER_E2E_LOCAL_OPERATOR (Phase 1b)
 
 # ===============================================================
 # Phase 2: readiness — dragonfly-operator, the seeded provider, the webhook
@@ -490,10 +560,16 @@ retry 30 10 -- kubectl -n "$RETAINED_NS" rollout status \
 # Phase 3: apply the needs.redis Application
 # ===============================================================
 
-phase "Phase 3: apply Applications with spec.base.needs.redis"
+phase "Phase 3: apply Applications with spec.base.needs.redis + explicit DSN refs"
 
 kubectl create namespace "$APP_NS" 2>/dev/null || true
 
+# 2.12 (ADR 0046 #5): the 2.4e implicit REDIS_URL/REDIS_CHANNEL_PREFIX injection
+# is removed — the app binds them by EXPLICIT claim refs. The cue-cmp renders
+# the bare selector `claim.redis.url` → the `{claim: "redis.url"}` marker; we
+# apply that resolved marker form directly (this walk runs raw CRs, not the
+# cue-cmp). The Phase 7 assertions verify the rendered Deployment carries
+# secretKeyRefs into the connection Secret's `url`/`channelPrefix` keys.
 kubectl apply -f - <<YAML
 apiVersion: apprafter.io/v1alpha1
 kind: Application
@@ -513,6 +589,11 @@ spec:
       redis:
         selector:
           tier: integrated
+    env:
+      REDIS_URL:
+        claim: "redis.url"
+      REDIS_CHANNEL_PREFIX:
+        claim: "redis.channelPrefix"
 YAML
 
 # A second app — same ephemeral pool instance, a DIFFERENT numbered DB.
@@ -586,8 +667,8 @@ assert_eq "ResourceClaim ownerRef Kind" "$claim_owner_kind" "Application"
 # artifact of a fast cluster, not a product behaviour to assert). The gate is
 # instead proven DETERMINISTICALLY by (a) claim GENERATION above — the
 # operator emitted a ResourceClaim rather than rendering the Deployment
-# immediately, the gate's load-bearing action — and (b) the Ready + REDIS_URL
-# injection (Phase 7) assertions: the workload only receives its DSN once the
+# immediately, the gate's load-bearing action — and (b) the Ready + env-ref
+# resolution (Phase 7) assertions: the workload only receives its DSN once the
 # claim is ready. The pause-while-unready logic itself is unit-tested in the
 # operator. (Mirrors the needs-disk-walk note; the equivalent pg poll flaked
 # the e2e-pg nightly when the backend was warm.)
@@ -641,20 +722,27 @@ if [ -z "$acl_line" ]; then
 fi
 printf '  ok: ACL user %s exists on %s\n' "$ACL_USER" "$DF_INSTANCE"
 
-# Connection Secret: status ref, BOTH keys, ownerRef cascade.
+# Connection Secret: status ref, DECOMPOSED keys (2.12 / ADR 0046 #3:
+# url user pass host port db channelPrefix — the old composed
+# REDIS_URL/REDIS_CHANNEL_PREFIX keys are dropped), ownerRef cascade.
 conn_ref=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.connectionSecretRef}')
 assert_eq "status.connectionSecretRef" "$conn_ref" "$CONN_SECRET"
-conn_url=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.REDIS_URL}')
+conn_url=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.url}')
 if [ -z "$conn_url" ]; then
-    printf 'ERROR: connection Secret %s missing REDIS_URL key\n' "$CONN_SECRET" >&2
+    printf 'ERROR: connection Secret %s missing decomposed `url` key\n' "$CONN_SECRET" >&2
     exit 1
 fi
-conn_pfx=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.REDIS_CHANNEL_PREFIX}')
+conn_pfx=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.channelPrefix}')
 if [ -z "$conn_pfx" ]; then
-    printf 'ERROR: connection Secret %s missing REDIS_CHANNEL_PREFIX key\n' "$CONN_SECRET" >&2
+    printf 'ERROR: connection Secret %s missing decomposed `channelPrefix` key\n' "$CONN_SECRET" >&2
     exit 1
 fi
-printf '  ok: connection Secret %s carries REDIS_URL + REDIS_CHANNEL_PREFIX\n' "$CONN_SECRET"
+printf '  ok: connection Secret %s carries decomposed `url` + `channelPrefix` keys\n' "$CONN_SECRET"
+# The old composed keys must be GONE (2.4e REDIS_URL/REDIS_CHANNEL_PREFIX removed).
+old_url=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.REDIS_URL}')
+assert_eq "connection Secret has NO REDIS_URL key (2.4e dropped)" "$old_url" ""
+old_pfx=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.REDIS_CHANNEL_PREFIX}')
+assert_eq "connection Secret has NO REDIS_CHANNEL_PREFIX key (2.4e dropped)" "$old_pfx" ""
 conn_owner_kind=$(jp secret "$APP_NS" "$CONN_SECRET" \
     '{.metadata.ownerReferences[0].kind}')
 assert_eq "connection Secret ownerRef Kind" "$conn_owner_kind" "ResourceClaim"
@@ -666,21 +754,32 @@ sched_after=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM" Scheduled)
 assert_eq "Scheduled still True after provision (SSA split)" "$sched_after" "True"
 
 # ===============================================================
-# Phase 7: resume + DSN (2.4d/2.4e/2.6-6) — Application Ready, env injected
+# Phase 7: resume + DSN (2.4d / 2.12) — Application Ready, env refs resolved
 # ===============================================================
 
-phase "Phase 7: resume — Application Ready, REDIS_URL + REDIS_CHANNEL_PREFIX injected"
+phase "Phase 7: resume — Application Ready, REDIS_URL + REDIS_CHANNEL_PREFIX claim refs resolved"
 
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 180
 
+# 2.12 (ADR 0046 #8): the explicit `{claim: "redis.url"}` ref resolves to a
+# secretKeyRef into the connection Secret, key `url` (the decomposed URL key,
+# NOT the old composed `REDIS_URL` key). Same for `channelPrefix`.
 env_secret=$(kubectl -n "$APP_NS" get deployment "$APP" \
     -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"REDIS_URL\")].valueFrom.secretKeyRef.name}" \
     2>/dev/null || true)
 assert_eq "Deployment env REDIS_URL secretKeyRef.name" "$env_secret" "$CONN_SECRET"
+env_key=$(kubectl -n "$APP_NS" get deployment "$APP" \
+    -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"REDIS_URL\")].valueFrom.secretKeyRef.key}" \
+    2>/dev/null || true)
+assert_eq "Deployment env REDIS_URL secretKeyRef.key" "$env_key" "url"
 env_pfx_secret=$(kubectl -n "$APP_NS" get deployment "$APP" \
     -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"REDIS_CHANNEL_PREFIX\")].valueFrom.secretKeyRef.name}" \
     2>/dev/null || true)
 assert_eq "Deployment env REDIS_CHANNEL_PREFIX secretKeyRef.name" "$env_pfx_secret" "$CONN_SECRET"
+env_pfx_key=$(kubectl -n "$APP_NS" get deployment "$APP" \
+    -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"REDIS_CHANNEL_PREFIX\")].valueFrom.secretKeyRef.key}" \
+    2>/dev/null || true)
+assert_eq "Deployment env REDIS_CHANNEL_PREFIX secretKeyRef.key" "$env_pfx_key" "channelPrefix"
 
 kubectl -n "$APP_NS" wait --for=condition=Available \
     "deployment/${APP}" --timeout=300s
@@ -756,7 +855,7 @@ phase "Phase 9: Pre-merge #4/#5/#6 — EVAL confinement, client init, restart re
 
 PW=$(claim_password "$APP_NS" "$CONN_SECRET")
 if [ -z "$PW" ]; then
-    printf 'ERROR: could not recover web claim password from %s REDIS_URL\n' "$CONN_SECRET" >&2
+    printf 'ERROR: could not recover web claim password from %s (decomposed `pass` key)\n' "$CONN_SECRET" >&2
     exit 1
 fi
 
@@ -1107,4 +1206,4 @@ fi
 rm -rf "$TMPDIR_WORK"
 
 printf '\nneeds-redis-walk GREEN in %s\n' "$(elapsed)"
-printf 'Chain proven: generate -> schedule -> provision -> resume + DSN -> isolation -> EVAL-confinement/client-init/restart-repin -> persistent variant + restart-durable -> delete + snapshot -> GC -> FLUSHDB/DELUSER\n'
+printf 'Chain proven: generate -> schedule -> provision -> resume + explicit env refs (2.12) -> isolation -> EVAL-confinement/client-init/restart-repin -> persistent variant + restart-durable -> delete + snapshot -> GC -> FLUSHDB/DELUSER\n'
