@@ -14,6 +14,9 @@ pre-commit:
       run: ./scripts/check-spdx-headers.sh
     cyrillic:
       run: ./scripts/check-no-cyrillic.sh
+    crd-check:
+      glob: "{schemas/v1alpha1/*.cue,operator/operator-core/src/*.rs,operator/charts/apprafter-operator/templates/crd-*.yaml}"
+      run: ./scripts/crd-check.sh
 
 commit-msg:
   commands:

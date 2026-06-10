@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: crd-check
+
+# Drift gate for the CUE->CRD codegen (ADR 0047): the committed operator
+# chart crd-*.yaml must be byte-identical to what `crdgen` renders from the
+# schemas/v1alpha1 CUE schemas. Runs under the repo flake (nix) so cue is
+# the flake.lock-pinned version - the byte-compare needs ONE cue version
+# across local + CI (ADR 0047 R4); the same flake shell provides cargo.
+on:
+  pull_request:
+    paths:
+      - 'schemas/v1alpha1/**'
+      - 'operator/operator-core/**'
+      - 'operator/crdgen/**'
+      - 'operator/charts/apprafter-operator/templates/crd-*.yaml'
+      - 'scripts/crd-check.sh'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/crd-check.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'schemas/v1alpha1/**'
+      - 'operator/operator-core/**'
+      - 'operator/crdgen/**'
+      - 'operator/charts/apprafter-operator/templates/crd-*.yaml'
+      - 'scripts/crd-check.sh'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/crd-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  crd-check:
+    name: CRD codegen drift gate (CUE vs committed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix (flake toolchain - cue + cargo)
+        uses: DeterminateSystems/nix-installer-action@main
+      - name: crdgen check
+        run: bash scripts/crd-check.sh

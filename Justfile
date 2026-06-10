@@ -85,9 +85,16 @@ test:
 
 # Generate the operator chart CRDs from the v1alpha1 CUE schemas (ADR 0047).
 # CUE is the single source of truth; the crd-*.yaml files are GENERATED and
-# committed. Run after any schema change, then `just crd-check` gates drift.
+# committed. Runs under `nix develop` so the cue version is flake.lock-pinned
+# (the drift gate compares byte-for-byte). Run after any schema change.
 gen-crds:
-    cd operator && cargo run -q -p crdgen -- generate
+    nix develop --command bash -c 'cd operator && cargo run -q -p crdgen -- generate'
+
+# CRD drift gate (ADR 0047): assert the committed crd-*.yaml match what
+# crdgen generates from CUE. Local-first — the lefthook pre-commit hook and
+# the crd-check CI workflow run the same script.
+crd-check:
+    bash scripts/crd-check.sh
 
 # Validate every CRD against a REAL apiserver (ephemeral kind cluster).
 # `helm lint` does NOT catch CRD structural-schema errors — only the
