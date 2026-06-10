@@ -13,14 +13,17 @@ use std::collections::BTreeMap;
 mod egress;
 pub use egress::{default_target, render_egress_policy, ConnectionTarget};
 
+mod env;
+pub use env::resolve_env;
+
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaimVolumeSource, PodSpec,
-    PodTemplateSpec, SecretKeySelector, Service, ServicePort, ServiceSpec, Volume, VolumeMount,
+    Container, ContainerPort, EnvVar, PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
+    Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use operator_core::{Application, ApplicationBaseSpec, EnvValue};
+use operator_core::{Application, ApplicationBaseSpec};
 
 /// Output of `render_application`. Always carries a Deployment;
 /// `service` is `Some(...)` only when the Application sets
@@ -63,49 +66,6 @@ pub struct DiskMount {
     pub pvc_name: String,
 }
 
-/// needs-type → the env vars to inject, each as (env-var-name,
-/// secret-key). The provisioner writes exactly these keys into the
-/// connection Secret; the injected EnvVar's `secretKeyRef.key` points
-/// at the secret-key. `pg` ships one DSN key (2.4e); `redis` (2.6)
-/// ships two — the DSN plus the pub/sub channel prefix.
-///
-/// KEEP IN SYNC with the admission webhook's reserved-env guard
-/// (`RESERVED_ENV`) and the provisioner's connection-Secret builders.
-const NEEDS_ENV_BINDINGS: &[(&str, &[(&str, &str)])] = &[
-    ("pg", &[("DATABASE_URL", "DATABASE_URL")]),
-    (
-        "redis",
-        &[
-            ("REDIS_URL", "REDIS_URL"),
-            ("REDIS_CHANNEL_PREFIX", "REDIS_CHANNEL_PREFIX"),
-        ],
-    ),
-];
-
-fn needs_env_bindings(service_type: &str) -> &'static [(&'static str, &'static str)] {
-    NEEDS_ENV_BINDINGS
-        .iter()
-        .find(|(k, _)| *k == service_type)
-        .map(|(_, v)| *v)
-        .unwrap_or(&[])
-}
-
-/// Fold a `(type, name)` claim name into a valid env-var-NAME segment
-/// (2.6b / ADR 0043): uppercase every ASCII letter and map `-` → `_`.
-/// A named claim's injected env NAME is `<VAR>_<fold(name)>`
-/// (`my-cache` → `MY_CACHE` → `DATABASE_URL_MY_CACHE`); the Secret KEY
-/// is unchanged (`DATABASE_URL`). The webhook guarantees `name` is a
-/// DNS-1123 label, so the fold always yields a valid `[A-Z_][A-Z0-9_]*`
-/// suffix — no other characters can appear.
-pub fn fold_env_segment(name: &str) -> String {
-    name.chars()
-        .map(|ch| match ch {
-            '-' => '_',
-            other => other.to_ascii_uppercase(),
-        })
-        .collect()
-}
-
 /// Render the Application's `base` block (no environment override
 /// applied). v0.1.30 entry point — keeps the simple call-site
 /// shape; new code should prefer [`render_application_for_env`]
@@ -129,14 +89,15 @@ pub fn render_application(app: &Application) -> RenderedApplication {
 /// its provisioned connection Secret (the ready claim's
 /// `status.connectionSecretRef`). The `name` half is `None` for the
 /// unnamed/default claim of a type and `Some(<name>)` for a named array
-/// entry (2.6b / ADR 0043). When threaded in (the reconcile builds it
-/// from the SAME ready claims the 2.4d gate validated, AFTER the gate),
-/// the renderer appends a `valueFrom.secretKeyRef` EnvVar per known
-/// need: the default claim keeps the base env NAME (`DATABASE_URL`),
-/// a named claim gets `<VAR>_<fold(name)>` (the Secret KEY stays
-/// `DATABASE_URL`). `None` (pre-gate / claims unready) renders the
-/// workload WITHOUT the DSN. Keeping the map a threaded param preserves
-/// the renderer's purity — no kube client here.
+/// entry (2.6b / ADR 0043). This map is consumed by [`resolve_env`]
+/// (2.12c / ADR 0046) to expand `EnvValue::Ref(Claim(…))` entries in
+/// `spec.*.env` into concrete `valueFrom.secretKeyRef` EnvVars. The
+/// 2.4e implicit DSN injection is removed in 2.12c — claim-backed env
+/// vars are now expressed explicitly via `spec.*.env` claim refs.
+/// `None` (pre-gate / claims unready) causes Claim-ref vars to be
+/// skipped (the claim-readiness gate should precede the render call).
+/// Keeping the map a threaded param preserves the renderer's purity —
+/// no kube client here.
 ///
 /// `resolved_image` (2.4h-c) pins the container image to a resolved
 /// `repo@sha256:...` digest when `Some(...)`; `None` renders the
@@ -355,86 +316,22 @@ fn render_deployment(
         ..Default::default()
     });
 
-    // 2.12 (ADR 0046): env values are now `EnvValue` — either a plain
-    // `Literal(String)` (same rendering as before) or a `Ref(EnvRef)`
-    // (claim / external-secret reference). Ref resolution is implemented
-    // in the next task (2.12b); for the schema-foundation task (2.12a)
-    // only Literal values are rendered. Ref variants are deferred (the
-    // renderer will resolve them once the connection-secret map and the
-    // ref-resolution logic land in 2.12b).
-    let mut env_vars: Vec<EnvVar> = spec
+    // 2.12c (ADR 0046): resolve spec.env via the pure `resolve_env`
+    // function. `Literal` values become plain `EnvVar { value }` entries;
+    // `Ref(Claim(…))` entries are resolved through `needs_secrets` into
+    // `valueFrom.secretKeyRef` EnvVars; `Ref(Secret(…))` entries are
+    // resolved directly into `valueFrom.secretKeyRef` EnvVars. The
+    // 2.4e/2.6 implicit DSN injection (DATABASE_URL / REDIS_URL etc.)
+    // is removed — claim-backed env vars must now be declared explicitly
+    // in `spec.*.env`. Deterministic BTreeMap order keeps the output
+    // byte-stable (SSA no-op across reconciles).
+    let empty_secrets = BTreeMap::new();
+    let resolved_secrets = needs_secrets.unwrap_or(&empty_secrets);
+    let env_vars: Vec<EnvVar> = spec
         .env
         .as_ref()
-        .map(|env| {
-            env.iter()
-                .filter_map(|(k, v)| match v {
-                    EnvValue::Literal(s) => Some(EnvVar {
-                        name: k.clone(),
-                        value: Some(s.clone()),
-                        value_from: None,
-                    }),
-                    // Ref resolution deferred to 2.12b (renderer expansion).
-                    EnvValue::Ref(_) => None,
-                })
-                .collect()
-        })
+        .map(|env| resolve_env(env, resolved_secrets))
         .unwrap_or_default();
-
-    // 2.4e/2.6: append a `valueFrom.secretKeyRef` EnvVar per known
-    // need whose claim has a resolved connection Secret. A need may
-    // inject more than one var (redis: REDIS_URL + REDIS_CHANNEL_PREFIX)
-    // — the bindings slice is fixed-order. Walking `Needs::entries()`
-    // (a deterministic key/index order) keeps the appended order stable
-    // so the rendered Deployment is byte-stable across reconciles (SSA
-    // no-op; non-deterministic order would spin the operator). Appended
-    // AFTER the literal env so a (rejected-by-webhook, but defensively)
-    // colliding literal would never silently win.
-    //
-    // 2.6b (ADR 0043): inject one Secret per `(type, name)` claim
-    // identity. `needs_secrets` is keyed by `(service_type, name_opt)` —
-    // `name_opt == None` is the unnamed/default claim (keeps the base env
-    // NAME, e.g. `DATABASE_URL`, backward-compatible), `Some(name)` is a
-    // named array entry (env NAME `<VAR>_<fold(name)>`, e.g.
-    // `DATABASE_URL_ANALYTICS`; the Secret KEY stays `DATABASE_URL`).
-    // Walking `Needs::entries()` (a deterministic key/index order) keeps
-    // the appended order byte-stable across reconciles (SSA no-op).
-    // Appended AFTER the literal env so a (webhook-rejected, but
-    // defensively) colliding literal would never silently win. Disk
-    // entries carry no env binding and are skipped here.
-    if let (Some(needs), Some(secrets)) = (spec.needs.as_ref(), needs_secrets) {
-        for (service_type, entry) in needs.entries() {
-            if entry.disk.is_some() {
-                continue;
-            }
-            let key = (service_type.clone(), entry.name.clone());
-            let Some(secret_name) = secrets.get(&key) else {
-                continue;
-            };
-            let suffix = entry
-                .name
-                .as_deref()
-                .filter(|n| !n.is_empty())
-                .map(|n| format!("_{}", fold_env_segment(n)));
-            for (var_name, secret_key) in needs_env_bindings(&service_type) {
-                let env_name = match &suffix {
-                    Some(s) => format!("{var_name}{s}"),
-                    None => var_name.to_string(),
-                };
-                env_vars.push(EnvVar {
-                    name: env_name,
-                    value: None,
-                    value_from: Some(EnvVarSource {
-                        secret_key_ref: Some(SecretKeySelector {
-                            name: secret_name.clone(),
-                            key: secret_key.to_string(),
-                            optional: Some(false),
-                        }),
-                        ..Default::default()
-                    }),
-                });
-            }
-        }
-    }
 
     // 2.6b (ADR 0043): mount ready disk claims into the pod. Each
     // DiskMount contributes a container `volumeMount` + a pod
@@ -562,7 +459,7 @@ fn render_service(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use operator_core::{ApplicationExpose, ApplicationSpec};
+    use operator_core::{ApplicationExpose, ApplicationSpec, EnvValue};
 
     fn make_app_with_uid(
         spec: ApplicationSpec,
@@ -1202,9 +1099,11 @@ mod tests {
         );
     }
 
-    // ---- 2.4e: DATABASE_URL DSN injection ----
+    // ---- 2.12c: env claim/secret refs rendered via resolve_env ----
+    // (2.4e auto-inject removed — claim-backed env vars must be declared
+    // explicitly in spec.*.env as EnvValue::Ref(Claim(…)) entries.)
 
-    use operator_core::{Needs, OneOrMany, ServiceNeed};
+    use operator_core::{EnvRef, Needs, OneOrMany, ServiceNeed};
 
     /// Helper: build a base with a single (unnamed, scalar) need of the
     /// given type (no selector/size). 2.6b: `needs` is a closed struct.
@@ -1243,7 +1142,10 @@ mod tests {
     }
 
     #[test]
-    fn pg_need_injects_database_url_secret_key_ref() {
+    fn pg_need_without_env_ref_produces_no_env_vars() {
+        // 2.12c: the 2.4e implicit DSN injection is removed. An app that
+        // declares needs.pg but has NO spec.env claim-ref entries gets NO
+        // DATABASE_URL injected — it must be wired explicitly.
         let app = make_app_with_uid(
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
@@ -1264,24 +1166,18 @@ mod tests {
             operator_core::EgressProfile::Internet,
             None,
         );
-        let envs = container_env(&r).expect("env present");
-        let dsn = envs
-            .iter()
-            .find(|e| e.name == "DATABASE_URL")
-            .expect("DATABASE_URL injected");
-        assert_eq!(dsn.value, None);
-        let source = dsn.value_from.as_ref().expect("value_from set");
-        let key_ref = source.secret_key_ref.as_ref().expect("secret_key_ref set");
-        assert_eq!(key_ref.name, "parser-pg-conn");
-        assert_eq!(key_ref.key, "DATABASE_URL");
-        assert_eq!(key_ref.optional, Some(false));
+        // No spec.env → no env vars regardless of the secrets map.
+        assert!(
+            container_env(&r).is_none(),
+            "no auto-inject: needs.pg without an env ref must not produce DATABASE_URL"
+        );
     }
 
     #[test]
-    fn needs_present_but_no_secrets_map_skips_injection() {
-        // The 2.4d "resumes WITHOUT DATABASE_URL" contract: a need is
-        // declared but no resolved secret map is threaded in (claims not
-        // ready / pre-gate) → no DATABASE_URL env.
+    fn needs_present_but_no_env_refs_and_no_secrets_map_yields_no_env() {
+        // The 2.4d "resumes without DSN" contract still holds in 2.12c:
+        // a need is declared but no resolved secret map is threaded in
+        // AND no env refs → no env vars.
         let app = make_app_with_uid(
             ApplicationSpec {
                 base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
@@ -1302,44 +1198,21 @@ mod tests {
             None,
         );
         let envs = container_env(&r);
-        // No literal env + no injected DSN → env stays None.
-        assert!(envs.is_none(), "no DATABASE_URL when secrets map is None");
+        assert!(envs.is_none(), "no env when no spec.env and no secrets map");
     }
 
     #[test]
-    fn empty_env_plus_dsn_yields_some_env_of_len_one() {
-        let app = make_app_with_uid(
-            ApplicationSpec {
-                base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
-                environments: None,
-                environment: None,
-            },
-            "parser",
-            "demo",
-            "uid-1",
+    fn claim_ref_in_env_resolves_to_secret_key_ref() {
+        // 2.12c: an explicit `spec.env.DB = {claim: "pg.url"}` entry is
+        // resolved to a valueFrom.secretKeyRef against the connection
+        // Secret threaded in via needs_secrets.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "DB".to_string(),
+            EnvValue::Ref(EnvRef::Claim("pg.url".to_string())),
         );
-        let secrets = BTreeMap::from([(("pg".to_string(), None), "parser-pg-conn".to_string())]);
-        let r = render_application_for_env(
-            &app,
-            None,
-            Some(&secrets),
-            None,
-            None,
-            operator_core::EgressProfile::Internet,
-            None,
-        );
-        let envs = container_env(&r).expect("env present (DSN injected)");
-        assert_eq!(envs.len(), 1);
-        assert_eq!(envs[0].name, "DATABASE_URL");
-    }
-
-    #[test]
-    fn literal_env_coexists_with_dsn_appended_after() {
         let mut base = base_with_need("ghcr.io/acme/web:1.0", "pg");
-        base.env = Some(BTreeMap::from([(
-            "LOG_LEVEL".to_string(),
-            EnvValue::Literal("info".to_string()),
-        )]));
+        base.env = Some(env);
         let app = make_app_with_uid(
             ApplicationSpec {
                 base: Some(base),
@@ -1361,259 +1234,39 @@ mod tests {
             None,
         );
         let envs = container_env(&r).expect("env present");
-        assert_eq!(envs.len(), 2);
-        // Literal env first, DSN appended AFTER.
-        assert_eq!(envs[0].name, "LOG_LEVEL");
-        assert_eq!(envs[0].value.as_deref(), Some("info"));
-        assert_eq!(envs[1].name, "DATABASE_URL");
-        assert!(envs[1].value_from.is_some());
-    }
-
-    #[test]
-    fn unknown_need_in_secrets_map_is_not_injected() {
-        // The bindings table is closed: an unknown need type (no entry
-        // in NEEDS_ENV_BINDINGS) must NOT produce any env var, even when
-        // a secret name is threaded in for it.
-        let app = make_app_with_uid(
-            ApplicationSpec {
-                base: Some(base_with_need("ghcr.io/acme/web:1.0", "clickhouse")),
-                environments: None,
-                environment: None,
-            },
-            "parser",
-            "demo",
-            "uid-1",
-        );
-        let secrets = BTreeMap::from([(
-            ("clickhouse".to_string(), None),
-            "parser-clickhouse-conn".to_string(),
-        )]);
-        let r = render_application_for_env(
-            &app,
-            None,
-            Some(&secrets),
-            None,
-            None,
-            operator_core::EgressProfile::Internet,
-            None,
-        );
-        let envs = container_env(&r);
-        assert!(
-            envs.is_none(),
-            "unknown need must not inject any env (closed bindings table)"
-        );
-    }
-
-    // ---- 2.6-6: redis injects REDIS_URL + REDIS_CHANNEL_PREFIX ----
-
-    #[test]
-    fn redis_need_injects_url_and_channel_prefix() {
-        let app = make_app_with_uid(
-            ApplicationSpec {
-                base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
-                environments: None,
-                environment: None,
-            },
-            "web",
-            "demo",
-            "uid-1",
-        );
-        let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
-        let r = render_application_for_env(
-            &app,
-            None,
-            Some(&secrets),
-            None,
-            None,
-            operator_core::EgressProfile::Internet,
-            None,
-        );
-        let envs = container_env(&r).expect("env present");
-        let url = envs
-            .iter()
-            .find(|e| e.name == "REDIS_URL")
-            .expect("REDIS_URL injected");
-        assert_eq!(
-            url.value_from
-                .as_ref()
-                .unwrap()
-                .secret_key_ref
-                .as_ref()
-                .unwrap()
-                .key,
-            "REDIS_URL"
-        );
-        assert_eq!(
-            url.value_from
-                .as_ref()
-                .unwrap()
-                .secret_key_ref
-                .as_ref()
-                .unwrap()
-                .name,
-            "web-redis-conn"
-        );
-        let pfx = envs
-            .iter()
-            .find(|e| e.name == "REDIS_CHANNEL_PREFIX")
-            .expect("REDIS_CHANNEL_PREFIX injected");
-        assert_eq!(
-            pfx.value_from
-                .as_ref()
-                .unwrap()
-                .secret_key_ref
-                .as_ref()
-                .unwrap()
-                .name,
-            "web-redis-conn"
-        );
-        assert_eq!(
-            pfx.value_from
-                .as_ref()
-                .unwrap()
-                .secret_key_ref
-                .as_ref()
-                .unwrap()
-                .key,
-            "REDIS_CHANNEL_PREFIX"
-        );
-    }
-
-    #[test]
-    fn redis_injection_is_deterministic_two_vars() {
-        // Both redis env vars present, fixed binding-slice order
-        // (REDIS_URL then REDIS_CHANNEL_PREFIX), no literal env.
-        let app = make_app_with_uid(
-            ApplicationSpec {
-                base: Some(base_with_need("ghcr.io/acme/web:1.0", "redis")),
-                environments: None,
-                environment: None,
-            },
-            "web",
-            "demo",
-            "uid-1",
-        );
-        let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
-        let r = render_application_for_env(
-            &app,
-            None,
-            Some(&secrets),
-            None,
-            None,
-            operator_core::EgressProfile::Internet,
-            None,
-        );
-        let envs = container_env(&r).expect("env present");
-        assert_eq!(envs.len(), 2);
-        assert_eq!(envs[0].name, "REDIS_URL");
-        assert_eq!(envs[1].name, "REDIS_CHANNEL_PREFIX");
-    }
-
-    // ---- 2.6b: env disambiguation DATABASE_URL_<NAME> for named claims ----
-
-    #[test]
-    fn fold_env_segment_uppercases_and_maps_hyphen_to_underscore() {
-        assert_eq!(fold_env_segment("my-cache"), "MY_CACHE");
-        assert_eq!(fold_env_segment("analytics"), "ANALYTICS");
-        assert_eq!(fold_env_segment("read-replica-2"), "READ_REPLICA_2");
-        // already-uppercase / digits pass through.
-        assert_eq!(fold_env_segment("a1b"), "A1B");
-    }
-
-    /// Helper: build a base with TWO pg needs — the unnamed default plus
-    /// a named array entry. Renders to two `(pg, name)` claim identities.
-    fn base_with_two_pg(image: &str, named: &str) -> ApplicationBaseSpec {
-        let needs = Needs {
-            pg: Some(OneOrMany::Many(vec![
-                ServiceNeed::default(),
-                ServiceNeed {
-                    name: Some(named.to_string()),
-                    ..Default::default()
-                },
-            ])),
-            ..Default::default()
-        };
-        ApplicationBaseSpec {
-            image: Some(image.to_string()),
-            needs: Some(needs),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn two_pg_claims_yield_database_url_and_suffixed_named_var() {
-        // Two ready pg claims (default + named "analytics") → the
-        // Deployment carries DATABASE_URL (default) AND
-        // DATABASE_URL_ANALYTICS (named), each a secretKeyRef to its own
-        // per-claim conn Secret with key DATABASE_URL.
-        let app = make_app_with_uid(
-            ApplicationSpec {
-                base: Some(base_with_two_pg("ghcr.io/acme/web:1.0", "analytics")),
-                environments: None,
-                environment: None,
-            },
-            "parser",
-            "demo",
-            "uid-1",
-        );
-        let secrets = BTreeMap::from([
-            (("pg".to_string(), None), "parser-pg-conn".to_string()),
-            (
-                ("pg".to_string(), Some("analytics".to_string())),
-                "parser-pg-analytics-conn".to_string(),
-            ),
-        ]);
-        let r = render_application_for_env(
-            &app,
-            None,
-            Some(&secrets),
-            None,
-            None,
-            operator_core::EgressProfile::Internet,
-            None,
-        );
-        let envs = container_env(&r).expect("env present");
-
-        let default = envs
-            .iter()
-            .find(|e| e.name == "DATABASE_URL")
-            .expect("DATABASE_URL injected for the default claim");
-        let dref = default
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].name, "DB");
+        assert!(envs[0].value.is_none());
+        let kr = envs[0]
             .value_from
             .as_ref()
             .unwrap()
             .secret_key_ref
             .as_ref()
             .unwrap();
-        assert_eq!(dref.name, "parser-pg-conn");
-        assert_eq!(dref.key, "DATABASE_URL");
-
-        let named = envs
-            .iter()
-            .find(|e| e.name == "DATABASE_URL_ANALYTICS")
-            .expect("DATABASE_URL_ANALYTICS injected for the named claim");
-        let nref = named
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        // The Secret KEY stays DATABASE_URL — only the env NAME is suffixed.
-        assert_eq!(nref.key, "DATABASE_URL");
-        assert_eq!(nref.name, "parser-pg-analytics-conn");
-
-        // Exactly the two injected DSN vars (no literal env here).
-        assert_eq!(envs.len(), 2);
+        assert_eq!(kr.name, "parser-pg-conn");
+        assert_eq!(kr.key, "url");
+        assert_eq!(kr.optional, Some(false));
     }
 
     #[test]
-    fn single_unnamed_pg_still_yields_exactly_database_url() {
-        // Backward-compat: a single unnamed pg claim keeps the bare
-        // DATABASE_URL env NAME — no suffix, no migration.
+    fn literal_env_coexists_with_claim_ref_in_btreemap_order() {
+        // 2.12c: literal env + a Claim ref coexist; the output is in
+        // BTreeMap (lexicographic) order. No implicit DATABASE_URL.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "LOG_LEVEL".to_string(),
+            EnvValue::Literal("info".to_string()),
+        );
+        env.insert(
+            "DB".to_string(),
+            EnvValue::Ref(EnvRef::Claim("pg.url".to_string())),
+        );
+        let mut base = base_with_need("ghcr.io/acme/web:1.0", "pg");
+        base.env = Some(env);
         let app = make_app_with_uid(
             ApplicationSpec {
-                base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
+                base: Some(base),
                 environments: None,
                 environment: None,
             },
@@ -1632,8 +1285,203 @@ mod tests {
             None,
         );
         let envs = container_env(&r).expect("env present");
+        // BTreeMap order: DB < LOG_LEVEL
+        assert_eq!(envs.len(), 2);
+        assert_eq!(envs[0].name, "DB");
+        assert!(envs[0].value_from.is_some());
+        assert_eq!(envs[1].name, "LOG_LEVEL");
+        assert_eq!(envs[1].value.as_deref(), Some("info"));
+    }
+
+    #[test]
+    fn needs_pg_with_no_env_ref_gets_no_database_url_auto_inject_removed() {
+        // 2.12c regression-guard: an app with needs.pg + a secrets map but
+        // no spec.env must NOT get a DATABASE_URL injected implicitly.
+        // (The 2.4e auto-inject is fully removed.)
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base_with_need("ghcr.io/acme/web:1.0", "pg")),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([(("pg".to_string(), None), "web-pg-conn".to_string())]);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
+        assert!(
+            container_env(&r).is_none(),
+            "DATABASE_URL must NOT be auto-injected (2.4e removed)"
+        );
+    }
+
+    #[test]
+    fn redis_claim_ref_in_env_resolves_to_channel_prefix() {
+        // 2.12c: explicit redis.channelPrefix ref → resolves to the
+        // connection Secret's channelPrefix key. No auto REDIS_URL
+        // injection.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "REDIS_PFX".to_string(),
+            EnvValue::Ref(EnvRef::Claim("redis.channelPrefix".to_string())),
+        );
+        let mut base = base_with_need("ghcr.io/acme/web:1.0", "redis");
+        base.env = Some(env);
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([(("redis".to_string(), None), "web-redis-conn".to_string())]);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
+        let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 1);
-        assert_eq!(envs[0].name, "DATABASE_URL");
+        assert_eq!(envs[0].name, "REDIS_PFX");
+        let kr = envs[0]
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(kr.name, "web-redis-conn");
+        assert_eq!(kr.key, "channelPrefix");
+    }
+
+    #[test]
+    fn named_pg_claim_ref_resolves_to_named_connection_secret() {
+        // 2.12c: `spec.env.DB_MAIN = {claim: "pg.main.url"}` — named
+        // claim `(pg, Some("main"))` → resolved from the
+        // `("pg", Some("main"))` entry in needs_secrets.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "DB_MAIN".to_string(),
+            EnvValue::Ref(EnvRef::Claim("pg.main.url".to_string())),
+        );
+        let needs = Needs {
+            pg: Some(OneOrMany::Many(vec![
+                ServiceNeed::default(),
+                ServiceNeed {
+                    name: Some("main".to_string()),
+                    ..Default::default()
+                },
+            ])),
+            ..Default::default()
+        };
+        let base = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".to_string()),
+            needs: Some(needs),
+            env: Some(env),
+            ..Default::default()
+        };
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(base),
+                environments: None,
+                environment: None,
+            },
+            "parser",
+            "demo",
+            "uid-1",
+        );
+        let secrets = BTreeMap::from([
+            (("pg".to_string(), None), "parser-pg-conn".to_string()),
+            (
+                ("pg".to_string(), Some("main".to_string())),
+                "parser-pg-main-conn".to_string(),
+            ),
+        ]);
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
+        let envs = container_env(&r).expect("env present");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].name, "DB_MAIN");
+        let kr = envs[0]
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(kr.name, "parser-pg-main-conn");
+        assert_eq!(kr.key, "url");
+    }
+
+    #[test]
+    fn secret_ref_in_env_resolves_to_secret_key_ref() {
+        // 2.12c: `spec.env.TOKEN = {secret: "stripe/api-key"}` →
+        // valueFrom.secretKeyRef{name:"stripe", key:"api-key"}.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "TOKEN".to_string(),
+            EnvValue::Ref(EnvRef::Secret("stripe/api-key".to_string())),
+        );
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    env: Some(env),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "demo",
+            "uid-1",
+        );
+        let secrets: BTreeMap<(String, Option<String>), String> = BTreeMap::new();
+        let r = render_application_for_env(
+            &app,
+            None,
+            Some(&secrets),
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
+        let envs = container_env(&r).expect("env present");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].name, "TOKEN");
+        let kr = envs[0]
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(kr.name, "stripe");
+        assert_eq!(kr.key, "api-key");
+        assert_eq!(kr.optional, Some(false));
     }
 
     // ---- 2.4h-c: resolved-digest threading ----
