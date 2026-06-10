@@ -14,7 +14,9 @@ removed `cli-providers::k8s::application_crd` (dropped in B.1.71; the CRD now
 ships only from the operator chart); and the CLAUDE.md architecture note ("There
 is no CUE→CRD/Rust generator yet … hand-rolled mirrors, kept in sync by hand").
 The same landing pass fixes both the "no generator yet" wording and the stale
-`application_crd` reference. It does not move any §6 box.
+`application_crd` reference. It does not move any §6 box. The Phase-0 Application
+spike (2026-06-10) cleared the R1 gate: a CUE-generated Application CRD reached
+`Established` on a real apiserver and accepted the union-bearing objects.
 
 ## Context
 
@@ -73,17 +75,20 @@ mirror so that none can silently drift from the CUE.
 1. **CUE owns the schema *and* the CRD envelope.** Each
    `schemas/v1alpha1/<crd>.cue` carries, alongside its `#Type`, the CRD-envelope
    metadata (group/version/kind/names, scope, shortNames, additionalPrinterColumns,
-   subresources). The exact CUE encoding (hidden field, definition, or sidecar
-   file — constrained by what `cue export` can surface) is fixed by the
-   Application spike (see Risks R1). The envelope must not remain a hand-rolled
-   YAML mirror, or the refactor defeats itself.
+   subresources). The Phase-0 spike fixed the encoding: a hidden `_crdMeta` field,
+   which `cue export -e '_crdMeta'` surfaces. The envelope must not remain a
+   hand-rolled YAML mirror, or the refactor defeats itself.
 
 2. **Generate the chart CRDs from CUE.** A small Rust tool, `crdgen`, in the
-   operator workspace runs `cue export --out openapi` over the schema,
-   post-processes the result into a Kubernetes *structural* schema (mapping CUE
-   field attributes to `x-kubernetes-preserve-unknown-fields` /
-   `x-kubernetes-int-or-string`, dropping constructs the apiserver forbids),
-   wraps it in the CRD envelope from the CUE metadata, and writes
+   operator workspace runs `cue export ./schemas/v1alpha1 --out openapi`, takes
+   the CR's component schema, and post-processes it into a Kubernetes *structural*
+   schema: inline every `$ref` (structural schemas forbid references), collapse
+   each `oneOf`/`anyOf` union node (the untagged `EnvValue`, the `OneOrMany` needs
+   shapes) to `x-kubernetes-preserve-unknown-fields: true` (the webhook validates
+   the union), and give each object node a `type`. CRD-only constraints CUE
+   deliberately keeps out of `cue vet` — the `image` `pattern: "^.+$"`, for one —
+   are carried by `@crd(...)` field attributes the generator reads and emits. It
+   then wraps the schema in the CRD envelope from `_crdMeta`, and writes
    `operator/charts/apprafter-operator/templates/crd-<crd>.yaml` with a
    "GENERATED — do not edit" header. `just gen-crds` regenerates; the files are
    committed so chart consumers and code review still see a diff. CUE remains the
@@ -202,9 +207,10 @@ Neutral:
 - **R3 — the gate allowlist becomes a dumping ground that masks real drift.**
   *Mitigation:* every entry carries a one-line reason; the gate fails on an
   unexplained entry (the same discipline as `yankedReason`).
-- **R4 — cue version drift** (pinned v0.10) changes the OpenAPI output.
-  *Mitigation:* the gen path pins cue and reuses the `build.rs` nix fallback;
-  the CUE↔committed gate catches any output change as drift.
+- **R4 — cue version drift changes the OpenAPI output** (the spike saw cue
+  v0.16 locally vs v0.10 pinned in CI). *Mitigation:* the generator pins **one**
+  cue version via nix, and CI's `setup-cue` + the gate use that same version, so
+  the byte-compare is reproducible; the CUE↔committed gate catches any drift.
 - **R5 — retyping a webhook validator subtly changes its behaviour** (a rule
   that leaned on a permissive `Value` lookup, an absent-field default, or a
   string-parse quirk). *Mitigation:* the existing validator unit tests are the
