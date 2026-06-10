@@ -27,6 +27,16 @@ const CRDS: &[Crd] = &[Crd {
     file_stem: "crd-application",
 }];
 
+/// A rendered CRD: its CUE component name, the chart file path, the YAML
+/// text (assertion A compares this to the committed file), and the CRD
+/// object (assertion B compares its field set to the kube-rs derivation).
+pub(crate) struct Rendered {
+    pub component: &'static str,
+    pub path: PathBuf,
+    pub text: String,
+    pub crd: Value,
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -51,7 +61,7 @@ fn find_repo_root() -> Result<PathBuf> {
 /// Render every in-scope CRD to its `(chart path, YAML text)`. Shared by
 /// `generate` (writes them) and `check` (compares them to the committed
 /// files), so both see byte-identical output.
-pub(crate) fn render_all() -> Result<Vec<(PathBuf, String)>> {
+pub(crate) fn render_all() -> Result<Vec<Rendered>> {
     let root = find_repo_root()?;
     let schemas = cue::export_schemas(&root)?;
     let metas = cue::export_crd_metas(&root)?;
@@ -99,15 +109,20 @@ pub(crate) fn render_all() -> Result<Vec<(PathBuf, String)>> {
         let text = envelope::render(&source, &crd_obj)?;
 
         let path = templates.join(format!("{}.yaml", crd.file_stem));
-        rendered.push((path, text));
+        rendered.push(Rendered {
+            component: crd.component,
+            path,
+            text,
+            crd: crd_obj,
+        });
     }
     Ok(rendered)
 }
 
 fn generate() -> Result<()> {
-    for (path, text) in render_all()? {
-        std::fs::write(&path, &text).with_context(|| format!("write {}", path.display()))?;
-        eprintln!("generated {}", path.display());
+    for r in render_all()? {
+        std::fs::write(&r.path, &r.text).with_context(|| format!("write {}", r.path.display()))?;
+        eprintln!("generated {}", r.path.display());
     }
     Ok(())
 }

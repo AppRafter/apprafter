@@ -13,6 +13,10 @@ name = "crdgen"
 path = "src/main.rs"
 
 [dependencies]
-serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-anyhow     = { workspace = true }
+serde_json    = { workspace = true }
+serde_yaml    = { workspace = true }
+anyhow        = { workspace = true }
+# Assertion B (Rust↔CUE): derive each CRD from the kube-rs types and
+# compare its field set to the CUE-derived CRD.
+operator-core = { path = "../operator-core" }
+kube          = { workspace = true }
