@@ -20,7 +20,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use operator_core::{Application, ApplicationBaseSpec};
+use operator_core::{Application, ApplicationBaseSpec, EnvValue};
 
 /// Output of `render_application`. Always carries a Deployment;
 /// `service` is `Some(...)` only when the Application sets
@@ -355,15 +355,26 @@ fn render_deployment(
         ..Default::default()
     });
 
+    // 2.12 (ADR 0046): env values are now `EnvValue` — either a plain
+    // `Literal(String)` (same rendering as before) or a `Ref(EnvRef)`
+    // (claim / external-secret reference). Ref resolution is implemented
+    // in the next task (2.12b); for the schema-foundation task (2.12a)
+    // only Literal values are rendered. Ref variants are deferred (the
+    // renderer will resolve them once the connection-secret map and the
+    // ref-resolution logic land in 2.12b).
     let mut env_vars: Vec<EnvVar> = spec
         .env
         .as_ref()
         .map(|env| {
             env.iter()
-                .map(|(k, v)| EnvVar {
-                    name: k.clone(),
-                    value: Some(v.clone()),
-                    value_from: None,
+                .filter_map(|(k, v)| match v {
+                    EnvValue::Literal(s) => Some(EnvVar {
+                        name: k.clone(),
+                        value: Some(s.clone()),
+                        value_from: None,
+                    }),
+                    // Ref resolution deferred to 2.12b (renderer expansion).
+                    EnvValue::Ref(_) => None,
                 })
                 .collect()
         })
@@ -637,8 +648,11 @@ mod tests {
     #[test]
     fn deployment_env_vars_match_base_env_in_btreemap_order() {
         let mut env = BTreeMap::new();
-        env.insert("LOG_LEVEL".to_string(), "info".to_string());
-        env.insert("ALPHA".to_string(), "1".to_string());
+        env.insert(
+            "LOG_LEVEL".to_string(),
+            EnvValue::Literal("info".to_string()),
+        );
+        env.insert("ALPHA".to_string(), EnvValue::Literal("1".to_string()));
         let app = make_app_with_uid(
             ApplicationSpec {
                 base: Some(ApplicationBaseSpec {
@@ -1021,11 +1035,17 @@ mod tests {
     #[test]
     fn effective_spec_env_override_env_merges_with_override_wins_on_conflict() {
         let mut base_env = BTreeMap::new();
-        base_env.insert("LOG_LEVEL".to_string(), "info".to_string());
-        base_env.insert("REGION".to_string(), "eu".to_string());
+        base_env.insert(
+            "LOG_LEVEL".to_string(),
+            EnvValue::Literal("info".to_string()),
+        );
+        base_env.insert("REGION".to_string(), EnvValue::Literal("eu".to_string()));
         let mut prod_env = BTreeMap::new();
-        prod_env.insert("LOG_LEVEL".to_string(), "warn".to_string());
-        prod_env.insert("PROD_FLAG".to_string(), "1".to_string());
+        prod_env.insert(
+            "LOG_LEVEL".to_string(),
+            EnvValue::Literal("warn".to_string()),
+        );
+        prod_env.insert("PROD_FLAG".to_string(), EnvValue::Literal("1".to_string()));
         let mut envs = BTreeMap::new();
         envs.insert(
             "prod".to_string(),
@@ -1045,11 +1065,11 @@ mod tests {
         let s = effective_spec(&app, Some("prod"));
         let env = s.env.expect("env decoded");
         // override wins:
-        assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("warn"));
+        assert_eq!(env["LOG_LEVEL"], EnvValue::Literal("warn".into()));
         // base survives:
-        assert_eq!(env.get("REGION").map(String::as_str), Some("eu"));
+        assert_eq!(env["REGION"], EnvValue::Literal("eu".into()));
         // override-only:
-        assert_eq!(env.get("PROD_FLAG").map(String::as_str), Some("1"));
+        assert_eq!(env["PROD_FLAG"], EnvValue::Literal("1".into()));
     }
 
     #[test]
@@ -1318,7 +1338,7 @@ mod tests {
         let mut base = base_with_need("ghcr.io/acme/web:1.0", "pg");
         base.env = Some(BTreeMap::from([(
             "LOG_LEVEL".to_string(),
-            "info".to_string(),
+            EnvValue::Literal("info".to_string()),
         )]));
         let app = make_app_with_uid(
             ApplicationSpec {

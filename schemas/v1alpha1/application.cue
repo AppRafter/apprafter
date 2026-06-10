@@ -9,9 +9,10 @@ package v1alpha1
 //                nor any environment override sets it.
 //   - replicas — non-negative; defaults to 1 at render time.
 //   - expose   — optional Gateway-side exposure (port + visibility).
-//   - env      — string→string map. Literals only; secret/configmap
-//                refs land in 2.x with ResourceClaim and 4.x with
-//                OpenBao.
+//   - env      — string→#EnvValue map. Values may be literal strings,
+//                claim references ({claim: "<type>.<field>"}), or
+//                external secret references ({secret: "<name>/<key>"}).
+//                See ADR 0046 and the #EnvValue / #EnvRef definitions.
 //   - environments — per-environment overrides via CUE unification;
 //                see spec.md §3.1 and ADR 0004.
 //
@@ -72,8 +73,9 @@ package v1alpha1
 		network?: "public" | "internal" | "vpn" | *"internal"
 	}
 
-	// Literal string values only — no secret refs in v1alpha1.
-	env?: [string]: string
+	// Env value map (ADR 0046). Each value is a literal string OR a
+	// structured reference (claim / external secret). See #EnvValue.
+	env?: [string]: #EnvValue
 
 	// Declared platform-service dependencies, keyed by service
 	// type. Each entry becomes a `ResourceClaim` of that type —
@@ -100,6 +102,75 @@ package v1alpha1
 	// `(type, name)` uniqueness invariants at the apiserver — that
 	// is the runtime gate.
 	needs?: #Needs
+}
+
+// 2.12 (ADR 0046): an env value is a literal string OR a structured
+// reference. The reference is a single-key discriminated marker — the
+// renderer resolves it to a Deployment EnvVar valueFrom.secretKeyRef.
+#EnvValue: string | #EnvRef
+
+#EnvRef: {claim: string} | {secret: string}
+// claim payload:  "<type>.<field>"  or  "<type>.<name>.<field>"
+// secret payload: "<name>/<key>"
+
+// The per-network-need field set (keys the provisioner writes into the
+// connection Secret). pg + redis only ship connection Secrets today.
+_pgFieldNames: ["url", "user", "pass", "host", "port", "db"]
+_redisFieldNames: ["url", "user", "pass", "host", "port", "db", "channelPrefix"]
+_fieldsFor: {pg: _pgFieldNames, redis: _redisFieldNames}
+
+// _mkFields — markers for one (need[,name]) claim. Each field becomes a
+// {claim: "<type>[.<name>].<field>"} marker (string-discriminated).
+_mkFields: {
+	_need: string
+	_name: string | *""
+	_fields: [...string]
+	_seg: [if _name != "" {"\(_need).\(_name)"}, "\(_need)"][0]
+	for f in _fields {(f): {claim: "\(_seg).\(f)"}}
+}
+
+// _mkClaim — derive the `claim` binding from an effective `needs` value.
+// A later task (cue-cmp + `apprafter app validate`) injects
+// `claim: _mkClaim & {_needs: <needs>}` so `claim.pg.url` resolves AND a
+// reference to an undeclared need / non-enum field is a `cue` error.
+//
+// Scalar `needs: {pg: {}}` → `claim.pg.url` (unnamed default).
+// Named-only array `[{name:"main"},{name:"ro"}]` → `claim.pg.main.url` /
+// `claim.pg.ro.url`; `claim.pg.url` is undefined (no unnamed default).
+// Mixed array (one unnamed + named entries) → BOTH `claim.pg.url` (unnamed
+// default) AND `claim.pg.<name>.url` (named entries).
+//
+// Array branch uses `let _nm = [if e.name != _|_ {e.name}, ""][0]` to
+// coalesce each entry's name to "" when absent — avoids bottoming on
+// `(e.name)` as a dynamic key for the unnamed-entry case.
+_mkClaim: {
+	_needs: {...}
+	for type, n in _needs if (_fieldsFor[type] != _|_) {
+		(type): {
+			// scalar branch: n is a struct (one unnamed default claim)
+			if (n & {...}) != _|_ {_mkFields & {_need: type, _fields: _fieldsFor[type]}}
+
+			// array branch: n is a list; iterate entries, emitting named
+			// sub-structs or default (type-level) fields as appropriate.
+			if (n & [...]) != _|_ {
+				for e in n {
+					let _nm = [if e.name != _|_ {e.name}, ""][0]
+					if _nm != "" {
+						(_nm): {
+							for f in _fieldsFor[type] {
+								(f): {claim: "\(type).\(_nm).\(f)"}
+							}
+						}
+					}
+					if _nm == "" {
+						for f in _fieldsFor[type] {
+							(f): {claim: "\(type).\(f)"}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // #Needs — the closed set of declared dependency keys (2.6b /

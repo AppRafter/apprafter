@@ -71,10 +71,16 @@ spec:
                         network:
                           type: string
                           enum: [public, internal, vpn]
+                    # env (2.12 / ADR 0046): values are string | {claim:string}
+                    # | {secret:string} — a string-or-object union. A structural
+                    # CRD node cannot declare `type: [string, object]`; using
+                    # x-kubernetes-preserve-unknown-fields mirrors the same
+                    # escape hatch `needs` uses for its scalar|array union.
+                    # The admission webhook enforces claim/secret format rules.
                     env:
                       type: object
                       additionalProperties:
-                        type: string
+                        x-kubernetes-preserve-unknown-fields: true
                     # needs (2.6b / ADR 0043): an explicit closed struct.
                     # Each service key accepts a SCALAR #ServiceNeed object OR
                     # an ARRAY of named #ServiceNeeds; `disk` carries a
@@ -141,10 +147,12 @@ spec:
                           network:
                             type: string
                             enum: [public, internal, vpn]
+                      # env (2.12 / ADR 0046): same string-or-object union as
+                      # spec.base.env — x-kubernetes-preserve-unknown-fields.
                       env:
                         type: object
                         additionalProperties:
-                          type: string
+                          x-kubernetes-preserve-unknown-fields: true
                       # needs (2.6b / ADR 0043): same closed-struct shape as
                       # spec.base.needs. Each union key uses x-kubernetes-
                       # preserve-unknown-fields (scalar object | array of

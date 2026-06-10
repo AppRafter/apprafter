@@ -40,7 +40,7 @@ pub struct ApplicationBaseSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expose: Option<ApplicationExpose>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
+    pub env: Option<BTreeMap<String, EnvValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs: Option<Needs>,
     /// Image resolution policy (ADR 0040). Absent => default `digest`
@@ -183,6 +183,32 @@ pub struct Needs {
     pub notifications: Option<OneOrMany<ServiceNeed>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<OneOrMany<DiskClaim>>,
+}
+
+/// 2.12 (ADR 0046): an env value is a literal string OR a single-key
+/// reference. The `#[serde(untagged)]` attribute makes the literal variant
+/// deserialise from a plain JSON string, and the `Ref` variant from a
+/// `{"claim":…}` or `{"secret":…}` object. Mirrors `#EnvValue` in
+/// `schemas/v1alpha1/application.cue`.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(untagged)]
+pub enum EnvValue {
+    Literal(String),
+    Ref(EnvRef),
+}
+
+/// Single-key discriminated reference inside an `EnvValue::Ref`.
+/// `claim` resolves to a provisioned connection-Secret field;
+/// `secret` resolves to an external Secret in the app namespace.
+/// Mirrors `#EnvRef` in `schemas/v1alpha1/application.cue`.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvRef {
+    /// `"<type>.<field>"` or `"<type>.<name>.<field>"` — claim-backed
+    /// connection-Secret field (pg / redis field vocabulary, ADR 0046).
+    Claim(String),
+    /// `"<name>/<key>"` — external Secret in the app namespace.
+    Secret(String),
 }
 
 /// A single flattened `needs` entry produced by [`Needs::entries`]. A
@@ -396,7 +422,7 @@ mod tests {
         assert_eq!(expose.port, 8080);
         assert_eq!(expose.network.as_deref(), Some("internal"));
         let env = base.env.as_ref().expect("env decoded");
-        assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("info"));
+        assert_eq!(env["LOG_LEVEL"], EnvValue::Literal("info".into()));
 
         let envs = app
             .spec
@@ -639,5 +665,17 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "phase": "Ready", "environment": "dev" }))
                 .unwrap();
         assert_eq!(status.environment.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn env_value_deserialises_literal_claim_secret() {
+        let j = serde_json::json!({"LOG":"info","DB":{"claim":"pg.url"},"K":{"secret":"stripe/api-key"}});
+        let m: std::collections::BTreeMap<String, EnvValue> = serde_json::from_value(j).unwrap();
+        assert_eq!(m["LOG"], EnvValue::Literal("info".into()));
+        assert_eq!(m["DB"], EnvValue::Ref(EnvRef::Claim("pg.url".into())));
+        assert_eq!(
+            m["K"],
+            EnvValue::Ref(EnvRef::Secret("stripe/api-key".into()))
+        );
     }
 }
