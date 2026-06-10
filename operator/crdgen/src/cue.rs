@@ -56,13 +56,15 @@ pub fn export_schemas(repo_root: &Path) -> Result<Map<String, Value>> {
         .context("cue openapi output missing components.schemas")
 }
 
-/// Export the hidden `_crdMetas` map (kind → CRD-envelope metadata).
+/// Export the `_crdMetas` map (kind → CRD-envelope metadata). It lives in
+/// `schemas/crdmeta`, NOT `schemas/v1alpha1`, so crdgen metadata never
+/// reaches the cue-cmp-bundled schema (ADR 0047; schemas/crdmeta/meta.cue).
 pub fn export_crd_metas(repo_root: &Path) -> Result<Map<String, Value>> {
     let bytes = run_cue(
         repo_root,
         &[
             "export",
-            "./schemas/v1alpha1",
+            "./schemas/crdmeta",
             "-e",
             "_crdMetas",
             "--out",

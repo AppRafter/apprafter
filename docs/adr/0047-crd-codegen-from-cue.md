@@ -72,12 +72,16 @@ We will make **CUE the single source of truth** for every CRD's schema,
 generate the drift-prone mirror from it, and bind every remaining hand-written
 mirror so that none can silently drift from the CUE.
 
-1. **CUE owns the schema *and* the CRD envelope.** Each
-   `schemas/v1alpha1/<crd>.cue` carries, alongside its `#Type`, the CRD-envelope
-   metadata (group/version/kind/names, scope, shortNames, additionalPrinterColumns,
-   subresources). The Phase-0 spike fixed the encoding: a hidden `_crdMeta` field,
-   which `cue export -e '_crdMeta'` surfaces. The envelope must not remain a
-   hand-rolled YAML mirror, or the refactor defeats itself.
+1. **CUE owns the schema *and* the CRD envelope.** The CRD-envelope metadata
+   (group/version/kind/names, scope, shortNames, additionalPrinterColumns,
+   subresources, plus `schemaPatches` for CRD-only constraints — see #2) lives in
+   CUE as a hidden `_crdMetas` map keyed by kind, surfaced by
+   `cue export ./schemas/crdmeta -e '_crdMetas'`. It sits in **`schemas/crdmeta/`**,
+   not inside each `schemas/v1alpha1/<crd>.cue`: the `v1alpha1` package is bundled
+   into the argocd-cue-cmp image (`schemas/v1alpha1/*.cue`), so crdgen-only metadata
+   there would republish cue-cmp — and trip its drift guard — on every CRD
+   migration. The envelope must not remain a hand-rolled YAML mirror, or the
+   refactor defeats itself.
 
 2. **Generate the chart CRDs from CUE.** A small Rust tool, `crdgen`, in the
    operator workspace runs `cue export ./schemas/v1alpha1 --out openapi`, takes
