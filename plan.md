@@ -2638,6 +2638,293 @@ instead of carrying parallel definitions.
 
 ---
 
+### 1.83a Chart: gateway component + LB-IPAM/L2 + per-domain listeners + redirect
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
+
+**Source:** инфра-долг (servicelb выключен с 1.3, L2/IPPool ресурсов в чарте до сих пор нет); precursor для 4.1 platform Gateway.
+
+**Цель:** платформенный Gateway получает публичный IP узла через Cilium LB-IPAM + L2 announce. Для каждой entry в `values.gateway.allowedDomains[]` Gateway получает пару HTTPS listener'ов (apex + wildcard) со static cert-ref на per-entry Secret. Один catch-all HTTP listener + одна platform-wide redirect HTTPRoute обслуживают HTTP→HTTPS 301 для всех зон. Conditional на непустой массив — иначе компонент disabled.
+
+**Поставка:**
+- [ ] `platform-stack/cue/component_gateway.cue` — новый component, default-off на solo (включается когда `len(values.gateway.allowedDomains) > 0`), on на team.
+- [ ] Подтвердить `gatewayAPI.enabled: true` в `_loaderValues.cilium` + `component_cilium.cue` (CRD стоят с 1.4; флаг проверить и добавить если отсутствует — см. PART 0.6 чек 1).
+- [ ] `CiliumLoadBalancerIPPool` `apprafter-node-public` — single-IP pool по селектору `apprafter.io/platform-gateway: "true"`.
+- [ ] `CiliumL2AnnouncementPolicy` `apprafter-node-public` — externalIPs + loadBalancerIPs both true, тот же селектор.
+- [ ] `Gateway` `platform` в `apprafter-system`:
+    - Label `apprafter.io/platform-gateway: "true"` — **shim для ExternalSurface adoption по ownerRef в 4.1**.
+    - `gatewayClassName: cilium`.
+    - **HTTPS listeners (per-entry):** CUE-comprehension по `values.gateway.allowedDomains` × `[apex, wildcard]`:
+        ```cue
+        for entry in values.gateway.allowedDomains
+        for variant in [
+            {nameSuffix: "apex",     hostname: entry.domain},
+            {nameSuffix: "wildcard", hostname: "*." + entry.domain},
+        ] {
+            name:     "https-\(variant.nameSuffix)-\(entry.domain)"
+            port:     443
+            protocol: "HTTPS"
+            hostname: variant.hostname
+            tls: {
+                mode: "Terminate"
+                certificateRefs: [{
+                    name:      entry.importedCertRef
+                    namespace: "apprafter-system"
+                    kind:      "Secret"
+                }]
+            }
+            allowedRoutes: namespaces: from: "All"
+        }
+        ```
+      2N listener'ов для N зон. Gateway API hard-limit (>>) любого реалистичного N.
+    - **HTTP catch-all listener:** один listener name `http`, port 80, без hostname (matches any), `allowedRoutes.namespaces.from: All`. Не зависит от количества зон.
+- [ ] Platform `HTTPRoute` `platform-http-redirect` в `apprafter-system`:
+    - `parentRefs: [{name: platform, sectionName: "http"}]`.
+    - Catch-all (без hostnames, pathPrefix `/`).
+    - `filters: [{type: RequestRedirect, requestRedirect: {scheme: "https", statusCode: 301}}]` (original Host сохраняется автоматически).
+    - В 4.1b `#TlsOptions.redirect: bool` сделает per-app конфигурируемым; platform-wide remains as fallback.
+- [ ] Conditional rendering: пустой `allowedDomains` ⇒ component fully disabled (нет Gateway/IPPool/L2/redirect ресурсов; zero-impact на existing solo-кластера).
+
+**Acceptance:**
+- Apply кластера с `values.gateway.allowedDomains: [{domain: "apprafter.dev", certMode: "imported", importedCertRef: "cf-origin-cert-apprafter-dev", addedAt: "...", addedBy: "..."}]` ⇒ `kubectl get gateway platform -n apprafter-system` показывает `Programmed: True`, две `https-*-apprafter.dev` listener'а в `status.listeners` (apex + wildcard), один `http` listener.
+- Добавление второй entry (например `apprafter.io`) в массив ⇒ ещё два HTTPS listener'а появляются после reconcile, оба ссылаются на свой Secret.
+- `curl -I http://<любая-зона>/` отвечает `301` с `Location: https://<тот же host>/...`.
+- Пустой массив ⇒ нет gateway-ресурсов; existing solo-кластера не ломаются.
+
+**Зависит от:** 1.4 ✅, 1.71 ✅.
+
+**Размер:** M+
+
+---
+
+### 1.83b Schema: `expose.hostname` + `expose.tls` + allowedDomains admission
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
+
+**Source:** срез 4.1a schema extension + 4.1b `allowedDomains` admission rule.
+
+**Цель:** ввести поля `hostname` и `tls` в Application; admission webhook валидирует hostname против `PlatformStack.spec.values.gateway.allowedDomains`. Оба rules signature-stable с 4.1b — миграция == webhook читает `ExternalSurface.spec.allowedDomains` вместо PlatformStack.
+
+**Поставка:**
+- [ ] `schemas/v1alpha1/application.cue` — расширить `#Expose`:
+    ```cue
+    #Expose: {
+        port:     int
+        public:   bool | *false
+        network:  "public" | "internal" | "vpn" | *"internal"
+        hostname: string | *""   // required when public: true (validated в admission)
+        tls:      bool | *true   // default on для public; full #TlsOptions в 4.1b
+    }
+    ```
+- [ ] OpenAPI v3 CRD пересгенерирована (или hand-rolled mirror) + apply через chart upgrade.
+- [ ] Admission webhook (existing `apprafter-admission-webhook`):
+    - Rule 1: `public: true ⇒ hostname != ""` с error «expose.public: true requires expose.hostname (defaultDomain auto-generation lands в 4.1b)».
+    - Rule 2: `public: true` ⇒ `hostname` matches минимум одной entry в `PlatformStack.spec.values.gateway.allowedDomains[]`:
+        - Exact apex match: `hostname == entry.domain`.
+        - Single-label wildcard match: `hostname == "<label>." + entry.domain`.
+        - Multi-label deep matches (например `a.b.entry.domain`) ⇒ reject (slice purposefully не поддерживает deep — Gateway listener wildcard это один level).
+        - Mismatch ⇒ reject «hostname '<x>' not in cluster's allowed domains. Run `apprafter target domain add <zone> --cert <name>` first».
+    - Webhook читает PlatformStack singleton (`default` в `apprafter-system`) на каждый validate (низкочастотный path, кэш не делаем в slice).
+    - Пустой `allowedDomains` ⇒ Rule 2 пропускается на Rule 1's error (нет где match'ить).
+- [ ] `expose.tls: false` + `public: true` ⇒ пока reject (в slice нет HTTP-only маршрута; добавится в 4.1b как `#TlsOptions{enabled: false}`).
+- [ ] Migration лендинг-манифеста: убрать label `apprafter.io/hostname` (см. PART 0.6 чек 2 — если label не используется, пропустить), добавить `spec.base.expose.hostname: "apprafter.dev"`.
+
+**Acceptance:**
+- `kubectl apply` лендинга с `expose.hostname: "apprafter.dev"` после `apprafter target domain add apprafter.dev --cert ...` проходит.
+- `kubectl apply` Application с `hostname: "foo.com"` (вне `allowedDomains`) ⇒ reject с понятным error.
+- `kubectl apply` с `public: true` без hostname ⇒ reject.
+- `kubectl apply` с `hostname: "a.b.apprafter.dev"` (deep) ⇒ reject.
+- `kubectl apply` с `hostname: "cms.apprafter.dev"` (single-label wildcard match) ⇒ accept.
+
+**Зависит от:** 1.7 ✅, 1.72 ✅.
+
+**Размер:** S+
+
+---
+
+### 1.83c Operator: HTTPRoute emission из `expose.public + expose.hostname`
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
+
+**Source:** core 4.1a (срез без Certificate emission и без rewrites/ws/sticky).
+
+**Цель:** Application с `public: true` + `hostname` → operator-rendered HTTPRoute. Gateway API сам резолвит listener по hostname matching (apex или wildcard какой угодно зарегистрированной зоны), оператор не знает про количество listener'ов / зон. Certificate не эмитим — cert живёт на per-listener cert-ref'ах статически (1.83a + 1.83e). Multi-zone naturally работает без правок renderer'а.
+
+**Поставка:**
+- [ ] `operator-rendering` — extension `render_application`:
+    - `expose.public: true` + `hostname != ""` ⇒ render `HTTPRoute`:
+        - Name `<app>-public` в namespace Application'а.
+        - `parentRefs: [{name: platform, namespace: apprafter-system, kind: Gateway}]` — **без `sectionName`**, Gateway сам выбирает listener по SNI.
+        - `hostnames: [<expose.hostname>]`.
+        - `rules: [{matches: [{path: {type: PathPrefix, value: "/"}}], backendRefs: [{name: <service-name>, port: <expose.port>}]}]`.
+    - OwnerRef → Application (cascading delete через 1.9 mechanism).
+    - **Никакого Certificate** в slice-variant.
+- [ ] HTTPRoute и Service Application'а в одном namespace ⇒ `ReferenceGrant` не требуется. Cross-namespace Gateway↔HTTPRoute разрешён через `allowedRoutes.namespaces.from: All` (1.83a).
+- [ ] Status: `Application.status.endpointURL` ⇒ `https://<hostname>` при `public: true` (вместо internal cluster-DNS endpoint).
+- [ ] Тесты:
+    - In-file: pure renderer тест на HTTPRoute shape для public+hostname.
+    - In-file: assert что Certificate не рендерится.
+    - In-file: assert renderer не зависит от количества зарегистрированных зон.
+    - Real-cluster smoke (gated `APPRAFTER_INGRESS_SMOKE=1`): apply Application с public+hostname ⇒ HTTPRoute появляется, `curl https://<hostname>` отвечает.
+
+**Acceptance:**
+- Apply Application с `expose.public: true, hostname: "apprafter.dev"` (после регистрации) ⇒ HTTPRoute создан в течение 30s, `Accepted: True`, `ResolvedRefs: True`.
+- Apply Application с `hostname: "foo.apprafter.dev"` ⇒ HTTPRoute matches wildcard listener того же Gateway, тот же cert.
+- Apply Application с `hostname: "bar.apprafter.io"` (после регистрации второй зоны) ⇒ HTTPRoute matches apex listener apprafter.io, другой cert.
+- Удаление Application ⇒ HTTPRoute удаляется через ownerRef.
+- `expose.public: false` ⇒ HTTPRoute не создаётся, status.endpointURL = internal.
+
+**Зависит от:** 1.7 ✅, 1.8 ✅, 1.9 ✅, 1.83a, 1.83b.
+
+**Размер:** M — standard kube-rs renderer, distributed-penalty не применяется.
+
+---
+
+### 1.83d Origin firewall в Hetzner Cloud builder (CF IPs only, fail-fast)
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a). NB: net-new, в order-5 launch-пути отсутствует (тот предполагает external-dns automation, не CF-orange).
+
+**Source:** CF orange без origin firewall = theatre (атакующий ходит мимо CF по IP узла).
+
+**Цель:** Hetzner Cloud Firewall разрешает 80/443 inbound только из CF IPv4/v6 сетей; остальное deny. Один firewall обслуживает все зарегистрированные зоны — CF IPs универсальны across CF zones. Label `apprafter=true` на firewall-ресурсе для существующего idempotency-слоя. Fail-fast при недоступности CF endpoints — никакого stale snapshot'а.
+
+**Поставка:**
+- [ ] `cli-providers/hetzner_cloud` — новый builder `cf_ingress_firewall_rules()`:
+    - Pull `https://www.cloudflare.com/ips-v4` и `ips-v6` на каждый apply (text body, по CIDR на строку).
+    - **Fail-fast:** non-200 / network error / empty body ⇒ apply abort'ится с error «cannot fetch Cloudflare IP ranges; aborting to avoid stale firewall». Никаких hardcoded fallback CIDRs.
+    - Build inbound rules: `tcp:80 from <cf-v4 ∪ cf-v6>`, `tcp:443 from same set`. SSH (22) — separate, не трогаем.
+- [ ] `commands/apply.rs` — после apply узла вызывает `cf_ingress_firewall_rules()`, аттачит firewall к серверу. Label `apprafter=true` на firewall-ресурсе.
+- [ ] Idempotency: дельта против existing firewall — CF добавили CIDR ⇒ update; убрали ⇒ remove (fail-fast политика требует точного отражения upstream).
+- [ ] Tests: in-file mock на CF endpoints возвращает фиксированный набор + один тест на network-error path (apply должен fail'нуть до cloud-call'а).
+- [ ] Doc-note в RELEASE: «Origin firewall pulls CF IPs on every `apprafter apply`. Periodic re-apply recommended (quarterly) для подхвата CF range changes. PlatformController-managed cloud-firewall — future work.»
+
+**Acceptance:**
+- На свежем bootstrap: `hcloud firewall describe <name>` показывает текущие CF v4 + v6 диапазоны на 80/443.
+- `curl --resolve <любая-зона>:443:<node-ip> https://<зона>/` минуя CF ⇒ connection refused/timeout.
+- `curl https://<зона>/` через CF ⇒ 200.
+- Mock network outage на CF endpoints ⇒ `apprafter apply` aborts до изменения cloud state.
+
+**Зависит от:** 1.2 ✅, 1.83a.
+
+**Размер:** S
+
+---
+
+### 1.83e `apprafter target cert import` — multi-call под imported certs
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
+
+**Source:** subset 4.1b `apprafter target cert import`.
+
+**Цель:** import imported-cert как `kubernetes.io/tls` Secret с labels/annotations, точно совпадающими с full 4.1b spec — для bit-identity при landing'е 4.1b. CLI-сигнатура идентична 4.1b: `apprafter target cert import <name> --cert <path> --key <path>`. Может вызываться много раз для разных registrable-зон (один Secret per zone).
+
+**Поставка:**
+- [ ] `apprafter target cert import <name> --cert <pem> --key <pem> [--namespace apprafter-system] [--replace]`:
+    - Pre-validation: PEM parse, cert matches key, expiry > 30 days, SANs extracted.
+    - Creates Secret в `apprafter-system` (default ns для platform certs), type `kubernetes.io/tls`, name из позиционного аргумента.
+    - Labels (точно как в 4.1b):
+        - `apprafter.io/managed-by: apprafter`
+        - `apprafter.io/cert-mode: imported`
+        - `apprafter.io/cert-name: <name>`
+    - Annotations: `apprafter.io/cert-not-before`, `apprafter.io/cert-not-after`, `apprafter.io/cert-sans`.
+    - `--replace`: in-place update Secret'а (no downtime — cert-manager + Gateway API подхватывают новый Secret).
+- [ ] Output: SANs, expiry, hint что listener'ы автоматически подхватят при reference из `target domain add`.
+- [ ] Doc-page «How to get a CF Origin CA cert» (CF dashboard → SSL/TLS → Origin Server → Create Certificate, hostnames `<zone>` + `*.<zone>`, RSA 2048, validity 15 years, save cert + key) — линк из RELEASE notes 1.83.
+- [ ] Deferred to full 4.1b (subset note): `cert list`, `cert show`, `cert renew`, `cert remove`, `--chain` flag, MigrationPlan при remove с active references.
+
+**Acceptance:**
+- `apprafter target cert import cf-origin-cert-apprafter-dev --cert ./d.pem --key ./d.key` создаёт Secret с правильными labels/annotations.
+- Повторный вызов с другим именем (`cf-origin-cert-apprafter-io --cert ./i.pem --key ./i.key`) создаёт отдельный Secret — multi-zone naturally supported, никаких коллизий.
+- Mismatched cert/key ⇒ fail до записи Secret.
+- `--replace` обновляет Secret in-place, listener'ы подхватывают новый cert без рестарта.
+- Labels/annotations bit-identical с тем, что произведёт 4.1b на том же входе.
+
+**Зависит от:** 1.79a.
+
+**Размер:** S
+
+---
+
+### 1.83f `apprafter target domain` — multi-zone CLI
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
+
+**Source:** subset 4.1b `apprafter target domain` группа.
+
+**Цель:** идиоматическая регистрация зон с массивом entries; CLI-сигнатура и UX идентичны 4.1b. Под капотом slice-impl патчит `PlatformStack.spec.values.gateway.allowedDomains: [#AllowedDomainEntry]`; full 4.1b impl переносит storage в `ExternalSurface.spec.allowedDomains` — **массив тот же, shape entry тот же, CLI-команда та же**. Stability promise screencast-friendly.
+
+**Поставка:**
+- [ ] Shape entry в `values.gateway.allowedDomains[]` (bit-identical с 4.1b `#DomainEntry` минус computed `wildcard` field и enum-extension `certMode` — см. PART 0.6 чек 4):
+    ```cue
+    {
+        domain:           string         // например "apprafter.dev"; apex registrable, без префикса "*."
+        certMode:         "imported"     // slice-only literal; 4.1b расширяет enum
+        importedCertRef:  string         // имя Secret'а из 1.83e
+        addedAt:          string         // ISO timestamp (CLI заполняет)
+        addedBy:          string         // identity (CLI: from active target's user record или env)
+    }
+    ```
+- [ ] `apprafter target domain add <domain> --cert <cert-name>`:
+    - Validation: `<domain>` это RFC 1123 hostname без префикса `*.` (apex registrable; wildcard listener генерится chart'ом автоматически из apex entry).
+    - `--cert <name>` **required в slice** (нет LE-дефолта; в 4.1b становится optional с дефолтом `letsencrypt-http01`, signature-stable — existing вызовы с `--cert` продолжают работать).
+    - Pre-check 1: Secret `<cert-name>` существует в `apprafter-system` с label `apprafter.io/cert-mode: imported`. Не существует ⇒ error «Cert '<x>' not found. Run `apprafter target cert import <x> --cert ... --key ...` first».
+    - Pre-check 2: domain уже в массиве ⇒ reject «Domain already registered: <existing>. Use `apprafter target domain remove <existing>` to swap».
+    - Action: SSA-patch `PlatformStack.spec.values.gateway.allowedDomains` (field manager `apprafter-cli`), append entry с `certMode: "imported"`, `importedCertRef: <cert-name>`, `addedAt: <now>`, `addedBy: <identity>`.
+    - Output: registered domain, public IP узла (для DNS A/AAAA records у регистратора), hint про CF setup (orange + Full strict) и `apprafter target domain list`.
+- [ ] `apprafter target domain list`:
+    - Таблица: domain, certMode, importedCertRef, addedAt, addedBy, apps using (count Application'ов с matching `expose.hostname`).
+    - Пустой массив ⇒ "No domains registered. Run `apprafter target domain add <zone> --cert <name>`".
+- [ ] `apprafter target domain remove <domain>`:
+    - Pre-check: scan Application'ов с `expose.hostname` matching `<domain>` (apex) или `*.<domain>` (single-label wildcard). Active apps есть ⇒ error «<N> applications using <domain>: [list]. Remove apps first or use `--force` (apps will lose external access)».
+    - `--force`: clears entry, output warning per affected app.
+    - SSA-patch удаляющий entry из массива.
+    - Cert Secret **не удаляется** (matches 4.1b separation `domain remove` vs `cert remove`; orphan cert acceptable в slice).
+- [ ] Deferred to full 4.1b (subset notes): `--cert` optional (LE default), wildcard `*.example.com` domain entries (slice — apex only), `target domain verify`, `set-default`, `status`, MigrationPlan для destructive ops, cert renewal flows, `target cert remove` orphan-check.
+- [ ] **Stability promise** в RELEASE notes: «`apprafter target domain add/list/remove` сигнатура стабильна между slice-impl (PlatformStack-storage) и full 4.1b (ExternalSurface-storage). Array shape entry и CLI-сигнатуры идентичны».
+
+**Acceptance:**
+- `apprafter target domain add apprafter.dev --cert cf-origin-cert-apprafter-dev` ⇒ массив получает entry; через ~2-3 минуты Gateway получает пару listener'ов (apex + wildcard) для apprafter.dev.
+- Второй `add apprafter.io --cert cf-origin-cert-apprafter-io` ⇒ ещё одна entry; Gateway получает ещё пару listener'ов на другом cert.
+- `list` показывает обе зоны с правильным count apps.
+- `add apprafter.dev ...` второй раз ⇒ reject (duplicate).
+- `add foo.dev --cert non-existent` ⇒ reject (cert not found).
+- `add "*.example.com" --cert ...` ⇒ reject (wildcard input not supported в slice — apex only).
+- `add example.com` без `--cert` ⇒ reject (cert required в slice).
+- `remove apprafter.io` без active apps ⇒ entry удалена; Gateway теряет соответствующие listener'ы; Secret остаётся.
+- `remove apprafter.dev` с active landing app ⇒ reject; `--force` clears + warning.
+
+**Зависит от:** 1.72 ✅, 1.73 ✅, 1.79a, 1.83a, 1.83e.
+
+**Размер:** S+
+
+---
+
+### 1.83g One-time DNS + CF setup runbook (per-zone iteration)
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a). NB: manual stand-in для 4.4a — после landing 4.4a (external-dns) этот runbook deprecated.
+
+**Source:** outside-of-code, замыкает acceptance слайса.
+
+**Цель:** documented one-time flow для каждой registrable-зоны: registrar → CF NS swap → CF Origin CA cert → `apprafter target cert import` → `apprafter target domain add`. Повторяется столько раз, сколько зон.
+
+**Поставка (docs):**
+- [ ] **Per registrable zone** (повторяется per domain):
+    - CF: Add site `<zone>` → Free plan → записать два NS.
+    - У registrar'а (GoDaddy/Namecheap/etc.): выключить DNSSEC; Nameservers → custom → CF NS.
+    - CF: ждать «Active»; DNS records:
+        - `A @ <node-v4>` proxied
+        - `AAAA @ <node-v6>` proxied
+        - `CNAME www <zone>` proxied (опционально)
+    - CF: SSL/TLS mode → **Full (strict)**.
+    - CF: SSL/TLS → Origin Server → Create Certificate (hostnames `<zone>` + `*.<zone>`, RSA 2048, validity 15 years). Скачать cert + key.
+    - `apprafter target cert import cf-origin-cert-<sanitized-zone> --cert ./origin.pem --key ./origin.key` (1.83e).
+    - `apprafter target domain add <zone> --cert cf-origin-cert-<sanitized-zone>` (1.83f).
+- [ ] Apply Application'ов с обновлённой схемой (`expose.hostname: "<some-zone-or-subdomain>"`, 1.83b).
+- [ ] Verify per zone: `curl -v https://<zone>/` — CF cert на edge, response от соответствующего Application.
+- [ ] Verify cross-zone: на одном кластере одновременно отвечают `https://apprafter.dev/` и `https://apprafter.io/` (или сколько зон зарегистрировано), каждая со своим cert на edge.
+- [ ] Verify firewall bypass blocked: `curl --resolve <zone>:443:<node-ip> https://<zone>/` минуя CF — connection refused/timeout (1.83d).
+
+**Acceptance:** все зарегистрированные зоны отдают свои Application'ы через CF; direct-to-node connections refused; `apprafter target domain list` показывает все зоны с правильным apps-count.
+
+**Зависит от:** 1.83a–f.
+
+**Размер:** S
+
+---
+
 ## Фаза 1.9 — Dev Mode MVP (Phase 1B из dev-mode-task.md)
 > 🏁 SR: D — dev mode dropped from launch (managed users don't bootstrap local clusters); reactivate after managed traction
 
@@ -3546,6 +3833,7 @@ Tests:
 
 ### 4.1 ExternalSurface CRD
 > 🏁 SR: B · order 5 — ExternalSurface CRD
+> 🔗 order-3.5 precursor: platform Gateway + LB-IPAM/L2 landed early в 1.83a с label `apprafter.io/platform-gateway: "true"`. Этот item = full ExternalSurface CRD + adoption существующего Gateway по ownerRef (НЕ пересоздавать).
 
 **Поставка:**
 - [ ] CUE-схема (§3.5).
@@ -3558,6 +3846,7 @@ Tests:
 
 ### 4.1a HTTPRoute auto-generation
 > 🏁 SR: B · order 5 — HTTPRoute auto-gen (deployed = reachable; cheapest UX win)
+> 🔗 order-3.5 precursor: HTTPRoute emission из `expose.public + hostname` landed в 1.83c (imported-cert path, БЕЗ Certificate-эмиссии). Этот item добавляет: per-app Certificate + issuerRef, rewrites/websocket/sticky/protocols, hostname-conflict admission webhook, Backstage TLS view, migration scan existing deployments.
 
 **Source:** tracker 2.6.
 
@@ -3590,6 +3879,7 @@ Tests:
 
 ### 4.1b TLS schema + custom cert import + manual DNS-01 + domain management
 > 🏁 SR: C — advanced TLS/cert/DNS-01 beyond launch minimum (4.1a + 4.4a cover launch)
+> 🔗 order-3.5 subset: `imported` cert mode + `target cert import` + `target domain add/list/remove` + `allowedDomains` array (`#DomainEntry`) landed в 1.83e/1.83f, storage в `PlatformStack.spec.values.gateway.allowedDomains`. Этот item добавляет: LE issuers (http01 + dns01-manual), полный `#TlsOptions`, `defaultDomain`, MigrationPlan для destructive ops — и МИГРИРУЕТ storage из PlatformStack.spec.values в ExternalSurface.spec (literal move, shape `#DomainEntry` идентичен). `imported` остаётся валидным режимом, не выпиливается.
 
 **Source:** Продолжение 4.1a; ADR 0027 (MigrationPlan) для destructive domain ops. Automated DNS provider integration вынесен в 4.1c.
 
@@ -4217,6 +4507,7 @@ Tests:
 
 ### 4.4a external-dns integration + `DNSZone` CRD
 > 🏁 SR: B · order 5 — external-dns + DNSZone CRD (closes DNS friction)
+> 🔗 order-3.5 manual stand-in: DNS records ставятся руками через runbook в 1.83g. Этот item автоматит через external-dns operator; после landing — 1.83g runbook deprecated.
 
 **Source:** tracker 2.8.
 
