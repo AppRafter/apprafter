@@ -100,6 +100,61 @@ _components: argocd: #Component & {
 				return hs
 				"""
 
+			// 2.13/argo-upgrade-approval-surface: custom health
+			// for the MigrationPlan CR. The platform-stack root
+			// Application anchors the MigrationPlan into its
+			// resource tree (ownerRef to the chart's
+			// `platform-migration-anchor` ConfigMap), so this
+			// health both labels the tree node with the upgrade
+			// details AND, via Argo CD's health aggregation of
+			// the anchored node, bubbles the root Application to
+			// non-healthy whenever an upgrade is pending — the
+			// root-level "an update is pending" signal, for free.
+			//
+			// Reads `spec.trigger.{from,to}`,
+			// `spec.risks.classification`, `status.phase` — all
+			// fields the operator already populates. `->` (not the
+			// unicode arrow) avoids encoding/lint surprises in
+			// argocd-cm.
+			"resource.customizations.health.apprafter.io_MigrationPlan": """
+				hs = {}
+				local phase = ""
+				if obj.status ~= nil and obj.status.phase ~= nil then phase = obj.status.phase end
+				local from, to, class = "?", "?", "?"
+				if obj.spec ~= nil then
+				  if obj.spec.trigger ~= nil then
+				    from = obj.spec.trigger.from or from
+				    to   = obj.spec.trigger.to or to
+				  end
+				  if obj.spec.risks ~= nil and obj.spec.risks.classification ~= nil then
+				    class = obj.spec.risks.classification
+				  end
+				end
+				if phase == "pending-approval" or phase == "" then
+				  hs.status = "Suspended"
+				  hs.message = "Upgrade " .. from .. "->" .. to .. " (" .. class .. ") awaiting approval - click Approve, or run 'apprafter migration approve " .. (obj.metadata.name or "<name>") .. "'"
+				  return hs
+				end
+				if phase == "approved" or phase == "executing" then
+				  hs.status = "Progressing"
+				  hs.message = "Upgrade " .. from .. "->" .. to .. " approved; applying"
+				  return hs
+				end
+				if phase == "completed" then
+				  hs.status = "Healthy"
+				  hs.message = "Upgrade " .. from .. "->" .. to .. " complete"
+				  return hs
+				end
+				if phase == "rejected" then
+				  hs.status = "Degraded"
+				  hs.message = "Upgrade " .. from .. "->" .. to .. " rejected"
+				  return hs
+				end
+				hs.status = "Progressing"
+				hs.message = "MigrationPlan phase: " .. phase
+				return hs
+				"""
+
 			// B.1.79: Argo CD resource action buttons for
 			// MigrationPlan. Operators can `Approve` / `Reject`
 			// directly from the Argo CD UI alongside the CLI
