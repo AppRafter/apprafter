@@ -233,6 +233,19 @@ _gatewayTemplate: """
 	     Public ingress (1.83a): emitted only when allowedDomains is non-empty. */}}
 	{{- if .Values.gateway.allowedDomains }}
 	{{- $gw := .Values.gateway }}
+	{{/* The IPPool / L2 policy below are deliberately UNSCOPED (no serviceSelector).
+	     Cilium's Gateway-API controller creates a SEPARATE LoadBalancer Service
+	     (cilium-gateway-platform) for the Gateway and does NOT copy the Gateway's
+	     metadata.labels onto it — it only sets io.cilium.gateway/owning-gateway —
+	     so a serviceSelector keyed on apprafter.io/platform-gateway would never
+	     match the generated Service and the Gateway would get no address. On T1 the
+	     platform Gateway is the SOLE LoadBalancer Service, so an unscoped pool/policy
+	     correctly assigns + announces the node IP (per the Cilium docs: "The pool
+	     will allocate to any service if no service selector is specified" and "If no
+	     service selector is provided, all services are selected by the policy").
+	     Scoping to the generated Service (via io.cilium.gateway/owning-gateway, or
+	     Gateway spec.infrastructure.labels once confirmed on a real Cilium 1.16) is a
+	     future optimization for multi-service tiers (T2+). */}}
 	---
 	apiVersion: cilium.io/v2alpha1
 	kind: CiliumLoadBalancerIPPool
@@ -241,9 +254,6 @@ _gatewayTemplate: """
 	  annotations:
 	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 	spec:
-	  serviceSelector:
-	    matchLabels:
-	      apprafter.io/platform-gateway: "true"
 	  blocks:
 	  {{- if $gw.nodePublicIP }}
 	  - cidr: {{ printf "%s/32" $gw.nodePublicIP | quote }}
@@ -259,9 +269,6 @@ _gatewayTemplate: """
 	  annotations:
 	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 	spec:
-	  serviceSelector:
-	    matchLabels:
-	      apprafter.io/platform-gateway: "true"
 	  externalIPs: true
 	  loadBalancerIPs: true
 	---
