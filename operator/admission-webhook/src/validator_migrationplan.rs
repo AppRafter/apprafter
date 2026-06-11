@@ -27,9 +27,29 @@
 //!     `risks` etc. once the controller exists to enforce
 //!     execution-order semantics.
 //!
-//! Operates on `serde_json::Value` like the other validators
-//! in this crate.
+//! Typed against `operator_core::MigrationPlanSpec` (ADR 0047
+//! Decision #4): the spec is deserialized into the operator-core
+//! struct once and the scope-discriminator + approver-email rules
+//! read TYPED fields (`scope.type_`, `application.ref_.{name,
+//! namespace}`, `application.environment`, `platform.components`,
+//! `approvers`), so a renamed field fails to compile instead of
+//! silently bypassing a rule. The PRESENCE ("is required") and
+//! not-a-string diagnostics stay on the raw `Value`: the typed
+//! struct's non-`Option` fields (`scope`, `scope.type_`,
+//! `application.ref_`, `application.environment`,
+//! `platform.components` elements) cannot represent an *absent* /
+//! wrong-typed input, and an approver that is not a string cannot
+//! land in `Vec<String>`. A non-conforming object never reaches
+//! admission in production (a validating webhook runs after the
+//! apiserver's structural validation, which already enforced the
+//! generated CRD's `required`/types); those branches exist only for
+//! defence-in-depth and the unit tests. The status-phase FSM and the
+//! scope-immutability diff stay on the raw `Value` — they compare
+//! `oldObject`/`object` JSON directly (a typed round-trip would erase
+//! the absent-vs-present distinction the FSM's empty-phase fast-path
+//! relies on).
 
+use operator_core::MigrationPlanSpec;
 use serde_json::Value;
 
 use crate::validator::ValidationError;
@@ -52,10 +72,22 @@ pub fn validate_migrationplan(object: &Value, old_object: Option<&Value>) -> Vec
         return errors;
     };
 
-    let Some(spec) = obj.get("spec").and_then(Value::as_object) else {
+    let Some(spec_value) = obj.get("spec").filter(|s| s.is_object()) else {
         errors.push(ValidationError::new("spec", "spec is required"));
         return errors;
     };
+
+    // Deserialize the spec into the typed operator-core struct. In
+    // production this always succeeds — a validating webhook runs after
+    // the apiserver's structural validation against the generated CRD.
+    // When it succeeds the scope-discriminator + approver-email rules
+    // read the TYPED fields, so a renamed field fails to compile instead
+    // of silently bypassing a rule (ADR 0047 #4). When it does not (a
+    // unit-test fixture exercising a malformed input, or a misconfigured
+    // apiserver) the rules fall back to the raw `Value`, matching the
+    // pre-refactor `as_object()`/`as_str()` semantics exactly.
+    let typed = serde_json::from_value::<MigrationPlanSpec>(spec_value.clone()).ok();
+    let spec = spec_value.as_object().expect("filtered to an object above");
 
     // ---- scope discriminator ----
     let scope = spec.get("scope").and_then(Value::as_object);
@@ -64,10 +96,18 @@ pub fn validate_migrationplan(object: &Value, old_object: Option<&Value>) -> Vec
         return errors;
     };
 
-    let scope_type = scope.get("type").and_then(Value::as_str).unwrap_or("");
+    // Prefer the typed discriminator (`scope.type_`); fall back to the raw
+    // value when the spec did not deserialize. `scope.type` is non-`Option`
+    // in the struct, so an absent / non-string `type` (the "" / other
+    // branches below) is only representable on the raw `Value`.
+    let scope_type = typed
+        .as_ref()
+        .map(|t| t.scope.type_.as_str())
+        .unwrap_or_else(|| scope.get("type").and_then(Value::as_str).unwrap_or(""));
+    let typed_scope = typed.as_ref().map(|t| &t.scope);
     match scope_type {
-        "application" => validate_application_scope(scope, &mut errors),
-        "platform" => validate_platform_scope(scope, &mut errors),
+        "application" => validate_application_scope(scope, typed_scope, &mut errors),
+        "platform" => validate_platform_scope(scope, typed_scope, &mut errors),
         "" => {
             errors.push(ValidationError::new(
                 "spec.scope.type",
@@ -83,20 +123,43 @@ pub fn validate_migrationplan(object: &Value, old_object: Option<&Value>) -> Vec
     }
 
     // ---- approver emails ----
-    if let Some(approvers) = spec.get("approvers").and_then(Value::as_array) {
-        for (i, val) in approvers.iter().enumerate() {
-            let Some(email) = val.as_str() else {
-                errors.push(ValidationError::new(
-                    format!("spec.approvers[{i}]"),
-                    "approver must be a string email",
-                ));
-                continue;
-            };
-            if !is_emailish(email) {
-                errors.push(ValidationError::new(
-                    format!("spec.approvers[{i}]"),
-                    format!("{email:?} is not a valid email address"),
-                ));
+    // On the typed path `approvers` is `Option<Vec<String>>`, so every entry
+    // is already a string (the "must be a string email" branch is then
+    // unreachable — a non-string approver fails deserialization, dropping to
+    // the raw path). The raw path preserves the per-element not-a-string
+    // diagnostic for the test fixtures / a non-conforming object.
+    match typed.as_ref().map(|t| t.approvers.as_deref()) {
+        Some(Some(approvers)) => {
+            for (i, email) in approvers.iter().enumerate() {
+                if !is_emailish(email) {
+                    errors.push(ValidationError::new(
+                        format!("spec.approvers[{i}]"),
+                        format!("{email:?} is not a valid email address"),
+                    ));
+                }
+            }
+        }
+        // typed-but-no-approvers: nothing to check.
+        Some(None) => {}
+        // spec did not deserialize: fall back to the raw array, preserving
+        // the not-a-string branch.
+        None => {
+            if let Some(approvers) = spec.get("approvers").and_then(Value::as_array) {
+                for (i, val) in approvers.iter().enumerate() {
+                    let Some(email) = val.as_str() else {
+                        errors.push(ValidationError::new(
+                            format!("spec.approvers[{i}]"),
+                            "approver must be a string email",
+                        ));
+                        continue;
+                    };
+                    if !is_emailish(email) {
+                        errors.push(ValidationError::new(
+                            format!("spec.approvers[{i}]"),
+                            format!("{email:?} is not a valid email address"),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -248,94 +311,174 @@ fn is_allowed_phase_transition(old_phase: &str, new_phase: &str, scope_type: &st
     }
 }
 
+/// `typed` is `Some` only when the whole spec deserialized; it carries
+/// the typed `scope` (`application` / `platform` are `Option`, so a
+/// populated `Some` reads the discriminator sub-objects with the
+/// compiler gating the field names). The raw `scope` map is retained for
+/// the PRESENCE / empty-string diagnostics the non-`Option` typed fields
+/// cannot represent.
 fn validate_application_scope(
     scope: &serde_json::Map<String, Value>,
+    typed: Option<&operator_core::MigrationPlanScope>,
     errors: &mut Vec<ValidationError>,
 ) {
-    if scope.contains_key("platform") {
+    // Mismatched sub-object: `platform` must be absent. Prefer the typed
+    // `Option` (gates the field name); fall back to raw presence.
+    let platform_present = match typed {
+        Some(s) => s.platform.is_some(),
+        None => scope.contains_key("platform"),
+    };
+    if platform_present {
         errors.push(ValidationError::new(
             "spec.scope.platform",
             "platform block must not be set when scope.type is application",
         ));
     }
 
-    let Some(app) = scope.get("application").and_then(Value::as_object) else {
+    // `application` is `Option` on the typed scope; `None` (or a spec that
+    // did not deserialize and has no `application` map) is the "required"
+    // branch. When present, read the typed `ref_`/`environment`.
+    let typed_app = typed.and_then(|s| s.application.as_ref());
+    let raw_app = scope.get("application").and_then(Value::as_object);
+    if typed_app.is_none() && raw_app.is_none() {
         errors.push(ValidationError::new(
             "spec.scope.application",
             "scope.application is required when scope.type is application",
         ));
         return;
-    };
+    }
 
-    let ref_ = app.get("ref").and_then(Value::as_object);
-    match ref_ {
-        None => errors.push(ValidationError::new(
-            "spec.scope.application.ref",
-            "ref is required (name + namespace)",
-        )),
-        Some(r) => {
-            let name = r.get("name").and_then(Value::as_str).unwrap_or("");
-            let namespace = r.get("namespace").and_then(Value::as_str).unwrap_or("");
-            if name.is_empty() {
+    match typed_app {
+        // Typed happy path: `ref_` is non-`Option` so it is always present;
+        // `name`/`namespace` are non-`Option` `String` so the only failure
+        // the webhook still guards is an empty value (the CRD pattern also
+        // rejects it — defence-in-depth + the unit fixtures).
+        Some(app) => {
+            if app.ref_.name.is_empty() {
                 errors.push(ValidationError::new(
                     "spec.scope.application.ref.name",
                     "name is required",
                 ));
             }
-            if namespace.is_empty() {
+            if app.ref_.namespace.is_empty() {
                 errors.push(ValidationError::new(
                     "spec.scope.application.ref.namespace",
                     "namespace is required",
                 ));
             }
+            if app.environment.is_empty() {
+                errors.push(ValidationError::new(
+                    "spec.scope.application.environment",
+                    "environment is required",
+                ));
+            }
         }
-    }
-
-    let env = app.get("environment").and_then(Value::as_str).unwrap_or("");
-    if env.is_empty() {
-        errors.push(ValidationError::new(
-            "spec.scope.application.environment",
-            "environment is required",
-        ));
+        // Raw fallback (spec did not deserialize): `ref` may be absent, so
+        // the PRESENCE branch lives here, matching the pre-refactor
+        // `as_object()`/`as_str()` semantics exactly.
+        None => {
+            let app =
+                raw_app.expect("raw_app is Some when typed_app is None and we did not return");
+            match app.get("ref").and_then(Value::as_object) {
+                None => errors.push(ValidationError::new(
+                    "spec.scope.application.ref",
+                    "ref is required (name + namespace)",
+                )),
+                Some(r) => {
+                    let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+                    let namespace = r.get("namespace").and_then(Value::as_str).unwrap_or("");
+                    if name.is_empty() {
+                        errors.push(ValidationError::new(
+                            "spec.scope.application.ref.name",
+                            "name is required",
+                        ));
+                    }
+                    if namespace.is_empty() {
+                        errors.push(ValidationError::new(
+                            "spec.scope.application.ref.namespace",
+                            "namespace is required",
+                        ));
+                    }
+                }
+            }
+            let env = app.get("environment").and_then(Value::as_str).unwrap_or("");
+            if env.is_empty() {
+                errors.push(ValidationError::new(
+                    "spec.scope.application.environment",
+                    "environment is required",
+                ));
+            }
+        }
     }
 }
 
 fn validate_platform_scope(
     scope: &serde_json::Map<String, Value>,
+    typed: Option<&operator_core::MigrationPlanScope>,
     errors: &mut Vec<ValidationError>,
 ) {
-    if scope.contains_key("application") {
+    // Mismatched sub-object: `application` must be absent.
+    let application_present = match typed {
+        Some(s) => s.application.is_some(),
+        None => scope.contains_key("application"),
+    };
+    if application_present {
         errors.push(ValidationError::new(
             "spec.scope.application",
             "application block must not be set when scope.type is platform",
         ));
     }
 
-    let Some(platform) = scope.get("platform").and_then(Value::as_object) else {
-        errors.push(ValidationError::new(
-            "spec.scope.platform",
-            "scope.platform is required when scope.type is platform",
-        ));
-        return;
-    };
-
-    let components = platform.get("components").and_then(Value::as_array);
-    match components {
-        None => errors.push(ValidationError::new(
-            "spec.scope.platform.components",
-            "components is required (non-empty list of component names)",
-        )),
-        Some(arr) if arr.is_empty() => errors.push(ValidationError::new(
-            "spec.scope.platform.components",
-            "components must be non-empty",
-        )),
-        Some(arr) => {
-            for (i, val) in arr.iter().enumerate() {
-                if val.as_str().is_none_or(|s| s.is_empty()) {
+    // `platform` is `Option`; `None` is the "required" branch. When present,
+    // `components` is non-`Option` `Vec<String>` — every element is already a
+    // string, so the only webhook guard left on the typed path is non-empty
+    // list + non-empty element. The not-a-string element diagnostic survives
+    // only on the raw fallback.
+    let typed_platform = typed.and_then(|s| s.platform.as_ref());
+    let raw_platform = scope.get("platform").and_then(Value::as_object);
+    match typed_platform {
+        Some(platform) => {
+            if platform.components.is_empty() {
+                errors.push(ValidationError::new(
+                    "spec.scope.platform.components",
+                    "components must be non-empty",
+                ));
+            }
+            for (i, name) in platform.components.iter().enumerate() {
+                if name.is_empty() {
                     errors.push(ValidationError::new(
                         format!("spec.scope.platform.components[{i}]"),
                         "component name must be a non-empty string",
                     ));
+                }
+            }
+        }
+        None => {
+            let Some(platform) = raw_platform else {
+                errors.push(ValidationError::new(
+                    "spec.scope.platform",
+                    "scope.platform is required when scope.type is platform",
+                ));
+                return;
+            };
+            match platform.get("components").and_then(Value::as_array) {
+                None => errors.push(ValidationError::new(
+                    "spec.scope.platform.components",
+                    "components is required (non-empty list of component names)",
+                )),
+                Some(arr) if arr.is_empty() => errors.push(ValidationError::new(
+                    "spec.scope.platform.components",
+                    "components must be non-empty",
+                )),
+                Some(arr) => {
+                    for (i, val) in arr.iter().enumerate() {
+                        if val.as_str().is_none_or(|s| s.is_empty()) {
+                            errors.push(ValidationError::new(
+                                format!("spec.scope.platform.components[{i}]"),
+                                "component name must be a non-empty string",
+                            ));
+                        }
+                    }
                 }
             }
         }

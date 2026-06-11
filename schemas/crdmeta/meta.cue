@@ -118,6 +118,50 @@ _crdMetas: RetainedClaim: {
 	}
 }
 
+_crdMetas: MigrationPlan: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "migrationplans"
+		singular: "migrationplan"
+		kind:     "MigrationPlan"
+		listKind: "MigrationPlanList"
+		shortNames: ["mp", "migplan"]
+	}
+	annotations: _syncWave
+	subresources: status: {}
+	printerColumns: [
+		{name: "Scope", type: "string", jsonPath: ".spec.scope.type"},
+		{name: "Classification", type: "string", jsonPath: ".spec.risks.classification"},
+		{name: "Phase", type: "string", jsonPath: ".status.phase"},
+		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
+	]
+
+	// CRD-only SPEC constraints CUE deliberately omits (CUE-validation
+	// philosophy — no half-measure stubs). Paths are relative to `spec`;
+	// `[*]` descends into a map's additionalProperties. `[]` for array
+	// items is NOT supported, so a dropped constraint inside an array's
+	// items is restored by merging an `items:` object onto the array node.
+	schemaPatches: {
+		// `trigger.from` / `trigger.to` are the CUE top type (`from?: _`,
+		// `to?: _`), which `cue export --out openapi` emits as bare,
+		// non-structural nodes the apiserver would reject. Restore the
+		// hand-rolled CRD's `{x-kubernetes-preserve-unknown-fields: true}`
+		// (same "free-form JSON" acceptance set). `type` is intentionally
+		// omitted to match the hand-rolled mirror exactly.
+		"trigger.from": {"x-kubernetes-preserve-unknown-fields": true}
+		"trigger.to": {"x-kubernetes-preserve-unknown-fields": true}
+
+		// `previousSpecSnapshot?: {...}` is an open struct; `cue export`
+		// emits `{type: object}` with no additionalProperties, which the
+		// apiserver treats as a closed empty object (rejects every key).
+		// Restore the hand-rolled `{type: object,
+		// x-kubernetes-preserve-unknown-fields: true}` ("free-form JSON").
+		"previousSpecSnapshot": {type: "object", "x-kubernetes-preserve-unknown-fields": true}
+	}
+}
+
 _crdMetas: ResourceClaim: {
 	group:   "apprafter.io"
 	version: "v1alpha1"

@@ -191,6 +191,41 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          node. The status subtree constrains no user input and no subresource is wired \
          (no `subresources` in _crdMetas, so the generated CRD has no status subresource).",
     ),
+    (
+        "MigrationPlan",
+        "status",
+        "operator-written status: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the \
+         concrete status fields (phase, approvedAt, executedSteps, …). The status subtree \
+         constrains no user input.",
+    ),
+    (
+        "MigrationPlan",
+        "spec.trigger.from",
+        "free-form JSON trigger payload: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque, restored via a schemaPatch since \
+         CUE's `from?: _` top type exports as a bare node), the kube-rs type declares it \
+         `Option<serde_json::Value>` which schemars renders as an untyped node. Both \
+         accept any value; neither constrains its shape.",
+    ),
+    (
+        "MigrationPlan",
+        "spec.trigger.to",
+        "free-form JSON trigger payload: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque, restored via a schemaPatch since \
+         CUE's `to?: _` top type exports as a bare node), the kube-rs type declares it \
+         `Option<serde_json::Value>` which schemars renders as an untyped node. Both \
+         accept any value; neither constrains its shape.",
+    ),
+    (
+        "MigrationPlan",
+        "spec.previousSpecSnapshot",
+        "free-form JSON snapshot: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque, restored via a schemaPatch since \
+         CUE's `previousSpecSnapshot?: {...}` open struct exports as a closed empty \
+         object), the kube-rs type declares it `Option<serde_json::Value>` which schemars \
+         renders as an untyped node. Both accept any object; neither constrains its shape.",
+    ),
 ];
 
 /// The kube-rs (`CustomResourceExt::crd()`) CRD for a component, or `None`
@@ -202,7 +237,8 @@ fn rust_crd(component: &str) -> Option<Value> {
         "ServiceProvider" => operator_core::ServiceProvider::crd(),
         "ResourceClaim" => operator_core::ResourceClaim::crd(),
         "RetainedClaim" => operator_core::RetainedClaim::crd(),
-        // Phase 3 adds MigrationPlan / SourceCredential / PlatformStack.
+        "MigrationPlan" => operator_core::MigrationPlan::crd(),
+        // Phase 3 adds SourceCredential / PlatformStack.
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -335,8 +371,19 @@ mod tests {
         // are not allowlisted.
         assert!(allowed("RetainedClaim", "status"));
         assert!(!allowed("RetainedClaim", "spec.claimRef"));
+        // MigrationPlan allowlists its operator-written status subtree and the
+        // three free-form-JSON spec nodes (preserve-unknown in CUE vs an
+        // untyped `serde_json::Value` node in Rust); its other spec fields are
+        // not allowlisted.
+        assert!(allowed("MigrationPlan", "status"));
+        assert!(allowed("MigrationPlan", "status.phase"));
+        assert!(allowed("MigrationPlan", "spec.trigger.from"));
+        assert!(allowed("MigrationPlan", "spec.trigger.to"));
+        assert!(allowed("MigrationPlan", "spec.previousSpecSnapshot"));
+        assert!(!allowed("MigrationPlan", "spec.scope"));
+        assert!(!allowed("MigrationPlan", "spec.trigger.field"));
         // A component absent from the allowlist matches nothing.
-        assert!(!allowed("MigrationPlan", "status"));
+        assert!(!allowed("SourceCredential", "status"));
     }
 
     #[test]
