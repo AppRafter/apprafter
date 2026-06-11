@@ -287,6 +287,13 @@ package platformstack
 	// `kind: ServiceProvider` per entry. Empty by default; tiers
 	// set `serviceProviders: _serviceProviders`.
 	serviceProviders: [string]: #ServiceProviderSeed
+
+	// Public-ingress Gateway config (1.83a). Self-defaults to an
+	// empty `allowedDomains` list so the rendered `values.yaml`
+	// always carries a concrete `gateway: {allowedDomains: []}` —
+	// the chart's `{{- if .Values.gateway.allowedDomains }}` guard
+	// nil-panics if `.Values.gateway` is absent.
+	gateway: #GatewayValues
 }
 
 // `#AppProjectSpec` — the small shape `templates/appprojects.
@@ -307,6 +314,25 @@ package platformstack
 		group: string
 		kind:  string
 	}]
+}
+
+// One registrable zone admitted to the platform Gateway (1.83a/1.83f).
+// Shape mirrors the 4.1b #DomainEntry minus the computed `wildcard`,
+// with certMode pinned to the slice-only literal "imported".
+#AllowedDomainEntry: {
+	domain:          string // apex registrable, no "*." prefix
+	certMode:        "imported"
+	importedCertRef: string // kubernetes.io/tls Secret name in apprafter-system
+	addedAt:         string
+	addedBy:         string
+}
+
+#GatewayValues: {
+	allowedDomains: [...#AllowedDomainEntry] | *[]
+	// The node's public IP(s); the CLI sets these at bootstrap so the
+	// LB-IPAM pool announces the node's own IP (single-node T1).
+	nodePublicIP?:   string
+	nodePublicIPv6?: string
 }
 
 // `#ServiceProviderSeed` — the small shape
