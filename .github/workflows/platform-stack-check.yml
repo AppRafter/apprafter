@@ -37,6 +37,7 @@ on:
     paths:
       - 'platform-stack/**'
       - 'scripts/check-platform-stack-version.sh'
+      - 'scripts/check-gateway-render.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
   push:
@@ -44,6 +45,7 @@ on:
     paths:
       - 'platform-stack/**'
       - 'scripts/check-platform-stack-version.sh'
+      - 'scripts/check-gateway-render.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
 
@@ -162,6 +164,14 @@ jobs:
             echo "::error::tier-2 render did not enable backstage"
             exit 1
           }
+
+      - name: Gateway render assertions (1.83a public ingress)
+        # Pins the host-network public-ingress contract: the platform
+        # Gateway + platform-http-redirect HTTPRoute are emitted ONLY
+        # when gateway.allowedDomains is non-empty, listener names are
+        # dot-free, and no LB-IPAM / L2 objects ship. Resolves its own
+        # currentVersion and renders the chart, so it's self-contained.
+        run: bash scripts/check-gateway-render.sh
 
       - name: Drift detection (chart content changed without version bump)
         env:
