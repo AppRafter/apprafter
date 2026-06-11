@@ -46,9 +46,29 @@ _loaderValues: {
 		// with Cilium support work (single source per
 		// CLAUDE.md "one way to do things").
 		chartVersion: "1.16.5"
-		// Cilium values — byte-identical to the chart's
-		// component values (B.1.71 invariant below).
-		values: _components.cilium.values
+		// Cilium values — the loader subset of the chart's
+		// component values.
+		//
+		// The literal lives here (not in `component_cilium.cue`)
+		// so `build.rs` can lift it via
+		// `cue export -e _loaderValues.cilium.values`.
+		// `component_cilium.cue` derives its `values:` as
+		// `_loaderValues.cilium.values & { ...gateway extras... }`
+		// — unification, not equality (mirrors Argo CD below).
+		//
+		// Field order matches the pre-refactor `component_cilium.cue`
+		// `values:` block so YAML export round-trips byte-equivalent
+		// (CUE preserves declaration order on export).
+		values: {
+			kubeProxyReplacement: bool | *true
+			k8sServiceHost:       string | *"127.0.0.1"
+			k8sServicePort:       int | *6443
+			ipv4: enabled:      bool | *true
+			ipv6: enabled:      bool | *true
+			ipam: mode:         string | *"kubernetes"
+			hubble: enabled:    bool | *false
+			operator: replicas: int | *1
+		}
 	}
 
 	argocd: {
@@ -128,10 +148,17 @@ _loaderValues: {
 	}
 }
 
-// B.1.71 invariant: chart's cilium values ARE the loader values.
-// CUE unifies left + right; if any future edit makes them
-// diverge, `cue vet` fails with `incompatible values`.
-_components: cilium: values: _loaderValues.cilium.values
+// B.1.71 (1.83a update): the loader subset is the literal above;
+// `component_cilium.cue` derives the chart's cilium values as
+// `_loaderValues.cilium.values & { gatewayAPI/l2announcements/
+// externalIPs: enabled }` — the Argo-managed component carries
+// the gateway/L2 extras the CLI loader does NOT need on first
+// install (gatewayAPI requires the upstream Gateway API CRDs,
+// which the bootstrap installs only after Cilium is up). So
+// there is NO cilium equality assertion here, exactly like
+// Argo CD: the `& {…}` at the component call site already
+// encodes the subset relationship, and the loader export stays
+// byte-identical to the v0.1.x bootstrap install (no CLI change).
 
 // B.1.71b invariant: chart's Argo CD upstream chart version IS
 // the loader's chart version. Single source of truth.

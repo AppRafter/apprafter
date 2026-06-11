@@ -25,23 +25,24 @@ _components: cilium: #Component & {
 	// The literal lives in loader_values.cue; this field just
 	// references it to preserve export field order.
 	version: _loaderValues.cilium.chartVersion
-	// Values are the single source of truth for the Cilium
-	// loader install. `build.rs` in `cli-providers` extracts
-	// `_loaderValues.cilium` via `cue export`, so any edit here
-	// automatically propagates to the CLI loader — no parallel
-	// edit in `cli-providers` is needed. Walk-fix #6 (v0.1.103)
-	// critical fields are guarded by
+	// `values:` is `_loaderValues.cilium.values` (the loader
+	// subset — kube-proxy replacement, IPAM, hubble) unified
+	// with the Argo-managed extras below. The loader subset
+	// lives in `loader_values.cue` so the CLI's `build.rs` can
+	// lift it out as a `const &str` for `cluster-bootstrap`
+	// (extracted via `cue export -e _loaderValues.cilium.values`;
+	// critical fields guarded by
 	// `cilium_values_yaml_contains_loader_critical_fields` in
-	// `cli-providers/src/k8s/loader_values.rs`.
-	values: {
-		kubeProxyReplacement: bool | *true
-		k8sServiceHost:       string | *"127.0.0.1"
-		k8sServicePort:       int | *6443
-		ipv4: enabled:      bool | *true
-		ipv6: enabled:      bool | *true
-		ipam: mode:         string | *"kubernetes"
-		hubble: enabled:    bool | *false
-		operator: replicas: int | *1
+	// `cli-providers/src/k8s/loader_values.rs`). The gateway/L2
+	// extras (gatewayAPI, l2announcements, externalIPs) only
+	// matter once the upstream Gateway API CRDs are installed —
+	// which the bootstrap does AFTER Cilium — so they're chart-
+	// only and never enter the loader export (it stays byte-
+	// identical to the v0.1.x bootstrap install, no CLI change).
+	values: _loaderValues.cilium.values & {
+		gatewayAPI: enabled:      bool | *true
+		l2announcements: enabled: bool | *true
+		externalIPs: enabled:     bool | *true
 	}
 
 	// CNI is the prerequisite for every other component to
