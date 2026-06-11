@@ -1723,6 +1723,37 @@ compatibility: "0.1.23": {
 // breach) fixed by serializing reconciles; and the operator-only-CREATE
 // webhooks now accept `kubeadm:cluster-admins` break-glass (k8s 1.35).
 // CRD-compatible with 0.2.19; existing claims keep their allocation.
+compatibility: "0.2.25": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.24"
+	notes: """
+		Phase 1.83a (Public ingress MVP, order 3.5) — platform-stack-only;
+		no operator release (operator + admission-webhook stay pinned
+		v0.2.24). Adds a platform `Gateway` on the Cilium GatewayClass in
+		**host-network mode** — Envoy binds the node host ports 80/443
+		directly, so there is no LoadBalancer Service / LB-IPAM / L2
+		announcement (L2/ARP does not work on cloud SDNs). Per
+		`gateway.allowedDomains` entry the chart emits an apex + wildcard
+		HTTPS listener pair (imported-cert mode, `certificateRefs` to a
+		per-domain `kubernetes.io/tls` Secret) plus an http→https 301
+		redirect HTTPRoute. The upstream Gateway API v1.2.1 CRDs ship as a
+		new wave -25 Argo component. Empty `allowedDomains` (the default) ⇒
+		no Gateway resources are rendered.
+
+		**Upgrade impact:** the Argo-managed cilium component reconfigures
+		to host-network Gateway/Envoy on auto-update (Envoy DaemonSet roll
+		— `gatewayAPI.hostNetwork.enabled` + Envoy NET_BIND_SERVICE caps)
+		on EVERY cluster, including clusters with no configured domain
+		(those get the cilium reconfigure but no Gateway). Hence
+		`requires-restart`, not `safe`: the change is purely additive at the
+		umbrella-resource level but rolls the running CNI/Envoy DaemonSet on
+		upgrade. The bootstrap CLI loader values are byte-identical to
+		0.2.24 — no re-bootstrap and no CLI bump. CRD-compatible with
+		0.2.24 (purely additive umbrella resources + the Gateway API CRDs).
+		"""
+	references: ["plan.md#1.83a"]
+}
+
 compatibility: "0.2.24": {
 	change:          "safe"
 	operatorVersion: "v0.2.24"
