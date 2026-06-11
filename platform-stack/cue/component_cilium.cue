@@ -33,16 +33,54 @@ _components: cilium: #Component & {
 	// (extracted via `cue export -e _loaderValues.cilium.values`;
 	// critical fields guarded by
 	// `cilium_values_yaml_contains_loader_critical_fields` in
-	// `cli-providers/src/k8s/loader_values.rs`). The gateway/L2
-	// extras (gatewayAPI, l2announcements, externalIPs) only
-	// matter once the upstream Gateway API CRDs are installed —
-	// which the bootstrap does AFTER Cilium — so they're chart-
-	// only and never enter the loader export (it stays byte-
-	// identical to the v0.1.x bootstrap install, no CLI change).
+	// `cli-providers/src/k8s/loader_values.rs`).
+	//
+	// 1.83a — Gateway API HOST-NETWORK mode. The platform
+	// Gateway is exposed by binding the Cilium Envoy proxy
+	// listeners directly on the node's host network namespace
+	// (host-netns ports 80/443) rather than fronting them with
+	// a LoadBalancer Service + LB-IPAM/L2 announcements. A
+	// LoadBalancer Service needs either a cloud LB controller
+	// or bare-metal L2/BGP IPAM; on a single-node Hetzner Cloud
+	// VDS the node already owns a routable public IP, so
+	// host-network is the correct (and only working) mechanism
+	// — `l2announcements`/`externalIPs` are bare-metal-only and
+	// do NOT work on Hetzner Cloud, so they're removed here.
+	//
+	// Cilium 1.16.5 defaults Envoy to a STANDALONE DaemonSet
+	// (`envoy.enabled: ~` → "true for new installation"), so
+	// the NET_BIND_SERVICE grant for the privileged 80/443
+	// listeners goes on the standalone path:
+	// `envoy.securityContext.capabilities.{envoy,keepCapNetBindService}`.
+	// The Helm capability list REPLACES the chart default, so
+	// the full 1.16.5 default `envoy` capability list
+	// (`NET_ADMIN`, `SYS_ADMIN`) is reproduced verbatim with
+	// `NET_BIND_SERVICE` appended; `keepCapNetBindService` (chart
+	// default `false`) is flipped on so the forked Envoy process
+	// keeps it. `hostNetwork.nodes` is left unset → all nodes
+	// (the single node on T1).
+	//
+	// These gateway/security-context extras are COMPONENT-only
+	// (Argo-managed): they never enter the loader export, so
+	// `cluster-bootstrap` stays minimal and the loader's 8 keys
+	// remain byte-identical to the v0.1.x install (no CLI
+	// change). NOTE: host-network Cilium cannot run in CI/kind
+	// (no real host-netns port binding), so the exact capability
+	// config is validated on a real Hetzner node (T8 e2e).
 	values: _loaderValues.cilium.values & {
-		gatewayAPI: enabled:      bool | *true
-		l2announcements: enabled: bool | *true
-		externalIPs: enabled:     bool | *true
+		gatewayAPI: {
+			enabled: bool | *true
+			hostNetwork: enabled: bool | *true
+		}
+		envoy: {
+			enabled: true
+			securityContext: capabilities: {
+				keepCapNetBindService: true
+				// Cilium 1.16.5 chart default `envoy.securityContext.capabilities.envoy`
+				// (NET_ADMIN, SYS_ADMIN) + NET_BIND_SERVICE for ports 80/443.
+				envoy: ["NET_ADMIN", "SYS_ADMIN", "NET_BIND_SERVICE"]
+			}
+		}
 	}
 
 	// CNI is the prerequisite for every other component to
