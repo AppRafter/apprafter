@@ -18,7 +18,20 @@
 //!
 //! Unlike the other validators it needs `request.userInfo` +
 //! `request.operation`, which `server.rs` threads in only for this kind.
+//!
+//! Typed against `operator_core::ResourceClaimSpec` (ADR 0047
+//! Decision #4): the spec is deserialized into the operator-core struct
+//! once and the happy-path rules read TYPED fields (`type_`, `selector`,
+//! `size`), so a renamed field fails to compile instead of silently
+//! bypassing a rule. The presence ("is required") diagnostics for
+//! `type`/`selector` stay on the raw `Value`: those fields are non-`Option`
+//! in `ResourceClaimSpec`, so the typed struct cannot represent an absent
+//! one. A non-conforming object never reaches admission in production (a
+//! validating webhook runs after the apiserver's structural validation,
+//! which already enforced `required: [type, selector]`); those branches
+//! exist only for defence-in-depth and the unit tests below.
 
+use operator_core::ResourceClaimSpec;
 use serde_json::Value;
 
 use crate::validator::ValidationError;
@@ -77,30 +90,53 @@ pub fn validate_resourceclaim(
         ));
         return errors;
     };
-    let Some(spec) = obj.get("spec").and_then(Value::as_object) else {
+    let Some(spec_value) = obj.get("spec").filter(|s| s.is_object()) else {
         errors.push(ValidationError::new("spec", "spec is required"));
         return errors;
     };
 
-    match spec.get("type").and_then(Value::as_str) {
-        Some(t) if BUILTIN_TYPES.contains(&t) => {}
-        Some(t) => errors.push(ValidationError::new(
+    // Deserialize the spec into the typed operator-core struct. In
+    // production this always succeeds — a validating webhook runs after the
+    // apiserver's structural validation, which already enforced
+    // `required: [type, selector]` and the field types. When it succeeds the
+    // happy-path rules read the TYPED fields, so a renamed field fails to
+    // compile instead of silently bypassing a rule (ADR 0047 #4).
+    //
+    // `type`/`selector` are non-`Option` in `ResourceClaimSpec`, so the typed
+    // struct cannot represent an *absent* field; the per-field presence
+    // ("is required") branches below therefore stay on the raw `Value`,
+    // matching the pre-refactor `as_str()`/`as_object()` semantics exactly (a
+    // field that is not a usable string/map is treated as missing). They are
+    // only reachable in tests / a misconfigured apiserver.
+    let typed = serde_json::from_value::<ResourceClaimSpec>(spec_value.clone()).ok();
+    let spec = spec_value.as_object().expect("filtered to an object above");
+
+    match (typed.as_ref(), spec.get("type").and_then(Value::as_str)) {
+        // Happy path: read the typed field so the compiler gates `type_`.
+        (Some(t), Some(_)) if BUILTIN_TYPES.contains(&t.type_.as_str()) => {}
+        (_, Some(t)) if BUILTIN_TYPES.contains(&t) => {}
+        (_, Some(t)) => errors.push(ValidationError::new(
             "spec.type",
             format!(
                 "type must be one of {} (got {t:?})",
                 BUILTIN_TYPES.join("|")
             ),
         )),
-        None => errors.push(ValidationError::new("spec.type", "spec.type is required")),
+        (_, None) => errors.push(ValidationError::new("spec.type", "spec.type is required")),
     }
 
-    match spec.get("selector").and_then(Value::as_object) {
-        Some(m) if !m.is_empty() => {}
-        Some(_) => errors.push(ValidationError::new(
+    match (
+        typed.as_ref(),
+        spec.get("selector").and_then(Value::as_object),
+    ) {
+        // Happy path: read the typed field so the compiler gates `selector`.
+        (Some(t), Some(_)) if !t.selector.is_empty() => {}
+        (_, Some(m)) if !m.is_empty() => {}
+        (_, Some(_)) => errors.push(ValidationError::new(
             "spec.selector",
             "spec.selector must not be empty (it routes the claim to a ServiceProvider)",
         )),
-        None => errors.push(ValidationError::new(
+        (_, None) => errors.push(ValidationError::new(
             "spec.selector",
             "spec.selector is required",
         )),
@@ -110,10 +146,16 @@ pub fn validate_resourceclaim(
     // for service claims (pg/redis/…) but a Kubernetes quantity (the
     // storage capacity) for the `disk` claim. The CRD dropped its t-shirt
     // enum; the webhook is the per-type gate. The "must be a string" guard
-    // is shared by both branches.
+    // is shared by both branches. The typed `size`/`type_` drive the happy
+    // path (gating the renames); the not-a-string branch stays on the raw
+    // `Value` because `Option<String>` cannot represent a non-string input.
     if let Some(size) = spec.get("size") {
-        let claim_type = spec.get("type").and_then(Value::as_str);
-        match size.as_str() {
+        let claim_type = typed
+            .as_ref()
+            .map(|t| t.type_.as_str())
+            .or_else(|| spec.get("type").and_then(Value::as_str));
+        let typed_size = typed.as_ref().and_then(|t| t.size.as_deref());
+        match typed_size.or_else(|| size.as_str()) {
             Some(s) if claim_type == Some("disk") => {
                 if !is_k8s_quantity(s) {
                     errors.push(ValidationError::new(

@@ -174,6 +174,14 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          it `Option<serde_json::Value>` which schemars renders as an untyped node. Both \
          accept any object; neither constrains its shape.",
     ),
+    (
+        "ResourceClaim",
+        "status",
+        "operator-written status: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the \
+         concrete status fields (provider, conditions, dbnum, …). The status subtree \
+         constrains no user input.",
+    ),
 ];
 
 /// The kube-rs (`CustomResourceExt::crd()`) CRD for a component, or `None`
@@ -183,8 +191,9 @@ fn rust_crd(component: &str) -> Option<Value> {
     let crd = match component {
         "Application" => operator_core::Application::crd(),
         "ServiceProvider" => operator_core::ServiceProvider::crd(),
-        // Phase 3 adds ResourceClaim / RetainedClaim / MigrationPlan /
-        // SourceCredential / PlatformStack.
+        "ResourceClaim" => operator_core::ResourceClaim::crd(),
+        // Phase 3 adds RetainedClaim / MigrationPlan / SourceCredential /
+        // PlatformStack.
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -307,8 +316,13 @@ mod tests {
         assert!(allowed("ServiceProvider", "status.health"));
         assert!(allowed("ServiceProvider", "spec.config"));
         assert!(!allowed("ServiceProvider", "spec.backend"));
+        // ResourceClaim allowlists its operator-written status subtree; its
+        // typed spec fields are not allowlisted.
+        assert!(allowed("ResourceClaim", "status"));
+        assert!(allowed("ResourceClaim", "status.dbnum"));
+        assert!(!allowed("ResourceClaim", "spec.selector"));
         // A component absent from the allowlist matches nothing.
-        assert!(!allowed("ResourceClaim", "status"));
+        assert!(!allowed("MigrationPlan", "status"));
     }
 
     #[test]

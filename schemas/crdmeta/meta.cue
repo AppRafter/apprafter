@@ -78,3 +78,35 @@ _crdMetas: ServiceProvider: {
 		"config": {type: "object", "x-kubernetes-preserve-unknown-fields": true}
 	}
 }
+
+_crdMetas: ResourceClaim: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "resourceclaims"
+		singular: "resourceclaim"
+		kind:     "ResourceClaim"
+		listKind: "ResourceClaimList"
+		shortNames: ["rc"]
+	}
+	annotations: _syncWave
+	subresources: status: {}
+	printerColumns: [
+		{name: "Type", type: "string", jsonPath: ".spec.type"},
+		{name: "Size", type: "string", jsonPath: ".spec.size"},
+		{name: "Provider", type: "string", jsonPath: ".status.provider"},
+		{name: "Ready", type: "string", jsonPath: ".status.ready"},
+		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
+	]
+
+	// CRD-only SPEC constraint CUE omits: the hand-rolled CRD enforced
+	// `selector.minProperties: 1` (a non-empty routing map), but
+	// `selector: [string]: string` in CUE exports no minProperties (an
+	// empty map satisfies the open struct). Restore it so the generated
+	// CRD keeps the same acceptance set; the webhook also enforces it
+	// (clearer message). Paths are relative to `spec`.
+	schemaPatches: {
+		"selector": {minProperties: 1}
+	}
+}
