@@ -210,8 +210,11 @@ _serviceProvidersTemplate: """
 	"""
 
 // `_gatewayTemplate` — emits the public-ingress Gateway and its
-// Cilium LB-IPAM / L2-announcement backing (1.83a). The whole
-// block is guarded by `{{- if .Values.gateway.allowedDomains }}`
+// HTTP→HTTPS redirect (1.83a). Host-network mode: the Gateway's
+// Envoy binds the node host ports 80/443 directly (cilium
+// `gatewayAPI.hostNetwork.enabled`), so there is NO LoadBalancer
+// Service and hence no LB-IPAM IPPool / L2-announcement backing.
+// The whole block is guarded by `{{- if .Values.gateway.allowedDomains }}`
 // so a default tier-1 render (empty `allowedDomains`) produces
 // NO resources — the Gateway only materialises once an operator
 // registers at least one domain. The `gateway-api-crds` (wave
@@ -230,47 +233,12 @@ _serviceProvidersTemplate: """
 _gatewayTemplate: """
 	{{/* SPDX-License-Identifier: FSL-1.1-Apache-2.0
 	     Rendered by `cue cmd render`. Do not edit.
-	     Public ingress (1.83a): emitted only when allowedDomains is non-empty. */}}
+	     Public ingress (1.83a): host-network mode — the Gateway's Envoy binds the
+	     node host ports 80/443 directly (cilium gatewayAPI.hostNetwork); no
+	     LoadBalancer Service / LB-IPAM / L2. Emitted only when allowedDomains is
+	     non-empty. */}}
 	{{- if .Values.gateway.allowedDomains }}
 	{{- $gw := .Values.gateway }}
-	{{/* The IPPool / L2 policy below are deliberately UNSCOPED (no serviceSelector).
-	     Cilium's Gateway-API controller creates a SEPARATE LoadBalancer Service
-	     (cilium-gateway-platform) for the Gateway and does NOT copy the Gateway's
-	     metadata.labels onto it — it only sets io.cilium.gateway/owning-gateway —
-	     so a serviceSelector keyed on apprafter.io/platform-gateway would never
-	     match the generated Service and the Gateway would get no address. On T1 the
-	     platform Gateway is the SOLE LoadBalancer Service, so an unscoped pool/policy
-	     correctly assigns + announces the node IP (per the Cilium docs: "The pool
-	     will allocate to any service if no service selector is specified" and "If no
-	     service selector is provided, all services are selected by the policy").
-	     Scoping to the generated Service (via io.cilium.gateway/owning-gateway, or
-	     Gateway spec.infrastructure.labels once confirmed on a real Cilium 1.16) is a
-	     future optimization for multi-service tiers (T2+). */}}
-	---
-	apiVersion: cilium.io/v2alpha1
-	kind: CiliumLoadBalancerIPPool
-	metadata:
-	  name: apprafter-node-public
-	  annotations:
-	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
-	spec:
-	  blocks:
-	  {{- if $gw.nodePublicIP }}
-	  - cidr: {{ printf "%s/32" $gw.nodePublicIP | quote }}
-	  {{- end }}
-	  {{- if $gw.nodePublicIPv6 }}
-	  - cidr: {{ printf "%s/128" $gw.nodePublicIPv6 | quote }}
-	  {{- end }}
-	---
-	apiVersion: cilium.io/v2alpha1
-	kind: CiliumL2AnnouncementPolicy
-	metadata:
-	  name: apprafter-node-public
-	  annotations:
-	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
-	spec:
-	  externalIPs: true
-	  loadBalancerIPs: true
 	---
 	apiVersion: gateway.networking.k8s.io/v1
 	kind: Gateway
