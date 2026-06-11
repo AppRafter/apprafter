@@ -29,7 +29,25 @@
 //! Like `validator_resourceclaim.rs` it needs `request.userInfo` +
 //! `request.operation` (+ `oldObject` for the immutability check), which
 //! `server.rs` threads in for this kind.
+//!
+//! Typed against `operator_core::RetainedClaimSpec` (ADR 0047
+//! Decision #4): the spec is deserialized into the operator-core struct
+//! once and the field rules read TYPED fields, so a renamed field fails to
+//! compile instead of silently bypassing a rule. The backend-conditional
+//! set and the `backend` / `instance` / `volumeClaimRef` discriminators all
+//! read TYPED `Option` fields. Two PRESENCE diagnostics stay on the raw
+//! `Value` because the typed struct cannot represent the input they reject:
+//! the `claimRef.{name,namespace}` checks (`claim_ref` / `name` / `namespace`
+//! are non-`Option`, so the struct cannot model an absent `claimRef` or
+//! member — the diagnostic names the exact missing leaf), and the
+//! `retainUntil` presence check (`retain_until` is a non-`Option` `String`,
+//! so it cannot model an absent field). Those branches are unreachable in
+//! production — a validating webhook runs after the apiserver's structural
+//! validation, which already enforced `required: [claimRef, provider,
+//! backend, retainUntil]` and the `claimRef.{name,namespace}` requireds — and
+//! exist for the unit tests / defence-in-depth.
 
+use operator_core::RetainedClaimSpec;
 use serde_json::Value;
 
 use crate::validator::ValidationError;
@@ -147,6 +165,18 @@ pub fn validate_retainedclaim(
         return errors;
     };
 
+    // Deserialize the spec into the typed operator-core struct. In production
+    // this always succeeds — a validating webhook runs after the apiserver's
+    // structural validation, which already enforced `required: [claimRef,
+    // provider, backend, retainUntil]` (and `claimRef.{name,namespace}`). When
+    // it succeeds the backend-conditional set + the `backend` / `instance` /
+    // `volumeClaimRef` discriminators read TYPED fields, so a renamed field
+    // fails to compile instead of silently bypassing a rule (ADR 0047 #4). The
+    // `claimRef` / `retainUntil` PRESENCE checks stay on the raw `Value`: those
+    // fields are non-`Option` in `RetainedClaimSpec`, so the typed struct
+    // cannot represent an absent one (those branches are test-only).
+    let typed = serde_json::from_value::<RetainedClaimSpec>(Value::Object(spec.clone())).ok();
+
     // claimRef.{name, namespace}
     match spec.get("claimRef").and_then(Value::as_object) {
         Some(claim_ref) => {
@@ -177,7 +207,17 @@ pub fn validate_retainedclaim(
     // dragonfly arm and are always CNPG-shaped. Validating only the
     // matching set keeps the operator's own snapshot CREATE from being
     // rejected (failurePolicy: Fail → finalizer wedge → leak). ADR 0042.
-    let backend = spec.get("backend").and_then(Value::as_str).unwrap_or("");
+    //
+    // The discriminators (`backend`, `instance`, `volumeClaimRef`) read the
+    // TYPED `Option` fields when the spec deserialized (always, in production);
+    // a rename fails to compile. When `typed` is `None` (only reachable in
+    // tests / a misconfigured apiserver) the reads fall back to the raw
+    // `Value`, matching the pre-refactor `as_str()` semantics exactly.
+    let backend = typed
+        .as_ref()
+        .map(|t| t.backend.as_str())
+        .or_else(|| spec.get("backend").and_then(Value::as_str))
+        .unwrap_or("");
     // A dragonfly snapshot's GC-load-bearing set (instance/aclUser/conn*) only
     // exists once the claim was actually allocated. A claim deleted before the
     // provisioner wrote `status.instance` snapshots with `instance` empty/absent
@@ -187,19 +227,15 @@ pub fn validate_retainedclaim(
     // provider/backend CNPG carve-out so the operator's own pre-allocation
     // snapshot CREATE is not rejected (failurePolicy: Fail → wedge → leak).
     // ADR 0042 Pre-merge #5/#6.
-    let dragonfly_allocated = spec
-        .get("instance")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty());
+    let dragonfly_allocated =
+        typed_or_raw_str(typed.as_ref(), spec, "instance").is_some_and(|s| !s.is_empty());
     // A disk snapshot's GC-load-bearing set (volumeClaimRef/Namespace) only
     // exists once the PVC was actually provisioned. A disk claim deleted
     // before the provisioner wrote `status.volumeClaimRef` snapshots with the
     // ref empty; the GC reclaims nothing for it. Enforce the disk set only when
     // `volumeClaimRef` is present + non-empty (mirror of the dragonfly carve-out).
-    let disk_provisioned = spec
-        .get("volumeClaimRef")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty());
+    let disk_provisioned =
+        typed_or_raw_str(typed.as_ref(), spec, "volumeClaimRef").is_some_and(|s| !s.is_empty());
     let required_fields: &[&str] = if backend == "dragonfly" {
         if dragonfly_allocated {
             &DRAGONFLY_REQUIRED_STRING_FIELDS
@@ -216,11 +252,10 @@ pub fn validate_retainedclaim(
         &CNPG_REQUIRED_STRING_FIELDS
     };
     for field in required_fields {
-        if spec
-            .get(*field)
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-        {
+        // `typed_or_raw_str` reads the TYPED `Option<String>` for this field
+        // (gating its rename) and only falls back to the raw `Value` when the
+        // spec failed to deserialize (test / misconfigured-apiserver path).
+        if typed_or_raw_str(typed.as_ref(), spec, field).is_none_or(str::is_empty) {
             errors.push(ValidationError::new(
                 format!("spec.{field}"),
                 format!("spec.{field} is required"),
@@ -228,8 +263,15 @@ pub fn validate_retainedclaim(
         }
     }
 
-    // retainUntil must parse as RFC3339.
-    match spec.get("retainUntil").and_then(Value::as_str) {
+    // retainUntil must parse as RFC3339. The typed `retain_until` drives the
+    // parse on the happy path (gating its rename); the empty/absent "is
+    // required" branch stays on the raw `Value` because the non-`Option`
+    // `String` cannot represent an absent field (test-only).
+    let retain_until = typed
+        .as_ref()
+        .map(|t| t.retain_until.as_str())
+        .or_else(|| spec.get("retainUntil").and_then(Value::as_str));
+    match retain_until {
         Some(s) if !s.is_empty() => {
             if chrono::DateTime::parse_from_rfc3339(s).is_err() {
                 errors.push(ValidationError::new(
@@ -245,6 +287,42 @@ pub fn validate_retainedclaim(
     }
 
     errors
+}
+
+/// Read the backend-conditional `spec` field `name` from the TYPED
+/// `RetainedClaimSpec` when it deserialized (gating a rename at compile
+/// time), falling back to the raw `Value` when it did not (only reachable
+/// in tests / a misconfigured apiserver — production always deserializes).
+/// The match is exhaustive over every field name this validator reads; a
+/// rename in `RetainedClaimSpec` makes the corresponding arm fail to
+/// compile. Returns `None` for an absent field, matching the pre-refactor
+/// `spec.get(name).and_then(Value::as_str)` semantics.
+fn typed_or_raw_str<'a>(
+    typed: Option<&'a RetainedClaimSpec>,
+    spec: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> Option<&'a str> {
+    if let Some(t) = typed {
+        return match name {
+            // CNPG set.
+            "cnpgCluster" => t.cnpg_cluster.as_deref(),
+            "cnpgNamespace" => t.cnpg_namespace.as_deref(),
+            "role" => t.role.as_deref(),
+            "database" => t.database.as_deref(),
+            "databaseObjectName" => t.database_object_name.as_deref(),
+            "passwordSecretName" => t.password_secret_name.as_deref(),
+            // Dragonfly set + discriminator.
+            "instance" => t.instance.as_deref(),
+            "aclUser" => t.acl_user.as_deref(),
+            "connectionSecretRef" => t.connection_secret_ref.as_deref(),
+            "connectionSecretNamespace" => t.connection_secret_namespace.as_deref(),
+            // Disk set + discriminator.
+            "volumeClaimRef" => t.volume_claim_ref.as_deref(),
+            "volumeClaimNamespace" => t.volume_claim_namespace.as_deref(),
+            other => unreachable!("typed_or_raw_str: unmapped field {other:?}"),
+        };
+    }
+    spec.get(name).and_then(Value::as_str)
 }
 
 fn is_operator_or_admin(user_info: &Value) -> bool {

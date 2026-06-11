@@ -116,7 +116,9 @@ fn resolve_inner(node: &Value, schemas: &Map<String, Value>, seen: &mut Vec<Stri
 /// `image` non-empty `pattern`, per the CUE-validation policy) so the
 /// generated CRD still enforces them. Path mini-language, relative to the
 /// spec node: a `name` segment descends into `properties.name`; a
-/// `name[*]` segment descends into `properties.name.additionalProperties`.
+/// `name[*]` segment descends into `properties.name.additionalProperties`;
+/// the empty path `""` targets the spec root node itself (e.g. to attach a
+/// spec-level `x-kubernetes-validations` CEL rule).
 pub fn apply_patches(spec: &mut Value, patches: &Map<String, Value>) -> Result<()> {
     for (path, patch) in patches {
         let node =
@@ -134,6 +136,11 @@ pub fn apply_patches(spec: &mut Value, patches: &Map<String, Value>) -> Result<(
 }
 
 fn navigate<'a>(root: &'a mut Value, path: &str) -> Option<&'a mut Value> {
+    // An empty path targets the node itself (the `spec` root) — used to
+    // patch spec-level keys like `x-kubernetes-validations`.
+    if path.is_empty() {
+        return Some(root);
+    }
     let mut cur = root;
     for seg in path.split('.') {
         let (name, additional) = match seg.strip_suffix("[*]") {
@@ -249,6 +256,21 @@ mod tests {
                 ["pattern"],
             json!("^.+$")
         );
+    }
+
+    #[test]
+    fn apply_patches_empty_path_targets_the_spec_root() {
+        let mut spec = json!({ "type": "object", "properties": { "a": {"type": "string"} } });
+        let patches = schemas(json!({
+            "": { "x-kubernetes-validations": [{ "rule": "self == oldSelf" }] }
+        }));
+        apply_patches(&mut spec, &patches).unwrap();
+        assert_eq!(
+            spec["x-kubernetes-validations"][0]["rule"],
+            json!("self == oldSelf")
+        );
+        // existing keys untouched
+        assert_eq!(spec["properties"]["a"]["type"], json!("string"));
     }
 
     #[test]

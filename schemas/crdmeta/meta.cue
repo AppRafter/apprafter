@@ -79,6 +79,45 @@ _crdMetas: ServiceProvider: {
 	}
 }
 
+_crdMetas: RetainedClaim: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "retainedclaims"
+		singular: "retainedclaim"
+		kind:     "RetainedClaim"
+		listKind: "RetainedClaimList"
+		shortNames: ["rclaim"]
+	}
+	annotations: _syncWave
+	// NO `subresources` — RetainedClaim has no status subresource; the
+	// GC reads `spec` only. Omitting the field keeps `subresources` out
+	// of the generated CRD (matches the hand-rolled mirror).
+	printerColumns: [
+		{name: "SourceClaim", type: "string", jsonPath: ".spec.claimRef.name"},
+		{name: "Backend", type: "string", jsonPath: ".spec.backend"},
+		{name: "RetainUntil", type: "date", jsonPath: ".spec.retainUntil"},
+		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
+	]
+
+	// CRD-only SPEC constraints CUE deliberately omits (CUE-validation
+	// philosophy — no half-measure stubs). Paths are relative to `spec`;
+	// "" patches the spec root node itself.
+	schemaPatches: {
+		// Immutability: the hand-rolled CRD pinned the whole `spec` to
+		// `self == oldSelf` via an `x-kubernetes-validations` CEL rule (the
+		// snapshot is a fixed record of a deleted claim). CUE cannot express
+		// a same-as-old cross-version rule, so restore it here. The webhook
+		// layers the same guard (clearer message + the operator-only CREATE
+		// gate); this is the CRD half.
+		"": {"x-kubernetes-validations": [{
+			rule:    "self == oldSelf"
+			message: "RetainedClaim spec is immutable"
+		}]}
+	}
+}
+
 _crdMetas: ResourceClaim: {
 	group:   "apprafter.io"
 	version: "v1alpha1"

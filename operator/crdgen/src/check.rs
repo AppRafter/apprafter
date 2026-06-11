@@ -182,6 +182,15 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          concrete status fields (provider, conditions, dbnum, …). The status subtree \
          constrains no user input.",
     ),
+    (
+        "RetainedClaim",
+        "status",
+        "no status subresource: RetainedClaim has none (the GC reads spec only), so the \
+         kube-rs type declares no status and CustomResourceExt omits it, while crdgen \
+         always emits a catch-all x-kubernetes-preserve-unknown-fields (opaque) status \
+         node. The status subtree constrains no user input and no subresource is wired \
+         (no `subresources` in _crdMetas, so the generated CRD has no status subresource).",
+    ),
 ];
 
 /// The kube-rs (`CustomResourceExt::crd()`) CRD for a component, or `None`
@@ -192,8 +201,8 @@ fn rust_crd(component: &str) -> Option<Value> {
         "Application" => operator_core::Application::crd(),
         "ServiceProvider" => operator_core::ServiceProvider::crd(),
         "ResourceClaim" => operator_core::ResourceClaim::crd(),
-        // Phase 3 adds RetainedClaim / MigrationPlan / SourceCredential /
-        // PlatformStack.
+        "RetainedClaim" => operator_core::RetainedClaim::crd(),
+        // Phase 3 adds MigrationPlan / SourceCredential / PlatformStack.
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -321,6 +330,11 @@ mod tests {
         assert!(allowed("ResourceClaim", "status"));
         assert!(allowed("ResourceClaim", "status.dbnum"));
         assert!(!allowed("ResourceClaim", "spec.selector"));
+        // RetainedClaim allowlists the crdgen-emitted catch-all status node
+        // (it has no status subresource / Rust status type); its spec fields
+        // are not allowlisted.
+        assert!(allowed("RetainedClaim", "status"));
+        assert!(!allowed("RetainedClaim", "spec.claimRef"));
         // A component absent from the allowlist matches nothing.
         assert!(!allowed("MigrationPlan", "status"));
     }
