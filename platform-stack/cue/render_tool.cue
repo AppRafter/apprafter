@@ -307,6 +307,50 @@ _gatewayTemplate: """
 
 	"""
 
+// `_migrationAnchorTemplate` — emits the platform MigrationPlan tree
+// anchor ConfigMap (ADR 0048). STATIC: always emitted, no iteration.
+// The PlatformController sets each platform MigrationPlan's
+// ownerReference to this ConfigMap so the plan (operator-created
+// in-cluster, not repo-synced) is pulled into the platform-stack root
+// Application's Argo CD resource tree, where its approve/reject action
+// buttons become clickable. MUST be in apprafter-system (same namespace
+// as the plan) — a cross-namespace ownerReference makes k8s GC silently
+// delete the plan. sync-wave 5 lands it AFTER the operator/webhook
+// create apprafter-system at wave 0 — mirroring the positive sync-wave
+// the top-level ServiceProvider seeds carry. This is a top-level
+// umbrella resource (a Go template emitted by the renderer), NOT a child
+// Application, so the ConfigMap is a resource of the platform-stack ROOT
+// Application — exactly where the MigrationPlan needs to be anchored.
+//
+// Note the comment is a literal Go-template comment Helm strips at
+// install time; CUE ships the whole string verbatim.
+_migrationAnchorTemplate: """
+	{{/* SPDX-License-Identifier: FSL-1.1-Apache-2.0
+	     Rendered by `cue cmd render`. Do not edit.
+	     Tree anchor (ADR 0048): the PlatformController sets each platform
+	     MigrationPlan's ownerReference to this ConfigMap so the plan (operator-
+	     created, not repo-synced) is pulled into the platform-stack root
+	     Application's resource tree, where its approve/reject buttons become
+	     clickable. MUST be in apprafter-system (same namespace as the plan) —
+	     a cross-namespace ownerRef makes k8s GC silently delete the plan.
+	     sync-wave 5: after the operator/webhook create apprafter-system (wave 0). */}}
+	---
+	apiVersion: v1
+	kind: ConfigMap
+	metadata:
+	  name: platform-migration-anchor
+	  namespace: apprafter-system
+	  annotations:
+	    argocd.argoproj.io/sync-wave: "5"
+	  labels:
+	    apprafter.io/role: platform-migration-anchor
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	data:
+	  purpose: platform MigrationPlan tree anchor (see ADR 0048)
+
+	"""
+
 _applicationsTemplate: """
 	{{/*
 	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
@@ -579,6 +623,12 @@ command: render: {
 	gatewayTemplate: file.Create & {
 		filename: "\(_distDir)/templates/gateway.yaml"
 		contents: _gatewayTemplate
+		$dep:     mktemplates.$done
+	}
+
+	migrationAnchorTemplate: file.Create & {
+		filename: "\(_distDir)/templates/platform-migration-anchor.yaml"
+		contents: _migrationAnchorTemplate
 		$dep:     mktemplates.$done
 	}
 
