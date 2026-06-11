@@ -253,6 +253,25 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          CUE-derived CRD, while the kube-rs `SourceBackend` declares both fields optional on \
          one struct. The admission webhook enforces exactly-one + the inner non-empty rules.",
     ),
+    (
+        "PlatformStack",
+        "status",
+        "operator-written status: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the concrete \
+         status fields (currentVersion, targetVersion, availableVersion, components, \
+         versionHistory, conditions, …). The status subtree constrains no user input.",
+    ),
+    (
+        "PlatformStack",
+        "spec.overrides.[*].values",
+        "free-form per-component values merge: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque, restored via a schemaPatch since CUE's \
+         `values?: {...}` open struct exports as a closed empty object), the kube-rs \
+         `PlatformStackComponentOverride.values` is `Option<serde_json::Value>` which schemars \
+         renders as an untyped node. Both accept any object; neither constrains its shape. \
+         (The top-level `spec.values` matches on both sides — schemars renders the `#[serde(flatten)] \
+         extras` map as a preserve-unknown node, same opaque kind as the CUE patch.)",
+    ),
 ];
 
 /// The kube-rs (`CustomResourceExt::crd()`) CRD for a component, or `None`
@@ -266,7 +285,7 @@ fn rust_crd(component: &str) -> Option<Value> {
         "RetainedClaim" => operator_core::RetainedClaim::crd(),
         "MigrationPlan" => operator_core::MigrationPlan::crd(),
         "SourceCredential" => operator_core::SourceCredential::crd(),
-        // Phase 3 adds PlatformStack.
+        "PlatformStack" => operator_core::PlatformStack::crd(),
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -428,8 +447,18 @@ mod tests {
         ));
         assert!(!allowed("SourceCredential", "spec.git.repoPrefixes"));
         assert!(!allowed("SourceCredential", "spec.registry.hosts"));
+        // PlatformStack allowlists its operator-written status subtree and the
+        // free-form per-component `overrides[*].values` node (CUE opaque vs an
+        // untyped serde_json::Value in Rust); its other typed spec fields
+        // (source, values.tier, …) are not allowlisted.
+        assert!(allowed("PlatformStack", "status"));
+        assert!(allowed("PlatformStack", "status.currentVersion"));
+        assert!(allowed("PlatformStack", "status.components.[].ready"));
+        assert!(allowed("PlatformStack", "spec.overrides.[*].values"));
+        assert!(!allowed("PlatformStack", "spec.source.upstream"));
+        assert!(!allowed("PlatformStack", "spec.values.tier"));
         // A component absent from the allowlist matches nothing.
-        assert!(!allowed("PlatformStack", "status"));
+        assert!(!allowed("NotACrd", "status"));
     }
 
     #[test]

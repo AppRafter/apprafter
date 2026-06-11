@@ -201,6 +201,57 @@ _crdMetas: SourceCredential: {
 	}
 }
 
+_crdMetas: PlatformStack: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "platformstacks"
+		singular: "platformstack"
+		kind:     "PlatformStack"
+		listKind: "PlatformStackList"
+		shortNames: ["ps", "pstack"]
+	}
+	annotations: _syncWave
+	subresources: status: {}
+	printerColumns: [
+		{name: "Channel", type: "string", jsonPath: ".spec.channel"},
+		{name: "Pin", type: "string", jsonPath: ".spec.pin"},
+		{name: "Current", type: "string", jsonPath: ".status.currentVersion"},
+		{name: "Available", type: "string", jsonPath: ".status.availableVersion"},
+		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
+	]
+
+	// CRD-only SPEC constraints CUE deliberately omits (CUE-validation
+	// philosophy — no half-measure stubs), restored so the generated CRD
+	// keeps the hand-rolled mirror's acceptance set. Paths are relative to
+	// `spec`; `[*]` descends into a map's additionalProperties.
+	//
+	// `source.upstream` / `source.repoURL` / `source.checkInterval`: the
+	// hand-rolled CRD enforced `pattern: ^oci://.+$` (the two OCI URLs) and
+	// `pattern: ^[0-9]+(h|m|s)$` (the Go-duration check interval). CUE keeps
+	// these bare `string`s (it carries only a `*default`, no `=~`), so the
+	// export drops the patterns — restore them. The webhook layers the
+	// stronger `checkInterval >= 1h` numeric rule (OpenAPI v3 can't compare
+	// durations); the `pin` semver pattern already survives from CUE's `=~`.
+	//
+	// `values` and `overrides[*].values` are open structs (the top-level
+	// `tier` + optional `domain` plus tier-specific chart fields; the
+	// per-component `values?: {...}` free-form merge map) — the hand-rolled
+	// CRD carried `x-kubernetes-preserve-unknown-fields: true` on both so new
+	// fields need no CRD bump. CUE exports the `{...}`-less / `{...}` open
+	// structs as closed objects, so restore preserve-unknown to keep the same
+	// "accept extra keys" set. (The `tier` enum + `required: [tier]` survive
+	// the CUE export — no patch.)
+	schemaPatches: {
+		"source.upstream": {pattern: "^oci://.+$"}
+		"source.repoURL": {pattern: "^oci://.+$"}
+		"source.checkInterval": {pattern: "^[0-9]+(h|m|s)$"}
+		"values": {"x-kubernetes-preserve-unknown-fields": true}
+		"overrides[*].values": {"x-kubernetes-preserve-unknown-fields": true}
+	}
+}
+
 _crdMetas: ResourceClaim: {
 	group:   "apprafter.io"
 	version: "v1alpha1"

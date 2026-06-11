@@ -19,9 +19,26 @@
 //!     warning, NOT rejection — pre-declaring an override for a
 //!     future chart version is legitimate.
 //!
-//! No `kube` types — operates on `serde_json::Value` like the
-//! Application validator does.
+//! Typed against `operator_core::PlatformStackSpec` (ADR 0047
+//! Decision #4): the spec is deserialized into the operator-core struct
+//! once and the value rules read TYPED fields (`channel`, `pin`,
+//! `source.check_interval`), so a renamed field fails to compile rather
+//! than silently bypassing a rule. Three branches stay on the raw `Value`
+//! and are documented inline:
+//!
+//!   - **spec presence** — the typed struct cannot represent an absent
+//!     `spec`; this diagnostic exists for the unit tests / a misconfigured
+//!     apiserver (a validating webhook runs after structural validation).
+//!   - **`network.egress.profile` enum** — `profile` is typed as the
+//!     `EgressProfile` enum, so an invalid value (`"wide-open"`) makes the
+//!     WHOLE spec fail to deserialize; the typed struct cannot represent the
+//!     rejected input, so this enum check reads the raw `Value` (matching the
+//!     CRD's enum + the pre-refactor behaviour exactly).
+//!   - the typed deserialize is `Option` — when it fails (e.g. the invalid
+//!     profile above), every typed rule falls back to the raw `Value` so the
+//!     other diagnostics still fire, exactly as before.
 
+use operator_core::PlatformStackSpec;
 use serde_json::Value;
 
 use crate::validator::ValidationError;
@@ -72,13 +89,29 @@ pub fn validate_platformstack(object: &Value) -> Vec<ValidationError> {
         ));
     }
 
-    let spec = obj.get("spec").and_then(Value::as_object);
-    let Some(spec) = spec else {
+    let Some(spec_value) = obj.get("spec").filter(|s| s.is_object()) else {
         errors.push(ValidationError::new("spec", "spec is required"));
         return errors;
     };
+    let spec = spec_value.as_object().expect("filtered to an object above");
 
-    if let Some(channel) = spec.get("channel").and_then(Value::as_str) {
+    // Deserialize the spec into the typed operator-core struct. In
+    // production this always succeeds — a validating webhook runs after the
+    // apiserver's structural validation. When it does, the value rules read
+    // TYPED fields so a renamed field fails to compile (ADR 0047 #4). When it
+    // fails (e.g. an invalid `network.egress.profile` enum — see below), each
+    // rule falls back to the raw `Value` so the other diagnostics still fire.
+    let typed = serde_json::from_value::<PlatformStackSpec>(spec_value.clone()).ok();
+
+    // `channel` — typed `String` (serde-defaults to "stable" when absent),
+    // so reading it typed is behaviour-identical to the pre-refactor
+    // `spec.get("channel")` (an absent channel resolves to the valid default;
+    // a present invalid value is a plain String and is rejected here).
+    if let Some(channel) = typed
+        .as_ref()
+        .map(|s| s.channel.as_str())
+        .or_else(|| spec.get("channel").and_then(Value::as_str))
+    {
         if !matches!(channel, "stable" | "beta" | "edge") {
             errors.push(ValidationError::new(
                 "spec.channel",
@@ -87,6 +120,12 @@ pub fn validate_platformstack(object: &Value) -> Vec<ValidationError> {
         }
     }
 
+    // `network.egress.profile` — typed as the `EgressProfile` enum, so an
+    // invalid value makes the WHOLE spec fail to deserialize (`typed` is
+    // None) and cannot be read off the typed struct. This enum check stays on
+    // the raw `Value`, matching the CRD's enum + the pre-refactor behaviour
+    // exactly: a valid profile is also a valid enum (typed deserialize
+    // succeeds), an invalid one is caught here.
     if let Some(profile) = spec
         .get("network")
         .and_then(|n| n.get("egress"))
@@ -101,7 +140,14 @@ pub fn validate_platformstack(object: &Value) -> Vec<ValidationError> {
         }
     }
 
-    if let Some(pin) = spec.get("pin").and_then(Value::as_str) {
+    // `pin` — typed `Option<String>`, which faithfully represents presence;
+    // read it typed on the happy path, falling back to the raw `Value` when
+    // the deserialize failed (so an invalid pin still surfaces).
+    if let Some(pin) = typed
+        .as_ref()
+        .and_then(|s| s.pin.as_deref())
+        .or_else(|| spec.get("pin").and_then(Value::as_str))
+    {
         if !is_semver(pin) {
             errors.push(ValidationError::new(
                 "spec.pin",
@@ -110,30 +156,41 @@ pub fn validate_platformstack(object: &Value) -> Vec<ValidationError> {
         }
     }
 
-    if let Some(source) = spec.get("source").and_then(Value::as_object) {
-        if let Some(interval) = source.get("checkInterval").and_then(Value::as_str) {
-            match parse_duration_to_seconds(interval) {
-                Some(secs) if secs < 3600 => {
-                    errors.push(ValidationError::new(
-                        "spec.source.checkInterval",
-                        format!(
-                            "checkInterval must be at least 1h (got {interval:?}); \
-                             PlatformController polling tighter than 1h overloads the \
-                             OCI registry and the controller's reconciliation budget"
-                        ),
-                    ));
-                }
-                None => {
-                    errors.push(ValidationError::new(
-                        "spec.source.checkInterval",
-                        format!(
-                            "checkInterval must be a Go duration string like \"6h\", \
-                             \"30m\", \"3600s\" (got {interval:?})"
-                        ),
-                    ));
-                }
-                _ => {}
+    // `source.checkInterval` — typed `source.check_interval: String`
+    // (non-`Option`; the apiserver requires `source`). Read it typed on the
+    // happy path; fall back to the raw `Value` lookup (which gracefully skips
+    // when `source`/`checkInterval` is absent) when the deserialize failed.
+    if let Some(interval) = typed
+        .as_ref()
+        .map(|s| s.source.check_interval.as_str())
+        .or_else(|| {
+            spec.get("source")
+                .and_then(Value::as_object)
+                .and_then(|src| src.get("checkInterval"))
+                .and_then(Value::as_str)
+        })
+    {
+        match parse_duration_to_seconds(interval) {
+            Some(secs) if secs < 3600 => {
+                errors.push(ValidationError::new(
+                    "spec.source.checkInterval",
+                    format!(
+                        "checkInterval must be at least 1h (got {interval:?}); \
+                         PlatformController polling tighter than 1h overloads the \
+                         OCI registry and the controller's reconciliation budget"
+                    ),
+                ));
             }
+            None => {
+                errors.push(ValidationError::new(
+                    "spec.source.checkInterval",
+                    format!(
+                        "checkInterval must be a Go duration string like \"6h\", \
+                         \"30m\", \"3600s\" (got {interval:?})"
+                    ),
+                ));
+            }
+            _ => {}
         }
     }
 
