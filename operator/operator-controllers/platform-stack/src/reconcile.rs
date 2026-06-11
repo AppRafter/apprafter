@@ -607,6 +607,27 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         helm_values: desired.helm_values.clone(),
     };
 
+    // ADR 0048: stamp the pending-upgrade surface onto the root
+    // Application ONLY while a destructive transition is held
+    // behind a not-yet-completed MigrationPlan. `migration_pending`
+    // is `Some` exactly in the two gating arms of step 7 (an
+    // existing non-`completed` plan, or a freshly-created
+    // destructive plan) and stays `None` when the plan reaches
+    // `completed` (operator approved + executed) or no destructive
+    // transition exists — so the annotations (and the optional
+    // approval banner they feed) clear automatically on approval.
+    // `from`/`to` are the held current target and the gated
+    // desired target — the same pair `synthesize_platform_plan_name`
+    // hashed into `plan_name`, keeping the surface self-consistent.
+    let pending_upgrade = migration_pending.as_ref().map(|m| PendingUpgrade {
+        from: current_target.clone(),
+        to: desired.target_revision.clone(),
+        class: m.classification.clone(),
+        plan: m.plan_name.clone().unwrap_or_else(|| {
+            synthesize_platform_plan_name(&current_target, &desired.target_revision)
+        }),
+    });
+
     // Detect foreign writer BEFORE patching — so we know whether
     // we need force=true on the SSA patch. Walk-found bug
     // v0.1.117 → v0.1.118: the old order (patch without force,
@@ -660,7 +681,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                 warn!(error = %e, "failed to publish ForeignFieldManager event (continuing)");
             }
         }
-        patch_application(&apps, &patch_payload).await?;
+        patch_application(&apps, &patch_payload, &pending_upgrade).await?;
         if foreign_writer.is_some() {
             // Companion Normal event so the audit trail
             // records the recovery action, not just the
@@ -1270,6 +1291,7 @@ fn detect_outside_writer(parent: &Value) -> Option<String> {
 async fn patch_application(
     apps: &Api<DynamicObject>,
     desired: &DesiredSource,
+    pending: &Option<PendingUpgrade>,
 ) -> Result<(), Error> {
     // PlatformController is the single writer for parent
     // Application's `spec.source.{targetRevision, helm.valuesObject}`
@@ -1284,22 +1306,40 @@ async fn patch_application(
         target = %desired.target_revision,
         "SSA-patching parent platform Application (force=true)"
     );
-    let payload = build_application_patch(desired);
+    let payload = build_application_patch(desired, pending);
     let params = PatchParams::apply(FIELD_MANAGER).force();
     apps.patch(PARENT_APPLICATION_NAME, &params, &Patch::Apply(&payload))
         .await?;
     Ok(())
 }
 
-fn build_application_patch(desired: &DesiredSource) -> Value {
+fn build_application_patch(desired: &DesiredSource, pending: &Option<PendingUpgrade>) -> Value {
     // apiVersion + kind + metadata.name are REQUIRED in every SSA
     // patch body — the apiserver uses them to resolve the target
     // resource's schema. Same TypeMeta contract that
     // `build_status_patch` enforces for PlatformStack writes.
+    //
+    // `metadata.annotations` carries the ADR-0048 pending-upgrade
+    // surface ONLY while a destructive transition is gated behind
+    // a `pending-approval` MigrationPlan. On every other path
+    // (`pending == None`) the field is omitted entirely:
+    // `platform-controller` owns these keys, so an annotation-free
+    // body makes SSA prune any set stamped on a prior gated cycle
+    // — the approval banner clears as soon as the gate releases.
+    let mut metadata = json!({ "name": PARENT_APPLICATION_NAME });
+    if let Some(up) = pending {
+        metadata["annotations"] = json!({
+            "apprafter.io/upgrade-pending": "true",
+            "apprafter.io/upgrade-from": up.from,
+            "apprafter.io/upgrade-to": up.to,
+            "apprafter.io/upgrade-class": up.class,
+            "apprafter.io/upgrade-plan": up.plan,
+        });
+    }
     json!({
         "apiVersion": "argoproj.io/v1alpha1",
         "kind": "Application",
-        "metadata": { "name": PARENT_APPLICATION_NAME },
+        "metadata": metadata,
         "spec": {
             "source": {
                 "targetRevision": desired.target_revision,
@@ -1495,6 +1535,24 @@ fn error_policy(_: Arc<PlatformStack>, err: &Error, _: Arc<Context>) -> Action {
 struct MigrationPendingState {
     classification: String,
     plan_name: Option<String>,
+}
+
+/// ADR 0048 — the upgrade metadata stamped onto the root Argo
+/// `Application` (`argocd/platform`) as machine-readable
+/// `apprafter.io/upgrade-*` annotations while a destructive
+/// transition is gated behind a `pending-approval`
+/// `MigrationPlan`. `platform-controller` is the sole owner of
+/// these keys, so emitting the patch body WITHOUT them (the
+/// `&None` arm of `build_application_patch`) makes SSA prune any
+/// previously-stamped set — the optional approval banner clears
+/// the moment the gate releases (operator approves the plan, or
+/// the transition turns out non-destructive).
+#[derive(Debug, Clone)]
+struct PendingUpgrade {
+    from: String,
+    to: String,
+    class: String,
+    plan: String,
 }
 
 /// Build a deterministic `MigrationPlan` CR name from a
@@ -2327,7 +2385,7 @@ mod tests {
             target_revision: "0.1.17".into(),
             helm_values: json!({"tier": 1}),
         };
-        let patch = build_application_patch(&desired);
+        let patch = build_application_patch(&desired, &None);
         assert_eq!(
             patch.get("apiVersion").and_then(Value::as_str),
             Some("argoproj.io/v1alpha1")
@@ -2351,6 +2409,85 @@ mod tests {
                 .pointer("/spec/source/helm/valuesObject/tier")
                 .and_then(Value::as_i64),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn application_patch_stamps_upgrade_annotations_when_pending() {
+        // ADR 0048: while a destructive upgrade is gated behind a
+        // pending-approval MigrationPlan, the root Application
+        // carries machine-readable `apprafter.io/upgrade-*`
+        // annotations (input for the optional approval-banner UI).
+        let desired = DesiredSource {
+            target_revision: "0.2.24".into(),
+            helm_values: json!({"tier": 1}),
+        };
+        let pending = Some(PendingUpgrade {
+            from: "0.2.24".into(),
+            to: "0.2.25".into(),
+            class: "requires-restart".into(),
+            plan: "platform-0-2-24-to-0-2-25".into(),
+        });
+        let patch = build_application_patch(&desired, &pending);
+        assert_eq!(
+            patch
+                .pointer("/metadata/annotations/apprafter.io~1upgrade-pending")
+                .and_then(Value::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            patch
+                .pointer("/metadata/annotations/apprafter.io~1upgrade-from")
+                .and_then(Value::as_str),
+            Some("0.2.24")
+        );
+        assert_eq!(
+            patch
+                .pointer("/metadata/annotations/apprafter.io~1upgrade-to")
+                .and_then(Value::as_str),
+            Some("0.2.25")
+        );
+        assert_eq!(
+            patch
+                .pointer("/metadata/annotations/apprafter.io~1upgrade-class")
+                .and_then(Value::as_str),
+            Some("requires-restart")
+        );
+        assert_eq!(
+            patch
+                .pointer("/metadata/annotations/apprafter.io~1upgrade-plan")
+                .and_then(Value::as_str),
+            Some("platform-0-2-24-to-0-2-25")
+        );
+        // spec.source must remain unchanged by the annotation block.
+        assert_eq!(
+            patch
+                .pointer("/spec/source/targetRevision")
+                .and_then(Value::as_str),
+            Some("0.2.24")
+        );
+    }
+
+    #[test]
+    fn application_patch_omits_upgrade_annotations_when_not_pending() {
+        // No pending upgrade ⇒ no `apprafter.io/upgrade-*`
+        // annotation keys. `platform-controller` owns them, so
+        // their absence from the SSA body prunes any stamped on a
+        // prior (pending) cycle — the banner clears on approval.
+        let desired = DesiredSource {
+            target_revision: "0.2.25".into(),
+            helm_values: json!({"tier": 1}),
+        };
+        let patch = build_application_patch(&desired, &None);
+        // No `annotations` object at all on this path.
+        assert!(
+            patch.pointer("/metadata/annotations").is_none(),
+            "metadata.annotations must be absent so SSA prunes upgrade-* keys"
+        );
+        // metadata.name is still present.
+        assert_eq!(
+            patch.pointer("/metadata/name").and_then(Value::as_str),
+            Some(PARENT_APPLICATION_NAME)
         );
     }
 
