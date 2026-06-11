@@ -209,6 +209,129 @@ _serviceProvidersTemplate: """
 
 	"""
 
+// `_gatewayTemplate` — emits the public-ingress Gateway and its
+// Cilium LB-IPAM / L2-announcement backing (1.83a). The whole
+// block is guarded by `{{- if .Values.gateway.allowedDomains }}`
+// so a default tier-1 render (empty `allowedDomains`) produces
+// NO resources — the Gateway only materialises once an operator
+// registers at least one domain. The `gateway-api-crds` (wave
+// -25) + cilium `gatewayAPI` (wave -20) components run first, so
+// at this template's default sync-wave 0 the Gateway API CRDs and
+// the cilium gateway controller are already present.
+//
+// Per allowed domain the Gateway gets two HTTPS listeners (apex +
+// wildcard), each named with a DOT-FREE sanitised host so the
+// listener name stays a valid k8s section name; a single HTTP
+// listener + an HTTPRoute redirect everything to HTTPS (301).
+//
+// Note the double-curly braces: this string is itself a Go
+// template Helm executes at install time, so we keep the `{{ }}`
+// literal. CUE ships it verbatim.
+_gatewayTemplate: """
+	{{/* SPDX-License-Identifier: FSL-1.1-Apache-2.0
+	     Rendered by `cue cmd render`. Do not edit.
+	     Public ingress (1.83a): emitted only when allowedDomains is non-empty. */}}
+	{{- if .Values.gateway.allowedDomains }}
+	{{- $gw := .Values.gateway }}
+	---
+	apiVersion: cilium.io/v2alpha1
+	kind: CiliumLoadBalancerIPPool
+	metadata:
+	  name: apprafter-node-public
+	  annotations:
+	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+	spec:
+	  serviceSelector:
+	    matchLabels:
+	      apprafter.io/platform-gateway: "true"
+	  blocks:
+	  {{- if $gw.nodePublicIP }}
+	  - cidr: {{ printf "%s/32" $gw.nodePublicIP | quote }}
+	  {{- end }}
+	  {{- if $gw.nodePublicIPv6 }}
+	  - cidr: {{ printf "%s/128" $gw.nodePublicIPv6 | quote }}
+	  {{- end }}
+	---
+	apiVersion: cilium.io/v2alpha1
+	kind: CiliumL2AnnouncementPolicy
+	metadata:
+	  name: apprafter-node-public
+	  annotations:
+	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+	spec:
+	  serviceSelector:
+	    matchLabels:
+	      apprafter.io/platform-gateway: "true"
+	  externalIPs: true
+	  loadBalancerIPs: true
+	---
+	apiVersion: gateway.networking.k8s.io/v1
+	kind: Gateway
+	metadata:
+	  name: platform
+	  namespace: apprafter-system
+	  labels:
+	    apprafter.io/platform-gateway: "true"
+	  annotations:
+	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+	spec:
+	  gatewayClassName: cilium
+	  listeners:
+	  {{- range $e := $gw.allowedDomains }}
+	  {{- $san := $e.domain | replace "." "-" }}
+	  - name: {{ printf "https-apex-%s" $san | quote }}
+	    port: 443
+	    protocol: HTTPS
+	    hostname: {{ $e.domain | quote }}
+	    tls:
+	      mode: Terminate
+	      certificateRefs:
+	      - kind: Secret
+	        name: {{ $e.importedCertRef | quote }}
+	        namespace: apprafter-system
+	    allowedRoutes:
+	      namespaces:
+	        from: All
+	  - name: {{ printf "https-wild-%s" $san | quote }}
+	    port: 443
+	    protocol: HTTPS
+	    hostname: {{ printf "*.%s" $e.domain | quote }}
+	    tls:
+	      mode: Terminate
+	      certificateRefs:
+	      - kind: Secret
+	        name: {{ $e.importedCertRef | quote }}
+	        namespace: apprafter-system
+	    allowedRoutes:
+	      namespaces:
+	        from: All
+	  {{- end }}
+	  - name: http
+	    port: 80
+	    protocol: HTTP
+	    allowedRoutes:
+	      namespaces:
+	        from: All
+	---
+	apiVersion: gateway.networking.k8s.io/v1
+	kind: HTTPRoute
+	metadata:
+	  name: platform-http-redirect
+	  namespace: apprafter-system
+	spec:
+	  parentRefs:
+	  - name: platform
+	    sectionName: http
+	  rules:
+	  - filters:
+	    - type: RequestRedirect
+	      requestRedirect:
+	        scheme: https
+	        statusCode: 301
+	{{- end }}
+
+	"""
+
 _applicationsTemplate: """
 	{{/*
 	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
@@ -475,6 +598,12 @@ command: render: {
 	serviceProvidersTemplate: file.Create & {
 		filename: "\(_distDir)/templates/serviceproviders.yaml"
 		contents: _serviceProvidersTemplate
+		$dep:     mktemplates.$done
+	}
+
+	gatewayTemplate: file.Create & {
+		filename: "\(_distDir)/templates/gateway.yaml"
+		contents: _gatewayTemplate
 		$dep:     mktemplates.$done
 	}
 
