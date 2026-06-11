@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::ObjectReference;
+use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
@@ -25,7 +26,7 @@ use kube::{Client, Resource, ResourceExt};
 use semver::Version;
 use serde_json::{json, Value};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use kube::api::PostParams;
 use operator_core::{
@@ -56,6 +57,15 @@ const PARENT_APPLICATION_NAMESPACE: &str = "argocd";
 /// imported to avoid a circular workspace-internal dep between
 /// the two controller crates.
 const MIGRATION_PLAN_NAMESPACE: &str = "apprafter-system";
+
+/// Name of the chart-emitted anchor `ConfigMap` in
+/// `apprafter-system` (ADR 0048). Platform `MigrationPlan`s
+/// carry a same-namespace `ownerReference` to it so Argo CD's
+/// ownerRef walk pulls the plan into the platform-stack root
+/// Application's resource tree. A cross-namespace ownerRef would
+/// make k8s GC silently delete the plan, so the anchor MUST live
+/// in `MIGRATION_PLAN_NAMESPACE`.
+const PLATFORM_MIGRATION_ANCHOR: &str = "platform-migration-anchor";
 
 /// Reporter identity stamped onto every Kubernetes Event this
 /// controller publishes. Shows up in `kubectl describe
@@ -535,6 +545,32 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                         to = %desired.target_revision,
                         "creating platform MigrationPlan for destructive transition"
                     );
+                    // ADR 0048: GET the chart-emitted anchor
+                    // ConfigMap so the new plan can carry a
+                    // same-namespace ownerRef to it (Argo CD then
+                    // surfaces the plan on the platform-stack
+                    // tree). 404/None-tolerant by design: an
+                    // older chart without the anchor yields an
+                    // un-owned (off-tree, still CLI-approvable)
+                    // plan rather than blocking the create.
+                    let anchor_api: Api<ConfigMap> =
+                        Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
+                    let anchor_uid = anchor_api
+                        .get_opt(PLATFORM_MIGRATION_ANCHOR)
+                        .await?
+                        .and_then(|c| c.metadata.uid);
+                    if anchor_uid.is_none() {
+                        warn!(
+                            anchor = PLATFORM_MIGRATION_ANCHOR,
+                            namespace = MIGRATION_PLAN_NAMESPACE,
+                            "anchor ConfigMap absent — creating MigrationPlan un-owned (off the Argo tree)"
+                        );
+                    } else {
+                        debug!(
+                            anchor = PLATFORM_MIGRATION_ANCHOR,
+                            "anchoring MigrationPlan to ConfigMap ownerRef"
+                        );
+                    }
                     create_platform_migration_plan(
                         &plan_api,
                         &plan_name,
@@ -542,6 +578,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                         &desired.target_revision,
                         class,
                         spec.pin.as_deref(),
+                        anchor_uid.as_deref(),
                     )
                     .await?;
                     migration_pending = Some(MigrationPendingState {
@@ -1515,9 +1552,16 @@ async fn create_platform_migration_plan(
     to_version: &str,
     class: ChangeClass,
     current_pin: Option<&str>,
+    anchor_uid: Option<&str>,
 ) -> Result<(), Error> {
-    let plan =
-        build_platform_migration_plan_cr(plan_name, from_version, to_version, class, current_pin);
+    let plan = build_platform_migration_plan_cr(
+        plan_name,
+        from_version,
+        to_version,
+        class,
+        current_pin,
+        anchor_uid,
+    );
     api.create(&PostParams::default(), &plan).await?;
     Ok(())
 }
@@ -1531,6 +1575,7 @@ fn build_platform_migration_plan_cr(
     to_version: &str,
     class: ChangeClass,
     current_pin: Option<&str>,
+    anchor_uid: Option<&str>,
 ) -> MigrationPlan {
     let classification = change_class_to_string(class).to_string();
     // `previousSpecSnapshot.pin` — verbatim copy of the
@@ -1573,6 +1618,22 @@ fn build_platform_migration_plan_cr(
     };
     let mut mp = MigrationPlan::new(plan_name, spec);
     mp.metadata.namespace = Some(MIGRATION_PLAN_NAMESPACE.to_string());
+    // ADR 0048: anchor the plan to the chart-emitted ConfigMap in
+    // the SAME namespace so Argo CD's ownerRef walk surfaces it on
+    // the platform-stack root Application's tree. `controller` and
+    // `block_owner_deletion` are both false — this is a
+    // tree-membership anchor, not a lifecycle owner, and we never
+    // want it to interfere with GC of either object.
+    if let Some(uid) = anchor_uid {
+        mp.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            name: PLATFORM_MIGRATION_ANCHOR.into(),
+            uid: uid.into(),
+            controller: Some(false),
+            block_owner_deletion: Some(false),
+        }]);
+    }
     mp
 }
 
@@ -2348,6 +2409,7 @@ mod tests {
             "0.1.33",
             ChangeClass::Breaking,
             Some("0.1.32"),
+            None,
         );
 
         assert_eq!(
@@ -2404,9 +2466,54 @@ mod tests {
             "0.2.0",
             ChangeClass::Breaking,
             None,
+            None,
         );
         let snapshot = mp.spec.previous_spec_snapshot.as_ref().unwrap();
         assert_eq!(snapshot.pointer("/pin"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn migration_plan_owner_ref_points_at_anchor() {
+        // ADR 0048: when the chart-emitted anchor ConfigMap is
+        // present, the plan carries a same-namespace ownerRef to
+        // it so Argo CD's ownerRef walk pulls the plan into the
+        // platform-stack root Application's resource tree.
+        let mp = build_platform_migration_plan_cr(
+            "platform-0-1-32-to-0-1-33",
+            "0.1.32",
+            "0.1.33",
+            ChangeClass::Breaking,
+            Some("0.1.32"),
+            Some("anchor-uid-123"),
+        );
+        let refs = mp
+            .metadata
+            .owner_references
+            .as_ref()
+            .expect("ownerReferences set");
+        assert_eq!(refs.len(), 1);
+        let owner = &refs[0];
+        assert_eq!(owner.api_version, "v1");
+        assert_eq!(owner.kind, "ConfigMap");
+        assert_eq!(owner.name, "platform-migration-anchor");
+        assert_eq!(owner.uid, "anchor-uid-123");
+        assert_eq!(owner.controller, Some(false));
+        assert_eq!(owner.block_owner_deletion, Some(false));
+    }
+
+    #[test]
+    fn migration_plan_unowned_when_no_anchor() {
+        // No anchor (e.g. older chart) → plan is created
+        // un-owned. Still CLI-approvable, just off the Argo tree.
+        let mp = build_platform_migration_plan_cr(
+            "platform-0-1-32-to-0-1-33",
+            "0.1.32",
+            "0.1.33",
+            ChangeClass::Breaking,
+            Some("0.1.32"),
+            None,
+        );
+        assert!(mp.metadata.owner_references.is_none());
     }
 
     #[test]
