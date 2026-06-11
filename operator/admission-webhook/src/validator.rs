@@ -9,10 +9,45 @@
 //! labels, env keys match `^[A-Z_][A-Z0-9_]*$`, and `needs` keys
 //! are known platform-service types.
 //!
-//! No `kube` types are pulled in — the validator works directly on
-//! `serde_json::Value`. The HTTP layer (`server.rs`) extracts the
-//! `request.object.spec` value before passing it here.
+//! The HTTP layer (`server.rs`) extracts the `request.object.spec`
+//! value before passing it here.
+//!
+//! Typed against `operator_core::ApplicationSpec` (ADR 0047
+//! Decision #4): the spec is deserialized into the operator-core
+//! struct once and the happy-path reads go through the TYPED fields
+//! (`base.image`, the `environments` keys, each scope's `env` /
+//! `needs` / `replicas`, the `EnvValue` literal/claim/secret variants,
+//! `DiskClaim` name/size/mountPath/class), so a renamed/removed field
+//! fails to compile instead of silently bypassing a rule.
+//!
+//! A handful of PRESENCE / not-a-string / unknown-KEY diagnostics
+//! necessarily stay on the raw `Value` because the typed struct cannot
+//! represent the input they reject:
+//!   - **unknown `needs` key** (`mysql`, …): `operator_core::Needs` is a
+//!     closed struct, so an unknown key cannot exist in the typed view —
+//!     only the raw map can surface it;
+//!   - **env KEY regex shape** (`^[A-Z_][A-Z0-9_]*$`): the keys of
+//!     `Option<BTreeMap<String, EnvValue>>` are arbitrary `String`s, so
+//!     the typed struct constrains the value, not the key's character set;
+//!   - **disk `mountPath` / `size` presence and disk-key-presence for the
+//!     inherit merge**: `DiskClaim.size`/`mount_path` are non-`Option`
+//!     (a missing one fails the typed deserialize) and the per-key needs
+//!     merge pivots on whether a scope LITERALLY declares the `disk` key.
+//!
+//! Those branches are unreachable in production — a validating webhook
+//! runs after the apiserver's structural validation, which already
+//! enforced the CUE-generated Application CRD shape — and exist for the
+//! unit tests / defence-in-depth. When the spec fails to deserialize
+//! (test / misconfigured apiserver) every typed read falls back to the
+//! raw `Value`, matching the pre-refactor `as_object()` / `as_str()`
+//! semantics exactly.
 
+use std::collections::BTreeMap;
+
+use operator_core::{
+    ApplicationBaseSpec, ApplicationSpec, DiskClaim, EnvRef, EnvValue, Needs, OneOrMany,
+    ServiceNeed,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,10 +79,28 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     let base = obj.get("base").and_then(|v| v.as_object());
     let envs = obj.get("environments").and_then(|v| v.as_object());
 
-    let base_image_set = base
-        .and_then(|b| b.get("image"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty());
+    // Deserialize the whole spec into the typed operator-core struct. In
+    // production this always succeeds — a validating webhook runs after the
+    // apiserver's structural validation, which already enforced the
+    // CUE-generated Application CRD. When it succeeds the happy-path reads
+    // go through the TYPED fields, so a renamed field fails to compile
+    // (ADR 0047 #4). When it fails (test / misconfigured apiserver) every
+    // typed read below falls back to the raw `Value`, matching the
+    // pre-refactor `as_object()` / `as_str()` semantics exactly.
+    let typed = serde_json::from_value::<ApplicationSpec>(spec.clone()).ok();
+    let typed_base = typed.as_ref().and_then(|s| s.base.as_ref());
+    let typed_envs = typed.as_ref().and_then(|s| s.environments.as_ref());
+
+    // `base.image` set <=> a non-empty string. `image: Option<String>`
+    // models the absent case and the empty string is `Some("")`, so the
+    // typed read is exact. Falls back to the raw map when deserialize fails.
+    let base_image_set = match typed_base {
+        Some(b) => b.image.as_deref().is_some_and(|s| !s.is_empty()),
+        None => base
+            .and_then(|b| b.get("image"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+    };
 
     if !base_image_set {
         match envs {
@@ -61,11 +114,15 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
             )),
             Some(envs_obj) => {
                 for (name, val) in envs_obj {
-                    let env_image_set = val
-                        .as_object()
-                        .and_then(|o| o.get("image"))
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| !s.is_empty());
+                    // Typed env image when the scope decoded; else the raw read.
+                    let env_image_set = match typed_envs.and_then(|m| m.get(name)) {
+                        Some(env_spec) => env_spec.image.as_deref().is_some_and(|s| !s.is_empty()),
+                        None => val
+                            .as_object()
+                            .and_then(|o| o.get("image"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.is_empty()),
+                    };
                     if !env_image_set {
                         errors.push(ValidationError::new(
                             format!("spec.environments.{name}.image"),
@@ -77,36 +134,45 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         }
     }
 
-    if let Some(envs_obj) = envs {
-        for name in envs_obj.keys() {
-            if !is_dns_1123_label(name) {
-                errors.push(ValidationError::new(
-                    format!("spec.environments.{name}"),
-                    format!(
-                        "environment name {name:?} must be a DNS-1123 label (lowercase alphanumeric + '-', 1..=63 chars, start and end alphanumeric)"
-                    ),
-                ));
-            }
+    // Environment NAMES are the keys of `environments`. On the happy path
+    // they are the keys of the typed `BTreeMap<String, ApplicationBaseSpec>`
+    // (a renamed `environments` field fails to compile); the raw keys are
+    // the fallback when deserialize fails.
+    let env_names: Vec<&str> = match typed_envs {
+        Some(m) => m.keys().map(String::as_str).collect(),
+        None => envs
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default(),
+    };
+    for name in env_names {
+        if !is_dns_1123_label(name) {
+            errors.push(ValidationError::new(
+                format!("spec.environments.{name}"),
+                format!(
+                    "environment name {name:?} must be a DNS-1123 label (lowercase alphanumeric + '-', 1..=63 chars, start and end alphanumeric)"
+                ),
+            ));
         }
     }
 
+    // env KEY shape + unknown needs KEY: the env keys come from the typed
+    // `env` map on the happy path (compiler-gated `env` field); the unknown
+    // needs key can only be seen on the raw map (`Needs` is a closed struct),
+    // so `validate_needs_keys` stays raw.
+    validate_env_keys_scope("spec.base.env", typed_base, base, &mut errors);
     if let Some(base_obj) = base {
-        if let Some(env) = base_obj.get("env").and_then(|v| v.as_object()) {
-            validate_env_keys("spec.base.env", env, &mut errors);
-        }
         if let Some(needs) = base_obj.get("needs").and_then(|v| v.as_object()) {
             validate_needs_keys("spec.base.needs", needs, &mut errors);
         }
     }
     if let Some(envs_obj) = envs {
         for (name, val) in envs_obj {
-            if let Some(env) = val
-                .as_object()
-                .and_then(|o| o.get("env"))
-                .and_then(|v| v.as_object())
-            {
-                validate_env_keys(&format!("spec.environments.{name}.env"), env, &mut errors);
-            }
+            validate_env_keys_scope(
+                &format!("spec.environments.{name}.env"),
+                typed_envs.and_then(|m| m.get(name)),
+                val.as_object(),
+                &mut errors,
+            );
             if let Some(needs) = val
                 .as_object()
                 .and_then(|o| o.get("needs"))
@@ -121,14 +187,52 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         }
     }
 
-    let app_environment = obj.get("environment").and_then(|v| v.as_str());
+    // `spec.environment` selector — typed `Option<String>` on the happy path.
+    let app_environment = match typed.as_ref() {
+        Some(s) => s.environment.as_deref(),
+        None => obj.get("environment").and_then(|v| v.as_str()),
+    };
 
-    validate_needs_names(base, envs, &mut errors);
-    validate_env_refs(base, envs, &mut errors);
-    validate_disk_claims(base, envs, &mut errors);
-    validate_spec_environment(app_environment, envs, &mut errors);
+    validate_needs_names(typed_base, typed_envs, base, envs, &mut errors);
+    validate_env_refs(typed_base, typed_envs, base, envs, &mut errors);
+    validate_disk_claims(typed_base, typed_envs, base, envs, &mut errors);
+    validate_spec_environment(app_environment, typed_envs, envs, &mut errors);
 
     errors
+}
+
+/// Validate env KEY shapes for one scope. On the happy path the keys come
+/// from the TYPED `env: Option<BTreeMap<String, EnvValue>>` (so a renamed
+/// `env` field fails to compile); when the scope did not decode it falls
+/// back to the raw map. The key character-set rule itself is on the key
+/// `String` either way — the typed struct constrains the VALUE, not the
+/// key's `^[A-Z_][A-Z0-9_]*$` shape.
+fn validate_env_keys_scope(
+    path: &str,
+    typed_scope: Option<&ApplicationBaseSpec>,
+    raw_scope: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    match typed_scope.and_then(|s| s.env.as_ref()) {
+        Some(env_map) => {
+            for key in env_map.keys() {
+                if !is_env_var_name(key) {
+                    errors.push(ValidationError::new(
+                        format!("{path}.{key}"),
+                        format!("env key {key:?} must match ^[A-Z_][A-Z0-9_]*$"),
+                    ));
+                }
+            }
+        }
+        None => {
+            if let Some(env) = raw_scope
+                .and_then(|o| o.get("env"))
+                .and_then(|v| v.as_object())
+            {
+                validate_env_keys(path, env, errors);
+            }
+        }
+    }
 }
 
 /// 2.6b (ADR 0043): a `needs.<type>` value is either a scalar entry
@@ -160,21 +264,73 @@ fn needs_entry_names(value: &Value) -> Vec<Option<&str>> {
 /// Multi-error: one error per offending `needs.<type>` field, no
 /// short-circuit (matching the validator contract).
 fn validate_needs_names(
+    typed_base: Option<&ApplicationBaseSpec>,
+    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let check_scope = |path: &str,
-                       obj: Option<&serde_json::Map<String, Value>>,
-                       errors: &mut Vec<ValidationError>| {
+    // Check one (type, OneOrMany<ServiceNeed>) slot's entry names. The
+    // `name` of each entry is read from the TYPED `ServiceNeed.name`
+    // (compiler-gated). `disk` is NOT a service slot here — its identity
+    // rules live in `validate_disk_claims` — so iterating the six service
+    // slots already excludes it.
+    fn check_typed_slot(
+        path: &str,
+        service_type: &str,
+        slot: &OneOrMany<ServiceNeed>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let entries = slot.as_slice_vec();
+        let mut seen: Vec<String> = Vec::new();
+        let mut unnamed = 0usize;
+        for need in &entries {
+            // An empty explicit name folds to the unnamed default (matches
+            // the raw `filter(|n| !n.is_empty())` in `needs_entry_names`).
+            match need.name.as_deref().filter(|n| !n.is_empty()) {
+                None => unnamed += 1,
+                Some(n) => {
+                    if !is_dns_1123_label(n) {
+                        errors.push(ValidationError::new(
+                            format!("{path}.{service_type}"),
+                            format!(
+                                "needs.{service_type} entry name {n:?} must be a DNS-1123 label (lowercase alphanumeric + '-', start and end alphanumeric) so it folds to a valid [A-Z_][A-Z0-9_]* env-var suffix"
+                            ),
+                        ));
+                    } else if seen.iter().any(|s| s == n) {
+                        errors.push(ValidationError::new(
+                            format!("{path}.{service_type}"),
+                            format!(
+                                "needs.{service_type} has a duplicate entry name {n:?}; names must be unique within a type"
+                            ),
+                        ));
+                    } else {
+                        seen.push(n.to_string());
+                    }
+                }
+            }
+        }
+        if unnamed > 1 {
+            errors.push(ValidationError::new(
+                format!("{path}.{service_type}"),
+                format!(
+                    "needs.{service_type} declares {unnamed} unnamed entries; at most one unnamed default per type is allowed (give the others a name)"
+                ),
+            ));
+        }
+    }
+
+    // Raw fallback for a scope that did not decode (test / misconfigured
+    // apiserver): iterate the raw needs map exactly as before, skipping disk.
+    fn check_scope_raw(
+        path: &str,
+        obj: Option<&serde_json::Map<String, Value>>,
+        errors: &mut Vec<ValidationError>,
+    ) {
         let Some(needs) = obj.and_then(|o| o.get("needs")).and_then(|v| v.as_object()) else {
             return;
         };
         for (service_type, value) in needs {
-            // `disk` is not a connection-secret/env-injected service — its
-            // `(name, mountPath)` identity + DNS-1123/uniqueness rules are
-            // validated by `validate_disk_claims` (which also derives a name
-            // from `mountPath`). Skip it here to avoid double-reporting.
             if service_type == "disk" {
                 continue;
             }
@@ -214,18 +370,52 @@ fn validate_needs_names(
                 ));
             }
         }
+    }
+
+    // Dispatch a scope: typed slots on the happy path, raw map as fallback.
+    let check_scope = |path: &str,
+                       typed_scope: Option<&ApplicationBaseSpec>,
+                       raw_scope: Option<&serde_json::Map<String, Value>>,
+                       errors: &mut Vec<ValidationError>| {
+        match typed_scope.and_then(|s| s.needs.as_ref()) {
+            Some(needs) => {
+                for (service_type, slot) in service_need_slots(needs) {
+                    if let Some(slot) = slot {
+                        check_typed_slot(path, service_type, slot, errors);
+                    }
+                }
+            }
+            None => check_scope_raw(path, raw_scope, errors),
+        }
     };
 
-    check_scope("spec.base.needs", base, errors);
+    check_scope("spec.base.needs", typed_base, base, errors);
     if let Some(envs_obj) = envs {
         for (env_name, val) in envs_obj {
+            let path = format!("spec.environments.{env_name}.needs");
             check_scope(
-                &format!("spec.environments.{env_name}.needs"),
+                &path,
+                typed_envs.and_then(|m| m.get(env_name)),
                 val.as_object(),
                 errors,
             );
         }
     }
+}
+
+/// The six connection-secret/env-injected service slots of a typed
+/// `Needs`, in the fixed declaration order (`disk` is intentionally
+/// excluded — its identity rules live in `validate_disk_claims`). A
+/// renamed slot field on `Needs` fails to compile here.
+fn service_need_slots(needs: &Needs) -> [(&'static str, &Option<OneOrMany<ServiceNeed>>); 6] {
+    [
+        ("pg", &needs.pg),
+        ("jetstream", &needs.jetstream),
+        ("clickhouse", &needs.clickhouse),
+        ("redis", &needs.redis),
+        ("s3", &needs.s3),
+        ("notifications", &needs.notifications),
+    ]
 }
 
 /// 2.6b (ADR 0043): the `needs.disk` value, scalar or array, as a list
@@ -337,42 +527,54 @@ fn scope_disk_value(scope: Option<&serde_json::Map<String, Value>>) -> Option<&V
 ///
 /// Multi-error: one message per offending field, no short-circuit
 /// (matching the validator contract).
+///
+/// One disk value-guard scope: (field-path prefix, typed view, raw map).
+type DiskValueScope<'a> = (
+    String,
+    Option<&'a ApplicationBaseSpec>,
+    Option<&'a serde_json::Map<String, Value>>,
+);
+
 fn validate_disk_claims(
+    typed_base: Option<&ApplicationBaseSpec>,
+    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let base_replicas = base
-        .and_then(|b| b.get("replicas"))
-        .and_then(|v| v.as_i64());
+    // A scope's typed view if it decoded, else `None` (raw fallback). Carries
+    // the raw map too so the cannot-model branches (mountPath/size presence)
+    // and the deserialize-failure fallback read it.
+    let base_replicas = scope_replicas(typed_base, base);
 
     // ---- replicas guard on the EFFECTIVE-merged view ----
-    // base's literal disk, inherited by any env that omits the disk key.
-    let base_disk = scope_disk_value(base);
-    let base_disk_nonempty = base_disk.is_some_and(|v| !disk_entries(v).is_empty());
+    // base's literal disk-key presence + non-emptiness, inherited by any env
+    // that omits the disk key. `Needs.disk: Option<…>` models the key being
+    // present (even as an empty array) on the typed path; the raw
+    // `scope_disk_value` is the fallback.
+    let base_disk_present = scope_disk_present(typed_base, base);
+    let base_disk_nonempty = base_disk_present && !scope_disk_entries(typed_base, base).is_empty();
 
     let mut replicas_scopes: Vec<(String, bool, Option<i64>)> =
         vec![("spec.base".to_string(), base_disk_nonempty, base_replicas)];
     if let Some(envs_obj) = envs {
-        for (env_name, val) in envs_obj {
-            let env_obj = val.as_object();
-            // Per-key needs merge: the env's disk wins when its `disk` key
-            // is present (even empty); else it inherits base's disk.
-            let effective_disk = match scope_disk_value(env_obj) {
-                Some(v) => v,
-                None => match base_disk {
-                    Some(v) => v,
-                    None => continue,
-                },
+        for env_name in envs_obj.keys() {
+            let typed_env = typed_envs.and_then(|m| m.get(env_name));
+            let raw_env = envs_obj.get(env_name).and_then(|v| v.as_object());
+            // Per-key needs merge: the env's disk wins when its `disk` key is
+            // present (even empty); else it inherits base's disk.
+            let (eff_typed, eff_raw, eff_present) = if scope_disk_present(typed_env, raw_env) {
+                (typed_env, raw_env, true)
+            } else if base_disk_present {
+                (typed_base, base, true)
+            } else {
+                (None, None, false)
             };
-            if disk_entries(effective_disk).is_empty() {
+            if !eff_present || scope_disk_entries(eff_typed, eff_raw).is_empty() {
                 continue;
             }
             // Env-override replaces base replicas; else inherit base.
-            let effective_replicas = env_obj
-                .and_then(|o| o.get("replicas"))
-                .and_then(|v| v.as_i64())
-                .or(base_replicas);
+            let effective_replicas = scope_replicas(typed_env, raw_env).or(base_replicas);
             replicas_scopes.push((
                 format!("spec.environments.{env_name}"),
                 true,
@@ -400,20 +602,21 @@ fn validate_disk_claims(
     // collect every seen mountPath, reporting on the second+ occurrence.
     let mut seen_mount_paths: Vec<String> = Vec::new();
 
-    // Each scope's own field-path prefix + the scope object.
-    let mut value_scopes: Vec<(String, Option<&serde_json::Map<String, Value>>)> =
-        vec![("spec.base".to_string(), base)];
+    // Each scope's own field-path prefix + (typed, raw) scope views.
+    let mut value_scopes: Vec<DiskValueScope<'_>> =
+        vec![("spec.base".to_string(), typed_base, base)];
     if let Some(envs_obj) = envs {
-        for (env_name, val) in envs_obj {
-            value_scopes.push((format!("spec.environments.{env_name}"), val.as_object()));
+        for env_name in envs_obj.keys() {
+            value_scopes.push((
+                format!("spec.environments.{env_name}"),
+                typed_envs.and_then(|m| m.get(env_name)),
+                envs_obj.get(env_name).and_then(|v| v.as_object()),
+            ));
         }
     }
 
-    for (prefix, scope) in value_scopes {
-        let Some(value) = scope_disk_value(scope) else {
-            continue;
-        };
-        let entries = disk_entries(value);
+    for (prefix, typed_scope, raw_scope) in value_scopes {
+        let entries = scope_disk_entries(typed_scope, raw_scope);
         if entries.is_empty() {
             continue;
         }
@@ -424,7 +627,7 @@ fn validate_disk_claims(
 
         for entry in &entries {
             // ---- name (explicit or mountPath-derived) ----
-            match disk_name(entry) {
+            match entry.derived_name() {
                 Some(name) => {
                     if !is_dns_1123_label(&name) {
                         errors.push(ValidationError::new(
@@ -454,7 +657,7 @@ fn validate_disk_claims(
             }
 
             // ---- mountPath: absolute + app-wide unique ----
-            match entry.get("mountPath").and_then(|v| v.as_str()) {
+            match entry.mount_path() {
                 Some(mp) if mp.starts_with('/') => {
                     if seen_mount_paths.iter().any(|p| p == mp) {
                         errors.push(ValidationError::new(
@@ -484,7 +687,7 @@ fn validate_disk_claims(
             }
 
             // ---- size: a Kubernetes quantity ----
-            match entry.get("size").and_then(|v| v.as_str()) {
+            match entry.size() {
                 Some(size) if is_k8s_quantity(size) => {}
                 Some(size) => {
                     errors.push(ValidationError::new(
@@ -503,7 +706,7 @@ fn validate_disk_claims(
             }
 
             // ---- class: local only at launch ----
-            if let Some(class) = entry.get("class").and_then(|v| v.as_str()) {
+            if let Some(class) = entry.class() {
                 if class != "local" {
                     errors.push(ValidationError::new(
                         &needs_disk_field,
@@ -514,6 +717,112 @@ fn validate_disk_claims(
                 }
             }
         }
+    }
+}
+
+/// A scope's `replicas` value as `i64`. Typed `Option<i32>` on the happy
+/// path (compiler-gated `replicas` field); the raw `as_i64()` is the
+/// deserialize-failure fallback.
+fn scope_replicas(
+    typed_scope: Option<&ApplicationBaseSpec>,
+    raw_scope: Option<&serde_json::Map<String, Value>>,
+) -> Option<i64> {
+    match typed_scope {
+        Some(s) => s.replicas.map(i64::from),
+        None => raw_scope
+            .and_then(|o| o.get("replicas"))
+            .and_then(|v| v.as_i64()),
+    }
+}
+
+/// Whether a scope LITERALLY declares the `needs.disk` key (even as an
+/// empty array). `Needs.disk: Option<OneOrMany<DiskClaim>>` models the key
+/// being present on the typed path; the raw `scope_disk_value` is the
+/// fallback. The per-key needs merge pivots on this presence.
+fn scope_disk_present(
+    typed_scope: Option<&ApplicationBaseSpec>,
+    raw_scope: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    match typed_scope {
+        Some(s) => s.needs.as_ref().is_some_and(|n| n.disk.is_some()),
+        None => scope_disk_value(raw_scope).is_some(),
+    }
+}
+
+/// A view over one disk entry that reads its fields from the TYPED
+/// `DiskClaim` when the scope decoded, falling back to the raw map
+/// otherwise. The renderer-load-bearing fields (`name` derivation,
+/// `mountPath`, `size`, `class`) are compiler-gated on the typed path; the
+/// raw variant preserves the pre-refactor `as_str()` semantics for a scope
+/// that failed to deserialize (test / misconfigured apiserver).
+enum DiskEntry<'a> {
+    Typed(&'a DiskClaim),
+    Raw(&'a serde_json::Map<String, Value>),
+}
+
+impl DiskEntry<'_> {
+    /// Explicit `name`, else the last non-empty `mountPath` segment.
+    fn derived_name(&self) -> Option<String> {
+        match self {
+            DiskEntry::Typed(d) => {
+                if let Some(n) = d.name.as_deref().filter(|n| !n.is_empty()) {
+                    return Some(n.to_string());
+                }
+                d.mount_path
+                    .rsplit('/')
+                    .find(|seg| !seg.is_empty())
+                    .map(|seg| seg.to_string())
+            }
+            DiskEntry::Raw(o) => disk_name(o),
+        }
+    }
+
+    fn mount_path(&self) -> Option<&str> {
+        match self {
+            // `mount_path` is non-`Option` on `DiskClaim`, so the typed path
+            // always has it (a missing one fails the deserialize → raw path).
+            DiskEntry::Typed(d) => Some(d.mount_path.as_str()),
+            DiskEntry::Raw(o) => o.get("mountPath").and_then(|v| v.as_str()),
+        }
+    }
+
+    fn size(&self) -> Option<&str> {
+        match self {
+            // `size` is non-`Option` on `DiskClaim` (same reasoning).
+            DiskEntry::Typed(d) => Some(d.size.as_str()),
+            DiskEntry::Raw(o) => o.get("size").and_then(|v| v.as_str()),
+        }
+    }
+
+    fn class(&self) -> Option<&str> {
+        match self {
+            DiskEntry::Typed(d) => d.class.as_deref(),
+            DiskEntry::Raw(o) => o.get("class").and_then(|v| v.as_str()),
+        }
+    }
+}
+
+/// The disk entries a scope declares, as [`DiskEntry`] views. Typed
+/// `OneOrMany<DiskClaim>` on the happy path (every entry is a
+/// `DiskEntry::Typed`, compiler-gating the field reads); the raw
+/// `disk_entries` is the deserialize-failure fallback.
+fn scope_disk_entries<'a>(
+    typed_scope: Option<&'a ApplicationBaseSpec>,
+    raw_scope: Option<&'a serde_json::Map<String, Value>>,
+) -> Vec<DiskEntry<'a>> {
+    match typed_scope {
+        Some(s) => match s.needs.as_ref().and_then(|n| n.disk.as_ref()) {
+            Some(OneOrMany::One(d)) => vec![DiskEntry::Typed(d)],
+            Some(OneOrMany::Many(v)) => v.iter().map(DiskEntry::Typed).collect(),
+            None => Vec::new(),
+        },
+        None => match scope_disk_value(raw_scope) {
+            Some(value) => disk_entries(value)
+                .into_iter()
+                .map(DiskEntry::Raw)
+                .collect(),
+            None => Vec::new(),
+        },
     }
 }
 
@@ -530,126 +839,179 @@ const CLAIM_SUPPORTED_TYPES: &[(&str, &[&str])] = &[("pg", PG_FIELDS), ("redis",
 const CLAIM_UNSUPPORTED_TYPES: &[&str] =
     &["disk", "jetstream", "clickhouse", "s3", "notifications"];
 
-/// 2.12 (ADR 0046): compute the effective `needs` map for a given scope.
-/// Base scope: just `base.needs`. Per-environment scope: base.needs
-/// merged per-key with environments[name].needs (override-wins per key),
-/// matching the renderer's `effective_spec` logic.
-///
-/// Returns a `serde_json::Map` of `type → value` representing the
-/// merged needs for the scope.  The returned map is constructed from
-/// references so no cloning of the large tree is needed — callers only
-/// read the type keys and their entry shapes.
-fn effective_needs_for_scope<'a>(
-    base: Option<&'a serde_json::Map<String, Value>>,
-    env_scope: Option<&'a serde_json::Map<String, Value>>,
-) -> std::collections::HashMap<&'a str, &'a Value> {
-    let mut merged: std::collections::HashMap<&str, &Value> = std::collections::HashMap::new();
-    // Start from base.
-    if let Some(base_needs) = base
-        .and_then(|b| b.get("needs"))
-        .and_then(|v| v.as_object())
-    {
-        for (k, v) in base_needs {
-            merged.insert(k.as_str(), v);
-        }
+/// 2.12 (ADR 0046): compute the effective TYPED `needs` for a given scope.
+/// Base scope: just `base.needs`. Per-environment scope: base.needs merged
+/// per-key with environments[name].needs (override-wins per key), matching
+/// the renderer's `effective_spec` logic. The merge selects whole slots
+/// (the env's slot wins when `Some`), so a renamed `Needs` field fails to
+/// compile.
+fn effective_needs_for_scope(base: Option<&Needs>, env_needs: Option<&Needs>) -> Needs {
+    // Per-key override: env's slot wins when present, else inherit base's.
+    fn pick<T: Clone>(env: &Option<T>, base: &Option<T>) -> Option<T> {
+        env.clone().or_else(|| base.clone())
     }
-    // Override per-key with the env scope's needs.
-    if let Some(env_needs) = env_scope
-        .and_then(|e| e.get("needs"))
-        .and_then(|v| v.as_object())
-    {
-        for (k, v) in env_needs {
-            merged.insert(k.as_str(), v);
-        }
+    let empty = Needs::default();
+    let b = base.unwrap_or(&empty);
+    let e = env_needs.unwrap_or(&empty);
+    Needs {
+        pg: pick(&e.pg, &b.pg),
+        jetstream: pick(&e.jetstream, &b.jetstream),
+        clickhouse: pick(&e.clickhouse, &b.clickhouse),
+        redis: pick(&e.redis, &b.redis),
+        s3: pick(&e.s3, &b.s3),
+        notifications: pick(&e.notifications, &b.notifications),
+        disk: pick(&e.disk, &b.disk),
     }
-    merged
 }
-
-/// A scope for env-ref validation: (field-path-prefix, env-value-map,
-/// env-scope-needs-obj). The third element is `None` for the base scope
-/// (no extra needs to merge in) and `Some(env_obj)` for a per-environment
-/// scope (its own `needs` override base's per-key).
-type EnvRefScope<'a> = (
-    String,
-    &'a serde_json::Map<String, Value>,
-    Option<&'a serde_json::Map<String, Value>>,
-);
 
 /// 2.12 (ADR 0046): validate env claim/secret refs across `base.env` and
 /// every `environments[*].env`. For each scope the effective needs are
 /// base.needs merged per-key with the scope's own needs (override-wins).
 /// Multi-error, one message per bad ref, no short-circuit.
+///
+/// Each env VALUE is matched against the typed `EnvValue`
+/// (`Literal` / `Ref(Claim)` / `Ref(Secret)`) instead of string-key
+/// probing the raw object — a renamed `EnvValue`/`EnvRef` variant fails to
+/// compile. When a scope did not decode, the raw map is the fallback.
 fn validate_env_refs(
+    typed_base: Option<&ApplicationBaseSpec>,
+    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Build the list of (field-path-prefix, env-map, effective-needs-scope-obj)
-    // for every scope we need to check.  For base the effective needs is just
-    // base.needs; for each environment it's base merged with env's own needs.
-    let mut scopes: Vec<EnvRefScope<'_>> = Vec::new();
+    let base_needs = typed_base.and_then(|b| b.needs.as_ref());
 
-    if let Some(base_obj) = base {
-        if let Some(env_map) = base_obj.get("env").and_then(|v| v.as_object()) {
-            scopes.push(("spec.base.env".to_string(), env_map, None));
-        }
-    }
-    if let Some(envs_obj) = envs {
-        for (env_name, val) in envs_obj {
-            if let Some(env_map) = val
-                .as_object()
-                .and_then(|o| o.get("env"))
-                .and_then(|v| v.as_object())
-            {
-                scopes.push((
-                    format!("spec.environments.{env_name}.env"),
-                    env_map,
-                    val.as_object(),
-                ));
-            }
-        }
-    }
-
-    for (prefix, env_map, env_scope) in scopes {
-        let eff_needs = effective_needs_for_scope(base, env_scope);
-
-        for (var_name, val) in env_map {
-            match val {
-                // A plain string → literal; no validation needed.
-                Value::String(_) => {}
-                // An object → must be exactly `{"claim": "..."}` or `{"secret": "..."}`
-                Value::Object(obj) => {
-                    if let Some(claim_path) = obj.get("claim").and_then(|v| v.as_str()) {
-                        validate_claim_ref(
+    // Check one scope's env map. On the happy path `typed_env` is the
+    // scope's decoded `env`; the raw map is the fallback. `env_needs` is the
+    // scope's OWN typed needs (merged with base by the caller).
+    let check_scope = |prefix: &str,
+                       typed_env: Option<&BTreeMap<String, EnvValue>>,
+                       raw_env: Option<&serde_json::Map<String, Value>>,
+                       scope_needs: Option<&Needs>,
+                       errors: &mut Vec<ValidationError>| {
+        let eff_needs = effective_needs_for_scope(base_needs, scope_needs);
+        match typed_env {
+            Some(env_map) => {
+                for (var_name, val) in env_map {
+                    match val {
+                        // A plain string → literal; no validation needed.
+                        EnvValue::Literal(_) => {}
+                        EnvValue::Ref(EnvRef::Claim(claim_path)) => validate_claim_ref(
                             &format!("{prefix}.{var_name}"),
-                            var_name,
                             claim_path,
                             &eff_needs,
                             errors,
-                        );
-                    } else if let Some(secret_path) = obj.get("secret").and_then(|v| v.as_str()) {
-                        validate_secret_ref(
+                        ),
+                        EnvValue::Ref(EnvRef::Secret(secret_path)) => validate_secret_ref(
                             &format!("{prefix}.{var_name}"),
-                            var_name,
                             secret_path,
                             errors,
-                        );
+                        ),
                     }
-                    // Other shapes are rejected by the CRD layer; nothing to add here.
                 }
-                _ => {}
+            }
+            None => {
+                // Deserialize-failure fallback: probe the raw map exactly as
+                // before (other shapes are rejected by the CRD layer).
+                if let Some(env_map) = raw_env
+                    .and_then(|o| o.get("env"))
+                    .and_then(|v| v.as_object())
+                {
+                    for (var_name, val) in env_map {
+                        match val {
+                            Value::String(_) => {}
+                            Value::Object(obj) => {
+                                if let Some(claim_path) = obj.get("claim").and_then(|v| v.as_str())
+                                {
+                                    validate_claim_ref(
+                                        &format!("{prefix}.{var_name}"),
+                                        claim_path,
+                                        &eff_needs,
+                                        errors,
+                                    );
+                                } else if let Some(secret_path) =
+                                    obj.get("secret").and_then(|v| v.as_str())
+                                {
+                                    validate_secret_ref(
+                                        &format!("{prefix}.{var_name}"),
+                                        secret_path,
+                                        errors,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Base scope (its own needs ARE base.needs → no extra merge).
+    let base_has_env = typed_base.and_then(|b| b.env.as_ref()).is_some()
+        || base
+            .and_then(|o| o.get("env"))
+            .and_then(|v| v.as_object())
+            .is_some();
+    if base_has_env {
+        check_scope(
+            "spec.base.env",
+            typed_base.and_then(|b| b.env.as_ref()),
+            base,
+            None,
+            errors,
+        );
+    }
+    if let Some(envs_obj) = envs {
+        for (env_name, val) in envs_obj {
+            let typed_env_scope = typed_envs.and_then(|m| m.get(env_name));
+            let scope_has_env = typed_env_scope.and_then(|e| e.env.as_ref()).is_some()
+                || val
+                    .as_object()
+                    .and_then(|o| o.get("env"))
+                    .and_then(|v| v.as_object())
+                    .is_some();
+            if scope_has_env {
+                check_scope(
+                    &format!("spec.environments.{env_name}.env"),
+                    typed_env_scope.and_then(|e| e.env.as_ref()),
+                    val.as_object(),
+                    typed_env_scope.and_then(|e| e.needs.as_ref()),
+                    errors,
+                );
             }
         }
     }
 }
 
+/// The `OneOrMany<ServiceNeed>` slot of a typed `Needs` for a runtime
+/// service-type name, or `None` when the type is absent / not a service
+/// type. `disk` is intentionally not matched — a `claim.disk.*` ref is
+/// rejected earlier by `CLAIM_UNSUPPORTED_TYPES`. A renamed `Needs` slot
+/// fails to compile here.
+fn needs_slot<'a>(needs: &'a Needs, service_type: &str) -> Option<&'a OneOrMany<ServiceNeed>> {
+    let slot = match service_type {
+        "pg" => &needs.pg,
+        "jetstream" => &needs.jetstream,
+        "clickhouse" => &needs.clickhouse,
+        "redis" => &needs.redis,
+        "s3" => &needs.s3,
+        "notifications" => &needs.notifications,
+        _ => return None,
+    };
+    slot.as_ref()
+}
+
 /// Validate a `claim` ref string (`"<type>.<field>"` or
-/// `"<type>.<name>.<field>"`). Reports one error for each violation.
+/// `"<type>.<name>.<field>"`). Reports one error for each violation. The
+/// "type declared in needs" + named-entry checks read the TYPED effective
+/// `Needs` (compiler-gated slot fields); only the type/field VOCABULARY
+/// (`CLAIM_*_TYPES`, ADR 0046) is a webhook-side constant, not a CRD field.
 fn validate_claim_ref(
     field_path: &str,
-    _var_name: &str,
     path: &str,
-    eff_needs: &std::collections::HashMap<&str, &Value>,
+    eff_needs: &Needs,
     errors: &mut Vec<ValidationError>,
 ) {
     let parts: Vec<&str> = path.splitn(4, '.').collect();
@@ -678,8 +1040,9 @@ fn validate_claim_ref(
         return;
     }
 
-    // Check if the type is in the effective needs for this scope.
-    if !eff_needs.contains_key(service_type) {
+    // Check if the type is declared in the effective needs for this scope
+    // (the typed slot is `Some`).
+    let Some(slot) = needs_slot(eff_needs, service_type) else {
         errors.push(ValidationError::new(
             field_path,
             format!(
@@ -687,7 +1050,7 @@ fn validate_claim_ref(
             ),
         ));
         return;
-    }
+    };
 
     // Check if the field is in the type's enum.
     let type_fields = CLAIM_SUPPORTED_TYPES
@@ -708,12 +1071,16 @@ fn validate_claim_ref(
         }
     }
 
-    // If a name segment is present, validate the named entry exists.
+    // If a name segment is present, validate the named entry exists. The
+    // entry names come from the TYPED slot's `ServiceNeed.name` fields.
     if let Some(name) = name_opt {
-        let need_value = eff_needs[service_type];
-        let entry_names = needs_entry_names(need_value);
-        let named_entries: Vec<&str> = entry_names.iter().filter_map(|n| *n).collect();
-        if !named_entries.contains(&name) {
+        let named_entries: Vec<String> = slot
+            .as_slice_vec()
+            .into_iter()
+            .filter_map(|n| n.name)
+            .filter(|n| !n.is_empty())
+            .collect();
+        if !named_entries.iter().any(|n| n == name) {
             // The need is declared but has no entry by this name.
             // Check if it's a scalar (no named entries) vs an array lacking the name.
             let has_any_named = !named_entries.is_empty();
@@ -739,12 +1106,7 @@ fn validate_claim_ref(
 
 /// Validate a `secret` ref string (`"<name>/<key>"`). Reports one error
 /// for each violation.
-fn validate_secret_ref(
-    field_path: &str,
-    _var_name: &str,
-    path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
+fn validate_secret_ref(field_path: &str, path: &str, errors: &mut Vec<ValidationError>) {
     let Some(slash_pos) = path.find('/') else {
         errors.push(ValidationError::new(
             field_path,
@@ -796,13 +1158,20 @@ fn is_secret_key(s: &str) -> bool {
 /// (ADR 0044). An empty string is treated as absent (codebase convention).
 fn validate_spec_environment(
     app_environment: Option<&str>,
+    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
     let Some(env) = app_environment.filter(|s| !s.is_empty()) else {
         return;
     };
-    let declared = envs.is_some_and(|m| m.contains_key(env));
+    // Declared <=> the env names a key of `environments`. Typed keys on the
+    // happy path (compiler-gated `environments` field); raw keys are the
+    // deserialize-failure fallback.
+    let declared = match typed_envs {
+        Some(m) => m.contains_key(env),
+        None => envs.is_some_and(|m| m.contains_key(env)),
+    };
     if !declared {
         errors.push(ValidationError::new(
             "spec.environment",
