@@ -22,10 +22,16 @@ struct Crd {
 }
 
 /// Phase 1 ships Application; the other six land in Phase 3 (ADR 0047).
-const CRDS: &[Crd] = &[Crd {
-    component: "Application",
-    file_stem: "crd-application",
-}];
+const CRDS: &[Crd] = &[
+    Crd {
+        component: "Application",
+        file_stem: "crd-application",
+    },
+    Crd {
+        component: "ServiceProvider",
+        file_stem: "crd-serviceprovider",
+    },
+];
 
 /// A rendered CRD: its CUE component name, the chart file path, the YAML
 /// text (assertion A compares this to the committed file), and the CRD

@@ -17,6 +17,10 @@ name = "admission-webhook"
 path = "src/main.rs"
 
 [dependencies]
+# Typed CRD specs (ADR 0047 Decision #4): validators deserialize the
+# admission object into the operator-core structs and read typed fields,
+# so the compiler gates a renamed field instead of a silent string-key miss.
+operator-core      = { path = "../operator-core" }
 axum               = { workspace = true }
 tokio              = { workspace = true }
 axum-server        = { workspace = true }

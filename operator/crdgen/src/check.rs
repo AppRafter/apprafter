@@ -150,13 +150,31 @@ fn field_kinds(schema: &Value) -> BTreeMap<String, String> {
 /// legitimately differs between the kube-rs (schemars) derivation and the
 /// CUE-derived CRD. Every entry MUST carry a non-empty reason
 /// (`allowlist_entries_carry_reasons` enforces it).
-const ALLOWLIST: &[(&str, &str, &str)] = &[(
-    "Application",
-    "status",
-    "operator-written status: the CUE-derived CRD marks it \
-     x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the \
-     concrete status fields. The status subtree constrains no user input.",
-)];
+const ALLOWLIST: &[(&str, &str, &str)] = &[
+    (
+        "Application",
+        "status",
+        "operator-written status: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the \
+         concrete status fields. The status subtree constrains no user input.",
+    ),
+    (
+        "ServiceProvider",
+        "status",
+        "operator-written status: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the \
+         concrete status.health field. The status subtree constrains no user input.",
+    ),
+    (
+        "ServiceProvider",
+        "spec.config",
+        "backend-defined opaque config: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque, restored via a schemaPatch since \
+         CUE's `config?: _` top type exports as a bare node), the kube-rs type declares \
+         it `Option<serde_json::Value>` which schemars renders as an untyped node. Both \
+         accept any object; neither constrains its shape.",
+    ),
+];
 
 /// The kube-rs (`CustomResourceExt::crd()`) CRD for a component, or `None`
 /// if it has no Rust type yet (the schema-only CRDs).
@@ -164,8 +182,9 @@ fn rust_crd(component: &str) -> Option<Value> {
     use kube::CustomResourceExt;
     let crd = match component {
         "Application" => operator_core::Application::crd(),
-        // Phase 3 adds ServiceProvider / ResourceClaim / RetainedClaim /
-        // MigrationPlan / SourceCredential / PlatformStack.
+        "ServiceProvider" => operator_core::ServiceProvider::crd(),
+        // Phase 3 adds ResourceClaim / RetainedClaim / MigrationPlan /
+        // SourceCredential / PlatformStack.
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -282,7 +301,14 @@ mod tests {
         assert!(allowed("Application", "status.phase"));
         assert!(!allowed("Application", "statustypo"));
         assert!(!allowed("Application", "spec.base.image"));
-        assert!(!allowed("ServiceProvider", "status"));
+        // ServiceProvider allowlists its operator-written status subtree and
+        // the backend-opaque spec.config node.
+        assert!(allowed("ServiceProvider", "status"));
+        assert!(allowed("ServiceProvider", "status.health"));
+        assert!(allowed("ServiceProvider", "spec.config"));
+        assert!(!allowed("ServiceProvider", "spec.backend"));
+        // A component absent from the allowlist matches nothing.
+        assert!(!allowed("ResourceClaim", "status"));
     }
 
     #[test]

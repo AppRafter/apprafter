@@ -16,6 +16,7 @@ dependencies = [
  "axum-server",
  "chrono",
  "http-body-util",
+ "operator-core",
  "rustls",
  "serde",
  "serde_json",

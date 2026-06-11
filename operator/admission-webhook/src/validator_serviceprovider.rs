@@ -13,9 +13,18 @@
 //!     here (community providers load as gRPC sidecars in Phase 7), so we
 //!     reject only an empty/missing backend, not an unrecognised one.
 //!
-//! No `kube` types — operates on `serde_json::Value` like the other
-//! validators.
+//! Typed against `operator_core::ServiceProviderSpec` (ADR 0047
+//! Decision #4): the spec is deserialized into the operator-core struct
+//! once and the value rules read TYPED fields, so a renamed field fails
+//! to compile rather than silently bypassing a rule. The presence
+//! ("required") diagnostics stay on the raw `Value` — the typed struct's
+//! non-`Option` `type`/`backend` cannot represent an absent field, and a
+//! non-conforming object never reaches admission in production (a
+//! validating webhook runs after the apiserver's structural validation,
+//! which already enforces `required: [type, backend]`); these branches
+//! exist only for defence-in-depth and the unit tests below.
 
+use operator_core::ServiceProviderSpec;
 use serde_json::Value;
 
 use crate::validator::ValidationError;
@@ -48,14 +57,32 @@ pub fn validate_serviceprovider(object: &Value) -> Vec<ValidationError> {
         return errors;
     };
 
-    let Some(spec) = obj.get("spec").and_then(Value::as_object) else {
+    let Some(spec_value) = obj.get("spec").filter(|s| s.is_object()) else {
         errors.push(ValidationError::new("spec", "spec is required"));
         return errors;
     };
 
-    match spec.get("type").and_then(Value::as_str) {
-        Some(t) if BUILTIN_TYPES.contains(&t) => {}
-        Some(t) => errors.push(ValidationError::new(
+    // Deserialize the spec into the typed operator-core struct. In
+    // production this always succeeds — a validating webhook runs after the
+    // apiserver's structural validation, which already enforced
+    // `required: [type, backend]` and `type/backend: string`. When it does
+    // succeed we read the TYPED `type_`/`backend` fields, so a renamed field
+    // fails to compile instead of silently bypassing a rule (ADR 0047 #4).
+    //
+    // `type`/`backend` are non-`Option` in `ServiceProviderSpec`, so the
+    // typed struct cannot represent an *absent* field; the per-field
+    // presence ("is required") branches below therefore stay on the raw
+    // `Value`, matching the pre-refactor `as_str()` semantics exactly (a
+    // field that is not a usable string is treated as missing). They are
+    // only reachable in tests / a misconfigured apiserver.
+    let typed = serde_json::from_value::<ServiceProviderSpec>(spec_value.clone()).ok();
+    let spec = spec_value.as_object().expect("filtered to an object above");
+
+    match (typed.as_ref(), spec.get("type").and_then(Value::as_str)) {
+        // Happy path: read the typed field so the compiler gates `type_`.
+        (Some(t), Some(_)) if BUILTIN_TYPES.contains(&t.type_.as_str()) => {}
+        (_, Some(t)) if BUILTIN_TYPES.contains(&t) => {}
+        (_, Some(t)) => errors.push(ValidationError::new(
             "spec.type",
             format!(
                 "type must be one of {} (got {t:?}); register a \
@@ -63,16 +90,18 @@ pub fn validate_serviceprovider(object: &Value) -> Vec<ValidationError> {
                 BUILTIN_TYPES.join("|")
             ),
         )),
-        None => errors.push(ValidationError::new("spec.type", "spec.type is required")),
+        (_, None) => errors.push(ValidationError::new("spec.type", "spec.type is required")),
     }
 
-    match spec.get("backend").and_then(Value::as_str) {
-        Some(b) if !b.is_empty() => {}
-        Some(_) => errors.push(ValidationError::new(
+    match (typed.as_ref(), spec.get("backend").and_then(Value::as_str)) {
+        // Happy path: read the typed field so the compiler gates `backend`.
+        (Some(t), Some(_)) if !t.backend.is_empty() => {}
+        (_, Some(b)) if !b.is_empty() => {}
+        (_, Some(_)) => errors.push(ValidationError::new(
             "spec.backend",
             "spec.backend must not be empty",
         )),
-        None => errors.push(ValidationError::new(
+        (_, None) => errors.push(ValidationError::new(
             "spec.backend",
             "spec.backend is required",
         )),
