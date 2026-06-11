@@ -16,10 +16,32 @@
 //!   - **Non-empty coverage.** `repoPrefixes` / `hosts` must each list
 //!     at least one non-empty entry.
 //!
-//! Operates on `serde_json::Value` like the other validators. Takes the
-//! full object (not just `spec`) so the destructive-change gate added
-//! in a later slice can read `metadata` without changing this signature.
+//! Takes the full object (not just `spec`) so the destructive-change gate
+//! added in a later slice can read `metadata` without changing this
+//! signature.
+//!
+//! Typed against `operator_core::SourceCredentialSpec` (ADR 0047
+//! Decision #4): the spec is deserialized into the operator-core struct
+//! once and the half/backend discriminators read TYPED fields, so a
+//! renamed field fails to compile instead of silently bypassing a rule.
+//! Several PRESENCE / non-string diagnostics stay on the raw `Value`
+//! because the typed struct cannot represent the input they reject:
+//!   - `backend` presence — `SourceGit.backend` / `SourceRegistry.backend`
+//!     are non-`Option`, so the struct cannot model an absent `backend`;
+//!   - `repoPrefixes` / `hosts` presence and per-entry non-string — they
+//!     are `Vec<String>`, so the struct cannot model a missing list nor a
+//!     non-string entry (a non-string entry would fail deserialization).
+//!
+//! Those branches are unreachable in production — a validating webhook
+//! runs after the apiserver's structural validation, which already
+//! enforced `required: [backend, repoPrefixes]` / `[backend, hosts]`,
+//! `items.type: string`, and the `minItems: 1` floor — and exist for the
+//! unit tests / defence-in-depth. When the spec fails to deserialize
+//! (test / misconfigured apiserver) the typed reads fall back to the raw
+//! `Value`, matching the pre-refactor `as_object()` / `as_str()`
+//! semantics exactly.
 
+use operator_core::{SourceBackend, SourceCredentialSpec, SourceGit, SourceRegistry};
 use serde_json::{Map, Value};
 
 use crate::validator::ValidationError;
@@ -42,6 +64,15 @@ pub fn validate_sourcecredential(object: &Value) -> Vec<ValidationError> {
         return errors;
     };
 
+    // Deserialize the spec into the typed operator-core struct. In production
+    // this always succeeds — a validating webhook runs after the apiserver's
+    // structural validation, which already enforced the CRD shape. When it
+    // succeeds the half presence + the backend discriminator read TYPED fields,
+    // so a renamed field fails to compile instead of silently bypassing a rule
+    // (ADR 0047 #4). When it fails (test / misconfigured apiserver) the typed
+    // reads fall back to the raw `Value`, matching the pre-refactor semantics.
+    let typed = serde_json::from_value::<SourceCredentialSpec>(Value::Object(spec.clone())).ok();
+
     let git = spec.get("git").and_then(Value::as_object);
     let registry = spec.get("registry").and_then(Value::as_object);
 
@@ -54,19 +85,61 @@ pub fn validate_sourcecredential(object: &Value) -> Vec<ValidationError> {
     }
 
     if let Some(git) = git {
-        validate_half(git, "spec.git", "repoPrefixes", &mut errors);
+        let typed_git = typed.as_ref().and_then(|t| t.git.as_ref());
+        validate_half(
+            git,
+            typed_git.map(GitHalf),
+            "spec.git",
+            "repoPrefixes",
+            &mut errors,
+        );
     }
     if let Some(registry) = registry {
-        validate_half(registry, "spec.registry", "hosts", &mut errors);
+        let typed_registry = typed.as_ref().and_then(|t| t.registry.as_ref());
+        validate_half(
+            registry,
+            typed_registry.map(RegistryHalf),
+            "spec.registry",
+            "hosts",
+            &mut errors,
+        );
     }
 
     errors
 }
 
+/// A typed view of one half that exposes its `backend` uniformly so
+/// `validate_half` reads it the same way for git and registry. Carrying
+/// the typed half (not just its backend) keeps the field reference
+/// (`SourceGit::backend` / `SourceRegistry::backend`) compiler-gated.
+enum TypedHalf<'a> {
+    Git(&'a SourceGit),
+    Registry(&'a SourceRegistry),
+}
+use TypedHalf::{Git as GitHalf, Registry as RegistryHalf};
+
+impl<'a> TypedHalf<'a> {
+    fn backend(&self) -> &'a SourceBackend {
+        match self {
+            TypedHalf::Git(g) => &g.backend,
+            TypedHalf::Registry(r) => &r.backend,
+        }
+    }
+}
+
 /// Validate one half (`git` or `registry`): a valid `backend` plus a
 /// non-empty coverage list (`repoPrefixes` or `hosts`).
+///
+/// `typed_half` is the deserialized half on the happy path (always, in
+/// production); the backend discriminator reads its TYPED `Option` fields.
+/// The `backend` / `list_field` PRESENCE diagnostics and the per-entry
+/// non-string check stay on the raw `Map`: `SourceGit.backend` /
+/// `SourceRegistry.backend` are non-`Option` and `repoPrefixes` / `hosts`
+/// are `Vec<String>`, so the typed struct cannot model an absent backend, a
+/// missing list, or a non-string entry (those are test-only branches).
 fn validate_half(
     half: &Map<String, Value>,
+    typed_half: Option<TypedHalf<'_>>,
     path: &str,
     list_field: &str,
     errors: &mut Vec<ValidationError>,
@@ -76,7 +149,12 @@ fn validate_half(
             format!("{path}.backend"),
             "backend is required",
         )),
-        Some(backend) => validate_backend(backend, &format!("{path}.backend"), errors),
+        Some(backend) => validate_backend(
+            backend,
+            typed_half.as_ref().map(TypedHalf::backend),
+            &format!("{path}.backend"),
+            errors,
+        ),
     }
 
     match half.get(list_field).and_then(Value::as_array) {
@@ -103,9 +181,30 @@ fn validate_half(
 
 /// Enforce exactly-one-of `sealedSecretRef` / `openBaoPath`, plus the
 /// non-empty inner field of whichever is set.
-fn validate_backend(backend: &Map<String, Value>, path: &str, errors: &mut Vec<ValidationError>) {
-    let has_sealed = backend.get("sealedSecretRef").is_some_and(|v| !v.is_null());
-    let has_openbao = backend.get("openBaoPath").is_some_and(|v| !v.is_null());
+///
+/// `typed_backend` is the deserialized backend on the happy path (always,
+/// in production): the `sealed_secret_ref` / `open_bao_path` presence
+/// discriminator and the inner `name` / path reads come from the TYPED
+/// `Option` fields, so a rename fails to compile. When the spec failed to
+/// deserialize (test / misconfigured apiserver) the reads fall back to the
+/// raw `Value` with the pre-refactor `is_null()` / `as_str()` semantics.
+fn validate_backend(
+    backend: &Map<String, Value>,
+    typed_backend: Option<&SourceBackend>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    // `sealedSecretRef: null` / `openBaoPath: null` count as absent on both
+    // paths: serde deserializes an explicit null to `None`, matching the raw
+    // `is_some_and(|v| !v.is_null())` guard.
+    let has_sealed = match typed_backend {
+        Some(b) => b.sealed_secret_ref.is_some(),
+        None => backend.get("sealedSecretRef").is_some_and(|v| !v.is_null()),
+    };
+    let has_openbao = match typed_backend {
+        Some(b) => b.open_bao_path.is_some(),
+        None => backend.get("openBaoPath").is_some_and(|v| !v.is_null()),
+    };
 
     match (has_sealed, has_openbao) {
         (false, false) => errors.push(ValidationError::new(
@@ -117,11 +216,16 @@ fn validate_backend(backend: &Map<String, Value>, path: &str, errors: &mut Vec<V
             "backend must set exactly one of sealedSecretRef or openBaoPath, not both",
         )),
         (true, false) => {
-            let name = backend
-                .get("sealedSecretRef")
-                .and_then(Value::as_object)
-                .and_then(|s| s.get("name"))
-                .and_then(Value::as_str)
+            let name = typed_backend
+                .and_then(|b| b.sealed_secret_ref.as_ref())
+                .map(|r| r.name.as_str())
+                .or_else(|| {
+                    backend
+                        .get("sealedSecretRef")
+                        .and_then(Value::as_object)
+                        .and_then(|s| s.get("name"))
+                        .and_then(Value::as_str)
+                })
                 .unwrap_or("");
             if name.trim().is_empty() {
                 errors.push(ValidationError::new(
@@ -131,9 +235,9 @@ fn validate_backend(backend: &Map<String, Value>, path: &str, errors: &mut Vec<V
             }
         }
         (false, true) => {
-            let p = backend
-                .get("openBaoPath")
-                .and_then(Value::as_str)
+            let p = typed_backend
+                .and_then(|b| b.open_bao_path.as_deref())
+                .or_else(|| backend.get("openBaoPath").and_then(Value::as_str))
                 .unwrap_or("");
             if p.trim().is_empty() {
                 errors.push(ValidationError::new(

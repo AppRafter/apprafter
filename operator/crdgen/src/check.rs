@@ -226,6 +226,33 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          object), the kube-rs type declares it `Option<serde_json::Value>` which schemars \
          renders as an untyped node. Both accept any object; neither constrains its shape.",
     ),
+    (
+        "SourceCredential",
+        "status",
+        "operator-written status: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the \
+         concrete status fields (conditions, coveredRepoPrefixes, coveredHosts, \
+         lastValidated). The status subtree constrains no user input.",
+    ),
+    (
+        "SourceCredential",
+        "spec.git.backend",
+        "backend discriminator union: `#SourceCredentialBackend` is a CUE `oneOf` \
+         (sealedSecretRef | openBaoPath) the apiserver cannot type structurally, so the \
+         CUE-derived CRD collapses it to x-kubernetes-preserve-unknown-fields (opaque); \
+         the kube-rs `SourceBackend` declares both fields optional on one struct (the \
+         apiserver rejects oneOf — same shape MigrationPlan's scope uses). The admission \
+         webhook enforces exactly-one + the inner non-empty rules. Both accept the \
+         apiserver-valid shapes; the union choice is webhook-validated, not CRD-validated.",
+    ),
+    (
+        "SourceCredential",
+        "spec.registry.backend",
+        "backend discriminator union: identical to spec.git.backend — `#SourceCredentialBackend` \
+         is a CUE `oneOf` collapsed to x-kubernetes-preserve-unknown-fields (opaque) in the \
+         CUE-derived CRD, while the kube-rs `SourceBackend` declares both fields optional on \
+         one struct. The admission webhook enforces exactly-one + the inner non-empty rules.",
+    ),
 ];
 
 /// The kube-rs (`CustomResourceExt::crd()`) CRD for a component, or `None`
@@ -238,7 +265,8 @@ fn rust_crd(component: &str) -> Option<Value> {
         "ResourceClaim" => operator_core::ResourceClaim::crd(),
         "RetainedClaim" => operator_core::RetainedClaim::crd(),
         "MigrationPlan" => operator_core::MigrationPlan::crd(),
-        // Phase 3 adds SourceCredential / PlatformStack.
+        "SourceCredential" => operator_core::SourceCredential::crd(),
+        // Phase 3 adds PlatformStack.
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -382,8 +410,26 @@ mod tests {
         assert!(allowed("MigrationPlan", "spec.previousSpecSnapshot"));
         assert!(!allowed("MigrationPlan", "spec.scope"));
         assert!(!allowed("MigrationPlan", "spec.trigger.field"));
+        // SourceCredential allowlists its operator-written status subtree and
+        // both backend-discriminator union nodes (CUE oneOf → opaque vs the
+        // kube-rs two-optional-field struct); the inner backend leaves match by
+        // prefix. Its other spec fields (the coverage lists) are not allowlisted.
+        assert!(allowed("SourceCredential", "status"));
+        assert!(allowed("SourceCredential", "status.conditions"));
+        assert!(allowed("SourceCredential", "spec.git.backend"));
+        assert!(allowed(
+            "SourceCredential",
+            "spec.git.backend.sealedSecretRef.name"
+        ));
+        assert!(allowed("SourceCredential", "spec.registry.backend"));
+        assert!(allowed(
+            "SourceCredential",
+            "spec.registry.backend.openBaoPath"
+        ));
+        assert!(!allowed("SourceCredential", "spec.git.repoPrefixes"));
+        assert!(!allowed("SourceCredential", "spec.registry.hosts"));
         // A component absent from the allowlist matches nothing.
-        assert!(!allowed("SourceCredential", "status"));
+        assert!(!allowed("PlatformStack", "status"));
     }
 
     #[test]

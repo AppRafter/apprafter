@@ -43,6 +43,10 @@ const CRDS: &[Crd] = &[
         component: "MigrationPlan",
         file_stem: "crd-migrationplan",
     },
+    Crd {
+        component: "SourceCredential",
+        file_stem: "crd-sourcecredential",
+    },
 ];
 
 /// A rendered CRD: its CUE component name, the chart file path, the YAML

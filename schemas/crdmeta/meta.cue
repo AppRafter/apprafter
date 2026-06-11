@@ -162,6 +162,45 @@ _crdMetas: MigrationPlan: {
 	}
 }
 
+_crdMetas: SourceCredential: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "sourcecredentials"
+		singular: "sourcecredential"
+		kind:     "SourceCredential"
+		listKind: "SourceCredentialList"
+		shortNames: ["srccred"]
+	}
+	annotations: _syncWave
+	subresources: status: {}
+	printerColumns: [
+		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
+	]
+
+	// CRD-only SPEC constraints CUE deliberately omits (CUE-validation
+	// philosophy — no half-measure stubs). Paths are relative to `spec`;
+	// `[]` for array items is NOT a navigable segment, so a constraint
+	// inside an array's items is restored by merging an `items:` object
+	// onto the array node.
+	//
+	// `repoPrefixes` / `hosts`: the hand-rolled CRD enforced
+	// `minItems: 1` (each half must list at least one coverage entry) and
+	// `items.pattern: "^.+$"` (each entry non-empty). CUE exports
+	// `[...string]` as `{type: array, items: {type: string}}` — no
+	// minItems, no item pattern. Restore both so the generated CRD keeps
+	// the same acceptance set; the webhook layers the same two rules
+	// (clearer per-entry messages). The `backend` discriminator
+	// (oneOf in CUE) collapses to x-kubernetes-preserve-unknown-fields,
+	// which drops the hand-rolled inner patterns + `required: [name]` to
+	// the webhook — same as MigrationPlan's scope discriminator; no patch.
+	schemaPatches: {
+		"git.repoPrefixes": {minItems: 1, items: {type: "string", pattern: "^.+$"}}
+		"registry.hosts": {minItems: 1, items: {type: "string", pattern: "^.+$"}}
+	}
+}
+
 _crdMetas: ResourceClaim: {
 	group:   "apprafter.io"
 	version: "v1alpha1"
