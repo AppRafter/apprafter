@@ -23,8 +23,8 @@ language).
 
 The platform commits to **CUE** for all manifests and schema
 definitions. A single CUE module under `schemas/` is the source of
-truth: it generates OpenAPI v3 CRD definitions and feeds the
-operator's renderer.
+truth: it generates OpenAPI v3 CRD definitions (realized by `crdgen`,
+ADR 0047) and feeds the operator's renderer.
 
 ## Consequences
 

@@ -1756,7 +1756,7 @@ apprafter/
 
 - `cue.mod/` is at the **repo root** (not under `schemas/`) so `schemas/` and `examples/` share import paths (`apprafter.io/schemas/v1alpha1`) — standard CUE monorepo practice.
 - `cli/` and `operator/` are **separate Cargo workspaces** (no top-level `Cargo.toml`); always `cd` into one before running `cargo`.
-- The OpenAPI v3 CRD shipped by `cli-providers::k8s::application_crd` and the kube-rs `Application` Rust type in `operator-core` are **hand-rolled mirrors** of `schemas/v1alpha1/Application` kept in sync by hand. There is no CUE→CRD/Rust generator yet.
+- The OpenAPI v3 CRDs in the operator chart (`operator/charts/apprafter-operator/templates/crd-*.yaml`) are **generated from the `schemas/v1alpha1` CUE schemas** by `crdgen` (ADR 0047). The kube-rs Rust types in `operator-core` and the typed admission-webhook validators stay hand-written, but `just crd-check` machine-gates them against the CUE (CUE↔CRD byte-identity + Rust↔CUE field set), so none can silently drift.
 - The `apprafter-agent` (managed-plan outbound connector, ADR 0031) ships from the `operator/` workspace — as a sibling binary or an `apprafter-operator` subcommand (distribution model still open) — and is not required for a self-host cluster to function.
 
 **CI publishes:**
