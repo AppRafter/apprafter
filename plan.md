@@ -3454,6 +3454,33 @@ Tests:
 
 ---
 
+### 2.16b — App-scope migration: auto-detect + Argo approval surface
+> 🏁 SR: A · order 3.7 (после слайса 1.83, перед T2 substrate; см. `speedrun-plan.md` §4.2) — «флип» детекта деструктивных операций приложения + безопасная in-Argo приёмка аппрува для app-scope MigrationPlan.
+
+**Контекст:** unified MigrationPlan (1.76-1.78) уже умеет application-scope, но **детект выключен**: `ApplicationMigrationStrategy::detect_destructive` безусловно возвращает `None` (`strategy.rs`), `create_plan_for` зовётся только из тестов (`application/src/lib.rs` — документировано как future Phase-2.x флип), потому что v1alpha1-схема (image/replicas/expose/env) на момент 1.77 не несла деструктивных операций. Теперь они **есть** (needs из 2.4, домены из 1.83, scale, image-path). Пауза УЖЕ видна юзеру: при блокирующем плане контроллер ставит Application CR в `phase: AwaitingMigrationApproval`, а health `apprafter.io_Application` (chart) рисует узел Degraded «awaiting MigrationPlan approval». Чего НЕТ: (а) авто-детекта+авто-создания app-плана, (б) кликабельного approve в дереве Argo-апа юзера (платформенный аналог — ADR 0048).
+
+**Таксономия деструктивных операций (что гейтить):**
+- **Hard (data-loss → класс `data-migration`):** удаление `needs.*` — триггерит ResourceClaim GC (2.4f) → потенциальная потеря данных (БД/диск). Гейт обязателен.
+- **Surface/availability (класс `requires-restart`/destructive):** удаление/смена домена (`expose.hostname`/allowedDomains из 1.83 — апп становится недоступен на старом домене, churn серта); **scale-to-zero** (replicas N→0 — намеренный даунтайм); **смена пути образа** (репозиторий, не тег — это потенциально другой апп/breaking).
+- **Soft / не гейтить:** **удаление env** — НЕ data-loss и НЕ даунтайм: rolling update само-защищается (новые поды без нужного env крашатся/не проходят readiness → старые поды продолжают обслуживать, rollout зависает, откатывается правкой; recoverable). → warn/caution, не hard-гейт; **ужесточить только если удаляется env с claim/secret-ссылкой** (нагруженнее литерала). **Смена тега образа** (тот же репо, плавающий типа `latest`) — НЕ деструктивно (резолв tag→digest + авто-роллаут, 2.4h). `needs` add, scale-from-zero, env add/смена-литерала — не гейтятся.
+
+**Цель:** включить app-scope детект деструктивных операций + авто-создание MigrationPlan + безопасную in-Argo приёмку аппрува на самом приложении.
+
+**Поставка:**
+- [ ] Классификатор `detect_destructive(old, new) -> Option<DestructiveChange>` по таксономии выше (per-op класс); юнит-таблица всех случаев (вкл. env-edge-кейсы и image tag-vs-path).
+- [ ] Врезка детекта в Application reconcile loop (сейчас не вызывается) + авто-создание app-плана через `create_plan_for` (не только из тестов).
+- [ ] **Безопасная Argo-обвязка (ОТЛИЧИЕ от ADR 0048):** app-план + ownerRef **в ОДНОМ namespace** — либо план в namespace приложения + ownerRef на Application CR (он managed-узел в дереве Argo-апа юзера), либо per-app anchor в namespace приложения. **НЕ** план в `apprafter-system` + cross-ns ownerRef на Application CR — k8s GC тихо удалит план (тот же foot-gun, что обошли для платформы одной-ns anchor'ом). Тогда existing approve/reject-action (`apprafter.io_MigrationPlan`) загорается на узле плана под приложением юзера.
+- [ ] Health-Lua узла плана (как `apprafter.io_MigrationPlan` для платформы — детали «from→to / op / awaiting approval»). Пауза на Application CR (AwaitingMigrationApproval health) — уже есть, интегрировать.
+- [ ] Live kind+Argo walk (per `feedback_phase_closure_validation`): деструктивная правка апа → план создан + видим на апе + approve в дереве кликается → flip → reconcile применяет; same-ns ownerRef не удаляется GC (assert «план жив через 60с»).
+
+**Acceptance:** правка апа с деструктивной операцией (напр. убрать `needs.pg`, удалить домен, scale-to-zero, сменить путь образа) → авто-создаётся app-scope MigrationPlan, апп паузится (AwaitingMigrationApproval), план виден+кликабелен на приложении в Argo, approve через UI/CLI снимает паузу; недеструктивные правки (смена тега, env-литерал, scale-from-zero) проходят без гейта.
+
+**Зависит от:** 1.76-1.78 (MigrationPlan + контроллер), 2.4 (needs/claim GC), 1.83 (domain-операции), 2.4h (image tag→digest), ADR 0048 (платформенный паттерн — переиспользовать, но ns-correct). **Связан с** [[project_argo_approval_surface]].
+
+**Размер:** M-L · детект (классификатор + врезка) — основная масса; Argo-обвязка ~как ADR 0048 минус cross-ns-нюанс. SR:A order 3.7.
+
+---
+
 ### 2.17 Закрытие чек-листа M2 spec
 
 - [ ] Обновить `spec.md` §6 M2.
