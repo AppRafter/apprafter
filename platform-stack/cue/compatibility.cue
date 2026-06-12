@@ -1728,6 +1728,24 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.28": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.26"
+	notes: """
+		Platform status/upgrade force-recheck. The operator now honors an
+		`apprafter.io/recheck-requested` annotation on `PlatformStack/default`
+		to force an immediate OCI upstream re-poll, bypassing the ~6h
+		`source.checkInterval` poll cadence. `apprafter platform status` and
+		`apprafter platform upgrade` stamp that annotation and wait briefly so
+		they show / act on a FRESH `availableVersion` instead of a possibly
+		hours-stale cached value; a `--cached` flag opts out of the round-trip.
+		Operator + admission-webhook images change v0.2.25 → v0.2.26 (new
+		operator image ⇒ operator pods restart on upgrade, hence
+		requires-restart); CLI bumps v0.2.12 → v0.2.13.
+		"""
+	references: ["docs/changelog/UNRELEASED.md"]
+}
+
 compatibility: "0.2.27": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.25"
