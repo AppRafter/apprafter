@@ -108,6 +108,29 @@ rules:
       - update
       - patch
       - delete
+  # ADR 0048 approval surface: the PlatformController GETs the
+  # chart-emitted `platform-migration-anchor` ConfigMap (in the
+  # operator namespace) to set a same-namespace ownerRef on the
+  # platform MigrationPlan it creates for a gated upgrade — that
+  # ownerRef is what pulls the plan onto the platform-stack root
+  # Application's Argo tree (clickable Approve). Read-only: the
+  # CHART owns the anchor, the operator only reads its UID.
+  # Walk-found v0.2.26 freeze: without this rule the GET 403s, and
+  # (before the best-effort fix in the same release) the 403
+  # aborted the whole reconcile BEFORE the status write — so
+  # `availableVersion` froze and the cluster stopped detecting
+  # upgrades entirely. The cluster could not even create its own
+  # gate, so GitOps self-healing was impossible (manual RBAC
+  # break-glass was required). Both the rule and the best-effort
+  # tolerance ship together.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
   # SourceCredential CRD + its derivations (1.79c / ADR 0039).
   # The controller watches SourceCredentials, reads the
   # controller-unsealed material Secret (in apprafter-system),

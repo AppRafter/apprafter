@@ -9,6 +9,42 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator + admission-webhook v0.2.26 + platform-stack 0.2.28 + cli v0.2.13 — platform force-recheck + gated-upgrade freeze fix (2026-06-12)
+
+### Added
+
+- **`apprafter platform status` / `upgrade` force a fresh upstream re-check.**
+  The operator now honours an `apprafter.io/recheck-requested` RFC3339
+  annotation on `PlatformStack/default` to force an immediate OCI re-poll,
+  bypassing the steady-state 60s throttle and the ~6h `source.checkInterval`
+  cadence. Both CLI commands stamp it and wait briefly so they report / act on
+  a FRESH `availableVersion` instead of a possibly hours-stale cached value; a
+  `--cached` flag opts out of the round-trip and renders last-known.
+
+### Fixed
+
+- **Gated platform upgrades no longer freeze the PlatformStack reconcile.**
+  The ADR 0048 approval surface (operator v0.2.25 / platform-stack 0.2.26)
+  GETs the chart's `platform-migration-anchor` ConfigMap to set the
+  MigrationPlan ownerRef, but (a) the operator ClusterRole lacked a
+  `configmaps` rule and (b) the GET was fatal to the reconcile. So on any
+  `requires-restart` upgrade the controller 403'd and aborted BEFORE the
+  status write — `availableVersion` froze and the cluster could not even
+  create the gate it needed approved (a GitOps deadlock). Fix: add the
+  `configmaps` get/list/watch ClusterRole rule, and make the anchor ownerRef
+  best-effort (`anchor_uid_from_get` collapses both `Ok(None)` and any `Err`
+  to `None` → an un-owned, still CLI-approvable plan; reconcile + status write
+  always proceed). Found on the live 0.2.26→0.2.27 upgrade walk.
+
+### Yanked
+
+- **platform-stack 0.2.26 and 0.2.27** — both ship the buggy operator v0.2.25
+  with the anchor-403 reconcile-freeze above (0.2.27's F1/F2 were chart-only
+  gateway fixes, no operator change). Channel-latest skips them to the fixed
+  0.2.28; a cluster already on 0.2.26 surfaces `YankedVersion=True` and needs
+  a one-off `configmaps` RBAC break-glass to create the gate that rolls it to
+  0.2.28.
+
 ## operator + admission-webhook + argocd-cue-cmp + platform-stack v0.2.24 + cli v0.2.11 — 2.12 Application.env value references (ADR 0046) — closes the M2 platform-services core (2026-06-10)
 
 ### Added

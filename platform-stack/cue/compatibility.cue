@@ -1739,11 +1739,23 @@ compatibility: "0.2.28": {
 		`apprafter platform upgrade` stamp that annotation and wait briefly so
 		they show / act on a FRESH `availableVersion` instead of a possibly
 		hours-stale cached value; a `--cached` flag opts out of the round-trip.
+
+		ALSO fixes the walk-found reconcile-FREEZE that yanks 0.2.26 and
+		0.2.27: operator v0.2.25 lacked `configmaps` RBAC and treated the
+		ADR 0048 anchor-ConfigMap GET as fatal, so on a gated upgrade the
+		PlatformController 403'd reading platform-migration-anchor and
+		aborted BEFORE the status write — availableVersion froze and the
+		cluster could not even create the gate it needed approved (GitOps
+		deadlock). 0.2.28 adds the `configmaps` get/list/watch ClusterRole
+		rule AND makes the anchor ownerRef best-effort (any GET error ⇒
+		un-owned, still CLI-approvable plan; the reconcile + status write
+		always proceed).
+
 		Operator + admission-webhook images change v0.2.25 → v0.2.26 (new
 		operator image ⇒ operator pods restart on upgrade, hence
 		requires-restart); CLI bumps v0.2.12 → v0.2.13.
 		"""
-	references: ["docs/changelog/UNRELEASED.md"]
+	references: ["docs/changelog/UNRELEASED.md", "docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
 }
 
 compatibility: "0.2.27": {
@@ -1770,6 +1782,8 @@ compatibility: "0.2.27": {
 		separately as a root-Application `ignoreDifferences` follow-up.)
 		"""
 	references: ["plan.md#1.83a", "docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
+	yanked:          true
+	yankedReason:    "Ships the same operator v0.2.25 as 0.2.26 (F1/F2 were chart-only gateway fixes, no operator change), so it carries the same anchor-403 reconcile-freeze: on a gated upgrade the PlatformController 403s reading the ADR 0048 platform-migration-anchor ConfigMap and aborts before the status write, freezing availableVersion. Fixed in 0.2.28 (operator v0.2.26)."
 }
 
 compatibility: "0.2.26": {
@@ -1791,6 +1805,8 @@ compatibility: "0.2.26": {
 		no CLI/re-bootstrap.
 		"""
 	references: ["docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
+	yanked:          true
+	yankedReason:    "operator v0.2.25 lacks `configmaps` RBAC AND treats the ADR 0048 anchor GET as fatal: on any gated (requires-restart) upgrade the PlatformController 403s reading platform-migration-anchor and aborts the reconcile BEFORE the status write — availableVersion freezes and the cluster can't even create the gate it needs to be approved (GitOps deadlock; manual configmaps-RBAC break-glass required). Fixed in 0.2.28 (operator v0.2.26: configmaps RBAC + best-effort anchor)."
 }
 
 compatibility: "0.2.25": {

@@ -577,28 +577,40 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
                     // ConfigMap so the new plan can carry a
                     // same-namespace ownerRef to it (Argo CD then
                     // surfaces the plan on the platform-stack
-                    // tree). 404/None-tolerant by design: an
-                    // older chart without the anchor yields an
-                    // un-owned (off-tree, still CLI-approvable)
-                    // plan rather than blocking the create.
+                    // tree). BEST-EFFORT by design: the anchor is an
+                    // OPTIONAL Argo-tree nicety, so its absence
+                    // (`Ok(None)` — older chart) OR an error reading
+                    // it (`Err` — e.g. a `configmaps` RBAC gap) must
+                    // yield an un-owned (off-tree, still
+                    // CLI-approvable) plan and NEVER abort the
+                    // reconcile. Walk-found v0.2.26 freeze: a 403 on
+                    // this GET used to propagate via `?` and kill the
+                    // reconcile BEFORE the status write, so
+                    // `availableVersion` froze and the cluster stopped
+                    // detecting upgrades — it could not even create
+                    // its own gate (GitOps deadlock). `anchor_uid_from_get`
+                    // swallows both None and Err to None.
                     let anchor_api: Api<ConfigMap> =
                         Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
-                    let anchor_uid = anchor_api
-                        .get_opt(PLATFORM_MIGRATION_ANCHOR)
-                        .await?
-                        .and_then(|c| c.metadata.uid);
-                    if anchor_uid.is_none() {
-                        warn!(
+                    let anchor_get = anchor_api.get_opt(PLATFORM_MIGRATION_ANCHOR).await;
+                    match &anchor_get {
+                        Ok(Some(_)) => debug!(
+                            anchor = PLATFORM_MIGRATION_ANCHOR,
+                            "anchoring MigrationPlan to ConfigMap ownerRef"
+                        ),
+                        Ok(None) => warn!(
                             anchor = PLATFORM_MIGRATION_ANCHOR,
                             namespace = MIGRATION_PLAN_NAMESPACE,
                             "anchor ConfigMap absent — creating MigrationPlan un-owned (off the Argo tree)"
-                        );
-                    } else {
-                        debug!(
+                        ),
+                        Err(e) => warn!(
                             anchor = PLATFORM_MIGRATION_ANCHOR,
-                            "anchoring MigrationPlan to ConfigMap ownerRef"
-                        );
+                            namespace = MIGRATION_PLAN_NAMESPACE,
+                            error = %e,
+                            "anchor ConfigMap lookup failed (e.g. configmaps RBAC) — creating MigrationPlan un-owned; detection/status NOT blocked"
+                        ),
                     }
+                    let anchor_uid = anchor_uid_from_get(anchor_get);
                     create_platform_migration_plan(
                         &plan_api,
                         &plan_name,
@@ -1037,6 +1049,18 @@ fn resolve_non_yanked_latest(candidates_desc: &[Version], doc: &CompatibilityDoc
         }
     }
     candidates_desc[0].to_string()
+}
+
+/// Best-effort extraction of the anchor ConfigMap's UID for the
+/// ADR 0048 MigrationPlan ownerRef. The anchor is an OPTIONAL
+/// Argo-tree nicety, so BOTH its absence (`Ok(None)` — older chart
+/// without the anchor) AND an error reading it (`Err` — e.g. the
+/// `configmaps` RBAC gap that caused the walk-found v0.2.26 reconcile
+/// freeze) collapse to `None`: the plan is created un-owned (off the
+/// Argo tree, still CLI-approvable) rather than propagating and
+/// aborting the reconcile before the `status.availableVersion` write.
+fn anchor_uid_from_get(get: Result<Option<ConfigMap>, kube::Error>) -> Option<String> {
+    get.ok().flatten().and_then(|cm| cm.metadata.uid)
 }
 
 /// ADR 0041 FAST PATH resolver. The compat doc fetched from the
@@ -1858,6 +1882,41 @@ mod tests {
         assert_eq!(parse_check_interval(""), DEFAULT_REQUEUE);
         assert_eq!(parse_check_interval("abc"), DEFAULT_REQUEUE);
         assert_eq!(parse_check_interval("10x"), DEFAULT_REQUEUE);
+    }
+
+    // --- ADR 0048 anchor ownerRef is best-effort (walk-found v0.2.26
+    // freeze: a `configmaps` RBAC 403 on the anchor GET used to abort
+    // the reconcile before the status write → availableVersion froze). ---
+    #[test]
+    fn anchor_uid_from_get_present_yields_uid() {
+        let mut cm = ConfigMap::default();
+        cm.metadata.uid = Some("uid-123".to_string());
+        assert_eq!(
+            anchor_uid_from_get(Ok(Some(cm))),
+            Some("uid-123".to_string())
+        );
+    }
+
+    #[test]
+    fn anchor_uid_from_get_absent_yields_none() {
+        // Ok(None) — older chart without the anchor: un-owned plan.
+        assert_eq!(anchor_uid_from_get(Ok(None)), None);
+        // Present but no uid set is also None (defensive).
+        assert_eq!(anchor_uid_from_get(Ok(Some(ConfigMap::default()))), None);
+    }
+
+    #[test]
+    fn anchor_uid_from_get_forbidden_does_not_propagate() {
+        // The exact failure that FROZE the reconcile pre-fix: a 403
+        // Forbidden on the anchor GET must collapse to None (un-owned
+        // plan), NOT propagate and abort before the status write.
+        let forbidden = kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "configmaps \"platform-migration-anchor\" is forbidden".to_string(),
+            reason: "Forbidden".to_string(),
+            code: 403,
+        });
+        assert_eq!(anchor_uid_from_get(Err(forbidden)), None);
     }
 
     #[test]
