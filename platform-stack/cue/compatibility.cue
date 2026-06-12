@@ -1728,6 +1728,32 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.32": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.29"
+	notes: """
+		T8 Run-2 walk-fix F2 (reframed + widened) — cilium config changes now
+		roll the WHOLE cilium stack. cilium reads its config FLAGS only at pod
+		start, so enabling gateway-api/host-network on a LIVE cluster needs the
+		AGENT (ds/cilium — serves the CiliumEnvoyConfig to Envoy over xDS), the
+		OPERATOR (Gateway→CEC), and the standalone ENVOY (ds/cilium-envoy —
+		binds host-netns 80/443) to ALL restart. The Run-2 live walk hit
+		exactly this: Gateway reached Programmed=True but Envoy never bound
+		80/443 because the agent ran on the stale config and never pushed the
+		CEC listener — only a manual rollout restart of all three unblocked it.
+		The prior fix (0.2.27 `operator.podAnnotations.cilium-config-rev`)
+		rolled ONLY the operator. Replaced by the STANDARD cilium Helm values
+		`rollOutCiliumPods` / `operator.rollOutPods` / `envoy.rollOutPods: true`
+		(a config checksum stamped on each pod template → auto-roll on
+		cilium-config change). Chart-only (component_cilium.cue; loader values
+		byte-identical, no operator/CLI change). Fresh installs unaffected —
+		this is upgrade-correctness. change=requires-restart because this
+		upgrade itself rolls the cilium DaemonSets. operatorVersion unchanged
+		(v0.2.29).
+		"""
+	references: ["plan.md#1.83a", "docs/changelog/UNRELEASED.md"]
+}
+
 compatibility: "0.2.31": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.29"

@@ -9,6 +9,25 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.32 — cilium config changes roll the whole stack (T8 Run-2 F2) (2026-06-13)
+
+### Fixed
+
+- **A cilium config change now restarts the whole cilium stack** (agent +
+  operator + envoy), not just the operator. cilium reads its config flags only
+  at pod start, so enabling gateway-api/host-network on a LIVE cluster needs
+  all three pods to restart — the agent (`ds/cilium`, serves the
+  CiliumEnvoyConfig to Envoy over xDS), the operator (Gateway→CEC), and the
+  standalone envoy (`ds/cilium-envoy`, binds host-netns 80/443). The T8 Run-2
+  live walk hit exactly this: the Gateway reached `Programmed=True` but Envoy
+  never bound 80/443 because the agent ran on the stale config and never pushed
+  the CEC listener; only a manual rollout-restart of all three unblocked it.
+  The prior 0.2.27 fix (`operator.podAnnotations.cilium-config-rev`) rolled
+  only the operator. Replaced by the standard cilium Helm values
+  `rollOutCiliumPods` / `operator.rollOutPods` / `envoy.rollOutPods: true`.
+  Chart-only (loader values byte-identical); fresh installs unaffected —
+  upgrade-correctness.
+
 ## operator + admission-webhook v0.2.29 + platform-stack 0.2.31 — MigrationPlan GC delete RBAC fix (2026-06-12)
 
 ### Fixed

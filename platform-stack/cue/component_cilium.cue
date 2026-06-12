@@ -72,17 +72,29 @@ _components: cilium: #Component & {
 			enabled: bool | *true
 			hostNetwork: enabled: bool | *true
 		}
-		operator: podAnnotations: {
-			// cilium-operator reads cilium-config only at start + does not
-			// roll on ConfigMap change (T8 walk-fix 2026-06-12, F2): without
-			// a pod-template change the gateway controller never picks up a
-			// newly-enabled gateway-api and fails SILENTLY. Bump this rev
-			// whenever the cilium gateway/host-network config changes so Argo
-			// rolls the operator to re-read cilium-config.
-			"apprafter.io/cilium-config-rev": "gw-hostnetwork-1"
-		}
+		// T8 walk-fix (Run 2, 2026-06-13 — F2 reframed + widened): cilium
+		// reads its config FLAGS only at pod START, so enabling
+		// gateway-api/host-network on a LIVE cluster requires ALL THREE
+		// cilium pods to restart — the AGENT (`ds/cilium`, serves the
+		// CiliumEnvoyConfig to Envoy over xDS), the OPERATOR (translates the
+		// Gateway → CEC), and the standalone ENVOY (`ds/cilium-envoy`, binds
+		// host-netns 80/443). The Run-2 walk hit exactly this: Gateway reached
+		// `Programmed=True` but Envoy never bound 80/443 because the agent ran
+		// on the stale (gateway-api-off) config and never pushed the CEC
+		// listener — only a manual `rollout restart` of operator + agent +
+		// envoy unblocked it. The standard cilium Helm values auto-roll each
+		// pod when the `cilium-config` ConfigMap changes (a config checksum is
+		// stamped on the pod template). This SUPERSEDES the earlier
+		// `operator.podAnnotations.cilium-config-rev` rev-bump (which rolled
+		// ONLY the operator). Fresh installs are unaffected (pods start with
+		// the final config) — purely upgrade-correctness. Docs: cilium "many
+		// configuration changes require an agent restart"; the Gateway API
+		// enable guide literally rolls cilium-operator + ds/cilium.
+		rollOutCiliumPods: true
+		operator: rollOutPods: true
 		envoy: {
-			enabled: true
+			enabled:     true
+			rollOutPods: true
 			securityContext: capabilities: {
 				keepCapNetBindService: true
 				// Cilium 1.16.5 chart default `envoy.securityContext.capabilities.envoy`
