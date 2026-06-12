@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: e2e-gateway-nightly
+
+# Standalone nightly kind+Cilium gate for the 1.83a host-network platform
+# Gateway (e2e/gateway-walk.sh; release 0.2.27 / commit 2bf0e25). It runs REAL
+# Cilium 1.16.5 + its gateway controller with the chart's host-network gateway
+# values, installs the EXPERIMENTAL Gateway API CRDs, applies the chart's
+# rendered Gateway + HTTPRoute, and asserts the Gateway reaches Programmed=True
+# (all 3 listeners — apex+wildcard 443, http 80 — Programmed).
+#
+# WHY THIS WALK EXISTS
+# --------------------
+# 1.83a shipped a BLOCKER (F1) that NO kind/sandbox test caught: the
+# `gateway-api-crds` component installed the Gateway API STANDARD channel, but
+# Cilium 1.16.5's gateway controller runs a required-resources check at startup
+# that needs `tlsroutes.gateway.networking.k8s.io` (v1alpha2) — present ONLY in
+# the EXPERIMENTAL channel. With the standard channel the controller never
+# starts, the Gateway never reaches Programmed, and no ingress works. kind (T6)
+# only did STRUCTURAL CRD validation; no real Cilium gateway controller ran.
+# The fix (0.2.27) switched the component to `config/crd/experimental`. This
+# nightly is the regression guard the team lacked — it would have caught F1 and
+# now validates the fix under real Cilium.
+#
+# UNLIKE the other e2e nightlies this one needs REAL Cilium (the feature is the
+# cilium gateway controller programming the Gateway). It therefore brings the
+# kind cluster up with the default CNI + kube-proxy DISABLED (kind_up_cilium)
+# and installs Cilium 1.16.5 directly with the chart's host-network gateway
+# values. Cilium converges under the runner's rootful Docker (unlimited
+# memlock); a rootless-podman dev host with a capped memlock ulimit cannot run
+# cilium-agent, so locally the walk runs under `sandbox-run` (rootful microVM) —
+# see e2e/gateway-walk.sh's header.
+#
+# Unlike the networkpolicy nightly this walk needs NO operator/CLI build: it
+# only renders the chart's Gateway (helm template + cue) and asserts the Cilium
+# datapath programs it. No Rust toolchain, no cargo.
+#
+# Security note: no secrets are consumed. Everything runs on a local kind
+# cluster; the only outbound traffic is public image / chart / CRD pulls.
+# `permissions: contents: read` is the minimum. No github.event.* input is
+# interpolated into any run: block.
+
+on:
+  schedule:
+    # 10:00 UTC -- staggered after e2e-networkpolicy-nightly.yml (09:00 UTC) so
+    # the two Cilium-booting nightlies don't contend for the runner pool.
+    - cron: '0 10 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-gateway-nightly:
+    name: kind+Cilium e2e (gateway nightly)
+    runs-on: ubuntu-latest
+    # Installs + boots Cilium 1.16.5 (kube-proxy replacement) + the gateway
+    # controller, then renders + applies the chart Gateway and waits for it to
+    # Program. Lighter than the networkpolicy nightly (no operator build, no
+    # CNPG), but Cilium bring-up still dominates.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install kind
+        run: |
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 -o ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Load iptables kernel modules for Cilium
+        # This walk REALLY uses Cilium (kube-proxy replacement), so these
+        # modules are load-bearing here.
+        run: |
+          sudo modprobe -a \
+            ip_tables iptable_mangle iptable_raw iptable_filter iptable_nat \
+            ip6_tables ip6table_mangle ip6table_raw ip6table_filter ip6table_nat \
+            nf_nat xt_socket || true
+          lsmod | grep -E 'ip6?table|nf_nat|xt_socket' || true
+
+      - name: Render the platform-stack chart (dist/ is gitignored)
+        # The walk renders the Gateway from dist/platform-stack-<currentVersion>;
+        # that directory is gitignored, so produce it from the committed CUE.
+        run: make -C platform-stack render-only
+
+      - name: Run the 1.83a host-network gateway kind+Cilium walk
+        # The walk forces APPRAFTER_E2E_RUNTIME=kind (Cilium-only). On the
+        # runner kind uses the docker provider (unlimited memlock), so Cilium
+        # starts without the sandbox-run microVM needed on a rootless-podman
+        # dev host.
+        run: bash e2e/gateway-walk.sh
+
+      - name: Run the NEGATIVE F1-guard check (standard channel must NOT Program)
+        # Proves the guard: with the STANDARD Gateway API channel (no tlsroutes)
+        # the cilium gateway controller never reconciles and the Gateway never
+        # reaches Programmed — the exact F1 symptom. A green positive run is
+        # only meaningful if this negative run also passes.
+        run: APPRAFTER_GW_WALK_NEGATIVE=1 bash e2e/gateway-walk.sh
