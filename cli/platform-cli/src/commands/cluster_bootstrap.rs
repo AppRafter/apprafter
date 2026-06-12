@@ -523,7 +523,9 @@ fn cilium_set_overrides() -> Vec<String> {
 /// app_projects.cue`) so Argo CD adopts them without an SSA conflict
 /// on the first umbrella sync. Keep in sync with `_appProjects`.
 pub(crate) fn render_app_projects() -> String {
-    // `default` allows any destination server (legacy/ad-hoc);
+    // `default` is unrestricted and allows any destination server;
+    // it hosts the root `platform` Application (created at bootstrap
+    // by `render_root_application`) plus ad-hoc Applications.
     // `platform` + `platform-providers` pin the in-cluster API.
     let project = |name: &str, description: &str, server: &str| {
         format!(
@@ -558,7 +560,7 @@ spec:
         "# SPDX-License-Identifier: FSL-1.1-Apache-2.0\n# Applied by `apprafter cluster-bootstrap`.\n{}{}{}",
         project(
             "default",
-            "Default project — Argo CD baseline, unrestricted (legacy + ad-hoc fallback).",
+            "Default project — unrestricted; hosts the root platform Application + ad-hoc Applications.",
             "'*'",
         ),
         project(
