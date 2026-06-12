@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
@@ -480,6 +480,29 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         let plan_name = synthesize_platform_plan_name(&current_target, &desired.target_revision);
         let plan_api: Api<MigrationPlan> =
             Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
+
+        // GC superseded platform plans. The plan name is keyed on
+        // (from → to); when the channel-latest target ADVANCES (e.g.
+        // a yank moved it 0.2.27 → 0.2.28) the controller mints a new
+        // plan under a new name and the prior pending-approval plan —
+        // keyed on the now-stale target — is orphaned under its own
+        // name (walk-found: `platform-…-to-0-2-27` lingered beside
+        // `…-to-0-2-28`). Drop those so the Argo tree shows exactly
+        // one active gate and a stale plan can't be approved into a
+        // yanked target. Best-effort: a list/delete failure is logged,
+        // never fatal — the worst case is extra nodes, not a wedge.
+        match plan_api.list(&ListParams::default()).await {
+            Ok(list) => {
+                for stale in superseded_platform_plan_names(&list.items, &plan_name) {
+                    info!(plan = %stale, keep = %plan_name, "GC superseded platform MigrationPlan");
+                    if let Err(e) = plan_api.delete(&stale, &DeleteParams::default()).await {
+                        warn!(plan = %stale, error = %e, "failed to GC superseded MigrationPlan (continuing)");
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to list MigrationPlans for GC (continuing)"),
+        }
+
         let existing_plan = match plan_api.get(&plan_name).await {
             Ok(p) => Some(p),
             Err(kube::Error::Api(api_err)) if api_err.code == 404 => None,
@@ -1075,6 +1098,36 @@ fn resolve_non_yanked_latest(candidates_desc: &[Version], doc: &CompatibilityDoc
 /// aborting the reconcile before the `status.availableVersion` write.
 fn anchor_uid_from_get(get: Result<Option<ConfigMap>, kube::Error>) -> Option<String> {
     get.ok().flatten().and_then(|cm| cm.metadata.uid)
+}
+
+/// Names of superseded platform MigrationPlans to garbage-collect.
+/// The plan name is keyed on `(from → to)`, so when the
+/// channel-latest target advances (e.g. a yank moved it 0.2.27 →
+/// 0.2.28) the controller mints a new plan and the prior one —
+/// keyed on the stale target — is orphaned under its own name
+/// (walk-found: 26-27 lingered beside 26-28). Collect every
+/// PLATFORM-scope plan that is still `pending-approval` and is NOT
+/// the current gate's `keep` name. Conservative: an
+/// approved/executing/completed/rejected plan is mid- or
+/// post-lifecycle (or a recorded operator decision) and is left
+/// untouched; application-scope plans are never collected here.
+fn superseded_platform_plan_names(plans: &[MigrationPlan], keep: &str) -> Vec<String> {
+    plans
+        .iter()
+        .filter(|p| p.spec.scope.type_ == "platform")
+        .filter_map(|p| {
+            let name = p.metadata.name.as_deref()?;
+            if name == keep {
+                return None;
+            }
+            let phase = p
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("pending-approval");
+            (phase == "pending-approval").then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// ADR 0041 FAST PATH resolver. The compat doc fetched from the
@@ -2000,6 +2053,50 @@ mod tests {
         assert!(pending_upgrade_annotations_differ(&matching, &None));
         // STEADY (no gate) — nothing stamped → nothing to do.
         assert!(!pending_upgrade_annotations_differ(&no_ann, &None));
+    }
+
+    // --- GC of superseded platform MigrationPlans (walk-found: a
+    // yank advanced the target 0.2.27 → 0.2.28, leaving 26-27 orphaned
+    // beside the new 26-28). ---
+    #[test]
+    fn superseded_platform_plan_names_collects_stale_pending_only() {
+        let mk = |name: &str, scope: &str, phase: Option<&str>| -> MigrationPlan {
+            let mut v = json!({
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "MigrationPlan",
+                "metadata": {"name": name, "namespace": "apprafter-system"},
+                "spec": {
+                    "scope": {"type": scope},
+                    "trigger": {"type": "platformUpgrade", "field": "spec.source.targetRevision"}
+                }
+            });
+            if let Some(ph) = phase {
+                v["status"] = json!({"phase": ph});
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let keep = "platform-0-2-26-to-0-2-28";
+        let plans = vec![
+            mk(keep, "platform", Some("pending-approval")), // current gate — keep
+            mk(
+                "platform-0-2-26-to-0-2-27",
+                "platform",
+                Some("pending-approval"),
+            ), // STALE → collect
+            mk("platform-0-2-20-to-0-2-24", "platform", Some("completed")), // post-lifecycle — keep
+            mk("platform-0-2-24-to-0-2-25", "platform", Some("executing")), // mid-rollout — keep
+            mk("some-app-plan", "application", Some("pending-approval")), // app-scope — never touch
+            mk("platform-no-status", "platform", None),     // no status ⇒ pending default → collect
+        ];
+        let mut got = superseded_platform_plan_names(&plans, keep);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "platform-0-2-26-to-0-2-27".to_string(),
+                "platform-no-status".to_string(),
+            ]
+        );
     }
 
     #[test]
