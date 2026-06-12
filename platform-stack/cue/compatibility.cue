@@ -1782,8 +1782,8 @@ compatibility: "0.2.27": {
 		separately as a root-Application `ignoreDifferences` follow-up.)
 		"""
 	references: ["plan.md#1.83a", "docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
-	yanked:          true
-	yankedReason:    "Ships the same operator v0.2.25 as 0.2.26 (F1/F2 were chart-only gateway fixes, no operator change), so it carries the same anchor-403 reconcile-freeze: on a gated upgrade the PlatformController 403s reading the ADR 0048 platform-migration-anchor ConfigMap and aborts before the status write, freezing availableVersion. Fixed in 0.2.28 (operator v0.2.26)."
+	yanked:       true
+	yankedReason: "Ships the same operator v0.2.25 as 0.2.26 (F1/F2 were chart-only gateway fixes, no operator change), so it carries the same anchor-403 reconcile-freeze: on a gated upgrade the PlatformController 403s reading the ADR 0048 platform-migration-anchor ConfigMap and aborts before the status write, freezing availableVersion. Fixed in 0.2.28 (operator v0.2.26)."
 }
 
 compatibility: "0.2.26": {
@@ -1805,8 +1805,8 @@ compatibility: "0.2.26": {
 		no CLI/re-bootstrap.
 		"""
 	references: ["docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
-	yanked:          true
-	yankedReason:    "operator v0.2.25 lacks `configmaps` RBAC AND treats the ADR 0048 anchor GET as fatal: on any gated (requires-restart) upgrade the PlatformController 403s reading platform-migration-anchor and aborts the reconcile BEFORE the status write — availableVersion freezes and the cluster can't even create the gate it needs to be approved (GitOps deadlock; manual configmaps-RBAC break-glass required). Fixed in 0.2.28 (operator v0.2.26: configmaps RBAC + best-effort anchor)."
+	yanked:       true
+	yankedReason: "operator v0.2.25 lacks `configmaps` RBAC AND treats the ADR 0048 anchor GET as fatal: on any gated (requires-restart) upgrade the PlatformController 403s reading platform-migration-anchor and aborts the reconcile BEFORE the status write — availableVersion freezes and the cluster can't even create the gate it needs to be approved (GitOps deadlock; manual configmaps-RBAC break-glass required). Fixed in 0.2.28 (operator v0.2.26: configmaps RBAC + best-effort anchor)."
 }
 
 compatibility: "0.2.25": {
