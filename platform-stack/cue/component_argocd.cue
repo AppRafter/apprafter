@@ -163,42 +163,47 @@ _components: argocd: #Component & {
 				return hs
 				"""
 
-			// 2.13/argo-upgrade-approval-surface (ADR 0048):
-			// custom health for Argo CD's own `Application` kind.
-			// The operator annotates the platform-stack root
-			// Application with `apprafter.io/upgrade-pending=true`
-			// (+ from/to/class/plan) when a platform upgrade is
-			// awaiting approval, surfacing a root-level "platform
-			// update pending approval" banner directly on the App
-			// tile in the Argo CD UI.
+			// ADR 0048 (revised — kind+Argo-validated, 2026-06-12):
+			// surface a pending platform upgrade on the ROOT platform
+			// App's own TILE. The prior approach — a custom health on
+			// `argoproj.io_Application` reading an annotation on the
+			// root App — was EMPIRICALLY DISPROVEN: Argo applies that
+			// customization only to Application resources appearing as
+			// CHILDREN in another app's tree, never to a top-level
+			// app's OWN tile (whose health is the worst-of aggregate of
+			// its managed `.status.resources`), so the root App stayed
+			// Healthy despite the annotation.
 			//
-			// CRITICAL: this OVERRIDES Argo CD's built-in health
-			// for EVERY Argo Application cluster-wide — the
-			// platform root App, all child Applications, AND every
-			// `apprafter app add` user app. The non-banner branch
-			// MUST forward Argo's own computed `obj.status.health`
-			// verbatim or it silently mis-reports every app. `->`
-			// is ASCII (not the unicode arrow) on purpose. This
-			// banner is the LOAD-BEARING root-level pending signal
-			// (the MigrationPlan health does not aggregate to the
-			// root App); the live walk validated the pass-through
-			// is safe on healthy/degraded/pending apps, so it ships.
-			"resource.customizations.health.argoproj.io_Application": """
+			// Validated fix: the operator stamps
+			// `apprafter.io/upgrade-pending=true` (+ from/to/class/plan)
+			// on the chart-MANAGED `platform-migration-anchor`
+			// ConfigMap — it IS in the root App's `.status.resources`,
+			// so its custom health aggregates into the root tile. This
+			// `ConfigMap` health returns Suspended for it → the root App
+			// tile rolls up to Suspended (purple "pause/attention", not
+			// red "broken") in the Applications LIST, nudging the
+			// operator to open + Approve. Confirmed live: the operator's
+			// SSA annotation survives Argo syncs and causes no OutOfSync
+			// (no ignoreDifferences needed); the SET→CLEAR cycle is clean.
+			//
+			// CRITICAL: this runs for EVERY ConfigMap cluster-wide.
+			// ConfigMaps carry no built-in health; the else-branch
+			// returns Healthy (a ConfigMap is inert data) — Healthy is
+			// the BEST status, so it never worsens any other app's
+			// aggregate. Only the operator-stamped anchor goes Suspended.
+			// The key is `ConfigMap` (core/empty group → NO leading
+			// underscore; `_ConfigMap` silently yields nil — verified on
+			// a live Argo). `->` is ASCII (not the unicode arrow).
+			"resource.customizations.health.ConfigMap": """
 				hs = {}
 				local a = nil
 				if obj.metadata ~= nil then a = obj.metadata.annotations end
 				if a ~= nil and a["apprafter.io/upgrade-pending"] == "true" then
 				  hs.status = "Suspended"
-				  hs.message = "platform update " .. (a["apprafter.io/upgrade-from"] or "?") .. "->" .. (a["apprafter.io/upgrade-to"] or "?") .. " pending approval (" .. (a["apprafter.io/upgrade-class"] or "?") .. ") - expand the tree and Approve the MigrationPlan, or run 'apprafter migration approve " .. (a["apprafter.io/upgrade-plan"] or "<plan>") .. "'"
+				  hs.message = "platform update " .. (a["apprafter.io/upgrade-from"] or "?") .. "->" .. (a["apprafter.io/upgrade-to"] or "?") .. " pending approval (" .. (a["apprafter.io/upgrade-class"] or "?") .. ") - open this app and Approve the MigrationPlan, or run 'apprafter migration approve " .. (a["apprafter.io/upgrade-plan"] or "<plan>") .. "'"
 				  return hs
 				end
-				if obj.status ~= nil and obj.status.health ~= nil and obj.status.health.status ~= nil and obj.status.health.status ~= "" then
-				  hs.status = obj.status.health.status
-				  hs.message = obj.status.health.message
-				  return hs
-				end
-				hs.status = "Progressing"
-				hs.message = "Initializing"
+				hs.status = "Healthy"
 				return hs
 				"""
 

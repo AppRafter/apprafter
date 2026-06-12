@@ -481,28 +481,6 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         let plan_api: Api<MigrationPlan> =
             Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
 
-        // GC superseded platform plans. The plan name is keyed on
-        // (from → to); when the channel-latest target ADVANCES (e.g.
-        // a yank moved it 0.2.27 → 0.2.28) the controller mints a new
-        // plan under a new name and the prior pending-approval plan —
-        // keyed on the now-stale target — is orphaned under its own
-        // name (walk-found: `platform-…-to-0-2-27` lingered beside
-        // `…-to-0-2-28`). Drop those so the Argo tree shows exactly
-        // one active gate and a stale plan can't be approved into a
-        // yanked target. Best-effort: a list/delete failure is logged,
-        // never fatal — the worst case is extra nodes, not a wedge.
-        match plan_api.list(&ListParams::default()).await {
-            Ok(list) => {
-                for stale in superseded_platform_plan_names(&list.items, &plan_name) {
-                    info!(plan = %stale, keep = %plan_name, "GC superseded platform MigrationPlan");
-                    if let Err(e) = plan_api.delete(&stale, &DeleteParams::default()).await {
-                        warn!(plan = %stale, error = %e, "failed to GC superseded MigrationPlan (continuing)");
-                    }
-                }
-            }
-            Err(e) => warn!(error = %e, "failed to list MigrationPlans for GC (continuing)"),
-        }
-
         let existing_plan = match plan_api.get(&plan_name).await {
             Ok(p) => Some(p),
             Err(kube::Error::Api(api_err)) if api_err.code == 404 => None,
@@ -690,6 +668,50 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
             synthesize_platform_plan_name(&current_target, &desired.target_revision)
         }),
     });
+
+    // GC platform MigrationPlans EVERY reconcile so the Argo tree shows
+    // at most ONE active gate. Keep only the current gate
+    // (`migration_pending`) + any mid-rollout plan (approved/executing);
+    // delete everything else — stale pending plans from a target that
+    // advanced (walk-found: a yank moved 0.2.27→0.2.28, orphaning 26-27
+    // beside 26-28) AND terminal completed/rejected/failed records that
+    // otherwise pile up one-per-upgrade (walk-found: 24-25 + 25-26 +
+    // 26-28 all lingered). Runs unconditionally — not only inside the
+    // gating branch — so the last completed plan is dropped once the
+    // upgrade settles. Best-effort: a failure is logged, never fatal.
+    {
+        let plan_api: Api<MigrationPlan> =
+            Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
+        let keep = migration_pending
+            .as_ref()
+            .and_then(|m| m.plan_name.as_deref())
+            .unwrap_or("");
+        match plan_api.list(&ListParams::default()).await {
+            Ok(list) => {
+                for stale in superseded_platform_plan_names(&list.items, keep) {
+                    info!(plan = %stale, keep = %keep, "GC platform MigrationPlan");
+                    if let Err(e) = plan_api.delete(&stale, &DeleteParams::default()).await {
+                        warn!(plan = %stale, error = %e, "failed to GC platform MigrationPlan (continuing)");
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to list MigrationPlans for GC (continuing)"),
+        }
+    }
+
+    // ADR 0048 (revised — kind+Argo-validated): mirror the pending
+    // surface onto the chart-managed `platform-migration-anchor`
+    // ConfigMap. The root App's OWN tile health is the worst-of
+    // aggregate of its managed `.status.resources`, and the anchor IS
+    // one of them — so a `ConfigMap` health customization that returns
+    // Suspended for the stamped anchor rolls the root App tile to
+    // Suspended (the argoproj.io_Application customization on the root
+    // App, by contrast, never affects the top-level app's own tile).
+    // SSA with our own field manager survives Argo syncs + causes no
+    // OutOfSync. Best-effort: the tile signal is a nicety, never fatal.
+    if let Err(e) = reconcile_anchor_health(&ctx, &pending_upgrade).await {
+        warn!(error = %e, "failed to reconcile anchor ConfigMap pending-upgrade annotation (continuing)");
+    }
 
     // Detect foreign writer BEFORE patching — so we know whether
     // we need force=true on the SSA patch. Walk-found bug
@@ -1100,17 +1122,20 @@ fn anchor_uid_from_get(get: Result<Option<ConfigMap>, kube::Error>) -> Option<St
     get.ok().flatten().and_then(|cm| cm.metadata.uid)
 }
 
-/// Names of superseded platform MigrationPlans to garbage-collect.
-/// The plan name is keyed on `(from → to)`, so when the
-/// channel-latest target advances (e.g. a yank moved it 0.2.27 →
-/// 0.2.28) the controller mints a new plan and the prior one —
-/// keyed on the stale target — is orphaned under its own name
-/// (walk-found: 26-27 lingered beside 26-28). Collect every
-/// PLATFORM-scope plan that is still `pending-approval` and is NOT
-/// the current gate's `keep` name. Conservative: an
-/// approved/executing/completed/rejected plan is mid- or
-/// post-lifecycle (or a recorded operator decision) and is left
-/// untouched; application-scope plans are never collected here.
+/// Names of platform MigrationPlans to garbage-collect, keeping at
+/// most ONE active gate. Collect every PLATFORM-scope plan that is
+/// NOT the current gate's `keep` name AND is NOT mid-rollout
+/// (`approved`/`executing`). That deletes both (a) stale
+/// `pending-approval` plans left when the channel-latest target
+/// advances — the name is keyed on `(from → to)`, so an advance mints
+/// a new name and orphans the old (walk-found: 26-27 lingered beside
+/// 26-28) — and (b) terminal `completed`/`rejected`/`failed` records
+/// that otherwise pile up one per upgrade (walk-found: 24-25, 25-26,
+/// 26-28 all lingered). A mid-rollout plan (approved → executing) is
+/// preserved so GC never interrupts an in-flight upgrade; app-scope
+/// plans are never collected here. With `keep == ""` (no pending gate
+/// — settled) every non-mid-rollout platform plan is collected, so the
+/// last completed plan is dropped once the upgrade settles.
 fn superseded_platform_plan_names(plans: &[MigrationPlan], keep: &str) -> Vec<String> {
     plans
         .iter()
@@ -1125,7 +1150,7 @@ fn superseded_platform_plan_names(plans: &[MigrationPlan], keep: &str) -> Vec<St
                 .as_ref()
                 .and_then(|s| s.phase.as_deref())
                 .unwrap_or("pending-approval");
-            (phase == "pending-approval").then(|| name.to_string())
+            (!matches!(phase, "approved" | "executing")).then(|| name.to_string())
         })
         .collect()
 }
@@ -1541,6 +1566,59 @@ fn build_application_patch(desired: &DesiredSource, pending: &Option<PendingUpgr
             }
         }
     })
+}
+
+/// Build the SSA patch for the `platform-migration-anchor` ConfigMap's
+/// pending-upgrade annotations (ADR 0048 revised). Mirrors
+/// `build_application_patch`'s metadata stanza but on the ConfigMap:
+/// the chart-managed anchor is one of the root App's managed
+/// `.status.resources`, so a `ConfigMap` health customization reading
+/// these annotations rolls the root App's TILE to Suspended
+/// (kind+Argo-validated — the root App's OWN annotations never do, as
+/// the `argoproj.io_Application` health customization never applies to
+/// a top-level app's own tile). Annotation-ONLY body (no `data`) so SSA
+/// owns just the annotations and never fights Argo over the ConfigMap's
+/// content. `pending == None` omits annotations → SSA prunes them → the
+/// tile returns to Healthy when the gate releases.
+fn build_anchor_health_patch(pending: &Option<PendingUpgrade>) -> Value {
+    let mut metadata = json!({ "name": PLATFORM_MIGRATION_ANCHOR });
+    if let Some(up) = pending {
+        metadata["annotations"] = json!({
+            "apprafter.io/upgrade-pending": "true",
+            "apprafter.io/upgrade-from": up.from,
+            "apprafter.io/upgrade-to": up.to,
+            "apprafter.io/upgrade-class": up.class,
+            "apprafter.io/upgrade-plan": up.plan,
+        });
+    }
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": metadata,
+    })
+}
+
+/// SSA-stamp (or prune) the pending-upgrade annotations on the
+/// chart-managed anchor ConfigMap so the root App's Argo TILE reflects
+/// the gate (see [`build_anchor_health_patch`]). A missing anchor
+/// (older chart / pre-first-sync) is a no-op — an SSA apply would
+/// otherwise CREATE a bare ConfigMap the chart must own. Same field
+/// manager as the root-App patch (a different object, so no
+/// field-ownership overlap); validated live to survive Argo syncs
+/// without OutOfSync.
+async fn reconcile_anchor_health(
+    ctx: &Context,
+    pending: &Option<PendingUpgrade>,
+) -> Result<(), Error> {
+    let api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), MIGRATION_PLAN_NAMESPACE);
+    if api.get_opt(PLATFORM_MIGRATION_ANCHOR).await?.is_none() {
+        return Ok(());
+    }
+    let payload = build_anchor_health_patch(pending);
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    api.patch(PLATFORM_MIGRATION_ANCHOR, &params, &Patch::Apply(&payload))
+        .await?;
+    Ok(())
 }
 
 async fn write_status(
@@ -2055,11 +2133,11 @@ mod tests {
         assert!(!pending_upgrade_annotations_differ(&no_ann, &None));
     }
 
-    // --- GC of superseded platform MigrationPlans (walk-found: a
-    // yank advanced the target 0.2.27 → 0.2.28, leaving 26-27 orphaned
-    // beside the new 26-28). ---
+    // --- GC: keep only the current gate + mid-rollout (approved/executing);
+    // collect stale-pending AND terminal completed/rejected/failed
+    // (walk-found: 24-25, 25-26, 26-28 all lingered beside the new gate). ---
     #[test]
-    fn superseded_platform_plan_names_collects_stale_pending_only() {
+    fn superseded_platform_plan_names_keeps_gate_and_in_flight_only() {
         let mk = |name: &str, scope: &str, phase: Option<&str>| -> MigrationPlan {
             let mut v = json!({
                 "apiVersion": "apprafter.io/v1alpha1",
@@ -2077,15 +2155,17 @@ mod tests {
         };
         let keep = "platform-0-2-26-to-0-2-28";
         let plans = vec![
-            mk(keep, "platform", Some("pending-approval")), // current gate — keep
+            mk(keep, "platform", Some("pending-approval")), // current gate — keep (name==keep)
             mk(
                 "platform-0-2-26-to-0-2-27",
                 "platform",
                 Some("pending-approval"),
-            ), // STALE → collect
-            mk("platform-0-2-20-to-0-2-24", "platform", Some("completed")), // post-lifecycle — keep
-            mk("platform-0-2-24-to-0-2-25", "platform", Some("executing")), // mid-rollout — keep
-            mk("some-app-plan", "application", Some("pending-approval")), // app-scope — never touch
+            ), // stale pending → collect
+            mk("platform-0-2-20-to-0-2-24", "platform", Some("completed")), // terminal → collect
+            mk("platform-0-2-22-to-0-2-23", "platform", Some("rejected")), // terminal → collect
+            mk("platform-0-2-24-to-0-2-25", "platform", Some("executing")), // mid-rollout → KEEP
+            mk("platform-0-2-25-to-0-2-26", "platform", Some("approved")), // mid-rollout → KEEP
+            mk("some-app-plan", "application", Some("pending-approval")), // app-scope → never touch
             mk("platform-no-status", "platform", None),     // no status ⇒ pending default → collect
         ];
         let mut got = superseded_platform_plan_names(&plans, keep);
@@ -2093,10 +2173,55 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "platform-0-2-20-to-0-2-24".to_string(),
+                "platform-0-2-22-to-0-2-23".to_string(),
                 "platform-0-2-26-to-0-2-27".to_string(),
                 "platform-no-status".to_string(),
             ]
         );
+
+        // SETTLED (keep == "") — no current gate → every non-mid-rollout
+        // platform plan is collected, incl. the just-completed one (so the
+        // last completed plan is dropped once the upgrade settles).
+        let mut settled = superseded_platform_plan_names(&plans, "");
+        settled.sort();
+        assert_eq!(
+            settled,
+            vec![
+                "platform-0-2-20-to-0-2-24".to_string(),
+                "platform-0-2-22-to-0-2-23".to_string(),
+                "platform-0-2-26-to-0-2-27".to_string(),
+                "platform-0-2-26-to-0-2-28".to_string(), // the gate too, now keep==""
+                "platform-no-status".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_anchor_health_patch_sets_and_prunes() {
+        // pending Some → annotation-only ConfigMap body carrying the surface.
+        let up = PendingUpgrade {
+            from: "0.2.28".to_string(),
+            to: "0.2.29".to_string(),
+            class: "RequiresRestart".to_string(),
+            plan: "platform-0-2-28-to-0-2-29".to_string(),
+        };
+        let set = build_anchor_health_patch(&Some(up));
+        assert_eq!(set["kind"], "ConfigMap");
+        assert_eq!(set["metadata"]["name"], PLATFORM_MIGRATION_ANCHOR);
+        assert_eq!(
+            set["metadata"]["annotations"]["apprafter.io/upgrade-pending"],
+            "true"
+        );
+        assert_eq!(
+            set["metadata"]["annotations"]["apprafter.io/upgrade-to"],
+            "0.2.29"
+        );
+        // No `data` — SSA owns only the annotations, never fights Argo.
+        assert!(set.get("data").is_none());
+        // pending None → annotations omitted → SSA prunes the surface.
+        let clear = build_anchor_health_patch(&None);
+        assert!(clear["metadata"].get("annotations").is_none());
     }
 
     #[test]
