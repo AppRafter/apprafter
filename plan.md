@@ -2638,61 +2638,33 @@ instead of carrying parallel definitions.
 
 ---
 
-### 1.83a Chart: gateway component + LB-IPAM/L2 + per-domain listeners + redirect
+### 1.83a Chart: gateway component (host-network) + gateway-api-crds + per-domain listeners + redirect
 > 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
 
-**Source:** инфра-долг (servicelb выключен с 1.3, L2/IPPool ресурсов в чарте до сих пор нет); precursor для 4.1 platform Gateway.
+> 🔁 **ПИВОТ при реализации (2026-06-11): host-network, НЕ LB-IPAM+L2.** Cilium L2-announcement — bare-metal-only (ARP на общем L2-сегменте, IPv6/NDP не поддерживает); на Hetzner Cloud публичный IP узла маршрутизируется SDN провайдера, не через ARP → LB-IPAM/L2 не назначат и не анонсируют адрес. Правильный механизм для single-node-cloud (у узла уже есть публичный IP) — Gateway API **host-network mode**: Envoy биндит host-netns порты 80/443 прямо на узле, `node-IP:443` → Gateway, БЕЗ LoadBalancer-Service / LB-IPAM / L2. Релиз **platform-stack 0.2.25** (chart-only, БЕЗ CLI — cilium loader-values байт-идентичны). Build отгружен на master; закрытие 1.83a — после T8 live-Hetzner-walk.
 
-**Цель:** платформенный Gateway получает публичный IP узла через Cilium LB-IPAM + L2 announce. Для каждой entry в `values.gateway.allowedDomains[]` Gateway получает пару HTTPS listener'ов (apex + wildcard) со static cert-ref на per-entry Secret. Один catch-all HTTP listener + одна platform-wide redirect HTTPRoute обслуживают HTTP→HTTPS 301 для всех зон. Conditional на непустой массив — иначе компонент disabled.
+**Source:** инфра-долг (servicelb выключен с 1.3); precursor для 4.1 platform Gateway.
 
-**Поставка:**
-- [ ] `platform-stack/cue/component_gateway.cue` — новый component, default-off на solo (включается когда `len(values.gateway.allowedDomains) > 0`), on на team.
-- [ ] Подтвердить `gatewayAPI.enabled: true` в `_loaderValues.cilium` + `component_cilium.cue` (CRD стоят с 1.4; флаг проверить и добавить если отсутствует — см. PART 0.6 чек 1).
-- [ ] `CiliumLoadBalancerIPPool` `apprafter-node-public` — single-IP pool по селектору `apprafter.io/platform-gateway: "true"`.
-- [ ] `CiliumL2AnnouncementPolicy` `apprafter-node-public` — externalIPs + loadBalancerIPs both true, тот же селектор.
-- [ ] `Gateway` `platform` в `apprafter-system`:
-    - Label `apprafter.io/platform-gateway: "true"` — **shim для ExternalSurface adoption по ownerRef в 4.1**.
-    - `gatewayClassName: cilium`.
-    - **HTTPS listeners (per-entry):** CUE-comprehension по `values.gateway.allowedDomains` × `[apex, wildcard]`:
-        ```cue
-        for entry in values.gateway.allowedDomains
-        for variant in [
-            {nameSuffix: "apex",     hostname: entry.domain},
-            {nameSuffix: "wildcard", hostname: "*." + entry.domain},
-        ] {
-            name:     "https-\(variant.nameSuffix)-\(entry.domain)"
-            port:     443
-            protocol: "HTTPS"
-            hostname: variant.hostname
-            tls: {
-                mode: "Terminate"
-                certificateRefs: [{
-                    name:      entry.importedCertRef
-                    namespace: "apprafter-system"
-                    kind:      "Secret"
-                }]
-            }
-            allowedRoutes: namespaces: from: "All"
-        }
-        ```
-      2N listener'ов для N зон. Gateway API hard-limit (>>) любого реалистичного N.
-    - **HTTP catch-all listener:** один listener name `http`, port 80, без hostname (matches any), `allowedRoutes.namespaces.from: All`. Не зависит от количества зон.
-- [ ] Platform `HTTPRoute` `platform-http-redirect` в `apprafter-system`:
-    - `parentRefs: [{name: platform, sectionName: "http"}]`.
-    - Catch-all (без hostnames, pathPrefix `/`).
-    - `filters: [{type: RequestRedirect, requestRedirect: {scheme: "https", statusCode: 301}}]` (original Host сохраняется автоматически).
-    - В 4.1b `#TlsOptions.redirect: bool` сделает per-app конфигурируемым; platform-wide remains as fallback.
-- [ ] Conditional rendering: пустой `allowedDomains` ⇒ component fully disabled (нет Gateway/IPPool/L2/redirect ресурсов; zero-impact на existing solo-кластера).
+**Цель:** платформенный Gateway на одном узле публично обслуживает домены (host-network: Envoy слушает 80/443 на публичном IP узла). Для каждой entry в `gateway.allowedDomains[]` — пара HTTPS-listener'ов (apex + wildcard) со static cert-ref на per-entry imported-cert Secret + один catch-all HTTP listener + platform-wide redirect HTTPRoute (HTTP→HTTPS 301). Пустой массив ⇒ ноль gateway-ресурсов (zero-impact на existing solo).
 
-**Acceptance:**
-- Apply кластера с `values.gateway.allowedDomains: [{domain: "apprafter.dev", certMode: "imported", importedCertRef: "cf-origin-cert-apprafter-dev", addedAt: "...", addedBy: "..."}]` ⇒ `kubectl get gateway platform -n apprafter-system` показывает `Programmed: True`, две `https-*-apprafter.dev` listener'а в `status.listeners` (apex + wildcard), один `http` listener.
-- Добавление второй entry (например `apprafter.io`) в массив ⇒ ещё два HTTPS listener'а появляются после reconcile, оба ссылаются на свой Secret.
-- `curl -I http://<любая-зона>/` отвечает `301` с `Location: https://<тот же host>/...`.
-- Пустой массив ⇒ нет gateway-ресурсов; existing solo-кластера не ломаются.
+**Поставка (отгружено в 0.2.25, host-network):**
+- [x] `gateway.allowedDomains` values-схема (`#AllowedDomainEntry` + `#GatewayValues` в `platform.cue`; default пусто). Поля entry: `domain`, `certMode:"imported"`, `importedCertRef`, `addedAt`, `addedBy`; + `nodePublicIP?`/`nodePublicIPv6?` (для DNS / 1.83f; в host-network чартом не используются).
+- [x] Cilium КОМПОНЕНТ (Argo-managed, НЕ loader) включает Gateway API **host-network mode**: `gatewayAPI.hostNetwork.enabled` + envoy `NET_BIND_SERVICE` caps (standalone-envoy, cilium 1.16.5). Loader-values **байт-идентичны** (no CLI change, no CLI bump) — паттерн `_loaderValues.cilium.values & {extras}` как у argocd-компонента. Прежние `l2announcements`/`externalIPs` — дропнуты.
+- [x] `gateway-api-crds` Argo-компонент (sync-wave **−25**, до cilium −20) — ставит upstream Gateway API **v1.2.1** CRD (git-source `kubernetes-sigs/gateway-api`, path `config/crd/standard`; прецедент network-policies). Доставка через Argo, НЕ через bootstrap (bootstrap минимален).
+- [x] `gateway.yaml` render-шаблон (umbrella-emitted в `render_tool.cue`, guarded `{{- if .Values.gateway.allowedDomains }}`): `Gateway` `platform` в `apprafter-system` (gatewayClassName cilium, label `apprafter.io/platform-gateway: "true"` — adoption-shim для 4.1; per-entry apex+wildcard HTTPS-listener'ы, имена dot-free через `replace "." "-"` + http catch-all) + `platform-http-redirect` HTTPRoute (301). **БЕЗ** LoadBalancer-Service / `CiliumLoadBalancerIPPool` / `CiliumL2AnnouncementPolicy` (дропнуты — host-network их не требует).
+- [x] Регресс-гард `scripts/check-gateway-render.sh` + врезка в CI (`platform-stack-check`): empty→ноль gateway-ресурсов; populated→1 Gateway + 4 https-listener'а (apex+wild ×2) + 1 http + 1 redirect-301, без IPPool/L2; dot-free имена.
+- [x] kind apiserver-валидация (структурная приёмка Gateway+HTTPRoute против v1.2.1 CRD; PROGRAMMED не валидируется — нет cilium-контроллера в kind) + релиз platform-stack **0.2.25** (`currentVersion`/compat `change: requires-restart`; operator/cli не бампались).
+- [ ] **T8 — live Hetzner host-network smoke (приёмка, gated, sandbox/kind не валидируют host-network port-binding):** Gateway `Programmed=True`, Envoy биндит ОБА порта 80/443, `curl -I http://<zone>` → 301. Острые углы доводятся там: cilium [#42786](https://github.com/cilium/cilium/issues/42786) (PROGRAMMED:False), [#39422](https://github.com/cilium/cilium/issues/39422) (80+443 одновременно). Домен/серт конфигурируются вручную (эргономика — 1.83e `target cert import` + 1.83f `target domain`, дальше по слайсу). **Команды — в ответе ассистента 2026-06-12.**
+
+**Acceptance (= T8):**
+- Создать `kubernetes.io/tls` Secret (SAN на apex+wildcard) + выставить `PlatformStack.spec.values.gateway.allowedDomains: [{domain, certMode:"imported", importedCertRef, addedAt, addedBy}]` ⇒ `kubectl get gateway platform -n apprafter-system` → `Programmed: True`, listener'ы `https-apex-<san>` + `https-wild-<san>` + `http`.
+- Вторая entry ⇒ ещё два HTTPS-listener'а после reconcile, каждый на свой Secret.
+- `curl -I http://<zone>/` → `301` `Location: https://<host>/`; `curl -Ik https://<zone>/` достаёт Gateway.
+- Пустой массив ⇒ нет gateway-ресурсов; existing solo-кластера не ломаются (cilium переконфигурируется на host-network через Argo на апдейте — `change: requires-restart`).
 
 **Зависит от:** 1.4 ✅, 1.71 ✅.
 
-**Размер:** M+
+**Размер:** M+ (build отгружен; остаётся T8 live-Hetzner-walk)
 
 ---
 
