@@ -1728,6 +1728,32 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.27": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.25"
+	notes: """
+		1.83a T8 live-Hetzner walk-fixes (2026-06-12) — the host-network
+		platform Gateway never reached `Programmed` on a real cluster; two
+		chart fixes (operator image unchanged, v0.2.25). **F1 (blocker):**
+		`gateway-api-crds` now installs the **experimental** Gateway API
+		channel (`config/crd/experimental`) instead of standard — Cilium
+		1.16.5's gateway controller fails its startup required-resources
+		check without `tlsroutes.gateway.networking.k8s.io` (v1alpha2), which
+		exists only in the experimental channel; without it the `cilium`
+		GatewayClass never Accepts and no Gateway is Programmed. Experimental
+		is a superset of standard. **F2 (operability):** cilium-operator now
+		carries an `operator.podAnnotations.apprafter.io/cilium-config-rev`
+		so Argo rolls it when the cilium gateway/host-network config changes
+		— the operator reads cilium-config only at start and otherwise keeps
+		a stale config (gateway controller silently never starts). On upgrade
+		both the Gateway API CRDs are replaced standard→experimental (additive
+		superset) and cilium-operator rolls once. (Cosmetic OutOfSync of the
+		Gateway/HTTPRoute — finalizer + API-defaulting drift — is tracked
+		separately as a root-Application `ignoreDifferences` follow-up.)
+		"""
+	references: ["plan.md#1.83a", "docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
+}
+
 compatibility: "0.2.26": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.25"
