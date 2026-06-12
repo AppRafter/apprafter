@@ -22,7 +22,10 @@
 #   3. The cilium Argo Application carries `gatewayAPI.hostNetwork.
 #      enabled: true` and NO `l2announcements` / `externalIPs`.
 #   4. The `gateway-api-crds` Argo Application renders at sync-wave -25
-#      with targetRevision v1.2.1.
+#      with targetRevision v1.2.1 and source.path `config/crd/experimental`
+#      (the EXPERIMENTAL channel, NOT `standard` — cilium 1.16.5's gateway
+#      controller fails its required-resources check without TLSRoute, which
+#      lives only in the experimental channel; T8 walk-fix 2026-06-12).
 #
 # Usage:
 #
@@ -190,11 +193,22 @@ grep -qE '^[[:space:]]*argocd\.argoproj\.io/sync-wave: "-25"$' <<<"$crds_block" 
   || fail "gateway-api-crds Application missing sync-wave -25"
 grep -qE '^[[:space:]]*targetRevision: "v1\.2\.1"$' <<<"$crds_block" \
   || fail "gateway-api-crds Application missing targetRevision v1.2.1"
-echo "PASS: gateway-api-crds Application renders at sync-wave -25 with targetRevision v1.2.1."
+# The EXPERIMENTAL channel is required: cilium 1.16.5's gateway controller
+# runs a required-resources check at startup that includes TLSRoute (v1alpha2),
+# which ships ONLY in the experimental channel. The standard channel makes the
+# controller fail (`error="...tlsroutes...not found"`) and no Gateway ever
+# reaches Programmed (T8 walk-fix 2026-06-12). Pin the experimental path so a
+# revert to `standard` can't silently re-break the platform Gateway.
+grep -qE '^[[:space:]]*path: "config/crd/experimental"$' <<<"$crds_block" \
+  || fail "gateway-api-crds Application source.path is not config/crd/experimental (cilium 1.16.5 needs the experimental channel for TLSRoute)"
+if grep -qE '^[[:space:]]*path: "config/crd/standard"$' <<<"$crds_block"; then
+  fail "gateway-api-crds Application uses config/crd/standard — must be config/crd/experimental (TLSRoute required by cilium 1.16.5)"
+fi
+echo "PASS: gateway-api-crds Application renders at sync-wave -25 with targetRevision v1.2.1 and source.path config/crd/experimental."
 
 echo
 echo "SUCCESS: gateway render assertions passed for platform-stack ${VERSION}:"
 echo "  - default render: no Gateway / platform-http-redirect / LB-IPAM / L2"
 echo "  - populated render: 1 platform Gateway, 5 dot-free listeners, 1 redirect (301), no LB-IPAM / L2"
 echo "  - cilium Application: gatewayAPI.hostNetwork.enabled, no l2announcements / externalIPs"
-echo "  - gateway-api-crds Application: sync-wave -25, targetRevision v1.2.1"
+echo "  - gateway-api-crds Application: sync-wave -25, targetRevision v1.2.1, path config/crd/experimental"
