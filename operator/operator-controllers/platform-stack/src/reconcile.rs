@@ -134,6 +134,19 @@ const DEFAULT_REQUEUE: Duration = Duration::from_secs(3600);
 /// woke us up".
 const MIN_OCI_POLL_INTERVAL_SECS: i64 = 60;
 
+/// Annotation the CLI stamps on the PlatformStack CR to request an
+/// immediate upstream re-poll, bypassing the 60s
+/// `MIN_OCI_POLL_INTERVAL_SECS` throttle. Holds an RFC3339
+/// timestamp; the operator force-polls when it is NEWER than
+/// `status.lastUpstreamCheck` (i.e. a recheck was requested since
+/// the last successful poll). Self-clearing: a successful poll
+/// advances `lastUpstreamCheck` past the request, so the next
+/// reconcile won't re-poll for the same request — no annotation
+/// removal needed. Backs `apprafter platform status`/`update` so
+/// `availableVersion` is never shown stale for up to
+/// `spec.source.checkInterval` (default 6h).
+const RECHECK_REQUESTED_ANNOTATION: &str = "apprafter.io/recheck-requested";
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("kube-rs error: {0}")]
@@ -270,10 +283,25 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         .status
         .as_ref()
         .and_then(|s| s.available_version.clone());
-    let should_poll_oci = match (prior_last_check, &prior_available) {
-        (Some(t), Some(_)) => (now - t).num_seconds() >= MIN_OCI_POLL_INTERVAL_SECS,
-        _ => true,
-    };
+    // CLI-triggered force-recheck: the `apprafter.io/recheck-requested`
+    // annotation carries an RFC3339 timestamp. When it parses and is
+    // newer than `lastUpstreamCheck`, `should_poll_oci` bypasses the
+    // 60s throttle so `apprafter platform status`/`update` never show
+    // a stale `availableVersion`. Self-clearing via the
+    // `lastUpstreamCheck` advance below — no annotation removal.
+    let recheck_requested = stack
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(RECHECK_REQUESTED_ANNOTATION))
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc));
+    let should_poll_oci = should_poll_oci(
+        prior_last_check,
+        prior_available.as_deref(),
+        recheck_requested,
+        now,
+    );
     // Resolve the channel-latest + pull compatibility.yaml in a
     // single throttled OCI poll cycle. The compat doc is needed
     // twice:
@@ -1046,6 +1074,48 @@ fn latest_non_yanked_in_compat(
         .max()
 }
 
+/// Decide whether to query the OCI upstream this cycle.
+///
+/// Steady state: a poll is throttled to once per
+/// `MIN_OCI_POLL_INTERVAL_SECS` (60s) — a watch-event burst must
+/// not loop the controller re-polling + re-stamping
+/// `lastUpstreamCheck`. The throttle applies only once we have a
+/// prior poll AND a cached `availableVersion`; the first reconcile
+/// (or any state with no cached version) always polls.
+///
+/// Override: a CLI-triggered force-recheck bypasses the throttle.
+/// The CLI stamps `apprafter.io/recheck-requested` with an RFC3339
+/// timestamp; when that is NEWER than the last poll
+/// (`recheck_requested > prior_last_check`, or `prior_last_check`
+/// is None) the request is unserviced, so we poll NOW regardless
+/// of the 60s window. This keeps `apprafter platform status`/
+/// `update` from showing a stale `availableVersion` for up to
+/// `spec.source.checkInterval` (default 6h). Self-clearing: the
+/// poll advances `lastUpstreamCheck` past the request timestamp,
+/// so the next reconcile sees the request as already serviced and
+/// re-throttles — no annotation removal required.
+fn should_poll_oci(
+    prior_last_check: Option<DateTime<Utc>>,
+    prior_available: Option<&str>,
+    recheck_requested: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    // Force-recheck: a recheck requested after (or with no) prior
+    // poll bypasses the throttle entirely.
+    let force_recheck = match recheck_requested {
+        Some(req) => prior_last_check.is_none_or(|last| req > last),
+        None => false,
+    };
+    if force_recheck {
+        return true;
+    }
+    // Steady-state throttle.
+    match (prior_last_check, prior_available) {
+        (Some(t), Some(_)) => (now - t).num_seconds() >= MIN_OCI_POLL_INTERVAL_SECS,
+        _ => true,
+    }
+}
+
 /// Decide how to DEGRADE when channel-latest resolution fails,
 /// keeping DETECTION failures from blocking ENFORCEMENT. Returns
 /// the `(channel_latest, did_poll_oci=false, compat_doc=None)`
@@ -1711,6 +1781,76 @@ mod tests {
         assert_eq!(parse_check_interval("6h"), Duration::from_secs(6 * 3600));
         assert_eq!(parse_check_interval("30m"), Duration::from_secs(30 * 60));
         assert_eq!(parse_check_interval("3600s"), Duration::from_secs(3600));
+    }
+
+    // --- should_poll_oci decision (CLI force-recheck) ---
+
+    #[test]
+    fn should_poll_oci_throttled_within_window_no_recheck() {
+        // Fresh poll 10s ago, cached version, no recheck request →
+        // throttled (false).
+        let now = Utc::now();
+        let last = now - chrono::Duration::seconds(10);
+        assert!(!should_poll_oci(Some(last), Some("0.2.20"), None, now));
+    }
+
+    #[test]
+    fn should_poll_oci_force_recheck_newer_than_last_check_bypasses_throttle() {
+        // Within the 60s window, but a recheck was requested AFTER
+        // the last poll → poll now (true), bypassing the throttle.
+        let now = Utc::now();
+        let last = now - chrono::Duration::seconds(10);
+        let recheck = now - chrono::Duration::seconds(5); // after `last`
+        assert!(should_poll_oci(
+            Some(last),
+            Some("0.2.20"),
+            Some(recheck),
+            now
+        ));
+    }
+
+    #[test]
+    fn should_poll_oci_force_recheck_older_than_last_check_is_serviced() {
+        // Within the 60s window and the recheck request predates the
+        // last poll (already serviced — self-cleared) → throttled
+        // (false).
+        let now = Utc::now();
+        let last = now - chrono::Duration::seconds(10);
+        let recheck = now - chrono::Duration::seconds(30); // before `last`
+        assert!(!should_poll_oci(
+            Some(last),
+            Some("0.2.20"),
+            Some(recheck),
+            now
+        ));
+    }
+
+    #[test]
+    fn should_poll_oci_no_prior_check_always_polls() {
+        // First reconcile: no prior poll → always poll, regardless
+        // of recheck presence.
+        let now = Utc::now();
+        assert!(should_poll_oci(None, None, None, now));
+        // A recheck with no prior poll is also unserviced → poll.
+        assert!(should_poll_oci(None, None, Some(now), now));
+    }
+
+    #[test]
+    fn should_poll_oci_elapsed_beyond_window_polls() {
+        // >60s since last poll → poll (existing throttle expiry),
+        // no recheck needed.
+        let now = Utc::now();
+        let last = now - chrono::Duration::seconds(120);
+        assert!(should_poll_oci(Some(last), Some("0.2.20"), None, now));
+    }
+
+    #[test]
+    fn should_poll_oci_no_cached_version_polls_even_within_window() {
+        // Throttle only applies once a version is cached; a prior
+        // check with no cached availableVersion still polls.
+        let now = Utc::now();
+        let last = now - chrono::Duration::seconds(10);
+        assert!(should_poll_oci(Some(last), None, None, now));
     }
 
     #[test]
