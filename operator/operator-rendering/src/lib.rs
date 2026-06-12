@@ -401,7 +401,22 @@ fn render_deployment(
             replicas: Some(replicas),
             strategy,
             selector: LabelSelector {
-                match_labels: Some(labels.clone()),
+                // STABLE MINIMAL selector. `spec.selector` is IMMUTABLE, so
+                // it must be a fixed subset that never grows with the
+                // pod/metadata label-set — walk-found: 2.9 widened
+                // `make_labels` (added apprafter.io/application +
+                // .../environment) and, because the selector reused the FULL
+                // set, every Deployment created under the prior set 422'd on
+                // every reconcile ("spec.selector: field is immutable") and
+                // could never be updated again. `apprafter.io/application`
+                // equals the Deployment name, so it is unique within the
+                // namespace (two Deployments can't share a name) — a single
+                // label is sufficient AND stable. The pod template + metadata
+                // keep the full label-set below.
+                match_labels: Some(BTreeMap::from([(
+                    "apprafter.io/application".to_string(),
+                    name.to_string(),
+                )])),
                 ..Default::default()
             },
             template: PodTemplateSpec {
@@ -735,6 +750,74 @@ mod tests {
             Some("apprafter-operator")
         );
         assert_eq!(labels.get("apprafter").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn deployment_selector_is_minimal_and_env_stable() {
+        // Regression (walk-found): `spec.selector` must be the STABLE
+        // minimal `{apprafter.io/application: <name>}` — NOT the full
+        // label-set — or a later label-set widening (as 2.9 did) wedges
+        // every existing Deployment on the immutable-selector apiserver
+        // rule. The env key in particular must NOT be a selector key.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("x".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "u",
+        );
+        let r = render_application(&app);
+        let sel = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .selector
+            .match_labels
+            .clone()
+            .unwrap();
+        assert_eq!(
+            sel,
+            BTreeMap::from([("apprafter.io/application".to_string(), "web".to_string())])
+        );
+
+        // Env-scoped render: the selector is IDENTICAL (env is not a
+        // selector key — the stability invariant), even though the pod
+        // labels below DO carry apprafter.io/environment.
+        let mut envapp = Application::new("web", ApplicationSpec::default());
+        envapp.metadata.namespace = Some("web-dev".into());
+        envapp.spec.base = Some(ApplicationBaseSpec {
+            image: Some("x".into()),
+            ..Default::default()
+        });
+        let renv = render_application_for_env(
+            &envapp,
+            Some("dev"),
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+        );
+        let sel_env = renv
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .selector
+            .match_labels
+            .clone()
+            .unwrap();
+        assert_eq!(
+            sel_env,
+            BTreeMap::from([("apprafter.io/application".to_string(), "web".to_string())])
+        );
     }
 
     #[test]

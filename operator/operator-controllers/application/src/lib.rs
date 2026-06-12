@@ -15,7 +15,7 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{LocalObjectReference, Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
@@ -542,9 +542,48 @@ async fn apply_deployment(
         .as_deref()
         .unwrap_or_default()
         .to_string();
+
+    // One-time selector migration. `spec.selector` is IMMUTABLE, so a
+    // Deployment created under an older selector label-set can never be
+    // SSA-updated to a new one — the apiserver 422s ("field is immutable")
+    // every reconcile and the workload is wedged (no image roll, no spec
+    // change). Walk-found: 2.9 widened the selector label-set and stranded
+    // every pre-2.9 Deployment. When the live selector differs from the
+    // rendered (now stable+minimal) one, delete the Deployment (cascade) so
+    // the `.owns(Deployment)` watch re-fires and the next reconcile recreates
+    // it cleanly. One-time, brief downtime, only for mismatched Deployments.
+    if let Some(existing) = api.get_opt(&name).await? {
+        if selector_needs_migration(&existing, deployment) {
+            warn!(
+                deployment = %name,
+                namespace = %namespace,
+                "Deployment selector changed (immutable field) — deleting to recreate with the stable minimal selector (one-time migration)"
+            );
+            api.delete(&name, &DeleteParams::default()).await?;
+            // Skip the apply this cycle: recreating while the old object is
+            // terminating races the name. The delete fires the
+            // `.owns(Deployment)` watch → the next reconcile recreates it.
+            return Ok(());
+        }
+    }
+
     let payload = into_apply_payload("apps/v1", "Deployment", deployment)?;
     api.patch(&name, pp, &Patch::Apply(&payload)).await?;
     Ok(())
+}
+
+/// True when an existing Deployment's IMMUTABLE `spec.selector.matchLabels`
+/// differs from the rendered one — so it must be delete+recreated (the
+/// selector cannot change in place). Walk-found: 2.9 widened the selector
+/// label-set, wedging every Deployment created before it.
+fn selector_needs_migration(existing: &Deployment, desired: &Deployment) -> bool {
+    let match_labels = |d: &Deployment| {
+        d.spec
+            .as_ref()
+            .and_then(|s| s.selector.match_labels.clone())
+            .unwrap_or_default()
+    };
+    match_labels(existing) != match_labels(desired)
 }
 
 async fn apply_service(
@@ -1617,6 +1656,36 @@ fn ready_condition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Walk-found: 2.9 widened the Deployment selector label-set, and
+    // because spec.selector is immutable every Deployment created under the
+    // prior set 422'd forever. The fix delete+recreates only when the live
+    // selector differs from the rendered (stable minimal) one.
+    #[test]
+    fn selector_needs_migration_detects_widened_selector() {
+        let mk = |labels: serde_json::Value| -> Deployment {
+            serde_json::from_value(json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "web"},
+                "spec": {
+                    "selector": {"matchLabels": labels},
+                    "template": {"spec": {"containers": []}}
+                }
+            }))
+            .unwrap()
+        };
+        // Pre-2.9 (no apprafter.io/application) vs rendered minimal → migrate.
+        let existing = mk(json!({
+            "app.kubernetes.io/name": "web",
+            "app.kubernetes.io/managed-by": "apprafter-operator",
+            "apprafter": "true"
+        }));
+        let desired = mk(json!({"apprafter.io/application": "web"}));
+        assert!(selector_needs_migration(&existing, &desired));
+        // Post-migration (already minimal) == rendered → steady, no delete.
+        assert!(!selector_needs_migration(&desired, &desired));
+    }
     use operator_core::{
         ApplicationBaseSpec, ApplicationSpec, MigrationApplicationRef, MigrationApplicationScope,
         MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus, MigrationTrigger,
