@@ -9,6 +9,30 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator + admission-webhook v0.2.27 + platform-stack 0.2.29 — MigrationPlan GC + stable Deployment selector (2026-06-12)
+
+### Fixed
+
+- **Superseded platform MigrationPlans are garbage-collected.** The plan name
+  is keyed on `(from → to)`, so when the channel-latest target advanced (e.g.
+  publishing 0.2.28 yanked 0.2.27, moving the gate 0.2.26→0.2.27 to
+  0.2.26→0.2.28), the controller minted a new plan but left the prior
+  `pending-approval` plan orphaned under its old name — two plans in the tree,
+  the stale one approvable into a yanked target. The reconcile now lists
+  platform plans and deletes any `pending-approval` plan that is not the
+  current gate (`superseded_platform_plan_names`; approved/executing/completed/
+  rejected and app-scope plans untouched).
+- **The rendered Deployment selector is now stable + minimal.** It reused the
+  FULL `make_labels` set as its IMMUTABLE `spec.selector`, so 2.9 widening the
+  label-set (`apprafter.io/application` + `.../environment`) wedged every
+  Deployment created under the prior set — `spec.selector: field is immutable`
+  (422) on every reconcile, so no image roll and no spec change ever applied.
+  The selector is now `{apprafter.io/application: <name>}` (equals the
+  Deployment name → unique per namespace, never grows with the label-set); the
+  Application controller delete+recreates any Deployment whose live selector
+  differs (`selector_needs_migration`). **Upgrade impact: every existing
+  Deployment is recreated once on this upgrade (brief per-app downtime).**
+
 ## operator + admission-webhook v0.2.26 + platform-stack 0.2.28 + cli v0.2.13 — platform force-recheck + gated-upgrade freeze fix (2026-06-12)
 
 ### Added

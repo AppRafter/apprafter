@@ -1728,6 +1728,34 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.29": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.27"
+	notes: """
+		Two walk-found operator fixes. (1) GC of superseded platform
+		MigrationPlans: the plan name is keyed on (from→to), so when the
+		channel-latest target advances (a yank moved it 0.2.27→0.2.28) the
+		prior pending-approval plan is orphaned beside the new one — the
+		controller now lists platform plans and deletes any pending-approval
+		plan that is not the current gate. (2) Stable minimal Deployment
+		selector: the rendered Deployment reused the FULL label-set as its
+		IMMUTABLE `spec.selector`, so 2.9 widening the label-set (added
+		`apprafter.io/application` + `.../environment`) wedged every
+		Deployment created under the prior set (422 "field is immutable"
+		every reconcile — no image roll, no spec change). The selector is now
+		the stable minimal `{apprafter.io/application: <name>}` (unique per
+		namespace, never grows); the Application controller delete+recreates
+		any Deployment whose live selector differs.
+
+		**Upgrade impact:** the selector normalization recreates EVERY
+		existing Deployment ONCE on this upgrade (delete + owns-watch
+		recreate) — a brief per-app downtime. Operator + admission-webhook
+		images move v0.2.26 → v0.2.27 (operator pods restart), hence
+		requires-restart. Chart-delivered, no CLI / re-bootstrap.
+		"""
+	references: ["docs/changelog/UNRELEASED.md"]
+}
+
 compatibility: "0.2.28": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.26"
