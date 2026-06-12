@@ -155,6 +155,43 @@ _components: argocd: #Component & {
 				return hs
 				"""
 
+			// 2.13/argo-upgrade-approval-surface (ADR 0048):
+			// custom health for Argo CD's own `Application` kind.
+			// The operator annotates the platform-stack root
+			// Application with `apprafter.io/upgrade-pending=true`
+			// (+ from/to/class/plan) when a platform upgrade is
+			// awaiting approval, surfacing a root-level "platform
+			// update pending approval" banner directly on the App
+			// tile in the Argo CD UI.
+			//
+			// CRITICAL: this OVERRIDES Argo CD's built-in health
+			// for EVERY Argo Application cluster-wide — the
+			// platform root App, all child Applications, AND every
+			// `apprafter app add` user app. The non-banner branch
+			// MUST forward Argo's own computed `obj.status.health`
+			// verbatim or it silently mis-reports every app. `->`
+			// is ASCII (not the unicode arrow) on purpose. A live
+			// walk gates whether this ships and validates the
+			// pass-through; it may be dropped.
+			"resource.customizations.health.argoproj.io_Application": """
+				hs = {}
+				local a = nil
+				if obj.metadata ~= nil then a = obj.metadata.annotations end
+				if a ~= nil and a["apprafter.io/upgrade-pending"] == "true" then
+				  hs.status = "Suspended"
+				  hs.message = "platform update " .. (a["apprafter.io/upgrade-from"] or "?") .. "->" .. (a["apprafter.io/upgrade-to"] or "?") .. " pending approval (" .. (a["apprafter.io/upgrade-class"] or "?") .. ") - expand the tree and Approve the MigrationPlan, or run 'apprafter migration approve " .. (a["apprafter.io/upgrade-plan"] or "<plan>") .. "'"
+				  return hs
+				end
+				if obj.status ~= nil and obj.status.health ~= nil and obj.status.health.status ~= nil and obj.status.health.status ~= "" then
+				  hs.status = obj.status.health.status
+				  hs.message = obj.status.health.message
+				  return hs
+				end
+				hs.status = "Progressing"
+				hs.message = "Initializing"
+				return hs
+				"""
+
 			// B.1.79: Argo CD resource action buttons for
 			// MigrationPlan. Operators can `Approve` / `Reject`
 			// directly from the Argo CD UI alongside the CLI
