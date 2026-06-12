@@ -44,6 +44,11 @@ operator-created `MigrationPlan` into the platform-stack root Application's
 resource tree and labelling it there, so the already-registered approve action
 becomes clickable and the root Application reflects the pending upgrade.
 
+> Live-walk (kind + Argo CD) confirmation: the grandchild approve button is
+> discoverable and works on the anchored MigrationPlan node, and the
+> `argoproj.io_Application` banner's pass-through branch is safe on healthy,
+> degraded, and pending apps.
+
 1. **Tree anchor.** The argocd component emits a trivial chart-managed
    `ConfigMap/platform-migration-anchor` in `apprafter-system` (via its
    `extraObjects`). The `PlatformController` sets each platform `MigrationPlan`'s
@@ -57,29 +62,36 @@ becomes clickable and the root Application reflects the pending upgrade.
    `resource.customizations.health.apprafter.io_MigrationPlan` health script
    labels the node — `Upgrade <from>→<to> (<class>) awaiting approval` — derived
    from `spec.trigger.{from,to}`, `spec.risks.classification`, and
-   `status.phase`. Because Argo CD aggregates a node's health into its
-   Application, an anchored, non-healthy (`Suspended`/`Degraded`) MigrationPlan
-   node makes the root Application non-healthy automatically — root-level
-   visibility of a pending upgrade for free, with no extra plumbing.
+   `status.phase`. This drives the in-tree row state and is what makes the
+   approve action discoverable on the node (Decision 1). It does **not** bubble
+   to the root Application: Argo CD aggregates an Application's health from its
+   **managed** resource set (`status.resources`), not from arbitrary
+   `ownerReference` tree children, and the anchored MigrationPlan is a live tree
+   node but is not managed — so a `Suspended` MigrationPlan leaves the root
+   Application `Healthy`. The root-level "an update is pending" signal therefore
+   comes solely from the Decision-4 banner, not from aggregation. (The live walk
+   confirmed this: a `Suspended` anchored plan did not change the root App's
+   health.)
 
 3. **Root-Application annotations.** While an upgrade is pending, the operator
    stamps machine-readable `apprafter.io/upgrade-{pending,from,to,class,plan}`
    annotations on the root Argo Application (`argocd/platform`), cleared
    (SSA-pruned by the `platform-controller` field manager) on completion. These
-   are the durable machine-readable state of the held upgrade and the input for
-   the optional banner (Decision 4).
+   are the durable machine-readable state of the held upgrade and the input the
+   load-bearing root-App banner (Decision 4) reads.
 
-4. **Optional root-App banner (walk-gated).** A custom
+4. **Root-App banner (load-bearing root-level signal).** A custom
    `resource.customizations.health.argoproj.io_Application` health script banners
    the root Application with the upgrade message when our annotation is present
-   and otherwise forwards Argo CD's own computed Application health. This
-   **overrides Argo CD's built-in Application health cluster-wide** — for every
-   Argo Application, including every `apprafter app add` user app — so it ships
-   **only** if a live kind + Argo CD walk proves the pass-through branch
-   faithfully reproduces Argo's health across healthy, degraded, and pending
-   apps. If the walk cannot prove this, the banner is dropped and the health
-   aggregation of Decision 2 remains the root-level signal. The core
-   (Decisions 1–3) delivers the full ask without it.
+   and otherwise forwards Argo CD's own computed Application health. Because the
+   anchored MigrationPlan does **not** aggregate to the root App (Decision 2),
+   this banner is the **only** root-level "an update is pending" signal — it is
+   load-bearing, not additive. This **overrides Argo CD's built-in Application
+   health cluster-wide** — for every Argo Application, including every
+   `apprafter app add` user app — so it was gated on a live kind + Argo CD walk
+   proving the pass-through branch faithfully reproduces Argo's health across
+   healthy, degraded, and pending apps. The walk proved the pass-through safe, so
+   the banner ships.
 
 ## Consequences
 
@@ -88,11 +100,11 @@ Positive:
 - The approve/reject action buttons registered in B.1.79 stop being dead: the
   MigrationPlan node now exists in a tree, so the existing approve action is
   clickable. No new action surface is built.
-- A pending platform upgrade is visible at the root Application via health
-  aggregation (Decision 2) regardless of whether the optional banner ships, and
-  the upgrade's `from→to (class)` is readable on the node.
+- A pending platform upgrade is visible at the root Application via the
+  Decision-4 banner (which reads the Decision-3 annotations), and the upgrade's
+  `from→to (class)` is readable on the anchored MigrationPlan node.
 - The held-upgrade state is machine-readable on the root Application
-  (Decision 3), available to the optional banner and to any future consumer
+  (Decision 3), driving the banner and available to any future consumer
   (e.g. the Phase-3 Backstage approval UI) without re-deriving it.
 - No second approval path is introduced: approval stays on the MigrationPlan via
   the existing action + the existing CLI, so the ADR-0027 state machine and its
@@ -100,11 +112,12 @@ Positive:
 
 Negative / neutral:
 
-- A new chart-managed ConfigMap and two (one core, one optional) Lua health
-  customizations to own in `component_argocd.cue`.
-- The optional banner, if shipped, replaces Argo CD's built-in Application
-  health cluster-wide — a broad blast radius gated behind a live walk (see
-  Risks).
+- A new chart-managed ConfigMap and two Lua health customizations (the
+  MigrationPlan node label and the root-App banner) to own in
+  `component_argocd.cue`.
+- The banner replaces Argo CD's built-in Application health cluster-wide — a
+  broad blast radius that was gated behind a live walk (see Risks) and proved
+  safe there.
 - The human-readable upgrade `notes` (from `compatibility.cue`) are **not**
   surfaced on the node yet; that is a deferred follow-up (see References /
   Re-evaluation) because it needs a new `#MigrationPlanSpec.notes` CRD field,
@@ -133,21 +146,22 @@ Negative / neutral:
 
 ## Risks
 
-- **R1 — the optional banner's cluster-wide health override mis-reports other
-  apps.** The `argoproj.io_Application` health customization runs for every Argo
-  Application; if the pass-through branch fails to reproduce Argo's own computed
-  health, it silently mis-reports every user app's health. *Mitigation:* the
-  banner is walk-gated and strictly additive — it ships only after a live kind +
-  Argo CD walk confirms the pass-through is faithful across healthy, degraded,
-  and pending apps; otherwise it is dropped and Decision 2's aggregation is the
-  root signal. The core stands without it.
+- **R1 — the banner's cluster-wide health override mis-reports other apps.** The
+  `argoproj.io_Application` health customization runs for every Argo Application;
+  if the pass-through branch fails to reproduce Argo's own computed health, it
+  silently mis-reports every user app's health. *Mitigation:* the banner was
+  walk-gated — it shipped only after a live kind + Argo CD walk confirmed the
+  pass-through is faithful across healthy, degraded, and pending apps. The walk
+  confirmed it; the banner is the load-bearing root-level signal (the anchored
+  MigrationPlan does not aggregate to the root App), so there is no aggregation
+  fallback to drop back to.
 - **R2 — grandchild button rendering.** The anchor → MigrationPlan path is tree
   depth 2; kind-scoped Argo actions should fire regardless of depth, but only a
   live Argo CD confirms the approve button is discoverable on a grandchild node.
-  *Mitigation:* the live walk validates the action is available via the Argo
-  API; if it is not, the node is still visible with details + the CLI approve,
-  and surfacing `PlatformStack/default` as the managed parent is a documented
-  fallback.
+  *Mitigation:* the live walk validated the approve button is available and works
+  on the grandchild MigrationPlan node; if it had not been, the node is still
+  visible with details + the CLI approve, and surfacing `PlatformStack/default`
+  as the managed parent is a documented fallback.
 - **R3 — cross-namespace ownerReference deletes the plan.** A cross-namespace
   ownerRef makes the namespace-scoped k8s garbage collector silently delete the
   MigrationPlan when its owner-scan finds no owner in the plan's namespace.

@@ -1541,12 +1541,19 @@ struct MigrationPendingState {
 /// `Application` (`argocd/platform`) as machine-readable
 /// `apprafter.io/upgrade-*` annotations while a destructive
 /// transition is gated behind a `pending-approval`
-/// `MigrationPlan`. `platform-controller` is the sole owner of
-/// these keys, so emitting the patch body WITHOUT them (the
-/// `&None` arm of `build_application_patch`) makes SSA prune any
-/// previously-stamped set — the optional approval banner clears
-/// the moment the gate releases (operator approves the plan, or
-/// the transition turns out non-destructive).
+/// `MigrationPlan`. These annotations are the LOAD-BEARING source
+/// of the root-level "platform update pending" signal: the
+/// `argoproj.io_Application` health customization reads them to
+/// raise the banner on the root App tile. (There is no health
+/// aggregation from the anchored MigrationPlan — Argo CD computes
+/// an App's health from its MANAGED resource set, not from the
+/// anchored ownerRef child, so the banner is the only root-level
+/// cue.) `platform-controller` is the sole owner of these keys, so
+/// emitting the patch body WITHOUT them (the `&None` arm of
+/// `build_application_patch`) makes SSA prune any previously-
+/// stamped set — the approval banner clears the moment the gate
+/// releases (operator approves the plan, or the transition turns
+/// out non-destructive).
 #[derive(Debug, Clone)]
 struct PendingUpgrade {
     from: String,
@@ -2417,7 +2424,9 @@ mod tests {
         // ADR 0048: while a destructive upgrade is gated behind a
         // pending-approval MigrationPlan, the root Application
         // carries machine-readable `apprafter.io/upgrade-*`
-        // annotations (input for the optional approval-banner UI).
+        // annotations — the load-bearing input the
+        // `argoproj.io_Application` health banner reads (there is no
+        // health aggregation from the anchored plan).
         let desired = DesiredSource {
             target_revision: "0.2.24".into(),
             helm_values: json!({"tier": 1}),

@@ -105,11 +105,19 @@ _components: argocd: #Component & {
 			// Application anchors the MigrationPlan into its
 			// resource tree (ownerRef to the chart's
 			// `platform-migration-anchor` ConfigMap), so this
-			// health both labels the tree node with the upgrade
-			// details AND, via Argo CD's health aggregation of
-			// the anchored node, bubbles the root Application to
-			// non-healthy whenever an upgrade is pending — the
-			// root-level "an update is pending" signal, for free.
+			// health LABELS that tree node with the upgrade
+			// details: it drives the in-tree row state and the
+			// Approve-button discovery. It does NOT bubble up to
+			// the root Application -- Argo CD aggregates an App's
+			// health from its MANAGED resource set
+			// (`status.resources`), not from arbitrary
+			// ownerReference tree children, and the anchored
+			// MigrationPlan is a live tree node but is not managed
+			// (the live walk confirmed a Suspended plan leaves the
+			// root App Healthy). The ROOT-level "an update is
+			// pending" signal comes solely from the
+			// `argoproj.io_Application` banner below, which reads
+			// the operator's `apprafter.io/upgrade-*` annotations.
 			//
 			// Reads `spec.trigger.{from,to}`,
 			// `spec.risks.classification`, `status.phase` — all
@@ -170,9 +178,11 @@ _components: argocd: #Component & {
 			// `apprafter app add` user app. The non-banner branch
 			// MUST forward Argo's own computed `obj.status.health`
 			// verbatim or it silently mis-reports every app. `->`
-			// is ASCII (not the unicode arrow) on purpose. A live
-			// walk gates whether this ships and validates the
-			// pass-through; it may be dropped.
+			// is ASCII (not the unicode arrow) on purpose. This
+			// banner is the LOAD-BEARING root-level pending signal
+			// (the MigrationPlan health does not aggregate to the
+			// root App); the live walk validated the pass-through
+			// is safe on healthy/degraded/pending apps, so it ships.
 			"resource.customizations.health.argoproj.io_Application": """
 				hs = {}
 				local a = nil
