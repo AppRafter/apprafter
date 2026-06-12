@@ -1723,6 +1723,32 @@ compatibility: "0.1.23": {
 // breach) fixed by serializing reconciles; and the operator-only-CREATE
 // webhooks now accept `kubeadm:cluster-admins` break-glass (k8s 1.35).
 // CRD-compatible with 0.2.19; existing claims keep their allocation.
+// 0.2.26 — ADR 0048 (Argo CD platform-upgrade approval surface). The
+// coordinated operator + chart release that makes the platform-stack
+// MigrationPlan approvable from the Argo CD UI. Operator + webhook images
+// move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
+// upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.26": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.25"
+	notes: """
+		ADR 0048 — Argo CD platform-upgrade approval surface: the platform
+		MigrationPlan is anchored into the platform-stack root Application's
+		resource tree (via a chart `ConfigMap/platform-migration-anchor` it
+		ownerReferences) so its approve/reject buttons become clickable in the
+		Argo UI; a custom `apprafter.io_MigrationPlan` health labels the node
+		with the upgrade (from→to, class) + approval hint; the operator stamps
+		`apprafter.io/upgrade-*` annotations on the root Application, and a
+		custom `argoproj.io_Application` health renders a "platform update
+		pending approval" banner (the root-level signal; live-walk-validated
+		safe). Approval still goes through the same `apprafter migration
+		approve` / status.phase=approved path (ADR 0027 webhook guard).
+		Operator + webhook images change (v0.2.24 → v0.2.25); chart-delivered,
+		no CLI/re-bootstrap.
+		"""
+	references: ["docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
+}
+
 compatibility: "0.2.25": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.24"
