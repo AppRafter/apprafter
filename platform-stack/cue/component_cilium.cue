@@ -72,6 +72,15 @@ _components: cilium: #Component & {
 			enabled: bool | *true
 			hostNetwork: enabled: bool | *true
 		}
+		operator: podAnnotations: {
+			// cilium-operator reads cilium-config only at start + does not
+			// roll on ConfigMap change (T8 walk-fix 2026-06-12, F2): without
+			// a pod-template change the gateway controller never picks up a
+			// newly-enabled gateway-api and fails SILENTLY. Bump this rev
+			// whenever the cilium gateway/host-network config changes so Argo
+			// rolls the operator to re-read cilium-config.
+			"apprafter.io/cilium-config-rev": "gw-hostnetwork-1"
+		}
 		envoy: {
 			enabled: true
 			securityContext: capabilities: {
