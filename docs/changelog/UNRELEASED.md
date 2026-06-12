@@ -36,6 +36,17 @@ patch of each phase.
   to `None` → an un-owned, still CLI-approvable plan; reconcile + status write
   always proceed). Found on the live 0.2.26→0.2.27 upgrade walk.
 
+- **The root-App "platform update pending approval" banner now actually
+  appears.** The ADR 0048 root-Application `apprafter.io/upgrade-*` annotation
+  surface (which the `argoproj.io_Application` health Lua reads to render the
+  banner) was stamped only inside the `spec.source` patch — but a GATED
+  upgrade HOLDS the source unchanged, so in exactly the state the banner is
+  for, the patch never fired and the root App stayed green (only the
+  MigrationPlan tree node showed the pause + Approve/Reject). The annotation
+  surface now reconciles independently via a `pending_upgrade_annotations_differ`
+  diff (SET when gated, PRUNE on approval; the idempotent held-target source
+  re-apply adds no churn). Found on the same live walk.
+
 ### Yanked
 
 - **platform-stack 0.2.26 and 0.2.27** — both ship the buggy operator v0.2.25

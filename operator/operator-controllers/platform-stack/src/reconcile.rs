@@ -683,8 +683,22 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // surfaces the audit condition; the patch itself is
     // unconditional and always wins.
     let foreign_writer = detect_outside_writer(&parent_json);
-    let patched_this_cycle =
-        target_changed || values_changed || !platform_controller_owns_source(&parent_json);
+    // ADR 0048 (walk-found 2026-06-12): the pending-upgrade
+    // annotation surface must reconcile INDEPENDENTLY of the source
+    // patch. A gated upgrade HOLDS `spec.source.targetRevision`
+    // unchanged, so without this term `patched_this_cycle` is false
+    // in exactly the state the banner is meant for — the root-App
+    // `apprafter.io/upgrade-*` annotations never get stamped and the
+    // root approval banner never appears (the MigrationPlan node
+    // still works; the root App just stays green). Driving the patch
+    // off the annotation diff too fixes the SET path (gated) and
+    // hardens the CLEAR path (post-approval) — the source re-apply it
+    // rides is idempotent (held target) so it adds no real churn.
+    let annotations_changed = pending_upgrade_annotations_differ(&parent_json, &pending_upgrade);
+    let patched_this_cycle = target_changed
+        || values_changed
+        || !platform_controller_owns_source(&parent_json)
+        || annotations_changed;
     if patched_this_cycle || foreign_writer.is_some() {
         if let Some(foreign) = &foreign_writer {
             warn!(manager = %foreign, "foreign field manager on parent spec.source; force-reverting");
@@ -1407,6 +1421,39 @@ async fn patch_application(
     Ok(())
 }
 
+/// True when the root Application's current `apprafter.io/upgrade-*`
+/// annotation surface (ADR 0048) does not already match the desired
+/// pending-upgrade state — so the SSA patch must run to converge it.
+///
+/// Walk-found 2026-06-12: the annotation patch used to ride ONLY the
+/// `spec.source` patch (`patched_this_cycle`), but a gated upgrade
+/// holds the source unchanged — so in exactly the state the approval
+/// banner is for, the patch never fired and the root App stayed green
+/// (annotations never stamped). Pure over the parent JSON + desired
+/// state so the SET (pending → stamp) and CLEAR (approved → prune)
+/// transitions are both unit-tested.
+fn pending_upgrade_annotations_differ(
+    parent_json: &Value,
+    pending: &Option<PendingUpgrade>,
+) -> bool {
+    let ann = parent_json
+        .get("metadata")
+        .and_then(|m| m.get("annotations"));
+    let get = |k: &str| ann.and_then(|a| a.get(k)).and_then(Value::as_str);
+    match pending {
+        Some(up) => {
+            get("apprafter.io/upgrade-pending") != Some("true")
+                || get("apprafter.io/upgrade-from") != Some(up.from.as_str())
+                || get("apprafter.io/upgrade-to") != Some(up.to.as_str())
+                || get("apprafter.io/upgrade-class") != Some(up.class.as_str())
+                || get("apprafter.io/upgrade-plan") != Some(up.plan.as_str())
+        }
+        // No gate: the banner must be absent — patch (to prune) only
+        // if a stale `upgrade-pending` is still stamped.
+        None => get("apprafter.io/upgrade-pending").is_some(),
+    }
+}
+
 fn build_application_patch(desired: &DesiredSource, pending: &Option<PendingUpgrade>) -> Value {
     // apiVersion + kind + metadata.name are REQUIRED in every SSA
     // patch body — the apiserver uses them to resolve the target
@@ -1917,6 +1964,42 @@ mod tests {
             code: 403,
         });
         assert_eq!(anchor_uid_from_get(Err(forbidden)), None);
+    }
+
+    // --- ADR 0048 root-App banner: the annotation surface reconciles
+    // independently of the source patch (walk-found 2026-06-12: a gated
+    // upgrade holds the source, so the banner never appeared). ---
+    #[test]
+    fn pending_upgrade_annotations_differ_set_clear_steady() {
+        let up = PendingUpgrade {
+            from: "0.2.26".to_string(),
+            to: "0.2.27".to_string(),
+            class: "RequiresRestart".to_string(),
+            plan: "platform-0-2-26-to-0-2-27".to_string(),
+        };
+        let pending = Some(up);
+        let matching = json!({"metadata": {"annotations": {
+            "apprafter.io/upgrade-pending": "true",
+            "apprafter.io/upgrade-from": "0.2.26",
+            "apprafter.io/upgrade-to": "0.2.27",
+            "apprafter.io/upgrade-class": "RequiresRestart",
+            "apprafter.io/upgrade-plan": "platform-0-2-26-to-0-2-27",
+        }}});
+        let no_ann = json!({"metadata": {"name": "platform"}});
+
+        // SET — the gated-upgrade case the old code missed: no
+        // annotations yet, a gate pending → MUST patch.
+        assert!(pending_upgrade_annotations_differ(&no_ann, &pending));
+        // STEADY (gated) — already matches → no churn.
+        assert!(!pending_upgrade_annotations_differ(&matching, &pending));
+        // STALE — a field drifted (to) → re-patch.
+        let mut stale = matching.clone();
+        stale["metadata"]["annotations"]["apprafter.io/upgrade-to"] = json!("0.2.28");
+        assert!(pending_upgrade_annotations_differ(&stale, &pending));
+        // CLEAR — gate released but a stale banner is stamped → prune.
+        assert!(pending_upgrade_annotations_differ(&matching, &None));
+        // STEADY (no gate) — nothing stamped → nothing to do.
+        assert!(!pending_upgrade_annotations_differ(&no_ann, &None));
     }
 
     #[test]
