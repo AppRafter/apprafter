@@ -55,6 +55,13 @@ rules:
   # `create_platform_migration_plan` would 403 forbidden and
   # the controller would never gate destructive platform-stack
   # upgrades — silently bumping past breaking changes.
+  #
+  # 0.2.31 extension: the PlatformController GCs superseded platform
+  # MigrationPlans (stale-pending + terminal completed/rejected/failed)
+  # so the Argo tree shows at most one active gate. `delete` enables
+  # that — without it the GC's delete 403s (best-effort, logged) and
+  # completed plans pile up (walk-found: the GC shipped in 0.2.29/0.2.30
+  # but the delete verb did not, so it never cleaned anything).
   - apiGroups:
       - apprafter.io
     resources:
@@ -67,6 +74,7 @@ rules:
       - create
       - patch
       - update
+      - delete
   # Argo CD's `Application` CRD lives under argoproj.io. The
   # PlatformController SSA-patches the parent `platform`
   # Application in the `argocd` namespace with field manager

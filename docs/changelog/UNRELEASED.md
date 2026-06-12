@@ -9,6 +9,20 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator + admission-webhook v0.2.29 + platform-stack 0.2.31 — MigrationPlan GC delete RBAC fix (2026-06-12)
+
+### Fixed
+
+- **The MigrationPlan GC can now actually delete.** The GC shipped in 0.2.29
+  (broadened in 0.2.30) but the operator ClusterRole granted only
+  `get/list/watch/create/patch/update` on `migrationplans` — **no `delete`** —
+  so every GC delete 403'd (best-effort, logged) and superseded plans piled up
+  regardless (found after reaching 0.2.30: the completed 28-29 + 29-30 plans
+  lingered). Adds the `delete` verb; the running operator then prunes
+  superseded plans on its next reconcile. Same class as the 0.2.28
+  configmaps-RBAC freeze — a code path needing a verb the chart RBAC did not
+  grant.
+
 ## operator + admission-webhook v0.2.28 + platform-stack 0.2.30 — root App tile pending-upgrade signal + broadened MigrationPlan GC (2026-06-12)
 
 ### Fixed

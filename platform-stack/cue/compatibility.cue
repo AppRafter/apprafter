@@ -1728,6 +1728,26 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.31": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.29"
+	notes: """
+		MigrationPlan GC delete RBAC fix. The GC shipped in 0.2.29 (and was
+		broadened in 0.2.30) but the operator ClusterRole granted only
+		get/list/watch/create/patch/update on `migrationplans` — NO `delete` —
+		so every GC delete 403'd (best-effort, logged) and completed plans
+		piled up regardless (walk-found: 28-29 + 29-30 lingered after reaching
+		0.2.30). Adds the `delete` verb; the running operator then prunes
+		superseded plans on its next reconcile. Same class as the 0.2.28
+		configmaps-RBAC freeze: a code path needs a verb the chart RBAC did not
+		grant. Operator + admission-webhook images move v0.2.28 → v0.2.29
+		(binary-identical — RBAC is chart-template-only — but the image tag
+		bumps so the pods restart), hence requires-restart. Chart-delivered, no
+		CLI / re-bootstrap.
+		"""
+	references: ["docs/changelog/UNRELEASED.md"]
+}
+
 compatibility: "0.2.30": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.28"
