@@ -1728,6 +1728,41 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.30": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.28"
+	notes: """
+		ADR 0048 (revised) — the ROOT platform App's Argo TILE now reflects a
+		pending upgrade. The prior `argoproj.io_Application` health banner was
+		empirically disproven (kind+Argo): Argo applies that customization only
+		to Application resources appearing as CHILDREN in another app's tree,
+		never to a top-level app's OWN tile (whose health is the worst-of
+		aggregate of its managed `.status.resources`) — so the root App stayed
+		Healthy despite the annotation. Validated fix: the operator stamps
+		`apprafter.io/upgrade-pending` (+from/to/class/plan) on the
+		chart-managed `platform-migration-anchor` ConfigMap (it IS in the root
+		App's `.status.resources`), and a `ConfigMap` health customization
+		returns Suspended for it → the root App tile rolls up to **Suspended**
+		(purple pause/attention) in the Applications list, nudging the operator
+		to open + Approve. The dead `argoproj.io_Application` customization is
+		removed. Confirmed live: the operator's SSA annotation survives Argo
+		syncs with no OutOfSync (no ignoreDifferences needed); the key is
+		`ConfigMap` (core/empty group — NOT `_ConfigMap`, which silently
+		yields nil). Operator RBAC gains `configmaps` update/patch.
+
+		ALSO: platform MigrationPlan GC is broadened + now runs every reconcile
+		— it keeps only the current gate + any mid-rollout (approved/executing)
+		plan and deletes the rest (stale pending + terminal
+		completed/rejected/failed), so the Argo tree shows at most one active
+		gate (walk-found: 24-25 + 25-26 + 26-28 completed plans all lingered).
+
+		Operator + admission-webhook images move v0.2.27 → v0.2.28 (operator
+		pods restart), hence requires-restart. Chart-delivered, no CLI /
+		re-bootstrap.
+		"""
+	references: ["docs/changelog/UNRELEASED.md", "docs/adr/0048-argo-platform-upgrade-approval-surface.md"]
+}
+
 compatibility: "0.2.29": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.27"

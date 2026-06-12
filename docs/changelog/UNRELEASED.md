@@ -9,6 +9,33 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator + admission-webhook v0.2.28 + platform-stack 0.2.30 — root App tile pending-upgrade signal + broadened MigrationPlan GC (2026-06-12)
+
+### Fixed
+
+- **The root platform App's Argo TILE now reflects a pending upgrade.** The
+  ADR 0048 `argoproj.io_Application` health "banner" was empirically disproven
+  on a kind+Argo cluster: Argo applies that health customization only to
+  Application resources appearing as CHILDREN in another app's tree, never to a
+  top-level app's OWN tile (whose health is the worst-of aggregate of its
+  managed `.status.resources`) — so the root App stayed Healthy despite the
+  annotation. Validated fix: the operator stamps `apprafter.io/upgrade-pending`
+  (+from/to/class/plan) on the chart-managed `platform-migration-anchor`
+  ConfigMap — which IS one of the root App's managed resources — and a
+  `ConfigMap` health customization returns **Suspended** for it, so the root
+  App tile rolls up to Suspended (purple pause/attention) in the Applications
+  list and nudges the operator to open + Approve. Confirmed live: the operator
+  SSA annotation survives Argo syncs with no OutOfSync (no `ignoreDifferences`
+  needed); the key is `ConfigMap` (core/empty group — NOT `_ConfigMap`, which
+  silently yields nil). The dead `argoproj.io_Application` customization is
+  removed; operator RBAC gains `configmaps` update/patch.
+- **MigrationPlan GC broadened + runs every reconcile.** It now keeps only the
+  current gate plus any mid-rollout (`approved`/`executing`) plan and deletes
+  everything else — stale `pending-approval` plans from an advanced target AND
+  terminal `completed`/`rejected`/`failed` records that otherwise pile up one
+  per upgrade. So the Argo tree shows at most one active gate (walk-found:
+  24-25 + 25-26 + 26-28 completed plans all lingered beside the new gate).
+
 ## operator + admission-webhook v0.2.27 + platform-stack 0.2.29 — MigrationPlan GC + stable Deployment selector (2026-06-12)
 
 ### Fixed
