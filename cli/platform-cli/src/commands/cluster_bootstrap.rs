@@ -620,14 +620,19 @@ metadata:
   name: platform
   namespace: argocd
 spec:
-  # Track B.1.79a (chart 0.1.40): root platform Application
-  # joins the dedicated `platform` AppProject. Project ships
-  # with the initial Argo CD install through
-  # `_loaderValues.argocd.values.configs.projects.platform`,
-  # so it exists by the time this manifest is applied. Legacy
-  # `default` project stays around for ad-hoc Applications
-  # operators apply outside of `apprafter app add`.
-  project: platform
+  # Root platform Application joins the `default` AppProject so
+  # it surfaces in the default operator Argo view (`apprafter
+  # open argocd`) right next to the user's apps — kept separate
+  # from the platform component Applications (cilium, operator,
+  # cert-manager, …), which stay in the `platform` project.
+  # `default` is created at bootstrap by `render_app_projects`
+  # (one of its four projects, fully unrestricted) and that
+  # manifest is applied BEFORE this one, so the project exists
+  # by the time the root Application lands. (B.1.79a originally
+  # parked the root App in `platform` only because the `default`
+  # project wasn't auto-created back then — that reason is moot
+  # now that `render_app_projects` always emits it.)
+  project: default
   source:
     repoURL: "{repo_url}"
     chart: {chart_name}
@@ -1143,28 +1148,34 @@ mod tests {
     }
 
     #[test]
-    fn render_root_application_joins_platform_app_project() {
-        // Track B.1.79a chart 0.1.40 — root Application is a
-        // platform-internal resource and must live in the
-        // `platform` AppProject (declared in
-        // `_loaderValues.argocd.values.configs.projects` so it
-        // exists in the initial Argo CD install). The legacy
-        // `default` project stays around for ad-hoc
-        // Applications operators apply outside `apprafter app
-        // add`, but the chart-managed root Application no
-        // longer references it. Regression guard: if a future
-        // refactor flips back to `default`, walks would
-        // surface "AppProject default missing → root
-        // Application Degraded" only at runtime; this test
-        // fails at unit-test time instead.
+    fn render_root_application_joins_default_app_project() {
+        // The root platform Application lives in the `default`
+        // AppProject so it shows up in the default operator Argo
+        // view next to the user's apps — separate from the
+        // platform component Applications (which stay in
+        // `platform`). `default` is one of the projects
+        // `render_app_projects` emits at bootstrap (and is fully
+        // unrestricted), applied before this manifest, so the
+        // reference resolves. Regression guard: a flip back to
+        // `platform` would re-bury the root App away from the
+        // default operator view; this test catches it at
+        // unit-test time instead of at runtime.
         let yaml = render_root_application(APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, "0.1.0");
         assert!(
-            yaml.contains("project: platform"),
-            "root Application should join the `platform` AppProject, got:\n{yaml}"
+            yaml.contains("project: default"),
+            "root Application should join the `default` AppProject, got:\n{yaml}"
         );
         assert!(
-            !yaml.contains("project: default"),
-            "root Application must NOT use the legacy `default` project, got:\n{yaml}"
+            !yaml.contains("project: platform"),
+            "root Application must NOT use the `platform` project (that's for component apps), got:\n{yaml}"
+        );
+
+        // The referenced `default` AppProject is actually emitted
+        // at bootstrap, so the project exists when this manifest
+        // applies — guards the comment's claim.
+        assert!(
+            render_app_projects().contains("name: default"),
+            "render_app_projects must emit the `default` AppProject the root Application references"
         );
     }
 

@@ -788,13 +788,15 @@ pub enum OpenUi {
     /// username and printing the password.
     Argocd {
         /// AppProject filter applied to the opened URL —
-        /// Argo CD's UI honours `?proj=<name>` to scope the
-        /// Applications list. Defaults to `apps` so the
-        /// operator lands on their own apps first; pass
-        /// `--project platform` to inspect chart-managed
-        /// components, or `--all-projects` to drop the
-        /// filter entirely.
-        #[arg(long = "project", default_value = "apps")]
+        /// Argo CD's UI honours `?proj=<name>` (comma-separated
+        /// list) to scope the Applications list. Defaults to
+        /// `apps,default` so the operator lands on their own
+        /// apps plus the platform root Application (in
+        /// `default`), while the platform component apps stay
+        /// hidden; pass `--project platform` to inspect
+        /// chart-managed components, or `--all-projects` to
+        /// drop the filter entirely.
+        #[arg(long = "project", default_value = "apps,default")]
         project: String,
         /// Drop the `?proj=<name>` filter — UI shows all
         /// AppProjects.

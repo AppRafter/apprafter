@@ -35,11 +35,14 @@ use crate::commands::port_forward::{open_in_browser, spawn_kubectl_port_forward,
 ///      group, Rust's default).
 ///
 /// `project_filter` controls the URL's `?proj=<name>` query
-/// parameter. `None` drops the filter entirely (renders
-/// `apprafter open argocd --all-projects`); `Some("apps")` is
-/// the CLI default per Track B.1.79a — operators land on
-/// their own user-apps view first, since platform components
-/// are mostly hands-off after bootstrap.
+/// parameter (Argo CD accepts a comma-separated list). `None`
+/// drops the filter entirely (renders `apprafter open argocd
+/// --all-projects`); `Some("apps,default")` is the CLI default
+/// — operators land on their own user apps (`apps`) plus the
+/// platform root Application (which lives in `default`), while
+/// the platform component apps (cilium, operator, cert-manager,
+/// …, in the `platform` project) stay hidden from the default
+/// view.
 pub fn argocd(project_filter: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
@@ -135,10 +138,16 @@ mod tests {
 
     #[test]
     fn build_argocd_url_appends_proj_filter() {
-        // Standard B.1.79a default — `apps` filter narrows
-        // the UI to the user-application view. Regression:
-        // ensure the path is `/applications?proj=<name>`
-        // exactly (Argo CD's documented filter URL shape).
+        // CLI default — `apps,default` shows the user's apps plus
+        // the platform root Application (in `default`), passed
+        // through verbatim as a comma-separated `?proj=` list.
+        // Regression: ensure the path is
+        // `/applications?proj=<filter>` exactly (Argo CD's
+        // documented filter URL shape).
+        assert_eq!(
+            build_argocd_url(8080, Some("apps,default")),
+            "https://localhost:8080/applications?proj=apps,default"
+        );
         assert_eq!(
             build_argocd_url(8080, Some("apps")),
             "https://localhost:8080/applications?proj=apps"
