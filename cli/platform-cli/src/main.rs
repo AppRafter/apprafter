@@ -85,8 +85,10 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             commands::bootstrap_all::run(target.as_deref(), dry_run)?
         }
         Commands::Platform { action } => match action {
-            PlatformCommand::Status => commands::platform::status()?,
-            PlatformCommand::Upgrade { to } => commands::platform::upgrade(to.as_deref())?,
+            PlatformCommand::Status { cached } => commands::platform::status(cached)?,
+            PlatformCommand::Upgrade { to, cached } => {
+                commands::platform::upgrade(to.as_deref(), cached)?
+            }
             PlatformCommand::Freeze { component, version } => {
                 commands::platform::freeze(&component, version.as_deref())?
             }

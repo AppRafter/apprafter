@@ -22,6 +22,28 @@ use cli_providers::k8s::kubectl::APPRAFTER_CLI_EGRESS_FIELD_MANAGER;
 const PLATFORMSTACK_NAME: &str = "default";
 const PLATFORMSTACK_NAMESPACE: &str = "apprafter-system";
 
+/// Annotation the CLI stamps to ask the operator for an immediate
+/// upstream OCI re-poll (instead of waiting for the operator's 6h
+/// cadence). Contract shared with the operator: the operator sees
+/// this RFC3339 timestamp is newer than `status.lastUpstreamCheck`,
+/// does an immediate poll, and then stamps
+/// `status.lastUpstreamCheck = now` (> the request ts). The CLI's
+/// "recheck completed" signal is `status.lastUpstreamCheck` parsing
+/// to a moment STRICTLY AFTER the request ts.
+const RECHECK_REQUESTED_ANNOTATION: &str = "apprafter.io/recheck-requested";
+
+/// How long `status` / `update` wait for the operator to honour a
+/// recheck before falling back to the last-known status. Kept short
+/// — the operator's poll is a single OCI HEAD; a longer wait would
+/// only punish operators whose cluster runs a binary that predates
+/// the recheck contract (it ignores the annotation, so we'd wait the
+/// full budget every time).
+const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll interval while waiting for `status.lastUpstreamCheck` to
+/// advance past the request timestamp.
+const RECHECK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Tabled)]
 struct ConditionRow {
     #[tabled(rename = "TYPE")]
@@ -44,8 +66,17 @@ struct HistoryRow {
     outcome: String,
 }
 
-pub fn status() -> Result<()> {
+pub fn status(cached: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+
+    // Unless the operator opted into the last-known snapshot, ask the
+    // operator for a fresh upstream re-check first so the displayed
+    // `available` / `lastCheck` / `UpgradeAvailable` reflect the most
+    // recent OCI poll rather than the operator's (up to 6h stale) cadence.
+    if !cached {
+        force_recheck_and_wait(kc.path(), Utc::now)?;
+    }
+
     let json = kubectl_get_json(
         "platformstack",
         Some(PLATFORMSTACK_NAME),
@@ -61,6 +92,108 @@ pub fn status() -> Result<()> {
 
     print_status(&json, Utc::now());
     Ok(())
+}
+
+/// Stamp the recheck-request annotation on the singleton
+/// PlatformStack, then POLL `status.lastUpstreamCheck` until it
+/// advances past the timestamp we wrote (the operator completed an
+/// immediate poll) or the [`RECHECK_TIMEOUT`] budget elapses.
+///
+/// GRACEFUL on timeout: a cluster whose operator predates this
+/// contract simply ignores the annotation and never advances
+/// `lastUpstreamCheck` in response — we must NOT hard-fail (status
+/// still has to render the last-known data). On timeout we print a
+/// one-line `note:` and return `Ok(())`; the caller then reads +
+/// renders whatever the cluster currently reports.
+///
+/// `now` is injected (a `Fn() -> DateTime<Utc>`) so the request
+/// timestamp and the elapsed-budget check use the same clock and
+/// tests can drive the comparison deterministically.
+fn force_recheck_and_wait<F: Fn() -> DateTime<Utc>>(
+    kubeconfig_path: &std::path::Path,
+    now: F,
+) -> Result<()> {
+    let requested = now();
+    let body = recheck_annotation_patch_body(&requested.to_rfc3339());
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kubeconfig_path,
+    )?;
+
+    let deadline = std::time::Instant::now() + RECHECK_TIMEOUT;
+    loop {
+        // Re-read just the status each cycle. A transient read error
+        // here shouldn't abort the whole command — treat it like a
+        // not-yet-fresh poll and keep waiting until the deadline.
+        let last_check = kubectl_get_json(
+            "platformstack",
+            Some(PLATFORMSTACK_NAME),
+            Some(PLATFORMSTACK_NAMESPACE),
+            kubeconfig_path,
+        )
+        .ok()
+        .flatten()
+        .and_then(|j| {
+            j.pointer("/status/lastUpstreamCheck")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+
+        if recheck_completed(last_check.as_deref(), requested) {
+            return Ok(());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "note: upstream re-check did not complete within {}s (operator may predate this \
+                 feature); showing last-known data",
+                RECHECK_TIMEOUT.as_secs()
+            );
+            return Ok(());
+        }
+        std::thread::sleep(RECHECK_POLL_INTERVAL);
+    }
+}
+
+/// RFC 7396 merge-patch body that stamps the recheck-request
+/// annotation. Pure fn — the timestamp string is the caller's; the
+/// builder just wraps it in the metadata/annotations envelope so it
+/// can be unit-tested without a cluster.
+pub(crate) fn recheck_annotation_patch_body(ts: &str) -> String {
+    // serde_json so the timestamp is JSON-escaped correctly (RFC3339
+    // has no quotes/backslashes, but route it through the encoder
+    // rather than hand-splicing to stay safe).
+    serde_json::json!({
+        "metadata": { "annotations": { RECHECK_REQUESTED_ANNOTATION: ts } }
+    })
+    .to_string()
+}
+
+/// The "recheck completed" predicate: did the operator stamp a
+/// `status.lastUpstreamCheck` STRICTLY AFTER the request ts we
+/// wrote? Pure fn so every branch is unit-testable.
+///
+/// - `None` (status carries no `lastUpstreamCheck`) → not completed.
+/// - Unparseable timestamp → not completed (defensive; the operator
+///   always writes RFC3339, but a mid-write CR shouldn't read as done).
+/// - Parsed but `<= requested` → the value is stale (operator hasn't
+///   polled since our request, OR predates the contract) → not done.
+/// - Parsed and `> requested` → fresh → done.
+pub(crate) fn recheck_completed(
+    last_upstream_check: Option<&str>,
+    requested: DateTime<Utc>,
+) -> bool {
+    let Some(raw) = last_upstream_check else {
+        return false;
+    };
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(parsed) => parsed.with_timezone(&Utc) > requested,
+        Err(_) => false,
+    }
 }
 
 /// Pure formatter — pulled out so unit tests can drive with a
@@ -502,8 +635,17 @@ pub fn rescue(yes: bool) -> Result<()> {
     crate::commands::cluster_bootstrap::run()
 }
 
-pub fn upgrade(to: Option<&str>) -> Result<()> {
+pub fn upgrade(to: Option<&str>, cached: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+
+    // Force a fresh upstream re-check first (unless `--cached`) so the
+    // upgrade decision — and the operator's subsequent channel-latest
+    // resolution when clearing the pin — acts on the most recent
+    // availableVersion rather than the operator's up-to-6h-stale poll.
+    if !cached {
+        force_recheck_and_wait(kc.path(), Utc::now)?;
+    }
+
     let body = match to {
         Some(v) => format!(r#"{{"spec":{{"pin":"{v}"}}}}"#),
         None => r#"{"spec":{"pin":null,"autoUpgrade":true}}"#.to_string(),
@@ -1015,6 +1157,51 @@ mod tests {
             }
         });
         assert!(!egress_field_appears_git_managed(&argo_other));
+    }
+
+    #[test]
+    fn recheck_annotation_patch_body_is_well_formed_merge_patch() {
+        // The body must be a valid RFC-7396 merge patch nesting the
+        // request timestamp under metadata.annotations[<annotation>].
+        let ts = "2026-06-11T12:00:00+00:00";
+        let body = recheck_annotation_patch_body(ts);
+        let parsed: Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            parsed.pointer(&format!(
+                "/metadata/annotations/{}",
+                RECHECK_REQUESTED_ANNOTATION.replace('/', "~1")
+            )),
+            Some(&Value::String(ts.to_string())),
+            "body must stamp the request ts under the recheck annotation: {body}"
+        );
+    }
+
+    #[test]
+    fn recheck_completed_true_only_when_last_check_strictly_after_request() {
+        let requested = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+
+        // Strictly after → the operator polled in response → done.
+        assert!(recheck_completed(Some("2026-06-11T12:00:01Z"), requested));
+        // A minute later, different-but-equivalent zone form → done.
+        assert!(recheck_completed(
+            Some("2026-06-11T13:01:00+01:00"),
+            requested
+        ));
+    }
+
+    #[test]
+    fn recheck_completed_false_when_stale_equal_absent_or_unparseable() {
+        let requested = Utc.with_ymd_and_hms(2026, 6, 11, 12, 0, 0).unwrap();
+
+        // Older than the request — pre-existing 6h-cadence value the
+        // operator hasn't refreshed yet.
+        assert!(!recheck_completed(Some("2026-06-11T11:59:59Z"), requested));
+        // Exactly equal must NOT count (operator stamps strictly later).
+        assert!(!recheck_completed(Some("2026-06-11T12:00:00Z"), requested));
+        // No lastUpstreamCheck at all (fresh CR / pre-contract operator).
+        assert!(!recheck_completed(None, requested));
+        // Mid-write garbage reads as not-yet-done, not a crash.
+        assert!(!recheck_completed(Some("not-a-timestamp"), requested));
     }
 
     #[test]

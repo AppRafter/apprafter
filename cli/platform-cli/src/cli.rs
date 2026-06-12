@@ -358,14 +358,30 @@ pub enum RepoCredsCommand {
 #[derive(Debug, Subcommand)]
 pub enum PlatformCommand {
     /// Print PlatformStack/default summary — versions,
-    /// conditions, recent history.
-    Status,
+    /// conditions, recent history. By default first asks the
+    /// operator for an immediate upstream re-check (stamps
+    /// `apprafter.io/recheck-requested` and waits up to 30s for
+    /// `status.lastUpstreamCheck` to advance) so the reported
+    /// `available` version is fresh rather than up to 6h stale.
+    Status {
+        /// Skip the upstream re-check and render the last-known
+        /// status immediately (no wait). For scripting / when the
+        /// 6h-cadence snapshot is good enough.
+        #[arg(long, default_value_t = false)]
+        cached: bool,
+    },
     /// Patch PlatformStack.spec.pin. With `--to <version>` —
     /// pin to that version. Without `--to` — clear pin and enable
-    /// autoUpgrade (channel-following mode).
+    /// autoUpgrade (channel-following mode). By default forces a
+    /// fresh upstream re-check first (see `platform status`) so the
+    /// upgrade decision acts on the latest availableVersion.
     Upgrade {
         #[arg(long = "to")]
         to: Option<String>,
+        /// Skip the upstream re-check and act on the last-known
+        /// status immediately (no wait).
+        #[arg(long, default_value_t = false)]
+        cached: bool,
     },
     /// Freeze a specific component's version through
     /// `PlatformStack.spec.overrides.<component>.pin`. Useful
