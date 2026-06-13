@@ -1728,6 +1728,24 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.34": {
+	change:          "safe"
+	operatorVersion: "v0.2.30"
+	notes: """
+		1.83b follow-up — bundle the cue-cmp sidecar that knows the new
+		`expose` schema. The argocd-cue-cmp image bundles `schemas/v1alpha1`
+		(ADR 0046); 1.83b changed `expose` (dropped `public`, added
+		`hostname`/`tls`), so the sidecar is bumped to v0.1.10 — without it the
+		repo-server's cue-cmp rejects a GitOps Application that sets
+		`expose.hostname` (an unknown field in the previously-bundled schema).
+		The operator (v0.2.30) is unchanged; change=safe — only the Argo CD
+		repo-server's cue-cmp sidecar rolls, no workload/data impact. (0.2.33
+		shipped the operator but still referenced cue-cmp v0.1.9 — this closes
+		that gap.)
+		"""
+	references: ["plan.md#1.83b", "argocd-cue-cmp/version.cue"]
+}
+
 compatibility: "0.2.33": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.30"
