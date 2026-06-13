@@ -13,10 +13,10 @@ metadata:
     apprafter: "true"
 spec:
   base:
-    image: ghcr.io/example/parser:latest
+    image: nginxdemos/hello:plain-text
     replicas: 1
     expose:
-      port: 8080
+      port: 80
       network: internal
     env:
       LOG_LEVEL: info
