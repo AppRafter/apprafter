@@ -61,8 +61,8 @@ landingWebPreview: v1alpha1.#Application & {
 			replicas: 1
 			expose: {
 				port:    80
-				public:  true
-				network: "public"
+				network:  "public"
+				hostname: "preview.apprafter.dev"
 			}
 		}
 		environments: {
@@ -70,7 +70,6 @@ landingWebPreview: v1alpha1.#Application & {
 				replicas: 1
 				expose: {
 					port:    80
-					public:  false
 					network: "internal"
 				}
 			}

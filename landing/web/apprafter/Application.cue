@@ -47,8 +47,8 @@ landingWeb: v1alpha1.#Application & {
 			replicas: 2
 			expose: {
 				port:    80
-				public:  true
-				network: "public"
+				network:  "public"
+				hostname: "apprafter.dev"
 			}
 			// No runtime env — the page is fully prerendered.
 			// PUBLIC_CMS_URL is baked in during `astro build`.
@@ -59,7 +59,6 @@ landingWeb: v1alpha1.#Application & {
 				replicas: 1
 				expose: {
 					port:    80
-					public:  false
 					network: "internal"
 				}
 			}

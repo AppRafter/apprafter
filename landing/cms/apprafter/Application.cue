@@ -45,8 +45,8 @@ landingCms: v1alpha1.#Application & {
 			replicas: 1
 			expose: {
 				port:    3000
-				public:  true
-				network: "public"
+				network:  "public"
+				hostname: "cms.apprafter.dev"
 			}
 			needs: {
 				pg: {},
@@ -75,7 +75,6 @@ landingCms: v1alpha1.#Application & {
 				replicas: 1
 				expose: {
 					port:    3000
-					public:  false
 					network: "internal"
 				}
 				env: {
