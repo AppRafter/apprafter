@@ -44,15 +44,15 @@
 # After the Gateway is Programmed (Phase 5), Phases 6-9 validate that the
 # operator turns `expose.network: public` into a working public route:
 #
-#   Phase 6  — deploy the WORKING-TREE operator + Application CRD + admission
-#              webhook (1.83b is UNRELEASED, so build the images from the
-#              working tree + kind-load them, mirroring
-#              needs-networkpolicy-walk.sh's Phase 1b). This walk does NOT run
-#              `apprafter cluster-bootstrap`, so the chart's CRDs/RBAC/Deployment
-#              are applied straight from the chart, and cert-manager is installed
-#              standalone first (the webhook chart's Certificate + CA-injection
-#              depend on it). Seeds a PlatformStack/default whose
-#              gateway.allowedDomains carries the $SAMPLE_DOMAIN zone so the
+#   Phase 6  — deploy the WORKING-TREE operator + Application/PlatformStack CRDs
+#              (1.83b is UNRELEASED, so build the operator image from the working
+#              tree + kind-load it, mirroring needs-networkpolicy-walk.sh's Phase
+#              1b). This walk does NOT run `apprafter cluster-bootstrap`, so the
+#              chart's CRDs/RBAC/Deployment are applied straight from the chart.
+#              The admission-webhook is NOT deployed (its 1.83b rules are pure +
+#              unit-tested; its failurePolicy:Fail VWC would only block the valid
+#              applies below — see the Phase 6 NOTE). Seeds a PlatformStack/default
+#              whose gateway.allowedDomains carries the $SAMPLE_DOMAIN zone so the
 #              operator's PublicRouteReady zone-coverage check passes.
 #   Phase 7  — apply a public Application `web` (traefik/whoami, hostname
 #              app.$SAMPLE_DOMAIN). Assert: operator renders httproute/web with
@@ -115,8 +115,6 @@ TLS_SECRET="platform-tls"           # kubernetes.io/tls Secret the listeners ref
 CILIUM_VERSION="1.16.5"             # pinned: _loaderValues.cilium.chartVersion
 CILIUM_REPO="https://helm.cilium.io/"
 GATEWAY_API_VERSION="v1.2.1"        # gateway-api-crds component targetRevision
-CERT_MANAGER_VERSION="v1.16.2"      # pinned: platform-stack component_cert-manager.cue
-CERT_MANAGER_URL="https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
 
 # 1.83b: operator-rendered public-ingress phases (6-9). A tenant app namespace,
 # a public `web` app + an `internal-web` app, the whoami echo image (listens on
@@ -129,10 +127,10 @@ APP_INTERNAL="internal-web"         # network: internal → NO HTTPRoute
 WHOAMI_IMAGE="traefik/whoami:latest"  # tiny HTTP echo on :80 (body has `Hostname:`)
 APP_HOSTNAME="app.${SAMPLE_DOMAIN}" # the public host (single-label subdomain)
 
-# The operator + admission-webhook charts (1.83b Phase 6 deploys the
-# WORKING-TREE build, mirroring needs-networkpolicy-walk.sh's Phase 1b).
+# The operator chart (1.83b Phase 6 deploys the WORKING-TREE build, mirroring
+# needs-networkpolicy-walk.sh's Phase 1b). The admission-webhook is NOT deployed
+# here — see the Phase 6 NOTE below.
 OPERATOR_CHART="${REPO_ROOT}/operator/charts/apprafter-operator"
-WEBHOOK_CHART="${REPO_ROOT}/operator/charts/apprafter-admission-webhook"
 
 # The F1 marker CRD — present ONLY in the experimental channel; Cilium 1.16.5's
 # gateway controller requires it at its startup required-resources check.
@@ -641,23 +639,20 @@ fi
 # Programmed (the F1 symptom), so there is no working platform Gateway for an
 # HTTPRoute to attach to — these phases would be meaningless there. Skip them.
 #
-# Phase 6 deploys the WORKING-TREE operator + admission-webhook (1.83b is
-# UNRELEASED, so it cannot use the published image — mirrors
-# needs-networkpolicy-walk.sh's Phase 1b: build the images from the working
-# tree + kind-load them via cluster_load_image). Unlike the needs/* walks this
-# walk does NOT run `apprafter cluster-bootstrap` (it installs Cilium directly),
-# so the operator chart's CRDs/RBAC/Deployment are applied straight from the
-# chart here, and cert-manager (a hard dependency of the webhook chart's
-# Certificate + cert-manager.io/inject-ca-from CA injection) is installed
-# standalone first so the `failurePolicy: Fail` ValidatingWebhookConfiguration
-# does not block the Application applies in Phases 7-9.
+# Phase 6 deploys the WORKING-TREE operator (1.83b is UNRELEASED, so it cannot
+# use the published image — mirrors needs-networkpolicy-walk.sh's Phase 1b:
+# build the image from the working tree + kind-load it via cluster_load_image).
+# Unlike the needs/* walks this walk does NOT run `apprafter cluster-bootstrap`
+# (it installs Cilium directly), so the operator chart's CRDs/RBAC/Deployment
+# are applied straight from the chart here. The admission-webhook is NOT
+# deployed (see the NOTE after the operator rollout).
 if [ "$NEGATIVE" != 1 ]; then
 
 # ===============================================================
-# Phase 6: deploy the working-tree operator + Application CRD + webhook
+# Phase 6: deploy the working-tree operator + Application/PlatformStack CRDs
 # ===============================================================
 
-phase "Phase 6: deploy working-tree operator + CRDs + admission-webhook (1.83b unreleased)"
+phase "Phase 6: deploy working-tree operator + CRDs (1.83b unreleased)"
 
 builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
 printf '  container builder: %s\n' "$builder"
@@ -702,39 +697,18 @@ kubectl -n "$OPERATOR_NS" rollout restart deploy/apprafter-operator
 kubectl -n "$OPERATOR_NS" rollout status deploy/apprafter-operator --timeout=240s
 printf '  ok: apprafter-operator Available (working-tree build)\n'
 
-# (d) cert-manager — a hard dependency of the webhook chart (the Certificate
-# CR + the cert-manager.io/inject-ca-from CA injection on the
-# ValidatingWebhookConfiguration). cluster-bootstrap would install this; this
-# walk skips bootstrap, so install it standalone (pinned to the platform
-# version) before the webhook chart.
-phase "Phase 6b: cert-manager ${CERT_MANAGER_VERSION} (webhook CA-injection dependency)"
-printf '  applying %s ...\n' "$CERT_MANAGER_URL"
-retry 5 10 -- kubectl apply -f "$CERT_MANAGER_URL"
-kubectl -n cert-manager rollout status deploy/cert-manager --timeout=300s
-kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=300s
-kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=300s
-printf '  ok: cert-manager rollout complete\n'
-
-# (e) admission-webhook chart (Certificate + ClusterIssuer + Service +
-# Deployment + ValidatingWebhookConfiguration). The chart's ClusterIssuer
-# `apprafter-selfsigned` signs the webhook cert; cainjector wires the caBundle.
-phase "Phase 6c: deploy working-tree admission-webhook"
-printf '  applying admission-webhook chart objects ...\n'
-# cert-manager's OWN validating webhook intercepts Certificate/ClusterIssuer
-# applies; it can briefly 503 right after rollout, so retry the apply.
-WEBHOOK_RENDER="${TMPDIR_WORK}/webhook.yaml"
-helm template apprafter-admission-webhook "$WEBHOOK_CHART" \
-    --namespace "$OPERATOR_NS" >"$WEBHOOK_RENDER"
-retry 8 8 -- kubectl apply --server-side --force-conflicts -f "$WEBHOOK_RENDER"
-WH_IMG=$(kubectl -n "$OPERATOR_NS" get deploy apprafter-admission-webhook \
-    -o jsonpath='{.spec.template.spec.containers[0].image}')
-printf '  building webhook image %s from the working tree ...\n' "$WH_IMG"
-"$builder" build -f "${REPO_ROOT}/operator/admission-webhook/Dockerfile" \
-    -t "$WH_IMG" "${REPO_ROOT}/operator"
-cluster_load_image "$CLUSTER_NAME" "$WH_IMG"
-kubectl -n "$OPERATOR_NS" rollout restart deploy/apprafter-admission-webhook
-kubectl -n "$OPERATOR_NS" rollout status deploy/apprafter-admission-webhook --timeout=240s
-printf '  ok: admission-webhook Available (working-tree build)\n'
+# NOTE (1.83b): the admission-webhook + cert-manager are INTENTIONALLY NOT
+# deployed in this walk. The webhook's 1.83b expose rules (public⇒hostname,
+# DNS-1123 subdomain, vpn/tls:false rejects) are a PURE validator fully covered
+# by the Task-4 unit tests — a live cluster adds nothing for them. Here the
+# webhook's ValidatingWebhookConfiguration (failurePolicy: Fail, no
+# namespaceSelector) would only BLOCK the valid Application applies below, and
+# its cert-manager CA-injection adds ~5min + flakiness on this bootstrap-less
+# cluster (no `apprafter cluster-bootstrap`). A real cluster bootstraps the
+# webhook via the platform-stack chart; this walk validates the load-bearing,
+# NOT-unit-testable facts — the operator-rendered HTTPRoute + its Gateway-API
+# attachment (parentRef :443 → HTTPS listeners, cross-ns hostname match) +
+# PublicRouteReady + prune — none of which need the webhook.
 
 # (f) seed the singleton PlatformStack/default in apprafter-system so the
 # operator's PublicRouteReady zone-coverage check finds the $SAMPLE_DOMAIN zone
