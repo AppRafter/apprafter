@@ -45,6 +45,21 @@ async fn cilium_available(client: &Client) -> bool {
         .is_some()
 }
 
+/// Probe whether the `httproutes.gateway.networking.k8s.io` CRD is served on
+/// this cluster (1.83b). Run ONCE at startup and threaded into the Application
+/// controller's `Context` so the reconcile loop can gate the HTTPRoute SSA
+/// apply: on a cluster without the Gateway-API CRDs (e.g. a plain e2e/kindnet
+/// cluster) applying an HTTPRoute would 404 every reconcile. Best-effort: any
+/// read error degrades to `false` (skip the apply).
+async fn gateway_api_available(client: &Client) -> bool {
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    api.get_opt("httproutes.gateway.networking.k8s.io")
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -111,6 +126,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "probed Cilium CNP CRD availability"
     );
 
+    let gateway_api = gateway_api_available(&client).await;
+    info!(
+        gateway_api_available = gateway_api,
+        "probed Gateway-API HTTPRoute CRD availability"
+    );
+
     // 2.9 (ADR 0044): the active environment is now a PER-CR property
     // (`Application.spec.environment`), resolved inside the reconcile
     // loop — there is no cluster-wide `APPRAFTER_ENV` selector anymore.
@@ -118,7 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = client.clone();
         let metrics = metrics.clone();
         async move {
-            if let Err(err) = application_controller::run(client, metrics, cilium).await {
+            if let Err(err) =
+                application_controller::run(client, metrics, cilium, gateway_api).await
+            {
                 error!(%err, "Application controller error");
             }
         }

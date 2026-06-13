@@ -82,6 +82,10 @@ pub struct Context {
     /// 404s every reconcile. When `false`, the controller renders the CNP
     /// the same way but skips the apply.
     pub cilium_available: bool,
+    /// Whether the `httproutes.gateway.networking.k8s.io` CRD is served on this
+    /// cluster (1.83b). Probed ONCE at startup; gates the HTTPRoute SSA apply +
+    /// prune (a non-Gateway-API cluster renders the route but skips the apply).
+    pub gateway_api_available: bool,
 }
 
 #[derive(Debug, Error)]
@@ -101,6 +105,7 @@ pub async fn run(
     client: Client,
     metrics: Arc<Metrics>,
     cilium_available: bool,
+    gateway_api_available: bool,
 ) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
@@ -113,6 +118,7 @@ pub async fn run(
         metrics,
         oci_http: oci_resolve::ReqwestHttp::new(),
         cilium_available,
+        gateway_api_available,
     });
 
     Controller::new(apps, watcher::Config::default())
@@ -470,11 +476,38 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         );
     }
 
-    let endpoint_url = rendered
-        .service
+    // 1.83b: SSA-apply the per-Application HTTPRoute when the app is public —
+    // but ONLY when the Gateway-API CRDs are served (the probe ran once at
+    // startup; a non-Gateway-API cluster would 404). When NOT public (or
+    // unset) PRUNE any stale route (the app flipped public → internal). The
+    // route carries the SAME Application ownerRef → cascades on app delete.
+    if ctx.gateway_api_available {
+        if let Some(route) = rendered.httproute.take() {
+            let owner = owner_reference(&app);
+            apply_http_route(&ctx.client, &namespace, &owner, route).await?;
+        } else {
+            prune_http_route(&ctx.client, &namespace, &name).await?;
+        }
+    }
+
+    // 1.83b: a public app's endpoint is its public HTTPS URL (the first
+    // hostname); otherwise the internal cluster-DNS Service URL.
+    let public_hostnames: Vec<String> = effective
+        .expose
         .as_ref()
-        .and_then(|s| s.metadata.name.as_deref())
-        .map(|svc_name| cluster_internal_endpoint_url(svc_name, &namespace, 80));
+        .filter(|e| e.network.as_deref() == Some("public"))
+        .and_then(|e| e.hostname.as_ref())
+        .map(|h| h.as_slice_vec())
+        .unwrap_or_default();
+    let endpoint_url = if let Some(first) = public_hostnames.first() {
+        Some(format!("https://{first}/"))
+    } else {
+        rendered
+            .service
+            .as_ref()
+            .and_then(|s| s.metadata.name.as_deref())
+            .map(|svc_name| cluster_internal_endpoint_url(svc_name, &namespace, 80))
+    };
 
     // Preserve lastTransitionTime if the previous Ready condition
     // already had the same `status` value — per k8s convention the
@@ -499,6 +532,23 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // condition, no status.image.
     if let Some((ok, reason)) = &image_resolved_cond {
         conditions.push(image_resolved_condition(*ok, reason, previous_conditions));
+    }
+    // 1.83b: soft PublicRouteReady condition for a public app — zone coverage
+    // + the route's own Accepted/ResolvedRefs. NEVER gates Ready; the route is
+    // always emitted regardless of the verdict.
+    if !public_hostnames.is_empty() {
+        let allowed_domains = read_allowed_domains(&ctx.client).await;
+        let route_status = if ctx.gateway_api_available {
+            read_http_route_status(&ctx.client, &namespace, &name).await
+        } else {
+            None
+        };
+        conditions.push(public_route_ready_condition(
+            &public_hostnames,
+            &allowed_domains,
+            route_status.as_ref(),
+            previous_conditions,
+        ));
     }
     let mut status = build_status(&app, "Ready", conditions, endpoint_url);
     status.image = image_status;
@@ -677,6 +727,92 @@ async fn apply_network_policy(
     )
     .await?;
     Ok(())
+}
+
+// ---- 1.83b: per-Application HTTPRoute apply / prune / status read ----
+
+/// `ApiResource` for the externally-installed Gateway-API `HTTPRoute` CRD
+/// (group `gateway.networking.k8s.io`, version `v1`). 1.83b. Gated by
+/// [`Context::gateway_api_available`] on clusters without the Gateway-API CRDs.
+fn httproute_api_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "gateway.networking.k8s.io",
+        "v1",
+        "HTTPRoute",
+    ))
+}
+
+/// SSA-apply the per-Application `HTTPRoute` as a `DynamicObject`
+/// (gateway.networking.k8s.io/v1), mirroring `apply_network_policy`: inject
+/// `metadata.namespace` (the app's) + `ownerReferences` (the SAME Application
+/// ownerRef the Deployment/Service carry → cascade on delete), then apply under
+/// [`FIELD_MANAGER`]. 1.83b.
+async fn apply_http_route(
+    client: &Client,
+    namespace: &str,
+    owner: &OwnerReference,
+    mut body: Value,
+) -> Result<(), ReconcileError> {
+    let name = body
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    body["metadata"]["namespace"] = json!(namespace);
+    body["metadata"]["ownerReferences"] = json!([owner]);
+
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &httproute_api_resource());
+    api.patch(
+        &name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&body),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Best-effort delete of a stale `HTTPRoute` named `name` (the app flipped
+/// `public → internal`, or removed `expose`). 404-tolerant (a missing route is
+/// a no-op — it may never have existed, or already cascaded). 1.83b — the
+/// Service has no analogous prune, but the design requires the route disappears
+/// when the app stops being public.
+async fn prune_http_route(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ReconcileError> {
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &httproute_api_resource());
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read the applied `HTTPRoute`'s `status` value for the soft
+/// `PublicRouteReady` condition (best-effort; `None` when absent / not yet
+/// populated). 1.83b.
+async fn read_http_route_status(client: &Client, namespace: &str, name: &str) -> Option<Value> {
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &httproute_api_resource());
+    api.get_opt(name)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|o| o.data.get("status").cloned())
+}
+
+/// Read `spec.values.gateway.allowedDomains[].domain` from the singleton
+/// PlatformStack (1.83b). Best-effort: a missing CR / read error → empty (the
+/// route is still emitted; the soft condition reports `NoMatchingZone`).
+async fn read_allowed_domains(client: &Client) -> Vec<String> {
+    let api: Api<PlatformStack> = Api::namespaced(client.clone(), PLATFORM_STACK_NAMESPACE);
+    match api.get_opt(PLATFORM_STACK_NAME).await {
+        Ok(Some(ps)) => allowed_domains_from_values(&ps.spec.values),
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve the connection-target catalog for the effective needs' network
