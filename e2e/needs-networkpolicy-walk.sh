@@ -637,7 +637,6 @@ spec:
     replicas: 1
     expose:
       port: 80
-      public: false
     needs:
       pg:
         selector:
@@ -661,7 +660,6 @@ spec:
     replicas: 1
     expose:
       port: 80
-      public: false
 YAML
 
 # Both Deployments must reach Ready. web pauses on its pg claim first, then

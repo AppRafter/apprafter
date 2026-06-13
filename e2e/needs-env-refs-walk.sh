@@ -551,7 +551,6 @@ spec:
     replicas: 1
     expose:
       port: 80
-      public: false
     needs:
       pg:
         selector:

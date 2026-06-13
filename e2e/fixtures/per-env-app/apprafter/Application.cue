@@ -41,7 +41,6 @@ spec: {
 		replicas: 1
 		expose: {
 			port:   80
-			public: false
 		}
 	}
 	environments: {
