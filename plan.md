@@ -2676,12 +2676,14 @@ instead of carrying parallel definitions.
 ### 1.83b Schema: `expose.hostname` + `expose.tls` + allowedDomains admission
 > 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
 
+> ✅ **CLOSED 2026-06-13** (delivered as ONE vertical, merging 1.83b schema/webhook + 1.83c operator HTTPRoute). Release: operator v0.2.30 / platform-stack 0.2.33 / cli v0.2.15. kind+Cilium live walk GREEN (e2e/gateway-walk.sh). **Deviations from the original 1.83b/1.83c wording:** (1) `expose.public` (bool) DROPPED — `network: "public"` is the single visibility trigger (the bool was never consumed). (2) `expose.tls` KEPT as the minimal `bool | *true` (full `#TlsOptions` deferred to 4.1b, NOT cancelled); `tls:false`+public is webhook-rejected for now. (3) The hostname↔allowedDomains zone check is a SOFT operator `PublicRouteReady` condition (route still emitted; adding the zone later attaches it), NOT a hard webhook reject — the webhook only checks DNS-1123-subdomain shape. (4) The landing-manifest migration to `expose.hostname` (1.83b "Поставка" last bullet) is a SEPARATE landing-repo change, NOT done here.
+
 **Source:** срез 4.1a schema extension + 4.1b `allowedDomains` admission rule.
 
 **Цель:** ввести поля `hostname` и `tls` в Application; admission webhook валидирует hostname против `PlatformStack.spec.values.gateway.allowedDomains`. Оба rules signature-stable с 4.1b — миграция == webhook читает `ExternalSurface.spec.allowedDomains` вместо PlatformStack.
 
 **Поставка:**
-- [ ] `schemas/v1alpha1/application.cue` — расширить `#Expose`:
+- [x] `schemas/v1alpha1/application.cue` — расширить `#Expose`:
     ```cue
     #Expose: {
         port:     int
@@ -2691,8 +2693,8 @@ instead of carrying parallel definitions.
         tls:      bool | *true   // default on для public; full #TlsOptions в 4.1b
     }
     ```
-- [ ] OpenAPI v3 CRD пересгенерирована (или hand-rolled mirror) + apply через chart upgrade.
-- [ ] Admission webhook (existing `apprafter-admission-webhook`):
+- [x] OpenAPI v3 CRD пересгенерирована (или hand-rolled mirror) + apply через chart upgrade.
+- [x] Admission webhook (existing `apprafter-admission-webhook`):
     - Rule 1: `public: true ⇒ hostname != ""` с error «expose.public: true requires expose.hostname (defaultDomain auto-generation lands в 4.1b)».
     - Rule 2: `public: true` ⇒ `hostname` matches минимум одной entry в `PlatformStack.spec.values.gateway.allowedDomains[]`:
         - Exact apex match: `hostname == entry.domain`.
@@ -2701,7 +2703,7 @@ instead of carrying parallel definitions.
         - Mismatch ⇒ reject «hostname '<x>' not in cluster's allowed domains. Run `apprafter target domain add <zone> --cert <name>` first».
     - Webhook читает PlatformStack singleton (`default` в `apprafter-system`) на каждый validate (низкочастотный path, кэш не делаем в slice).
     - Пустой `allowedDomains` ⇒ Rule 2 пропускается на Rule 1's error (нет где match'ить).
-- [ ] `expose.tls: false` + `public: true` ⇒ пока reject (в slice нет HTTP-only маршрута; добавится в 4.1b как `#TlsOptions{enabled: false}`).
+- [x] `expose.tls: false` + `public: true` ⇒ пока reject (в slice нет HTTP-only маршрута; добавится в 4.1b как `#TlsOptions{enabled: false}`).
 - [ ] Migration лендинг-манифеста: убрать label `apprafter.io/hostname` (см. PART 0.6 чек 2 — если label не используется, пропустить), добавить `spec.base.expose.hostname: "apprafter.dev"`.
 
 **Acceptance:**
@@ -2725,7 +2727,7 @@ instead of carrying parallel definitions.
 **Цель:** Application с `public: true` + `hostname` → operator-rendered HTTPRoute. Gateway API сам резолвит listener по hostname matching (apex или wildcard какой угодно зарегистрированной зоны), оператор не знает про количество listener'ов / зон. Certificate не эмитим — cert живёт на per-listener cert-ref'ах статически (1.83a + 1.83e). Multi-zone naturally работает без правок renderer'а.
 
 **Поставка:**
-- [ ] `operator-rendering` — extension `render_application`:
+- [x] `operator-rendering` — extension `render_application`:
     - `expose.public: true` + `hostname != ""` ⇒ render `HTTPRoute`:
         - Name `<app>-public` в namespace Application'а.
         - `parentRefs: [{name: platform, namespace: apprafter-system, kind: Gateway}]` — **без `sectionName`**, Gateway сам выбирает listener по SNI.
@@ -2733,9 +2735,9 @@ instead of carrying parallel definitions.
         - `rules: [{matches: [{path: {type: PathPrefix, value: "/"}}], backendRefs: [{name: <service-name>, port: <expose.port>}]}]`.
     - OwnerRef → Application (cascading delete через 1.9 mechanism).
     - **Никакого Certificate** в slice-variant.
-- [ ] HTTPRoute и Service Application'а в одном namespace ⇒ `ReferenceGrant` не требуется. Cross-namespace Gateway↔HTTPRoute разрешён через `allowedRoutes.namespaces.from: All` (1.83a).
-- [ ] Status: `Application.status.endpointURL` ⇒ `https://<hostname>` при `public: true` (вместо internal cluster-DNS endpoint).
-- [ ] Тесты:
+- [x] HTTPRoute и Service Application'а в одном namespace ⇒ `ReferenceGrant` не требуется. Cross-namespace Gateway↔HTTPRoute разрешён через `allowedRoutes.namespaces.from: All` (1.83a).
+- [x] Status: `Application.status.endpointURL` ⇒ `https://<hostname>` при `public: true` (вместо internal cluster-DNS endpoint).
+- [x] Тесты:
     - In-file: pure renderer тест на HTTPRoute shape для public+hostname.
     - In-file: assert что Certificate не рендерится.
     - In-file: assert renderer не зависит от количества зарегистрированных зон.

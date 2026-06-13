@@ -79,7 +79,7 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 | Status | Feature | plan.md | Checkpoint |
 |---|---|---|---|
-| ☐ | Automatic public URL + HTTPS on the app's domain (HTTPRoute auto-generated from `Application.expose`) | 4.1a | CP1 `*` |
+| ✅ | Automatic public URL + HTTPS on the app's domain (HTTPRoute auto-generated from `Application.expose`) | 4.1a | CP1 `*` |
 | ☐ | Declarative external surface (`ExternalSurface` CRD) | 4.1 | CP1 `*` |
 | ☐ | Automatic DNS (external-dns + `DNSZone`) | 4.4a | CP3 |
 | ☐ | Automatic backups to external S3 (default ON for Tier-1) | 4.12 | CP3 |

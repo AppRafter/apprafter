@@ -9,6 +9,55 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator v0.2.30 — public ingress: operator-rendered HTTPRoute (1.83b) (2026-06-13)
+
+### Added
+
+- **The operator renders a public Gateway-API `HTTPRoute` for an exposed app.**
+  When an `Application` sets `expose.network: "public"` + a `hostname`, the
+  operator emits an `HTTPRoute` (`<app>-public`, in the app's own namespace) on
+  the platform `platform` Gateway (port 443, no `sectionName` — the Gateway
+  resolves the listener by SNI), routing the host to the app's own Service. The
+  route carries an OwnerRef back to the `Application` for cascading delete.
+- **`PublicRouteReady` Application condition** surfaces the route's readiness:
+  whether the `hostname` is covered by the cluster's `allowedDomains` zones plus
+  the route's own `Accepted` / `ResolvedRefs` from the Gateway. It is
+  informational — the route is still emitted when a zone is missing, and adding
+  the zone later attaches it (soft check, not a hard reject).
+- **Public-aware `status.endpointURL`** — becomes `https://<hostname>` when the
+  app is public (instead of the internal cluster-DNS endpoint).
+- **Prune-on-flip** — flipping `expose.network` from `public` back to `internal`
+  (or clearing the hostname) removes the previously-rendered HTTPRoute.
+- **Admission-webhook expose rules** — the webhook now enforces
+  hostname-required-when-public (a DNS-1123 subdomain) and rejects a `hostname`
+  set without `network: "public"`, `network: "vpn"`, and `tls: false` combined
+  with a public expose.
+
+### Changed
+
+- **`Application.spec.*.expose` drops the unused `public` bool** — `network:
+  "public"` is the single public-visibility trigger. The schema adds `hostname`
+  (a string or list of strings) and keeps `tls` (bool, default `true`; `tls:
+  false` is rejected for public for now — the HTTP-only route lands with the
+  full `#TlsOptions` in 4.1b).
+
+## platform-stack 0.2.33 — operator v0.2.30 (public ingress) (2026-06-13)
+
+### Changed
+
+- **Bumps the `apprafter-operator` + `admission-webhook` components to v0.2.30**
+  (1.83b app public ingress). `change=requires-restart`: the operator Deployment
+  rolls to the new image. Chart-delivered, no CLI re-bootstrap.
+
+## cli v0.2.15 — drop expose.public from the parsed manifest type (1.83b) (2026-06-13)
+
+### Changed
+
+- **The CLI's `Application` manifest parser no longer reads `expose.public`** —
+  the field was dropped from the schema (`network: "public"` is the single
+  public-visibility trigger). No behavioural change to any CLI command; the
+  parsed manifest type simply stops carrying the removed field.
+
 ## cli v0.2.14 — root App ignoreDifferences for Gateway-API defaulting (T8 Run-2 F3) (2026-06-13)
 
 ### Fixed
