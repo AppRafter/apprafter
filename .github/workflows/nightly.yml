@@ -63,6 +63,23 @@ jobs:
         with:
           version: v0.10.0
 
+      - name: Write the SSH private key (kubeconfig SSH-in)
+        env:
+          APPRAFTER_SSH_PRIVATE_KEY: ${{ secrets.APPRAFTER_SSH_PRIVATE_KEY }}
+        run: |
+          # The mvp walk provisions the Hetzner server with the PUBLIC key, then
+          # SSHes in to fetch the k3s kubeconfig using the DEFAULT identity
+          # (~/.ssh/id_ed25519). The runner has no private key, so materialise
+          # the matching one from a secret. ADD `APPRAFTER_SSH_PRIVATE_KEY` (the
+          # private half of APPRAFTER_SSH_PUBLIC_KEY) to the repo secrets.
+          if [ -z "${APPRAFTER_SSH_PRIVATE_KEY:-}" ]; then
+            echo "::error::APPRAFTER_SSH_PRIVATE_KEY secret is not set — the mvp walk needs the private half of APPRAFTER_SSH_PUBLIC_KEY to SSH in for the kubeconfig." >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$APPRAFTER_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
       - name: Run E2E MVP smoke
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
