@@ -18,6 +18,7 @@
 //! the spinner finishes cleanly via `finish_and_clear()` and is
 //! replaced with the static success line on success.
 
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use cli_core::style;
@@ -283,8 +284,17 @@ fn wait_for_kubeconfig(target_override: Option<&str>, pb: &ProgressBar) -> Resul
         pb.set_message(format!(
             "attempt {attempt} — fetching /etc/rancher/k3s/k3s.yaml over SSH…"
         ));
+        // Two gates, not one. k3s writes /etc/rancher/k3s/k3s.yaml BEFORE the
+        // apiserver binds :6443, so "the kubeconfig is fetchable over SSH" is
+        // NOT "the cluster is reachable". Without the second gate, [3/3]
+        // cluster-bootstrap races a slow-booting node and fails
+        // "Kubernetes cluster unreachable … :6443 connect: connection refused".
         let err = match kubeconfig::fetch_and_cache(true, target_override) {
-            Ok(_) => return Ok(()),
+            Ok(yaml) => match apiserver_addr(&yaml) {
+                Some(addr) if apiserver_listening(&addr) => return Ok(()),
+                Some(addr) => format!("apiserver {addr} not accepting connections yet"),
+                None => "fetched kubeconfig has no server URL yet".to_string(),
+            },
             Err(e) => format!("{e}"),
         };
         warn!(attempt, error = %err, "kubeconfig fetch failed; retrying");
@@ -308,6 +318,46 @@ fn timeout_error(attempt: u32, last_err: &str) -> CliError {
         "kubeconfig did not become reachable within {}s ({attempt} attempts); last error: {last_err}. Run `apprafter kubeconfig --refresh` once the cluster reports ready.",
         KUBECONFIG_POLL_TIMEOUT.as_secs(),
     ))
+}
+
+/// Parse `HOST:PORT` from the kubeconfig's `server: https://HOST:PORT` line.
+/// `None` when there is no server line yet / it is unparseable, in which case
+/// the caller keeps polling. Pure (unit-tested); locates the `server:` line the
+/// same way `cli_providers::…::rewrite_server_url` does.
+fn apiserver_addr(kubeconfig_yaml: &str) -> Option<String> {
+    let line = kubeconfig_yaml
+        .lines()
+        .map(str::trim_start)
+        .find(|l| l.starts_with("server:"))?;
+    let url = line.trim_start_matches("server:").trim();
+    let hostport = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    if hostport.is_empty() {
+        return None;
+    }
+    // k3s always includes the port (`:6443`); default it defensively when the
+    // trailing colon-segment isn't a port number.
+    match hostport.rsplit(':').next().map(|p| p.parse::<u16>()) {
+        Some(Ok(_)) => Some(hostport.to_string()),
+        _ => Some(format!("{hostport}:6443")),
+    }
+}
+
+/// True when the k3s apiserver is actually accepting TCP connections on
+/// `host:port`. k3s writes the kubeconfig BEFORE binding the port, so this is
+/// the gate that stops [3/3] cluster-bootstrap racing a slow-booting node. A
+/// short connect timeout keeps each poll attempt snappy; network-dependent, so
+/// not unit-tested (the SSH fetch it complements isn't either).
+fn apiserver_listening(addr: &str) -> bool {
+    let Ok(socks) = addr.to_socket_addrs() else {
+        return false;
+    };
+    socks
+        .take(4)
+        .any(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(5)).is_ok())
 }
 
 fn format_elapsed(d: Duration) -> String {
@@ -334,6 +384,35 @@ fn short_error(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apiserver_addr_parses_https_server_line() {
+        let kc = "apiVersion: v1\nclusters:\n- cluster:\n    \
+                  server: https://167.233.83.240:6443\n    \
+                  certificate-authority-data: eHh4\n";
+        assert_eq!(apiserver_addr(kc).as_deref(), Some("167.233.83.240:6443"));
+    }
+
+    #[test]
+    fn apiserver_addr_none_when_no_server_line() {
+        assert_eq!(apiserver_addr("apiVersion: v1\nkind: Config\n"), None);
+    }
+
+    #[test]
+    fn apiserver_addr_defaults_port_when_absent() {
+        assert_eq!(
+            apiserver_addr("    server: https://10.0.0.5\n").as_deref(),
+            Some("10.0.0.5:6443")
+        );
+    }
+
+    #[test]
+    fn apiserver_addr_strips_trailing_slash() {
+        assert_eq!(
+            apiserver_addr("    server: https://10.0.0.5:6443/\n").as_deref(),
+            Some("10.0.0.5:6443")
+        );
+    }
 
     #[test]
     fn format_elapsed_uses_seconds_under_one_minute() {
