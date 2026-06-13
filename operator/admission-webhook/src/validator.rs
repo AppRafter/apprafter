@@ -196,6 +196,7 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     validate_needs_names(typed_base, typed_envs, base, envs, &mut errors);
     validate_env_refs(typed_base, typed_envs, base, envs, &mut errors);
     validate_disk_claims(typed_base, typed_envs, base, envs, &mut errors);
+    validate_expose(typed_base, typed_envs, base, envs, &mut errors);
     validate_spec_environment(app_environment, typed_envs, envs, &mut errors);
 
     errors
@@ -716,6 +717,123 @@ fn validate_disk_claims(
                     ));
                 }
             }
+        }
+    }
+}
+
+/// 1.83b: validate the `expose` block in BOTH base and every environment.
+///   - `network == "vpn"`  → reject (reserved until AccessGrant/ExternalSurface);
+///   - `network == "public"` → `hostname` REQUIRED, and every entry a DNS-1123
+///     subdomain (a concrete host, not a wildcard — the wildcard is the Gateway
+///     listener's, not the route's);
+///   - `hostname` set with `network != "public"` → reject (hostname is
+///     meaningless without public exposure; catches the `network:public` typo);
+///   - `tls == false` with `network == "public"` → reject (HTTP-only public
+///     exposure is deferred to 4.1b's `#TlsOptions`; this slice's route
+///     attaches to `:443` only).
+///
+/// `hostname` `OneOrMany` is normalized (scalar → `[scalar]`) before the check.
+fn validate_expose(
+    typed_base: Option<&ApplicationBaseSpec>,
+    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
+    base: Option<&serde_json::Map<String, Value>>,
+    envs: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    fn check_scope(
+        prefix: &str,
+        typed: Option<&ApplicationBaseSpec>,
+        raw: Option<&serde_json::Map<String, Value>>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        // network + hostnames + tls, typed-first with a raw fallback.
+        let (network, hostnames, tls): (Option<String>, Vec<String>, Option<bool>) =
+            match typed.and_then(|s| s.expose.as_ref()) {
+                Some(e) => (
+                    e.network.clone(),
+                    e.hostname
+                        .as_ref()
+                        .map(|h| h.as_slice_vec())
+                        .unwrap_or_default(),
+                    e.tls,
+                ),
+                None => {
+                    let expose = raw
+                        .and_then(|o| o.get("expose"))
+                        .and_then(|v| v.as_object());
+                    let network = expose
+                        .and_then(|e| e.get("network"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let hostnames = match expose.and_then(|e| e.get("hostname")) {
+                        Some(Value::String(s)) => vec![s.clone()],
+                        Some(Value::Array(a)) => a
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let tls = expose.and_then(|e| e.get("tls")).and_then(|v| v.as_bool());
+                    (network, hostnames, tls)
+                }
+            };
+        // expose absent → nothing to check (port-only / no expose).
+        let expose_present = typed.is_some_and(|s| s.expose.is_some())
+            || raw.is_some_and(|o| o.get("expose").is_some_and(|v| v.is_object()));
+        if !expose_present {
+            return;
+        }
+
+        let is_public = network.as_deref() == Some("public");
+
+        if network.as_deref() == Some("vpn") {
+            errors.push(ValidationError::new(
+                format!("{prefix}.expose.network"),
+                "expose.network: vpn is not yet implemented — coming with AccessGrant/ExternalSurface",
+            ));
+        }
+
+        if is_public {
+            if hostnames.is_empty() {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.expose.hostname"),
+                    "expose.hostname is required when expose.network: public",
+                ));
+            } else {
+                for h in &hostnames {
+                    if !is_dns_1123_subdomain(h) {
+                        errors.push(ValidationError::new(
+                            format!("{prefix}.expose.hostname"),
+                            format!(
+                                "expose.hostname {h:?} must be a DNS-1123 subdomain (a concrete host like \"app.demo.dev\", not a wildcard — the wildcard lives on the Gateway listener)"
+                            ),
+                        ));
+                    }
+                }
+            }
+            if tls == Some(false) {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.expose.tls"),
+                    "expose.tls: false (HTTP-only public exposure) is not yet implemented — coming with #TlsOptions in 4.1b; the public route terminates TLS on the platform Gateway listener",
+                ));
+            }
+        } else if !hostnames.is_empty() {
+            errors.push(ValidationError::new(
+                format!("{prefix}.expose.hostname"),
+                "expose.hostname requires expose.network: public",
+            ));
+        }
+    }
+
+    check_scope("spec.base", typed_base, base, errors);
+    if let Some(envs_obj) = envs {
+        for (env_name, val) in envs_obj {
+            check_scope(
+                &format!("spec.environments.{env_name}"),
+                typed_envs.and_then(|m| m.get(env_name)),
+                val.as_object(),
+                errors,
+            );
         }
     }
 }
@@ -1249,6 +1367,16 @@ fn is_dns_1123_label(s: &str) -> bool {
     }
     s.bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A DNS-1123 SUBDOMAIN (an FQDN host like `app.demo.dev`): one or more
+/// DNS-1123 labels joined by '.'. Rejects wildcards (`*` is not in the label
+/// alphabet), empty labels (leading/trailing/double dots), and >253 chars.
+fn is_dns_1123_subdomain(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(is_dns_1123_label)
 }
 
 fn is_env_var_name(s: &str) -> bool {
@@ -2530,5 +2658,109 @@ mod tests {
             .collect();
         assert_eq!(claim_errs.len(), 1);
         assert_eq!(secret_errs.len(), 1);
+    }
+
+    #[test]
+    fn accepts_public_with_valid_subdomain_hostname() {
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "expose": { "port": 8080, "network": "public", "hostname": "app.demo.dev" }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn accepts_public_with_array_hostnames() {
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "expose": { "port": 8080, "network": "public",
+                            "hostname": ["a.demo.dev", "b.demo.dev"] }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn rejects_public_without_hostname() {
+        let spec = json!({
+            "base": { "image": "x", "expose": { "port": 8080, "network": "public" } }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.expose.hostname");
+        assert!(errors[0].message.contains("required"));
+    }
+
+    #[test]
+    fn rejects_hostname_without_public() {
+        let spec = json!({
+            "base": { "image": "x",
+                      "expose": { "port": 8080, "hostname": "app.demo.dev" } }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.expose.hostname");
+        assert!(errors[0].message.contains("network: public"));
+    }
+
+    #[test]
+    fn rejects_network_vpn() {
+        let spec = json!({
+            "base": { "image": "x", "expose": { "port": 8080, "network": "vpn" } }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.expose.network");
+        assert!(errors[0].message.contains("not yet implemented"));
+    }
+
+    #[test]
+    fn rejects_public_wildcard_hostname() {
+        let spec = json!({
+            "base": { "image": "x",
+                      "expose": { "port": 8080, "network": "public", "hostname": "*.demo.dev" } }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.expose.hostname");
+    }
+
+    #[test]
+    fn validates_expose_under_environment_overrides_too() {
+        let spec = json!({
+            "base": { "image": "x" },
+            "environments": {
+                "prod": { "expose": { "port": 8080, "network": "public" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.environments.prod.expose.hostname");
+    }
+
+    #[test]
+    fn rejects_tls_false_with_public() {
+        let spec = json!({
+            "base": { "image": "x",
+                      "expose": { "port": 8080, "network": "public",
+                                  "hostname": "app.demo.dev", "tls": false } }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.expose.tls");
+        assert!(errors[0].message.contains("4.1b"));
+    }
+
+    #[test]
+    fn accepts_tls_true_explicit_with_public() {
+        let spec = json!({
+            "base": { "image": "x",
+                      "expose": { "port": 8080, "network": "public",
+                                  "hostname": "app.demo.dev", "tls": true } }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
     }
 }
