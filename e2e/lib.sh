@@ -286,39 +286,32 @@ cluster_kubeconfig_write() {
 # ---------------------------------------------------------------
 cluster_load_image() {
     local cluster_name="$1" image="$2"
-    if [ "$(cluster_runtime)" = "kind" ]; then
-        if _kind_uses_podman; then
-            # `kind load docker-image` cannot reliably resolve a podman-built
-            # image (podman's CLI store vs the DOCKER_HOST socket store —
-            # "image ... not present locally"). Export to a tarball and load
-            # that: provider-agnostic, no runtime store lookup.
-            local _imgtar
-            _imgtar="$(mktemp -t apprafter-img.XXXXXX.tar)"
-            podman save -o "$_imgtar" "$image"
+    # Load from whichever engine's store actually HAS the image, NOT from the
+    # cluster provider's store. The local-operator build prefers podman
+    # (`builder=podman; … || builder=docker`), but a CI runner ships BOTH
+    # podman AND docker, and kind/k3d there read the DOCKER store — so a
+    # podman-built image is "image … not present locally" to `kind load
+    # docker-image` / `k3d image import` (the failure the pg/redis/disk/
+    # networkpolicy/env-refs nightlies hit). `_kind_uses_podman` reflects the
+    # CLUSTER provider, not where the BUILD landed, so it's the wrong signal.
+    # When the image lives in podman's store, export a docker-format tarball
+    # and load THAT — store-agnostic for both kind and k3d.
+    if command -v podman >/dev/null 2>&1 && podman image exists "$image" 2>/dev/null; then
+        local _imgtar
+        _imgtar="$(mktemp -t apprafter-img.XXXXXX.tar)"
+        podman save -o "$_imgtar" "$image"
+        if [ "$(cluster_runtime)" = "kind" ]; then
             _kind load image-archive "$_imgtar" --name "$cluster_name"
-            rm -f "$_imgtar"
         else
-            _kind load docker-image "$image" --name "$cluster_name"
-        fi
-    else
-        # k3d imports from the DOCKER store. CI runners ship BOTH podman and
-        # docker, and the local-operator build picks podman first (`builder=
-        # podman; … || builder=docker`), so a podman-built image is invisible
-        # to `k3d image import` ("image … not present locally" — the failure
-        # the pg/networkpolicy/env-refs nightlies hit). Export to a tarball
-        # when the image lives in podman's store — `k3d image import` accepts a
-        # tarball path, store-agnostic (mirrors the kind+podman branch above).
-        if command -v podman >/dev/null 2>&1 && podman image exists "$image" 2>/dev/null; then
-            local _imgtar
-            _imgtar="$(mktemp -t apprafter-img.XXXXXX.tar)"
-            podman save -o "$_imgtar" "$image"
             # shellcheck disable=SC2086
             $(_k3d_bin) image import "$_imgtar" --cluster "$cluster_name"
-            rm -f "$_imgtar"
-        else
-            # shellcheck disable=SC2086
-            $(_k3d_bin) image import "$image" --cluster "$cluster_name"
         fi
+        rm -f "$_imgtar"
+    elif [ "$(cluster_runtime)" = "kind" ]; then
+        _kind load docker-image "$image" --name "$cluster_name"
+    else
+        # shellcheck disable=SC2086
+        $(_k3d_bin) image import "$image" --cluster "$cluster_name"
     fi
 }
 
