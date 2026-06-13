@@ -50,15 +50,13 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 			// process binds elsewhere.
 			port: {{primary_port}}
 
-			// Internal-only until you're ready to expose
-			// publicly. Flip to `true` + uncomment
-			// `network: "public"` below + add a `hostname`
-			// label on metadata when ready; the Gateway
-			// API HTTPRoute is rendered by the operator
-			// automatically once those three line up.
-			public: false
-
-			// network: "public"  // also accepts "internal" / "vpn"
+			// Internal-only by default (a ClusterIP Service). To
+			// expose publicly, uncomment `network: "public"` and add
+			// a `hostname` (a single host or a list) under one of the
+			// cluster's registered allowedDomains zones; the operator
+			// then renders the Gateway-API HTTPRoute automatically.
+			// network:  "public"           // also "internal" (default) / "vpn"
+			// hostname: "app.example.com"  // required when network: public
 		}{{needs_block}}
 
 		// Literal env values only in v1alpha1. Secret /

@@ -43,10 +43,10 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 			// TODO: container port your app listens on.
 			port: {{primary_port}}
 
-			// TODO: flip to `true` and add a `hostname`
-			// label on metadata when ready to expose
-			// publicly.
-			public: false
+			// TODO: to expose publicly, set network: "public" and add
+			// a hostname (under a registered allowedDomains zone).
+			// network:  "public"
+			// hostname: "app.example.com"
 		}{{needs_block}}
 
 		// TODO: env map. Literal values only in v1alpha1.
