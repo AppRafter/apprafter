@@ -1728,6 +1728,26 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.33": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.30"
+	notes: """
+		1.83b — app public ingress. The operator now renders a per-Application
+		Gateway-API HTTPRoute on the platform Gateway (port 443) when
+		`expose.network: public` + a `hostname` is set, routing the host to the
+		app's own Service; the `PublicRouteReady` Application condition surfaces
+		allowedDomains zone-coverage + the route's own Accepted/ResolvedRefs;
+		flipping public→internal prunes the route. The `Application.expose`
+		schema drops the unused `public` bool (network: public is the single
+		trigger), adds `hostname` (OneOrMany) + keeps `tls` (minimal bool,
+		full #TlsOptions deferred to 4.1b), and the admission webhook gains the
+		expose rules. change=requires-restart: the operator Deployment rolls to
+		the new image (v0.2.30); a kind+Cilium live walk validated the route on
+		:443 + curl 200 + http 301 + prune end-to-end.
+		"""
+	references: ["plan.md#1.83b", "docs/changelog/UNRELEASED.md"]
+}
+
 compatibility: "0.2.32": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.29"
