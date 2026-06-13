@@ -40,6 +40,12 @@ pub struct RenderedApplication {
     /// absent (e.g. the base `render_application` entry point, or a tier
     /// without Cilium) → the controller applies no CNP.
     pub network_policy: Option<serde_json::Value>,
+    /// The Gateway-API `HTTPRoute` (1.83b), built via `serde_json::json!`
+    /// (the external-CR pattern — no hand-rolled type). `Some(...)` only when
+    /// `effective.expose.network == "public"` AND a hostname is set; the
+    /// controller SSA-applies it under the platform Gateway and prunes it when
+    /// the app flips back to `internal`.
+    pub httproute: Option<serde_json::Value>,
 }
 
 /// One ready `needs.disk` claim resolved into render input (2.6b /
@@ -182,10 +188,25 @@ pub fn render_application_for_env(
         )
     });
 
+    // 1.83b: emit an HTTPRoute only when the app is public AND names at
+    // least one hostname (a hostname-less public app would attach to every
+    // listener — the webhook rejects it; the renderer is defensive). The
+    // child + Service are both named `name`; the route backend-refs the
+    // Service on port 80.
+    let httproute = effective
+        .expose
+        .as_ref()
+        .filter(|e| e.network.as_deref() == Some("public"))
+        .and_then(|e| e.hostname.as_ref())
+        .map(|h| h.as_slice_vec())
+        .filter(|hosts| !hosts.is_empty())
+        .map(|hosts| render_httproute(&name, &labels, &hosts, &name));
+
     RenderedApplication {
         deployment,
         service,
         network_policy,
+        httproute,
     }
 }
 
@@ -471,6 +492,49 @@ fn render_service(
     }
 }
 
+/// Build the per-Application Gateway-API `HTTPRoute` (1.83b) as a
+/// `serde_json::Value` — the external-CR pattern (`render_egress_policy`
+/// precedent; the gateway-api crate is not a dep). `name` is the app's
+/// child name (== the CR metadata name, already env-distinct); `service_name`
+/// is the backend Service's name (same as `name`). The route:
+///   - `parentRefs[0]` → the `platform` Gateway in `apprafter-system`,
+///     `port: 443` (attaches to the HTTPS listeners ONLY — never `:80`, so
+///     1.83a's catch-all http→https redirect is preserved — and NO
+///     `sectionName`, so Gateway API hostname-matches apex/wildcard
+///     zone-agnostically);
+///   - `hostnames` → the normalized `Vec<String>`;
+///   - one rule, `backendRefs` → the Service on port `80` (the Service maps
+///     `80` → `targetPort: expose.port`), no `matches` (apiserver defaults
+///     match-all `/`).
+///
+/// The controller injects `metadata.namespace` + `ownerReferences` at apply.
+fn render_httproute(
+    name: &str,
+    labels: &BTreeMap<String, String>,
+    hostnames: &[String],
+    service_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": {
+            "name": name,
+            "labels": labels,
+        },
+        "spec": {
+            "parentRefs": [{
+                "name": "platform",
+                "namespace": "apprafter-system",
+                "port": 443
+            }],
+            "hostnames": hostnames,
+            "rules": [{
+                "backendRefs": [{ "name": service_name, "port": 80 }]
+            }]
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +752,132 @@ mod tests {
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, 80);
         assert_eq!(ports[0].target_port, Some(IntOrString::Int(9000)));
+    }
+
+    // ---- 1.83b: HTTPRoute emission ----
+
+    #[test]
+    fn no_httproute_when_network_not_public() {
+        // internal (default) + a hostname is irrelevant → no route.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("x".into()),
+                    expose: Some(ApplicationExpose {
+                        port: 8080,
+                        network: Some("internal".into()),
+                        hostname: None,
+                        tls: None,
+                    }),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "u",
+        );
+        assert!(render_application(&app).httproute.is_none());
+    }
+
+    #[test]
+    fn httproute_emitted_for_public_with_scalar_hostname() {
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("x".into()),
+                    expose: Some(ApplicationExpose {
+                        port: 8080,
+                        network: Some("public".into()),
+                        hostname: Some(operator_core::OneOrMany::One("app.demo.dev".into())),
+                        tls: None,
+                    }),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "u",
+        );
+        let r = render_application(&app).httproute.expect("route rendered");
+        assert_eq!(r["apiVersion"], "gateway.networking.k8s.io/v1");
+        assert_eq!(r["kind"], "HTTPRoute");
+        assert_eq!(r["metadata"]["name"], "web");
+        // parentRef attaches to the HTTPS listeners ONLY (port 443), so http
+        // still hits 1.83a's catch-all 301 redirect; no sectionName (zone-agnostic).
+        let parent = &r["spec"]["parentRefs"][0];
+        assert_eq!(parent["name"], "platform");
+        assert_eq!(parent["namespace"], "apprafter-system");
+        assert_eq!(parent["port"], 443);
+        assert!(parent.get("sectionName").is_none());
+        // hostnames normalized to a list.
+        assert_eq!(r["spec"]["hostnames"], serde_json::json!(["app.demo.dev"]));
+        // backendRef → the Service (named after the app) on port 80 (the Service
+        // port; render_service maps 80 → targetPort expose.port). No `matches`.
+        let backend = &r["spec"]["rules"][0]["backendRefs"][0];
+        assert_eq!(backend["name"], "web");
+        assert_eq!(backend["port"], 80);
+        assert!(r["spec"]["rules"][0].get("matches").is_none());
+    }
+
+    #[test]
+    fn httproute_hostnames_normalize_array_form() {
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("x".into()),
+                    expose: Some(ApplicationExpose {
+                        port: 8080,
+                        network: Some("public".into()),
+                        hostname: Some(operator_core::OneOrMany::Many(vec![
+                            "a.demo.dev".into(),
+                            "b.demo.dev".into(),
+                        ])),
+                        tls: None,
+                    }),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "u",
+        );
+        let r = render_application(&app).httproute.expect("route rendered");
+        assert_eq!(
+            r["spec"]["hostnames"],
+            serde_json::json!(["a.demo.dev", "b.demo.dev"])
+        );
+    }
+
+    #[test]
+    fn no_httproute_when_public_but_hostname_absent() {
+        // Defensive: the webhook rejects this, but the renderer must not emit a
+        // hostname-less route (it would attach to every listener).
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("x".into()),
+                    expose: Some(ApplicationExpose {
+                        port: 8080,
+                        network: Some("public".into()),
+                        hostname: None,
+                        tls: None,
+                    }),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "u",
+        );
+        assert!(render_application(&app).httproute.is_none());
     }
 
     #[test]
