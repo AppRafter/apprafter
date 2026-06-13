@@ -17,7 +17,6 @@ spec:
     replicas: 1
     expose:
       port: 8080
-      public: false
       network: internal
     env:
       LOG_LEVEL: info

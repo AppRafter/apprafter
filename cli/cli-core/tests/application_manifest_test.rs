@@ -65,7 +65,7 @@ fn parse_full_application_fixture() {
 
     let expose = base.expose.expect("expose decoded");
     assert_eq!(expose.port, 8080);
-    assert_eq!(expose.public, Some(false));
+    assert_eq!(expose.network.as_deref(), None);
 
     let env = base.env.expect("env decoded");
     assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("info"));

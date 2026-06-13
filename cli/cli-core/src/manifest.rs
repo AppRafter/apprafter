@@ -223,8 +223,6 @@ pub struct ApplicationSpec {
 pub struct ApplicationExpose {
     pub port: u16,
     #[serde(default)]
-    pub public: Option<bool>,
-    #[serde(default)]
     pub network: Option<String>,
 }
 

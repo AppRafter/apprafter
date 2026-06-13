@@ -53,8 +53,6 @@ spec:
                           type: integer
                           minimum: 1
                           maximum: 65535
-                        public:
-                          type: boolean
                         network:
                           type: string
                           enum:
@@ -85,8 +83,6 @@ spec:
                             type: integer
                             minimum: 1
                             maximum: 65535
-                          public:
-                            type: boolean
                           network:
                             type: string
                             enum:

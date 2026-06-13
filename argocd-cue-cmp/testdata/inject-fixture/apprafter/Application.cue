@@ -25,7 +25,6 @@ spec: base: {
 	image:    "nginxdemos/hello:plain-text"
 	replicas: 1
 	expose: {
-		port:   80
-		public: false
+		port: 80
 	}
 }
