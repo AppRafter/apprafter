@@ -9,6 +9,22 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.14 — root App ignoreDifferences for Gateway-API defaulting (T8 Run-2 F3) (2026-06-13)
+
+### Fixed
+
+- **The bootstrapped root `platform` Application no longer sits permanently
+  OutOfSync** once a gateway is configured. The apiserver defaults Gateway-API
+  fields the chart leaves unset, so the platform Gateway + redirect HTTPRoute
+  drifted forever (and `selfHeal` churned re-applying them). `cluster-bootstrap`
+  now renders `spec.ignoreDifferences` muting the live-Argo-DIFF-confirmed
+  defaulted paths: the Gateway `.spec.listeners[].tls.certificateRefs[].group`
+  (apiserver fills the empty core group `''`), and on the redirect HTTPRoute
+  `.spec.parentRefs[].group` / `.kind` plus the auto-defaulted match-all
+  `.spec.rules[].matches`. New bootstraps only — an existing cluster's root App
+  takes a one-off `kubectl patch ... spec.ignoreDifferences` (a field the
+  operator does not manage, so it survives the PlatformController's SSA patches).
+
 ## platform-stack 0.2.32 — cilium config changes roll the whole stack (T8 Run-2 F2) (2026-06-13)
 
 ### Fixed

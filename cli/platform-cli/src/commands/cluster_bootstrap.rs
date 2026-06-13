@@ -649,6 +649,33 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+  # 1.83a F3 (live-Argo-DIFF-confirmed, T8 Run 2): the apiserver DEFAULTS
+  # Gateway-API fields our chart leaves unset, so the platform Gateway +
+  # redirect HTTPRoute would sit permanently OutOfSync (and selfHeal would
+  # churn re-applying them). Mute the defaulted paths: the Gateway
+  # certificateRef `group` (apiserver fills the empty core group ''), and on
+  # the redirect HTTPRoute the parentRef `group`/`kind` defaults + the
+  # auto-defaulted match-all `rules[].matches`.
+  ignoreDifferences:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: platform
+      namespace: apprafter-system
+      jqPathExpressions:
+        # `select(.tls)` skips the catch-all http listener (no tls) — without
+        # it `.tls.certificateRefs[]` iterates null on that listener and the
+        # whole jq expression errors, so the ignore silently never applies
+        # (T8 Run 2: the HTTPRoute ignore worked but the Gateway stayed
+        # OutOfSync until this filter was added).
+        - .spec.listeners[] | select(.tls) | .tls.certificateRefs[].group
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: platform-http-redirect
+      namespace: apprafter-system
+      jqPathExpressions:
+        - .spec.parentRefs[].group
+        - .spec.parentRefs[].kind
+        - .spec.rules[].matches
 "#,
         chart_name = APPRAFTER_PLATFORM_STACK_CHART_NAME,
         helm_block = helm_block,
@@ -1147,6 +1174,26 @@ mod tests {
         // component. Critical for upgrades.
         assert!(yaml.contains("prune: true"));
         assert!(yaml.contains("selfHeal: true"));
+    }
+
+    #[test]
+    fn render_root_application_ignores_gateway_api_defaulting() {
+        // 1.83a F3 (live-Argo-DIFF-confirmed): without these the platform
+        // Gateway + redirect HTTPRoute sit permanently OutOfSync because the
+        // apiserver defaults fields the chart leaves unset.
+        let yaml = render_root_application(APPRAFTER_PLATFORM_STACK_DEFAULT_REPO, "0.2.0");
+        assert!(yaml.contains("ignoreDifferences:"), "{yaml}");
+        // Gateway certificateRef group (apiserver fills empty core group) —
+        // `select(.tls)` skips the tls-less http listener so the jq doesn't
+        // error out and silently drop the whole ignore.
+        assert!(
+            yaml.contains(".spec.listeners[] | select(.tls) | .tls.certificateRefs[].group"),
+            "{yaml}"
+        );
+        // HTTPRoute parentRef + match-all defaulting.
+        assert!(yaml.contains(".spec.parentRefs[].group"), "{yaml}");
+        assert!(yaml.contains(".spec.parentRefs[].kind"), "{yaml}");
+        assert!(yaml.contains(".spec.rules[].matches"), "{yaml}");
     }
 
     #[test]
