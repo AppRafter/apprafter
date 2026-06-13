@@ -99,4 +99,7 @@ jobs:
         run: cargo build --bin apprafter
 
       - name: Run the needs.redis k3d walk
-        run: bash e2e/needs-redis-walk.sh
+        # 2.6 redis claim shape is unreleased relative to the published operator
+        # image, so the walk REQUIRES local-operator mode (Phase 1b builds +
+        # side-loads the working-tree operator/webhook). Mirrors the pg nightly.
+        run: APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-redis-walk.sh

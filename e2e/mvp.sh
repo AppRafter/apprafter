@@ -78,35 +78,41 @@ _KUBECONFIG_FILE=$(mktemp)
 export KUBECONFIG="$_KUBECONFIG_FILE"
 
 # ---------------------------------------------------------------
-# Step 1: init (write provider/tier/region into state)
+# Step 1: target add (provider/tier/region + token into the target store)
 # ---------------------------------------------------------------
 
-phase "Step 1: init (Hetzner, tier=solo, region=${REGION})"
+phase "Step 1: target add (Hetzner, tier=solo, region=${REGION})"
 
-# Write provider/tier/region into state so that bootstrap-all
-# knows what to provision.  HCLOUD_TOKEN and APPRAFTER_SSH_PUBLIC_KEY
-# are read by the credential resolver at apply time (cli-core
-# credentials.rs SSH_PUBLIC_KEY_ENV); no target-store entry is
-# required.
-apprafter init \
+# `apprafter init` was superseded by the target store (ADR 0030): `up`
+# (= bootstrap-all) operates on the ACTIVE target, so create one first —
+# `init` now errors "no active target". The token is passed explicitly
+# from HCLOUD_TOKEN; the SSH public key is still read from
+# APPRAFTER_SSH_PUBLIC_KEY at apply time (credentials.rs resolves that env
+# BEFORE any target ssh_key_path), so no --ssh-key is needed here. --force
+# keeps a re-run on a warm runner idempotent; the API ping verifies the
+# token authenticates against Hetzner Cloud.
+apprafter target add e2e \
     --provider hetzner-cloud \
     --tier     solo \
-    --region   "$REGION"
+    --region   "$REGION" \
+    --token    "$HCLOUD_TOKEN" \
+    --no-interactive --force
 
 # ---------------------------------------------------------------
 # Step 2: bootstrap-all (provision + kubeconfig poll + bootstrap)
 # ---------------------------------------------------------------
 
-phase "Step 2: bootstrap-all (provision + kubeconfig poll + cluster-bootstrap)"
+phase "Step 2: up (provision + kubeconfig poll + cluster-bootstrap)"
 
-# bootstrap-all runs three phases internally:
+# `apprafter up` is the alias for `bootstrap-all`; it operates on the
+# active target created above and runs three phases internally:
 #   [1/3] apply        — provision Hetzner Cloud resources
 #   [2/3] k3s-ready    — poll SSH until k3s kubeconfig is reachable
 #   [3/3] cluster-bootstrap — Cilium, Gateway API CRDs, Application
 #                             CRD, Argo CD, cert-manager, ClusterIssuer,
 #                             platform-stack Argo CD Apps
 # Running `apprafter apply` before this would double-provision (B1).
-apprafter bootstrap-all
+apprafter up
 
 # Pull the kubeconfig into our temp file so kubectl calls below work.
 apprafter kubeconfig > "$_KUBECONFIG_FILE"

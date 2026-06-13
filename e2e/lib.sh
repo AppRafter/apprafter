@@ -301,8 +301,24 @@ cluster_load_image() {
             _kind load docker-image "$image" --name "$cluster_name"
         fi
     else
-        # shellcheck disable=SC2086
-        $(_k3d_bin) image import "$image" --cluster "$cluster_name"
+        # k3d imports from the DOCKER store. CI runners ship BOTH podman and
+        # docker, and the local-operator build picks podman first (`builder=
+        # podman; … || builder=docker`), so a podman-built image is invisible
+        # to `k3d image import` ("image … not present locally" — the failure
+        # the pg/networkpolicy/env-refs nightlies hit). Export to a tarball
+        # when the image lives in podman's store — `k3d image import` accepts a
+        # tarball path, store-agnostic (mirrors the kind+podman branch above).
+        if command -v podman >/dev/null 2>&1 && podman image exists "$image" 2>/dev/null; then
+            local _imgtar
+            _imgtar="$(mktemp -t apprafter-img.XXXXXX.tar)"
+            podman save -o "$_imgtar" "$image"
+            # shellcheck disable=SC2086
+            $(_k3d_bin) image import "$_imgtar" --cluster "$cluster_name"
+            rm -f "$_imgtar"
+        else
+            # shellcheck disable=SC2086
+            $(_k3d_bin) image import "$image" --cluster "$cluster_name"
+        fi
     fi
 }
 
