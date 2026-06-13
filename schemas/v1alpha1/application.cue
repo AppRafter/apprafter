@@ -64,13 +64,24 @@ package v1alpha1
 	replicas?: int & >=0
 
 	expose?: {
-		port:    int & >0 & <=65535
-		public?: bool | *false
-		// Defaults to "internal" when the field is unset in the
-		// manifest. The OpenAPI v3 CRD enforces the enum at the
-		// kube-apiserver layer; the renderer consumes the field
-		// for HTTPRoute emission in phase 1.9c.
+		port: int & >0 & <=65535
+		// Visibility. `public` → the operator emits an HTTPRoute on the
+		// platform Gateway (1.83b); `internal` (default) → ClusterIP only;
+		// `vpn` → reserved (the admission webhook rejects it until
+		// AccessGrant/ExternalSurface lands). The OpenAPI v3 CRD enforces
+		// the enum at the kube-apiserver layer.
 		network?: "public" | "internal" | "vpn" | *"internal"
+		// One or several public hostnames (1.83b). A bare string OR a list
+		// of strings (the 2.6b `needs` OneOrMany union). Consumed only when
+		// network == "public". Required-when-public + DNS-1123-subdomain are
+		// enforced by the admission webhook; the CRD collapses the
+		// scalar|array union to x-kubernetes-preserve-unknown-fields.
+		hostname?: string | [...string]
+		// Terminate TLS (1.83b). Minimal bool form; the full #TlsOptions
+		// lands with 4.1b (deferred, not cancelled). Default on for public;
+		// `tls: false` + network: public is webhook-rejected for now (no
+		// HTTP-only public route in this slice — the route attaches to :443).
+		tls?: bool | *true
 	}
 
 	// Env value map (ADR 0046). Each value is a literal string OR a

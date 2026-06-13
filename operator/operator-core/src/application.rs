@@ -57,10 +57,28 @@ pub struct ApplicationBaseSpec {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct ApplicationExpose {
     pub port: i32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public: Option<bool>,
+    /// Visibility (ADR 0048 / 1.83b). `public` → emit an HTTPRoute on the
+    /// platform Gateway; `internal` (default) → ClusterIP only; `vpn` →
+    /// reserved (the webhook rejects it until AccessGrant/ExternalSurface).
+    /// Enforced as an enum by the CRD; a plain `String` here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
+    /// One or several public hostnames (1.83b). `OneOrMany` (the 2.6b `needs`
+    /// union): a bare string OR a list of strings. Consumed only when
+    /// `network == "public"`; the renderer normalizes it to a `Vec<String>`
+    /// for the HTTPRoute `hostnames`. The CRD field is
+    /// `x-kubernetes-preserve-unknown-fields` (CUE can't express scalar|array
+    /// structurally); the webhook validates each entry is a DNS-1123 subdomain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<OneOrMany<String>>,
+    /// Terminate TLS (1.83b). Minimal `bool` form; the full `#TlsOptions`
+    /// lands with 4.1b. Absent → default `true` (the public HTTPS route, TLS
+    /// on the 1.83a per-listener static cert). `false` + `network: public` is
+    /// rejected by the webhook for now (no HTTP-only public route in this
+    /// slice — the route attaches to `:443` only). Enforced as a `bool` by the
+    /// CRD; an `Option<bool>` here (`None` == default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
 }
 
 /// One declared platform-service dependency under
@@ -410,7 +428,7 @@ mod tests {
                 "base": {
                     "image": "ghcr.io/acme/web:1.0",
                     "replicas": 3,
-                    "expose": { "port": 8080, "public": false, "network": "internal" },
+                    "expose": { "port": 8080, "network": "internal" },
                     "env": { "LOG_LEVEL": "info" }
                 },
                 "environments": {
@@ -682,5 +700,42 @@ mod tests {
             m["K"],
             EnvValue::Ref(EnvRef::Secret("stripe/api-key".into()))
         );
+    }
+
+    #[test]
+    fn expose_hostname_round_trips_scalar_and_array_and_drops_public() {
+        // network: "public" + a scalar hostname + explicit tls.
+        let scalar: ApplicationExpose = serde_json::from_value(serde_json::json!({
+            "port": 8080, "network": "public", "hostname": "app.demo.dev", "tls": true
+        }))
+        .unwrap();
+        assert_eq!(scalar.network.as_deref(), Some("public"));
+        assert_eq!(scalar.tls, Some(true));
+        assert_eq!(
+            scalar.hostname.clone().unwrap().into_vec(),
+            vec!["app.demo.dev".to_string()]
+        );
+
+        // Array hostname form.
+        let many: ApplicationExpose = serde_json::from_value(serde_json::json!({
+            "port": 8080, "network": "public", "hostname": ["a.demo.dev", "b.demo.dev"]
+        }))
+        .unwrap();
+        assert_eq!(
+            many.hostname.unwrap().into_vec(),
+            vec!["a.demo.dev".to_string(), "b.demo.dev".to_string()]
+        );
+
+        // `public` is gone: an unknown field is ignored (serde default), and the
+        // struct no longer carries it. Absent hostname/tls are None, not serialized
+        // (tls defaults to true at the webhook/render layer, not on the wire).
+        let internal: ApplicationExpose =
+            serde_json::from_value(serde_json::json!({ "port": 8080 })).unwrap();
+        assert!(internal.hostname.is_none());
+        assert!(internal.tls.is_none());
+        let v = serde_json::to_value(&internal).unwrap();
+        assert!(v.get("hostname").is_none());
+        assert!(v.get("tls").is_none());
+        assert!(v.get("public").is_none());
     }
 }

@@ -29,7 +29,6 @@ bunHttpStarter: v1alpha1.#Application & {
 			replicas: 1
 			expose: {
 				port:    3000
-				public:  false
 				network: "internal"
 			}
 			env: {

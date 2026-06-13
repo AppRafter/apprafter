@@ -18,8 +18,9 @@ redisApp: v1alpha1.#Application & {
 			image:    "ghcr.io/example/web:latest"
 			replicas: 2
 			expose: {
-				port:   3000
-				public: true
+				port:     3000
+				network:  "public"
+				hostname: "web.demo.apprafter.dev"
 			}
 			needs: {
 				redis: {selector: {tier: "integrated"}}

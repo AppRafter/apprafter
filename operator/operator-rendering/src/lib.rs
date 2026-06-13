@@ -609,8 +609,9 @@ mod tests {
                     image: Some("x".to_string()),
                     expose: Some(ApplicationExpose {
                         port: 8080,
-                        public: Some(false),
                         network: None,
+                        hostname: None,
+                        tls: None,
                     }),
                     ..Default::default()
                 }),
@@ -666,8 +667,9 @@ mod tests {
                     image: Some("x".to_string()),
                     expose: Some(ApplicationExpose {
                         port: 9000,
-                        public: None,
                         network: None,
+                        hostname: None,
+                        tls: None,
                     }),
                     ..Default::default()
                 }),
@@ -696,8 +698,9 @@ mod tests {
                     image: Some("x".to_string()),
                     expose: Some(ApplicationExpose {
                         port: 8080,
-                        public: None,
                         network: None,
+                        hostname: None,
+                        tls: None,
                     }),
                     ..Default::default()
                 }),
@@ -953,8 +956,9 @@ mod tests {
             ApplicationBaseSpec {
                 expose: Some(ApplicationExpose {
                     port: 9000,
-                    public: Some(true),
                     network: Some("public".into()),
+                    hostname: Some(operator_core::OneOrMany::One("app.demo.dev".into())),
+                    tls: None,
                 }),
                 ..Default::default()
             },
@@ -964,8 +968,9 @@ mod tests {
                 image: Some("base".into()),
                 expose: Some(ApplicationExpose {
                     port: 8080,
-                    public: Some(false),
                     network: None,
+                    hostname: None,
+                    tls: None,
                 }),
                 ..Default::default()
             },
@@ -974,7 +979,10 @@ mod tests {
         let s = effective_spec(&app, Some("prod"));
         let expose = s.expose.expect("expose decoded");
         assert_eq!(expose.port, 9000);
-        assert_eq!(expose.public, Some(true));
+        assert_eq!(
+            expose.hostname.unwrap().into_vec(),
+            vec!["app.demo.dev".to_string()]
+        );
         assert_eq!(expose.network.as_deref(), Some("public"));
     }
 

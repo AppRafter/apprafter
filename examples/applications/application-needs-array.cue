@@ -19,8 +19,7 @@ needsArrayApp: v1alpha1.#Application & {
 			image:    "ghcr.io/example/warehouse:latest"
 			replicas: 1
 			expose: {
-				port:   8080
-				public: false
+				port: 8080
 			}
 			needs: {
 				// Array form: two named pg claims of one type.

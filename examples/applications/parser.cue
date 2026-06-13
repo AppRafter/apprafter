@@ -18,8 +18,7 @@ parser: v1alpha1.#Application & {
 			imagePolicy: {resolve: "digest"}
 			replicas: 3
 			expose: {
-				port:   8080
-				public: false
+				port: 8080
 			}
 			env: {
 				LOG_LEVEL: "info"
