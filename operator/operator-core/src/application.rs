@@ -333,6 +333,14 @@ pub struct StatusImage {
 /// successful resolution; absent when `imagePolicy.resolve: off`.
 pub const COND_IMAGE_RESOLVED: &str = "ImageResolved";
 
+/// `PublicRouteReady` — SOFT, informational condition for a `network: public`
+/// Application (1.83b). NEVER gates `Ready`. `True` when every hostname is
+/// under a registered `allowedDomains` zone AND the rendered HTTPRoute reports
+/// `Accepted`+`ResolvedRefs`; `False` (reason `NoMatchingZone`) when a hostname
+/// is under no zone (the route is STILL emitted, so adding the zone later
+/// attaches it); `False` (reason `Pending`) while the Gateway settles.
+pub const COND_PUBLIC_ROUTE_READY: &str = "PublicRouteReady";
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct ApplicationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]

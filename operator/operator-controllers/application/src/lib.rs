@@ -32,9 +32,9 @@ use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
     resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
     ApplicationStatus, DiskClaim, EgressProfile, Metrics, MigrationPlan, PlatformStack,
-    ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
-    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
-    PHASE_ENV_SECRET_MISSING,
+    PlatformStackValues, ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED,
+    COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING,
+    PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
 // dep so future Phase 2 commits can flip on detection +
@@ -1649,6 +1649,123 @@ fn ready_condition(
         last_transition_time,
         reason: reason.to_string(),
         message: message.to_string(),
+        observed_generation: None,
+    }
+}
+
+// ---- 1.83b: PublicRouteReady soft condition (pure helpers) ----
+
+/// A hostname is covered by a zone when it is the zone apex (exact) or a
+/// single-label subdomain (`<label>.zone`, no further dots — the Gateway
+/// wildcard listener matches one level only). 1.83b.
+fn hostname_covered_by_zone(host: &str, zone: &str) -> bool {
+    if host == zone {
+        return true;
+    }
+    match host.strip_suffix(&format!(".{zone}")) {
+        Some(prefix) => !prefix.is_empty() && !prefix.contains('.'),
+        None => false,
+    }
+}
+
+/// Read `Accepted` / `ResolvedRefs` from an HTTPRoute `status` value
+/// (`status.parents[].conditions[]`). Across all parents (any parent that
+/// reports the condition `True`).
+fn route_accepted_resolved(status: &Value) -> (bool, bool) {
+    let mut accepted = false;
+    let mut resolved = false;
+    if let Some(parents) = status.get("parents").and_then(Value::as_array) {
+        for p in parents {
+            if let Some(conds) = p.get("conditions").and_then(Value::as_array) {
+                for c in conds {
+                    let t = c.get("type").and_then(Value::as_str);
+                    let s = c.get("status").and_then(Value::as_str);
+                    if t == Some("Accepted") && s == Some("True") {
+                        accepted = true;
+                    }
+                    if t == Some("ResolvedRefs") && s == Some("True") {
+                        resolved = true;
+                    }
+                }
+            }
+        }
+    }
+    (accepted, resolved)
+}
+
+/// Compute the soft `PublicRouteReady` verdict (status, reason, message) for a
+/// public app's hostnames against the registered zones and the route's own
+/// status. The route is ALWAYS emitted — this is informational only. 1.83b.
+fn evaluate_public_route(
+    hostnames: &[String],
+    allowed_domains: &[String],
+    route_status: Option<&Value>,
+) -> (&'static str, String, String) {
+    if let Some(uncovered) = hostnames.iter().find(|h| {
+        !allowed_domains
+            .iter()
+            .any(|z| hostname_covered_by_zone(h, z))
+    }) {
+        return (
+            "False",
+            "NoMatchingZone".to_string(),
+            format!(
+                "hostname {uncovered:?} is not under any registered allowedDomains zone; the HTTPRoute is emitted and will attach once the zone is added (apprafter target domain add)"
+            ),
+        );
+    }
+    match route_status.map(route_accepted_resolved) {
+        Some((true, true)) => (
+            "True",
+            "Accepted".to_string(),
+            "HTTPRoute accepted by the platform Gateway (Accepted, ResolvedRefs).".to_string(),
+        ),
+        _ => (
+            "False",
+            "Pending".to_string(),
+            "HTTPRoute applied; awaiting Gateway acceptance.".to_string(),
+        ),
+    }
+}
+
+/// Extract `spec.values.gateway.allowedDomains[].domain` from a PlatformStack
+/// values block (the 1.83a gateway schema). Empty when the gateway key /
+/// allowedDomains is absent. 1.83b.
+fn allowed_domains_from_values(values: &PlatformStackValues) -> Vec<String> {
+    values
+        .extras
+        .get("gateway")
+        .and_then(|g| g.get("allowedDomains"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("domain").and_then(Value::as_str).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the soft `PublicRouteReady` condition, preserving `lastTransitionTime`
+/// across status-unchanged reconciles (the k8s convention used by
+/// `ready_condition`). 1.83b.
+fn public_route_ready_condition(
+    hostnames: &[String],
+    allowed_domains: &[String],
+    route_status: Option<&Value>,
+    previous: &[ApplicationCondition],
+) -> ApplicationCondition {
+    let (status, reason, message) = evaluate_public_route(hostnames, allowed_domains, route_status);
+    let last_transition_time = previous
+        .iter()
+        .find(|c| c.type_ == COND_PUBLIC_ROUTE_READY && c.status == status)
+        .map(|c| c.last_transition_time.clone())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    ApplicationCondition {
+        type_: COND_PUBLIC_ROUTE_READY.to_string(),
+        status: status.to_string(),
+        last_transition_time,
+        reason,
+        message,
         observed_generation: None,
     }
 }
@@ -3412,5 +3529,72 @@ mod tests {
             ready.last_transition_time, fixed_time,
             "lastTransitionTime must be preserved when Ready=False is unchanged"
         );
+    }
+
+    // ---- 1.83b: PublicRouteReady pure helpers ----
+
+    #[test]
+    fn hostname_covered_by_zone_apex_and_single_label_wildcard() {
+        assert!(hostname_covered_by_zone("demo.dev", "demo.dev"));
+        assert!(hostname_covered_by_zone("app.demo.dev", "demo.dev"));
+        assert!(!hostname_covered_by_zone("a.b.demo.dev", "demo.dev"));
+        assert!(!hostname_covered_by_zone("app.other.dev", "demo.dev"));
+        assert!(!hostname_covered_by_zone(".demo.dev", "demo.dev"));
+    }
+
+    #[test]
+    fn evaluate_public_route_no_matching_zone_is_false() {
+        let (status, reason, msg) =
+            evaluate_public_route(&["app.unknown.dev".into()], &["demo.dev".into()], None);
+        assert_eq!(status, "False");
+        assert_eq!(reason, "NoMatchingZone");
+        assert!(msg.contains("app.unknown.dev"));
+    }
+
+    #[test]
+    fn evaluate_public_route_covered_but_no_status_is_pending() {
+        let (status, reason, _) =
+            evaluate_public_route(&["app.demo.dev".into()], &["demo.dev".into()], None);
+        assert_eq!(status, "False");
+        assert_eq!(reason, "Pending");
+    }
+
+    #[test]
+    fn evaluate_public_route_covered_and_accepted_is_true() {
+        let route_status = serde_json::json!({
+            "parents": [{
+                "conditions": [
+                    { "type": "Accepted", "status": "True" },
+                    { "type": "ResolvedRefs", "status": "True" }
+                ]
+            }]
+        });
+        let (status, reason, _) = evaluate_public_route(
+            &["app.demo.dev".into()],
+            &["demo.dev".into()],
+            Some(&route_status),
+        );
+        assert_eq!(status, "True");
+        assert_eq!(reason, "Accepted");
+    }
+
+    #[test]
+    fn allowed_domains_from_values_reads_gateway_allowed_domains() {
+        use operator_core::PlatformStackValues;
+        let values: PlatformStackValues = serde_json::from_value(serde_json::json!({
+            "tier": 1,
+            "gateway": { "allowedDomains": [
+                { "domain": "demo.dev", "importedCertRef": "demo-cert" },
+                { "domain": "demo2.dev", "importedCertRef": "demo2-cert" }
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            allowed_domains_from_values(&values),
+            vec!["demo.dev".to_string(), "demo2.dev".to_string()]
+        );
+        let bare: PlatformStackValues =
+            serde_json::from_value(serde_json::json!({ "tier": 1 })).unwrap();
+        assert!(allowed_domains_from_values(&bare).is_empty());
     }
 }
