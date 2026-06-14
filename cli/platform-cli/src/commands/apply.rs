@@ -122,7 +122,7 @@ pub fn run(target_override: Option<&str>) -> Result<()> {
     let server_spec = build_server_spec(manifest.as_ref(), &cluster, &region);
     let ssh_keys = build_ssh_specs(manifest.as_ref(), &cluster, &target_store, target_override)?;
     let networks = vec![build_network_spec(manifest.as_ref(), &cluster)];
-    let firewalls = vec![build_firewall_spec(manifest.as_ref(), &cluster)];
+    let firewalls = vec![build_firewall_spec(manifest.as_ref(), &cluster, None)];
     let floating_ips = build_floating_ip_specs(manifest.as_ref(), &cluster, &region);
 
     let provider = HetznerCloudProvider {
@@ -221,15 +221,35 @@ fn build_network_spec(manifest: Option<&InfrastructureManifest>, cluster: &str) 
     }
 }
 
-fn build_firewall_spec(manifest: Option<&InfrastructureManifest>, cluster: &str) -> FirewallSpec {
-    let rules = manifest
+fn build_firewall_spec(
+    manifest: Option<&InfrastructureManifest>,
+    cluster: &str,
+    cf_ips: Option<&[String]>,
+) -> FirewallSpec {
+    let mut rules = manifest
         .and_then(|m| m.spec.firewall.as_ref())
         .and_then(|f| f.ingress.as_ref())
         .map(|ingress| ingress.iter().map(rule_from_manifest).collect::<Vec<_>>())
         .unwrap_or_else(default_ingress_rules);
+    if let Some(cf) = cf_ips {
+        apply_cf_origin(&mut rules, cf);
+    }
     FirewallSpec {
         name: format!("{cluster}-fw"),
         rules,
+    }
+}
+
+/// 1.83d: rewrite the `tcp/80` and `tcp/443` ingress rules' sources to the
+/// Cloudflare set, leaving every other rule (22, 6443, 51820, ICMP) untouched.
+/// `6443` is deliberately NOT gated — Cloudflare does not proxy the kube
+/// apiserver, so CF-gating it would break `kubectl`. Pure — unit-tested.
+fn apply_cf_origin(rules: &mut [FirewallRuleSpec], cf_ips: &[String]) {
+    for r in rules.iter_mut() {
+        let is_http = r.protocol == "tcp" && matches!(r.port.as_deref(), Some("80") | Some("443"));
+        if is_http {
+            r.source_ips = cf_ips.to_vec();
+        }
     }
 }
 
@@ -479,7 +499,7 @@ mod tests {
 
     #[test]
     fn build_firewall_spec_uses_default_ingress_when_absent() {
-        let f = build_firewall_spec(None, "cl");
+        let f = build_firewall_spec(None, "cl", None);
         assert_eq!(f.name, "cl-fw");
         // Defaults whitelist ssh + kube API + HTTP + HTTPS over tcp
         // and wireguard over udp; all rules are inbound from
@@ -512,11 +532,51 @@ mod tests {
                 }
             }
         }));
-        let f = build_firewall_spec(Some(&m), "p");
+        let f = build_firewall_spec(Some(&m), "p", None);
         assert_eq!(f.rules.len(), 1);
         assert_eq!(f.rules[0].port.as_deref(), Some("8080"));
         assert_eq!(f.rules[0].protocol, "udp");
         assert_eq!(f.rules[0].source_ips, vec!["10.0.0.0/8"]);
+    }
+
+    #[test]
+    fn cf_origin_restricts_only_80_and_443() {
+        let cf = vec!["173.245.48.0/20".to_string(), "2400:cb00::/32".to_string()];
+        let rules = build_firewall_spec(None, "demo", Some(&cf)).rules;
+        let src_for = |port: &str, proto: &str| -> Vec<String> {
+            rules
+                .iter()
+                .find(|r| r.port.as_deref() == Some(port) && r.protocol == proto)
+                .unwrap_or_else(|| panic!("rule {proto}/{port} present"))
+                .source_ips
+                .clone()
+        };
+        // 80 + 443 → CF set.
+        assert_eq!(src_for("80", "tcp"), cf);
+        assert_eq!(src_for("443", "tcp"), cf);
+        // 22 + 6443 stay open (6443 can't be CF-gated — kubectl).
+        assert_eq!(
+            src_for("22", "tcp"),
+            vec!["0.0.0.0/0".to_string(), "::/0".to_string()]
+        );
+        assert_eq!(
+            src_for("6443", "tcp"),
+            vec!["0.0.0.0/0".to_string(), "::/0".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_cf_origin_leaves_all_rules_open() {
+        let rules = build_firewall_spec(None, "demo", None).rules;
+        for r in &rules {
+            assert_eq!(
+                r.source_ips,
+                vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+                "rule {}/{:?} should stay open without CF origin",
+                r.protocol,
+                r.port
+            );
+        }
     }
 
     #[test]
