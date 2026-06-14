@@ -501,6 +501,7 @@ version = "0.2.18"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
+ "chrono",
  "cli-core",
  "include_dir",
  "mockito",

@@ -49,6 +49,8 @@ tmp/
 *.pem
 *.key
 !**/age.pub.key
+# Test-only TLS key fixtures for cli-providers cert parsing (1.83e) — not real secrets.
+!cli/cli-providers/tests/fixtures/*.key
 
 # Local apprafter state (.apprafter/) — never commit raw, only age-encrypted blobs
 **/.apprafter/*

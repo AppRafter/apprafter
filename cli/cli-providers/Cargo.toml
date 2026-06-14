@@ -12,6 +12,7 @@ repository.workspace   = true
 
 [dependencies]
 base64     = { workspace = true }
+chrono     = { workspace = true }
 cli-core   = { path = "../cli-core" }
 include_dir = { workspace = true }
 serde      = { workspace = true }
