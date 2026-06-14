@@ -117,6 +117,35 @@ fn time_to_utc(t: &x509_cert::time::Time) -> DateTime<Utc> {
     DateTime::<Utc>::from(t.to_system_time())
 }
 
+/// Validity classification of a cert at instant `now` (injected for tests).
+pub enum ExpiryStatus {
+    Expired,
+    NotYetValid,
+    NearExpiry { days: i64 },
+    Ok,
+}
+
+/// Pure expiry classification. `< 30` days remaining warns (not rejects);
+/// already-expired / not-yet-valid is a hard error at the call site.
+pub fn expiry_status(
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> ExpiryStatus {
+    if now < not_before {
+        return ExpiryStatus::NotYetValid;
+    }
+    if now >= not_after {
+        return ExpiryStatus::Expired;
+    }
+    let days = (not_after - now).num_days();
+    if days < 30 {
+        ExpiryStatus::NearExpiry { days }
+    } else {
+        ExpiryStatus::Ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +182,35 @@ mod tests {
     fn rejects_cert_without_dns_sans() {
         let err = parse_and_validate(NOSAN_CRT, VALID_KEY).unwrap_err();
         assert!(format!("{err}").contains("no DNS SANs"));
+    }
+
+    fn dt(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn expiry_status_classifies_window() {
+        let nb = dt("2026-01-01T00:00:00Z");
+        let na = dt("2027-01-01T00:00:00Z");
+        // before notBefore
+        assert!(matches!(
+            expiry_status(nb, na, dt("2025-12-01T00:00:00Z")),
+            ExpiryStatus::NotYetValid
+        ));
+        // after notAfter
+        assert!(matches!(
+            expiry_status(nb, na, dt("2027-02-01T00:00:00Z")),
+            ExpiryStatus::Expired
+        ));
+        // <30 days left
+        assert!(matches!(
+            expiry_status(nb, na, dt("2026-12-20T00:00:00Z")),
+            ExpiryStatus::NearExpiry { days } if (0..30).contains(&days)
+        ));
+        // comfortably valid
+        assert!(matches!(
+            expiry_status(nb, na, dt("2026-06-01T00:00:00Z")),
+            ExpiryStatus::Ok
+        ));
     }
 }
