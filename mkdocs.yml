@@ -82,6 +82,8 @@ nav:
       - Migration plans: operator-guide/migration-plans.md
       - Troubleshooting: operator-guide/troubleshooting.md
       - Recovery: operator-guide/recovery.md
+  - Public ingress:
+      - Cloudflare Origin CA cert: public-ingress/cloudflare-origin-cert.md
   - Developer Guide:
       - Overview: dev-guide/index.md
       - Quickstart: dev-guide/quickstart.md
