@@ -27,7 +27,13 @@ use cli_providers::{HetznerCloudValidator, ProviderValidator};
 use tabled::{settings::Style, Table, Tabled};
 use tracing::info;
 
-use crate::cli::TargetCommand;
+use crate::cli::{TargetCertCommand, TargetCommand};
+use crate::commands::k8s_helpers::{
+    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
+};
+use cli_providers::cert::{
+    build_tls_secret, expiry_status, parse_and_validate, validate_cert_name, ExpiryStatus,
+};
 
 use crate::commands::hcloud::hcloud_base_url;
 
@@ -74,6 +80,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
         TargetCommand::Show { name } => run_show(name.as_deref()),
         TargetCommand::Rename { from, to } => run_rename(&from, &to),
         TargetCommand::Remove { name, yes } => run_remove(&name, yes),
+        TargetCommand::Cert { action } => run_cert(action),
     }
 }
 
@@ -861,6 +868,89 @@ fn run_remove(name: &str, yes: bool) -> Result<()> {
     } else {
         println!("target `{name}` removed");
     }
+    Ok(())
+}
+
+fn run_cert(action: TargetCertCommand) -> Result<()> {
+    match action {
+        TargetCertCommand::Import {
+            name,
+            cert,
+            key,
+            namespace,
+            replace,
+        } => run_cert_import(&name, &cert, &key, &namespace, replace),
+    }
+}
+
+// Command fn fans out cert path, key path, namespace, and the replace
+// flag — five inputs is intrinsic to the subcommand surface.
+#[allow(clippy::too_many_arguments)]
+fn run_cert_import(
+    name: &str,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+    namespace: &str,
+    replace: bool,
+) -> Result<()> {
+    validate_cert_name(name)?;
+
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .map_err(|e| CliError::Other(format!("read cert {}: {e}", cert_path.display())))?;
+    let key_pem = std::fs::read_to_string(key_path)
+        .map_err(|e| CliError::Other(format!("read key {}: {e}", key_path.display())))?;
+
+    let imported = parse_and_validate(&cert_pem, &key_pem)?;
+
+    match expiry_status(imported.not_before, imported.not_after, chrono::Utc::now()) {
+        ExpiryStatus::Expired => {
+            return Err(CliError::Other(format!(
+                "certificate expired (notAfter {})",
+                imported.not_after.to_rfc3339()
+            )));
+        }
+        ExpiryStatus::NotYetValid => {
+            return Err(CliError::Other(format!(
+                "certificate not yet valid (notBefore {})",
+                imported.not_before.to_rfc3339()
+            )));
+        }
+        ExpiryStatus::NearExpiry { days } => {
+            eprintln!(
+                "{}",
+                cli_core::style::warn(&format!(
+                    "certificate '{name}' expires in {days} days — import proceeding"
+                ))
+            );
+        }
+        ExpiryStatus::Ok => {}
+    }
+
+    let kc = ensure_kubeconfig_tempfile()?;
+
+    if !replace && kubectl_get_json("secret", Some(name), Some(namespace), kc.path())?.is_some() {
+        return Err(CliError::Other(format!(
+            "Secret '{name}' already exists in {namespace}. \
+             Re-run with --replace to update it in place."
+        )));
+    }
+
+    let secret = build_tls_secret(name, namespace, &imported);
+    let manifest = serde_json::to_string(&secret)
+        .map_err(|e| CliError::Other(format!("serialize Secret: {e}")))?;
+    // "apprafter-cli" == cli_providers::k8s::kubectl::APPRAFTER_CLI_FIELD_MANAGER.
+    kubectl_apply_server_side(&manifest, "apprafter-cli", kc.path())?;
+
+    println!("✓ Certificate '{name}' imported to {namespace}");
+    println!("  SANs:        {}", imported.sans.join(", "));
+    println!(
+        "  Valid until: {}",
+        imported.not_after.format("%Y-%m-%d %H:%M UTC")
+    );
+    println!();
+    println!("Register a domain that uses it:");
+    println!("  apprafter target domain add <zone> --cert {name}");
+    println!("(How to mint a Cloudflare Origin CA cert: docs → Public ingress → Cloudflare Origin CA cert.)");
     Ok(())
 }
 

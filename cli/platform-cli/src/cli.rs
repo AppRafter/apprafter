@@ -942,6 +942,38 @@ pub enum TargetCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Manage imported TLS certificates for the platform Gateway.
+    Cert {
+        #[command(subcommand)]
+        action: TargetCertCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TargetCertCommand {
+    /// Import a TLS cert + key as a kubernetes.io/tls Secret in
+    /// apprafter-system. The platform Gateway terminates TLS from
+    /// it once a `target domain add --cert <name>` references it.
+    Import {
+        /// Cert name (DNS-1123 label, e.g. cf-origin-cert-apprafter-dev).
+        /// Becomes the Secret name.
+        name: String,
+        /// Path to the PEM-encoded certificate (chain ok).
+        #[arg(long)]
+        cert: std::path::PathBuf,
+        /// Path to the PEM-encoded private key (RSA only in this slice).
+        #[arg(long)]
+        key: std::path::PathBuf,
+        /// Namespace for the cert Secret (the platform Gateway reads
+        /// certs from apprafter-system).
+        #[arg(long, short = 'n', default_value = "apprafter-system")]
+        namespace: String,
+        /// Update an existing cert Secret in place (no downtime — the
+        /// Gateway picks up the new cert). Without this, importing over
+        /// an existing name is rejected.
+        #[arg(long, default_value_t = false)]
+        replace: bool,
+    },
 }
 
 /// `apprafter auth …` subcommands. All currently print the same
@@ -960,4 +992,43 @@ pub enum AuthCommand {
     /// Report current AppRafter Cloud (Managed) authentication
     /// status. Stub.
     Status,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_target_cert_import() {
+        let cli = Cli::parse_from([
+            "apprafter",
+            "target",
+            "cert",
+            "import",
+            "my-cert",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+        ]);
+        match cli.command {
+            Commands::Target {
+                action:
+                    TargetCommand::Cert {
+                        action:
+                            TargetCertCommand::Import {
+                                name,
+                                namespace,
+                                replace,
+                                ..
+                            },
+                    },
+            } => {
+                assert_eq!(name, "my-cert");
+                assert_eq!(namespace, "apprafter-system"); // default
+                assert!(!replace); // default
+            }
+            _ => panic!("expected target cert import"),
+        }
+    }
 }
