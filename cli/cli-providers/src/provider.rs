@@ -23,6 +23,8 @@ pub enum Action {
     DestroyNetwork(u64),
     /// Provision a Hetzner Cloud firewall by spec name.
     CreateFirewall(String),
+    /// Update an existing Hetzner Cloud firewall's rules by spec name (1.83d).
+    SetFirewallRules(String),
     /// Destroy a Hetzner Cloud firewall by id.
     DestroyFirewall(u64),
     /// Provision a Hetzner Cloud floating IP by spec name.

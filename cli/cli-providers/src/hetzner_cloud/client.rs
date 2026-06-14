@@ -324,6 +324,44 @@ impl HetznerCloudClient {
         }
     }
 
+    /// Replace an existing firewall's entire rule set (1.83d — closes the
+    /// create-only reconcile gap so Cloudflare-IP drift is picked up on
+    /// re-apply).
+    pub fn set_firewall_rules(&self, id: u64, rules: &[super::types::FirewallRule]) -> Result<()> {
+        let endpoint = self.endpoint(&format!("/firewalls/{id}/actions/set_rules"));
+        let req = super::types::SetFirewallRulesRequest {
+            rules: rules.to_vec(),
+        };
+        let resp = ureq::post(&endpoint)
+            .set("Authorization", &self.auth_header())
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_json(&req);
+
+        match resp {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let envelope: ApiErrorEnvelope =
+                    serde_json::from_str(&body).unwrap_or(ApiErrorEnvelope {
+                        error: super::types::ApiErrorDetails {
+                            code: "unknown".to_string(),
+                            message: body,
+                        },
+                    });
+                Err(CliError::Hetzner {
+                    endpoint: format!("POST {endpoint}"),
+                    status,
+                    code: envelope.error.code,
+                    message: envelope.error.message,
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(CliError::Other(format!(
+                "transport error talking to {endpoint}: {t}"
+            ))),
+        }
+    }
+
     pub fn delete_firewall(&self, id: u64) -> Result<()> {
         let endpoint = self.endpoint(&format!("/firewalls/{id}"));
         delete_with_retry_on_transient_lock(&endpoint, || {

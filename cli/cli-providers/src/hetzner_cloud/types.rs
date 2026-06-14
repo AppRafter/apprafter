@@ -216,6 +216,13 @@ pub struct FirewallCreateResponse {
     pub firewall: Firewall,
 }
 
+/// Body for `POST /firewalls/{id}/actions/set_rules` — replaces the entire
+/// rule set atomically. 1.83d.
+#[derive(Debug, Clone, Serialize)]
+pub struct SetFirewallRulesRequest {
+    pub rules: Vec<FirewallRule>,
+}
+
 /// Reference shape used in `ServerCreateRequest.firewalls`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirewallReference {

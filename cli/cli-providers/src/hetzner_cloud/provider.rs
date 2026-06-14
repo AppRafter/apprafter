@@ -218,6 +218,40 @@ fn rule_spec_to_wire(spec: &FirewallRuleSpec) -> FirewallRule {
     }
 }
 
+/// `(direction, protocol, port, sorted source_ips, sorted destination_ips)` —
+/// the comparable, order-normalized projection of a firewall rule used by
+/// [`rules_differ`]. 1.83d.
+type NormalizedRule = (String, String, String, Vec<String>, Vec<String>);
+
+/// Order-insensitive comparison of a live firewall's rules against the desired
+/// wire rules: are they meaningfully different (⇒ a `set_rules` is needed)?
+/// Normalizes each rule to `(direction, protocol, port, sorted source_ips,
+/// sorted destination_ips)` — `description` is ignored because Hetzner may add
+/// or normalize it server-side. 1.83d.
+fn rules_differ(live: &[FirewallRule], desired: &[FirewallRule]) -> bool {
+    fn norm(rs: &[FirewallRule]) -> Vec<NormalizedRule> {
+        let mut out: Vec<_> = rs
+            .iter()
+            .map(|r| {
+                let mut src = r.source_ips.clone();
+                src.sort();
+                let mut dst = r.destination_ips.clone();
+                dst.sort();
+                (
+                    r.direction.clone(),
+                    r.protocol.clone(),
+                    r.port.clone().unwrap_or_default(),
+                    src,
+                    dst,
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+    norm(live) != norm(desired)
+}
+
 impl Provider for HetznerCloudProvider {
     fn plan(&self) -> Result<Plan> {
         let live_keys = self.refresh_ssh_keys()?;
@@ -238,8 +272,15 @@ impl Provider for HetznerCloudProvider {
             }
         }
         for s in &self.firewalls {
-            if !live_firewalls.iter().any(|f| f.name == s.name) {
-                actions.push(Action::CreateFirewall(s.name.clone()));
+            match live_firewalls.iter().find(|f| f.name == s.name) {
+                None => actions.push(Action::CreateFirewall(s.name.clone())),
+                Some(existing) => {
+                    let desired: Vec<FirewallRule> =
+                        s.rules.iter().map(rule_spec_to_wire).collect();
+                    if rules_differ(&existing.rules, &desired) {
+                        actions.push(Action::SetFirewallRules(s.name.clone()));
+                    }
+                }
             }
         }
         if !live_servers.iter().any(|s| s.name == self.spec.name) {
@@ -320,6 +361,12 @@ impl Provider for HetznerCloudProvider {
         for spec in &self.firewalls {
             if let Some(existing) = live_fws.iter().find(|f| f.name == spec.name) {
                 fw_ids.push(existing.id);
+                let desired: Vec<FirewallRule> = spec.rules.iter().map(rule_spec_to_wire).collect();
+                if rules_differ(&existing.rules, &desired) {
+                    info!(firewall = %spec.name, id = existing.id, "updating Hetzner firewall rules");
+                    self.client.set_firewall_rules(existing.id, &desired)?;
+                    applied += 1;
+                }
             } else {
                 info!(firewall = %spec.name, "creating Hetzner firewall");
                 let resp = self
@@ -446,5 +493,35 @@ impl Provider for HetznerCloudProvider {
         }
 
         Ok(DestroyOutcome { destroyed })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rules_differ_is_order_insensitive_on_set_and_sources() {
+        use crate::hetzner_cloud::types::FirewallRule;
+        let mk = |port: &str, srcs: &[&str]| FirewallRule {
+            direction: "in".into(),
+            port: Some(port.into()),
+            protocol: "tcp".into(),
+            source_ips: srcs.iter().map(|s| s.to_string()).collect(),
+            destination_ips: vec![],
+            description: None,
+        };
+        // Same rules, different rule order + different source order → NOT different.
+        let live = vec![mk("443", &["b", "a"]), mk("80", &["a"])];
+        let desired = vec![mk("80", &["a"]), mk("443", &["a", "b"])];
+        assert!(!rules_differ(&live, &desired));
+        // A changed source set → different.
+        let desired2 = vec![mk("80", &["a"]), mk("443", &["a", "c"])];
+        assert!(rules_differ(&live, &desired2));
+        // A description-only difference is NOT a difference (Hetzner adds them).
+        let mut live3 = vec![mk("80", &["a"])];
+        live3[0].description = Some("hetzner-added".into());
+        let desired3 = vec![mk("80", &["a"])];
+        assert!(!rules_differ(&live3, &desired3));
     }
 }
