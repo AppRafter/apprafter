@@ -81,6 +81,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
         TargetCommand::Rename { from, to } => run_rename(&from, &to),
         TargetCommand::Remove { name, yes } => run_remove(&name, yes),
         TargetCommand::Cert { action } => run_cert(action),
+        TargetCommand::Domain { action } => crate::commands::target_domain::run(action),
     }
 }
 

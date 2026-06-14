@@ -32,6 +32,7 @@ pub mod secret;
 pub mod state_paths;
 pub mod status;
 pub mod target;
+pub mod target_domain;
 pub mod target_wizard;
 pub mod upgrade_tier;
 pub mod version_check;

@@ -947,6 +947,11 @@ pub enum TargetCommand {
         #[command(subcommand)]
         action: TargetCertCommand,
     },
+    /// Manage public-ingress zones (domains) on the platform Gateway.
+    Domain {
+        #[command(subcommand)]
+        action: TargetDomainCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -973,6 +978,32 @@ pub enum TargetCertCommand {
         /// an existing name is rejected.
         #[arg(long, default_value_t = false)]
         replace: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TargetDomainCommand {
+    /// Register an apex zone, pointing it at an imported cert.
+    Add {
+        /// Apex domain (RFC-1123, no "*." prefix), e.g. apprafter.dev.
+        domain: String,
+        /// Imported cert name (the Secret from `target cert import`).
+        #[arg(long)]
+        cert: String,
+        /// Audit "added by" (defaults to $USER).
+        #[arg(long = "added-by")]
+        added_by: Option<String>,
+    },
+    /// List registered zones + the apps using each.
+    #[command(alias = "ls")]
+    List,
+    /// Unregister a zone. Blocked if apps use it (unless --force).
+    Remove {
+        /// Apex domain to unregister.
+        domain: String,
+        /// Remove even if applications still reference the domain.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -1029,6 +1060,47 @@ mod tests {
                 assert!(!replace); // default
             }
             _ => panic!("expected target cert import"),
+        }
+    }
+
+    #[test]
+    fn parses_target_domain_subcommands() {
+        let cli = Cli::parse_from([
+            "apprafter",
+            "target",
+            "domain",
+            "add",
+            "apprafter.dev",
+            "--cert",
+            "c",
+        ]);
+        match cli.command {
+            Commands::Target {
+                action:
+                    TargetCommand::Domain {
+                        action:
+                            TargetDomainCommand::Add {
+                                domain,
+                                cert,
+                                added_by,
+                            },
+                    },
+            } => {
+                assert_eq!(domain, "apprafter.dev");
+                assert_eq!(cert, "c");
+                assert!(added_by.is_none());
+            }
+            _ => panic!("expected target domain add"),
+        }
+        let cli = Cli::parse_from(["apprafter", "target", "domain", "remove", "apprafter.dev"]);
+        match cli.command {
+            Commands::Target {
+                action:
+                    TargetCommand::Domain {
+                        action: TargetDomainCommand::Remove { force, .. },
+                    },
+            } => assert!(!force),
+            _ => panic!("expected target domain remove"),
         }
     }
 }
