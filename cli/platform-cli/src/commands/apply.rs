@@ -122,7 +122,15 @@ pub fn run(target_override: Option<&str>) -> Result<()> {
     let server_spec = build_server_spec(manifest.as_ref(), &cluster, &region);
     let ssh_keys = build_ssh_specs(manifest.as_ref(), &cluster, &target_store, target_override)?;
     let networks = vec![build_network_spec(manifest.as_ref(), &cluster)];
-    let firewalls = vec![build_firewall_spec(manifest.as_ref(), &cluster, None)];
+    // 1.83d: opt-in Cloudflare origin firewall. Fetch CF ranges FIRST — a
+    // CF-endpoint outage aborts here (via `?`), before any cloud mutation
+    // (`provider.apply()` below), so we never leave a half-provisioned cluster.
+    let cf_ips = resolve_cf_ips(manifest.as_ref(), &cli_providers::UreqCloudflareIpSource)?;
+    let firewalls = vec![build_firewall_spec(
+        manifest.as_ref(),
+        &cluster,
+        cf_ips.as_deref(),
+    )];
     let floating_ips = build_floating_ip_specs(manifest.as_ref(), &cluster, &region);
 
     let provider = HetznerCloudProvider {
@@ -218,6 +226,25 @@ fn build_network_spec(manifest: Option<&InfrastructureManifest>, cluster: &str) 
         ip_range,
         subnet_ip_range,
         network_zone,
+    }
+}
+
+/// 1.83d: when the manifest opts into the Cloudflare origin firewall, fetch the
+/// CF IP ranges (fail-fast) BEFORE any cloud mutation; otherwise `None` and no
+/// network call. Generic over the source so tests inject a mock. Pure w.r.t.
+/// cloud state — it runs before the provider is constructed in `apply::run`.
+fn resolve_cf_ips(
+    manifest: Option<&InfrastructureManifest>,
+    cf_source: &impl cli_providers::CloudflareIpSource,
+) -> Result<Option<Vec<String>>> {
+    let on = manifest
+        .and_then(|m| m.spec.firewall.as_ref())
+        .and_then(|f| f.cloudflare_origin)
+        .unwrap_or(false);
+    if on {
+        Ok(Some(cli_providers::fetch_cloudflare_ips(cf_source)?))
+    } else {
+        Ok(None)
     }
 }
 
@@ -393,6 +420,49 @@ mod tests {
             "metadata": {"name": "platform-1"},
             "spec": {"provider": "hetzner-cloud"}
         }))
+    }
+
+    fn manifest_with_cf_origin(on: bool) -> InfrastructureManifest {
+        manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "platform-1"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "firewall": {"cloudflareOrigin": on}
+            }
+        }))
+    }
+
+    #[test]
+    fn resolve_cf_ips_off_when_flag_absent_or_false() {
+        use cli_core::Result;
+        use cli_providers::CloudflareIpSource;
+        struct ExplodingSource;
+        impl CloudflareIpSource for ExplodingSource {
+            fn get(&self, _url: &str) -> Result<String> {
+                panic!("must NOT fetch when cloudflareOrigin is off")
+            }
+        }
+        // No firewall block → None, no fetch.
+        assert!(resolve_cf_ips(None, &ExplodingSource).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_cf_ips_fail_fast_propagates_when_on() {
+        use cli_core::{CliError, Result};
+        use cli_providers::CloudflareIpSource;
+        struct FailingSource;
+        impl CloudflareIpSource for FailingSource {
+            fn get(&self, _url: &str) -> Result<String> {
+                Err(CliError::Other("network down".into()))
+            }
+        }
+        // A manifest with cloudflareOrigin: true + a failing source → Err
+        // BEFORE any cloud call (resolve_cf_ips runs before the provider exists).
+        let m = manifest_with_cf_origin(true);
+        let err = resolve_cf_ips(Some(&m), &FailingSource).unwrap_err();
+        assert!(format!("{err}").contains("cannot fetch Cloudflare IP ranges"));
     }
 
     #[test]
