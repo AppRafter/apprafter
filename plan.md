@@ -2790,30 +2790,32 @@ instead of carrying parallel definitions.
 ### 1.83e `apprafter target cert import` — multi-call под imported certs
 > 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
 
+> ✅ **CLOSED 2026-06-14** (design `docs/superpowers/specs/2026-06-14-1-83e-cert-import-design.md`). Release: cli **v0.2.19** (CLI-only — no schema/operator/chart change). **Decisions/deviations:** (1) **imperative `kubectl` server-side-apply** of a plain `kubernetes.io/tls` Secret (field-manager `apprafter-cli`), NOT sealed/GitOps — the Gateway terminates TLS from a plain tls Secret, and this is a `target`-level admin op like its siblings. (2) **RSA-only** this slice (CF Origin CA is RSA 2048); a non-RSA key → a clear "unsupported (deferred to 4.1b)" error. (3) **Expiry: reject only already-invalid** (notAfter past / notBefore future), **warn (not reject) at `<30d`** — the plan's literal "expiry > 30 days" would block a legitimate short-validity cert. (4) Implemented as a pure `cli-providers::cert` module (parse/validate/expiry/build, openssl-fixture unit tests + a redacting `Debug` that never prints the key) + a thin `target.rs` command; everything that can fail aborts BEFORE any cluster write. (5) Live acceptance (Secret applied + Gateway pickup) is a **closure-smoke on the end-of-1.83-track manual walk** (real Hetzner), NOT unit-tested — the pure logic is fully unit-covered.
+
 **Source:** subset 4.1b `apprafter target cert import`.
 
 **Цель:** import imported-cert как `kubernetes.io/tls` Secret с labels/annotations, точно совпадающими с full 4.1b spec — для bit-identity при landing'е 4.1b. CLI-сигнатура идентична 4.1b: `apprafter target cert import <name> --cert <path> --key <path>`. Может вызываться много раз для разных registrable-зон (один Secret per zone).
 
 **Поставка:**
-- [ ] `apprafter target cert import <name> --cert <pem> --key <pem> [--namespace apprafter-system] [--replace]`:
-    - Pre-validation: PEM parse, cert matches key, expiry > 30 days, SANs extracted.
-    - Creates Secret в `apprafter-system` (default ns для platform certs), type `kubernetes.io/tls`, name из позиционного аргумента.
+- [x] `apprafter target cert import <name> --cert <pem> --key <pem> [--namespace apprafter-system] [--replace]`:
+    - Pre-validation: PEM parse, cert matches key (RSA), SANs extracted; **expiry — reject только already-invalid, warn при `<30d`** (не «> 30 days» hard-reject).
+    - Creates Secret в `apprafter-system` (default ns для platform certs), type `kubernetes.io/tls`, name из позиционного аргумента; imperative `kubectl` SSA (field-manager `apprafter-cli`).
     - Labels (точно как в 4.1b):
         - `apprafter.io/managed-by: apprafter`
         - `apprafter.io/cert-mode: imported`
         - `apprafter.io/cert-name: <name>`
     - Annotations: `apprafter.io/cert-not-before`, `apprafter.io/cert-not-after`, `apprafter.io/cert-sans`.
-    - `--replace`: in-place update Secret'а (no downtime — cert-manager + Gateway API подхватывают новый Secret).
-- [ ] Output: SANs, expiry, hint что listener'ы автоматически подхватят при reference из `target domain add`.
-- [ ] Doc-page «How to get a CF Origin CA cert» (CF dashboard → SSL/TLS → Origin Server → Create Certificate, hostnames `<zone>` + `*.<zone>`, RSA 2048, validity 15 years, save cert + key) — линк из RELEASE notes 1.83.
-- [ ] Deferred to full 4.1b (subset note): `cert list`, `cert show`, `cert renew`, `cert remove`, `--chain` flag, MigrationPlan при remove с active references.
+    - `--replace`: in-place update Secret'а (no downtime — Gateway API подхватывает новый Secret); без `--replace` существующее имя → reject.
+- [x] Output: SANs, valid-until, hint `apprafter target domain add <zone> --cert <name>` + ссылка на CF-origin doc-page.
+- [x] Doc-page «Cloudflare Origin CA certificate» (`docs/public-ingress/cloudflare-origin-cert.md`, в mkdocs nav «Public ingress»).
+- [x] Deferred to full 4.1b (subset note): `cert list`, `cert show`, `cert renew`, `cert remove`, `--chain` flag, ECDSA/EdDSA ключи, MigrationPlan при remove с active references.
 
-**Acceptance:**
-- `apprafter target cert import cf-origin-cert-apprafter-dev --cert ./d.pem --key ./d.key` создаёт Secret с правильными labels/annotations.
-- Повторный вызов с другим именем (`cf-origin-cert-apprafter-io --cert ./i.pem --key ./i.key`) создаёт отдельный Secret — multi-zone naturally supported, никаких коллизий.
-- Mismatched cert/key ⇒ fail до записи Secret.
-- `--replace` обновляет Secret in-place, listener'ы подхватывают новый cert без рестарта.
-- Labels/annotations bit-identical с тем, что произведёт 4.1b на том же входе.
+**Acceptance:** (логика unit-покрыта; live-применение Secret'а на кластере = **closure-smoke на track-end walk**, real Hetzner)
+- [~] `apprafter target cert import cf-origin-cert-apprafter-dev --cert ./d.pem --key ./d.key` создаёт Secret с правильными labels/annotations — **closure-smoke** (build_tls_secret shape unit-покрыт).
+- [~] Повторный вызов с другим именем создаёт отдельный Secret — multi-zone, никаких коллизий — **closure-smoke**.
+- [x] Mismatched cert/key ⇒ fail до записи Secret — **unit-covered** (`rejects_cert_key_mismatch` + fail-before-cluster-write ordering).
+- [~] `--replace` обновляет Secret in-place, listener'ы подхватывают новый cert без рестарта — **closure-smoke**.
+- [x] Labels/annotations bit-identical с тем, что произведёт 4.1b на том же входе — **unit-covered** (`build_tls_secret_has_locked_shape`).
 
 **Зависит от:** 1.79a.
 

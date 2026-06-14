@@ -9,6 +9,27 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.19 — target cert import (1.83e) (2026-06-14)
+
+### Added
+
+- **`apprafter target cert import <name> --cert <pem> --key <pem> [--namespace
+  apprafter-system] [--replace]`** imports a TLS certificate + private key as a
+  plain `kubernetes.io/tls` Secret in `apprafter-system`, ready for the platform
+  Gateway to terminate TLS from. Before writing anything to the cluster it
+  parses the PEM, verifies the certificate matches the key (RSA), extracts the
+  DNS SANs, and checks the validity window. The Secret carries the platform
+  labels (`apprafter.io/managed-by`, `apprafter.io/cert-mode: imported`,
+  `apprafter.io/cert-name`) and annotations (`cert-not-before`/`cert-not-after`/
+  `cert-sans`). Call it once per registrable zone; `--replace` rotates a cert in
+  place (the Gateway picks up the new Secret with no downtime).
+- An **already-expired or not-yet-valid certificate is rejected** before any
+  cluster write; a certificate with **under 30 days** remaining imports with a
+  warning. Only **RSA** keys are supported in this slice (Cloudflare Origin CA
+  is RSA 2048); ECDSA/EdDSA is deferred to 4.1b.
+- A new docs page, **"Cloudflare Origin CA certificate"**, walks through minting
+  the cert in the Cloudflare dashboard and importing it.
+
 ## cli v0.2.18 — Cloudflare origin firewall (1.83d) (2026-06-14)
 
 ### Added
