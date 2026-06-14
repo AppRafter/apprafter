@@ -86,6 +86,7 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 | ☐ | Built-in observability: metrics/traces/logs (OTel + Tempo + Prometheus/Grafana) + network flow (Hubble UI) | 3.4 + 3.7a subset | CP3 |
 
 > `*` `4.1`/`4.1a` are built in order 5 but are included in the Tier-1 demo (CP1). Build order is 5; the checkpoint is CP1.
+> The opt-in **Cloudflare origin firewall** (1.83d — `Infrastructure.spec.firewall.cloudflareOrigin`, restricts the node's 80/443 to Cloudflare IP ranges so an orange-cloud proxy isn't bypassable via the node IP) is not a tracker row — like the auto-`NetworkPolicy` note above it is a security-posture hardening of the public-URL capability, shipped opt-in alongside the ingress path, not a standalone launch feature.
 
 ---
 

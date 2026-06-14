@@ -9,6 +9,39 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.18 — Cloudflare origin firewall (1.83d) (2026-06-14)
+
+### Added
+
+- **Opt-in Cloudflare origin firewall** (`Infrastructure.spec.firewall.cloudflareOrigin: bool`,
+  default `false`). When `true`, `apprafter apply` restricts the Hetzner Cloud
+  Firewall's `80`/`443` inbound to Cloudflare's published IPv4+IPv6 ranges, so a
+  Cloudflare orange-cloud proxy can't be bypassed by hitting the node's public
+  IP directly. `22` (SSH), `6443` (kube-apiserver — Cloudflare doesn't proxy it,
+  so gating it would break `kubectl`), `51820` (WireGuard) and ICMP stay open.
+  Default off ⇒ a cluster not fronted by Cloudflare is unaffected.
+- **Cloudflare IP fetch is fail-fast** — the CLI pulls `cloudflare.com/ips-v4` +
+  `ips-v6` at the START of `apply`, before any cloud mutation. A non-200,
+  transport error, or empty body aborts the apply with "cannot fetch Cloudflare
+  IP ranges; aborting to avoid stale firewall" — there are **no** hardcoded
+  fallback CIDRs (a stale allowlist is worse than a failed apply).
+
+### Fixed
+
+- **Firewall reconcile now updates an existing firewall's rules** (previously
+  create-only). A new `set_firewall_rules` path (`POST
+  /firewalls/{id}/actions/set_rules`) fires on an order-insensitive rule diff, so
+  Cloudflare-IP drift — and any other rule change — is picked up on re-apply
+  instead of being silently ignored.
+
+### Release chain
+
+- `cli/Cargo.toml` `0.2.17 → 0.2.18` (monorepo tag `v0.2.18`, local). The
+  `schemas/v1alpha1/infrastructure.cue` schema gained `cloudflareOrigin`; the
+  argocd-cue-cmp sidecar bundles `schemas/v1alpha1` (ADR 0046), so it bumps
+  `0.1.10 → 0.1.11` and platform-stack `currentVersion 0.2.34 → 0.2.35`
+  (compatibility `change=safe`, operator unchanged at `v0.2.30`).
+
 ## operator v0.2.30 — public ingress: operator-rendered HTTPRoute (1.83b) (2026-06-13)
 
 ### Added

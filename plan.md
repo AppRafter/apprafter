@@ -2759,25 +2759,27 @@ instead of carrying parallel definitions.
 ### 1.83d Origin firewall в Hetzner Cloud builder (CF IPs only, fail-fast)
 > 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a). NB: net-new, в order-5 launch-пути отсутствует (тот предполагает external-dns automation, не CF-orange).
 
+> ✅ **CLOSED 2026-06-14** (ADR-less slice; design `docs/superpowers/specs/2026-06-14-1-83d-origin-firewall-design.md`). Release: cli **v0.2.18** + cue-cmp **v0.1.11** + platform-stack **0.2.35** (the infra schema bundle — `infrastructure.cue` gained `cloudflareOrigin`, and cue-cmp bundles `schemas/v1alpha1`). **Deviations from the original wording above:** (1) **OPT-IN, not always-on** — gated by `Infrastructure.spec.firewall.cloudflareOrigin: bool|*false`; always-on would break any cluster NOT fronted by Cloudflare (direct DNS / outer Caddy), and a manifest flag persists across re-applies unlike a per-invocation CLI flag. Default off ⇒ today's `0.0.0.0/0` behaviour unchanged. (2) **Implementation shape** — not a standalone `cf_ingress_firewall_rules()`; instead `cli-providers::cloudflare::fetch_cloudflare_ips` (a `CloudflareIpSource` seam, fail-fast, NO fallback CIDRs) + `apply.rs::resolve_cf_ips` (fetch-FIRST, before any cloud mutation) + the pure `apply_cf_origin` rewriting **only** `tcp/80`+`tcp/443` sources (22/6443/51820/ICMP untouched — **6443 deliberately stays open**, CF doesn't proxy the kube-apiserver so gating it would break `kubectl`). (3) **Bonus — closed the create-only firewall reconcile gap:** added `client.set_firewall_rules` (`POST /firewalls/{id}/actions/set_rules`) + `Action::SetFirewallRules` + an order-insensitive `rules_differ`, so CF-IP drift (and ANY rule change) now refreshes on re-apply instead of being ignored. (4) The live `hcloud firewall describe` + `curl`-bypass acceptance is a **closure-smoke on a real Hetzner cluster** (rides the next nightly `e2e/mvp.sh` / a manual check) — all logic is unit-covered (CF-fetch seam, fail-fast ordering, rule-building, set_rules diff).
+
 **Source:** CF orange без origin firewall = theatre (атакующий ходит мимо CF по IP узла).
 
 **Цель:** Hetzner Cloud Firewall разрешает 80/443 inbound только из CF IPv4/v6 сетей; остальное deny. Один firewall обслуживает все зарегистрированные зоны — CF IPs универсальны across CF zones. Label `apprafter=true` на firewall-ресурсе для существующего idempotency-слоя. Fail-fast при недоступности CF endpoints — никакого stale snapshot'а.
 
 **Поставка:**
-- [ ] `cli-providers/hetzner_cloud` — новый builder `cf_ingress_firewall_rules()`:
+- [x] `cli-providers` — CF IP fetcher (delivered as `cloudflare::fetch_cloudflare_ips` + `CloudflareIpSource` seam, NOT a `cf_ingress_firewall_rules()` builder):
     - Pull `https://www.cloudflare.com/ips-v4` и `ips-v6` на каждый apply (text body, по CIDR на строку).
     - **Fail-fast:** non-200 / network error / empty body ⇒ apply abort'ится с error «cannot fetch Cloudflare IP ranges; aborting to avoid stale firewall». Никаких hardcoded fallback CIDRs.
-    - Build inbound rules: `tcp:80 from <cf-v4 ∪ cf-v6>`, `tcp:443 from same set`. SSH (22) — separate, не трогаем.
-- [ ] `commands/apply.rs` — после apply узла вызывает `cf_ingress_firewall_rules()`, аттачит firewall к серверу. Label `apprafter=true` на firewall-ресурсе.
-- [ ] Idempotency: дельта против existing firewall — CF добавили CIDR ⇒ update; убрали ⇒ remove (fail-fast политика требует точного отражения upstream).
-- [ ] Tests: in-file mock на CF endpoints возвращает фиксированный набор + один тест на network-error path (apply должен fail'нуть до cloud-call'а).
-- [ ] Doc-note в RELEASE: «Origin firewall pulls CF IPs on every `apprafter apply`. Periodic re-apply recommended (quarterly) для подхвата CF range changes. PlatformController-managed cloud-firewall — future work.»
+    - Build inbound rules: `tcp:80 from <cf-v4 ∪ cf-v6>`, `tcp:443 from same set` (via `apply_cf_origin`). SSH (22) / 6443 / 51820 / ICMP — не трогаем (6443 нельзя CF-gate'ить — `kubectl`).
+- [x] `commands/apply.rs` — `resolve_cf_ips()` (opt-in `cloudflareOrigin`) фетчит CF IPs **ПЕРЕД** любой cloud-mutation, затем `build_firewall_spec(..., cf_ips)`; firewall аттачится к серверу существующим путём, label `apprafter=true` сохранён.
+- [x] Idempotency: дельта против existing firewall — **закрыт create-only gap**: `set_firewall_rules` (`POST .../actions/set_rules`) + `Action::SetFirewallRules` + order-insensitive `rules_differ` ⇒ CF drift (и любое изменение правил) подхватывается на re-apply.
+- [x] Tests: in-file mock на CF endpoints (`CloudflareIpSource` seam) — фиксированный набор + fail-fast paths (non-200/transport/empty) + ordering-тест (failing source ⇒ apply abort'ится до cloud-call'а) + rule-building + set_rules diff.
+- [x] Doc-note: «Origin firewall pulls CF IPs on every `apprafter apply`; periodic re-apply (quarterly) recommended; PlatformController-managed cloud-firewall — future work» — записан в compatibility.cue 0.2.35 notes + design §Out-of-scope.
 
 **Acceptance:**
-- На свежем bootstrap: `hcloud firewall describe <name>` показывает текущие CF v4 + v6 диапазоны на 80/443.
-- `curl --resolve <любая-зона>:443:<node-ip> https://<зона>/` минуя CF ⇒ connection refused/timeout.
-- `curl https://<зона>/` через CF ⇒ 200.
-- Mock network outage на CF endpoints ⇒ `apprafter apply` aborts до изменения cloud state.
+- [~] На свежем bootstrap: `hcloud firewall describe <name>` показывает текущие CF v4 + v6 диапазоны на 80/443 — **closure-smoke** (real Hetzner, рядом со следующим `e2e/mvp.sh`).
+- [~] `curl --resolve <любая-зона>:443:<node-ip> https://<зона>/` минуя CF ⇒ connection refused/timeout — **closure-smoke** (real Hetzner).
+- [~] `curl https://<зона>/` через CF ⇒ 200 — **closure-smoke** (real Hetzner).
+- [x] Mock network outage на CF endpoints ⇒ `apprafter apply` aborts до изменения cloud state — **unit-covered** (`resolve_cf_ips_fail_fast_propagates_when_on`).
 
 **Зависит от:** 1.2 ✅, 1.83a.
 
