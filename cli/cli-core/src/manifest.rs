@@ -128,6 +128,11 @@ pub struct SubnetBlock {
 pub struct FirewallBlock {
     #[serde(default)]
     pub ingress: Option<Vec<FirewallIngressRule>>,
+    /// 1.83d: restrict `80`/`443` inbound to Cloudflare's published IP ranges
+    /// (origin firewall). Opt-in — absent/false leaves them open to all, so a
+    /// non-Cloudflare-fronted cluster is unaffected.
+    #[serde(rename = "cloudflareOrigin", default)]
+    pub cloudflare_origin: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -315,6 +320,19 @@ mod tests {
         assert_eq!(aw.enabled, Some(true));
         assert_eq!(aw.image.as_deref(), Some("ghcr.io/x/aw"));
         assert_eq!(aw.tag.as_deref(), Some("v0.1.65"));
+    }
+
+    #[test]
+    fn firewall_block_decodes_cloudflare_origin() {
+        let fw: FirewallBlock = serde_json::from_value(serde_json::json!({
+            "ingress": [{ "port": "443" }],
+            "cloudflareOrigin": true
+        }))
+        .unwrap();
+        assert_eq!(fw.cloudflare_origin, Some(true));
+        // Absent → None (defaults to off at the apply layer).
+        let bare: FirewallBlock = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(bare.cloudflare_origin, None);
     }
 
     #[test]

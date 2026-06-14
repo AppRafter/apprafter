@@ -55,6 +55,11 @@ package v1alpha1
 				protocol?: "tcp" | "udp" | "icmp"
 				source_ips?: [...string]
 			}]
+			// 1.83d: opt-in Cloudflare origin firewall — when true,
+			// `apprafter apply` restricts 80/443 inbound to Cloudflare's
+			// published IP ranges (the CLI fetches them per apply). Default
+			// false; non-Cloudflare clusters leave 80/443 open.
+			cloudflareOrigin?: bool | *false
 		}
 
 		// Optional SSH keys. Each entry needs at least the
