@@ -2826,12 +2826,14 @@ instead of carrying parallel definitions.
 ### 1.83f `apprafter target domain` — multi-zone CLI
 > 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a)
 
+> ✅ **CLOSED 2026-06-15** (design `docs/superpowers/specs/2026-06-15-1-83f-target-domain-design.md`). Release: cli **v0.2.20** (CLI-only — `#AllowedDomainEntry` уже полный + `spec.values` preserve-unknown ⇒ нет chart/cue-cmp/operator бампа). **Decisions/deviations:** (1) запись массива через **JSON merge-patch (`kubectl_merge_patch`), НЕ SSA** — `allowedDomains` под preserve-unknown `spec.values`, чья SSA-гранулярность apiserver-зависима; merge-patch path-scoped и доказуемо сохраняет sibling-поля (`tier`/`nodePublicIP`/`egress`). (2) `addedBy` = `--added-by` ∥ `$USER` ∥ "unknown" (в CLI нет identity-системы). (3) apps-using guard считает **любую** matching-hostname app (base+per-env), не только public — консервативно. (4) `add` apex-only (reject `*.`). (5) `remove` сначала проверяет domain-registered, потом apps-guard; cert Secret сохраняется. (6) Чистая логика unit-покрыта в `commands/target_domain.rs`; live merge-patch + Gateway-listener-генерация + `curl` = **closure-smoke на track-end walk** — walk обязан проверить, что merge-patch сохранил `tier`/`nodePublicIP`/`egress` + `allowedDomains` переживает reconcile. (7) `apprafter` — BINARY-крейт, поэтому хелперы + их command-вызыватели легли одним коммитом (`-D warnings` dead_code на невызванных хелперах; в отличие от 1.83e, где cert-модуль жил в LIBRARY-крейте `cli-providers`).
+
 **Source:** subset 4.1b `apprafter target domain` группа.
 
 **Цель:** идиоматическая регистрация зон с массивом entries; CLI-сигнатура и UX идентичны 4.1b. Под капотом slice-impl патчит `PlatformStack.spec.values.gateway.allowedDomains: [#AllowedDomainEntry]`; full 4.1b impl переносит storage в `ExternalSurface.spec.allowedDomains` — **массив тот же, shape entry тот же, CLI-команда та же**. Stability promise screencast-friendly.
 
 **Поставка:**
-- [ ] Shape entry в `values.gateway.allowedDomains[]` (bit-identical с 4.1b `#DomainEntry` минус computed `wildcard` field и enum-extension `certMode` — см. PART 0.6 чек 4):
+- [x] Shape entry в `values.gateway.allowedDomains[]` (уже объявлен в chart'е как `#AllowedDomainEntry`, 1.83a — CLI его не добавлял, а использует; bit-identical с 4.1b `#DomainEntry` минус computed `wildcard`):
     ```cue
     {
         domain:           string         // например "apprafter.dev"; apex registrable, без префикса "*."
@@ -2841,25 +2843,25 @@ instead of carrying parallel definitions.
         addedBy:          string         // identity (CLI: from active target's user record или env)
     }
     ```
-- [ ] `apprafter target domain add <domain> --cert <cert-name>`:
+- [x] `apprafter target domain add <domain> --cert <cert-name>`:
     - Validation: `<domain>` это RFC 1123 hostname без префикса `*.` (apex registrable; wildcard listener генерится chart'ом автоматически из apex entry).
     - `--cert <name>` **required в slice** (нет LE-дефолта; в 4.1b становится optional с дефолтом `letsencrypt-http01`, signature-stable — existing вызовы с `--cert` продолжают работать).
     - Pre-check 1: Secret `<cert-name>` существует в `apprafter-system` с label `apprafter.io/cert-mode: imported`. Не существует ⇒ error «Cert '<x>' not found. Run `apprafter target cert import <x> --cert ... --key ...` first».
     - Pre-check 2: domain уже в массиве ⇒ reject «Domain already registered: <existing>. Use `apprafter target domain remove <existing>` to swap».
-    - Action: SSA-patch `PlatformStack.spec.values.gateway.allowedDomains` (field manager `apprafter-cli`), append entry с `certMode: "imported"`, `importedCertRef: <cert-name>`, `addedAt: <now>`, `addedBy: <identity>`.
-    - Output: registered domain, public IP узла (для DNS A/AAAA records у регистратора), hint про CF setup (orange + Full strict) и `apprafter target domain list`.
-- [ ] `apprafter target domain list`:
-    - Таблица: domain, certMode, importedCertRef, addedAt, addedBy, apps using (count Application'ов с matching `expose.hostname`).
+    - Action: **merge-patch** `PlatformStack.spec.values.gateway.allowedDomains` (`kubectl_merge_patch`, path-scoped — НЕ SSA; сохраняет sibling-поля), append entry с `certMode: "imported"`, `importedCertRef: <cert-name>`, `addedAt: <now>`, `addedBy: <identity = --added-by ∥ $USER ∥ "unknown">`.
+    - Output: registered domain, public IP узла из `spec.values.gateway.nodePublicIP{,v6}` (для DNS A/AAAA records у регистратора), hint про CF setup (orange + Full strict) и `apprafter target domain list`.
+- [x] `apprafter target domain list`:
+    - Таблица: Domain, Cert, Apps (count Application'ов с matching `expose.hostname`), Added At, Added By.
     - Пустой массив ⇒ "No domains registered. Run `apprafter target domain add <zone> --cert <name>`".
-- [ ] `apprafter target domain remove <domain>`:
-    - Pre-check: scan Application'ов с `expose.hostname` matching `<domain>` (apex) или `*.<domain>` (single-label wildcard). Active apps есть ⇒ error «<N> applications using <domain>: [list]. Remove apps first or use `--force` (apps will lose external access)».
+- [x] `apprafter target domain remove <domain>`:
+    - Pre-check: domain-registered FIRST (иначе «Domain not registered»), затем scan Application'ов с `expose.hostname` matching `<domain>` (apex) или `<label>.<domain>` (single-label wildcard), base+per-env. Active apps есть ⇒ error «<N> applications using <domain>: [list]. Remove apps first or use `--force` (apps will lose external access)».
     - `--force`: clears entry, output warning per affected app.
-    - SSA-patch удаляющий entry из массива.
+    - merge-patch удаляющий entry из массива.
     - Cert Secret **не удаляется** (matches 4.1b separation `domain remove` vs `cert remove`; orphan cert acceptable в slice).
-- [ ] Deferred to full 4.1b (subset notes): `--cert` optional (LE default), wildcard `*.example.com` domain entries (slice — apex only), `target domain verify`, `set-default`, `status`, MigrationPlan для destructive ops, cert renewal flows, `target cert remove` orphan-check.
-- [ ] **Stability promise** в RELEASE notes: «`apprafter target domain add/list/remove` сигнатура стабильна между slice-impl (PlatformStack-storage) и full 4.1b (ExternalSurface-storage). Array shape entry и CLI-сигнатуры идентичны».
+- [x] Deferred to full 4.1b (subset notes): `--cert` optional (LE default), wildcard `*.example.com` domain entries (slice — apex only), `target domain verify`, `set-default`, `status`, MigrationPlan для destructive ops, cert renewal flows, `target cert remove` orphan-check.
+- [x] **Stability promise** в UNRELEASED/RELEASE notes: «`apprafter target domain add/list/remove` сигнатура стабильна между slice-impl (PlatformStack-storage) и full 4.1b (ExternalSurface-storage). Array shape entry и CLI-сигнатуры идентичны».
 
-**Acceptance:**
+**Acceptance:** (чистая логика — apex-validation, entry-build, dedup, hostname-match, apps-scan — unit-покрыта; всё ниже = **closure-smoke на track-end walk**, real Hetzner; walk также проверяет, что merge-patch сохранил `tier`/`nodePublicIP`/`egress` + `allowedDomains` переживает reconcile)
 - `apprafter target domain add apprafter.dev --cert cf-origin-cert-apprafter-dev` ⇒ массив получает entry; через ~2-3 минуты Gateway получает пару listener'ов (apex + wildcard) для apprafter.dev.
 - Второй `add apprafter.io --cert cf-origin-cert-apprafter-io` ⇒ ещё одна entry; Gateway получает ещё пару listener'ов на другом cert.
 - `list` показывает обе зоны с правильным count apps.

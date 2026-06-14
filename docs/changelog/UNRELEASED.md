@@ -9,6 +9,32 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.20 — target domain (1.83f) (2026-06-15)
+
+### Added
+
+- **`apprafter target domain {add,list,remove}`** registers apex zones for the
+  platform Gateway, each pointing at an imported cert (from `apprafter target
+  cert import`). `add <domain> --cert <name>` validates the domain (apex only —
+  no `*.`), checks the cert Secret exists, and appends an entry to the live
+  `PlatformStack.spec.values.gateway.allowedDomains`; the Gateway then serves the
+  zone on apex + wildcard `:443` listeners. `list` shows each registered zone and
+  the count of apps using it; `remove <domain>` is blocked while applications
+  still reference the domain (override with `--force`) and **keeps** the cert
+  Secret. `addedBy` defaults to `$USER` (override with `--added-by`).
+- **Stability promise:** the `add/list/remove` signature is stable between this
+  slice (which stores zones in `PlatformStack.spec.values.gateway.allowedDomains`)
+  and the full 4.1b feature (which moves storage to
+  `ExternalSurface.spec.allowedDomains`) — the array shape, entry shape, and CLI
+  commands stay the same.
+
+### Notes
+
+- The zone array is written with a JSON **merge-patch** (path-scoped), so it
+  cannot clobber sibling `PlatformStack.spec.values` fields (e.g. the required
+  `tier`). CLI-only — no chart/operator change (the gateway chart's
+  `allowedDomains` entry schema already carried these fields).
+
 ## cli v0.2.19 — target cert import (1.83e) (2026-06-14)
 
 ### Added
