@@ -146,6 +146,57 @@ pub fn expiry_status(
     }
 }
 
+/// Build the `kubernetes.io/tls` Secret manifest with the 4.1b-locked labels +
+/// annotations. Pure (`serde_json::Value`); the command applies it via kubectl.
+pub fn build_tls_secret(name: &str, namespace: &str, cert: &ImportedCert) -> serde_json::Value {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "kubernetes.io/tls",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+                "apprafter.io/cert-mode": "imported",
+                "apprafter.io/cert-name": name,
+            },
+            "annotations": {
+                "apprafter.io/cert-not-before": cert.not_before.to_rfc3339(),
+                "apprafter.io/cert-not-after": cert.not_after.to_rfc3339(),
+                "apprafter.io/cert-sans": cert.sans.join(","),
+            },
+        },
+        "data": {
+            "tls.crt": b64.encode(cert.cert_pem.as_bytes()),
+            "tls.key": b64.encode(cert.key_pem.as_bytes()),
+        },
+    })
+}
+
+/// DNS-1123 label check for the cert (= Secret) name. Same ruleset as the app
+/// wizard's `validate_dns_1123_for_app`, but returns a `CliError` for the
+/// non-interactive command path.
+pub fn validate_cert_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if ok {
+        Ok(())
+    } else {
+        Err(CliError::Other(format!(
+            "cert name '{name}' must be a DNS-1123 label: 1-63 chars, \
+             lower-case [a-z0-9-], no leading/trailing dash"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +263,45 @@ mod tests {
             expiry_status(nb, na, dt("2026-06-01T00:00:00Z")),
             ExpiryStatus::Ok
         ));
+    }
+
+    #[test]
+    fn build_tls_secret_has_locked_shape() {
+        use base64::Engine as _;
+        let c = parse_and_validate(VALID_CRT, VALID_KEY).unwrap();
+        let s = build_tls_secret("cf-origin-cert-apprafter-dev", "apprafter-system", &c);
+        assert_eq!(s["type"], "kubernetes.io/tls");
+        assert_eq!(s["metadata"]["namespace"], "apprafter-system");
+        assert_eq!(
+            s["metadata"]["labels"]["apprafter.io/managed-by"],
+            "apprafter"
+        );
+        assert_eq!(
+            s["metadata"]["labels"]["apprafter.io/cert-mode"],
+            "imported"
+        );
+        assert_eq!(
+            s["metadata"]["labels"]["apprafter.io/cert-name"],
+            "cf-origin-cert-apprafter-dev"
+        );
+        let sans = s["metadata"]["annotations"]["apprafter.io/cert-sans"]
+            .as_str()
+            .unwrap();
+        assert!(sans.contains("apprafter.dev"));
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let crt = b64.decode(s["data"]["tls.crt"].as_str().unwrap()).unwrap();
+        assert_eq!(String::from_utf8(crt).unwrap(), VALID_CRT);
+        assert!(s["metadata"]["annotations"]["apprafter.io/cert-not-after"]
+            .as_str()
+            .unwrap()
+            .contains('T'));
+    }
+
+    #[test]
+    fn validate_cert_name_enforces_dns_1123_label() {
+        assert!(validate_cert_name("cf-origin-cert-apprafter-dev").is_ok());
+        assert!(validate_cert_name("Bad_Name").is_err()); // uppercase + underscore
+        assert!(validate_cert_name("-lead").is_err());
+        assert!(validate_cert_name("").is_err());
     }
 }

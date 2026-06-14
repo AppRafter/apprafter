@@ -9,7 +9,10 @@ pub mod k8s;
 pub mod provider;
 pub mod validators;
 
-pub use cert::{expiry_status, parse_and_validate, ExpiryStatus, ImportedCert};
+pub use cert::{
+    build_tls_secret, expiry_status, parse_and_validate, validate_cert_name, ExpiryStatus,
+    ImportedCert,
+};
 pub use cloudflare::{fetch_cloudflare_ips, CloudflareIpSource, UreqCloudflareIpSource};
 pub use dry_run::DryRunProvider;
 pub use hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider};
