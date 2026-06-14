@@ -1728,6 +1728,26 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.35": {
+	change:          "safe"
+	operatorVersion: "v0.2.30"
+	notes: """
+		1.83d — opt-in Cloudflare origin firewall (CLI-side; no cluster
+		workload change). `apprafter apply` can now restrict a Hetzner Cloud
+		Firewall's 80/443 inbound to Cloudflare's published IP ranges when
+		`Infrastructure.spec.firewall.cloudflareOrigin: true`, closing the
+		orange-cloud-bypass hole; the firewall reconcile also gained a
+		`set_rules` update path so CF-IP drift refreshes on re-apply. The
+		`schemas/v1alpha1/infrastructure.cue` schema gained `cloudflareOrigin`,
+		so the cue-cmp sidecar (which bundles `schemas/v1alpha1`, ADR 0046)
+		rolls to v0.1.11. The operator (v0.2.30) is unchanged; change=safe —
+		only the Argo CD repo-server's cue-cmp sidecar rolls, and the infra
+		schema is not even Application-validated, so no GitOps Application is
+		affected.
+		"""
+	references: ["plan.md#1.83d", "argocd-cue-cmp/version.cue"]
+}
+
 compatibility: "0.2.34": {
 	change:          "safe"
 	operatorVersion: "v0.2.30"
