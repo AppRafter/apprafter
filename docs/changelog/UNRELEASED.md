@@ -9,6 +9,22 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.21 — target firewall (1.83h) (2026-06-15)
+
+### Added
+
+- **`apprafter target firewall cloudflare-origin enable|disable`** toggles the
+  Cloudflare origin firewall (restrict the node's `80`/`443` to Cloudflare's IP
+  ranges) **without an Infrastructure manifest** — the last manifest-bound piece
+  of the public-ingress flow becomes a manifest-free `target` operation, like
+  `target cert import` and `target domain`. The command persists the toggle in
+  the target store AND immediately reconciles the live Hetzner firewall (`enable`
+  fetches Cloudflare's ranges and restricts 80/443; `disable` reopens them).
+  `apprafter apply` / `up` honor the persisted toggle, so it survives a
+  manifest-less re-provision (a manifest `firewall.cloudflareOrigin` still
+  overrides when present). Before the cluster is provisioned, the toggle is saved
+  and applies on the next `up`/`apply`.
+
 ## cli v0.2.20 — target domain (1.83f) (2026-06-15)
 
 ### Added

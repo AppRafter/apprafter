@@ -15,22 +15,21 @@ nameservers on.
 ## 1. Cluster prep (once)
 
 Restrict the node's `80`/`443` to Cloudflare's IP ranges so an attacker can't
-bypass Cloudflare by hitting the node directly. In your infrastructure manifest,
-opt the cluster into the origin firewall:
-
-```cue
-spec: firewall: cloudflareOrigin: true
-```
-
-Apply it:
+bypass Cloudflare by hitting the node directly:
 
 ```bash
-apprafter apply
+apprafter target firewall cloudflare-origin enable
 ```
 
-`apply` fetches Cloudflare's published IPv4 + IPv6 ranges and allows inbound
+This fetches Cloudflare's published IPv4 + IPv6 ranges and allows inbound
 `80`/`443` only from them (SSH, the Kubernetes API, and WireGuard keep their
-existing access). This is a cluster-wide setting — you do it once, not per zone.
+existing access). It's a cluster-wide setting — do it once, not per zone — and it
+survives re-provisioning. Run `apprafter target firewall cloudflare-origin
+disable` to reopen `80`/`443`.
+
+> Infrastructure-as-code / fork users can instead opt in via the manifest:
+> `spec: firewall: cloudflareOrigin: true` + `apprafter apply` (a manifest value
+> overrides the CLI toggle).
 
 ## 2. Per zone (repeat for each domain)
 

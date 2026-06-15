@@ -2912,6 +2912,30 @@ instead of carrying parallel definitions.
 
 ---
 
+### 1.83h `apprafter target firewall` — manifest-free origin-firewall toggle
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo). NB: net-new, всплыло из T1-UX вопроса пользователя — замыкает последний manifest-bound кусок public-ingress флоу.
+
+> ✅ **CLOSED 2026-06-15** (net-new; design `docs/superpowers/specs/2026-06-15-1-83h-target-firewall-design.md`). Release: cli **v0.2.21** (CLI-only — `TargetConfig` Rust-only, без CUE/CRD-мирора; firewall out-of-cluster). **Проблема:** включение CF origin firewall (1.83d) было ЕДИНСТВЕННОй manifest-bound частью T1-флоу (требовало `Infrastructure.spec.firewall.cloudflareOrigin: true` + `apprafter apply`); всё остальное (`target cert import`/`target domain`/`platform egress set`) уже императивно. **Решение/decisions:** (1) `apprafter target firewall cloudflare-origin enable|disable` — **persist** toggle в target-store (`TargetConfig.firewall.cloudflareOrigin`) + **сразу реконсайл live Hetzner-firewall** (переиспользует 1.83d: `fetch_cloudflare_ips` + `build_firewall_spec` + `set_firewall_rules`; enable → 80/443 на CF-диапазоны, disable → wide-open). (2) `apply`/`up` уважают toggle через чистый `cf_origin_enabled(manifest, target)` (manifest `cloudflareOrigin` override > target-store > false) — manifest-less re-provision не сбрасывает firewall. (3) Не запровижен (firewall ещё нет) → persist-only + warn. (4) firewall-spec билдеры вынесены из `apply.rs` в `commands/firewall_spec.rs` (DRY) + `rule_spec_to_wire` → pub. (5) Live `set_firewall_rules` реконсайл = **closure-smoke на track-end walk**; чистая логика (TargetConfig round-trip, cf_origin_enabled precedence, build_firewall_spec) unit-покрыта.
+
+**Поставка:**
+- [x] `TargetConfig.firewall: Option<FirewallConfig{cloudflareOrigin: bool}>` (cli-core, serde-default, без schema).
+- [x] `apprafter target firewall cloudflare-origin enable|disable` — persist + live reconcile (или persist-only + warn если кластер не запровижен).
+- [x] `apply` fallback: `cf_origin_enabled(manifest, target)` (manifest override > target-store > false); `resolve_cf_ips(enabled: bool)`.
+- [x] Вынос `commands/firewall_spec.rs` (`build_firewall_spec`/`default_ingress_rules`/`apply_cf_origin`/`rule_from_manifest`) + pub `rule_spec_to_wire`.
+- [x] Runbook `connect-a-domain.md` §1 → команда (manifest-путь оставлен как fork/IaC-заметка).
+
+**Acceptance:** (чистая логика unit-покрыта; live ниже = **closure-smoke на track-end walk**, real Hetzner)
+- [~] `apprafter target firewall cloudflare-origin enable` (без манифеста) → `hcloud firewall describe <cluster>-fw` показывает CF v4+v6 на 80/443 (22/6443/51820/ICMP открыты).
+- [~] `... disable` → 80/443 обратно на `0.0.0.0/0`+`::/0`.
+- [~] enable затем `apprafter up` (без манифеста, re-provision) → firewall остаётся CF-restricted (target-store toggle переживает, без clobber).
+- [~] enable до provision → persist + warn; последующий `up` поднимает firewall CF-restricted.
+
+**Зависит от:** 1.2 ✅, 1.83d ✅.
+
+**Размер:** S+
+
+---
+
 ## Фаза 1.9 — Dev Mode MVP (Phase 1B из dev-mode-task.md)
 > 🏁 SR: D — dev mode dropped from launch (managed users don't bootstrap local clusters); reactivate after managed traction
 
