@@ -82,6 +82,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
         TargetCommand::Remove { name, yes } => run_remove(&name, yes),
         TargetCommand::Cert { action } => run_cert(action),
         TargetCommand::Domain { action } => crate::commands::target_domain::run(action),
+        TargetCommand::Firewall { action } => crate::commands::target_firewall::run(action),
     }
 }
 

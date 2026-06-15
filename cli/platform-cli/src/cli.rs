@@ -952,6 +952,11 @@ pub enum TargetCommand {
         #[command(subcommand)]
         action: TargetDomainCommand,
     },
+    /// Manage the cluster's cloud firewall (origin-firewall toggle).
+    Firewall {
+        #[command(subcommand)]
+        action: TargetFirewallCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1005,6 +1010,22 @@ pub enum TargetDomainCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TargetFirewallCommand {
+    /// Restrict the node's 80/443 to Cloudflare's IP ranges (origin firewall).
+    CloudflareOrigin {
+        /// enable | disable.
+        #[arg(value_enum)]
+        state: FirewallToggle,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum FirewallToggle {
+    Enable,
+    Disable,
 }
 
 /// `apprafter auth …` subcommands. All currently print the same
@@ -1101,6 +1122,42 @@ mod tests {
                     },
             } => assert!(!force),
             _ => panic!("expected target domain remove"),
+        }
+    }
+
+    #[test]
+    fn parses_target_firewall_cloudflare_origin() {
+        let cli = Cli::parse_from([
+            "apprafter",
+            "target",
+            "firewall",
+            "cloudflare-origin",
+            "enable",
+        ]);
+        match cli.command {
+            Commands::Target {
+                action:
+                    TargetCommand::Firewall {
+                        action: TargetFirewallCommand::CloudflareOrigin { state },
+                    },
+            } => assert!(matches!(state, FirewallToggle::Enable)),
+            _ => panic!("expected target firewall cloudflare-origin enable"),
+        }
+        let cli = Cli::parse_from([
+            "apprafter",
+            "target",
+            "firewall",
+            "cloudflare-origin",
+            "disable",
+        ]);
+        match cli.command {
+            Commands::Target {
+                action:
+                    TargetCommand::Firewall {
+                        action: TargetFirewallCommand::CloudflareOrigin { state },
+                    },
+            } => assert!(matches!(state, FirewallToggle::Disable)),
+            _ => panic!("expected ... disable"),
         }
     }
 }
