@@ -3535,6 +3535,27 @@ Tests:
 
 ---
 
+### 2.16c — Per-environment partial override для struct-полей (deep-merge `expose`)
+> 🏁 SR: A — устранить асимметрию base↔override: env должен нести только diff, а не полную копию struct-поля. Surfaced дегфудингом launch-лендинга (procvue/landing) — есть обходной костыль, не hard-блокер.
+
+**Контекст (находка 2026-06-15, dogfood landing):** ожидание «общее пишем в `base`, в окружении переопределяем только то, что реально отличается» выполняется почти для всех полей — `image`/`replicas`/`imagePolicy` наследуются (replace-if-set), `env`-мапа и `needs` deep-merge'атся (ключи base выживают). НО **`expose` (struct) заменяется ЦЕЛИКОМ**: `effective_spec` (`operator-rendering/src/lib.rs:233-235`) делает `if env_override.expose.is_some() { effective.expose = env_override.expose.clone() }`. Плюс на CUE-слое `environments?: [string]: #ApplicationSpec` (тот же тип, что base; `application.cue:30`) — `expose?.port` обязателен-когда-`expose`-присутствует, без cross-inheritance. Итог: чтобы в `dev` поменять только `expose.network: "internal"`, юзер ВЫНУЖДЕН переписать весь expose, включая env-инвариантный `port` (порт контейнера — он не меняется от окружения к окружению). То же касается `imagePolicy` (тоже struct, тоже wholesale-replace). Костыль на landing (дублирование `port` в `dev.expose`) — оставлен временно; DRY достижим и сейчас CUE-композицией (вынести инвариант в скрытое поле), но это не то, что должна давать base↔override-модель.
+
+**Цель:** per-environment override struct-полей становится **частичным** (deep-merge по подполям, override-wins) — env несёт только diff; инвариантное наследуется из base. Драйвер — `expose`; `imagePolicy` разрешить в том же духе (или явно задокументировать, если оставляем wholesale — решить в spec).
+
+**Механизм (три согласованных части, по образцу уже сделанной релаксации `image` v0.1.42 — CUE ослаблен, инвариант в CRD/webhook):**
+- [ ] **Оператор:** `effective_spec` мёржит `expose` по подполям (`port`/`network`/`hostname`/`tls` — override-wins per field), а не целиком; тест `effective_spec_env_override_replaces_expose_block` → deep-merge-тест; решить то же для `imagePolicy`.
+- [ ] **CUE:** `expose.port` → `port?` (опциональный) в `#ApplicationSpec`, чтобы частичный `environments[*].expose` экспортировался (`cue export` больше не требует конкретный port в env-override). Schema-change ⇒ cue-cmp пересобирает (bundle `schemas/v1alpha1`).
+- [ ] **Webhook:** кросс-полевой инвариант «у **эффективного** expose есть `port`» — `port` присутствует в `base.expose` ИЛИ в каждом переопределяющем `environments[*].expose` (ровно как существующее правило «image в base ИЛИ в каждом env»). Не даём смёржиться в expose-без-порта.
+- [ ] **Walk:** манифест с `base.expose:{port,network:public,hostname}` + `environments.dev.expose:{network:"internal"}` (только diff) → cue-cmp экспортит, оператор рендерит dev с `port` из base + internal (без публичного route), prod наследует публичный expose. Подтвердить на kind.
+
+**Acceptance:** в манифесте можно написать `environments.dev: expose: network: "internal"` (без `port`/`hostname`) → валидно (cue-cmp + webhook), и dev-деплой получает `port`/`tls` из `base.expose`, переопределив только `network`. Дублирование env-инвариантных полей больше не требуется.
+
+**Зависит от:** 2.9 (per-env модель), 2.12 (env-value-модель + релаксация-через-webhook прецедент), webhook image-rule (образец кросс-полевого инварианта). **Релиз:** operator + webhook + schema ⇒ cue-cmp bump + platform-stack bump + operator-chart appVersion (НЕ CLI — манифест-семантика чисто in-cluster).
+
+**Размер:** M · оператор deep-merge — мелочь; основная масса — schema-relax + webhook effective-invariant + CRD-regen + walk. Сам wholesale→deep-merge касается осмысления base↔override в целом (struct-поля), в русле замысла 2.9.
+
+---
+
 ### 2.17 Закрытие чек-листа M2 spec
 
 - [ ] Обновить `spec.md` §6 M2.
