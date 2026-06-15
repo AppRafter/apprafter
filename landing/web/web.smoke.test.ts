@@ -71,8 +71,18 @@ describe('hero section pieces', () => {
     // ADR 0032 license string — must NOT slip back to FSL-1.1-MIT.
     expect(heroJson).toContain('FSL-1.1-Apache-2.0');
     expect(heroJson).not.toContain('FSL-1.1-MIT');
-    // Status badge — Q7 (2026-05-22).
-    expect(heroJson).toContain('v0.3 · Phase 3');
+    // Status badge — honesty pass (2026-06-15): Phase 2 shipped, Tier 1 live,
+    // Tier 2 + managed still in development (no "shipped on Tier 2" claim).
+    expect(heroJson).toContain('v0.2 · Phase 2 shipped');
+    expect(heroJson).not.toContain('shipped on Tier 1 and Tier 2');
+    // Hero CUE manifest is valid against schemas/v1alpha1 (see Task 1):
+    // correct env forms + public hostname, none of the old invalid syntax.
+    expect(heroJson).toContain('claim.pg.url');
+    expect(heroJson).toContain('secret: \\"stripe/api-key\\"');
+    expect(heroJson).toContain('hostname: \\"billing.example.com\\"');
+    expect(heroJson).not.toContain('public:  true');
+    expect(heroJson).not.toContain('claim.pg.uri');
+    expect(heroJson).not.toContain('network: \\"vpn\\"');
   });
 
   test('waitlist form POSTs to /api/waitlist-signups (Vite proxy / PUBLIC_CMS_URL)', () => {
