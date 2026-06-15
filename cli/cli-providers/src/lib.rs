@@ -15,6 +15,6 @@ pub use cert::{
 };
 pub use cloudflare::{fetch_cloudflare_ips, CloudflareIpSource, UreqCloudflareIpSource};
 pub use dry_run::DryRunProvider;
-pub use hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider};
+pub use hetzner_cloud::{rule_spec_to_wire, HetznerCloudClient, HetznerCloudProvider};
 pub use provider::{Action, ApplyOutcome, DestroyOutcome, Plan, Provider};
 pub use validators::{HetznerCloudValidator, ProviderValidator, RegionInfo};

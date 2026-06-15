@@ -207,7 +207,7 @@ impl HetznerCloudProvider {
     }
 }
 
-fn rule_spec_to_wire(spec: &FirewallRuleSpec) -> FirewallRule {
+pub fn rule_spec_to_wire(spec: &FirewallRuleSpec) -> FirewallRule {
     FirewallRule {
         direction: spec.direction.clone(),
         port: spec.port.clone(),

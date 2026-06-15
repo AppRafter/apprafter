@@ -13,7 +13,7 @@ pub use client::{HetznerCloudClient, DEFAULT_BASE_URL};
 pub use kubeconfig::{
     default_ssh_identity_path, rewrite_server_url, KubeconfigFetcher, SshKubeconfigFetcher,
 };
-pub use provider::HetznerCloudProvider;
+pub use provider::{rule_spec_to_wire, HetznerCloudProvider};
 pub use server::{
     FirewallRuleSpec, FirewallSpec, FloatingIpSpec, NetworkSpec, ServerSpec, SshKeySpec,
     APPRAFTER_LABEL, APPRAFTER_LABEL_VALUE,
