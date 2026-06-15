@@ -9,6 +9,19 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.27 — apprafter secret remove (2026-06-15)
+
+### Added
+
+- **`apprafter secret remove <name>`** deletes a `SealedSecret` and the
+  `Secret` the controller unsealed from it — so cleaning up (e.g. a secret
+  sealed into the wrong namespace) no longer needs a manual `kubectl delete
+  sealedsecret,secret`. Deletes the SealedSecret first (the source of truth,
+  whose deletion cascade-removes the owned Secret), then the Secret
+  explicitly to also cover a plain un-owned Secret; `--ignore-not-found`
+  makes it idempotent. Prompts unless `--yes`; `--namespace` defaults to
+  `apprafter-system` (matching `secret seal`).
+
 ## cli v0.2.26 — parse 2.12 env value references (2026-06-15)
 
 ### Fixed
