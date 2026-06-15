@@ -4,8 +4,9 @@
   <!-- AppRafter favicon: the stepped-platform LogoMark
        (landing/web/src/components/brand/LogoMark.astro) on the brand
        accent (#14b8a6) so the tab icon reads on any browser chrome.
-       Mark in --accent-fg (#03110e). Paths copied verbatim from the
-       LogoMark; concrete colours replace its currentColor/var(--accent). -->
+       Mark in the accent-fg token (#03110e). Paths copied verbatim from
+       the LogoMark; concrete colours replace its currentColor / accent var.
+       Note: a double-hyphen digraph is illegal inside an XML/SVG comment. -->
   <rect width="200" height="200" rx="44" fill="#14b8a6" />
   <g fill="#03110e" fill-rule="evenodd">
     <path d="M 100.000 126.192 L 180.000 131.786 L 180.000 143.786 L 100.000 149.380 L 20.000 143.786 L 20.000 131.786 Z M 55.789 146.288 L 63.090 128.773 L 72.018 128.148 L 64.211 146.877 Z M 136.910 128.773 L 144.211 146.288 L 135.789 146.877 L 127.982 128.148 Z M 99.500 149.345 L 99.500 126.227 L 100.000 126.192 L 100.000 149.380 Z M 100.000 149.380 L 100.000 126.192 L 100.500 126.227 L 100.500 149.345 Z" />
