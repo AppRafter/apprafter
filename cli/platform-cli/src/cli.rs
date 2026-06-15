@@ -254,6 +254,21 @@ pub enum SecretCommand {
         #[arg(long, default_value_t = false)]
         stdout: bool,
     },
+    /// Delete a `SealedSecret` and the `Secret` the controller
+    /// unsealed from it, by name — so you don't `kubectl delete
+    /// sealedsecret,secret` by hand. Idempotent (absent objects
+    /// are fine). Prompts unless `--yes`.
+    Remove {
+        /// SealedSecret / Secret `metadata.name`. DNS-1123.
+        name: String,
+        /// Target namespace. Defaults to `apprafter-system` (matches
+        /// `secret seal`); pass the app's namespace for app secrets.
+        #[arg(long, short = 'n', default_value = "apprafter-system")]
+        namespace: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

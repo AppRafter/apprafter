@@ -5,7 +5,7 @@
 //! one-way operation: the output is safe to print, commit, or apply.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -95,9 +95,82 @@ fn apply_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Pure: the `kubectl delete` argv for one resource. `--ignore-not-found`
+/// makes it idempotent (an absent object is a no-op, not an error).
+/// Extracted so the command shape is unit-testable without a cluster.
+fn delete_args<'a>(kind: &'a str, name: &'a str, namespace: &'a str) -> [&'a str; 6] {
+    ["delete", kind, name, "-n", namespace, "--ignore-not-found"]
+}
+
+/// `apprafter secret remove <name>` — delete the `SealedSecret` and the
+/// `Secret` the controller unsealed from it, in `namespace`. Saves a manual
+/// `kubectl delete sealedsecret,secret`. The SealedSecret is the source of
+/// truth (the controller re-creates the Secret from it), so it is deleted
+/// FIRST — cascade-removing its owned Secret — and the Secret is then deleted
+/// explicitly to also cover a plain Secret that has no SealedSecret.
+/// Idempotent via `--ignore-not-found`.
+pub fn run_remove(name: &str, namespace: &str, yes: bool) -> Result<()> {
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
+            ));
+        }
+        println!("Delete SealedSecret + Secret '{name}' in namespace '{namespace}'?");
+        let confirmed = inquire::Confirm::new("Confirm?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+        if !confirmed {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let kc = ensure_kubeconfig_tempfile()?;
+    // SealedSecret first (source of truth — its deletion cascade-removes the
+    // owned Secret), then the Secret explicitly for a plain/un-owned one.
+    for kind in ["sealedsecret", "secret"] {
+        let out = Command::new("kubectl")
+            .args(delete_args(kind, name, namespace))
+            .env("KUBECONFIG", kc.path())
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl delete {kind}: {e}")))?;
+        if !out.status.success() {
+            return Err(CliError::Other(format!(
+                "kubectl delete {kind}/{name} failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let trimmed = stdout.trim();
+        if !trimmed.is_empty() {
+            println!("  {trimmed}");
+        }
+    }
+    println!("✓ Removed '{name}' (SealedSecret + Secret) from namespace '{namespace}'.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_args_are_idempotent_and_namespaced() {
+        assert_eq!(
+            delete_args("sealedsecret", "my-secret", "apprafter"),
+            [
+                "delete",
+                "sealedsecret",
+                "my-secret",
+                "-n",
+                "apprafter",
+                "--ignore-not-found"
+            ]
+        );
+    }
 
     #[test]
     fn parses_key_value_pairs() {
