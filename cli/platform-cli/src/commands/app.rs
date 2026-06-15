@@ -51,6 +51,8 @@ const ARGOCD_CASCADE_FINALIZER: &str = "resources-finalizer.argocd.argoproj.io/b
 struct AppRow {
     #[tabled(rename = "NAME")]
     name: String,
+    #[tabled(rename = "ENV")]
+    env: String,
     #[tabled(rename = "PROJECT")]
     project: String,
     #[tabled(rename = "REPO")]
@@ -2432,8 +2434,13 @@ fn app_row(app: &Value) -> AppRow {
         .and_then(Value::as_str)
         .unwrap_or("Unknown")
         .to_string();
+    // ADR 0044 (1.83j): which environment this deployment targets. Reuses
+    // the same label → status → `(base)` resolution as the `app status`
+    // per-env aggregation so the two surfaces never disagree.
+    let env = deployment_environment(app);
     AppRow {
         name,
+        env,
         project,
         repo,
         revision,
@@ -3668,6 +3675,34 @@ mod tests {
         assert_eq!(rows[0].health, "Unknown");
         assert_eq!(rows[1].environment, "staging");
         assert_eq!(rows[1].argo_name, "api-staging");
+    }
+
+    #[test]
+    fn app_row_populates_env_column_from_label_then_status_then_base() {
+        // ADR 0044 (1.83j PART 2): `app list` surfaces an ENV column so a
+        // per-environment deploy (`<name>-<env>`) is distinguishable at a
+        // glance from a base-only one. Resolution mirrors
+        // `deployment_environment`: label → status → `(base)`.
+        let labelled = serde_json::json!({
+            "metadata": {
+                "name": "web-staging",
+                "labels": { "apprafter.io/environment": "staging" }
+            },
+            "spec": { "project": "apps", "source": { "repoURL": "r", "targetRevision": "main" } }
+        });
+        assert_eq!(app_row(&labelled).env, "staging");
+
+        let from_status = serde_json::json!({
+            "metadata": { "name": "web-prod" },
+            "status": { "environment": "prod" }
+        });
+        assert_eq!(app_row(&from_status).env, "prod");
+
+        let base_only = serde_json::json!({
+            "metadata": { "name": "legacy" },
+            "spec": { "project": "apps" }
+        });
+        assert_eq!(app_row(&base_only).env, "(base)");
     }
 
     #[test]
