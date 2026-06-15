@@ -9,6 +9,22 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.23 — platform env set/show + app list ENV column (1.83j) (2026-06-15)
+
+### Added
+
+- **`apprafter platform env set <env>` / `apprafter platform env show`** set and
+  show the cluster's default environment (`PlatformStack.spec.defaultEnvironment`,
+  ADR 0044) — previously only settable via a raw `kubectl patch`. The default is
+  **soft**: it only preselects the interactive `apprafter app add` environment
+  picker; it does **not** change what the operator renders (an app added without
+  `--env` is still base-only), and both commands print that disclaimer. `set`
+  uses a path-scoped JSON merge-patch, so the required `tier` / `source` /
+  `values` siblings are preserved; `show` reports `(unset)` when absent.
+- **`apprafter app list`** now shows an **ENV** column — each deployment's
+  environment (the `apprafter.io/environment` label, or `(base)`), matching what
+  `apprafter app status` already reports per deployment.
+
 ## cli v0.2.22 — target ip (1.83i) (2026-06-15)
 
 ### Added

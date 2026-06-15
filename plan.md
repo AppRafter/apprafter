@@ -2958,6 +2958,27 @@ instead of carrying parallel definitions.
 
 ---
 
+### 1.83j `apprafter platform env set/show` + `app list` ENV-колонка
+> 🏁 SR: A · order 3.5 — public ingress MVP track (env-management UX). NB: net-new, всплыло на проходе runbook'а (вопрос «как из CLI выставить/посмотреть дефолтный env кластера и env задеплоенного app»).
+
+> ✅ **CLOSED 2026-06-15** (net-new; design `docs/superpowers/specs/2026-06-15-1-83j-platform-env-design.md`). Release: cli **v0.2.23** (CLI-only). **Проблема:** `PlatformStack.spec.defaultEnvironment` (soft per-cluster default, ADR 0044) выставлялся только сырым `kubectl patch` — не было `apprafter`-команды, хотя CLI его уже *читает* (преселект env-пикера `app add`); и `app list` не показывал env задеплоенных приложений (per-deployment env показывает только `app status`). **Решение:** (1) `apprafter platform env set <env>` / `show` — set/show `spec.defaultEnvironment` через path-scoped JSON **merge-patch** (поле структурное+опциональное, без REQUIRED-siblings → merge-patch проще/безопаснее SSA-dedicated-manager'а egress'а; зеркало `platform freeze`/`unfreeze`); семантика остаётся **SOFT** (преселект визарда, НЕ меняет рендеринг) — оба вывода печатают `SOFT_ENV_NOTE`-дисклеймер, `show` без поля → `(unset)`. (2) `apprafter app list` получил колонку **ENV** (через существующий `deployment_environment` → label `apprafter.io/environment` / `(base)`), так что `app list` и `app status` согласованы по env. **Decisions:** (a) merge-patch, НЕ SSA (нет REQUIRED-siblings под `spec.defaultEnvironment`). (b) SOFT-семантика не усиливается (hard-default = ADR-ревизит, out of scope). (c) НЕТ команды смены env задеплоенного app — env = идентичность Argo-app'а `<name>-<env>`; «смена» = задокументированный `app remove --env old` + `app add --env new` (user-confirmed). Чистые `validate_env`/`default_environment_patch_body` + ENV-колонка unit-покрыты; live merge-patch/get = closure-smoke на track-end walk. Исполнено subagent-driven через Workflow (последовательный implement → параллельное spec+quality Explore-ревью на задачу — обе SHIP, blocking нет).
+
+**Поставка:**
+- [x] clap `EnvCommand{Show,Set{env}}` + `PlatformCommand::Env` (зеркало Egress) + main.rs dispatch.
+- [x] `platform env set` (merge-patch `spec.defaultEnvironment` + `SOFT_ENV_NOTE`) / `show` (read + `(unset)`).
+- [x] `app list` ENV-колонка (после NAME) через `deployment_environment`.
+
+**Acceptance:** (чистая логика + колонка unit-покрыты; live = **closure-smoke на track-end walk**)
+- [~] `platform env set staging` патчит `spec.defaultEnvironment` (tier/source/values/network не тронуты — merge-patch сохраняет siblings); `show` печатает значение/`(unset)` + дисклеймер.
+- [~] после `env set staging` интерактивный `app add` преселектит `staging`.
+- [~] `app list` показывает ENV-колонку с env каждого деплоя (`<env>` / `(base)`).
+
+**Зависит от:** 2.9 ✅ (ADR 0044).
+
+**Размер:** S
+
+---
+
 ## Фаза 1.9 — Dev Mode MVP (Phase 1B из dev-mode-task.md)
 > 🏁 SR: D — dev mode dropped from launch (managed users don't bootstrap local clusters); reactivate after managed traction
 
