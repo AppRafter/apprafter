@@ -44,8 +44,16 @@ disable` to reopen `80`/`443`.
 
 ### 2.2 DNS records
 
-You need the node's public IP. It is printed by `apprafter target domain add`
-(below), and you can also read it with `kubectl get nodes -o wide`.
+You need the node's public IP. Run:
+
+```bash
+apprafter target ip
+```
+
+It prints the `A` (IPv4) and `AAAA` (IPv6) record values from the Hetzner API.
+(Fallback: `kubectl get nodes -o wide` shows them too — but on Hetzner, which has
+no cloud-controller-manager, the public IP appears under the **`INTERNAL-IP`**
+column, not `EXTERNAL-IP`.)
 
 In Cloudflare's DNS for the zone, add (all **Proxied** — orange cloud):
 

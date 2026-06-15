@@ -2936,6 +2936,28 @@ instead of carrying parallel definitions.
 
 ---
 
+### 1.83i `apprafter target ip` — node public IP readout
+> 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo). NB: net-new, всплыло на проходе runbook §2.2 (не было способа узнать IP ноды для DNS A/AAAA без kubectl-escape-hatch).
+
+> ✅ **CLOSED 2026-06-15** (net-new; design `docs/superpowers/specs/2026-06-15-1-83i-target-ip-design.md`). Release: cli **v0.2.22** (CLI-only). **Проблема:** на §2.2 runbook'а не было чистого способа узнать публичные IP ноды для DNS-записей — `PlatformStack.nodePublicIP` vestigial (документирован, но CLI его не выставляет; чарт не потребляет с 1.83a host-network), state.json хранит только server_id, ни одна команда IP не показывала. **Решение:** `apprafter target ip` берёт IP **живьём из Hetzner API** (`list_servers().public_net`, server_id из state, токен из target) → печатает `A → <v4>` / `AAAA → <v6>`. IPv6 = адрес ноды `<prefix>::1` (выведен из /64-делегации Hetzner). Не запровижен → «run `apprafter up` first». **Decisions:** (1) чистые хелперы (`node_ipv6_address`/`extract_public_ips`) + live `node_public_ips` — в **cli-providers** (lib-крейт, dead_code-exempt, unit-тест; правильный Hetzner-слой; обход bin-крейт dead_code-ловушки 1.83h). (2) `target domain add`'s IP-подсказка теперь **ссылается** на `apprafter target ip` (убран вечно-пустой nodePublicIP-read), не дублирует lookup. Live-readout (+ `::1` vs реальный v6 ноды) = closure-smoke на track-end walk; чистая логика unit-покрыта.
+
+**Поставка:**
+- [x] cli-providers: `node_ipv6_address` + `extract_public_ips` (pure, unit-тест) + `node_public_ips` (live `list_servers`).
+- [x] `apprafter target ip` (`TargetCommand::Ip`) → live A/AAAA readout; «run up first» если не запровижен.
+- [x] `target domain add`'s IP-подсказка → ссылка на `apprafter target ip` (drop nodePublicIP-read).
+- [x] Runbook `connect-a-domain.md` §2.2 → `apprafter target ip` (+ caveat про Hetzner INTERNAL-IP в fallback).
+
+**Acceptance:** (чистая логика unit-покрыта; live = **closure-smoke на track-end walk**)
+- [~] `apprafter target ip` на запровиженном T1 → печатает v4 (совпадает с Hetzner-консолью) + v6 `::1`; подтвердить, что `::1` = реальный v6 ноды.
+- [~] `apprafter target ip` до provision → «run `apprafter up` first».
+- [~] `target domain add` печатает ссылку на `apprafter target ip` (нет «not recorded»).
+
+**Зависит от:** 1.2 ✅.
+
+**Размер:** S
+
+---
+
 ## Фаза 1.9 — Dev Mode MVP (Phase 1B из dev-mode-task.md)
 > 🏁 SR: D — dev mode dropped from launch (managed users don't bootstrap local clusters); reactivate after managed traction
 

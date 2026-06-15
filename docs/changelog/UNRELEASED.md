@@ -9,6 +9,19 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.22 — target ip (1.83i) (2026-06-15)
+
+### Added
+
+- **`apprafter target ip`** prints the cluster node's public IPv4 + IPv6 — the
+  values to set as DNS **A / AAAA** records when connecting a domain — by
+  querying the Hetzner Cloud API live (no manifest, no kubectl). The IPv6 is the
+  node's `<prefix>::1` address (derived from Hetzner's `/64` delegation). Before
+  the cluster is provisioned it prints a "run `apprafter up` first" message.
+- **`apprafter target domain add`** now points at `apprafter target ip` for the
+  DNS values (dropping the old "node public IP not recorded" placeholder, which
+  always fired because `PlatformStack.nodePublicIP` is never populated).
+
 ## cli v0.2.21 — target firewall (1.83h) (2026-06-15)
 
 ### Added
