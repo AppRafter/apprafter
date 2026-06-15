@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod kubeconfig;
+pub mod node_ip;
 pub mod provider;
 pub mod server;
 pub mod server_type;
@@ -13,6 +14,7 @@ pub use client::{HetznerCloudClient, DEFAULT_BASE_URL};
 pub use kubeconfig::{
     default_ssh_identity_path, rewrite_server_url, KubeconfigFetcher, SshKubeconfigFetcher,
 };
+pub use node_ip::{extract_public_ips, node_ipv6_address, node_public_ips};
 pub use provider::{rule_spec_to_wire, HetznerCloudProvider};
 pub use server::{
     FirewallRuleSpec, FirewallSpec, FloatingIpSpec, NetworkSpec, ServerSpec, SshKeySpec,
