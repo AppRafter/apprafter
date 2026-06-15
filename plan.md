@@ -2881,12 +2881,14 @@ instead of carrying parallel definitions.
 ### 1.83g One-time DNS + CF setup runbook (per-zone iteration)
 > 🏁 SR: A · order 3.5 — public ingress MVP (completes T1 demo); minimal slice — full ingress остаётся order 5 (4.1/4.1a/4.4a). NB: manual stand-in для 4.4a — после landing 4.4a (external-dns) этот runbook deprecated.
 
+> ✅ **CLOSED 2026-06-15** (docs-only — НЕТ cli-бампа/монорепо-тега). Runbook-страница `docs/public-ingress/connect-a-domain.md` («Connect a domain») + mkdocs nav (под «Public ingress», выше cert-страницы). Структура: (1) one-time cluster prep — включить CF origin firewall (`Infrastructure.spec.firewall.cloudflareOrigin: true` + `apprafter apply`, 1.83d) — добавлено к плановому per-zone flow, т.к. firewall cluster-wide; (2) per-zone loop (CF add-site → NS swap → DNS A/AAAA proxied → Full strict → Origin CA cert (линк на существующую `cloudflare-origin-cert.md`, не дублирует) → `target cert import` → `target domain add` → apply Application с `expose.hostname`); (3) verify (per-zone curl, cross-zone, firewall-bypass-blocked, `target domain list`) + removing-a-zone. Strict mkdocs build GREEN. **Живая verify-проверка (curl'ы) = closure-smoke на track-end ручном walk** (real Hetzner) — страница её документирует, не исполняет. **Это последняя subphase 1.83-трека**; следующее — консолидированный track-end walk (НЕ phase closure — 1.83 = order-3.5 pulled-up, не нумерованная фаза, spec.md не актуализируется).
+
 **Source:** outside-of-code, замыкает acceptance слайса.
 
 **Цель:** documented one-time flow для каждой registrable-зоны: registrar → CF NS swap → CF Origin CA cert → `apprafter target cert import` → `apprafter target domain add`. Повторяется столько раз, сколько зон.
 
-**Поставка (docs):**
-- [ ] **Per registrable zone** (повторяется per domain):
+**Поставка (docs):** (всё ниже задокументировано в `connect-a-domain.md`; живые curl-проверки — на track-end walk)
+- [x] **Per registrable zone** (повторяется per domain):
     - CF: Add site `<zone>` → Free plan → записать два NS.
     - У registrar'а (GoDaddy/Namecheap/etc.): выключить DNSSEC; Nameservers → custom → CF NS.
     - CF: ждать «Active»; DNS records:
@@ -2897,10 +2899,10 @@ instead of carrying parallel definitions.
     - CF: SSL/TLS → Origin Server → Create Certificate (hostnames `<zone>` + `*.<zone>`, RSA 2048, validity 15 years). Скачать cert + key.
     - `apprafter target cert import cf-origin-cert-<sanitized-zone> --cert ./origin.pem --key ./origin.key` (1.83e).
     - `apprafter target domain add <zone> --cert cf-origin-cert-<sanitized-zone>` (1.83f).
-- [ ] Apply Application'ов с обновлённой схемой (`expose.hostname: "<some-zone-or-subdomain>"`, 1.83b).
-- [ ] Verify per zone: `curl -v https://<zone>/` — CF cert на edge, response от соответствующего Application.
-- [ ] Verify cross-zone: на одном кластере одновременно отвечают `https://apprafter.dev/` и `https://apprafter.io/` (или сколько зон зарегистрировано), каждая со своим cert на edge.
-- [ ] Verify firewall bypass blocked: `curl --resolve <zone>:443:<node-ip> https://<zone>/` минуя CF — connection refused/timeout (1.83d).
+- [x] Apply Application'ов с обновлённой схемой (`expose.hostname: "<some-zone-or-subdomain>"`, 1.83b) — задокументировано.
+- [~] Verify per zone: `curl -v https://<zone>/` — CF cert на edge, response от соответствующего Application — **track-end walk**.
+- [~] Verify cross-zone: на одном кластере одновременно отвечают `https://apprafter.dev/` и `https://apprafter.io/` (или сколько зон зарегистрировано), каждая со своим cert на edge — **track-end walk**.
+- [~] Verify firewall bypass blocked: `curl --resolve <zone>:443:<node-ip> https://<zone>/` минуя CF — connection refused/timeout (1.83d) — **track-end walk**.
 
 **Acceptance:** все зарегистрированные зоны отдают свои Application'ы через CF; direct-to-node connections refused; `apprafter target domain list` показывает все зоны с правильным apps-count.
 

@@ -83,6 +83,7 @@ nav:
       - Troubleshooting: operator-guide/troubleshooting.md
       - Recovery: operator-guide/recovery.md
   - Public ingress:
+      - Connect a domain: public-ingress/connect-a-domain.md
       - Cloudflare Origin CA cert: public-ingress/cloudflare-origin-cert.md
   - Developer Guide:
       - Overview: dev-guide/index.md
