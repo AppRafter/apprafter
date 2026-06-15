@@ -378,7 +378,10 @@ pub fn add(
     println!();
     warn_if_no_matching_repo_creds(&repo_url, kc.path());
     println!("Argo CD will sync the workload within a reconcile cycle. State:");
-    println!("  apprafter app status {argo_app_name}");
+    // `app status` takes the LOGICAL name (it aggregates every
+    // `<name>-<env>` deployment via the apprafter.io/application label),
+    // NOT the per-env Argo app name — mirror the collision-path hint above.
+    println!("  apprafter app status {derived_name}");
     Ok(())
 }
 
@@ -2466,7 +2469,12 @@ fn app_row(app: &Value) -> AppRow {
 }
 
 /// Pure formatter — tests drive it with a fixture JSON.
-fn print_status(app: &Value) {
+/// The Argo CD summary lines for one Application — name, project, repo,
+/// revision, path, destination, ENVIRONMENT, sync, health. Pure +
+/// testable; the `environment:` line closes a 2.9 gap where `app status`
+/// surfaced the env only in the multi-deployment header, never in the
+/// single-deployment detail block.
+fn status_detail_lines(app: &Value) -> Vec<String> {
     let name = app
         .pointer("/metadata/name")
         .and_then(Value::as_str)
@@ -2499,15 +2507,25 @@ fn print_status(app: &Value) {
         .pointer("/status/health/status")
         .and_then(Value::as_str)
         .unwrap_or("Unknown");
+    let environment = deployment_environment(app);
 
-    println!("Application {ARGOCD_NAMESPACE}/{name}");
-    println!("  project:       {project}");
-    println!("  repo:          {repo}");
-    println!("  revision:      {revision}");
-    println!("  path:          {path}");
-    println!("  destination:   {dest_ns}");
-    println!("  sync state:    {sync}");
-    println!("  health:        {health}");
+    vec![
+        format!("Application {ARGOCD_NAMESPACE}/{name}"),
+        format!("  project:       {project}"),
+        format!("  repo:          {repo}"),
+        format!("  revision:      {revision}"),
+        format!("  path:          {path}"),
+        format!("  destination:   {dest_ns}"),
+        format!("  environment:   {environment}"),
+        format!("  sync state:    {sync}"),
+        format!("  health:        {health}"),
+    ]
+}
+
+fn print_status(app: &Value) {
+    for line in status_detail_lines(app) {
+        println!("{line}");
+    }
 
     if let Some(revs) = app.pointer("/status/history").and_then(Value::as_array) {
         if !revs.is_empty() {
@@ -3174,6 +3192,47 @@ mod tests {
             }
         });
         print_status(&app);
+    }
+
+    #[test]
+    fn status_detail_lines_shows_environment() {
+        // An env deployment (`<name>-<env>`) carries the
+        // apprafter.io/environment label — the detail view must show it
+        // (the 2.9 gap: env was only printed in the multi-deploy header).
+        let prod = serde_json::json!({
+            "metadata": { "name": "web-prod", "labels": { "apprafter.io/environment": "prod" } },
+            "spec": {
+                "project": "apps",
+                "source": { "repoURL": "https://r", "targetRevision": "main" },
+                "destination": { "namespace": "web" }
+            }
+        });
+        let env_line = status_detail_lines(&prod)
+            .into_iter()
+            .find(|l| l.contains("environment:"))
+            .expect("detail view must include an environment: line");
+        assert!(
+            env_line.contains("prod"),
+            "labelled deployment must show its env; got {env_line:?}"
+        );
+
+        // A base-only app (no env label) shows `(base)`.
+        let base = serde_json::json!({
+            "metadata": { "name": "web" },
+            "spec": {
+                "project": "apps",
+                "source": { "repoURL": "https://r", "targetRevision": "main" },
+                "destination": { "namespace": "web" }
+            }
+        });
+        let env_line = status_detail_lines(&base)
+            .into_iter()
+            .find(|l| l.contains("environment:"))
+            .expect("detail view must include an environment: line");
+        assert!(
+            env_line.contains("(base)"),
+            "base-only deployment must show (base); got {env_line:?}"
+        );
     }
 
     #[test]
