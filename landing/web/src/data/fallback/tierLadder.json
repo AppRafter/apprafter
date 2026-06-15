@@ -14,9 +14,9 @@
       "num": "Tier 2",
       "title": "Production cluster",
       "price": "3+ nodes",
-      "desc": "Production. 3 or more nodes of any size and any count — grows with your project. Hetzner Cloud at launch.",
-      "status": "live",
-      "statusText": "Available now"
+      "desc": "Production. 3 or more nodes of any size and any count — grows with your project. Designed and in progress; ships in Phase 3 (Hetzner Cloud).",
+      "status": "roadmap",
+      "statusText": "Roadmap · Phase 3"
     },
     {
       "num": "Tier 3",

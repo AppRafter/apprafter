@@ -17,7 +17,7 @@ const cards = data.cards ?? [];
       <div class="stair" aria-hidden="true">
         {
           [1, 2, 3, 4].map((n) => (
-            <div class={`step${n <= 2 ? ' live' : ''}`} style={`height: ${20 + n * 16}px`}>
+            <div class={`step${n <= 1 ? ' live' : ''}`} style={`height: ${20 + n * 16}px`}>
               <span class="label">T{n}</span>
             </div>
           ))
@@ -32,6 +32,15 @@ const cards = data.cards ?? [];
               <div class="price">{t.price}</div>
               <p>{t.desc}</p>
               <span class={`status ${t.status}`}>{t.statusText}</span>
+              {t.status !== 'live' && (
+                <button
+                  type="button"
+                  class="tier-waitlist btn-waitlist"
+                  data-preselect={t.num === 'Tier 2' ? 'tier2' : t.num === 'Tier 3' ? 'tier3' : 'tier4'}
+                >
+                  Join the waitlist
+                </button>
+              )}
             </div>
           ))
         }
@@ -40,6 +49,17 @@ const cards = data.cards ?? [];
     </div>
   </Container>
 </section>
+
+<script>
+  for (const b of document.querySelectorAll('.tier-waitlist')) {
+    b.addEventListener('click', () => {
+      const preselect = (b as HTMLElement).dataset.preselect;
+      document.dispatchEvent(
+        new CustomEvent('waitlist:toggle', { detail: { open: true, preselect } }),
+      );
+    });
+  }
+</script>
 
 <style>
   .ladder-wrap {
@@ -118,6 +138,23 @@ const cards = data.cards ?? [];
     height: 6px;
     border: 1px solid var(--fg-faint);
     display: inline-block;
+  }
+  .tier-card .btn-waitlist {
+    margin-top: 12px;
+    align-self: flex-start;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--fg);
+    cursor: pointer;
+    border-radius: 4px;
+    transition: border-color 150ms ease;
+  }
+  .tier-card .btn-waitlist:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
 
   .stair {

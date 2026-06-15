@@ -401,3 +401,24 @@ describe('cue-highlight build-time tokenizer', () => {
     expect(html).toContain('&lt;script&gt;');
   });
 });
+
+describe('honesty pass — tiers (2026-06-15)', () => {
+  test('Tier 2 is no longer marked Available now; carries Phase 3', () => {
+    const tl = readFileSync(join(ROOT, 'src/data/fallback/tierLadder.json'), 'utf8');
+    const data = JSON.parse(tl);
+    const t2 = data.cards.find((c: { num: string }) => c.num === 'Tier 2');
+    expect(t2.status).toBe('roadmap');
+    expect(t2.statusText).toContain('Phase 3');
+    expect(t2.statusText).not.toContain('Available now');
+  });
+
+  test('TierLadder renders a waitlist button that dispatches the toggle with a preselect', () => {
+    const c = readFileSync(join(ROOT, 'src/components/sections/TierLadder.astro'), 'utf8');
+    expect(c).toContain('waitlist:toggle');
+    expect(c).toContain('preselect');
+    expect(c).toContain('data-preselect');
+    // only T1 lights the stair now
+    expect(c).toContain('n <= 1');
+    expect(c).not.toContain('n <= 2');
+  });
+});
