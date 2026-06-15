@@ -428,6 +428,23 @@ pub enum PlatformCommand {
         #[command(subcommand)]
         action: EgressCommand,
     },
+    /// Show or set the cluster's soft default environment (ADR 0044).
+    Env {
+        #[command(subcommand)]
+        action: EnvCommand,
+    },
+}
+
+/// `apprafter platform env …` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum EnvCommand {
+    /// Show the cluster's default environment.
+    Show,
+    /// Set the cluster's default environment (a soft `app add` preselect).
+    Set {
+        /// Environment name (e.g. prod, staging).
+        env: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1170,6 +1187,37 @@ mod tests {
             cli.command,
             Commands::Target {
                 action: TargetCommand::Ip
+            }
+        ));
+    }
+
+    #[test]
+    fn platform_env_set_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["apprafter", "platform", "env", "set", "staging"])
+            .expect("should parse");
+        match cli.command {
+            Commands::Platform {
+                action:
+                    PlatformCommand::Env {
+                        action: EnvCommand::Set { env },
+                    },
+            } => assert_eq!(env, "staging"),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn platform_env_show_parses() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["apprafter", "platform", "env", "show"]).expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Platform {
+                action: PlatformCommand::Env {
+                    action: EnvCommand::Show
+                }
             }
         ));
     }

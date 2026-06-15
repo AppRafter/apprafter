@@ -809,6 +809,65 @@ pub fn egress_set(profile: &str) -> Result<()> {
     Ok(())
 }
 
+/// Shown after every `platform env` output so operators aren't misled: the
+/// default env is a CLI convenience, not a rendering gate (ADR 0044).
+const SOFT_ENV_NOTE: &str =
+    "(soft default — preselects the `apprafter app add` env picker; it does NOT \
+     change rendering. An app added without `--env` is still base-only.)";
+
+/// Trim + reject empty/whitespace. Pure (unit-tested without a cluster).
+fn validate_env(env: &str) -> Result<&str> {
+    let trimmed = env.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::Other("environment must not be empty".into()));
+    }
+    Ok(trimmed)
+}
+
+/// The path-scoped JSON merge-patch body for `spec.defaultEnvironment`. Pure.
+fn default_environment_patch_body(env: &str) -> String {
+    serde_json::json!({ "spec": { "defaultEnvironment": env } }).to_string()
+}
+
+/// `apprafter platform env show` — print the cluster's default environment.
+pub fn env_show() -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let stack = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?;
+    let current = stack
+        .as_ref()
+        .and_then(|s| s.pointer("/spec/defaultEnvironment"))
+        .and_then(Value::as_str);
+    match current {
+        Some(env) => println!("Default environment: {env}"),
+        None => println!("Default environment: (unset)"),
+    }
+    println!("{SOFT_ENV_NOTE}");
+    Ok(())
+}
+
+/// `apprafter platform env set <env>` — set the cluster's default environment.
+pub fn env_set(env: &str) -> Result<()> {
+    let env = validate_env(env)?;
+    let kc = ensure_kubeconfig_tempfile()?;
+    let body = default_environment_patch_body(env);
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+    println!("✓ Default environment set to '{env}'.");
+    println!("{SOFT_ENV_NOTE}");
+    Ok(())
+}
+
 /// Best-effort: does any `metadata.managedFields` entry owned by a
 /// manager OTHER than `apprafter-cli` whose name looks like Argo CD
 /// (`argocd`, `argo-cd-*`, `application-controller`) carry the
@@ -1202,6 +1261,26 @@ mod tests {
         assert!(!recheck_completed(None, requested));
         // Mid-write garbage reads as not-yet-done, not a crash.
         assert!(!recheck_completed(Some("not-a-timestamp"), requested));
+    }
+
+    #[test]
+    fn validate_env_trims_and_accepts() {
+        assert_eq!(validate_env("staging").unwrap(), "staging");
+        assert_eq!(validate_env("  prod ").unwrap(), "prod");
+    }
+
+    #[test]
+    fn validate_env_rejects_empty_and_whitespace() {
+        assert!(validate_env("").is_err());
+        assert!(validate_env("   ").is_err());
+    }
+
+    #[test]
+    fn default_environment_patch_body_shape() {
+        let body = default_environment_patch_body("staging");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["spec"]["defaultEnvironment"], "staging");
+        assert_eq!(v["spec"].as_object().unwrap().len(), 1);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use cli_core::logging;
 use miette::{IntoDiagnostic, Result};
 
 use crate::cli::{
-    AppCommand, Cli, Commands, EgressCommand, MigrationCommand, OpenUi, PlatformCommand,
-    RepoCommand, RepoCredsCommand, SecretCommand,
+    AppCommand, Cli, Commands, EgressCommand, EnvCommand, MigrationCommand, OpenUi,
+    PlatformCommand, RepoCommand, RepoCredsCommand, SecretCommand,
 };
 
 fn main() -> Result<()> {
@@ -97,6 +97,10 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             PlatformCommand::Egress { action } => match action {
                 EgressCommand::Show => commands::platform::egress_show()?,
                 EgressCommand::Set { profile } => commands::platform::egress_set(&profile)?,
+            },
+            PlatformCommand::Env { action } => match action {
+                EnvCommand::Show => commands::platform::env_show()?,
+                EnvCommand::Set { env } => commands::platform::env_set(&env)?,
             },
         },
         Commands::Migration { action } => match action {
