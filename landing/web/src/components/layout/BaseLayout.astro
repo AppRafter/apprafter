@@ -9,6 +9,7 @@
 // etc.) without overriding the defaults.
 
 import '../../styles/index.css';
+import { assetExists, assetVersion } from '../../lib/asset-version';
 import { THEME_INIT_SCRIPT } from '../../lib/theme-init';
 
 type Props = {
@@ -24,7 +25,25 @@ const {
   canonical = Astro.url.href,
   ogImage = '/og-image.png',
 } = Astro.props;
-const ogImageAbs = new URL(ogImage, Astro.site ?? Astro.url).href;
+
+// Content-hash `?v=` busts Cloudflare's edge cache + the browser favicon
+// cache the moment an icon's bytes change (see lib/asset-version.ts).
+const faviconIco = `/favicon.ico?v=${assetVersion('favicon.ico')}`;
+const faviconSvg = `/favicon.svg?v=${assetVersion('favicon.svg')}`;
+const favicon16 = `/favicon-16.png?v=${assetVersion('favicon-16.png')}`;
+const appleTouchIcon = `/apple-touch-icon.png?v=${assetVersion('apple-touch-icon.png')}`;
+
+// Version local og images too — but only when the file is actually present
+// (icons above are required and fail loudly; the og image is optional, so a
+// missing one must not break the build). External/absolute URLs pass through.
+// Strip any query/hash before the filesystem lookup, and append v= with the
+// right separator whether or not the URL already carries a query.
+const ogPath = ogImage.startsWith('/') ? ogImage.slice(1).split(/[?#]/)[0] : null;
+const ogImageVersioned =
+  ogPath && assetExists(ogPath)
+    ? `${ogImage}${ogImage.includes('?') ? '&' : '?'}v=${assetVersion(ogPath)}`
+    : ogImage;
+const ogImageAbs = new URL(ogImageVersioned, Astro.site ?? Astro.url).href;
 ---
 
 <!doctype html>
@@ -49,9 +68,10 @@ const ogImageAbs = new URL(ogImage, Astro.site ?? Astro.url).href;
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={ogImageAbs} />
 
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" href={faviconIco} sizes="32x32" />
+    <link rel="icon" type="image/svg+xml" href={faviconSvg} />
+    <link rel="icon" type="image/png" sizes="16x16" href={favicon16} />
+    <link rel="apple-touch-icon" sizes="180x180" href={appleTouchIcon} />
 
     <link
       rel="preload"

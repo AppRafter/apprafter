@@ -110,6 +110,43 @@ describe('page shell (Phase G)', () => {
   });
 });
 
+describe('favicon — well-formed, theme-adaptive, cache-busted', () => {
+  const svg = readFileSync(join(ROOT, 'public/favicon.svg'), 'utf8');
+
+  test('no double-hyphen inside any XML comment (regression)', () => {
+    // `--` inside <!-- --> makes the SVG not well-formed XML; the browser
+    // refuses to parse it and the favicon silently breaks.
+    const commentBodies = [...svg.matchAll(/<!--([\s\S]*?)-->/g)].map((m) => m[1]);
+    expect(commentBodies.length).toBeGreaterThan(0);
+    for (const body of commentBodies) {
+      expect(body).not.toContain('--');
+    }
+  });
+
+  test('transparent + theme-adaptive + on-palette', () => {
+    expect(svg).toContain('prefers-color-scheme'); // mark follows OS theme
+    expect(svg).toContain('#14b8a6'); // brand accent kept on the roof
+    expect(svg).not.toContain('#03110e'); // off-palette foreground gone
+    expect(svg).not.toContain('<rect'); // no filled tile — transparent
+  });
+
+  test('a legacy favicon.ico is shipped for bare-root browser probes', () => {
+    expect(existsSync(join(ROOT, 'public/favicon.ico'))).toBe(true);
+  });
+
+  test('BaseLayout cache-busts every icon + og ref through assetVersion', () => {
+    const layout = readFileSync(join(ROOT, 'src/components/layout/BaseLayout.astro'), 'utf8');
+    expect(layout).toContain('assetVersion');
+    // each icon href carries a content-hash ?v= query
+    expect(layout).toMatch(/\/favicon\.svg\?v=/);
+    expect(layout).toMatch(/assetVersion\('favicon\.ico'\)/);
+    expect(layout).toMatch(/assetVersion\('favicon-16\.png'\)/);
+    expect(layout).toMatch(/assetVersion\('apple-touch-icon\.png'\)/);
+    // og:image is versioned too (local assets only)
+    expect(layout).toContain('ogImageVersioned');
+  });
+});
+
 describe('polish — sitemap, robots, 404, legal stubs (Phase I)', () => {
   test('robots.txt allows everything + advertises sitemap', () => {
     const r = readFileSync(join(ROOT, 'public/robots.txt'), 'utf8');

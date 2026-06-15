@@ -18,6 +18,13 @@
 	header /_astro/* Cache-Control "public, max-age=31536000, immutable"
 	header / Cache-Control "public, max-age=3600"
 
+	# Icons + OG image are referenced with a content-hash ?v= query
+	# (see src/lib/asset-version.ts), so a changed file always gets a
+	# fresh URL. A 1-day TTL keeps direct/probe hits on the bare path
+	# reasonably fresh instead of inheriting Cloudflare's 4h default.
+	@icons path /favicon.ico /favicon.svg /favicon-16.png /apple-touch-icon.png /og-image.png
+	header @icons Cache-Control "public, max-age=86400"
+
 	try_files {path} {path}/ /404.html
 
 	handle_errors {
