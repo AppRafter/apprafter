@@ -175,6 +175,7 @@ fn run_add(mut args: AddArgs) -> Result<()> {
             default_tier: args.tier,
             cluster_name: args.cluster_name,
             ssh_key_path: args.ssh_key,
+            firewall: None,
         },
         credentials: TargetCredentials {
             hetzner_token: Some(token),

@@ -211,6 +211,15 @@ impl Default for GlobalConfig {
     }
 }
 
+/// Per-target firewall toggles (1.83h). Persisted in the target store so a
+/// manifest-free `apprafter apply`/`up` honors them. Absent ⇒ defaults off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FirewallConfig {
+    /// Restrict the node's 80/443 to Cloudflare's IP ranges (origin firewall, 1.83d).
+    pub cloudflare_origin: bool,
+}
+
 /// Non-secret target configuration. Stored alongside credentials
 /// in the same target directory but in a separate file so a user
 /// can inspect / version-control / share `config.yaml` while the
@@ -235,6 +244,9 @@ pub struct TargetConfig {
     /// the user's `~/.ssh/` and Track A.1 of operator never copies
     /// or re-renders the key material.
     pub ssh_key_path: Option<PathBuf>,
+    /// 1.83h: cloud-firewall toggles for this target (e.g. the Cloudflare
+    /// origin firewall). `#[serde(default)]` keeps legacy configs loading.
+    pub firewall: Option<FirewallConfig>,
 }
 
 /// Secret target credentials. Stored at mode 0600. **Never** derive
@@ -690,6 +702,9 @@ mod tests {
                 default_tier: Some("solo".into()),
                 cluster_name: Some("platform-1".into()),
                 ssh_key_path: Some(PathBuf::from("/home/me/.ssh/id_ed25519.pub")),
+                firewall: Some(FirewallConfig {
+                    cloudflare_origin: true,
+                }),
             },
             credentials: TargetCredentials {
                 hetzner_token: Some(
@@ -1080,5 +1095,33 @@ mod tests {
             leftovers.is_empty(),
             "expected no leftover tempfiles, found {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn target_config_firewall_round_trips() {
+        let cfg = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            firewall: Some(FirewallConfig {
+                cloudflare_origin: true,
+            }),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let back: TargetConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(
+            back.firewall,
+            Some(FirewallConfig {
+                cloudflare_origin: true
+            })
+        );
+    }
+
+    #[test]
+    fn target_config_without_firewall_key_defaults_to_none() {
+        // A legacy config.yaml (pre-1.83h) has no `firewall:` key.
+        let legacy = "provider: hetzner-cloud\n";
+        let cfg: TargetConfig = serde_yaml::from_str(legacy).unwrap();
+        assert_eq!(cfg.firewall, None);
     }
 }
