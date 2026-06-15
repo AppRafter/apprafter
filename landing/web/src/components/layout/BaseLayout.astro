@@ -63,6 +63,27 @@ const ogImageAbs = new URL(ogImage, Astro.site ?? Astro.url).href;
 
     <script is:inline set:html={THEME_INIT_SCRIPT} />
 
+    {/* Privacy-friendly analytics by Plausible (site: apprafter.dev). */}
+    {/* is:inline keeps Astro from bundling/hoisting these — the loader must */}
+    {/* stay verbatim and the init queue must run before the async script lands. */}
+    <script
+      is:inline
+      async
+      src="https://plausible.io/js/pa-ObkWGtUzPqv9gmVcgCKLF.js"></script>
+    <script is:inline>
+      window.plausible =
+        window.plausible ||
+        function () {
+          (plausible.q = plausible.q || []).push(arguments);
+        };
+      plausible.init =
+        plausible.init ||
+        function (i) {
+          plausible.o = i || {};
+        };
+      plausible.init();
+    </script>
+
     <slot name="head" />
   </head>
   <body>
