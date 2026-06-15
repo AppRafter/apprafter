@@ -115,8 +115,11 @@ fn fetch_platformstack_default_env(kubeconfig_path: &std::path::Path) -> Result<
 /// `spec.environments` map keys are returned. An empty vec means the
 /// manifest declares no environments (base-only app).
 fn get_manifest_environments(cwd: &std::path::Path) -> Result<Vec<String>> {
+    // Inject the shipped schema (post-2.12 manifests don't vendor it —
+    // a bare `cue export` would fail "no cue.mod/module.cue"), the same
+    // way `apprafter app validate` + the cue-cmp sidecar do.
     let manifest =
-        cli_core::manifest::parse_application(&cwd.join("apprafter"), std::path::Path::new("."))?;
+        crate::commands::app_validate::parse_application_injected(&cwd.join("apprafter"))?;
     Ok(manifest
         .spec
         .environments
@@ -592,7 +595,20 @@ fn add_via_wizard(
     // The kubeconfig tempfile is resolved once and reused for both
     // cluster reads.
     let cwd = std::env::current_dir().map_err(|e| CliError::Other(format!("cwd: {e}")))?;
-    let declared_envs = get_manifest_environments(&cwd).unwrap_or_default();
+    // `Ok(vec![])` = manifest declares no environments (base-only — no
+    // picker, no warning). An `Err` = the manifest couldn't be rendered;
+    // surface it instead of silently hiding the env picker (the cause is
+    // usually an incomplete/invalid manifest, not a base-only one).
+    let declared_envs = match get_manifest_environments(&cwd) {
+        Ok(envs) => envs,
+        Err(e) => {
+            eprintln!(
+                "⚠ Could not read declared environments from apprafter/Application.cue \
+                 ({e}); the environment picker is hidden. Pass `--env <env>` to pin one."
+            );
+            Vec::new()
+        }
+    };
     let (platform_default, existing_namespaces) = match ensure_kubeconfig_tempfile() {
         Ok(kc) => (
             fetch_platformstack_default_env(kc.path()).ok().flatten(),

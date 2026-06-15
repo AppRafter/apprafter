@@ -181,6 +181,38 @@ pub fn validate_manifest(manifest: &Path) -> std::result::Result<(), Vec<String>
     run_cue_vet(root)
 }
 
+/// Parse the manifest's Application doc with the CURRENT shipped schema
+/// injected — the `cue export` counterpart of [`validate_manifest`].
+///
+/// A post-2.12 manifest does NOT vendor the schema (`apprafter app
+/// scaffold` stopped vendoring — ADR 0046 Decision #7), so a bare
+/// `cue export` of the manifest directory fails with "imports are
+/// unavailable because there is no cue.mod/module.cue file". Laying the
+/// embedded schema into a temp workspace's `cue.mod/pkg/` lets the
+/// manifest's `import "apprafter.io/schemas/v1alpha1"` resolve without a
+/// vendored copy (mirrors the cue-cmp sidecar + `validate_manifest`).
+///
+/// Used by the `app add` wizard's environment picker and `--env`
+/// validation (via `get_manifest_environments`): both need the
+/// manifest's declared `spec.environments`, which a bare parse could no
+/// longer read. `manifest` is the `apprafter/` directory (or a single
+/// `.cue` file).
+pub(crate) fn parse_application_injected(
+    manifest: &Path,
+) -> Result<cli_core::manifest::ApplicationManifest> {
+    let workdir = tempfile::tempdir()
+        .map_err(|e| CliError::Other(format!("could not create temp workspace: {e}")))?;
+    let root = workdir.path().join("workspace");
+    std::fs::create_dir_all(&root)
+        .map_err(|e| CliError::Other(format!("create workspace dir: {e}")))?;
+    let root = root.as_path();
+    lay_out_workspace(root, manifest)?;
+    // Mirror validate's two-pass claim binding so a manifest using bare
+    // `claim.<type>.<field>` env refs (2.12) still exports.
+    generate_claim_binding(root);
+    cli_core::manifest::parse_application(root, std::path::Path::new("."))
+}
+
 /// Copy the schema bundle, module file, and the user manifest
 /// into the temp workspace. The manifest may be a single `.cue`
 /// FILE (copied verbatim, keeping its filename) or a DIRECTORY
@@ -803,6 +835,65 @@ app: v1alpha1.#Application & {
             res.is_ok(),
             "directory form must validate; got: {:?}",
             res.err()
+        );
+    }
+
+    // Manifest with declared `spec.environments` and NO vendored
+    // `cue.mod` (write_manifest writes only Application.cue) — exactly
+    // the post-2.12 layout that silently emptied the wizard env picker
+    // because a bare `cue export` can't resolve the schema import.
+    const ENV_MANIFEST: &str = r#"package apprafter
+
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+landing: v1alpha1.#Application & {
+	metadata: {
+		name:      "landing"
+		namespace: "procvue"
+	}
+	spec: base: {
+		image: "ghcr.io/procvue/landing:latest"
+		expose: {
+			port:     8080
+			network:  "public"
+			hostname: "procvue.com"
+		}
+	}
+	spec: environments: {
+		dev: expose: {
+			port:    8080
+			network: "internal"
+		}
+		prod: replicas: 2
+	}
+}
+"#;
+
+    #[test]
+    fn parse_application_injected_reads_environments_without_vendored_schema() {
+        assert!(
+            cue_available(),
+            "`cue` not runnable — local schema injection is load-bearing; \
+             run under `nix develop` (or ensure ~/bin/cue shim is present). \
+             Refusing to silently pass."
+        );
+        let dir = tempdir().unwrap();
+        write_manifest(dir.path(), ENV_MANIFEST);
+        let app_dir = dir.path().join("apprafter");
+        // No cue.mod was written — the injected workspace must supply
+        // the schema so `import "apprafter.io/schemas/v1alpha1"` resolves.
+        let manifest = parse_application_injected(&app_dir)
+            .expect("injected parse must resolve the schema import without a vendored cue.mod");
+        let mut envs: Vec<String> = manifest
+            .spec
+            .environments
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        envs.sort();
+        assert_eq!(
+            envs,
+            vec!["dev".to_string(), "prod".to_string()],
+            "wizard env picker (via get_manifest_environments) must see the declared envs"
         );
     }
 }
