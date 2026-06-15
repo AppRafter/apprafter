@@ -9,6 +9,20 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.26 — parse 2.12 env value references (2026-06-15)
+
+### Fixed
+
+- **`apprafter app add` / `app validate` parse manifests that use 2.12 env
+  value references.** A manifest whose `env` mixes literals with
+  `claim.<type>.<field>` / `secret:"<name>/<key>"` references (ADR 0046)
+  previously broke the CLI's manifest parser with `invalid type: map,
+  expected a string` — surfacing as the wizard's "could not read
+  apprafter/Application.cue" warning (so the env picker was hidden and the
+  namespace wasn't preselected). The parsed env-value type now accepts a
+  literal string OR a structured reference marker. (The CLI doesn't consume
+  env values; it parses the manifest only for the env + namespace pickers.)
+
 ## cli v0.2.25 — app status/open/add per-environment UX (2026-06-15)
 
 ### Fixed
