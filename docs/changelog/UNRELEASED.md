@@ -9,6 +9,23 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.24 — wizard env-picker reads non-vendored manifests (2026-06-15)
+
+### Fixed
+
+- **`apprafter app add`'s interactive wizard now shows the Environment
+  picker for manifests that don't vendor the schema.** Since `apprafter app
+  scaffold` stopped vendoring the AppRafter schema (a freshly scaffolded app
+  has no `cue.mod`), the wizard's environment-extraction shelled `cue export`
+  straight at the manifest directory, which fails with "imports are
+  unavailable because there is no cue.mod/module.cue file" — and the error was
+  swallowed, so the wizard silently skipped the Environment step (and `--env`
+  validation lost its declared-environment check). It now renders the manifest
+  through the same schema-injection workspace `apprafter app validate` uses, so
+  the picker (with the cluster default-environment preselect) works without a
+  vendored copy. When the manifest genuinely can't be rendered, the wizard now
+  warns instead of silently hiding the picker.
+
 ## cli v0.2.23 — platform env set/show + app list ENV column (1.83j) (2026-06-15)
 
 ### Added
