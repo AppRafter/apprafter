@@ -77,6 +77,10 @@ landingCms: v1alpha1.#Application & {
 			}
 			prod: {
 				replicas: 1
+				env: {
+					GITHUB_REPO:           "AppRafter/apprafter"
+					GITHUB_DISPATCH_TOKEN: secret: "apprafter-landing-cms-token/TOKEN"
+				}
 			}
 		}
 	}
