@@ -45,16 +45,18 @@ landingCms: v1alpha1.#Application & {
 			replicas: 1
 			expose: {
 				port:    3000
-				network:  "public"
+				network:  "internal"
 				hostname: "cms.apprafter.dev"
 			}
 			needs: {
 				pg: {},
 			},
 			env: {
+				DATABASE_URL: claim.pg.url
 				// DATABASE_URL auto-injected via needs.pg claim
-				PAYLOAD_SECRET: "ZiZn1bW3IHmAGj8g72CSHZsvWERDDrEXWGU+kxnLCqsWfOBB3O9EJ3R8RBPOvddS" // fixme
-				LANDING_CMS_CSRF_ORIGINS: "http://localhost:8080" // fixme: for tests only
+				PAYLOAD_SECRET: secret: "apprafter-landing-cms-secrets/PAYLOAD_SECRET"
+				// for test via port forwarding
+				LANDING_CMS_CSRF_ORIGINS: "http://localhost:8080"
 
 				// Server URL Payload reports back in admin links,
 				// password-reset emails, etc.
@@ -73,10 +75,6 @@ landingCms: v1alpha1.#Application & {
 		environments: {
 			dev: {
 				replicas: 1
-				expose: {
-					port:    3000
-					network: "internal"
-				}
 				env: {
 					PAYLOAD_PUBLIC_SERVER_URL: "http://cms.dev.apprafter.local:3000"
 					LANDING_CMS_PORT:          "3000"

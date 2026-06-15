@@ -61,17 +61,12 @@ landingWebPreview: v1alpha1.#Application & {
 			replicas: 1
 			expose: {
 				port:    80
-				network:  "public"
-				hostname: "preview.apprafter.dev"
+				network:  "internal"
 			}
 		}
 		environments: {
 			dev: {
 				replicas: 1
-				expose: {
-					port:    80
-					network: "internal"
-				}
 			}
 			// Single replica — preview is a low-traffic
 			// internal-review host.
