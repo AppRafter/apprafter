@@ -2776,9 +2776,9 @@ instead of carrying parallel definitions.
 - [x] Doc-note: «Origin firewall pulls CF IPs on every `apprafter apply`; periodic re-apply (quarterly) recommended; PlatformController-managed cloud-firewall — future work» — записан в compatibility.cue 0.2.35 notes + design §Out-of-scope.
 
 **Acceptance:**
-- [~] На свежем bootstrap: `hcloud firewall describe <name>` показывает текущие CF v4 + v6 диапазоны на 80/443 — **closure-smoke** (real Hetzner, рядом со следующим `e2e/mvp.sh`).
-- [~] `curl --resolve <любая-зона>:443:<node-ip> https://<зона>/` минуя CF ⇒ connection refused/timeout — **closure-smoke** (real Hetzner).
-- [~] `curl https://<зона>/` через CF ⇒ 200 — **closure-smoke** (real Hetzner).
+- [x] На свежем bootstrap: `hcloud firewall describe <name>` показывает текущие CF v4 + v6 диапазоны на 80/443 — **closure-smoke** (real Hetzner, рядом со следующим `e2e/mvp.sh`).
+- [x] `curl --resolve <любая-зона>:443:<node-ip> https://<зона>/` минуя CF ⇒ connection refused/timeout — **closure-smoke** (real Hetzner).
+- [x] `curl https://<зона>/` через CF ⇒ 200 — **closure-smoke** (real Hetzner).
 - [x] Mock network outage на CF endpoints ⇒ `apprafter apply` aborts до изменения cloud state — **unit-covered** (`resolve_cf_ips_fail_fast_propagates_when_on`).
 
 **Зависит от:** 1.2 ✅, 1.83a.
@@ -2811,8 +2811,8 @@ instead of carrying parallel definitions.
 - [x] Deferred to full 4.1b (subset note): `cert list`, `cert show`, `cert renew`, `cert remove`, `--chain` flag, ECDSA/EdDSA ключи, MigrationPlan при remove с active references.
 
 **Acceptance:** (логика unit-покрыта; live-применение Secret'а на кластере = **closure-smoke на track-end walk**, real Hetzner)
-- [~] `apprafter target cert import cf-origin-cert-apprafter-dev --cert ./d.pem --key ./d.key` создаёт Secret с правильными labels/annotations — **closure-smoke** (build_tls_secret shape unit-покрыт).
-- [~] Повторный вызов с другим именем создаёт отдельный Secret — multi-zone, никаких коллизий — **closure-smoke**.
+- [x] `apprafter target cert import cf-origin-cert-apprafter-dev --cert ./d.pem --key ./d.key` создаёт Secret с правильными labels/annotations — **closure-smoke** (build_tls_secret shape unit-покрыт).
+- [x] Повторный вызов с другим именем создаёт отдельный Secret — multi-zone, никаких коллизий — **closure-smoke**.
 - [x] Mismatched cert/key ⇒ fail до записи Secret — **unit-covered** (`rejects_cert_key_mismatch` + fail-before-cluster-write ordering).
 - [~] `--replace` обновляет Secret in-place, listener'ы подхватывают новый cert без рестарта — **closure-smoke**.
 - [x] Labels/annotations bit-identical с тем, что произведёт 4.1b на том же входе — **unit-covered** (`build_tls_secret_has_locked_shape`).
@@ -2900,9 +2900,9 @@ instead of carrying parallel definitions.
     - `apprafter target cert import cf-origin-cert-<sanitized-zone> --cert ./origin.pem --key ./origin.key` (1.83e).
     - `apprafter target domain add <zone> --cert cf-origin-cert-<sanitized-zone>` (1.83f).
 - [x] Apply Application'ов с обновлённой схемой (`expose.hostname: "<some-zone-or-subdomain>"`, 1.83b) — задокументировано.
-- [~] Verify per zone: `curl -v https://<zone>/` — CF cert на edge, response от соответствующего Application — **track-end walk**.
-- [~] Verify cross-zone: на одном кластере одновременно отвечают `https://apprafter.dev/` и `https://apprafter.io/` (или сколько зон зарегистрировано), каждая со своим cert на edge — **track-end walk**.
-- [~] Verify firewall bypass blocked: `curl --resolve <zone>:443:<node-ip> https://<zone>/` минуя CF — connection refused/timeout (1.83d) — **track-end walk**.
+- [x] Verify per zone: `curl -v https://<zone>/` — CF cert на edge, response от соответствующего Application — **track-end walk**.
+- [x] Verify cross-zone: на одном кластере одновременно отвечают `https://apprafter.dev/` и `https://apprafter.io/` (или сколько зон зарегистрировано), каждая со своим cert на edge — **track-end walk**.
+- [x] Verify firewall bypass blocked: `curl --resolve <zone>:443:<node-ip> https://<zone>/` минуя CF — connection refused/timeout (1.83d) — **track-end walk**.
 
 **Acceptance:** все зарегистрированные зоны отдают свои Application'ы через CF; direct-to-node connections refused; `apprafter target domain list` показывает все зоны с правильным apps-count.
 
@@ -2925,7 +2925,7 @@ instead of carrying parallel definitions.
 - [x] Runbook `connect-a-domain.md` §1 → команда (manifest-путь оставлен как fork/IaC-заметка).
 
 **Acceptance:** (чистая логика unit-покрыта; live ниже = **closure-smoke на track-end walk**, real Hetzner)
-- [~] `apprafter target firewall cloudflare-origin enable` (без манифеста) → `hcloud firewall describe <cluster>-fw` показывает CF v4+v6 на 80/443 (22/6443/51820/ICMP открыты).
+- [x] `apprafter target firewall cloudflare-origin enable` (без манифеста) → `hcloud firewall describe <cluster>-fw` показывает CF v4+v6 на 80/443 (22/6443/51820/ICMP открыты).
 - [~] `... disable` → 80/443 обратно на `0.0.0.0/0`+`::/0`.
 - [~] enable затем `apprafter up` (без манифеста, re-provision) → firewall остаётся CF-restricted (target-store toggle переживает, без clobber).
 - [~] enable до provision → persist + warn; последующий `up` поднимает firewall CF-restricted.
@@ -2948,9 +2948,9 @@ instead of carrying parallel definitions.
 - [x] Runbook `connect-a-domain.md` §2.2 → `apprafter target ip` (+ caveat про Hetzner INTERNAL-IP в fallback).
 
 **Acceptance:** (чистая логика unit-покрыта; live = **closure-smoke на track-end walk**)
-- [~] `apprafter target ip` на запровиженном T1 → печатает v4 (совпадает с Hetzner-консолью) + v6 `::1`; подтвердить, что `::1` = реальный v6 ноды.
+- [x] `apprafter target ip` на запровиженном T1 → печатает v4 (совпадает с Hetzner-консолью) + v6 `::1`; подтвердить, что `::1` = реальный v6 ноды.
 - [~] `apprafter target ip` до provision → «run `apprafter up` first».
-- [~] `target domain add` печатает ссылку на `apprafter target ip` (нет «not recorded»).
+- [x] `target domain add` печатает ссылку на `apprafter target ip` (нет «not recorded»).
 
 **Зависит от:** 1.2 ✅.
 
@@ -2969,9 +2969,9 @@ instead of carrying parallel definitions.
 - [x] `app list` ENV-колонка (после NAME) через `deployment_environment`.
 
 **Acceptance:** (чистая логика + колонка unit-покрыты; live = **closure-smoke на track-end walk**)
-- [~] `platform env set staging` патчит `spec.defaultEnvironment` (tier/source/values/network не тронуты — merge-patch сохраняет siblings); `show` печатает значение/`(unset)` + дисклеймер.
-- [~] после `env set staging` интерактивный `app add` преселектит `staging`.
-- [~] `app list` показывает ENV-колонку с env каждого деплоя (`<env>` / `(base)`).
+- [x] `platform env set staging` патчит `spec.defaultEnvironment` (tier/source/values/network не тронуты — merge-patch сохраняет siblings); `show` печатает значение/`(unset)` + дисклеймер.
+- [x] после `env set staging` интерактивный `app add` преселектит `staging`.
+- [x] `app list` показывает ENV-колонку с env каждого деплоя (`<env>` / `(base)`).
 
 **Зависит от:** 2.9 ✅ (ADR 0044).
 
