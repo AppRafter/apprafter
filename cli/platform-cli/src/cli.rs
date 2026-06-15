@@ -957,6 +957,8 @@ pub enum TargetCommand {
         #[command(subcommand)]
         action: TargetFirewallCommand,
     },
+    /// Show the cluster node's public IPv4 + IPv6 (for DNS A/AAAA records).
+    Ip,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1159,5 +1161,16 @@ mod tests {
             } => assert!(matches!(state, FirewallToggle::Disable)),
             _ => panic!("expected ... disable"),
         }
+    }
+
+    #[test]
+    fn parses_target_ip() {
+        let cli = Cli::parse_from(["apprafter", "target", "ip"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Target {
+                action: TargetCommand::Ip
+            }
+        ));
     }
 }

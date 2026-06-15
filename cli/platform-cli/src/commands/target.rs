@@ -23,7 +23,8 @@ use cli_core::target::{
     Target, TargetConfig, TargetCredentials, TargetStorePaths,
 };
 use cli_core::{CliError, Result};
-use cli_providers::{HetznerCloudValidator, ProviderValidator};
+use cli_providers::{HetznerCloudClient, HetznerCloudValidator, ProviderValidator};
+use cli_state::State;
 use tabled::{settings::Style, Table, Tabled};
 use tracing::info;
 
@@ -36,6 +37,7 @@ use cli_providers::cert::{
 };
 
 use crate::commands::hcloud::hcloud_base_url;
+use crate::commands::state_paths::resolve_state_paths;
 
 /// Maximum length for a target name. Matches the spec
 /// (`cli-dx-task.md` §5.1 validation rules). A short cap keeps
@@ -83,6 +85,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
         TargetCommand::Cert { action } => run_cert(action),
         TargetCommand::Domain { action } => crate::commands::target_domain::run(action),
         TargetCommand::Firewall { action } => crate::commands::target_firewall::run(action),
+        TargetCommand::Ip => run_ip(),
     }
 }
 
@@ -634,6 +637,33 @@ struct TargetListRow {
     region: String,
     #[tabled(rename = "Tier")]
     tier: String,
+}
+
+fn run_ip() -> Result<()> {
+    let resolved = resolve_state_paths(None)?;
+    let store = resolved.store;
+    let state = State::load_or_default(&resolved.paths)?;
+
+    let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
+        println!("No provisioned server for the active target — run `apprafter up` first.");
+        return Ok(());
+    };
+
+    let token = cli_core::resolve_hetzner_token(None, &store, None)?;
+    let client = HetznerCloudClient::new(hcloud_base_url(), token);
+    let (v4, v6) = cli_providers::node_public_ips(&client, server_id)?;
+
+    match v4 {
+        Some(ip) => println!("  A    record → {ip}"),
+        None => println!("  (no IPv4 reported by Hetzner)"),
+    }
+    if let Some(ip6) = v6 {
+        println!("  AAAA record → {ip6}");
+    }
+    println!();
+    println!("Set these as your domain's DNS records (proxied through Cloudflare), then:");
+    println!("  apprafter target domain add <zone> --cert <name>");
+    Ok(())
 }
 
 fn run_list() -> Result<()> {

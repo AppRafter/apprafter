@@ -277,22 +277,9 @@ fn run_domain_add(domain: &str, cert: &str, added_by: Option<String>) -> Result<
     merge_patch_allowed_domains(&updated, kc.path())?;
 
     println!("✓ Domain '{domain}' registered (cert '{cert}').");
-    match stack
-        .pointer("/spec/values/gateway/nodePublicIP")
-        .and_then(Value::as_str)
-    {
-        Some(ip) => println!("  DNS A    record → {ip}"),
-        None => println!("  (node public IP not recorded — set at bootstrap; find it with `kubectl get nodes -o wide`)"),
-    }
-    if let Some(ip6) = stack
-        .pointer("/spec/values/gateway/nodePublicIPv6")
-        .and_then(Value::as_str)
-    {
-        println!("  DNS AAAA record → {ip6}");
-    }
-    println!();
     println!(
-        "Cloudflare: proxy the DNS records (orange-cloud) + set SSL/TLS mode to Full (strict)."
+        "  Point your domain's DNS at the node — run `apprafter target ip` for the A/AAAA values — \
+         proxied through Cloudflare (orange-cloud, SSL/TLS Full (strict))."
     );
     println!("See your zones: apprafter target domain list");
     Ok(())
