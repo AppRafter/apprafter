@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cli_core::manifest::{self, ApplicationManifest};
+use cli_core::manifest::{self, ApplicationManifest, EnvValue};
 use cli_core::CliError;
 
 fn repo_root() -> PathBuf {
@@ -68,7 +68,10 @@ fn parse_full_application_fixture() {
     assert_eq!(expose.network.as_deref(), None);
 
     let env = base.env.expect("env decoded");
-    assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("info"));
+    assert!(
+        matches!(env.get("LOG_LEVEL"), Some(EnvValue::Literal(s)) if s == "info"),
+        "LOG_LEVEL literal must decode to EnvValue::Literal(\"info\")"
+    );
 
     let envs = parsed.spec.environments.expect("environments decoded");
     let dev = envs.get("dev").expect("dev override present");

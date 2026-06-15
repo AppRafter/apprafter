@@ -227,7 +227,23 @@ pub struct ApplicationSpec {
     #[serde(default)]
     pub expose: Option<ApplicationExpose>,
     #[serde(default)]
-    pub env: Option<BTreeMap<String, String>>,
+    pub env: Option<BTreeMap<String, EnvValue>>,
+}
+
+/// An `Application.spec.*.env` value (ADR 0046 / 2.12): a literal string,
+/// OR a structured reference the cue-cmp renders to a marker object
+/// (`{claim: "<type>.<field>"}` / `{secret: "<name>/<key>"}`). The CLI does
+/// not consume env values (it parses the manifest only for the env +
+/// namespace pickers), so this only has to DESERIALIZE every shape the
+/// schema permits — the untagged `Reference(Value)` fallback accepts any
+/// non-string marker, current or future, without erroring. (Before 2.12
+/// env was `[string]: string`, which now fails to parse a claim/secret
+/// reference with "invalid type: map, expected a string".)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EnvValue {
+    Literal(String),
+    Reference(Value),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,6 +286,51 @@ fn parse_application_from_value(value: &Value) -> Result<ApplicationManifest> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn application_env_accepts_literal_claim_and_secret_refs() {
+        // ADR 0046 / 2.12: env values are literal strings OR structured
+        // reference markers (`{claim:…}` / `{secret:…}`). The CLI parses the
+        // manifest only for the env + namespace pickers and never consumes
+        // the values, so it must DESERIALIZE all three without erroring.
+        // Regression for "invalid type: map, expected a string" (cli v0.2.26).
+        let v = json!({
+            "landingCms": {
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": "landing-cms", "namespace": "apprafter" },
+                "spec": {
+                    "base": {
+                        "image": "ghcr.io/apprafter/landing-cms:latest",
+                        "env": {
+                            "LANDING_CMS_PORT": "3000",
+                            "DATABASE_URL": { "claim": "pg.url" },
+                            "PAYLOAD_SECRET": { "secret": "ns-secrets/PAYLOAD_SECRET" }
+                        }
+                    },
+                    "environments": { "dev": { "replicas": 1 }, "prod": { "replicas": 1 } }
+                }
+            }
+        });
+        let parsed =
+            parse_application_from_value(&v).expect("mixed literal/claim/secret env must parse");
+        assert_eq!(parsed.metadata.namespace.as_deref(), Some("apprafter"));
+        let envs: Vec<&String> = parsed.spec.environments.as_ref().unwrap().keys().collect();
+        assert_eq!(envs, vec!["dev", "prod"]);
+        let base_env = parsed.spec.base.as_ref().unwrap().env.as_ref().unwrap();
+        assert!(matches!(
+            base_env.get("LANDING_CMS_PORT"),
+            Some(EnvValue::Literal(_))
+        ));
+        assert!(matches!(
+            base_env.get("DATABASE_URL"),
+            Some(EnvValue::Reference(_))
+        ));
+        assert!(matches!(
+            base_env.get("PAYLOAD_SECRET"),
+            Some(EnvValue::Reference(_))
+        ));
+    }
 
     #[test]
     fn operator_block_parses_all_three_fields() {
