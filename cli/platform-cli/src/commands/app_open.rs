@@ -49,10 +49,9 @@ use cli_core::{CliError, Result};
 use inquire::Confirm;
 use serde_json::Value;
 
-use crate::commands::k8s_helpers::{ensure_kubeconfig_tempfile, kubectl_get_json};
+use crate::commands::k8s_helpers::ensure_kubeconfig_tempfile;
 use crate::commands::port_forward::{open_in_browser, spawn_kubectl_port_forward, wait_ready};
 
-const ARGOCD_NAMESPACE: &str = "argocd";
 const DEFAULT_LOCAL_PORT: u16 = 8080;
 const LOCAL_PORT_MAX_PROBES: u16 = 10;
 
@@ -70,24 +69,19 @@ pub(crate) struct ServiceInfo {
 /// Entry point for `apprafter app open <name>`.
 pub fn open(
     name: &str,
+    env: Option<String>,
     local_port: Option<u16>,
     container_port: Option<u16>,
     no_browser: bool,
 ) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
-    let app = kubectl_get_json(
-        "application.argoproj.io",
-        Some(name),
-        Some(ARGOCD_NAMESPACE),
-        kc.path(),
-    )?
-    .ok_or_else(|| {
-        CliError::Other(format!(
-            "Application '{name}' not found in namespace {ARGOCD_NAMESPACE}. \
-             List with `apprafter app list`."
-        ))
-    })?;
+    // Resolve by the LOGICAL name (the one shown in `app list` / typed into
+    // `app add`), same as `app status`/`logs`/`rollback`: a single env
+    // deployment auto-resolves, `--env` targets one when several exist, and a
+    // bare `<name>` / explicit `<name>-<env>` Argo name still resolves directly.
+    let (app, _argo_name) =
+        crate::commands::app::resolve_app_for_command(name, env.as_deref(), kc.path())?;
 
     let dest_ns = app
         .pointer("/spec/destination/namespace")

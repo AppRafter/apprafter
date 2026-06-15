@@ -31,6 +31,12 @@ pub struct InfrastructureManifest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Metadata {
     pub name: String,
+    /// Destination namespace declared in the manifest. Application
+    /// manifests set it (`metadata.namespace`); Infrastructure manifests
+    /// omit it. The `app add` wizard reads it to preselect the namespace
+    /// picker. `#[serde(default)]` ⇒ absent in JSON deserializes to `None`.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

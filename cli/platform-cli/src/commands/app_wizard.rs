@@ -14,8 +14,10 @@
 //!  5. AppProject (Select: `apps` / `platform` /
 //!     `platform-providers`, default = the `--project` flag's
 //!     value).
-//!  6. Destination namespace (Text, default `apprafter` — see
-//!     walk-fix #12 / v0.1.160).
+//!  7. Environment (Select over the manifest's declared
+//!     `spec.environments`; preselects the cluster default-env).
+//!  8. Destination namespace (Select; default preselects the
+//!     manifest's `metadata.namespace`, else `apprafter`).
 //!
 //! Validators run inline on each prompt: URL is normalised,
 //! name is DNS-1123 checked, branch is non-empty, namespace is
@@ -119,10 +121,23 @@ pub(crate) fn preselect_env(declared: &[String], platform_default: Option<&str>)
     )
 }
 
+/// Default for the namespace picker. Precedence: an explicit `--namespace`
+/// (any value other than the clap default) wins; else the manifest's
+/// `metadata.namespace`; else the platform default. The clap default is
+/// indistinguishable from "operator didn't pass --namespace", so it yields
+/// to the manifest — mirroring the `path` default precedence above.
+pub(crate) fn namespace_default(flag: Option<&str>, manifest_ns: Option<&str>) -> String {
+    flag.filter(|n| !n.is_empty() && *n != DEFAULT_DESTINATION_NAMESPACE)
+        .or(manifest_ns.filter(|n| !n.is_empty()))
+        .unwrap_or(DEFAULT_DESTINATION_NAMESPACE)
+        .to_string()
+}
+
 pub fn run(
     inputs: WizardInputs,
     declared_envs: &[String],
     platform_default: Option<&str>,
+    manifest_namespace: Option<&str>,
     existing_namespaces: &[String],
 ) -> Result<WizardOutput> {
     eprintln!();
@@ -183,10 +198,7 @@ pub fn run(
         Some(prompt_env(declared_envs, platform_default)?)
     };
 
-    let namespace_default = inputs
-        .namespace
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| DEFAULT_DESTINATION_NAMESPACE.into());
+    let namespace_default = namespace_default(inputs.namespace.as_deref(), manifest_namespace);
     let namespace = prompt_namespace_interactive(existing_namespaces, &namespace_default)?;
 
     Ok(WizardOutput {
@@ -481,6 +493,29 @@ mod tests {
             Some(0)
         );
         assert_eq!(preselect_env(&[], Some("prod")), None);
+    }
+
+    #[test]
+    fn namespace_default_prefers_explicit_then_manifest_then_default() {
+        // An explicit (non-default) `--namespace` wins.
+        assert_eq!(
+            namespace_default(Some("explicit"), Some("manifest")),
+            "explicit"
+        );
+        // The clap default value is treated as "unset" → the manifest's
+        // metadata.namespace is preselected (the walk-fix: the picker no
+        // longer defaults to `apprafter` when the manifest declares a ns).
+        assert_eq!(
+            namespace_default(Some(DEFAULT_DESTINATION_NAMESPACE), Some("procvue")),
+            "procvue"
+        );
+        // No manifest namespace → the platform default.
+        assert_eq!(
+            namespace_default(Some(DEFAULT_DESTINATION_NAMESPACE), None),
+            DEFAULT_DESTINATION_NAMESPACE
+        );
+        // No flag at all → manifest namespace.
+        assert_eq!(namespace_default(None, Some("procvue")), "procvue");
     }
 
     #[test]

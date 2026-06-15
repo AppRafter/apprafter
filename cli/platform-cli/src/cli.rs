@@ -761,6 +761,11 @@ pub enum AppCommand {
     Open {
         /// Application name (as listed via `apprafter app list`).
         name: String,
+        /// Target a specific environment's deployment (`<name>-<env>`).
+        /// Optional — a single-env app resolves without it; needed only to
+        /// disambiguate when the app is deployed to several environments.
+        #[arg(long)]
+        env: Option<String>,
         /// Local port to bind. Defaults to 8080; if busy, the
         /// command probes 8081…8090 before giving up.
         #[arg(long)]

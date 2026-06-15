@@ -598,20 +598,31 @@ fn add_via_wizard(
     // The kubeconfig tempfile is resolved once and reused for both
     // cluster reads.
     let cwd = std::env::current_dir().map_err(|e| CliError::Other(format!("cwd: {e}")))?;
-    // `Ok(vec![])` = manifest declares no environments (base-only — no
-    // picker, no warning). An `Err` = the manifest couldn't be rendered;
-    // surface it instead of silently hiding the env picker (the cause is
-    // usually an incomplete/invalid manifest, not a base-only one).
-    let declared_envs = match get_manifest_environments(&cwd) {
-        Ok(envs) => envs,
-        Err(e) => {
-            eprintln!(
-                "⚠ Could not read declared environments from apprafter/Application.cue \
-                 ({e}); the environment picker is hidden. Pass `--env <env>` to pin one."
-            );
-            Vec::new()
-        }
-    };
+    // Parse the manifest ONCE (schema injected — post-2.12 apps don't vendor
+    // it) for BOTH the env picker's declared environments AND the namespace
+    // picker's preselect (`metadata.namespace`). `Ok` with no environments =
+    // base-only (no env picker, no warning); `Err` = couldn't render, so warn
+    // rather than silently hiding the pickers.
+    let (declared_envs, manifest_namespace) =
+        match crate::commands::app_validate::parse_application_injected(&cwd.join("apprafter")) {
+            Ok(m) => {
+                let envs = m
+                    .spec
+                    .environments
+                    .as_ref()
+                    .map(|e| e.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (envs, m.metadata.namespace)
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠ Could not read apprafter/Application.cue ({e}); the environment \
+                     picker is hidden and the namespace isn't preselected. Pass \
+                     `--env <env>` / `--namespace <ns>` to set them."
+                );
+                (Vec::new(), None)
+            }
+        };
     let (platform_default, existing_namespaces) = match ensure_kubeconfig_tempfile() {
         Ok(kc) => (
             fetch_platformstack_default_env(kc.path()).ok().flatten(),
@@ -638,6 +649,7 @@ fn add_via_wizard(
         inputs,
         &declared_envs,
         platform_default.as_deref(),
+        manifest_namespace.as_deref(),
         &existing_namespaces,
     )?;
     add(
@@ -1661,7 +1673,39 @@ fn per_env_guidance_message(name: &str, envs: &[String]) -> String {
     )
 }
 
-fn resolve_app_for_command(name: &str, env: Option<&str>, kc: &Path) -> Result<(Value, String)> {
+/// Given the per-env deployments matching `apprafter.io/application=<name>`
+/// (looked up when `--env` was omitted), either auto-resolve the single one
+/// or guide to `--env`. EXACTLY ONE ⇒ the logical name is unambiguous, so
+/// resolve it (the user interacts by the logical name — the same one in
+/// `app list` — and shouldn't need `--env` for a single-env app). TWO OR
+/// MORE ⇒ ambiguous, return the `--env` guidance. Pure + testable; callers
+/// pass a non-empty `grouped`.
+fn single_deployment_or_guidance(name: &str, grouped: Vec<Value>) -> Result<(Value, String)> {
+    if grouped.len() == 1 {
+        let app = grouped.into_iter().next().expect("len == 1 checked");
+        let argo_name = app
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string();
+        return Ok((app, argo_name));
+    }
+    let envs: Vec<String> = grouped
+        .iter()
+        .filter_map(|a| {
+            a.pointer("/metadata/labels/apprafter.io~1environment")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .collect();
+    Err(CliError::Other(per_env_guidance_message(name, &envs)))
+}
+
+pub(crate) fn resolve_app_for_command(
+    name: &str,
+    env: Option<&str>,
+    kc: &Path,
+) -> Result<(Value, String)> {
     let argo_name = argo_app_name_for(name, env);
     if let Some(app) = kubectl_get_json(
         "application.argoproj.io",
@@ -1682,15 +1726,7 @@ fn resolve_app_for_command(name: &str, env: Option<&str>, kc: &Path) -> Result<(
         )
         .unwrap_or_default();
         if !grouped.is_empty() {
-            let envs: Vec<String> = grouped
-                .iter()
-                .filter_map(|a| {
-                    a.pointer("/metadata/labels/apprafter.io~1environment")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                })
-                .collect();
-            return Err(CliError::Other(per_env_guidance_message(name, &envs)));
+            return single_deployment_or_guidance(name, grouped);
         }
     }
     Err(CliError::Other(format!(
@@ -2700,6 +2736,41 @@ mod tests {
         // Empty env list (labels absent) falls back to "multiple".
         let generic = per_env_guidance_message("web", &[]);
         assert!(generic.contains("(multiple)"));
+    }
+
+    #[test]
+    fn single_deployment_auto_resolves_logical_name() {
+        // ONE env deployment ⇒ the logical name is unambiguous, so commands
+        // (status/logs/rollback/open) resolve it WITHOUT requiring `--env`.
+        let one = vec![serde_json::json!({
+            "metadata": { "name": "web-prod", "labels": { "apprafter.io/environment": "prod" } }
+        })];
+        let (app, argo_name) = single_deployment_or_guidance("web", one).unwrap();
+        assert_eq!(argo_name, "web-prod");
+        assert_eq!(
+            app.pointer("/metadata/name").and_then(Value::as_str),
+            Some("web-prod")
+        );
+    }
+
+    #[test]
+    fn multiple_deployments_require_env_flag() {
+        // TWO+ deployments ⇒ ambiguous, guide the user to `--env`.
+        let two = vec![
+            serde_json::json!({
+                "metadata": { "name": "web-dev", "labels": { "apprafter.io/environment": "dev" } }
+            }),
+            serde_json::json!({
+                "metadata": { "name": "web-prod", "labels": { "apprafter.io/environment": "prod" } }
+            }),
+        ];
+        let err = single_deployment_or_guidance("web", two).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("--env"), "must guide to --env; got {msg:?}");
+        assert!(
+            msg.contains("dev") && msg.contains("prod"),
+            "must list envs; got {msg:?}"
+        );
     }
 
     #[test]

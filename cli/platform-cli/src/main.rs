@@ -164,10 +164,11 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             }
             AppCommand::Open {
                 name,
+                env,
                 port,
                 container_port,
                 no_browser,
-            } => commands::app_open::open(&name, port, container_port, no_browser)?,
+            } => commands::app_open::open(&name, env, port, container_port, no_browser)?,
             AppCommand::Scaffold {
                 runtime,
                 name,
