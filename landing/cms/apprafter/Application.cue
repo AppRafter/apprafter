@@ -12,12 +12,6 @@
 //   ghcr.io/apprafter/landing-cms:landing-v0.1.0   (pinned, prod)
 //   ghcr.io/apprafter/landing-cms:latest           (head, dev)
 //
-// Same channel injects PAYLOAD_SECRET + SMTP_* secrets. v1alpha1
-// `env` only accepts string literals; secret-ref support lands
-// with ResourceClaim (2.x) and OpenBao (4.x). Until then, the
-// secrets stay in the env-file outside the manifest, and the
-// non-secret config lives in `env` below.
-//
 // Replicas: 1 in both environments. Payload caches in-process
 // state (importMap, server functions) that doesn't shard across
 // replicas without shared session storage — adding HA is a Phase
@@ -46,7 +40,6 @@ landingCms: v1alpha1.#Application & {
 			expose: {
 				port:    3000
 				network:  "internal"
-				hostname: "cms.apprafter.dev"
 			}
 			needs: {
 				pg: {},
