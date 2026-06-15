@@ -9,6 +9,27 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.25 — app status/open/add per-environment UX (2026-06-15)
+
+### Fixed
+
+- **`apprafter app status` now shows the deployment's environment** in the
+  detail view (it previously appeared only in the multi-deployment header).
+- **`apprafter app add`'s success hint points at the logical name** —
+  `apprafter app status <name>` (which aggregates every env deployment), not
+  the per-env Argo app name `<name>-<env>`.
+- **`apprafter app open <name>` accepts the logical name** (the one in
+  `apprafter app list`), like `app status`/`logs`/`rollback`, and gained an
+  `--env` option. A single-environment deployment resolves without `--env`;
+  `--env` is needed only to pick one when an app is deployed to several
+  environments. (This also lets `app logs`/`app rollback` resolve a
+  single-env app by its logical name without `--env`.)
+- **The `apprafter app add` wizard preselects the manifest's namespace** —
+  the destination-namespace picker now defaults to the manifest's
+  `metadata.namespace` instead of the platform default, so the operator no
+  longer has to scroll the list to re-select it. An explicit `--namespace`
+  still wins.
+
 ## cli v0.2.24 — wizard env-picker reads non-vendored manifests (2026-06-15)
 
 ### Fixed
