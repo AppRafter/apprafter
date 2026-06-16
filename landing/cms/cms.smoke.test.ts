@@ -275,4 +275,21 @@ describe('landing/cms scaffold', () => {
     expect(nextCfg).toContain('/admin');
     expect(nextCfg).toContain('redirects');
   });
+
+  // Public-exposure hardening: the CMS is reachable at cms.apprafter.dev so the
+  // GitHub preview-build can fetch live globals — so it must not hand out the
+  // GraphQL schema, and dev must stay cluster-internal.
+  test('GraphQL is hardened for public exposure (no playground/introspection in prod)', () => {
+    const cfg = readFileSync(join(ROOT, 'src/payload.config.ts'), 'utf8');
+    expect(cfg).toContain('disablePlaygroundInProduction: true');
+    expect(cfg).toContain('__schema');
+    expect(cfg).toContain('__type');
+  });
+
+  test('CMS Application manifest exposes cms.apprafter.dev publicly, dev stays internal', () => {
+    const m = readFileSync(join(ROOT, 'apprafter/Application.cue'), 'utf8');
+    expect(m).toContain('"cms.apprafter.dev"');
+    expect(m).toMatch(/network:\s+"public"/);
+    expect(m).toMatch(/network:\s+"internal"/);
+  });
 });

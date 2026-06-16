@@ -37,13 +37,20 @@ landingCms: v1alpha1.#Application & {
 			// runtime. Built via `bun run build:cms`.
 			image:    "ghcr.io/apprafter/landing-cms:latest"
 			replicas: 1
+			// Public so the GitHub `landing-preview-build` runner can fetch
+			// live globals at build time (LANDING_USE_FALLBACK=0) and so
+			// visitor browsers can POST the waitlist form. Sits behind the
+			// Cloudflare orange-cloud + the cloudflareOrigin firewall (the
+			// node's 80/443 are restricted to Cloudflare IP ranges). The
+			// hostname matches the wildcard *.apprafter.dev :443 listener.
 			expose: {
-				port:    3000
-				network:  "internal"
+				port:     3000
+				network:  "public"
+				hostname: "cms.apprafter.dev"
 			}
 			needs: {
-				pg: {},
-			},
+				pg: {}
+			}
 			env: {
 				DATABASE_URL: claim.pg.url
 				// DATABASE_URL auto-injected via needs.pg claim
@@ -68,6 +75,12 @@ landingCms: v1alpha1.#Application & {
 		environments: {
 			dev: {
 				replicas: 1
+				// Dev cluster CMS stays cluster-internal (reached via the
+				// .local host / port-forward), never publicly exposed.
+				expose: {
+					port:    3000
+					network: "internal"
+				}
 				env: {
 					PAYLOAD_PUBLIC_SERVER_URL: "http://cms.dev.apprafter.local:3000"
 					LANDING_CMS_PORT:          "3000"
@@ -78,7 +91,7 @@ landingCms: v1alpha1.#Application & {
 			prod: {
 				replicas: 1
 				env: {
-					GITHUB_REPO:           "AppRafter/apprafter"
+					GITHUB_REPO: "AppRafter/apprafter"
 					GITHUB_DISPATCH_TOKEN: secret: "apprafter-landing-cms-token/TOKEN"
 				}
 			}

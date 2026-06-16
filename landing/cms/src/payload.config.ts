@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { postgresAdapter } from '@payloadcms/db-postgres';
 import { lexicalEditor } from '@payloadcms/richtext-lexical';
+import { GraphQLError, type ValidationRule } from 'graphql';
 import { buildConfig } from 'payload';
 
 import { Users } from './collections/Users';
@@ -69,8 +70,29 @@ const csrfOrigins = [
     .filter(Boolean),
 ];
 
+// Once the CMS is publicly reachable (cms.apprafter.dev), don't hand out
+// the GraphQL schema. The playground is disabled in production (below) and
+// schema introspection (__schema / __type) is rejected. Public REST reads
+// of the landing globals are unaffected — this only blocks schema disclosure.
+const noProductionIntrospection: ValidationRule = (context) => ({
+  Field(node) {
+    if (
+      process.env.NODE_ENV === 'production' &&
+      (node.name.value === '__schema' || node.name.value === '__type')
+    ) {
+      context.reportError(
+        new GraphQLError('GraphQL introspection is disabled in production.', { nodes: [node] }),
+      );
+    }
+  },
+});
+
 export default buildConfig({
   serverURL,
+  graphQL: {
+    disablePlaygroundInProduction: true,
+    validationRules: () => [noProductionIntrospection],
+  },
   secret: process.env.PAYLOAD_SECRET ?? '',
   db: postgresAdapter({
     pool: { connectionString: process.env.DATABASE_URL ?? '' },
