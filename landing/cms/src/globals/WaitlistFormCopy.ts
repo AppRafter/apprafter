@@ -6,8 +6,7 @@ import type { GlobalConfig } from 'payload';
 export const WaitlistFormCopy: GlobalConfig = {
   slug: 'waitlist-form-copy',
   admin: {
-    description:
-      'Visible copy for the inline managed-launch waitlist form (Svelte island in Hero).',
+    description: 'Visible copy for the inline waitlist form (Svelte island in Hero).',
   },
   access: {
     read: () => true,
@@ -22,6 +21,25 @@ export const WaitlistFormCopy: GlobalConfig = {
       required: true,
       localized: true,
       defaultValue: "What's your use case? (optional)",
+    },
+    {
+      name: 'interestsLabel',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'What are you waiting for? (pick any)',
+    },
+    {
+      name: 'interests',
+      type: 'array',
+      labels: { singular: 'Interest', plural: 'Interests' },
+      admin: {
+        description: 'Phase-keyed checkboxes. `key` must match WaitlistSignups.interests values.',
+      },
+      fields: [
+        { name: 'key', type: 'text', required: true },
+        { name: 'label', type: 'text', required: true, localized: true },
+      ],
     },
     {
       name: 'callLabel',
@@ -56,7 +74,7 @@ export const WaitlistFormCopy: GlobalConfig = {
       type: 'text',
       required: true,
       localized: true,
-      defaultValue: 'Stored only for launch announcement.',
+      defaultValue: 'Stored only for launch announcements.',
     },
   ],
 };

@@ -1,10 +1,18 @@
 {
-  "formIntro": "The managed version of AppRafter is in development. Drop your email — we'll let you know when it's ready. One email, no newsletter, no marketing drip.",
+  "formIntro": "Parts of AppRafter are still in development. Drop your email and pick what you're waiting for — we'll let you know when each ships. One email, no newsletter, no marketing drip.",
   "emailLabel": "Email",
   "useCaseLabel": "What's your use case? (optional)",
+  "interestsLabel": "What are you waiting for? (pick any)",
+  "interests": [
+    { "key": "tier2", "label": "Production multi-node — Tier 2 (Phase 3)" },
+    { "key": "observability", "label": "Observability — metrics/logs/traces (Phase 3)" },
+    { "key": "managed", "label": "Managed offering (Phase 4)" },
+    { "key": "tier3", "label": "Bare metal — Tier 3 (Phase 5+)" },
+    { "key": "tier4", "label": "Confidential — Tier 4 (Phase 6+)" }
+  ],
   "callLabel": "I'd like a short call to discuss my use case.",
   "submitLabel": "Notify me",
   "successMessage": "→ We'll be in touch.",
   "successWithCall": "→ We'll be in touch. You'll get a separate email with a calendar link.",
-  "storageNote": "Stored only for launch announcement."
+  "storageNote": "Stored only for launch announcements."
 }

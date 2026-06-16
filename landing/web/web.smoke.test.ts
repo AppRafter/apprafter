@@ -443,4 +443,13 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     // existing Phase 8+ entry must still be present (anchor cross-link)
     expect(JSON.stringify(data)).toContain('Phase 8+');
   });
+
+  test('waitlist copy carries the 5 phase-keyed interests', () => {
+    const data = JSON.parse(
+      readFileSync(join(ROOT, 'src/data/fallback/waitlistCopy.json'), 'utf8'),
+    );
+    expect(data.interestsLabel).toBeTruthy();
+    const keys = data.interests.map((i: { key: string }) => i.key).sort();
+    expect(keys).toEqual(['managed', 'observability', 'tier2', 'tier3', 'tier4']);
+  });
 });
