@@ -14,6 +14,8 @@ type Props = {
   formIntro: string;
   emailLabel: string;
   useCaseLabel: string;
+  interestsLabel: string;
+  interests: { key: string; label: string }[];
   callLabel: string;
   submitLabel: string;
   successMessage: string;
@@ -25,6 +27,8 @@ let {
   formIntro,
   emailLabel,
   useCaseLabel,
+  interestsLabel,
+  interests,
   callLabel,
   submitLabel,
   successMessage,
@@ -39,11 +43,26 @@ let wantsCall = $state(false);
 let submitted = $state(false);
 let submitting = $state(false);
 let error = $state<string | null>(null);
+let selected = $state<Record<string, boolean>>({});
 
 $effect(() => {
   const onToggle = (e: Event) => {
-    const detail = (e as CustomEvent<boolean>).detail;
-    open = typeof detail === 'boolean' ? detail : !open;
+    const detail = (e as CustomEvent<boolean | { open?: boolean; preselect?: string }>).detail;
+    if (typeof detail === 'boolean') {
+      open = detail;
+    } else if (detail && typeof detail === 'object') {
+      open = detail.open ?? true;
+      if (detail.preselect) selected = { ...selected, [detail.preselect]: true };
+    } else {
+      open = !open;
+    }
+    if (open) {
+      requestAnimationFrame(() =>
+        document
+          .getElementById('waitlist-form')
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+      );
+    }
   };
   document.addEventListener('waitlist:toggle', onToggle);
   return () => document.removeEventListener('waitlist:toggle', onToggle);
@@ -61,6 +80,9 @@ async function submit(ev: SubmitEvent) {
   submitting = true;
   try {
     const base = import.meta.env.PUBLIC_CMS_URL || '';
+    const interestKeys = Object.entries(selected)
+      .filter(([, v]) => v)
+      .map(([k]) => k);
     const res = await fetch(`${base}/api/waitlist-signups`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -68,6 +90,7 @@ async function submit(ev: SubmitEvent) {
         email,
         useCase: useCase || undefined,
         wantsCall,
+        interests: interestKeys.length ? interestKeys : undefined,
         source: typeof document !== 'undefined' ? document.referrer || 'direct' : 'direct',
       }),
     });
@@ -88,7 +111,7 @@ async function submit(ev: SubmitEvent) {
 </script>
 
 {#if open}
-  <div class="waitlist" id="waitlist-form" role="region" aria-label="Managed launch waitlist">
+  <div class="waitlist" id="waitlist-form" role="region" aria-label="Waitlist">
     {#if submitted}
       <div class="waitlist-success" role="status">
         {wantsCall ? successWithCall : successMessage}
@@ -120,6 +143,18 @@ async function submit(ev: SubmitEvent) {
             disabled={submitting}
           />
         </div>
+
+        {#if interests?.length}
+          <fieldset class="interests">
+            <legend>{interestsLabel}</legend>
+            {#each interests as it (it.key)}
+              <label class="checkbox-row">
+                <input type="checkbox" bind:checked={selected[it.key]} disabled={submitting} />
+                <span>{it.label}</span>
+              </label>
+            {/each}
+          </fieldset>
+        {/if}
 
         <label class="checkbox-row">
           <input type="checkbox" bind:checked={wantsCall} disabled={submitting} />
@@ -186,6 +221,22 @@ async function submit(ev: SubmitEvent) {
   }
   .field input:focus {
     border-color: var(--accent);
+  }
+  .interests {
+    border: 0;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 10px;
+  }
+  .interests legend {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    padding: 0;
+    margin-bottom: 4px;
   }
   .checkbox-row {
     display: flex;

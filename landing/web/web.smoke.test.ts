@@ -85,12 +85,15 @@ describe('hero section pieces', () => {
     expect(heroJson).not.toContain('network: \\"vpn\\"');
   });
 
-  test('waitlist form POSTs to /api/waitlist-signups (Vite proxy / PUBLIC_CMS_URL)', () => {
+  test('waitlist form POSTs to /api/waitlist-signups + renders interest checkboxes + handles preselect', () => {
     const wl = readFileSync(join(ROOT, 'src/components/hero/WaitlistForm.svelte'), 'utf8');
     expect(wl).toContain('/api/waitlist-signups');
     expect(wl).toContain('PUBLIC_CMS_URL');
-    // listens for the toggle event dispatched by Hero.astro
     expect(wl).toContain("'waitlist:toggle'");
+    // new: interests are submitted + the toggle carries an optional preselect
+    expect(wl).toContain('interests');
+    expect(wl).toContain('preselect');
+    expect(wl).toContain('scrollIntoView');
   });
 });
 
