@@ -73,6 +73,8 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 | ☐ | The same manifest runs on Tier-1 and Tier-2 (tier chosen at provision time) | 3.1 + 1.9c | CP3 |
 | ☐ | Workload mTLS between services (Cilium) | 3.3 | CP3 |
 
+> The landing roadmap surfaces these as **Phase 3 — Production multi-node + observability** (the public-facing name for order 4 + the observability slice of order 5); Tier 2 is presented as roadmap/waitlist, not available, until these ship.
+
 ---
 
 ## order 5 — external surface + observability (pulled from Phase 4)
