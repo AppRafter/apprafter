@@ -4,6 +4,22 @@
   "lede": "Phases, not quarters. Each one a finished product on its own, not “an MVP we'll polish later”.",
   "phases": [
     {
+      "num": "Phase 3",
+      "title": "Production multi-node + observability",
+      "items": [
+        {
+          "text": "Tier 2: 3-node HA cluster (k3s + kube-vip + embedded etcd) — the same manifest, tier chosen at provision time"
+        },
+        { "text": "Workload mTLS between services (Cilium)" },
+        {
+          "text": "Built-in observability: metrics, logs, traces (OTel + Prometheus/Grafana + Tempo) + network flow (Hubble UI)"
+        },
+        { "text": "Replayable audit log (kine + NATS JetStream control plane)" },
+        { "text": "OpenBao-backed secrets (Tier 2+)" },
+        { "text": "Automatic DNS (external-dns) + automatic backups to external S3" }
+      ]
+    },
+    {
       "num": "Phase 4",
       "title": "Managed offering launch",
       "items": [

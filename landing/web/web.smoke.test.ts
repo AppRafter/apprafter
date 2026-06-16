@@ -435,4 +435,12 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     expect(s).not.toContain('Tier 1 and Tier 2 ready at signup');
     expect(s).toContain('ships in Phase 3');
   });
+
+  test('roadmap leads with Phase 3 (production multi-node + observability)', () => {
+    const data = JSON.parse(readFileSync(join(ROOT, 'src/data/fallback/roadmap.json'), 'utf8'));
+    expect(data.phases[0].num).toBe('Phase 3');
+    expect(data.phases[0].title).toContain('Production multi-node');
+    // existing Phase 8+ entry must still be present (anchor cross-link)
+    expect(JSON.stringify(data)).toContain('Phase 8+');
+  });
 });
