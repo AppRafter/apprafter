@@ -455,4 +455,10 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     const keys = data.interests.map((i: { key: string }) => i.key).sort();
     expect(keys).toEqual(['managed', 'observability', 'tier2', 'tier3', 'tier4']);
   });
+
+  test('Comparison plans table has a Managed waitlist button preselecting managed', () => {
+    const c = readFileSync(join(ROOT, 'src/components/sections/Comparison.astro'), 'utf8');
+    expect(c).toContain('waitlist:toggle');
+    expect(c).toContain("preselect: 'managed'");
+  });
 });

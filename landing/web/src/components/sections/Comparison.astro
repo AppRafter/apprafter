@@ -70,6 +70,7 @@ const safeKind = (k: string | null | undefined): Kind =>
               kind={safeKind(cols?.managed?.statusKind)}
               label={cols?.managed?.statusLabel ?? ''}
             />
+            <button type="button" class="managed-waitlist btn-waitlist">Join the waitlist</button>
           </td>
           <td>
             <StatusPill
@@ -97,9 +98,35 @@ const safeKind = (k: string | null | undefined): Kind =>
       }
     </div>
   </Container>
+<script>
+  for (const b of document.querySelectorAll('.managed-waitlist')) {
+    b.addEventListener('click', () => {
+      document.dispatchEvent(
+        new CustomEvent('waitlist:toggle', { detail: { open: true, preselect: 'managed' } }),
+      );
+    });
+  }
+</script>
 </section>
 
 <style>
+  .btn-waitlist {
+    display: inline-block;
+    margin-top: 10px;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    padding: 7px 12px;
+    border: 1px solid var(--accent);
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    border-radius: 4px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .btn-waitlist:hover {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
   .compare-table {
     width: 100%;
     border-collapse: collapse;
