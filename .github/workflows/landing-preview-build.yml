@@ -72,12 +72,21 @@ jobs:
           tags: |
             ${{ steps.image-base.outputs.image }}:preview
             ${{ steps.image-base.outputs.image }}:preview-${{ github.sha }}
+          # CONTENT_REV is unique per run so BuildKit always rebuilds the
+          # `bun run build` layer against live CMS — the network fetch is
+          # invisible to the layer cache, so without this a cached dist/
+          # is reused and admin edits never reach the image (see
+          # landing/web/Dockerfile).
           build-args: |
             LANDING_USE_FALLBACK=0
             LANDING_CMS_URL=https://cms.apprafter.dev
             PUBLIC_CMS_URL=https://cms.apprafter.dev
+            CONTENT_REV=${{ github.run_id }}-${{ github.run_attempt }}
           platforms: linux/amd64
-          # Share the cache scope with release-landing.yml's web
-          # job so install + build layers are reused.
+          # Share the cache scope with release-landing.yml's web job so the
+          # install/deps layers are reused. The `bun run build` layer is
+          # deliberately NOT reused here (CONTENT_REV differs from the
+          # release build's stable default), so the fallback dist never
+          # leaks into a preview image.
           cache-from: type=gha,scope=landing-web
           cache-to: type=gha,mode=max,scope=landing-web

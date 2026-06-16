@@ -46,4 +46,20 @@ describe('landing workspace shape', () => {
     const checker = readFileSync(join(ROOT, 'scripts/check-spdx.sh'), 'utf8');
     expect(checker).toContain('FSL-1.1-Apache-2.0');
   });
+
+  test('preview-build cache-busts the live-CMS build layer per run', () => {
+    // Regression guard. `bun run build` fetches live CMS content when
+    // LANDING_USE_FALLBACK=0, but that network read is invisible to
+    // BuildKit's layer cache. Without a per-run cache-bust the cached
+    // dist/ (incl. the fallback release build sharing scope=landing-web)
+    // is reused, so admin edits silently never reach the :preview →
+    // :prod image. Lock both halves of the fix in place.
+    const dockerfile = readFileSync(join(ROOT, 'web/Dockerfile'), 'utf8');
+    expect(dockerfile).toContain('ARG CONTENT_REV');
+    expect(dockerfile).toContain('ENV CONTENT_REV=${CONTENT_REV}');
+
+    const wf = readFileSync(join(ROOT, '../.github/workflows/landing-preview-build.yml'), 'utf8');
+    // Passed as a build-arg whose value is unique per workflow run.
+    expect(wf).toMatch(/CONTENT_REV=\$\{\{\s*github\.run_id\s*\}\}/);
+  });
 });

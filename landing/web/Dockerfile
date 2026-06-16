@@ -35,9 +35,9 @@ COPY web web
 
 # Defaults to 1 → lib/cms.ts reads JSON fallbacks during SSG, no
 # CMS connection required. The release workflow takes this path.
-# The rebuild workflow overrides to 0 so the build fetches live
+# The preview-build workflow overrides to 0 so the build fetches live
 # content from LANDING_CMS_URL — that workflow then re-publishes
-# `landing-web:edge` after each admin edit.
+# `landing-web:preview` after each admin edit.
 ARG LANDING_USE_FALLBACK=1
 ENV LANDING_USE_FALLBACK=${LANDING_USE_FALLBACK}
 
@@ -52,6 +52,18 @@ ENV LANDING_CMS_URL=${LANDING_CMS_URL}
 # `--build-arg PUBLIC_CMS_URL=...`.
 ARG PUBLIC_CMS_URL=https://cms.apprafter.dev
 ENV PUBLIC_CMS_URL=${PUBLIC_CMS_URL}
+
+# Cache-bust the `bun run build` layer below. With LANDING_USE_FALLBACK=0
+# the build fetches CMS content over the network — a side effect that is
+# invisible to BuildKit's layer cache, so a cached dist/ (from an earlier
+# preview build, or the fallback release build sharing the gha cache
+# scope) gets reused and CMS edits never reach the image. The
+# preview-build workflow passes a value that is unique per run, forcing
+# this layer to rebuild against live CMS every time; the release/fallback
+# build leaves the default, since its content is deterministic from the
+# repo sources (the COPY above) and SHOULD stay cached.
+ARG CONTENT_REV=fallback
+ENV CONTENT_REV=${CONTENT_REV}
 
 RUN cd web && bun run build
 
