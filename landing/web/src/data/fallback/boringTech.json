@@ -13,7 +13,7 @@
     },
     {
       "name": "NATS JetStream",
-      "desc": "Event/messaging backbone and control plane storage (via the community kine-nats adapter)."
+      "desc": "Event/messaging backbone. Control-plane storage via the community kine-nats adapter is exploratory R&D."
     },
     {
       "name": "CloudNativePG",
@@ -37,7 +37,7 @@
     },
     {
       "name": "apprafter CLI",
-      "desc": "Bootstrap, manifest workflow, dev mode, migration tooling."
+      "desc": "Bootstrap, manifest workflow, migration tooling."
     },
     {
       "name": "MCP server with agentic safety gate",
@@ -45,7 +45,7 @@
     },
     {
       "name": "NATS-based audit log layer on top of kine",
-      "desc": "Turning the control plane's NATS backing store into a replayable platform event log (Tier 2+; opt-in upgrade on Tier 1)."
+      "desc": "Exploratory R&D: turning the control plane's NATS backing store into a replayable platform event log — available on request, not a default."
     },
     {
       "name": "MigrationPlan reconciler",

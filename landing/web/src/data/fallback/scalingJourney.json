@@ -12,7 +12,7 @@
     "eyebrow": "Tier 2 · HA cluster",
     "fileName": "Application.cue",
     "fileMeta": "identical · 23 LOC",
-    "caption": "3+ nodes. CloudNativePG. Replayable audit log + OpenBao secrets. Ships in Phase 3."
+    "caption": "3+ nodes. CloudNativePG. NATS JetStream. OpenBao secrets. Ships in Phase 3."
   },
   "arrowLabel": "Tier upgrade",
   "footerKickers": [

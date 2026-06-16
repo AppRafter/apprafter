@@ -467,4 +467,27 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     expect(vp).not.toContain('needs.jetstream');
     expect(vp).toContain('Phase 3');
   });
+
+  test('deferred local-dev / dev-mode is not claimed anywhere in user-facing copy', () => {
+    for (const f of ['advantages', 'boringTech', 'valueProps', 'scalingJourney']) {
+      const s = readFileSync(join(ROOT, `src/data/fallback/${f}.json`), 'utf8').toLowerCase();
+      expect(s).not.toContain('local dev');
+      expect(s).not.toContain('dev mode');
+      expect(s).not.toContain('k3d');
+    }
+  });
+
+  test('kine+NATS replayable audit log is framed as R&D / on request (NATS is the definite Phase 3 item)', () => {
+    const a = readFileSync(join(ROOT, 'src/data/fallback/advantages.json'), 'utf8');
+    const r = readFileSync(join(ROOT, 'src/data/fallback/roadmap.json'), 'utf8');
+    const bt = readFileSync(join(ROOT, 'src/data/fallback/boringTech.json'), 'utf8');
+    // no "out of the box" / "ships in Phase 3" certainty for the kine audit log
+    expect(a).not.toContain('out of the box');
+    expect(a).toMatch(/R&D|on request|exploratory/i);
+    // roadmap: NATS is definite; the kine audit log is qualified as exploratory/on-request
+    expect(r).toContain('NATS JetStream');
+    expect(r).toMatch(/exploratory|on request|R&D/i);
+    // the boringTech "audit log on top of kine" entry is no longer an opt-in upgrade promise
+    expect(bt).not.toContain('opt-in upgrade on Tier 1');
+  });
 });

@@ -14,7 +14,9 @@
         {
           "text": "Built-in observability: metrics, logs, traces (OTel + Prometheus/Grafana + Tempo) + network flow (Hubble UI)"
         },
-        { "text": "Replayable audit log (kine + NATS JetStream control plane)" },
+        {
+          "text": "NATS JetStream event backbone (a kine-backed replayable audit log on top of it is exploratory R&D, available on request)"
+        },
         { "text": "OpenBao-backed secrets (Tier 2+)" },
         { "text": "Automatic DNS (external-dns) + automatic backups to external S3" }
       ]

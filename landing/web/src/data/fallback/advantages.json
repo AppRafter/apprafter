@@ -5,16 +5,16 @@
   "blocks": [
     {
       "title": "Manifest portability across tiers.",
-      "leadHtml": "<strong>The same Application manifest is designed to run from local dev (k3d) through a single VDS, multi-node clusters, bare metal, and hyperscalers — without rewrites.</strong> Not “we tested in a few environments” — a structural property: one CUE schema, one operator, one ResourceClaim contract. Only the backing changes.",
-      "detail": "Today it runs on local dev and Tier 1 (single VDS). Tier 2 (multi-node) ships in Phase 3; Tier 3 in Phase 5+, Tier 4 in Phase 6+.",
-      "phaseTag": "Today: local dev + Tier 1",
+      "leadHtml": "<strong>The same Application manifest is designed to run from a single VDS through multi-node clusters, bare metal, and hyperscalers — without rewrites.</strong> Not “we tested in a few environments” — a structural property: one CUE schema, one operator, one ResourceClaim contract. Only the backing changes.",
+      "detail": "Today it runs on Tier 1 (single VDS). Tier 2 (multi-node) ships in Phase 3; Tier 3 in Phase 5+, Tier 4 in Phase 6+.",
+      "phaseTag": "Today: Tier 1",
       "featured": false
     },
     {
-      "title": "Replayable audit log out of the box.",
-      "leadHtml": "<strong>The control plane runs on kine + NATS JetStream, which means every platform operation can be replayed from the event log.</strong> Not a separate audit pipeline, not an add-on to etcd. Compliance-friendly <strong>architecturally</strong>, not by promise. A competitor would have to swap out their control plane storage layer to match — a major architectural commitment.",
-      "detail": "Ships in Phase 3 (Tier 2+). Today Tier 1 uses kine + SQLite; the replayable log arrives with the kine + NATS control plane in Phase 3.",
-      "phaseTag": "Phase 3 (Tier 2+)",
+      "title": "Replayable audit log, by architecture.",
+      "leadHtml": "<strong>The control plane is designed to run on kine + NATS JetStream — which would let every platform operation be replayed from the event log.</strong> Not a separate audit pipeline, not an add-on to etcd. Compliance-friendly <strong>architecturally</strong>, not by promise. A competitor would have to swap out their control plane storage layer to match — a major architectural commitment.",
+      "detail": "NATS JetStream lands in Phase 3; the kine-backed replayable log on top of it is exploratory R&D, available on request. Today Tier 1 uses kine + SQLite.",
+      "phaseTag": "NATS: Phase 3 · audit log: on request",
       "featured": false
     },
     {
