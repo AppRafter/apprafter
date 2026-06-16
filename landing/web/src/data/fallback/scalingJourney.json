@@ -1,7 +1,7 @@
 {
   "eyebrow": "How scaling works",
   "title": "One file. From single node to HA cluster.",
-  "ledeHtml": "Most PaaS platforms cap at vertical scaling — when you grow, you migrate. Most Kubernetes distros assume you're starting big. AppRafter is the same platform from a €5 VPS to a multi-node HA cluster, and the same <code class=\"mono\">Application.cue</code> deploys to both.",
+  "ledeHtml": "Most PaaS platforms cap at vertical scaling — when you grow, you migrate. Most Kubernetes distros assume you're starting big. AppRafter is designed to be the same platform from a €5 VPS to a multi-node HA cluster, and the same <code class=\"mono\">Application.cue</code> deploys to both. Tier 1 is live today; Tier 2 (HA) ships in Phase 3.",
   "leftStage": {
     "eyebrow": "Tier 1 · €5 VPS",
     "fileName": "Application.cue",
@@ -12,7 +12,7 @@
     "eyebrow": "Tier 2 · HA cluster",
     "fileName": "Application.cue",
     "fileMeta": "identical · 23 LOC",
-    "caption": "3+ nodes. CloudNativePG. Replayable audit log. OpenBao for secrets."
+    "caption": "3+ nodes. CloudNativePG. Replayable audit log + OpenBao secrets. Ships in Phase 3."
   },
   "arrowLabel": "Tier upgrade",
   "footerKickers": [
@@ -20,5 +20,5 @@
     { "text": "No migration tool." },
     { "text": "One CUE manifest." }
   ],
-  "caveatHtml": "<strong>Today:</strong> Tier 1 and Tier 2 ready at signup. T1→T2 migration tool ships in the first post-launch bundle (~2–4 weeks after release)."
+  "caveatHtml": "<strong>Today:</strong> Tier 1 ready at signup. Tier 2 (HA) ships in Phase 3; the T1→T2 migration tool follows in the first post-launch bundle."
 }

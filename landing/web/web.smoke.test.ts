@@ -429,4 +429,10 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     expect(a).not.toContain('Today: Postgres · JetStream · Redis');
     expect(a).toContain('Phase 3');
   });
+
+  test('scaling journey no longer says Tier 2 is ready at signup', () => {
+    const s = readFileSync(join(ROOT, 'src/data/fallback/scalingJourney.json'), 'utf8');
+    expect(s).not.toContain('Tier 1 and Tier 2 ready at signup');
+    expect(s).toContain('ships in Phase 3');
+  });
 });
