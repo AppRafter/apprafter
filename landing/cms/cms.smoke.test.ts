@@ -63,6 +63,12 @@ describe('landing/cms scaffold', () => {
     // public create — anyone may submit; read locked to authed users.
     expect(wl).toMatch(/create:\s*\(\)\s*=>\s*true/);
     expect(wl).toMatch(/read:.*Boolean\(req\.user\)/);
+    // honesty pass: signups carry which upcoming things they want notified about
+    expect(wl).toContain("name: 'interests'");
+    expect(wl).toContain('hasMany: true');
+    for (const k of ['tier2', 'observability', 'managed', 'tier3', 'tier4']) {
+      expect(wl).toContain(`value: '${k}'`);
+    }
   });
 
   test('Booking global has Calendly default + {{url}} template placeholder', () => {

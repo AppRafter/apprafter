@@ -6,17 +6,18 @@ import type { CollectionConfig } from 'payload';
 import { sendDiscoveryEmail } from '../hooks/sendDiscoveryEmail';
 
 /**
- * Pre-launch managed-waitlist storage. Submitted unauthenticated
- * from landing/web's WaitlistForm island. The afterChange hook
- * sends a Calendly link when `wantsCall` is true and SMTP is
- * configured; without SMTP it logs the intent and moves on so
- * dev signups don't fail.
+ * Pre-launch waitlist storage. Submitted unauthenticated from
+ * landing/web's WaitlistForm island; each signup records which
+ * upcoming releases it wants to hear about (`interests`). The
+ * afterChange hook sends a Calendly link when `wantsCall` is true
+ * and SMTP is configured; without SMTP it logs the intent and
+ * moves on so dev signups don't fail.
  */
 export const WaitlistSignups: CollectionConfig = {
   slug: 'waitlist-signups',
   admin: {
     useAsTitle: 'email',
-    defaultColumns: ['email', 'wantsCall', 'callEmailSentAt', 'createdAt'],
+    defaultColumns: ['email', 'wantsCall', 'interests', 'callEmailSentAt', 'createdAt'],
     description:
       'Managed-launch waitlist. Email is the unique key; wantsCall toggles a follow-up Calendly invitation.',
   },
@@ -40,6 +41,19 @@ export const WaitlistSignups: CollectionConfig = {
       name: 'useCase',
       type: 'text',
       admin: { description: 'Optional one-liner — Mary, 3 services, on Render' },
+    },
+    {
+      name: 'interests',
+      type: 'select',
+      hasMany: true,
+      options: [
+        { label: 'Tier 2 — production multi-node (Phase 3)', value: 'tier2' },
+        { label: 'Observability (Phase 3)', value: 'observability' },
+        { label: 'Managed offering (Phase 4)', value: 'managed' },
+        { label: 'Tier 3 — bare metal (Phase 5+)', value: 'tier3' },
+        { label: 'Tier 4 — confidential (Phase 6+)', value: 'tier4' },
+      ],
+      admin: { description: 'Which upcoming releases this signup wants to hear about.' },
     },
     {
       name: 'wantsCall',
