@@ -189,6 +189,10 @@ export interface WaitlistSignup {
    */
   useCase?: string | null;
   /**
+   * Which upcoming releases this signup wants to hear about.
+   */
+  interests?: ('tier2' | 'observability' | 'managed' | 'tier3' | 'tier4')[] | null;
+  /**
    * Triggers a Calendly link email via afterChange hook.
    */
   wantsCall?: boolean | null;
@@ -307,6 +311,7 @@ export interface UsersSelect<T extends boolean = true> {
 export interface WaitlistSignupsSelect<T extends boolean = true> {
   email?: T;
   useCase?: T;
+  interests?: T;
   wantsCall?: T;
   source?: T;
   callEmailSentAt?: T;
@@ -694,7 +699,7 @@ export interface FooterContent {
   createdAt?: string | null;
 }
 /**
- * Visible copy for the inline managed-launch waitlist form (Svelte island in Hero).
+ * Visible copy for the inline waitlist form (Svelte island in Hero).
  *
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "waitlist-form-copy".
@@ -704,6 +709,17 @@ export interface WaitlistFormCopy {
   formIntro: string;
   emailLabel: string;
   useCaseLabel: string;
+  interestsLabel: string;
+  /**
+   * Phase-keyed checkboxes. `key` must match WaitlistSignups.interests values.
+   */
+  interests?:
+    | {
+        key: string;
+        label: string;
+        id?: string | null;
+      }[]
+    | null;
   callLabel: string;
   submitLabel: string;
   successMessage: string;
@@ -1076,6 +1092,14 @@ export interface WaitlistFormCopySelect<T extends boolean = true> {
   formIntro?: T;
   emailLabel?: T;
   useCaseLabel?: T;
+  interestsLabel?: T;
+  interests?:
+    | T
+    | {
+        key?: T;
+        label?: T;
+        id?: T;
+      };
   callLabel?: T;
   submitLabel?: T;
   successMessage?: T;
