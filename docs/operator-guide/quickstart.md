@@ -186,6 +186,11 @@ Service via server-side apply. The status field `phase=Ready` and
 reconcile. The admission webhook validates the create and update
 payloads against the CRD schema and cross-field invariants.
 
+The `kubectl apply` above is a platform smoke test. To ship a real
+application from a Git repo — scaffold, register with `apprafter app
+add`, then watch it with `apprafter app status` / `app logs` — follow
+the [developer quickstart](../dev-guide/quickstart.md).
+
 To opt out of the operator or webhook in a custom `Infrastructure.cue`:
 
 ```cue
@@ -200,7 +205,7 @@ spec: {
 | Task                          | Command                                                  |
 | ----------------------------- | -------------------------------------------------------- |
 | Open Argo CD UI               | `apprafter open argocd`                                  |
-| List Applications             | `kubectl get applications.apprafter.io -A`               |
+| List Applications             | `apprafter app list` (raw: `kubectl get applications.apprafter.io -A`) |
 | Argo CD admin password only   | `apprafter argocd-password`                              |
 | Re-fetch kubeconfig           | `apprafter kubeconfig --refresh` (alias: `apprafter kc --refresh`) |
 | Rebuild local state           | `apprafter import` (live Hetzner → state.json)           |
