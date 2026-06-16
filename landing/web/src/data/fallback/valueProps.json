@@ -2,12 +2,12 @@
   "blocks": [
     {
       "title": "Deploy with a single manifest.",
-      "bodyHtml": "Describe your application in CUE: <code class=\"mono\">kind: Application</code>, declare dependencies through <code class=\"mono\">needs.pg</code> / <code class=\"mono\">needs.jetstream</code> / <code class=\"mono\">needs.redis</code>. Deploy via CLI or through an AI agent over MCP — destructive operations gated by a CRD, no <code class=\"mono\">kubectl delete</code> surprises. The platform handles the rest — Postgres clusters with backups, NATS streams with retention, Redis instances. No 400-line <code class=\"mono\">values.yaml</code>. No drift between dev and prod.",
+      "bodyHtml": "Describe your application in CUE: <code class=\"mono\">kind: Application</code>, declare dependencies through <code class=\"mono\">needs.pg</code> / <code class=\"mono\">needs.redis</code> / <code class=\"mono\">needs.disk</code>. Deploy via CLI or through an AI agent over MCP — destructive operations gated by a CRD, no <code class=\"mono\">kubectl delete</code> surprises. The platform handles the rest — managed Postgres, Redis instances, persistent disks. No 400-line <code class=\"mono\">values.yaml</code>. No drift between dev and prod.",
       "iconName": "grid"
     },
     {
       "title": "From one VDS to production, no scaling ceiling.",
-      "bodyHtml": "The same manifest runs on a €5 Hetzner VDS (single node, Tier 1) and scales horizontally to an HA cluster of any size and node mix (Tier 2). When you grow, you add nodes — you don't migrate to a different platform when you hit your provider's vertical ceiling. No rewriting applications between dev and prod.",
+      "bodyHtml": "The same manifest runs on a €5 Hetzner VDS today (single node, Tier 1) and is designed to scale horizontally to an HA cluster of any size and node mix (Tier 2, Phase 3). When you grow, you'll add nodes — you don't migrate to a different platform when you hit your provider's vertical ceiling. No rewriting applications between dev and prod.",
       "iconName": "bars"
     },
     {

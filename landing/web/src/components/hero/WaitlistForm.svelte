@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //
-// Inline managed-launch waitlist. Hidden by default; the secondary
+// Inline launch waitlist. Hidden by default; the secondary
 // CTA in Hero.astro dispatches a `waitlist:toggle` CustomEvent that
 // flips the open state here. POST target: Payload's auto-generated
 // REST endpoint for the WaitlistSignups collection (lands in Phase

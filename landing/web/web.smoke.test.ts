@@ -461,4 +461,10 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     expect(c).toContain('waitlist:toggle');
     expect(c).toContain("preselect: 'managed'");
   });
+
+  test('valueProps no longer present-tense-claims jetstream or Tier 2 HA', () => {
+    const vp = readFileSync(join(ROOT, 'src/data/fallback/valueProps.json'), 'utf8');
+    expect(vp).not.toContain('needs.jetstream');
+    expect(vp).toContain('Phase 3');
+  });
 });

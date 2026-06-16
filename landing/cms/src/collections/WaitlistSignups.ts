@@ -19,7 +19,7 @@ export const WaitlistSignups: CollectionConfig = {
     useAsTitle: 'email',
     defaultColumns: ['email', 'wantsCall', 'interests', 'callEmailSentAt', 'createdAt'],
     description:
-      'Managed-launch waitlist. Email is the unique key; wantsCall toggles a follow-up Calendly invitation.',
+      'Launch waitlist. Email is the unique key; interests record which upcoming releases the signup wants; wantsCall toggles a follow-up Calendly invitation.',
   },
   access: {
     // Anyone can submit (no auth on the public site); only admins
