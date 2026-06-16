@@ -176,7 +176,7 @@ export interface User {
   collection: 'users';
 }
 /**
- * Managed-launch waitlist. Email is the unique key; wantsCall toggles a follow-up Calendly invitation.
+ * Launch waitlist. Email is the unique key; interests record which upcoming releases the signup wants; wantsCall toggles a follow-up Calendly invitation.
  *
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "waitlist-signups".
