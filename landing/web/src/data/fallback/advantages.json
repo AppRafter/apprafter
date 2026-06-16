@@ -6,15 +6,15 @@
     {
       "title": "Manifest portability across tiers.",
       "leadHtml": "<strong>The same Application manifest is designed to run from local dev (k3d) through a single VDS, multi-node clusters, bare metal, and hyperscalers — without rewrites.</strong> Not “we tested in a few environments” — a structural property: one CUE schema, one operator, one ResourceClaim contract. Only the backing changes.",
-      "detail": "Today it works on local dev, Tier 1 (single VDS), and Tier 2 (multi-node). Tier 3 is in Phase 5+, Tier 4 in Phase 6+.",
-      "phaseTag": "Today: Tier 1 + Tier 2",
+      "detail": "Today it runs on local dev and Tier 1 (single VDS). Tier 2 (multi-node) ships in Phase 3; Tier 3 in Phase 5+, Tier 4 in Phase 6+.",
+      "phaseTag": "Today: local dev + Tier 1",
       "featured": false
     },
     {
       "title": "Replayable audit log out of the box.",
       "leadHtml": "<strong>The control plane runs on kine + NATS JetStream, which means every platform operation can be replayed from the event log.</strong> Not a separate audit pipeline, not an add-on to etcd. Compliance-friendly <strong>architecturally</strong>, not by promise. A competitor would have to swap out their control plane storage layer to match — a major architectural commitment.",
-      "detail": "Works today on Tier 2 and above. On Tier 1 the control plane uses kine + SQLite for simplicity; replayable log is available as an opt-in upgrade.",
-      "phaseTag": "Today: Tier 2+",
+      "detail": "Ships in Phase 3 (Tier 2+). Today Tier 1 uses kine + SQLite; the replayable log arrives with the kine + NATS control plane in Phase 3.",
+      "phaseTag": "Phase 3 (Tier 2+)",
       "featured": false
     },
     {
@@ -27,8 +27,8 @@
     {
       "title": "Six platform services through one typed primitive.",
       "leadHtml": "<strong>Not a Helm wrapper over Postgres.</strong> A standardized CRD contract via ResourceClaim and ServiceProvider, which means a drop-in replacement (Postgres → AlloyDB, Redis → Valkey, S3 → Garage) is a container-level swap of the ServiceProvider — not an application rewrite. Competitors who expose services through Helm values would have to change their resource model from the ground up.",
-      "detail": "Works today: Postgres, JetStream, Redis (Phase 2). Coming: ClickHouse, S3, Notifications (Phase 3).",
-      "phaseTag": "Today: Postgres · JetStream · Redis",
+      "detail": "Works today: Postgres, Redis, block storage (Phase 2). Coming: ClickHouse, S3, notifications (Phase 3+).",
+      "phaseTag": "Today: Postgres · Redis · disk",
       "featured": false
     },
     {

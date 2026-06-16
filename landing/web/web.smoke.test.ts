@@ -421,4 +421,12 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     expect(c).toContain('n <= 1');
     expect(c).not.toContain('n <= 2');
   });
+
+  test('advantages no longer claims Tier 2 / JetStream as available today', () => {
+    const a = readFileSync(join(ROOT, 'src/data/fallback/advantages.json'), 'utf8');
+    expect(a).not.toContain('Today: Tier 1 + Tier 2');
+    expect(a).not.toContain('Works today on Tier 2 and above');
+    expect(a).not.toContain('Today: Postgres · JetStream · Redis');
+    expect(a).toContain('Phase 3');
+  });
 });
