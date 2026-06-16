@@ -15,7 +15,7 @@ type Props = {
   emailLabel: string;
   useCaseLabel: string;
   interestsLabel: string;
-  interests: { key: string; label: string }[];
+  interests?: { key: string; label: string; id?: string | null }[] | null | undefined;
   callLabel: string;
   submitLabel: string;
   successMessage: string;
