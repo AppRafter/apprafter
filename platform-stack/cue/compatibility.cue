@@ -1728,6 +1728,24 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.36": {
+	change:          "safe"
+	operatorVersion: "v0.2.30"
+	notes: """
+		Metadata-only — fix stale GitHub repo links (`/tree/main` ->
+		`/tree/master`; the repo's default branch is `master`, so `/main/`
+		404s). Touches the chart's `sources:` URL (`Chart.yaml.tmpl`,
+		`render_tool.cue`), the rendered README pointer, and the
+		informational `argocd-cue-cmp` source `repoURL`. Carries a cue-cmp
+		sidecar bump to v0.1.12 (its only change is the OCI
+		`org.opencontainers.image.source` LABEL link). The operator
+		(v0.2.30) is unchanged and rendered manifests are byte-equivalent
+		apart from these metadata strings — change=safe, no workload/data
+		impact.
+		"""
+	references: ["argocd-cue-cmp/version.cue", "platform-stack/cue/render_tool.cue"]
+}
+
 compatibility: "0.2.35": {
 	change:          "safe"
 	operatorVersion: "v0.2.30"

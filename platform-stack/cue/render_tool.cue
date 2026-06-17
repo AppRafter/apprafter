@@ -67,7 +67,7 @@ _chartYaml: """
 	appVersion: "\(tier1.version)"
 	home: https://apprafter.io
 	sources:
-	  - https://github.com/apprafter/apprafter/tree/main/platform-stack
+	  - https://github.com/apprafter/apprafter/tree/master/platform-stack
 	maintainers:
 	  - name: AppRafter Authors
 	    url: https://apprafter.io
@@ -523,7 +523,7 @@ _readmeContent: """
 	Rendered umbrella Helm chart for the AppRafter platform layer.
 	**Do not edit this directory by hand** — it is generated from
 	the CUE source at
-	[`platform-stack/cue/`](https://github.com/apprafter/apprafter/tree/main/platform-stack/cue)
+	[`platform-stack/cue/`](https://github.com/apprafter/apprafter/tree/master/platform-stack/cue)
 	by `cue cmd render` and published to
 	`oci://ghcr.io/apprafter/platform-stack`.
 

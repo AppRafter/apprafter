@@ -36,7 +36,7 @@ _components: "argocd-cue-cmp": #Component & {
 		// repoURL points operators at the source of the
 		// image so `cue/compatibility.cue` retrospect is
 		// possible.
-		repoURL: "https://github.com/apprafter/apprafter/tree/main/argocd-cue-cmp"
+		repoURL: "https://github.com/apprafter/apprafter/tree/master/argocd-cue-cmp"
 		path:    "argocd-cue-cmp"
 	}
 	// The `v` prefix is added here; the SoT version in
