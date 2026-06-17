@@ -235,6 +235,74 @@ not trigger a DaemonSet restart on every config change; manually
 `kubectl -n kube-system rollout restart ds/cilium` after the
 chart bump.
 
+### Provisioning fails on a Hetzner quota or server-type limit {#quota}
+
+`apprafter up` / `apply` surfaces the provider's error directly.
+The common ones:
+
+- `apprafter::provider::server_type_unavailable` — the requested
+  server type isn't offered in that region. Pick another
+  `--region`, or a server type the location stocks.
+- A `403 forbidden` with a quota message — your Hetzner project
+  has hit its server / IP / volume limit. Raise the limit in the
+  Hetzner Cloud Console (Project → Limits) or free up resources,
+  then re-run. `apprafter destroy --yes` clears any half-built
+  resources tagged `apprafter=true` before you retry.
+
+### SSH key rejected or `ssh-key path` FAIL {#ssh-key}
+
+`apprafter doctor` reports `✗ SSH public key readable` when the
+path passed to `target add --ssh-key` doesn't exist or isn't a
+public key. Point it at a real `*.pub` file (e.g.
+`~/.ssh/id_ed25519.pub`, not the private key) and re-add the
+target. The key is injected into the node at provision time, so a
+change only takes effect on the next `apply`/`up`.
+
+### App stuck on `ImagePullBackOff` (registry auth) {#registry-auth}
+
+The Deployment can't pull your image. Almost always a private
+registry without (or with the wrong) credentials:
+
+- For **GHCR**, the pull token must be a **classic** PAT with
+  `read:packages` (plus `repo` if the package inherits a private
+  repo's visibility). Fine-grained PATs and GitHub App tokens are
+  **not** accepted by `ghcr.io` — see
+  [private repos & registries](../dev-guide/private-repos-and-registries.md).
+- Confirm the image ref in `apprafter/Application.cue` matches what
+  you pushed (`apprafter app status <name>` shows the rendered
+  image), and that the tag actually exists in the registry.
+- A public image with a typo'd path fails the same way — check the
+  registry path before assuming an auth problem.
+
+### Public domain doesn't resolve or returns 5xx through Cloudflare {#dns}
+
+The step-5 public path has several moving parts; work outward:
+
+- **DNS not resolving** — give Cloudflare time to propagate the
+  nameserver change, and confirm the A/AAAA records match
+  `apprafter target ip`. Records must be **Proxied** (orange
+  cloud) for the origin-firewall lock to make sense.
+- **521 / 522 from Cloudflare** — the origin is unreachable.
+  Check the firewall toggle (`apprafter target firewall
+  cloudflare-origin enable` allows only Cloudflare ranges) and
+  that the zone is registered (`apprafter target domain list`).
+- **526 (invalid certificate)** — SSL/TLS mode isn't **Full
+  (strict)** or the imported Origin CA cert doesn't cover the
+  host. Re-check `apprafter target cert import` and the zone's
+  apex + wildcard coverage.
+
+Full runbook: [connect a domain](../public-ingress/connect-a-domain.md).
+
+### Node shows `NotReady` after bootstrap {#node-not-ready}
+
+A freshly provisioned node stays `NotReady` until the CNI is up.
+If `kubectl get nodes` doesn't reach `Ready` within a couple of
+minutes of `up` completing, the Cilium agent is usually the
+culprit — `kubectl -n kube-system get pods -l k8s-app=cilium` and,
+if it's crash-looping, check its logs. This is distinct from the
+[`k3s-ready` phase](#phase-2-of-bootstrap-all-k3s-ready-takes-longer-than-expected),
+which is the node coming up at all, before the CNI install.
+
 ## Reading the rendered output
 
 A worked example. After `apprafter target add bad --token

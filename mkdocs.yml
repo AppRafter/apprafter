@@ -54,6 +54,7 @@ plugins:
   - search
 
 markdown_extensions:
+  - attr_list
   - admonition
   - pymdownx.details
   - pymdownx.superfences
@@ -89,6 +90,7 @@ nav:
       - Overview: dev-guide/index.md
       - Quickstart: dev-guide/quickstart.md
       - Writing Application.cue: dev-guide/application-cue.md
+      - Private repos & registries: dev-guide/private-repos-and-registries.md
       - Image iteration: dev-guide/image-iteration.md
   - Reference:
       - Overview: reference/index.md
