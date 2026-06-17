@@ -224,11 +224,12 @@ describe('content sections (Phase F)', () => {
   });
 
   test('all section eyebrows are unique (no copy-paste collisions)', () => {
-    // Eyebrows moved out of Hero.astro into the fallback JSONs.
-    // Read each section's JSON and assert the set has the right
-    // size — no duplicates.
+    // Every section's eyebrow lives in its fallback JSON — ValueProps
+    // moved its previously-hardcoded "Why AppRafter" into the CMS
+    // global + fallback in the CMS-copy migration, so all seven read
+    // uniformly. Assert the set has the right size — no duplicates.
     const sectionJsons = [
-      'valueProps', // ValueProps uses a hardcoded "Why AppRafter"
+      'valueProps',
       'scalingJourney',
       'tierLadder',
       'comparison',
@@ -237,20 +238,13 @@ describe('content sections (Phase F)', () => {
       'roadmap',
     ];
     const eyebrows = new Set<string>();
-    // ValueProps eyebrow lives in the component (no eyebrow field
-    // in the global) — pick it up from the source.
-    const vp = readFileSync(join(ROOT, 'src/components/sections/ValueProps.astro'), 'utf8');
-    const vpEyebrow = vp.match(/eyebrow="([^"]+)"/)?.[1];
-    expect(vpEyebrow).toBeTruthy();
-    if (vpEyebrow) eyebrows.add(vpEyebrow);
-
-    for (const name of sectionJsons.slice(1)) {
+    for (const name of sectionJsons) {
       const data = JSON.parse(readFileSync(join(ROOT, `src/data/fallback/${name}.json`), 'utf8'));
       expect(data.eyebrow).toBeTruthy();
       expect(eyebrows.has(data.eyebrow)).toBe(false);
       eyebrows.add(data.eyebrow);
     }
-    // ValueProps + 6 JSON eyebrows = 7 unique.
+    // 7 sections, 7 unique eyebrows.
     expect(eyebrows.size).toBe(7);
   });
 });
