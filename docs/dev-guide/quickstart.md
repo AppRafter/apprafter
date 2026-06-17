@@ -6,23 +6,85 @@ application, to serving it in production on a public domain through
 Cloudflare. Everything runs through the `apprafter` CLI. Budget ~15
 minutes of hands-on time, plus DNS-propagation wait at the end.
 
+!!! warning "This guide provisions a paid server"
+    Bringing the cluster up creates a real **Hetzner Cloud CPX22**
+    server, billed by Hetzner (hourly) for as long as it runs — this
+    is not a free sandbox. When you are done, tear everything down
+    with [`apprafter destroy --yes`](#clean-up) so you stop being
+    billed. If you only want to evaluate AppRafter without the public
+    domain, there is an [exit point](#checkpoint) after step 4.
+
+## Install
+
+Get the `apprafter` CLI onto your `PATH`. The release binary is the
+recommended path; build-from-source is for contributors.
+
+=== "Recommended — release binary"
+
+    Download the prebuilt binary for your platform from
+    [GitHub Releases](https://github.com/AppRafter/apprafter/releases)
+    and drop it on your `PATH`. Pick the latest tag from the releases
+    page, then:
+
+    ```sh
+    VERSION=v0.2.27                              # latest tag from the releases page
+    TARGET=x86_64-unknown-linux-gnu              # or x86_64-apple-darwin / aarch64-apple-darwin
+    curl -fsSL "https://github.com/AppRafter/apprafter/releases/download/${VERSION}/apprafter-${VERSION}-${TARGET}.tar.gz" | tar xz
+    sudo mv apprafter /usr/local/bin/
+    apprafter --version
+    ```
+
+    Or, with the GitHub CLI (resolves the latest release for you):
+
+    ```sh
+    gh release download --repo AppRafter/apprafter \
+        --pattern 'apprafter-*-x86_64-unknown-linux-gnu.tar.gz'
+    tar xzf apprafter-*-x86_64-unknown-linux-gnu.tar.gz && sudo mv apprafter /usr/local/bin/
+    ```
+
+    Each release ships a `.sha256` next to every tarball — verify with
+    `shasum -a 256 -c apprafter-${VERSION}-${TARGET}.tar.gz.sha256`.
+    Prebuilt targets are Linux `x86_64`, macOS `x86_64` (Intel), and
+    macOS `aarch64` (Apple Silicon). **Linux `aarch64` (ARM) is not
+    published yet** — build from source for ARM servers.
+
+=== "Contributors — build from source"
+
+    Requires a Rust toolchain (`mise.toml` pins `stable`). From a repo
+    checkout:
+
+    ```sh
+    cargo install --path cli/platform-cli
+    ```
+
+    See [Contributing → Setup](../contributing/setup.md) for the full
+    contributor toolchain.
+
+=== "Local dev — Nix / devcontainer"
+
+    The repo's `nix develop` shell pre-installs Bun, Rust, cue,
+    kubectl, helm, and friends; the `.devcontainer/` mirrors it.
+    Inside the shell, build the CLI once with `cargo install --path
+    cli/platform-cli` so `apprafter` is on your `PATH`.
+
 ## Prerequisites
 
-| Tool          | Version | Purpose                                              |
-| ------------- | ------- | ---------------------------------------------------- |
-| `apprafter`   | latest  | the CLI; `cargo install --path cli/platform-cli` puts it on PATH. |
-| Bun           | ≥ 1.x   | runs the OneBun starter; ships in the dev shell.     |
-| Docker        | ≥ 24    | builds the container image.                          |
-| `cue`         | ≥ 0.10  | local manifest validation (in the dev shell).        |
-| `kubectl`     | ≥ 1.29  | reaches the apiserver after bootstrap.               |
-| Hetzner Cloud token | n/a | API token from the Cloud console.                  |
-| Cloudflare account + a domain | n/a | for the public-ingress step.             |
+Only the CLI and a Hetzner token are needed to stand up a Tier 1
+cluster. The rest depends on what you want to do — the happy path
+drives everything through `apprafter app *` and server-side
+validation, so `kubectl` and `cue` are **optional**.
 
-The repo's `nix develop` shell pre-installs Bun, Rust, cue, kubectl,
-helm, and friends. Build the CLI once with `cargo install --path
-cli/platform-cli` so `apprafter` is on your PATH; the rest of this
-page assumes it is. (Outside Nix, install the tools via your package
-manager.)
+| Tool / credential | When you need it | Notes |
+| ----------------- | ---------------- | ----- |
+| `apprafter` CLI | **Always** | the one hard requirement — see [Install](#install). |
+| Hetzner Cloud API token | **Always (Tier 1)** | create one in the Hetzner Cloud console. |
+| SSH public key | **Always (Tier 1)** | injected into the node for break-glass access. |
+| Docker ≥ 24 | To ship **your own** app | builds and pushes the container image (step 3). |
+| A container registry | To ship **your own** app | e.g. GHCR — where the image lives. See [private repos & registries](./private-repos-and-registries.md). |
+| Domain + Cloudflare account | **Public HTTPS only** | step 5 — skip it if you only want to evaluate. |
+| `kubectl` ≥ 1.29 | _Optional_ | only for raw cluster inspection; `apprafter app *` covers the happy path. |
+| `cue` ≥ 0.10 | _Optional_ | only for `apprafter app validate` locally; the cluster validates every change server-side regardless. |
+| Bun ≥ 1.x | _Optional_ | only to run the OneBun starter on your machine. |
 
 ## 1. Register a target and bring the cluster up
 
@@ -53,7 +115,26 @@ under one progress display. Preview it first with
 day-2 commands are in the
 [operator quickstart](../operator-guide/quickstart.md).
 
-Point `kubectl` at the new cluster:
+`apprafter doctor` prints one line per check; output resembles:
+
+```text
+Checking target `prod`...
+  ✓ credentials.yaml present
+  ✓ Hetzner token format
+  ✓ Hetzner API reachable (token authenticates)
+  ✓ SSH public key readable
+
+Checking environment...
+  ✓ kubectl (Client Version: v1.29.x)
+  ⚠ cue (not found — optional; needed only for local `app validate`)
+
+N checks: … passed, 1 warning(s), 0 FAIL
+```
+
+A non-zero exit (any `✗ FAIL`) means something is broken — see
+[Troubleshooting](../operator-guide/troubleshooting.md). Then point
+`kubectl` at the new cluster (optional — only if you want to poke at
+raw resources):
 
 ```sh
 apprafter kubeconfig | tee /tmp/kc
@@ -63,27 +144,33 @@ kubectl get nodes                # ↳ Ready
 
 ## 2. Scaffold your application
 
-Work from the root of your application repository — a `Dockerfile`
-plus a supported runtime (Bun, Node, Python, Rust, or Go). Let the
-CLI detect the runtime and generate an `apprafter/Application.cue`
-manifest for you:
+Work from the root of your application repository (it needs a
+`Dockerfile`). `apprafter app scaffold` writes a minimal
+`apprafter/Application.cue` from a starter **skeleton** — it does
+**not** inspect your `Dockerfile`, source, ports, or env. The
+`--runtime` flag only picks which skeleton to start from (omit it and
+the CLI guesses from files in the current directory; pass it to force
+the choice). The one value auto-filled from your project is the
+`image` ref, derived from your git `origin` (GitHub → `ghcr.io`,
+GitLab → `registry.gitlab.com`, …) — review `image` / `port` / `env`
+/ `needs` before you commit:
 
 ```sh
 git init
 git remote add origin https://github.com/<your-org>/my-service.git
 
 apprafter app scaffold --runtime bun --name my-service
-# ↳ detects bun.lock and writes apprafter/Application.cue. It
-#   pre-fills the image ref from your git origin — edit `image:` if
-#   your registry path differs. Add --needs pg|redis|disk to declare
-#   a managed dependency.
+# ↳ writes apprafter/Application.cue from the `bun` skeleton. The
+#   image ref comes from your git origin — edit `image:`, `port`, and
+#   `env` to match your app. Add --needs pg|redis|disk to declare a
+#   managed dependency.
 
 apprafter app validate           # local cue render check (needs cue on PATH)
 git add . && git commit -m "feat: scaffold apprafter manifest"
 ```
 
 > **No app yet?** The `bun-http` example under
-> [`examples/templates/bun-http/`](https://github.com/apprafter/apprafter/blob/main/examples/templates/bun-http/README.md)
+> [`examples/templates/bun-http/`](https://github.com/apprafter/apprafter/blob/master/examples/templates/bun-http/README.md)
 > is a runnable OneBun service (Bun.js + Effect.ts) you can copy as a
 > starting point.
 
@@ -101,6 +188,12 @@ the runtime is `distroless/nodejs20-debian12:nonroot`. Final image is
 build → push → redeploy iteration loop is covered in
 [`image-iteration.md`](./image-iteration.md).
 
+A **private** image (or a private source repo) needs credentials
+registered first — the token types and scopes differ between Git
+read and registry pull, so see
+[private repos & registries](./private-repos-and-registries.md)
+before you continue.
+
 ## 4. Deploy and verify (internal)
 
 Push the repo, then register it with one command. Argo CD tracks the
@@ -110,11 +203,24 @@ Service. By default `expose.network` is `internal`, so the app is
 ClusterIP-only at this point:
 
 ```sh
-git push -u origin main
+git push -u origin main          # or your repo's default branch
 
 apprafter app add                # auto-detects the git origin
 # ↳ for a private repo, register credentials first with
 #   `apprafter repo creds add`.
+```
+
+`apprafter app add` confirms the registration; output resembles:
+
+```text
+✓ Application 'my-service' registered in AppProject 'apps'.
+  Repo:        https://github.com/<your-org>/my-service.git
+  Revision:    main
+  Path:        apprafter
+  Destination: my-service (created if missing)
+
+Argo CD will sync the workload within a reconcile cycle. State:
+  apprafter app status my-service
 ```
 
 Watch it converge with the simple `app` commands — no raw `kubectl`
@@ -126,8 +232,31 @@ apprafter app logs my-service -f # stream workload logs
 apprafter app open my-service    # port-forward + open in a browser
 ```
 
+`apprafter app status` reports the Argo CD + operator view; once it
+has converged you'll see:
+
+```text
+Application argocd/my-service
+  project:       apps
+  repo:          https://github.com/<your-org>/my-service.git
+  revision:      main
+  path:          apprafter
+  destination:   my-service
+  environment:   prod
+  sync state:    Synced
+  health:        Healthy
+```
+
 `apprafter app list` shows every app you've registered; `apprafter
 app rollback my-service` reverts to the previous revision.
+
+!!! success "Checkpoint — you have a working cluster + app"
+    <a id="checkpoint"></a>
+    You now have a running Tier 1 cluster and an internally-reachable
+    app. **Stop here if you only wanted to evaluate AppRafter** — jump
+    to [Clean up](#clean-up) to tear the paid server down. Continue
+    below only for the full public-HTTPS path on your own domain,
+    which is the heaviest part of the guide.
 
 ## 5. Release to production on a Cloudflare domain
 
@@ -228,12 +357,31 @@ curl --resolve <zone>:443:<node-ip> https://<zone>/   # refused / times out
   staging`), and set the cluster's default environment with
   `apprafter platform env set`.
 
+## Clean up
+
+The Tier 1 server bills for as long as it runs. When you're done,
+tear down the whole cluster and its infrastructure:
+
+```sh
+apprafter destroy --yes          # removes the Hetzner server + all tagged resources
+```
+
+`destroy` reads live state from the Hetzner API and removes every
+resource tagged `apprafter=true`, so it works even if your local
+state file is stale. Drop the `--yes` to be prompted for confirmation
+first.
+
 ## Where to look next
 
 - [`application-cue.md`](./application-cue.md) — the Application.cue
   manifest in depth: fields, `needs`, multi-environment patterns.
+- [private repos & registries](./private-repos-and-registries.md) —
+  credentials for private source repos and private image pulls, and
+  the token-scope gotchas that differ between the two.
 - [`image-iteration.md`](./image-iteration.md) — the build → push →
   auto-redeploy iteration loop.
+- [Troubleshooting](../operator-guide/troubleshooting.md) — diagnostic
+  codes and common bring-up failures.
 - [connect a domain](../public-ingress/connect-a-domain.md) and the
   [Cloudflare Origin CA cert](../public-ingress/cloudflare-origin-cert.md)
   guide — the full public-ingress runbook.
@@ -241,5 +389,5 @@ curl --resolve <zone>:443:<node-ip> https://<zone>/   # refused / times out
   cluster lifecycle and day-2 operations.
 - [gitops-walk](../operator-guide/gitops-walk.md) — wiring Argo CD to
   GitHub / GitLab, public and private.
-- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/main/schemas/v1alpha1/application.cue) —
+- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue) —
   the Application CRD shape your manifest is validated against.
