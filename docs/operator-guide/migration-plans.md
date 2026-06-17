@@ -7,7 +7,7 @@ it creates a `MigrationPlan` and pauses the change; the previous
 version keeps running until you act.
 
 See [ADR 0027](../adr/0027-migrationplan-unification.md) for the
-design rationale and [`spec.md` §3.8](https://github.com/apprafter/apprafter/blob/main/spec.md)
+design rationale and [`spec.md` §3.8](https://github.com/apprafter/apprafter/blob/master/spec.md)
 for the full field reference.
 
 ## What counts as destructive

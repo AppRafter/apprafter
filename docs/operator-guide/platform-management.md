@@ -52,7 +52,7 @@ status:
       message: "0.2.0 → 0.2.1 (safe)"
 ```
 
-See [`spec.md` §3.11](https://github.com/apprafter/apprafter/blob/main/spec.md)
+See [`spec.md` §3.11](https://github.com/apprafter/apprafter/blob/master/spec.md)
 and [ADR 0026](../adr/0026-platformstack-crd.md) for the full field
 reference and design rationale.
 

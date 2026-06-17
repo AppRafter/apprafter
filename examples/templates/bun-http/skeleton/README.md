@@ -3,7 +3,7 @@
 ${{ values.description }}
 
 Generated from the AppRafter `bun-http` golden-path template
-([source](https://github.com/apprafter/apprafter/tree/main/examples/templates/bun-http)).
+([source](https://github.com/apprafter/apprafter/tree/master/examples/templates/bun-http)).
 Built on [OneBun](https://github.com/RemRyahirev/onebun).
 
 ## Develop

@@ -348,14 +348,14 @@ a running Deployment.
 
 ## Where to look next
 
-- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/main/schemas/v1alpha1/application.cue)
+- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue)
   — the CUE schema `#Application` and `#ApplicationSpec` are defined
   here. This is the authoritative field list.
-- [`operator/operator-core/src/application.rs`](https://github.com/apprafter/apprafter/blob/main/operator/operator-core/src/application.rs)
+- [`operator/operator-core/src/application.rs`](https://github.com/apprafter/apprafter/blob/master/operator/operator-core/src/application.rs)
   — the Rust mirror of the schema; `APPRAFTER_ENV` selection and the
   per-environment merge semantics are implemented here.
 - [ADR 0029](../adr/0029-cue-cmp.md) — CUE CMP design rationale.
-- [`examples/applications/parser.cue`](https://github.com/apprafter/apprafter/blob/main/examples/applications/parser.cue)
+- [`examples/applications/parser.cue`](https://github.com/apprafter/apprafter/blob/master/examples/applications/parser.cue)
   — a worked multi-environment example.
 - [`docs/dev-guide/quickstart.md`](./quickstart.md) — scaffold and
   register a first Application end-to-end.
