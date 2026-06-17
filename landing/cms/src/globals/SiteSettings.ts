@@ -24,7 +24,7 @@ export const SiteSettings: GlobalConfig = {
       name: 'specUrl',
       type: 'text',
       required: true,
-      defaultValue: 'https://github.com/AppRafter/apprafter/blob/main/spec.md',
+      defaultValue: 'https://github.com/AppRafter/apprafter/blob/master/spec.md',
     },
     {
       name: 'docsUrl',

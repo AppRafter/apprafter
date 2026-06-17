@@ -6,7 +6,7 @@
       "links": [
         {
           "label": "Spec",
-          "href": "https://github.com/AppRafter/apprafter/blob/main/spec.md",
+          "href": "https://github.com/AppRafter/apprafter/blob/master/spec.md",
           "external": true,
           "soon": false
         },
@@ -30,7 +30,7 @@
       "links": [
         {
           "label": "License — FSL-1.1-Apache-2.0",
-          "href": "https://github.com/AppRafter/apprafter/blob/main/LICENSE",
+          "href": "https://github.com/AppRafter/apprafter/blob/master/LICENSE",
           "external": true,
           "soon": false
         },
