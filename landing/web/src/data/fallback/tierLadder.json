@@ -1,6 +1,7 @@
 {
   "eyebrow": "Tier ladder",
   "title": "One Application manifest. The backing changes — not your app.",
+  "waitlistButtonLabel": "Join the waitlist",
   "cards": [
     {
       "num": "Tier 1",

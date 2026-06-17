@@ -5,12 +5,12 @@
 import BaseLayout from '../components/layout/BaseLayout.astro';
 import Brand from '../components/brand/Brand.astro';
 import Container from '../components/primitives/Container.astro';
+import { getNotFound } from '../lib/cms';
+
+const page = await getNotFound();
 ---
 
-<BaseLayout
-  title="404 — AppRafter"
-  description="The page you were looking for does not exist on apprafter.dev."
->
+<BaseLayout title={page.seoTitle} description={page.seoDescription}>
   <Fragment slot="head">
     <meta name="robots" content="noindex" />
   </Fragment>
@@ -19,16 +19,9 @@ import Container from '../components/primitives/Container.astro';
     <Container>
       <div class="wrap">
         <Brand variant="twoTone" size={28} />
-        <p class="eyebrow" style="margin-top: 48px;">/ 404</p>
-        <h1>Page not found.</h1>
-        <p class="lede">
-          The page you were looking for does not exist on
-          <a href="/">apprafter.dev</a>. The
-          <a href="https://github.com/AppRafter/apprafter/blob/master/spec.md">spec</a>
-          and the
-          <a href="https://github.com/AppRafter/apprafter">GitHub repo</a>
-          are probably what you wanted.
-        </p>
+        <p class="eyebrow" style="margin-top: 48px;">{page.eyebrow}</p>
+        <h1>{page.heading}</h1>
+        <p class="lede" set:html={page.bodyHtml} />
       </div>
     </Container>
   </main>
@@ -53,11 +46,11 @@ import Container from '../components/primitives/Container.astro';
     line-height: 1.55;
     max-width: 560px;
   }
-  .lede a {
+  .lede :global(a) {
     color: var(--accent);
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   }
-  .lede a:hover {
+  .lede :global(a:hover) {
     border-bottom-color: var(--accent);
   }
 </style>

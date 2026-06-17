@@ -14,5 +14,8 @@
   "submitLabel": "Notify me",
   "successMessage": "→ We'll be in touch.",
   "successWithCall": "→ We'll be in touch. You'll get a separate email with a calendar link.",
-  "storageNote": "Stored only for launch announcements."
+  "storageNote": "Stored only for launch announcements.",
+  "emailValidationError": "Please enter a valid email address.",
+  "submitErrorMessage": "Submit failed. Try again in a minute.",
+  "networkErrorMessage": "Network error — try again."
 }

@@ -38,7 +38,7 @@ const cards = data.cards ?? [];
                   class="tier-waitlist btn-waitlist"
                   data-preselect={t.num === 'Tier 2' ? 'tier2' : t.num === 'Tier 3' ? 'tier3' : 'tier4'}
                 >
-                  Join the waitlist
+                  {data.waitlistButtonLabel}
                 </button>
               )}
             </div>

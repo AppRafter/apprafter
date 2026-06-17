@@ -11,6 +11,20 @@ export const ValueProps: GlobalConfig = {
   },
   fields: [
     {
+      name: 'eyebrow',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'Why AppRafter',
+    },
+    {
+      name: 'title',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: "Three things you don't have to fight anymore.",
+    },
+    {
       name: 'blocks',
       type: 'array',
       minRows: 3,

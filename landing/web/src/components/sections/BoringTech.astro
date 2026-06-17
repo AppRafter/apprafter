@@ -16,7 +16,7 @@ const ourCode = data.ourCode ?? [];
     <SectionHead eyebrow={data.eyebrow} title={data.title} lede={data.lede} />
     <div class="boring-grid">
       <div class="boring-col">
-        <h3>Under the hood</h3>
+        <h3>{data.underHoodLabel}</h3>
         <ul class="tech-list">
           {
             underHood.map((item) => (
@@ -29,7 +29,7 @@ const ourCode = data.ourCode ?? [];
         </ul>
       </div>
       <div class="boring-col">
-        <h3>What we wrote ourselves</h3>
+        <h3>{data.ourCodeLabel}</h3>
         <ul class="tech-list">
           {
             ourCode.map((item) => (

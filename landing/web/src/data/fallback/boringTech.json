@@ -1,5 +1,7 @@
 {
   "eyebrow": "The stack",
+  "underHoodLabel": "Under the hood",
+  "ourCodeLabel": "What we wrote ourselves",
   "title": "Boring tech, opinionated glue.",
   "lede": "We don't reinvent the Kubernetes control plane. Under the hood — well-known, proven components. The real work is opinionated composition and a thin layer of code where no ready solution exists.",
   "underHood": [

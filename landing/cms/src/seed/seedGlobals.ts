@@ -35,6 +35,9 @@ export const GLOBAL_MAP: Record<string, string> = {
   bootstrapStrip: 'bootstrap-strip',
   footer: 'footer-content',
   waitlistCopy: 'waitlist-form-copy',
+  legalTerms: 'legal-terms',
+  legalPrivacy: 'legal-privacy',
+  notFound: 'not-found',
 };
 
 export interface SeedOptions {

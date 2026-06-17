@@ -14,21 +14,31 @@ import CodeCopyButton from './CodeCopyButton.svelte';
 type Props = {
   filename: string;
   snippet: string;
+  caption?: string | null | undefined;
 };
 
-const { filename, snippet }: Props = Astro.props;
+const { filename, snippet, caption }: Props = Astro.props;
 const html = cueTokenize(snippet);
 ---
 
-<div class="codeblock" aria-label="Application manifest example">
-  <div class="codeblock-header">
-    <span class="filename">{filename}</span>
-    <CodeCopyButton client:idle snippet={snippet} />
+<div class="codeblock-col">
+  <div class="codeblock" aria-label="Application manifest example">
+    <div class="codeblock-header">
+      <span class="filename">{filename}</span>
+      <CodeCopyButton client:idle snippet={snippet} />
+    </div>
+    <pre set:html={html} />
   </div>
-  <pre set:html={html} />
+  {caption && <p class="cue-caption">{caption}</p>}
 </div>
 
 <style>
+  /* Single grid item for the right hero column: the snippet plus the
+     caption directly beneath it (min-width:0 lets the column shrink so
+     the codeblock's pre keeps its own overflow-x). */
+  .codeblock-col {
+    min-width: 0;
+  }
   .codeblock {
     position: relative;
     background: var(--code-bg);
@@ -97,5 +107,12 @@ const html = cueTokenize(snippet);
   }
   pre :global(.tok-acc) {
     color: var(--accent);
+  }
+  .cue-caption {
+    margin-top: 14px;
+    font-size: 13px;
+    color: var(--fg-faint);
+    line-height: 1.5;
+    max-width: 100%;
   }
 </style>

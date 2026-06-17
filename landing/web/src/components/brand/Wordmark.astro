@@ -2,19 +2,28 @@
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
+import { getSiteSettings } from '../../lib/cms';
+
 type Props = {
   variant?: 'twoTone' | 'mono';
 };
 
 const { variant = 'twoTone' } = Astro.props;
+
+const settings = await getSiteSettings();
+const accent = settings.brandNameAccent;
+const prefix = settings.brandName.endsWith(accent)
+  ? settings.brandName.slice(0, settings.brandName.length - accent.length)
+  : settings.brandName;
 ---
 
 {
   variant === 'mono' ? (
-    <span class="wordmark">AppRafter</span>
+    <span class="wordmark">{settings.brandName}</span>
   ) : (
     <span class="wordmark">
-      App<span class="accented">Rafter</span>
+      {prefix}
+      <span class="accented">{accent}</span>
     </span>
   )
 }

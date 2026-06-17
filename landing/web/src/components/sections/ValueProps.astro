@@ -12,7 +12,7 @@ const blocks = data.blocks ?? [];
 
 <section aria-label="Value props" data-screen-label="value-props">
   <Container>
-    <SectionHead eyebrow="Why AppRafter" title="Three things you don't have to fight anymore." />
+    <SectionHead eyebrow={data.eyebrow} title={data.title} />
     <div class="value-grid">
       {
         blocks.map((p, i) => (

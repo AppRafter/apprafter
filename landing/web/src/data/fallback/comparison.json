@@ -1,6 +1,8 @@
 {
   "eyebrow": "How to run AppRafter",
   "title": "Three ways to run AppRafter.",
+  "statusRowLabel": "Status",
+  "managedWaitlistButtonLabel": "Join waitlist",
   "columns": {
     "self": {
       "label": "Self-host",

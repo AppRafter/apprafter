@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
 import Brand from '../brand/Brand.astro';
-import { getFooterContent, renderCopyright } from '../../lib/cms';
+import { getFooterContent, getSiteSettings, renderCopyright } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
 
 const footer = await getFooterContent();
+const settings = await getSiteSettings();
 const copyright = renderCopyright(footer.copyright);
 const columns = footer.columns ?? [];
 ---
@@ -31,8 +32,11 @@ const columns = footer.columns ?? [];
                   >
                     {link.label}
                     {link.soon && (
-                      <span class="faint mono" style="font-size: 10px; margin-left: 6px;">
-                        SOON
+                      <span
+                        class="faint mono"
+                        style="font-size: 10px; margin-left: 6px; text-transform: uppercase;"
+                      >
+                        {settings.soonBadgeLabel}
                       </span>
                     )}
                   </a>

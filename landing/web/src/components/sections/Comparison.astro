@@ -58,7 +58,7 @@ const safeKind = (k: string | null | undefined): Kind =>
           ))
         }
         <tr class="status-row">
-          <td>Status</td>
+          <td>{data.statusRowLabel}</td>
           <td>
             <StatusPill
               kind={safeKind(cols?.self?.statusKind)}
@@ -66,7 +66,7 @@ const safeKind = (k: string | null | undefined): Kind =>
             />
           </td>
           <td>
-            <button type="button" class="managed-waitlist">Join waitlist</button>
+            <button type="button" class="managed-waitlist">{data.managedWaitlistButtonLabel}</button>
           </td>
           <td>
             <StatusPill

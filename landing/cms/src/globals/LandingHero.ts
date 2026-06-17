@@ -21,12 +21,27 @@ export const LandingHero: GlobalConfig = {
     },
     { name: 'subhead', type: 'textarea', required: true, localized: true },
     { name: 'statusBadge', type: 'text', required: true, localized: true },
+    {
+      name: 'licenseFootnoteHtml',
+      type: 'textarea',
+      localized: true,
+      admin: {
+        description:
+          'Raw HTML for the footnote under the hero, keyed to the * marker on “Open source” in headlineHtml (add <sup>*</sup> there). Leave empty to hide the footnote.',
+      },
+    },
     { name: 'cueFilename', type: 'text', required: true, defaultValue: 'billing-api.cue' },
     {
       name: 'cueSnippet',
       type: 'code',
       required: true,
       admin: { language: 'yaml' },
+    },
+    {
+      name: 'cueCaption',
+      type: 'text',
+      localized: true,
+      admin: { description: 'Caption rendered under the hero code block.' },
     },
     {
       name: 'primaryCTA',

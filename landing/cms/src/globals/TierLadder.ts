@@ -13,6 +13,13 @@ export const TierLadder: GlobalConfig = {
     { name: 'eyebrow', type: 'text', required: true, localized: true },
     { name: 'title', type: 'text', required: true, localized: true },
     {
+      name: 'waitlistButtonLabel',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'Join the waitlist',
+    },
+    {
       name: 'cards',
       type: 'array',
       minRows: 4,

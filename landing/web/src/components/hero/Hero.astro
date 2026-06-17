@@ -71,6 +71,8 @@ const waitlistCopy = await getWaitlistCopy();
         <span>{hero.statusBadge}</span>
       </div>
 
+      {hero.licenseFootnoteHtml && (<p class="hero-footnote"><sup>*</sup> <Fragment set:html={hero.licenseFootnoteHtml} /></p>)}
+
       <WaitlistForm
         client:load
         formIntro={waitlistCopy.formIntro}
@@ -83,10 +85,13 @@ const waitlistCopy = await getWaitlistCopy();
         successMessage={waitlistCopy.successMessage}
         successWithCall={waitlistCopy.successWithCall}
         storageNote={waitlistCopy.storageNote}
+        emailValidationError={waitlistCopy.emailValidationError}
+        submitErrorMessage={waitlistCopy.submitErrorMessage}
+        networkErrorMessage={waitlistCopy.networkErrorMessage}
       />
     </div>
 
-    <HeroCodeBlock filename={hero.cueFilename} snippet={hero.cueSnippet} />
+    <HeroCodeBlock filename={hero.cueFilename} snippet={hero.cueSnippet} caption={hero.cueCaption} />
   </Container>
 </section>
 
@@ -114,6 +119,12 @@ const waitlistCopy = await getWaitlistCopy();
   }
   h1 :global(.accented) {
     color: var(--accent);
+  }
+  h1 :global(sup) {
+    color: var(--accent);
+    font-weight: 500;
+    font-size: 0.5em;
+    vertical-align: super;
   }
   .subhead {
     color: var(--fg-muted);
@@ -190,6 +201,20 @@ const waitlistCopy = await getWaitlistCopy();
     border-radius: 50%;
     background: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+
+  .hero-footnote {
+    margin-top: 24px;
+    font-size: 13px;
+    color: var(--fg-faint);
+    font-style: italic;
+    line-height: 1.55;
+    max-width: 560px;
+  }
+  .hero-footnote :global(sup) {
+    color: var(--accent);
+    font-style: normal;
+    font-weight: 500;
   }
 
   @media (max-width: 1080px) {

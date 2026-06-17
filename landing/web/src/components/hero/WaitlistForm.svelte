@@ -21,6 +21,9 @@ type Props = {
   successMessage: string;
   successWithCall: string;
   storageNote: string;
+  emailValidationError: string;
+  submitErrorMessage: string;
+  networkErrorMessage: string;
 };
 
 let {
@@ -34,6 +37,9 @@ let {
   successMessage,
   successWithCall,
   storageNote,
+  emailValidationError,
+  submitErrorMessage,
+  networkErrorMessage,
 }: Props = $props();
 
 let open = $state(false);
@@ -74,7 +80,7 @@ async function submit(ev: SubmitEvent) {
   ev.preventDefault();
   error = null;
   if (!EMAIL_RE.test(email)) {
-    error = 'Please enter a valid email address.';
+    error = emailValidationError;
     return;
   }
   submitting = true;
@@ -100,10 +106,10 @@ async function submit(ev: SubmitEvent) {
       // unique constraint — treat as already-signed-up success
       submitted = true;
     } else {
-      error = `Submit failed (${res.status}). Try again in a minute.`;
+      error = `${submitErrorMessage} (${res.status})`;
     }
   } catch {
-    error = 'Network error — try again.';
+    error = networkErrorMessage;
   } finally {
     submitting = false;
   }

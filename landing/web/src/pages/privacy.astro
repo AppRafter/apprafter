@@ -9,12 +9,12 @@ import BaseLayout from '../components/layout/BaseLayout.astro';
 import Footer from '../components/layout/Footer.astro';
 import Header from '../components/layout/Header.astro';
 import Container from '../components/primitives/Container.astro';
+import { getLegalPrivacy } from '../lib/cms';
+
+const page = await getLegalPrivacy();
 ---
 
-<BaseLayout
-  title="Privacy — AppRafter"
-  description="AppRafter privacy policy. Currently in preparation; minimal data-collection summary below."
->
+<BaseLayout title={page.seoTitle} description={page.seoDescription}>
   <Fragment slot="head">
     <meta name="robots" content="noindex" />
   </Fragment>
@@ -23,42 +23,10 @@ import Container from '../components/primitives/Container.astro';
   <main id="main">
     <Container>
       <article class="legal">
-        <p class="eyebrow" style="margin-top: 64px;">/ Legal</p>
-        <h1>Privacy.</h1>
+        <p class="eyebrow" style="margin-top: 64px;">{page.eyebrow}</p>
+        <h1>{page.heading}</h1>
 
-        <p class="lede">
-          A formal privacy policy is in preparation. While the project is
-          pre-MVP and AppRafter does not host customer workloads, here is the
-          minimal data-collection summary that applies to <a href="/">apprafter.dev</a> itself.
-        </p>
-
-        <h2>What we collect on apprafter.dev</h2>
-        <ul>
-          <li>Server access logs (IP, user-agent, request path) — retained 30 days for abuse mitigation.</li>
-          <li>Email address you submit via the managed-launch waitlist — used exactly once, for a launch announcement.</li>
-          <li>An optional one-liner about your use case — used to gauge interest, never published.</li>
-          <li>An optional opt-in for a discovery call — triggers a single follow-up email with a Calendly link.</li>
-        </ul>
-
-        <h2>What we don’t do</h2>
-        <ul>
-          <li>No third-party trackers. No advertising pixels. No cross-site cookies.</li>
-          <li>No mailing list. The waitlist is a one-shot announcement channel, not a newsletter.</li>
-          <li>No data sale or transfer to third parties.</li>
-        </ul>
-
-        <h2>Removal</h2>
-        <p>
-          Want your email removed from the waitlist before launch? Send
-          a message to <a href="mailto:hello@apprafter.dev">hello@apprafter.dev</a>
-          and we delete the record.
-        </p>
-
-        <p class="closing">
-          When the formal policy ships it will replace this stub. The
-          source of truth will move to a Payload <code class="mono">LegalPages</code>
-          collection so updates don’t require a code deploy.
-        </p>
+        <div set:html={page.bodyHtml} />
       </article>
     </Container>
   </main>
@@ -76,36 +44,36 @@ import Container from '../components/primitives/Container.astro';
     letter-spacing: -0.02em;
     margin-top: 16px;
   }
-  .legal .lede {
+  .legal :global(.lede) {
     margin-top: 24px;
     color: var(--fg-muted);
     font-size: 18px;
     line-height: 1.55;
   }
-  .legal h2 {
+  .legal :global(h2) {
     margin-top: 48px;
     font-size: 22px;
   }
-  .legal ul {
+  .legal :global(ul) {
     margin-top: 16px;
     padding-left: 22px;
     color: var(--fg-muted);
     display: grid;
     gap: 10px;
   }
-  .legal p {
+  .legal :global(p) {
     margin-top: 16px;
     color: var(--fg-muted);
     line-height: 1.6;
   }
-  .legal a {
+  .legal :global(a) {
     color: var(--accent);
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   }
-  .legal a:hover {
+  .legal :global(a:hover) {
     border-bottom-color: var(--accent);
   }
-  .legal .closing {
+  .legal :global(.closing) {
     margin-top: 56px;
     font-style: italic;
     color: var(--fg-faint);

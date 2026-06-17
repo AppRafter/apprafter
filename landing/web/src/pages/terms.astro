@@ -9,12 +9,12 @@ import BaseLayout from '../components/layout/BaseLayout.astro';
 import Footer from '../components/layout/Footer.astro';
 import Header from '../components/layout/Header.astro';
 import Container from '../components/primitives/Container.astro';
+import { getLegalTerms } from '../lib/cms';
+
+const page = await getLegalTerms();
 ---
 
-<BaseLayout
-  title="Terms — AppRafter"
-  description="AppRafter terms of use. License is FSL-1.1-Apache-2.0; full text in repo."
->
+<BaseLayout title={page.seoTitle} description={page.seoDescription}>
   <Fragment slot="head">
     <meta name="robots" content="noindex" />
   </Fragment>
@@ -23,56 +23,10 @@ import Container from '../components/primitives/Container.astro';
   <main id="main">
     <Container>
       <article class="legal">
-        <p class="eyebrow" style="margin-top: 64px;">/ Legal</p>
-        <h1>Terms.</h1>
+        <p class="eyebrow" style="margin-top: 64px;">{page.eyebrow}</p>
+        <h1>{page.heading}</h1>
 
-        <p class="lede">
-          AppRafter the open-source project is governed by its
-          <a
-            href="https://github.com/AppRafter/apprafter/blob/master/LICENSE"
-            target="_blank"
-            rel="noreferrer">LICENSE</a>
-          (FSL-1.1-Apache-2.0 — see
-          <a
-            href="https://github.com/AppRafter/apprafter/blob/master/docs/adr/0032-license-fsl-1-1-apache-2-0.md"
-            target="_blank"
-            rel="noreferrer">ADR 0032</a>).
-          This page covers terms specific to
-          <a href="/">apprafter.dev</a>.
-        </p>
-
-        <h2>The site</h2>
-        <p>
-          apprafter.dev is informational. No accounts, no purchases, no
-          contracts are signed by browsing it. The site is provided
-          “as is” without warranty.
-        </p>
-
-        <h2>The software</h2>
-        <p>
-          The platform code (cli, operator, schemas, manifests,
-          platform services) is licensed under <strong>FSL-1.1-Apache-2.0</strong>
-          and converts to plain Apache 2.0 two years after each release.
-          You may use it for any purpose — personal, internal business,
-          or commercial workloads — <em>except</em> offering AppRafter
-          itself as a managed service to third parties during the FSL
-          window. After two years, that restriction lifts.
-        </p>
-
-        <h2>The waitlist</h2>
-        <p>
-          Submitting the managed-launch waitlist form is not a contract.
-          We send exactly one announcement email when the managed
-          offering ships, plus one optional follow-up if you ticked the
-          discovery-call box. You can ask us to delete the entry any
-          time at <a href="mailto:hello@apprafter.dev">hello@apprafter.dev</a>.
-        </p>
-
-        <p class="closing">
-          When the formal terms ship they will replace this stub. The
-          source of truth will move to a Payload <code class="mono">LegalPages</code>
-          collection.
-        </p>
+        <div set:html={page.bodyHtml} />
       </article>
     </Container>
   </main>
@@ -90,33 +44,33 @@ import Container from '../components/primitives/Container.astro';
     letter-spacing: -0.02em;
     margin-top: 16px;
   }
-  .legal .lede {
+  .legal :global(.lede) {
     margin-top: 24px;
     color: var(--fg-muted);
     font-size: 18px;
     line-height: 1.55;
   }
-  .legal h2 {
+  .legal :global(h2) {
     margin-top: 48px;
     font-size: 22px;
   }
-  .legal p {
+  .legal :global(p) {
     margin-top: 16px;
     color: var(--fg-muted);
     line-height: 1.6;
   }
-  .legal p strong {
+  .legal :global(p strong) {
     color: var(--fg);
     font-weight: 500;
   }
-  .legal a {
+  .legal :global(a) {
     color: var(--accent);
     border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   }
-  .legal a:hover {
+  .legal :global(a:hover) {
     border-bottom-color: var(--accent);
   }
-  .legal .closing {
+  .legal :global(.closing) {
     margin-top: 56px;
     font-style: italic;
     color: var(--fg-faint);

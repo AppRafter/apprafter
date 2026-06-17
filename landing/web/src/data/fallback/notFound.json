@@ -1,0 +1,7 @@
+{
+  "seoTitle": "404 — AppRafter",
+  "seoDescription": "The page you were looking for does not exist on apprafter.dev.",
+  "eyebrow": "/ 404",
+  "heading": "Page not found.",
+  "bodyHtml": "The page you were looking for does not exist on\n          <a href=\"/\">apprafter.dev</a>. The\n          <a href=\"https://github.com/AppRafter/apprafter/blob/master/spec.md\">spec</a>\n          and the\n          <a href=\"https://github.com/AppRafter/apprafter\">GitHub repo</a>\n          are probably what you wanted."
+}

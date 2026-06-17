@@ -1,5 +1,7 @@
 {
-  "headlineHtml": "One manifest. From a <span class=\"accented\">€5 VPS</span> to production. Open source.",
+  "headlineHtml": "One manifest. From a <span class=\"accented\">€5 VPS</span> to production. Open source<sup>*</sup>.",
+  "cueCaption": "The whole app contract — image, port, env, scale, deps. Not 400 lines of Kubernetes YAML.",
+  "licenseFootnoteHtml": "FSL-1.1-Apache-2.0 — source-available now; converts to plain Apache 2.0 two years after each release. Free for any use — personal, internal, commercial — except offering AppRafter itself as a managed service to third parties.",
   "subhead": "AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — it runs on a single VDS today, and is designed to run unchanged on a multi-node production cluster (Tier 2, Phase 3). Open source (FSL-1.1-Apache-2.0). A managed version is coming for those who'd rather not run ops themselves.",
   "statusBadge": "v0.2 · Phase 2 shipped · live on Tier 1 (single VDS) · Tier 2 + managed in development",
   "cueFilename": "billing-api.cue",

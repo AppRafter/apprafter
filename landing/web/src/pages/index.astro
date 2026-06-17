@@ -14,11 +14,10 @@ import Roadmap from '../components/sections/Roadmap.astro';
 import ScalingJourney from '../components/sections/ScalingJourney.astro';
 import TierLadder from '../components/sections/TierLadder.astro';
 import ValueProps from '../components/sections/ValueProps.astro';
+import { getSiteSettings } from '../lib/cms';
 
-const title =
-  'AppRafter — One manifest. From a €5 VPS to production. Open source.';
-const description =
-  'AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — the same one runs from a single VDS to a multi-node production cluster. Open source (FSL-1.1-Apache-2.0).';
+const settings = await getSiteSettings();
+const description = settings.homeSeoDescription;
 
 const organizationLd = {
   '@context': 'https://schema.org',
@@ -42,7 +41,7 @@ const softwareLd = {
 };
 ---
 
-<BaseLayout title={title} description={description}>
+<BaseLayout title={settings.homeSeoTitle} description={description}>
   <Fragment slot="head">
     <script
       type="application/ld+json"

@@ -10,6 +10,7 @@
 
 import '../../styles/index.css';
 import { assetExists, assetVersion } from '../../lib/asset-version';
+import { getSiteSettings } from '../../lib/cms';
 import { THEME_INIT_SCRIPT } from '../../lib/theme-init';
 
 type Props = {
@@ -44,6 +45,8 @@ const ogImageVersioned =
     ? `${ogImage}${ogImage.includes('?') ? '&' : '?'}v=${assetVersion(ogPath)}`
     : ogImage;
 const ogImageAbs = new URL(ogImageVersioned, Astro.site ?? Astro.url).href;
+
+const settings = await getSiteSettings();
 ---
 
 <!doctype html>
@@ -56,7 +59,7 @@ const ogImageAbs = new URL(ogImageVersioned, Astro.site ?? Astro.url).href;
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
 
-    <meta property="og:site_name" content="AppRafter" />
+    <meta property="og:site_name" content={settings.brandName} />
     <meta property="og:type" content="website" />
     <meta property="og:url" content={canonical} />
     <meta property="og:title" content={title} />

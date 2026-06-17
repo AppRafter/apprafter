@@ -33,9 +33,10 @@ const docsSoon = !settings.docsUrl?.trim();
         rel="noreferrer"
         class={docsSoon ? 'soon' : undefined}
       >
-        Docs
+        {settings.navDocsLabel}
+        {docsSoon && <span class="soon-badge">{settings.soonBadgeLabel}</span>}
       </a>
-      <a href={specUrl} target="_blank" rel="noreferrer">Spec</a>
+      <a href={specUrl} target="_blank" rel="noreferrer">{settings.navSpecLabel}</a>
       <a href={githubUrl} target="_blank" rel="noreferrer" aria-label="GitHub">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path
@@ -93,8 +94,7 @@ const docsSoon = !settings.docsUrl?.trim();
   .nav a:hover {
     color: var(--fg);
   }
-  .nav .soon::after {
-    content: 'Soon';
+  .nav .soon-badge {
     font-family: var(--font-mono);
     font-size: 9px;
     letter-spacing: 0.1em;

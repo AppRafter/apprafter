@@ -76,5 +76,29 @@ export const WaitlistFormCopy: GlobalConfig = {
       localized: true,
       defaultValue: 'Stored only for launch announcements.',
     },
+    {
+      name: 'emailValidationError',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'Please enter a valid email address.',
+    },
+    {
+      name: 'submitErrorMessage',
+      type: 'text',
+      required: true,
+      localized: true,
+      admin: {
+        description: 'Shown on a non-2xx submit; the HTTP status is appended in parentheses.',
+      },
+      defaultValue: 'Submit failed. Try again in a minute.',
+    },
+    {
+      name: 'networkErrorMessage',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'Network error — try again.',
+    },
   ],
 };

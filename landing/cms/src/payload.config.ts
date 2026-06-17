@@ -18,6 +18,9 @@ import { Comparison } from './globals/Comparison';
 import { FooterContent } from './globals/FooterContent';
 import { LandingHero } from './globals/LandingHero';
 import { LandingTransparency } from './globals/LandingTransparency';
+import { LegalPrivacy } from './globals/LegalPrivacy';
+import { LegalTerms } from './globals/LegalTerms';
+import { NotFound } from './globals/NotFound';
 import { Publishing } from './globals/Publishing';
 import { Roadmap } from './globals/Roadmap';
 import { ScalingJourney } from './globals/ScalingJourney';
@@ -127,6 +130,9 @@ export default buildConfig({
     withRebuildHook(BootstrapStrip),
     withRebuildHook(FooterContent),
     withRebuildHook(WaitlistFormCopy),
+    withRebuildHook(LegalTerms),
+    withRebuildHook(LegalPrivacy),
+    withRebuildHook(NotFound),
     Booking,
     Publishing,
   ],

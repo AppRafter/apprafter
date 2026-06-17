@@ -14,6 +14,20 @@ export const BoringTech: GlobalConfig = {
     { name: 'title', type: 'text', required: true, localized: true },
     { name: 'lede', type: 'textarea', required: true, localized: true },
     {
+      name: 'underHoodLabel',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'Under the hood',
+    },
+    {
+      name: 'ourCodeLabel',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'What we wrote ourselves',
+    },
+    {
       name: 'underHood',
       type: 'array',
       labels: { singular: 'Under-the-hood item', plural: 'Under the hood' },

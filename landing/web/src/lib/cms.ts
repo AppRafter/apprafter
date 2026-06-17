@@ -111,6 +111,12 @@ export const getFooterContent = () => fetchGlobal<T.FooterContent>('footer-conte
 export const getWaitlistCopy = () =>
   fetchGlobal<T.WaitlistFormCopy>('waitlist-form-copy', 'waitlistCopy');
 
+export const getLegalTerms = () => fetchGlobal<T.LegalTerm>('legal-terms', 'legalTerms');
+
+export const getLegalPrivacy = () => fetchGlobal<T.LegalPrivacy>('legal-privacy', 'legalPrivacy');
+
+export const getNotFound = () => fetchGlobal<T.NotFound>('not-found', 'notFound');
+
 /** Substitute {{year}} in the footer copyright string. */
 export function renderCopyright(template: string, year = new Date().getFullYear()): string {
   return template.replace(/\{\{year\}\}/g, String(year));

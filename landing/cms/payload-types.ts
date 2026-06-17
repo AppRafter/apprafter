@@ -101,6 +101,9 @@ export interface Config {
     'bootstrap-strip': BootstrapStrip;
     'footer-content': FooterContent;
     'waitlist-form-copy': WaitlistFormCopy;
+    'legal-terms': LegalTerm;
+    'legal-privacy': LegalPrivacy;
+    'not-found': NotFound;
     booking: Booking;
     publishing: Publishing;
   };
@@ -118,6 +121,9 @@ export interface Config {
     'bootstrap-strip': BootstrapStripSelect<false> | BootstrapStripSelect<true>;
     'footer-content': FooterContentSelect<false> | FooterContentSelect<true>;
     'waitlist-form-copy': WaitlistFormCopySelect<false> | WaitlistFormCopySelect<true>;
+    'legal-terms': LegalTermsSelect<false> | LegalTermsSelect<true>;
+    'legal-privacy': LegalPrivacySelect<false> | LegalPrivacySelect<true>;
+    'not-found': NotFoundSelect<false> | NotFoundSelect<true>;
     booking: BookingSelect<false> | BookingSelect<true>;
     publishing: PublishingSelect<false> | PublishingSelect<true>;
   };
@@ -376,6 +382,25 @@ export interface SiteSetting {
    * Reserved for Phase I+ analytics. Leave empty for v1.
    */
   plausibleDomain?: string | null;
+  /**
+   * Full brand name — og:site_name + the mono wordmark.
+   */
+  brandName: string;
+  /**
+   * Trailing slice of brandName rendered in the accent colour in the two-tone wordmark.
+   */
+  brandNameAccent: string;
+  navDocsLabel: string;
+  navSpecLabel: string;
+  soonBadgeLabel: string;
+  /**
+   * The <title> for the home page.
+   */
+  homeSeoTitle: string;
+  /**
+   * The meta description for the home page.
+   */
+  homeSeoDescription: string;
   updatedAt?: string | null;
   createdAt?: string | null;
 }
@@ -391,8 +416,16 @@ export interface LandingHero {
   headlineHtml: string;
   subhead: string;
   statusBadge: string;
+  /**
+   * Raw HTML for the footnote under the hero, keyed to the * marker on “Open source” in headlineHtml (add <sup>*</sup> there). Leave empty to hide the footnote.
+   */
+  licenseFootnoteHtml?: string | null;
   cueFilename: string;
   cueSnippet: string;
+  /**
+   * Caption rendered under the hero code block.
+   */
+  cueCaption?: string | null;
   primaryCTA: {
     label: string;
     href: string;
@@ -416,6 +449,8 @@ export interface LandingHero {
  */
 export interface ValueProp {
   id: number;
+  eyebrow: string;
+  title: string;
   blocks?:
     | {
         title: string;
@@ -476,6 +511,7 @@ export interface TierLadder {
   id: number;
   eyebrow: string;
   title: string;
+  waitlistButtonLabel: string;
   cards?:
     | {
         num: string;
@@ -524,6 +560,8 @@ export interface Comparison {
       statusLabel: string;
     };
   };
+  statusRowLabel: string;
+  managedWaitlistButtonLabel: string;
   rows?:
     | {
         label: string;
@@ -571,6 +609,8 @@ export interface BoringTech {
   eyebrow: string;
   title: string;
   lede: string;
+  underHoodLabel: string;
+  ourCodeLabel: string;
   underHood?:
     | {
         name: string;
@@ -725,6 +765,69 @@ export interface WaitlistFormCopy {
   successMessage: string;
   successWithCall: string;
   storageNote: string;
+  emailValidationError: string;
+  /**
+   * Shown on a non-2xx submit; the HTTP status is appended in parentheses.
+   */
+  submitErrorMessage: string;
+  networkErrorMessage: string;
+  updatedAt?: string | null;
+  createdAt?: string | null;
+}
+/**
+ * Terms page (apprafter.dev/terms) — stub copy until the formal terms ship.
+ *
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "legal-terms".
+ */
+export interface LegalTerm {
+  id: number;
+  seoTitle: string;
+  seoDescription: string;
+  eyebrow: string;
+  heading: string;
+  /**
+   * Raw HTML for the page body — lede paragraph, <h2>/<p> sections, and the .closing note.
+   */
+  bodyHtml: string;
+  updatedAt?: string | null;
+  createdAt?: string | null;
+}
+/**
+ * Privacy page (apprafter.dev/privacy) — stub copy until the formal policy ships.
+ *
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "legal-privacy".
+ */
+export interface LegalPrivacy {
+  id: number;
+  seoTitle: string;
+  seoDescription: string;
+  eyebrow: string;
+  heading: string;
+  /**
+   * Raw HTML for the page body — lede paragraph, <h2>/<ul>/<p> sections, and the .closing note.
+   */
+  bodyHtml: string;
+  updatedAt?: string | null;
+  createdAt?: string | null;
+}
+/**
+ * Copy for the 404 page (apprafter.dev/404).
+ *
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "not-found".
+ */
+export interface NotFound {
+  id: number;
+  seoTitle: string;
+  seoDescription: string;
+  eyebrow: string;
+  heading: string;
+  /**
+   * Raw HTML for the lede paragraph under the 404 heading.
+   */
+  bodyHtml: string;
   updatedAt?: string | null;
   createdAt?: string | null;
 }
@@ -795,6 +898,13 @@ export interface SiteSettingsSelect<T extends boolean = true> {
   specUrl?: T;
   docsUrl?: T;
   plausibleDomain?: T;
+  brandName?: T;
+  brandNameAccent?: T;
+  navDocsLabel?: T;
+  navSpecLabel?: T;
+  soonBadgeLabel?: T;
+  homeSeoTitle?: T;
+  homeSeoDescription?: T;
   updatedAt?: T;
   createdAt?: T;
   globalType?: T;
@@ -807,8 +917,10 @@ export interface LandingHeroSelect<T extends boolean = true> {
   headlineHtml?: T;
   subhead?: T;
   statusBadge?: T;
+  licenseFootnoteHtml?: T;
   cueFilename?: T;
   cueSnippet?: T;
+  cueCaption?: T;
   primaryCTA?:
     | T
     | {
@@ -835,6 +947,8 @@ export interface LandingHeroSelect<T extends boolean = true> {
  * via the `definition` "value-props_select".
  */
 export interface ValuePropsSelect<T extends boolean = true> {
+  eyebrow?: T;
+  title?: T;
   blocks?:
     | T
     | {
@@ -890,6 +1004,7 @@ export interface ScalingJourneySelect<T extends boolean = true> {
 export interface TierLadderSelect<T extends boolean = true> {
   eyebrow?: T;
   title?: T;
+  waitlistButtonLabel?: T;
   cards?:
     | T
     | {
@@ -940,6 +1055,8 @@ export interface ComparisonSelect<T extends boolean = true> {
               statusLabel?: T;
             };
       };
+  statusRowLabel?: T;
+  managedWaitlistButtonLabel?: T;
   rows?:
     | T
     | {
@@ -979,6 +1096,8 @@ export interface BoringTechSelect<T extends boolean = true> {
   eyebrow?: T;
   title?: T;
   lede?: T;
+  underHoodLabel?: T;
+  ourCodeLabel?: T;
   underHood?:
     | T
     | {
@@ -1105,6 +1224,51 @@ export interface WaitlistFormCopySelect<T extends boolean = true> {
   successMessage?: T;
   successWithCall?: T;
   storageNote?: T;
+  emailValidationError?: T;
+  submitErrorMessage?: T;
+  networkErrorMessage?: T;
+  updatedAt?: T;
+  createdAt?: T;
+  globalType?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "legal-terms_select".
+ */
+export interface LegalTermsSelect<T extends boolean = true> {
+  seoTitle?: T;
+  seoDescription?: T;
+  eyebrow?: T;
+  heading?: T;
+  bodyHtml?: T;
+  updatedAt?: T;
+  createdAt?: T;
+  globalType?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "legal-privacy_select".
+ */
+export interface LegalPrivacySelect<T extends boolean = true> {
+  seoTitle?: T;
+  seoDescription?: T;
+  eyebrow?: T;
+  heading?: T;
+  bodyHtml?: T;
+  updatedAt?: T;
+  createdAt?: T;
+  globalType?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "not-found_select".
+ */
+export interface NotFoundSelect<T extends boolean = true> {
+  seoTitle?: T;
+  seoDescription?: T;
+  eyebrow?: T;
+  heading?: T;
+  bodyHtml?: T;
   updatedAt?: T;
   createdAt?: T;
   globalType?: T;

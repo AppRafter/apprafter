@@ -103,6 +103,20 @@ export const Comparison: GlobalConfig = {
       ],
     },
     {
+      name: 'statusRowLabel',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'Status',
+    },
+    {
+      name: 'managedWaitlistButtonLabel',
+      type: 'text',
+      required: true,
+      localized: true,
+      defaultValue: 'Join waitlist',
+    },
+    {
       name: 'rows',
       type: 'array',
       minRows: 1,
