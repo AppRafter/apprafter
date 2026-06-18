@@ -3297,6 +3297,53 @@ Tests:
 
 ---
 
+### 2.6c needs.disk durability + cross-app SharedVolume
+
+> 🏁 SR: A · order 3.5 (post-T1-demo, pre-T2-substrate) — disk backup + capacity-signal (owned **и** shared диски) + cross-app SharedVolume (`needs.disk.ref`, single-node same-ns). Early-adopter unblocker: pm2-юзер с shared-папкой между приложениями переезжает на AppRafter, получая изоляцию лучше pm2 + backups/мониторинг, которых у него сейчас нет. **Cross-ns / multi-node shared И intra-app `shareMode: shared` — НЕ здесь, остаются T2 (2.6b-deferred).**
+
+Пакет закрывает два ортогональных слоя поверх 2.6b owned-disk пайплайна:
+
+1. **Disk-level durability (owned + shared).** Голый PVC без backup и без сигнала о заполнении — это pm2-grade footgun, который платформа обязана убирать («enterprise practices без enterprise complexity»). Поэтому backup + capacity-signal — это **disk-level** capability (нужна owned-дискам независимо от shared-истории), shared volume её просто наследует.
+2. **Cross-app SharedVolume.** Несколько приложений *одного владельца* в одном namespace разделяют один том на запись — явный opt-in, релаксирующий дефолтную изоляцию **внутри объявленной trust-group**, а не глобально (философия orthogonal opt-in switches, ADR 0033). Storage-share и network-share — независимые оси: шарится папка, сеть НЕ открывается (для сети — отдельный `connects`).
+
+**Жёсткий T1-инвариант, который держат webhook + capacity-signal:** на single-node `local-path` requested-`size` НЕ энфорсится как квота (это request, не limit) — разогнавшийся том заполняет **диск ноды целиком**, утаскивая k3s/etcd. Значит значимый сигнал — node-disk-free, а не «size минус used».
+
+**Декомпозиция (порядок сборки) — durability сначала, SharedVolume следом:**
+
+- [ ] **2.6c-1 — capacity-signal (owned + shared).** Оператор читает per-PVC `usedBytes`/`capacityBytes`/`availableBytes` + node-level `fsAvailableBytes` через kubelet Summary API (`/stats/summary`, RBAC `nodes/stats`) — **без зависимости от full OTel-пайплайна** (он order 5). Условие на `status` claim'а/Application + Warning Event при `node-free < threshold` (default 15%) или `volume-used > soft-limit`. Surface в `apprafter app status` / `apprafter volume status` (used/free at a glance). **Defer:** Grafana-дашборды + Alertmanager-правила → order 5 (OTel-subset 3.7a).
+- [ ] **2.6c-2 — T1 disk backup (restic → внешний таргет), owned + shared.** Поле `backup: {enabled, schedule?, retention?}` уже в 2.6b-deferred-схеме (`plan.md:2889`) — здесь даётся **T1-механизм** под него, не новая схема. При `backup.enabled` оператор эмитит `CronJob` per backup-enabled claim: монтирует PVC **RO** → `restic`/`kopia` push в **внешний** repo (Hetzner Storage Box / B2 / S3 — на T1 нет CSI-снапшотов и in-cluster `needs.s3` отложен; бэкап на ту же ноду бессмысленен). Repo-creds из SealedSecret (platform-configured backup target). Retention через `restic forget --keep-*`. Restore = ручная процедура в DR-доке. **Соотношение с 2.6b-deferred CSI-snapshot backup:** оба механизма за ОДНИМ полем `backup`, резолв по tier-capability (restic→external на T1; CSI-snapshot + Velero на T2+ где есть 4.12) — комплементарны, не конфликтуют.
+- [ ] **2.6c-3 — SharedVolume backend + `shared-local` provider + объект с явным lifecycle.** Новый backend-тип **`shared-disk`** (НЕ `disk`) → scheduler не кросс-матчит его на owned-`disk` линейку (`disk-local`/`disk-hcloud`). Сид `shared-local` ServiceProvider (T1): `storageClass: local-path`, провижинит **один unowned** PVC под SharedVolume, `accessMode: ReadWriteOnce` (node-level — на single-node несколько подов монтируют один RWO-том корректно). Та же `local-path` строка, что у `disk-local`, но **другой backend/provider** → разные provisioning-arm'ы, ноль пересечений; T2-расширение свопает `shared-local`→`shared-nfs` (RWX), не трогая манифесты. SharedVolume — объект (CRD или platform-ns-scoped) с **explicit** lifecycle (`apprafter volume create/rm`), lifecycle независим от приложений. Моделируем объектом, а не «ref на голый PVC» — ради portability (0.2): `ref` стабилен, пока backing меняется local-path→NFS поперёк тиров.
+- [ ] **2.6c-4 — `ref`-форма грамматики + reference-arm + renderer mount + CLI.**
+    - [ ] Грамматика: `needs.disk: { ref: "<name>", mountPath, readOnly? }` (referenced) против `{ name, size, mountPath }` (owned). Webhook разводит по shape: `ref`-claim не несёт `size`/backend, это чистый binding.
+    - [ ] Webhook: reject `ref` на несуществующий SharedVolume; **reject cross-ns ref** на T1 (все референсящие apps + SharedVolume PVC обязаны быть в одном namespace — PVC namespaced, single-node same-ns = v1-инвариант) с сообщением «cross-namespace shared volumes require T2 (NFS) — deferred».
+    - [ ] Provisioner **reference-arm**: на `ref`-claim биндит существующий PVC SharedVolume, **не** провижинит новый backing, **не** GC'ит его при удалении app (lifecycle у SharedVolume, не у claim'а).
+    - [ ] Renderer: mount как owned-disk, но **БЕЗ форса `strategy: Recreate`** (owned-arm форсит Recreate из-за single-PVC-cross-node; reference-arm на single-node RWO-multi-pod терпит RollingUpdate — наследовать 0043-правило нельзя).
+    - [ ] CLI: `apprafter volume create/rm/list/status`; `rm` отказывает пока есть референсы (delete-guard). Автоматический refcount-GC с grace — defer (explicit create/rm + guard достаточно для раннего адоптера).
+- [ ] **2.6c-5 — walk/e2e + docs + ADR + координированный release.**
+    - [ ] `e2e/shared-volume-walk.sh` (kind+podman, по образцу `needs-disk-walk.sh`): 2 app в одном ns референсят один SharedVolume → оба видят writes друг друга; rolling update одного app не роняет mount у второго; `backup.enabled` CronJob производит restore-able snapshot; capacity warning срабатывает при заполнении; `volume rm` отказывает пока референсится, проходит после снятия последнего `ref`.
+    - [ ] Docs: `operator-guide/shared-volumes.md` (ref-семантика, trust-group модель, T1 single-ns инвариант), `operator-guide/backup-restore.md` (restic restore procedure), update `dev-guide` needs-reference.
+    - [ ] ADR 0047 — cross-app SharedVolume (`needs.disk.ref`): вводит *reference*-концепт в claim-грамматику (cross-cutting, ровно как `(type,name)` в ADR 0043). Mechanism-выбор backup (restic→external vs CSI) — в §Consequences 0047 либо отдельным коротким ADR.
+    - [ ] Координированный release operator + platform-stack + cli (CRD-additive → safe), по образцу 2.6b v0.2.21. Гейты: `cargo fmt/clippy -D/test --workspace` + `just lint` + `cue vet` + `just crd-validate` + `just platform-stack-check` + strict mkdocs.
+
+**Не входит (отложено — distinct from this package):**
+- **intra-app `shareMode: shared`** (реплики ОДНОГО app видят writes друг друга через RWX) — другой концепт, остаётся 2.6b-deferred / T2 (rook-nfs). Пересекается с 2.6c только общим NFS-бэкендом, который появляется на T2.
+- **cross-namespace + multi-node SharedVolume** (включая «dev/prod в одну папку» — это и есть настоящий cross-ns кейс): требует NFS export + static-PV-per-ns; уезжает в T2 вместе с RWX-бэкендом. `ref`-грамматика к этому forward-compatible (меняется только backing).
+- **CSI-snapshot backup / autoExpand / quota enforcement / StatefulSet pivot** — остаются 2.6b-deferred (T2+).
+
+**Acceptance:**
+- 2 app (`needs.disk.ref` на один SharedVolume) в одном ns деплоятся, оба читают/пишут общий том, видят writes друг друга; rolling update одного не прерывает доступ второго.
+- `apprafter volume create` создаёт SharedVolume; `apprafter volume status` показывает used/free; `apprafter volume rm` отказывает «still referenced by N apps», проходит после снятия референсов.
+- `ref` на несуществующий volume → webhook reject; cross-ns `ref` на T1 → webhook reject с T2-hint.
+- `backup.enabled` на owned-диске → CronJob пушит в внешний repo по cron; `restic restore` восстанавливает данные в свежий PVC; retention удаляет старые снапшоты.
+- Заполнение тома до node-free < threshold → Warning Event + condition в `status` + видно в `app status`/`volume status`.
+- Owned-disk пайплайн 2.6b (provision/RetainedClaim/GC/reattach) не регрессирует.
+
+**Зависит от:** 2.6b (owned-disk пайплайн: ResourceClaim/ServiceProvider/RetainedClaim/renderer); 2.11 (SealedSecrets — для backup-target creds). **Full OTel — НЕ зависимость** (capacity-signal через kubelet Summary API; дашборды отложены к order 5).
+
+**Размер:** L. **Carve-опция:** durability (`2.6c-1` + `2.6c-2`) и SharedVolume (`2.6c-3…5`) — независимо releasable; при желании развести в `### 2.6c` (durability, owned+shared, можно отгрузить чуть раньше) + `### 2.6d` (SharedVolume).
+
+---
+
 ### 2.7 SPIRE installation + workload identity
 > 🏁 SR: C — SPIRE; trigger: first Tier-2 OpenBao-grade or compliance ask
 
@@ -3553,6 +3600,102 @@ Tests:
 **Зависит от:** 2.9 (per-env модель), 2.12 (env-value-модель + релаксация-через-webhook прецедент), webhook image-rule (образец кросс-полевого инварианта). **Релиз:** operator + webhook + schema ⇒ cue-cmp bump + platform-stack bump + operator-chart appVersion (НЕ CLI — манифест-семантика чисто in-cluster).
 
 **Размер:** M · оператор deep-merge — мелочь; основная масса — schema-relax + webhook effective-invariant + CRD-regen + walk. Сам wholesale→deep-merge касается осмысления base↔override в целом (struct-поля), в русле замысла 2.9.
+
+---
+
+### 2.16d — Resource requests baseline: seed-or-explicit + backends + LimitRange
+> 🏁 SR: A — ни один под не BestEffort (safety baseline); live T1 prod (Hetzner cpx22, ~788Mi headroom, no swap; замер 2026-06-17: kubepods ws ~1.07G / k3s.service ~1.5G) сейчас весь BestEffort. Хочет раннего слота — перенести при желании.
+
+**Контекст:** реквесты не настроены (давний near-term gap). Все поды — app Deployments, `platform-postgres-1` (CNPG-инстанс), Dragonfly — BestEffort QoS. Под memory pressure ядро может OOM-killнуть stateful Postgres так же легко, как контроллер: нет QoS-приоритета. Stateful backend под ножом — худший исход (OOM посреди записи).
+
+**Цель:** ни один под не BestEffort; контейнер приложения и backends получают requests/limits по умолчанию; явный override для тех, кто точно знает (pro-mode).
+
+**Поставка (рендерер — чистая функция; override-wins по образцу `image`):**
+- [ ] `operator-rendering` эмитит блок `resources` на контейнере приложения. Default seed = **Burstable: low memory/cpu request + memory limit**. NB: «limit-only» НЕ вариант — limit без request авто-выставляет request=limit (это уже не BestEffort и резервирует весь limit); нужен явный низкий request + потолок-limit. Asymmetry: memory request щедро (incompressible → не OOM), CPU скромно (compressible → throttle, не kill). Seed **runtime-agnostic** консервативный (runtime-detector отвергнут как хрупкий для прода; наблюдение из 2.16e поправит точнее, чем угадывание по рантайму).
+- [ ] **Pro-mode:** если `Application.spec.*.resources` задан юзером — берётся дословно (override-wins); seed применяется ТОЛЬКО когда поле опущено. Per-env merge (как `expose`/`needs`).
+- [ ] **Backends:** provisioner проставляет `resources` в CNPG `Cluster` CR и Dragonfly CR (они тоже BestEffort; stateful Postgres — самый опасный). Tier-aware дефолт (как CNPG `instances`).
+- [ ] **LimitRange** per tenant namespace (`defaultRequest`/`default`/`min`/`max`) — catch-all backstop для всего, что рендерер не владеет (jobs, raw-поды). Платформенный chart.
+- [ ] CRD-additive: опциональное `resources` на Application spec; `just crd-validate`.
+- [ ] Live walk: апп без `resources` → под **Burstable** (assert `kubectl get pod -o jsonpath='{.status.qosClass}'` ≠ BestEffort); апп с явным `resources` → дословно; CNPG/Dragonfly поды не BestEffort.
+
+**Acceptance:** ни один под платформы/приложений не BestEffort; явный `resources` уважается verbatim; stateful backends (Postgres/Dragonfly) имеют QoS-приоритет выше новых/stateless ворклоадов.
+
+**Зависит от:** 2.4 (provisioner — для resources на backend CR), 2.9 (per-env merge), webhook image-rule + 2.12 (образец override-wins / schema-relax-через-webhook). **Релиз:** operator + webhook + schema ⇒ cue-cmp bump + platform-stack bump (манифест-семантика чисто in-cluster, CLI вряд ли — как 2.16c).
+
+**Размер:** M · seed + pro-override в рендерере — основная масса; LimitRange + backend resources — мелочь.
+
+---
+
+### 2.16e — Vertical autoscaling через VPA (InPlaceOrRecreate)
+> 🏁 SR: A · после 2.16d — авто-коррекция requests по наблюдаемому usage; seed из 2.16d закрывает только safety, не over/under. Постоянный движок (дневные/недельные пики), не разовый bootstrap.
+
+**Контекст:** seed из 2.16d консервативен — safe, но переплачивает; over/under для произвольных аппов закрывает только наблюдение. На t=0 данных нет ни у кого (ни VPA, ни любой stats-engine), поэтому seed + bootstrap-окно неизбежны → VPA берёт верх после накопления истории (~24-48h до осмысленной rec, неделя+ до cyclic-aware). **Adopt VPA, НЕ строить recommender** — decaying histogram (затухание, cross-restart, percentile, по памяти не ниже peak) зрелый; «do it right once». Дифференциатор — путь применения (in-place / GitOps-clean), не алгоритм.
+
+**Предусловия (✅ закрыты на T1):** k8s v1.35.5 (in-place resize GA, без feature gates), containerd 2.2.3 (≥2.0 для UpdateContainerResources CRI), cgroup v2. → `InPlaceOrRecreate` без рестарта снимает single-node eviction-возражение.
+
+**Поставка:**
+- [ ] VPA в platform-stack (recommender + updater + admission-controller). Mode `InPlaceOrRecreate` (Auto deprecated с VPA 1.4.0). Старт в `Off` (recommendation-only) → enforcement после walk-валидации.
+- [ ] **Recommender tuning под недельные пики:** `--memory-aggregation-interval=24h` + `--memory-aggregation-interval-count=14` (14д окно) + `--memory-histogram-decay-half-life=168h` (7д half-life). NB: дефолтный 24h half-life стирает недельный пик (2⁻⁷≈0.8%) → недопровижн cyclic-аппов. Trade-off: длиннее окно = медленнее реакция на снижения (консервативнее) — на узком узле в правильную сторону. `--memory-saver=true` (рекоммендер держит state только для VPA-таргетнутых подов → меньше его RAM на тесном T1).
+- [ ] **`minAllowed.memory` floor — обязателен** per-VPA. Defense: checkpoint float→int rounding bug может выдать 0-memory rec после рестарта рекоммендера → OOM-loop; плюс incompressible memory. `maxAllowed` тоже.
+- [ ] **GitOps-reconciliation** (VPA мутирует live spec out-of-band → Argo видит drift на `resources`): решить в ADR — либо Argo `ignoreDifferences` на `/spec/template/spec/containers/*/resources` для VPA-managed, либо writeback рекомендации в манифест. Writeback чище под GitOps-as-sole-control-surface + ложится на MCP-agent approval-gate.
+- [ ] **Pro-mode opt-out:** аппы с явным `resources` (2.16d) → VPA `Off`/не таргетятся (юзер владеет; advisory-нотификация «actual=X» в портал — единственный осмысленный сток в pro-режиме).
+- [ ] **KEDA-эксклюзия:** VPA НЕ на одном CPU/mem-метрике с KEDA-скейлингом (ADR 0019) — death-spiral (VPA↓request → HPA-математика едет → реплики взрываются → гистограммы скашиваются). Гард + докум.
+- [ ] VPACheckpoint персист (CRD в datastore — на single-node k3s это kine/sqlite); пережить рестарт рекоммендера.
+- [ ] Live walk: апп без `resources` → VPA набирает историю → `InPlaceOrRecreate` поднимает/опускает request на живом поде **без рестарта** (assert `RESTARTS=0`, под не пересоздан); minAllowed держит пол.
+
+**Acceptance:** VPA авто-корректирует requests аппов по usage без рестарта (in-place); недельный пик в окне тянет memory-request вверх; minAllowed предотвращает 0-rec; pro-mode аппы не трогаются; KEDA-ворклоады исключены.
+
+**Зависит от:** 2.16d (resource-модель + pro-override field), KEDA (3.x — эксклюзия), новый ADR resource governance (~0049). **Footprint-нюанс:** VPA-компоненты сами едят память (histograms в RAM) — на узком T1 это meta-overhead; `--memory-saver` смягчает, на T2+ некритично.
+
+**Размер:** M-L · VPA-деплой + tuning + minAllowed — умеренно; GitOps-reconciliation (ignoreDifferences vs writeback) — основной дизайн-вопрос; walk на in-place.
+
+---
+
+### 2.16f — Argo CD footprint tuning (T1)
+> 🏁 SR: A — срезать платформенный footprint на узком T1 (live prod 788Mi headroom); НЕЗАВИСИМ от 2.16d/e, быстрый reversible win, может ехать раньше. Перенести при желании.
+
+**Контекст:** на live T1 (4GB) Argo CD — самый тяжёлый «арендатор»: app-controller ~305Mi + repo-server ~109Mi на горстку Applications (замер 2026-06-17). Контроллер — Go-приложение: держит resource-tree всех аппов в памяти (~40% его памяти — live-resource-cache) + Go-runtime не отдаёт freed heap до удвоения. На Cilium-кластере вдобавок трекает churny `CiliumIdentity`/`CiliumEndpoint` без нужды.
+
+**Цель:** снизить working set Argo-компонентов на T1 без потери функциональности (ожидание: app-controller 305→~175Mi, итого ~−140Mi → headroom 21%→~24%). NB: пол ~150-200Mi (Go-runtime + informer baseline) — ниже не упасть; k3s control plane (~1.4GB) тюнингом Argo НЕ трогается.
+
+**Поставка (всё через platform-stack chart values — НЕ kubectl; инвариант «платформа реконсилится через Argo»):**
+- [ ] `GOMEMLIMIT` на app-controller (~256MiB) + `GOGC=50` — заставить Go отдавать heap / чаще GC. То же на repo-server.
+- [ ] `resource.exclusions` в `argocd-cm`: `Event`, `Endpoints`/`EndpointSlice`, coordination `Lease`, `metrics.k8s.io/*`, и **`cilium.io` `CiliumIdentity`/`CiliumEndpoint`** (churny на Cilium, Argo они не нужны) — режет live-resource-cache И CPU-diff'ы.
+- [ ] (опц.) Отключить `applicationset-controller` (~26Mi), если ApplicationSets не используются.
+- [ ] Замер до/после: `kubectl top pods -n argocd`; зафиксировать в PROJECT_STATS.
+- [ ] Skip: sharding (single-node, это для many-clusters), Kyverno-exclusions (не используется).
+
+**Acceptance:** Argo-компоненты на T1 потребляют ощутимо меньше (app-controller < ~200Mi) при сохранении sync/health; платформа по-прежнему реконсилится без ручного apply.
+
+**Зависит от:** — (независим). Связан с 2.16d (та же цель — освободить headroom на live T1).
+
+**Размер:** S · конфиг-only (env + `argocd-cm` в chart values) + замер.
+
+---
+
+### 2.16g — Provisioned swap + NoSwap behaviour (node-substrate default, tier-aware)
+> 🏁 SR: A — превратить OOM-склонный no-swap дефолт в прощающий: host-своп поглощает спайки control plane (на live T1 `k3s.service` пикал 2.8G при 788Mi headroom), поды НЕ свопятся (NoSwap → Postgres в RAM). T1-часть launch-scope; T2-тюнинг активируется с 3.1.
+
+**Контекст:** ноды провижатся БЕЗ свопа (swap=0). При тонком headroom транзиентный спайк host-процесса (apiserver/kubelet/datastore) → reclaim → OOM, без подушки. `NoSwap` (дефолт k8s) даёт ровно нужное: поды свопиться не могут (Postgres/apps в RAM, без latency-яда), а системные демоны вне scope k8s (включая k3s-процесс) — могут, поглощая спайк. **Бенефит tier- и node-size-agnostic** (любая нода с control plane — хоть cx22, хоть ccx — выигрывает от подушки; спайк относителен размеру ноды). Substrate у T1 и T2 ОДИН (любая hcloud-нода cx/cax/cpx/ccx); отличие T1↔T2 — node count + datastore + HA, **НЕ класс ноды**. Единственный risk-водораздел для свопа — datastore, и он контринтуитивен: на T2 своп не «меньше нужен», а **рискованнее**.
+
+**Развилка по тирам (datastore-driven, НЕ node-class):**
+- **T1 — 1 hcloud-нода, kine/sqlite** (disk-backed, swap-толерантен): своп безопасен, `swappiness=10`. Single-node = нет HA-fallback → OOM control plane = полный простой кластера → подушка особенно ценна (независимо от размера ноды).
+- **T2 — 3+ hcloud-нод, embedded etcd, quorum:** per-node spike-risk и бенефит подушки — **те же** (substrate тот же, любая нода). HA смягчает *последствие* отсутствия свопа (quorum переживёт OOM одной ноды), но **etcd делает сам своп опасным**: swap-latency → пропуск heartbeat'ов → leader-election churn. etcd встроен в k3s-процесс (host) → при NoSwap host МОЖЕТ его свопнуть. Значит `swappiness=1` (агрессивно-консервативно) + защита etcd от свопа (mlock/исключение) — open research.
+- **T3 (bare metal, Robot) / T4 (гиперскейлеры):** Talos — своп вероятно не поддерживается (immutable OS), **verify**; на T4 provisioning вообще hyperscaler-specific (managed node pools) → отдельная история. Revisit при kine+NATS.
+
+**Поставка (CLI node-provisioning / k3s-installer path):**
+- [ ] Swapfile при node-setup (диск, НЕ zram — zram ест дефицитный RAM); размер скромный 2-4 ГБ (подушка, не ёмкость).
+- [ ] `vm.swappiness` per-tier (T1=10 / T2=1) через sysctl при provisioning.
+- [ ] `fail-swap-on=false` в k3s kubelet-args (kubelet стартует при свопе; swapBehavior=NoSwap по дефолту — юзеру не настраивать).
+- [ ] T2: исследовать защиту etcd от свопа (k3s embedded etcd — mlock/cgroup) — open decision, НЕ блокер T1-части.
+- [ ] (опц.) encrypted swap (security-first; при NoSwap секреты подов в своп не попадают, host-память — да).
+- [ ] Walk/verify: на T1 спайк host-процесса свопится (не OOM); под с Postgres НЕ свопится (`grep VmSwap /proc/<pg-pid>/status` ≈ 0).
+
+**Acceptance:** ноды провижатся со свопом + NoSwap; спайк control plane поглощается свопом вместо OOM; поды (особенно Postgres) в RAM; swappiness tier-aware.
+
+**Зависит от:** CLI node-provisioning / k3s-installer (1.x). T2-строка — с 3.1 (HA-bootstrap, embedded etcd). **Связан с** 2.16d (та же тема — тесный узел безопасен по умолчанию).
+
+**Размер:** S-M · swapfile + sysctl + kubelet-arg — мелочь; etcd-swap-protection research на T2 — основная неизвестность.
 
 ---
 
