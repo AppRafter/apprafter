@@ -29,7 +29,9 @@ use rand::Rng;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use operator_core::{ResourceClaim, ResourceClaimCondition, RetainedClaim, ServiceProvider};
+use operator_core::{
+    ResourceClaim, ResourceClaimCondition, RetainedClaim, ServiceProvider, SharedVolume,
+};
 
 use crate::cnpg;
 use crate::disk;
@@ -65,6 +67,10 @@ const PASSWORD_LEN: usize = 32;
 /// is the StorageClass that ships on the launch tier (k3s/kind), 2.6b.
 const DEFAULT_DISK_STORAGE_CLASS: &str = "local-path";
 
+/// `Ready=False` reason a `shared-disk` reference-claim publishes while the
+/// referenced `SharedVolume` is absent or not yet `status.ready` (2.6c).
+const REASON_AWAITING_SHARED_VOLUME: &str = "AwaitingSharedVolume";
+
 /// How many times to retry the read-modify-write of the shared Cluster's
 /// unkeyed `spec.managed.roles` list when the GET→replace races another
 /// claim's provisioner pass (HTTP 409 Conflict).
@@ -82,6 +88,10 @@ pub enum Backend {
     Cloudnativepg,
     Dragonfly,
     Disk,
+    /// Reference arm (2.6c): a `shared-disk` claim BINDS to an existing
+    /// `SharedVolume`'s PVC. It provisions nothing and owns no backing, so
+    /// it never snapshots a `RetainedClaim`.
+    SharedDisk,
 }
 
 impl Backend {
@@ -93,6 +103,7 @@ impl Backend {
             "cloudnative-pg" => Some(Backend::Cloudnativepg),
             "dragonfly" => Some(Backend::Dragonfly),
             "disk" => Some(Backend::Disk),
+            "shared-disk" => Some(Backend::SharedDisk),
             _ => None,
         }
     }
@@ -191,6 +202,9 @@ pub async fn reconcile(
         }
         Some(Backend::Dragonfly) => provision_dragonfly(&ctx, &claim, &ns, &name, &provider).await,
         Some(Backend::Disk) => provision_disk(&ctx, &claim, &ns, &name, &provider).await,
+        Some(Backend::SharedDisk) => {
+            provision_shared_disk(&ctx, &claim, &ns, &name, &provider).await
+        }
         None => {
             warn!(
                 %name, %ns, backend = %provider.spec.backend,
@@ -781,6 +795,106 @@ async fn provision_disk(
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
+/// The `SharedVolume` name a `shared-disk` reference-claim binds, read from
+/// its `apprafter.io/shared-volume=<ref>` label (the app-controller stamps
+/// this when a `needs.disk.ref` is rendered, 2.6c-T9).
+///
+/// The RFC6901 escape `~1` encodes the `/` in the label key so the JSON
+/// pointer resolves the single label entry rather than walking a path.
+pub fn shared_volume_ref_of(claim: &Value) -> Option<String> {
+    claim
+        .pointer("/metadata/labels/apprafter.io~1shared-volume")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Provision arm for a `shared-disk` reference-claim (2.6c). BINDING-ONLY:
+/// it neither creates a PVC nor snapshots a `RetainedClaim` — a
+/// reference-claim owns no backing storage. It reads the
+/// `apprafter.io/shared-volume=<ref>` label, GETs that `SharedVolume` in
+/// the claim's own namespace, and on `status.ready` writes the
+/// SharedVolume's `status.pvcRef` onto this claim's `status.volumeClaimRef`
+/// (the renderer reads the PVC name there). The PVC itself is owned by the
+/// `SharedVolume` reconciler; this arm only points at it.
+///
+/// Absent or not-yet-ready `SharedVolume` → `Ready=False` reason
+/// [`REASON_AWAITING_SHARED_VOLUME`], requeue 30s. The status write
+/// honours the SSA split (only `ready` / `volumeClaimRef` / the `Ready`
+/// condition under [`FIELD_MANAGER`]; never `status.provider` /
+/// `Scheduled`). No connection Secret, no allocation.
+async fn provision_shared_disk(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+    _provider: &ServiceProvider,
+) -> Result<Action, ReconcileError> {
+    let claim_json = serde_json::to_value(claim.as_ref())?;
+    let sv_name = shared_volume_ref_of(&claim_json).ok_or_else(|| {
+        ReconcileError::Provisioning(
+            "shared-disk claim missing apprafter.io/shared-volume label".into(),
+        )
+    })?;
+
+    let prior: Vec<ResourceClaimCondition> = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+
+    // GET the referenced SharedVolume in the claim's own namespace. A
+    // missing CR (`get_opt` → None) and a present-but-not-ready CR both
+    // route to the same waiting path: surface `AwaitingSharedVolume` and
+    // requeue. This arm NEVER creates a PVC or a SharedVolume.
+    let sv_api: Api<SharedVolume> = Api::namespaced(ctx.client.clone(), ns);
+    let pvc_ref = match sv_api.get_opt(&sv_name).await? {
+        Some(sv) if sv.status.as_ref().and_then(|s| s.ready) == Some(true) => sv
+            .status
+            .as_ref()
+            .and_then(|s| s.pvc_ref.clone())
+            .filter(|p| !p.is_empty()),
+        _ => None,
+    };
+
+    let Some(pvc_ref) = pvc_ref else {
+        info!(
+            %name, %ns, shared_volume = %sv_name,
+            "referenced SharedVolume absent or not ready — awaiting; requeue 30s"
+        );
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_VOLUME,
+            &format!("SharedVolume {sv_name} not ready"),
+            &prior,
+        );
+        patch_status(&ctx.client, ns, name, None, None, cond, None).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    };
+
+    // BIND: write the existing SharedVolume PVC onto this claim's status.
+    // No PVC apply, no RetainedClaim snapshot — the SharedVolume owns the
+    // PVC's lifecycle; this reference-claim only points at it.
+    let cond = ready_condition(
+        "True",
+        "Bound",
+        &format!("bound SharedVolume {sv_name} PVC {pvc_ref}"),
+        &prior,
+    );
+    patch_status(&ctx.client, ns, name, None, Some(&pvc_ref), cond, None).await?;
+
+    ctx.metrics
+        .claim_provisioned_total
+        .with_label_values(&["shared-disk", ns])
+        .inc();
+    ctx.metrics
+        .reconcile_total
+        .with_label_values(&[KIND, ns, "ok"])
+        .inc();
+    info!(%name, %ns, shared_volume = %sv_name, %pvc_ref, "shared-disk reference-claim bound");
+
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
 /// Read the `password` key from a pool instance's admin Secret. The
 /// Secret is created with `stringData`, so on read the value comes back
 /// base64-encoded under `data.password`. Thin wrapper over the
@@ -970,6 +1084,19 @@ async fn snapshot_retained_claim(
     // the deterministic ACL user + connection-Secret ref so the GC
     // (2.6-7) can FLUSHDB + DELUSER. Everything else stays the CNPG shape.
     let payload = match Backend::from_spec_backend(&backend) {
+        Some(Backend::SharedDisk) => {
+            // A `shared-disk` reference-claim owns NO backing storage — it
+            // only points at a `SharedVolume`'s PVC (the SharedVolume owns
+            // that PVC's lifecycle). Snapshotting a RetainedClaim here would
+            // be wrong: the grace-GC would eventually try to drop a PVC this
+            // claim never owned, racing the SharedVolume's own refCount-based
+            // reaping. So retain NOTHING and skip the snapshot entirely.
+            info!(
+                %name, %ns,
+                "shared-disk reference-claim deleted — owns no backing; no RetainedClaim snapshot"
+            );
+            return Ok(());
+        }
         Some(Backend::Dragonfly) => {
             let (instance, dbnum) = claim
                 .status
@@ -1627,6 +1754,27 @@ mod tests {
     #[test]
     fn backend_maps_disk() {
         assert_eq!(Backend::from_spec_backend("disk"), Some(Backend::Disk));
+    }
+
+    #[test]
+    fn backend_maps_shared_disk() {
+        assert_eq!(
+            Backend::from_spec_backend("shared-disk"),
+            Some(Backend::SharedDisk)
+        );
+    }
+
+    #[test]
+    fn shared_volume_name_from_claim_label() {
+        let claim = json!({"metadata":{"labels":{"apprafter.io/shared-volume":"shared"}}});
+        assert_eq!(shared_volume_ref_of(&claim), Some("shared".to_string()));
+    }
+
+    #[test]
+    fn shared_volume_name_absent_when_no_label() {
+        let claim = json!({"metadata":{"labels":{"app":"web"}}});
+        assert_eq!(shared_volume_ref_of(&claim), None);
+        assert_eq!(shared_volume_ref_of(&json!({"metadata":{}})), None);
     }
 
     #[test]
