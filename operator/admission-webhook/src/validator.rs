@@ -17,7 +17,7 @@
 //! struct once and the happy-path reads go through the TYPED fields
 //! (`base.image`, the `environments` keys, each scope's `env` /
 //! `needs` / `replicas`, the `EnvValue` literal/claim/secret variants,
-//! `DiskClaim` name/size/mountPath/class), so a renamed/removed field
+//! `DiskClaim` name/size/mountPath/class); `size` is now `Option<String>`
 //! fails to compile instead of silently bypassing a rule.
 //!
 //! A handful of PRESENCE / not-a-string / unknown-KEY diagnostics
@@ -30,9 +30,11 @@
 //!     `Option<BTreeMap<String, EnvValue>>` are arbitrary `String`s, so
 //!     the typed struct constrains the value, not the key's character set;
 //!   - **disk `mountPath` / `size` presence and disk-key-presence for the
-//!     inherit merge**: `DiskClaim.size`/`mount_path` are non-`Option`
-//!     (a missing one fails the typed deserialize) and the per-key needs
-//!     merge pivots on whether a scope LITERALLY declares the `disk` key.
+//!     inherit merge**: `DiskClaim.mount_path` is non-`Option` (a missing one
+//!     fails the typed deserialize); `size` is now `Option<String>` (required
+//!     on the owned shape; the raw fallback enforces presence for the webhook
+//!     rule below) and the per-key needs merge pivots on whether a scope
+//!     LITERALLY declares the `disk` key.
 //!
 //! Those branches are unreachable in production — a validating webhook
 //! runs after the apiserver's structural validation, which already
@@ -906,8 +908,9 @@ impl DiskEntry<'_> {
 
     fn size(&self) -> Option<&str> {
         match self {
-            // `size` is non-`Option` on `DiskClaim` (same reasoning).
-            DiskEntry::Typed(d) => Some(d.size.as_str()),
+            // `size` is `Option<String>` on `DiskClaim` (2.6c: owned|referenced
+            // disjunction); owned entries carry the size, referenced ones don't.
+            DiskEntry::Typed(d) => d.size.as_deref(),
             DiskEntry::Raw(o) => o.get("size").and_then(|v| v.as_str()),
         }
     }

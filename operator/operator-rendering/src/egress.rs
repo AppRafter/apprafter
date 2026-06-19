@@ -356,7 +356,8 @@ mod tests {
                     service: None,
                     disk: Some(DiskClaim {
                         name: Some("data".to_string()),
-                        size: "1Gi".to_string(),
+                        size: Some("1Gi".to_string()), // 2.6c: owned-disk path; reference handling in T9/T10
+                        reference: None,
                         mount_path: "/data".to_string(),
                         class: None,
                         read_only: None,

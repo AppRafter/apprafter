@@ -1324,6 +1324,13 @@ fn generate_resource_claims(
         // A disk entry has `service = None` + `disk = Some(..)`; emit a
         // minimal `type: disk` claim and skip the service-only fields.
         if let Some(disk) = entry.disk {
+            // 2.6c: referenced disks (needs.disk.ref) bind an existing SharedVolume.
+            // Reference-claim generation lands in T9 — guard the owned-disk path until
+            // then so a ref-shape entry never reaches the owned json! below (which would
+            // emit "size": null). T9 replaces this `continue` with ref-claim emission.
+            if disk.is_reference() {
+                continue;
+            }
             let mut claim_spec = json!({
                 "type": service_type,
                 "selector": default_integrated_selector(),
@@ -2658,7 +2665,8 @@ mod tests {
             needs: Some(Needs {
                 disk: Some(OneOrMany::Many(vec![DiskClaim {
                     name: Some("data".into()),
-                    size: "2Gi".into(),
+                    size: Some("2Gi".into()), // 2.6c: owned-disk path; reference handling in T9/T10
+                    reference: None,
                     mount_path: "/var/lib/data".into(),
                     class: None,
                     read_only: None,
@@ -3028,7 +3036,8 @@ mod tests {
             needs: Some(Needs {
                 disk: Some(OneOrMany::One(DiskClaim {
                     name: name.map(String::from),
-                    size: "1Gi".into(),
+                    size: Some("1Gi".into()), // 2.6c: owned-disk path; reference handling in T9/T10
+                    reference: None,
                     mount_path: mount_path.to_string(),
                     class: None,
                     read_only,
@@ -3045,7 +3054,8 @@ mod tests {
         assert_eq!(
             disk_identity_name(&DiskClaim {
                 name: Some("data".into()),
-                size: "1Gi".into(),
+                size: Some("1Gi".into()), // 2.6c: owned-disk path; reference handling in T9/T10
+                reference: None,
                 mount_path: "/var/data".into(),
                 class: None,
                 read_only: None,
@@ -3056,7 +3066,8 @@ mod tests {
         assert_eq!(
             disk_identity_name(&DiskClaim {
                 name: None,
-                size: "1Gi".into(),
+                size: Some("1Gi".into()), // 2.6c: owned-disk path; reference handling in T9/T10
+                reference: None,
                 mount_path: "/var/lib/uploads".into(),
                 class: None,
                 read_only: None,
@@ -3067,7 +3078,8 @@ mod tests {
         assert_eq!(
             disk_identity_name(&DiskClaim {
                 name: None,
-                size: "1Gi".into(),
+                size: Some("1Gi".into()), // 2.6c: owned-disk path; reference handling in T9/T10
+                reference: None,
                 mount_path: "/data/".into(),
                 class: None,
                 read_only: None,

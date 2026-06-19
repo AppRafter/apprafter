@@ -144,13 +144,22 @@ impl<T: Clone> OneOrMany<T> {
 }
 
 /// One persistent-disk dependency under `Application.spec.*.needs.disk`
-/// (2.6b). The provisioner (`Backend::Disk`) creates a standalone,
-/// **unowned** RWO PVC; the renderer mounts the ready claim at
-/// `mountPath` into the `replicas: 1` Deployment (`strategy: Recreate`).
-/// `mountPath` / `readOnly` stay here as render input — only `size`
-/// (and the tier `selector`) reach the ResourceClaim. Mirrors
-/// `#DiskClaim` in `application.cue` and the `disk` block of the
-/// OpenAPI v3 CRD.
+/// (2.6b/2.6c). Two discriminated shapes share this struct (the CUE
+/// disjunction + webhook enforce which fields co-exist at admission):
+///
+/// **Owned shape** (`reference.is_none()`): the provisioner
+/// (`Backend::Disk`) creates a standalone, **unowned** RWO PVC; the
+/// renderer mounts the ready claim at `mountPath` into the
+/// `replicas: 1` Deployment (`strategy: Recreate`). `size` is required
+/// on this path; `mountPath`/`readOnly` stay render-side — only `size`
+/// (and the tier `selector`) reach the ResourceClaim.
+///
+/// **Referenced shape** (`reference.is_some()`): binds an existing
+/// `SharedVolume` by name (`ref` wire key). `size` is absent; the
+/// actual reference-claim generation is T9/T10.
+///
+/// Mirrors `#DiskClaim` in `application.cue` and the `disk` block of
+/// the OpenAPI v3 CRD.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskClaim {
@@ -160,11 +169,19 @@ pub struct DiskClaim {
     /// the webhook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Requested capacity (`"10Gi"`) — required. A Kubernetes quantity.
-    pub size: String,
-    /// Container mount point (`"/data"`) — required. Unique within the
-    /// app (enforced by the webhook). `rename_all = "camelCase"` already
-    /// yields the `mountPath` wire key.
+    /// Requested capacity (`"10Gi"`) — required for the owned shape;
+    /// absent on the referenced shape (discriminated by `reference`).
+    /// A Kubernetes quantity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Name of an existing `SharedVolume` to bind (wire key `ref`).
+    /// Present on the referenced shape; absent on the owned shape.
+    /// `ref` is a Rust keyword, so the field is named `reference` here.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub reference: Option<String>,
+    /// Container mount point (`"/data"`) — required on both shapes.
+    /// `rename_all = "camelCase"` already yields the `mountPath` wire
+    /// key.
     pub mount_path: String,
     /// Storage class abstraction — `"local"` only at launch (the matched
     /// `disk-local` provider maps it to a concrete `storageClass`).
@@ -176,6 +193,15 @@ pub struct DiskClaim {
     /// "camelCase"` already yields the `readOnly` wire key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+}
+
+impl DiskClaim {
+    /// Returns `true` when this entry references an existing
+    /// `SharedVolume` (`ref` shape); `false` for the owned shape.
+    /// Used to gate reference-claim generation in T9/T10.
+    pub fn is_reference(&self) -> bool {
+        self.reference.is_some()
+    }
 }
 
 /// `Application.spec.*.needs` — an explicit closed struct (2.6b) so
@@ -557,7 +583,7 @@ mod tests {
         let disk = needs.disk.unwrap().into_vec();
         assert_eq!(disk.len(), 1);
         assert_eq!(disk[0].name.as_deref(), Some("data"));
-        assert_eq!(disk[0].size, "1Gi");
+        assert_eq!(disk[0].size.as_deref(), Some("1Gi"));
         assert_eq!(disk[0].mount_path, "/data");
         // Launch defaults are absent on the wire (filled by the platform).
         assert_eq!(disk[0].class, None);
@@ -745,5 +771,27 @@ mod tests {
         assert!(v.get("hostname").is_none());
         assert!(v.get("tls").is_none());
         assert!(v.get("public").is_none());
+    }
+
+    #[test]
+    fn disk_claim_referenced_shape_parses() {
+        let d: DiskClaim = serde_json::from_value(serde_json::json!({
+            "ref": "shared", "mountPath": "/data"
+        }))
+        .unwrap();
+        assert_eq!(d.reference.as_deref(), Some("shared"));
+        assert!(d.size.is_none());
+        assert!(d.is_reference());
+    }
+
+    #[test]
+    fn disk_claim_owned_shape_parses() {
+        let d: DiskClaim = serde_json::from_value(serde_json::json!({
+            "size": "1Gi", "mountPath": "/data"
+        }))
+        .unwrap();
+        assert_eq!(d.size.as_deref(), Some("1Gi"));
+        assert!(d.reference.is_none());
+        assert!(!d.is_reference());
     }
 }

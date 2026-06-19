@@ -270,14 +270,17 @@ _mkFields: {
 }
 
 // #DiskClaim — one declared persistent-disk dependency under
-// `Application.spec.*.needs.disk` (2.6b / ADR 0043). Each entry
-// becomes a `ResourceClaim` of `type: disk`; the provisioner creates
-// a standalone RWO PVC (unowned, GC-managed for retention) and the
-// renderer mounts it into the workload Deployment (`replicas: 1`,
-// `strategy: Recreate`). Deferred fields (`shareMode`, `backup`,
-// `autoExpand`, replicated/shared classes) are intentionally absent
-// until implemented — no half-measure CUE stubs.
+// `Application.spec.*.needs.disk` (2.6b/2.6c / ADR 0043). Two
+// discriminated shapes (the webhook enforces the disjunction; no
+// half-measure CUE stubs for cross-field invariants).
 #DiskClaim: {
+	// Owned shape: the provisioner creates a standalone RWO PVC
+	// (unowned, GC-managed for retention) and the renderer mounts it
+	// into the workload Deployment (`replicas: 1`, `strategy:
+	// Recreate`). Deferred fields (`shareMode`, `backup`, `autoExpand`,
+	// replicated/shared classes) are intentionally absent until
+	// implemented.
+
 	// `(type, name)` claim identity. Omit → derived from the last
 	// segment of `mountPath` (`/var/lib/uploads` → `uploads`);
 	// explicit wins. Must be a DNS-1123 label (it becomes part of the
@@ -285,7 +288,8 @@ _mkFields: {
 	name?: string
 
 	// Requested capacity as a Kubernetes quantity (`"10Gi"`).
-	// Required. The webhook validates it parses as a quantity.
+	// Required on the owned shape. The webhook validates it parses as
+	// a quantity.
 	size: string
 
 	// Absolute in-container mount point (`"/data"`). Required and
@@ -296,6 +300,20 @@ _mkFields: {
 	// matched `disk-local` provider's `config.storageClass`); the
 	// replicated/shared classes are deferred to T2+.
 	class?: "local" | *"local"
+
+	// Mount the volume read-only (default false).
+	readOnly?: bool | *false
+} | {
+	// Referenced shape (2.6c): binds an existing SharedVolume by name.
+	// The actual reference-claim generation is T9/T10.
+
+	// Name of the SharedVolume to bind (`ref` is the wire key).
+	// Required on this shape.
+	ref: string
+
+	// Absolute in-container mount point (`"/data"`). Required and
+	// unique within the app (webhook-enforced).
+	mountPath: string
 
 	// Mount the volume read-only (default false).
 	readOnly?: bool | *false
