@@ -89,4 +89,24 @@ _serviceProviders: {
 			storageClass: string | *"local-path"
 		}
 	}
+	"shared-local": #ServiceProviderSeed & {
+		namespace: "apprafter-system"
+		labels: {
+			tier:     "integrated"
+			location: "in-cluster"
+		}
+		type:    "shared-disk"
+		backend: "shared-disk"
+		config: {
+			// StorageClass the 2.6c SharedVolume provisioner stamps onto
+			// the shared RWX PVC it creates per shared-disk claim group.
+			// `config` is open ({...}) so a per-tier overlay can point
+			// shared-local at a different class (e.g. an NFS-backed CSI
+			// class on T2+) without a ServiceProvider schema change.
+			// Tier-1 uses `local-path` — the default k3s/kind class;
+			// `local-path` PVCs are RWO-only so the provisioner must
+			// request RWO and co-locate consumers on the same node.
+			storageClass: string | *"local-path"
+		}
+	}
 }

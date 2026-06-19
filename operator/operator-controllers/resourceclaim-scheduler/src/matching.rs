@@ -157,4 +157,15 @@ mod tests {
         let cands = vec![cand("redis-a", "redis", &[("tier", "integrated")])];
         assert_eq!(select_provider("pg", &BTreeMap::new(), &cands), None);
     }
+
+    #[test]
+    fn shared_disk_claim_does_not_match_owned_disk_provider() {
+        let sel = BTreeMap::new();
+        let mut labels = BTreeMap::new();
+        labels.insert("tier".to_string(), "integrated".to_string());
+        // a shared-disk claim must NOT bind an owned disk-local provider (type "disk")
+        assert!(!matches("shared-disk", &sel, "disk", &labels));
+        // ...but DOES match a shared-disk provider
+        assert!(matches("shared-disk", &sel, "shared-disk", &labels));
+    }
 }

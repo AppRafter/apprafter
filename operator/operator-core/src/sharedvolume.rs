@@ -76,8 +76,7 @@ mod tests {
 
     #[test]
     fn spec_round_trips_with_size_and_default_class() {
-        let spec: SharedVolumeSpec =
-            serde_json::from_value(json!({ "size": "5Gi" })).unwrap();
+        let spec: SharedVolumeSpec = serde_json::from_value(json!({ "size": "5Gi" })).unwrap();
         assert_eq!(spec.size, "5Gi");
         assert_eq!(spec.class.as_deref(), None);
         let out = serde_json::to_value(&spec).unwrap();
@@ -94,7 +93,8 @@ mod tests {
                 "type": "Ready", "status": "True",
                 "lastTransitionTime": "2026-06-19T00:00:00Z"
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(status.pvc_ref.as_deref(), Some("sv-demo-shared"));
         assert_eq!(status.ref_count, Some(2));
         assert_eq!(status.conditions.as_ref().unwrap()[0].type_, "Ready");
