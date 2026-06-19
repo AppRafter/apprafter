@@ -57,7 +57,7 @@ use kube::Client;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use operator_core::{Metrics, ResourceClaim};
+use operator_core::{Metrics, ResourceClaim, SharedVolume};
 
 pub mod acl_reconcile;
 pub mod cnpg;
@@ -133,32 +133,61 @@ pub enum ReconcileError {
 /// `Cluster` / `Database` CRs. A proper watch is future work.
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
     let claims: Api<ResourceClaim> = Api::all(client.clone());
+    let shared_volumes: Api<SharedVolume> = Api::all(client.clone());
     let ctx = Arc::new(Context::new(client, metrics));
     info!(
         field_manager = FIELD_MANAGER,
         "ResourceClaimProvisioner starting"
     );
-    // Serialize reconciles (concurrency = 1). The dbnum allocator does a
-    // read-allocate-write (list live claims → pick the lowest free dbnum →
-    // patch status) that is NOT atomic: with the default unbounded
-    // concurrency, two claims provisioning onto the same pool instance at the
-    // same time both list before either writes its dbnum, so both pick the
-    // same number → two tenants pinned to one logical DB (isolation breach).
-    // One in-flight reconcile at a time makes each claim's allocation visible
-    // (a fresh apiserver list) before the next claim allocates. Leader
-    // election already guarantees a single active controller, so this fully
-    // serializes allocation. Throughput is a non-issue at claim volumes.
-    Controller::new(claims, watcher::Config::default())
+
+    // Controller 1 — ResourceClaim. Serialize reconciles (concurrency = 1).
+    // The dbnum allocator does a read-allocate-write (list live claims → pick
+    // the lowest free dbnum → patch status) that is NOT atomic: with the
+    // default unbounded concurrency, two claims provisioning onto the same
+    // pool instance at the same time both list before either writes its dbnum,
+    // so both pick the same number → two tenants pinned to one logical DB
+    // (isolation breach). One in-flight reconcile at a time makes each claim's
+    // allocation visible (a fresh apiserver list) before the next claim
+    // allocates. Leader election already guarantees a single active
+    // controller, so this fully serializes allocation. Throughput is a
+    // non-issue at claim volumes.
+    let claim_drive = Controller::new(claims, watcher::Config::default())
         .with_config(ControllerConfig::default().concurrency(1))
-        .run(reconcile::reconcile, reconcile::error_policy, ctx)
+        .run(reconcile::reconcile, reconcile::error_policy, ctx.clone())
         .for_each(|res| async move {
             match res {
                 Ok((obj_ref, _)) => info!(claim = %obj_ref.name, "provisioned"),
                 Err(e) => warn!(error = %e, "provision failed"),
             }
-        })
-        .await;
-    info!("ResourceClaimProvisioner stream ended");
+        });
+
+    // Controller 2 — SharedVolume (2.6c). Driven concurrently in the same
+    // binary; it provisions an unowned RWO backing PVC per SharedVolume CR,
+    // maintains `status.refCount`, and reaps the PVC via a finalizer on
+    // delete. Serialized too (concurrency = 1) under the same leader so the
+    // refCount list-then-write never races a sibling SharedVolume reconcile.
+    let sv_drive = Controller::new(shared_volumes, watcher::Config::default())
+        .with_config(ControllerConfig::default().concurrency(1))
+        .run(
+            shared_volume::reconcile_shared_volume,
+            shared_volume::error_policy_sv,
+            ctx,
+        )
+        .for_each(|res| async move {
+            match res {
+                Ok((obj_ref, _)) => info!(shared_volume = %obj_ref.name, "provisioned"),
+                Err(e) => warn!(error = %e, "SharedVolume provision failed"),
+            }
+        });
+
+    // Drive BOTH controllers for the binary's lifetime. `tokio::join!` runs
+    // both stream-drive futures concurrently and returns only if both ever
+    // complete (the kube-rs `Controller` streams run forever in practice).
+    // NOTE: if one stream terminates, `run()` stays pending on the other and
+    // the ended controller is NOT restarted — a future improvement would
+    // drive each under its own `tokio::spawn` with a restart-on-exit policy.
+    tokio::join!(claim_drive, sv_drive);
+    info!("ResourceClaimProvisioner streams ended");
     Ok(())
 }
 

@@ -15,7 +15,6 @@ use tracing::{info, warn};
 
 use operator_core::{Metrics, ResourceClaim};
 
-pub mod matching;
 pub mod reconcile;
 
 pub(crate) const KIND: &str = "ResourceClaim";

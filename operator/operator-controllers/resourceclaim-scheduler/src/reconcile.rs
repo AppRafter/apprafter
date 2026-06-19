@@ -65,18 +65,17 @@ pub async fn reconcile(
         .items;
 
     // 2. Project into Candidate structs for the pure matcher.
-    let candidates: Vec<crate::matching::Candidate> = providers
+    let candidates: Vec<operator_core::matching::Candidate> = providers
         .iter()
-        .map(|p| crate::matching::Candidate {
-            name: p.name_any(),
-            type_: p.spec.type_.clone(),
-            labels: p.metadata.labels.clone().unwrap_or_default(),
-        })
+        .map(operator_core::matching::Candidate::from_provider)
         .collect();
 
     // 3. Run the matcher.
-    let chosen =
-        crate::matching::select_provider(&claim.spec.type_, &claim.spec.selector, &candidates);
+    let chosen = operator_core::matching::select_provider(
+        &claim.spec.type_,
+        &claim.spec.selector,
+        &candidates,
+    );
 
     // 4. Read prior conditions for the timestamp-preservation guard.
     let prior: Vec<ResourceClaimCondition> = claim

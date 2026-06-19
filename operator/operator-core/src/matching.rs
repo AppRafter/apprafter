@@ -4,6 +4,10 @@
 
 use std::collections::BTreeMap;
 
+use kube::ResourceExt;
+
+use crate::ServiceProvider;
+
 /// A ServiceProvider candidate projected to the only fields matching
 /// needs: name, service type, and labels.
 #[derive(Debug, Clone)]
@@ -11,6 +15,17 @@ pub struct Candidate {
     pub name: String,
     pub type_: String,
     pub labels: BTreeMap<String, String>,
+}
+
+impl Candidate {
+    /// Project a ServiceProvider into a scheduler Candidate.
+    pub fn from_provider(p: &ServiceProvider) -> Self {
+        Candidate {
+            name: p.name_any(),
+            type_: p.spec.type_.clone(),
+            labels: p.metadata.labels.clone().unwrap_or_default(),
+        }
+    }
 }
 
 /// A provider matches a claim iff the service types are equal AND the

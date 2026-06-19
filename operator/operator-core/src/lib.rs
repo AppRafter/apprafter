@@ -3,6 +3,7 @@
 
 pub mod application;
 pub mod leader;
+pub mod matching;
 pub mod metrics;
 pub mod migration;
 pub mod migration_plan;
@@ -21,6 +22,7 @@ pub use application::{
     PHASE_ENV_SECRET_MISSING,
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
+pub use matching::{matches, select_provider, Candidate};
 pub use metrics::Metrics;
 pub use migration::{DestructiveChange, MigrationError, MigrationStrategy, StepOutcome};
 pub use migration_plan::{
