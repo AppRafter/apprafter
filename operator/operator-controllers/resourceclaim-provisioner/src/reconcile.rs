@@ -1238,8 +1238,9 @@ pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
 // Status + finalizer I/O
 // ---------------------------------------------------------------------------
 
-/// Build the terminal status SSA-apply body. Always carries `ready` +
-/// the `Ready` condition. `connectionSecretRef` and `volumeClaimRef` are
+/// Build the terminal status SSA-apply body. Always carries the `Ready`
+/// condition the caller passed and a `ready` bool DERIVED from it
+/// (`ready = cond.status == "True"`). `connectionSecretRef` and `volumeClaimRef` are
 /// mutually-exclusive optionals: the pg/redis backends send
 /// `connectionSecretRef` (a connection Secret), the disk backend sends
 /// `volumeClaimRef` (the PVC name) and no Secret. When an `allocation`
@@ -1267,8 +1268,19 @@ fn status_apply_body(
     cond: ResourceClaimCondition,
     allocation: Option<(&str, u16)>,
 ) -> Value {
+    // `ready` is DERIVED from the Ready condition the caller passed (the
+    // `cond` arg is always the `Ready` condition): `ready=true` iff the
+    // condition is `True`. The success paths (CNPG / dragonfly / disk /
+    // shared-disk bind) pass `Ready=True` → `ready:true` (unchanged); the
+    // not-ready paths (e.g. shared-disk `AwaitingSharedVolume`) pass
+    // `Ready=False` → `ready:false`. Hard-coding `ready:true` here let a
+    // `Ready=False` write still flip `ready` true, so `should_provision`
+    // then skipped the claim forever (walk-found: a reference-claim to a
+    // missing SharedVolume came up `ready:true` with no durable
+    // `Ready` condition).
+    let ready = cond.status == "True";
     let mut status = json!({
-        "ready": true,
+        "ready": ready,
         "conditions": [cond],
     });
     // The CNPG / dragonfly backends publish a `connectionSecretRef`; the
@@ -2018,6 +2030,35 @@ mod tests {
         assert!(body["status"].get("dbnum").is_none());
         assert!(body["status"]["conditions"].is_array());
         assert_eq!(body["metadata"]["name"], "claim-demo-app-disk-data");
+    }
+
+    #[test]
+    fn terminal_status_body_derives_ready_false_from_not_ready_condition() {
+        // Walk-found regression: a `shared-disk` reference-claim to a MISSING
+        // SharedVolume writes status via patch_status with a `Ready=False /
+        // AwaitingSharedVolume` condition. status_apply_body previously
+        // hard-coded `ready:true`, so the claim came up `ready:true` (and
+        // should_provision then skipped it forever). `ready` is now DERIVED
+        // from the condition: a non-`True` Ready condition → `ready:false`.
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_VOLUME,
+            "SharedVolume does-not-exist not ready",
+            &[],
+        );
+        let body = status_apply_body("web-shared-disk", None, None, cond, None);
+        assert_eq!(
+            body["status"]["ready"], false,
+            "a Ready=False condition must yield ready:false"
+        );
+        // The durable Ready=False condition rides along (no longer pruned by a
+        // bogus ready:true that masked it).
+        assert_eq!(body["status"]["conditions"][0]["type"], "Ready");
+        assert_eq!(body["status"]["conditions"][0]["status"], "False");
+        assert_eq!(
+            body["status"]["conditions"][0]["reason"],
+            REASON_AWAITING_SHARED_VOLUME
+        );
     }
 
     // --- redis_connection_secret_object() (2.6-4 → 2.12 decomposed keys) ---
