@@ -121,6 +121,7 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
             &user_info,
             operation,
         ),
+        "SharedVolume" => crate::validator::validate_sharedvolume(&object),
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The

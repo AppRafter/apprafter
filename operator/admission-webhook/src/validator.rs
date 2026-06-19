@@ -555,11 +555,25 @@ fn validate_disk_claims(
     // that omits the disk key. `Needs.disk: Option<…>` models the key being
     // present (even as an empty array) on the typed path; the raw
     // `scope_disk_value` is the fallback.
+    //
+    // 2.6c (T10): only OWNED disks gate the single-replica invariant. An
+    // owned disk is a standalone RWO PVC (one writer at a time → replicas:1);
+    // a REFERENCED disk binds a shared SharedVolume (RWX), so it does not
+    // constrain the replica count. The guard therefore counts only the
+    // owned entries in each scope's effective disk value.
+    let scope_has_owned_disk = |typed_scope: Option<&ApplicationBaseSpec>,
+                                raw_scope: Option<&serde_json::Map<String, Value>>|
+     -> bool {
+        scope_disk_entries(typed_scope, raw_scope)
+            .iter()
+            .any(|e| !e.is_reference())
+    };
+
     let base_disk_present = scope_disk_present(typed_base, base);
-    let base_disk_nonempty = base_disk_present && !scope_disk_entries(typed_base, base).is_empty();
+    let base_owned_disk = scope_has_owned_disk(typed_base, base);
 
     let mut replicas_scopes: Vec<(String, bool, Option<i64>)> =
-        vec![("spec.base".to_string(), base_disk_nonempty, base_replicas)];
+        vec![("spec.base".to_string(), base_owned_disk, base_replicas)];
     if let Some(envs_obj) = envs {
         for env_name in envs_obj.keys() {
             let typed_env = typed_envs.and_then(|m| m.get(env_name));
@@ -573,7 +587,7 @@ fn validate_disk_claims(
             } else {
                 (None, None, false)
             };
-            if !eff_present || scope_disk_entries(eff_typed, eff_raw).is_empty() {
+            if !eff_present || !scope_has_owned_disk(eff_typed, eff_raw) {
                 continue;
             }
             // Env-override replaces base replicas; else inherit base.
@@ -689,38 +703,112 @@ fn validate_disk_claims(
                 }
             }
 
-            // ---- size: a Kubernetes quantity ----
-            match entry.size() {
-                Some(size) if is_k8s_quantity(size) => {}
-                Some(size) => {
+            // ---- owned/referenced shape discrimination (2.6c T10) ----
+            // The presence of `ref` is the discriminant. The owned shape
+            // (`ref` absent) carries `size` (required) and an optional
+            // `class`; the referenced shape (`ref` present) binds an existing
+            // SharedVolume by name and carries ONLY ref + mountPath + readOnly.
+            // The name/mountPath guards above apply to BOTH shapes (mountPath
+            // app-wide uniqueness + derived-name uniqueness prevent pod
+            // volume-name collisions). The webhook is STATELESS, so SharedVolume
+            // EXISTENCE is the controller's job (AwaitingSharedVolume), not ours.
+            if let Some(reference) = entry.reference() {
+                // ---- referenced shape: only ref + mountPath + readOnly ----
+                if reference.contains('/') {
                     errors.push(ValidationError::new(
                         &needs_disk_field,
                         format!(
-                            "needs.disk size {size:?} must be a Kubernetes quantity (e.g. \"10Gi\", \"500Mi\", \"1G\")"
+                            "needs.disk ref {reference:?} is namespaced; cross-namespace shared volumes require T2 (NFS) and are deferred — reference a SharedVolume in the application's own namespace"
                         ),
                     ));
                 }
-                None => {
+                if entry.size().is_some() {
                     errors.push(ValidationError::new(
                         &needs_disk_field,
-                        "needs.disk entry is missing the required `size`",
+                        "needs.disk with `ref` must not also set `size`; a referenced disk binds an existing SharedVolume (which owns the capacity) and carries only ref + mountPath + readOnly",
                     ));
                 }
-            }
+                if entry.has_explicit_name() {
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        "needs.disk with `ref` must not also set `name`; a referenced disk carries only ref + mountPath + readOnly",
+                    ));
+                }
+                if entry.class().is_some() {
+                    errors.push(ValidationError::new(
+                        &needs_disk_field,
+                        "needs.disk with `ref` must not also set `class`; the storage class is a property of the referenced SharedVolume, not the reference",
+                    ));
+                }
+            } else {
+                // ---- owned shape: size required + quantity, class local ----
+                match entry.size() {
+                    Some(size) if is_k8s_quantity(size) => {}
+                    Some(size) => {
+                        errors.push(ValidationError::new(
+                            &needs_disk_field,
+                            format!(
+                                "needs.disk size {size:?} must be a Kubernetes quantity (e.g. \"10Gi\", \"500Mi\", \"1G\")"
+                            ),
+                        ));
+                    }
+                    None => {
+                        errors.push(ValidationError::new(
+                            &needs_disk_field,
+                            "needs.disk entry is missing the required `size`",
+                        ));
+                    }
+                }
 
-            // ---- class: local only at launch ----
-            if let Some(class) = entry.class() {
-                if class != "local" {
-                    errors.push(ValidationError::new(
-                        &needs_disk_field,
-                        format!(
-                            "needs.disk class {class:?} is not supported; only `local` is available at launch (replicated/shared classes are T2, deferred)"
-                        ),
-                    ));
+                // ---- class: local only at launch ----
+                if let Some(class) = entry.class() {
+                    if class != "local" {
+                        errors.push(ValidationError::new(
+                            &needs_disk_field,
+                            format!(
+                                "needs.disk class {class:?} is not supported; only `local` is available at launch (replicated/shared classes are T2, deferred)"
+                            ),
+                        ));
+                    }
                 }
             }
         }
     }
+}
+
+/// 2.6c (T10): SHAPE validation for a `SharedVolume` object. The webhook
+/// is STATELESS, so this checks only the static shape — `spec.size` must
+/// be a Kubernetes quantity and `spec.class` (when set) must be `local`
+/// (replicated/shared classes are T2-deferred, matching the owned-disk
+/// class rule). EXISTENCE / capacity-fit against referencing Applications
+/// is the controller's responsibility, not the webhook's.
+///
+/// Multi-error: one message per offending field, no short-circuit.
+pub fn validate_sharedvolume(obj: &serde_json::Value) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let size = obj
+        .pointer("/spec/size")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !is_k8s_quantity(size) {
+        errors.push(ValidationError::new(
+            "spec.size",
+            format!(
+                "size {size:?} must be a Kubernetes quantity (e.g. \"10Gi\", \"500Mi\", \"1G\")"
+            ),
+        ));
+    }
+    if let Some(class) = obj.pointer("/spec/class").and_then(|v| v.as_str()) {
+        if class != "local" {
+            errors.push(ValidationError::new(
+                "spec.class",
+                format!(
+                    "class {class:?} is not supported; only `local` is available at launch (replicated/shared classes are T2, deferred)"
+                ),
+            ));
+        }
+    }
+    errors
 }
 
 /// 1.83b: validate the `expose` block in BOTH base and every environment.
@@ -919,6 +1007,31 @@ impl DiskEntry<'_> {
         match self {
             DiskEntry::Typed(d) => d.class.as_deref(),
             DiskEntry::Raw(o) => o.get("class").and_then(|v| v.as_str()),
+        }
+    }
+
+    /// 2.6c (T10): the `ref` value when this entry is the REFERENCED shape
+    /// (binds an existing `SharedVolume`); `None` for the owned shape. The
+    /// presence of `ref` is the owned/referenced discriminant.
+    fn reference(&self) -> Option<&str> {
+        match self {
+            DiskEntry::Typed(d) => d.reference.as_deref(),
+            DiskEntry::Raw(o) => o.get("ref").and_then(|v| v.as_str()),
+        }
+    }
+
+    /// 2.6c (T10): whether this entry is the REFERENCED disk shape.
+    fn is_reference(&self) -> bool {
+        self.reference().is_some()
+    }
+
+    /// Whether this entry literally carries a `name` field (owned-shape
+    /// vocabulary). Used to reject `ref` + `name` mixed shapes — distinct
+    /// from `derived_name()`, which falls back to the `mountPath` segment.
+    fn has_explicit_name(&self) -> bool {
+        match self {
+            DiskEntry::Typed(d) => d.name.is_some(),
+            DiskEntry::Raw(o) => o.contains_key("name"),
         }
     }
 }
@@ -2225,6 +2338,176 @@ mod tests {
             }
         });
         assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    // ── 2.6c (T10): reference-disk discrimination ─────────────────────────
+
+    #[test]
+    fn reference_disk_does_not_require_replicas_one() {
+        // A referenced disk (binds an existing SharedVolume) is an RWX
+        // shared volume, so it does NOT contribute to the single-replica
+        // guard — a multi-replica app may mount it.
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "replicas": 3,
+                "needs": { "disk": { "ref": "shared", "mountPath": "/data" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert!(
+            errors.is_empty(),
+            "reference disk must allow multi-replica: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_namespaced_ref() {
+        // A `ref` carrying a namespace (`ns/name`) implies a cross-namespace
+        // shared volume — deferred to T2 (NFS).
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": { "ref": "other-ns/shared", "mountPath": "/data" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert!(
+            errors.iter().any(|e| e.message.contains("cross-namespace")),
+            "expected a cross-namespace rejection, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn reference_disk_rejects_size_field() {
+        // `ref` + `size` is an invalid mixed shape: a referenced disk
+        // carries only ref + mountPath + readOnly.
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": { "ref": "shared", "size": "1Gi", "mountPath": "/d" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert!(
+            !errors.is_empty(),
+            "ref + size is an invalid mixed shape: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn reference_disk_rejects_name_and_class_fields() {
+        // A referenced disk carries only ref + mountPath + readOnly; an
+        // explicit `name` or `class` is the owned-shape vocabulary.
+        let with_name = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": { "ref": "shared", "name": "data", "mountPath": "/d" } }
+            }
+        });
+        assert!(
+            !validate_application_spec(&with_name).is_empty(),
+            "ref + name is an invalid mixed shape"
+        );
+        let with_class = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": { "ref": "shared", "class": "local", "mountPath": "/d" } }
+            }
+        });
+        assert!(
+            !validate_application_spec(&with_class).is_empty(),
+            "ref + class is an invalid mixed shape"
+        );
+    }
+
+    #[test]
+    fn reference_disk_still_requires_absolute_unique_mount_path() {
+        // Reference disks STILL go through mountPath (absolute + app-wide
+        // unique) — this prevents pod volume-name collisions.
+        let relative = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": { "ref": "shared", "mountPath": "data" } }
+            }
+        });
+        assert!(
+            validate_application_spec(&relative)
+                .iter()
+                .any(|e| e.message.contains("absolute")),
+            "reference disk mountPath must still be absolute"
+        );
+        // Two reference disks colliding on mountPath.
+        let collide = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": [
+                    { "ref": "a", "mountPath": "/data" },
+                    { "ref": "b", "mountPath": "/data" }
+                ] }
+            }
+        });
+        assert!(
+            validate_application_spec(&collide)
+                .iter()
+                .any(|e| e.message.contains("more than once")),
+            "reference disk mountPath must still be app-wide unique"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_reference_disk() {
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": { "ref": "shared", "mountPath": "/data", "readOnly": true } }
+            }
+        });
+        assert!(
+            validate_application_spec(&spec).is_empty(),
+            "a bare ref + mountPath + readOnly disk must be accepted"
+        );
+    }
+
+    #[test]
+    fn owned_disk_still_requires_size_and_replicas_one() {
+        // Regression: an owned disk with replicas 3 is still rejected.
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "replicas": 3,
+                "needs": { "disk": { "size": "1Gi", "mountPath": "/data" } }
+            }
+        });
+        assert!(!validate_application_spec(&spec).is_empty());
+        // And an owned disk missing `size` is still rejected.
+        let no_size = json!({
+            "base": {
+                "image": "x",
+                "needs": { "disk": { "mountPath": "/data" } }
+            }
+        });
+        assert!(
+            validate_application_spec(&no_size)
+                .iter()
+                .any(|e| e.message.contains("required `size`")),
+            "owned disk still requires size"
+        );
+    }
+
+    #[test]
+    fn sharedvolume_requires_quantity_size_and_local_class() {
+        assert!(
+            validate_sharedvolume(&json!({ "spec": { "size": "oops" } }))
+                .iter()
+                .any(|e| e.message.contains("quantity"))
+        );
+        assert!(validate_sharedvolume(
+            &json!({ "spec": { "size": "5Gi", "class": "replicated" } })
+        )
+        .iter()
+        .any(|e| e.message.contains("local")));
+        assert!(validate_sharedvolume(&json!({ "spec": { "size": "5Gi" } })).is_empty());
     }
 
     #[test]
