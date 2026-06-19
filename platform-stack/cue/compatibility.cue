@@ -1728,6 +1728,47 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.37": {
+	change:          "safe"
+	operatorVersion: "v0.2.31"
+	notes: """
+		2.6c — capacity-signal + cross-app SharedVolume (CRD-additive,
+		ADR 0049). The operator + admission-webhook images roll v0.2.30 ->
+		v0.2.31, and the cue-cmp sidecar rolls to v0.1.13 (it bundles
+		`schemas/v1alpha1`, ADR 0046, which gained the new SharedVolume
+		schema + the `needs.disk` owned|referenced disjunction). New surface,
+		all backward-compatible:
+		  * a new namespaced `SharedVolume` CRD (`spec:{size,class}`,
+		    `status:{ready,pvcRef,refCount}`) provisioned out-of-band via
+		    `apprafter volume create/rm` — an explicit-lifecycle object that
+		    cross-app `needs.disk.ref` binds (single-node same-ns, T1).
+		  * `Application.needs.disk` accepts an owned `{name,size,mountPath}`
+		    OR a referenced `{ref,mountPath,readOnly?}` shape (webhook
+		    discriminates by shape); the reference-arm binds an existing
+		    SharedVolume's PVC without provisioning/GC'ing backing.
+		  * a `shared-disk` backend type allowed on `ServiceProvider.type`
+		    and `ResourceClaim.type` (a NEW value alongside `disk`, so the
+		    scheduler never cross-matches the owned-disk line); the
+		    `shared-local` ServiceProvider seed (T1 local-path) ships in
+		    `service_providers.cue`.
+		  * the operator now reads per-PVC + node-level capacity via the
+		    kubelet Summary API (RBAC `nodes/stats`) and surfaces a Warning
+		    Event + condition when node-free drops below the threshold.
+		  * `conditions` on ResourceClaim + SharedVolume gain an additive
+		    SSA `x-kubernetes-list-map-keys: [type]` server-merge marker.
+		change=safe — old Deployments/claims ignore the new fields, existing
+		owned-disk (2.6b) claims keep their allocation, the new CRD is purely
+		additive; the operator image rolls so co-ordinated with v0.2.31. A
+		kind+podman live walk validated the full chain end-to-end (2 apps in
+		one ns ref one SharedVolume read/write a shared dir, rolling update
+		keeps the mount, `volume rm` is refused while referenced); the
+		node-free capacity live-read is best-effort and was SOFT-skipped on
+		kind (kubelet `nodes/stats` reachability is cluster-dependent —
+		validated on a real cluster later).
+		"""
+	references: ["plan.md#2.6c", "docs/adr/0049-cross-app-sharedvolume.md"]
+}
+
 compatibility: "0.2.36": {
 	change:          "safe"
 	operatorVersion: "v0.2.30"
