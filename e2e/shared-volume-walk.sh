@@ -739,15 +739,35 @@ assert_eq "alpha Deployment strategy.type (referenced disk)" "$strategy_a" "Roll
 # across alpha's roll.
 beta_gen_before=$(jp deployment "$APP_NS" "$APP_B" '{.metadata.generation}')
 apply_consumer_app "$APP_A" "v2"
+# RACE FIX: wait_jsonpath on the Application's Ready phase returns immediately
+# when alpha is already Ready (it never dropped from v1's Ready → not-Ready →
+# Ready), so it says nothing about whether the Deployment rolled over to the
+# new ReplicaSet yet. Use `kubectl rollout status` — the canonical gate that
+# waits until the new RS is fully rolled out (desired == updated == available).
+# Only AFTER that do we read the pod env so we're sure we're hitting the NEW pod.
+printf '  waiting for alpha rollout to complete (new ReplicaSet fully up) ...\n'
+kubectl -n "$APP_NS" rollout status deployment/"$APP_A" --timeout=120s
+# Belt-and-suspenders: also wait for the Application and Deployment conditions.
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP_A" '{.status.phase}' Ready 240
 kubectl -n "$APP_NS" wait --for=condition=Available \
     "deployment/${APP_A}" --timeout=300s
-# The new alpha pod carries the updated env marker.
+# The new alpha pod carries the updated env marker.  After `rollout status`
+# returns, the new pod is the ONLY Running one; the old pod has been removed.
+# Poll until WALK_MARKER=v2 is observed (protects against brief kubelet lag
+# between the ReplicaSet settling and container env being readable via the API).
 retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
     pod -l "app.kubernetes.io/name=${APP_A}" --timeout=20s
 POD_A2=$(app_pod "$APP_A")
-marker=$(kubectl -n "$APP_NS" get pod "$POD_A2" \
-    -o jsonpath="{.spec.containers[0].env[?(@.name==\"WALK_MARKER\")].value}" 2>/dev/null || true)
+printf '  polling alpha pod %s for WALK_MARKER=v2 ...\n' "$POD_A2"
+_marker_deadline=$(( $(date +%s) + 60 ))
+marker=""
+while [ "$(date +%s)" -lt "$_marker_deadline" ]; do
+    marker=$(kubectl -n "$APP_NS" get pod "$POD_A2" \
+        -o jsonpath="{.spec.containers[0].env[?(@.name==\"WALK_MARKER\")].value}" 2>/dev/null || true)
+    [ "$marker" = "v2" ] && break
+    printf '    %s: WALK_MARKER=%q (want v2)\n' "$(date +%H:%M:%S)" "$marker"
+    sleep 3
+done
 assert_eq "alpha rolled to the new WALK_MARKER" "$marker" "v2"
 
 # beta untouched: its Deployment generation did not change and it stays
