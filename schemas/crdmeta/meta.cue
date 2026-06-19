@@ -252,6 +252,27 @@ _crdMetas: PlatformStack: {
 	}
 }
 
+_crdMetas: SharedVolume: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "sharedvolumes"
+		singular: "sharedvolume"
+		kind:     "SharedVolume"
+		listKind: "SharedVolumeList"
+		shortNames: ["sv"]
+	}
+	annotations: _syncWave
+	subresources: status: {}
+	printerColumns: [
+		{name: "Ready", type: "string", jsonPath: ".status.ready"},
+		{name: "Size", type: "string", jsonPath: ".spec.size"},
+		{name: "Refs", type: "integer", jsonPath: ".status.refCount"},
+		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
+	]
+}
+
 _crdMetas: ResourceClaim: {
 	group:   "apprafter.io"
 	version: "v1alpha1"

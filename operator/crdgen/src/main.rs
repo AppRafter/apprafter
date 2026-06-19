@@ -51,6 +51,10 @@ const CRDS: &[Crd] = &[
         component: "PlatformStack",
         file_stem: "crd-platformstack",
     },
+    Crd {
+        component: "SharedVolume",
+        file_stem: "crd-sharedvolume",
+    },
 ];
 
 /// A rendered CRD: its CUE component name, the chart file path, the YAML

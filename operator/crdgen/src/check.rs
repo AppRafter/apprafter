@@ -262,6 +262,14 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          versionHistory, conditions, …). The status subtree constrains no user input.",
     ),
     (
+        "SharedVolume",
+        "status",
+        "operator-written status: the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque), the kube-rs type declares the \
+         concrete status fields (ready, pvcRef, refCount, capacity, conditions). The status \
+         subtree constrains no user input.",
+    ),
+    (
         "PlatformStack",
         "spec.overrides.[*].values",
         "free-form per-component values merge: the CUE-derived CRD marks it \
@@ -286,6 +294,7 @@ fn rust_crd(component: &str) -> Option<Value> {
         "MigrationPlan" => operator_core::MigrationPlan::crd(),
         "SourceCredential" => operator_core::SourceCredential::crd(),
         "PlatformStack" => operator_core::PlatformStack::crd(),
+        "SharedVolume" => operator_core::SharedVolume::crd(),
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -457,6 +466,12 @@ mod tests {
         assert!(allowed("PlatformStack", "spec.overrides.[*].values"));
         assert!(!allowed("PlatformStack", "spec.source.upstream"));
         assert!(!allowed("PlatformStack", "spec.values.tier"));
+        // SharedVolume allowlists its operator-written status subtree; its typed
+        // spec fields (size, class) are not allowlisted.
+        assert!(allowed("SharedVolume", "status"));
+        assert!(allowed("SharedVolume", "status.ready"));
+        assert!(!allowed("SharedVolume", "spec.size"));
+        assert!(!allowed("SharedVolume", "spec.class"));
         // A component absent from the allowlist matches nothing.
         assert!(!allowed("NotACrd", "status"));
     }
