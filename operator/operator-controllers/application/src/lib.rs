@@ -1551,6 +1551,7 @@ fn resolve_disk_mounts(
             mount_path: disk.mount_path.clone(),
             read_only: disk.read_only.unwrap_or(false),
             pvc_name,
+            owned: !disk.is_reference(),
         });
     }
     mounts

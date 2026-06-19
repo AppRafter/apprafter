@@ -55,7 +55,7 @@ pub struct RenderedApplication {
 /// [`render_application_for_env`]. The renderer appends one container
 /// `volumeMount` + one pod `volume{persistentVolumeClaim}` per entry
 /// (deterministic, sorted by `volume_name` → byte-stable SSA) and forces
-/// `strategy: Recreate` when any is present. Keeping this a threaded
+/// `strategy: Recreate` when any owned disk is present. Keeping this a threaded
 /// input preserves the renderer's purity (no kube client here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskMount {
@@ -70,6 +70,9 @@ pub struct DiskMount {
     pub read_only: bool,
     /// The standalone RWO PVC name (the claim's `status.volumeClaimRef`).
     pub pvc_name: String,
+    /// Owned disks force `strategy: Recreate` (ADR 0043); reference disks
+    /// (SharedVolume bind) tolerate RollingUpdate on single-node RWO.
+    pub owned: bool,
 }
 
 /// Render the Application's `base` block (no environment override
@@ -112,12 +115,13 @@ pub fn render_application(app: &Application) -> RenderedApplication {
 /// keeping this function pure (no registry calls here).
 ///
 /// `disks` (2.6b / ADR 0043) carries the ready `needs.disk` claims as
-/// render input — one [`DiskMount`] per resolved disk. When non-empty the
-/// renderer appends a container `volumeMount` + a pod
-/// `volume{persistentVolumeClaim}` per entry (sorted by `volume_name` →
-/// byte-stable SSA) and forces `strategy: Recreate` (an RWO PVC cannot be
-/// held by two pods during a RollingUpdate). `None`/empty leaves the
-/// Deployment strategy unchanged from today (unset → apiserver default).
+/// render input — one [`DiskMount`] per resolved disk. The renderer appends
+/// a container `volumeMount` + a pod `volume{persistentVolumeClaim}` per
+/// entry (sorted by `volume_name` → byte-stable SSA) and forces
+/// `strategy: Recreate` when any [`DiskMount::owned`] disk is present (an
+/// owned RWO PVC cannot be held by two pods during a RollingUpdate; reference
+/// disks tolerate RollingUpdate). `None`/empty leaves the Deployment strategy
+/// unchanged from today (unset → apiserver default).
 ///
 /// `egress_profile` + `needs_targets` (2.10 / ADR 0045) drive the
 /// per-Application egress [`render_egress_policy`]. The controller reads
@@ -358,10 +362,11 @@ fn render_deployment(
     // DiskMount contributes a container `volumeMount` + a pod
     // `volume{persistentVolumeClaim}`, sorted by `volume_name` so the
     // rendered Deployment is byte-stable across reconciles (SSA no-op).
-    // When ANY disk is present the strategy is forced to `Recreate` — an
-    // RWO PVC cannot be held by the old + new pod simultaneously during a
-    // RollingUpdate; with no disk the strategy stays unset (apiserver
-    // default RollingUpdate), unchanged from today.
+    // When ANY owned disk is present the strategy is forced to `Recreate` —
+    // an owned RWO PVC cannot be held by the old + new pod simultaneously
+    // during a RollingUpdate; reference disks (SharedVolume bind) tolerate
+    // RollingUpdate on single-node RWO. With no owned disk the strategy stays
+    // unset (apiserver default RollingUpdate), unchanged from today.
     let mut sorted_disks: Vec<&DiskMount> = disks.unwrap_or(&[]).iter().collect();
     sorted_disks.sort_by(|a, b| a.volume_name.cmp(&b.volume_name));
     let volume_mounts: Vec<VolumeMount> = sorted_disks
@@ -384,13 +389,14 @@ fn render_deployment(
             ..Default::default()
         })
         .collect();
-    let strategy = if sorted_disks.is_empty() {
-        None
-    } else {
+    let force_recreate = sorted_disks.iter().any(|d| d.owned);
+    let strategy = if force_recreate {
         Some(DeploymentStrategy {
             type_: Some("Recreate".to_string()),
             rolling_update: None,
         })
+    } else {
+        None
     };
 
     let container = Container {
@@ -1886,6 +1892,7 @@ mod tests {
             mount_path: "/data".to_string(),
             read_only: false,
             pvc_name: "claim-demo-app-disk-data".to_string(),
+            owned: true,
         }];
         let r = render_application_for_env(
             &app,
@@ -2012,12 +2019,14 @@ mod tests {
                 mount_path: "/z".to_string(),
                 read_only: true,
                 pvc_name: "claim-demo-app-disk-z".to_string(),
+                owned: true,
             },
             DiskMount {
                 volume_name: "disk-a".to_string(),
                 mount_path: "/a".to_string(),
                 read_only: false,
                 pvc_name: "claim-demo-app-disk-a".to_string(),
+                owned: true,
             },
         ];
         let r = render_application_for_env(
@@ -2038,5 +2047,112 @@ mod tests {
         let volumes = pod_volumes(&r).expect("volumes present");
         assert_eq!(volumes[0].name, "disk-a");
         assert_eq!(volumes[1].name, "disk-z");
+    }
+
+    #[test]
+    fn reference_only_disks_do_not_force_recreate() {
+        // A render with a single reference (owned:false) DiskMount must NOT
+        // force Recreate — SharedVolume binds tolerate RollingUpdate on a
+        // single-node RWO PVC. The volume + volumeMount must still be present.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "demo-app",
+            "demo",
+            "uid-ref",
+        );
+        let disks = vec![DiskMount {
+            volume_name: "disk-shared".to_string(),
+            mount_path: "/shared".to_string(),
+            read_only: false,
+            pvc_name: "pvc-shared-vol".to_string(),
+            owned: false,
+        }];
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            Some(&disks),
+            operator_core::EgressProfile::Internet,
+            None,
+        );
+        // Strategy must remain unset (apiserver default = RollingUpdate).
+        assert!(
+            r.deployment.spec.as_ref().unwrap().strategy.is_none(),
+            "reference-only disks must NOT force Recreate"
+        );
+        // The volume + volumeMount must still be present.
+        let mounts = container_volume_mounts(&r).expect("volumeMounts present for reference disk");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "disk-shared");
+        assert_eq!(mounts[0].mount_path, "/shared");
+        let volumes = pod_volumes(&r).expect("volumes present for reference disk");
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].name, "disk-shared");
+        let pvc = volumes[0]
+            .persistent_volume_claim
+            .as_ref()
+            .expect("persistentVolumeClaim source");
+        assert_eq!(pvc.claim_name, "pvc-shared-vol");
+    }
+
+    #[test]
+    fn any_owned_disk_forces_recreate() {
+        // Two DiskMounts: one reference (owned:false) + one owned (owned:true).
+        // The presence of the owned disk must force strategy: Recreate.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "demo-app",
+            "demo",
+            "uid-mixed",
+        );
+        let disks = vec![
+            DiskMount {
+                volume_name: "disk-ref".to_string(),
+                mount_path: "/ref".to_string(),
+                read_only: false,
+                pvc_name: "pvc-shared-vol".to_string(),
+                owned: false,
+            },
+            DiskMount {
+                volume_name: "disk-own".to_string(),
+                mount_path: "/own".to_string(),
+                read_only: false,
+                pvc_name: "claim-demo-app-disk-own".to_string(),
+                owned: true,
+            },
+        ];
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            Some(&disks),
+            operator_core::EgressProfile::Internet,
+            None,
+        );
+        let strategy = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .strategy
+            .as_ref()
+            .expect("strategy set when owned disk present");
+        assert_eq!(strategy.type_.as_deref(), Some("Recreate"));
     }
 }
