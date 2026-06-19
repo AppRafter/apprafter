@@ -31,6 +31,12 @@ package v1alpha1
 // `disk` (2.6b / ADR 0043) is persistent block storage: a `needs.disk`
 // entry generates a `type: disk` ResourceClaim that the `Backend::Disk`
 // provisioner backs with a standalone RWO PVC.
+//
+// `shared-disk` (2.6c) is shared persistent block storage: a
+// `needs.sharedVolume` entry generates a `type: shared-disk`
+// ResourceClaim that the SharedVolume provisioner backs with a shared
+// RWX PVC (one PVC per SharedVolume group, mounted read-write by
+// multiple pods simultaneously).
 #PlatformServiceType:
 	"pg" |
 	"jetstream" |
@@ -38,7 +44,8 @@ package v1alpha1
 	"redis" |
 	"s3" |
 	"notifications" |
-	"disk"
+	"disk" |
+	"shared-disk"
 
 #Size: "nano" | "small" | "medium" | "large" | "xlarge"
 

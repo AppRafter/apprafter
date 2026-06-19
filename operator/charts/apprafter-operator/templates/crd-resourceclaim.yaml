@@ -69,6 +69,7 @@ spec:
                 - s3
                 - notifications
                 - disk
+                - shared-disk
                 type: string
             required:
             - type

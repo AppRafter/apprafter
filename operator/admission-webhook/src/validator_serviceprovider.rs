@@ -5,7 +5,7 @@
 //! deserves a clearer error message:
 //!
 //!   - **`spec.type` is one of the closed built-in set**
-//!     (`pg|jetstream|clickhouse|redis|s3|notifications|disk`). An
+//!     (`pg|jetstream|clickhouse|redis|s3|notifications|disk|shared-disk`). An
 //!     unknown type is rejected — in v1alpha1 there is no plugin registry
 //!     yet (ServiceProviderPlugin lands in Phase 7), so the set is closed.
 //!   - **`spec.backend` is present and non-empty.** The backend set is
@@ -33,7 +33,7 @@ use crate::validator::ValidationError;
 /// `#PlatformServiceType` in `schemas/v1alpha1/types.cue`. Phase 7
 /// `ServiceProviderPlugin` will extend this at runtime; until then a
 /// type outside this set is an admission error.
-const BUILTIN_TYPES: [&str; 7] = [
+const BUILTIN_TYPES: [&str; 8] = [
     "pg",
     "jetstream",
     "clickhouse",
@@ -41,6 +41,7 @@ const BUILTIN_TYPES: [&str; 7] = [
     "s3",
     "notifications",
     "disk",
+    "shared-disk",
 ];
 
 /// Validate a ServiceProvider AdmissionReview object. The caller
@@ -183,6 +184,21 @@ mod tests {
         obj["spec"]["type"] = json!("disk");
         obj["spec"]["backend"] = json!("disk");
         assert!(validate_serviceprovider(&obj).is_empty());
+    }
+
+    #[test]
+    fn accepts_shared_disk_type() {
+        // Regression test for the 2.6c walk-found bug: the `shared-local`
+        // ServiceProvider seed uses `type: shared-disk` but the enum in
+        // the CRD + BUILTIN_TYPES did not include it, causing the apiserver
+        // to reject the seed with "Unsupported value: shared-disk".
+        let mut obj = valid_object();
+        obj["spec"]["type"] = json!("shared-disk");
+        obj["spec"]["backend"] = json!("shared-disk");
+        assert!(
+            validate_serviceprovider(&obj).is_empty(),
+            "shared-disk must be accepted as a built-in ServiceProvider type"
+        );
     }
 
     #[test]

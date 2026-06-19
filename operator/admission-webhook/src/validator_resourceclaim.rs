@@ -42,7 +42,7 @@ use crate::validator::ValidationError;
 /// HA changes the SA naming.
 const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
 /// Mirrors `#PlatformServiceType` in `schemas/v1alpha1/types.cue`.
-const BUILTIN_TYPES: [&str; 7] = [
+const BUILTIN_TYPES: [&str; 8] = [
     "pg",
     "jetstream",
     "clickhouse",
@@ -51,6 +51,8 @@ const BUILTIN_TYPES: [&str; 7] = [
     "notifications",
     // 2.6b (ADR 0043): the `disk` claim type (persistent block storage).
     "disk",
+    // 2.6c: the `shared-disk` claim type (shared RWX PVC for SharedVolume).
+    "shared-disk",
 ];
 /// Mirrors `#Size` in `schemas/v1alpha1/types.cue`.
 const SIZES: [&str; 5] = ["nano", "small", "medium", "large", "xlarge"];
