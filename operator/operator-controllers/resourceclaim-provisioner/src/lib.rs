@@ -67,6 +67,7 @@ pub mod gc;
 pub mod grace;
 pub mod reconcile;
 pub mod redis_client;
+pub mod shared_volume;
 
 use redis_client::{RedisAdmin, RedisClient};
 
