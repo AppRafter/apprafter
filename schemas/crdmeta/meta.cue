@@ -271,6 +271,22 @@ _crdMetas: SharedVolume: {
 		{name: "Refs", type: "integer", jsonPath: ".status.refCount"},
 		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
 	]
+
+	// `status.conditions` as a server-side-merged list keyed by `type` (the
+	// standard Kubernetes conditions pattern). CUE→OpenAPI cannot emit the
+	// `x-kubernetes-list-*` markers, so restore them here. Without the
+	// listMap the list is ATOMIC under SSA: each manager's apply replaces
+	// the whole array. SharedVolume's conditions (Ready + CapacityWarning)
+	// are written by a single manager today, but a keyed list is the
+	// correct, future-proof shape (and keeps it consistent with
+	// ResourceClaim, whose two managers actively conflict). Paths are
+	// relative to the `status` node.
+	statusSchemaPatches: {
+		"conditions": {
+			"x-kubernetes-list-type": "map"
+			"x-kubernetes-list-map-keys": ["type"]
+		}
+	}
 }
 
 _crdMetas: ResourceClaim: {
@@ -302,5 +318,23 @@ _crdMetas: ResourceClaim: {
 	// (clearer message). Paths are relative to `spec`.
 	schemaPatches: {
 		"selector": {minProperties: 1}
+	}
+
+	// `status.conditions` as a server-side-merged list keyed by `type` (the
+	// standard Kubernetes conditions pattern). REQUIRED here (walk-found):
+	// the SCHEDULER (`[Scheduled]`) and the PROVISIONER (`[Ready]`) write
+	// `status.conditions` under DIFFERENT field managers. Without
+	// `x-kubernetes-list-type: map` the list is ATOMIC under SSA, so each
+	// forced apply REPLACES the whole array and the two managers overwrite
+	// each other (only `[Scheduled]` survived → the durable `Ready=False /
+	// AwaitingSharedVolume` condition was pruned). The listMap makes both
+	// conditions coexist (merged by their `type` key). CUE→OpenAPI cannot
+	// emit these markers, so restore them here. Paths are relative to the
+	// `status` node.
+	statusSchemaPatches: {
+		"conditions": {
+			"x-kubernetes-list-type": "map"
+			"x-kubernetes-list-map-keys": ["type"]
+		}
 	}
 }

@@ -279,4 +279,38 @@ mod tests {
         let patches = schemas(json!({ "base.image": { "pattern": "^.+$" } }));
         assert!(apply_patches(&mut spec, &patches).is_err());
     }
+
+    #[test]
+    fn apply_patches_passes_through_list_type_map_markers() {
+        // Walk-found Bug B: `status.conditions` must be an SSA-merged listMap
+        // keyed by `type` so the scheduler's `[Scheduled]` and the
+        // provisioner's `[Ready]` conditions coexist instead of overwriting.
+        // `apply_patches` is a generic key-merge, so the `x-kubernetes-list-*`
+        // markers (which CUE→OpenAPI can't emit) pass straight through onto
+        // the `conditions` array node — no extension of the patch engine
+        // needed beyond rooting the patch at the `status` node.
+        let mut status = json!({
+            "type": "object",
+            "properties": {
+                "conditions": { "type": "array", "items": { "type": "object" } }
+            }
+        });
+        let patches = schemas(json!({
+            "conditions": {
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["type"]
+            }
+        }));
+        apply_patches(&mut status, &patches).unwrap();
+        assert_eq!(
+            status["properties"]["conditions"]["x-kubernetes-list-type"],
+            json!("map")
+        );
+        assert_eq!(
+            status["properties"]["conditions"]["x-kubernetes-list-map-keys"],
+            json!(["type"])
+        );
+        // The array shape is preserved (the merge only adds keys).
+        assert_eq!(status["properties"]["conditions"]["type"], json!("array"));
+    }
 }

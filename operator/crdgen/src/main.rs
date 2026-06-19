@@ -126,6 +126,16 @@ pub(crate) fn render_all() -> Result<Vec<Rendered>> {
         let status = match props.get("status") {
             Some(s) => {
                 let mut r = structural::resolve(s, &schemas);
+                // Status-targeted CRD-only constraints CUE can't express
+                // (e.g. the `x-kubernetes-list-type: map` SSA-merge marker on
+                // `conditions` so independent field managers' conditions
+                // coexist instead of overwriting). Same path mini-language as
+                // the spec patches, but rooted at the `status` node. Applied
+                // BEFORE the preserve-unknown wrapper so a navigate failure
+                // surfaces the bad path.
+                if let Some(patches) = meta.get("statusSchemaPatches").and_then(Value::as_object) {
+                    structural::apply_patches(&mut r, patches)?;
+                }
                 if let Some(o) = r.as_object_mut() {
                     o.insert("x-kubernetes-preserve-unknown-fields".into(), json!(true));
                 }
