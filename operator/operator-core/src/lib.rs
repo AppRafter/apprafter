@@ -10,6 +10,7 @@ pub mod platform_stack;
 pub mod resourceclaim;
 pub mod retainedclaim;
 pub mod serviceprovider;
+pub mod sharedvolume;
 pub mod sourcecredential;
 
 pub use application::{
@@ -38,6 +39,10 @@ pub use resourceclaim::{
 };
 pub use retainedclaim::{ClaimRef, RetainedClaim, RetainedClaimSpec};
 pub use serviceprovider::{ServiceProvider, ServiceProviderSpec, ServiceProviderStatus};
+pub use sharedvolume::{
+    SharedVolume, SharedVolumeCapacity, SharedVolumeCondition, SharedVolumeSpec,
+    SharedVolumeStatus, COND_CAPACITY_WARNING, COND_READY,
+};
 pub use sourcecredential::{
     SealedSecretRef, SourceBackend, SourceCredential, SourceCredentialCondition,
     SourceCredentialSpec, SourceCredentialStatus, SourceGit, SourceRegistry, COND_GIT_PRESENT,
