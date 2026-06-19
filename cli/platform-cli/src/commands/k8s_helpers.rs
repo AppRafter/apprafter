@@ -175,6 +175,131 @@ pub(crate) fn kubectl_get_json_by_selector(
         .unwrap_or_default())
 }
 
+/// Build the args for `kubectl get <resource> [-n <ns> | -A] -o json`.
+/// Factored out so the arg shape is unit-testable without spawning kubectl.
+/// When `namespace` is `None` the listing is cluster-wide (`-A`).
+pub(crate) fn kubectl_get_cluster_wide_args(
+    resource: &str,
+    namespace: Option<&str>,
+) -> Vec<String> {
+    let mut a = vec!["get".to_string(), resource.to_string()];
+    match namespace {
+        Some(ns) => {
+            a.push("-n".to_string());
+            a.push(ns.to_string());
+        }
+        None => a.push("-A".to_string()),
+    }
+    a.push("-o".to_string());
+    a.push("json".to_string());
+    a
+}
+
+/// Like [`kubectl_get_json`] but accepts `namespace: Option<&str>` and passes
+/// `-A` (all-namespaces) when it is `None`, instead of falling through to the
+/// kubeconfig default namespace.  Use this for listing verbs where the user
+/// omitting `--namespace` should mean cluster-wide, not current-context ns.
+pub(crate) fn kubectl_get_json_cluster_wide(
+    resource: &str,
+    namespace: Option<&str>,
+    kubeconfig_path: &Path,
+) -> Result<Option<serde_json::Value>> {
+    let mut c = Command::new("kubectl");
+    c.args(kubectl_get_cluster_wide_args(resource, namespace))
+        .env("KUBECONFIG", kubeconfig_path);
+
+    let out = c
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("NotFound") || stderr.contains("not found") {
+            return Ok(None);
+        }
+        return Err(CliError::Other(format!(
+            "kubectl get {resource} failed (exit {:?}): {stderr}",
+            out.status.code()
+        )));
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
+    Ok(Some(value))
+}
+
+/// Apply a manifest from a `serde_json::Value` via `kubectl apply -f <tempfile>`.
+/// Serialises the value to a temporary JSON file and passes the path; the temp
+/// file is removed when this function returns.  Simple client-side apply —
+/// equivalent to `kubectl apply -f manifest.json`.  Use
+/// `kubectl_apply_server_side` when SSA field-manager ownership is required.
+pub fn kubectl_apply_json(manifest: &serde_json::Value, kubeconfig_path: &Path) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut file = tempfile::Builder::new()
+        .prefix("apprafter-apply-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|e| CliError::Other(format!("create apply tempfile: {e}")))?;
+    let body = serde_json::to_vec_pretty(manifest)
+        .map_err(|e| CliError::Other(format!("serialise manifest: {e}")))?;
+    file.write_all(&body)
+        .map_err(|e| CliError::Other(format!("write apply tempfile: {e}")))?;
+    file.flush()
+        .map_err(|e| CliError::Other(format!("flush apply tempfile: {e}")))?;
+
+    let out = Command::new("kubectl")
+        .arg("apply")
+        .arg("-f")
+        .arg(file.path())
+        .env("KUBECONFIG", kubeconfig_path)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl apply: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl apply failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// Run `kubectl delete <resource> <name> -n <namespace> --ignore-not-found`.
+/// Idempotent — absent objects are a no-op, not an error.
+pub fn kubectl_delete(
+    resource: &str,
+    name: &str,
+    namespace: &str,
+    kubeconfig_path: &Path,
+) -> Result<()> {
+    let out = Command::new("kubectl")
+        .args([
+            "delete",
+            resource,
+            name,
+            "-n",
+            namespace,
+            "--ignore-not-found",
+        ])
+        .env("KUBECONFIG", kubeconfig_path)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl delete {resource}/{name} failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim();
+    if !trimmed.is_empty() {
+        println!("  {trimmed}");
+    }
+    Ok(())
+}
+
 /// Run `kubectl patch ... --type=merge -p <body>` against a
 /// namespaced or cluster-scoped resource. When `subresource`
 /// is `Some(name)` (`status`, `scale`), the patch routes
@@ -285,5 +410,35 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-n", "argocd"]));
         let all = kubectl_list_args("x", "y=z", None);
         assert!(all.iter().any(|a| a == "-A"));
+    }
+
+    #[test]
+    fn cluster_wide_args_all_namespaces_when_none() {
+        // When no namespace is given, -A must appear (cluster-wide listing).
+        let args = kubectl_get_cluster_wide_args("sharedvolume.apprafter.io", None);
+        assert!(args.iter().any(|a| a == "-A"), "expected -A flag: {args:?}");
+        assert!(
+            !args.iter().any(|a| a == "-n"),
+            "-n must be absent: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "json"),
+            "expected -o json: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_wide_args_namespaced_when_some() {
+        // When a namespace is given, -n <ns> must appear and -A must not.
+        let args =
+            kubectl_get_cluster_wide_args("sharedvolume.apprafter.io", Some("apprafter-system"));
+        assert!(
+            args.windows(2).any(|w| w == ["-n", "apprafter-system"]),
+            "expected -n apprafter-system: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-A"),
+            "-A must be absent: {args:?}"
+        );
     }
 }

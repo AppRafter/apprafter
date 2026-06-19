@@ -38,4 +38,5 @@ pub mod target_firewall;
 pub mod target_wizard;
 pub mod upgrade_tier;
 pub mod version_check;
+pub mod volume;
 pub mod whoami;

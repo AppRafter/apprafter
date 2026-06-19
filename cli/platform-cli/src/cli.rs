@@ -224,6 +224,13 @@ pub enum Commands {
         #[command(subcommand)]
         action: SecretCommand,
     },
+    /// Manage SharedVolume CRs — persistent volumes shared across
+    /// multiple Applications (2.6c). Volumes are namespaced;
+    /// `rm` is refused while any Application references the volume.
+    Volume {
+        #[command(subcommand)]
+        action: VolumeCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1083,6 +1090,48 @@ pub enum AuthCommand {
     /// Report current AppRafter Cloud (Managed) authentication
     /// status. Stub.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+/// `apprafter volume …` subcommands (2.6c SharedVolume CRs).
+pub enum VolumeCommand {
+    /// Create a SharedVolume CR in the cluster.
+    Create {
+        /// SharedVolume `metadata.name` (DNS-1123).
+        name: String,
+        /// Requested storage size (e.g. `5Gi`, `100Mi`).
+        #[arg(long)]
+        size: String,
+        /// Target namespace. Defaults to `apprafter-system`.
+        #[arg(long, short = 'n', default_value = "apprafter-system")]
+        namespace: String,
+    },
+    /// List SharedVolumes with refCount and used/free capacity.
+    #[command(alias = "ls")]
+    List {
+        /// Namespace to list. Omit for cluster-wide listing.
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+    },
+    /// Show detail for one SharedVolume (pvcRef, refCount, capacity).
+    Status {
+        /// SharedVolume `metadata.name`.
+        name: String,
+        /// Namespace. Defaults to `apprafter-system`.
+        #[arg(long, short = 'n', default_value = "apprafter-system")]
+        namespace: String,
+    },
+    /// Delete a SharedVolume. Refused while still referenced by apps.
+    Rm {
+        /// SharedVolume `metadata.name`.
+        name: String,
+        /// Namespace. Defaults to `apprafter-system`.
+        #[arg(long, short = 'n', default_value = "apprafter-system")]
+        namespace: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 #[cfg(test)]

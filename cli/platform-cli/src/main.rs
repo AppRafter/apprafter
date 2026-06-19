@@ -253,6 +253,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 yes,
             } => commands::secret::run_remove(&name, &namespace, yes)?,
         },
+        Commands::Volume { action } => commands::volume::run(action)?,
     }
     Ok(())
 }
