@@ -56,12 +56,13 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 | ✅ | On-demand Postgres (`needs.pg`, CloudNativePG) | 2.1–2.4 | CP2 |
 | ✅ | On-demand Redis cache (`needs.redis`, Dragonfly) | 2.6 | CP2 |
 | ✅ | On-demand block storage (`needs.disk`) | 2.6b | CP2 |
+| ✅ | Cross-app shared volumes (`SharedVolume` + `needs.disk.ref`, `apprafter volume`) + disk capacity-signal | 2.6c | CP2 |
 | ✅ | Reference secrets/claims directly in `Application.env` (`secret()` / `claim.*`) | 2.12 | CP2 |
 | ✅ | Secrets management — SealedSecrets (encrypted secrets in Git) | 2.11 | CP2 |
 | 🚧 | Deploy from private repos (`SourceCredential`: git + registry credentials from one source) | 1.79c | CP2 |
 
 > Invisible infrastructure in order 3 (auto-`NetworkPolicy` derivation from `needs`, 2.10) is not a tracker row — it shipped alongside `needs.*` as a security default.
-> Caveats: **2.11** ships the seal capability + `apprafter secret seal`; the Backstage encrypt-wizard is deferred to PL1. **1.79c** is `🚧` — S0–S4 land the vertical (CRD + controller + webhook + `apprafter repo creds`); S5 + the manual walk remain.
+> Caveats: **2.11** ships the seal capability + `apprafter secret seal`; the Backstage encrypt-wizard is deferred to PL1. **1.79c** is `🚧` — S0–S4 land the vertical (CRD + controller + webhook + `apprafter repo creds`); S5 + the manual walk remain. **2.6c** — the cross-app SharedVolume path (two apps ref one volume, rolling-update mount survival, `volume rm` refused while referenced) is walk-verified GREEN on kind+podman; the disk **capacity-signal** Warning/condition live-read (kubelet `nodes/stats`) is best-effort and was SOFT-skipped on kind (cluster-dependent reachability — to be confirmed on a real cluster). Cross-ns / multi-node shared volumes + intra-app `shareMode: shared` remain T2.
 
 ---
 

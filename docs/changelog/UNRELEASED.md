@@ -9,6 +9,68 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator + admission-webhook v0.2.31 + platform-stack 0.2.37 + cue-cmp 0.1.13 + cli v0.2.28 — 2.6c capacity-signal + cross-app SharedVolume (2026-06-19)
+
+2.6c (order-3.5 pulled-up; ADR 0049). A coordinated CRD-additive release
+(`change: safe`) that adds cross-app shared volumes + a disk capacity-signal
+on top of the 2.6b owned-disk pipeline. The kind+podman live walk
+(`e2e/shared-volume-walk.sh`) is GREEN end-to-end.
+
+### Added
+
+- **`SharedVolume` CRD** (namespaced; `spec:{size,class}`,
+  `status:{ready,pvcRef,refCount}`) — an explicit-lifecycle storage object,
+  decoupled from any Application, provisioned out-of-band via the new
+  **`apprafter volume create / rm / list / status`** CLI group. The
+  provisioner creates one **unowned** PVC on the volume's class (T1:
+  `shared-local`, `local-path`, RWO) and tracks `refCount`; `volume rm` is
+  refused while `refCount > 0`.
+- **Cross-app `needs.disk.ref`** — `Application.needs.disk` now accepts a
+  *referenced* `{ref, mountPath, readOnly?}` shape (bind an existing
+  SharedVolume) alongside the *owned* `{name, size, mountPath}` shape (2.6b);
+  the admission webhook discriminates by shape, rejects a `ref` to a
+  non-existent SharedVolume, and rejects a cross-namespace `ref` on T1 (the
+  single-node same-ns invariant) with a "cross-namespace → T2 (NFS)" hint.
+  The provisioner's reference-arm binds the existing SharedVolume's PVC
+  without provisioning or GC'ing backing; the renderer mounts it **without**
+  forcing `strategy: Recreate` (the owned-arm forces it for the
+  single-PVC-cross-node case; a reference-arm on single-node RWO-multi-pod
+  tolerates RollingUpdate).
+- **`shared-disk` backend type** — a new value on `ServiceProvider.type` and
+  `ResourceClaim.type` (distinct from `disk`, so the scheduler never
+  cross-matches the owned-disk line) + the seeded `shared-local`
+  ServiceProvider (T1 local-path).
+- **Disk capacity-signal** — the operator reads per-PVC + node-level capacity
+  via the kubelet Summary API (`/stats/summary`, RBAC `nodes/stats`,
+  per-reconcile TTL cache; no full-OTel dependency) and raises a Warning
+  Event + a status condition when node-free drops below the threshold
+  (default 15%), surfaced in `apprafter app status` / `apprafter volume
+  status`. **Best-effort live-read** — it was SOFT-skipped on the kind walk
+  (kubelet `nodes/stats` reachability is cluster-dependent; to be confirmed
+  on a real cluster).
+
+### Fixed
+
+- Walk-found product bugs (all gates upstream had passed): the
+  ServiceProvider `type` enum lacked `shared-disk`; a SharedVolume's
+  `refCount` was stale when a referencing claim changed (no reconcile on
+  ref-claim change); `ResourceClaim.status.ready` wasn't derived from the
+  `Ready` condition; `conditions` weren't an SSA-merged listMap
+  (`x-kubernetes-list-map-keys: [type]`) so server-side apply churned them;
+  and the SharedVolume watch fanned out on orphaned/unrelated objects (store
+  filter missing).
+
+### Delivery
+
+- Operator + admission-webhook images roll v0.2.30 → **v0.2.31**; the cue-cmp
+  sidecar rolls 0.1.12 → **0.1.13** (it bundles `schemas/v1alpha1`, which
+  gained the SharedVolume schema + the `needs.disk` disjunction). The chart
+  rolls to **platform-stack 0.2.37** (`change: safe`, `operatorVersion
+  v0.2.31`). CLI rolls v0.2.27 → **v0.2.28** (the new `apprafter volume`
+  group). Chart-delivered, no re-bootstrap. `operator/v0.2.31`,
+  `platform-stack/v0.2.37`, and `argocd-cue-cmp/v0.1.13` tags are
+  workflow-made on push.
+
 ## cli v0.2.27 — apprafter secret remove (2026-06-15)
 
 ### Added
