@@ -1324,11 +1324,38 @@ fn generate_resource_claims(
         // A disk entry has `service = None` + `disk = Some(..)`; emit a
         // minimal `type: disk` claim and skip the service-only fields.
         if let Some(disk) = entry.disk {
-            // 2.6c: referenced disks (needs.disk.ref) bind an existing SharedVolume.
-            // Reference-claim generation lands in T9 — guard the owned-disk path until
-            // then so a ref-shape entry never reaches the owned json! below (which would
-            // emit "size": null). T9 replaces this `continue` with ref-claim emission.
-            if disk.is_reference() {
+            // 2.6c (T9): a referenced disk (`needs.disk.ref`) binds an
+            // existing SharedVolume. Emit a `shared-disk` ResourceClaim
+            // carrying ONLY the binding label `apprafter.io/shared-volume`
+            // (the key the T6/T7 provisioner reads to find the SharedVolume
+            // and write back `status.volumeClaimRef`) + the integrated-tier
+            // selector + the Application ownerRef. NO `size`, NO `spec.name`
+            // — the reference shape is discriminated purely by `ref`, and
+            // `resolve_disk_mounts` pairs the mount back by that same label.
+            if let Some(reference) = disk.reference.as_deref() {
+                let ref_name = claim_name(app_name, "shared-disk", Some(reference));
+                let payload = json!({
+                    "apiVersion": "apprafter.io/v1alpha1",
+                    "kind": "ResourceClaim",
+                    "metadata": {
+                        "name": ref_name,
+                        "namespace": namespace,
+                        "labels": { "apprafter.io/shared-volume": reference },
+                        "ownerReferences": [{
+                            "apiVersion": "apprafter.io/v1alpha1",
+                            "kind": "Application",
+                            "name": app_name,
+                            "uid": app_uid,
+                            "controller": true,
+                            "blockOwnerDeletion": true,
+                        }],
+                    },
+                    "spec": {
+                        "type": "shared-disk",
+                        "selector": default_integrated_selector(),
+                    },
+                });
+                out.push((ref_name, payload));
                 continue;
             }
             let mut claim_spec = json!({
@@ -1532,14 +1559,31 @@ fn resolve_disk_mounts(
         // for an explicit name) — so a derived-default entry matches its
         // `<app>-disk` claim (whose `spec.name` is None).
         let identity = disk_identity_name(&disk);
-        let want_spec_name = disk.name.as_deref().filter(|n| !n.is_empty());
-        let want_claim_name = claim_name(app, "disk", want_spec_name);
-        // Match by k8s claim name (robust for both named + derived-default
-        // entries) OR by spec.name (the explicit (disk,name) identity).
-        let claim = claims.iter().find(|c| {
-            c.name_any() == want_claim_name
-                || (want_spec_name.is_some() && c.spec.name.as_deref() == want_spec_name)
-        });
+        // 2.6c (T9): a referenced disk pairs with its `shared-disk` claim
+        // by the `apprafter.io/shared-volume` label (== `ref`) — the SAME
+        // binding key the T6/T7 provisioner uses — NOT by k8s/spec name
+        // (the reference claim carries neither a size nor a spec.name). The
+        // owned path below keeps its name-based pairing.
+        let claim = if let Some(reference) = disk.reference.as_deref() {
+            claims.iter().find(|c| {
+                c.spec.type_ == "shared-disk"
+                    && c.metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|l| l.get("apprafter.io/shared-volume"))
+                        .map(String::as_str)
+                        == Some(reference)
+            })
+        } else {
+            let want_spec_name = disk.name.as_deref().filter(|n| !n.is_empty());
+            let want_claim_name = claim_name(app, "disk", want_spec_name);
+            // Match by k8s claim name (robust for both named + derived-default
+            // entries) OR by spec.name (the explicit (disk,name) identity).
+            claims.iter().find(|c| {
+                c.name_any() == want_claim_name
+                    || (want_spec_name.is_some() && c.spec.name.as_deref() == want_spec_name)
+            })
+        };
         let Some(pvc_name) = claim
             .and_then(|c| c.status.as_ref())
             .and_then(|s| s.volume_claim_ref.clone())
@@ -3146,6 +3190,181 @@ mod tests {
         let spec = base_with_needs(needs);
         let claims = vec![ready_claim("demo-app-pg", Some(true), Some("conn"))];
         assert!(resolve_disk_mounts(&spec, "demo-app", &claims).is_empty());
+    }
+
+    // ---- 2.6c (T9): reference disk (needs.disk.ref) — SharedVolume bind ----
+
+    /// Helper: base spec with a single REFERENCED disk need
+    /// (`needs.disk.ref = <ref>`, `mountPath = <mount_path>`, no `size`).
+    fn base_with_disk_ref(reference: &str, mount_path: &str) -> ApplicationBaseSpec {
+        use operator_core::{Needs, OneOrMany};
+        ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(Needs {
+                disk: Some(OneOrMany::One(DiskClaim {
+                    name: None,
+                    size: None,
+                    reference: Some(reference.to_string()),
+                    mount_path: mount_path.to_string(),
+                    class: None,
+                    read_only: None,
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Helper: a ready `shared-disk` reference ResourceClaim as the
+    /// provisioner's T7 arm writes it — type=`shared-disk`, the binding
+    /// label `apprafter.io/shared-volume=<ref>`, `status.ready=true`,
+    /// `status.volumeClaimRef=<pvc_name>` (no connectionSecretRef).
+    fn ready_reference_claim(reference: &str, pvc_name: &str) -> ResourceClaim {
+        let mut c = ResourceClaim::new(
+            "demo-app-shared-disk",
+            ResourceClaimSpec {
+                type_: "shared-disk".into(),
+                name: None,
+                selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
+                size: None,
+                persistent: None,
+            },
+        );
+        c.metadata.namespace = Some("demo".into());
+        c.metadata.labels = Some(BTreeMap::from([(
+            "apprafter.io/shared-volume".to_string(),
+            reference.to_string(),
+        )]));
+        c.status = Some(ResourceClaimStatus {
+            provider: None,
+            connection_secret_ref: None,
+            ready: Some(true),
+            conditions: None,
+            volume_claim_ref: Some(pvc_name.to_string()),
+            ..Default::default()
+        });
+        c
+    }
+
+    #[test]
+    fn reference_disk_emits_shared_disk_claim_with_label() {
+        // A `needs.disk.ref = shared` entry → ONE `shared-disk` claim
+        // carrying the binding label + NO size + NO spec.name + the
+        // integrated-tier selector + an Application ownerRef.
+        let spec = base_with_disk_ref("shared", "/data");
+        let claims = generate_resource_claims(&spec, "demo-app", "uid-1", "demo");
+        assert_eq!(claims.len(), 1);
+        let (name, claim) = claims
+            .iter()
+            .find(|(_, c)| c["spec"]["type"] == json!("shared-disk"))
+            .expect("a shared-disk claim is emitted");
+        assert_eq!(name, "demo-app-shared-disk-shared");
+        assert_eq!(
+            claim["metadata"]["name"],
+            json!("demo-app-shared-disk-shared")
+        );
+        assert_eq!(
+            claim["metadata"]["labels"]["apprafter.io/shared-volume"],
+            json!("shared")
+        );
+        assert_eq!(claim["spec"]["selector"], json!({ "tier": "integrated" }));
+        // No size + no spec.name on the reference claim.
+        assert!(claim["spec"].get("size").is_none());
+        assert!(claim["spec"].get("name").is_none());
+        // SSA split guard: no status on the apply payload.
+        assert!(claim.get("status").is_none());
+        // ownerRef → Application (controller + blockOwnerDeletion).
+        let owner = &claim["metadata"]["ownerReferences"][0];
+        assert_eq!(owner["name"], json!("demo-app"));
+        assert_eq!(owner["uid"], json!("uid-1"));
+        assert_eq!(owner["controller"], json!(true));
+        assert_eq!(owner["blockOwnerDeletion"], json!(true));
+    }
+
+    #[test]
+    fn reference_disks_array_emits_distinct_claims_per_ref() {
+        // Regression: an app with TWO reference disks pointing at DIFFERENT
+        // SharedVolumes must emit TWO `shared-disk` claims with DISTINCT k8s
+        // names (`<app>-shared-disk-<ref>`).  The old code used
+        // `claim_name(app, "shared-disk", None)` → both collapsed to
+        // `demo-app-shared-disk` (last-write-wins SSA bug).
+        use operator_core::{Needs, OneOrMany};
+        let spec = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(Needs {
+                disk: Some(OneOrMany::Many(vec![
+                    DiskClaim {
+                        name: None,
+                        size: None,
+                        reference: Some("shared-a".into()),
+                        mount_path: "/a".into(),
+                        class: None,
+                        read_only: None,
+                    },
+                    DiskClaim {
+                        name: None,
+                        size: None,
+                        reference: Some("shared-b".into()),
+                        mount_path: "/b".into(),
+                        class: None,
+                        read_only: None,
+                    },
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let claims = generate_resource_claims(&spec, "demo-app", "uid-1", "demo");
+        assert_eq!(claims.len(), 2, "one claim per referenced SharedVolume");
+        let names: Vec<&str> = claims.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"demo-app-shared-disk-shared-a"),
+            "expected demo-app-shared-disk-shared-a in {names:?}"
+        );
+        assert!(
+            names.contains(&"demo-app-shared-disk-shared-b"),
+            "expected demo-app-shared-disk-shared-b in {names:?}"
+        );
+        // Each carries its own apprafter.io/shared-volume label.
+        let label_for = |ref_val: &str| {
+            claims.iter().any(|(_, c)| {
+                c["metadata"]["labels"]["apprafter.io/shared-volume"] == json!(ref_val)
+            })
+        };
+        assert!(
+            label_for("shared-a"),
+            "missing shared-volume=shared-a label"
+        );
+        assert!(
+            label_for("shared-b"),
+            "missing shared-volume=shared-b label"
+        );
+    }
+
+    #[test]
+    fn resolve_disk_mounts_marks_reference_mount_unowned() {
+        // A referenced disk entry pairs with the ready `shared-disk` claim
+        // by the `apprafter.io/shared-volume` label, reads its
+        // volumeClaimRef as the PVC, and yields a DiskMount with
+        // owned=false.
+        let spec = base_with_disk_ref("shared", "/data");
+        let claims = vec![ready_reference_claim("shared", "sv-ns-shared")];
+        let mounts = resolve_disk_mounts(&spec, "demo-app", &claims);
+        assert_eq!(mounts.len(), 1);
+        assert!(!mounts[0].owned);
+        assert_eq!(mounts[0].pvc_name, "sv-ns-shared");
+        assert_eq!(mounts[0].mount_path, "/data");
+        assert!(!mounts[0].read_only);
+    }
+
+    #[test]
+    fn resolve_disk_mounts_skips_reference_claim_without_volume_claim_ref() {
+        // A `shared-disk` claim not yet bound (no volumeClaimRef) is
+        // skipped — render omits the reference mount until the bind lands.
+        let spec = base_with_disk_ref("shared", "/data");
+        let mut claim = ready_reference_claim("shared", "ignored");
+        claim.status.as_mut().unwrap().volume_claim_ref = None;
+        assert!(resolve_disk_mounts(&spec, "demo-app", &[claim]).is_empty());
     }
 
     // ---- 2.4h-d: image-resolution policy gate + ImageResolved condition ----
