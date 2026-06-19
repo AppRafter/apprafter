@@ -60,6 +60,7 @@ use tracing::{info, warn};
 use operator_core::{Metrics, ResourceClaim, SharedVolume};
 
 pub mod acl_reconcile;
+pub mod capacity;
 pub mod cnpg;
 pub mod disk;
 pub mod dragonfly;
@@ -69,6 +70,7 @@ pub mod reconcile;
 pub mod redis_client;
 pub mod shared_volume;
 
+use capacity::CapacityCache;
 use redis_client::{RedisAdmin, RedisClient};
 
 pub(crate) const KIND: &str = "ResourceClaim";
@@ -94,6 +96,11 @@ pub struct Context {
     /// is testable with a fake; production is [`RedisClient`]. Unused by
     /// the CNPG path. ADR 0042 §2/§4.
     pub redis: Arc<dyn RedisAdmin>,
+    /// Per-node TTL cache of kubelet Summary documents (2.6c, T11). Shared
+    /// across BOTH controllers so a single node's kubelet is sampled at
+    /// most once per TTL across all reconciles. Capacity sampling is
+    /// best-effort and NEVER fails a reconcile.
+    pub capacity: Arc<CapacityCache>,
 }
 
 impl Context {
@@ -105,6 +112,7 @@ impl Context {
             client,
             metrics,
             redis: Arc::new(RedisClient),
+            capacity: Arc::new(CapacityCache::new()),
         }
     }
 }

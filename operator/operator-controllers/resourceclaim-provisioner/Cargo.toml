@@ -17,6 +17,7 @@ operator-core = { path = "../../operator-core" }
 
 kube        = { workspace = true }
 k8s-openapi = { workspace = true }
+http        = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }
 futures     = { workspace = true }

@@ -22,16 +22,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use k8s_openapi::api::core::v1::{Node, ObjectReference};
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
-use kube::{Client, ResourceExt};
+use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
+use kube::{Client, Resource, ResourceExt};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use operator_core::matching::{select_provider, Candidate};
-use operator_core::{ServiceProvider, SharedVolume, SharedVolumeCondition};
+use operator_core::{ServiceProvider, SharedVolume, SharedVolumeCondition, COND_CAPACITY_WARNING};
 
+use crate::capacity::{
+    is_capacity_warning, node_free_fraction, pvc_usage, should_emit_event,
+    DEFAULT_NODE_FREE_THRESHOLD,
+};
 use crate::{Context, ReconcileError, FIELD_MANAGER};
 
 /// The `ServiceProvider.spec.type` a `SharedVolume` binds to. There is no
@@ -45,6 +51,9 @@ const KIND: &str = "SharedVolume";
 
 /// Condition type this controller owns on a `SharedVolume`.
 const COND_READY: &str = "Ready";
+
+/// `Reporter.controller` for `SharedVolume` capacity Warning Events.
+const EVENT_REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-provisioner";
 
 /// Finalizer that reaps the backing PVC on `SharedVolume` delete. The PVC
 /// is unowned (no `ownerReferences`), so without this finalizer the PVC
@@ -165,6 +174,63 @@ pub fn sv_status_apply_body_with_condition(
     let mut body = sv_status_apply_body(sv_name, ready, pvc_ref, ref_count, capacity);
     body["status"]["conditions"] = json!([cond]);
     body
+}
+
+/// As [`sv_status_apply_body`] but stamps BOTH the `Ready` and the
+/// `CapacityWarning` conditions in the single terminal `conditions` array.
+///
+/// SSA REPLACES the manager's owned field-set on each apply, so when this
+/// controller owns two conditions they MUST both ride this one body — a
+/// body carrying only `Ready` would prune the `CapacityWarning` it set on a
+/// prior apply (and vice-versa). The `CapacityWarning` condition is
+/// optional: a sample-less cycle (`None`) drops back to the single-`Ready`
+/// shape so capacity simply goes absent rather than stamping a stale value.
+pub fn sv_status_apply_body_with_conditions(
+    sv_name: &str,
+    ready: bool,
+    pvc_ref: Option<&str>,
+    ref_count: i64,
+    capacity: Option<(i64, i64)>,
+    ready_cond: SharedVolumeCondition,
+    capacity_cond: Option<SharedVolumeCondition>,
+) -> Value {
+    let mut body = sv_status_apply_body(sv_name, ready, pvc_ref, ref_count, capacity);
+    body["status"]["conditions"] = match capacity_cond {
+        Some(cap) => json!([ready_cond, cap]),
+        None => json!([ready_cond]),
+    };
+    body
+}
+
+/// Build the `CapacityWarning` condition, preserving `lastTransitionTime`
+/// when the `(type, status)` pair is unchanged (same hot-loop guard as
+/// [`ready_condition`]).
+pub fn capacity_warning_condition(
+    status: &str,
+    reason: &str,
+    message: &str,
+    previous: &[SharedVolumeCondition],
+) -> SharedVolumeCondition {
+    let last_transition_time = previous
+        .iter()
+        .find(|c| c.type_ == COND_CAPACITY_WARNING && c.status == status)
+        .map(|c| c.last_transition_time.clone())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    SharedVolumeCondition {
+        type_: COND_CAPACITY_WARNING.to_string(),
+        status: status.to_string(),
+        last_transition_time,
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+    }
+}
+
+/// Whether the `previous` conditions show `CapacityWarning=True` (the prior
+/// state used to edge-trigger the Warning Event).
+pub fn was_capacity_warning(previous: &[SharedVolumeCondition]) -> bool {
+    previous
+        .iter()
+        .any(|c| c.type_ == COND_CAPACITY_WARNING && c.status == "True")
 }
 
 /// Build the `Ready` condition, preserving `lastTransitionTime` when the
@@ -312,23 +378,59 @@ pub async fn reconcile_shared_volume(
     // 5. Count the reference-ResourceClaims bound to this volume.
     let ref_count = current_ref_count(&ctx.client, &ns, &name).await?;
 
-    // 6. capacity sample is wired in Task 11 (kubelet `df` over the PVC).
-    let capacity: Option<(i64, i64)> = None; // T11: capacity sample
+    // 6. Sample capacity via the kubelet Summary API (BEST-EFFORT — any
+    //    failure leaves `capacity = None` + no CapacityWarning, NEVER fails
+    //    the reconcile). On single-node T1 the local-path PVC lives on the
+    //    one node, so we sample the first node's kubelet for both the
+    //    node-free fraction (warning trigger) and the PVC's own used/cap.
+    let summary = match first_node_name(&ctx.client).await {
+        Some(node) => ctx.capacity.summary_for_node(&ctx.client, &node).await,
+        None => None,
+    };
+    let capacity: Option<(i64, i64)> = summary.as_ref().and_then(|s| pvc_usage(s, &pvc_name));
+    let node_free = summary.as_ref().and_then(node_free_fraction);
+    let now_warning =
+        node_free.is_some_and(|f| is_capacity_warning(f, DEFAULT_NODE_FREE_THRESHOLD));
 
-    // 7. Write the terminal status — ready / pvcRef / refCount / Ready
-    //    condition, under our own field manager (never `.spec`).
+    // 7. Write the terminal status — ready / pvcRef / refCount / capacity /
+    //    BOTH the `Ready` and (when sampled) the `CapacityWarning`
+    //    conditions, under our own field manager (never `.spec`). SSA
+    //    REPLACES the manager's field-set, so both conditions ride one body.
     let prior = sv
         .status
         .as_ref()
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
-    let cond = ready_condition(
+    let ready_cond = ready_condition(
         "True",
         "Provisioned",
         &format!("provisioned PVC {pvc_name} (class {storage_class})"),
         &prior,
     );
-    patch_shared_volume_status(
+    // The CapacityWarning condition is only stamped when we have a node-free
+    // sample this cycle; a sample-less cycle leaves it absent (no stale value).
+    let capacity_cond = node_free.map(|frac| {
+        let pct_free = frac * 100.0;
+        if now_warning {
+            capacity_warning_condition(
+                "True",
+                "NodeNearlyFull",
+                &format!(
+                    "node filesystem {pct_free:.1}% free (< {:.0}% threshold)",
+                    DEFAULT_NODE_FREE_THRESHOLD * 100.0
+                ),
+                &prior,
+            )
+        } else {
+            capacity_warning_condition(
+                "False",
+                "SufficientCapacity",
+                &format!("node filesystem {pct_free:.1}% free"),
+                &prior,
+            )
+        }
+    });
+    patch_shared_volume_status_with_conditions(
         &ctx.client,
         &ns,
         &name,
@@ -336,9 +438,31 @@ pub async fn reconcile_shared_volume(
         Some(&pvc_name),
         ref_count,
         capacity,
-        cond,
+        ready_cond,
+        capacity_cond,
     )
     .await?;
+
+    // 8. Edge-triggered Warning Event on an OK→warning transition only
+    //    (anti-spam). Best-effort: a publish failure is logged, not fatal.
+    let was_warning = was_capacity_warning(&prior);
+    if should_emit_event(was_warning, now_warning) {
+        let pct_free = node_free.map(|f| f * 100.0).unwrap_or(0.0);
+        let recorder = build_recorder(&ctx.client, &sv);
+        let ev = KubeEvent {
+            type_: EventType::Warning,
+            reason: "CapacityWarning".into(),
+            note: Some(format!(
+                "SharedVolume {name}: node filesystem only {pct_free:.1}% free (< {:.0}% threshold) — backing volume may stop accepting writes",
+                DEFAULT_NODE_FREE_THRESHOLD * 100.0
+            )),
+            action: "Provision".into(),
+            secondary: None,
+        };
+        if let Err(e) = recorder.publish(ev).await {
+            warn!(%name, %ns, error = %e, "failed to publish CapacityWarning event (continuing)");
+        }
+    }
 
     // SharedVolume provisioning is deliberately counted under the shared
     // `claim_provisioned_total` metric with the synthetic `shared-disk`
@@ -415,6 +539,65 @@ async fn patch_shared_volume_status(
     api.patch_status(name, &apply_params(), &Patch::Apply(&body))
         .await?;
     Ok(())
+}
+
+/// SSA-patch the `SharedVolume` `.status` carrying BOTH the `Ready` and
+/// (when present) the `CapacityWarning` conditions in the single terminal
+/// body. SSA REPLACES the manager's owned field-set, so both conditions
+/// must ride this one apply (see [`sv_status_apply_body_with_conditions`]).
+#[allow(clippy::too_many_arguments)]
+async fn patch_shared_volume_status_with_conditions(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    ready: bool,
+    pvc_ref: Option<&str>,
+    ref_count: i64,
+    capacity: Option<(i64, i64)>,
+    ready_cond: SharedVolumeCondition,
+    capacity_cond: Option<SharedVolumeCondition>,
+) -> Result<(), ReconcileError> {
+    let api: Api<SharedVolume> = Api::namespaced(client.clone(), ns);
+    let body = sv_status_apply_body_with_conditions(
+        name,
+        ready,
+        pvc_ref,
+        ref_count,
+        capacity,
+        ready_cond,
+        capacity_cond,
+    );
+    api.patch_status(name, &apply_params(), &Patch::Apply(&body))
+        .await?;
+    Ok(())
+}
+
+/// Best-effort name of the first node in the cluster (single-node T1 hosts
+/// the local-path PVCs). Returns `None` on any list failure — capacity
+/// sampling is decorative and must never fail the reconcile.
+async fn first_node_name(client: &Client) -> Option<String> {
+    match Api::<Node>::all(client.clone())
+        .list(&Default::default())
+        .await
+    {
+        Ok(nodes) => nodes.items.first().map(|n| n.name_any()),
+        Err(e) => {
+            warn!(error = %e, "capacity: failed to list nodes (continuing without capacity)");
+            None
+        }
+    }
+}
+
+/// Build a `Recorder` that publishes Events against the given
+/// `SharedVolume`. Per-reconcile construction keeps the reconcile pure;
+/// `Recorder::new` is cheap.
+fn build_recorder(client: &Client, sv: &SharedVolume) -> Recorder {
+    let reporter = Reporter {
+        controller: EVENT_REPORTER_CONTROLLER.into(),
+        instance: std::env::var("POD_NAME").ok(),
+    };
+    let reference: ObjectReference = sv.object_ref(&());
+    Recorder::new(client.clone(), reporter, reference)
 }
 
 /// Merge-patch the SharedVolume's `metadata.finalizers` to `list`.
@@ -539,5 +722,80 @@ mod tests {
         let c = ready_condition("True", "Provisioned", "ok", &prev);
         assert_eq!(c.last_transition_time, ts);
         assert_eq!(c.type_, COND_READY);
+    }
+
+    #[test]
+    fn dual_condition_body_carries_both_when_capacity_present() {
+        let ready = ready_condition("True", "Provisioned", "ok", &[]);
+        let cap = capacity_warning_condition("True", "NodeNearlyFull", "10% free", &[]);
+        let body = sv_status_apply_body_with_conditions(
+            "shared",
+            true,
+            Some("sv-demo-shared"),
+            1,
+            Some((90, 100)),
+            ready,
+            Some(cap),
+        );
+        let conds = body["status"]["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0]["type"], "Ready");
+        assert_eq!(conds[1]["type"], "CapacityWarning");
+        assert_eq!(conds[1]["status"], "True");
+        assert_eq!(body["status"]["capacity"]["usedBytes"], 90);
+    }
+
+    #[test]
+    fn dual_condition_body_carries_only_ready_when_no_capacity_sample() {
+        let ready = ready_condition("True", "Provisioned", "ok", &[]);
+        let body = sv_status_apply_body_with_conditions(
+            "shared",
+            true,
+            Some("sv-demo-shared"),
+            1,
+            None,
+            ready,
+            None,
+        );
+        let conds = body["status"]["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0]["type"], "Ready");
+        assert!(body["status"].get("capacity").is_none());
+    }
+
+    #[test]
+    fn capacity_warning_condition_reuses_timestamp_when_unchanged() {
+        let ts = "2026-01-01T00:00:00+00:00";
+        let prev = vec![SharedVolumeCondition {
+            type_: COND_CAPACITY_WARNING.to_string(),
+            status: "True".to_string(),
+            last_transition_time: ts.to_string(),
+            reason: Some("NodeNearlyFull".to_string()),
+            message: Some("low".to_string()),
+        }];
+        let c = capacity_warning_condition("True", "NodeNearlyFull", "low", &prev);
+        assert_eq!(c.last_transition_time, ts);
+        assert_eq!(c.type_, COND_CAPACITY_WARNING);
+    }
+
+    #[test]
+    fn was_capacity_warning_reads_prior_true_only() {
+        let warned = vec![SharedVolumeCondition {
+            type_: COND_CAPACITY_WARNING.to_string(),
+            status: "True".to_string(),
+            last_transition_time: "t".to_string(),
+            reason: None,
+            message: None,
+        }];
+        assert!(was_capacity_warning(&warned));
+        let cleared = vec![SharedVolumeCondition {
+            type_: COND_CAPACITY_WARNING.to_string(),
+            status: "False".to_string(),
+            last_transition_time: "t".to_string(),
+            reason: None,
+            message: None,
+        }];
+        assert!(!was_capacity_warning(&cleared));
+        assert!(!was_capacity_warning(&[]));
     }
 }
