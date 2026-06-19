@@ -74,3 +74,6 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0044 | [Per-environment deploy via a deploy-time, per-Application env selector](./0044-per-environment-deploy.md) | Accepted |
 | 0045 | [needs → CiliumNetworkPolicy egress auto-derivation, config-driven cluster egress profile](./0045-needs-networkpolicy-egress.md) | Accepted |
 | 0046 | [`Application.env` value references — claim and secret sources](./0046-env-value-references.md) | Accepted |
+| 0047 | [CRD codegen — CUE as the single source; generated CRD, gated Rust, typed webhook](./0047-crd-codegen-from-cue.md) | Accepted |
+| 0048 | [Argo CD platform-upgrade approval surface](./0048-argo-platform-upgrade-approval-surface.md) | Accepted |
+| 0049 | [cross-app SharedVolume](./0049-cross-app-sharedvolume.md) | Accepted |

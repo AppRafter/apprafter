@@ -79,6 +79,7 @@ nav:
       - needs.redis walk: operator-guide/needs-redis-walk.md
       - needs.disk walk: operator-guide/needs-disk-walk.md
       - needs.networkpolicy walk: operator-guide/needs-networkpolicy-walk.md
+      - Shared volumes: operator-guide/shared-volumes.md
       - Platform management: operator-guide/platform-management.md
       - Migration plans: operator-guide/migration-plans.md
       - Troubleshooting: operator-guide/troubleshooting.md

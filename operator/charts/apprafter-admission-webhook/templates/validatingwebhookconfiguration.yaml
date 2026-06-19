@@ -161,3 +161,34 @@ webhooks:
         resources:
           - retainedclaims
         scope: Namespaced
+  - name: sharedvolumes.apprafter.io
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    admissionReviewVersions:
+      - v1
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    clientConfig:
+      service:
+        name: {{ include "apprafter-admission-webhook.fullname" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate
+        port: 443
+    rules:
+      # 2.6c SharedVolume (ADR 0049) — shape validation on CREATE and
+      # UPDATE: `spec.size` must be a non-empty Kubernetes quantity
+      # (`[0-9]+[EPTGMK]i?`); `spec.class`, when present, must be
+      # `local` (the only supported T1 class; T2 adds `nfs`). The
+      # webhook is STATELESS — SharedVolume EXISTENCE checks for
+      # `needs.disk.ref` references are the controller's job
+      # (AwaitingSharedVolume condition on the Application), not the
+      # webhook's.
+      - apiGroups:
+          - apprafter.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - sharedvolumes
+        scope: Namespaced

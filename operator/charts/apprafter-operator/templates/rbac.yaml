@@ -280,6 +280,11 @@ rules:
   # and every disk claim stalls Pending, and the GC cannot drop the PVC
   # after grace. `delete` covers the GC drop; `get`/`list`/`watch` and
   # the apply verbs cover provisioning + idempotent reattach.
+  #
+  # Phase 2.6c extension: the SharedVolume reconciler also SSA-applies
+  # an unowned RWO PVC (the shared-volume backing PVC `sv-<ns>-<name>`)
+  # and its deletion finalizer deletes it on `SharedVolume` remove. Same
+  # verbs already granted here; no new rule needed — noted for clarity.
   - apiGroups:
       - ""
     resources:
@@ -292,6 +297,66 @@ rules:
       - update
       - patch
       - delete
+  # Phase 2.6c SharedVolume CRD (ADR 0049): the SharedVolume reconciler
+  # (in the resourceclaim-provisioner binary) watches SharedVolume CRs,
+  # SSA-writes their `.status` (ready / pvcRef / refCount / capacity /
+  # conditions), and manages the `apprafter.io/sharedvolume-pvc-cleanup`
+  # finalizer via merge-patch. `/status` and `/finalizers` are separate
+  # subresource rules so the provisioner can patch status without
+  # implicitly owning the whole resource. Without these verbs the
+  # SharedVolume controller 403s on its first list/watch call and every
+  # SharedVolume stalls.
+  #
+  # The operator NEVER creates or deletes SharedVolume CRs — that is the
+  # CLI's job (`apprafter volume create/rm`). The finalizer only deletes
+  # the backing PVC (via the persistentvolumeclaims rule above) and then
+  # drops its own finalizer entry via patch. `create` and `delete` on
+  # the parent resource and /finalizers subresource are therefore not
+  # granted here (least-privilege).
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - sharedvolumes
+      - sharedvolumes/finalizers
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - sharedvolumes/status
+    verbs:
+      - get
+      - patch
+      - update
+  # Phase 2.6c capacity-signal (ADR 0049, Task 11): the SharedVolume
+  # reconciler samples the kubelet Summary API per-reconcile via the
+  # apiserver node-proxy subresource
+  # (`GET /api/v1/nodes/{node}/proxy/stats/summary`, RBAC group ""
+  # resource `nodes/proxy`, verb `get`). On single-node T1 all
+  # local-path PVCs live on the one node, so one node-proxy fetch
+  # yields both the node-free fraction (CapacityWarning trigger) and
+  # the PVC's own used/capacity bytes. The fetch is BEST-EFFORT — any
+  # RBAC denial / kubelet unreachable / parse error is logged and
+  # swallowed (capacity simply absent that cycle, never fails the
+  # reconcile). `nodes` get/list is needed for `first_node_name` (the
+  # single-node lookup that identifies which node to proxy through).
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - nodes/proxy
+    verbs:
+      - get
   # Phase 2.4f RetainedClaim CRD — written by the provisioner
   # finalizer (the deletion snapshot: create/patch via SSA) and
   # consumed + deleted by the RetainedClaim GC controller (the
