@@ -27,7 +27,7 @@ use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParam
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
-use kube::runtime::reflector::ObjectRef;
+use kube::runtime::reflector::{ObjectRef, Store};
 use kube::{Client, Resource, ResourceExt};
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -99,6 +99,25 @@ pub fn shared_volume_ref_for_claim(claim: &ResourceClaim) -> Option<ObjectRef<Sh
     let ns = claim.metadata.namespace.as_deref()?;
     let name = claim.metadata.labels.as_ref()?.get(SHARED_VOLUME_LABEL)?;
     Some(ObjectRef::<SharedVolume>::new(name).within(ns))
+}
+
+/// The watch-mapper fan-out for a claim, FILTERED against the SharedVolume
+/// reflector `store`: only emit the referenced `SharedVolume` if it actually
+/// exists in the store (i.e. the runtime can reconcile it).
+///
+/// An ORPHAN reference-claim — labelled `apprafter.io/shared-volume=<gone>`
+/// for a SharedVolume that was deleted or never existed — would otherwise map
+/// to a ref the Controller runtime cannot resolve (`tried to reconcile object
+/// SharedVolume/<gone> that was not found in local store`), erroring + requeue
+/// every 30s forever (walk-found Bug C). Dropping the unresolvable ref kills
+/// the storm. A SharedVolume that DOES exist self-reconciles on create + the
+/// 300s requeue, so the rare not-yet-in-store window is at worst a brief
+/// refCount-refresh delay (the safety net), never a missed reconcile.
+pub fn shared_volume_refs_in_store(
+    claim: &ResourceClaim,
+    store: &Store<SharedVolume>,
+) -> Option<ObjectRef<SharedVolume>> {
+    shared_volume_ref_for_claim(claim).filter(|r| store.get(r).is_some())
 }
 
 /// Pure SSA-apply body for the unowned backing PVC.
@@ -731,6 +750,53 @@ mod tests {
             json!({"metadata":{"labels":{}}}),
         ];
         assert_eq!(ref_count_for("shared", &claims), 2);
+    }
+
+    /// Build a `Store<SharedVolume>` seeded with the given SharedVolumes
+    /// (name, ns), mirroring what the reflector holds at runtime.
+    fn store_with(svs: &[(&str, &str)]) -> Store<SharedVolume> {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher;
+        use operator_core::SharedVolumeSpec;
+        let (reader, mut writer) = store::<SharedVolume>();
+        for (name, ns) in svs {
+            let mut sv = SharedVolume::new(name, SharedVolumeSpec::default());
+            sv.metadata.namespace = Some((*ns).to_string());
+            writer.apply_watcher_event(&watcher::Event::Apply(sv));
+        }
+        reader
+    }
+
+    #[test]
+    fn store_filtered_mapper_emits_ref_when_shared_volume_exists() {
+        // The referenced SharedVolume IS in the store → fan the reconcile out
+        // so refCount refreshes promptly (the correctness path the mapper
+        // protects).
+        let store = store_with(&[("shared", "demo")]);
+        let claim = claim_with(Some("demo"), Some("shared"));
+        let want = ObjectRef::<SharedVolume>::new("shared").within("demo");
+        assert_eq!(shared_volume_refs_in_store(&claim, &store), Some(want));
+    }
+
+    #[test]
+    fn store_filtered_mapper_drops_orphan_ref_to_missing_shared_volume() {
+        // Walk-found Bug C: an ORPHAN reference-claim labelled
+        // `apprafter.io/shared-volume=does-not-exist` maps to a SharedVolume
+        // the runtime cannot find in its store, which would error + requeue
+        // every 30s forever. The store filter drops the unresolvable ref so
+        // NO fan-out (and no storm) is produced.
+        let store = store_with(&[("shared", "demo")]);
+        let orphan = claim_with(Some("demo"), Some("does-not-exist"));
+        assert_eq!(shared_volume_refs_in_store(&orphan, &store), None);
+    }
+
+    #[test]
+    fn store_filtered_mapper_drops_ref_in_a_different_namespace() {
+        // SharedVolume is namespaced — a same-named SharedVolume in ANOTHER
+        // namespace must not satisfy the filter (the ObjectRef carries the ns).
+        let store = store_with(&[("shared", "other-ns")]);
+        let claim = claim_with(Some("demo"), Some("shared"));
+        assert_eq!(shared_volume_refs_in_store(&claim, &store), None);
     }
 
     #[test]

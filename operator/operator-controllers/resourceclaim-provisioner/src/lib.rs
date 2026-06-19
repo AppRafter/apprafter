@@ -183,10 +183,25 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
     // an in-use volume — a correctness bug, walk-found. The 300s requeue stays
     // as the safety net.
     let sv_claims: Api<ResourceClaim> = Api::all(ctx.client.clone());
-    let sv_drive = Controller::new(shared_volumes, watcher::Config::default())
-        .with_config(ControllerConfig::default().concurrency(1))
-        .watches(sv_claims, watcher::Config::default(), |claim| {
-            shared_volume::shared_volume_ref_for_claim(&claim).into_iter()
+    let sv_controller = Controller::new(shared_volumes, watcher::Config::default())
+        .with_config(ControllerConfig::default().concurrency(1));
+    // Reflector store of the SharedVolume controller, used by the watch
+    // mapper to drop fan-outs to a SharedVolume that does NOT exist (an
+    // ORPHAN reference-claim labelled `apprafter.io/shared-volume=<gone>`).
+    // Without this guard the mapper still emits `ObjectRef(<gone>)`, and the
+    // Controller runtime errors `tried to reconcile object SharedVolume/<gone>
+    // that was not found in local store` and requeues it forever (30s storm,
+    // walk-found). The store is the same reflector the runtime reconciles
+    // from, so `store.get(&r).is_some()` is exactly "the runtime can reconcile
+    // this" — no extra apiserver call. A SharedVolume that DOES exist always
+    // self-reconciles on its own create/300s-requeue, so dropping a fan-out
+    // for one not-yet-in-store is at worst a brief refCount-refresh delay (the
+    // safety net), never a missed reconcile — the only case fully dropped is
+    // the genuinely-orphan ref, which is exactly the storm we kill.
+    let sv_store = sv_controller.store();
+    let sv_drive = sv_controller
+        .watches(sv_claims, watcher::Config::default(), move |claim| {
+            shared_volume::shared_volume_refs_in_store(&claim, &sv_store).into_iter()
         })
         .run(
             shared_volume::reconcile_shared_volume,
