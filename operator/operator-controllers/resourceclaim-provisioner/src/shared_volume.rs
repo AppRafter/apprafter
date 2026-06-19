@@ -27,12 +27,15 @@ use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParam
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
+use kube::runtime::reflector::ObjectRef;
 use kube::{Client, Resource, ResourceExt};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use operator_core::matching::{select_provider, Candidate};
-use operator_core::{ServiceProvider, SharedVolume, SharedVolumeCondition, COND_CAPACITY_WARNING};
+use operator_core::{
+    ResourceClaim, ServiceProvider, SharedVolume, SharedVolumeCondition, COND_CAPACITY_WARNING,
+};
 
 use crate::capacity::{
     is_capacity_warning, node_free_fraction, pvc_usage, should_emit_event,
@@ -64,12 +67,38 @@ const SV_PVC_FINALIZER: &str = "apprafter.io/sharedvolume-pvc-cleanup";
 /// `shared-disk` ServiceProvider config omits `/storageClass`.
 const DEFAULT_STORAGE_CLASS: &str = "local-path";
 
+/// Label the app-controller stamps on a `shared-disk` reference-claim (and
+/// this controller stamps on the backing PVC) carrying the `SharedVolume`
+/// name it binds to. The watch mapper ([`shared_volume_ref_for_claim`]) and
+/// the refCount query (`apprafter.io/shared-volume=<name>`) both key off it.
+const SHARED_VOLUME_LABEL: &str = "apprafter.io/shared-volume";
+
 /// Deterministic unowned-PVC name for a SharedVolume.
 ///
 /// The `sv-` prefix avoids any collision with owned-disk PVC names
 /// (which are named `claim-<ns>-<app>-disk-<claim>`).
 pub fn sv_pvc_name(ns: &str, name: &str) -> String {
     format!("sv-{ns}-{name}")
+}
+
+/// Map a `shared-disk` reference-`ResourceClaim` to the `SharedVolume` it
+/// references, for the SharedVolume controller's `.watches()` fan-out.
+///
+/// `refCount` is computed by LISTING reference-claims labelled
+/// `apprafter.io/shared-volume=<name>`, so it only refreshes when the
+/// SharedVolume itself reconciles. Without this mapper a claim CREATE/DELETE
+/// would not re-trigger the parent SharedVolume, leaving `refCount` stale
+/// until the 300s requeue — a correctness bug, not just latency, because the
+/// `volume rm` delete-guard reads `refCount` to decide whether the volume is
+/// still in use (a stale `0` would wrongly allow deletion). This is the
+/// standard kube-rs "reconcile the parent when a child changes" pattern.
+///
+/// Returns `None` for a claim with no `apprafter.io/shared-volume` label (not
+/// a reference-claim) or no namespace (SharedVolume is namespaced).
+pub fn shared_volume_ref_for_claim(claim: &ResourceClaim) -> Option<ObjectRef<SharedVolume>> {
+    let ns = claim.metadata.namespace.as_deref()?;
+    let name = claim.metadata.labels.as_ref()?.get(SHARED_VOLUME_LABEL)?;
+    Some(ObjectRef::<SharedVolume>::new(name).within(ns))
 }
 
 /// Pure SSA-apply body for the unowned backing PVC.
@@ -96,7 +125,7 @@ pub fn sv_pvc_object(
             "namespace": ns,
             "labels": {
                 "apprafter.io/managed-by": "apprafter",
-                "apprafter.io/shared-volume": sv_name,
+                SHARED_VOLUME_LABEL: sv_name,
             },
         },
         "spec": {
@@ -653,6 +682,44 @@ mod tests {
     #[test]
     fn sv_pvc_name_is_deterministic_and_prefixed() {
         assert_eq!(sv_pvc_name("demo", "shared"), "sv-demo-shared");
+    }
+
+    /// Build a `ResourceClaim` with the given namespace + optional
+    /// `apprafter.io/shared-volume` label for the watch-mapper tests.
+    fn claim_with(ns: Option<&str>, sv_label: Option<&str>) -> ResourceClaim {
+        use operator_core::ResourceClaimSpec;
+        let mut claim = ResourceClaim::new("ref-claim", ResourceClaimSpec::default());
+        claim.metadata.namespace = ns.map(str::to_string);
+        if let Some(v) = sv_label {
+            claim.metadata.labels = Some(
+                [(SHARED_VOLUME_LABEL.to_string(), v.to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        claim
+    }
+
+    #[test]
+    fn watch_mapper_targets_the_referenced_shared_volume() {
+        let claim = claim_with(Some("demo"), Some("shared"));
+        let want = ObjectRef::<SharedVolume>::new("shared").within("demo");
+        assert_eq!(shared_volume_ref_for_claim(&claim), Some(want));
+    }
+
+    #[test]
+    fn watch_mapper_is_none_without_the_label() {
+        // A claim that is not a shared-disk reference-claim must not fan a
+        // reconcile to any SharedVolume.
+        let claim = claim_with(Some("demo"), None);
+        assert_eq!(shared_volume_ref_for_claim(&claim), None);
+    }
+
+    #[test]
+    fn watch_mapper_is_none_without_a_namespace() {
+        // SharedVolume is namespaced; a namespace-less claim can't target one.
+        let claim = claim_with(None, Some("shared"));
+        assert_eq!(shared_volume_ref_for_claim(&claim), None);
     }
 
     #[test]

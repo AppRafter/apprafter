@@ -174,8 +174,20 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
     // maintains `status.refCount`, and reaps the PVC via a finalizer on
     // delete. Serialized too (concurrency = 1) under the same leader so the
     // refCount list-then-write never races a sibling SharedVolume reconcile.
+    //
+    // `.watches(ResourceClaim, …)` fans a reference-claim CREATE/DELETE back
+    // to the SharedVolume it labels (`apprafter.io/shared-volume`), so
+    // `status.refCount` (computed by listing those claims) refreshes promptly
+    // instead of only on the 300s requeue. Without it the `volume rm`
+    // delete-guard would read a stale refCount=0 and wrongly allow deletion of
+    // an in-use volume — a correctness bug, walk-found. The 300s requeue stays
+    // as the safety net.
+    let sv_claims: Api<ResourceClaim> = Api::all(ctx.client.clone());
     let sv_drive = Controller::new(shared_volumes, watcher::Config::default())
         .with_config(ControllerConfig::default().concurrency(1))
+        .watches(sv_claims, watcher::Config::default(), |claim| {
+            shared_volume::shared_volume_ref_for_claim(&claim).into_iter()
+        })
         .run(
             shared_volume::reconcile_shared_volume,
             shared_volume::error_policy_sv,
