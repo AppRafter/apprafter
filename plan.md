@@ -2979,6 +2979,13 @@ instead of carrying parallel definitions.
 
 ---
 
+### 1.83 — Track-end ручной walk (закрытие order-3.5 public-ingress трека)
+> 🏁 SR: A · order 3.5 — консолидированный live-прогон на real Hetzner; батчит отложенные «closure-smoke на track-end walk» хвосты 1.83d/e/f/g/h/i/j.
+
+> ✅ **WALK PASSED 2026-06-18** (real Hetzner, user-confirmed) — закрывает order-3.5 public-ingress MVP трек целиком. Код 1.83a–j был закрыт ранее (v0.2.14…v0.2.23); этот прогон снимает все отложенные live-проверки из `connect-a-domain.md`: CF origin firewall активен + bypass (`curl --resolve … минуя CF`) refused (1.83d/h), `target cert import` → Gateway терминирует TLS импортированным сертом (1.83e), multi-zone `target domain` listeners + per-zone/cross-zone `curl https://<zone>/` через CF = 200 + merge-patch сохранил `tier`/`nodePublicIP`/`egress` siblings (1.83f/g), `target ip` отдаёт верные A/AAAA (1.83i), `platform env`/`app list` ENV (1.83j). **НЕ phase closure** — 1.83 = pulled-up order-3.5, не нумерованная фаза → spec.md НЕ актуализируется, монорепо-тег НЕ ставится (docs/plan-only). **Следующее по SR-порядку: `2.6c`** (order 3.5 — needs.disk durability + cross-app SharedVolume).
+
+---
+
 ## Фаза 1.9 — Dev Mode MVP (Phase 1B из dev-mode-task.md)
 > 🏁 SR: D — dev mode dropped from launch (managed users don't bootstrap local clusters); reactivate after managed traction
 
@@ -3297,50 +3304,68 @@ Tests:
 
 ---
 
-### 2.6c needs.disk durability + cross-app SharedVolume
+### 2.6c capacity-signal + cross-app SharedVolume
 
-> 🏁 SR: A · order 3.5 (post-T1-demo, pre-T2-substrate) — disk backup + capacity-signal (owned **и** shared диски) + cross-app SharedVolume (`needs.disk.ref`, single-node same-ns). Early-adopter unblocker: pm2-юзер с shared-папкой между приложениями переезжает на AppRafter, получая изоляцию лучше pm2 + backups/мониторинг, которых у него сейчас нет. **Cross-ns / multi-node shared И intra-app `shareMode: shared` — НЕ здесь, остаются T2 (2.6b-deferred).**
+> 🏁 SR: A · order 3.5 (post-T1-demo, pre-T2-substrate) — capacity-signal (owned+shared диски) + cross-app SharedVolume (`needs.disk.ref`, single-node same-ns). Early-adopter unblocker (pm2 с shared-папкой → AppRafter, изоляция лучше pm2). Cross-ns / multi-node shared И intra-app `shareMode: shared` — НЕ здесь, остаются T2 (2.6b-deferred).
 
-Пакет закрывает два ортогональных слоя поверх 2.6b owned-disk пайплайна:
+Storage-примитивы поверх 2.6b owned-disk пайплайна. Жёсткий T1-инвариант: на single-node `local-path` requested-`size` НЕ энфорсится как квота — разогнавшийся том заполняет диск ноды целиком, утаскивая k3s/etcd; значимый сигнал — node-disk-free.
 
-1. **Disk-level durability (owned + shared).** Голый PVC без backup и без сигнала о заполнении — это pm2-grade footgun, который платформа обязана убирать («enterprise practices без enterprise complexity»). Поэтому backup + capacity-signal — это **disk-level** capability (нужна owned-дискам независимо от shared-истории), shared volume её просто наследует.
-2. **Cross-app SharedVolume.** Несколько приложений *одного владельца* в одном namespace разделяют один том на запись — явный opt-in, релаксирующий дефолтную изоляцию **внутри объявленной trust-group**, а не глобально (философия orthogonal opt-in switches, ADR 0033). Storage-share и network-share — независимые оси: шарится папка, сеть НЕ открывается (для сети — отдельный `connects`).
+**Декомпозиция:**
 
-**Жёсткий T1-инвариант, который держат webhook + capacity-signal:** на single-node `local-path` requested-`size` НЕ энфорсится как квота (это request, не limit) — разогнавшийся том заполняет **диск ноды целиком**, утаскивая k3s/etcd. Значит значимый сигнал — node-disk-free, а не «size минус used».
+- [ ] **2.6c-1 — capacity-signal (owned + shared).** Оператор читает per-PVC `usedBytes`/`capacityBytes` + node-level `fsAvailableBytes` через kubelet Summary API (`/stats/summary`, RBAC `nodes/stats`) — **без зависимости от full OTel** (он order 5). Condition в `status` + Warning Event при `node-free < threshold` (default 15%). Surface в `apprafter app status` / `apprafter volume status`. Defer: Grafana/Alertmanager → order 5.
+- [ ] **2.6c-2 — SharedVolume backend + `shared-local` provider + объект lifecycle.** Новый backend-тип **`shared-disk`** (НЕ `disk`) → scheduler не кросс-матчит на owned-`disk` линейку. `shared-local` ServiceProvider (T1): `storageClass: local-path`, провижинит ОДИН unowned PVC, `accessMode: ReadWriteOnce` (node-level — на single-node N подов монтируют корректно). T2-расширение свопает `shared-local`→`shared-nfs` (RWX), не трогая манифесты. SharedVolume — **выделенный namespaced CRD `apprafter.io/SharedVolume`** (`spec:{size,class}`, `status:{ready,pvcRef,refCount}`) с explicit lifecycle (`apprafter volume create/rm`), независим от приложений. Объектом, не «ref на голый PVC» — ради portability 0.2 (`ref` стабилен, backing меняется local-path→NFS).
+- [ ] **2.6c-3 — `ref`-грамматика + reference-arm + renderer + CLI.**
+    - [ ] `needs.disk: { ref, mountPath, readOnly? }` (referenced) vs `{ name, size, mountPath }` (owned); webhook разводит по shape.
+    - [ ] Webhook: reject `ref` на несуществующий SharedVolume; **reject cross-ns ref** на T1 (single-node same-ns инвариант) с hint «cross-namespace → T2 (NFS)».
+    - [ ] Provisioner reference-arm: биндит существующий PVC, не провижинит backing, **не GC'ит** при удалении app.
+    - [ ] Renderer: mount, **БЕЗ форса `strategy: Recreate`** (owned-arm форсит из-за single-PVC-cross-node; reference-arm на single-node RWO-multi-pod терпит RollingUpdate).
+    - [ ] CLI: `apprafter volume create/rm/list/status`; `rm` отказывает пока есть референсы. Refcount-GC с grace — defer.
+- [ ] **2.6c-4 — walk + docs + ADR 0049 + release.** `e2e/shared-volume-walk.sh` (2 app один ns ref один SharedVolume → оба видят writes; rolling update не роняет mount второго; `volume rm` отказывает пока референсится). Docs `operator-guide/shared-volumes.md`. ADR 0049 (cross-app SharedVolume, reference-концепт в claim-грамматике — cross-cutting как `(type,name)` в 0043). Координированный release operator+platform-stack+cli (CRD-additive).
 
-**Декомпозиция (порядок сборки) — durability сначала, SharedVolume следом:**
+**Не входит (отложено):** intra-app `shareMode: shared` (multi-replica RWX) → 2.6b-deferred/T2; cross-ns + multi-node SharedVolume (вкл. dev/prod в одну папку) → T2 + NFS (`ref` forward-compatible); CSI-snapshot/autoExpand/quota → 2.6b-deferred.
 
-- [ ] **2.6c-1 — capacity-signal (owned + shared).** Оператор читает per-PVC `usedBytes`/`capacityBytes`/`availableBytes` + node-level `fsAvailableBytes` через kubelet Summary API (`/stats/summary`, RBAC `nodes/stats`) — **без зависимости от full OTel-пайплайна** (он order 5). Условие на `status` claim'а/Application + Warning Event при `node-free < threshold` (default 15%) или `volume-used > soft-limit`. Surface в `apprafter app status` / `apprafter volume status` (used/free at a glance). **Defer:** Grafana-дашборды + Alertmanager-правила → order 5 (OTel-subset 3.7a).
-- [ ] **2.6c-2 — T1 disk backup (restic → внешний таргет), owned + shared.** Поле `backup: {enabled, schedule?, retention?}` уже в 2.6b-deferred-схеме (`plan.md:2889`) — здесь даётся **T1-механизм** под него, не новая схема. При `backup.enabled` оператор эмитит `CronJob` per backup-enabled claim: монтирует PVC **RO** → `restic`/`kopia` push в **внешний** repo (Hetzner Storage Box / B2 / S3 — на T1 нет CSI-снапшотов и in-cluster `needs.s3` отложен; бэкап на ту же ноду бессмысленен). Repo-creds из SealedSecret (platform-configured backup target). Retention через `restic forget --keep-*`. Restore = ручная процедура в DR-доке. **Соотношение с 2.6b-deferred CSI-snapshot backup:** оба механизма за ОДНИМ полем `backup`, резолв по tier-capability (restic→external на T1; CSI-snapshot + Velero на T2+ где есть 4.12) — комплементарны, не конфликтуют.
-- [ ] **2.6c-3 — SharedVolume backend + `shared-local` provider + объект с явным lifecycle.** Новый backend-тип **`shared-disk`** (НЕ `disk`) → scheduler не кросс-матчит его на owned-`disk` линейку (`disk-local`/`disk-hcloud`). Сид `shared-local` ServiceProvider (T1): `storageClass: local-path`, провижинит **один unowned** PVC под SharedVolume, `accessMode: ReadWriteOnce` (node-level — на single-node несколько подов монтируют один RWO-том корректно). Та же `local-path` строка, что у `disk-local`, но **другой backend/provider** → разные provisioning-arm'ы, ноль пересечений; T2-расширение свопает `shared-local`→`shared-nfs` (RWX), не трогая манифесты. SharedVolume — объект (CRD или platform-ns-scoped) с **explicit** lifecycle (`apprafter volume create/rm`), lifecycle независим от приложений. Моделируем объектом, а не «ref на голый PVC» — ради portability (0.2): `ref` стабилен, пока backing меняется local-path→NFS поперёк тиров.
-- [ ] **2.6c-4 — `ref`-форма грамматики + reference-arm + renderer mount + CLI.**
-    - [ ] Грамматика: `needs.disk: { ref: "<name>", mountPath, readOnly? }` (referenced) против `{ name, size, mountPath }` (owned). Webhook разводит по shape: `ref`-claim не несёт `size`/backend, это чистый binding.
-    - [ ] Webhook: reject `ref` на несуществующий SharedVolume; **reject cross-ns ref** на T1 (все референсящие apps + SharedVolume PVC обязаны быть в одном namespace — PVC namespaced, single-node same-ns = v1-инвариант) с сообщением «cross-namespace shared volumes require T2 (NFS) — deferred».
-    - [ ] Provisioner **reference-arm**: на `ref`-claim биндит существующий PVC SharedVolume, **не** провижинит новый backing, **не** GC'ит его при удалении app (lifecycle у SharedVolume, не у claim'а).
-    - [ ] Renderer: mount как owned-disk, но **БЕЗ форса `strategy: Recreate`** (owned-arm форсит Recreate из-за single-PVC-cross-node; reference-arm на single-node RWO-multi-pod терпит RollingUpdate — наследовать 0043-правило нельзя).
-    - [ ] CLI: `apprafter volume create/rm/list/status`; `rm` отказывает пока есть референсы (delete-guard). Автоматический refcount-GC с grace — defer (explicit create/rm + guard достаточно для раннего адоптера).
-- [ ] **2.6c-5 — walk/e2e + docs + ADR + координированный release.**
-    - [ ] `e2e/shared-volume-walk.sh` (kind+podman, по образцу `needs-disk-walk.sh`): 2 app в одном ns референсят один SharedVolume → оба видят writes друг друга; rolling update одного app не роняет mount у второго; `backup.enabled` CronJob производит restore-able snapshot; capacity warning срабатывает при заполнении; `volume rm` отказывает пока референсится, проходит после снятия последнего `ref`.
-    - [ ] Docs: `operator-guide/shared-volumes.md` (ref-семантика, trust-group модель, T1 single-ns инвариант), `operator-guide/backup-restore.md` (restic restore procedure), update `dev-guide` needs-reference.
-    - [ ] ADR 0047 — cross-app SharedVolume (`needs.disk.ref`): вводит *reference*-концепт в claim-грамматику (cross-cutting, ровно как `(type,name)` в ADR 0043). Mechanism-выбор backup (restic→external vs CSI) — в §Consequences 0047 либо отдельным коротким ADR.
-    - [ ] Координированный release operator + platform-stack + cli (CRD-additive → safe), по образцу 2.6b v0.2.21. Гейты: `cargo fmt/clippy -D/test --workspace` + `just lint` + `cue vet` + `just crd-validate` + `just platform-stack-check` + strict mkdocs.
+**Acceptance:** 2 app `ref` на один SharedVolume в одном ns деплоятся, читают/пишут общий том; `volume status` показывает used/free; `volume rm` отказывает «still referenced»; cross-ns `ref` на T1 → reject; заполнение до node-free<threshold → Warning + condition; owned-disk 2.6b не регрессирует.
 
-**Не входит (отложено — distinct from this package):**
-- **intra-app `shareMode: shared`** (реплики ОДНОГО app видят writes друг друга через RWX) — другой концепт, остаётся 2.6b-deferred / T2 (rook-nfs). Пересекается с 2.6c только общим NFS-бэкендом, который появляется на T2.
-- **cross-namespace + multi-node SharedVolume** (включая «dev/prod в одну папку» — это и есть настоящий cross-ns кейс): требует NFS export + static-PV-per-ns; уезжает в T2 вместе с RWX-бэкендом. `ref`-грамматика к этому forward-compatible (меняется только backing).
-- **CSI-snapshot backup / autoExpand / quota enforcement / StatefulSet pivot** — остаются 2.6b-deferred (T2+).
+**Зависит от:** 2.6b (owned-disk пайплайн).
 
-**Acceptance:**
-- 2 app (`needs.disk.ref` на один SharedVolume) в одном ns деплоятся, оба читают/пишут общий том, видят writes друг друга; rolling update одного не прерывает доступ второго.
-- `apprafter volume create` создаёт SharedVolume; `apprafter volume status` показывает used/free; `apprafter volume rm` отказывает «still referenced by N apps», проходит после снятия референсов.
-- `ref` на несуществующий volume → webhook reject; cross-ns `ref` на T1 → webhook reject с T2-hint.
-- `backup.enabled` на owned-диске → CronJob пушит в внешний repo по cron; `restic restore` восстанавливает данные в свежий PVC; retention удаляет старые снапшоты.
-- Заполнение тома до node-free < threshold → Warning Event + condition в `status` + видно в `app status`/`volume status`.
-- Owned-disk пайплайн 2.6b (provision/RetainedClaim/GC/reattach) не регрессирует.
+**Размер:** M.
 
-**Зависит от:** 2.6b (owned-disk пайплайн: ResourceClaim/ServiceProvider/RetainedClaim/renderer); 2.11 (SealedSecrets — для backup-target creds). **Full OTel — НЕ зависимость** (capacity-signal через kubelet Summary API; дашборды отложены к order 5).
+---
 
-**Размер:** L. **Carve-опция:** durability (`2.6c-1` + `2.6c-2`) и SharedVolume (`2.6c-3…5`) — независимо releasable; при желании развести в `### 2.6c` (durability, owned+shared, можно отгрузить чуть раньше) + `### 2.6d` (SharedVolume).
+### 2.6d data export + backup/restore (restic-движок)
+
+> 🏁 SR: A · order 3.5 (post-T1-demo) — `export` (Kind 1, native, inspect/migrate-out) + restic-based backup/restore (Kind 2). **T1 default backup = local pull на машину оператора + restore с него**; automated S3 backup = opt-in. Без реального restore prod на платформу не доверят. S3-automated tail + T2-warning/internal-S3 — follow-on (ниже).
+
+Два вида поверх одной extraction (native dumps: `pg_dump -Fc` / дерево файлов / redis-snapshot), один restore-путь. `export` — read-only утилита (ноль restore-логики), `backup`/`restore` — restic-обёртка тех же dumps + CR-serialization + секреты.
+
+**Архитектурные решения (зафиксированы в обсуждении — для ADR 0050 / spec §1.9):**
+- **Velero отклонён.** Поддерживает только object storage как BSL; restic-FSB не stand-alone (всё равно нужен bucket); локальный artifact + restore-from-file — открытый незакрытый feature request. Форсить покупку *любого* S3-бакета в дефолтном пути = продуктовое трение. Не годится для дефолта.
+- **Движок = restic, оркестрирует AppRafter.** Backend'ы restic: local-filesystem, SFTP, rclone (~70 провайдеров), S3 → репозиторий переносимый и restorable plain-restic'ом откуда угодно. No-lock-in на уровне формата.
+- **T1 default backup = local pull на машину оператора** (через ephemeral RO-helper). Ноль форса бакета. Automated S3 backup = opt-in.
+- **Scheduled-runner — open decision, current lean = K8up** (CNCF, restic-based: scheduling + prune/check + app-aware `backupcommand` + зрелость) vs AppRafter CronJob-restic (уже есть pg_dump + ephemeral-restic, доделать prune/check). Решаем ближе к делу.
+- **`export` (Kind 1) ≠ backup.** Native dumps на машину оператора для (1) изучить локально, (2) выйти/мигрировать. Восстановление из него — это `backup`/`restore` (Kind 2), не `export`.
+- **`restore` (Kind 2) = в аналогичный свежий кластер** (DR «source мёртв»): replay сериализованных CR (auto-register всех приложений, без ручного re-add) + reload данных + re-seal секретов в SealedSecrets/OpenBao target'а. Не cross-version/cross-topology.
+- **No-lock-in (§1.9)** — данные и манифесты забираемы наружу в нативном, напрямую-используемом виде; одновременно happy-path-свойство И механизм доверия для migration-in.
+
+**Декомпозиция (порядок сборки):**
+
+- [ ] **2.6d-1 — `export` (Kind 1).** Per-resource native pull на машину оператора: `apprafter export <ns>` энумерит stateful-claim'ы → `pg_dump -Fc` (НЕ CNPG barman — он in-cluster PITR), дерево файлов (volume/SharedVolume), redis-snapshot (если persistent). Плоская самодостаточная папка (`pg/*.dump`, `volumes/<name>/...`, `manifest.json`). Цель: изучить локально + migrate-out. **Не backup.** Транспорт вниз — ephemeral RO-helper-pod → `tar`/stream (kubectl-cp семантика; на single-node RWO node-level → helper монтирует RO рядом с работающим app без contention).
+- [ ] **2.6d-2 — restic-движок + local-pull backup (T1 default).** AppRafter оркестрирует restic против extraction'а. **Default backend = local-filesystem на машине оператора** (через тот же ephemeral RO-helper → restic в локальный репо). Артефакт = `data (native dumps) + сериализованные AppRafter+Argo CR + секреты (расшифрованные) + manifest`, restic-wrapped (dedup/incremental). Репо шифруется (содержит секреты; ключ у оператора). Ноль форса бакета.
+- [ ] **2.6d-3 — `restore` с local pull (Kind 2).** Единственный restore-путь, в **аналогичный свежий кластер** (DR «source мёртв»): apply сериализованных CR → оператор провижинит свежие claim'ы → restic restore данных / `pg_restore` в них → **re-seal секретов** в SealedSecrets/OpenBao target'а. **Auto-register всех приложений** из бэкапа (Argo Application CR пересоздаются → ворклоады из Git); **ручного re-add приложений нет.** Restore-ordering (apply→provision→load→re-seal) — основная сложность блока. Также data-restore в существующий кластер (recover тома/БД без пересоздания app).
+- [ ] **2.6d-4 — automated S3 backup (opt-in).** Scheduled push того же restic-репо в remote (S3/SFTP/rclone — R2/Scaleway/B2/Hetzner, выбор юзера). **Runner — OPEN DECISION, current lean = K8up** (scheduling + prune/check + app-aware `backupcommand` + зрелость) vs AppRafter CronJob-restic (есть pg_dump+ephemeral-restic, доделать prune/check). Решить ближе к делу. **Не дефолт, opt-in.**
+- [ ] **2.6d-5 — walk + docs + ADR 0050 + release.** `e2e/backup-restore-walk.sh`: `export` даёт открываемые dumps; local-pull backup → restore в свежий kind-кластер поднимает app'ы (auto-register) + данные + секреты; data-restore в существующий кластер. Docs `operator-guide/backup-restore.md` (local-pull default, S3 opt-in, restore-into-fresh, restic repo portability). ADR 0050 (backup/restore + data portability: restic-движок, Kind1/Kind2, local-default+S3-opt-in, restore-ordering, re-seal, Velero-rejected rationale).
+
+**Follow-on (T2-эра, не order 3.5):**
+- [ ] **«Backups not configured» warning** на T2, когда automated backup не настроен (local-pull остаётся дефолтом).
+- [ ] **Internal redundant/cross-node S3 default** — OPEN: на T2 дефолтом может стать внутренний S3 (на другой ноде / с резервированием), когда появится; либо остаётся local-pull-default + warning. Решить на T2.
+
+**Open decisions (свести в ADR 0050):** scheduled-runner K8up vs CronJob-restic; T2-default local-pull+warning vs internal-redundant-S3; нужен ли отдельный шифрованный-бандл формат vs «папка + restic-репо».
+
+**Acceptance:** `export <ns>` → локально открываемые `pg_dump`/деревья, `pg_restore` в локальный pg работает; local-pull backup → `restore --into <fresh-cluster>` поднимает все app'ы (auto-register, без ручного re-add) + данные + re-sealed секреты; restore данных в существующий кластер восстанавливает том/БД; restic-репо читается plain-restic'ом (no-lock-in).
+
+**Зависит от:** 2.6b (owned-disk), 2.6c (SharedVolume — чтобы export/backup покрывал shared-тома), 2.11 (SealedSecrets — расшифровка/re-seal), `needs.pg`/`needs.redis` (источники dumps). Full OTel — НЕ зависимость.
+
+**Размер:** L (extraction + restic-оркестрация + CR-serialization + restore-ordering + re-seal; default-local-pull можно дать раньше S3-opt-in'а).
 
 ---
 
