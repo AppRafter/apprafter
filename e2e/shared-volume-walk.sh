@@ -355,7 +355,23 @@ cond_reason() {
 }
 
 # app_pod <app-name>  — the current running pod for an Application.
+# Prefers a Running pod so that during a rolling update (where both an old
+# Terminating pod and the new Running pod may be present) this resolves to the
+# new pod rather than the outgoing one.
 app_pod() {
+    # First try: a pod that is already Running (covers the post-roll steady state
+    # and avoids latching onto a Terminating old pod during the roll).
+    local running
+    running=$(kubectl -n "$APP_NS" get pod \
+        -l "app.kubernetes.io/name=$1" \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [ -n "$running" ]; then
+        printf '%s' "$running"
+        return
+    fi
+    # Fallback: any pod (e.g. during initial provisioning before it reaches
+    # Running, or on environments where --field-selector on phase is unsupported).
     kubectl -n "$APP_NS" get pod -l "app.kubernetes.io/name=$1" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
 }
@@ -757,15 +773,20 @@ kubectl -n "$APP_NS" wait --for=condition=Available \
 # between the ReplicaSet settling and container env being readable via the API).
 retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
     pod -l "app.kubernetes.io/name=${APP_A}" --timeout=20s
-POD_A2=$(app_pod "$APP_A")
-printf '  polling alpha pod %s for WALK_MARKER=v2 ...\n' "$POD_A2"
+# Re-resolve the pod name on EACH iteration: after `rollout status` completes
+# the old pod is deleted, so a pod name captured beforehand becomes stale and
+# reads WALK_MARKER='' forever once the old pod is gone.  Re-calling app_pod
+# (which prefers a Running pod) converges on the new ReplicaSet's pod.
+printf '  polling alpha (re-resolving pod each iteration) for WALK_MARKER=v2 ...\n'
 _marker_deadline=$(( $(date +%s) + 60 ))
 marker=""
+POD_A2=""
 while [ "$(date +%s)" -lt "$_marker_deadline" ]; do
+    POD_A2=$(app_pod "$APP_A")
     marker=$(kubectl -n "$APP_NS" get pod "$POD_A2" \
         -o jsonpath="{.spec.containers[0].env[?(@.name==\"WALK_MARKER\")].value}" 2>/dev/null || true)
     [ "$marker" = "v2" ] && break
-    printf '    %s: WALK_MARKER=%q (want v2)\n' "$(date +%H:%M:%S)" "$marker"
+    printf '    %s: pod=%s WALK_MARKER=%q (want v2)\n' "$(date +%H:%M:%S)" "$POD_A2" "$marker"
     sleep 3
 done
 assert_eq "alpha rolled to the new WALK_MARKER" "$marker" "v2"
