@@ -480,6 +480,40 @@ apprafter() {
 }
 
 # ---------------------------------------------------------------
+# ensure_restic_on_path
+#   The 2.6d backup/restore CLI shells out to `restic` via
+#   `Command::new("restic")`, so restic MUST be resolvable on $PATH
+#   for the CLI subprocess (NOT just inside this shell). When the bare
+#   binary is absent (a fresh nix-dev checkout), install a thin wrapper
+#   under a temp bin dir and PREPEND it to $PATH so both this shell and
+#   the `cargo run` child inherit it. The wrapper execs
+#   `nix run nixpkgs#restic --` (the project's standard
+#   missing-binary fallback — same pattern as ~/bin/cue / ~/bin/helm).
+#   Idempotent: a no-op when restic is already on $PATH.
+#   Modifies $PATH IN THE CURRENT SHELL (so the `cargo run` child inherits it)
+#   and sets the global RESTIC_WRAPPER_BIN_DIR to the wrapper dir (empty when
+#   restic was already present) so the caller can clean it up. Call WITHOUT a
+#   subshell (`ensure_restic_on_path`, not `$(ensure_restic_on_path)`), else
+#   the PATH export is lost with the subshell.
+# ---------------------------------------------------------------
+RESTIC_WRAPPER_BIN_DIR=""
+ensure_restic_on_path() {
+    if command -v restic >/dev/null 2>&1; then
+        return 0
+    fi
+    local bindir
+    bindir="$(mktemp -d -t apprafter-restic-bin.XXXXXX)"
+    cat >"${bindir}/restic" <<'WRAP'
+#!/usr/bin/env bash
+exec nix run nixpkgs#restic -- "$@"
+WRAP
+    chmod +x "${bindir}/restic"
+    PATH="${bindir}:${PATH}"
+    export PATH
+    RESTIC_WRAPPER_BIN_DIR="$bindir"
+}
+
+# ---------------------------------------------------------------
 # dump_diagnostics
 #   Best-effort cluster-state dump for CI debugging. Call this on
 #   failure BEFORE tearing the cluster down — otherwise the evidence

@@ -1,0 +1,233 @@
+# ADR 0050: backup, export, and restore — restic engine, local-pull default
+
+## Status
+
+`Accepted` (2026-06-21).
+
+## Context
+
+AppRafter runs stateful workloads — PostgreSQL (CNPG), Dragonfly (redis),
+owned and shared persistent volumes — provisioned through the `needs.*`
+ResourceClaim pipeline (ADRs 0042, 0043, 0049), with user secrets sealed via
+the SealedSecrets controller (Phase 2.11) and private-source credentials bound
+through `SourceCredential` CRs (ADR 0039). Operators will not trust production
+to the platform without a working, demonstrable restore.
+
+Two distinct needs were apparent:
+
+1. **Inspect / migrate out** — pull the live native data to the operator's
+   machine in an open, self-contained form, with no platform involvement to
+   read it. A debugging convenience and an anti-lock-in escape hatch.
+2. **Disaster recovery** — capture enough to rebuild a cluster (data + the
+   config and app custom resources + the user secrets) into one portable
+   artifact, and replay it.
+
+The forces:
+
+- **Zero forced purchase in the default path.** The Tier-1 operator runs a €5
+  VDS; forcing them to buy an object-storage bucket just to take a backup is
+  product friction. The default must be a local pull onto the operator's
+  machine.
+- **The artifact contains decrypted secrets**, so it must be encrypted at
+  rest, and the key must stay with the operator.
+- **SealedSecrets are cluster-bound** — sealed material only unseals as
+  `<namespace>/<name>` under the controller key of the cluster that sealed it,
+  so a restore cannot copy them; it must re-seal for the target.
+- **GitOps owns the workloads.** Argo CD pulls app source from Git, so a
+  backup need not carry source code — but it must carry the Argo `Application`
+  CRs so a restore re-registers the apps (no manual re-add).
+- **The provisioning pipeline must not deadlock the restore**, and a restore
+  must not race a live workload onto half-loaded data.
+
+## Decision
+
+We will ship a **restic-based, CLI-orchestrated** backup/restore engine with a
+**local-filesystem default** backend, exposed as three commands.
+
+### `export` (Kind 1) and `backup` (Kind 2)
+
+`apprafter export` pulls native data only (pg `pg_dump -Fc`, volume tars,
+redis snapshots) to a plain folder plus a `manifest.json` — no CRs, no
+secrets, no encryption. `apprafter backup create` runs the same extraction and
+**additionally** serializes the config/app CRs and the decrypted user secrets,
+then wraps everything into an encrypted restic repository. `apprafter backup
+list` enumerates a repo's snapshots. Both extraction paths share one engine
+(`cli-providers::backup`); native data is pulled through ephemeral helper pods
+that stream `pg_dump` / `tar` over `kubectl exec`.
+
+### Cluster scope by default; user-vs-platform discrimination (H1)
+
+Both commands default to the **whole cluster** — the *app-namespace set*
+derived from `kubectl get applications.apprafter.io -A`, never from
+`kubectl get ns` (which would sweep platform/system namespaces we must never
+replay). `--namespace`/`--select` narrow it.
+
+The backup captures **user** material only — the load-bearing **H1**
+discrimination:
+
+- Argo `Application`s are filtered to those carrying
+  `apprafter.io/managed-by=apprafter`. The platform umbrella and per-component
+  Argo Applications lack the label and are never serialized, so a restore
+  never double-owns the target's own bootstrap Applications.
+- Config CRs are captured by **kind**: `PlatformStack/default` and every
+  `SourceCredential` (cluster-wide). There is no in-cluster `Infrastructure`
+  CR in M2 — the infrastructure topology is the **local manifest**, and its
+  essentials ride `manifest.platformVersion`. A missing
+  `infrastructures.apprafter.io` listing is expected, never an error.
+
+### The serialized config-CR set and the two secret-capture paths
+
+The captured config CRs are a fixed set: `PlatformStack` →
+`SourceCredential` (follow-the-reference) → user `Application`s (gated) → user
+`ArgoApplication`s → `SharedVolume`s. Secrets are captured by **two distinct
+paths**, because the SealedSecret-backed app-namespace sweep cannot see
+everything:
+
+- **(a) app user secrets** — for each in-scope namespace, a Secret is carried
+  only when a SealedSecret of the same name exists. Derived secrets the
+  operator re-creates (connection Secrets, pull-secrets) are skipped.
+- **(b) `SourceCredential` material** — the material lives in
+  `apprafter-system`, outside the app-ns set, so the sweep misses it. The
+  backup instead **follows the reference**: it resolves each
+  `SourceCredential`'s `spec.git.backend.sealedSecretRef` and
+  `spec.registry.backend.sealedSecretRef` and reads the underlying unsealed
+  material directly (a cluster-wide path).
+
+### `restore` — into a running target; modes (a) and (b)
+
+`apprafter restore <repo> --target <name>` replays a backup into a **running,
+already-bootstrapped** target cluster. The git/registry token used to pull
+private workloads after restore comes from the **target's own configuration**
+(its re-applied `SourceCredential`), not from a flag — a two-source restore
+(repo artifact + target config).
+
+- **(a) restore-into-running** (default): replay config CRs → gate apps → wait
+  for fresh claims → load data → re-seal secrets → resume workloads.
+- **(b) data-only** (`--data-only`): reload only the native data — scale the
+  existing apps to zero, load, resume. No CR/secret replay.
+- **clone-to-new** (`--reprovision`: re-provision a fresh cluster, then
+  replay) is **deferred** — the flag is wired but exits with a clear error.
+  Full cross-version / cross-topology DR ("source is dead, rebuild from
+  nothing") reconciles with the Phase-4 external-S3 DR drill
+  (`plan.md` Phase 4.x, "test restore: a new cluster from backup in < 1 hour")
+  and the Phase-8.5 `DisasterRecoveryPlan` resource.
+
+### Restore ordering and the two invariants (H2, R1)
+
+The full restore is a fixed sequence:
+
+```
+RestoreArtifact -> ApplyPlatformStack -> ApplySourceCredentials ->
+ApplyAppsGated -> WaitClaimsBound -> LoadData -> ReSealUserSecrets ->
+ResumeWorkloads
+```
+
+- **H2 — workload gating.** Apps are applied with `replicas: 0` and their user
+  Argo Applications have `syncPolicy.automated` stripped, so the operator
+  provisions fresh claims but **no pod runs** during the load. Data is loaded
+  into the empty backends, then workloads are resumed at their original
+  replica count and Argo auto-sync is re-enabled. This is what lets a
+  framework-style tracked migration see the restored state and **skip** on
+  boot rather than race the load.
+- **R1 — wait for the claim, not the volume bind.** `WaitClaimsBound` polls
+  each regenerated `ResourceClaim` for `status.ready == true`, **not** for the
+  PVC to be `Bound`. A 2.6b disk claim reports ready as soon as its
+  `volumeClaimRef` is set; on a `WaitForFirstConsumer` StorageClass the PVC
+  binds only when its first consumer schedules — and the restore's own load
+  helper is that first consumer. Waiting for `Bound` would deadlock.
+  *Caveat:* on a Tier-2 multi-node cluster, an RWO PVC may bind to a node
+  other than the one the load helper lands on; the restore pins the load
+  helper to the same node the workload will use, but this is the area to watch
+  as multi-node lands.
+
+### Data load mechanics and secret roundtrip
+
+- **pg**: a helper pod pipes the dump on stdin to `pg_restore --no-owner
+  --clean --if-exists`. `--no-owner` is **assumed** because the target role is
+  the newly-provisioned one, not whatever owned the source objects. Credentials
+  come from the claim's **fresh** `status.connectionSecretRef`, never the
+  backed-up ones.
+- **volumes**: a helper pod streams the tar on stdin to `tar x` into the fresh
+  PVC mounted read-write.
+- **secrets**: the source SealedSecrets are not copied. The restore reads the
+  decrypted material from the backup and **re-seals** it against the target's
+  controller public key, round-tripping the Kubernetes secret **type** (a
+  `kubernetes.io/tls` secret stays TLS). App user secrets re-seal into their
+  app namespace; `SourceCredential` material re-seals into `apprafter-system`.
+
+### Storage engine: restic pull (T1) vs CSI snapshot (T2+)
+
+For Tier 1, the data is pulled natively (logical dumps / tars) through helper
+pods and stored in restic — engine-agnostic and portable. CSI
+volume-snapshot-based backup (storage-level, faster for large volumes) is the
+Tier-2+ path and is out of scope here.
+
+### Version-aligned target
+
+The default restore targets a cluster bootstrapped at the same platform-stack
+version as the backup (`manifest.platformVersion`). A cross-version restore is
+not blocked but **warns** — a different target version may re-render
+components, so the operator verifies after restoring.
+
+## Consequences
+
+- **Easier:** a Tier-1 operator can take an encrypted backup and restore it
+  with zero cloud spend; the artifact is a plain restic repo readable with
+  stock `restic` (no lock-in); apps auto-register on restore (no manual
+  re-add); secrets survive a cluster rebuild.
+- **Harder / accepted:** restore ordering is intricate (the H2/R1 invariants
+  are the crux); the default path requires the target to be bootstrapped first
+  (clone-to-new is deferred); the operator owns the passphrase and any cloud
+  token, and losing the passphrase makes the backup unrecoverable.
+- **Neutral:** restic becomes a runtime dependency of the CLI (resolved on the
+  operator machine; the e2e harness wraps a `nix run nixpkgs#restic` fallback).
+
+## Alternatives considered
+
+- **Velero — rejected.** Velero supports only object storage as a backup
+  location (BSL); its restic/file-system backup is not stand-alone (still
+  needs a bucket), and a local-artifact + restore-from-file flow is an open,
+  unclosed feature request. Forcing a bucket purchase into the default path is
+  product friction, so Velero is unfit for the default. (It may reappear as a
+  Tier-2+ option alongside CSI snapshots.)
+- **CNPG Barman / continuous PITR for pg — not for export.** Barman is
+  in-cluster continuous backup; `export`/`backup` deliberately use logical
+  `pg_dump -Fc` so the artifact is self-contained, openable off-cluster, and
+  uniform with the volume/redis dumps.
+- **An always-on object-storage default — rejected** for the same
+  zero-forced-purchase reason. Automated S3 push stays **opt-in** (below).
+
+## Risks
+
+- **Lost passphrase ⇒ unrecoverable backup.** Mitigation: the command refuses
+  an empty passphrase and documents the operator's responsibility; no silent
+  weak-key path exists.
+- **RWO multi-node bind (R1 caveat).** On Tier-2 multi-node, an RWO PVC could
+  bind to the wrong node for the load helper. Mitigation: the load helper is
+  pinned to the workload's node; re-evaluate when multi-node lands.
+- **Cross-version restore re-render.** Mitigation: warn on a version mismatch;
+  the operator verifies after restore. Cross-version DR is explicitly deferred.
+- **pg major mismatch on `pg_restore`.** The helper image is major-matched to
+  the source CNPG image where visible; a mismatch surfaces as a `pg_restore`
+  error, not silent corruption.
+
+## Owner
+
+Platform CLI / storage maintainers.
+
+## Re-evaluation
+
+Revisit when the Phase-4 external-S3 DR drill lands (clone-to-new + automated
+S3 push), or at platform M-tier-2 (CSI snapshot path + multi-node RWO), or if
+restic proves an unacceptable operator-machine dependency.
+
+## References
+
+- `plan.md` § 2.6d (data export + backup/restore), § 4.x (external-S3 DR),
+  § 8.5 (`DisasterRecoveryPlan`).
+- ADR 0039 (SourceCredential), 0042 (needs.redis), 0043 (needs.disk),
+  0046 (env value references), 0049 (cross-app SharedVolume).
+- `docs/operator-guide/backup-restore.md` — the operator how-to.
+- `cli/platform-cli/src/commands/{backup,restore}.rs`,
+  `cli/cli-providers/src/backup/` — the implementation.
+- `e2e/backup-restore-walk.sh` — the end-to-end validation harness.

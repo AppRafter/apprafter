@@ -77,3 +77,4 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0047 | [CRD codegen — CUE as the single source; generated CRD, gated Rust, typed webhook](./0047-crd-codegen-from-cue.md) | Accepted |
 | 0048 | [Argo CD platform-upgrade approval surface](./0048-argo-platform-upgrade-approval-surface.md) | Accepted |
 | 0049 | [cross-app SharedVolume](./0049-cross-app-sharedvolume.md) | Accepted |
+| 0050 | [backup, export, and restore — restic engine, local-pull default](./0050-backup-restore.md) | Accepted |
