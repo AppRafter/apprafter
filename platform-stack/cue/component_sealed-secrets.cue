@@ -28,7 +28,11 @@ _components: "sealed-secrets": #Component & {
 	enabled:   bool | *true
 	namespace: "apprafter-system"
 	source: {
-		repoURL: "https://bitnami-labs.github.io/sealed-secrets"
+		// Chart repo moved bitnami-labs.github.io -> bitnami.github.io
+		// (the `-labs` host 404s as of 2026-06; the new host serves the
+		// identical chart 2.18.6 / appVersion 0.37.0). A fresh bootstrap
+		// could not install the secrets controller from the dead host.
+		repoURL: "https://bitnami.github.io/sealed-secrets"
 		chart:   "sealed-secrets"
 	}
 	version: "2.18.6"

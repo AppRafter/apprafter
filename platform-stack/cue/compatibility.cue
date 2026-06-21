@@ -1728,6 +1728,28 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.38": {
+	change:          "safe"
+	operatorVersion: "v0.2.31"
+	notes: """
+		Hotfix — repoint the sealed-secrets chart source. The
+		`bitnami-labs.github.io/sealed-secrets` Helm repo index 404s as of
+		2026-06 (the project's GitHub Pages repo moved to
+		`bitnami.github.io/sealed-secrets`); a fresh `cluster-bootstrap`
+		could no longer install the Tier-1 secrets controller, breaking
+		SealedSecrets / SourceCredential / `apprafter secret seal` on every
+		new cluster. The new host serves the IDENTICAL chart 2.18.6
+		(appVersion 0.37.0), so this is a pure repoURL change — no chart
+		version, operator, CRD, or schema change (operatorVersion stays
+		v0.2.31, cue-cmp unchanged). change=safe — existing clusters that
+		already installed sealed-secrets are unaffected; new bootstraps now
+		succeed. Surfaced by the 2.6d backup-restore walk (re-seal is core
+		to backup/restore) — the prior 2.6c walks tolerated the 404 because
+		they did not depend on the controller.
+		"""
+	references: ["docs/adr/0049-cross-app-sharedvolume.md"]
+}
+
 compatibility: "0.2.37": {
 	change:          "safe"
 	operatorVersion: "v0.2.31"
