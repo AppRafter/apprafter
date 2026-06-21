@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Infrastructure providers for `apprafter`.
 
+pub mod backup;
 pub mod cert;
 pub mod cloudflare;
 pub mod dry_run;
