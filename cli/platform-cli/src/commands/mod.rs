@@ -9,6 +9,7 @@ pub mod app_wizard;
 pub mod apply;
 pub mod argocd_password;
 pub mod auth;
+pub mod backup;
 pub mod bootstrap_all;
 pub mod cluster_bootstrap;
 pub mod destroy;
