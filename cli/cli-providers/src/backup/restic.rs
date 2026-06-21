@@ -10,6 +10,7 @@ pub fn restic_init_argv(repo: &str) -> Vec<String> {
 }
 
 /// `restic backup` argv: snapshot the staging dir into the repo, tagged.
+/// `--json` is included so the caller can parse the structured summary line.
 pub fn restic_backup_argv(repo: &str, staging_dir: &str, tag: &str) -> Vec<String> {
     vec![
         "backup".into(),
@@ -17,6 +18,7 @@ pub fn restic_backup_argv(repo: &str, staging_dir: &str, tag: &str) -> Vec<Strin
         repo.into(),
         "--tag".into(),
         tag.into(),
+        "--json".into(),
         staging_dir.into(),
     ]
 }
@@ -67,6 +69,7 @@ mod tests {
         assert!(a.contains(&"--tag".to_string()));
         assert!(a.contains(&"k3d-demo-2026-06-20T00:00:00Z".to_string()));
         assert!(a.contains(&"/stage".to_string()));
+        assert!(a.contains(&"--json".to_string()));
     }
 
     #[test]

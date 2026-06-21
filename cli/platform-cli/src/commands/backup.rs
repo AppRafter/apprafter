@@ -5,7 +5,8 @@
 // invokes them is wired in a follow-up task (T10). Until that lands the
 // module is reachable only from its own `#[cfg(test)]` block, which the
 // dead-code lint does not count — so allow it at the module level rather
-// than scattering per-item `#[allow]`s. Remove this when T10 wires the verbs.
+// than scattering per-item `#[allow]`s.
+// TODO(T10): remove #![allow(dead_code)] once the clap verbs are wired
 #![allow(dead_code)]
 //! `apprafter export` / `apprafter backup` — 2.6d backup/restore command
 //! logic (Task 9).
@@ -478,7 +479,6 @@ pub fn run_backup(
 ) -> Result<()> {
     let resolved = resolve_state_paths(None)?;
     let cluster_id = resolved.target_name.clone();
-    let target_name = resolved.target_name.clone();
 
     let env_pass = std::env::var("RESTIC_PASSWORD").ok();
     let is_tty = std::io::stdin().is_terminal();
@@ -639,7 +639,7 @@ pub fn run_backup(
     // 5. restic init (only if the repo doesn't already exist) + backup.
     let repo_path = match repo {
         Some(r) => PathBuf::from(r),
-        None => default_backup_repo(&target_name)?,
+        None => default_backup_repo(&cluster_id)?,
     };
     let repo_str = repo_path.to_string_lossy().to_string();
 
@@ -738,7 +738,7 @@ fn restic_repo_exists(repo: &str, pass: &str) -> Result<bool> {
     Ok(out.status.success())
 }
 
-/// Run a restic command, inheriting stdout/stderr (for `init` progress).
+/// Run a restic command, capturing output — silent on success, surfaces stderr on failure.
 fn run_restic(argv: &[String], pass: &str) -> Result<()> {
     let out = Command::new("restic")
         .args(argv)
@@ -775,17 +775,23 @@ fn run_restic_stdout(argv: &[String], pass: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Run `restic backup` and return the new snapshot id parsed from its stdout
-/// (`restic backup` prints `snapshot <id> saved` on its final line). Returns
-/// `None` when the line isn't found (a restic format change) — the backup
-/// still succeeded, we just can't echo the id.
+/// Run `restic backup --json` and return the snapshot id from the structured
+/// summary line. `restic backup --json` emits one JSON object per line; the
+/// final summary object has `"message_type": "summary"` and carries
+/// `"snapshot_id"`. Returns `None` when the summary object is not found (a
+/// restic version difference) — the backup still succeeded, we just can't echo
+/// the id.
 fn run_restic_backup(argv: &[String], pass: &str) -> Result<Option<String>> {
     let stdout = run_restic_stdout(argv, pass)?;
-    let snapshot_id = stdout.lines().rev().find_map(|line| {
-        line.trim()
-            .strip_prefix("snapshot ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .map(str::to_string)
+    let snapshot_id = stdout.lines().find_map(|line| {
+        let obj: Value = serde_json::from_str(line.trim()).ok()?;
+        if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
+            obj.pointer("/snapshot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
     });
     Ok(snapshot_id)
 }
