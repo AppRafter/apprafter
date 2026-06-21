@@ -28,6 +28,7 @@ pub mod platform;
 pub mod port_forward;
 pub mod repo_creds;
 pub mod repo_creds_wizard;
+pub mod restore;
 pub mod runtime_detect;
 pub mod scaffold_wizard;
 pub mod secret;

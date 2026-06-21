@@ -282,7 +282,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             snapshot,
             data_only,
             passphrase,
-        } => commands::backup::run_restore(
+        } => commands::restore::run_restore(
             &repo,
             target.as_deref(),
             reprovision,
