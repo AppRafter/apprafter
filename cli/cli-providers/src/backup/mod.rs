@@ -4,6 +4,7 @@
 
 pub mod images;
 pub mod manifest;
+pub mod reseal;
 pub mod restic;
 pub mod sanitize;
 
