@@ -15,7 +15,7 @@ use cli_core::logging;
 use miette::{IntoDiagnostic, Result};
 
 use crate::cli::{
-    AppCommand, Cli, Commands, EgressCommand, EnvCommand, MigrationCommand, OpenUi,
+    AppCommand, BackupAction, Cli, Commands, EgressCommand, EnvCommand, MigrationCommand, OpenUi,
     PlatformCommand, RepoCommand, RepoCredsCommand, SecretCommand,
 };
 
@@ -254,6 +254,42 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             } => commands::secret::run_remove(&name, &namespace, yes)?,
         },
         Commands::Volume { action } => commands::volume::run(action)?,
+        Commands::Export {
+            namespace,
+            select,
+            out,
+        } => commands::backup::run_export(&namespace, select, out.as_deref())?,
+        Commands::Backup { action } => match action {
+            BackupAction::Create {
+                namespace,
+                select,
+                repo,
+                passphrase,
+            } => commands::backup::run_backup(
+                &namespace,
+                select,
+                repo.as_deref(),
+                passphrase.as_deref(),
+            )?,
+            BackupAction::List { repo, passphrase } => {
+                commands::backup::run_backup_list(repo.as_deref(), passphrase.as_deref())?
+            }
+        },
+        Commands::Restore {
+            repo,
+            target,
+            reprovision,
+            snapshot,
+            data_only,
+            passphrase,
+        } => commands::backup::run_restore(
+            &repo,
+            target.as_deref(),
+            reprovision,
+            snapshot.as_deref(),
+            data_only,
+            passphrase.as_deref(),
+        )?,
     }
     Ok(())
 }

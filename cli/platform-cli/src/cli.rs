@@ -231,6 +231,54 @@ pub enum Commands {
         #[command(subcommand)]
         action: VolumeCommand,
     },
+    /// Native data export (Kind 1) — pull pg dumps, volume tars, redis
+    /// snapshots to a plain local folder + `manifest.json`. No CRs, no
+    /// secrets, no encryption. A debugging / one-off-recovery convenience.
+    Export {
+        /// Narrow scope to these namespaces (repeatable). Ignored unless
+        /// `--select` is also passed.
+        #[arg(long)]
+        namespace: Vec<String>,
+        /// When set, only the namespaces given via `--namespace` are
+        /// exported. Without `--select` the scope is the whole cluster.
+        #[arg(long, default_value_t = false)]
+        select: bool,
+        /// Output directory. Defaults to `./apprafter-export`.
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Encrypted backup (Kind 2, restic local-pull): native extraction +
+    /// serialized config/app CRs + decrypted user secrets, all wrapped
+    /// into a restic repository. Use `apprafter restore` to replay.
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
+    /// Restore a backup into a target cluster. Replays the CRs,
+    /// secrets and native data captured by `apprafter backup`.
+    /// Full restore logic lands in 2.6d T11/T13 — today the command
+    /// is wired and accepts flags but exits with a clear error.
+    Restore {
+        /// Path to the restic repository created by `apprafter backup`.
+        repo: String,
+        /// Target name to restore into (defaults to the active target).
+        #[arg(long)]
+        target: Option<String>,
+        /// Re-provision the target cluster before replaying data.
+        #[arg(long, default_value_t = false)]
+        reprovision: bool,
+        /// Snapshot id to restore (defaults to the latest).
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Replay only native data (pg/redis/volumes); skip CR + secret
+        /// replay. Useful when the cluster is already configured.
+        #[arg(long, default_value_t = false)]
+        data_only: bool,
+        /// Passphrase for the restic repo. Falls back to
+        /// `RESTIC_PASSWORD`; prompts interactively on a TTY.
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1131,6 +1179,44 @@ pub enum VolumeCommand {
         /// Skip the confirmation prompt.
         #[arg(long, default_value_t = false)]
         yes: bool,
+    },
+}
+
+/// `apprafter backup …` subcommands (2.6d).
+#[derive(Debug, Subcommand)]
+pub enum BackupAction {
+    /// Create a full encrypted backup of the cluster (default scope:
+    /// whole cluster). Wraps native data + CRs + secrets into a
+    /// restic repository.
+    Create {
+        /// Narrow scope to these namespaces (repeatable). Ignored
+        /// unless `--select` is also passed.
+        #[arg(long)]
+        namespace: Vec<String>,
+        /// When set, only the namespaces given via `--namespace` are
+        /// backed up.
+        #[arg(long, default_value_t = false)]
+        select: bool,
+        /// Path to the restic repository. Defaults to
+        /// `<config>/backups/<target>`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Passphrase for the restic repo. Falls back to
+        /// `RESTIC_PASSWORD`; prompts interactively on a TTY.
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+    /// List snapshots stored in a backup repo.
+    #[command(alias = "ls")]
+    List {
+        /// Path to the restic repository. Defaults to
+        /// `<config>/backups/<target>`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Passphrase for the restic repo. Falls back to
+        /// `RESTIC_PASSWORD`; prompts interactively on a TTY.
+        #[arg(long)]
+        passphrase: Option<String>,
     },
 }
 

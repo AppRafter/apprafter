@@ -1,13 +1,4 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//
-// `run_export` / `run_backup` / `run_backup_list` (and the private helpers
-// they alone call) are the command entrypoints; the clap subcommand that
-// invokes them is wired in a follow-up task (T10). Until that lands the
-// module is reachable only from its own `#[cfg(test)]` block, which the
-// dead-code lint does not count — so allow it at the module level rather
-// than scattering per-item `#[allow]`s.
-// TODO(T10): remove #![allow(dead_code)] once the clap verbs are wired
-#![allow(dead_code)]
 //! `apprafter export` / `apprafter backup` — 2.6d backup/restore command
 //! logic (Task 9).
 //!
@@ -720,6 +711,25 @@ pub fn run_backup_list(repo: Option<&str>, passphrase: Option<&str>) -> Result<(
         println!("{id:<12}  {time:<25}  {tags}");
     }
     Ok(())
+}
+
+/// `apprafter restore` — replay a backup into a target cluster.
+///
+/// Full restore logic (CR replay, secret re-sealing, native data injection)
+/// lands in 2.6d T11/T13. This stub accepts + validates the flags and errors
+/// clearly so the CLI surface is testable end-to-end before the implementation
+/// arrives.
+pub fn run_restore(
+    _repo: &str,
+    _target: Option<&str>,
+    _reprovision: bool,
+    _snapshot: Option<&str>,
+    _data_only: bool,
+    _passphrase: Option<&str>,
+) -> Result<()> {
+    Err(CliError::Other(
+        "apprafter restore lands in 2.6d T11/T13 — not yet implemented".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
