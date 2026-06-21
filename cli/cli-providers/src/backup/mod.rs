@@ -2,6 +2,7 @@
 //! 2.6d backup/restore: native export + restic-wrapped local-pull backup +
 //! restore. CLI-orchestrated; cluster-scoped by default.
 
+pub mod helper_pod;
 pub mod images;
 pub mod manifest;
 pub mod reseal;
