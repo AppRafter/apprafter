@@ -6,6 +6,7 @@ pub mod images;
 pub mod manifest;
 pub mod reseal;
 pub mod restic;
+pub mod restore;
 pub mod sanitize;
 
 /// The native data kinds an extraction pulls.
