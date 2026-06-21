@@ -48,7 +48,18 @@ use crate::commands::state_paths::resolve_state_paths;
 /// commands reuse it instead of re-implementing the chain
 /// across five modules.
 pub fn ensure_kubeconfig_tempfile() -> Result<NamedTempFile> {
-    let resolved = resolve_state_paths(None)?;
+    ensure_kubeconfig_tempfile_for_target(None)
+}
+
+/// Like [`ensure_kubeconfig_tempfile`] but resolves the state of a SPECIFIC
+/// target (the `--target <name>` override) rather than always the active one.
+/// Used by `apprafter restore`, which replays a backup into a target cluster
+/// that may not be the active deployment target. `None` resolves the active
+/// target, identical to [`ensure_kubeconfig_tempfile`].
+pub fn ensure_kubeconfig_tempfile_for_target(
+    target_override: Option<&str>,
+) -> Result<NamedTempFile> {
+    let resolved = resolve_state_paths(target_override)?;
     let state = State::load_or_default(&resolved.paths)?;
     let hetzner = state.hetzner_cloud.clone().ok_or_else(|| {
         CliError::Other(

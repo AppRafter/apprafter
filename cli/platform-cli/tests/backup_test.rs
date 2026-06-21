@@ -4,6 +4,7 @@
 //! (offline-safe). 2.6d T10.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 fn cli() -> Command {
@@ -68,12 +69,28 @@ fn restore_requires_repo_positional() {
 }
 
 #[test]
-fn restore_stub_errors_clearly() {
-    // Invoking `apprafter restore` with a repo should fail with the
-    // T11/T13 stub message (not a panic / clap parse error).
+fn restore_reprovision_errors_t13() {
+    // `--reprovision` (fresh-cluster re-provision then replay) is not wired
+    // until 2.6d T13 — it must fail fast with a clear T13 message, BEFORE
+    // touching any repo/cluster, so the operator isn't left half-restored.
     cli()
-        .args(["restore", "/tmp/fake-repo"])
+        .args(["restore", "/tmp/fake-repo", "--reprovision"])
         .assert()
         .failure()
-        .stderr(contains("T11/T13"));
+        .stderr(contains("T13"));
+}
+
+#[test]
+fn restore_into_running_errors_for_a_real_reason_not_a_stub() {
+    // Post-T11, `apprafter restore <repo>` drives the real restore-into-running
+    // flow. With no RESTIC_PASSWORD set and no TTY (assert_cmd has no terminal),
+    // the mandatory-passphrase gate fires first — a REAL precondition error, not
+    // the removed "not yet implemented" stub.
+    cli()
+        .args(["restore", "/tmp/fake-repo"])
+        .env_remove("RESTIC_PASSWORD")
+        .assert()
+        .failure()
+        .stderr(contains("passphrase"))
+        .stderr(contains("not yet implemented").not());
 }
