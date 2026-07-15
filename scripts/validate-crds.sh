@@ -47,4 +47,33 @@ echo "==> waiting for every CRD to be Established"
 kubectl --context "$CTX" wait --for=condition=Established --timeout=60s \
     -f "$crds"
 
+# Regression proof for the imagePolicy.resolve enum (ADR 0040): the generated
+# CRD must accept the STRING "off" as a valid enum value. Before the crdgen
+# YAML-quoting fix, `off` was emitted bare and coerced to boolean `false` by
+# the apiserver's YAML-1.1 parser, so the OpenAPI enum became ["digest", false]
+# and this apply was HARD-REJECTED ("Unsupported value: \"off\": supported
+# values: \"digest\", \"false\""). A server-side dry-run validates against the
+# live OpenAPI schema without needing the operator to run.
+echo "==> regression: Application imagePolicy.resolve: \"off\" must be accepted"
+kubectl --context "$CTX" create namespace crd-validate >/dev/null 2>&1 || true
+if kubectl --context "$CTX" apply --dry-run=server -f - >/dev/null 2>/tmp/crd-off-err.txt <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: crd-validate-off
+  namespace: crd-validate
+spec:
+  base:
+    image: example.com/app:latest
+    imagePolicy:
+      resolve: "off"
+YAML
+then
+    echo "    OK: resolve: \"off\" accepted by the apiserver"
+else
+    echo "==> REGRESSION: apiserver REJECTED imagePolicy.resolve: \"off\"" >&2
+    cat /tmp/crd-off-err.txt >&2
+    exit 1
+fi
+
 echo "==> CRD apiserver validation PASSED (all CRDs accepted + Established)"
