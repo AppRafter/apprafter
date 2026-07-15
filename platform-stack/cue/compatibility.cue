@@ -1728,6 +1728,38 @@ compatibility: "0.1.23": {
 // MigrationPlan approvable from the Argo CD UI. Operator + webhook images
 // move v0.2.24 -> v0.2.25 (new operator image -> operator pods restart on
 // upgrade, hence requires-restart). Chart-delivered, no CLI / re-bootstrap.
+compatibility: "0.2.39": {
+	change:          "safe"
+	operatorVersion: "v0.2.32"
+	notes: """
+		CRD-YAML fix — the generated `Application` CRD now quotes the
+		`spec.base.imagePolicy.resolve` enum value `"off"` (ADR 0040 image
+		auto-deploy opt-out). crdgen (the CUE->CRD generator, ADR 0047)
+		emitted `off` as a BARE YAML scalar; the apiserver parses CRD YAML
+		with `sigs.k8s.io/yaml` (YAML 1.1), which coerces unquoted `off` to
+		boolean `false`, so the compiled OpenAPI enum became
+		`["digest", false]` and HARD-REJECTED the string `"off"` the operator
+		emits (`ImagePolicy.resolve: Some("off")`) — making the documented
+		per-app opt-out of image tag->digest resolution completely unusable
+		(live proof: `Unsupported value: "off": supported values: "digest",
+		"false"`). The fix is in crdgen: it now force-quotes every
+		YAML-1.1-ambiguous STRING enum value (the `y/n/yes/no/on/off` family)
+		while leaving genuine booleans/numbers bare, so the CRD ships
+		`- 'off'`. The operator + admission-webhook IMAGES are functionally
+		unchanged (the Rust `ImagePolicy.resolve: Option<String>` already
+		accepts `"off"`); only the operator chart's `crd-application.yaml`
+		template changes, but the images roll v0.2.31 -> v0.2.32 in lockstep
+		with the chart per the release-operator convention. cue-cmp is
+		UNCHANGED (no `schemas/v1alpha1` edit — the bug was purely in the
+		generated CRD + generator). change=safe — the `off` enum value was
+		never usable before, so no existing object relied on it; the enum only
+		GAINS a value; no field removed, no re-render of any other CRD line.
+		Regression-guarded by a crdgen unit test + a `just crd-validate`
+		server-side apply of `resolve: "off"` against a real kind apiserver.
+		"""
+	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
+}
+
 compatibility: "0.2.38": {
 	change:          "safe"
 	operatorVersion: "v0.2.31"
