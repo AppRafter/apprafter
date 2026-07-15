@@ -37,6 +37,72 @@ convention, but the reconciler is functionally unchanged.
   against a real kind apiserver. No other YAML-ambiguous enum value exists
   across the 8 CRDs.
 
+## cli v0.2.29 — 2.6d data export + backup/restore core (2026-07-15)
+
+2.6d CORE (order-3.5 pulled-up; ADR 0050). A **CLI-only** release — the change
+touched `cli/`, `e2e/`, and `docs/` only, so there is **no operator, schema, or
+chart bump**. Three cluster-scope commands over one extraction give T1 a real
+export + backup/restore path (local-pull default, nothing forces a bucket). The
+two-cluster kind+podman walk (`e2e/backup-restore-walk.sh`) is GREEN
+end-to-end, run twice.
+
+### Added
+
+- **`apprafter export <ns>`** (Kind 1) — a read-only pull of native dumps to the
+  operator's machine: it enumerates the namespace's stateful claims and runs
+  `pg_dump -Fc` (not CNPG barman — that is in-cluster PITR) plus file-tree
+  copies through an ephemeral **read-only helper-pod**, writing a flat,
+  self-contained folder (`pg/*.dump`, `volumes/<name>/…`, `manifest.json`) for
+  local inspection or migrate-out. Zero restore logic.
+- **`apprafter backup`** (Kind 2, engine) — a **restic** wrapper over the same
+  extraction plus the serialized AppRafter + Argo CRs, the decrypted secrets,
+  and a manifest, written to an **encrypted** restic repo (it contains secrets;
+  the key stays with the operator). The **default backend is the local
+  filesystem** on the operator's machine, so nothing forces a bucket. Because
+  restic is the engine, the repo is portable and restorable by plain `restic`
+  from anywhere (no lock-in). Velero was rejected (object-storage-only BSL, no
+  stand-alone restic-FSB, no local-artifact restore).
+- **`apprafter restore --into <fresh-cluster>`** (Kind 2, the DR path for a dead
+  source) — the single restore path into a like-for-like fresh cluster: it
+  applies the serialized CRs (the operator provisions fresh claims), runs
+  `pg_restore` / `restic restore` of the data into them, and **re-seals** the
+  secrets into the target's SealedSecrets. It **auto-registers every
+  application** from the backup (the Argo Application CRs are recreated →
+  workloads flow from Git) with **no manual re-add**. Restore-ordering
+  (apply → provision → load → re-seal) is the hard part of the block.
+- **`apprafter restore … --data-only`** — data-restore into an already-running
+  cluster (recover a volume/DB without recreating the app).
+
+### Fixed
+
+Bugs surfaced by the two-cluster walk that every unit/review gate had passed:
+
+- **pg helper-image major-version match.** `pg_dump` / `pg_restore` must run
+  against a helper image whose PostgreSQL major matches the source/target DB;
+  a mismatch failed the dump/restore. The helper-image selection now matches
+  the pg major (`3d22d92`, with a regression test).
+- **claim-ready vs DB-ready race on restore.** The restore step advanced when
+  the ResourceClaim reported ready but before the backing database was
+  actually accepting connections, racing `pg_restore`. Restore now waits for
+  DB-ready, not just claim-ready (`3d22d92`).
+- **walk-fixes** — helper image name, pg18, target registry, and timing
+  (`f170d6a`).
+
+### Delivery / notes
+
+- **CLI-only.** cli `v0.2.28 → v0.2.29` (monorepo tag `v0.2.29`, local). No
+  operator / platform-stack / cue-cmp bump.
+- **Surfaced (shipped as their own separate releases, not part of this bump):**
+  the sealed-secrets chart-source repoint (platform-stack **0.2.38**) and the
+  2.4h `imagePolicy.resolve: "off"` CRD-YAML fix (operator v0.2.32 /
+  platform-stack **0.2.39**).
+- **Deferred:** `restore --reprovision` (mode a — provision a fresh cluster as
+  part of restore, T13) is a real-Hetzner fast-follow (kind has no provider →
+  the command errors clearly with "T13"); full DR validation (`restore` in
+  <1h on a real cluster) rides the same real-Hetzner manual run; and
+  **automated S3 push** (scheduled backup to a remote bucket, 2.6d-4 / 4.12) is
+  a follow-on — local-pull stays the default.
+
 ## operator + admission-webhook v0.2.31 + platform-stack 0.2.37 + cue-cmp 0.1.13 + cli v0.2.28 — 2.6c capacity-signal + cross-app SharedVolume (2026-06-19)
 
 2.6c (order-3.5 pulled-up; ADR 0049). A coordinated CRD-additive release
