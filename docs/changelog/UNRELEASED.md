@@ -9,6 +9,34 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator + admission-webhook v0.2.32 + platform-stack 0.2.39 — imagePolicy.resolve `off` CRD-YAML fix (2026-07-15)
+
+CRD-only fix (`change: safe`) restoring the ADR-0040 image-auto-deploy
+opt-out. No CLI, schema, or cue-cmp change; the operator/webhook images roll
+`v0.2.31 → v0.2.32` in lockstep with the chart per the release-operator
+convention, but the reconciler is functionally unchanged.
+
+### Fixed
+
+- **`Application.spec.base.imagePolicy.resolve: "off"` is now accepted by the
+  apiserver.** The generated CRD emitted the enum value `off` as a **bare**
+  YAML scalar; because the apiserver parses CRD YAML with `sigs.k8s.io/yaml`
+  (YAML 1.1), unquoted `off` was coerced to the boolean `false`, so the
+  compiled OpenAPI enum became `["digest", false]` and **hard-rejected** the
+  string `"off"` the operator emits — `Unsupported value: "off": supported
+  values: "digest", "false"`. The documented per-app opt-out of image
+  tag→digest auto-resolution (ADR 0040) was therefore completely unusable.
+  The fix is in **crdgen** (the CUE→CRD generator, ADR 0047): it now walks the
+  typed CRD value tree and force-quotes every YAML-1.1-ambiguous **string**
+  enum value (the `y/n/yes/no/on/off` family, all case spellings) while
+  leaving genuine booleans/numbers bare, so the CRD ships `- 'off'` in both
+  the `base` and `environments` enum locations. The CUE schema
+  (`"digest" | "off"`) and the Rust `ImagePolicy.resolve: Option<String>`
+  type were already correct and are unchanged. Regression-guarded by a crdgen
+  unit test and a `just crd-validate` server-side apply of `resolve: "off"`
+  against a real kind apiserver. No other YAML-ambiguous enum value exists
+  across the 8 CRDs.
+
 ## operator + admission-webhook v0.2.31 + platform-stack 0.2.37 + cue-cmp 0.1.13 + cli v0.2.28 — 2.6c capacity-signal + cross-app SharedVolume (2026-06-19)
 
 2.6c (order-3.5 pulled-up; ADR 0049). A coordinated CRD-additive release
