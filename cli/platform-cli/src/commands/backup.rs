@@ -372,21 +372,55 @@ fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
     refs
 }
 
-/// The CNPG `Cluster.spec.imageName` of the first CNPG Cluster found in the
-/// app namespaces, used to pick a major-matched `pg_dump` helper image. Falls
-/// back to the default pg image when none is found.
-fn first_cnpg_image(namespaces: &[String], kubeconfig: &Path) -> Option<String> {
-    for ns in namespaces {
+/// The CNPG operator's own namespace, where the lazily-provisioned shared
+/// integrated `platform-postgres` Cluster lives (never in an app namespace).
+const CNPG_OPERATOR_NS: &str = "cnpg-system";
+
+/// The CNPG operand image of the first CNPG Cluster found across the app
+/// namespaces AND `cnpg-system`, used to pick a major-matched `pg_dump` helper
+/// image. Falls back to the default pg image when none is found.
+///
+/// The `cnpg-system` scan is load-bearing: integrated-tier claims all share the
+/// `platform-postgres` Cluster there (see the resourceclaim-provisioner), which
+/// never appears in an app namespace, so an app-ns-only scan structurally
+/// misses it and always falls back to the default major. For each Cluster CR
+/// the image is read from `spec.imageName` first and, when that is unset (CNPG
+/// derives the operand image from its own default or an ImageCatalogRef — the
+/// common case, so `spec.imageName` is typically EMPTY), from `status.image`
+/// (the resolved operand image CNPG stamps once the Cluster is running).
+/// Without the `status.image` fallback a modern CNPG (PG 18) would silently
+/// mismatch a `postgres:16` `pg_dump` (`pg_dump: server version mismatch`).
+pub(crate) fn first_cnpg_image(namespaces: &[String], kubeconfig: &Path) -> Option<String> {
+    // App namespaces first (per-claim owned clusters, if any), then the shared
+    // integrated cluster's namespace. Dedup so `cnpg-system` isn't scanned
+    // twice when it is already an app namespace.
+    let mut scan: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    if !scan.contains(&CNPG_OPERATOR_NS) {
+        scan.push(CNPG_OPERATOR_NS);
+    }
+    for ns in scan {
         if let Ok(items) = list_items("clusters.postgresql.cnpg.io", Some(ns), kubeconfig) {
-            if let Some(img) = items
-                .iter()
-                .find_map(|c| c.pointer("/spec/imageName").and_then(Value::as_str))
-            {
-                return Some(img.to_string());
+            if let Some(img) = items.iter().find_map(cnpg_cluster_image) {
+                return Some(img);
             }
         }
     }
     None
+}
+
+/// Resolve a CNPG `Cluster`'s operand image: `spec.imageName` when set, else the
+/// resolved `status.image` (populated once the Cluster is running, even when the
+/// image comes from a default/ImageCatalogRef rather than an explicit spec).
+fn cnpg_cluster_image(c: &Value) -> Option<String> {
+    c.pointer("/spec/imageName")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            c.pointer("/status/image")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
 }
 
 /// Enumerate ResourceClaims across the given namespaces (cluster-wide when the
@@ -918,6 +952,39 @@ mod tests {
     fn backup_requires_passphrase() {
         assert!(backup_passphrase_or_error(None, None, false).is_err());
         assert!(backup_passphrase_or_error(Some("p"), None, false).is_ok());
+    }
+
+    #[test]
+    fn cnpg_cluster_image_prefers_spec_then_status() {
+        // Explicit spec.imageName wins.
+        let spec = json!({"spec":{"imageName":"ghcr.io/cloudnative-pg/postgresql:16.2"}});
+        assert_eq!(
+            cnpg_cluster_image(&spec).as_deref(),
+            Some("ghcr.io/cloudnative-pg/postgresql:16.2")
+        );
+        // Absent/empty spec.imageName falls back to the resolved status.image —
+        // the integrated shared cluster path (CNPG derives PG 18 from its own
+        // default, leaving spec.imageName empty). This is the regression: an
+        // app-ns-only, spec-only lookup returned None → default postgres:16 →
+        // `pg_dump: server version mismatch` against the PG 18 server.
+        let status_only =
+            json!({"spec":{},"status":{"image":"ghcr.io/cloudnative-pg/postgresql:18.3-1"}});
+        assert_eq!(
+            cnpg_cluster_image(&status_only).as_deref(),
+            Some("ghcr.io/cloudnative-pg/postgresql:18.3-1")
+        );
+        let empty_spec = json!({"spec":{"imageName":""},"status":{"image":"postgres:17"}});
+        assert_eq!(
+            cnpg_cluster_image(&empty_spec).as_deref(),
+            Some("postgres:17")
+        );
+        // The chosen image drives the helper major — 18.3-1 → postgres:18-alpine.
+        assert_eq!(
+            pg_helper_image(cnpg_cluster_image(&status_only).as_deref()),
+            "postgres:18-alpine"
+        );
+        // Neither present → None (caller uses the pinned default).
+        assert_eq!(cnpg_cluster_image(&json!({"spec":{}})), None);
     }
 
     #[test]

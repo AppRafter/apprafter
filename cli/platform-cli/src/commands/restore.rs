@@ -29,7 +29,7 @@ use cli_providers::backup::helper_pod::{
     apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_from_file, pg_dump_pod_spec,
     volume_pod_spec,
 };
-use cli_providers::backup::images::VOLUME_IMAGE;
+use cli_providers::backup::images::{pg_helper_image, VOLUME_IMAGE};
 use cli_providers::backup::manifest::BackupManifest;
 use cli_providers::backup::reseal::reseal_secret;
 use cli_providers::backup::restic::restic_restore_argv;
@@ -40,8 +40,8 @@ use cli_providers::k8s::sealing::fetch_controller_public_key;
 use serde_json::Value;
 
 use crate::commands::backup::{
-    backup_passphrase_or_error, list_items, read_platform_version, read_secret_data,
-    sourcecred_material_refs,
+    backup_passphrase_or_error, first_cnpg_image, list_items, read_platform_version,
+    read_secret_data, sourcecred_material_refs,
 };
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile_for_target, kubectl_apply_server_side, kubectl_get_json,
@@ -637,12 +637,27 @@ fn load_pg_dumps(data_dir: &Path, kubeconfig: &Path) -> Result<()> {
     let Ok(ns_entries) = std::fs::read_dir(&pg_root) else {
         return Ok(());
     };
-    for ns_entry in ns_entries.flatten() {
-        let ns_path = ns_entry.path();
-        if !ns_path.is_dir() {
-            continue;
-        }
-        let ns = ns_entry.file_name().to_string_lossy().into_owned();
+    // Collect the dump namespaces up front so the pg helper image can be
+    // major-matched to the TARGET cluster's CNPG (reachable via `kubeconfig`).
+    // `pg_restore` reading a custom-format archive written by a NEWER `pg_dump`
+    // (the export now major-matches the server) fails with "unsupported
+    // version" if the helper is the pinned default `postgres:16` while the
+    // target runs PG 18 — so resolve the target major the same way export
+    // does (spec.imageName / status.image across app-ns + cnpg-system), and
+    // only fall back to the pinned default when discovery finds nothing.
+    let ns_dirs: Vec<(String, PathBuf)> = ns_entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter_map(|p| {
+            p.file_name()
+                .map(|n| (n.to_string_lossy().into_owned(), p.clone()))
+        })
+        .collect();
+    let namespaces: Vec<String> = ns_dirs.iter().map(|(ns, _)| ns.clone()).collect();
+    let pg_image = pg_helper_image(first_cnpg_image(&namespaces, kubeconfig).as_deref());
+
+    for (ns, ns_path) in ns_dirs {
         let Ok(dump_entries) = std::fs::read_dir(&ns_path) else {
             continue;
         };
@@ -656,7 +671,7 @@ fn load_pg_dumps(data_dir: &Path, kubeconfig: &Path) -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            load_one_pg(&ns, &claim, &dump_path, kubeconfig)?;
+            load_one_pg(&ns, &claim, &dump_path, kubeconfig, &pg_image)?;
         }
     }
     Ok(())
@@ -668,7 +683,13 @@ fn load_pg_dumps(data_dir: &Path, kubeconfig: &Path) -> Result<()> {
 /// user/pass/host/port/db from THAT (the post-provision Secret), never the
 /// creds embedded in the backup. L2: `pg_restore` reads the dump on stdin via
 /// `exec_stream_from_file`; `PGPASSWORD` is injected into the helper pod env.
-fn load_one_pg(ns: &str, claim: &str, dump_path: &Path, kubeconfig: &Path) -> Result<()> {
+fn load_one_pg(
+    ns: &str,
+    claim: &str,
+    dump_path: &Path,
+    kubeconfig: &Path,
+    pg_image: &str,
+) -> Result<()> {
     // Resolve the FRESH connection Secret name from the regenerated claim.
     let claim_json = kubectl_get_json(
         "resourceclaims.apprafter.io",
@@ -714,7 +735,7 @@ fn load_one_pg(ns: &str, claim: &str, dump_path: &Path, kubeconfig: &Path) -> Re
     // Helper pod (network pod — pg_dump image carries pg_restore). Inject
     // PGPASSWORD into the env so pg_restore never prompts.
     let pod_name = truncate_pod_name(&format!("ld-pg-{claim}"));
-    let mut spec = pg_dump_pod_spec(&pod_name, ns, images_default_pg());
+    let mut spec = pg_dump_pod_spec(&pod_name, ns, pg_image);
     if let Some(container) = spec
         .pointer_mut("/spec/containers/0")
         .and_then(Value::as_object_mut)
@@ -733,6 +754,17 @@ fn load_one_pg(ns: &str, claim: &str, dump_path: &Path, kubeconfig: &Path) -> Re
     };
     apply_and_wait_pod_ready(&spec, kubeconfig)?;
 
+    // Wait for the TARGET database to actually accept a connection before
+    // streaming the dump. `WaitClaimsBound` only guarantees the ResourceClaim's
+    // `.status.ready` (a control-plane condition); for the FIRST claim that
+    // lazily provisions the shared CNPG cluster, the server can still be
+    // finishing initdb (connection refused) AND the per-claim database can be
+    // uncreated (`FATAL: database "…" does not exist`) when the claim flips
+    // ready, so an immediate `pg_restore` aborts the whole restore. Probe the
+    // db with `psql SELECT 1` (bounded) — the same "claim-ready ≠ TCP/DB-ready"
+    // gap the export side and the app entrypoint already tolerate.
+    wait_pg_reachable(&pod_name, ns, &host, &port, &user, &db, kubeconfig)?;
+
     let argv: Vec<&str> = vec![
         "pg_restore",
         "--no-owner",
@@ -750,6 +782,58 @@ fn load_one_pg(ns: &str, claim: &str, dump_path: &Path, kubeconfig: &Path) -> Re
     exec_stream_from_file(&pod_name, ns, &argv, dump_path, kubeconfig)?;
     println!("  ✓ pg restored: {ns}/{claim}");
     Ok(())
+}
+
+/// Poll a real connection to the TARGET database inside an already-running
+/// helper pod until it succeeds, or a bounded timeout elapses. `PGPASSWORD` is
+/// already in the pod env (set by the caller).
+///
+/// A `pg_isready` probe is NOT enough: for a lazily-provisioned shared CNPG
+/// cluster, the SERVER accepts connections (to `postgres`) well before the
+/// per-claim database (`claim_<ns>_<name>`) is created — `pg_isready -d <db>`
+/// reports "up" regardless of whether `<db>` exists, so `pg_restore` would then
+/// fail with `FATAL: database "<db>" does not exist`. Probe with `psql -d <db>
+/// -c 'SELECT 1'`, which only succeeds once the database itself is reachable.
+fn wait_pg_reachable(
+    pod: &str,
+    ns: &str,
+    host: &str,
+    port: &str,
+    user: &str,
+    db: &str,
+    kubeconfig: &Path,
+) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 90; // ~3 min at 2s spacing
+    const SPACING: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut last = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let out = std::process::Command::new("kubectl")
+            .args([
+                "exec", pod, "-n", ns, "--", "psql", "-h", host, "-p", port, "-U", user, "-d", db,
+                "-tAc", "SELECT 1",
+            ])
+            .env("KUBECONFIG", kubeconfig)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => return Ok(()),
+            Ok(o) => {
+                last = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            Err(e) => last = format!("kubectl exec psql failed to spawn: {e}"),
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            std::thread::sleep(SPACING);
+        }
+    }
+    Err(CliError::Other(format!(
+        "pg database {db} on {host}:{port} was not reachable within {}s (last probe: {})",
+        MAX_ATTEMPTS as u64 * SPACING.as_secs(),
+        last.trim()
+    )))
 }
 
 /// Restore every `data/volumes/<ns>/<name>/data.tar` into its fresh PVC via a
@@ -1045,14 +1129,6 @@ fn argo_apps_for(app_name: &str, kubeconfig: &Path) -> Result<Vec<(String, Strin
             Some((ns, name))
         })
         .collect())
-}
-
-/// The default pg helper image for restore (pg_restore runs in the same image
-/// family as pg_dump). Restore can't always see the source CNPG image, so it
-/// uses the pinned default; a pg-major mismatch surfaces as a `pg_restore`
-/// error on the live walk (T12).
-fn images_default_pg() -> &'static str {
-    cli_providers::backup::images::DEFAULT_PG_IMAGE
 }
 
 /// Deletes a helper pod on drop — guarantees cleanup on every return path of a
