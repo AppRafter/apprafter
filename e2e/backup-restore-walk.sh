@@ -112,13 +112,28 @@ RESTIC_PASS="walk-restic-passphrase-2026"
 # The test app image. The Application schema has NO `command` field (the
 # renderer sets only image/replicas/env/expose/needs), so a framework-style
 # tracked migration on boot (R3) must live in the IMAGE's ENTRYPOINT. We build
-# a tiny image at walk time (Phase 0b) from postgres:16-alpine (carries psql +
-# pg_restore) whose entrypoint: (1) ensures a `_migrations` tracking table,
+# a tiny image at walk time (Phase 0b) from postgres:18-alpine (carries psql +
+# pg_restore). The MAJOR must match the CNPG server (the current platform-stack
+# ships CNPG 1.29 → PG 18), because Phase 2 verifies the exported dump with
+# `pg_restore -l` INSIDE this pod — a pg16 client cannot list a pg18-format
+# custom archive ("unsupported version"), and pg16 `psql` against a pg18 server
+# is only tolerated by luck. The entrypoint: (1) ensures a `_migrations` table,
 # (2) applies migration `001` only if absent + records it, (3) prints whether
 # the user secret arrived, (4) sleeps forever. Side-loaded into BOTH clusters
 # (imagePullPolicy IfNotPresent on a local tag), mirroring the local-operator
 # image-build pattern the sibling walks use. The `:walk` tag is never published.
-APP_IMAGE="apprafter-br-walk-app:walk"
+#
+# FULLY-QUALIFIED name (docker.io/library/…): podman prefixes a BARE tag with
+# `localhost/` on build, so the image would land in the kind/k3d node's
+# containerd as `localhost/apprafter-br-walk-app:walk` while the manifest's
+# bare `image:` gets kubelet-normalized to `docker.io/library/…` → NAME
+# MISMATCH → kubelet tries a doomed remote pull → ImagePullBackOff. Naming the
+# image `docker.io/library/…` makes `podman build -t` (no localhost prefix),
+# `cluster_load_image` (loads under that exact name), the manifest `image:`
+# ref, AND kubelet's normalization all AGREE across podman (local) + docker
+# (CI). The manifest also sets `imagePolicy.resolve: "off"` (ADR 0040) so the
+# operator never makes a doomed docker.io HEAD for this never-published tag.
+APP_IMAGE="docker.io/library/apprafter-br-walk-app:walk"
 
 # ---------------------------------------------------------------
 # Tool checks (fail loudly, never silently skip)
@@ -241,6 +256,21 @@ _write_state() {
   }
 }
 STATE
+
+    # Register the target in the `targets/<name>/` REGISTRY too, not just the
+    # `state/<name>/` kubeconfig cache. `apprafter restore --target fresh` does
+    # an eager existence check (state_paths::resolve_state_paths → list_target_
+    # names) that enumerates `targets/`, NOT `state/` — so a state-only seed
+    # fails with "target `fresh` not found (available: )". A minimal
+    # config.yaml (just `provider:`) is enough to make the target enumerable;
+    # the kubeconfig still comes from the state cache above. (The active target
+    # `source` skips this check because export/backup carry no --target
+    # override — only the explicit --target path validates the registry.)
+    mkdir -p "${APPRAFTER_CONFIG_DIR}/targets/${target}"
+    cat >"${APPRAFTER_CONFIG_DIR}/targets/${target}/config.yaml" <<TCFG
+provider: hetzner-cloud
+cluster_name: ${target}
+TCFG
 }
 
 # Set the active target in config.yaml (so cluster-bootstrap / export / backup
@@ -299,6 +329,31 @@ app_pod() {
     if [ -n "$running" ]; then printf '%s' "$running"; return; fi
     kubectl -n "$APP_NS" get pod -l "app.kubernetes.io/name=$1" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+}
+
+# wait_pod_log <pod> <extended-regex> [timeout]  (uses $KUBECONFIG)
+#   Poll a pod's stdout until it matches. The app's ENTRYPOINT runs its
+#   tracked migration ASYNCHRONOUSLY relative to pod-Ready — the container has
+#   no readiness probe gated on the migration, and the pg claim's Service may
+#   settle a beat after the pod starts (the entrypoint's own `until psql
+#   SELECT 1` retry loop, up to 120s). So the boot marker (MIGRATION_001_* /
+#   secret-seen) can lag pod-Ready by tens of seconds — read ONCE and we race
+#   the loop. Prints the matched line on success; dumps the tail on timeout.
+wait_pod_log() {
+    local pod="$1" pattern="$2" timeout="${3:-180}" deadline log
+    deadline=$(( $(date +%s) + timeout ))
+    printf '  wait pod/%s log =~ /%s/ (timeout %ss) ...\n' "$pod" "$pattern" "$timeout"
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        log=$(kubectl -n "$APP_NS" logs "$pod" 2>/dev/null || true)
+        if printf '%s' "$log" | grep -qE "$pattern"; then
+            printf '  ok: pod/%s log matched /%s/\n' "$pod" "$pattern"
+            return 0
+        fi
+        sleep 5
+    done
+    printf 'FAILED: pod/%s log never matched /%s/ within %ss\n' "$pod" "$pattern" "$timeout" >&2
+    kubectl -n "$APP_NS" logs "$pod" --tail=40 >&2 2>&1 || true
+    return 1
 }
 
 # bring up + bootstrap one cluster on $1=name, writing kubeconfig to $2.
@@ -417,7 +472,7 @@ echo "boot complete; sleeping"
 exec sleep 100000
 ENTRY
     cat >"${ctx}/Dockerfile" <<'DOCKER'
-FROM postgres:16-alpine
+FROM postgres:18-alpine
 COPY entrypoint.sh /usr/local/bin/walk-entrypoint.sh
 RUN chmod +x /usr/local/bin/walk-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/walk-entrypoint.sh"]
@@ -441,6 +496,18 @@ metadata:
 spec:
   base:
     image: ${APP_IMAGE}
+    # NB: we deliberately do NOT set an imagePolicy.resolve opt-out here. The
+    # shipped CRD's enum entry for the off value is the UNQUOTED YAML token off,
+    # which sigs.k8s.io/yaml (YAML 1.1) coerces to the boolean false -- so the
+    # apiserver enum is really digest plus boolean-false, and it hard-rejects
+    # the string off that the operator expects (Unsupported value: off). The
+    # opt-out is therefore currently unusable (product bug, flagged separately
+    # in the walk report -- NOT a 2.6d regression). It is not needed anyway:
+    # the name-match fix (fully-qualified image ref) lets kubelet find the
+    # side-loaded image locally under IfNotPresent, and the operator tag-to-
+    # digest resolve SOFT-fails for the never-published walk tag without
+    # blocking Ready (2.4h best-effort). One harmless failing HEAD per
+    # reconcile, no rollout impact.
     replicas: 1
     expose:
       port: 5432
@@ -507,23 +574,22 @@ POD="$(app_pod "$APP")"
 [ -n "$POD" ] || { printf 'FAILED: no app pod\n' >&2; exit 1; }
 printf '  app pod: %s\n' "$POD"
 
-# The tracked migration applied 001 on first boot (proof: it's recorded).
+# The tracked migration applied 001 on first boot (proof: it's recorded). The
+# entrypoint waits for the DB (its own `until psql SELECT 1` loop) BEFORE it
+# prints the migration marker, and CNPG's initdb can still be running when the
+# app pod flips Ready — so POLL the log for the marker rather than reading it
+# once (else we race the entrypoint's DB-wait loop).
+wait_pod_log "$POD" "MIGRATION_001_DONE|MIGRATION_001_SKIPPED" 180
 boot_log=$(kubectl -n "$APP_NS" logs "$POD" 2>/dev/null || true)
 if printf '%s' "$boot_log" | grep -q "MIGRATION_001_DONE"; then
     printf '  ok: tracked migration 001 applied on first boot\n'
-elif printf '%s' "$boot_log" | grep -q "MIGRATION_001_SKIPPED"; then
+else
     printf '  ok: tracked migration 001 already recorded (idempotent re-run)\n'
-else
-    printf 'FAILED: tracked-migration boot did not run as expected\n%s\n' "$boot_log" >&2
-    exit 1
 fi
-# The user secret reached the container (APIKEY mounted).
-if printf '%s' "$boot_log" | grep -q "secret-seen=${USER_SECRET_VALUE}"; then
-    printf '  ok: user secret reached the container (APIKEY mounted)\n'
-else
-    printf 'FAILED: user secret did not reach the container\n%s\n' "$boot_log" >&2
-    exit 1
-fi
+# The user secret reached the container (APIKEY mounted). The entrypoint prints
+# secret-seen AFTER the migration marker, so a short poll settles any lag.
+wait_pod_log "$POD" "secret-seen=${USER_SECRET_VALUE}" 60
+printf '  ok: user secret reached the container (APIKEY mounted)\n'
 
 # Resolve the pg connection Secret -> psql DSN so the walk can write a KNOWN row.
 pg_url=$(kubectl -n "$APP_NS" get secret "$PG_CONN" -o jsonpath='{.data.url}' 2>/dev/null | base64 -d || true)
@@ -575,22 +641,25 @@ phase "Phase 2: apprafter export -> pg dump + volume tar + manifest.json, all op
 
 apprafter export --out "$EXPORT_DIR"
 
-# manifest.json exists + carries platformVersion + the demo namespace.
+# manifest.json exists + carries platformVersion + the demo namespace. NB the
+# BackupManifest struct is `#[serde(rename_all = "camelCase")]`, so the JSON key
+# is `platformVersion` (camelCase), NOT `platform_version`.
 [ -f "${EXPORT_DIR}/manifest.json" ] || { printf 'FAILED: export manifest.json missing\n' >&2; exit 1; }
-pv=$(python3 -c "import json,sys; print(json.load(open('${EXPORT_DIR}/manifest.json')).get('platform_version',''))" 2>/dev/null \
-     || grep -o '"platform_version"[^,]*' "${EXPORT_DIR}/manifest.json")
-printf '  manifest platform_version: %s\n' "$pv"
-grep -q '"platform_version"' "${EXPORT_DIR}/manifest.json" || {
-    printf 'FAILED: manifest.json has no platform_version\n' >&2; exit 1; }
+pv=$(python3 -c "import json,sys; print(json.load(open('${EXPORT_DIR}/manifest.json')).get('platformVersion',''))" 2>/dev/null \
+     || grep -o '"platformVersion"[^,]*' "${EXPORT_DIR}/manifest.json")
+printf '  manifest platformVersion: %s\n' "$pv"
+grep -q '"platformVersion"' "${EXPORT_DIR}/manifest.json" || {
+    printf 'FAILED: manifest.json has no platformVersion\n' >&2; exit 1; }
 grep -q "\"${APP_NS}\"" "${EXPORT_DIR}/manifest.json" || {
     printf 'FAILED: manifest.json does not list the %s namespace\n' "$APP_NS" >&2; exit 1; }
-printf '  ok: manifest.json present with platform_version + %s namespace\n' "$APP_NS"
+printf '  ok: manifest.json present with platformVersion + %s namespace\n' "$APP_NS"
 
 # pg dump exists + is a valid pg custom-format archive (pg_restore -l lists it).
 PG_DUMP="${EXPORT_DIR}/pg/${APP_NS}/${PG_CLAIM}.dump"
 [ -f "$PG_DUMP" ] || { printf 'FAILED: expected pg dump %s missing\n' "$PG_DUMP" >&2; ls -R "$EXPORT_DIR" >&2; exit 1; }
 # pg_restore lives in the postgres helper image — run it via a throwaway pod's
-# psql image is overkill; instead use the app pod (postgres:16-alpine carries it).
+# psql image is overkill; instead use the app pod (postgres:18-alpine carries a
+# pg_restore whose major matches the CNPG server, so it can read the dump).
 if kubectl -n "$APP_NS" cp "$PG_DUMP" "${POD}:/tmp/walk.dump"; then
     toc=$(kubectl -n "$APP_NS" exec "$POD" -- pg_restore -l /tmp/walk.dump 2>/dev/null || true)
     if printf '%s' "$toc" | grep -qi "app_data\|TABLE DATA\|_migrations"; then
@@ -652,10 +721,15 @@ else
     exit 1
 fi
 
-# ---- H1: platform Argo Apps NOT captured; only the user app's Argo App ----
-# Inspect the restic snapshot's crs/ tree. The platform umbrella + component
-# Argo Applications (no managed-by label) must be ABSENT; the user app's Argo
-# Application (managed-by=apprafter) must be present.
+# ---- H1: user app CR captured; platform Argo Apps NOT captured ----
+# Inspect the restic snapshot's crs/ tree. This walk deploys the app by
+# `kubectl apply`-ing the raw apprafter.io Application CR (NOT `apprafter app
+# add`), so NO Argo CD Application wraps `shop` — the user-app signal is the
+# captured `Application` CR itself. The platform umbrella + component Argo
+# Applications (`platform`, `argocd`, `cilium`, …) DO exist (Argo CD manages the
+# platform) but lack the managed-by label, so `is_user_argo_app` must filter
+# them out — that filtering is the real user-vs-platform discrimination H1
+# proves.
 DUMP_DIR="${TMPDIR_WORK}/h1-dump"
 mkdir -p "$DUMP_DIR"
 RESTIC_PASSWORD="$RESTIC_PASS" restic -r "$RESTIC_REPO" restore latest --target "$DUMP_DIR" >/dev/null 2>&1 || {
@@ -664,12 +738,13 @@ CRS_DIR=$(find "$DUMP_DIR" -type d -name crs | head -1)
 [ -n "$CRS_DIR" ] || { printf 'FAILED: no crs/ dir in the snapshot\n' >&2; find "$DUMP_DIR" >&2; exit 1; }
 printf '  crs/ contents:\n'; find "$CRS_DIR" -maxdepth 1 -type f -printf '    %f\n'
 
-# The user app's Argo Application IS present (managed-by=apprafter). The Argo
-# app for `shop` is named shop-<env>; the on-disk file is tagged ArgoApplication.
-if find "$CRS_DIR" -maxdepth 1 -type f -name '*ArgoApplication*' | grep -q .; then
-    printf '  ok: a user ArgoApplication is captured\n'
+# The user app's Application CR IS captured (the on-disk file is tagged
+# `Application`, named <seq>-Application-<ns>-<name>.json). Match the apprafter
+# Application CR specifically — NOT the platform ArgoApplications.
+if find "$CRS_DIR" -maxdepth 1 -type f -name "*-Application-${APP_NS}-${APP}.json" | grep -q .; then
+    printf '  ok: the user Application CR (%s/%s) is captured\n' "$APP_NS" "$APP"
 else
-    printf 'FAILED: H1 — no user ArgoApplication captured (expected the shop app)\n' >&2
+    printf 'FAILED: H1 — user Application CR %s/%s NOT captured\n' "$APP_NS" "$APP" >&2
     find "$CRS_DIR" -maxdepth 1 -type f -printf '%f\n' >&2; exit 1
 fi
 # The PLATFORM Argo Applications (umbrella `platform`, `apprafter-operator`,
@@ -761,7 +836,10 @@ else
 
     # R3/H2: the tracked migration SKIPS on boot — it sees the restored
     # _migrations row, so it does NOT re-apply 001. The data we read is the
-    # BACKED-UP data, not freshly-migrated data.
+    # BACKED-UP data, not freshly-migrated data. POLL the log (the entrypoint's
+    # DB-wait loop lags pod-Ready, same as first boot); a MIGRATION_001_DONE
+    # here would mean the restore did NOT seed _migrations before boot — fail.
+    wait_pod_log "$RPOD" "MIGRATION_001_SKIPPED|MIGRATION_001_DONE" 180
     rlog=$(kubectl -n "$APP_NS" logs "$RPOD" 2>/dev/null || true)
     if printf '%s' "$rlog" | grep -q "MIGRATION_001_SKIPPED"; then
         printf '  ok: R3/H2 — tracked migration SKIPPED on boot (restored _migrations seen)\n'
