@@ -74,15 +74,6 @@ use crate::commands::k8s_helpers::{
 };
 use crate::commands::state_paths::resolve_state_paths;
 
-/// The `apprafter.io/managed-by=apprafter` label that marks a user-owned Argo
-/// `Application`. Mirrors `app::APPRAFTER_MANAGED_LABEL` (kept in sync as a
-/// literal — `app`'s const is private to that module). The `key=value` form
-/// is convenient for `kubectl -l`; here we split it for a JSON label lookup.
-// Used by is_user_argo_app (tested below); not called from non-test binary code
-// after the orchestration moved to backup_core::engine.
-#[allow(dead_code)]
-const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
-
 /// Namespace the `PlatformStack` singleton + `SourceCredential`s + their sealed
 /// material live in. Mirrors `repo_creds::SOURCECRED_NAMESPACE` /
 /// `platform::PLATFORMSTACK_NAMESPACE` (both private to their modules).
@@ -119,50 +110,6 @@ pub fn app_namespaces(apprafter_apps: &[Value], select: &[String]) -> Vec<String
     } else {
         set.into_iter().filter(|ns| select.contains(ns)).collect()
     }
-}
-
-/// True iff this Argo `Application` JSON carries the
-/// `apprafter.io/managed-by: apprafter` label. The platform umbrella and the
-/// per-component Argo Applications lack it; only user apps registered via
-/// `apprafter app add` set it. Filtering on it keeps the backup from
-/// double-owning the bootstrap's own Applications on restore.
-#[allow(dead_code)]
-pub fn is_user_argo_app(argo_app: &Value) -> bool {
-    let (key, value) = APPRAFTER_MANAGED_LABEL
-        .split_once('=')
-        .expect("APPRAFTER_MANAGED_LABEL is a key=value literal");
-    argo_app
-        .pointer("/metadata/labels")
-        .and_then(Value::as_object)
-        .and_then(|labels| labels.get(key))
-        .and_then(Value::as_str)
-        == Some(value)
-}
-
-/// Of the Secret names present in `ns`, keep only those that have a
-/// matching SealedSecret (same name, same namespace). A SealedSecret-backed
-/// Secret is a user secret we sealed; a plain Secret with no SealedSecret is
-/// a system/derived artifact (e.g. connection Secrets, dockerconfig) that the
-/// operator re-creates on restore — we don't carry it.
-#[allow(dead_code)]
-pub fn secrets_to_back_up(
-    secret_names: &[String],
-    sealed_secrets: &[Value],
-    ns: &str,
-) -> Vec<String> {
-    let sealed_in_ns: Vec<&str> = sealed_secrets
-        .iter()
-        .filter(|s| {
-            s.pointer("/metadata/namespace").and_then(Value::as_str) == Some(ns)
-                || s.pointer("/metadata/namespace").is_none()
-        })
-        .filter_map(|s| s.pointer("/metadata/name").and_then(Value::as_str))
-        .collect();
-    secret_names
-        .iter()
-        .filter(|n| sealed_in_ns.contains(&n.as_str()))
-        .cloned()
-        .collect()
 }
 
 /// Resolve the backup passphrase: explicit `--passphrase` → `RESTIC_PASSWORD`
@@ -204,20 +151,6 @@ pub fn backup_passphrase_or_error(
         ));
     }
     Ok(pass)
-}
-
-/// The restic snapshot tag: `<cluster_id>-<created_at>`, plus a
-/// `-ns-<joined>` marker when the backup is a namespace subset. Identifies the
-/// SOURCE CLUSTER + WHEN, NOT a single namespace (a whole-cluster backup spans
-/// many namespaces, so a namespace-based tag would be wrong / ambiguous).
-#[allow(dead_code)]
-pub fn backup_tag(cluster_id: &str, created_at: &str, subset_namespaces: &[String]) -> String {
-    let base = format!("{cluster_id}-{created_at}");
-    if subset_namespaces.is_empty() {
-        base
-    } else {
-        format!("{base}-ns-{}", subset_namespaces.join("_"))
-    }
 }
 
 /// `(namespace, name)` of each sealed material Secret a `SourceCredential`
@@ -1078,26 +1011,6 @@ mod tests {
     }
 
     #[test]
-    fn is_user_argo_app_checks_managed_by_label() {
-        let user = json!({"metadata":{"labels":{"apprafter.io/managed-by":"apprafter"}}});
-        let platform = json!({"metadata":{"labels":{"app.kubernetes.io/part-of":"argocd"}}});
-        let nolabels = json!({"metadata":{"name":"x"}});
-        assert!(is_user_argo_app(&user));
-        assert!(!is_user_argo_app(&platform));
-        assert!(!is_user_argo_app(&nolabels));
-    }
-
-    #[test]
-    fn secrets_to_back_up_are_those_with_a_sealedsecret() {
-        let sealed = vec![json!({"metadata":{"name":"stripe","namespace":"demo"}})];
-        let secrets = vec!["stripe".to_string(), "alpha-pg-conn".to_string()];
-        assert_eq!(
-            secrets_to_back_up(&secrets, &sealed, "demo"),
-            vec!["stripe"]
-        );
-    }
-
-    #[test]
     fn backup_requires_passphrase() {
         assert!(backup_passphrase_or_error(None, None, false).is_err());
         assert!(backup_passphrase_or_error(Some("p"), None, false).is_ok());
@@ -1134,15 +1047,6 @@ mod tests {
         );
         // Neither present → None (caller uses the pinned default).
         assert_eq!(cnpg_cluster_image(&json!({"spec":{}})), None);
-    }
-
-    #[test]
-    fn backup_tag_is_cluster_id_and_timestamp_not_namespace() {
-        let t = backup_tag("k3d-demo", "2026-06-20T00:00:00Z", &[]);
-        assert!(t.contains("k3d-demo"));
-        assert!(t.contains("2026-06-20"));
-        let sub = backup_tag("k3d-demo", "2026-06-20T00:00:00Z", &["prod".to_string()]);
-        assert!(sub.contains("prod"));
     }
 
     #[test]

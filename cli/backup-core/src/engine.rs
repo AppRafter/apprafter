@@ -90,14 +90,14 @@ pub fn run_backup(
 // Pure helpers (mirrors of the helpers in backup.rs)
 // ---------------------------------------------------------------------------
 
-const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
+pub const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
 const APPRAFTER_SYSTEM_NAMESPACE: &str = "apprafter-system";
 const PLATFORMSTACK_NAME: &str = "default";
 const CNPG_OPERATOR_NS: &str = "cnpg-system";
 
 /// True iff this Argo `Application` JSON carries the
 /// `apprafter.io/managed-by: apprafter` label.
-fn is_user_argo_app(argo_app: &Value) -> bool {
+pub fn is_user_argo_app(argo_app: &Value) -> bool {
     let (key, value) = APPRAFTER_MANAGED_LABEL
         .split_once('=')
         .expect("APPRAFTER_MANAGED_LABEL is a key=value literal");
@@ -111,7 +111,11 @@ fn is_user_argo_app(argo_app: &Value) -> bool {
 
 /// Of the Secret names present in `ns`, keep only those that have a matching
 /// SealedSecret.
-fn secrets_to_back_up(secret_names: &[String], sealed_secrets: &[Value], ns: &str) -> Vec<String> {
+pub fn secrets_to_back_up(
+    secret_names: &[String],
+    sealed_secrets: &[Value],
+    ns: &str,
+) -> Vec<String> {
     let sealed_in_ns: Vec<&str> = sealed_secrets
         .iter()
         .filter(|s| {
@@ -196,7 +200,7 @@ fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
 }
 
 /// The restic snapshot tag.
-fn backup_tag(cluster_id: &str, created_at: &str, subset_namespaces: &[String]) -> String {
+pub fn backup_tag(cluster_id: &str, created_at: &str, subset_namespaces: &[String]) -> String {
     let base = format!("{cluster_id}-{created_at}");
     if subset_namespaces.is_empty() {
         base
@@ -587,4 +591,43 @@ fn run_backup_monolithic_with_summary(
         extracted_count,
         tag,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests (pure engine helpers)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn is_user_argo_app_checks_managed_by_label() {
+        let user = json!({"metadata":{"labels":{"apprafter.io/managed-by":"apprafter"}}});
+        let platform = json!({"metadata":{"labels":{"app.kubernetes.io/part-of":"argocd"}}});
+        let nolabels = json!({"metadata":{"name":"x"}});
+        assert!(is_user_argo_app(&user));
+        assert!(!is_user_argo_app(&platform));
+        assert!(!is_user_argo_app(&nolabels));
+    }
+
+    #[test]
+    fn secrets_to_back_up_are_those_with_a_sealedsecret() {
+        let sealed = vec![json!({"metadata":{"name":"stripe","namespace":"demo"}})];
+        let secrets = vec!["stripe".to_string(), "alpha-pg-conn".to_string()];
+        assert_eq!(
+            secrets_to_back_up(&secrets, &sealed, "demo"),
+            vec!["stripe"]
+        );
+    }
+
+    #[test]
+    fn backup_tag_is_cluster_id_and_timestamp_not_namespace() {
+        let t = backup_tag("k3d-demo", "2026-06-20T00:00:00Z", &[]);
+        assert!(t.contains("k3d-demo"));
+        assert!(t.contains("2026-06-20"));
+        let sub = backup_tag("k3d-demo", "2026-06-20T00:00:00Z", &["prod".to_string()]);
+        assert!(sub.contains("prod"));
+    }
 }
