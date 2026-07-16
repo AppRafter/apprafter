@@ -21,85 +21,24 @@
 //!
 //! Only the controller's in-cluster private key can decrypt; the sealed
 //! blob is safe in transit, at rest, and in Git.
+//!
+//! The four pure crypto helpers (`strict_label`, `seal_value`,
+//! `seal_encrypted_data`, `build_sealed_secret`) now live canonically in
+//! `backup_core::sealing` and are re-exported here so existing callers
+//! (`repo_creds.rs`, `secret.rs`) keep resolving without change.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use base64::Engine;
 use cli_core::{CliError, Result};
-use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
-use rsa::{Oaep, RsaPublicKey};
-use serde_json::{json, Value};
-use sha2::Sha256;
+use rsa::RsaPublicKey;
 use x509_cert::der::{DecodePem, Encode};
 use x509_cert::Certificate;
 
-/// Strict-scope RSA-OAEP label, byte-identical to bitnami sealed-secrets'
-/// `EncryptionLabel`: `fmt.Sprintf("%s/%s", namespace, name)` — the
-/// namespace and name joined by a forward slash. The separator is
-/// load-bearing: the controller derives the same label from the
-/// SealedSecret's namespace+name when decrypting, so any divergence makes
-/// RSA-OAEP decryption fail with "no key could decrypt".
-pub fn strict_label(namespace: &str, name: &str) -> Vec<u8> {
-    format!("{namespace}/{name}").into_bytes()
-}
-
-/// Seal one value into the bitnami wire format. `label` is the scope —
-/// use [`strict_label`] for the strict-scope default.
-pub fn seal_value(pub_key: &RsaPublicKey, label: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let mut rng = rand::thread_rng();
-
-    // (1) random single-use AES-256 session key.
-    let mut session_key = [0u8; 32];
-    rng.fill_bytes(&mut session_key);
-
-    // (2) AES-256-GCM with a zero nonce + empty AAD.
-    let cipher = Aes256Gcm::new_from_slice(&session_key)
-        .map_err(|e| CliError::Other(format!("aes-256-gcm init: {e}")))?;
-    let nonce = Nonce::from_slice(&[0u8; 12]);
-    let gcm_ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| CliError::Other(format!("aes-256-gcm encrypt: {e}")))?;
-
-    // (3) RSA-OAEP-SHA256 wrap of the session key, label = scope bytes.
-    let label = String::from_utf8(label.to_vec())
-        .map_err(|e| CliError::Other(format!("oaep label is not utf-8: {e}")))?;
-    let padding = Oaep::new_with_label::<Sha256, _>(label);
-    let rsa_block = pub_key
-        .encrypt(&mut rng, padding, &session_key)
-        .map_err(|e| CliError::Other(format!("rsa-oaep encrypt: {e}")))?;
-
-    // (4) wire = 2-byte BE length || RSA block || GCM ciphertext.
-    let rsa_len = u16::try_from(rsa_block.len())
-        .map_err(|_| CliError::Other("rsa block exceeds u16 length prefix".to_string()))?;
-    let mut wire = Vec::with_capacity(2 + rsa_block.len() + gcm_ciphertext.len());
-    wire.extend_from_slice(&rsa_len.to_be_bytes());
-    wire.extend_from_slice(&rsa_block);
-    wire.extend_from_slice(&gcm_ciphertext);
-    Ok(wire)
-}
-
-/// Seal every entry of `data` under the strict scope for
-/// `(namespace, name)` and return the base64-encoded `encryptedData` map
-/// for a `SealedSecret` CR.
-pub fn seal_encrypted_data(
-    pub_key: &RsaPublicKey,
-    namespace: &str,
-    name: &str,
-    data: &BTreeMap<String, Vec<u8>>,
-) -> Result<BTreeMap<String, String>> {
-    let label = strict_label(namespace, name);
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let mut out = BTreeMap::new();
-    for (k, v) in data {
-        let wire = seal_value(pub_key, &label, v)?;
-        out.insert(k.clone(), b64.encode(wire));
-    }
-    Ok(out)
-}
+// Pure crypto helpers — canonical home is backup-core::sealing.
+pub use backup_core::sealing::{
+    build_sealed_secret, seal_encrypted_data, seal_value, strict_label,
+};
 
 /// Parse the controller's PEM X.509 certificate and extract its RSA public
 /// key. The cert is fetched over the TLS-authenticated kube API (see
@@ -136,39 +75,18 @@ pub fn fetch_controller_public_key(
     public_key_from_cert_pem(&pem)
 }
 
-/// Build a bitnami `SealedSecret` CR (as a `serde_json::Value`) that seals
-/// every entry of `data` under strict scope for `(namespace, name)`. The
-/// `template` carries the resulting `Secret`'s metadata + type so the
-/// controller materialises it in place.
-pub fn build_sealed_secret(
-    pub_key: &RsaPublicKey,
-    namespace: &str,
-    name: &str,
-    data: &BTreeMap<String, Vec<u8>>,
-    secret_type: &str,
-) -> Result<Value> {
-    let encrypted = seal_encrypted_data(pub_key, namespace, name, data)?;
-    Ok(json!({
-        "apiVersion": "bitnami.com/v1alpha1",
-        "kind": "SealedSecret",
-        "metadata": { "name": name, "namespace": namespace },
-        "spec": {
-            "encryptedData": encrypted,
-            "template": {
-                "metadata": { "name": name, "namespace": namespace },
-                "type": secret_type,
-            }
-        }
-    }))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeMap;
+
     use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use base64::Engine;
     use rsa::traits::PublicKeyParts;
     use rsa::{Oaep, RsaPrivateKey};
     use sha2::Sha256;
+
+    use super::*;
 
     fn test_keypair() -> (RsaPrivateKey, RsaPublicKey) {
         // 2048 keeps the unit test fast; production uses the controller's
