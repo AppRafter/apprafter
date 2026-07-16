@@ -19,7 +19,8 @@
 //!   disable its Argo auto-sync) → `LoadData` → `ResumeWorkloads`.
 //!   No CR/secret replay.
 //!
-//! `--reprovision` (fresh cluster re-provision then replay) lands in 2.6d T13.
+//! `--reprovision` (mode a) provisions a FRESH cluster in the target first
+//! (`bootstrap_all::run`), then replays as restore-into-running.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -95,7 +96,8 @@ struct LoadedCr {
 /// cluster (modes a-into-running / b). Drives the pure step list from
 /// [`cli_providers::backup::restore::restore_steps`].
 ///
-/// `--reprovision` (fresh cluster in the target first) lands in 2.6d T13.
+/// `--reprovision` (mode a) provisions a fresh cluster in the target first, then
+/// replays; topology + cloud token come from the target's local config.
 pub fn run_restore(
     repo: &str,
     target: Option<&str>,
@@ -104,24 +106,44 @@ pub fn run_restore(
     data_only: bool,
     passphrase: Option<&str>,
 ) -> Result<()> {
-    if reprovision {
+    // Mutually-exclusive modes: `--reprovision` rebuilds the WHOLE cluster from
+    // the backup (its step list has no data-only shortcut); `--data-only` reloads
+    // native data into an ALREADY-running cluster. `restore_steps` returns the
+    // data-only sequence (no Reprovision step) whenever `data_only`, so the combo
+    // would silently skip provisioning and then fail with an unresolved
+    // kubeconfig — reject it up front instead.
+    if reprovision && data_only {
         return Err(CliError::Other(
-            "restore --reprovision (fresh-cluster re-provision then replay) lands in 2.6d T13; \
-             for now restore into an already-bootstrapped target (drop --reprovision)"
+            "--reprovision and --data-only are mutually exclusive: --reprovision rebuilds the \
+             whole cluster from the backup, --data-only reloads data into a running one"
                 .into(),
         ));
     }
 
-    // 1. Passphrase (mandatory — the repo holds decrypted secrets) + TARGET
-    //    kubeconfig. Hold the kubeconfig tempfile alive for the WHOLE flow:
-    //    every kubectl/restic-adjacent shell-out below depends on it.
+    // 1. Passphrase (mandatory — the repo holds decrypted secrets). Gate FIRST,
+    //    before touching any cluster/repo — a bad passphrase must not leave a
+    //    freshly re-provisioned cluster half-restored.
     let env_pass = std::env::var("RESTIC_PASSWORD").ok();
     let is_tty = std::io::stdin().is_terminal();
     let pass = backup_passphrase_or_error(passphrase, env_pass.as_deref(), is_tty)?;
-    let kc = ensure_kubeconfig_tempfile_for_target(target)?;
 
-    let mode = RestoreMode::IntoRunning;
+    let mode = if reprovision {
+        RestoreMode::Reprovision
+    } else {
+        RestoreMode::IntoRunning
+    };
     let steps = restore_steps(mode, data_only);
+
+    // Kubeconfig resolution is LAZY. For `--reprovision` the target cluster does
+    // not exist yet — the Reprovision step provisions it (and caches its
+    // kubeconfig into state), after which we resolve kc. For restore-into-running
+    // / --data-only the cluster is already up, so resolve it now. Held alive for
+    // the WHOLE flow: every kubectl/restic-adjacent shell-out below depends on it.
+    let mut kc: Option<tempfile::NamedTempFile> = if reprovision {
+        None
+    } else {
+        Some(ensure_kubeconfig_tempfile_for_target(target)?)
+    };
 
     // Held across the whole restore: the restic restore unpacks the decrypted
     // secrets here and it must NOT be cleaned up until every step that reads
@@ -146,13 +168,24 @@ pub fn run_restore(
     let snap = snapshot.unwrap_or("latest");
 
     for step in &steps {
+        // The Reprovision step provisions + bootstraps a fresh cluster in the
+        // target (topology + cloud token come from the target's local config,
+        // exactly as `apprafter up` — R2), then resolves the now-cached
+        // kubeconfig. It is always first, and every later step needs kc.
+        if let RestoreStep::Reprovision = step {
+            println!(
+                "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
+                target.unwrap_or("<active>")
+            );
+            crate::commands::bootstrap_all::run(target, false)?;
+            kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
+            continue;
+        }
+        let kc = kc.as_ref().ok_or_else(|| {
+            CliError::Other("internal: kubeconfig unresolved before a restore step".into())
+        })?;
         match step {
-            RestoreStep::Reprovision => {
-                // Unreachable for IntoRunning (guarded above); T13 owns this.
-                return Err(CliError::Other(
-                    "restore reprovision step requires --reprovision (2.6d T13)".into(),
-                ));
-            }
+            RestoreStep::Reprovision => unreachable!("Reprovision handled before the match"),
             RestoreStep::RestoreArtifact => {
                 run_restic_restore(
                     &restic_restore_argv(repo, snap, &restore_root.path().to_string_lossy()),

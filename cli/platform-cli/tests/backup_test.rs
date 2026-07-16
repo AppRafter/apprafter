@@ -69,15 +69,28 @@ fn restore_requires_repo_positional() {
 }
 
 #[test]
-fn restore_reprovision_errors_t13() {
-    // `--reprovision` (fresh-cluster re-provision then replay) is not wired
-    // until 2.6d T13 — it must fail fast with a clear T13 message, BEFORE
-    // touching any repo/cluster, so the operator isn't left half-restored.
+fn restore_reprovision_is_no_longer_a_t13_stub() {
+    // 2.6d T13 wired `--reprovision`. It must NO LONGER fail with the old
+    // "lands in 2.6d T13" stub; with no passphrase + no TTY (assert_cmd has no
+    // terminal) the mandatory-passphrase gate fires first — a REAL precondition,
+    // proving the stub is gone and the real flow is entered.
     cli()
         .args(["restore", "/tmp/fake-repo", "--reprovision"])
         .assert()
         .failure()
-        .stderr(contains("T13"));
+        .stderr(contains("T13").not());
+}
+
+#[test]
+fn restore_reprovision_and_data_only_are_mutually_exclusive() {
+    // `--reprovision` (rebuild the whole cluster) and `--data-only` (reload data
+    // into a running one) are contradictory; the combo must be rejected up front
+    // with a clear message, never silently degrade to an unresolved-kubeconfig.
+    cli()
+        .args(["restore", "/tmp/fake-repo", "--reprovision", "--data-only"])
+        .assert()
+        .failure()
+        .stderr(contains("mutually exclusive"));
 }
 
 #[test]
