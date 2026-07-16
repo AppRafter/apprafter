@@ -358,21 +358,105 @@ cms_pod() {
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
 }
 
-# Read the pg DSN from the connection Secret (key `url`, decomposed DSN — 2.12).
-cms_pg_dsn() {
-    kubectl -n "$CMS_NS" get secret "$CMS_PG_CONN" \
-        -o jsonpath='{.data.url}' 2>/dev/null | base64 -d 2>/dev/null || true
+# Seed/read the marker WITHOUT touching the network: exec INTO the CNPG PRIMARY
+# and run psql as the postgres SUPERUSER over the LOCAL unix socket (peer auth —
+# no password, no `-h`/TCP). This sidesteps, in one move, every failure mode the
+# earlier loopback-as-app-role attempt hit on a real cluster: pg_hba host rules,
+# scram, a possibly-empty password key, AND every NetworkPolicy/Cilium egress.
+# It's the canonical CNPG break-glass (`kubectl exec <primary> -- psql`).
+# NB: this fixes only the WALK's marker seed/read — the 2.6d PRODUCT export helper
+# (Phase 3) is deliberately left untouched, so it answers the real question.
+#
+# The app DATABASE + ROLE come from the CMS pg connection Secret (`db`/`user`) —
+# a plain kubectl read that is reliable once the claim is Ready (the provisioner
+# writes the Secret before it flips `.status.ready`). `... || true` keeps every
+# read from tripping `set -euo pipefail`.
+cms_appdb() {
+    kubectl -n "$CMS_NS" get secret "$CMS_PG_CONN" -o jsonpath='{.data.db}' 2>/dev/null | base64 -d 2>/dev/null || true
+}
+cms_approle() {
+    kubectl -n "$CMS_NS" get secret "$CMS_PG_CONN" -o jsonpath='{.data.user}' 2>/dev/null | base64 -d 2>/dev/null || true
+}
+# psql_super <db> <sql> — echoes clean psql stdout; on any failure it stays quiet
+# on stdout (returns '') but prints a REDACTED diagnostic to stderr (which pod,
+# which db, psql rc + message) so a failing run is self-explaining, not blind.
+# NB: `-c postgres` is LOAD-BEARING. Without it, `kubectl exec` on a CNPG
+# instance pod can land in a non-postgres container → psql can't find the
+# /controller/run socket → exits 2 ("could not connect"). A local kind+CNPG
+# 1.29.1 repro confirmed `-c postgres` + peer-as-postgres works (uid 26 =
+# postgres, pg_hba `local all all peer map=local`, ident `local postgres
+# postgres`) and that a marker table re-owned to the app role IS captured by
+# `pg_dump` run as that role. The `set +e`/`set -e` fence keeps a failed
+# substitution from tripping `set -e` BEFORE the diagnostic runs (the earlier
+# `out=$(...); rc=$?` form aborted the whole walk at psql's exit code, silently).
+psql_super() {
+    local db="$1" sql="$2" primary out rc errf
+    primary=$(kubectl -n cnpg-system get pods -l 'cnpg.io/instanceRole=primary' -o name 2>/dev/null | head -1) || true
+    [ -n "$primary" ] || primary=$(kubectl -n cnpg-system get pods -l 'role=primary' -o name 2>/dev/null | head -1) || true
+    if [ -z "$primary" ] || [ -z "$db" ]; then
+        printf 'psql_super: no primary (got "%s") or no db (got "%s")\n' "$primary" "$db" >&2
+        printf ''; return 0
+    fi
+    { set +x; } 2>/dev/null
+    errf="${TMPDIR:-/tmp}/psql_super.$$"
+    set +e
+    out=$(kubectl -n cnpg-system exec "$primary" -c postgres -- \
+        psql -U postgres -d "$db" -v ON_ERROR_STOP=1 -tAc "$sql" 2>"$errf")
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        printf 'psql_super: rc=%s db=%s primary=%s :: %s\n' \
+            "$rc" "$db" "$primary" "$(tr '\n' ' ' < "$errf" 2>/dev/null)" >&2
+        rm -f "$errf"; printf ''; return 0
+    fi
+    rm -f "$errf"
+    printf '%s' "$out"
 }
 
-# Run a one-shot psql against the CMS pg over its DSN, via a throwaway
-# postgres:18-alpine pod (the CMS image ships no psql). Echoes psql stdout.
-#   psql_oneshot <dsn> <sql>
-psql_oneshot() {
-    local dsn="$1" sql="$2" pod
-    pod="dr-psql-$(date +%s%N | tail -c 8)"
-    kubectl -n "$CMS_NS" run "$pod" --rm -i --restart=Never \
-        --image="$PSQL_IMAGE" --command -- \
-        psql "$dsn" -v ON_ERROR_STOP=1 -tAc "$sql" 2>/dev/null || true
+# Block until the shared CNPG cluster has a Ready primary pod. The resourceclaim
+# can flip `.status.ready=true` (and the CMS can even boot + migrate) during a
+# window where CNPG is mid-bootstrap/rolling-restart and NO pod carries the
+# primary label — seeding then races an empty pod list. Poll for a Ready primary.
+wait_for_pg_primary() {
+    local ns=cnpg-system timeout="${1:-300}" waited=0 name
+    printf '  wait: CNPG primary pod Ready in %s (timeout %ss) ...\n' "$ns" "$timeout"
+    while [ "$waited" -lt "$timeout" ]; do
+        name=$(kubectl -n "$ns" get pods -l 'cnpg.io/instanceRole=primary' -o name 2>/dev/null | head -1) || true
+        [ -n "$name" ] || name=$(kubectl -n "$ns" get pods -l 'role=primary' -o name 2>/dev/null | head -1) || true
+        if [ -n "$name" ] && kubectl -n "$ns" wait "$name" --for=condition=Ready --timeout=5s >/dev/null 2>&1; then
+            printf '  ok: CNPG primary ready (%s)\n' "$name"
+            return 0
+        fi
+        sleep 5; waited=$((waited + 5))
+    done
+    printf 'FAILED: no CNPG primary became Ready in %s within %ss\n' "$ns" "$timeout" >&2
+    return 1
+}
+
+# Block until the app DATABASE actually exists on the primary. CNPG provisions
+# databases DECLARATIVELY (a `Database` CR reconciled asynchronously), and the
+# resourceclaim flips `.status.ready=true` — and the CMS pod even reaches Ready
+# via its HTTP probe — BEFORE CNPG has run `CREATE DATABASE`. Seeding into that
+# window hits `FATAL: database "<db>" does not exist`. Poll pg_database (as the
+# postgres superuser over the local socket — the `postgres` maintenance db always
+# exists) until the target db appears. (Product note: claim/app Ready preceding
+# db materialisation is a 2.4 provisioner readiness-timing gap — self-heals via
+# Payload's connect-retry — logged as a possible follow-up, not a 2.6d blocker.)
+wait_for_appdb() {
+    local db="$1" timeout="${2:-240}" waited=0 got
+    printf '  wait: app database %s to exist (timeout %ss) ...\n' "$db" "$timeout"
+    while [ "$waited" -lt "$timeout" ]; do
+        got=$(psql_super postgres "SELECT 1 FROM pg_database WHERE datname = '${db}';")
+        [ "$got" = "1" ] && { printf '  ok: app database %s exists\n' "$db"; return 0; }
+        sleep 5; waited=$((waited + 5))
+    done
+    printf 'FAILED: app database %s never appeared in %ss. pg_database has: [%s]. CNPG Database CRs: [%s]\n' \
+        "$db" "$timeout" \
+        "$(psql_super postgres "SELECT string_agg(datname, ' ') FROM pg_database;")" \
+        "$(kubectl -n cnpg-system get databases.postgresql.cnpg.io \
+            -o custom-columns=NAME:.metadata.name,DB:.spec.name,APPLIED:.status.applied,MSG:.status.message \
+            --no-headers 2>/dev/null | tr '\n' ';')" >&2
+    return 1
 }
 
 # Provision + bootstrap ONE cluster on a target that already carries a stored
@@ -554,15 +638,21 @@ assert_eq "CMS Ready condition on OLD (secret resolved, not EnvSecretMissing)" "
 
 # Seed the deterministic KNOWN data into the CMS pg (a dedicated marker table,
 # independent of Payload's schema). This is the equivalence anchor we read back
-# on the restored cluster.
-DSN_OLD="$(cms_pg_dsn)"
-[ -n "$DSN_OLD" ] || { printf 'FAILED: could not read the CMS pg connection url on OLD\n' >&2; exit 1; }
-psql_oneshot "$DSN_OLD" \
-    "CREATE TABLE IF NOT EXISTS ${DR_MARKER_TABLE} (id INT PRIMARY KEY, note TEXT NOT NULL);" >/dev/null
-psql_oneshot "$DSN_OLD" \
-    "INSERT INTO ${DR_MARKER_TABLE} (id, note) VALUES (1, '${DR_MARKER_VALUE}') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note;" >/dev/null
-old_marker=$(psql_oneshot "$DSN_OLD" "SELECT note FROM ${DR_MARKER_TABLE} WHERE id=1;" | tr -d '[:space:]')
-assert_eq "known marker row present on OLD pg" "$old_marker" "$DR_MARKER_VALUE"
+# on the restored cluster. Wait for a Ready primary first (CNPG bootstrap race).
+# The table is created by the superuser then RE-OWNED to the app role, so the
+# 2.6d product pg_dump (which connects AS the app role) can read + dump its data
+# — a superuser-owned table would fail pg_dump with "permission denied" and
+# poison Phase 3 for a reason unrelated to the product.
+wait_for_pg_primary
+CMS_APPDB="$(cms_appdb)"; CMS_APPROLE="$(cms_approle)"
+[ -n "$CMS_APPDB" ] || { printf 'FAILED: could not resolve CMS app db name from %s/%s\n' "$CMS_NS" "$CMS_PG_CONN" >&2; exit 1; }
+wait_for_appdb "$CMS_APPDB"
+seed_sql="CREATE TABLE IF NOT EXISTS ${DR_MARKER_TABLE} (id INT PRIMARY KEY, note TEXT NOT NULL);"
+seed_sql="${seed_sql} INSERT INTO ${DR_MARKER_TABLE} (id, note) VALUES (1, '${DR_MARKER_VALUE}') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note;"
+[ -n "$CMS_APPROLE" ] && seed_sql="${seed_sql} ALTER TABLE ${DR_MARKER_TABLE} OWNER TO \"${CMS_APPROLE}\";"
+psql_super "$CMS_APPDB" "$seed_sql" >/dev/null
+old_marker=$(psql_super "$CMS_APPDB" "SELECT note FROM ${DR_MARKER_TABLE} WHERE id=1;" | tr -d '[:space:]')
+assert_eq "known marker row present on OLD pg (superuser exec into CNPG primary, local socket)" "$old_marker" "$DR_MARKER_VALUE"
 
 # =====================================================================
 # Phase 3: export OLD
@@ -699,11 +789,13 @@ assert_eq "re-sealed PAYLOAD_SECRET decrypts to the OLD value on NEW" \
     "$new_secret_val" "$CMS_SECRET_VALUE"
 
 # The KNOWN marker row is present in NEW's pg (loaded via pg_restore from the
-# backup). Read it over the NEW connection Secret DSN.
-DSN_NEW="$(cms_pg_dsn)"
-[ -n "$DSN_NEW" ] || { printf 'FAILED: could not read the CMS pg connection url on NEW\n' >&2; exit 1; }
-new_marker=$(psql_oneshot "$DSN_NEW" "SELECT note FROM ${DR_MARKER_TABLE} WHERE id=1;" | tr -d '[:space:]')
-assert_eq "known marker row restored into NEW pg" "$new_marker" "$DR_MARKER_VALUE"
+# backup). Read it by exec-ing into the restored cluster's CNPG primary.
+wait_for_pg_primary
+NEW_APPDB="$(cms_appdb)"
+[ -n "$NEW_APPDB" ] || { printf 'FAILED: could not resolve CMS app db name on NEW from %s/%s\n' "$CMS_NS" "$CMS_PG_CONN" >&2; exit 1; }
+wait_for_appdb "$NEW_APPDB"
+new_marker=$(psql_super "$NEW_APPDB" "SELECT note FROM ${DR_MARKER_TABLE} WHERE id=1;" | tr -d '[:space:]')
+assert_eq "known marker row restored into NEW pg (superuser exec into CNPG primary, local socket)" "$new_marker" "$DR_MARKER_VALUE"
 
 # =====================================================================
 # Phase 8: export NEW + equivalence (query-result compare, not raw dump)
@@ -727,7 +819,7 @@ printf '  ok: NEW export produced a pg dump for %s/%s\n' "$CMS_NS" "$CMS_PG_CLAI
 assert_eq "OLD/NEW equivalence — marker query result identical across clusters" \
     "$new_marker" "$old_marker"
 # Row COUNT of the marker table also matches (single row, no dupes/loss).
-new_marker_count=$(psql_oneshot "$DSN_NEW" "SELECT count(*) FROM ${DR_MARKER_TABLE};" | tr -d '[:space:]')
+new_marker_count=$(psql_super "$NEW_APPDB" "SELECT count(*) FROM ${DR_MARKER_TABLE};" | tr -d '[:space:]')
 assert_eq "OLD/NEW equivalence — marker table row count preserved" "$new_marker_count" "1"
 printf '  ok: the two clusters are ~identical for the app data (query-result compare)\n'
 
