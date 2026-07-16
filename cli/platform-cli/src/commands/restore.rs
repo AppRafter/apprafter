@@ -6,6 +6,8 @@
 //!
 //! * **Full restore** (`--data-only == false`):
 //!   `RestoreArtifact` (restic → tempdir) → `ApplyPlatformStack` →
+//!   `EnsureNamespaces` (create the backup's app namespaces before any
+//!   namespaced apply — a fresh target lacks them) →
 //!   `ApplySourceCredentials` → `ApplyAppsGated` (H2: claims provision,
 //!   NO pod — [`zero_replicas`] + Argo auto-sync stripped) →
 //!   `WaitClaimsBound` (poll `status.ready`, NOT PVC Bound — R1) →
@@ -178,6 +180,12 @@ pub fn run_restore(
                     .as_ref()
                     .ok_or_else(|| CliError::Other("ApplyPlatformStack before artifact".into()))?;
                 apply_platformstack_from_crs(dd, kc.path())?;
+            }
+            RestoreStep::EnsureNamespaces => {
+                let m = manifest
+                    .as_ref()
+                    .ok_or_else(|| CliError::Other("EnsureNamespaces before artifact".into()))?;
+                ensure_namespaces(&m.namespaces, kc.path())?;
             }
             RestoreStep::ApplySourceCredentials => {
                 let dd = data_dir.as_ref().ok_or_else(|| {
@@ -403,6 +411,35 @@ fn apply_cr(cr: &Value, kubeconfig: &Path) -> Result<()> {
     let yaml = serde_json::to_string(cr)
         .map_err(|e| CliError::Other(format!("serialize CR for apply: {e}")))?;
     kubectl_apply_server_side(&yaml, RESTORE_FIELD_MANAGER, kubeconfig)
+}
+
+/// Build a bare `Namespace` object for `name` — the pure, unit-tested seam of
+/// [`ensure_namespaces`].
+fn namespace_object(name: &str) -> Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": { "name": name },
+    })
+}
+
+/// **EnsureNamespaces** — SSA-apply a bare `Namespace` for every namespace the
+/// backup captured, so the namespaced applies that follow (source credentials,
+/// apps, re-sealed user secrets, data-load helper pods) land in an existing
+/// namespace. Without this, a fresh restore target — which carries only the
+/// platform namespaces from bootstrap — fails the first namespaced apply with
+/// `namespaces "<ns>" not found`. Idempotent: a server-side apply of an
+/// already-present namespace (including the platform ones) is a no-op.
+fn ensure_namespaces(namespaces: &[String], kubeconfig: &Path) -> Result<()> {
+    let ensured: Vec<&String> = namespaces.iter().filter(|n| !n.is_empty()).collect();
+    for ns in &ensured {
+        apply_cr(&namespace_object(ns), kubeconfig)?;
+    }
+    if !ensured.is_empty() {
+        let names: Vec<&str> = ensured.iter().map(|s| s.as_str()).collect();
+        println!("  ✓ namespaces ensured: {}", names.join(", "));
+    }
+    Ok(())
 }
 
 /// **ApplyPlatformStack** — apply the sanitized `PlatformStack` from `crs/`,
@@ -1273,5 +1310,15 @@ mod tests {
         let (data, secret_type) = read_secret_file(&path).unwrap();
         assert_eq!(secret_type, "Opaque");
         assert_eq!(data.get("k").unwrap(), b"abc");
+    }
+
+    #[test]
+    fn namespace_object_has_the_apply_shape() {
+        let ns = namespace_object("apprafter");
+        assert_eq!(ns["apiVersion"], "v1");
+        assert_eq!(ns["kind"], "Namespace");
+        assert_eq!(ns["metadata"]["name"], "apprafter");
+        // Cluster-scoped: no metadata.namespace on a Namespace object.
+        assert!(ns["metadata"].get("namespace").is_none());
     }
 }

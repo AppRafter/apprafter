@@ -9,6 +9,38 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.30 — 2.6d restore creates target namespaces (real-Hetzner DR walk fix) (2026-07-16)
+
+CLI-only fix surfaced by the real-Hetzner two-cluster CMS disaster-recovery
+walk (needs.pg + a `secret:` ref, restore into a fresh second cluster). No
+operator/chart/schema change.
+
+### Fixed
+
+- **`apprafter restore` (restore-into-running) now creates the backup's app
+  namespaces before applying anything into them.** On a fresh restore target —
+  which carries only the platform namespaces from bootstrap — the first
+  namespaced apply (`ApplyAppsGated`, the sanitized `Application`/`SharedVolume`
+  CRs into e.g. `apprafter`) failed hard with `kubectl apply --server-side
+  failed: namespaces "apprafter" not found`, aborting the restore right after
+  `✓ PlatformStack applied`. A new ordered step `EnsureNamespaces` (between
+  `ApplyPlatformStack` and `ApplySourceCredentials`) idempotently server-side
+  applies a bare `Namespace` for every entry in the backup manifest's
+  `namespaces`, so the namespaced applies, re-sealed user secrets, and data-load
+  helper pods all land in an existing namespace. The shipped T12 kind walk
+  missed this because its target already carried the namespace; only the real
+  two-cluster DR walk (fresh second cluster) exercised the gap. Regression-
+  guarded by a pure step-order test (`ApplyPlatformStack < EnsureNamespaces <
+  ApplySourceCredentials`) and a `Namespace`-object shape test.
+
+### Confirmed (same walk)
+
+- **2.6d `apprafter export` reaches the CNPG pg over real Cilium.** The pg-dump
+  helper pod (label `apprafter.io/backup-helper`, app namespace) is not selected
+  by the per-app egress CiliumNetworkPolicy (2.10, keyed on the app's own
+  labels) → default-allow → it reaches `platform-postgres-rw.cnpg-system.svc`.
+  A suspected Cilium-block of the export helper was disproven end-to-end.
+
 ## operator + admission-webhook v0.2.32 + platform-stack 0.2.39 — imagePolicy.resolve `off` CRD-YAML fix (2026-07-15)
 
 CRD-only fix (`change: safe`) restoring the ADR-0040 image-auto-deploy

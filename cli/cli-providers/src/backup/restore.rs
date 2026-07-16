@@ -16,6 +16,11 @@ pub enum RestoreStep {
     Reprovision,
     RestoreArtifact,
     ApplyPlatformStack,
+    /// Create every namespace named in the backup manifest (idempotent SSA of a
+    /// bare `Namespace` object). A fresh restore target has only the platform
+    /// namespaces; the app namespaces (e.g. `apprafter`) do NOT exist yet, so
+    /// the first namespaced apply below would fail `namespaces "<ns>" not found`.
+    EnsureNamespaces,
     ApplySourceCredentials,
     /// Apply Argo Apps with `syncPolicy.automated` stripped + AppRafter
     /// `Application` CRs with replicas=0 — claims provision, NO workload pod (H2).
@@ -46,6 +51,7 @@ pub fn restore_steps(mode: RestoreMode, data_only: bool) -> Vec<RestoreStep> {
     steps.extend([
         RestoreArtifact,
         ApplyPlatformStack,
+        EnsureNamespaces,
         ApplySourceCredentials,
         ApplyAppsGated,
         WaitClaimsBound,
@@ -151,7 +157,11 @@ mod tests {
         assert!(!steps.contains(&RestoreStep::Reprovision));
         assert_eq!(steps.first(), Some(&RestoreStep::RestoreArtifact));
         let i = |s| steps.iter().position(|x| *x == s).unwrap();
-        assert!(i(RestoreStep::ApplyPlatformStack) < i(RestoreStep::ApplySourceCredentials));
+        // Namespaces must be created after the PlatformStack but BEFORE any
+        // namespaced apply (source credentials, apps) — else the first apply
+        // fails `namespaces "<ns>" not found` on a fresh target.
+        assert!(i(RestoreStep::ApplyPlatformStack) < i(RestoreStep::EnsureNamespaces));
+        assert!(i(RestoreStep::EnsureNamespaces) < i(RestoreStep::ApplySourceCredentials));
         assert!(i(RestoreStep::ApplySourceCredentials) < i(RestoreStep::ApplyAppsGated));
         assert!(i(RestoreStep::ApplyAppsGated) < i(RestoreStep::WaitClaimsBound));
         assert!(i(RestoreStep::WaitClaimsBound) < i(RestoreStep::LoadData));
