@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name        = "backup-core"
+description = "Execution-agnostic backup engine for AppRafter (CLI + in-cluster runner)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+cli-core   = { path = "../cli-core" }
+serde_json = { workspace = true }
+tempfile   = { workspace = true }

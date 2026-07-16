@@ -6,6 +6,7 @@ members = [
     "cli-core",
     "cli-state",
     "cli-providers",
+    "backup-core",
 ]
 
 [workspace.package]

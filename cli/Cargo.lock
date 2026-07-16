@@ -287,6 +287,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "backup-core"
+version = "0.2.31"
+dependencies = [
+ "cli-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
