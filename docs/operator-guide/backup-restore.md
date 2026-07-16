@@ -141,12 +141,27 @@ specific snapshot (default `latest`).
   same apps; `restore` reloads only the native data. It scales the existing
   apps to zero (and disables their Argo auto-sync so the scale-down is not
   reverted), loads the data, and resumes them. No CR or secret replay.
-- **clone-to-new** (re-provision a fresh cluster from scratch, then replay) is
-  the `--reprovision` flag; it is **deferred** to a later subphase and
-  currently exits with a clear error. Today, bootstrap the target first, then
-  restore into it. Full cross-version / cross-topology DR (`source is dead,
-  rebuild from nothing`) reconciles with the Phase-4 external-S3 DR drill and
-  the Phase-8.5 `DisasterRecoveryPlan`.
+- **(c) clone-to-new** (`--reprovision`): the "source cluster is dead, rebuild
+  from nothing" path. `restore --reprovision --target <name>` provisions **and**
+  bootstraps a fresh cluster in the target (the same provisioning
+  `apprafter up` runs — the server type, region, and cloud token come from the
+  target's **local** configuration, so the target must still be registered via
+  `apprafter target add`), then replays the backup exactly as mode (a). Use it
+  when you have only the backup artifact and a registered target, e.g.:
+
+  ```console
+  # the source cluster is gone; the encrypted restic repo survived off-cluster
+  $ RESTIC_PASSWORD=… apprafter restore /backups/prod-repo --reprovision --target prod
+  ```
+
+  It is **real-Hetzner only** (kind has no cloud provider). `--reprovision` and
+  `--data-only` are mutually exclusive (one rebuilds the whole cluster, the
+  other reloads data into a running one) and the combination is rejected up
+  front. Platform-version alignment rides the backup's captured `PlatformStack`
+  (applied during the replay) plus a cross-version warning if the freshly
+  bootstrapped platform differs. This is the flow the Phase-4 external-S3 DR
+  drill ("restore a new cluster from backup in < 1 hour") and the Phase-8.5
+  `DisasterRecoveryPlan` build on.
 
 ### Restore ordering and the two safety invariants
 
@@ -219,9 +234,9 @@ respective namespaces: app user secrets into their app namespace,
 - **Automated S3 backup (opt-in).** A scheduled push of the same restic
   repository to a remote (S3 / SFTP / rclone — R2, Scaleway, B2, Hetzner) is a
   follow-on. Local pull stays the default; the bucket is never forced.
-- **Clone-to-new** (`--reprovision`) and full cross-version DR land in later
-  subphases, reconciled with the external-S3 DR drill and the
-  `DisasterRecoveryPlan` resource.
+- **Clone-to-new** (`--reprovision`) ships and is real-Hetzner-validated (see
+  Target modes (c)); full cross-version DR reconciles with the external-S3 DR
+  drill and the `DisasterRecoveryPlan` resource.
 
 ## See also
 

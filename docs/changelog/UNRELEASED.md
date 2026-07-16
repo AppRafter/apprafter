@@ -9,6 +9,35 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.31 — 2.6d T13 restore --reprovision (clone-to-new) (2026-07-16)
+
+CLI-only. Wires the last deferred 2.6d restore mode. No operator/chart/schema change.
+
+### Added
+
+- **`apprafter restore --reprovision`** — the "source cluster is dead, rebuild
+  from nothing" DR path. It now provisions + bootstraps a FRESH cluster in the
+  target (`bootstrap_all::run` — topology + cloud token from the target's local
+  config, the same source as `apprafter up`) as a prepended `Reprovision` step,
+  then replays the backup as restore-into-running (config CRs → gated apps →
+  fresh claims → load data → re-seal secrets → resume). The kubeconfig is
+  resolved lazily (a fresh cluster has none until provisioned); version alignment
+  rides the backup's `PlatformStack` + the existing cross-version
+  `version_warning`. Previously the flag was wired but exited with a "lands in
+  2.6d T13" stub. Validated end-to-end on real Hetzner
+  (`e2e/restore-reprovision-hetzner.sh`: provision → deploy CMS + seed →
+  `backup create` → `destroy` (source dies) → `restore --reprovision` → the
+  Hetzner server id changes, CMS auto-Ready, re-sealed secret + pg marker intact).
+
+### Fixed
+
+- **`restore --reprovision --data-only` is rejected up front.** The two are
+  contradictory (`--reprovision` rebuilds the whole cluster; `--data-only`
+  reloads data into a running one) and `restore_steps` returns the data-only
+  sequence — with no `Reprovision` step — whenever `--data-only`, so the combo
+  would have silently skipped provisioning and failed later with an unresolved
+  kubeconfig. Now a clear "mutually exclusive" error fires before any work.
+
 ## cli v0.2.30 — 2.6d restore creates target namespaces (real-Hetzner DR walk fix) (2026-07-16)
 
 CLI-only fix surfaced by the real-Hetzner two-cluster CMS disaster-recovery

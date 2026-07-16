@@ -105,12 +105,19 @@ private workloads after restore comes from the **target's own configuration**
   for fresh claims → load data → re-seal secrets → resume workloads.
 - **(b) data-only** (`--data-only`): reload only the native data — scale the
   existing apps to zero, load, resume. No CR/secret replay.
-- **clone-to-new** (`--reprovision`: re-provision a fresh cluster, then
-  replay) is **deferred** — the flag is wired but exits with a clear error.
-  Full cross-version / cross-topology DR ("source is dead, rebuild from
-  nothing") reconciles with the Phase-4 external-S3 DR drill
-  (`plan.md` Phase 4.x, "test restore: a new cluster from backup in < 1 hour")
-  and the Phase-8.5 `DisasterRecoveryPlan` resource.
+- **(c) clone-to-new** (`--reprovision`): the "source is dead, rebuild from
+  nothing" path. A prepended `Reprovision` step provisions + bootstraps a fresh
+  cluster in the target (`bootstrap_all::run` — topology + cloud token from the
+  target's local config, R2, exactly as `apprafter up`), then replays as (a).
+  The kubeconfig is resolved lazily, after the fresh cluster exists; version
+  alignment rides the backup's `PlatformStack` (applied in `ApplyPlatformStack`)
+  plus the cross-version `version_warning`. `--reprovision` + `--data-only` are
+  mutually exclusive and rejected up front. **Real-Hetzner only** (kind has no
+  cloud provider). Validated end-to-end 2026-07-16 (`e2e/restore-reprovision-
+  hetzner.sh`: provision → backup → destroy → `restore --reprovision` → fresh
+  box, data + secret intact). It fulfils the Phase-4 external-S3 DR drill
+  (`plan.md`, "test restore: a new cluster from backup in < 1 hour") and the
+  Phase-8.5 `DisasterRecoveryPlan` resource.
 
 ### Restore ordering and the two invariants (H2, R1)
 
