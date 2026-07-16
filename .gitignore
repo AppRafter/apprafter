@@ -73,3 +73,5 @@ tmp/
 
 # scratch docs accidentally swept by a subagent git add -A (2026-06-10)
 /landing/docs/steps.md
+
+/backup-test.env
