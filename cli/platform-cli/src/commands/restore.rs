@@ -26,12 +26,11 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+use crate::commands::backup::KubectlExec;
+use backup_core::helper_pod::{pg_dump_pod_spec, volume_pod_spec};
+use backup_core::KubeExec;
 use base64::Engine as _;
 use cli_core::{CliError, Result};
-use cli_providers::backup::helper_pod::{
-    apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_from_file, pg_dump_pod_spec,
-    volume_pod_spec,
-};
 use cli_providers::backup::images::{pg_helper_image, VOLUME_IMAGE};
 use cli_providers::backup::manifest::BackupManifest;
 use cli_providers::backup::reseal::reseal_secret;
@@ -690,10 +689,11 @@ fn wait_claims_bound(manifest: &BackupManifest, kubeconfig: &Path) -> Result<()>
 /// **LoadData** — inject each native artifact under `data/{pg,volumes,redis}/`
 /// into its freshly-provisioned backend.
 fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> Result<()> {
+    let k = KubectlExec::new(kubeconfig.to_path_buf());
     // pg: data/pg/<ns>/<claim>.dump
-    load_pg_dumps(data_dir, kubeconfig)?;
+    load_pg_dumps(data_dir, &k, kubeconfig)?;
     // volumes: data/volumes/<ns>/<name>/data.tar
-    load_volumes(data_dir, manifest, kubeconfig)?;
+    load_volumes(data_dir, manifest, &k, kubeconfig)?;
     // redis: documented skeleton (T12 verifies Dragonfly RDB).
     load_redis_skeleton(data_dir);
     Ok(())
@@ -702,7 +702,7 @@ fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> R
 /// Restore every `data/pg/<ns>/<claim>.dump` via `pg_restore` over a helper
 /// pod, using the FRESH connection Secret (L3 — the post-provision creds, NOT
 /// the backed-up ones).
-fn load_pg_dumps(data_dir: &Path, kubeconfig: &Path) -> Result<()> {
+fn load_pg_dumps(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
     let pg_root = data_dir.join("pg");
     let Ok(ns_entries) = std::fs::read_dir(&pg_root) else {
         return Ok(());
@@ -741,7 +741,7 @@ fn load_pg_dumps(data_dir: &Path, kubeconfig: &Path) -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            load_one_pg(&ns, &claim, &dump_path, kubeconfig, &pg_image)?;
+            load_one_pg(&ns, &claim, &dump_path, k, kubeconfig, &pg_image)?;
         }
     }
     Ok(())
@@ -757,6 +757,7 @@ fn load_one_pg(
     ns: &str,
     claim: &str,
     dump_path: &Path,
+    k: &dyn KubeExec,
     kubeconfig: &Path,
     pg_image: &str,
 ) -> Result<()> {
@@ -820,9 +821,9 @@ fn load_one_pg(
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
         namespace: ns.to_string(),
-        kubeconfig,
+        k,
     };
-    apply_and_wait_pod_ready(&spec, kubeconfig)?;
+    k.apply_and_wait_pod_ready(&spec)?;
 
     // Wait for the TARGET database to actually accept a connection before
     // streaming the dump. `WaitClaimsBound` only guarantees the ResourceClaim's
@@ -849,7 +850,7 @@ fn load_one_pg(
         "-d",
         &db,
     ];
-    exec_stream_from_file(&pod_name, ns, &argv, dump_path, kubeconfig)?;
+    k.exec_stream_from_file(&pod_name, ns, &argv, dump_path)?;
     println!("  ✓ pg restored: {ns}/{claim}");
     Ok(())
 }
@@ -910,7 +911,12 @@ fn wait_pg_reachable(
 /// busybox helper pod mounted READ-WRITE (L1). The PVC to mount is the claim's
 /// regenerated `status.volumeClaimRef` (or, for a SharedVolume, the SV's bound
 /// PVC) — resolved from the live claim/SharedVolume by name.
-fn load_volumes(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> Result<()> {
+fn load_volumes(
+    data_dir: &Path,
+    manifest: &BackupManifest,
+    k: &dyn KubeExec,
+    kubeconfig: &Path,
+) -> Result<()> {
     let vol_root = data_dir.join("volumes");
     let Ok(ns_entries) = std::fs::read_dir(&vol_root) else {
         return Ok(());
@@ -935,7 +941,7 @@ fn load_volumes(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -
             }
             let name = name_entry.file_name().to_string_lossy().into_owned();
             let pvc = resolve_volume_pvc(&ns, &name, manifest, kubeconfig)?;
-            load_one_volume(&ns, &name, &pvc, &tar_path, kubeconfig)?;
+            load_one_volume(&ns, &name, &pvc, &tar_path, k)?;
         }
     }
     Ok(())
@@ -978,18 +984,18 @@ fn load_one_volume(
     name: &str,
     pvc: &str,
     tar_path: &Path,
-    kubeconfig: &Path,
+    k: &dyn KubeExec,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-vol-{name}"));
     let spec = volume_pod_spec(&pod_name, ns, VOLUME_IMAGE, pvc, false); // L1: RW
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
         namespace: ns.to_string(),
-        kubeconfig,
+        k,
     };
-    apply_and_wait_pod_ready(&spec, kubeconfig)?;
+    k.apply_and_wait_pod_ready(&spec)?;
     let argv: Vec<&str> = vec!["tar", "x", "-C", "/data"];
-    exec_stream_from_file(&pod_name, ns, &argv, tar_path, kubeconfig)?;
+    k.exec_stream_from_file(&pod_name, ns, &argv, tar_path)?;
     println!("  ✓ volume restored: {ns}/{name} → pvc {pvc}");
     Ok(())
 }
@@ -1206,12 +1212,12 @@ fn argo_apps_for(app_name: &str, kubeconfig: &Path) -> Result<Vec<(String, Strin
 struct PodCleanupGuard<'a> {
     name: String,
     namespace: String,
-    kubeconfig: &'a Path,
+    k: &'a dyn KubeExec,
 }
 
 impl Drop for PodCleanupGuard<'_> {
     fn drop(&mut self) {
-        delete_pod_best_effort(&self.name, &self.namespace, self.kubeconfig);
+        self.k.delete_pod_best_effort(&self.name, &self.namespace);
     }
 }
 

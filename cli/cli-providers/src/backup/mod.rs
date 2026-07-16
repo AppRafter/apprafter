@@ -2,8 +2,9 @@
 //! 2.6d backup/restore: native export + restic-wrapped local-pull backup +
 //! restore. CLI-orchestrated; cluster-scoped by default.
 
-pub mod extract;
-pub mod helper_pod;
+// extract and helper_pod now live in backup-core; re-export so existing import
+// paths (cli_providers::backup::{extract, helper_pod}) keep resolving.
+pub use backup_core::{extract, helper_pod};
 
 // Pure modules now live in backup-core; re-export so existing import paths
 // (cli_providers::backup::{restic, manifest, …}) keep resolving.

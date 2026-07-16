@@ -50,17 +50,22 @@
 //! (b) SourceCredential material — follow-the-reference, cluster-wide.
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
+use backup_core::engine::BackupOpts;
+use backup_core::extract::plan_extraction;
+use backup_core::{KubeExec, ResticRunner, StagingMode};
 use base64::Engine as _;
 use cli_core::{CliError, Result};
-use cli_providers::backup::extract::{plan_extraction, run_extraction};
+use cli_providers::backup::extract::run_extraction;
 use cli_providers::backup::images::pg_helper_image;
 use cli_providers::backup::manifest::BackupManifest;
-use cli_providers::backup::restic::{restic_backup_argv, restic_init_argv, restic_snapshots_argv};
-use cli_providers::backup::sanitize::sanitize_cr;
+use cli_providers::backup::restic::restic_snapshots_argv;
 use cli_providers::backup::ResourceRef;
 use serde_json::Value;
 
@@ -73,6 +78,9 @@ use crate::commands::state_paths::resolve_state_paths;
 /// `Application`. Mirrors `app::APPRAFTER_MANAGED_LABEL` (kept in sync as a
 /// literal — `app`'s const is private to that module). The `key=value` form
 /// is convenient for `kubectl -l`; here we split it for a JSON label lookup.
+// Used by is_user_argo_app (tested below); not called from non-test binary code
+// after the orchestration moved to backup_core::engine.
+#[allow(dead_code)]
 const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
 
 /// Namespace the `PlatformStack` singleton + `SourceCredential`s + their sealed
@@ -118,6 +126,7 @@ pub fn app_namespaces(apprafter_apps: &[Value], select: &[String]) -> Vec<String
 /// per-component Argo Applications lack it; only user apps registered via
 /// `apprafter app add` set it. Filtering on it keeps the backup from
 /// double-owning the bootstrap's own Applications on restore.
+#[allow(dead_code)]
 pub fn is_user_argo_app(argo_app: &Value) -> bool {
     let (key, value) = APPRAFTER_MANAGED_LABEL
         .split_once('=')
@@ -135,6 +144,7 @@ pub fn is_user_argo_app(argo_app: &Value) -> bool {
 /// Secret is a user secret we sealed; a plain Secret with no SealedSecret is
 /// a system/derived artifact (e.g. connection Secrets, dockerconfig) that the
 /// operator re-creates on restore — we don't carry it.
+#[allow(dead_code)]
 pub fn secrets_to_back_up(
     secret_names: &[String],
     sealed_secrets: &[Value],
@@ -200,6 +210,7 @@ pub fn backup_passphrase_or_error(
 /// `-ns-<joined>` marker when the backup is a namespace subset. Identifies the
 /// SOURCE CLUSTER + WHEN, NOT a single namespace (a whole-cluster backup spans
 /// many namespaces, so a namespace-based tag would be wrong / ambiguous).
+#[allow(dead_code)]
 pub fn backup_tag(cluster_id: &str, created_at: &str, subset_namespaces: &[String]) -> String {
     let base = format!("{cluster_id}-{created_at}");
     if subset_namespaces.is_empty() {
@@ -451,6 +462,400 @@ fn default_backup_repo(target_name: &str) -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Concrete KubeExec impl — subprocess kubectl
+// ---------------------------------------------------------------------------
+
+/// Maximum stderr lines to retain for error reporting.
+const STDERR_CAPTURE_LIMIT: usize = 20;
+
+/// Grace period after `child.wait()` to let the stderr-drainer thread flush.
+const STDERR_FLUSH_GRACE_MS: u64 = 100;
+
+/// CLI's concrete implementation of [`backup_core::KubeExec`]: shells out to
+/// `kubectl` with `KUBECONFIG=<path>`.
+pub(crate) struct KubectlExec {
+    pub kubeconfig: PathBuf,
+}
+
+impl KubectlExec {
+    pub(crate) fn new(kubeconfig: PathBuf) -> Self {
+        Self { kubeconfig }
+    }
+}
+
+/// Spawn a thread that drains `reader` to EOF, retaining the last
+/// `STDERR_CAPTURE_LIMIT` lines in a shared buffer for error reporting.
+fn spawn_capturing_drainer<R: Read + Send + 'static>(reader: R) -> Arc<Mutex<Vec<String>>> {
+    let buf: Arc<Mutex<Vec<String>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(STDERR_CAPTURE_LIMIT)));
+    let buf_clone = Arc::clone(&buf);
+    thread::spawn(move || {
+        let reader = BufReader::new(reader);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let mut guard = buf_clone.lock().unwrap();
+            if guard.len() >= STDERR_CAPTURE_LIMIT {
+                guard.remove(0);
+            }
+            guard.push(line);
+        }
+    });
+    buf
+}
+
+fn format_exec_error(
+    context: &str,
+    status: std::process::ExitStatus,
+    stderr_buf: &Arc<Mutex<Vec<String>>>,
+) -> CliError {
+    thread::sleep(Duration::from_millis(STDERR_FLUSH_GRACE_MS));
+    let captured = stderr_buf.lock().unwrap();
+    if captured.is_empty() {
+        CliError::Other(format!(
+            "{context}: kubectl exec exited with {status} and produced no stderr output"
+        ))
+    } else {
+        let text = captured.join("\n");
+        CliError::Other(format!(
+            "{context}: kubectl exec exited with {status}.\nkubectl stderr:\n  {}",
+            text.replace('\n', "\n  ")
+        ))
+    }
+}
+
+impl KubeExec for KubectlExec {
+    fn apply_and_wait_pod_ready(&self, spec: &serde_json::Value) -> Result<()> {
+        let name = spec["metadata"]["name"]
+            .as_str()
+            .ok_or_else(|| CliError::Other("pod spec missing metadata.name".into()))?;
+        let ns = spec["metadata"]["namespace"]
+            .as_str()
+            .ok_or_else(|| CliError::Other("pod spec missing metadata.namespace".into()))?;
+
+        let json_bytes = serde_json::to_vec(spec)
+            .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
+
+        let mut apply_child = Command::new("kubectl")
+            .args(["apply", "-f", "-", "-n", ns])
+            .env("KUBECONFIG", &self.kubeconfig)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| CliError::Other(format!("spawn kubectl apply: {e}")))?;
+
+        {
+            let mut stdin = apply_child
+                .stdin
+                .take()
+                .ok_or_else(|| CliError::Other("kubectl apply has no stdin".into()))?;
+            stdin
+                .write_all(&json_bytes)
+                .map_err(|e| CliError::Other(format!("write pod spec to kubectl apply: {e}")))?;
+        }
+
+        let apply_stderr = apply_child
+            .stderr
+            .take()
+            .ok_or_else(|| CliError::Other("kubectl apply has no stderr".into()))?;
+        let apply_stderr_buf = spawn_capturing_drainer(apply_stderr);
+        let apply_status = apply_child
+            .wait()
+            .map_err(|e| CliError::Other(format!("wait kubectl apply: {e}")))?;
+        if !apply_status.success() {
+            return Err(format_exec_error(
+                "apply_and_wait_pod_ready(apply)",
+                apply_status,
+                &apply_stderr_buf,
+            ));
+        }
+
+        let wait_status = Command::new("kubectl")
+            .args([
+                "wait",
+                "--for=condition=Ready",
+                &format!("pod/{name}"),
+                "-n",
+                ns,
+                "--timeout=300s",
+            ])
+            .env("KUBECONFIG", &self.kubeconfig)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| CliError::Other(format!("spawn kubectl wait: {e}")))?;
+
+        if wait_status.success() {
+            Ok(())
+        } else {
+            Err(CliError::Other(format!(
+                "pod {name} in {ns} did not reach Ready within 300s (kubectl wait exited {wait_status})"
+            )))
+        }
+    }
+
+    fn exec_stream_to_file(
+        &self,
+        pod: &str,
+        ns: &str,
+        argv: &[&str],
+        out_path: &Path,
+    ) -> Result<()> {
+        let mut cmd = Command::new("kubectl");
+        cmd.arg("exec")
+            .arg(pod)
+            .arg("-n")
+            .arg(ns)
+            .arg("--")
+            .args(argv)
+            .env("KUBECONFIG", &self.kubeconfig)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CliError::Other(format!("spawn kubectl exec (stream-to-file): {e}")))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CliError::Other("kubectl exec has no stdout".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CliError::Other("kubectl exec has no stderr".into()))?;
+
+        let stderr_buf = spawn_capturing_drainer(stderr);
+
+        let mut out_file = std::fs::File::create(out_path).map_err(|e| {
+            CliError::Other(format!("create output file {}: {e}", out_path.display()))
+        })?;
+        let mut reader = BufReader::new(stdout);
+        io::copy(&mut reader, &mut out_file)
+            .map_err(|e| CliError::Other(format!("copy kubectl exec stdout → file: {e}")))?;
+
+        let status = child
+            .wait()
+            .map_err(|e| CliError::Other(format!("wait kubectl exec: {e}")))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format_exec_error(
+                "exec_stream_to_file",
+                status,
+                &stderr_buf,
+            ))
+        }
+    }
+
+    fn exec_stream_from_file(
+        &self,
+        pod: &str,
+        ns: &str,
+        argv: &[&str],
+        in_path: &Path,
+    ) -> Result<()> {
+        let mut cmd = Command::new("kubectl");
+        cmd.arg("exec")
+            .arg("-i")
+            .arg(pod)
+            .arg("-n")
+            .arg(ns)
+            .arg("--")
+            .args(argv)
+            .env("KUBECONFIG", &self.kubeconfig)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CliError::Other(format!("spawn kubectl exec (stream-from-file): {e}")))?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CliError::Other("kubectl exec has no stdin".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CliError::Other("kubectl exec has no stderr".into()))?;
+
+        let stderr_buf = spawn_capturing_drainer(stderr);
+
+        let mut in_file = std::fs::File::open(in_path)
+            .map_err(|e| CliError::Other(format!("open input file {}: {e}", in_path.display())))?;
+        match io::copy(&mut in_file, &mut stdin) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+            Err(e) => {
+                return Err(CliError::Other(format!(
+                    "copy file → kubectl exec stdin: {e}"
+                )));
+            }
+        }
+        drop(stdin);
+
+        let status = child
+            .wait()
+            .map_err(|e| CliError::Other(format!("wait kubectl exec: {e}")))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format_exec_error(
+                "exec_stream_from_file",
+                status,
+                &stderr_buf,
+            ))
+        }
+    }
+
+    fn delete_pod_best_effort(&self, name: &str, ns: &str) {
+        let _ = Command::new("kubectl")
+            .args([
+                "delete",
+                "pod",
+                name,
+                "-n",
+                ns,
+                "--ignore-not-found",
+                "--wait=false",
+            ])
+            .env("KUBECONFIG", &self.kubeconfig)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
+        let out = Command::new("kubectl")
+            .args([
+                "get",
+                "secret",
+                secret,
+                "-n",
+                ns,
+                "-o",
+                &format!("jsonpath={{.data.{key}}}"),
+            ])
+            .env("KUBECONFIG", &self.kubeconfig)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl get secret: {e}")))?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            return Err(CliError::Other(format!(
+                "kubectl get secret {secret} -n {ns} -o jsonpath={{.data.{key}}} \
+                 failed (exit {:?}): {stderr}",
+                out.status.code()
+            )));
+        }
+
+        let b64 = String::from_utf8(out.stdout)
+            .map_err(|e| CliError::Other(format!("kubectl get secret stdout not utf-8: {e}")))?;
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|e| {
+                CliError::Other(format!(
+                    "decode secret {secret}/{key} (value was not valid base64): {e}"
+                ))
+            })?;
+
+        String::from_utf8(decoded)
+            .map_err(|e| CliError::Other(format!("secret {secret}/{key} is not utf-8: {e}")))
+    }
+
+    fn get_json(&self, args: &[&str]) -> Result<Option<serde_json::Value>> {
+        let mut c = Command::new("kubectl");
+        c.args(args).env("KUBECONFIG", &self.kubeconfig);
+
+        let out = c
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("NotFound") || stderr.contains("not found") {
+                return Ok(None);
+            }
+            return Err(CliError::Other(format!(
+                "kubectl {:?} failed (exit {:?}): {stderr}",
+                args.first().unwrap_or(&"?"),
+                out.status.code()
+            )));
+        }
+
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
+        Ok(Some(value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concrete ResticRunner impl — subprocess restic
+// ---------------------------------------------------------------------------
+
+/// CLI's concrete implementation of [`backup_core::ResticRunner`]: shells out
+/// to `restic` subprocess.
+pub(crate) struct SubprocessRestic;
+
+impl ResticRunner for SubprocessRestic {
+    fn run(&self, argv: &[String], pass: &str) -> Result<()> {
+        let out = Command::new("restic")
+            .args(argv)
+            .env("RESTIC_PASSWORD", pass)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+        if !out.status.success() {
+            return Err(CliError::Other(format!(
+                "restic {} failed (exit {:?}): {}",
+                argv.first().map(String::as_str).unwrap_or("?"),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    fn run_stdout(&self, argv: &[String], pass: &str) -> Result<String> {
+        let out = Command::new("restic")
+            .args(argv)
+            .env("RESTIC_PASSWORD", pass)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+        if !out.status.success() {
+            return Err(CliError::Other(format!(
+                "restic {} failed (exit {:?}): {}",
+                argv.first().map(String::as_str).unwrap_or("?"),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn run_backup(&self, argv: &[String], pass: &str) -> Result<Option<String>> {
+        let stdout = self.run_stdout(argv, pass)?;
+        let snapshot_id = stdout.lines().find_map(|line| {
+            let obj: Value = serde_json::from_str(line.trim()).ok()?;
+            if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
+                obj.pointer("/snapshot_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        });
+        Ok(snapshot_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -482,10 +887,11 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| CliError::Other(format!("create export dir {}: {e}", out_dir.display())))?;
 
+    let k = KubectlExec::new(kc.path().to_path_buf());
     let claims = claims_in_namespaces(&ns_set, kc.path())?;
     let plan = plan_extraction(&claims);
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
-    run_extraction(&plan, &out_dir, kc.path(), &pg_image)?;
+    run_extraction(&k, &plan, &out_dir, &pg_image)?;
 
     let platform_version = read_platform_version(kc.path())?;
     let manifest = BackupManifest {
@@ -531,6 +937,10 @@ pub fn run_backup(
     // shell-out below depends on it; dropping it deletes the file).
     let kc = ensure_kubeconfig_tempfile()?;
 
+    // Resolve ns_set BEFORE handing off to the engine (the engine's list_items
+    // uses KubeExec which doesn't know about the "app-namespace set" concept —
+    // that's a CLI-layer concern).
+    let k = KubectlExec::new(kc.path().to_path_buf());
     let subset: &[String] = if select { namespaces } else { &[] };
     let apps = list_items("applications.apprafter.io", None, kc.path())?;
     let ns_set = app_namespaces(&apps, subset);
@@ -542,176 +952,45 @@ pub fn run_backup(
         ));
     }
 
-    // Stage everything under a tempdir; restic snapshots `data/`.
-    let staging = tempfile::Builder::new()
-        .prefix("apprafter-backup-")
-        .tempdir()
-        .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
-    let data_dir = staging.path().join("data");
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| CliError::Other(format!("create staging data dir: {e}")))?;
-
-    // 1. Native data extraction.
-    let claims = claims_in_namespaces(&ns_set, kc.path())?;
-    let plan = plan_extraction(&claims);
-    let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
-    run_extraction(&plan, &data_dir, kc.path(), &pg_image)?;
-
-    // 2. Serialize CRs (sanitized) into data/crs/.
-    let crs_dir = data_dir.join("crs");
-    std::fs::create_dir_all(&crs_dir)
-        .map_err(|e| CliError::Other(format!("create crs dir: {e}")))?;
-
-    let mut captured_crs: Vec<(String, Value)> = Vec::new();
-
-    // 2a. PlatformStack/default (config CR, by kind).
-    if let Some(ps) = kubectl_get_json(
-        "platformstack",
-        Some(PLATFORMSTACK_NAME),
-        Some(APPRAFTER_SYSTEM_NAMESPACE),
-        kc.path(),
-    )? {
-        captured_crs.push(("PlatformStack".to_string(), ps));
-    }
-
-    // 2b. SourceCredential (config CRs, cluster-wide by kind).
-    let source_creds = list_items("sourcecredentials.apprafter.io", None, kc.path())?;
-    for sc in &source_creds {
-        captured_crs.push(("SourceCredential".to_string(), sc.clone()));
-    }
-
-    // 2c. AppRafter Application CRs (app-ns set).
-    let app_crs: Vec<Value> = apps
-        .iter()
-        .filter(|a| {
-            a.pointer("/metadata/namespace")
-                .and_then(Value::as_str)
-                .map(|ns| ns_set.iter().any(|n| n == ns))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-    for a in &app_crs {
-        captured_crs.push(("Application".to_string(), a.clone()));
-    }
-
-    // 2d. USER Argo Applications (managed-by filter). These live in the
-    //     `argocd` namespace (outside the app-ns set), so they are listed
-    //     cluster-wide and filtered by label — the platform umbrella +
-    //     component Argo Apps lack the label and are never captured.
-    let argo_apps = list_items("applications.argoproj.io", None, kc.path())?;
-    let user_argo: Vec<Value> = argo_apps
-        .iter()
-        .filter(|a| is_user_argo_app(a))
-        .cloned()
-        .collect();
-    for a in &user_argo {
-        captured_crs.push(("ArgoApplication".to_string(), a.clone()));
-    }
-
-    // 2e. SharedVolume CRs (app-ns set).
-    let mut shared_volumes = Vec::new();
-    for ns in &ns_set {
-        shared_volumes.extend(list_items(
-            "sharedvolumes.apprafter.io",
-            Some(ns),
-            kc.path(),
-        )?);
-    }
-    for sv in &shared_volumes {
-        captured_crs.push(("SharedVolume".to_string(), sv.clone()));
-    }
-
-    write_crs(&captured_crs, &crs_dir)?;
-
-    // 3. Secrets — TWO distinct paths.
-    let secrets_dir = data_dir.join("secrets");
-    std::fs::create_dir_all(&secrets_dir)
-        .map_err(|e| CliError::Other(format!("create secrets dir: {e}")))?;
-
-    // 3a. App user secrets — SealedSecret-backed sweep, app-ns scoped.
-    let mut secret_count = 0usize;
-    for ns in &ns_set {
-        let sealed = list_items("sealedsecrets.bitnami.com", Some(ns), kc.path())?;
-        let secret_names: Vec<String> = list_items("secrets", Some(ns), kc.path())?
-            .iter()
-            .filter_map(|s| {
-                s.pointer("/metadata/name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect();
-        let to_back_up = secrets_to_back_up(&secret_names, &sealed, ns);
-        let ns_dir = secrets_dir.join(ns);
-        for name in &to_back_up {
-            if let Some((data, secret_type)) = read_secret_data(name, ns, kc.path())? {
-                write_secret_json(&ns_dir, name, &data, &secret_type)?;
-                secret_count += 1;
-            }
-        }
-    }
-
-    // 3b. SourceCredential material — follow-the-reference, cluster-wide
-    //     (the app-ns sweep above MISSES it: it lives in apprafter-system).
-    let sourcecred_dir = secrets_dir.join("sourcecred");
-    let mut sc_refs: Vec<(String, String)> = source_creds
-        .iter()
-        .flat_map(sourcecred_material_refs)
-        .collect();
-    sc_refs.sort();
-    sc_refs.dedup();
-    for (ns, name) in &sc_refs {
-        if let Some((data, secret_type)) = read_secret_data(name, ns, kc.path())? {
-            write_secret_json(&sourcecred_dir, name, &data, &secret_type)?;
-            secret_count += 1;
-        }
-    }
-
-    // 4. manifest.json.
-    let manifest_crs: Vec<(&str, &Value)> =
-        captured_crs.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let manifest = BackupManifest {
-        cluster_id: cluster_id.clone(),
-        created_at: now_rfc3339(),
-        platform_version: read_platform_version(kc.path())?,
-        namespaces: ns_set.clone(),
-        resources: resource_refs(&manifest_crs, &claims),
-    };
-    write_manifest(&manifest, &data_dir)?;
-
-    // 5. restic init (only if the repo doesn't already exist) + backup.
     let repo_path = match repo {
         Some(r) => PathBuf::from(r),
         None => default_backup_repo(&cluster_id)?,
     };
     let repo_str = repo_path.to_string_lossy().to_string();
 
-    if !restic_repo_exists(&repo_str, &pass)? {
-        if let Some(parent) = repo_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                CliError::Other(format!("create repo parent {}: {e}", parent.display()))
-            })?;
-        }
-        run_restic(&restic_init_argv(&repo_str), &pass)?;
-    }
+    let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
+    let platform_version = read_platform_version(kc.path())?;
 
-    let tag = backup_tag(&cluster_id, &manifest.created_at, subset);
-    let snapshot_id = run_restic_backup(
-        &restic_backup_argv(&repo_str, &data_dir.to_string_lossy(), &tag),
-        &pass,
-    )?;
+    // Stage everything under a tempdir; the engine writes data/ under this root.
+    let staging = tempfile::Builder::new()
+        .prefix("apprafter-backup-")
+        .tempdir()
+        .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
+
+    let opts = BackupOpts {
+        repo: repo_str.clone(),
+        passphrase: pass,
+        cluster_id: cluster_id.clone(),
+        created_at: now_rfc3339(),
+        platform_version,
+        namespaces: ns_set.clone(),
+        is_subset: select,
+        staging_root: staging.path().to_path_buf(),
+        pg_image,
+        staging_mode: StagingMode::Monolithic,
+    };
+
+    let r = SubprocessRestic;
+    let summary = backup_core::engine::run_backup_with_summary(&k, &r, &opts)?;
 
     println!("✓ Backed up cluster '{cluster_id}' → {repo_str}");
     println!("  namespaces: {}", ns_set.join(", "));
     println!(
         "  captured:   {} CR(s), {} secret(s), {} claim(s) ({} extracted)",
-        captured_crs.len(),
-        secret_count,
-        claims.len(),
-        plan.len()
+        summary.cr_count, summary.secret_count, summary.claim_count, summary.extracted_count,
     );
-    println!("  tag:        {tag}");
-    if let Some(id) = snapshot_id {
+    println!("  tag:        {}", summary.tag);
+    if let Some(id) = summary.snapshot_id {
         println!("  snapshot:   {id}");
     }
     Ok(())
@@ -730,7 +1009,8 @@ pub fn run_backup_list(repo: Option<&str>, passphrase: Option<&str>) -> Result<(
     };
     let repo_str = repo_path.to_string_lossy().to_string();
 
-    let json = run_restic_stdout(&restic_snapshots_argv(&repo_str), &pass)?;
+    let r = SubprocessRestic;
+    let json = r.run_stdout(&restic_snapshots_argv(&repo_str), &pass)?;
     let snapshots: Value = serde_json::from_str(&json)
         .map_err(|e| CliError::Other(format!("parse restic snapshots JSON: {e}")))?;
 
@@ -765,142 +1045,11 @@ pub fn run_backup_list(repo: Option<&str>, passphrase: Option<&str>) -> Result<(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// restic runners + file writers
-// ---------------------------------------------------------------------------
-
-/// Probe whether a restic repository already exists at `repo`. `restic init`
-/// errors on an existing repo, so we run `snapshots` (which succeeds on any
-/// initialized repo, even an empty one) and treat success as "exists".
-fn restic_repo_exists(repo: &str, pass: &str) -> Result<bool> {
-    let out = Command::new("restic")
-        .args(restic_snapshots_argv(repo))
-        .env("RESTIC_PASSWORD", pass)
-        .output()
-        .map_err(|e| CliError::Other(format!("spawn restic snapshots (probe): {e}")))?;
-    Ok(out.status.success())
-}
-
-/// Run a restic command, capturing output — silent on success, surfaces stderr on failure.
-fn run_restic(argv: &[String], pass: &str) -> Result<()> {
-    let out = Command::new("restic")
-        .args(argv)
-        .env("RESTIC_PASSWORD", pass)
-        .output()
-        .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
-    if !out.status.success() {
-        return Err(CliError::Other(format!(
-            "restic {} failed (exit {:?}): {}",
-            argv.first().map(String::as_str).unwrap_or("?"),
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    Ok(())
-}
-
-/// Run a restic command and return its stdout verbatim. Used for
-/// `snapshots --json` (the caller parses the JSON).
-fn run_restic_stdout(argv: &[String], pass: &str) -> Result<String> {
-    let out = Command::new("restic")
-        .args(argv)
-        .env("RESTIC_PASSWORD", pass)
-        .output()
-        .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
-    if !out.status.success() {
-        return Err(CliError::Other(format!(
-            "restic {} failed (exit {:?}): {}",
-            argv.first().map(String::as_str).unwrap_or("?"),
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Run `restic backup --json` and return the snapshot id from the structured
-/// summary line. `restic backup --json` emits one JSON object per line; the
-/// final summary object has `"message_type": "summary"` and carries
-/// `"snapshot_id"`. Returns `None` when the summary object is not found (a
-/// restic version difference) — the backup still succeeded, we just can't echo
-/// the id.
-fn run_restic_backup(argv: &[String], pass: &str) -> Result<Option<String>> {
-    let stdout = run_restic_stdout(argv, pass)?;
-    let snapshot_id = stdout.lines().find_map(|line| {
-        let obj: Value = serde_json::from_str(line.trim()).ok()?;
-        if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
-            obj.pointer("/snapshot_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        } else {
-            None
-        }
-    });
-    Ok(snapshot_id)
-}
-
 fn write_manifest(manifest: &BackupManifest, dir: &Path) -> Result<()> {
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CliError::Other(format!("serialize manifest: {e}")))?;
     std::fs::write(dir.join("manifest.json"), body)
         .map_err(|e| CliError::Other(format!("write manifest.json: {e}")))
-}
-
-fn write_crs(crs: &[(String, Value)], crs_dir: &Path) -> Result<()> {
-    for (i, (kind, cr)) in crs.iter().enumerate() {
-        let name = cr
-            .pointer("/metadata/name")
-            .and_then(Value::as_str)
-            .unwrap_or("unnamed");
-        let ns = cr
-            .pointer("/metadata/namespace")
-            .and_then(Value::as_str)
-            .unwrap_or("cluster");
-        let sanitized = sanitize_cr(cr);
-        let body = serde_json::to_vec_pretty(&sanitized)
-            .map_err(|e| CliError::Other(format!("serialize CR {kind}/{name}: {e}")))?;
-        // Prefix with an index so two same-named CRs of different kinds/ns
-        // never collide on disk.
-        let file = format!("{i:03}-{kind}-{ns}-{name}.json");
-        std::fs::write(crs_dir.join(&file), body)
-            .map_err(|e| CliError::Other(format!("write CR {file}: {e}")))?;
-    }
-    Ok(())
-}
-
-/// Write one secret's decrypted `key → bytes` map under `<dir>/<name>.json`,
-/// including the Kubernetes secret type for a faithful roundtrip.
-///
-/// ## On-disk format
-///
-/// ```json
-/// { "type": "<secret-type>", "data": { "key": "<base64-value>", … } }
-/// ```
-///
-/// `restore.rs::read_secret_file` reads this shape and falls back gracefully
-/// to `"Opaque"` when the `type` field is absent (old backups).
-fn write_secret_json(
-    dir: &Path,
-    name: &str,
-    data: &BTreeMap<String, Vec<u8>>,
-    secret_type: &str,
-) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| CliError::Other(format!("create secret dir {}: {e}", dir.display())))?;
-    let encoded: BTreeMap<String, String> = data
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                base64::engine::general_purpose::STANDARD.encode(v),
-            )
-        })
-        .collect();
-    let envelope = serde_json::json!({ "type": secret_type, "data": encoded });
-    let body = serde_json::to_vec_pretty(&envelope)
-        .map_err(|e| CliError::Other(format!("serialize secret {name}: {e}")))?;
-    std::fs::write(dir.join(format!("{name}.json")), body)
-        .map_err(|e| CliError::Other(format!("write secret {name}.json: {e}")))
 }
 
 /// Current time as an RFC3339 string (manifest `created_at` + tag timestamp).

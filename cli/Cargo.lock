@@ -176,6 +176,7 @@ dependencies = [
  "age",
  "arboard",
  "assert_cmd",
+ "backup-core",
  "base64 0.22.1",
  "chrono",
  "clap",
