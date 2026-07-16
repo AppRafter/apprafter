@@ -839,13 +839,21 @@ phase "Phase 9: capacity live-read — kubelet /stats/summary on a real node (SO
 NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 [ -n "$NODE" ] || { printf 'FAILED: could not resolve a node name for the capacity read\n' >&2; exit 1; }
 summary=$(kubectl get --raw "/api/v1/nodes/${NODE}/proxy/stats/summary" 2>/dev/null || true)
-if printf '%s' "$summary" | grep -q '"nodeName"' && printf '%s' "$summary" | grep -q '"fs"'; then
-    printf '  ok: kubelet Summary API reachable on node %s (nodeName + fs capacity present)\n' "$NODE"
-else
-    printf 'FAILED: kubelet /stats/summary did not return node capacity data on %s\n' "$NODE" >&2
-    printf '  raw (first 400 chars): %s\n' "$(printf '%s' "$summary" | head -c 400)" >&2
-    exit 1
-fi
+# SUBSTRING match via `case`, NOT `printf ... | grep -q` — under `set -o pipefail`
+# a `grep -q` that matches EXITS EARLY, SIGPIPEs the feeding printf, and the pipe
+# then reports 141 (failure), so the `&&` reads a real match as a FALSE NEGATIVE.
+# (That harness bug once mis-reported this very assertion; the capacity-signal
+# `node.fs` field IS present on real Hetzner k3s — proven by the standalone
+# capacity-kubelet probe: node_free_fraction ~0.887.) Assert the exact field the
+# operator reads: node.fs with a capacityBytes value.
+case "$summary" in
+    *'"nodeName"'*'"fs"'*'"capacityBytes"'* | *'"fs"'*'"capacityBytes"'*'"nodeName"'*)
+        printf '  ok: kubelet Summary API reachable on node %s (node.fs capacityBytes present — capacity signal live)\n' "$NODE" ;;
+    *)
+        printf 'FAILED: kubelet /stats/summary lacked node.fs capacityBytes on %s\n' "$NODE" >&2
+        printf '  raw (first 400 chars): %s\n' "$(printf '%s' "$summary" | head -c 400)" >&2
+        exit 1 ;;
+esac
 
 # =====================================================================
 # Done — success path teardown runs in the trap (destroys BOTH + API-verify)
