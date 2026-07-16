@@ -4,28 +4,11 @@
 
 pub mod extract;
 pub mod helper_pod;
-pub mod images;
-pub mod manifest;
-pub mod reseal;
-pub mod restic;
-pub mod restore;
-pub mod sanitize;
 
-/// The native data kinds an extraction pulls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataKind {
-    Pg,
-    Redis,
-    Volume,
-}
+// Pure modules now live in backup-core; re-export so existing import paths
+// (cli_providers::backup::{restic, manifest, …}) keep resolving.
+pub use backup_core::{images, manifest, reseal, restic, restore, sanitize};
 
-/// A resource captured into the backup manifest.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ResourceRef {
-    pub namespace: String,
-    pub kind: String,
-    pub name: String,
-    /// For ResourceClaims / data artifacts: the claim type (pg/redis/disk/shared-disk). None for config CRs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_type: Option<String>,
-}
+// Shared types defined in backup-core; re-export here for callers that import
+// them via cli_providers::backup::{DataKind, ResourceRef}.
+pub use backup_core::{DataKind, ResourceRef};

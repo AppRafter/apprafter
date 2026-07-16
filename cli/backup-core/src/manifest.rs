@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! `manifest.json` builder for 2.6d backup/restore.
 
-use crate::backup::ResourceRef;
+use crate::ResourceRef;
 
 /// The `manifest.json` written at the root of an export/backup.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -20,7 +20,7 @@ pub struct BackupManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backup::ResourceRef;
+    use crate::ResourceRef;
 
     #[test]
     fn manifest_carries_scope_resources_and_platform_version() {

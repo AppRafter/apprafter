@@ -290,8 +290,14 @@ dependencies = [
 name = "backup-core"
 version = "0.2.31"
 dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
  "cli-core",
+ "rand 0.8.6",
+ "rsa",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -509,6 +515,7 @@ name = "cli-providers"
 version = "0.2.31"
 dependencies = [
  "aes-gcm",
+ "backup-core",
  "base64 0.22.1",
  "chrono",
  "cli-core",

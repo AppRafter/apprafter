@@ -11,6 +11,7 @@ authors.workspace      = true
 repository.workspace   = true
 
 [dependencies]
+backup-core = { path = "../backup-core" }
 base64     = { workspace = true }
 chrono     = { workspace = true }
 cli-core   = { path = "../cli-core" }

@@ -3,8 +3,8 @@
 //! scoped to the TARGET cluster's sealed-secrets public key and the secret's
 //! strict `namespace/name` label.
 //!
-//! This is a thin wrapper over [`crate::k8s::sealing::build_sealed_secret`],
-//! which applies the strict scope internally via [`crate::k8s::sealing::seal_encrypted_data`].
+//! This is a thin wrapper over [`crate::sealing::build_sealed_secret`],
+//! which applies the strict scope internally via [`crate::sealing::seal_encrypted_data`].
 
 use std::collections::BTreeMap;
 
@@ -12,13 +12,13 @@ use cli_core::Result;
 use rsa::RsaPublicKey;
 use serde_json::Value;
 
-use crate::k8s::sealing::build_sealed_secret;
+use crate::sealing::build_sealed_secret;
 
 /// Build a bitnami `SealedSecret` CR from the backed-up (decrypted) bytes of
 /// a secret, sealed for the TARGET cluster.
 ///
 /// The strict `namespace/name` scope is applied inside
-/// [`build_sealed_secret`] → [`crate::k8s::sealing::seal_encrypted_data`],
+/// [`build_sealed_secret`] → [`crate::sealing::seal_encrypted_data`],
 /// so the resulting blob can only be decrypted by the target cluster's
 /// sealed-secrets controller when it finds the SealedSecret in the given
 /// namespace with the given name.
@@ -26,7 +26,7 @@ use crate::k8s::sealing::build_sealed_secret;
 /// # Arguments
 /// * `target_pub_key` — RSA public key fetched from the TARGET cluster's
 ///   sealed-secrets controller (via
-///   [`crate::k8s::sealing::fetch_controller_public_key`]).
+///   [`cli_providers::k8s::sealing::fetch_controller_public_key`]).
 /// * `namespace` — namespace in the target cluster where the restored Secret
 ///   will live (and where the SealedSecret will be applied).
 /// * `name` — name of the restored Secret.
