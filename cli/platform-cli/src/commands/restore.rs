@@ -192,6 +192,9 @@ pub fn run_restore(
                 )?;
                 let dd = find_data_dir(restore_root.path())?;
                 let m = read_backup_manifest(&dd)?;
+                // m8: reject a backup written by a newer CLI — guard before
+                // any further parsing or cluster writes.
+                check_manifest_version(m.manifest_version)?;
                 // M1 version note: warn (don't fail) when the target's live
                 // PlatformStack version differs from the backup's — a
                 // cross-version restore may re-render components.
@@ -1233,6 +1236,24 @@ fn truncate_pod_name(name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Manifest version guard (m8)
+// ---------------------------------------------------------------------------
+
+/// Return `Ok(())` when `v <= MANIFEST_VERSION_CURRENT`, otherwise an error
+/// that contains "unsupported backup format" so callers and tests can match on
+/// it. The message also hints at upgrading the CLI so the user knows what to do.
+fn check_manifest_version(v: u32) -> cli_core::Result<()> {
+    let current = backup_core::manifest::MANIFEST_VERSION_CURRENT;
+    if v > current {
+        return Err(CliError::Other(format!(
+            "unsupported backup format: manifest version {v} is newer than this CLI supports \
+             (max {current}) — upgrade the CLI to restore this backup"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // restic runner
 // ---------------------------------------------------------------------------
 
@@ -1263,8 +1284,19 @@ fn run_restic_restore(argv: &[String], pass: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use backup_core::manifest::MANIFEST_VERSION_CURRENT;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn restore_rejects_a_newer_manifest_version_with_a_clear_error() {
+        assert!(check_manifest_version(MANIFEST_VERSION_CURRENT).is_ok());
+        let e = check_manifest_version(MANIFEST_VERSION_CURRENT + 1).unwrap_err();
+        assert!(
+            format!("{e}").contains("unsupported backup format"),
+            "got: {e}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // FIX 2 (M3): strip_argo_automated

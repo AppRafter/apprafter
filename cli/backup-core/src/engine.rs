@@ -545,6 +545,7 @@ fn run_backup_monolithic_with_summary(
     let manifest_crs: Vec<(&str, &Value)> =
         captured_crs.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let manifest = BackupManifest {
+        manifest_version: crate::manifest::MANIFEST_VERSION_CURRENT,
         cluster_id: opts.cluster_id.clone(),
         created_at: opts.created_at.clone(),
         platform_version: opts.platform_version.clone(),

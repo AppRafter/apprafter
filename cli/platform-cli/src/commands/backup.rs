@@ -828,6 +828,7 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
 
     let platform_version = read_platform_version(kc.path())?;
     let manifest = BackupManifest {
+        manifest_version: backup_core::manifest::MANIFEST_VERSION_CURRENT,
         cluster_id: cluster_id.clone(),
         created_at: now_rfc3339(),
         platform_version,
