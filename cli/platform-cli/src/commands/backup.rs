@@ -59,7 +59,7 @@ use std::time::Duration;
 
 use backup_core::engine::BackupOpts;
 use backup_core::extract::plan_extraction;
-use backup_core::{KubeExec, ResticRunner, StagingMode};
+use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
 use cli_core::{CliError, Result};
 use cli_providers::backup::extract::run_extraction;
@@ -726,65 +726,6 @@ impl KubeExec for KubectlExec {
         let value: serde_json::Value = serde_json::from_slice(&out.stdout)
             .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
         Ok(Some(value))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Concrete ResticRunner impl — subprocess restic
-// ---------------------------------------------------------------------------
-
-/// CLI's concrete implementation of [`backup_core::ResticRunner`]: shells out
-/// to `restic` subprocess.
-pub(crate) struct SubprocessRestic;
-
-impl ResticRunner for SubprocessRestic {
-    fn run(&self, argv: &[String], pass: &str) -> Result<()> {
-        let out = Command::new("restic")
-            .args(argv)
-            .env("RESTIC_PASSWORD", pass)
-            .output()
-            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
-        if !out.status.success() {
-            return Err(CliError::Other(format!(
-                "restic {} failed (exit {:?}): {}",
-                argv.first().map(String::as_str).unwrap_or("?"),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
-        Ok(())
-    }
-
-    fn run_stdout(&self, argv: &[String], pass: &str) -> Result<String> {
-        let out = Command::new("restic")
-            .args(argv)
-            .env("RESTIC_PASSWORD", pass)
-            .output()
-            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
-        if !out.status.success() {
-            return Err(CliError::Other(format!(
-                "restic {} failed (exit {:?}): {}",
-                argv.first().map(String::as_str).unwrap_or("?"),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    fn run_backup(&self, argv: &[String], pass: &str) -> Result<Option<String>> {
-        let stdout = self.run_stdout(argv, pass)?;
-        let snapshot_id = stdout.lines().find_map(|line| {
-            let obj: Value = serde_json::from_str(line.trim()).ok()?;
-            if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
-                obj.pointer("/snapshot_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            } else {
-                None
-            }
-        });
-        Ok(snapshot_id)
     }
 }
 

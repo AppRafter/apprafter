@@ -21,6 +21,7 @@ pub mod sealing;
 pub use engine::StagingMode;
 pub use kube::KubeExec;
 pub use restic_runner::ResticRunner;
+pub use restic_runner::SubprocessRestic;
 
 /// The native data kinds an extraction pulls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -72,6 +72,13 @@ pub fn restic_restore_argv(repo: &str, snapshot: &str, out: &str) -> Vec<String>
     ]
 }
 
+/// `restic unlock` argv: removes only stale locks (restic's default behaviour —
+/// no `--remove-all` flag, which would also kill live locks held by concurrent
+/// backup runs).
+pub fn restic_unlock_argv(repo: &str) -> Vec<String> {
+    vec!["unlock".into(), "--repo".into(), repo.into()]
+}
+
 /// Passphrase precedence: explicit arg → env. Returns None when neither is set
 /// (the caller then prompts on a TTY, or errors on non-TTY — the repo holds
 /// decrypted secrets so an empty passphrase is NEVER allowed). The resolved
@@ -145,6 +152,17 @@ mod tests {
     fn forget_argv_with_no_ids_is_still_well_formed() {
         let a = restic_forget_argv("/repo", &[]);
         assert_eq!(a, vec!["forget", "--repo", "/repo", "--prune"]);
+    }
+
+    #[test]
+    fn unlock_argv_targets_repo_and_removes_only_stale() {
+        let a = restic_unlock_argv("s3:repo");
+        assert_eq!(a[0], "unlock");
+        assert!(a.iter().any(|x| x == "--repo") && a.iter().any(|x| x == "s3:repo"));
+        assert!(
+            !a.iter().any(|x| x == "--remove-all"),
+            "must NOT remove live locks"
+        );
     }
 
     #[test]
