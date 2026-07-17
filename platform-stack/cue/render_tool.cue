@@ -380,7 +380,7 @@ _backupTemplate: """
 	rules:
 	# CRs the engine's list/get sweep reads (serialized into the backup manifest).
 	- apiGroups: ["apprafter.io"]
-	  resources: ["applications", "sharedvolumes", "platformstacks", "resourceclaims"]
+	  resources: ["applications", "sharedvolumes", "platformstacks", "resourceclaims", "sourcecredentials"]
 	  verbs: ["get", "list"]
 	- apiGroups: ["argoproj.io"]
 	  resources: ["applications"]
@@ -392,23 +392,34 @@ _backupTemplate: """
 	  resources: ["sealedsecrets"]
 	  verbs: ["get", "list"]
 	# Core Secrets — the app/connection creds the sweep captures + reseals.
+	# `list` (not just get): the sweep enumerates each app namespace's secrets.
 	- apiGroups: [""]
 	  resources: ["secrets"]
-	  verbs: ["get"]
-	# Ephemeral helper pods (pg_dump / tar). exec is namespace-wide (k8s limit).
+	  verbs: ["get", "list"]
+	# Ephemeral helper pods (pg_dump / tar). `patch` because the runner
+	# server-side-APPLIES the helper Pod (SSA is a PATCH, not a create);
+	# `pods/exec` needs `get` because kube-rs's WebSocket exec is a GET upgrade
+	# (kubectl exec POSTs, hence the original create-only rule — the in-cluster
+	# runner's verb differs). exec is namespace-wide (k8s limit).
 	- apiGroups: [""]
 	  resources: ["pods"]
-	  verbs: ["create", "get", "delete"]
+	  verbs: ["create", "get", "patch", "delete"]
 	- apiGroups: [""]
 	  resources: ["pods/exec"]
-	  verbs: ["create"]
+	  verbs: ["create", "get"]
 	# The status ConfigMap ONLY (M-r3-2): create-or-update the single
-	# apprafter-backup-status CM. resourceNames locks this to that one object —
-	# NOT a platformstacks write.
+	# apprafter-backup-status CM. `create` CANNOT be restricted by resourceNames
+	# (the object name is unknown at authorization time — a resourceNames rule
+	# that includes `create` silently forbids it), so `create` is its own
+	# unrestricted rule and the mutating verbs stay locked to the one object —
+	# still NOT a platformstacks write.
+	- apiGroups: [""]
+	  resources: ["configmaps"]
+	  verbs: ["create"]
 	- apiGroups: [""]
 	  resources: ["configmaps"]
 	  resourceNames: ["apprafter-backup-status"]
-	  verbs: ["create", "get", "update", "patch"]
+	  verbs: ["get", "update", "patch"]
 	---
 	apiVersion: rbac.authorization.k8s.io/v1
 	kind: ClusterRoleBinding

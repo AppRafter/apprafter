@@ -95,7 +95,10 @@ impl KubeRsExec {
         // version. `versioned_resources` returns `(ApiResource, caps)`.
         let ver = apigroup.preferred_version_or_latest();
         for (ar, _caps) in apigroup.versioned_resources(ver) {
-            if ar.plural == plural {
+            // Match the PLURAL (`secrets`, `applications`) OR the singular kind
+            // (`secret`, `application`) — kubectl accepts both, so the shared
+            // engine may pass either; be as lenient as `KubectlExec` here.
+            if ar.plural == plural || ar.kind.eq_ignore_ascii_case(&plural) {
                 return Ok(ar);
             }
         }

@@ -94,9 +94,16 @@ fn run() -> i32 {
     //    recorded in the status CM and the exit code is 1.
     let outcome = match do_backup(&k, &r, &cfg) {
         Ok(snapshot) => RunOutcome::Success { snapshot },
-        Err(e) => RunOutcome::Failure {
-            error: format!("{e}"),
-        },
+        Err(e) => {
+            // Surface the failure reason on stderr so `kubectl logs <runner-pod>`
+            // shows WHY the backup failed. The status ConfigMap (below) is
+            // best-effort and may be unwritable (RBAC / apiserver), so stderr is
+            // the reliable operator-facing signal — never swallow the error.
+            eprintln!("backup failed: {e}");
+            RunOutcome::Failure {
+                error: format!("{e}"),
+            }
+        }
     };
 
     // 4. Status ConfigMap — BEST-EFFORT. A write failure is logged but does NOT

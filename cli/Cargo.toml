@@ -14,7 +14,7 @@ members = [
 # Bumped to match each released patch tag per the CONTRIBUTING.md
 # "Versioning" rule. Drifted at 0.1.2 from initial v0.1.2 commit
 # through v0.1.76; the policy starts at v0.1.77.
-version      = "0.2.32"
+version      = "0.2.33"
 edition      = "2021"
 rust-version = "1.88"
 license      = "FSL-1.1-Apache-2.0"

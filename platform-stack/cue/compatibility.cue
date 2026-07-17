@@ -1760,9 +1760,43 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.42": {
+	change:          "safe"
+	operatorVersion: "v0.2.33"
+	notes: """
+		Fixes the 2.6d-4 backup RUNNER so a scheduled backup actually completes —
+		0.2.41 wired the operator projection but the runner's RBAC + one code path
+		were wrong, so every backup Job crash-looped (found only on the real-Hetzner
+		S3 walk; unit/CRD/review all passed). Five fixes:
+
+		1. RBAC `pods: patch` — the runner server-side-APPLIES the pg_dump helper
+		   Pod (SSA is a PATCH); the rule granted only create/get/delete → 403.
+		2. RBAC `pods/exec: get` — kube-rs's WebSocket exec is a GET upgrade (not
+		   the POST/`create` kubectl uses) → 403 on the exec.
+		3. RBAC `secrets: list` — the sweep enumerates each app namespace's
+		   secrets; the rule granted only `get` → 403.
+		4. RBAC `sourcecredentials` (apprafter.io) — the config-CR sweep lists
+		   `SourceCredential`s (ADR 0039); the resource was absent from the rule.
+		5. RBAC `configmaps: create` split out of the resourceNames-scoped rule
+		   (`create` cannot be name-restricted — it was silently forbidden).
+
+		The runner-image code fixes (a singular→plural `secrets` resource string
+		that kube-rs discovery couldn't resolve, + the failure now prints to stderr
+		for `kubectl logs` visibility) ride the new runner image
+		`apprafter-backup:v0.2.33`. change=safe: additive default-off; existing
+		components byte-unchanged.
+		"""
+	references: [
+		"docs/superpowers/specs/2026-07-16-2-6d-4-s3-push-design.md",
+		"docs/adr/0050-backup-restore.md",
+	]
+}
+
 compatibility: "0.2.41": {
 	change:          "safe"
 	operatorVersion: "v0.2.33"
+	yanked:          true
+	yankedReason:    "backup runner crash-loops: the runner ClusterRole lacked pods:patch (SSA helper pod), pods/exec:get (kube-rs WebSocket exec), secrets:list, and sourcecredentials — every scheduled backup Job failed 403 before writing a snapshot. Fixed in 0.2.42 (+ runner image v0.2.33)."
 	notes: """
 		Lands the OPERATOR side of 2.6d-4 that 0.2.40 was missing. 0.2.40 shipped
 		the `backup` chart component but carried `operatorVersion: v0.2.32` — a

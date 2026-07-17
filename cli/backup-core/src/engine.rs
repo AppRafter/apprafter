@@ -290,7 +290,10 @@ pub fn read_secret_data(
     name: &str,
     namespace: &str,
 ) -> Result<Option<(BTreeMap<String, Vec<u8>>, String)>> {
-    let args = vec!["get", "secret", name, "-n", namespace, "-o", "json"];
+    // Canonical PLURAL `secrets`: kubectl (the CLI's `KubectlExec`) accepts the
+    // singular, but the in-cluster `KubeRsExec` resolves resources by exact
+    // plural via API discovery, so `secret` fails there. `secrets` works for both.
+    let args = vec!["get", "secrets", name, "-n", namespace, "-o", "json"];
     let Some(json) = k.get_json(&args)? else {
         return Ok(None);
     };
