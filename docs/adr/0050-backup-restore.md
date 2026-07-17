@@ -239,6 +239,34 @@ DR gets it without the platform forcing a bucket purchase on anyone else.
   ConfigMap (so Argo CD won't reconcile it away); `apprafter backup status`
   reads it plus the Job outcomes.
 
+### 2.6d-4 as-built notes (delivery mechanics)
+
+Recording where the shipped form differs from the loose design wording, so a
+future reader isn't misled:
+
+- **Delivery = a direct chart template, not a `#Component`.** The backup
+  resources (SA + scoped ClusterRole/-Binding + the two CronJobs + the
+  CiliumNetworkPolicy) render straight into the platform-stack umbrella chart's
+  `templates/backup.yaml`, guarded wholesale by `{{- if .Values.backup.enabled
+  }}` — there is no `component_backup.cue`/`_components` entry and thus no
+  self-managed Argo CD `Application` for backup. These are the umbrella's own
+  static manifests (not a third-party chart to wrap), so a direct value-gated
+  template is the right form; prune-on-disable is equivalent, and the absent
+  health-tile matches the "no first-class backup health condition" non-goal.
+- **`spec.backup` → chart values is operator-rendered (V8), not passthrough.**
+  The `PlatformController`'s `platform-stack::desired.rs::build()` explicitly
+  does `values["backup"] = serde_json::to_value(spec.backup)` (like
+  `spec.network`, unlike the `spec.values.*` cherry-pick) — so landing a new
+  typed `spec.*` block always needs a matching `build()` mapping + an operator
+  release, never bare passthrough.
+- **Runner SA verbs follow the kube-rs client, not kubectl.** The runner uses
+  server-side apply for the helper Pod (`pods: patch`, not just `create`) and a
+  WebSocket exec (`pods/exec: get`, not the POST/`create` kubectl uses). `pods:
+  patch` on app namespaces is formally broader than `create` (patching a
+  foreign Pod = image swap), but given the already-accepted namespace-wide
+  `pods/exec` on the same SA it does not change the SA's effective power —
+  accepted, single-tenant T1.
+
 ## Consequences
 
 - **Easier:** a Tier-1 operator can take an encrypted backup and restore it

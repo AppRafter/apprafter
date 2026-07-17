@@ -487,6 +487,15 @@ operator-side `check` when your provider can't express the scoped-delete policy
 and you disabled the in-cluster check (`--check-cron off`), or any time you want
 a manual verification with full credentials.
 
+> **Where check failures surface.** The weekly in-cluster check runs `restic`
+> directly (the runner binary has no check-only mode), so a failed check shows
+> up as a **`Failed` Job** in `apprafter-system` (kept per
+> `failedJobsHistoryLimit`) — it does **not** write the `apprafter-backup-status`
+> ConfigMap (only the backup runner does). So `apprafter backup status` reflects
+> the last *backup* outcome; for the last *check* outcome, look at the
+> `apprafter-backup-check` Job history (`kubectl get jobs -n apprafter-system`)
+> or run `apprafter backup check` yourself.
+
 ```
 apprafter backup unlock [--repo s3:…] [--credential-file <dotenv>]
 ```
