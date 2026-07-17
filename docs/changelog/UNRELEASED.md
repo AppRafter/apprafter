@@ -9,6 +9,65 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.32 / operator v0.2.32 / platform-stack 0.2.40 / apprafter-backup:v0.2.32 — 2.6d-4 automated off-site S3 backup (opt-in) (2026-07-17)
+
+Turns the operator-machine local-pull `apprafter backup` into an **opt-in**
+scheduled in-cluster CronJob pushing the same encrypted restic repo to a
+user-configured external S3 bucket. Zero forced bucket purchase; local-pull
+stays the default. Cross-workspace coordinated release.
+
+### Added
+
+- **`apprafter-backup` runner** — a new in-cluster CronJob binary
+  (`cli/apprafter-backup/`) on the shared `cli/backup-core/` engine (KubeExec +
+  ResticRunner traits, `pg_dump -Fc` + ephemeral restic), published as its own
+  `ghcr.io/apprafter/apprafter-backup:v*` image (own `apprafter-backup/v*` tag
+  stream via `release-backup-runner.yml`).
+- **`PlatformStack.spec.backup`** typed config (opt-in, `enabled: false`
+  default): `bucket`, `credentialRef.name`, `schedule`, `stagingMode`,
+  `stagingSizeLimit`, `retention.{keepDaily,keepWeekly,keepMonthly,enforce}`,
+  `checkSchedule`, `checkReadData`, `failureWebhook`. Operator projects it onto
+  the chart's `.Values.backup`.
+- **Chart delivery** (platform-stack `templates/backup.yaml`, guarded by
+  `{{- if .Values.backup.enabled }}`): a scoped ServiceAccount +
+  ClusterRole/-Binding, a nightly backup CronJob, a weekly `restic check`
+  CronJob, and a CiliumNetworkPolicy pinning the runner's egress (DNS +
+  apiserver + world:443). Credentials never live in values — only
+  `credentialRef.name`, mounted via `envFrom: secretRef`.
+- **CLI verbs** — `apprafter backup enable/disable/status/prune/check/unlock`.
+  `enable`/`disable`/`status` are declarative merge-patches of
+  `spec.backup` after a fail-closed preflight (restic ≥ 0.14, the sealed
+  credential Secret exists, repo reachability, an explicit
+  `--i-have-saved-credentials` DR confirmation). `prune`/`check`/`unlock` run
+  operator-side with the operator's full S3 creds (`--credential-file` dotenv
+  or env), never from the cluster; `prune` is host+format-aware and stamps
+  `apprafter.io/last-prune`.
+- **`--staging-mode monolithic|sequential`** on the local-pull `backup`, and
+  **`restore s3:… --credential-file`** — the operator-creds contract for
+  restoring from a remote repo (AWS_* + RESTIC_PASSWORD from a dotenv/env,
+  never the cluster); restore auto-detects the backup format via the manifest
+  version.
+
+### Retention & credentials model
+
+- Host+format-aware retention: the runner backs up under a fixed
+  `--host apprafter-backup` so restic's `forget` grouping is stable; the pure
+  `plan_prune` keeps daily/weekly/monthly representatives (default 7/4/6) over
+  the manifest snapshots and forgets by explicit id. **Not** S3 bucket
+  lifecycle rules (content-addressed packs would corrupt).
+- Two-tier scoped creds: the operator owns full creds outside the cluster;
+  the in-cluster Secret (default `enforce: operator`) should be scoped to
+  Put/Get/List + Delete only on `locks/*` so a compromise can't erase history.
+  Append-only protects integrity/availability, NOT confidentiality (that rests
+  on the passphrase, kept off the cluster).
+
+### Validation
+
+- `e2e/backup-s3-hetzner.sh` (real-Hetzner monolithic, user-gated on the
+  user's S3 bucket) + `e2e/backup-s3-sequential-kind.sh` (kind+MinIO
+  sequential-format). ADR 0050 amended (K8up rejected → AppRafter
+  CronJob-restic; retention + stagingMode + scoped-creds model).
+
 ## cli v0.2.31 — 2.6d T13 restore --reprovision (clone-to-new) (2026-07-16)
 
 CLI-only. Wires the last deferred 2.6d restore mode. No operator/chart/schema change.

@@ -2,7 +2,11 @@
 
 ## Status
 
-`Accepted` (2026-06-21).
+`Accepted` (2026-06-21). **Amended 2026-07-17** — the Phase-4 follow-on
+"automated off-site S3 push" was pulled up and delivered as **2.6d-4**; the
+open scheduled-runner decision (K8up vs AppRafter CronJob-restic) is now
+**resolved in favour of an AppRafter CronJob-restic runner** (see the
+off-site-push section under Decision + the K8up entry under Alternatives).
 
 ## Context
 
@@ -176,6 +180,65 @@ version as the backup (`manifest.platformVersion`). A cross-version restore is
 not blocked but **warns** — a different target version may re-render
 components, so the operator verifies after restoring.
 
+### Off-site scheduled S3 push (2.6d-4)
+
+The local-pull `backup` above is the default and stays so. **2.6d-4** adds an
+**opt-in** scheduled push of the same encrypted restic repo to a
+user-configured external S3 bucket, so a Tier-1 operator who *wants* off-site
+DR gets it without the platform forcing a bucket purchase on anyone else.
+
+- **Runner = an AppRafter CronJob running the `apprafter-backup` binary**, not
+  a third-party operator. The binary reuses the *same* `backup-core` engine as
+  the local-pull `backup` (the KubeExec + ResticRunner traits, `pg_dump -Fc` +
+  ephemeral restic), so there is one backup code path, not two. Delivery is
+  chart-owned: the platform-stack chart's `templates/backup.yaml` (guarded
+  entirely by `{{- if .Values.backup.enabled }}`) emits a scoped
+  ServiceAccount + ClusterRole/-Binding, a nightly backup CronJob, a weekly
+  `restic check` CronJob, and a CiliumNetworkPolicy pinning the runner's
+  egress. The operator projects `PlatformStack.spec.backup` onto
+  `.Values.backup`; the runner image is its own `apprafter-backup/v*` tag
+  stream, pinned in the chart via `.Values.backup.image`.
+- **Config lives on `PlatformStack.spec.backup`** (GitOps-native, opt-in,
+  default off). The CLI verbs `apprafter backup enable/disable/status` are
+  declarative merge-patches of that block after a fail-closed preflight
+  (restic ≥ 0.14, the sealed credential Secret exists, repo reachability, an
+  explicit DR-credentials-saved confirmation).
+- **Staging mode** — `monolithic` (default): stage every namespace's native
+  data at once, one snapshot per run (manifest format v1). `sequential`
+  (opt-in): stage + snapshot one claim at a time, writing the manifest
+  snapshot **last** as the commit-point, so peak staging disk is bounded by
+  the largest single claim rather than the sum. Restore auto-detects the
+  format via the manifest version.
+- **Retention is restic's own, host+format-aware.** The runner backs up under
+  a fixed `--host apprafter-backup` so restic's `forget` grouping is stable
+  (pod-name hosts would make every snapshot its own group and silently retain
+  everything). The pure `plan_prune` keeps daily/weekly/monthly
+  representatives (default 7/4/6) computed over the *manifest* snapshots and
+  deletes whole run-sets by tag + sweeps orphans, then forgets by **explicit
+  id** — never trusting restic's own keep-policy grouping. Prune is the
+  operator-side `apprafter backup prune` verb (full creds, outside the
+  cluster) by default; it stamps `apprafter.io/last-prune`. **Bucket
+  lifecycle rules are the wrong tool** — restic packs many snapshots into
+  content-addressed pack files, so an object-age lifecycle rule would delete
+  still-referenced packs and corrupt the repo; retention MUST flow through
+  `restic forget --prune`.
+- **Two-tier scoped credentials.** The operator owns the *full* S3 creds
+  outside the cluster (for prune + DR restore). The in-cluster Secret, in the
+  default `enforce: operator` model, should carry creds scoped to
+  Put/Get/List + Delete only on `locks/*` — so a cluster compromise can
+  rotate/stale-lock but cannot erase backup history (integrity + availability
+  of the history survive). `enforce: cluster` instead puts full creds in the
+  cluster Secret and runs `forget --prune` in the Job. **Confidentiality
+  caveat:** scoped-delete protects integrity/availability, NOT confidentiality
+  — anyone with the cluster creds can still *read* every snapshot; restic
+  encryption means confidentiality rests on the passphrase, which is why the
+  passphrase stays off the cluster and must be saved out-of-band.
+- **Credentials never live in chart values** — only `credentialRef.name`
+  names a Secret in `apprafter-system`, mounted via `envFrom: secretRef`. The
+  runner self-reports into a non-chart-owned `apprafter-backup-status`
+  ConfigMap (so Argo CD won't reconcile it away); `apprafter backup status`
+  reads it plus the Job outcomes.
+
 ## Consequences
 
 - **Easier:** a Tier-1 operator can take an encrypted backup and restore it
@@ -203,6 +266,16 @@ components, so the operator verifies after restoring.
   uniform with the volume/redis dumps.
 - **An always-on object-storage default — rejected** for the same
   zero-forced-purchase reason. Automated S3 push stays **opt-in** (below).
+- **K8up as the scheduled runner — rejected (2.6d-4).** K8up is a mature
+  CNCF restic-based backup operator with scheduling, prune/check, and an
+  app-aware `backupcommand`. It was the earlier lean, but adopting it means a
+  whole new in-cluster operator + its CRDs + its own scheduling/credential
+  model running *alongside* the `backup-core` engine we already ship and
+  control — two backup code paths, more RBAC surface, and a dependency the
+  "one way to do things" principle resists. An AppRafter CronJob invoking the
+  same `apprafter-backup` binary reuses the existing `pg_dump`+ephemeral-restic
+  engine, keeps retention format-aware in code we own, and adds no operator
+  dependency. K8up may still fit a Tier-2+ managed profile later.
 
 ## Risks
 
