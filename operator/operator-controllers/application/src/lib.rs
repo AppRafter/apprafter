@@ -13,13 +13,14 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{LocalObjectReference, Secret, Service};
+use k8s_openapi::api::core::v1::{LocalObjectReference, ObjectReference, Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
+use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
 use kube::runtime::watcher;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -30,12 +31,12 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
-    resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
-    ApplicationSpec, ApplicationStatus, DestructiveChange, DiskClaim, EgressProfile, Metrics,
-    MigrationPlan, PlatformStack, PlatformStackValues, ResourceClaim, SourceCredential,
-    StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
-    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
-    PHASE_ENV_SECRET_MISSING,
+    image_repo, resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
+    ApplicationSpec, ApplicationStatus, DestructiveChange, DiskClaim, EgressProfile, EnvValue,
+    Metrics, MigrationPlan, Needs, PlatformStack, PlatformStackValues, ResourceClaim,
+    SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
+    COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
+    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
 };
 // 2.16b Task 11: the app-scope migration classifier is now WIRED into
 // `reconcile_application`'s state machine (was a deferred "feature flag"
@@ -55,6 +56,11 @@ const KIND: &str = "Application";
 /// owns under this name, so future controllers (e.g. operators
 /// extending Applications) can co-own without conflicts.
 pub const FIELD_MANAGER: &str = "apprafter-operator";
+
+/// `reportingController` stamped on the Kubernetes Events this controller
+/// publishes (2.16b `SoftDestructiveChange`). Mirrors the pattern in the
+/// scheduler / provisioner / platform-stack controllers.
+const EVENT_REPORTER_CONTROLLER: &str = "apprafter-application-controller";
 
 /// Minimum interval between registry HEAD probes for the SAME tag
 /// (2.4h Fix 1 / ADR 0040). The controller reconciles on a 60s requeue
@@ -120,6 +126,12 @@ pub async fn run(
     // (resume from the AwaitingResourceClaim pause). Clone the client
     // BEFORE it moves into Context.
     let claims: Api<ResourceClaim> = Api::all(client.clone());
+    // 2.16b (R3-mn-a): watch the app-scope MigrationPlan children so a plan
+    // reaching `completed` (Task 8: a same-ns child with a controlling
+    // ownerRef → the Application) re-fires the owning Application reconcile
+    // IMMEDIATELY (instant consume → ConsumeApply), instead of waiting for
+    // the 30s paused-arm requeue. Mirrors the `.owns(claims)` shape below.
+    let plans: Api<MigrationPlan> = Api::all(client.clone());
     let context = Arc::new(Context {
         client,
         metrics,
@@ -130,6 +142,7 @@ pub async fn run(
 
     Controller::new(apps, watcher::Config::default())
         .owns(claims, watcher::Config::default())
+        .owns(plans, watcher::Config::default())
         .run(reconcile, error_policy, context)
         .for_each(|res| async move {
             match res {
@@ -229,13 +242,22 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         .status
         .as_ref()
         .and_then(|s| s.last_applied_spec.clone());
-    let change: Option<DestructiveChange> = match &baseline_spec {
-        None => None,
-        Some(baseline_spec) => {
-            let old_eff = effective_baseline(baseline_spec);
-            ApplicationMigrationStrategy::detect_destructive(&old_eff, &new_eff)
+    // 2.16b (R3-mn-d): SOFT-destructive notes for the *non-gated* path. When
+    // there IS a baseline but NO hard change, an edit may still be
+    // soft-destructive (env literal removal, selector/size change, image tag
+    // change, scale-down) — those roll through un-gated but earn a
+    // `SoftDestructiveChange` Event so operators notice. Computed here where
+    // both effective specs are in scope; emitted best-effort after the apply
+    // succeeds (only when `change.is_none()`).
+    let mut change: Option<DestructiveChange> = None;
+    let mut soft_notes: Vec<String> = Vec::new();
+    if let Some(baseline_spec) = &baseline_spec {
+        let old_eff = effective_baseline(baseline_spec);
+        change = ApplicationMigrationStrategy::detect_destructive(&old_eff, &new_eff);
+        if change.is_none() {
+            soft_notes = soft_destructive_notes(&old_eff, &new_eff);
         }
-    };
+    }
 
     // 2. Find the (at most one) key-matching plan of ANY phase and bucket
     // it against the change. `find_any_key_plan` (no blocking filter) is
@@ -285,7 +307,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                 "destructive change detected — creating gating MigrationPlan"
             );
             ssa_apply_plan(&ctx.client, &namespace, &mp, &pp).await?;
-            let status = build_paused_status(&app, &plan_name);
+            let status = build_paused_status(&app, &namespace, &plan_name);
             apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
             ctx.metrics
                 .reconcile_total
@@ -301,7 +323,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                 %name, %namespace, plan = %plan_name,
                 "destructive change already gated by a matching MigrationPlan — staying paused"
             );
-            let status = build_paused_status(&app, &plan_name);
+            let status = build_paused_status(&app, &namespace, &plan_name);
             apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
             ctx.metrics
                 .reconcile_total
@@ -328,7 +350,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                 "superseding stale/relic MigrationPlan with a fresh gating plan"
             );
             ssa_apply_plan(&ctx.client, &namespace, &mp, &pp).await?;
-            let status = build_paused_status(&app, &plan_name);
+            let status = build_paused_status(&app, &namespace, &plan_name);
             apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
             ctx.metrics
                 .reconcile_total
@@ -719,6 +741,30 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     status = with_stamped_baseline(status, &app.spec);
     apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
 
+    // 2.16b (R3-mn-d): a non-gated but SOFT-destructive edit rolled through —
+    // publish ONE `SoftDestructiveChange` Event on the Application so
+    // operators notice. `soft_notes` is populated ONLY on the `change.is_none()`
+    // path (see the diff block above), so reaching here with a non-empty list
+    // means a soft-destructive, un-gated edit was applied. Best-effort: a
+    // publish failure is logged, never fatal.
+    if !soft_notes.is_empty() {
+        let note = format!(
+            "soft-destructive changes applied (not gated): {}",
+            soft_notes.join("; ")
+        );
+        let recorder = build_recorder(&ctx.client, &app);
+        let ev = KubeEvent {
+            type_: EventType::Normal,
+            reason: "SoftDestructiveChange".into(),
+            note: Some(note),
+            action: "Reconcile".into(),
+            secondary: None,
+        };
+        if let Err(e) = recorder.publish(ev).await {
+            warn!(%name, %namespace, error = %e, "failed to publish SoftDestructiveChange event (continuing)");
+        }
+    }
+
     // 2.16b Task 11: `ConsumeApply` — delete the completed plan AFTER the
     // render + baseline stamp landed (crash-order render → stamp → delete).
     // A crash between the stamp and this delete re-enters as
@@ -842,8 +888,7 @@ async fn apply_service(
 /// Namespace + name of the singleton `PlatformStack` (CLI-bootstrap-seeded
 /// in `apprafter-system`; see `cluster_bootstrap.rs`). Duplicated rather
 /// than imported from the platform-stack controller crate to avoid a
-/// circular workspace-internal dep (mirrors how `MIGRATION_PLAN_NAMESPACE`
-/// is duplicated above).
+/// circular workspace-internal dep.
 const PLATFORM_STACK_NAMESPACE: &str = "apprafter-system";
 const PLATFORM_STACK_NAME: &str = "default";
 
@@ -1295,18 +1340,128 @@ fn build_status(
     }
 }
 
-/// Namespace where *platform-scope* MigrationPlan CRs live
-/// (see spec.md §3.8). Still used for platform plans + the
-/// paused-status message. 2.16b app-scope plans instead land in
-/// the Application's own namespace — see `blocking_plan_namespace`.
-const MIGRATION_PLAN_NAMESPACE: &str = "apprafter-system";
-
 /// 2.16b Task 9 (R1-H1): app-scope MigrationPlans are created in
 /// the Application's own namespace (Task 8), so the blocking-plan
 /// finder searches *there*, not the platform `apprafter-system`.
 /// Pure + trivial for unit-testability of the namespace choice.
 fn blocking_plan_namespace(app_ns: &str) -> String {
     app_ns.to_string()
+}
+
+/// 2.16b (R3-mn-d): the human notes for SOFT-destructive changes from
+/// `old` → `new` (two **effective** specs). Soft-destructive changes are
+/// NOT gated (no MigrationPlan) but SHOULD surface a `SoftDestructiveChange`
+/// Kubernetes Event so operators notice a potentially-disruptive-but-allowed
+/// edit rolled through.
+///
+/// This is the deliberate COMPLEMENT of
+/// [`ApplicationMigrationStrategy::detect_destructive`]: every op the
+/// classifier treats as HARD (env-ref removal, needs-removal, image-*repo*
+/// change, scale-to-zero, public-visibility/domain change) is intentionally
+/// absent here — those pause the app and already surface a MigrationPlan.
+/// The soft set is:
+///
+///   * env **literal** removal → `removed env <KEY> (literal)`
+///   * `needs.*.selector` change (deferred — 2.4d) → `changed <key> selector`
+///   * `needs.*.size` change (provisioner-guarded — V14) → `changed <key> size`
+///   * image **tag** change (repo unchanged) → `image tag <old>→<new>`
+///   * scale-DOWN N→M with M>0 → `scaled down <N>→<M>`
+///
+/// Order is deterministic (env keys by BTreeMap order, then needs by
+/// `Needs::entries`' fixed order, then image, then scale) so the joined
+/// Event note is stable across reconciles.
+fn soft_destructive_notes(old: &ApplicationBaseSpec, new: &ApplicationBaseSpec) -> Vec<String> {
+    let mut notes: Vec<String> = Vec::new();
+
+    // Env LITERAL removal (a ref removal is HARD — handled by the classifier).
+    let new_env_keys: Vec<&String> = new
+        .env
+        .as_ref()
+        .map(|m| m.keys().collect())
+        .unwrap_or_default();
+    if let Some(old_env) = old.env.as_ref() {
+        for (key, value) in old_env {
+            if new_env_keys.contains(&key) {
+                continue;
+            }
+            if let EnvValue::Literal(_) = value {
+                notes.push(format!("removed env {key} (literal)"));
+            }
+        }
+    }
+
+    // needs.*.selector / needs.*.size changes on a need present on BOTH sides.
+    // (A removed need is HARD; an added need is neutral — neither is soft.)
+    let old_map = needs_by_key(old.needs.as_ref());
+    let new_map = needs_by_key(new.needs.as_ref());
+    for (key, old_need) in &old_map {
+        let Some(new_need) = new_map.get(key) else {
+            continue; // removed — hard, not soft
+        };
+        if old_need.selector != new_need.selector {
+            notes.push(format!("changed {key} selector"));
+        }
+        if old_need.size != new_need.size {
+            notes.push(format!("changed {key} size"));
+        }
+    }
+
+    // Image TAG change (repo unchanged; a repo change is HARD). Only when both
+    // sides carry an image AND the repository is identical — the differing
+    // suffix is the tag.
+    if let (Some(old_img), Some(new_img)) = (old.image.as_deref(), new.image.as_deref()) {
+        if old_img != new_img && image_repo(old_img) == image_repo(new_img) {
+            notes.push(format!("image tag {old_img}→{new_img}"));
+        }
+    }
+
+    // Scale-DOWN N→M, M>0 (scale-to-zero is HARD; scale-up is neutral).
+    // `replicas` resolves to 1 at render time (application.cue), matching the
+    // classifier's REPLICAS_RENDER_DEFAULT.
+    const REPLICAS_RENDER_DEFAULT: i32 = 1;
+    let old_r = old.replicas.unwrap_or(REPLICAS_RENDER_DEFAULT);
+    let new_r = new.replicas.unwrap_or(REPLICAS_RENDER_DEFAULT);
+    if new_r > 0 && new_r < old_r {
+        notes.push(format!("scaled down {old_r}→{new_r}"));
+    }
+
+    notes
+}
+
+/// 2.16b: build a per-reconcile `Recorder` publishing Events against the
+/// given `Application`. Constructing per-reconcile keeps `reconcile` pure;
+/// `Recorder::new` is cheap (wires an Api + reference). Mirrors the scheduler
+/// / provisioner / platform-stack `build_recorder`.
+fn build_recorder(client: &Client, app: &Application) -> Recorder {
+    let reporter = Reporter {
+        controller: EVENT_REPORTER_CONTROLLER.into(),
+        instance: std::env::var("POD_NAME").ok(),
+    };
+    let reference: ObjectReference = app.object_ref(&());
+    Recorder::new(client.clone(), reporter, reference)
+}
+
+/// 2.16b: flatten a `Needs` block into a `key → ServiceNeed` map keyed on
+/// the stable `needs.<type>[.<name>]` key (matching the classifier's
+/// `needs_keys`). Disk entries carry no `ServiceNeed` (`selector`/`size`
+/// live on services) so they're skipped — a disk `size` change is handled
+/// by the 2.6b PVC-expansion path, not here.
+fn needs_by_key(needs: Option<&Needs>) -> BTreeMap<String, operator_core::ServiceNeed> {
+    let mut out = BTreeMap::new();
+    let Some(needs) = needs else {
+        return out;
+    };
+    for (ty, entry) in needs.entries() {
+        let Some(service) = entry.service else {
+            continue;
+        };
+        let key = match entry.name {
+            Some(name) => format!("needs.{ty}.{name}"),
+            None => format!("needs.{ty}"),
+        };
+        out.insert(key, service);
+    }
+    out
 }
 
 /// 2.16b Task 11: delete every app-namespace MigrationPlan gating the
@@ -1692,7 +1847,7 @@ fn is_deletion_marked(app: &Application) -> bool {
 ///     health Lua, alertmanager) see the platform halted.
 ///   * `MigrationPending=True` carrying the plan name in
 ///     `message` for direct `kubectl describe` discovery.
-fn build_paused_status(app: &Application, plan_name: &str) -> ApplicationStatus {
+fn build_paused_status(app: &Application, plan_ns: &str, plan_name: &str) -> ApplicationStatus {
     let previous_conditions = app
         .status
         .as_ref()
@@ -1705,11 +1860,11 @@ fn build_paused_status(app: &Application, plan_name: &str) -> ApplicationStatus 
         "MigrationPending",
         &format!(
             "paused awaiting approval of MigrationPlan \
-             {MIGRATION_PLAN_NAMESPACE}/{plan_name}"
+             {plan_ns}/{plan_name}"
         ),
         previous_conditions,
     );
-    let pending = migration_pending_condition(plan_name, previous_conditions);
+    let pending = migration_pending_condition(plan_ns, plan_name, previous_conditions);
 
     ApplicationStatus {
         phase: Some(PHASE_AWAITING_MIGRATION_APPROVAL.to_string()),
@@ -1793,6 +1948,7 @@ fn migration_failed_condition(
 }
 
 fn migration_pending_condition(
+    plan_ns: &str,
     plan_name: &str,
     previous: &[ApplicationCondition],
 ) -> ApplicationCondition {
@@ -1806,9 +1962,10 @@ fn migration_pending_condition(
         status: "True".to_string(),
         last_transition_time,
         reason: "MigrationPlanPending".to_string(),
-        message: format!(
-            "MigrationPlan {MIGRATION_PLAN_NAMESPACE}/{plan_name} is awaiting approval"
-        ),
+        // 2.16b (Task 11 review Risk 2): app-scope plans live in the APP
+        // namespace (Task 8), not `apprafter-system` — surface the plan's
+        // real namespace so `kubectl describe migrationplan -n <ns>` lands.
+        message: format!("MigrationPlan {plan_ns}/{plan_name} is awaiting approval"),
         observed_generation: None,
     }
 }
@@ -2606,7 +2763,9 @@ mod tests {
             previous_spec_snapshot: None,
         };
         let mut plan = MigrationPlan::new(name, spec);
-        plan.metadata.namespace = Some(MIGRATION_PLAN_NAMESPACE.into());
+        // 2.16b: app-scope plans are co-located in the APP namespace (Task 8),
+        // so the fixture's metadata.namespace mirrors the app's own ns.
+        plan.metadata.namespace = Some(target_ns.into());
         if let Some(p) = phase {
             plan.status = Some(MigrationPlanStatus {
                 phase: Some(p.into()),
@@ -2637,7 +2796,8 @@ mod tests {
             previous_spec_snapshot: None,
         };
         let mut plan = MigrationPlan::new(name, spec);
-        plan.metadata.namespace = Some(MIGRATION_PLAN_NAMESPACE.into());
+        // Platform-scope plans live in the platform `apprafter-system` ns.
+        plan.metadata.namespace = Some("apprafter-system".into());
         plan
     }
 
@@ -2752,7 +2912,7 @@ mod tests {
             environment: None,
             last_applied_spec: None,
         });
-        let status = build_paused_status(&app, "web-prod-migration-1");
+        let status = build_paused_status(&app, "team-a", "web-prod-migration-1");
 
         assert_eq!(
             status.phase.as_deref(),
@@ -2780,6 +2940,14 @@ mod tests {
             .expect("migration pending");
         assert_eq!(pending.status, "True");
         assert!(pending.message.contains("web-prod-migration-1"));
+        // 2.16b (Task 11 review Risk 2): the message references the plan's
+        // REAL namespace (the app namespace), not the platform
+        // `apprafter-system` — an app-scope plan lives in the app's own ns.
+        assert!(pending.message.contains("team-a/web-prod-migration-1"));
+        assert!(!pending.message.contains("apprafter-system"));
+        // The Ready condition message carries the same real namespace.
+        assert!(ready.message.contains("team-a/web-prod-migration-1"));
+        assert!(!ready.message.contains("apprafter-system"));
     }
 
     #[test]
@@ -2787,12 +2955,192 @@ mod tests {
         // First reconcile that pauses before ever succeeding:
         // app.status is None. Endpoint stays None too.
         let app = Application::new("web", ApplicationSpec::default());
-        let status = build_paused_status(&app, "plan-1");
+        let status = build_paused_status(&app, "team-a", "plan-1");
         assert!(status.endpoint_url.is_none());
         assert_eq!(
             status.phase.as_deref(),
             Some(PHASE_AWAITING_MIGRATION_APPROVAL)
         );
+    }
+
+    // ---- 2.16b (R3-mn-d): soft-destructive notes (SoftDestructiveChange) ----
+
+    #[test]
+    fn soft_destructive_notes_lists_soft_ops() {
+        use operator_core::OneOrMany;
+
+        // old: env X=literal + needs.pg selector {tier: a}
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("X".to_string(), EnvValue::Literal("hi".into()));
+        let old = ApplicationBaseSpec {
+            env: Some(env),
+            needs: Some(Needs {
+                pg: Some(OneOrMany::One(pg_selector_need("a"))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // new: env X removed (soft literal removal) + needs.pg selector → {tier: b}
+        let new = ApplicationBaseSpec {
+            needs: Some(Needs {
+                pg: Some(OneOrMany::One(pg_selector_need("b"))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let notes = soft_destructive_notes(&old, &new);
+        // literal-env removal note names the KEY.
+        assert!(
+            notes.iter().any(|n| n.contains("env") && n.contains("X")),
+            "expected an env-X removal note, got {notes:?}"
+        );
+        // selector-change note mentions "selector".
+        assert!(
+            notes.iter().any(|n| n.to_lowercase().contains("selector")),
+            "expected a selector-change note, got {notes:?}"
+        );
+    }
+
+    /// A `needs.pg` `ServiceNeed` carrying only `selector: {tier: <tier>}`.
+    fn pg_selector_need(tier: &str) -> operator_core::ServiceNeed {
+        operator_core::ServiceNeed {
+            selector: Some(
+                [("tier".to_string(), tier.to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn soft_destructive_notes_empty_when_no_soft_change() {
+        use operator_core::{OneOrMany, ServiceNeed};
+        let s = ApplicationBaseSpec {
+            needs: Some(Needs {
+                pg: Some(OneOrMany::One(ServiceNeed::default())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(soft_destructive_notes(&s, &s).is_empty());
+    }
+
+    #[test]
+    fn soft_destructive_notes_covers_image_tag_and_scale_down_and_size() {
+        use operator_core::{OneOrMany, ServiceNeed};
+        let pg_sized = |size: &str| ServiceNeed {
+            size: Some(size.into()),
+            ..Default::default()
+        };
+        // image tag change (repo unchanged) → soft; scale down 3→2; pg size change.
+        let old = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/api:v1".into()),
+            replicas: Some(3),
+            needs: Some(Needs {
+                pg: Some(OneOrMany::One(pg_sized("10Gi"))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let new = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/api:v2".into()),
+            replicas: Some(2), // scale down N->M, M>0 → soft
+            needs: Some(Needs {
+                pg: Some(OneOrMany::One(pg_sized("20Gi"))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let notes = soft_destructive_notes(&old, &new);
+        assert!(
+            notes.iter().any(|n| n.contains("v1") && n.contains("v2")),
+            "expected an image-tag note, got {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("3") && n.contains("2")),
+            "expected a scale-down note, got {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.to_lowercase().contains("size")),
+            "expected a size note, got {notes:?}"
+        );
+    }
+
+    #[test]
+    fn soft_destructive_notes_ignores_hard_and_neutral_changes() {
+        use operator_core::{EnvRef, OneOrMany, ServiceNeed};
+        // env REF removal is hard-gated, not soft → not listed.
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "DB".to_string(),
+            EnvValue::Ref(EnvRef::Claim("pg.url".into())),
+        );
+        let old = ApplicationBaseSpec {
+            env: Some(env),
+            ..Default::default()
+        };
+        let new = ApplicationBaseSpec::default();
+        assert!(soft_destructive_notes(&old, &new).is_empty());
+
+        // scale UP (2->3) and scale-to-ZERO are NOT soft-destructive here.
+        let up = soft_destructive_notes(
+            &ApplicationBaseSpec {
+                replicas: Some(2),
+                ..Default::default()
+            },
+            &ApplicationBaseSpec {
+                replicas: Some(3),
+                ..Default::default()
+            },
+        );
+        assert!(
+            up.is_empty(),
+            "scale-up must not be a soft note, got {up:?}"
+        );
+        let to_zero = soft_destructive_notes(
+            &ApplicationBaseSpec {
+                replicas: Some(2),
+                ..Default::default()
+            },
+            &ApplicationBaseSpec {
+                replicas: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(
+            to_zero.is_empty(),
+            "scale-to-zero is HARD-gated, not a soft note, got {to_zero:?}"
+        );
+
+        // image REPO change is hard-gated, not soft.
+        let repo = soft_destructive_notes(
+            &ApplicationBaseSpec {
+                image: Some("ghcr.io/acme/api:v1".into()),
+                ..Default::default()
+            },
+            &ApplicationBaseSpec {
+                image: Some("ghcr.io/acme/other:v1".into()),
+                ..Default::default()
+            },
+        );
+        assert!(repo.is_empty(), "image-repo change is hard, got {repo:?}");
+
+        // adding a need is neutral (needs-removal is hard, needs-add is neutral).
+        let add = soft_destructive_notes(
+            &ApplicationBaseSpec::default(),
+            &ApplicationBaseSpec {
+                needs: Some(Needs {
+                    pg: Some(OneOrMany::One(ServiceNeed::default())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(add.is_empty(), "needs-add is neutral, got {add:?}");
     }
 
     #[test]
@@ -2810,7 +3158,7 @@ mod tests {
             message: "old message".into(),
             observed_generation: None,
         }];
-        let next = migration_pending_condition("plan-1", &prior);
+        let next = migration_pending_condition("team-a", "plan-1", &prior);
         assert_eq!(next.last_transition_time, "2026-05-22T12:00:00+00:00");
     }
 
