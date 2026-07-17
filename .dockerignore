@@ -1,0 +1,18 @@
+# Build artefacts must NOT be sent to the Docker build context.
+# Without this, any COPY from a repo-root context pushes the host's
+# full target/ trees (hundreds of GBs of debug/release objects and
+# incremental caches) into the builder — causing OOM on CI runners
+# and multi-minute context-upload stalls locally.
+#
+# This file covers the repo-root build context used by:
+#   cli/apprafter-backup/Dockerfile  (COPY cli/ ...)
+# The operator/ build uses its own sibling .dockerignore (context: operator/).
+cli/target/
+operator/target/
+
+# Local state and editor noise.
+.git/
+.gitignore
+**/*.swp
+**/.DS_Store
+result
