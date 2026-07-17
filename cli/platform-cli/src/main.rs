@@ -277,7 +277,29 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             BackupAction::Prune {
                 repo,
                 credential_file,
-            } => commands::backup::run_backup_prune(&repo, credential_file.as_deref())?,
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+            } => commands::backup::run_backup_prune(
+                repo.as_deref(),
+                credential_file.as_deref(),
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+            )?,
+            BackupAction::Check {
+                repo,
+                credential_file,
+                read_data,
+            } => commands::backup::run_backup_check(
+                repo.as_deref(),
+                credential_file.as_deref(),
+                read_data,
+            )?,
+            BackupAction::Unlock {
+                repo,
+                credential_file,
+            } => commands::backup::run_backup_unlock(repo.as_deref(), credential_file.as_deref())?,
             BackupAction::Enable {
                 bucket,
                 credential,

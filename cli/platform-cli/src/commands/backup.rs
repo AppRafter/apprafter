@@ -59,6 +59,8 @@ use std::time::Duration;
 
 use backup_core::engine::BackupOpts;
 use backup_core::extract::plan_extraction;
+use backup_core::prune::{run_prune, RetentionPolicy};
+use backup_core::restic::{restic_check_argv, restic_unlock_argv};
 use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
 use cli_core::{CliError, Result};
@@ -1131,24 +1133,272 @@ pub(crate) fn apply_creds_to_command(cmd: &mut Command, creds: &BTreeMap<String,
     }
 }
 
-/// `apprafter backup prune` — remove old snapshots from an S3-backed restic
-/// repository using the operator-supplied credentials.
+// ---------------------------------------------------------------------------
+// Operator-side restic maintenance verbs — prune / check / unlock
+//
+// These run OUTSIDE the cluster, on the operator's workstation, with the
+// operator's FULL S3 creds (from `--credential-file` or env). They reach an
+// `s3:` repo directly via a [`CredentialedRestic`] runner that injects the
+// AWS_* + RESTIC_PASSWORD env on every restic Command (unlike the in-cluster
+// scheduled path, which uses scoped creds mounted into the CronJob).
+// ---------------------------------------------------------------------------
+
+/// A [`ResticRunner`] that injects operator S3 credentials (AWS_* +
+/// RESTIC_PASSWORD) onto every restic subprocess, WITHOUT mutating the global
+/// process environment. Mirrors [`SubprocessRestic`]'s error handling
+/// (non-zero exit → `Err` carrying stderr), adding the creds on top so restic
+/// can reach an `s3:` repo the plain `SubprocessRestic` can't.
 ///
-/// **Stub — full implementation arrives in chunk 5 task 2.** Declared here so
-/// `parse_credential_file`, `resolve_operator_s3_creds`, and
-/// `apply_creds_to_command` are referenced from non-test production code,
-/// satisfying the dead-code lint without annotating the helpers with
-/// `#[allow(dead_code)]`.
-pub fn run_backup_prune(repo: &str, credential_file: Option<&Path>) -> Result<()> {
+/// The `ResticRunner` trait is declared over `cli_core::Result` — the SAME
+/// `Result`/`CliError` platform-cli uses — so these methods return exactly the
+/// caller's error type; no cross-error mapping is needed at the call sites.
+struct CredentialedRestic {
+    creds: BTreeMap<String, String>,
+}
+
+impl CredentialedRestic {
+    /// Build the restic Command for `argv`, applying the operator creds and the
+    /// `RESTIC_PASSWORD` env. `pass` and `creds["RESTIC_PASSWORD"]` are the same
+    /// value (`resolve_operator_s3_creds` guarantees the key is present); the
+    /// explicit `RESTIC_PASSWORD` set from `pass` honours the trait contract
+    /// while `apply_creds_to_command` carries the AWS_* keys.
+    fn command(&self, argv: &[String], pass: &str) -> Command {
+        let mut c = Command::new("restic");
+        c.args(argv);
+        apply_creds_to_command(&mut c, &self.creds);
+        c.env("RESTIC_PASSWORD", pass);
+        c
+    }
+}
+
+impl ResticRunner for CredentialedRestic {
+    fn run(&self, argv: &[String], pass: &str) -> Result<()> {
+        let out = self
+            .command(argv, pass)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+        if !out.status.success() {
+            return Err(CliError::Other(format!(
+                "restic {} failed (exit {:?}): {}",
+                argv.first().map(String::as_str).unwrap_or("?"),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    fn run_stdout(&self, argv: &[String], pass: &str) -> Result<String> {
+        let out = self
+            .command(argv, pass)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+        if !out.status.success() {
+            return Err(CliError::Other(format!(
+                "restic {} failed (exit {:?}): {}",
+                argv.first().map(String::as_str).unwrap_or("?"),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn run_backup(&self, argv: &[String], pass: &str) -> Result<Option<String>> {
+        // Not exercised by prune/check/unlock, but implemented for real (mirrors
+        // SubprocessRestic) so the trait stays honest for any future caller.
+        let stdout = self.run_stdout(argv, pass)?;
+        let snapshot_id = stdout.lines().find_map(|line| {
+            let obj: Value = serde_json::from_str(line.trim()).ok()?;
+            if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
+                obj.pointer("/snapshot_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        });
+        Ok(snapshot_id)
+    }
+}
+
+/// Resolve the target restic repo for an operator maintenance verb.
+///
+/// * `Some(repo)` — use the explicit `--repo` override verbatim.
+/// * `None` — read `PlatformStack/default.spec.backup.bucket`; error when
+///   backup is unconfigured (no `spec.backup.bucket`), directing the operator
+///   to pass `--repo` or run `apprafter backup enable`.
+fn resolve_backup_repo(repo_override: Option<&str>, kubeconfig: &Path) -> Result<String> {
+    if let Some(r) = repo_override {
+        return Ok(r.to_string());
+    }
+    let ps = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kubeconfig,
+    )?;
+    ps.as_ref()
+        .and_then(|p| p.pointer("/spec/backup/bucket"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CliError::Other(
+                "backup not configured — pass --repo or run `apprafter backup enable`".into(),
+            )
+        })
+}
+
+/// Compute the retention policy for a prune from the CR's `spec.backup` plus CLI
+/// `--keep-*` overrides.
+///
+/// Precedence per field: CLI override (`Some`) wins → else the CR's
+/// `.retention.{keepDaily,keepWeekly,keepMonthly}` when present → else the
+/// [`RetentionPolicy::default`] (7 / 4 / 6). Pure — the impure caller fetches
+/// `spec.backup` and reads the CLI flags.
+fn retention_from_spec_backup(
+    spec_backup: Option<&Value>,
+    keep_daily: Option<u32>,
+    keep_weekly: Option<u32>,
+    keep_monthly: Option<u32>,
+) -> RetentionPolicy {
+    let default = RetentionPolicy::default();
+    let cr = |key: &str| -> Option<u32> {
+        spec_backup
+            .and_then(|s| s.pointer(&format!("/retention/{key}")))
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+    };
+    RetentionPolicy {
+        keep_daily: keep_daily
+            .or_else(|| cr("keepDaily"))
+            .unwrap_or(default.keep_daily),
+        keep_weekly: keep_weekly
+            .or_else(|| cr("keepWeekly"))
+            .unwrap_or(default.keep_weekly),
+        keep_monthly: keep_monthly
+            .or_else(|| cr("keepMonthly"))
+            .unwrap_or(default.keep_monthly),
+    }
+}
+
+/// `apprafter backup prune` — format-aware retention prune of an off-site restic
+/// repo, run OUTSIDE the cluster with the operator's full S3 creds.
+///
+/// Resolves the repo (`--repo` → `spec.backup.bucket`) + creds
+/// (`--credential-file` → env), computes the retention policy (CLI overrides →
+/// CR → 7/4/6 default), then delegates the run-aware forget-set + prune to the
+/// chunk-1 [`run_prune`]. On success it stamps the PlatformStack
+/// `apprafter.io/last-prune` annotation with the current RFC3339 time so
+/// `apprafter backup status` can surface when the repo was last pruned.
+pub fn run_backup_prune(
+    repo_override: Option<&str>,
+    credential_file: Option<&Path>,
+    keep_daily: Option<u32>,
+    keep_weekly: Option<u32>,
+    keep_monthly: Option<u32>,
+) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
     let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
-    let mut cmd = Command::new("restic");
-    cmd.args(["forget", "--prune", "-r", repo]);
-    apply_creds_to_command(&mut cmd, &creds);
-    // parse_credential_file is also reachable via resolve_operator_s3_creds
-    // (called on the Some branch), so no explicit dummy call is needed here.
-    Err(CliError::Other(
-        "backup prune: not yet implemented — arrives in chunk 5 task 2".into(),
-    ))
+    let pass = creds["RESTIC_PASSWORD"].clone();
+
+    // Fetch the CR once: repo fallback (spec.backup.bucket) + retention defaults
+    // (spec.backup.retention) both read from it.
+    let ps = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?;
+    let spec_backup = ps.as_ref().and_then(|p| p.pointer("/spec/backup"));
+
+    let repo = match repo_override {
+        Some(r) => r.to_string(),
+        None => spec_backup
+            .and_then(|s| s.pointer("/bucket"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                CliError::Other(
+                    "backup not configured — pass --repo or run `apprafter backup enable`".into(),
+                )
+            })?,
+    };
+
+    let policy = retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
+
+    let runner = CredentialedRestic { creds };
+    run_prune(&runner, &repo, &pass, &policy)?;
+
+    // Stamp last-prune so `backup status` can report it. Best-effort ordering:
+    // the prune already succeeded, so a merge-patch failure here surfaces as an
+    // error (the annotation is the audit trail — we don't want to swallow it).
+    let ts = chrono::Utc::now().to_rfc3339();
+    let body = serde_json::json!({
+        "metadata": { "annotations": { "apprafter.io/last-prune": ts } }
+    })
+    .to_string();
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+
+    println!("✓ Pruned {repo}");
+    println!(
+        "  retention: keepDaily={} keepWeekly={} keepMonthly={}",
+        policy.keep_daily, policy.keep_weekly, policy.keep_monthly
+    );
+    println!("  last-prune stamped: {ts}");
+    Ok(())
+}
+
+/// `apprafter backup check` — verify an off-site restic repo's integrity
+/// (`restic check`, opt-in `--read-data` for a deep, full-download verify), run
+/// OUTSIDE the cluster with the operator's full S3 creds.
+pub fn run_backup_check(
+    repo_override: Option<&str>,
+    credential_file: Option<&Path>,
+    read_data: bool,
+) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
+    let pass = creds["RESTIC_PASSWORD"].clone();
+    let repo = resolve_backup_repo(repo_override, kc.path())?;
+
+    let runner = CredentialedRestic { creds };
+    runner.run(&restic_check_argv(&repo, read_data), &pass)?;
+
+    if read_data {
+        println!("✓ Repository check passed (deep --read-data verify).");
+    } else {
+        println!("✓ Repository check passed.");
+    }
+    Ok(())
+}
+
+/// `apprafter backup unlock` — remove STALE locks from an off-site restic repo
+/// (`restic unlock`; never touches live locks held by a concurrent run), run
+/// OUTSIDE the cluster with the operator's full S3 creds.
+pub fn run_backup_unlock(
+    repo_override: Option<&str>,
+    credential_file: Option<&Path>,
+) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
+    let pass = creds["RESTIC_PASSWORD"].clone();
+    let repo = resolve_backup_repo(repo_override, kc.path())?;
+
+    let runner = CredentialedRestic { creds };
+    runner.run(&restic_unlock_argv(&repo), &pass)?;
+
+    println!("✓ Stale locks removed.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1914,6 +2164,58 @@ mod tests {
             backup_disable_patch()["spec"]["backup"]["enabled"],
             serde_json::json!(false)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 5. retention_from_spec_backup (CLI override → CR → 7/4/6 default)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn retention_from_spec_backup_uses_cr_values() {
+        let spec = json!({
+            "bucket": "s3:x",
+            "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
+        });
+        let p = retention_from_spec_backup(Some(&spec), None, None, None);
+        assert_eq!(p.keep_daily, 10);
+        assert_eq!(p.keep_weekly, 8);
+        assert_eq!(p.keep_monthly, 12);
+    }
+
+    #[test]
+    fn retention_from_spec_backup_override_wins_over_cr() {
+        let spec = json!({
+            "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
+        });
+        // keep_daily override wins; the other two fall back to the CR.
+        let p = retention_from_spec_backup(Some(&spec), Some(3), None, None);
+        assert_eq!(p.keep_daily, 3);
+        assert_eq!(p.keep_weekly, 8);
+        assert_eq!(p.keep_monthly, 12);
+    }
+
+    #[test]
+    fn retention_from_spec_backup_all_unset_is_default_7_4_6() {
+        // No CR retention block and no overrides → the 7/4/6 default.
+        let p = retention_from_spec_backup(None, None, None, None);
+        assert_eq!(p.keep_daily, 7);
+        assert_eq!(p.keep_weekly, 4);
+        assert_eq!(p.keep_monthly, 6);
+        // A CR with no `.retention` also falls through to the default.
+        let spec = json!({ "bucket": "s3:x" });
+        let p2 = retention_from_spec_backup(Some(&spec), None, None, None);
+        assert_eq!(p2.keep_daily, 7);
+        assert_eq!(p2.keep_weekly, 4);
+        assert_eq!(p2.keep_monthly, 6);
+    }
+
+    #[test]
+    fn retention_override_applies_with_no_cr_retention() {
+        let spec = json!({ "bucket": "s3:x" });
+        let p = retention_from_spec_backup(Some(&spec), Some(1), Some(2), Some(3));
+        assert_eq!(p.keep_daily, 1);
+        assert_eq!(p.keep_weekly, 2);
+        assert_eq!(p.keep_monthly, 3);
     }
 
     // ------------------------------------------------------------------

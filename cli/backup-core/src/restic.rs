@@ -72,6 +72,21 @@ pub fn restic_restore_argv(repo: &str, snapshot: &str, out: &str) -> Vec<String>
     ]
 }
 
+/// `restic check` argv: verify the repository's structural integrity.
+///
+/// With `read_data = false` (the default) restic checks metadata + pack
+/// consistency only — fast, no data download. With `read_data = true` it adds
+/// `--read-data`, downloading and re-hashing every pack to catch bit-rot at the
+/// cost of a full repo read (a deep, opt-in verify). RESTIC_PASSWORD is passed
+/// via env, never argv.
+pub fn restic_check_argv(repo: &str, read_data: bool) -> Vec<String> {
+    let mut argv = vec!["check".into(), "--repo".into(), repo.into()];
+    if read_data {
+        argv.push("--read-data".into());
+    }
+    argv
+}
+
 /// `restic unlock` argv: removes only stale locks (restic's default behaviour —
 /// no `--remove-all` flag, which would also kill live locks held by concurrent
 /// backup runs).
@@ -163,6 +178,19 @@ mod tests {
             !a.iter().any(|x| x == "--remove-all"),
             "must NOT remove live locks"
         );
+    }
+
+    #[test]
+    fn check_argv_basic() {
+        assert_eq!(
+            restic_check_argv("s3:x", false),
+            vec!["check", "--repo", "s3:x"]
+        );
+    }
+
+    #[test]
+    fn check_argv_read_data() {
+        assert!(restic_check_argv("s3:x", true).contains(&"--read-data".to_string()));
     }
 
     #[test]

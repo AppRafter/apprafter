@@ -1219,16 +1219,55 @@ pub enum BackupAction {
         passphrase: Option<String>,
     },
     /// Remove old snapshots from an S3-backed restic repository
-    /// according to the configured retention policy.
-    /// (Full implementation arrives in chunk 5 task 2.)
+    /// according to the configured retention policy. Run OUTSIDE the
+    /// cluster with the operator's full S3 credentials.
     Prune {
         /// S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`).
+        /// Defaults to `PlatformStack.spec.backup.bucket`.
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         /// Path to a dotenv credential file containing
         /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
         /// `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`).
         /// Falls back to the matching environment variables.
+        #[arg(long)]
+        credential_file: Option<std::path::PathBuf>,
+        /// Keep-daily retention override (else spec.backup.retention, else 7).
+        #[arg(long)]
+        keep_daily: Option<u32>,
+        /// Keep-weekly retention override (else spec.backup.retention, else 4).
+        #[arg(long)]
+        keep_weekly: Option<u32>,
+        /// Keep-monthly retention override (else spec.backup.retention, else 6).
+        #[arg(long)]
+        keep_monthly: Option<u32>,
+    },
+    /// Verify the structural integrity of an S3-backed restic repository
+    /// (`restic check`). Run OUTSIDE the cluster with the operator's full
+    /// S3 credentials.
+    Check {
+        /// S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`,
+        /// `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional
+        /// `AWS_DEFAULT_REGION`). Falls back to the matching env vars.
+        #[arg(long)]
+        credential_file: Option<std::path::PathBuf>,
+        /// Deep verify: download and re-hash every pack (`--read-data`).
+        #[arg(long, default_value_t = false)]
+        read_data: bool,
+    },
+    /// Remove STALE locks from an S3-backed restic repository
+    /// (`restic unlock`; live locks are never touched). Run OUTSIDE the
+    /// cluster with the operator's full S3 credentials.
+    Unlock {
+        /// S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`,
+        /// `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional
+        /// `AWS_DEFAULT_REGION`). Falls back to the matching env vars.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
     },
