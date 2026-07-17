@@ -31,10 +31,11 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
     resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
-    ApplicationStatus, DiskClaim, EgressProfile, Metrics, MigrationPlan, PlatformStack,
-    PlatformStackValues, ResourceClaim, SourceCredential, StatusImage, COND_IMAGE_RESOLVED,
-    COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING,
-    PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
+    ApplicationStatus, DestructiveChange, DiskClaim, EgressProfile, Metrics, MigrationPlan,
+    PlatformStack, PlatformStackValues, ResourceClaim, SourceCredential, StatusImage,
+    COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
+    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
+    PHASE_ENV_SECRET_MISSING,
 };
 // `ApplicationMigrationStrategy` is wired through Cargo.toml
 // dep so future Phase 2 commits can flip on detection +
@@ -1112,16 +1113,25 @@ fn build_status(
     }
 }
 
-/// Namespace where MigrationPlan CRs live (see spec.md §3.8).
-/// Plans are namespaced for RBAC granularity but treated as
-/// cluster-scoped in user terms — the reconciler always looks
-/// in this one namespace.
+/// Namespace where *platform-scope* MigrationPlan CRs live
+/// (see spec.md §3.8). Still used for platform plans + the
+/// paused-status message. 2.16b app-scope plans instead land in
+/// the Application's own namespace — see `blocking_plan_namespace`.
 const MIGRATION_PLAN_NAMESPACE: &str = "apprafter-system";
 
+/// 2.16b Task 9 (R1-H1): app-scope MigrationPlans are created in
+/// the Application's own namespace (Task 8), so the blocking-plan
+/// finder searches *there*, not the platform `apprafter-system`.
+/// Pure + trivial for unit-testability of the namespace choice.
+fn blocking_plan_namespace(app_ns: &str) -> String {
+    app_ns.to_string()
+}
+
 /// Find an unsealed MigrationPlan gating this Application +
-/// environment pair, if any. Lists all MigrationPlans in
-/// `apprafter-system` and filters in-memory — the namespace
-/// is small and the list is bounded.
+/// environment pair, if any. 2.16b app-scope plans live in the
+/// Application's own namespace, so this lists MigrationPlans in
+/// `app_namespace` (via `blocking_plan_namespace`) and filters
+/// in-memory — a per-app namespace is small and bounded.
 ///
 /// "Unsealed" = phase is missing OR one of
 /// `pending-approval | approved | executing | failed`. Plans
@@ -1132,7 +1142,8 @@ async fn find_blocking_migration_plan(
     app_namespace: &str,
     environment: Option<&str>,
 ) -> Result<Option<MigrationPlan>, ReconcileError> {
-    let api: Api<MigrationPlan> = Api::namespaced(client.clone(), MIGRATION_PLAN_NAMESPACE);
+    let api: Api<MigrationPlan> =
+        Api::namespaced(client.clone(), &blocking_plan_namespace(app_namespace));
     let list = api.list(&Default::default()).await?;
     Ok(pick_blocking_plan(
         list.items,
@@ -1177,6 +1188,116 @@ fn plan_is_blocking(plan: &MigrationPlan) -> bool {
         .and_then(|s| s.phase.as_deref())
         .unwrap_or("pending-approval");
     !matches!(phase, "completed" | "rejected")
+}
+
+/// 2.16b Task 10 (R2-H2): the finer bucket a reconcile needs to
+/// pick a decision. Coarser `plan_is_blocking` only answers
+/// "does this pause the app"; the state machine also needs to
+/// know whether a live/terminal plan MATCHES the current change.
+#[derive(Debug, PartialEq)]
+pub enum PlanState {
+    /// No plan exists for this app+env.
+    None,
+    /// A blocking (not completed/rejected) plan whose trigger
+    /// `(type, field)` equals the current change's — the app is
+    /// legitimately paused on THIS change; leave it be.
+    BlockingMatch,
+    /// A blocking plan whose trigger is for a DIFFERENT change —
+    /// stale gate; supersede it with a fresh plan.
+    BlockingMismatch,
+    /// Phase `failed` — needs operator/user action; keep gating.
+    Failed,
+    /// Phase `completed` AND trigger matches the current change —
+    /// the migration ran, so the render may now consume + apply.
+    CompletedMatch,
+    /// Any other terminal/stale plan (completed-mismatch,
+    /// rejected, unknown phase) — a relic to clean up.
+    Relic,
+}
+
+/// 2.16b Task 10 (R2-H2 / R3-M1): the reconcile decision for one
+/// Application, as a pure function of "did we detect a
+/// destructive change this reconcile?" × the live `PlanState`.
+/// Total over the (bool × PlanState) product so Task 11's async
+/// wiring can never fall through an unhandled cell.
+#[derive(Debug, PartialEq)]
+pub enum MigrationDecision {
+    /// No change + no plan → render children normally.
+    Render,
+    /// Change detected + no plan → create the gating plan.
+    CreatePlan,
+    /// Change detected + a matching blocking plan already gates →
+    /// nothing to do; stay paused.
+    NoOp,
+    /// Change detected but the blocking/relic plan is for a
+    /// different change → delete it, then create the right plan.
+    DeleteThenCreate,
+    /// Change detected + its plan already completed → consume the
+    /// migration result and apply children.
+    ConsumeApply,
+    /// No change but a plan lingers (any state) → delete the stale
+    /// plan, then render normally.
+    DeleteThenRender,
+    /// Change detected + its plan is `failed` → keep gating, do
+    /// not silently re-plan; surface the failure.
+    BlockFailed,
+}
+
+/// Pure decision table (2.16b spec state-machine section).
+/// See `MigrationDecision` for what each arm means.
+pub fn decide(has_change: bool, state: PlanState) -> MigrationDecision {
+    use MigrationDecision::*;
+    match (has_change, state) {
+        // No destructive change this reconcile.
+        (false, PlanState::None) => Render,
+        // Any lingering plan (blocking/terminal/relic) with no
+        // current change → supersede/cleanup, then render.
+        (false, _) => DeleteThenRender,
+        // Destructive change detected.
+        (true, PlanState::None) => CreatePlan,
+        (true, PlanState::BlockingMatch) => NoOp,
+        (true, PlanState::BlockingMismatch) => DeleteThenCreate,
+        (true, PlanState::Failed) => BlockFailed,
+        (true, PlanState::CompletedMatch) => ConsumeApply,
+        (true, PlanState::Relic) => DeleteThenCreate,
+    }
+}
+
+/// Bucket a plan (if any) against the current change into a
+/// `PlanState`. Blocking/terminal is decided by phase (via
+/// `plan_is_blocking`); "match" compares the plan's trigger
+/// `(type, field)` to the current change's `(trigger_type,
+/// field)` — the two-tuple that identifies WHICH destructive
+/// change a plan was cut for.
+pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveChange) -> PlanState {
+    let Some(plan) = plan else {
+        return PlanState::None;
+    };
+    let phase = plan
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .unwrap_or("pending-approval");
+    let trigger_matches = plan.spec.trigger.type_ == current_trigger.trigger_type
+        && plan.spec.trigger.field == current_trigger.field;
+
+    if phase == "failed" {
+        return PlanState::Failed;
+    }
+    if plan_is_blocking(plan) {
+        // Not completed/rejected/failed → live gate.
+        return if trigger_matches {
+            PlanState::BlockingMatch
+        } else {
+            PlanState::BlockingMismatch
+        };
+    }
+    // Terminal (completed | rejected).
+    if phase == "completed" && trigger_matches {
+        PlanState::CompletedMatch
+    } else {
+        PlanState::Relic
+    }
 }
 
 /// True once the Application is marked for deletion. The reconcile loop
@@ -3982,5 +4103,124 @@ mod tests {
         let bare: PlatformStackValues =
             serde_json::from_value(serde_json::json!({ "tier": 1 })).unwrap();
         assert!(allowed_domains_from_values(&bare).is_empty());
+    }
+
+    // 2.16b Task 9 (R1-H1): app-scope MigrationPlans land in the APP
+    // namespace, so the blocking-plan finder must search there — NOT
+    // the platform `apprafter-system` namespace.
+    #[test]
+    fn blocking_plan_searched_in_app_namespace() {
+        assert_eq!(blocking_plan_namespace("team-a"), "team-a"); // NOT "apprafter-system"
+    }
+
+    // 2.16b Task 10 (R2-H2 / R3-M1): pure state-machine decision fn.
+    // All 8 detect × plan-state cells (12 total incl. detect=None
+    // buckets) must map exactly to the spec's decision table.
+    #[test]
+    fn state_machine_cells() {
+        use MigrationDecision::*;
+        // detect = None
+        assert_eq!(decide(false, PlanState::None), Render);
+        assert_eq!(decide(false, PlanState::BlockingMatch), DeleteThenRender);
+        assert_eq!(decide(false, PlanState::BlockingMismatch), DeleteThenRender);
+        assert_eq!(decide(false, PlanState::Failed), DeleteThenRender);
+        assert_eq!(decide(false, PlanState::CompletedMatch), DeleteThenRender);
+        assert_eq!(decide(false, PlanState::Relic), DeleteThenRender);
+        // detect = Some
+        assert_eq!(decide(true, PlanState::None), CreatePlan);
+        assert_eq!(decide(true, PlanState::BlockingMatch), NoOp);
+        assert_eq!(decide(true, PlanState::BlockingMismatch), DeleteThenCreate);
+        assert_eq!(decide(true, PlanState::Failed), BlockFailed);
+        assert_eq!(decide(true, PlanState::CompletedMatch), ConsumeApply);
+        assert_eq!(decide(true, PlanState::Relic), DeleteThenCreate);
+    }
+
+    // Helper: a change whose (trigger_type, field) can be tuned to
+    // match / not-match a plan's trigger for the `plan_state` bucketer.
+    fn change(trigger_type: &str, field: &str) -> DestructiveChange {
+        DestructiveChange {
+            trigger_type: trigger_type.into(),
+            field: field.into(),
+            from: None,
+            to: None,
+            classification: "breaking".into(),
+        }
+    }
+
+    // Helper: an app-scope plan carrying a specific (type, field)
+    // trigger and phase — the `app_plan` helper above hard-codes the
+    // trigger to `t`/`f`, so build one directly here.
+    fn plan_with_trigger(trigger_type: &str, field: &str, phase: Option<&str>) -> MigrationPlan {
+        let spec = MigrationPlanSpec {
+            scope: MigrationPlanScope {
+                type_: "application".into(),
+                application: Some(MigrationApplicationScope {
+                    ref_: MigrationApplicationRef {
+                        name: "parser".into(),
+                        namespace: "demo".into(),
+                    },
+                    environment: "prod".into(),
+                }),
+                platform: None,
+            },
+            trigger: MigrationTrigger {
+                type_: trigger_type.into(),
+                field: field.into(),
+                from: None,
+                to: None,
+            },
+            risks: None,
+            plan: None,
+            approvers: None,
+            previous_spec_snapshot: None,
+        };
+        let mut plan = MigrationPlan::new("parser-pg", spec);
+        if let Some(p) = phase {
+            plan.status = Some(MigrationPlanStatus {
+                phase: Some(p.into()),
+                ..MigrationPlanStatus::default()
+            });
+        }
+        plan
+    }
+
+    #[test]
+    fn plan_state_buckets_by_phase_and_trigger_match() {
+        let cur = change("selector-change", "needs.pg.selector");
+        // No plan → None.
+        assert_eq!(plan_state(None, &cur), PlanState::None);
+        // Blocking (pending) + trigger matches → BlockingMatch.
+        let matching = plan_with_trigger(
+            "selector-change",
+            "needs.pg.selector",
+            Some("pending-approval"),
+        );
+        assert_eq!(plan_state(Some(&matching), &cur), PlanState::BlockingMatch);
+        // Blocking (pending) + trigger differs → BlockingMismatch.
+        let mismatch = plan_with_trigger(
+            "storage-class-change",
+            "needs.pg.storage",
+            Some("pending-approval"),
+        );
+        assert_eq!(
+            plan_state(Some(&mismatch), &cur),
+            PlanState::BlockingMismatch
+        );
+        // Phase failed → Failed (regardless of trigger match).
+        let failed = plan_with_trigger("selector-change", "needs.pg.selector", Some("failed"));
+        assert_eq!(plan_state(Some(&failed), &cur), PlanState::Failed);
+        // Completed + trigger matches → CompletedMatch.
+        let done = plan_with_trigger("selector-change", "needs.pg.selector", Some("completed"));
+        assert_eq!(plan_state(Some(&done), &cur), PlanState::CompletedMatch);
+        // Completed + trigger differs → Relic.
+        let done_other = plan_with_trigger(
+            "storage-class-change",
+            "needs.pg.storage",
+            Some("completed"),
+        );
+        assert_eq!(plan_state(Some(&done_other), &cur), PlanState::Relic);
+        // Rejected → Relic.
+        let rejected = plan_with_trigger("selector-change", "needs.pg.selector", Some("rejected"));
+        assert_eq!(plan_state(Some(&rejected), &cur), PlanState::Relic);
     }
 }
