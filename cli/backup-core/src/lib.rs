@@ -9,6 +9,7 @@ pub mod helper_pod;
 pub mod images;
 pub mod kube;
 pub mod manifest;
+pub mod prune;
 pub mod reseal;
 pub mod restic;
 pub mod restic_runner;

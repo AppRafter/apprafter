@@ -11,6 +11,9 @@ repository.workspace   = true
 
 [dependencies]
 cli-core   = { path = "../cli-core" }
+# RFC-3339 parse + ISO-week/month bucketing for the retention prune planner
+# (prune.rs). Already a workspace dependency (used by platform-cli / cli-providers).
+chrono     = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 tempfile   = { workspace = true }

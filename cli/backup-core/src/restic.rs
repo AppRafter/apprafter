@@ -48,6 +48,18 @@ pub fn restic_snapshots_argv(repo: &str) -> Vec<String> {
     ]
 }
 
+/// `restic forget <ids...> --prune` argv (retention prune, spec §M-r3-1b).
+///
+/// Forgets an explicit set of snapshot ids (the run-aware planner in
+/// [`crate::prune`] decides the set) and runs `--prune` to reclaim the space.
+/// RESTIC_PASSWORD is passed via env, never argv.
+pub fn restic_forget_argv(repo: &str, ids: &[String]) -> Vec<String> {
+    let mut argv = vec!["forget".into(), "--repo".into(), repo.into()];
+    argv.extend(ids.iter().cloned());
+    argv.push("--prune".into());
+    argv
+}
+
 /// `restic restore <snapshot> --target <out>` argv.
 pub fn restic_restore_argv(repo: &str, snapshot: &str, out: &str) -> Vec<String> {
     vec![
@@ -113,6 +125,26 @@ mod tests {
         assert_eq!(r[0], "restore");
         assert!(r.contains(&"latest".to_string()));
         assert!(r.windows(2).any(|w| w == ["--target", "/out"]));
+    }
+
+    #[test]
+    fn forget_argv_lists_ids_and_prunes() {
+        let ids = vec!["aaaa".to_string(), "bbbb".to_string()];
+        let a = restic_forget_argv("s3:repo", &ids);
+        assert_eq!(a[0], "forget");
+        assert!(a.windows(2).any(|w| w == ["--repo", "s3:repo"]));
+        assert!(a.contains(&"aaaa".to_string()));
+        assert!(a.contains(&"bbbb".to_string()));
+        assert_eq!(a.last(), Some(&"--prune".to_string()));
+        // ids come before --prune (restic parses positional ids, then the flag).
+        let prune_i = a.iter().position(|x| x == "--prune").unwrap();
+        assert!(a.iter().position(|x| x == "aaaa").unwrap() < prune_i);
+    }
+
+    #[test]
+    fn forget_argv_with_no_ids_is_still_well_formed() {
+        let a = restic_forget_argv("/repo", &[]);
+        assert_eq!(a, vec!["forget", "--repo", "/repo", "--prune"]);
     }
 
     #[test]
