@@ -274,6 +274,10 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             BackupAction::List { repo, passphrase } => {
                 commands::backup::run_backup_list(repo.as_deref(), passphrase.as_deref())?
             }
+            BackupAction::Prune {
+                repo,
+                credential_file,
+            } => commands::backup::run_backup_prune(&repo, credential_file.as_deref())?,
         },
         Commands::Restore {
             repo,

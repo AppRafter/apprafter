@@ -1218,6 +1218,20 @@ pub enum BackupAction {
         #[arg(long)]
         passphrase: Option<String>,
     },
+    /// Remove old snapshots from an S3-backed restic repository
+    /// according to the configured retention policy.
+    /// (Full implementation arrives in chunk 5 task 2.)
+    Prune {
+        /// S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`).
+        #[arg(long)]
+        repo: String,
+        /// Path to a dotenv credential file containing
+        /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+        /// `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`).
+        /// Falls back to the matching environment variables.
+        #[arg(long)]
+        credential_file: Option<std::path::PathBuf>,
+    },
 }
 
 #[cfg(test)]
