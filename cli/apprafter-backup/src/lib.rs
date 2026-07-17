@@ -5,3 +5,4 @@ pub mod config;
 pub mod kube_rs_exec;
 pub mod orchestrate;
 pub mod status;
+pub mod webhook;

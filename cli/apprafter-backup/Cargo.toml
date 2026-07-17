@@ -31,3 +31,4 @@ tokio       = { workspace = true, features = ["fs", "io-util"] }
 kube        = { workspace = true, features = ["ws"] }
 k8s-openapi = { workspace = true }
 futures     = { workspace = true }
+ureq        = { workspace = true }
