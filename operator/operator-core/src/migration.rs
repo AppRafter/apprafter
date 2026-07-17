@@ -81,6 +81,18 @@ pub enum MigrationError {
     Backend(String),
 }
 
+/// Ordinal severity of a MigrationPlan classification. Higher = more
+/// destructive. Used to pick ONE primary DestructiveChange when an edit
+/// carries several destructive ops (2.16b spec: highest-severity wins).
+pub fn classification_severity(classification: &str) -> u8 {
+    match classification {
+        "data-migration" => 3,
+        "breaking" => 2,
+        "requires-restart" => 1,
+        _ => 0, // "safe" / unknown
+    }
+}
+
 /// Per-scope behaviour shared between application + platform
 /// strategies. Trait-object friendly (no associated types, no
 /// generics).
@@ -105,4 +117,19 @@ pub trait MigrationStrategy: Send + Sync {
     ) -> Result<StepOutcome, MigrationError>;
 
     async fn reject(&self, plan: &MigrationPlan) -> Result<(), MigrationError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classification_severity;
+
+    #[test]
+    fn severity_orders_data_migration_above_requires_restart() {
+        assert!(
+            classification_severity("data-migration") > classification_severity("requires-restart")
+        );
+        assert!(classification_severity("requires-restart") > classification_severity("safe"));
+        // unknown classifications sort lowest (defensive)
+        assert_eq!(classification_severity("bogus"), 0);
+    }
 }
