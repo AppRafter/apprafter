@@ -32,10 +32,10 @@ use tracing::info;
 
 use operator_core::migration::classification_severity;
 use operator_core::{
-    image_repo, Application, ApplicationBaseSpec, DestructiveChange, MigrationApplicationRef,
-    MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope,
-    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, Needs, OneOrMany,
-    SourceCredentialSpec, StepOutcome,
+    image_repo, Application, ApplicationBaseSpec, DestructiveChange, EnvRef, EnvValue,
+    MigrationApplicationRef, MigrationApplicationScope, MigrationError, MigrationPlan,
+    MigrationPlanScope, MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger,
+    Needs, OneOrMany, SourceCredentialSpec, StepOutcome,
 };
 
 /// Render-time default for `Application.spec.*.replicas` (application.cue:
@@ -202,6 +202,36 @@ impl ApplicationMigrationStrategy {
             }
         }
 
+        // Env-ref removal. Removing an env var whose value is an
+        // `EnvValue::Ref(_)` (a claim- or secret-backed reference, ADR
+        // 0046) is gated (requires-restart): the container loses a
+        // resolved connection/secret value it may depend on, so the
+        // rollout is a restart the platform surfaces for approval.
+        // Removing a `Literal` env is a soft edit; env ADD and a
+        // key that stays present (ref→ref, ref→literal) are also soft —
+        // only a removal of a ref-valued key gates here.
+        let new_env_keys: Vec<&String> = new
+            .env
+            .as_ref()
+            .map(|m| m.keys().collect())
+            .unwrap_or_default();
+        if let Some(old_env) = old.env.as_ref() {
+            for (key, value) in old_env {
+                if new_env_keys.contains(&key) {
+                    continue;
+                }
+                if let EnvValue::Ref(r) = value {
+                    candidates.push(DestructiveChange {
+                        trigger_type: "env-ref-removal".to_string(),
+                        field: format!("env.{key}"),
+                        from: Some(json!(render_env_ref(r))),
+                        to: Some(json!("(removed)")),
+                        classification: "requires-restart".to_string(),
+                    });
+                }
+            }
+        }
+
         pick_primary(candidates)
     }
 
@@ -321,6 +351,21 @@ fn first_hostname(s: &ApplicationBaseSpec) -> Option<String> {
         Some(OneOrMany::One(h)) => Some(h.clone()),
         Some(OneOrMany::Many(v)) => v.first().cloned(),
         None => None,
+    }
+}
+
+/// Render an `EnvRef` to a stable human string sentinel for a
+/// `DestructiveChange.from` value. Mirrors the ADR 0046 env-marker
+/// vocabulary: a claim reference renders `claim.<type>.<field>` (the
+/// `EnvRef::Claim` payload is already `"<type>.<field>"` /
+/// `"<type>.<name>.<field>"`) and a secret reference renders
+/// `secret:<name>/<key>`. The result is non-empty for any well-formed
+/// ref, so the trigger surfaces a legible "what was removed" for the
+/// approver.
+fn render_env_ref(r: &EnvRef) -> String {
+    match r {
+        EnvRef::Claim(target) => format!("claim.{target}"),
+        EnvRef::Secret(target) => format!("secret:{target}"),
     }
 }
 
@@ -844,7 +889,7 @@ mod tests {
 #[cfg(test)]
 mod application_detect_destructive_tests {
     use super::*;
-    use operator_core::{ApplicationExpose, OneOrMany, ServiceNeed};
+    use operator_core::{ApplicationExpose, EnvRef, EnvValue, OneOrMany, ServiceNeed};
 
     fn base() -> ApplicationBaseSpec {
         ApplicationBaseSpec::default()
@@ -1076,6 +1121,85 @@ mod application_detect_destructive_tests {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_image(base(), "ghcr.io/acme/api:v1"),
             &base()
+        )
+        .is_none());
+    }
+
+    // ---- Task 5: env-ref removal (gated) vs literal removal (soft) ----
+
+    fn with_env(mut s: ApplicationBaseSpec, k: &str, v: EnvValue) -> ApplicationBaseSpec {
+        s.env
+            .get_or_insert_with(Default::default)
+            .insert(k.into(), v);
+        s
+    }
+
+    fn claim_ref() -> EnvValue {
+        EnvValue::Ref(EnvRef::Claim("pg.url".into()))
+    }
+
+    fn secret_ref() -> EnvValue {
+        EnvValue::Ref(EnvRef::Secret("stripe/key".into()))
+    }
+
+    #[test]
+    fn removing_env_ref_gates() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "DB", claim_ref()),
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "env-ref-removal");
+        assert_eq!(c.classification, "requires-restart");
+        assert_eq!(c.field, "env.DB");
+        // `from` renders the reference to a non-empty sentinel; `to` is
+        // the removed marker.
+        assert!(!c.from.as_ref().unwrap().as_str().unwrap().is_empty());
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "claim.pg.url");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+    }
+
+    #[test]
+    fn removing_env_secret_ref_gates_with_secret_sentinel() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "STRIPE", secret_ref()),
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "env-ref-removal");
+        assert_eq!(c.field, "env.STRIPE");
+        assert_eq!(
+            c.from.as_ref().unwrap().as_str().unwrap(),
+            "secret:stripe/key"
+        );
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+    }
+
+    #[test]
+    fn removing_env_literal_is_soft() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "X", EnvValue::Literal("hi".into())),
+            &base()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn adding_env_ref_is_soft() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &base(),
+            &with_env(base(), "DB", claim_ref())
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn changing_env_ref_value_is_soft() {
+        // Task 5 gates only REMOVAL of a ref-valued env; a key that stays
+        // present (ref → ref, or ref → literal) is a soft rollout.
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "DB", claim_ref()),
+            &with_env(base(), "DB", EnvValue::Literal("postgres://…".into()))
         )
         .is_none());
     }
