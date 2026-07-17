@@ -294,6 +294,17 @@ package platformstack
 	// the chart's `{{- if .Values.gateway.allowedDomains }}` guard
 	// nil-panics if `.Values.gateway` is absent.
 	gateway: #GatewayValues
+
+	// Off-site scheduled-backup config (2.6d-4). Self-defaults to
+	// `enabled: false` so the rendered `values.yaml` always carries
+	// a concrete `backup: {enabled: false, image: …}` — the chart's
+	// `{{- if .Values.backup.enabled }}` guard nil-panics if
+	// `.Values.backup` is absent. The operator's PlatformController
+	// projects `PlatformStack.spec.backup` onto this key
+	// (`values["backup"] = serialize(spec.backup)` in
+	// `platform-stack::desired.rs::build()`); the chart is a
+	// default-off consumer of that block.
+	backup: #BackupValues
 }
 
 // `#AppProjectSpec` — the small shape `templates/appprojects.
@@ -333,6 +344,83 @@ package platformstack
 	// LB-IPAM pool announces the node's own IP (single-node T1).
 	nodePublicIP?:   string
 	nodePublicIPv6?: string
+}
+
+// `#BackupValues` — the off-site scheduled-backup config the chart's
+// `templates/backup.yaml` consumes (2.6d-4). The operator's
+// PlatformController projects `PlatformStack.spec.backup` onto
+// `.Values.backup`; this shape mirrors that typed CR block. Every
+// field self-defaults so a default tier render always carries a
+// concrete `backup:` object with `enabled: false` — the chart guard
+// `{{- if .Values.backup.enabled }}` nil-panics on a missing
+// `.Values.backup`, and a default render must emit NO backup resources.
+//
+// SECRETS NEVER LIVE HERE: only `credentialRef.name` names a Secret in
+// `apprafter-system`; the CronJob templates mount it via
+// `envFrom: secretRef` at install time. The passphrase + S3 keys are
+// operator-owned (H1) and reach the cluster only through that Secret.
+#BackupValues: {
+	// Opt-in master switch. Default false — the whole
+	// `templates/backup.yaml` block is guarded by this, so an
+	// unconfigured cluster ships no ServiceAccount / RBAC / CronJobs /
+	// CNP.
+	enabled: bool | *false
+
+	// Runner container image (the `apprafter-backup` binary + restic +
+	// a shell). Pinned to a placeholder tag here; chunk 6 finalises it
+	// to the released runner image, and `PlatformController` / chart
+	// bumps roll it forward in lockstep with the CLI.
+	image: string | *"ghcr.io/apprafter/apprafter-backup:0.2.32"
+
+	// Cron schedule for the full backup Job. Default nightly 03:00.
+	schedule: string | *"0 3 * * *"
+
+	// Restic repository URL, e.g. `s3:https://<endpoint>/<bucket>` —
+	// NO credentials (those come from `credentialRef`). Empty until the
+	// operator enables backup; the guard keys off `enabled`, not this.
+	bucket: string | *""
+
+	// Secret in `apprafter-system` carrying `RESTIC_PASSWORD` + `AWS_*`
+	// (+ endpoint/region). Consumed via `envFrom: secretRef`.
+	credentialRef: {
+		name: string | *""
+	}
+
+	// Staging mode: `monolithic` (one snapshot/run, default) or
+	// `sequential` (per-claim snapshot-set). Forwarded to the runner
+	// as `APPRAFTER_BACKUP_STAGING_MODE`.
+	stagingMode: "monolithic" | "sequential" | *"monolithic"
+
+	// `emptyDir.sizeLimit` for the staging volume. Overrun is a hard
+	// fail whose error suggests raising this or switching to
+	// `sequential`.
+	stagingSizeLimit: string | *"10Gi"
+
+	// Retention policy. `enforce: operator` (default) means the runner
+	// does NOT forget/prune (retention is the operator-side `apprafter
+	// backup prune` verb with full creds); `enforce: cluster` runs
+	// format-aware `forget --prune` in the Job (requires full creds in
+	// the cluster Secret). `keep*` are optional — the runner defaults
+	// to 7/4/6 when unset, so the chart only threads them through when
+	// explicitly configured.
+	retention: {
+		keepDaily?:   int
+		keepWeekly?:  int
+		keepMonthly?: int
+		enforce:      "operator" | "cluster" | *"operator"
+	}
+
+	// Cron schedule for the weekly `restic check` Job. Default Sunday
+	// 06:00 (staggered clear of the daily backup).
+	checkSchedule: string | *"0 6 * * 0"
+
+	// Opt-in full re-download `restic check --read-data`. Default false
+	// (metadata-only structural check).
+	checkReadData: bool | *false
+
+	// Optional URL the runner POSTs a JSON failure report to. When set,
+	// the CNP also allows egress to its host (folded into world:443).
+	failureWebhook?: string
 }
 
 // `#ServiceProviderSeed` — the small shape
@@ -396,7 +484,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.2.39"
+currentVersion: #Version & "0.2.40"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

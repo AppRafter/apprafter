@@ -307,6 +307,288 @@ _gatewayTemplate: """
 
 	"""
 
+// `_backupTemplate` — emits the opt-in off-site scheduled-backup
+// component (2.6d-4): a ServiceAccount + scoped ClusterRole/-Binding, a
+// nightly backup CronJob, a weekly `restic check` CronJob, and a
+// CiliumNetworkPolicy pinning the runner pods' egress. The WHOLE block
+// is guarded by `{{- if .Values.backup.enabled }}` so a default tier-1
+// render (`backup.enabled: false`) produces NO resources — off-site
+// backup only materialises once an operator runs `apprafter backup
+// enable`, which flips `PlatformStack.spec.backup.enabled` and the
+// PlatformController projects it onto `.Values.backup`.
+//
+// Credentials NEVER live in chart values — the CronJobs mount the
+// operator-sealed Secret named `.Values.backup.credentialRef.name` via
+// `envFrom: secretRef`; restic reads `RESTIC_PASSWORD` + `AWS_*` from
+// it natively.
+//
+// RBAC is scoped to the runner's ACTUAL read-set (chunk-2 code:
+// `kube_rs_exec.rs` + `status.rs`): list/get the AppRafter + Argo
+// `Application`s, `SharedVolume`s, `PlatformStack`, `ResourceClaim`s,
+// CNPG `Cluster`s, `SealedSecret`s cluster-wide; get core `Secret`s;
+// create/get/delete helper `pods` + create `pods/exec`; and
+// create/get/update/patch ONLY the `apprafter-backup-status` ConfigMap.
+// It deliberately does NOT grant write on `platformstacks` — a
+// compromised backup pod must never reach the platform upgrade control
+// (k8s has no field-level RBAC; the status write is a ConfigMap, not a
+// CR annotation). `pods`/`pods/exec` is unavoidably cluster-wide: k8s
+// RBAC cannot scope exec to "only the runner's own helper pods".
+//
+// The `check` CronJob runs `restic` directly (the runner image bundles
+// restic + a shell) rather than the runner binary — the chunk-2 runner
+// has no check-only mode, so this keeps the periodic repository check
+// operator-independent and needs no runner change.
+//
+// Note the double-curly braces: this string is itself a Go template
+// Helm executes at install time, so we keep the `{{ }}` literal. CUE
+// ships it verbatim.
+_backupTemplate: """
+	{{/* SPDX-License-Identifier: FSL-1.1-Apache-2.0
+	     Rendered by `cue cmd render`. Do not edit.
+	     Off-site scheduled backup (2.6d-4): opt-in, default-off. Emitted only when
+	     .Values.backup.enabled. ServiceAccount + scoped ClusterRole/-Binding, a
+	     nightly backup CronJob (runner binary), a weekly `restic check` CronJob
+	     (restic directly), and a CiliumNetworkPolicy fixing the runner pods'
+	     egress (DNS + kube-apiserver + world:443 for S3/webhook). Credentials come
+	     ONLY from the operator-sealed Secret via envFrom: secretRef — never chart
+	     values. RBAC matches the chunk-2 runner's actual reads and MUST NOT grant
+	     write on platformstacks. */}}
+	{{- if .Values.backup.enabled }}
+	{{- $b := .Values.backup }}
+	---
+	apiVersion: v1
+	kind: ServiceAccount
+	metadata:
+	  name: apprafter-backup
+	  namespace: apprafter-system
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	---
+	# Scoped to the runner's ACTUAL read-set (chunk-2 code). NOTE: cluster-wide
+	# pods/exec is unavoidable — k8s RBAC cannot scope exec to the runner's own
+	# helper pods. Deliberately powerful SA (backup legitimately reads everything);
+	# it must NOT be able to write platformstacks (no field-level RBAC → a
+	# compromised backup pod must not reach the platform upgrade control).
+	apiVersion: rbac.authorization.k8s.io/v1
+	kind: ClusterRole
+	metadata:
+	  name: apprafter-backup
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	rules:
+	# CRs the engine's list/get sweep reads (serialized into the backup manifest).
+	- apiGroups: ["apprafter.io"]
+	  resources: ["applications", "sharedvolumes", "platformstacks", "resourceclaims"]
+	  verbs: ["get", "list"]
+	- apiGroups: ["argoproj.io"]
+	  resources: ["applications"]
+	  verbs: ["get", "list"]
+	- apiGroups: ["postgresql.cnpg.io"]
+	  resources: ["clusters"]
+	  verbs: ["get", "list"]
+	- apiGroups: ["bitnami.com"]
+	  resources: ["sealedsecrets"]
+	  verbs: ["get", "list"]
+	# Core Secrets — the app/connection creds the sweep captures + reseals.
+	- apiGroups: [""]
+	  resources: ["secrets"]
+	  verbs: ["get"]
+	# Ephemeral helper pods (pg_dump / tar). exec is namespace-wide (k8s limit).
+	- apiGroups: [""]
+	  resources: ["pods"]
+	  verbs: ["create", "get", "delete"]
+	- apiGroups: [""]
+	  resources: ["pods/exec"]
+	  verbs: ["create"]
+	# The status ConfigMap ONLY (M-r3-2): create-or-update the single
+	# apprafter-backup-status CM. resourceNames locks this to that one object —
+	# NOT a platformstacks write.
+	- apiGroups: [""]
+	  resources: ["configmaps"]
+	  resourceNames: ["apprafter-backup-status"]
+	  verbs: ["create", "get", "update", "patch"]
+	---
+	apiVersion: rbac.authorization.k8s.io/v1
+	kind: ClusterRoleBinding
+	metadata:
+	  name: apprafter-backup
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	roleRef:
+	  apiGroup: rbac.authorization.k8s.io
+	  kind: ClusterRole
+	  name: apprafter-backup
+	subjects:
+	- kind: ServiceAccount
+	  name: apprafter-backup
+	  namespace: apprafter-system
+	---
+	apiVersion: batch/v1
+	kind: CronJob
+	metadata:
+	  name: apprafter-backup
+	  namespace: apprafter-system
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	spec:
+	  schedule: {{ $b.schedule | default "0 3 * * *" | quote }}
+	  concurrencyPolicy: Forbid
+	  successfulJobsHistoryLimit: 3
+	  failedJobsHistoryLimit: 3
+	  jobTemplate:
+	    spec:
+	      template:
+	        metadata:
+	          labels:
+	            apprafter.io/backup-runner: "true"
+	        spec:
+	          serviceAccountName: apprafter-backup
+	          restartPolicy: Never
+	          containers:
+	          - name: runner
+	            image: {{ $b.image | quote }}
+	            envFrom:
+	            - secretRef:
+	                name: {{ $b.credentialRef.name | quote }}
+	            env:
+	            - name: APPRAFTER_BACKUP_REPO
+	              value: {{ $b.bucket | quote }}
+	            - name: APPRAFTER_CLUSTER_ID
+	              value: {{ .Release.Name | quote }}
+	            - name: APPRAFTER_BACKUP_STAGING_MODE
+	              value: {{ $b.stagingMode | default "monolithic" | quote }}
+	            - name: APPRAFTER_BACKUP_ENFORCE
+	              value: {{ $b.retention.enforce | default "operator" | quote }}
+	            {{- if $b.retention.keepDaily }}
+	            - name: APPRAFTER_BACKUP_KEEP_DAILY
+	              value: {{ $b.retention.keepDaily | quote }}
+	            {{- end }}
+	            {{- if $b.retention.keepWeekly }}
+	            - name: APPRAFTER_BACKUP_KEEP_WEEKLY
+	              value: {{ $b.retention.keepWeekly | quote }}
+	            {{- end }}
+	            {{- if $b.retention.keepMonthly }}
+	            - name: APPRAFTER_BACKUP_KEEP_MONTHLY
+	              value: {{ $b.retention.keepMonthly | quote }}
+	            {{- end }}
+	            {{- if $b.failureWebhook }}
+	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
+	              value: {{ $b.failureWebhook | quote }}
+	            {{- end }}
+	            resources:
+	              requests:
+	                cpu: 100m
+	                memory: 256Mi
+	              limits:
+	                memory: 512Mi
+	            volumeMounts:
+	            - name: staging
+	              mountPath: /staging
+	          volumes:
+	          - name: staging
+	            emptyDir:
+	              sizeLimit: {{ $b.stagingSizeLimit | default "10Gi" | quote }}
+	---
+	apiVersion: batch/v1
+	kind: CronJob
+	metadata:
+	  name: apprafter-backup-check
+	  namespace: apprafter-system
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	spec:
+	  schedule: {{ $b.checkSchedule | default "0 6 * * 0" | quote }}
+	  concurrencyPolicy: Forbid
+	  successfulJobsHistoryLimit: 3
+	  failedJobsHistoryLimit: 3
+	  jobTemplate:
+	    spec:
+	      template:
+	        metadata:
+	          labels:
+	            apprafter.io/backup-runner: "true"
+	        spec:
+	          serviceAccountName: apprafter-backup
+	          restartPolicy: Never
+	          containers:
+	          - name: check
+	            image: {{ $b.image | quote }}
+	            # The chunk-2 runner binary has no check-only mode, so the check Job
+	            # runs restic directly (the runner image bundles restic + a shell).
+	            # restic reads RESTIC_PASSWORD + AWS_* from the mounted creds and the
+	            # s3: repo from APPRAFTER_BACKUP_REPO.
+	            command: ["sh", "-c"]
+	            args:
+	            - >-
+	              restic -r "$APPRAFTER_BACKUP_REPO" unlock;
+	              restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ end }}
+	            envFrom:
+	            - secretRef:
+	                name: {{ $b.credentialRef.name | quote }}
+	            env:
+	            - name: APPRAFTER_BACKUP_REPO
+	              value: {{ $b.bucket | quote }}
+	            resources:
+	              requests:
+	                cpu: 100m
+	                memory: 256Mi
+	              limits:
+	                memory: 512Mi
+	---
+	# Egress policy for the backup + check runner pods (m-r3-1). A Cilium FQDN
+	# policy without a DNS-allow rule silently fails to resolve and the backup
+	# hangs with no clear symptom, so DNS is MANDATORY. S3 endpoint is not known at
+	# render time (it's a template value), so we open world:443 pragmatically; the
+	# failureWebhook host (also 443) is covered by the same rule.
+	apiVersion: cilium.io/v2
+	kind: CiliumNetworkPolicy
+	metadata:
+	  name: apprafter-backup-egress
+	  namespace: apprafter-system
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	spec:
+	  endpointSelector:
+	    matchLabels:
+	      apprafter.io/backup-runner: "true"
+	  egress:
+	  # DNS → kube-dns (UDP+TCP/53) with FQDN visibility. REQUIRED (m-r3-1):
+	  # without the dns visibility rule a toFQDNs policy silently never resolves.
+	  - toEndpoints:
+	    - matchLabels:
+	        io.kubernetes.pod.namespace: kube-system
+	        k8s-app: kube-dns
+	    toPorts:
+	    - ports:
+	      - port: "53"
+	        protocol: UDP
+	      - port: "53"
+	        protocol: TCP
+	      rules:
+	        dns:
+	        - matchPattern: "*"
+	  # The runner talks to the kube-apiserver (list CRs, exec helper pods, write
+	  # the status ConfigMap).
+	  - toEntities:
+	    - kube-apiserver
+	  # S3 endpoint (and, when set, the failureWebhook host) on 443.
+	  # NOTE: tighten to toFQDNs when the endpoint is known.
+	  - toEntities:
+	    - world
+	    toPorts:
+	    - ports:
+	      - port: "443"
+	        protocol: TCP
+	{{- end }}
+
+	"""
+
 // `_migrationAnchorTemplate` — emits the platform MigrationPlan tree
 // anchor ConfigMap (ADR 0048). STATIC: always emitted, no iteration.
 // The PlatformController sets each platform MigrationPlan's
@@ -510,6 +792,46 @@ _valuesSchema: {
 			}
 			additionalProperties: false
 		}
+		// Off-site scheduled-backup config (2.6d-4). Default-off; the
+		// operator's PlatformController projects
+		// `PlatformStack.spec.backup` onto this key. Secrets never live
+		// here — only `credentialRef.name` names a Secret in
+		// `apprafter-system`. Validated at Helm-install time so a
+		// malformed override (e.g. a non-enum `stagingMode`) fails
+		// install rather than rendering a broken CronJob.
+		backup: {
+			type: "object"
+			properties: {
+				enabled: {type: "boolean"}
+				image: {type: "string"}
+				schedule: {type: "string"}
+				bucket: {type: "string"}
+				credentialRef: {
+					type: "object"
+					properties: name: {type: "string"}
+				}
+				stagingMode: {
+					type: "string"
+					enum: ["monolithic", "sequential"]
+				}
+				stagingSizeLimit: {type: "string"}
+				retention: {
+					type: "object"
+					properties: {
+						keepDaily: {type: "integer"}
+						keepWeekly: {type: "integer"}
+						keepMonthly: {type: "integer"}
+						enforce: {
+							type: "string"
+							enum: ["operator", "cluster"]
+						}
+					}
+				}
+				checkSchedule: {type: "string"}
+				checkReadData: {type: "boolean"}
+				failureWebhook: {type: "string"}
+			}
+		}
 	}
 }
 
@@ -623,6 +945,12 @@ command: render: {
 	gatewayTemplate: file.Create & {
 		filename: "\(_distDir)/templates/gateway.yaml"
 		contents: _gatewayTemplate
+		$dep:     mktemplates.$done
+	}
+
+	backupTemplate: file.Create & {
+		filename: "\(_distDir)/templates/backup.yaml"
+		contents: _backupTemplate
 		$dep:     mktemplates.$done
 	}
 

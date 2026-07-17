@@ -1760,6 +1760,43 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.40": {
+	change:          "safe"
+	operatorVersion: "v0.2.32"
+	notes: """
+		Adds the opt-in default-off `backup` component (2.6d-4) — off-site
+		scheduled S3 backup. A new `templates/backup.yaml` (guarded entirely by
+		`{{- if .Values.backup.enabled }}`) emits a ServiceAccount + a scoped
+		ClusterRole/-Binding, a nightly backup CronJob (the `apprafter-backup`
+		runner binary), a weekly `restic check` CronJob (restic directly — the
+		runner has no check-only mode), and a CiliumNetworkPolicy pinning the
+		runner pods' egress (mandatory DNS-allow to kube-dns + kube-apiserver +
+		world:443 for the S3 endpoint / optional failureWebhook). A new
+		self-defaulting `backup: #BackupValues` key on `#PlatformValues` (mirrors
+		`gateway`) so a default render always carries `backup: {enabled: false,
+		…}`; `values.schema.json` gains a `backup` property. change=safe: purely
+		additive, default-off — a default tier-1/tier-2 render emits NO backup
+		resource and every existing component is byte-unchanged.
+
+		Credentials NEVER live in chart values — the CronJobs mount the
+		operator-sealed Secret named `backup.credentialRef.name` via
+		`envFrom: secretRef`. RBAC is scoped to the runner's actual read-set and
+		deliberately grants NO write on `platformstacks` (a compromised backup
+		pod must not reach the platform upgrade control).
+
+		The runner `image` tag is a placeholder pin here (chunk 6 finalises it to
+		the released runner image). Full delivery also needs the chunk-3/3b
+		operator release (`PlatformStack.spec.backup` schema +
+		`platform-stack::desired.rs::build()` `spec.backup -> values.backup`
+		mapping) — this chart bump is additive and inert until that lands, so the
+		operatorVersion is carried forward unchanged.
+		"""
+	references: [
+		"docs/superpowers/specs/2026-07-16-2-6d-4-s3-push-design.md",
+		"docs/adr/0050-backup-restore.md",
+	]
+}
+
 compatibility: "0.2.38": {
 	change:          "safe"
 	operatorVersion: "v0.2.31"
