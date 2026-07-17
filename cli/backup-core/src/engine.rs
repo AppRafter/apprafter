@@ -66,6 +66,15 @@ pub struct BackupOpts {
     pub pg_image: String,
     /// Staging / snapshotting behaviour.
     pub staging_mode: StagingMode,
+    /// Fixed `--host` passed to every `restic backup` invocation for this run.
+    ///
+    /// When `Some(h)`, restic groups snapshots under `h` so `restic forget`
+    /// retention policies apply across runs (spec §Retention M-r3-1a). Set to
+    /// `Some("apprafter-backup")` in the in-cluster runner (where the pod name
+    /// is ephemeral). Leave as `None` for the CLI local-pull path, which keeps
+    /// the machine's own hostname as the group (correct for a per-operator
+    /// station grouping).
+    pub backup_host: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +632,12 @@ fn run_backup_monolithic_with_summary(
 
     let tag = run_tag(opts);
     let snapshot_id = r.run_backup(
-        &restic_backup_argv(repo, &data_dir.to_string_lossy(), &tag),
+        &restic_backup_argv(
+            repo,
+            &data_dir.to_string_lossy(),
+            &tag,
+            opts.backup_host.as_deref(),
+        ),
         pass,
     )?;
 
@@ -676,7 +690,12 @@ fn run_backup_sequential_with_summary(
         run_extraction(k, std::slice::from_ref(item), &claim_dir, &opts.pg_image)?;
 
         snapshot_id = r.run_backup(
-            &restic_backup_argv(repo, &claim_dir.to_string_lossy(), &tag),
+            &restic_backup_argv(
+                repo,
+                &claim_dir.to_string_lossy(),
+                &tag,
+                opts.backup_host.as_deref(),
+            ),
             pass,
         )?;
 
@@ -692,7 +711,12 @@ fn run_backup_sequential_with_summary(
     let non_claim = capture_non_claim_artifacts(k, opts, &claims, &commit_dir)?;
 
     let manifest_snapshot_id = r.run_backup(
-        &restic_backup_argv(repo, &commit_dir.to_string_lossy(), &tag),
+        &restic_backup_argv(
+            repo,
+            &commit_dir.to_string_lossy(),
+            &tag,
+            opts.backup_host.as_deref(),
+        ),
         pass,
     )?;
     // The manifest snapshot is the run's representative id (its presence marks a
@@ -858,6 +882,7 @@ mod tests {
             staging_root,
             pg_image: "postgres:16-alpine".into(),
             staging_mode: mode,
+            backup_host: None,
         }
     }
 

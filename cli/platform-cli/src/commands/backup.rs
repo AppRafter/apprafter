@@ -912,6 +912,11 @@ pub fn run_backup(
         staging_root: staging.path().to_path_buf(),
         pg_image,
         staging_mode: StagingMode::Monolithic,
+        // CLI local-pull: keep the machine's hostname as the restic group
+        // (correct per-operator-station grouping). The in-cluster runner
+        // (chunk 2) will set Some("apprafter-backup") for a stable pod-agnostic
+        // host (spec §Retention M-r3-1a).
+        backup_host: None,
     };
 
     let r = SubprocessRestic;
