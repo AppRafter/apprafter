@@ -43,7 +43,7 @@ use serde_json::Value;
 
 use crate::commands::backup::{
     backup_passphrase_or_error, first_cnpg_image, list_items, read_platform_version,
-    read_secret_data, sourcecred_material_refs,
+    read_secret_data, resolve_operator_s3_creds, sourcecred_material_refs,
 };
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile_for_target, kubectl_apply_server_side, kubectl_get_json,
@@ -104,6 +104,7 @@ pub fn run_restore(
     snapshot: Option<&str>,
     data_only: bool,
     passphrase: Option<&str>,
+    credential_file: Option<&Path>,
 ) -> Result<()> {
     // Mutually-exclusive modes: `--reprovision` rebuilds the WHOLE cluster from
     // the backup (its step list has no data-only shortcut); `--data-only` reloads
@@ -119,12 +120,40 @@ pub fn run_restore(
         ));
     }
 
-    // 1. Passphrase (mandatory — the repo holds decrypted secrets). Gate FIRST,
-    //    before touching any cluster/repo — a bad passphrase must not leave a
-    //    freshly re-provisioned cluster half-restored.
-    let env_pass = std::env::var("RESTIC_PASSWORD").ok();
+    // 1. Passphrase + credentials (mandatory — the repo holds decrypted
+    //    secrets). Gate FIRST, before touching any cluster/repo — a bad
+    //    passphrase must not leave a freshly re-provisioned cluster
+    //    half-restored.
+    //
+    //    Two credential sources, mirroring the operator maintenance verbs
+    //    (prune/check/unlock): a REMOTE `s3:`/`b2:`/`gs:`/`azure:`/`rest:` repo
+    //    (or ANY repo when `--credential-file` is given) needs the operator's
+    //    full S3-style creds (AWS_* + RESTIC_PASSWORD) — resolved from the
+    //    dotenv file or the process env, NEVER from the cluster. A LOCAL
+    //    filesystem repo keeps the legacy RESTIC_PASSWORD-from-flag/env path.
     let is_tty = std::io::stdin().is_terminal();
-    let pass = backup_passphrase_or_error(passphrase, env_pass.as_deref(), is_tty)?;
+    let (pass, creds): (String, BTreeMap<String, String>) =
+        if credential_file.is_some() || is_remote_restic_repo(repo) {
+            // resolve_operator_s3_creds errors when RESTIC_PASSWORD is absent;
+            // surface that in the restore context (which knobs to reach for).
+            let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())
+                .map_err(|e| {
+                    CliError::Other(format!(
+                        "restore from a remote repo '{repo}' needs the operator's S3 \
+                         credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / \
+                         RESTIC_PASSWORD) via --credential-file or the environment: {e}"
+                    ))
+                })?;
+            let pass = creds
+                .get("RESTIC_PASSWORD")
+                .cloned()
+                .expect("resolve_operator_s3_creds guarantees RESTIC_PASSWORD is present");
+            (pass, creds)
+        } else {
+            let env_pass = std::env::var("RESTIC_PASSWORD").ok();
+            let pass = backup_passphrase_or_error(passphrase, env_pass.as_deref(), is_tty)?;
+            (pass, BTreeMap::new())
+        };
 
     let mode = if reprovision {
         RestoreMode::Reprovision
@@ -189,6 +218,7 @@ pub fn run_restore(
                 run_restic_restore(
                     &restic_restore_argv(repo, snap, &restore_root.path().to_string_lossy()),
                     &pass,
+                    &creds,
                 )?;
                 let dd = find_data_dir(restore_root.path())?;
                 let m = read_backup_manifest(&dd)?;
@@ -1257,13 +1287,30 @@ fn check_manifest_version(v: u32) -> cli_core::Result<()> {
 // restic runner
 // ---------------------------------------------------------------------------
 
+/// True when `repo` names a REMOTE restic backend (`s3:` / `b2:` / `gs:` /
+/// `azure:` / `rest:`) that needs the operator's full S3-style credentials —
+/// as opposed to a local filesystem path. Used to decide whether restore must
+/// resolve operator creds (`--credential-file` / env) before shelling out to
+/// restic: a local repo keeps the legacy RESTIC_PASSWORD-only path.
+pub(crate) fn is_remote_restic_repo(repo: &str) -> bool {
+    const REMOTE_PREFIXES: &[&str] = &["s3:", "b2:", "gs:", "azure:", "rest:"];
+    REMOTE_PREFIXES.iter().any(|p| repo.starts_with(p))
+}
+
 /// Run a restic command, capturing output — silent on success, surfaces stderr
 /// on failure. Used only for `restic restore` here; the backup-side runners
 /// live in `backup.rs`.
-fn run_restic_restore(argv: &[String], pass: &str) -> Result<()> {
-    let out = std::process::Command::new("restic")
-        .args(argv)
-        .env("RESTIC_PASSWORD", pass)
+///
+/// `pass` sets `RESTIC_PASSWORD` explicitly (the trait/legacy contract), and
+/// `creds` layers the operator's full S3 credentials (AWS_* + RESTIC_PASSWORD)
+/// on top so an `s3:` (or other remote) repo is reachable — for a local repo it
+/// is empty and only `RESTIC_PASSWORD` is set. `pass` and any
+/// `creds["RESTIC_PASSWORD"]` are the same value at the call sites.
+fn run_restic_restore(argv: &[String], pass: &str, creds: &BTreeMap<String, String>) -> Result<()> {
+    let mut cmd = std::process::Command::new("restic");
+    cmd.args(argv).env("RESTIC_PASSWORD", pass);
+    crate::commands::backup::apply_creds_to_command(&mut cmd, creds);
+    let out = cmd
         .output()
         .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
     if !out.status.success() {
@@ -1381,6 +1428,28 @@ mod tests {
         let (data, secret_type) = read_secret_file(&path).unwrap();
         assert_eq!(secret_type, "Opaque");
         assert_eq!(data.get("k").unwrap(), b"abc");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_remote_restic_repo — remote-backend detection for the creds contract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_remote_restic_repo_matches_remote_backends() {
+        assert!(is_remote_restic_repo("s3:s3.amazonaws.com/bucket/prefix"));
+        assert!(is_remote_restic_repo("b2:bucketname/path"));
+        assert!(is_remote_restic_repo("gs:bucket/path"));
+        assert!(is_remote_restic_repo("azure:container/path"));
+        assert!(is_remote_restic_repo("rest:https://host/repo"));
+    }
+
+    #[test]
+    fn is_remote_restic_repo_rejects_local_paths() {
+        assert!(!is_remote_restic_repo("/var/lib/apprafter/backups/prod"));
+        assert!(!is_remote_restic_repo("./relative/repo"));
+        assert!(!is_remote_restic_repo("backups/prod"));
+        // A local path that merely CONTAINS a scheme-like segment is still local.
+        assert!(!is_remote_restic_repo("/tmp/s3-backup"));
     }
 
     #[test]

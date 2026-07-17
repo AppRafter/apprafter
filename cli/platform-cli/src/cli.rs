@@ -278,6 +278,14 @@ pub enum Commands {
         /// `RESTIC_PASSWORD`; prompts interactively on a TTY.
         #[arg(long)]
         passphrase: Option<String>,
+        /// Path to a dotenv credential file containing the operator's
+        /// S3 credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+        /// `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). REQUIRED
+        /// to restore from a remote `s3:`/`b2:`/`gs:`/`azure:` repo
+        /// (falls back to the matching env vars); the operator's full
+        /// creds are read locally, NEVER from the cluster.
+        #[arg(long)]
+        credential_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -1205,6 +1213,12 @@ pub enum BackupAction {
         /// `RESTIC_PASSWORD`; prompts interactively on a TTY.
         #[arg(long)]
         passphrase: Option<String>,
+        /// Staging strategy: `monolithic` (default — stage every
+        /// namespace's native data at once, one snapshot) or
+        /// `sequential` (stage + snapshot one namespace at a time,
+        /// bounding peak staging disk on large clusters).
+        #[arg(long)]
+        staging_mode: Option<String>,
     },
     /// List snapshots stored in a backup repo.
     #[command(alias = "ls")]

@@ -893,6 +893,24 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     Ok(())
 }
 
+/// Parse the local-pull `apprafter backup --staging-mode` flag into a
+/// [`StagingMode`].
+///
+/// * `None` / `Some("monolithic")` → [`StagingMode::Monolithic`] (the default —
+///   stage every namespace's native data at once, one restic snapshot).
+/// * `Some("sequential")` → [`StagingMode::Sequential`] (stage + snapshot one
+///   namespace at a time; bounds peak staging disk on large clusters).
+/// * anything else → `Err` naming the two accepted values.
+pub(crate) fn parse_staging_mode(s: Option<&str>) -> Result<StagingMode> {
+    match s {
+        None | Some("monolithic") => Ok(StagingMode::Monolithic),
+        Some("sequential") => Ok(StagingMode::Sequential),
+        Some(other) => Err(CliError::Other(format!(
+            "invalid --staging-mode '{other}': expected 'monolithic' or 'sequential'"
+        ))),
+    }
+}
+
 /// `apprafter backup` — full encrypted backup (Kind 2): native extraction +
 /// serialized config/app CRs + decrypted user secrets, wrapped into a restic
 /// repository.
@@ -901,7 +919,10 @@ pub fn run_backup(
     select: bool,
     repo: Option<&str>,
     passphrase: Option<&str>,
+    staging_mode: Option<&str>,
 ) -> Result<()> {
+    let staging_mode = parse_staging_mode(staging_mode)?;
+
     let resolved = resolve_state_paths(None)?;
     let cluster_id = resolved.target_name.clone();
 
@@ -953,7 +974,7 @@ pub fn run_backup(
         is_subset: select,
         staging_root: staging.path().to_path_buf(),
         pg_image,
-        staging_mode: StagingMode::Monolithic,
+        staging_mode,
         // CLI local-pull: keep the machine's hostname as the restic group
         // (correct per-operator-station grouping). The in-cluster runner
         // (chunk 2) will set Some("apprafter-backup") for a stable pod-agnostic
@@ -2072,6 +2093,39 @@ mod tests {
         let mut cmd = Command::new("true");
         apply_creds_to_command(&mut cmd, &creds);
         // If we reach here without panic the function is wired correctly.
+    }
+
+    // ------------------------------------------------------------------
+    // 2z. parse_staging_mode (local-pull `apprafter backup --staging-mode`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn staging_mode_defaults_monolithic() {
+        assert!(matches!(
+            parse_staging_mode(None).unwrap(),
+            StagingMode::Monolithic
+        ));
+    }
+
+    #[test]
+    fn staging_mode_explicit_monolithic() {
+        assert!(matches!(
+            parse_staging_mode(Some("monolithic")).unwrap(),
+            StagingMode::Monolithic
+        ));
+    }
+
+    #[test]
+    fn staging_mode_sequential() {
+        assert!(matches!(
+            parse_staging_mode(Some("sequential")).unwrap(),
+            StagingMode::Sequential
+        ));
+    }
+
+    #[test]
+    fn staging_mode_rejects_garbage() {
+        assert!(parse_staging_mode(Some("weird")).is_err());
     }
 
     // ------------------------------------------------------------------

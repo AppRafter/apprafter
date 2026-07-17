@@ -265,11 +265,13 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 select,
                 repo,
                 passphrase,
+                staging_mode,
             } => commands::backup::run_backup(
                 &namespace,
                 select,
                 repo.as_deref(),
                 passphrase.as_deref(),
+                staging_mode.as_deref(),
             )?,
             BackupAction::List { repo, passphrase } => {
                 commands::backup::run_backup_list(repo.as_deref(), passphrase.as_deref())?
@@ -339,6 +341,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             snapshot,
             data_only,
             passphrase,
+            credential_file,
         } => commands::restore::run_restore(
             &repo,
             target.as_deref(),
@@ -346,6 +349,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             snapshot.as_deref(),
             data_only,
             passphrase.as_deref(),
+            credential_file.as_deref(),
         )?,
     }
     Ok(())
