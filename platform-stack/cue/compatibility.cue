@@ -1760,9 +1760,43 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.41": {
+	change:          "safe"
+	operatorVersion: "v0.2.33"
+	notes: """
+		Lands the OPERATOR side of 2.6d-4 that 0.2.40 was missing. 0.2.40 shipped
+		the `backup` chart component but carried `operatorVersion: v0.2.32` — a
+		version that had ALREADY been published (for the 2.4h `imagePolicy.resolve`
+		CRD-YAML fix), so `release-operator`'s two-axis gate skipped the rebuild
+		and the chunk-3/3b operator change never shipped: the deployed operator
+		v0.2.32 lacked the `PlatformStack.spec.backup` CRD field AND the
+		`spec.backup -> values.backup` projection. On 0.2.40 `apprafter backup
+		enable` therefore had its `spec.backup` silently pruned by the apiserver
+		(structural schema) and no backup resources ever rendered.
+
+		0.2.41 pins operator **v0.2.33** (a fresh version so the gate rebuilds +
+		publishes the operator with the backup CRD field + projection) and bumps
+		the bundled cue-cmp to **v0.1.14** (the sidecar image COPYs
+		`schemas/v1alpha1/*.cue`, which gained the `backup` block — the cue-cmp
+		drift guard requires the version bump even though the user-Application
+		schema is functionally unchanged). change=safe: still purely additive +
+		default-off; existing components byte-unchanged. The runner `image` stays
+		`apprafter-backup:v0.2.32` (the runner binary is unchanged; CLI stays
+		v0.2.32, so operator v0.2.33 deliberately breaks the historical
+		operator==CLI numeric lockstep — the operator is the only artifact that
+		needed a republish).
+		"""
+	references: [
+		"docs/superpowers/specs/2026-07-16-2-6d-4-s3-push-design.md",
+		"docs/adr/0050-backup-restore.md",
+	]
+}
+
 compatibility: "0.2.40": {
 	change:          "safe"
 	operatorVersion: "v0.2.32"
+	yanked:          true
+	yankedReason:    "backup feature non-functional: operatorVersion v0.2.32 predates the spec.backup CRD field + projection (v0.2.32 was already published for the 2.4h imagePolicy fix, so the operator never rebuilt) — `backup enable` is silently pruned. Fixed in 0.2.41 (operator v0.2.33 + cue-cmp v0.1.14)."
 	notes: """
 		Adds the opt-in default-off `backup` component (2.6d-4) — off-site
 		scheduled S3 backup. A new `templates/backup.yaml` (guarded entirely by
