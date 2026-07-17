@@ -478,9 +478,13 @@ fn pod_is_ready(pod: &Pod) -> bool {
 ///
 /// The k8s remotecommand protocol reports a `metav1.Status` on stream close:
 /// `status: Some("Success")` on exit-0, else `status: Some("Failure")` with a
-/// `reason` (`NonZeroExitCode`) and a human-readable `message`. When the status
-/// channel yields nothing (older apiservers / a dropped connection), a clean
-/// return is treated as success — the streamed data already succeeded.
+/// `reason` (`NonZeroExitCode`) and a human-readable `message`.
+///
+/// **Fail-closed**: after streaming, the terminal `metav1.Status` MUST arrive
+/// and MUST be `Success`. A missing status channel (`take_status()` → `None`)
+/// or an empty status future (`status_fut.await` → `None`) means we cannot
+/// verify the command's exit code — a truncated or failed `pg_dump`/`tar` must
+/// never be recorded as a successful backup, so we return `Err` in both cases.
 async fn check_exec_status(
     attached: &mut AttachedProcess,
     context: &str,
@@ -488,19 +492,23 @@ async fn check_exec_status(
     ns: &str,
     pod: &str,
 ) -> Result<()> {
-    if let Some(status_fut) = attached.take_status() {
-        if let Some(status) = status_fut.await {
-            if status.status.as_deref() == Some("Success") {
-                return Ok(());
-            }
-            let reason = status.reason.clone().unwrap_or_default();
-            let message = status.message.clone().unwrap_or_default();
-            return Err(CliError::Other(format!(
-                "{context}: command {argv:?} in {ns}/{pod} failed (status={:?}, reason={reason}): \
-                 {message}",
-                status.status
-            )));
-        }
+    match attached.take_status() {
+        Some(status_fut) => match status_fut.await {
+            Some(status) if status.status.as_deref() == Some("Success") => Ok(()),
+            Some(status) => Err(CliError::Other(format!(
+                "{context}: exec {argv:?} in {ns}/{pod} failed (status={:?}, reason={}): {}",
+                status.status,
+                status.reason.clone().unwrap_or_default(),
+                status.message.clone().unwrap_or_default(),
+            ))),
+            None => Err(CliError::Other(format!(
+                "{context}: exec {argv:?} in {ns}/{pod} returned no terminal status — cannot \
+                 verify exit code (failing closed to avoid a truncated backup)",
+            ))),
+        },
+        None => Err(CliError::Other(format!(
+            "{context}: exec {argv:?} in {ns}/{pod} exposed no status channel — cannot verify \
+             exit code (failing closed)",
+        ))),
     }
-    Ok(())
 }
