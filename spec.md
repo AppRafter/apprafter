@@ -4,7 +4,7 @@
 > **Domain:** `apprafter.dev`.
 > **Status:** Phase 1 (Tier 1 single-node MVP) delivered as `v0.1.0-mvp` on 2026-05-08; Phases 2–8 in active design. See `plan.md` for the phase ledger.
 > **Audience:** Architecture decisions, contributors onboarding, design rationale.
-> **Revision:** 11 (Phase 2 — Platform Services (M2) — **closed** 2026-06-10: subphases 2.1–2.12 deliver the launch platform-services scope (pg + redis + `needs.disk`, ADR 0034) — ServiceProvider/ResourceClaim machinery, CloudNativePG + Dragonfly providers, per-environment deploy (ADR 0044), needs-derived egress CiliumNetworkPolicy (ADR 0045), and `Application.env` value references (ADR 0046, §3.1: literal / bare `claim.<type>.<field>` / braceless `secret: "<name>/<key>"` → operator-resolved `secretKeyRef`; the 2.4e `DATABASE_URL` auto-injection removed; cue-cmp + `apprafter app validate` inject the schema + a generated `claim` binding so the scaffold no longer vendors the schema). spec.md §3.1/§4.4/§4.5 actualized (env-value model + the 2.9-deferred unification→override-wins and substrate→scalar reconciliation); §6 M2 box flipped at the 2.10–2.12 gate (the launch-scoped 2.16a per-claim rotation + the 2.17 checklist-housekeeping follow, 2.13–2.16 Notifications dropped); JetStream/ClickHouse/S3 providers, SPIRE workload-identity, and the Backstage ResourceClaim view deferred post-launch. Rev 10: M1.5 — Self-managing platform rethink — **closed** 2026-06-02: §6 milestone box flipped after the GitOps loop went green on the k3d e2e gate (CUE CMP render → Argo CD sync → operator reconcile → Deployment, with source-change propagation); `apprafter platform fork` (item 1.80), the Backstage MigrationPlan plugin (M3), and `platform channel` (M2) deferred; platform-scope MigrationPlan gate covered by operator unit + integration tests, real-infra migration e2e a nightly-Hetzner follow-up. No architecture change — the M1.5 design was actualized in Rev 7. Rev 9: SourceCredential CRD for private-repo credentials — ADR 0039: a config-only credential-reference CRD (§3.12) carrying zero secret material, the material sealed (SealedSecrets on Tier 1, OpenBao on Tier 2); the Application Operator derives both the Argo CD git repo-cred and the workload registry pull-secret from one source and reports validity in status; the `repo creds` CLI becomes a thin SourceCredential front-end; destructive credential change is gated via MigrationPlan. Rev 8: Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
+> **Revision:** 12 (App-scope destructive-change gating — 2.16b, ADR 0051: the application-scope `detect_destructive` classifier is enabled and wired into the Application reconcile loop, so a destructive edit to a user `Application` auto-creates an application-scope `MigrationPlan` in the app's own namespace, owned by the `Application` CR, and pauses the app at `AwaitingMigrationApproval` until approved via `apprafter migration approve` or the Argo CD "Approve" node — rejection remains a Git revert. §3.8 actualizes the destructive taxonomy (app scope: `needs.*` removal; `expose.hostname`/`expose.network` change of a publicly-routed app; scale-to-zero; image repository change; env-reference removal — with soft carve-outs for literals, tag changes, adds, scale-from-zero, and the deferred `needs` selector/size changes) and the diff baseline (`Application.status.lastAppliedSpec`, effective per-environment); §3.1 replaces the pre-1.83b `public: … , network: …` expose examples with the current single-field `expose.network: "public" | "internal" | "vpn"` form. Rev 11: Phase 2 — Platform Services (M2) — **closed** 2026-06-10: subphases 2.1–2.12 deliver the launch platform-services scope (pg + redis + `needs.disk`, ADR 0034) — ServiceProvider/ResourceClaim machinery, CloudNativePG + Dragonfly providers, per-environment deploy (ADR 0044), needs-derived egress CiliumNetworkPolicy (ADR 0045), and `Application.env` value references (ADR 0046, §3.1: literal / bare `claim.<type>.<field>` / braceless `secret: "<name>/<key>"` → operator-resolved `secretKeyRef`; the 2.4e `DATABASE_URL` auto-injection removed; cue-cmp + `apprafter app validate` inject the schema + a generated `claim` binding so the scaffold no longer vendors the schema). spec.md §3.1/§4.4/§4.5 actualized (env-value model + the 2.9-deferred unification→override-wins and substrate→scalar reconciliation); §6 M2 box flipped at the 2.10–2.12 gate (the launch-scoped 2.16a per-claim rotation + the 2.17 checklist-housekeeping follow, 2.13–2.16 Notifications dropped); JetStream/ClickHouse/S3 providers, SPIRE workload-identity, and the Backstage ResourceClaim view deferred post-launch. Rev 10: M1.5 — Self-managing platform rethink — **closed** 2026-06-02: §6 milestone box flipped after the GitOps loop went green on the k3d e2e gate (CUE CMP render → Argo CD sync → operator reconcile → Deployment, with source-change propagation); `apprafter platform fork` (item 1.80), the Backstage MigrationPlan plugin (M3), and `platform channel` (M2) deferred; platform-scope MigrationPlan gate covered by operator unit + integration tests, real-infra migration e2e a nightly-Hetzner follow-up. No architecture change — the M1.5 design was actualized in Rev 7. Rev 9: SourceCredential CRD for private-repo credentials — ADR 0039: a config-only credential-reference CRD (§3.12) carrying zero secret material, the material sealed (SealedSecrets on Tier 1, OpenBao on Tier 2); the Application Operator derives both the Argo CD git repo-cred and the workload registry pull-secret from one source and reports validity in status; the `repo creds` CLI becomes a thin SourceCredential front-end; destructive credential change is gated via MigrationPlan. Rev 8: Managed-offering actualization for the Hosted Services launch — ADRs 0034–0038 + 0031: hardware-tier vs managed-plan terminology (0034), Minimal Data Exposure (0035), MCP agentic-safety (0036), managed control-plane infrastructure (0037), Tier 2 hard multi-tenancy via Kamaji changed to opt-in / default off (0038), apprafter-agent outbound connector (0031); managed-launch control-plane storage is embedded etcd with kine + NATS JetStream as the eventual target; managed-launch platform-services scope is pg + redis + needs.disk. Rev 7: Pre-Phase-2 spec refinements — tier model clarification, IPv6 strategy, Tenant CRD, Hubble + KEDA + Karpenter formalisation, multi-tenancy via Kamaji, cluster-admin constrain bundle, multi-cloud deferred to v2; Self-managing platform via Argo CD (M1.5): minimal cluster-bootstrap, PlatformStack CRD, unified MigrationPlan with application+platform scopes, CUE source + OCI chart distribution, CUE CMP for user app repositories).
 
 ---
 
@@ -152,15 +152,15 @@ spec: {
 
         expose: {
             port: 8080
-            public: true                              // expose externally via Gateway
+            network: "public"                         // "public" → HTTPRoute on the platform Gateway; "internal" (default) → ClusterIP only; "vpn" → reserved
 
-            // Optional — defaults to {app}.{env}.{platform-domain}
+            // Optional — defaults to {app}.{env}.{platform-domain}. Consumed when network == "public"
             hostname: "parser-prod.example.com"
 
             // Optional — defaults to ["/"]
             paths: ["/", "/api/v1"]
 
-            // TLS via cert-manager + ClusterIssuer; default true when public: true
+            // TLS via cert-manager + ClusterIssuer; default true when network == "public"
             tls: true
 
             // Optional URL rewrites (Gateway API HTTPRoute filters)
@@ -211,18 +211,18 @@ spec: {
     environments: {
         dev: {
             replicas: 1
-            expose: {public: false, network: "vpn"}
+            expose: {network: "vpn"}  // reserved — reachable only over the VPN
             env: {LOG_LEVEL: "debug"}
             needs: {pg: {selector: {tier: "integrated"}}}
         }
         staging: {
             replicas: 2
-            expose: {public: false, network: "vpn"}
+            expose: {network: "vpn"}
             needs: {pg: {selector: {tier: "integrated"}}}
         }
         prod: {
             replicas: 3
-            expose: {public: false}  // internal only via Gateway
+            expose: {network: "internal"}  // internal only (ClusterIP)
             needs: {pg: {selector: {tier: "managed-aws"}}}
             confidential: true
             network: {
@@ -539,6 +539,8 @@ spec: {
 
 **Detection.** Reconcilers (the Application reconciler in the AppRafter operator, the PlatformController for platform changes) detect destructive changes during normal reconciliation. On detection, they create a `MigrationPlan` and **pause patching of dependent resources** — the source CR continues to exist with its new spec, but its child resources (Deployment, Service, HTTPRoute for Applications; Argo CD Application CRs for platform components) keep running the prior version. The source CR's `status.phase` reflects `AwaitingMigrationApproval`.
 
+For application scope the diff is computed against `Application.status.lastAppliedSpec` — an operator-owned record of the last successfully applied spec, held in `status` (Argo CD ignores it, so it stays GitOps-clean) and re-stamped only after a non-blocked apply. Because one logical app is a separate `Application` CR per environment (§3.1), both sides of the diff are compared as the *effective* spec, each unified under its own environment, so a change in one environment gates that environment's CR alone. An application-scope `MigrationPlan` is created in the **application's own namespace** with a controlling `ownerReference` back to the `Application` CR, so Kubernetes garbage-collects it when the app is deleted and it renders in the user's Argo CD application tree without a separate anchor (ADR 0051).
+
 **Gate location.** The gate is implemented inside the AppRafter reconcilers, not at the Argo CD layer. Argo CD remains a transport: it synchronises whatever is in the source. AppRafter reconcilers gate the propagation from "CR in cluster" to "child resources reflect the CR's spec." This avoids fighting Argo CD's automated sync and keeps Argo CD's role simple.
 
 **Approve / reject semantics differ by scope:**
@@ -546,25 +548,36 @@ spec: {
 - **`application` scope:** approve-only. There is no explicit reject. The application manifest lives in the user's Git repository; if the user wants to reverse a change, they revert the commit in the source repo. Argo CD synchronises the reverted manifest, the reconciler observes it as a non-destructive (or differently-destructive) change, and the original MigrationPlan is superseded.
 - **`platform` scope:** approve or reject. The platform target lives in the cluster (PlatformStack CR, see §3.11), not in a user repository. Reject means "revert `spec.pin` to the value stored in the plan's previous-spec snapshot annotation."
 
-**What's destructive (triggers MigrationPlan):**
+**What's destructive (triggers MigrationPlan).** For **application** scope, over the effective (per-environment) spec (ADR 0051):
 
-- Selector change for stateful claims (pg, clickhouse)
-- Major version upgrade of a platform service (e.g., pg 15 → 16)
-- Storage class change
-- Any change marked `destructive: true` in the ServiceProvider schema
-- Platform-stack diffs classified as `requires-restart`, `data-migration`, or `breaking` (see §3.11 PlatformStack)
+- Removal of any `needs.*` entry — data loss, because the backing `ResourceClaim` and its data are garbage-collected (`data-migration`).
+- `expose.hostname` removal or change **of a publicly-routed app** (`expose.network: "public"`) — the app becomes unreachable on the old hostname and the certificate churns (`requires-restart`). On a non-public app no route is emitted, so a hostname edit is inert.
+- `expose.network` change from `public` to a non-public value (`internal` or `vpn`) — removes external reachability (`requires-restart`).
+- `replicas` N → 0 (scale-to-zero) — a deliberate outage (`requires-restart`).
+- Image **repository** (path) change — a different image rather than the same image at a new tag (`requires-restart`).
+- Removal of an env value that is a **reference** (a `claim.*` selector or a `secret: "name/key"` reference, §3.1) — the workload loses a wired dependency (`requires-restart`).
 
-**What's NOT destructive (auto-applies):**
+For **platform** scope, and for ServiceProvider-declared destructive fields:
 
-- Replica count changes
-- Expose rule changes
-- Env var additions
-- Image updates (those are routine deployments via Argo CD)
-- Platform-stack diffs classified as `safe`
+- Selector change for stateful claims (pg, clickhouse) — *deferred while a single integrated provider is the only option (ADR 0051); revisit when a second provider ships*.
+- Major version upgrade of a platform service (e.g., pg 15 → 16).
+- Storage class change.
+- Any change marked `destructive: true` in the ServiceProvider schema.
+- Platform-stack diffs classified as `requires-restart`, `data-migration`, or `breaking` (see §3.11 PlatformStack).
+
+**What's NOT destructive (auto-applies).** For **application** scope these are soft — they auto-apply, and the soft-destructive ones emit a `SoftDestructiveChange` Kubernetes Event rather than gating:
+
+- Any addition (`needs`, env, or `expose` add) and scale from zero (0 → N) or scale down to a non-zero count.
+- Env value *literal* removal (a plain string, not a reference) — a failed rollout self-protects (new pods fail readiness, old pods keep serving, revert in Git).
+- Image **tag** change on the same repository — resolved tag → digest and rolled out automatically (§3.1, image auto-rollout).
+- A `needs.*.size` change — PVC and CNPG storage are expansion-only, so a shrink is rejected at the provisioner layer.
+- Replica count changes that are not a scale-to-zero, and other expose edits that do not remove public reachability.
+
+For **platform** scope: any diff classified as `safe`.
 
 **No automatic expiration.** A `MigrationPlan` in `pending-approval` state remains there indefinitely. Auto-rejection would harm solo operators on extended absences. If a user wants to dismiss a plan without acting, manual reject (platform scope) or Git revert (application scope) is the path.
 
-**Backstage UI** surfaces the queue of pending plans across both scopes, allowing approval through a unified interface. Argo CD UI also exposes an "Approve Migration" Resource Action via a Lua script for users who do not use Backstage. The CLI provides `apprafter migration list`, `apprafter migration approve <name>`, `apprafter migration reject <name>` as fallback paths.
+**Approval surfaces.** The CLI provides `apprafter migration list` (across all namespaces — platform-scope plans live in `apprafter-system`, application-scope plans in the application's namespace), `apprafter migration approve <name>` (resolves the plan's namespace automatically), and `apprafter migration reject <name>` (platform scope only — an application-scope reject is a Git revert). The Argo CD UI also exposes an "Approve" Resource Action via a Lua script on the plan node — for a platform plan under the platform-stack tree, and for an application plan under the user's own Argo application tree (ADR 0048, ADR 0051). A Backstage queue view across both scopes follows in the post-launch portal bundle.
 
 **Approvers** are listed as email addresses in `spec.approvers`. When the AccessGrant subsystem (§3.4) is fully delivered, the field will accept identity references and approval will route through the same identity layer.
 
@@ -1336,7 +1349,7 @@ Subsequent to M1 delivery, ADRs 0025–0029 reframe `cluster-bootstrap` as a min
 **Target:** declarative external contour, AccessGrant working.
 
 - [ ] ExternalSurface CRD
-- [ ] HTTPRoute auto-generation by operator (`expose.public: true` → working route + cert + sticky/WS as needed)
+- [ ] HTTPRoute auto-generation by operator (`expose.network: "public"` → working route + cert + sticky/WS as needed)
 - [ ] GitLab/Forgejo deployable from manifest
 - [ ] Harbor registry deployable from manifest
 - [ ] Headscale + Tailscale Operator integration

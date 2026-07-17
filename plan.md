@@ -3614,6 +3614,28 @@ Storage-примитивы поверх 2.6b owned-disk пайплайна. Жё
 
 ---
 
+### 2.16b-sc — SourceCredential-scope MigrationPlan wiring
+> 🏁 SR: A · order 3.7 (следом за 2.16b — тот же «флип», другой scope) — включить live-создание MigrationPlan при деструктивной правке `SourceCredential` (ре-анкор co-отложенного 1.79c S5).
+
+**Контекст:** 1.79c S5 поставил классификатор `SourceCredentialMigrationStrategy::detect_destructive` (coverage-removal / drop-half → `breaking`, 7 тестов), но **live plan-creation co-отложил** «с application-scope live-wiring (B.1.77 флип)» (`plan.md §1.79c` S5). 2.16b ЕСТЬ этот флип — но он включает только **application**-scope. SourceCredential-scope — отдельный **новый scope-вариант** дискриминатора MigrationPlan (не «раскомментировать один call-site»): нужны свои mirror'ы ns/ownerRef/webhook-form/CLI по образцу application-scope (ADR 0051) + врезка в SourceCredential reconciler. Пока этого нет, удаление покрытия репо/реестра проходит без гейта (derived pull-secret передеривается под reverse-dep gate CLI `repo creds remove` из S4; полного end-to-end gating нет).
+
+**Цель:** `sourcecredential`-вариант MigrationPlan-scope + live-создание плана в SourceCredential reconciler, когда ротация/удаление credential деструктивно (coverage-removal при матчащихся приложениях), паузя derivation до approve.
+
+**Поставка:**
+- [ ] Scope-вариант `sourcecredential` в MigrationPlan (kube-rs тип + OpenAPI CRD + CUE schema + admission `validator_migrationplan.rs` — required-fields per scope, как application/platform).
+- [ ] `create_plan_for` для SourceCredential: план в namespace SourceCredential CR (или release-ns) + controlling ownerRef на SourceCredential CR (same-ns GC-safe, паттерн ADR 0051); webhook-valid form; `previous_spec_snapshot` по семантике reject (approve-only vs revert — решить, зеркалит ли application-scope).
+- [ ] Врезка `detect_destructive` (уже есть) в SourceCredential reconcile loop → авто-создание плана + пауза derivation derived Secret'ов до `completed`; consume-ticket по образцу 2.16b (approve → apply → delete plan).
+- [ ] CLI `migration list` уже cluster-wide (2.16b) — подтвердить, что sourcecredential-план видим; approve-путь тот же.
+- [ ] Live walk: убрать registry-host из покрытия CR при матчащемся приложении → авто-план + derived pull-secret не трогается до approve (закрывает 1.79c acceptance #4).
+
+**Acceptance:** удаление covering repo-prefix / registry-host, пока приложение матчится → авто-создаётся `sourcecredential`-scope MigrationPlan, derivation паузится, план виден+кликабелен + `apprafter migration approve` снимает паузу; ротация на эквивалентный валидный credential проходит без гейта.
+
+**Зависит от:** 1.79c S5 (классификатор + актор-agnostic detect), 2.16b / ADR 0051 (scope-вариант ns/ownerRef/webhook-form/CLI-паттерн для реюза), 1.76-1.78 (MigrationPlan + контроллер). **Связан с** [[project_1_79c_sourcecredential]].
+
+**Размер:** S-M · классификатор готов; масса — новый scope-вариант (4 hand-rolled mirror'а: kube-rs/OpenAPI/CUE/admission) + reconciler-врезка + walk. SR:A order 3.7.
+
+---
+
 ### 2.16c — Per-environment partial override для struct-полей (deep-merge `expose`)
 > 🏁 SR: A — устранить асимметрию base↔override: env должен нести только diff, а не полную копию struct-поля. Surfaced дегфудингом launch-лендинга (procvue/landing) — есть обходной костыль, не hard-блокер.
 
