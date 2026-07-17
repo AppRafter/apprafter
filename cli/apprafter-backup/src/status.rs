@@ -14,8 +14,9 @@ use crate::orchestrate::RunOutcome;
 /// `new`.  The result starts from `old` and overlays every key from `new`,
 /// so that:
 ///
-/// * A success run overlays `lastSuccess` + `lastRunFormat` while keeping
-///   `lastFailure` / `lastError` that a prior failure had written.
+/// * A success run overlays `lastSuccess` + `lastRunFormat` and CLEARS
+///   `lastError` (empty string) so a prior failure's message doesn't linger as
+///   if current (E2); the `lastFailure` timestamp is kept as history.
 /// * A failure run overlays `lastFailure` + `lastError` + `lastRunFormat`
 ///   while keeping `lastSuccess` from a prior success.
 ///
@@ -130,6 +131,13 @@ pub fn status_configmap(outcome: &RunOutcome, format: &str, now: &str) -> serde_
     match outcome {
         RunOutcome::Success { .. } => {
             data["lastSuccess"] = serde_json::Value::String(now.to_string());
+            // CLEAR a prior run's `lastError` (E2): the merge preserves keys the
+            // new run omits, so without this an old failure's error string
+            // lingers next to a fresh `lastSuccess` and `backup status` reads as
+            // "currently erroring". Emit an empty string so the merge overwrites
+            // it. `lastFailure` (a timestamp) is intentionally kept as "when it
+            // last failed" history — only the misleading message is cleared.
+            data["lastError"] = serde_json::Value::String(String::new());
         }
         RunOutcome::Failure { error } => {
             data["lastFailure"] = serde_json::Value::String(now.to_string());
@@ -159,7 +167,8 @@ mod tests {
     // -- merge_status_data ----------------------------------------------------
 
     #[test]
-    fn merge_keeps_prior_lastfailure_on_a_success_run() {
+    fn success_run_keeps_lastfailure_ts_but_clears_lasterror() {
+        // Mirrors what `status_configmap` emits on Success (E2): lastError="".
         let old = serde_json::json!({
             "lastFailure": "t0",
             "lastError": "boom",
@@ -167,12 +176,13 @@ mod tests {
         });
         let new = serde_json::json!({
             "lastSuccess": "t1",
+            "lastError": "",
             "lastRunFormat": "monolithic"
         });
         let m = merge_status_data(&old, &new);
         assert_eq!(m["lastSuccess"], "t1");
-        assert_eq!(m["lastFailure"], "t0"); // preserved
-        assert_eq!(m["lastError"], "boom"); // preserved
+        assert_eq!(m["lastFailure"], "t0"); // kept as history
+        assert_eq!(m["lastError"], ""); // stale error cleared
         assert_eq!(m["lastRunFormat"], "monolithic");
     }
 
@@ -226,7 +236,7 @@ mod tests {
         assert_eq!(cm["kind"], "ConfigMap");
         assert_eq!(cm["data"]["lastSuccess"], "2026-07-17T03:00:00Z");
         assert_eq!(cm["data"]["lastRunFormat"], "monolithic");
-        assert!(cm["data"].get("lastError").is_none());
+        assert_eq!(cm["data"]["lastError"], ""); // cleared on success (E2)
         assert!(cm["data"].get("lastFailure").is_none());
     }
 
