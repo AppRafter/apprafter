@@ -544,17 +544,27 @@ pub enum EgressCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum MigrationCommand {
-    /// List MigrationPlans in the apprafter-system namespace
-    /// — name, scope, classification, phase.
+    /// List MigrationPlans across all namespaces — namespace,
+    /// name, scope, classification, phase. Platform-scope plans
+    /// live in `apprafter-system`; app-scope plans (2.16b) live
+    /// in the Application's own namespace.
     #[command(alias = "ls")]
     List,
     /// Patch status.phase=approved on a MigrationPlan.
     /// MigrationController transitions through executing →
-    /// completed.
+    /// completed. The plan's namespace is resolved automatically
+    /// (app-scope plans live in the app's namespace); pass `-n`
+    /// only to disambiguate a name that exists in multiple
+    /// namespaces.
     Approve {
         /// MigrationPlan name (as listed via `apprafter
         /// migration list`).
         name: String,
+        /// Namespace of the MigrationPlan. Omit to auto-resolve
+        /// from `apprafter migration list`; required only when
+        /// the same name exists in more than one namespace.
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
     },
     /// Patch status.phase=rejected. The admission webhook
     /// denies application-scope rejects per ADR 0027 — the

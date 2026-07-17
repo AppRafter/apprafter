@@ -105,7 +105,9 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
         },
         Commands::Migration { action } => match action {
             MigrationCommand::List => commands::migration::list()?,
-            MigrationCommand::Approve { name } => commands::migration::approve(&name)?,
+            MigrationCommand::Approve { name, namespace } => {
+                commands::migration::approve(&name, namespace.as_deref())?
+            }
             MigrationCommand::Reject { name } => commands::migration::reject(&name)?,
         },
         Commands::Open { ui } => match ui {
