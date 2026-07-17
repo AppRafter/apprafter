@@ -9,7 +9,7 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## cli v0.2.32 / operator v0.2.33 / platform-stack 0.2.41 / apprafter-backup:v0.2.32 / cue-cmp v0.1.14 — 2.6d-4 automated off-site S3 backup (opt-in) (2026-07-17)
+## cli v0.2.33 / operator v0.2.33 / platform-stack 0.2.42 / apprafter-backup:v0.2.33 / cue-cmp v0.1.14 — 2.6d-4 automated off-site S3 backup (opt-in) (2026-07-17)
 
 Turns the operator-machine local-pull `apprafter backup` into an **opt-in**
 scheduled in-cluster CronJob pushing the same encrypted restic repo to a
@@ -81,10 +81,31 @@ went out pinning that stale operator (backup silently non-functional). (2) the
 cue-cmp drift guard failed because the bundled `schemas/v1alpha1/*.cue` changed
 without a `version.cue` bump. Fix: operator → **v0.2.33** (fresh version forces
 the rebuild), cue-cmp → **v0.1.14**, platform-stack → **0.2.41** (re-pins both;
-0.2.40 is immutable) and **0.2.40 is YANKED** (backup non-functional). The CLI
-stays v0.2.32 and the runner image stays `apprafter-backup:v0.2.32` (neither
-binary changed), so operator v0.2.33 deliberately breaks the historical
-operator==CLI numeric lockstep.
+0.2.40 is immutable) and **0.2.40 is YANKED** (backup non-functional). operator
+v0.2.33 deliberately breaks the historical operator==CLI numeric lockstep.
+
+### Runner fixes (found on the real-Hetzner S3 walk) → cli/runner v0.2.33 + ps 0.2.42
+
+0.2.41 wired the operator projection correctly (`backup enable` worked, the
+CronJob rendered), but the RUNNER Job crash-looped — 7 bugs every unit/CRD/review
+gate had passed, surfaced only by the live walk (diagnosed via the runner's
+`apprafter-backup-status` ConfigMap `lastError` + a live additive-RBAC
+iteration). Four were runner-ClusterRole verb/resource gaps: `pods: patch` (the
+runner server-side-**applies** the pg_dump helper Pod — SSA is a PATCH, not
+create), `pods/exec: get` (kube-rs's WebSocket exec is a GET upgrade, not the
+POST/create `kubectl` uses), `secrets: list` (the sweep enumerates each app
+namespace's secrets), and `sourcecredentials` (the config-CR sweep lists
+`SourceCredential`s). One was a `configmaps: create` rule silently forbidden by
+its `resourceNames` scope (create can't be name-restricted) — split out. Two
+were runner-image code bugs: the engine passed the singular `secret` resource
+string that kube-rs discovery can't resolve (→ canonical plural `secrets` + a
+defensive singular-kind match), and a backup Failure was never printed to stderr
+(→ `eprintln!` so `kubectl logs` shows why). **Validated end-to-end on real
+Hetzner**: the fixed runner image + RBAC ran a full backup to Hetzner Object
+Storage (snapshot committed, `lastSuccess` recorded) and the restic repo
+restored cleanly. Release: cli/runner → **v0.2.33**, platform-stack → **0.2.42**
+(re-pins runner image v0.2.33 + the RBAC), **0.2.41 YANKED** (runner
+crash-loops). operator v0.2.33 + cue-cmp v0.1.14 unchanged.
 
 ## cli v0.2.31 — 2.6d T13 restore --reprovision (clone-to-new) (2026-07-16)
 
