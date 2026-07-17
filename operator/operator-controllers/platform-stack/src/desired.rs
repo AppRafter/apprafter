@@ -42,6 +42,9 @@ pub fn build(stack_spec: &PlatformStackSpec, resolved_version: &str) -> DesiredS
         }
         values["overrides"] = Value::Object(over);
     }
+    if let Some(backup) = &stack_spec.backup {
+        values["backup"] = serde_json::to_value(backup).unwrap_or(serde_json::Value::Null);
+    }
     DesiredSource {
         target_revision: resolved_version.to_string(),
         helm_values: values,
@@ -112,6 +115,41 @@ mod tests {
             .insert("ingress_class".into(), json!("nginx"));
         let desired = build(&spec, "0.1.15");
         assert_eq!(desired.helm_values["ingress_class"], json!("nginx"));
+    }
+
+    #[test]
+    fn backup_config_propagates_to_helm_values() {
+        let mut spec = base_spec();
+        spec.backup = Some(operator_core::platform_stack::BackupConfig {
+            enabled: true,
+            schedule: "@daily".into(),
+            bucket: "s3:https://ep/b".into(),
+            credential_ref: operator_core::platform_stack::CredentialRef {
+                name: "bkcreds".into(),
+            },
+            staging_mode: "monolithic".into(),
+            staging_size_limit: None,
+            retention: None,
+            check_schedule: "@weekly".into(),
+            check_read_data: false,
+            failure_webhook: None,
+        });
+        let desired = build(&spec, "0.2.31");
+        assert_eq!(desired.helm_values["backup"]["enabled"], json!(true));
+        assert_eq!(
+            desired.helm_values["backup"]["bucket"],
+            json!("s3:https://ep/b")
+        );
+        assert_eq!(
+            desired.helm_values["backup"]["credentialRef"]["name"],
+            json!("bkcreds")
+        );
+    }
+
+    #[test]
+    fn no_backup_block_leaves_helm_values_without_backup_key() {
+        let spec = base_spec();
+        assert!(build(&spec, "0.2.31").helm_values.get("backup").is_none());
     }
 
     #[test]
