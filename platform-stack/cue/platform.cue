@@ -367,10 +367,11 @@ package platformstack
 	enabled: bool | *false
 
 	// Runner container image (the `apprafter-backup` binary + restic +
-	// a shell). Pinned to a placeholder tag here; chunk 6 finalises it
-	// to the released runner image, and `PlatformController` / chart
-	// bumps roll it forward in lockstep with the CLI.
-	image: string | *"ghcr.io/apprafter/apprafter-backup:0.2.32"
+	// a shell). Pinned to the released runner image; the
+	// `release-backup-runner.yml` workflow publishes this tag from
+	// `cli/Cargo.toml` `workspace.package.version`, and chart bumps roll
+	// it forward in lockstep with the CLI.
+	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.32"
 
 	// Cron schedule for the full backup Job. Default nightly 03:00.
 	schedule: string | *"0 3 * * *"

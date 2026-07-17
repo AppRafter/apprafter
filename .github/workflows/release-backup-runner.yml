@@ -1,0 +1,233 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: release-backup-runner
+
+# Builds and pushes the `apprafter-backup` runner container image
+# (the in-cluster CronJob binary for 2.6d-4 off-site S3 backup) on
+# runner-code changes. Mirrors the path-filtered + two-axis-gate +
+# per-stream-tag pattern of `release-operator.yml`.
+#
+# ## Trigger discipline
+#
+# The runner lives in the `cli/` workspace (`cli/apprafter-backup/`,
+# built on `cli/backup-core/`), so its code only changes when those
+# paths change — and a change to them is a CLI change, which bumps
+# `cli/Cargo.toml` `workspace.package.version` by the repo's
+# versioning rule. The workflow therefore triggers on master pushes
+# touching those two crates (+ this file), plus `workflow_dispatch`.
+# CLI tag pushes and pushes that don't touch the runner crates do
+# NOT wake it; a push that touches them without an image-worthy delta
+# wakes it but skips publish via the gate below (same image already
+# on ghcr.io).
+#
+# ## Tag stream
+#
+# Runner releases live on their own `apprafter-backup/v<version>` tag
+# series (matches `operator/v*`, `platform-stack/v*`,
+# `argocd-cue-cmp/v*`). The version is `cli/Cargo.toml`
+# `workspace.package.version` — the SoT the platform-stack chart pins
+# via `#BackupValues.image` (`ghcr.io/<owner>/apprafter-backup:v<ver>`).
+# The publish job creates the git tag itself via `gh release create`
+# at the end of a successful run — do NOT pre-emptively `git tag` the
+# value locally (it would trip the "tag exists" gate and skip publish).
+#
+# ## Detect gate
+#
+# `detect` reads `cli/Cargo.toml` `workspace.package.version`,
+# computes the tag, and checks TWO axes: (1) git tag
+# `apprafter-backup/v<version>` on origin, (2) image at
+# `ghcr.io/<owner>/apprafter-backup:v<version>`. BOTH must be present
+# to skip. Either absent triggers the build (recovers a tag-without-
+# image or image-without-tag state). Default to publish on any
+# uncertainty.
+#
+# ## First push
+#
+# First push creates the ghcr package as private. Flip it to public
+# once via the GitHub UI (Packages -> apprafter-backup -> Settings ->
+# Change visibility -> Public) so the tier-1 default (no
+# imagePullSecret) pull works; subsequent runs update the existing
+# public package.
+#
+# ## Security
+#
+# Every dynamic value (`github.repository_owner`, `github.actor`) is
+# consumed only as an input to docker/login-action /
+# docker/build-push-action or via an `env:` binding in a shell step —
+# never interpolated directly into a `run:` command (anti-injection).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'cli/apprafter-backup/**'
+      - 'cli/backup-core/**'
+      - 'cli/Cargo.toml'
+      - '.github/workflows/release-backup-runner.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create GitHub Release + tag
+  packages: write   # push to ghcr.io
+
+jobs:
+  detect:
+    name: resolve version + check if publish needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_publish: ${{ steps.gate.outputs.should_publish }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from cli/Cargo.toml
+        id: version
+        env:
+          CARGO_FILE: cli/Cargo.toml
+        run: |
+          # `workspace.package.version` is the runner's SoT (the
+          # runner is a cli/ workspace member, so it shares this
+          # version). Grep the first `version` line under
+          # [workspace.package] — the field is a bare semver.
+          version=$(awk '/^\[workspace.package\]/{f=1} f&&/^version/{print; exit}' "$CARGO_FILE" \
+              | sed -E 's/.*"([^"]+)".*/\1/')
+          if [[ -z "${version:-}" ]]; then
+            echo "::error::failed to extract workspace.package.version from $CARGO_FILE"
+            exit 1
+          fi
+          version="${version#v}"
+          tag="apprafter-backup/v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$version, tag=$tag"
+
+      - name: Check whether version is already published
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          # Two-axis gate (mirrors release-operator.yml): the
+          # published version requires BOTH the git tag AND the
+          # image on ghcr.io. Default to "publish" on uncertainty.
+          tag_exists=false
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            tag_exists=true
+          fi
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          runner_image="ghcr.io/${owner_lc}/apprafter-backup:v${VERSION}"
+          echo "${GH_TOKEN}" | docker login ghcr.io \
+              -u "${GITHUB_ACTOR}" --password-stdin >/dev/null
+          image_exists=false
+          if docker manifest inspect "${runner_image}" >/dev/null 2>&1; then
+            image_exists=true
+          fi
+          if [[ "$tag_exists" == "true" && "$image_exists" == "true" ]]; then
+            echo "::notice::Both exist (tag ${TAG}, ${runner_image}) — skipping publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::tag_exists=${tag_exists}, image_exists=${image_exists} — proceeding to publish."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  runner:
+    name: build apprafter-backup
+    needs: detect
+    if: needs.detect.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image base
+        id: image-base
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/apprafter-backup" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push runner image
+        uses: docker/build-push-action@v5
+        with:
+          # The Dockerfile COPYs the whole `cli/` workspace, so the
+          # build context is the repo root.
+          context: .
+          file: cli/apprafter-backup/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image-base.outputs.image }}:v${{ needs.detect.outputs.version }}
+            ${{ steps.image-base.outputs.image }}:latest
+          # Tier-1 substrate is x86 only (Hetzner CPX22); arm64 lands
+          # with the operator's multi-arch work.
+          platforms: linux/amd64
+          cache-from: type=gha,scope=apprafter-backup
+          cache-to: type=gha,mode=max,scope=apprafter-backup
+
+  release:
+    name: create GitHub Release + apprafter-backup/v<version> tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [detect, runner]
+    if: needs.detect.outputs.should_publish == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release + tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          runner_image="ghcr.io/${owner_lc}/apprafter-backup:v${VERSION}"
+          notes_file=$(mktemp)
+          cat > "$notes_file" <<EOF
+          ## apprafter-backup ${VERSION}
+
+          In-cluster backup runner image for the 2.6d-4 off-site S3
+          backup CronJobs. Consumed by the platform-stack chart's
+          \`templates/backup.yaml\` via \`.Values.backup.image\`.
+
+          ### Pull
+
+          \`\`\`sh
+          docker pull ${runner_image}
+          \`\`\`
+
+          Source: [\`cli/apprafter-backup/\`](https://github.com/${REPO}/tree/${TAG}/cli/apprafter-backup).
+          EOF
+          # Recovery path: if the git tag already exists on origin
+          # without a matching release, reset the release entry cleanly
+          # (mirrors release-operator.yml).
+          release_args=()
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::notice::Tag ${TAG} already on origin — recovering via release re-create."
+            gh release delete "$TAG" --yes 2>/dev/null || true
+          else
+            release_args+=(--target "$SHA")
+          fi
+          gh release create "$TAG" \
+            --title "apprafter-backup ${VERSION}" \
+            --notes-file "$notes_file" \
+            "${release_args[@]}"
