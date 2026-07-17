@@ -34,7 +34,7 @@ use operator_core::migration::classification_severity;
 use operator_core::{
     Application, ApplicationBaseSpec, DestructiveChange, MigrationApplicationRef,
     MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope,
-    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, Needs,
+    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, Needs, OneOrMany,
     SourceCredentialSpec, StepOutcome,
 };
 
@@ -110,6 +110,51 @@ impl ApplicationMigrationStrategy {
                 from: Some(json!(key)),
                 to: Some(json!("(removed)")),
                 classification: "data-migration".to_string(),
+            });
+        }
+
+        // Network visibility + public-domain ops. The `network` field
+        // defaults to `internal` (application.cue:73) when absent, so an
+        // Application with no `expose.network` is treated as internal.
+        let old_net = old
+            .expose
+            .as_ref()
+            .and_then(|e| e.network.as_deref())
+            .unwrap_or("internal");
+        let new_net = new
+            .expose
+            .as_ref()
+            .and_then(|e| e.network.as_deref())
+            .unwrap_or("internal");
+        let old_host = first_hostname(old);
+        let new_host = first_hostname(new);
+
+        // public -> any non-public visibility flip: the app stops being
+        // reachable on its public HTTPRoute, so it's gated (requires-restart).
+        if old_net == "public" && new_net != "public" {
+            candidates.push(DestructiveChange {
+                trigger_type: "network-visibility-change".to_string(),
+                field: "expose.network".to_string(),
+                from: Some(json!("public")),
+                to: Some(json!(new_net)),
+                classification: "requires-restart".to_string(),
+            });
+        }
+
+        // Hostname removal / change of a PUBLICLY-ROUTED app ONLY. On a
+        // non-public app the HTTPRoute isn't emitted, so the hostname is
+        // inert and its change is soft. Gating on `old_net == "public"`
+        // (the app was routed before the edit) also covers the
+        // public->internal case where the route is being withdrawn.
+        if old_net == "public" && old_host != new_host {
+            candidates.push(DestructiveChange {
+                trigger_type: "domain-change".to_string(),
+                field: "expose.hostname".to_string(),
+                from: Some(json!(old_host.clone().unwrap_or_default())),
+                to: Some(json!(new_host
+                    .clone()
+                    .unwrap_or_else(|| "(removed)".to_string()))),
+                classification: "requires-restart".to_string(),
             });
         }
 
@@ -219,6 +264,20 @@ fn needs_keys(needs: Option<&Needs>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The first declared public hostname of a spec, or `None` when the
+/// Application declares no `expose.hostname`. `OneOrMany::One(h)` → `h`;
+/// `OneOrMany::Many(v)` → the first element (`None` for an empty vec).
+/// Only the first hostname participates in domain-change detection — a
+/// multi-hostname edit still gates on the primary, which is enough to
+/// flag the route change (the full hostname-set diff is render-side).
+fn first_hostname(s: &ApplicationBaseSpec) -> Option<String> {
+    match s.expose.as_ref().and_then(|e| e.hostname.as_ref()) {
+        Some(OneOrMany::One(h)) => Some(h.clone()),
+        Some(OneOrMany::Many(v)) => v.first().cloned(),
+        None => None,
+    }
 }
 
 /// Keys present in `old` but absent from `new` — i.e. the `needs`
@@ -741,10 +800,23 @@ mod tests {
 #[cfg(test)]
 mod application_detect_destructive_tests {
     use super::*;
-    use operator_core::{OneOrMany, ServiceNeed};
+    use operator_core::{ApplicationExpose, OneOrMany, ServiceNeed};
 
     fn base() -> ApplicationBaseSpec {
         ApplicationBaseSpec::default()
+    }
+
+    fn expose(network: &str, host: Option<&str>) -> ApplicationExpose {
+        ApplicationExpose {
+            network: Some(network.into()),
+            hostname: host.map(|h| OneOrMany::One(h.to_string())),
+            ..Default::default()
+        }
+    }
+
+    fn with_expose(mut s: ApplicationBaseSpec, e: ApplicationExpose) -> ApplicationBaseSpec {
+        s.expose = Some(e);
+        s
     }
 
     fn with_pg(mut s: ApplicationBaseSpec) -> ApplicationBaseSpec {
@@ -811,6 +883,67 @@ mod application_detect_destructive_tests {
     #[test]
     fn no_needs_either_side_is_not_destructive() {
         assert!(ApplicationMigrationStrategy::detect_destructive(&base(), &base()).is_none());
+    }
+
+    // ---- Task 3: domain-change (gated on public) + network-visibility ----
+
+    #[test]
+    fn hostname_change_on_public_app_gates() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(base(), expose("public", Some("b.example.com"))),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "domain-change");
+        assert_eq!(c.classification, "requires-restart");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+    }
+
+    #[test]
+    fn hostname_change_on_internal_app_is_soft() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("internal", Some("a.example.com"))),
+            &with_expose(base(), expose("internal", Some("b.example.com")))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn hostname_removal_on_public_app_gates_with_removed_sentinel() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(base(), expose("public", None)),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "domain-change");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+    }
+
+    #[test]
+    fn public_to_internal_gates_as_visibility() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(base(), expose("internal", Some("a.example.com"))),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "network-visibility-change");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "public");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "internal");
+    }
+
+    #[test]
+    fn internal_to_vpn_and_to_public_are_soft() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("internal", None)),
+            &with_expose(base(), expose("vpn", None))
+        )
+        .is_none());
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("internal", None)),
+            &with_expose(base(), expose("public", None))
+        )
+        .is_none());
     }
 }
 
