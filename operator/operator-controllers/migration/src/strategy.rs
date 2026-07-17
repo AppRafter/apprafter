@@ -110,6 +110,16 @@ impl ApplicationMigrationStrategy {
     ) -> Option<DestructiveChange> {
         let mut candidates: Vec<DestructiveChange> = Vec::new();
 
+        // Needs handling gates only REMOVAL of a `needs.<type>` entry
+        // (the backing claim + data is torn down). Two edits on an
+        // EXISTING need are intentionally NOT gated:
+        //   * `needs.*.selector` change is DEFERRED (2.4d; single provider
+        //     tier:integrated at launch — revisit 2.5+ when selectors can
+        //     route across provider tiers). A selector-only edit produces
+        //     the same `(type, name)` key on both sides, so no candidate.
+        //   * `needs.*.size` change is provisioner-guarded (V14): PVC/CNPG
+        //     storage is expansion-only and a shrink is refused at the
+        //     provisioner/apiserver layer, so 2.16b needn't gate it here.
         for key in removed_needs_keys(old.needs.as_ref(), new.needs.as_ref()) {
             candidates.push(DestructiveChange {
                 trigger_type: "needs-removal".to_string(),
@@ -153,7 +163,13 @@ impl ApplicationMigrationStrategy {
         // inert and its change is soft. Gating on `old_net == "public"`
         // (the app was routed before the edit) also covers the
         // public->internal case where the route is being withdrawn.
-        if old_net == "public" && old_host != new_host {
+        //
+        // `old_host.is_some()` is load-bearing: adding a hostname to a
+        // public app (`None -> Some`) is NOT destructive — no existing
+        // route is disrupted, it's just added exposure detail. We gate
+        // only when there WAS a hostname before (its removal or change of
+        // an existing public route). This also avoids an empty `from`.
+        if old_net == "public" && old_host.is_some() && old_host != new_host {
             candidates.push(DestructiveChange {
                 trigger_type: "domain-change".to_string(),
                 field: "expose.hostname".to_string(),
@@ -382,12 +398,22 @@ fn removed_needs_keys(old: Option<&Needs>, new: Option<&Needs>) -> Vec<String> {
 
 /// Pick the single primary `DestructiveChange` from the candidates an
 /// edit produced: highest `classification_severity` wins (2.16b spec).
-/// `max_by_key` returns the LAST maximum on ties — Task 6 replaces this
-/// with a fully deterministic tie-break across equal-severity ops.
-fn pick_primary(candidates: Vec<DestructiveChange>) -> Option<DestructiveChange> {
-    candidates
-        .into_iter()
-        .max_by_key(|c| classification_severity(&c.classification))
+///
+/// Deterministic (Task 6, R3-mn-b): sort by
+/// `(classification_severity desc, trigger_type asc, field asc)` and take
+/// the head. The tie-break on `trigger_type` then `field` makes the
+/// primary stable across runs and independent of candidate-push order —
+/// two equal-severity ops (e.g. two `requires-restart` changes in one
+/// edit) always resolve to the same primary, so the same edit never
+/// yields a flapping MigrationPlan trigger.
+fn pick_primary(mut v: Vec<DestructiveChange>) -> Option<DestructiveChange> {
+    v.sort_by(|a, b| {
+        classification_severity(&b.classification)
+            .cmp(&classification_severity(&a.classification))
+            .then(a.trigger_type.cmp(&b.trigger_type))
+            .then(a.field.cmp(&b.field))
+    });
+    v.into_iter().next()
 }
 
 // Suppress the `Application` type-import that's only used in
@@ -927,6 +953,38 @@ mod application_detect_destructive_tests {
         s
     }
 
+    /// Set `needs.pg.selector` (a `BTreeMap<String,String>`, the real
+    /// `ServiceNeed.selector` field) to `{tier: <tier>}`. Used to prove a
+    /// pure selector-change stays deferred → `None` (Fix C).
+    fn with_pg_selector(mut s: ApplicationBaseSpec, tier: &str) -> ApplicationBaseSpec {
+        s.needs = Some(Needs {
+            pg: Some(OneOrMany::One(ServiceNeed {
+                selector: Some(
+                    [("tier".to_string(), tier.to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        s
+    }
+
+    /// Set `needs.pg.size` (the real `ServiceNeed.size: Option<String>`
+    /// field, a size-class / quantity string) so a size change can be
+    /// exercised — it must stay soft (Fix D).
+    fn with_pg_size(mut s: ApplicationBaseSpec, size: &str) -> ApplicationBaseSpec {
+        s.needs = Some(Needs {
+            pg: Some(OneOrMany::One(ServiceNeed {
+                size: Some(size.to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        s
+    }
+
     #[test]
     fn removing_needs_pg_is_data_migration() {
         let c =
@@ -1202,6 +1260,58 @@ mod application_detect_destructive_tests {
             &with_env(base(), "DB", EnvValue::Literal("postgres://…".into()))
         )
         .is_none());
+    }
+
+    // ---- Task 6: finalize the classifier ----
+
+    // Fix A — deterministic pick_primary (R3-mn-b).
+    #[test]
+    fn multi_op_picks_highest_severity_deterministically() {
+        // remove needs.pg (data-migration) AND scale to zero (requires-restart)
+        let old = with_replicas(with_pg(base()), Some(2));
+        let new = with_replicas(base(), Some(0));
+        let c1 = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        let c2 = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        assert_eq!(c1.classification, "data-migration"); // highest severity wins
+        assert_eq!(c1, c2); // deterministic
+    }
+
+    // Fix B — adding a hostname to a public app is NOT destructive.
+    #[test]
+    fn adding_hostname_to_public_app_is_soft() {
+        // public app, no hostname -> public app WITH a hostname = adding exposure
+        // detail, not destructive (no existing route is disrupted).
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("public", None)),
+            &with_expose(base(), expose("public", Some("a.example.com")))
+        )
+        .is_none());
+    }
+
+    // Fix C — a pure needs.*.selector change stays DEFERRED → None (R1-M5).
+    #[test]
+    fn changing_needs_pg_selector_is_deferred_not_gated() {
+        // 2.4d ruled selector-change non-destructive (single provider
+        // tier:integrated; revisit 2.5+).
+        let old = with_pg_selector(base(), "tier-a");
+        let new = with_pg_selector(base(), "tier-b");
+        // Guard against a false pass: the two specs must genuinely differ in
+        // the selector (otherwise the None below would be meaningless).
+        assert_ne!(old.needs, new.needs);
+        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new).is_none());
+    }
+
+    // Fix D — needs.*.size change stays soft (provisioner-guarded, V14).
+    #[test]
+    fn changing_needs_pg_size_is_not_gated_provisioner_guards_shrink() {
+        // V14: PVC/CNPG storage is expansion-only; a shrink is refused at the
+        // provisioner layer, so 2.16b does NOT gate needs.*.size changes (the
+        // provisioner is the guard).
+        let old = with_pg_size(base(), "10Gi");
+        let new = with_pg_size(base(), "5Gi");
+        // Guard against a false pass: the two specs must genuinely differ in size.
+        assert_ne!(old.needs, new.needs);
+        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new).is_none());
     }
 }
 
