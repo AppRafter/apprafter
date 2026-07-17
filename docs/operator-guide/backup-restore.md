@@ -430,6 +430,42 @@ compensating provider controls (object versioning / object lock).
 > run `apprafter backup check` operator-side instead. Verify your provider's
 > behavior (this is spec item **V2** in the Verify checklist below).
 
+> **Hetzner Object Storage (the flagship provider) — branch (a), verified.**
+> Hetzner OS supports statement-level bucket policies with per-key `Principal`
+> and per-prefix `Resource`/`NotResource` scoping, so the scoped model IS fully
+> expressible **and enforced** (empirically confirmed 2026-07-17: under a policy
+> denying `s3:DeleteObject` outside `locks/*`, a `data/` delete is refused while
+> a `locks/` delete succeeds). Two differences from the illustrative AWS shape:
+>
+> - Hetzner OS keys default to **full access to every bucket in the project**,
+>   so you narrow a key with explicit **`Deny`** statements (an Allow-only policy
+>   does *not* reduce the default). Reference a key as the principal via
+>   `arn:aws:iam:::user/p<project_id>:<access_key>`.
+> - **V7 reduction (also verified):** you may additionally deny the cluster key
+>   `s3:GetObject` on `data/*` — a `restic backup` still succeeds (it reads
+>   `index/` + `snapshots/`, never the `data/` packs), so a compromised cluster
+>   can neither *erase* nor *read* the historical backup data, only the small
+>   metadata. `check` / `restore` / `prune` run operator-side with full creds.
+>
+> Create a **second, cluster-only** access key (the operator's key stays
+> full-access and is not named in the policy), then apply this bucket policy:
+>
+> ```jsonc
+> {
+>   "Version": "2012-10-17",
+>   "Statement": [
+>     { "Sid": "ClusterDenyDeleteOutsideLocks", "Effect": "Deny",
+>       "Principal": { "AWS": "arn:aws:iam:::user/p<project_id>:<cluster_key>" },
+>       "Action": "s3:DeleteObject",
+>       "NotResource": "arn:aws:s3:::my-bucket/my-prefix/locks/*" },
+>     { "Sid": "ClusterDenyReadData", "Effect": "Deny",           // V7 (optional)
+>       "Principal": { "AWS": "arn:aws:iam:::user/p<project_id>:<cluster_key>" },
+>       "Action": "s3:GetObject",
+>       "Resource": "arn:aws:s3:::my-bucket/my-prefix/data/*" }
+>   ]
+> }
+> ```
+
 > **Confidentiality caveat (read this).** The scoped / append-only credential
 > protects the **integrity and availability** of the backup history — an
 > attacker with the cluster's credential cannot *erase* your snapshots. It does
