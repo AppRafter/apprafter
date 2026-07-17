@@ -39,6 +39,15 @@ package v1alpha1
 	status?: {
 		phase?:       string
 		environment?: string
+
+		// Full spec snapshot the operator stamps after a successful apply
+		// (2.16b). The app-scope migration classifier diffs the incoming
+		// spec against this baseline. Free-form JSON here — the whole
+		// `status` node is emitted x-kubernetes-preserve-unknown-fields by
+		// crdgen (status is operator-owned, constrains no user input), so
+		// this nested #ApplicationSpec snapshot is opaque in the CRD and
+		// needs no structural schema (no crdmeta patch).
+		lastAppliedSpec?: {...}
 	}
 }
 

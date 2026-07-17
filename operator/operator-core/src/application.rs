@@ -420,6 +420,20 @@ pub struct ApplicationStatus {
     pub image: Option<StatusImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// Full `ApplicationSpec` snapshot the operator stamps after a
+    /// successful apply (2.16b). The app-scope migration classifier diffs
+    /// the incoming spec against this baseline to decide whether a change
+    /// is safe or needs a gating MigrationPlan. Operator-owned; lives in
+    /// `status` so Argo (which ignores status) never sees it as drift. The
+    /// CUE-derived CRD carries the whole `status` node as
+    /// `x-kubernetes-preserve-unknown-fields`, so this nested spec snapshot
+    /// is opaque there and needs no structural schema.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "lastAppliedSpec"
+    )]
+    pub last_applied_spec: Option<ApplicationSpec>,
 }
 
 /// Reserved phase: Application reconciler is paused awaiting
@@ -472,6 +486,36 @@ mod tests {
     use super::*;
     use kube::Resource;
     use serde_json::json;
+
+    #[test]
+    fn status_roundtrips_last_applied_spec() {
+        // 2.16b Task 7: `status.lastAppliedSpec` is a full ApplicationSpec
+        // snapshot the operator stamps after a successful apply; the classifier
+        // diffs against it. `ApplicationSpec` has no direct `image` — it lives
+        // on `base` (ApplicationBaseSpec) — so the snapshot carries a `base`.
+        let st = ApplicationStatus {
+            last_applied_spec: Some(ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("x:1".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let j = serde_json::to_value(&st).unwrap();
+        assert_eq!(j["lastAppliedSpec"]["base"]["image"], "x:1");
+        let back: ApplicationStatus = serde_json::from_value(j).unwrap();
+        assert_eq!(
+            back.last_applied_spec
+                .unwrap()
+                .base
+                .unwrap()
+                .image
+                .as_deref(),
+            Some("x:1")
+        );
+    }
 
     #[test]
     fn application_kind_and_apiversion_match_crd() {

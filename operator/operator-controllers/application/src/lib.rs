@@ -1104,6 +1104,11 @@ fn build_status(
         // 2.9 (ADR 0044): surface the per-CR active environment so
         // consumers see which `spec.environment` override resolved.
         environment: app.spec.environment.clone(),
+        // 2.16b Task 7: `None` here omits `lastAppliedSpec` from this SSA
+        // payload (skip_serializing_if), so this status write does not
+        // clobber a baseline stamped by the classifier's own apply. The
+        // stamp itself lands with a later 2.16b reconcile task.
+        last_applied_spec: None,
     }
 }
 
@@ -1217,6 +1222,9 @@ fn build_paused_status(app: &Application, plan_name: &str) -> ApplicationStatus 
         endpoint_url: previous_endpoint,
         image: None,
         environment: app.spec.environment.clone(),
+        // 2.16b Task 7: omitted from the SSA payload (skip_serializing_if);
+        // does not clobber a classifier-stamped baseline.
+        last_applied_spec: None,
     }
 }
 
@@ -1633,6 +1641,9 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
         endpoint_url: previous_endpoint,
         image: None,
         environment: app.spec.environment.clone(),
+        // 2.16b Task 7: omitted from the SSA payload (skip_serializing_if);
+        // does not clobber a classifier-stamped baseline.
+        last_applied_spec: None,
     }
 }
 
@@ -1720,6 +1731,9 @@ fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> Ap
         endpoint_url: previous_endpoint,
         image: None,
         environment: app.spec.environment.clone(),
+        // 2.16b Task 7: omitted from the SSA payload (skip_serializing_if);
+        // does not clobber a classifier-stamped baseline.
+        last_applied_spec: None,
     }
 }
 
@@ -2224,6 +2238,7 @@ mod tests {
             endpoint_url: Some("http://web.demo.svc.cluster.local:80".into()),
             image: None,
             environment: None,
+            last_applied_spec: None,
         });
         let status = build_paused_status(&app, "web-prod-migration-1");
 
@@ -2833,6 +2848,7 @@ mod tests {
             endpoint_url: Some("http://parser.demo.svc.cluster.local:80".into()),
             image: None,
             environment: None,
+            last_applied_spec: None,
         });
         let status = build_resource_claim_paused_status(&app, &["parser-pg".to_string()]);
         assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));
@@ -3823,6 +3839,7 @@ mod tests {
             endpoint_url: Some("http://web.demo.svc.cluster.local:80".into()),
             image: None,
             environment: None,
+            last_applied_spec: None,
         });
         let messages = vec![
             "env STRIPE_KEY → secret \"stripe/api-key\": Secret \"stripe\" not found or missing key \"api-key\"".to_string(),
@@ -3881,6 +3898,7 @@ mod tests {
             endpoint_url: None,
             image: None,
             environment: None,
+            last_applied_spec: None,
         });
         let status = build_env_secret_missing_status(
             &app,

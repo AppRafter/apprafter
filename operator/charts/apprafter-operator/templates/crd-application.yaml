@@ -163,6 +163,8 @@ spec:
             properties:
               environment:
                 type: string
+              lastAppliedSpec:
+                type: object
               phase:
                 type: string
             type: object
