@@ -32,11 +32,18 @@ use tracing::info;
 
 use operator_core::migration::classification_severity;
 use operator_core::{
-    Application, ApplicationBaseSpec, DestructiveChange, MigrationApplicationRef,
+    image_repo, Application, ApplicationBaseSpec, DestructiveChange, MigrationApplicationRef,
     MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope,
     MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, Needs, OneOrMany,
     SourceCredentialSpec, StepOutcome,
 };
+
+/// Render-time default for `Application.spec.*.replicas` (application.cue:
+/// "defaults to 1 at render time"). The field is optional with no CUE
+/// default value, so an absent `replicas` is resolved to this before the
+/// scale-to-zero comparison — editing an app from its implicit `1` down
+/// to an explicit `0` still counts as a scale-to-zero.
+const REPLICAS_RENDER_DEFAULT: i32 = 1;
 
 /// SSA field manager used by the strategies' reject path when
 /// patching outside resources (currently only PlatformStack).
@@ -156,6 +163,43 @@ impl ApplicationMigrationStrategy {
                     .unwrap_or_else(|| "(removed)".to_string()))),
                 classification: "requires-restart".to_string(),
             });
+        }
+
+        // Scale-to-zero. `replicas` is optional and resolves to 1 at
+        // render time (application.cue), so an absent value is the
+        // effective `1`. Only the `>0 -> 0` transition is destructive
+        // (the app goes dark); every other move (N->M, 0->N) is a soft
+        // scale that the rollout handles without a MigrationPlan.
+        let old_r = old.replicas.unwrap_or(REPLICAS_RENDER_DEFAULT);
+        let new_r = new.replicas.unwrap_or(REPLICAS_RENDER_DEFAULT);
+        if old_r > 0 && new_r == 0 {
+            candidates.push(DestructiveChange {
+                trigger_type: "scale-to-zero".to_string(),
+                field: "replicas".to_string(),
+                from: Some(json!(old_r.to_string())),
+                to: Some(json!("0")),
+                classification: "requires-restart".to_string(),
+            });
+        }
+
+        // Image *repository* change (2.4h split). A tag change is a soft
+        // rollout (the controller resolves the new tag→digest and rolls
+        // the Deployment), but moving to a different repository is a
+        // pull-source change we gate. Only when BOTH sides carry an image
+        // — a None on either side is an image add/remove, out of scope
+        // here. `image_repo` mirrors the 2.4h `image_repo_path` heuristic.
+        if let (Some(old_img), Some(new_img)) = (old.image.as_deref(), new.image.as_deref()) {
+            let old_repo = image_repo(old_img);
+            let new_repo = image_repo(new_img);
+            if old_repo != new_repo {
+                candidates.push(DestructiveChange {
+                    trigger_type: "image-path-change".to_string(),
+                    field: "spec.image".to_string(),
+                    from: Some(json!(old_repo)),
+                    to: Some(json!(new_repo)),
+                    classification: "requires-restart".to_string(),
+                });
+            }
         }
 
         pick_primary(candidates)
@@ -942,6 +986,96 @@ mod application_detect_destructive_tests {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("internal", None)),
             &with_expose(base(), expose("public", None))
+        )
+        .is_none());
+    }
+
+    // ---- Task 4: scale-to-zero + image-path ----
+
+    fn with_replicas(mut s: ApplicationBaseSpec, r: Option<i32>) -> ApplicationBaseSpec {
+        s.replicas = r;
+        s
+    }
+
+    fn with_image(mut s: ApplicationBaseSpec, i: &str) -> ApplicationBaseSpec {
+        s.image = Some(i.into());
+        s
+    }
+
+    #[test]
+    fn scale_to_zero_gates_but_scale_down_and_up_dont() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_replicas(base(), Some(3)),
+            &with_replicas(base(), Some(0)),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "scale-to-zero");
+        assert_eq!(c.classification, "requires-restart");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "3");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "0");
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_replicas(base(), Some(3)),
+            &with_replicas(base(), Some(1))
+        )
+        .is_none()); // N->M soft
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_replicas(base(), Some(0)),
+            &with_replicas(base(), Some(3))
+        )
+        .is_none()); // 0->N soft
+    }
+
+    #[test]
+    fn replicas_none_to_zero_gates() {
+        // application.cue: `replicas` is optional and resolves to 1 at
+        // render time — so an absent `replicas` is the effective `1`.
+        // Editing it explicitly to `0` is therefore a scale-to-zero.
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_replicas(base(), None),
+            &with_replicas(base(), Some(0)),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "scale-to-zero");
+        assert_eq!(c.classification, "requires-restart");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "1");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "0");
+        // The reverse (0 -> absent, i.e. back to the render default 1) is
+        // a scale-UP, so it must stay soft.
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_replicas(base(), Some(0)),
+            &with_replicas(base(), None)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn image_repo_change_gates_but_tag_change_doesnt() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_image(base(), "ghcr.io/acme/api:v1"),
+            &with_image(base(), "ghcr.io/acme/other:v1"),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "image-path-change");
+        assert_eq!(c.classification, "requires-restart");
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_image(base(), "ghcr.io/acme/api:v1"),
+            &with_image(base(), "ghcr.io/acme/api:v2")
+        )
+        .is_none()); // tag soft
+    }
+
+    #[test]
+    fn image_add_or_remove_is_not_a_path_change() {
+        // A None -> Some or Some -> None is an image add/remove, out of
+        // scope for image-path-change (Task 4 handles Some↔Some only).
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &base(),
+            &with_image(base(), "ghcr.io/acme/api:v1")
+        )
+        .is_none());
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_image(base(), "ghcr.io/acme/api:v1"),
+            &base()
         )
         .is_none());
     }

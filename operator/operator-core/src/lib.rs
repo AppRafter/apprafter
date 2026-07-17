@@ -15,11 +15,11 @@ pub mod sharedvolume;
 pub mod sourcecredential;
 
 pub use application::{
-    Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose, ApplicationSpec,
-    ApplicationStatus, DiskClaim, EnvRef, EnvValue, ImagePolicy, NeedEntry, Needs, OneOrMany,
-    ServiceNeed, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
-    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
-    PHASE_ENV_SECRET_MISSING,
+    image_repo, Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose,
+    ApplicationSpec, ApplicationStatus, DiskClaim, EnvRef, EnvValue, ImagePolicy, NeedEntry, Needs,
+    OneOrMany, ServiceNeed, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
+    COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
+    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use matching::{matches, select_provider, Candidate};

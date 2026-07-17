@@ -334,6 +334,37 @@ pub struct ImagePolicy {
     pub resolve: Option<String>,
 }
 
+/// The repository portion of an image reference, with any tag or digest
+/// stripped: `"ghcr.io/acme/app:v1"` → `"ghcr.io/acme/app"`,
+/// `"ghcr.io/acme/app@sha256:…"` → `"ghcr.io/acme/app"`,
+/// `"localhost:5000/app:v1"` → `"localhost:5000/app"` (a `:` before the
+/// last `/` is a registry port, not a tag), `"nginx:1.27"` → `"nginx"`.
+///
+/// Mirrors the 2.4h split heuristic in
+/// `operator-controllers-application::pull_secret::image_repo_path`
+/// (kept here as a **borrowing** `&str` variant so the migration
+/// classifier — which may only depend on `operator-core` — can tell a
+/// repository change (gate) from a tag change (soft rollout) without a
+/// crate cycle into the application controller). The stricter
+/// `oci_resolve::parse_image_ref` is a full OCI grammar validator; this
+/// helper only needs the tag/port split, matching `image_repo_path`.
+pub fn image_repo(image: &str) -> &str {
+    let no_digest = image.split('@').next().unwrap_or(image);
+    let last_slash = no_digest.rfind('/');
+    let tag_colon = no_digest.rfind(':');
+    let cut = match (last_slash, tag_colon) {
+        // A ':' after the last '/' is a tag separator; one before it is
+        // a registry port (e.g. localhost:5000/app) and is NOT a tag.
+        (Some(ls), Some(tc)) if tc > ls => Some(tc),
+        (None, Some(tc)) => Some(tc),
+        _ => None,
+    };
+    match cut {
+        Some(c) => &no_digest[..c],
+        None => no_digest,
+    }
+}
+
 /// `status.image` — the resolved-image truth (ADR 0040). `tag` is the
 /// reference as written in `spec`; `resolved` is `repo@sha256:…`
 /// actually rendered into the Deployment; `resolvedAt` is the RFC3339
@@ -793,5 +824,42 @@ mod tests {
         assert_eq!(d.size.as_deref(), Some("1Gi"));
         assert!(d.reference.is_none());
         assert!(!d.is_reference());
+    }
+
+    #[test]
+    fn image_repo_strips_tag_but_keeps_repo() {
+        // A tag change leaves the repo untouched (soft rollout, 2.16b).
+        assert_eq!(image_repo("ghcr.io/acme/api:v1"), "ghcr.io/acme/api");
+        assert_eq!(image_repo("ghcr.io/acme/api:v2"), "ghcr.io/acme/api");
+        assert_eq!(
+            image_repo("ghcr.io/acme/api:v1"),
+            image_repo("ghcr.io/acme/api:v2")
+        );
+        // A repo change moves the repo (gated).
+        assert_ne!(
+            image_repo("ghcr.io/acme/api:v1"),
+            image_repo("ghcr.io/acme/other:v1")
+        );
+    }
+
+    #[test]
+    fn image_repo_strips_digest() {
+        assert_eq!(
+            image_repo("ghcr.io/acme/api@sha256:abc"),
+            "ghcr.io/acme/api"
+        );
+    }
+
+    #[test]
+    fn image_repo_keeps_registry_port() {
+        // A ':' before the last '/' is a registry port, NOT a tag.
+        assert_eq!(image_repo("localhost:5000/app"), "localhost:5000/app");
+        assert_eq!(image_repo("localhost:5000/app:v1"), "localhost:5000/app");
+    }
+
+    #[test]
+    fn image_repo_bare_name_and_tagged_bare_name() {
+        assert_eq!(image_repo("nginx"), "nginx");
+        assert_eq!(image_repo("nginx:1.27"), "nginx");
     }
 }
