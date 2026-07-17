@@ -23,15 +23,21 @@ use crate::ResourceRef;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Staging behaviour.  For now only `Monolithic` is implemented (identical to
-/// the CLI's original single-pass behaviour: extract + CRs + secrets all land
-/// in one staging dir before a single restic snapshot).  `Sequential` is
-/// reserved for a later task and returns a real error when selected.
+/// Staging behaviour.
+///
+/// * `Monolithic` — extract + CRs + secrets all land in one staging dir before
+///   a single restic snapshot (the CLI's original single-pass behaviour). Peak
+///   staged disk = `sum(claims)`.
+/// * `Sequential` — each claim is staged, snapshotted, and deleted one at a
+///   time (peak = `max(claim)`), then the non-claim components go into a final
+///   commit-point manifest snapshot written LAST. Every snapshot shares one
+///   `run-<id>` tag. See [`run_backup`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagingMode {
     /// All artifacts staged together, then a single restic snapshot.
     Monolithic,
-    /// Each namespace staged and snapshotted independently (later task).
+    /// Each claim staged + snapshotted + deleted independently (peak =
+    /// `max(claim)`), then a final commit-point manifest snapshot.
     Sequential,
 }
 
@@ -76,8 +82,11 @@ pub struct BackupOpts {
 ///
 /// * `Monolithic` — everything staged in one pass, then a single snapshot
 ///   (the original CLI behaviour, byte-for-byte equivalent).
-/// * `Sequential` — per-namespace staging (not yet implemented); returns
-///   `Err` with a descriptive message when selected.
+/// * `Sequential` — stage → snapshot → delete each claim in turn (own snapshot,
+///   peak disk = `max(claim)`), then a final commit-point snapshot carrying
+///   `crs/` + `secrets/` + `manifest.json` written LAST. Every snapshot shares
+///   the same `run-<id>` tag (== the monolithic tag); a run that dies before
+///   the final snapshot leaves no manifest, so restore ignores the set.
 pub fn run_backup(
     k: &dyn KubeExec,
     r: &dyn ResticRunner,
@@ -430,28 +439,31 @@ pub fn run_backup_with_summary(
 ) -> Result<BackupSummary> {
     match opts.staging_mode {
         StagingMode::Monolithic => run_backup_monolithic_with_summary(k, r, opts),
-        StagingMode::Sequential => Err(CliError::Other(
-            "sequential staging not yet implemented".into(),
-        )),
+        StagingMode::Sequential => run_backup_sequential_with_summary(k, r, opts),
     }
 }
 
-fn run_backup_monolithic_with_summary(
+/// The CRs + secrets a run captures, plus the manifest resources. Written into
+/// the "non-claim" staging dir by [`capture_non_claim_artifacts`] — that dir is
+/// `<staging>/data` for `Monolithic` (colocated with the dumps) and the final
+/// commit-point dir for `Sequential`.
+struct NonClaimArtifacts {
+    cr_count: usize,
+    secret_count: usize,
+}
+
+/// Write the non-claim components (`crs/` serialized CRs + `secrets/` +
+/// `manifest.json`) into `dest_dir`. Shared verbatim by both staging modes —
+/// in `Monolithic` `dest_dir == <staging>/data`, in `Sequential` it is the
+/// final commit-point dir written LAST. Returns the CR / secret counts.
+fn capture_non_claim_artifacts(
     k: &dyn KubeExec,
-    r: &dyn ResticRunner,
     opts: &BackupOpts,
-) -> Result<BackupSummary> {
-    let data_dir = opts.staging_root.join("data");
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| CliError::Other(format!("create staging data dir: {e}")))?;
-
-    // 1. Native data extraction.
-    let claims = claims_in_namespaces(k, &opts.namespaces)?;
-    let plan = plan_extraction(&claims);
-    run_extraction(k, &plan, &data_dir, &opts.pg_image)?;
-
-    // 2. CRs.
-    let crs_dir = data_dir.join("crs");
+    claims: &[Value],
+    dest_dir: &Path,
+) -> Result<NonClaimArtifacts> {
+    // CRs.
+    let crs_dir = dest_dir.join("crs");
     std::fs::create_dir_all(&crs_dir)
         .map_err(|e| CliError::Other(format!("create crs dir: {e}")))?;
 
@@ -501,8 +513,8 @@ fn run_backup_monolithic_with_summary(
 
     write_crs(&captured_crs, &crs_dir)?;
 
-    // 3. Secrets.
-    let secrets_dir = data_dir.join("secrets");
+    // Secrets.
+    let secrets_dir = dest_dir.join("secrets");
     std::fs::create_dir_all(&secrets_dir)
         .map_err(|e| CliError::Other(format!("create secrets dir: {e}")))?;
 
@@ -541,7 +553,7 @@ fn run_backup_monolithic_with_summary(
         }
     }
 
-    // 4. manifest.json.
+    // manifest.json (the commit point in `Sequential`).
     let manifest_crs: Vec<(&str, &Value)> =
         captured_crs.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let manifest = BackupManifest {
@@ -550,14 +562,18 @@ fn run_backup_monolithic_with_summary(
         created_at: opts.created_at.clone(),
         platform_version: opts.platform_version.clone(),
         namespaces: opts.namespaces.clone(),
-        resources: resource_refs(&manifest_crs, &claims),
+        resources: resource_refs(&manifest_crs, claims),
     };
-    write_manifest(&manifest, &data_dir)?;
+    write_manifest(&manifest, dest_dir)?;
 
-    // 5. restic.
-    let repo = &opts.repo;
-    let pass = &opts.passphrase;
+    Ok(NonClaimArtifacts {
+        cr_count: captured_crs.len(),
+        secret_count,
+    })
+}
 
+/// Init the restic repo iff it does not already exist (probe = `snapshots`).
+fn ensure_repo(r: &dyn ResticRunner, repo: &str, pass: &str) -> Result<()> {
     if !restic_repo_exists(r, repo, pass)? {
         if let Some(parent) = Path::new(repo).parent() {
             if !parent.as_os_str().is_empty() {
@@ -568,28 +584,127 @@ fn run_backup_monolithic_with_summary(
         }
         r.run(&restic_init_argv(repo), pass)?;
     }
+    Ok(())
+}
 
+/// The `run-<id>` tag every snapshot in a run shares. IS the monolithic tag
+/// (`<cluster_id>-<created_at>[…-ns-…]`) — the run id and the restic tag are
+/// the same value.
+fn run_tag(opts: &BackupOpts) -> String {
     let subset_ns: Vec<String> = if opts.is_subset {
         opts.namespaces.clone()
     } else {
         vec![]
     };
-    let tag = backup_tag(&opts.cluster_id, &opts.created_at, &subset_ns);
+    backup_tag(&opts.cluster_id, &opts.created_at, &subset_ns)
+}
+
+fn run_backup_monolithic_with_summary(
+    k: &dyn KubeExec,
+    r: &dyn ResticRunner,
+    opts: &BackupOpts,
+) -> Result<BackupSummary> {
+    let data_dir = opts.staging_root.join("data");
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| CliError::Other(format!("create staging data dir: {e}")))?;
+
+    // 1. Native data extraction — the WHOLE plan into <staging>/data.
+    let claims = claims_in_namespaces(k, &opts.namespaces)?;
+    let plan = plan_extraction(&claims);
+    run_extraction(k, &plan, &data_dir, &opts.pg_image)?;
+
+    // 2-4. CRs + secrets + manifest, colocated in <staging>/data.
+    let non_claim = capture_non_claim_artifacts(k, opts, &claims, &data_dir)?;
+
+    // 5. restic — ONE snapshot over the whole staged tree.
+    let repo = &opts.repo;
+    let pass = &opts.passphrase;
+    ensure_repo(r, repo, pass)?;
+
+    let tag = run_tag(opts);
     let snapshot_id = r.run_backup(
         &restic_backup_argv(repo, &data_dir.to_string_lossy(), &tag),
         pass,
     )?;
 
-    let extracted_count = plan.len();
-    let claim_count = claims.len();
-    let cr_count = captured_crs.len();
+    Ok(BackupSummary {
+        snapshot_id,
+        cr_count: non_claim.cr_count,
+        secret_count: non_claim.secret_count,
+        claim_count: claims.len(),
+        extracted_count: plan.len(),
+        tag,
+    })
+}
+
+/// `Sequential` staging: peak disk = `max(claim)`, not `sum`.
+///
+/// For each data claim: stage ONLY that claim's artifact into a per-claim
+/// staging dir → `restic backup --tag run-<id>` it (its own snapshot) → delete
+/// the staged dir → next claim. Then the non-claim components (`crs/` +
+/// `secrets/` + `manifest.json`) go into a FINAL snapshot written LAST — the
+/// COMMIT POINT: a run that dies before it leaves no manifest, so restore
+/// ignores the incomplete set (its orphan snapshots are reaped by the next
+/// prune). Every snapshot in the run shares the SAME `run-<id>` tag.
+fn run_backup_sequential_with_summary(
+    k: &dyn KubeExec,
+    r: &dyn ResticRunner,
+    opts: &BackupOpts,
+) -> Result<BackupSummary> {
+    let repo = &opts.repo;
+    let pass = &opts.passphrase;
+    let tag = run_tag(opts);
+
+    let claims = claims_in_namespaces(k, &opts.namespaces)?;
+    let plan = plan_extraction(&claims);
+
+    ensure_repo(r, repo, pass)?;
+
+    let mut snapshot_id: Option<String> = None;
+
+    // Per-claim: stage one → back it up (run-tagged) → delete → next.
+    // Each claim becomes its own restic snapshot, so peak staged disk is a
+    // single claim's dump/tar rather than the sum of them all.
+    for (i, item) in plan.iter().enumerate() {
+        let claim_dir = opts.staging_root.join(format!("claim-{i}"));
+        std::fs::create_dir_all(&claim_dir)
+            .map_err(|e| CliError::Other(format!("create per-claim staging dir {i}: {e}")))?;
+
+        // Extract exactly THIS claim — reuses run_extraction (and thus the same
+        // extract_pg / extract_volume) on a one-element slice, so the per-claim
+        // path is byte-identical to the monolithic per-claim layout.
+        run_extraction(k, std::slice::from_ref(item), &claim_dir, &opts.pg_image)?;
+
+        snapshot_id = r.run_backup(
+            &restic_backup_argv(repo, &claim_dir.to_string_lossy(), &tag),
+            pass,
+        )?;
+
+        std::fs::remove_dir_all(&claim_dir)
+            .map_err(|e| CliError::Other(format!("remove per-claim staging dir {i}: {e}")))?;
+    }
+
+    // FINAL snapshot = the commit point: crs/ + secrets/ + manifest.json,
+    // written LAST. Same run-<id> tag. No manifest ⇒ restore ignores the run.
+    let commit_dir = opts.staging_root.join("commit");
+    std::fs::create_dir_all(&commit_dir)
+        .map_err(|e| CliError::Other(format!("create commit staging dir: {e}")))?;
+    let non_claim = capture_non_claim_artifacts(k, opts, &claims, &commit_dir)?;
+
+    let manifest_snapshot_id = r.run_backup(
+        &restic_backup_argv(repo, &commit_dir.to_string_lossy(), &tag),
+        pass,
+    )?;
+    // The manifest snapshot is the run's representative id (its presence marks a
+    // complete run); prefer it over the last per-claim id.
+    snapshot_id = manifest_snapshot_id.or(snapshot_id);
 
     Ok(BackupSummary {
         snapshot_id,
-        cr_count,
-        secret_count,
-        claim_count,
-        extracted_count,
+        cr_count: non_claim.cr_count,
+        secret_count: non_claim.secret_count,
+        claim_count: claims.len(),
+        extracted_count: plan.len(),
         tag,
     })
 }
@@ -601,7 +716,227 @@ fn run_backup_monolithic_with_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::path::Path;
+
     use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // In-crate test doubles — drive the engine end-to-end with NO cluster and
+    // NO real restic, capturing the restic `backup` argv of every snapshot.
+    // -----------------------------------------------------------------------
+
+    /// Records every `run_backup` argv so a test can assert the snapshot count,
+    /// the per-call `--tag`, and the staged path of each snapshot. `run` /
+    /// `run_stdout` are no-ops. `run_stdout` returning `Ok` makes
+    /// `restic_repo_exists` report the repo already exists, so the engine skips
+    /// `init` (keeping the recorded calls to just the `backup` snapshots).
+    #[derive(Default)]
+    struct RecordingRestic {
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl RecordingRestic {
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl ResticRunner for RecordingRestic {
+        fn run(&self, _argv: &[String], _passphrase: &str) -> Result<()> {
+            Ok(())
+        }
+        fn run_stdout(&self, _argv: &[String], _passphrase: &str) -> Result<String> {
+            // Ok(..) => restic_repo_exists() == true => engine skips `init`.
+            Ok(String::new())
+        }
+        fn run_backup(&self, argv: &[String], _passphrase: &str) -> Result<Option<String>> {
+            self.calls.borrow_mut().push(argv.to_vec());
+            Ok(Some("snap".into()))
+        }
+    }
+
+    /// Extract the value that follows `--tag` in a recorded restic argv.
+    fn tag_of(argv: &[String]) -> Option<String> {
+        argv.windows(2)
+            .find(|w| w[0] == "--tag")
+            .map(|w| w[1].clone())
+    }
+
+    /// The staged path a `restic backup` argv points at — the last positional
+    /// (the argv is `backup --repo <r> --tag <t> --json <staging_dir>`).
+    fn staged_path_of(argv: &[String]) -> Option<String> {
+        argv.last().cloned()
+    }
+
+    /// A `KubeExec` that returns a fixed set of pg ResourceClaims for the
+    /// claim-list probe and empty (`Ok(None)`) for every other list, so the
+    /// engine's CR/secret sweep produces an empty-but-valid artifact. Its
+    /// `exec_stream_to_file` CREATES the `out` file (a few bytes) so the
+    /// sequential stage→backup→delete loop sees a real staged file.
+    struct FakeKube {
+        /// The pg claim JSONs returned for the `resourceclaims.apprafter.io` list.
+        claims: Vec<Value>,
+    }
+
+    impl FakeKube {
+        /// `n` fake, fully-provisioned pg claims in namespace `demo`.
+        fn with_pg_claims(n: usize) -> Self {
+            let claims = (0..n)
+                .map(|i| {
+                    json!({
+                        "spec": { "type": "pg" },
+                        "metadata": { "name": format!("pg-{i}"), "namespace": "demo" },
+                        "status": { "connectionSecretRef": format!("pg-{i}-conn") }
+                    })
+                })
+                .collect();
+            Self { claims }
+        }
+    }
+
+    impl KubeExec for FakeKube {
+        fn apply_and_wait_pod_ready(&self, _spec: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn exec_stream_to_file(
+            &self,
+            _pod: &str,
+            _ns: &str,
+            _argv: &[&str],
+            out: &Path,
+        ) -> Result<()> {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            // A real staged file so the stage→backup→delete loop has something
+            // to delete and the backup argv points at a non-empty tree.
+            std::fs::write(out, b"DUMP").unwrap();
+            Ok(())
+        }
+
+        fn exec_stream_from_file(
+            &self,
+            _pod: &str,
+            _ns: &str,
+            _argv: &[&str],
+            _input: &Path,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete_pod_best_effort(&self, _name: &str, _ns: &str) {}
+
+        fn get_secret_key(&self, _secret: &str, _ns: &str, _key: &str) -> Result<String> {
+            Ok("x".into())
+        }
+
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            // The only list the engine needs populated to exercise the
+            // per-claim path is the ResourceClaim list; everything else
+            // (platformstack, sourcecredentials, applications, argo apps,
+            // sharedvolumes, sealedsecrets, secrets) reports empty so the CR /
+            // secret sweep yields an empty-but-valid artifact.
+            if args.iter().any(|a| a.starts_with("resourceclaims")) {
+                Ok(Some(json!({ "items": self.claims })))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    fn opts_for(mode: StagingMode, staging_root: PathBuf) -> BackupOpts {
+        BackupOpts {
+            repo: "/tmp/does-not-matter-repo".into(),
+            passphrase: "pw".into(),
+            cluster_id: "k3d-demo".into(),
+            created_at: "2026-06-20T00:00:00Z".into(),
+            platform_version: "0.2.37".into(),
+            namespaces: vec!["demo".into()],
+            is_subset: false,
+            staging_root,
+            pg_image: "postgres:16-alpine".into(),
+            staging_mode: mode,
+        }
+    }
+
+    #[test]
+    fn monolithic_writes_exactly_one_snapshot() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = FakeKube::with_pg_claims(2);
+        let r = RecordingRestic::default();
+        let opts = opts_for(StagingMode::Monolithic, staging.path().to_path_buf());
+
+        let out = run_backup(&k, &r, &opts).expect("monolithic backup");
+        assert_eq!(out, Some("snap".to_string()));
+
+        let calls = r.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "monolithic must write exactly ONE snapshot, got {calls:?}"
+        );
+        // The single snapshot is over <staging>/data.
+        let staged = staged_path_of(&calls[0]).unwrap();
+        let expected = staging.path().join("data");
+        assert_eq!(staged, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn sequential_writes_a_snapshot_per_claim_plus_a_final_manifest_snapshot_all_run_tagged() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = FakeKube::with_pg_claims(2);
+        let r = RecordingRestic::default();
+        let opts = opts_for(StagingMode::Sequential, staging.path().to_path_buf());
+
+        run_backup(&k, &r, &opts).expect("sequential backup");
+
+        let calls = r.calls();
+        // 2 per-claim snapshots + 1 final manifest/commit snapshot.
+        assert_eq!(
+            calls.len(),
+            3,
+            "sequential(2 claims) must write 3 snapshots (2 claim + 1 manifest), got {calls:?}"
+        );
+
+        // Every snapshot shares the SAME run-id tag (== the monolithic tag).
+        let run_id = backup_tag(&opts.cluster_id, &opts.created_at, &[]);
+        for c in &calls {
+            assert_eq!(
+                tag_of(c).as_deref(),
+                Some(run_id.as_str()),
+                "every sequential snapshot must be run-tagged {run_id}: {c:?}"
+            );
+        }
+
+        // The LAST snapshot is the manifest/commit-point snapshot: its staged
+        // path holds manifest.json (and crs/ + secrets/), distinct from the
+        // per-claim dump paths.
+        let last = &calls[calls.len() - 1];
+        let manifest_dir = PathBuf::from(staged_path_of(last).unwrap());
+        assert!(
+            manifest_dir.join("manifest.json").exists(),
+            "final snapshot staged dir must hold manifest.json: {manifest_dir:?}"
+        );
+        assert!(
+            manifest_dir.join("crs").exists() && manifest_dir.join("secrets").exists(),
+            "final snapshot staged dir must hold crs/ + secrets/: {manifest_dir:?}"
+        );
+
+        // The per-claim snapshots point at distinct, non-manifest paths.
+        for c in &calls[..calls.len() - 1] {
+            let p = PathBuf::from(staged_path_of(c).unwrap());
+            assert_ne!(
+                p, manifest_dir,
+                "claim snapshot path must differ from manifest snapshot"
+            );
+            assert!(
+                !p.join("manifest.json").exists(),
+                "a per-claim snapshot must NOT carry manifest.json: {p:?}"
+            );
+        }
+    }
 
     #[test]
     fn is_user_argo_app_checks_managed_by_label() {
