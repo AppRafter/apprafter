@@ -25,7 +25,10 @@ chrono      = { workspace = true }
 tempfile    = { workspace = true }
 # `fs` + `io-util`: stream a pod-exec AsyncRead/AsyncWrite to/from a file
 # (`tokio::fs::File`, `tokio::io::copy`, `AsyncWriteExt::shutdown`).
-tokio       = { workspace = true, features = ["fs", "io-util"] }
+# `rt-multi-thread`: `main` builds a manual `tokio::runtime::Runtime` (NOT
+# `#[tokio::main]`) so the SYNC backup engine runs on the main thread while
+# `KubeRsExec` block_on's its async kube-rs bodies onto the runtime handle.
+tokio       = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"] }
 # `ws`: the WebSocket attach/exec subresource (`Api::<Pod>::exec`) the
 # in-cluster runner drives pg_dump / tar / restore-load helper pods through.
 kube        = { workspace = true, features = ["ws"] }
