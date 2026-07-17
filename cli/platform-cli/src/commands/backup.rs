@@ -71,6 +71,7 @@ use serde_json::Value;
 
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_get_json, kubectl_get_json_cluster_wide,
+    kubectl_merge_patch,
 };
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -80,6 +81,10 @@ use crate::commands::state_paths::resolve_state_paths;
 /// Exported `pub(crate)` so `restore.rs` can use it without re-declaring.
 pub(crate) const APPRAFTER_SYSTEM_NAMESPACE: &str = "apprafter-system";
 pub(crate) const PLATFORMSTACK_NAME: &str = "default";
+/// Namespace the `PlatformStack` singleton lives in — the `spec.backup`
+/// merge-patch target. Alias of [`APPRAFTER_SYSTEM_NAMESPACE`], named to mirror
+/// `platform::PLATFORMSTACK_NAMESPACE` at the merge-patch call sites.
+pub(crate) const PLATFORMSTACK_NAMESPACE: &str = APPRAFTER_SYSTEM_NAMESPACE;
 
 // ---------------------------------------------------------------------------
 // Pure helpers (the tested core — some exported pub(crate) for restore.rs)
@@ -183,6 +188,100 @@ pub fn sourcecred_material_refs(sc: &Value) -> Vec<(String, String)> {
         }
     }
     refs
+}
+
+// ---------------------------------------------------------------------------
+// 2a. `apprafter backup enable` / `disable` — spec.backup patch builders (pure)
+// ---------------------------------------------------------------------------
+
+/// Options for `apprafter backup enable`, mapped 1:1 onto the
+/// `PlatformStack.spec.backup` CRD block (camelCase). `bucket` + `credential`
+/// are mandatory; every other field is an override the operator may leave to
+/// the chart/operator default (omitted from the patch when `None`).
+#[derive(Default)]
+pub(crate) struct EnableOpts {
+    /// Restic S3 repository URL → `spec.backup.bucket`.
+    pub bucket: String,
+    /// Cluster credential Secret name → `spec.backup.credentialRef.name`.
+    pub credential: String,
+    /// Backup cron → `spec.backup.schedule`.
+    pub cron: Option<String>,
+    /// `spec.backup.retention.keepDaily`.
+    pub keep_daily: Option<u32>,
+    /// `spec.backup.retention.keepWeekly`.
+    pub keep_weekly: Option<u32>,
+    /// `spec.backup.retention.keepMonthly`.
+    pub keep_monthly: Option<u32>,
+    /// `spec.backup.retention.enforce` (`operator` | `cluster`).
+    pub enforce: Option<String>,
+    /// `spec.backup.stagingMode` (`monolithic` | `sequential`).
+    pub staging_mode: Option<String>,
+    /// `spec.backup.checkSchedule` cron.
+    pub check_cron: Option<String>,
+    /// `spec.backup.failureWebhook` URL.
+    pub failure_webhook: Option<String>,
+}
+
+/// Build the JSON merge-patch body `{"spec":{"backup":{…}}}` for
+/// `apprafter backup enable`.
+///
+/// `enabled:true`, `bucket`, and `credentialRef:{name}` are always present.
+/// `schedule` / `stagingMode` / `checkSchedule` / `failureWebhook` appear only
+/// when their option is `Some`. The nested `retention` object contains only the
+/// keys whose option is `Some`, and is omitted ENTIRELY when none of
+/// `keep_daily` / `keep_weekly` / `keep_monthly` / `enforce` is set — a bare
+/// enable then leaves retention to the operator/chart default rather than
+/// merge-patching an empty object.
+///
+/// Pure: no I/O, no validation of enum values (the impure caller
+/// [`run_backup_enable`] validates `enforce` / `staging_mode` before calling).
+pub(crate) fn backup_enable_patch(o: &EnableOpts) -> serde_json::Value {
+    let mut backup = serde_json::Map::new();
+    backup.insert("enabled".to_string(), Value::Bool(true));
+    backup.insert("bucket".to_string(), Value::String(o.bucket.clone()));
+    backup.insert(
+        "credentialRef".to_string(),
+        serde_json::json!({ "name": o.credential }),
+    );
+
+    if let Some(cron) = &o.cron {
+        backup.insert("schedule".to_string(), Value::String(cron.clone()));
+    }
+    if let Some(mode) = &o.staging_mode {
+        backup.insert("stagingMode".to_string(), Value::String(mode.clone()));
+    }
+    if let Some(check) = &o.check_cron {
+        backup.insert("checkSchedule".to_string(), Value::String(check.clone()));
+    }
+    if let Some(hook) = &o.failure_webhook {
+        backup.insert("failureWebhook".to_string(), Value::String(hook.clone()));
+    }
+
+    let mut retention = serde_json::Map::new();
+    if let Some(d) = o.keep_daily {
+        retention.insert("keepDaily".to_string(), Value::from(d));
+    }
+    if let Some(w) = o.keep_weekly {
+        retention.insert("keepWeekly".to_string(), Value::from(w));
+    }
+    if let Some(m) = o.keep_monthly {
+        retention.insert("keepMonthly".to_string(), Value::from(m));
+    }
+    if let Some(e) = &o.enforce {
+        retention.insert("enforce".to_string(), Value::String(e.clone()));
+    }
+    if !retention.is_empty() {
+        backup.insert("retention".to_string(), Value::Object(retention));
+    }
+
+    serde_json::json!({ "spec": { "backup": Value::Object(backup) } })
+}
+
+/// Build the JSON merge-patch body `{"spec":{"backup":{"enabled":false}}}` for
+/// `apprafter backup disable` — flips `enabled` off while retaining every other
+/// configured field (merge-patch only touches the keys it names).
+pub(crate) fn backup_disable_patch() -> serde_json::Value {
+    serde_json::json!({ "spec": { "backup": { "enabled": false } } })
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1152,269 @@ pub fn run_backup_prune(repo: &str, credential_file: Option<&Path>) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// 2c. `apprafter backup enable` / `disable` — preflight + spec.backup patch
+// ---------------------------------------------------------------------------
+
+/// Minimum restic version the off-site backup path relies on (compression +
+/// `s3:` repo behaviour). Anything confidently older is rejected up front.
+const MIN_RESTIC_MAJOR: u64 = 0;
+const MIN_RESTIC_MINOR: u64 = 14;
+
+/// Parse the `x.y.z` semver out of a `restic version` stdout line
+/// (e.g. `restic 0.16.4 compiled with go1.21.6 on linux/amd64`). Returns
+/// `(major, minor, patch)` or `None` when no dotted-triple token is found.
+/// Pure — unit-testable without a restic binary.
+fn parse_restic_version(stdout: &str) -> Option<(u64, u64, u64)> {
+    for tok in stdout.split_whitespace() {
+        // Strip a leading `v` if present (restic prints bare, but be lenient).
+        let t = tok.strip_prefix('v').unwrap_or(tok);
+        let mut parts = t.split('.');
+        let (Some(a), Some(b), Some(c)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        // Only accept when the third segment starts with digits (guards against
+        // matching e.g. `go1.21.6` — that would parse, so we additionally
+        // require the token to not be prefixed by non-version text).
+        if let (Ok(major), Ok(minor)) = (a.parse::<u64>(), b.parse::<u64>()) {
+            // `c` may carry a trailing suffix; take its leading digits.
+            let patch_digits: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if let Ok(patch) = patch_digits.parse::<u64>() {
+                return Some((major, minor, patch));
+            }
+        }
+    }
+    None
+}
+
+/// Is `(major, minor, _)` confidently BELOW the required `MIN_RESTIC_*`?
+fn restic_version_too_old(v: (u64, u64, u64)) -> bool {
+    let (major, minor, _) = v;
+    (major, minor) < (MIN_RESTIC_MAJOR, MIN_RESTIC_MINOR)
+}
+
+/// `apprafter backup enable` — validate the repo + credential Secret + operator
+/// intent, then merge-patch `PlatformStack.spec.backup` to turn on scheduled
+/// off-site backup.
+///
+/// Preflight (fail-closed, in order):
+/// 1. Validate `--enforce` / `--staging-mode` enum values (pure).
+/// 2. Resolve operator S3 creds (`--credential-file` → env); errors without
+///    `RESTIC_PASSWORD` (the preflight repo probe needs it).
+/// 3. `restic version` ≥ 0.14 (not-on-PATH → error; unparseable → warn+continue;
+///    confidently-lower → error).
+/// 4. The cluster credential Secret exists in `apprafter-system` (else the
+///    operator would have no creds to run scheduled backups).
+/// 5. Repo reachability: `restic cat config` succeeds, else `restic init`; if
+///    both fail the repo is unreachable / creds are bad → error with stderr.
+/// 6. DR confirmation: `--i-have-saved-credentials`, else a TTY prompt, else a
+///    non-interactive error (never patches without the operator confirming the
+///    passphrase + creds live OUTSIDE the cluster).
+///
+/// Only after all six pass does it merge-patch `spec.backup`.
+pub fn run_backup_enable(
+    opts: EnableOpts,
+    credential_file: Option<&Path>,
+    i_have_saved: bool,
+) -> Result<()> {
+    // 1. Validate enum-valued options before touching the cluster.
+    if let Some(enforce) = &opts.enforce {
+        if enforce != "operator" && enforce != "cluster" {
+            return Err(CliError::Other(format!(
+                "invalid --enforce '{enforce}': expected 'operator' or 'cluster'"
+            )));
+        }
+    }
+    if let Some(mode) = &opts.staging_mode {
+        if mode != "monolithic" && mode != "sequential" {
+            return Err(CliError::Other(format!(
+                "invalid --staging-mode '{mode}': expected 'monolithic' or 'sequential'"
+            )));
+        }
+    }
+
+    // 2. Resolve operator S3 creds (errors if RESTIC_PASSWORD is absent — the
+    //    repo probe below needs it to read/init an encrypted repo).
+    let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
+
+    // 3. restic version preflight.
+    preflight_restic_version()?;
+
+    // Kubeconfig for the Secret-existence probe + the merge-patch. Keep it
+    // alive across both kubectl shell-outs (drop deletes the tempfile).
+    let kc = ensure_kubeconfig_tempfile()?;
+
+    // 4. Cluster credential Secret must already exist (sealed) in apprafter-system.
+    let secret = kubectl_get_json(
+        "secret",
+        Some(&opts.credential),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?;
+    if secret.is_none() {
+        return Err(CliError::Other(format!(
+            "credential Secret '{}' not found in {PLATFORMSTACK_NAMESPACE} — seal it first: \
+             apprafter secret seal {} ... --namespace {PLATFORMSTACK_NAMESPACE}",
+            opts.credential, opts.credential
+        )));
+    }
+
+    // 5. Repo reachability: cat config → init → error.
+    preflight_repo_reachable(&opts.bucket, &creds)?;
+
+    // 6. DR credential confirmation.
+    if !i_have_saved {
+        if std::io::stdin().is_terminal() {
+            let confirmed = inquire::Confirm::new(
+                "Have you saved the restic passphrase AND S3 credentials somewhere OUTSIDE \
+                 this cluster? Without them, backups are UNRECOVERABLE.",
+            )
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+            if !confirmed {
+                println!(
+                    "Aborted — no changes made. Save the restic passphrase + S3 credentials \
+                     outside the cluster, then re-run."
+                );
+                return Ok(());
+            }
+        } else {
+            return Err(CliError::Other(
+                "non-interactive: re-run with --i-have-saved-credentials once you've saved the \
+                 passphrase + S3 creds outside the cluster"
+                    .into(),
+            ));
+        }
+    }
+
+    // 7. Merge-patch spec.backup (path-scoped; spec.backup has no required
+    //    siblings, so a JSON merge-patch is correct — no SSA field-manager).
+    let patch = backup_enable_patch(&opts);
+    let body = serde_json::to_string(&patch)
+        .map_err(|e| CliError::Other(format!("serialize spec.backup patch: {e}")))?;
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+
+    // 8. Success + GitOps advisory.
+    println!(
+        "✓ Scheduled off-site backup enabled → {} (credential Secret '{}').",
+        opts.bucket, opts.credential
+    );
+    println!("{BACKUP_GITOPS_ADVISORY}");
+    Ok(())
+}
+
+/// `apprafter backup disable` — merge-patch `spec.backup.enabled=false`,
+/// retaining every other configured field for a later re-enable.
+pub fn run_backup_disable() -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let body = serde_json::to_string(&backup_disable_patch())
+        .map_err(|e| CliError::Other(format!("serialize spec.backup patch: {e}")))?;
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+    println!(
+        "✓ Scheduled backup disabled (config retained; re-enable with `apprafter backup enable`)."
+    );
+    Ok(())
+}
+
+/// One-line advisory printed after a successful `spec.backup` merge-patch, in
+/// the same spirit as `platform env set` / `platform egress set`: a live
+/// merge-patch is not durable if the field is git-managed via Argo CD.
+const BACKUP_GITOPS_ADVISORY: &str =
+    "If PlatformStack.spec.backup is git-managed via Argo CD, the next sync will overwrite this \
+     — set it in your infra repo for a durable change.";
+
+/// Run `restic version`, parse the semver, and error when it is confidently
+/// older than the required minimum. `restic` not on PATH → error. An
+/// unparseable version → warn to stderr and continue (don't hard-fail purely on
+/// a parse miss — only on a confidently-lower version).
+fn preflight_restic_version() -> Result<()> {
+    let out = Command::new("restic")
+        .arg("version")
+        .output()
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                CliError::Other("restic not on PATH — install restic >= 0.14 first".into())
+            } else {
+                CliError::Other(format!("spawn restic version: {e}"))
+            }
+        })?;
+    if !out.status.success() {
+        // `restic version` failing is unusual but shouldn't itself block enable
+        // — warn and continue; the repo probe below is the real gate.
+        eprintln!(
+            "warning: `restic version` exited with {} — continuing (repo probe still validates)",
+            out.status
+        );
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    match parse_restic_version(&stdout) {
+        Some(v) if restic_version_too_old(v) => Err(CliError::Other(format!(
+            "restic >= {MIN_RESTIC_MAJOR}.{MIN_RESTIC_MINOR} required, found {}.{}.{}",
+            v.0, v.1, v.2
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            eprintln!(
+                "warning: could not parse restic version from `{}` — continuing",
+                stdout.trim()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Probe repo reachability: `restic cat config` (repo already initialised) or,
+/// failing that, `restic init`. If both fail the repo is unreachable or the
+/// creds are wrong → error carrying restic's stderr. Creds are injected via
+/// [`apply_creds_to_command`] (AWS_* + RESTIC_PASSWORD), never persisted.
+fn preflight_repo_reachable(bucket: &str, creds: &BTreeMap<String, String>) -> Result<()> {
+    let mut cat = Command::new("restic");
+    cat.args(["cat", "config", "-r", bucket]);
+    apply_creds_to_command(&mut cat, creds);
+    let cat_out = cat
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn restic cat config: {e}")))?;
+    if cat_out.status.success() {
+        return Ok(());
+    }
+
+    // Not initialised (or unreachable) — try to init it.
+    let mut init = Command::new("restic");
+    init.args(["init", "-r", bucket]);
+    apply_creds_to_command(&mut init, creds);
+    let init_out = init
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn restic init: {e}")))?;
+    if init_out.status.success() {
+        return Ok(());
+    }
+
+    let cat_err = String::from_utf8_lossy(&cat_out.stderr);
+    let init_err = String::from_utf8_lossy(&init_out.stderr);
+    Err(CliError::Other(format!(
+        "backup repo '{bucket}' unreachable / bad credentials — neither `restic cat config` nor \
+         `restic init` succeeded.\n  cat config stderr: {}\n  init stderr: {}",
+        cat_err.trim(),
+        init_err.trim()
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Tests (pure helpers — the tested core)
 // ---------------------------------------------------------------------------
 
@@ -1203,5 +1565,123 @@ mod tests {
         let mut cmd = Command::new("true");
         apply_creds_to_command(&mut cmd, &creds);
         // If we reach here without panic the function is wired correctly.
+    }
+
+    // ------------------------------------------------------------------
+    // 2a. backup_enable_patch / backup_disable_patch (pure patch builders)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn enable_patch_sets_spec_backup_fields() {
+        let p = backup_enable_patch(&EnableOpts {
+            bucket: "s3:x".into(),
+            credential: "c".into(),
+            cron: Some("0 2 * * *".into()),
+            enforce: Some("cluster".into()),
+            staging_mode: Some("sequential".into()),
+            keep_daily: Some(5),
+            ..Default::default()
+        });
+        assert_eq!(p["spec"]["backup"]["enabled"], serde_json::json!(true));
+        assert_eq!(p["spec"]["backup"]["bucket"], serde_json::json!("s3:x"));
+        assert_eq!(
+            p["spec"]["backup"]["credentialRef"]["name"],
+            serde_json::json!("c")
+        );
+        assert_eq!(
+            p["spec"]["backup"]["schedule"],
+            serde_json::json!("0 2 * * *")
+        );
+        assert_eq!(
+            p["spec"]["backup"]["retention"]["enforce"],
+            serde_json::json!("cluster")
+        );
+        assert_eq!(
+            p["spec"]["backup"]["retention"]["keepDaily"],
+            serde_json::json!(5)
+        );
+        assert_eq!(
+            p["spec"]["backup"]["stagingMode"],
+            serde_json::json!("sequential")
+        );
+    }
+
+    #[test]
+    fn enable_patch_omits_retention_when_no_retention_flags() {
+        // No keep_*/enforce set → the whole retention block is absent (a bare
+        // enable that leaves retention to the operator/chart default).
+        let p = backup_enable_patch(&EnableOpts {
+            bucket: "s3:x".into(),
+            credential: "c".into(),
+            check_cron: Some("0 6 * * 0".into()),
+            failure_webhook: Some("https://hook".into()),
+            ..Default::default()
+        });
+        assert!(
+            p["spec"]["backup"].get("retention").is_none(),
+            "retention must be absent when no retention flag is set: {p}"
+        );
+        // Optional non-retention fields still flow through when present.
+        assert_eq!(
+            p["spec"]["backup"]["checkSchedule"],
+            serde_json::json!("0 6 * * 0")
+        );
+        assert_eq!(
+            p["spec"]["backup"]["failureWebhook"],
+            serde_json::json!("https://hook")
+        );
+        // Optional fields the caller left unset are omitted (no null keys).
+        assert!(p["spec"]["backup"].get("schedule").is_none());
+        assert!(p["spec"]["backup"].get("stagingMode").is_none());
+    }
+
+    #[test]
+    fn enable_patch_retention_includes_only_set_keys() {
+        // Only keep_weekly set → retention present with just keepWeekly.
+        let p = backup_enable_patch(&EnableOpts {
+            bucket: "s3:x".into(),
+            credential: "c".into(),
+            keep_weekly: Some(3),
+            ..Default::default()
+        });
+        let ret = &p["spec"]["backup"]["retention"];
+        assert_eq!(ret["keepWeekly"], serde_json::json!(3));
+        assert!(ret.get("keepDaily").is_none());
+        assert!(ret.get("keepMonthly").is_none());
+        assert!(ret.get("enforce").is_none());
+    }
+
+    #[test]
+    fn disable_patch_sets_enabled_false() {
+        assert_eq!(
+            backup_disable_patch()["spec"]["backup"]["enabled"],
+            serde_json::json!(false)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 2c. restic version preflight (pure parse + comparison)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_restic_version_reads_dotted_triple() {
+        assert_eq!(
+            parse_restic_version("restic 0.16.4 compiled with go1.21.6 on linux/amd64"),
+            Some((0, 16, 4))
+        );
+        assert_eq!(parse_restic_version("restic 0.14.0"), Some((0, 14, 0)));
+        // Leading `v` tolerated.
+        assert_eq!(parse_restic_version("v1.2.3"), Some((1, 2, 3)));
+        // No dotted triple at all → None (warn+continue path).
+        assert_eq!(parse_restic_version("restic unknown"), None);
+    }
+
+    #[test]
+    fn restic_version_gate_rejects_below_014() {
+        assert!(restic_version_too_old((0, 13, 0)));
+        assert!(restic_version_too_old((0, 9, 6)));
+        assert!(!restic_version_too_old((0, 14, 0)));
+        assert!(!restic_version_too_old((0, 16, 4)));
+        assert!(!restic_version_too_old((1, 0, 0)));
     }
 }

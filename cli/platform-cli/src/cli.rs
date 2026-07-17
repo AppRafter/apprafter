@@ -1232,6 +1232,41 @@ pub enum BackupAction {
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
     },
+    /// Enable scheduled off-site S3 backup by patching PlatformStack.spec.backup.
+    Enable {
+        /// Restic S3 repository URL, e.g. `s3:s3.eu-central-1.amazonaws.com/bucket/prefix`.
+        #[arg(long)]
+        bucket: String,
+        /// Name of the (sealed) cluster credential Secret in apprafter-system → credentialRef.name.
+        #[arg(long)]
+        credential: String,
+        /// Operator's full S3 creds (dotenv) for the preflight repo init; falls back to env.
+        #[arg(long)]
+        credential_file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        cron: Option<String>,
+        #[arg(long)]
+        keep_daily: Option<u32>,
+        #[arg(long)]
+        keep_weekly: Option<u32>,
+        #[arg(long)]
+        keep_monthly: Option<u32>,
+        /// `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune).
+        #[arg(long)]
+        enforce: Option<String>,
+        /// `monolithic` (default) or `sequential`.
+        #[arg(long)]
+        staging_mode: Option<String>,
+        #[arg(long)]
+        check_cron: Option<String>,
+        #[arg(long)]
+        failure_webhook: Option<String>,
+        /// Confirm you have saved the restic passphrase + S3 credentials OUTSIDE the cluster.
+        #[arg(long)]
+        i_have_saved_credentials: bool,
+    },
+    /// Disable scheduled backup (sets spec.backup.enabled=false; keeps config).
+    Disable,
 }
 
 #[cfg(test)]
