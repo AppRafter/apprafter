@@ -935,6 +935,12 @@ mod tests {
                 !p.join("manifest.json").exists(),
                 "a per-claim snapshot must NOT carry manifest.json: {p:?}"
             );
+            // Peak-disk = max(claim): the per-claim staging dir is deleted after
+            // its backup, before the next claim is staged (not merely emptied).
+            assert!(
+                !p.exists(),
+                "per-claim staging dir must be deleted after backup (peak disk = max claim): {p:?}"
+            );
         }
     }
 
