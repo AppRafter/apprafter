@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name             = "apprafter-backup"
+description      = "In-cluster scheduled-backup runner for AppRafter (2.6d-4)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "apprafter-backup"
+path = "src/main.rs"
+
+[dependencies]
+backup-core = { path = "../backup-core" }
+cli-core    = { path = "../cli-core" }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+tempfile    = { workspace = true }
+tokio       = { workspace = true }
+kube        = { workspace = true }
+k8s-openapi = { workspace = true }
+futures     = { workspace = true }
