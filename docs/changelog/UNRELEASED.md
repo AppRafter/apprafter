@@ -9,7 +9,7 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## cli v0.2.32 / operator v0.2.32 / platform-stack 0.2.40 / apprafter-backup:v0.2.32 — 2.6d-4 automated off-site S3 backup (opt-in) (2026-07-17)
+## cli v0.2.32 / operator v0.2.33 / platform-stack 0.2.41 / apprafter-backup:v0.2.32 / cue-cmp v0.1.14 — 2.6d-4 automated off-site S3 backup (opt-in) (2026-07-17)
 
 Turns the operator-machine local-pull `apprafter backup` into an **opt-in**
 scheduled in-cluster CronJob pushing the same encrypted restic repo to a
@@ -66,7 +66,25 @@ stays the default. Cross-workspace coordinated release.
 - `e2e/backup-s3-hetzner.sh` (real-Hetzner monolithic, user-gated on the
   user's S3 bucket) + `e2e/backup-s3-sequential-kind.sh` (kind+MinIO
   sequential-format). ADR 0050 amended (K8up rejected → AppRafter
-  CronJob-restic; retention + stagingMode + scoped-creds model).
+  CronJob-restic; retention + stagingMode + scoped-creds model). The
+  local-pull **file** backup + full-DR restore path was regression-validated
+  GREEN end-to-end on real Hetzner post-refactor (`restore-reprovision-hetzner.sh`).
+
+### Release-coordination fix (post-first-push)
+
+The first master push exposed two coordination misses, fixed before the release
+lands: (1) `operatorVersion` was left at **v0.2.32**, which had ALREADY been
+published (for the 2.4h `imagePolicy` CRD fix) — so `release-operator`'s
+two-axis gate skipped the rebuild and the chunk-3/3b operator change (the
+`spec.backup` CRD field + projection) never shipped, and platform-stack 0.2.40
+went out pinning that stale operator (backup silently non-functional). (2) the
+cue-cmp drift guard failed because the bundled `schemas/v1alpha1/*.cue` changed
+without a `version.cue` bump. Fix: operator → **v0.2.33** (fresh version forces
+the rebuild), cue-cmp → **v0.1.14**, platform-stack → **0.2.41** (re-pins both;
+0.2.40 is immutable) and **0.2.40 is YANKED** (backup non-functional). The CLI
+stays v0.2.32 and the runner image stays `apprafter-backup:v0.2.32` (neither
+binary changed), so operator v0.2.33 deliberately breaks the historical
+operator==CLI numeric lockstep.
 
 ## cli v0.2.31 — 2.6d T13 restore --reprovision (clone-to-new) (2026-07-16)
 
