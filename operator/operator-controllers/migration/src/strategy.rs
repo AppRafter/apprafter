@@ -30,11 +30,12 @@ use kube::Client;
 use serde_json::{json, Value};
 use tracing::info;
 
+use operator_core::migration::classification_severity;
 use operator_core::{
-    Application, ApplicationSpec, DestructiveChange, MigrationApplicationRef,
+    Application, ApplicationBaseSpec, DestructiveChange, MigrationApplicationRef,
     MigrationApplicationScope, MigrationError, MigrationPlan, MigrationPlanScope,
-    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, SourceCredentialSpec,
-    StepOutcome,
+    MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger, Needs,
+    SourceCredentialSpec, StepOutcome,
 };
 
 /// SSA field manager used by the strategies' reject path when
@@ -81,23 +82,38 @@ impl MigrationStrategy for ApplicationMigrationStrategy {
 }
 
 impl ApplicationMigrationStrategy {
-    /// Decide whether the change from `_old` → `new` warrants a
-    /// MigrationPlan. B.1.77 skeleton: returns `None`
-    /// unconditionally — the current Application v1alpha1 schema
-    /// (image / replicas / expose / env) carries no destructive
-    /// operations per spec.md §3.8. Phase 2.x services
-    /// (`needs.*`, storage class, breaking image migrations)
-    /// populate this with real diff logic.
+    /// Decide whether the change from `old` → `new` (two **effective**
+    /// specs — the unified base fields `image/replicas/expose/env/needs`,
+    /// as returned by `operator_rendering::effective_spec`) warrants a
+    /// MigrationPlan.
     ///
-    /// The function takes both states so callers in B.1.77 can
-    /// already wire the call site through with a stable
-    /// signature; the implementation will replace `None` with
-    /// real comparisons when the schema grows destructive fields.
+    /// 2.16b builds this out op-class by op-class. This slice handles
+    /// **needs-removal**: dropping a `needs.<type>` (or a named
+    /// `needs.<type>.<name>`) that existed in `old` is a destructive
+    /// **data-migration** — the backing claim (and its data) is torn
+    /// down, so the change is gated through a MigrationPlan. Adding a
+    /// need (present in `new`, absent in `old`) is non-destructive.
+    ///
+    /// When an edit carries several destructive ops the classifier
+    /// collects every candidate and `pick_primary` returns the single
+    /// highest-severity one (2.16b spec: highest-severity wins).
     pub fn detect_destructive(
-        _old: Option<&ApplicationSpec>,
-        _new: &ApplicationSpec,
+        old: &ApplicationBaseSpec,
+        new: &ApplicationBaseSpec,
     ) -> Option<DestructiveChange> {
-        None
+        let mut candidates: Vec<DestructiveChange> = Vec::new();
+
+        for key in removed_needs_keys(old.needs.as_ref(), new.needs.as_ref()) {
+            candidates.push(DestructiveChange {
+                trigger_type: "needs-removal".to_string(),
+                field: key.clone(),
+                from: Some(json!(key)),
+                to: Some(json!("(removed)")),
+                classification: "data-migration".to_string(),
+            });
+        }
+
+        pick_primary(candidates)
     }
 
     /// Build a `MigrationPlan` CR for an application-scope
@@ -184,6 +200,46 @@ impl ApplicationMigrationStrategy {
         };
         mp
     }
+}
+
+/// Expand a `Needs` block into the set of stable `(type, name)` keys it
+/// declares: `needs.<type>` for the unnamed default of a type,
+/// `needs.<type>.<name>` for a named entry. Reuses `Needs::entries`
+/// (the byte-stable flatten used across claim-gen / renderer / GC) so
+/// the key vocabulary matches the rest of the operator exactly.
+fn needs_keys(needs: Option<&Needs>) -> Vec<String> {
+    needs
+        .map(|n| {
+            n.entries()
+                .into_iter()
+                .map(|(ty, entry)| match entry.name {
+                    Some(name) => format!("needs.{ty}.{name}"),
+                    None => format!("needs.{ty}"),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Keys present in `old` but absent from `new` — i.e. the `needs`
+/// entries this edit removes. Order follows `Needs::entries`' fixed
+/// per-type ordering, so the resulting candidate list is deterministic.
+fn removed_needs_keys(old: Option<&Needs>, new: Option<&Needs>) -> Vec<String> {
+    let new_keys = needs_keys(new);
+    needs_keys(old)
+        .into_iter()
+        .filter(|k| !new_keys.contains(k))
+        .collect()
+}
+
+/// Pick the single primary `DestructiveChange` from the candidates an
+/// edit produced: highest `classification_severity` wins (2.16b spec).
+/// `max_by_key` returns the LAST maximum on ties — Task 6 replaces this
+/// with a fully deterministic tie-break across equal-severity ops.
+fn pick_primary(candidates: Vec<DestructiveChange>) -> Option<DestructiveChange> {
+    candidates
+        .into_iter()
+        .max_by_key(|c| classification_severity(&c.classification))
 }
 
 // Suppress the `Application` type-import that's only used in
@@ -679,6 +735,82 @@ mod tests {
         // Missing field also distinct from a concrete string.
         assert!(!pins_equal(None, Some(&s)));
         assert!(!pins_equal(Some(&s), None));
+    }
+}
+
+#[cfg(test)]
+mod application_detect_destructive_tests {
+    use super::*;
+    use operator_core::{OneOrMany, ServiceNeed};
+
+    fn base() -> ApplicationBaseSpec {
+        ApplicationBaseSpec::default()
+    }
+
+    fn with_pg(mut s: ApplicationBaseSpec) -> ApplicationBaseSpec {
+        s.needs = Some(Needs {
+            pg: Some(OneOrMany::One(ServiceNeed::default())),
+            ..Default::default()
+        });
+        s
+    }
+
+    fn with_named_pg(mut s: ApplicationBaseSpec, name: &str) -> ApplicationBaseSpec {
+        s.needs = Some(Needs {
+            pg: Some(OneOrMany::Many(vec![ServiceNeed {
+                name: Some(name.to_string()),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn removing_needs_pg_is_data_migration() {
+        let c =
+            ApplicationMigrationStrategy::detect_destructive(&with_pg(base()), &base()).unwrap();
+        assert_eq!(c.classification, "data-migration");
+        assert_eq!(c.trigger_type, "needs-removal");
+        assert_eq!(c.field, "needs.pg");
+        // STRING sentinel: `from` mirrors the removed field key.
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "needs.pg");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+    }
+
+    #[test]
+    fn adding_needs_pg_is_not_destructive() {
+        assert!(
+            ApplicationMigrationStrategy::detect_destructive(&base(), &with_pg(base())).is_none()
+        );
+    }
+
+    #[test]
+    fn removing_named_needs_pg_uses_dotted_key() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_named_pg(base(), "main"),
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "needs-removal");
+        assert_eq!(c.field, "needs.pg.main");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "needs.pg.main");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+        assert_eq!(c.classification, "data-migration");
+    }
+
+    #[test]
+    fn unchanged_needs_is_not_destructive() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_pg(base()),
+            &with_pg(base())
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn no_needs_either_side_is_not_destructive() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(&base(), &base()).is_none());
     }
 }
 
