@@ -88,6 +88,15 @@ pub(crate) const PLATFORMSTACK_NAME: &str = "default";
 /// `platform::PLATFORMSTACK_NAMESPACE` at the merge-patch call sites.
 pub(crate) const PLATFORMSTACK_NAMESPACE: &str = APPRAFTER_SYSTEM_NAMESPACE;
 
+/// Platform defaults for the CRD-required `spec.backup` fields the CLI must
+/// always emit (the CRD drops the CUE `*`-defaults; see [`backup_enable_patch`]).
+/// These MUST stay in sync with `schemas/v1alpha1/platformstack.cue` +
+/// `platform-stack` `#BackupValues` so a bare `enable` reproduces the platform
+/// default exactly.
+const DEFAULT_BACKUP_SCHEDULE: &str = "0 3 * * *";
+const DEFAULT_STAGING_MODE: &str = "monolithic";
+const DEFAULT_CHECK_SCHEDULE: &str = "0 6 * * 0";
+
 // ---------------------------------------------------------------------------
 // Pure helpers (the tested core — some exported pub(crate) for restore.rs)
 // ---------------------------------------------------------------------------
@@ -246,15 +255,39 @@ pub(crate) fn backup_enable_patch(o: &EnableOpts) -> serde_json::Value {
         serde_json::json!({ "name": o.credential }),
     );
 
-    if let Some(cron) = &o.cron {
-        backup.insert("schedule".to_string(), Value::String(cron.clone()));
-    }
-    if let Some(mode) = &o.staging_mode {
-        backup.insert("stagingMode".to_string(), Value::String(mode.clone()));
-    }
-    if let Some(check) = &o.check_cron {
-        backup.insert("checkSchedule".to_string(), Value::String(check.clone()));
-    }
+    // The PlatformStack CRD marks schedule / stagingMode / checkSchedule /
+    // checkReadData REQUIRED whenever `spec.backup` is present (the CRD drops
+    // the CUE `*`-defaults, so the apiserver won't fill them and would reject a
+    // partial patch; the operator's `BackupConfig` likewise deserializes them
+    // as non-`Option` `String`s). So the patch must always carry a concrete
+    // value — the flag when given, else the platform default (identical to the
+    // CUE / chart `#BackupValues` defaults, so behaviour is unchanged from
+    // "the platform default").
+    backup.insert(
+        "schedule".to_string(),
+        Value::String(
+            o.cron
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BACKUP_SCHEDULE.to_string()),
+        ),
+    );
+    backup.insert(
+        "stagingMode".to_string(),
+        Value::String(
+            o.staging_mode
+                .clone()
+                .unwrap_or_else(|| DEFAULT_STAGING_MODE.to_string()),
+        ),
+    );
+    backup.insert(
+        "checkSchedule".to_string(),
+        Value::String(
+            o.check_cron
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CHECK_SCHEDULE.to_string()),
+        ),
+    );
+    backup.insert("checkReadData".to_string(), Value::Bool(false));
     if let Some(hook) = &o.failure_webhook {
         backup.insert("failureWebhook".to_string(), Value::String(hook.clone()));
     }
@@ -2191,9 +2224,52 @@ mod tests {
             p["spec"]["backup"]["failureWebhook"],
             serde_json::json!("https://hook")
         );
-        // Optional fields the caller left unset are omitted (no null keys).
-        assert!(p["spec"]["backup"].get("schedule").is_none());
-        assert!(p["spec"]["backup"].get("stagingMode").is_none());
+        // schedule / stagingMode are CRD-REQUIRED, so a bare enable defaults
+        // them (NOT omitted — the apiserver would reject a partial patch).
+        assert_eq!(
+            p["spec"]["backup"]["schedule"],
+            serde_json::json!("0 3 * * *")
+        );
+        assert_eq!(
+            p["spec"]["backup"]["stagingMode"],
+            serde_json::json!("monolithic")
+        );
+    }
+
+    #[test]
+    fn enable_patch_always_carries_every_crd_required_field() {
+        // Regression: the PlatformStack CRD marks
+        // [enabled, schedule, bucket, credentialRef, stagingMode,
+        //  checkSchedule, checkReadData] required whenever spec.backup is
+        // present. A minimal `apprafter backup enable --bucket --credential`
+        // (no other flags) MUST still produce all of them, else the apiserver
+        // rejects the merge-patch ("schedule: Required value") and every
+        // enable fails.
+        let p = backup_enable_patch(&EnableOpts {
+            bucket: "s3:b".into(),
+            credential: "cred".into(),
+            ..Default::default()
+        });
+        let b = &p["spec"]["backup"];
+        for key in [
+            "enabled",
+            "schedule",
+            "bucket",
+            "credentialRef",
+            "stagingMode",
+            "checkSchedule",
+            "checkReadData",
+        ] {
+            assert!(
+                b.get(key).is_some(),
+                "CRD-required field '{key}' missing from a bare enable patch: {p}"
+            );
+        }
+        assert_eq!(b["enabled"], serde_json::json!(true));
+        assert_eq!(b["schedule"], serde_json::json!("0 3 * * *"));
+        assert_eq!(b["stagingMode"], serde_json::json!("monolithic"));
+        assert_eq!(b["checkSchedule"], serde_json::json!("0 6 * * 0"));
+        assert_eq!(b["checkReadData"], serde_json::json!(false));
     }
 
     #[test]
