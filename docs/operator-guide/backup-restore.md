@@ -229,11 +229,337 @@ respective namespaces: app user secrets into their app namespace,
   cross-version restore is not blocked, but it warns: a different target
   version may re-render components, so verify after restoring.
 
+## Off-site scheduled backup (S3)
+
+The commands above are an **operator-machine local pull** — you run them by
+hand, and the encrypted repository lands on your laptop. On top of that same
+engine, AppRafter can run the backup **on a schedule, inside the cluster**,
+pushing the encrypted restic repository to a user-configured external object
+store (S3-compatible — AWS S3, Cloudflare R2, Backblaze B2, Hetzner Object
+Storage, Scaleway, …). The cluster then keeps an off-site backup with no
+operator laptop in the loop.
+
+It is **opt-in and GitOps-native**: no bucket is ever forced (local pull stays
+the default), and enabling it is a declarative patch of
+`PlatformStack.spec.backup`, not an imperative `kubectl apply` of a CronJob. A
+default-off platform-stack chart component renders two CronJobs (a daily backup
+and a weekly integrity check), a scoped ServiceAccount, and a
+CiliumNetworkPolicy from that typed spec. There is **no** operator controller
+and **no** first-class health condition — failure surfaces as a non-zero Job
+exit plus a status ConfigMap plus an optional webhook (below).
+
+The design and the rejected alternatives (K8up / helper-runs-restic) are in
+[ADR 0050](https://github.com/apprafter/apprafter/blob/master/docs/adr/0050-backup-restore.md).
+
+### The two-tier credential model — read this first
+
+The single most important idea: **the operator owns the full credentials; the
+cluster gets a reduced copy.**
+
+- **Operator credentials (authoritative, mandatory).** The restic passphrase
+  (`RESTIC_PASSWORD`) plus full S3 keys live **with you, outside the cluster**
+  (a password manager). They are required for the `backup enable` preflight,
+  for operator-side retention (`backup prune`) and integrity checks
+  (`backup check`), and — critically — for **restore after the cluster is
+  dead**. If these live only in the cluster, then when the cluster dies the
+  SealedSecret and the controller key die with it, and the off-site repository
+  becomes unreadable exactly when you need it. `backup enable` refuses to
+  proceed without them (see the DR confirmation below).
+- **In-cluster credentials (reduced).** One Kubernetes Secret in
+  `apprafter-system`, holding the same keys but **scoped** S3 rights (the
+  default `operator` enforce mode narrows delete to `locks/*` — the
+  scoped-credentials ladder below). On Tier 1 this is a SealedSecret you seal;
+  on Tier 2+ it is OpenBao via the same `credentialRef`.
+
+restic consumes `AWS_*` + `RESTIC_PASSWORD` + the `s3:` repo URL natively, so
+there is no AppRafter-specific credential format on the restic side.
+
+### Enabling
+
+First, **seal the in-cluster credential Secret into `apprafter-system`.** The
+scheduled Jobs read their S3 credentials from a Secret named by
+`credentialRef.name`; it must already exist, sealed into `apprafter-system`,
+before you enable — `backup enable` fails fast otherwise. The Secret holds:
+
+- `RESTIC_PASSWORD` — the repository passphrase (the same one you save
+  out-of-band).
+- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` — the S3 keys.
+- `AWS_DEFAULT_REGION` — optional, if your provider needs it.
+
+> **Namespace matters.** The backup credential Secret is a **platform** secret
+> and must live in `apprafter-system` — that is where `apprafter secret seal`
+> already defaults `--namespace`, so leave it at the default (a SealedSecret only
+> unseals as `<namespace>/<name>`, so sealing it into an app namespace by mistake
+> means the runner never finds it). Keep the `--namespace apprafter-system`
+> explicit as a guard:
+>
+> ```
+> apprafter secret seal backup-s3-creds \
+>   --from-literal RESTIC_PASSWORD=… \
+>   --from-literal AWS_ACCESS_KEY_ID=… \
+>   --from-literal AWS_SECRET_ACCESS_KEY=… \
+>   --from-literal AWS_DEFAULT_REGION=… \
+>   --namespace apprafter-system
+> ```
+
+Then enable:
+
+```
+apprafter backup enable --bucket s3:<endpoint>/<bucket>/<prefix> \
+                        --credential <sealed-secret-name> \
+                        [--credential-file <dotenv>] \
+                        [--cron "0 3 * * *"] \
+                        [--staging-mode monolithic|sequential] \
+                        [--enforce operator|cluster] \
+                        [--keep-daily N] [--keep-weekly N] [--keep-monthly N] \
+                        [--check-cron "0 6 * * 0"] \
+                        [--failure-webhook <url>] \
+                        --i-have-saved-credentials
+```
+
+`enable` does **not** blindly patch the CR. It runs a **fail-closed preflight
+with the operator's own credentials** (not the cluster's), in order:
+
+1. **restic version** — the operator's system `restic` must be **≥ 0.14** (repo
+   format v2). Not on `PATH` is an error; a confidently-lower version is an
+   error.
+2. **Operator S3 creds resolve** — from `--credential-file <dotenv>` (a
+   `KEY=VALUE` file with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+   `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`), falling back to the
+   matching environment variables. `RESTIC_PASSWORD` is required — the repo
+   probe below needs it.
+3. **The credential Secret exists** in `apprafter-system` — else the error tells
+   you to seal it first.
+4. **Repo reachability** — `restic cat config` against `--bucket` (an existing
+   repo) or, if that fails on an empty bucket, `restic init`. This validates the
+   endpoint, credentials, and passphrase **now**, and it means a typo in
+   `--bucket` can't silently create a second empty repo. The runner **never**
+   auto-inits at run time — an unreadable repo is an honest failure that points
+   back at `backup enable`.
+5. **DR confirmation** — `--i-have-saved-credentials` (or an interactive
+   confirm; non-interactive without the flag is an error). This makes the
+   operator-owns-the-keys rule *material*: you physically cannot enable without
+   asserting that the passphrase and S3 credentials are saved outside the
+   cluster.
+
+Only after all of these pass does `enable` **merge-patch**
+`PlatformStack.spec.backup`.
+
+> **GitOps advisory.** If `PlatformStack.spec.backup` is git-managed via Argo CD,
+> the next sync will overwrite an imperative patch — set the backup block in
+> your **infra repo** for a durable change. The CLI prints this reminder after
+> a successful `enable`.
+
+Defaults when a flag is omitted: `--cron` `"0 3 * * *"` (daily 03:00),
+`--check-cron` `"0 6 * * 0"` (weekly Sunday 06:00, staggered clear of the
+backup), `--staging-mode` `monolithic`, `--enforce` `operator`, retention
+`--keep-daily 7 --keep-weekly 4 --keep-monthly 6`.
+
+### Disable and status
+
+```
+apprafter backup disable
+```
+
+`disable` sets `spec.backup.enabled=false` and **keeps** every other configured
+field, so a later `enable` re-uses the same bucket, credential, and retention.
+
+```
+apprafter backup status
+```
+
+`status` reads three sources and reconciles them into one view:
+
+- the resolved `PlatformStack.spec.backup` (bucket, schedule, enforce mode,
+  retention, …);
+- the last backup and check **Job** outcomes;
+- the non-chart-owned **`apprafter-backup-status` ConfigMap** in
+  `apprafter-system` — the runner create-or-updates it on every run with
+  `lastSuccess`, `lastFailure`, `lastError` (short), and `lastRunFormat`. This
+  is why it is a ConfigMap and not just Job history: the `failedJobsHistoryLimit`
+  can rotate the last *successful* Job out of view, but "when did the last
+  successful backup run" — the core backup question — stays reliably
+  answerable;
+- the `apprafter.io/last-prune` annotation stamped on `PlatformStack` by the
+  operator-side `backup prune`.
+
+### The scoped-credentials ladder — `enforce: operator` vs `cluster`
+
+`--enforce` controls **who runs retention** and therefore **how much delete
+power the cluster credential needs.**
+
+**`enforce: operator` (the default).** The in-cluster Secret should carry S3
+rights scoped to **Put / Get / List on the repository prefix, plus Delete only
+on `locks/*`.** The scheduled backup Job then does `restic backup` only — it
+**cannot** delete `data/`, `index/`, or `snapshots/` objects, so a cluster
+compromise (ransomware) cannot erase the backup history. Retention runs
+**outside** the cluster: you run `apprafter backup prune` with your **full**
+credentials (see Retention below). A minimal bucket/IAM policy shape:
+
+```jsonc
+// enforce: operator — cluster credential (scoped, append-only-ish)
+{
+  "Statement": [
+    {                                    // write + read the repo
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/my-prefix/*"]
+    },
+    {                                    // delete ONLY restic lock files
+      "Effect": "Allow",
+      "Action": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::my-bucket/my-prefix/locks/*"]
+    }
+  ]
+}
+```
+
+**`enforce: cluster`.** The in-cluster Secret carries **full** credentials, and
+the backup Job runs `restic forget --prune` in-cluster after each backup. No
+operator-side prune is needed, but a compromised cluster can now delete the
+whole history — the trade-off is documented and opt-in. Use it only with
+compensating provider controls (object versioning / object lock).
+
+> **Statement-level granularity is provider-dependent.** "Delete only on
+> `locks/*`" needs **statement-level** scoping (different actions on different
+> prefixes), which AWS-style policies express but some key-prefix-only providers
+> do not. If your provider cannot express it and you decline to hand the cluster
+> full delete, issue a credential with **no** Delete at all: `backup` still
+> works (restic uses non-exclusive locks), but the in-cluster `check` cannot
+> drop its own lock — set `--check-cron off` to disable the in-cluster check and
+> run `apprafter backup check` operator-side instead. Verify your provider's
+> behavior (this is spec item **V2** in the Verify checklist below).
+
+> **Confidentiality caveat (read this).** The scoped / append-only credential
+> protects the **integrity and availability** of the backup history — an
+> attacker with the cluster's credential cannot *erase* your snapshots. It does
+> **not** protect confidentiality. The cluster credential still has `GetObject`
+> and holds `RESTIC_PASSWORD`, so anyone who compromises the cluster can **read
+> every snapshot in the history** — including secrets that were rotated long ago
+> and are no longer live in the cluster. restic encrypts the repository with the
+> passphrase, so confidentiality rests entirely on that passphrase; that is why
+> the passphrase must be saved **outside** the cluster and, in the spirit of the
+> `operator` model, kept off the cluster wherever the workflow allows. Do not
+> read "survives a compromise" as "the history is secret."
+
+### Retention and prune
+
+Retention uses **restic's own** snapshot retention — a host- and format-aware
+`forget --prune` keyed by keep-daily / keep-weekly / keep-monthly (built-in
+defaults **7 / 4 / 6**). In the default `enforce: operator` mode you run it
+yourself, outside the cluster, with full credentials:
+
+```
+apprafter backup prune [--repo s3:…] \
+                       [--credential-file <dotenv>] \
+                       [--keep-daily N] [--keep-weekly N] [--keep-monthly N]
+```
+
+`--repo` defaults to `PlatformStack.spec.backup.bucket`; the keep-* flags
+override the configured `spec.backup.retention` (else the 7/4/6 defaults).
+Credentials resolve from `--credential-file` then the environment. On success
+`prune` stamps `apprafter.io/last-prune` on `PlatformStack`, which
+`backup status` then shows. Run it on your own cadence (e.g. monthly) — restic
+dedup makes growth sub-linear, so retention is a rare, deliberate operation, not
+a per-run one.
+
+> **Why not an S3 bucket lifecycle rule?** It is tempting to set a bucket-level
+> "delete objects older than N days" lifecycle rule and skip `prune` entirely.
+> **Do not** — it will corrupt the repository. restic is content-addressed and
+> packs *many* snapshots' data into shared `data/` pack files; a fresh snapshot
+> routinely references pack objects that are physically old. A lifecycle rule
+> deletes objects by *object age*, so it will delete still-referenced packs and
+> leave the repo unrestorable. Retention **must** go through
+> `restic forget --prune` (i.e. `apprafter backup prune`), which walks the
+> reference graph and only removes truly unreferenced packs.
+
+### Integrity checks and locks
+
+```
+apprafter backup check [--repo s3:…] [--credential-file <dotenv>] [--read-data]
+```
+
+`check` runs `restic check` against the repository — the same verification that
+the in-cluster **`apprafter-backup-check` CronJob** runs weekly (default
+`0 6 * * 0`). By default it verifies structure only; `--read-data` re-downloads
+and re-hashes **every** pack for a deep verify (slower, bandwidth-heavy). Run the
+operator-side `check` when your provider can't express the scoped-delete policy
+and you disabled the in-cluster check (`--check-cron off`), or any time you want
+a manual verification with full credentials.
+
+```
+apprafter backup unlock [--repo s3:…] [--credential-file <dotenv>]
+```
+
+`unlock` removes **only stale** locks (`restic unlock`) — a live lock held by a
+running backup is never touched. Reach for it when a Job was killed mid-run
+(OOM, a node reboot) and left a lock behind that blocks the next operation. The
+in-cluster CronJobs already unlock stale locks as their first step, so you
+mostly need `unlock` for operator-side `prune`/`check` against a repo whose last
+in-cluster run died unexpectedly.
+
+### Restore from S3 (disaster-recovery runbook)
+
+Restore reads the repository over S3 using the **operator's** credentials —
+**never** from the cluster (in a real DR the source cluster is gone):
+
+```
+apprafter restore s3:<endpoint>/<bucket>/<prefix> \
+                  --credential-file <dotenv> \
+                  [--reprovision | --data-only] [--target <name>] \
+                  [--snapshot <id>]
+```
+
+`--credential-file` (or `AWS_*` + `RESTIC_PASSWORD` in the environment) is
+**required** for an `s3:` repo; the operator's full credentials are read locally.
+The DR steps:
+
+1. **Obtain the passphrase + S3 credentials you saved out-of-band** — from your
+   password manager, the artifacts the `--i-have-saved-credentials` gate made
+   you save. Confirm your operator machine has `restic ≥ 0.14`.
+2. **Put them in a dotenv file** (`RESTIC_PASSWORD`, `AWS_ACCESS_KEY_ID`,
+   `AWS_SECRET_ACCESS_KEY`, optional `AWS_DEFAULT_REGION`) and pass it as
+   `--credential-file`, or export the matching env vars.
+3. **Choose the mode** (the same modes as the local-pull restore above — see
+   [Target modes](#target-modes)):
+   - `--reprovision` — the source cluster is dead: provision **and** bootstrap a
+     fresh cluster in the registered target, then replay. Real-Hetzner only.
+   - neither flag (restore into a running, already-bootstrapped target; select
+     it with `--target <name>`) — the default path.
+   - `--data-only` — reload only native data into an already-configured target.
+4. Restore **auto-detects the backup format** — monolithic (the default, one
+   snapshot per run) vs sequential (a versioned snapshot-set) — by reading the
+   manifest version, so you don't specify the format. `latest` resolves to the
+   freshest run of **either** format. Both staging formats restore identically
+   from the operator's side; the only difference is on the write path.
+
+The restore ordering, the H2/R1 invariants, and the secret re-sealing behavior
+are identical to the local-pull restore documented above — the only difference
+is the repository lives in S3 and the credentials come from the operator, not
+the target.
+
+### Verify checklist (operator-runnable)
+
+Two checks are worth running before you trust the off-site backup, mapping to
+the design's Verify items:
+
+- **V2 — confirm your provider honors a prefix-scoped delete.** With the
+  `enforce: operator` scoped credential, actively **test** that the cluster
+  credential can delete an object under `locks/*` but is **refused** deleting an
+  object under `data/` (or `snapshots/`). If the deny doesn't hold, your
+  provider can't express the append-only guarantee — fall back to
+  `enforce: cluster` with provider object-lock, or to the no-delete +
+  `--check-cron off` variant.
+- **V7 — a minimal end-to-end.** `apprafter backup enable` → wait for (or
+  trigger) one backup Job → `apprafter backup status` shows a fresh
+  `lastSuccess` → `apprafter restore s3:… --reprovision` into a **throwaway**
+  cluster (or `--target` a running one) and confirm your data and a sealed
+  secret came back.
+  This is the only test that proves the whole chain — the passphrase you saved,
+  the bucket policy, the runner, and the restore path — actually works together.
+
 ## Follow-on work
 
-- **Automated S3 backup (opt-in).** A scheduled push of the same restic
-  repository to a remote (S3 / SFTP / rclone — R2, Scaleway, B2, Hetzner) is a
-  follow-on. Local pull stays the default; the bucket is never forced.
 - **Clone-to-new** (`--reprovision`) ships and is real-Hetzner-validated (see
   Target modes (c)); full cross-version DR reconciles with the external-S3 DR
   drill and the `DisasterRecoveryPlan` resource.
