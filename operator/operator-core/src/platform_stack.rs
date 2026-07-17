@@ -36,6 +36,8 @@ pub struct PlatformStackSpec {
     pub default_environment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupConfig>,
     pub source: PlatformStackSource,
     pub values: PlatformStackValues,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,6 +83,79 @@ pub fn resolve_egress_profile(spec: &PlatformStackSpec) -> EgressProfile {
         .and_then(|n| n.egress.as_ref())
         .and_then(|e| e.profile)
         .unwrap_or_default()
+}
+
+/// Opt-in automated off-site backup (2.6d-4). Absent (`spec.backup` unset) =
+/// disabled. Mirrors `schemas/v1alpha1/platformstack.cue#PlatformStackSpec`'s
+/// `backup?` block. Credentials never live here — only a `credentialRef`
+/// name pointing at a Secret the operator resolves.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct BackupConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub schedule: String,
+    pub bucket: String,
+    #[serde(rename = "credentialRef")]
+    pub credential_ref: CredentialRef,
+    #[serde(rename = "stagingMode")]
+    pub staging_mode: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "stagingSizeLimit"
+    )]
+    pub staging_size_limit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionConfig>,
+    #[serde(rename = "checkSchedule")]
+    pub check_schedule: String,
+    #[serde(default, rename = "checkReadData")]
+    pub check_read_data: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "failureWebhook"
+    )]
+    pub failure_webhook: Option<String>,
+}
+
+/// Name-only reference to a Secret carrying the backup destination
+/// credentials. Kept opaque here (the operator resolves it) so the spec
+/// never embeds secret material.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct CredentialRef {
+    pub name: String,
+}
+
+/// Snapshot retention policy. Absent → the platform-stack `backup`
+/// component's built-in defaults apply. `enforce` selects whether the
+/// operator or the in-cluster backup component prunes.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct RetentionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "keepDaily")]
+    pub keep_daily: Option<i64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "keepWeekly"
+    )]
+    pub keep_weekly: Option<i64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "keepMonthly"
+    )]
+    pub keep_monthly: Option<i64>,
+    pub enforce: String,
+}
+
+/// Resolve the effective backup staging mode from a PlatformStack spec.
+/// Field absent (`backup` unset) → the documented default `"monolithic"`.
+pub fn resolve_backup_staging_mode(spec: &PlatformStackSpec) -> &str {
+    spec.backup
+        .as_ref()
+        .map(|b| b.staging_mode.as_str())
+        .unwrap_or("monolithic")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -268,5 +343,159 @@ mod tests {
                 .and_then(|x| x.as_str()),
             Some("strict")
         );
+    }
+
+    #[test]
+    fn backup_absent_leaves_spec_backup_none() {
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 }
+        }))
+        .unwrap();
+        assert!(spec.backup.is_none());
+    }
+
+    #[test]
+    fn backup_full_block_parses_every_field() {
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 },
+            "backup": {
+                "enabled": true,
+                "schedule": "0 3 * * *",
+                "bucket": "s3://apprafter-backups/cluster-a",
+                "credentialRef": { "name": "backup-s3-creds" },
+                "stagingMode": "sequential",
+                "stagingSizeLimit": "20Gi",
+                "retention": {
+                    "keepDaily": 7,
+                    "keepWeekly": 4,
+                    "keepMonthly": 6,
+                    "enforce": "cluster"
+                },
+                "checkSchedule": "0 6 * * 0",
+                "checkReadData": true,
+                "failureWebhook": "https://hooks.example.com/backup-failed"
+            }
+        }))
+        .unwrap();
+        let b = spec.backup.as_ref().expect("backup present");
+        assert!(b.enabled);
+        assert_eq!(b.schedule, "0 3 * * *");
+        assert_eq!(b.bucket, "s3://apprafter-backups/cluster-a");
+        assert_eq!(b.credential_ref.name, "backup-s3-creds");
+        assert_eq!(b.staging_mode, "sequential");
+        assert_eq!(b.staging_size_limit.as_deref(), Some("20Gi"));
+        let r = b.retention.as_ref().expect("retention present");
+        assert_eq!(r.keep_daily, Some(7));
+        assert_eq!(r.keep_weekly, Some(4));
+        assert_eq!(r.keep_monthly, Some(6));
+        assert_eq!(r.enforce, "cluster");
+        assert_eq!(b.check_schedule, "0 6 * * 0");
+        assert!(b.check_read_data);
+        assert_eq!(
+            b.failure_webhook.as_deref(),
+            Some("https://hooks.example.com/backup-failed")
+        );
+
+        // camelCase round-trip: the serde renames land back on the wire keys.
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            v.pointer("/backup/credentialRef/name")
+                .and_then(|x| x.as_str()),
+            Some("backup-s3-creds")
+        );
+        assert_eq!(
+            v.pointer("/backup/stagingMode").and_then(|x| x.as_str()),
+            Some("sequential")
+        );
+        assert_eq!(
+            v.pointer("/backup/retention/keepMonthly")
+                .and_then(|x| x.as_i64()),
+            Some(6)
+        );
+        assert_eq!(
+            v.pointer("/backup/checkReadData").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn backup_minimal_block_omits_optionals() {
+        // Only the required (defaulted) fields present; the three optional
+        // sub-fields (`stagingSizeLimit`, `retention`, `failureWebhook`) are
+        // absent and must round-trip as absent, not serialize as null.
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 },
+            "backup": {
+                "enabled": false,
+                "schedule": "0 3 * * *",
+                "bucket": "s3://apprafter-backups/cluster-a",
+                "credentialRef": { "name": "backup-s3-creds" },
+                "stagingMode": "monolithic",
+                "checkSchedule": "0 6 * * 0",
+                "checkReadData": false
+            }
+        }))
+        .unwrap();
+        let b = spec.backup.as_ref().expect("backup present");
+        assert!(b.staging_size_limit.is_none());
+        assert!(b.retention.is_none());
+        assert!(b.failure_webhook.is_none());
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v.pointer("/backup/stagingSizeLimit").is_none());
+        assert!(v.pointer("/backup/retention").is_none());
+        assert!(v.pointer("/backup/failureWebhook").is_none());
+    }
+
+    #[test]
+    fn staging_mode_resolves_to_monolithic_when_backup_absent() {
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 }
+        }))
+        .unwrap();
+        assert!(spec.backup.is_none());
+        assert_eq!(resolve_backup_staging_mode(&spec), "monolithic");
+    }
+
+    #[test]
+    fn staging_mode_reads_explicit_sequential() {
+        let spec: PlatformStackSpec = serde_json::from_value(serde_json::json!({
+            "source": {
+                "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                "checkInterval": "6h"
+            },
+            "values": { "tier": 1 },
+            "backup": {
+                "enabled": true,
+                "schedule": "0 3 * * *",
+                "bucket": "s3://b",
+                "credentialRef": { "name": "c" },
+                "stagingMode": "sequential",
+                "checkSchedule": "0 6 * * 0",
+                "checkReadData": false
+            }
+        }))
+        .unwrap();
+        assert_eq!(resolve_backup_staging_mode(&spec), "sequential");
     }
 }

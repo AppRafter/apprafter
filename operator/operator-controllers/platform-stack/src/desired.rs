@@ -76,6 +76,7 @@ mod tests {
             auto_upgrade: false,
             default_environment: None,
             network: None,
+            backup: None,
             source: PlatformStackSource::default(),
             values: PlatformStackValues {
                 tier: 1,

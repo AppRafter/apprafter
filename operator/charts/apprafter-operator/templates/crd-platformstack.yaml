@@ -52,6 +52,65 @@ spec:
             properties:
               autoUpgrade:
                 type: boolean
+              backup:
+                properties:
+                  bucket:
+                    type: string
+                  checkReadData:
+                    type: boolean
+                  checkSchedule:
+                    type: string
+                  credentialRef:
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  enabled:
+                    type: boolean
+                  failureWebhook:
+                    type: string
+                  retention:
+                    properties:
+                      enforce:
+                        enum:
+                        - operator
+                        - cluster
+                        type: string
+                      keepDaily:
+                        exclusiveMinimum: true
+                        minimum: 0
+                        type: integer
+                      keepMonthly:
+                        exclusiveMinimum: true
+                        minimum: 0
+                        type: integer
+                      keepWeekly:
+                        exclusiveMinimum: true
+                        minimum: 0
+                        type: integer
+                    required:
+                    - enforce
+                    type: object
+                  schedule:
+                    type: string
+                  stagingMode:
+                    enum:
+                    - monolithic
+                    - sequential
+                    type: string
+                  stagingSizeLimit:
+                    type: string
+                required:
+                - enabled
+                - schedule
+                - bucket
+                - credentialRef
+                - stagingMode
+                - checkSchedule
+                - checkReadData
+                type: object
               channel:
                 enum:
                 - stable

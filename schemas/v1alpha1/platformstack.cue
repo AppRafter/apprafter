@@ -56,6 +56,27 @@ package v1alpha1
 		}
 	}
 
+	// Opt-in automated off-site backup (2.6d-4). Absent = disabled. The
+	// platform-stack `backup` component is templated from this + gated on
+	// `enabled`. Credentials are NEVER here — only a `credentialRef` name.
+	backup?: {
+		enabled:  bool | *false
+		schedule: string | *"0 3 * * *"
+		bucket:   string
+		credentialRef: {name: string}
+		stagingMode:       "monolithic" | "sequential" | *"monolithic"
+		stagingSizeLimit?: string
+		retention?: {
+			keepDaily?:   int & >0
+			keepWeekly?:  int & >0
+			keepMonthly?: int & >0
+			enforce:      "operator" | "cluster" | *"operator"
+		}
+		checkSchedule:   string | *"0 6 * * 0"
+		checkReadData:   bool | *false
+		failureWebhook?: string
+	}
+
 	// Chart pull source. Defaults match the canonical AppRafter
 	// upstream; fork installs override `repoURL` while leaving
 	// `upstream` pointing at canonical for availability
