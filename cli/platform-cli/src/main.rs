@@ -308,6 +308,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 i_have_saved_credentials,
             )?,
             BackupAction::Disable => commands::backup::run_backup_disable()?,
+            BackupAction::Status => commands::backup::run_backup_status()?,
         },
         Commands::Restore {
             repo,

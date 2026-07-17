@@ -1267,6 +1267,10 @@ pub enum BackupAction {
     },
     /// Disable scheduled backup (sets spec.backup.enabled=false; keeps config).
     Disable,
+    /// Show the current backup configuration, last Job outcomes, runner status,
+    /// and last prune time (reads PlatformStack.spec.backup + Jobs + the
+    /// apprafter-backup-status ConfigMap).
+    Status,
 }
 
 #[cfg(test)]

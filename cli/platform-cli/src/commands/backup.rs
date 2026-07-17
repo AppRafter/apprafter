@@ -1415,6 +1415,263 @@ fn preflight_repo_reachable(bucket: &str, creds: &BTreeMap<String, String>) -> R
 }
 
 // ---------------------------------------------------------------------------
+// 3a. `apprafter backup status` — pure formatter
+// ---------------------------------------------------------------------------
+
+/// Extract `.metadata.name` from a Job JSON object (empty string when absent).
+fn job_metadata_name(j: &serde_json::Value) -> &str {
+    j.pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// Extract `.status.startTime` from a Job JSON object (empty string when absent).
+fn job_start_time(j: &serde_json::Value) -> &str {
+    j.pointer("/status/startTime")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// Pick the most-recent Job from a slice by `.status.startTime` (lexicographic;
+/// RFC3339 timestamps sort correctly as strings). Returns `None` when the slice
+/// is empty.
+fn most_recent_job<'a>(jobs: &[&'a serde_json::Value]) -> Option<&'a serde_json::Value> {
+    jobs.iter().copied().max_by_key(|j| job_start_time(j))
+}
+
+/// Summarise a Job's terminal state from `.status.succeeded/.failed/.active`.
+fn job_outcome(j: &serde_json::Value) -> &'static str {
+    let succeeded = j
+        .pointer("/status/succeeded")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let active = j
+        .pointer("/status/active")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let failed = j
+        .pointer("/status/failed")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if succeeded > 0 {
+        "Succeeded"
+    } else if active > 0 {
+        "Running"
+    } else if failed > 0 {
+        "Failed"
+    } else {
+        "Unknown"
+    }
+}
+
+/// Render a human-readable status block for `apprafter backup status`.
+///
+/// All four inputs are optional / may be empty so the function works honestly
+/// for every cluster state (backup never configured, no Jobs yet, CM absent).
+///
+/// # ConfigMap data keys (from `apprafter-backup/src/status.rs`)
+/// * `lastRunFormat`  — staging mode of the last run (always written).
+/// * `lastSuccess`    — RFC3339 timestamp of the last successful run.
+/// * `lastFailure`    — RFC3339 timestamp of the last failed run.
+/// * `lastError`      — error message from the last failed run.
+///
+/// # CronJob names (from `platform-stack/cue/render_tool.cue _backupTemplate`)
+/// * `apprafter-backup`       — the scheduled backup CronJob.
+/// * `apprafter-backup-check` — the weekly check CronJob.
+///
+/// Jobs are selected by their `.metadata.name` prefix `apprafter-backup` (both
+/// CronJob-spawned Jobs share that prefix). For each of the two flavours (with
+/// and without `-check`) the most-recent Job (by `.status.startTime`) is shown.
+pub(crate) fn format_backup_status(
+    spec_backup: Option<&serde_json::Value>,
+    jobs: &[serde_json::Value],
+    status_cm: Option<&serde_json::Value>,
+    last_prune: Option<&str>,
+) -> String {
+    let mut out = String::new();
+
+    // --- Config block ---
+    let enabled = spec_backup
+        .and_then(|s| s.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if !enabled {
+        out.push_str("Backup: DISABLED — enable with `apprafter backup enable ...`\n");
+        if let Some(spec) = spec_backup {
+            if let Some(bucket) = spec.get("bucket").and_then(serde_json::Value::as_str) {
+                out.push_str(&format!("  bucket:   {bucket} (config retained)\n"));
+            }
+        }
+        return out;
+    }
+
+    let spec = spec_backup.unwrap(); // enabled=true implies Some
+
+    out.push_str("Backup: ENABLED\n");
+    if let Some(v) = spec.get("bucket").and_then(serde_json::Value::as_str) {
+        out.push_str(&format!("  bucket:        {v}\n"));
+    }
+    if let Some(v) = spec.get("schedule").and_then(serde_json::Value::as_str) {
+        out.push_str(&format!("  schedule:      {v}\n"));
+    }
+    if let Some(v) = spec.get("stagingMode").and_then(serde_json::Value::as_str) {
+        out.push_str(&format!("  stagingMode:   {v}\n"));
+    }
+    if let Some(v) = spec
+        .get("checkSchedule")
+        .and_then(serde_json::Value::as_str)
+    {
+        out.push_str(&format!("  checkSchedule: {v}\n"));
+    }
+    // Retention sub-block.
+    if let Some(ret) = spec.get("retention") {
+        out.push_str("  retention:\n");
+        for key in ["keepDaily", "keepWeekly", "keepMonthly"] {
+            if let Some(n) = ret.get(key) {
+                out.push_str(&format!("    {key}: {n}\n"));
+            }
+        }
+        if let Some(e) = ret.get("enforce").and_then(serde_json::Value::as_str) {
+            out.push_str(&format!("    enforce: {e}\n"));
+        }
+    }
+
+    // --- Job outcomes ---
+    // Partition into backup Jobs (name prefix `apprafter-backup` but NOT
+    // `apprafter-backup-check`) and check Jobs (prefix `apprafter-backup-check`).
+    let backup_jobs: Vec<&serde_json::Value> = jobs
+        .iter()
+        .filter(|j| {
+            let n = job_metadata_name(j);
+            n.starts_with("apprafter-backup") && !n.contains("check")
+        })
+        .collect();
+    let check_jobs: Vec<&serde_json::Value> = jobs
+        .iter()
+        .filter(|j| job_metadata_name(j).contains("apprafter-backup-check"))
+        .collect();
+
+    out.push_str("\nJobs:\n");
+    match most_recent_job(&backup_jobs) {
+        Some(j) => out.push_str(&format!(
+            "  Last backup Job: {} — {}\n",
+            job_metadata_name(j),
+            job_outcome(j)
+        )),
+        None => out.push_str("  Last backup Job: none\n"),
+    }
+    match most_recent_job(&check_jobs) {
+        Some(j) => out.push_str(&format!(
+            "  Last check Job:  {} — {}\n",
+            job_metadata_name(j),
+            job_outcome(j)
+        )),
+        None => out.push_str("  Last check Job:  none\n"),
+    }
+
+    // --- Runner status CM ---
+    out.push_str("\nRunner status:\n");
+    if let Some(cm) = status_cm {
+        // The CM may be passed as the full CM object (with a .data map) or as
+        // just the .data section. Check both to stay robust to caller choice.
+        let data = cm.get("data").filter(|d| d.is_object()).unwrap_or(cm);
+        let get_str = |key: &str| -> &str {
+            data.get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        };
+        let last_success = get_str("lastSuccess");
+        let last_failure = get_str("lastFailure");
+        let last_error = get_str("lastError");
+        let last_run_format = get_str("lastRunFormat");
+
+        if !last_success.is_empty() {
+            out.push_str(&format!("  lastSuccess:    {last_success}\n"));
+        } else {
+            out.push_str("  lastSuccess:    never\n");
+        }
+        if !last_failure.is_empty() {
+            out.push_str(&format!("  lastFailure:    {last_failure}\n"));
+        }
+        if !last_error.is_empty() {
+            out.push_str(&format!("  lastError:      {last_error}\n"));
+        }
+        if !last_run_format.is_empty() {
+            out.push_str(&format!("  lastRunFormat:  {last_run_format}\n"));
+        }
+    } else {
+        out.push_str("  (no status ConfigMap yet — backup may not have run)\n");
+    }
+
+    // --- Last prune ---
+    out.push_str(&format!(
+        "\nLast prune: {}\n",
+        last_prune.unwrap_or("never")
+    ));
+
+    out
+}
+
+/// `apprafter backup status` — show the operator's backup configuration, last
+/// Job outcomes, runner self-reported status, and last prune time.
+pub fn run_backup_status() -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+
+    // 1. Fetch PlatformStack to get spec.backup + last-prune annotation.
+    let ps = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?;
+    let spec_backup = ps.as_ref().and_then(|p| p.pointer("/spec/backup")).cloned();
+    let last_prune: Option<String> = ps
+        .as_ref()
+        .and_then(|p| {
+            p.pointer("/metadata/annotations/apprafter.io~1last-prune")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string);
+
+    // 2. List Jobs in apprafter-system and filter by name prefix.
+    let jobs_list = kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kc.path())?;
+    let jobs: Vec<serde_json::Value> = jobs_list
+        .as_ref()
+        .and_then(|v| v.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|j| {
+            j.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .starts_with("apprafter-backup")
+        })
+        .collect();
+
+    // 3. Fetch the runner status ConfigMap.
+    let status_cm = kubectl_get_json(
+        "configmap",
+        Some("apprafter-backup-status"),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?;
+
+    println!(
+        "{}",
+        format_backup_status(
+            spec_backup.as_ref(),
+            &jobs,
+            status_cm.as_ref(),
+            last_prune.as_deref(),
+        )
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests (pure helpers — the tested core)
 // ---------------------------------------------------------------------------
 
@@ -1683,5 +1940,118 @@ mod tests {
         assert!(!restic_version_too_old((0, 14, 0)));
         assert!(!restic_version_too_old((0, 16, 4)));
         assert!(!restic_version_too_old((1, 0, 0)));
+    }
+
+    // ------------------------------------------------------------------
+    // 3a. format_backup_status
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn status_disabled_when_no_spec_backup() {
+        let s = format_backup_status(None, &[], None, None);
+        assert!(s.to_lowercase().contains("disabled"));
+    }
+
+    #[test]
+    fn status_disabled_when_enabled_false() {
+        let spec = json!({"enabled": false, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&spec), &[], None, None);
+        assert!(s.to_lowercase().contains("disabled"));
+        // Config is retained and shown even when disabled.
+        assert!(s.contains("s3:x"));
+    }
+
+    #[test]
+    fn status_renders_enabled_config_and_last_prune() {
+        let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *", "stagingMode": "monolithic"});
+        let s = format_backup_status(Some(&spec), &[], None, Some("2026-07-17T03:00:00Z"));
+        assert!(s.contains("s3:x"));
+        assert!(s.contains("2026-07-17T03:00:00Z"));
+        assert!(s.contains("0 3 * * *"));
+        assert!(s.contains("monolithic"));
+    }
+
+    #[test]
+    fn status_reports_job_outcome() {
+        let job = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {"succeeded": 1}
+        });
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&spec), std::slice::from_ref(&job), None, None);
+        assert!(s.contains("apprafter-backup-28900000"));
+        assert!(s.contains("Succeeded"));
+    }
+
+    #[test]
+    fn status_cm_last_success_and_error_keys_render() {
+        // Uses the REAL keys from apprafter-backup/src/status.rs:
+        // lastSuccess, lastFailure, lastError, lastRunFormat.
+        let cm = json!({
+            "data": {
+                "lastSuccess": "2026-07-17T03:00:00Z",
+                "lastFailure": "2026-07-16T03:00:00Z",
+                "lastError": "restic: connection refused",
+                "lastRunFormat": "monolithic"
+            }
+        });
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&spec), &[], Some(&cm), None);
+        assert!(
+            s.contains("2026-07-17T03:00:00Z"),
+            "lastSuccess not rendered: {s}"
+        );
+        assert!(
+            s.contains("2026-07-16T03:00:00Z"),
+            "lastFailure not rendered: {s}"
+        );
+        assert!(
+            s.contains("restic: connection refused"),
+            "lastError not rendered: {s}"
+        );
+        assert!(s.contains("monolithic"), "lastRunFormat not rendered: {s}");
+    }
+
+    #[test]
+    fn status_last_prune_never_when_absent() {
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&spec), &[], None, None);
+        assert!(s.contains("Last prune: never"));
+    }
+
+    #[test]
+    fn status_picks_most_recent_job_by_start_time() {
+        let job_old = json!({
+            "metadata": {"name": "apprafter-backup-28800000"},
+            "status": {"startTime": "2026-07-16T03:00:00Z", "failed": 1}
+        });
+        let job_new = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {"startTime": "2026-07-17T03:00:00Z", "succeeded": 1}
+        });
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&spec), &[job_old, job_new], None, None);
+        // Most-recent (new) should appear in the "Last backup Job" line.
+        assert!(s.contains("apprafter-backup-28900000"));
+        assert!(s.contains("Succeeded"));
+    }
+
+    #[test]
+    fn status_check_job_is_separated_from_backup_job() {
+        let backup_job = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {"succeeded": 1}
+        });
+        let check_job = json!({
+            "metadata": {"name": "apprafter-backup-check-28900000"},
+            "status": {"failed": 1}
+        });
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&spec), &[backup_job, check_job], None, None);
+        assert!(s.contains("apprafter-backup-28900000"));
+        assert!(s.contains("apprafter-backup-check-28900000"));
+        // backup is Succeeded, check is Failed
+        assert!(s.contains("Succeeded"));
+        assert!(s.contains("Failed"));
     }
 }
