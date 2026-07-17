@@ -291,7 +291,8 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
         .map_err(|e| CliError::Other(format!("create dir {}: {e}", dest.display())))?;
     let dump_path = dest.join(format!("{claim}.dump"));
 
-    let argv: Vec<&str> = vec!["pg_dump", "-Fc", "-h", &host, "-U", &user, "-p", &port, &db];
+    let owned = pg_dump_argv(&db, &user, &host, &port);
+    let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
     exec_stream_to_file(k, &pod_name, ns, &argv, &dump_path)
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
 }
@@ -333,6 +334,26 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
     let argv: Vec<&str> = vec!["tar", "c", "-C", "/data", "."];
     exec_stream_to_file(k, &pod_name, ns, &argv, &tar_path)
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
+}
+
+/// Build the `pg_dump` argument vector for a custom-format dump.
+///
+/// Returns a `Vec<String>` so the caller is not constrained by the lifetime of
+/// local credential variables.  The caller converts to `Vec<&str>` immediately
+/// before passing to `exec_stream_to_file`.
+pub fn pg_dump_argv(db: &str, user: &str, host: &str, port: &str) -> Vec<String> {
+    vec![
+        "pg_dump".to_string(),
+        "-Fc".to_string(),
+        "--compress=0".to_string(),
+        "-h".to_string(),
+        host.to_string(),
+        "-U".to_string(),
+        user.to_string(),
+        "-p".to_string(),
+        port.to_string(),
+        db.to_string(),
+    ]
 }
 
 /// Truncate a pod name to 63 chars (DNS-1123 label limit) and strip any
@@ -445,6 +466,16 @@ mod tests {
         assert_eq!(plan[0].source, "my-cache");
         assert_eq!(plan[0].claim_name, "my-cache");
         assert_eq!(plan[0].namespace, "prod");
+    }
+
+    #[test]
+    fn pg_dump_argv_disables_dump_compression_so_restic_dedups() {
+        let argv = pg_dump_argv("appdb", "approle", "hostx", "5432");
+        assert!(
+            argv.iter().any(|a| a == "--compress=0"),
+            "argv missing --compress=0: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "-Fc"), "argv: {argv:?}");
     }
 
     #[test]
