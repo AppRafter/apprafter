@@ -10,8 +10,6 @@ use std::collections::BTreeMap;
 use cli_core::{CliError, Result};
 
 /// Full resolved configuration for one backup runner invocation.
-// Fields are read by main in Task 7 (runner loop); not yet wired.
-#[allow(dead_code)]
 pub struct RunnerConfig {
     /// Restic repository URL, e.g. `s3:https://endpoint/bucket`.
     pub repo: String,
@@ -77,8 +75,6 @@ impl RunnerConfig {
     }
 
     /// Build a [`RunnerConfig`] from the real process environment.
-    // Not yet called by main; will be wired in Task 7 (runner loop).
-    #[allow(dead_code)]
     pub fn from_env() -> Result<Self> {
         let map: BTreeMap<String, String> = std::env::vars().collect();
         Self::from_env_map(&map)

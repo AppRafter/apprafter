@@ -9,6 +9,10 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+[lib]
+name = "apprafter_backup"
+path = "src/lib.rs"
+
 [[bin]]
 name = "apprafter-backup"
 path = "src/main.rs"
