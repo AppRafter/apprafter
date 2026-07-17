@@ -31,20 +31,18 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
     resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
-    ApplicationStatus, DestructiveChange, DiskClaim, EgressProfile, Metrics, MigrationPlan,
-    PlatformStack, PlatformStackValues, ResourceClaim, SourceCredential, StatusImage,
-    COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
+    ApplicationSpec, ApplicationStatus, DestructiveChange, DiskClaim, EgressProfile, Metrics,
+    MigrationPlan, PlatformStack, PlatformStackValues, ResourceClaim, SourceCredential,
+    StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
     COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
     PHASE_ENV_SECRET_MISSING,
 };
-// `ApplicationMigrationStrategy` is wired through Cargo.toml
-// dep so future Phase 2 commits can flip on detection +
-// auto-plan-creation by editing one call site here; the
-// strategy struct + its concrete `detect_destructive` /
-// `create_plan_for` fns ship in
-// `operator-controllers-migration` (B.1.77). The unused-import
-// guard turns the dep into a "feature flag" — Phase 2 simply
-// uncomments the `use` line.
+// 2.16b Task 11: the app-scope migration classifier is now WIRED into
+// `reconcile_application`'s state machine (was a deferred "feature flag"
+// import through B.1.77). `detect_destructive` diffs the effective spec
+// against the stamped `status.lastAppliedSpec` baseline; `create_plan_for`
+// builds the gating MigrationPlan in the app's own namespace.
+use operator_controllers_migration::ApplicationMigrationStrategy;
 use operator_rendering::{
     default_target, effective_spec, owner_reference, render_application_for_env, ConnectionTarget,
     DiskMount,
@@ -96,6 +94,14 @@ pub enum ReconcileError {
 
     #[error("serde_json error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// 2.16b Task 11: an Application without a `metadata.uid` reached the
+    /// MigrationPlan-creation path. The uid is required for the plan's
+    /// controller `ownerReference` (so the plan cascades on Application
+    /// delete); the apiserver always assigns one, so this is defensive —
+    /// surface it rather than emit an owner-less plan.
+    #[error("Application {0} has no metadata.uid; cannot own a MigrationPlan")]
+    MissingUid(String),
 }
 
 /// Spawn the Application Controller. Watches `apprafter.io/v1alpha1`
@@ -195,33 +201,180 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         return Ok(Action::await_change());
     }
 
-    // B.1.77 pause gate. Must run BEFORE child patches —
-    // otherwise we'd race the user's "I just pushed a
-    // destructive change, please pause" flow.
-    if let Some(plan) = find_blocking_migration_plan(
+    let pp = PatchParams::apply(FIELD_MANAGER).force();
+
+    // ---- 2.16b Task 11: app-scope migration state machine ----
+    // Wired at the former B.1.77 pause-gate site: runs BEFORE the 2.4d
+    // needs gate + the render, so a destructive edit pauses the app
+    // before any child is re-applied. The machine is a pure function of
+    // "did we detect a destructive change vs the stamped baseline?" ×
+    // the live plan's `PlanState` (see `decide`); this block only does
+    // the async I/O each arm dictates.
+    //
+    // The (app, env) key + a fresh plan name. `env` is the app's active
+    // environment (`spec.environment`) or the empty string for the
+    // base/default env — the same value `create_plan_for` / the plan
+    // scope carry, and a wildcard-compatible key for the
+    // `spec.environment.as_deref()` (None) search below.
+    let env_owned = app.spec.environment.clone().unwrap_or_default();
+    let env = env_owned.as_str();
+    let key: PlanKey = (name.clone(), env_owned.clone());
+
+    // 1. Effective diff, EACH SIDE UNDER ITS OWN ENVIRONMENT (H4/R2-M2).
+    // A missing baseline (never applied yet, or a pre-2.16b app) does
+    // NOT gate — detection is skipped and the render stamps the first
+    // baseline below.
+    let new_eff = effective_spec(&app, app.spec.environment.as_deref());
+    let baseline_spec = app
+        .status
+        .as_ref()
+        .and_then(|s| s.last_applied_spec.clone());
+    let change: Option<DestructiveChange> = match &baseline_spec {
+        None => None,
+        Some(baseline_spec) => {
+            let old_eff = effective_baseline(baseline_spec);
+            ApplicationMigrationStrategy::detect_destructive(&old_eff, &new_eff)
+        }
+    };
+
+    // 2. Find the (at most one) key-matching plan of ANY phase and bucket
+    // it against the change. `find_any_key_plan` (no blocking filter) is
+    // load-bearing: the state machine must SEE a `completed` plan (→
+    // ConsumeApply) and a `rejected`/relic plan (→ cleanup), not just live
+    // gating ones. It searches the app namespace (2.16b) and wildcards on a
+    // `None` environment. `plan_state` needs a `DestructiveChange` to
+    // compare triggers, so the detect=None arm buckets by presence only
+    // (`plan_state_no_change`).
+    let plan = find_any_key_plan(
         &ctx.client,
         &name,
         &namespace,
         app.spec.environment.as_deref(),
     )
-    .await?
-    {
-        let plan_name = plan.name_any();
-        info!(
-            %name, %namespace, plan = %plan_name,
-            "MigrationPlan pending — pausing Application reconcile"
-        );
-        let pp = PatchParams::apply(FIELD_MANAGER).force();
-        let status = build_paused_status(&app, &plan_name);
-        apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
-        ctx.metrics
-            .reconcile_total
-            .with_label_values(&[KIND, &namespace, "paused"])
-            .inc();
-        return Ok(Action::requeue(Duration::from_secs(30)));
-    }
+    .await?;
+    let state = match &change {
+        Some(c) => plan_state(plan.as_ref(), c),
+        None => plan_state_no_change(plan.as_ref()),
+    };
 
-    let pp = PatchParams::apply(FIELD_MANAGER).force();
+    // 3. Decide + act. The render arms (`Render` / `ConsumeApply` /
+    // `DeleteThenRender`) fall through to the 2.4d needs gate + render
+    // below and ALWAYS stamp the baseline after a successful apply; the
+    // paused arms write a paused status and return here. `consume_plan`
+    // names the plan to delete AFTER the render+stamp (crash-ordering:
+    // render → stamp → delete) — set only by `ConsumeApply`.
+    let mut consume_plan: Option<String> = None;
+    match decide(change.is_some(), state) {
+        MigrationDecision::Render => {
+            // No change + no plan → render normally and stamp the
+            // (possibly first) baseline below.
+        }
+        MigrationDecision::CreatePlan => {
+            let change = change.expect("CreatePlan implies a detected change");
+            let mp = ApplicationMigrationStrategy::create_plan_for(
+                &change,
+                &plan_name(&name, env, Utc::now()),
+                &namespace,
+                &name,
+                env,
+                app_uid_or(&app)?,
+            );
+            let plan_name = mp.name_any();
+            info!(
+                %name, %namespace, plan = %plan_name, trigger = %change.trigger_type,
+                "destructive change detected — creating gating MigrationPlan"
+            );
+            ssa_apply_plan(&ctx.client, &namespace, &mp, &pp).await?;
+            let status = build_paused_status(&app, &plan_name);
+            apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        MigrationDecision::NoOp => {
+            // Change + a matching blocking plan already gates → stay
+            // paused, do not re-apply children.
+            let plan_name = plan.as_ref().map(|p| p.name_any()).unwrap_or_default();
+            info!(
+                %name, %namespace, plan = %plan_name,
+                "destructive change already gated by a matching MigrationPlan — staying paused"
+            );
+            let status = build_paused_status(&app, &plan_name);
+            apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        MigrationDecision::DeleteThenCreate => {
+            // The lingering plan gates a DIFFERENT change (stale gate /
+            // relic) → delete every key plan, then create the right one.
+            let change = change.expect("DeleteThenCreate implies a detected change");
+            delete_all_key_plans_except(&ctx.client, &namespace, &key, None).await?;
+            let mp = ApplicationMigrationStrategy::create_plan_for(
+                &change,
+                &plan_name(&name, env, Utc::now()),
+                &namespace,
+                &name,
+                env,
+                app_uid_or(&app)?,
+            );
+            let plan_name = mp.name_any();
+            info!(
+                %name, %namespace, plan = %plan_name, trigger = %change.trigger_type,
+                "superseding stale/relic MigrationPlan with a fresh gating plan"
+            );
+            ssa_apply_plan(&ctx.client, &namespace, &mp, &pp).await?;
+            let status = build_paused_status(&app, &plan_name);
+            apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        MigrationDecision::ConsumeApply => {
+            // The change's plan completed → consume the migration
+            // result: render + stamp, THEN delete the plan (crash
+            // ordering: a crash after stamp re-enters as
+            // detect=None×completed → DeleteThenRender cleanup; a crash
+            // before stamp re-enters as Some×completed-match → idempotent
+            // re-apply).
+            consume_plan = plan.as_ref().and_then(|p| p.metadata.name.clone());
+            info!(
+                %name, %namespace, plan = ?consume_plan,
+                "MigrationPlan completed — consuming result and applying children"
+            );
+        }
+        MigrationDecision::DeleteThenRender => {
+            // No change but a plan lingers → delete the stale plan(s),
+            // then render normally and re-stamp the baseline below.
+            info!(
+                %name, %namespace,
+                "no destructive change but a stale MigrationPlan lingers — cleaning up before render"
+            );
+            delete_all_key_plans_except(&ctx.client, &namespace, &key, None).await?;
+        }
+        MigrationDecision::BlockFailed => {
+            // The change's plan is `failed` → keep gating; surface a
+            // `MigrationFailed=True` condition requiring manual delete.
+            let plan_name = plan.as_ref().map(|p| p.name_any()).unwrap_or_default();
+            warn!(
+                %name, %namespace, plan = %plan_name,
+                "gating MigrationPlan is in phase=failed — staying paused, manual delete required"
+            );
+            let status = build_migration_failed_status(&app, &plan_name);
+            apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+    }
 
     // ---- 2.4d: generate ResourceClaims for needs, pause until ready ----
     // Runs AFTER the migration gate, BEFORE the render. Generates one
@@ -553,7 +706,36 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     }
     let mut status = build_status(&app, "Ready", conditions, endpoint_url);
     status.image = image_status;
+    // 2.16b Task 11: stamp `status.lastAppliedSpec = spec` (the RAW current
+    // spec) after the successful render+apply. Only the render arms
+    // (`Render` / `ConsumeApply` / `DeleteThenRender`) reach here — every
+    // paused arm returned early above — so an unconditional stamp is
+    // correct: a gated app never reaches this line and keeps its prior
+    // baseline. The classifier diffs the next reconcile's effective spec
+    // against this baseline. Folding the stamp into THIS status write means
+    // the child apply (above) precedes the stamp — satisfying the
+    // crash-order render → stamp → delete for `ConsumeApply`. A crash before
+    // this write re-enters as an idempotent re-apply of the same spec.
+    status = with_stamped_baseline(status, &app.spec);
     apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+
+    // 2.16b Task 11: `ConsumeApply` — delete the completed plan AFTER the
+    // render + baseline stamp landed (crash-order render → stamp → delete).
+    // A crash between the stamp and this delete re-enters as
+    // detect=None × completed-plan → `DeleteThenRender`, which cleans the
+    // relic up; so the delete is safe to be the last step. Best-effort
+    // (404-tolerant) via `delete_all_key_plans_except`.
+    if let Some(plan_to_delete) = &consume_plan {
+        delete_all_key_plans_except(
+            &ctx.client,
+            &namespace,
+            &key,
+            // keep = None → delete every key plan incl. the consumed one.
+            None,
+        )
+        .await?;
+        info!(%name, %namespace, plan = %plan_to_delete, "consumed MigrationPlan deleted after apply");
+    }
 
     ctx.metrics
         .reconcile_total
@@ -1127,16 +1309,114 @@ fn blocking_plan_namespace(app_ns: &str) -> String {
     app_ns.to_string()
 }
 
-/// Find an unsealed MigrationPlan gating this Application +
-/// environment pair, if any. 2.16b app-scope plans live in the
-/// Application's own namespace, so this lists MigrationPlans in
-/// `app_namespace` (via `blocking_plan_namespace`) and filters
-/// in-memory — a per-app namespace is small and bounded.
-///
-/// "Unsealed" = phase is missing OR one of
-/// `pending-approval | approved | executing | failed`. Plans
-/// in `completed` or `rejected` no longer gate.
-async fn find_blocking_migration_plan(
+/// 2.16b Task 11: delete every app-namespace MigrationPlan gating the
+/// `(app_name, env)` key EXCEPT `keep` (best-effort). Lists the plans in
+/// the app namespace, filters to the key via [`plans_to_delete`], and
+/// deletes each — a 404 is tolerated (the plan already cascaded / a
+/// concurrent reconcile removed it). This enforces "≤1 live plan per key"
+/// (R2-mn4 / R3-M1) and is the supersede (`keep = Some(new_plan)`) /
+/// consume / cleanup (`keep = None`) delete. A list failure propagates
+/// (the reconcile retries); an individual delete failure that is NOT a 404
+/// propagates too so a genuine RBAC / apiserver fault surfaces rather than
+/// silently leaving a stale gate.
+async fn delete_all_key_plans_except(
+    client: &Client,
+    app_ns: &str,
+    key: &PlanKey,
+    keep: Option<&str>,
+) -> Result<(), ReconcileError> {
+    let (app_name, env) = key;
+    let api: Api<MigrationPlan> = Api::namespaced(client.clone(), &blocking_plan_namespace(app_ns));
+    let list = api.list(&Default::default()).await?;
+    for name in plans_to_delete(&list.items, app_name, env, keep) {
+        match api.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {
+                info!(%app_name, %env, plan = %name, "deleted superseded/consumed MigrationPlan");
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                debug!(plan = %name, "MigrationPlan already gone on delete (404, tolerated)");
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// 2.16b Task 11: SSA-apply a freshly-built MigrationPlan into the app's
+/// own namespace (2.16b co-locates the plan with the Application it gates).
+/// The plan already carries its `metadata.name`/`namespace` +
+/// controller-ownerRef (from [`ApplicationMigrationStrategy::create_plan_for`]);
+/// this serializes it, injects the `apiVersion`/`kind` SSA requires, and
+/// applies under [`FIELD_MANAGER`] (`apprafter-operator` — the operator owns
+/// the plan). The RBAC `migrationplans` ClusterRole grants `create`/`patch`
+/// cluster-wide, so the write into any app namespace succeeds.
+async fn ssa_apply_plan(
+    client: &Client,
+    app_ns: &str,
+    plan: &MigrationPlan,
+    pp: &PatchParams,
+) -> Result<(), ReconcileError> {
+    let name = plan
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    let payload = into_apply_payload("apprafter.io/v1alpha1", "MigrationPlan", plan)?;
+    let api: Api<MigrationPlan> = Api::namespaced(client.clone(), app_ns);
+    api.patch(&name, pp, &Patch::Apply(&payload)).await?;
+    Ok(())
+}
+
+/// Pure application-scope match: the plan targets this exact
+/// `(app_name, app_namespace)` and — when `environment` is `Some` —
+/// this environment (a `None` environment wildcards). The blocking-vs-not
+/// distinction is NOT applied here — the state machine (`plan_state`) needs
+/// completed/rejected/failed plans too, and applies `plan_is_blocking` when
+/// it buckets. Pure — unit testable without a client.
+fn plan_scope_matches(
+    plan: &MigrationPlan,
+    app_name: &str,
+    app_namespace: &str,
+    environment: Option<&str>,
+) -> bool {
+    if plan.spec.scope.type_ != "application" {
+        return false;
+    }
+    let Some(app_scope) = &plan.spec.scope.application else {
+        return false;
+    };
+    if app_scope.ref_.name != app_name || app_scope.ref_.namespace != app_namespace {
+        return false;
+    }
+    match environment {
+        Some(e) => app_scope.environment == e,
+        None => true,
+    }
+}
+
+/// 2.16b Task 11: the (at most one) MigrationPlan for this key REGARDLESS
+/// of phase — the state machine's bucketer (`plan_state`) needs to see a
+/// `completed` plan (→ `ConsumeApply`) and a `rejected`/relic plan (→
+/// cleanup). Pure scope match (no blocking filter) — unit testable without
+/// a client; [`find_any_key_plan`] wraps it.
+fn pick_any_key_plan(
+    plans: Vec<MigrationPlan>,
+    app_name: &str,
+    app_namespace: &str,
+    environment: Option<&str>,
+) -> Option<MigrationPlan> {
+    plans
+        .into_iter()
+        .find(|plan| plan_scope_matches(plan, app_name, app_namespace, environment))
+}
+
+/// 2.16b Task 11: find the (at most one) key-matching MigrationPlan of ANY
+/// phase in the app namespace (2.16b app-scope plans live there). Returns
+/// completed / rejected / failed plans too (no blocking filter), so
+/// [`plan_state`] can bucket them for the `ConsumeApply` / cleanup arms of
+/// the state machine.
+async fn find_any_key_plan(
     client: &Client,
     app_name: &str,
     app_namespace: &str,
@@ -1145,40 +1425,12 @@ async fn find_blocking_migration_plan(
     let api: Api<MigrationPlan> =
         Api::namespaced(client.clone(), &blocking_plan_namespace(app_namespace));
     let list = api.list(&Default::default()).await?;
-    Ok(pick_blocking_plan(
+    Ok(pick_any_key_plan(
         list.items,
         app_name,
         app_namespace,
         environment,
     ))
-}
-
-/// Pure scope-matching logic for `find_blocking_migration_plan`.
-/// Extracted so unit tests can exercise the filter without a
-/// kube `Client`.
-fn pick_blocking_plan(
-    plans: Vec<MigrationPlan>,
-    app_name: &str,
-    app_namespace: &str,
-    environment: Option<&str>,
-) -> Option<MigrationPlan> {
-    plans.into_iter().find(|plan| {
-        if plan.spec.scope.type_ != "application" {
-            return false;
-        }
-        let Some(app_scope) = &plan.spec.scope.application else {
-            return false;
-        };
-        if app_scope.ref_.name != app_name || app_scope.ref_.namespace != app_namespace {
-            return false;
-        }
-        if let Some(e) = environment {
-            if app_scope.environment != e {
-                return false;
-            }
-        }
-        plan_is_blocking(plan)
-    })
 }
 
 fn plan_is_blocking(plan: &MigrationPlan) -> bool {
@@ -1300,6 +1552,129 @@ pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveCha
     }
 }
 
+/// 2.16b Task 11: bucket a plan (if any) when NO destructive change was
+/// detected this reconcile. `decide` ignores the finer `PlanState`
+/// distinctions in the `has_change == false` rows — it only cares
+/// "no plan" (`None` → `Render`) vs "some lingering plan" (`_` →
+/// `DeleteThenRender`). This helper therefore maps "no plan" → `None`
+/// and "any live/terminal/relic plan" → `Relic`, so the caller can feed
+/// a single `PlanState` into `decide(false, state)` without needing a
+/// `DestructiveChange` to compare triggers against (which it lacks when
+/// detection returned `None`).
+fn plan_state_no_change(plan: Option<&MigrationPlan>) -> PlanState {
+    match plan {
+        None => PlanState::None,
+        Some(_) => PlanState::Relic,
+    }
+}
+
+/// 2.16b Task 11: the (app, env) identity key a MigrationPlan gates,
+/// used to scope the "≤1 live plan per key" delete set. Held as an owned
+/// pair so the async delete helpers can move it around freely.
+type PlanKey = (String, String);
+
+/// 2.16b Task 11: synthesize a stable, human-readable MigrationPlan name
+/// for an (app, env) pair — `<app>-<env>-migration-<unix-secs>`. The
+/// timestamp gives each superseding plan a fresh name so a delete-then-
+/// create never collides with the object it just deleted (which may still
+/// be terminating). An empty `env` (the base/default env) collapses to
+/// `<app>-migration-<secs>`. Folded to a DNS-1123 name via [`claim_name`]'s
+/// per-char fold so any app/env string yields a valid `metadata.name`.
+fn plan_name(app: &str, env: &str, now: DateTime<Utc>) -> String {
+    let secs = now.timestamp();
+    let raw = if env.is_empty() {
+        format!("{app}-migration-{secs}")
+    } else {
+        format!("{app}-{env}-migration-{secs}")
+    };
+    let mut out = String::with_capacity(raw.len().min(63));
+    for ch in raw.chars() {
+        out.push(if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        });
+    }
+    out.truncate(63);
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// 2.16b Task 11: the effective baseline spec — reconstruct an
+/// `Application` from the stamped `status.lastAppliedSpec` snapshot and run
+/// it through the SAME `effective_spec` unifier the render path uses, under
+/// the baseline's OWN `spec.environment` (H4/R2-M2: each side is diffed
+/// under its own environment). `effective_spec` reads only `spec.base` +
+/// `spec.environments` (never `metadata`), so a `default()` meta on the
+/// reconstructed object is sufficient and keeps the diff a pure function of
+/// the two specs. Pure — a seam so the reconstruction is unit-testable
+/// without a client.
+fn effective_baseline(baseline_spec: &ApplicationSpec) -> ApplicationBaseSpec {
+    let baseline_app = Application {
+        metadata: Default::default(),
+        spec: baseline_spec.clone(),
+        status: None,
+    };
+    effective_spec(&baseline_app, baseline_spec.environment.as_deref())
+}
+
+/// 2.16b Task 11: return the names of app-namespace MigrationPlans that
+/// gate the given `(app_name, env)` key and are NOT `keep` — the set a
+/// supersede / consume / cleanup delete must remove to enforce "≤1 live
+/// plan per key" (R2-mn4 / R3-M1). Scope-matching mirrors
+/// [`pick_blocking_plan`]: application-scope, same app name + the plan's
+/// `environment` equals `env`. Pure so the filter is unit-testable without
+/// a client; the async [`delete_all_key_plans_except`] wraps it.
+fn plans_to_delete(
+    plans: &[MigrationPlan],
+    app_name: &str,
+    env: &str,
+    keep: Option<&str>,
+) -> Vec<String> {
+    plans
+        .iter()
+        .filter(|plan| {
+            if plan.spec.scope.type_ != "application" {
+                return false;
+            }
+            let Some(app_scope) = &plan.spec.scope.application else {
+                return false;
+            };
+            app_scope.ref_.name == app_name && app_scope.environment == env
+        })
+        .filter_map(|plan| plan.metadata.name.clone())
+        .filter(|name| Some(name.as_str()) != keep)
+        .collect()
+}
+
+/// 2.16b Task 11: the `status` payload with `lastAppliedSpec` stamped to
+/// `spec` (the RAW current spec snapshot the classifier diffs against),
+/// preserving every other field of `base`. Pure seam over the SSA stamp
+/// path so the field-set behaviour is unit-testable; the async caller
+/// applies the result via [`apply_status`]. `base` carries the status the
+/// happy-path reconcile just built (phase / conditions / endpoint / image
+/// / environment) — this only fills the one new field.
+fn with_stamped_baseline(base: ApplicationStatus, spec: &ApplicationSpec) -> ApplicationStatus {
+    ApplicationStatus {
+        last_applied_spec: Some(spec.clone()),
+        ..base
+    }
+}
+
+/// 2.16b Task 11: the Application's `metadata.uid` for the MigrationPlan
+/// controller ownerRef, or a clear [`ReconcileError::MissingUid`] when it
+/// is absent (the apiserver always assigns one, so this only fires on a
+/// hand-built object — defensively surfaced rather than emitting an
+/// owner-less plan).
+fn app_uid_or(app: &Application) -> Result<&str, ReconcileError> {
+    app.metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| ReconcileError::MissingUid(app.name_any()))
+}
+
 /// True once the Application is marked for deletion. The reconcile loop
 /// skips deletion-marked objects so it never re-applies children that a
 /// cascade delete (Argo CD finalizer) is trying to remove.
@@ -1346,6 +1721,74 @@ fn build_paused_status(app: &Application, plan_name: &str) -> ApplicationStatus 
         // 2.16b Task 7: omitted from the SSA payload (skip_serializing_if);
         // does not clobber a classifier-stamped baseline.
         last_applied_spec: None,
+    }
+}
+
+/// 2.16b Task 11: condition type for a gating MigrationPlan stuck in
+/// phase `failed`. Kept local to the controller (not a schema constant)
+/// — it is an operator-emitted status condition, not part of the CRD's
+/// declared vocabulary.
+const COND_MIGRATION_FAILED: &str = "MigrationFailed";
+
+/// 2.16b Task 11: build the paused status for the `BlockFailed` decision
+/// arm — the change's gating MigrationPlan is in phase `failed` and needs
+/// manual resolution. Mirrors [`build_paused_status`] (preserves
+/// `observedGeneration` + `endpointURL`, `phase =
+/// AwaitingMigrationApproval`) but emits a `MigrationFailed=True`
+/// condition instead of `MigrationPending`, so consumers can distinguish
+/// "awaiting approval" from "failed, manual delete required". `Ready`
+/// stays `False`.
+fn build_migration_failed_status(app: &Application, plan_name: &str) -> ApplicationStatus {
+    let previous_conditions = app
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let previous_endpoint = app.status.as_ref().and_then(|s| s.endpoint_url.clone());
+
+    let ready = ready_condition(
+        "False",
+        "MigrationFailed",
+        &format!("paused: MigrationPlan {plan_name} failed — manual delete required"),
+        previous_conditions,
+    );
+    let failed = migration_failed_condition(plan_name, previous_conditions);
+
+    ApplicationStatus {
+        phase: Some(PHASE_AWAITING_MIGRATION_APPROVAL.to_string()),
+        observed_generation: app.metadata.generation,
+        conditions: Some(vec![ready, failed]),
+        endpoint_url: previous_endpoint,
+        image: None,
+        environment: app.spec.environment.clone(),
+        // 2.16b: a failed gate does NOT re-stamp the baseline — the app is
+        // still on the prior applied spec; omit (skip_serializing_if) so
+        // the stamped baseline survives.
+        last_applied_spec: None,
+    }
+}
+
+/// 2.16b Task 11: the `MigrationFailed=True` condition. `lastTransitionTime`
+/// preserved when the prior `MigrationFailed` was already `True` (mirrors
+/// [`migration_pending_condition`]).
+fn migration_failed_condition(
+    plan_name: &str,
+    previous: &[ApplicationCondition],
+) -> ApplicationCondition {
+    let last_transition_time = previous
+        .iter()
+        .find(|c| c.type_ == COND_MIGRATION_FAILED && c.status == "True")
+        .map(|c| c.last_transition_time.clone())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    ApplicationCondition {
+        type_: COND_MIGRATION_FAILED.to_string(),
+        status: "True".to_string(),
+        last_transition_time,
+        reason: "MigrationPlanFailed".to_string(),
+        message: format!(
+            "MigrationPlan {plan_name} failed — manual delete required to unblock the Application"
+        ),
+        observed_generation: None,
     }
 }
 
@@ -2198,11 +2641,17 @@ mod tests {
         plan
     }
 
+    // 2.16b Task 11: `pick_any_key_plan` returns the (at most one)
+    // key-matching plan of ANY phase. The blocking-vs-not distinction
+    // that the old `pick_blocking_plan` applied here now lives in
+    // `plan_state` (covered by `plan_state_buckets_by_phase_and_trigger_match`),
+    // because the state machine must SEE completed / rejected / failed
+    // plans (ConsumeApply / cleanup arms). These tests therefore assert
+    // the SCOPE match only — and that phase does NOT filter.
     #[test]
-    fn pick_blocking_plan_finds_matching_pending_plan() {
-        // Baseline: a plan in `pending-approval` whose scope
-        // matches the Application's name + namespace +
-        // environment must be picked up.
+    fn pick_any_key_plan_finds_matching_pending_plan() {
+        // Baseline: a plan whose scope matches the Application's name +
+        // namespace + environment is picked up.
         let plans = vec![app_plan(
             "parser-pg",
             "parser",
@@ -2210,97 +2659,39 @@ mod tests {
             "prod",
             Some("pending-approval"),
         )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
+        let plan = pick_any_key_plan(plans, "parser", "demo", Some("prod"));
         assert!(plan.is_some());
         assert_eq!(plan.unwrap().metadata.name.as_deref(), Some("parser-pg"));
     }
 
     #[test]
-    fn pick_blocking_plan_skips_completed_plan() {
-        // Completed plans no longer gate the Application — the
-        // operator approved + ran them; future reconciles
-        // resume normal flow.
-        let plans = vec![app_plan(
-            "parser-pg",
-            "parser",
-            "demo",
-            "prod",
-            Some("completed"),
-        )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
-        assert!(plan.is_none());
-    }
-
-    #[test]
-    fn pick_blocking_plan_skips_rejected_plan() {
-        // Application-scope plans can't be rejected per the
-        // webhook FSM, but the pause path treats `rejected` as
-        // resumable defensively (matches Phase 2 platform-scope
-        // semantics).
-        let plans = vec![app_plan(
-            "parser-pg",
-            "parser",
-            "demo",
-            "prod",
-            Some("rejected"),
-        )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
-        assert!(plan.is_none());
-    }
-
-    #[test]
-    fn pick_blocking_plan_treats_missing_phase_as_blocking() {
-        // A plan just created — no status.phase yet. The
-        // reconciler must pause; the plan is on its way.
+    fn pick_any_key_plan_returns_completed_and_rejected_plans() {
+        // Phase does NOT filter here (unlike the old blocking finder) —
+        // the state machine needs to consume a `completed` plan and clean
+        // up a `rejected` relic, so both must be returned.
+        for phase in ["completed", "rejected", "failed", "executing"] {
+            let plans = vec![app_plan("parser-pg", "parser", "demo", "prod", Some(phase))];
+            assert!(
+                pick_any_key_plan(plans, "parser", "demo", Some("prod")).is_some(),
+                "phase {phase} must still be returned by the any-phase finder"
+            );
+        }
+        // A just-created plan (no status.phase yet) is returned too.
         let plans = vec![app_plan("parser-pg", "parser", "demo", "prod", None)];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
-        assert!(plan.is_some());
+        assert!(pick_any_key_plan(plans, "parser", "demo", Some("prod")).is_some());
     }
 
     #[test]
-    fn pick_blocking_plan_blocks_on_executing_plan() {
-        // Mid-execution plans gate the Application — the
-        // MigrationController is running steps, the user shouldn't
-        // get fresh child patches stepping on its work.
-        let plans = vec![app_plan(
-            "parser-pg",
-            "parser",
-            "demo",
-            "prod",
-            Some("executing"),
-        )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
-        assert!(plan.is_some());
-    }
-
-    #[test]
-    fn pick_blocking_plan_blocks_on_failed_plan() {
-        // A failed plan needs operator action; resuming child
-        // patches would silently override the intent. Better
-        // to keep paused until the user explicitly resolves
-        // (delete plan, create new one, etc.).
-        let plans = vec![app_plan(
-            "parser-pg",
-            "parser",
-            "demo",
-            "prod",
-            Some("failed"),
-        )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
-        assert!(plan.is_some());
-    }
-
-    #[test]
-    fn pick_blocking_plan_ignores_platform_scope_plans() {
+    fn pick_any_key_plan_ignores_platform_scope_plans() {
         // Platform-scope plans are observed by PlatformController,
-        // not Application reconciler. Filter must exclude them.
+        // not the Application reconciler. Scope filter must exclude them.
         let plans = vec![platform_plan("p-1")];
-        let plan = pick_blocking_plan(plans, "parser", "demo", None);
+        let plan = pick_any_key_plan(plans, "parser", "demo", None);
         assert!(plan.is_none());
     }
 
     #[test]
-    fn pick_blocking_plan_filters_by_application_namespace() {
+    fn pick_any_key_plan_filters_by_application_namespace() {
         // Same name in a different namespace must NOT match.
         let plans = vec![app_plan(
             "parser-pg",
@@ -2309,14 +2700,14 @@ mod tests {
             "prod",
             Some("pending-approval"),
         )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
+        let plan = pick_any_key_plan(plans, "parser", "demo", Some("prod"));
         assert!(plan.is_none());
     }
 
     #[test]
-    fn pick_blocking_plan_filters_by_environment_when_set() {
-        // Environments are scoped — a `dev` plan must not gate
-        // the `prod` reconcile.
+    fn pick_any_key_plan_filters_by_environment_when_set() {
+        // Environments are scoped — a `dev` plan must not match the
+        // `prod` reconcile.
         let plans = vec![app_plan(
             "parser-pg",
             "parser",
@@ -2324,15 +2715,15 @@ mod tests {
             "dev",
             Some("pending-approval"),
         )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", Some("prod"));
+        let plan = pick_any_key_plan(plans, "parser", "demo", Some("prod"));
         assert!(plan.is_none());
     }
 
     #[test]
-    fn pick_blocking_plan_ignores_environment_when_caller_passes_none() {
+    fn pick_any_key_plan_ignores_environment_when_caller_passes_none() {
         // The Application's `spec.environment` may be unset (the
         // base-only / single-env case). Environment becomes a wildcard
-        // matcher then — any matching app + namespace blocks.
+        // matcher then — any matching app + namespace matches.
         let plans = vec![app_plan(
             "parser-pg",
             "parser",
@@ -2340,7 +2731,7 @@ mod tests {
             "prod",
             Some("pending-approval"),
         )];
-        let plan = pick_blocking_plan(plans, "parser", "demo", None);
+        let plan = pick_any_key_plan(plans, "parser", "demo", None);
         assert!(plan.is_some());
     }
 
@@ -4222,5 +4613,250 @@ mod tests {
         // Rejected → Relic.
         let rejected = plan_with_trigger("selector-change", "needs.pg.selector", Some("rejected"));
         assert_eq!(plan_state(Some(&rejected), &cur), PlanState::Relic);
+    }
+
+    // ---- 2.16b Task 11: reconcile-wiring pure seams ----
+
+    // `plan_state_no_change` — the detect=None bucketer. No plan → None
+    // (`decide(false, None) = Render`); any plan → Relic (`decide(false, _)
+    // = DeleteThenRender`). The exact non-None variant is irrelevant to
+    // `decide`'s `has_change=false` rows, so bucketing every plan as Relic
+    // is sound.
+    #[test]
+    fn plan_state_no_change_buckets_presence_only() {
+        assert_eq!(plan_state_no_change(None), PlanState::None);
+        let any = plan_with_trigger("selector-change", "needs.pg.selector", Some("completed"));
+        assert_eq!(plan_state_no_change(Some(&any)), PlanState::Relic);
+        // And it composes with `decide` to the right no-change decisions.
+        assert_eq!(
+            decide(false, plan_state_no_change(None)),
+            MigrationDecision::Render
+        );
+        assert_eq!(
+            decide(false, plan_state_no_change(Some(&any))),
+            MigrationDecision::DeleteThenRender
+        );
+    }
+
+    // `with_stamped_baseline` — sets `last_applied_spec` to the passed spec
+    // and preserves every other status field it was handed (mirrors how the
+    // happy-path stamp folds into the render's own status write).
+    #[test]
+    fn with_stamped_baseline_sets_field_and_preserves_rest() {
+        let base = ApplicationStatus {
+            phase: Some("Ready".into()),
+            observed_generation: Some(9),
+            conditions: Some(vec![ready_condition("True", "Ok", "ok", &[])]),
+            endpoint_url: Some("http://web.demo.svc.cluster.local:80".into()),
+            image: Some(StatusImage {
+                tag: Some("app:v1".into()),
+                resolved: Some("app@sha256:abc".into()),
+                resolved_at: Some("2026-07-01T00:00:00Z".into()),
+            }),
+            environment: Some("prod".into()),
+            last_applied_spec: None,
+        };
+        let spec = ApplicationSpec {
+            base: Some(ApplicationBaseSpec {
+                image: Some("app:v1".into()),
+                ..Default::default()
+            }),
+            environment: Some("prod".into()),
+            ..Default::default()
+        };
+        let stamped = with_stamped_baseline(base.clone(), &spec);
+        // The one new field is set to the RAW spec.
+        assert_eq!(stamped.last_applied_spec.as_ref(), Some(&spec));
+        assert_eq!(
+            stamped
+                .last_applied_spec
+                .as_ref()
+                .unwrap()
+                .base
+                .as_ref()
+                .unwrap()
+                .image
+                .as_deref(),
+            Some("app:v1")
+        );
+        // Every other field is carried through untouched.
+        assert_eq!(stamped.phase, base.phase);
+        assert_eq!(stamped.observed_generation, base.observed_generation);
+        assert_eq!(stamped.conditions, base.conditions);
+        assert_eq!(stamped.endpoint_url, base.endpoint_url);
+        assert_eq!(stamped.image, base.image);
+        assert_eq!(stamped.environment, base.environment);
+    }
+
+    // `plans_to_delete` — the pure filter behind `delete_all_key_plans_except`.
+    // Keeps `keep`, drops every OTHER key-matching plan, ignores plans of a
+    // different app / env / scope.
+    #[test]
+    fn plans_to_delete_keeps_keep_and_scopes_by_app_env() {
+        // Two plans for (parser, prod): one is the keep, one is stale.
+        let keep = {
+            let mut p = plan_with_trigger("a", "f", Some("pending-approval"));
+            p.metadata.name = Some("parser-prod-migration-2".into());
+            p
+        };
+        let stale = {
+            let mut p = plan_with_trigger("b", "g", Some("completed"));
+            p.metadata.name = Some("parser-prod-migration-1".into());
+            p
+        };
+        // A plan for the SAME app but a DIFFERENT env — must be ignored.
+        let other_env = {
+            let mut p = plan_with_trigger("a", "f", Some("pending-approval"));
+            p.spec.scope.application.as_mut().unwrap().environment = "dev".into();
+            p.metadata.name = Some("parser-dev-migration-1".into());
+            p
+        };
+        // A plan for a DIFFERENT app — must be ignored.
+        let other_app = {
+            let mut p = plan_with_trigger("a", "f", Some("pending-approval"));
+            p.spec.scope.application.as_mut().unwrap().ref_.name = "other".into();
+            p.metadata.name = Some("other-prod-migration-1".into());
+            p
+        };
+        // A platform-scope plan — must be ignored (wrong scope).
+        let platform = platform_plan("platform-bump");
+
+        let plans = vec![keep.clone(), stale.clone(), other_env, other_app, platform];
+        let to_delete = plans_to_delete(&plans, "parser", "prod", Some("parser-prod-migration-2"));
+        // Only the stale (parser, prod) plan that is NOT the keep is deleted.
+        assert_eq!(to_delete, vec!["parser-prod-migration-1".to_string()]);
+
+        // keep = None → both (parser, prod) plans are deleted; scope filter
+        // still excludes the other-app / other-env / platform plans.
+        let all = plans_to_delete(&plans, "parser", "prod", None);
+        assert_eq!(
+            all,
+            vec![
+                "parser-prod-migration-2".to_string(),
+                "parser-prod-migration-1".to_string(),
+            ]
+        );
+    }
+
+    // `effective_baseline` — reconstructs an Application from the stamped
+    // spec and unifies it under the baseline's OWN environment (H4/R2-M2).
+    // The prod override must win over base when the baseline pins env=prod.
+    #[test]
+    fn effective_baseline_unifies_under_baseline_own_env() {
+        let baseline = ApplicationSpec {
+            base: Some(ApplicationBaseSpec {
+                image: Some("app:base".into()),
+                replicas: Some(1),
+                ..Default::default()
+            }),
+            environments: Some(
+                [(
+                    "prod".to_string(),
+                    ApplicationBaseSpec {
+                        replicas: Some(5),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            environment: Some("prod".into()),
+        };
+        let eff = effective_baseline(&baseline);
+        // base.image survives; prod override replaces replicas.
+        assert_eq!(eff.image.as_deref(), Some("app:base"));
+        assert_eq!(eff.replicas, Some(5));
+
+        // With NO environment pinned, the base (replicas=1) is the effective.
+        let base_only = ApplicationSpec {
+            base: baseline.base.clone(),
+            environments: baseline.environments.clone(),
+            environment: None,
+        };
+        assert_eq!(effective_baseline(&base_only).replicas, Some(1));
+    }
+
+    // `plan_name` — stable, DNS-1123-safe `<app>-<env>-migration-<secs>`;
+    // empty env collapses to `<app>-migration-<secs>`.
+    #[test]
+    fn plan_name_is_dns_safe_and_env_aware() {
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let secs = now.timestamp();
+        assert_eq!(
+            plan_name("web", "prod", now),
+            format!("web-prod-migration-{secs}")
+        );
+        // Empty env → no double dash, collapses cleanly.
+        assert_eq!(plan_name("web", "", now), format!("web-migration-{secs}"));
+        // Uppercase / underscores fold to a DNS-1123 name.
+        let folded = plan_name("Web_App", "Prod", now);
+        assert!(folded
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(folded.starts_with("web-app-prod-migration-"));
+    }
+
+    // `app_uid_or` — returns the uid when present, a clear MissingUid error
+    // otherwise (never emits an owner-less plan).
+    #[test]
+    fn app_uid_or_returns_uid_or_errors() {
+        let mut app = Application::new("web", ApplicationSpec::default());
+        app.metadata.uid = Some("uid-abc".into());
+        assert_eq!(app_uid_or(&app).unwrap(), "uid-abc");
+
+        let no_uid = Application::new("web", ApplicationSpec::default());
+        let err = app_uid_or(&no_uid).unwrap_err();
+        assert!(matches!(err, ReconcileError::MissingUid(name) if name == "web"));
+    }
+
+    // `build_migration_failed_status` — the BlockFailed arm status: phase
+    // stays AwaitingMigrationApproval, Ready=False/MigrationFailed, a
+    // MigrationFailed=True condition naming the plan; endpoint + generation
+    // preserved; lastAppliedSpec omitted (the failed gate does NOT re-stamp).
+    #[test]
+    fn build_migration_failed_status_sets_failed_condition() {
+        let mut app = Application::new("web", ApplicationSpec::default());
+        app.metadata.generation = Some(8);
+        app.status = Some(ApplicationStatus {
+            phase: Some("Ready".into()),
+            observed_generation: Some(7),
+            conditions: None,
+            endpoint_url: Some("http://web.demo.svc.cluster.local:80".into()),
+            image: None,
+            environment: None,
+            last_applied_spec: Some(ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("app:v1".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        });
+        let status = build_migration_failed_status(&app, "web-prod-migration-3");
+        assert_eq!(
+            status.phase.as_deref(),
+            Some(PHASE_AWAITING_MIGRATION_APPROVAL)
+        );
+        assert_eq!(status.observed_generation, Some(8));
+        assert_eq!(
+            status.endpoint_url.as_deref(),
+            Some("http://web.demo.svc.cluster.local:80")
+        );
+        // A failed gate must NOT re-stamp the baseline (skip_serializing_if
+        // omits None so the prior baseline survives on the wire).
+        assert!(status.last_applied_spec.is_none());
+
+        let conds = status.conditions.as_ref().expect("conditions");
+        let ready = conds.iter().find(|c| c.type_ == "Ready").expect("ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "MigrationFailed");
+        let failed = conds
+            .iter()
+            .find(|c| c.type_ == COND_MIGRATION_FAILED)
+            .expect("migration failed");
+        assert_eq!(failed.status, "True");
+        assert!(failed.message.contains("web-prod-migration-3"));
     }
 }
