@@ -23,6 +23,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ObjectMeta, Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::discovery::{ApiCapabilities, ApiResource};
@@ -252,15 +253,18 @@ impl ApplicationMigrationStrategy {
     }
 
     /// Build a `MigrationPlan` CR for an application-scope
-    /// destructive change. The Plan lands in
-    /// `apprafter-system` (per spec.md §3.8 — plans are
-    /// cluster-scoped from a user's POV even though the CR
-    /// itself is namespaced for RBAC granularity).
+    /// destructive change. The Plan lands in the **application's own
+    /// namespace** (`application_namespace`) — 2.16b co-locates the
+    /// plan with the Application it gates so a controller
+    /// `ownerReference` back to the Application cascades the plan on
+    /// Application delete and keeps RBAC namespace-scoped to the team.
     ///
     /// `application_name` / `application_namespace` / `environment`
     /// identify which Application + environment the plan
-    /// governs. The caller (B.1.77 Application reconciler) knows
-    /// these from the Application CR it just reconciled.
+    /// governs. The caller (Task 11 Application reconciler) knows
+    /// these from the Application CR it just reconciled, and passes the
+    /// Application CR's `metadata.uid` as `app_uid` so the
+    /// `ownerReference` binds the plan to that exact object.
     ///
     /// `plan_name` should embed the application + a date / UID
     /// so the resulting CR has a stable, human-readable name.
@@ -272,6 +276,7 @@ impl ApplicationMigrationStrategy {
         application_namespace: &str,
         application_name: &str,
         environment: &str,
+        app_uid: &str,
     ) -> MigrationPlan {
         let spec = MigrationPlanSpec {
             scope: MigrationPlanScope {
@@ -303,12 +308,23 @@ impl ApplicationMigrationStrategy {
             previous_spec_snapshot: None,
         };
         // ObjectMeta path used here (not `MigrationPlan::new`)
-        // because we need to set the namespace explicitly —
-        // `MigrationPlan::new` builds a cluster-scoped meta.
+        // because we need to set the namespace + ownerReference
+        // explicitly — `MigrationPlan::new` builds a cluster-scoped
+        // meta with no owner. The plan lands in the Application's own
+        // namespace and carries a controller ownerRef back to the
+        // Application so it cascades on Application delete (2.16b).
         let mut mp = MigrationPlan::new(plan_name, spec);
         mp.metadata = ObjectMeta {
             name: Some(plan_name.to_string()),
-            namespace: Some("apprafter-system".to_string()),
+            namespace: Some(application_namespace.to_string()),
+            owner_references: Some(vec![OwnerReference {
+                api_version: "apprafter.io/v1alpha1".to_string(),
+                kind: "Application".to_string(),
+                name: application_name.to_string(),
+                uid: app_uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]),
             labels: Some(
                 [
                     ("apprafter.io/scope".to_string(), "application".to_string()),
@@ -1312,6 +1328,59 @@ mod application_detect_destructive_tests {
         // Guard against a false pass: the two specs must genuinely differ in size.
         assert_ne!(old.needs, new.needs);
         assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new).is_none());
+    }
+
+    // ---- Task 8 Part 1: create_plan_for app-ns + controller ownerRef ----
+
+    #[test]
+    fn create_plan_lands_in_app_ns_with_controller_ownerref() {
+        let change = DestructiveChange {
+            trigger_type: "needs-removal".into(),
+            field: "needs.pg".into(),
+            from: Some(serde_json::json!("needs.pg")),
+            to: Some(serde_json::json!("(removed)")),
+            classification: "data-migration".into(),
+        };
+        let mp = ApplicationMigrationStrategy::create_plan_for(
+            &change,
+            "myapp-dev-migration-1",
+            "team-a",
+            "myapp",
+            "dev",
+            "uid-123",
+        );
+        assert_eq!(mp.metadata.namespace.as_deref(), Some("team-a")); // APP ns, NOT apprafter-system
+        let owner = &mp.metadata.owner_references.as_ref().unwrap()[0];
+        assert_eq!(owner.kind, "Application");
+        assert_eq!(owner.name, "myapp");
+        assert_eq!(owner.uid, "uid-123");
+        assert_eq!(owner.controller, Some(true));
+        assert_eq!(owner.block_owner_deletion, Some(true));
+        assert_eq!(owner.api_version, "apprafter.io/v1alpha1");
+        assert_eq!(mp.spec.scope.type_, "application");
+        assert!(mp.spec.scope.platform.is_none()); // webhook: no platform block
+        assert!(mp.spec.previous_spec_snapshot.is_none()); // app scope: no snapshot
+    }
+
+    // ---- Task 8 Part 2: classifier tie-break (review gap A) ----
+
+    // Two EQUAL-severity ops (both `requires-restart`) must resolve to the
+    // same primary deterministically. `pick_primary` sorts by
+    // `(severity desc, trigger_type asc, field asc)`, so the
+    // lexicographically-smaller `trigger_type` wins.
+    #[test]
+    fn tie_break_between_two_requires_restart_ops_is_deterministic() {
+        // scale-to-zero + image-path-change, both requires-restart
+        let old = with_replicas(with_image(base(), "ghcr.io/acme/api:v1"), Some(2));
+        let new = with_replicas(with_image(base(), "ghcr.io/acme/other:v1"), Some(0));
+        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        // "image-path-change" < "scale-to-zero" (trigger_type asc) → image-path wins, stably
+        assert_eq!(c.trigger_type, "image-path-change");
+        // and it's stable across calls
+        assert_eq!(
+            c,
+            ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap()
+        );
     }
 }
 
