@@ -279,11 +279,13 @@ plan_count_for() {
 wait_plan_appears() {
     local app="$1" timeout="${2:-120}" deadline nm
     deadline=$(( $(date +%s) + timeout ))
-    printf '  wait an app-scope MigrationPlan for %s to appear (timeout %ss) ...\n' "$app" "$timeout"
+    # Progress → STDERR: this function's STDOUT is captured as the plan NAME
+    # (`DEV_PLAN="$(wait_plan_appears …)"`), so any stdout chatter pollutes it.
+    printf '  wait an app-scope MigrationPlan for %s to appear (timeout %ss) ...\n' "$app" "$timeout" >&2
     while [ "$(date +%s)" -lt "$deadline" ]; do
         nm="$(app_scope_plan_name "$app")"
         if [ -n "$nm" ]; then
-            printf '  ok: MigrationPlan %s/%s exists for %s\n' "$APP_NS" "$nm" "$app"
+            printf '  ok: MigrationPlan %s/%s exists for %s\n' "$APP_NS" "$nm" "$app" >&2
             printf '%s' "$nm"
             return 0
         fi
