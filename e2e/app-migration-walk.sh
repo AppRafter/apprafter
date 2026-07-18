@@ -678,25 +678,35 @@ else
 fi
 
 # ===============================================================
-# Phase 7: revert = reject-via-Git (DeleteThenRender + network-visibility op)
+# Phase 7: revert = reject-via-Git (DeleteThenRender + image-path op)
 # ===============================================================
 
-phase "Phase 7: revert = reject-via-Git — gate mig-prod on network public->internal, then REVERT"
+phase "Phase 7: revert = reject-via-Git — gate mig-prod on image-repo change, then REVERT"
 
-# network public->internal is HARD-destructive (network-visibility-change,
-# requires-restart). Keep the tag from Phase 6 so ONLY the network flips.
-apply_app "$APP_PROD" prod 0 2 internal "$APP_IMAGE_TAG2"
+# An image REPOSITORY change is HARD-destructive (image-path-change,
+# requires-restart). Keep network=public + the Phase-6 tag; only the repo
+# flips → webhook-valid and a single, unambiguous trigger.
+#
+# Why NOT network public->internal here: the admission webhook couples
+# hostname<->public bi-directionally (validator.rs — a public app REQUIRES a
+# hostname; a hostname REQUIRES public). So flipping a public app to internal
+# must co-remove its hostname, and the classifier tie-break scores that combined
+# edit as `domain-change` (sorts before `network-visibility-change`). Thus
+# network-visibility-change is never the standalone primary trigger for a
+# webhook-valid edit — it is defense-in-depth, always shadowed by domain-change.
+# image-path-change is a clean, reachable single-trigger op for the revert test.
+apply_app "$APP_PROD" prod 0 2 public "nginxdemos/nginx-hello:0.4"
 
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP_PROD" '{.status.phase}' AwaitingMigrationApproval 180
 PROD_PLAN="$(wait_plan_appears "$APP_PROD" 120)"
 [ -n "$PROD_PLAN" ] || { printf 'FAILED: prod plan name empty\n' >&2; exit 1; }
 prod_trigger=$(jp "$PLAN_RES" "$APP_NS" "$PROD_PLAN" '{.spec.trigger.type}')
-assert_eq "prod plan trigger.type" "$prod_trigger" "network-visibility-change"
-printf '  ok: mig-prod gated on network-visibility-change (plan %s)\n' "$PROD_PLAN"
+assert_eq "prod plan trigger.type" "$prod_trigger" "image-path-change"
+printf '  ok: mig-prod gated on image-path-change (plan %s)\n' "$PROD_PLAN"
 
-# REVERT the change in-place (network back to public) — the analogue of
-# reverting the edit in Git. The operator sees no destructive delta vs the
-# baseline (still public), so it self-deletes the now-stale plan and un-freezes.
+# REVERT the change in-place (image repo back to the Phase-6 value) — the
+# analogue of reverting the edit in Git. The operator sees no destructive delta
+# vs the baseline, so it self-deletes the now-stale plan and un-freezes.
 printf '  reverting mig-prod network back to public (reject-via-Git) ...\n'
 apply_app "$APP_PROD" prod 0 2 public "$APP_IMAGE_TAG2"
 
