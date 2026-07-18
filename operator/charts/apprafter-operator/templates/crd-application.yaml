@@ -165,6 +165,7 @@ spec:
                 type: string
               lastAppliedSpec:
                 type: object
+                x-kubernetes-preserve-unknown-fields: true
               phase:
                 type: string
             type: object

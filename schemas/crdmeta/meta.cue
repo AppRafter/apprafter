@@ -41,6 +41,20 @@ _crdMetas: Application: {
 		"base.image": {pattern: "^.+$"}
 		"environments[*].image": {pattern: "^.+$"}
 	}
+
+	// `status.lastAppliedSpec` is the 2.16b migration baseline — a raw
+	// `ApplicationSpec` snapshot the operator stamps and later diffs against.
+	// CUE's `lastAppliedSpec?: {...}` open struct exports as a closed
+	// `{type: object}`; nested under the status root's
+	// x-kubernetes-preserve-unknown-fields that bare `type: object` is a
+	// STRUCTURAL PRUNING BOUNDARY — the apiserver strips every key inside it,
+	// so the baseline round-trips as `{}` and gating never fires (walk-found).
+	// Restore `{type: object, x-kubernetes-preserve-unknown-fields: true}` ON
+	// the node itself so its children survive (same shape as MigrationPlan's
+	// `previousSpecSnapshot`). Paths are relative to the `status` node.
+	statusSchemaPatches: {
+		"lastAppliedSpec": {type: "object", "x-kubernetes-preserve-unknown-fields": true}
+	}
 }
 
 _crdMetas: ServiceProvider: {

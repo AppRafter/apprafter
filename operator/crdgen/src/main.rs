@@ -166,3 +166,56 @@ fn generate() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read a committed chart CRD by file stem (cluster-free, no `cue`).
+    /// The file is a Helm template — `metadata.labels` is a single
+    /// `{{- include ... }}` directive line that is not plain YAML, so drop
+    /// any line containing a `{{` mustache before parsing (it never touches
+    /// the `spec.versions[].schema` subtree this guard navigates).
+    fn committed_crd(file_stem: &str) -> Value {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../charts/apprafter-operator/templates")
+            .join(format!("{file_stem}.yaml"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let plain: String = text
+            .lines()
+            .filter(|l| !l.contains("{{"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_yaml::from_str(&plain).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    }
+
+    /// 2.16b walk-found: `status.lastAppliedSpec` rendered as a bare
+    /// `{type: object}` is a STRUCTURAL PRUNING BOUNDARY — the status
+    /// root's preserve-unknown does NOT cascade past a child that declares
+    /// its own `type: object`, so the apiserver strips every key inside it
+    /// and the migration baseline round-trips as `{}` (gating never fires).
+    /// The `statusSchemaPatches` entry in `_crdMetas: Application` restores
+    /// `x-kubernetes-preserve-unknown-fields: true` ON the node so its
+    /// children survive. This guards the committed CRD without a cluster
+    /// (`crd-validate` can't catch it — the CRD stays structurally valid,
+    /// it just prunes).
+    #[test]
+    fn application_status_last_applied_spec_is_preserve_unknown() {
+        let crd = committed_crd("crd-application");
+        let laf = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"]["lastAppliedSpec"];
+        assert_eq!(
+            laf["type"],
+            json!("object"),
+            "status.lastAppliedSpec must stay a typed object node"
+        );
+        assert_eq!(
+            laf["x-kubernetes-preserve-unknown-fields"],
+            json!(true),
+            "status.lastAppliedSpec lost preserve-unknown — the apiserver \
+             will prune the 2.16b migration baseline to {{}} and gating \
+             never fires (re-run `just gen-crds`)"
+        );
+    }
+}
