@@ -43,9 +43,9 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 | Status | Feature | plan.md | Checkpoint |
 |---|---|---|---|
-| ✅ | MCP-native safety gate: destructive operations are paused (`MigrationPlan` CRD), approve/reject via CLI | 1.72–1.78 condensed | CP1 |
+| ✅ | MCP-native safety gate: destructive operations are paused (`MigrationPlan` CRD), approve/reject via CLI | 1.72–1.78 condensed, 2.16b | CP1 |
 
-> Delivered as a full vertical: `MigrationPlan` CRD + reconciler + admission webhook + `apprafter migration list/approve/reject`. The **hosted MCP endpoint** itself is in the managed section. At launch, approval is available via the CLI and Argo CD buttons; a dedicated Backstage MigrationPlan plugin lands post-launch (PL1).
+> Delivered as a full vertical: `MigrationPlan` CRD + reconciler + admission webhook + `apprafter migration list/approve/reject`. The **hosted MCP endpoint** itself is in the managed section. At launch, approval is available via the CLI and Argo CD buttons; a dedicated Backstage MigrationPlan plugin lands post-launch (PL1). **2.16b (ADR 0051)** turns on **app-scope** auto-detection: a destructive edit to a user `Application` (removing `needs.*`, scale-to-zero, image-repository/domain/network change, env-reference removal) auto-creates an app-scope `MigrationPlan` in the app's own namespace and pauses the app until approved; soft edits emit a `SoftDestructiveChange` Event instead; reject is via Git revert. Validated by a GREEN two-env kind+Argo e2e walk.
 
 ---
 

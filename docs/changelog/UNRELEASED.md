@@ -9,6 +9,58 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.34 / operator v0.2.34 / platform-stack 0.2.43 / cue-cmp v0.1.15 — 2.16b app-scope migration (auto-detect + Argo approval) (2026-07-18)
+
+Turns a **destructive edit to a user `Application`** into a gated,
+approve-before-apply flow (ADR 0051). Flips the previously-built-but-disabled
+`detect_destructive` classifier ON, so an edit that would tear down data or
+disrupt a running app auto-creates an app-scope `MigrationPlan` and pauses the
+app until it is approved.
+
+### Added
+
+- **App-scope destructive detection** — a deterministic classifier over the
+  **effective, per-environment** spec (`base` ∪ `environments[<env>]`, each side
+  under its own env) vs the stamped baseline. Gated ops: `needs.*` removal
+  (→ `data-migration`, data loss), `scale-to-zero` (N→0), image **repository**
+  change, `expose.hostname` change/removal of a publicly-routed app,
+  `expose.network` public→non-public, and env **reference** removal
+  (→ `requires-restart`). One primary is chosen deterministically
+  (severity ↓, trigger ↑, field ↑).
+- **`Application.status.lastAppliedSpec`** — the raw last-applied spec, stamped
+  after each successful render, used as the diff baseline (GitOps-clean;
+  `x-kubernetes-preserve-unknown-fields`).
+- **App-scope `MigrationPlan`** — lands in the **application's own namespace**
+  with a controlling `ownerReference` → the Application CR (cascades on delete,
+  keeps RBAC namespace-scoped). Approve via the Argo Approve node or
+  `apprafter migration approve`; on approve the operator renders the new spec,
+  re-stamps the baseline, and consumes (deletes) the plan — with an anti-loop
+  guard and `.owns(MigrationPlan)` instant-consume. **Reject = revert the change
+  in Git** (the plan self-deletes; approve-only surface, spec.md §3.8).
+- **`SoftDestructiveChange` Events** — soft edits (env-literal removal,
+  `needs.*.selector`/`.size` change, image-tag change, scale-down N→M) are NOT
+  gated but emit a k8s Event on the Application.
+- **`apprafter migration list`** now lists all namespaces; **`approve`**
+  auto-resolves the plan's namespace (explicit `-n` disambiguates); `reject`
+  stays platform-only (app-scope rejection is via Git).
+
+### Changed
+
+- The Application reconcile runs a total detect×plan-state consume-ticket state
+  machine at the former pause-gate site (before the 2.4d needs gate).
+
+### Fixed
+
+- **`status.lastAppliedSpec` no longer round-trips as `{}`** — a bare
+  `type: object` nested under the status root's preserve-unknown was a
+  structural pruning boundary; restored an explicit preserve-unknown patch so
+  the baseline persists (walk-found; regression-guarded).
+- **Pause-status writes carry the baseline forward** — `apply_status` is a
+  server-side apply under one field manager, so omitting `lastAppliedSpec`
+  PRUNED it (not "left it untouched"), self-cancelling the gate in ~200ms. All
+  four pause/awaiting status builders now re-send the baseline (walk-found;
+  regression-guarded).
+
 ## cli v0.2.33 / operator v0.2.33 / platform-stack 0.2.42 / apprafter-backup:v0.2.33 / cue-cmp v0.1.14 — 2.6d-4 automated off-site S3 backup (opt-in) (2026-07-17)
 
 Turns the operator-machine local-pull `apprafter backup` into an **opt-in**

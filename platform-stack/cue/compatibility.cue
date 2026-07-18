@@ -1760,6 +1760,43 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.43": {
+	change:          "safe"
+	operatorVersion: "v0.2.34"
+	notes: """
+		2.16b app-scope migration. A destructive edit to a user `Application`
+		now auto-creates an app-scope `MigrationPlan` in the app's OWN namespace
+		(controlling ownerRef → the Application CR), pauses the app at
+		`AwaitingMigrationApproval`, and surfaces an Approve node in Argo +
+		`apprafter migration approve`. Approve renders the new spec, stamps the
+		`status.lastAppliedSpec` baseline, and consumes (deletes) the plan;
+		reject = revert the change in Git (the plan self-deletes). Flips the
+		previously-built-but-disabled `detect_destructive` classifier ON:
+		`needs-removal` → data-migration; `scale-to-zero` / `image-path-change`
+		/ `domain-change` / `network-visibility-change` / `env-ref-removal` →
+		requires-restart. Adds `Application.status.lastAppliedSpec`
+		(x-kubernetes-preserve-unknown-fields) as the per-effective-environment
+		diff baseline.
+
+		change=safe: additive CRD status field + additive detection; existing
+		Applications are unaffected until their next destructive edit, and a
+		non-destructive edit renders exactly as before. Two walk-found fixes
+		hardened before ship: `status.lastAppliedSpec` needed an explicit
+		preserve-unknown patch (a bare `type: object` inside the status root's
+		preserve-unknown is a structural PRUNING boundary → the baseline
+		round-tripped as `{}`), and the pause-status writes must CARRY the
+		baseline forward (SSA under one field manager PRUNES an omitted field →
+		the gate self-cancelled). The two-env kind+Argo walk
+		(`e2e/app-migration-walk.sh`) is GREEN end-to-end. Ships operator +
+		admission-webhook v0.2.34 and cue-cmp v0.1.15 (the CRD's
+		`Application.status` schema changed).
+		"""
+	references: [
+		"docs/superpowers/specs/2026-07-17-2.16b-app-scope-migration-design.md",
+		"docs/adr/0051-app-scope-migration.md",
+	]
+}
+
 compatibility: "0.2.42": {
 	change:          "safe"
 	operatorVersion: "v0.2.33"
