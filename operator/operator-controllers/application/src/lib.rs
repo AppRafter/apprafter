@@ -1837,6 +1837,24 @@ fn is_deletion_marked(app: &Application) -> bool {
     app.metadata.deletion_timestamp.is_some()
 }
 
+/// 2.16b (walk-found): carry the stamped `lastAppliedSpec` migration baseline
+/// forward on every pause/awaiting status write. [`apply_status`] is a
+/// server-side apply under a SINGLE field manager ([`FIELD_MANAGER`],
+/// `.force()`), so a status payload that OMITS `lastAppliedSpec` makes the
+/// apiserver PRUNE it — the manager relinquishes the field, and no one else
+/// owns it. This is NOT "leave it untouched" (the merge-patch mental model the
+/// old `last_applied_spec: None` comments assumed). Emitting `None` on a paused
+/// write therefore wiped the baseline, so the NEXT reconcile read no baseline,
+/// skipped destructive detection, and the gate deleted its own MigrationPlan
+/// (the pause self-cancelled in ~200ms). Re-sending the existing baseline keeps
+/// the manager's ownership so it survives the pause. Only the render path
+/// ([`with_stamped_baseline`]) deliberately overrides it with the new spec.
+fn existing_baseline(app: &Application) -> Option<ApplicationSpec> {
+    app.status
+        .as_ref()
+        .and_then(|s| s.last_applied_spec.clone())
+}
+
 /// Build the Application status payload for the pause path.
 /// Preserves `observedGeneration` + `endpointURL` from the
 /// previous reconcile (child resources keep running, so the
@@ -1873,9 +1891,9 @@ fn build_paused_status(app: &Application, plan_ns: &str, plan_name: &str) -> App
         endpoint_url: previous_endpoint,
         image: None,
         environment: app.spec.environment.clone(),
-        // 2.16b Task 7: omitted from the SSA payload (skip_serializing_if);
-        // does not clobber a classifier-stamped baseline.
-        last_applied_spec: None,
+        // 2.16b (walk-found): carry the baseline forward — omitting it under
+        // SSA prunes it, self-cancelling the gate. See `existing_baseline`.
+        last_applied_spec: existing_baseline(app),
     }
 }
 
@@ -1917,9 +1935,10 @@ fn build_migration_failed_status(app: &Application, plan_name: &str) -> Applicat
         image: None,
         environment: app.spec.environment.clone(),
         // 2.16b: a failed gate does NOT re-stamp the baseline — the app is
-        // still on the prior applied spec; omit (skip_serializing_if) so
-        // the stamped baseline survives.
-        last_applied_spec: None,
+        // still on the prior applied spec. CARRY it forward: apply_status is
+        // SSA, so omitting the field prunes it (walk-found) rather than leaving
+        // it untouched. See `existing_baseline`.
+        last_applied_spec: existing_baseline(app),
     }
 }
 
@@ -2362,9 +2381,9 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
         endpoint_url: previous_endpoint,
         image: None,
         environment: app.spec.environment.clone(),
-        // 2.16b Task 7: omitted from the SSA payload (skip_serializing_if);
-        // does not clobber a classifier-stamped baseline.
-        last_applied_spec: None,
+        // 2.16b (walk-found): carry the baseline forward — omitting it under
+        // SSA prunes it. See `existing_baseline`.
+        last_applied_spec: existing_baseline(app),
     }
 }
 
@@ -2452,9 +2471,9 @@ fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> Ap
         endpoint_url: previous_endpoint,
         image: None,
         environment: app.spec.environment.clone(),
-        // 2.16b Task 7: omitted from the SSA payload (skip_serializing_if);
-        // does not clobber a classifier-stamped baseline.
-        last_applied_spec: None,
+        // 2.16b (walk-found): carry the baseline forward — omitting it under
+        // SSA prunes it. See `existing_baseline`.
+        last_applied_spec: existing_baseline(app),
     }
 }
 
@@ -2961,6 +2980,64 @@ mod tests {
             status.phase.as_deref(),
             Some(PHASE_AWAITING_MIGRATION_APPROVAL)
         );
+    }
+
+    #[test]
+    fn pause_status_builders_carry_the_baseline_forward() {
+        // 2.16b WALK-FOUND regression: apply_status is SSA under a single
+        // field manager, so a paused status payload that OMITS
+        // `lastAppliedSpec` makes the apiserver PRUNE the stamped baseline
+        // (the manager relinquishes it). That wiped the baseline on the very
+        // next reconcile → detection was skipped → the gate deleted its own
+        // MigrationPlan (the pause self-cancelled in ~200ms). Every
+        // pause/awaiting builder MUST re-send the existing baseline so the
+        // SSA manager keeps ownership and it survives the pause.
+        let baseline = ApplicationSpec {
+            environment: Some("dev".into()),
+            ..Default::default()
+        };
+        let mut app = Application::new("web", ApplicationSpec::default());
+        app.status = Some(ApplicationStatus {
+            phase: Some("Ready".into()),
+            observed_generation: Some(3),
+            conditions: None,
+            endpoint_url: None,
+            image: None,
+            environment: Some("dev".into()),
+            last_applied_spec: Some(baseline.clone()),
+        });
+
+        // All four production pause/awaiting builders must preserve it.
+        for (label, got) in [
+            (
+                "paused",
+                build_paused_status(&app, "team-a", "web-dev-migration-1"),
+            ),
+            (
+                "migration-failed",
+                build_migration_failed_status(&app, "web-dev-migration-1"),
+            ),
+            (
+                "resource-claim",
+                build_resource_claim_paused_status(&app, &["pg".to_string()]),
+            ),
+            (
+                "env-secret-missing",
+                build_env_secret_missing_status(&app, &["DB missing".to_string()]),
+            ),
+        ] {
+            assert_eq!(
+                got.last_applied_spec.as_ref().and_then(|s| s.environment.as_deref()),
+                Some("dev"),
+                "{label} status dropped the migration baseline — SSA will prune it and the gate self-cancels"
+            );
+        }
+
+        // And `existing_baseline` returns None when there is no prior stamp
+        // (first reconcile) — the render path stamps it, the pause path must
+        // not fabricate one.
+        let fresh = Application::new("web", ApplicationSpec::default());
+        assert!(existing_baseline(&fresh).is_none());
     }
 
     // ---- 2.16b (R3-mn-d): soft-destructive notes (SoftDestructiveChange) ----
@@ -5192,9 +5269,19 @@ mod tests {
             status.endpoint_url.as_deref(),
             Some("http://web.demo.svc.cluster.local:80")
         );
-        // A failed gate must NOT re-stamp the baseline (skip_serializing_if
-        // omits None so the prior baseline survives on the wire).
-        assert!(status.last_applied_spec.is_none());
+        // 2.16b (walk-found): a failed gate must NOT re-stamp the baseline to
+        // the NEW spec — but under SSA it MUST re-send the EXISTING baseline,
+        // because omitting a field the manager owns PRUNES it (an omitted
+        // `None` did NOT "survive on the wire" — it wiped the baseline and the
+        // gate self-cancelled). So the prior baseline is carried forward here.
+        assert_eq!(
+            status
+                .last_applied_spec
+                .as_ref()
+                .and_then(|s| s.base.as_ref())
+                .and_then(|b| b.image.as_deref()),
+            Some("app:v1")
+        );
 
         let conds = status.conditions.as_ref().expect("conditions");
         let ready = conds.iter().find(|c| c.type_ == "Ready").expect("ready");
