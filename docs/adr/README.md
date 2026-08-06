@@ -79,3 +79,4 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0049 | [cross-app SharedVolume](./0049-cross-app-sharedvolume.md) | Accepted |
 | 0050 | [backup, export, and restore — restic engine, local-pull default](./0050-backup-restore.md) | Accepted |
 | 0051 | [application-scope destructive-change detection and gating](./0051-app-scope-migration.md) | Accepted |
+| 0052 | [application-migration security axis — additive/escalation gating and structural hardening](./0052-migration-security-axis.md) | Accepted |
