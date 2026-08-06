@@ -1705,11 +1705,13 @@ pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveCha
     // match the CURRENT change's hash. Without that, an approval for
     // `replicas 2->0` would consume against a DIFFERENT `replicas 1->0`
     // (same tuple, different payload), fully defeating the gate for a
-    // security-boundary op. On a hash MISMATCH we demote the completed
-    // plan to a `Relic`, so `decide` yields `DeleteThenCreate` and the
-    // edit is re-gated as a fresh `pending-approval` plan. A legacy plan
-    // with no stamped hash (`None`) still consumes (`plan_hash_matches`
-    // returns `true`) — S-4 must not break plans cut before this change.
+    // security-boundary op. On a hash MISMATCH — including a
+    // MISSING/EMPTY stamped hash — we demote the completed plan to a
+    // `Relic`, so `decide` yields `DeleteThenCreate` and the edit is
+    // re-gated as a fresh `pending-approval` plan. App-scope migration is
+    // brand-new (no legacy hashless plans exist), so consume REQUIRES a
+    // non-empty stamped hash that matches (`plan_hash_matches`); a
+    // hashless completed plan never consumes a destructive change.
     if phase == "completed"
         && trigger_matches
         && plan_hash_matches(
@@ -1724,17 +1726,24 @@ pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveCha
 }
 
 /// 2.16b S-4: does the plan's stamped `approvedSpecHash` match the
-/// current detected change's content hash? A legacy plan carrying no
-/// stamped hash (`None`) matches unconditionally so S-4 never breaks a
-/// plan cut before the hash field existed. A stamped hash matches iff it
-/// equals `current_hash` — this is what makes an app-scope approval
-/// non-transferable across a different spec edit (the security fix): the
-/// approver signed off on ONE `from->to`, and swapping the payload before
-/// consume now yields a different hash → no match → re-gate.
+/// current detected change's content hash? App-scope migration is
+/// brand-new and unpushed — there are ZERO legacy app-scope plans — so a
+/// missing/empty stamped hash is NOT trusted as a legacy approval; it is
+/// treated as NO match, and the completed plan is demoted to a relic and
+/// re-gated. A hashless completed plan (forged or otherwise) must never
+/// consume a destructive change. Consume therefore requires
+/// `Some(non_empty_hash)` that EQUALS `current_hash` — this is what makes
+/// an app-scope approval non-transferable across a different spec edit
+/// (the security fix): the approver signed off on ONE `from->to`, and
+/// swapping the payload before consume now yields a different hash → no
+/// match → re-gate.
 fn plan_hash_matches(plan: &MigrationPlan, current_hash: &str) -> bool {
     match plan.spec.trigger.approved_spec_hash.as_deref() {
-        Some(h) => h == current_hash,
-        None => true, // legacy plan: don't break existing approvals
+        Some(h) if !h.is_empty() => h == current_hash,
+        // Missing OR empty hash → no match. App-scope consume REQUIRES a
+        // non-empty stamped hash; a hashless completed plan must re-gate,
+        // never apply a destructive change.
+        _ => false,
     }
 }
 
@@ -5059,8 +5068,13 @@ mod tests {
         // Phase failed → Failed (regardless of trigger match).
         let failed = plan_with_trigger("selector-change", "needs.pg.selector", Some("failed"));
         assert_eq!(plan_state(Some(&failed), &cur), PlanState::Failed);
-        // Completed + trigger matches → CompletedMatch.
-        let done = plan_with_trigger("selector-change", "needs.pg.selector", Some("completed"));
+        // Completed + trigger matches → CompletedMatch. Post-S-4-review the
+        // completed plan MUST carry the matching stamped content hash to
+        // consume (a hashless completed plan re-gates), so stamp it.
+        let mut done = plan_with_trigger("selector-change", "needs.pg.selector", Some("completed"));
+        done.spec.trigger.approved_spec_hash = Some(operator_core::migration::change_hash(
+            std::slice::from_ref(&cur),
+        ));
         assert_eq!(plan_state(Some(&done), &cur), PlanState::CompletedMatch);
         // Completed + trigger differs → Relic.
         let done_other = plan_with_trigger(
@@ -5158,12 +5172,17 @@ mod tests {
         // … but the content hash differs → Relic, NOT CompletedMatch.
         assert_eq!(plan_state(Some(&transferable), &current), PlanState::Relic);
 
-        // (c) legacy plan (no stamped hash) still consumes.
-        let legacy = completed_plan_with_hash(&current, None);
-        assert_eq!(
-            plan_state(Some(&legacy), &current),
-            PlanState::CompletedMatch
-        );
+        // (c) THE S-4 REVIEW ATTACK: a completed plan carrying NO stamped
+        // hash (forged or otherwise) must NOT consume. App-scope migration
+        // is brand-new — there are zero legacy hashless plans — so the
+        // former `None => true` "legacy safety" bypass is gone: a hashless
+        // completed plan re-gates (Relic), never applies the change.
+        let hashless = completed_plan_with_hash(&current, None);
+        assert_eq!(plan_state(Some(&hashless), &current), PlanState::Relic);
+
+        // (d) an EMPTY stamped hash is likewise no match → Relic.
+        let empty_hash = completed_plan_with_hash(&current, Some(String::new()));
+        assert_eq!(plan_state(Some(&empty_hash), &current), PlanState::Relic);
     }
 
     // The state machine as a whole must yield DeleteThenCreate (re-gate),

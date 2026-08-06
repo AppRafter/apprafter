@@ -108,40 +108,29 @@ pub fn classification_severity(classification: &str) -> u8 {
 /// the completed plan to a relic and re-gates the edit as a fresh
 /// pending-approval plan.
 ///
-/// Determinism: each change is canonicalised to
-/// `"<trigger_type>|<field>|<from>|<to>"` (from/to = the JSON value's
-/// string form, or `""` when `None`), the lines are SORTED (so the hash
-/// is independent of candidate discovery/push order), joined with `\n`,
-/// and SHA-256'd to a lowercase hex string.
+/// Determinism & collision-freedom: each change is canonicalised to a
+/// JSON array `[trigger_type, field, from, to]` where `from`/`to` are the
+/// RAW `Option<Value>` (NOT flattened to a string) — this preserves the
+/// JSON TYPE (a string `"2"` and a number `2` encode distinctly) and lets
+/// serde escape every special character, so no `from`/`to` payload can
+/// smuggle a separator to collide two distinct changes (e.g. from=`a`,
+/// to=`b|c` vs from=`a|b`, to=`c`). The per-change arrays are collected,
+/// SORTED by their own `serde_json::to_string()` form (so the hash is
+/// independent of candidate discovery/push order), wrapped in a JSON
+/// array, serialised once, and SHA-256'd to a lowercase hex string.
 pub fn change_hash(changes: &[DestructiveChange]) -> String {
-    /// Render a `from`/`to` JSON value to a stable string. A JSON string
-    /// contributes its inner text (`json!("2")` -> `2`); any other value
-    /// (number, object, array, bool, null) contributes its compact JSON
-    /// form so structured `from`/`to` payloads (e.g. SourceCredential's
-    /// object diffs) still participate in the hash. `None` -> `""`.
-    fn value_str(v: &Option<serde_json::Value>) -> String {
-        match v {
-            None => String::new(),
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-        }
-    }
-
-    let mut lines: Vec<String> = changes
+    let mut items: Vec<serde_json::Value> = changes
         .iter()
-        .map(|c| {
-            format!(
-                "{}|{}|{}|{}",
-                c.trigger_type,
-                c.field,
-                value_str(&c.from),
-                value_str(&c.to),
-            )
-        })
+        .map(|c| serde_json::json!([c.trigger_type, c.field, c.from, c.to]))
         .collect();
-    lines.sort();
-    let joined = lines.join("\n");
-    format!("{:x}", Sha256::digest(joined.as_bytes()))
+    // Sort deterministically by the canonical JSON form of each element so
+    // candidate order does not affect the hash. `to_string` on a
+    // serde_json::Value is infallible.
+    items.sort_by_key(|v| v.to_string());
+    let array = serde_json::Value::Array(items);
+    // Serialising a `Value` never fails.
+    let canonical = serde_json::to_string(&array).expect("serialising a JSON array cannot fail");
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
 }
 
 /// Per-scope behaviour shared between application + platform

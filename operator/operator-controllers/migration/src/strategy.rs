@@ -978,6 +978,40 @@ mod change_hash_tests {
         // sensitive: same tuple, different from/to → different hash.
         assert_ne!(change_hash(&[a]), change_hash(&[b]));
     }
+
+    // 2.16b S-4 review: the canonicalisation must be COLLISION-FREE across
+    // separator characters. The pre-review encoding joined fields with a
+    // literal `|` (and lines with `\n`); an unescaped `|`/`\n` inside a
+    // from/to value could collide two distinct changes (from=`a`,to=`b|c`
+    // vs from=`a|b`,to=`c`). The JSON encoding escapes every special char,
+    // so no separator can leak.
+    #[test]
+    fn change_hash_is_collision_free_across_separators() {
+        let a = DestructiveChange {
+            trigger_type: "t".into(),
+            field: "f".into(),
+            from: Some(json!("a")),
+            to: Some(json!("b|c")),
+            classification: "x".into(),
+        };
+        let b = DestructiveChange {
+            from: Some(json!("a|b")),
+            to: Some(json!("c")),
+            ..a.clone()
+        };
+        assert_ne!(change_hash(std::slice::from_ref(&a)), change_hash(&[b])); // must NOT collide
+                                                                              // newline variant
+        let c = DestructiveChange {
+            to: Some(json!("b\nc")),
+            ..a.clone()
+        };
+        let d = DestructiveChange {
+            from: Some(json!("a\nb")),
+            to: Some(json!("c")),
+            ..a
+        };
+        assert_ne!(change_hash(&[c]), change_hash(&[d]));
+    }
 }
 
 #[cfg(test)]
