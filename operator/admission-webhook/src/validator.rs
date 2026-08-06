@@ -67,6 +67,29 @@ impl ValidationError {
     }
 }
 
+/// 2.16b (S-1): the ONLY legitimate writer of `Application.status`.
+/// The operator's Application controller applies status via SSA with
+/// `PatchParams::apply("apprafter-operator")` — see
+/// `operator-controllers/application/src/lib.rs:58` (`FIELD_MANAGER`).
+/// `admission-webhook` deliberately does NOT depend on that controller
+/// crate (it avoids the heavy `kube` stack — see `server.rs`), so the
+/// value is duplicated here; keep the two in sync.
+pub const APPLICATION_STATUS_FIELD_MANAGER: &str = "apprafter-operator";
+
+/// 2.16b (S-1): whether a write to the `Application/status` subresource is
+/// allowed, given the request's `fieldManager`. `Application.status` is the
+/// root of trust for the app-migration gate — `status.lastAppliedSpec` is the
+/// baseline every destructive-change detection diffs against. The ONLY
+/// legitimate writer is the operator's SSA field manager
+/// (`apprafter-operator`); any other subject (or an absent fieldManager) is
+/// rejected so a direct `patch applications/status` cannot zero the baseline
+/// and silently disarm the gate. Unlike `MigrationPlan.status` (which
+/// legitimately accepts an external `phase→approved` approval signal),
+/// `Application.status` has no external writer.
+pub fn status_write_allowed(field_manager: Option<&str>) -> bool {
+    field_manager == Some(APPLICATION_STATUS_FIELD_MANAGER)
+}
+
 /// Validate the `spec` block of a v1alpha1 Application. Returns
 /// every error found (the validator does not short-circuit). An
 /// empty `Vec` means the manifest is valid.
@@ -1510,6 +1533,14 @@ fn is_env_var_name(s: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── 2.16b S-1: Application.status is operator-owned ──────────────────
+    #[test]
+    fn application_status_write_only_from_operator_manager() {
+        assert!(status_write_allowed(Some("apprafter-operator")));
+        assert!(!status_write_allowed(Some("kubectl-client-side-apply")));
+        assert!(!status_write_allowed(None));
+    }
 
     #[test]
     fn rejects_non_object_spec() {

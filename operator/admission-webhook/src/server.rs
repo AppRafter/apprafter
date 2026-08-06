@@ -98,7 +98,59 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         .and_then(Value::as_str)
         .unwrap_or("");
 
+    // The targeted subresource, if any. A status-subresource write
+    // (`kubectl patch --subresource=status`, or a direct
+    // `patch <resource>/status` API call) sets `request.subResource` to
+    // `"status"`; a write to the main object leaves it absent.
+    let sub_resource = request.get("subResource").and_then(Value::as_str);
+
+    // 2.16b (S-1): `Application.status` is the root of trust for the
+    // app-migration gate (`status.lastAppliedSpec` is the baseline every
+    // destructive-change detection diffs against). The ONLY legitimate
+    // writer is the operator's SSA field manager (`apprafter-operator`);
+    // any other subject with `patch applications/status` RBAC could zero
+    // `lastAppliedSpec` and silently disarm the gate. Reject every
+    // non-operator write to the `Application/status` subresource. This runs
+    // BEFORE the per-kind spec validation `match` below — a status write
+    // carries no meaningful `spec` change to validate, only the
+    // ownership/writer check.
+    if kind == "Application" && sub_resource == Some("status") {
+        let field_manager = request_field_manager(request);
+        if !crate::validator::status_write_allowed(field_manager) {
+            let fm = field_manager.unwrap_or("<none>");
+            let message = format!(
+                "Application.status is operator-owned; direct status writes are rejected (fieldManager={fm}). The migration gate's baseline (status.lastAppliedSpec) must not be overwritten."
+            );
+            warn!(
+                target: "admission_webhook",
+                fieldManager = %fm,
+                "rejected non-operator Application.status write"
+            );
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "apiVersion": api_version,
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": uid,
+                        "allowed": false,
+                        "status": {
+                            "code": 403,
+                            "message": message
+                        }
+                    }
+                })),
+            );
+        }
+    }
+
     let errors = match kind {
+        // A status-subresource write carries no meaningful spec change to
+        // validate — the operator-ownership guard above is the whole check
+        // for `Application/status`, and the operator's own status object
+        // has no `spec`. Skip spec validation for it (allow); the main
+        // Application resource still runs the full spec validator.
+        "Application" if sub_resource == Some("status") => Vec::new(),
         "Application" => {
             let spec = object
                 .get("spec")
@@ -173,6 +225,26 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
             }
         })),
     )
+}
+
+/// 2.16b (S-1): the `fieldManager` that issued this write, or `None`.
+///
+/// The apiserver forwards the operation's options object in
+/// `request.options` — a `PatchOptions` for PATCH, a `CreateOptions` for
+/// CREATE, an `UpdateOptions` for UPDATE — and the SSA/Apply field manager
+/// is its `fieldManager` field. The operator's status writes are SSA Apply
+/// patches under `PatchParams::apply("apprafter-operator")`, so the value
+/// arrives at `request.options.fieldManager`. Returns `None` when the
+/// options object is absent or carries no `fieldManager` (e.g. a
+/// client-side write that never set one) — the caller treats an absent
+/// fieldManager as "not the operator" and denies, which is the safe
+/// default since `Application.status` has no external writer.
+fn request_field_manager(request: &serde_json::Map<String, Value>) -> Option<&str> {
+    request
+        .get("options")
+        .and_then(|o| o.get("fieldManager"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 fn render_error_message(kind: &str, errors: &[ValidationError]) -> String {
@@ -404,6 +476,124 @@ mod tests {
         assert_eq!(parsed["response"]["allowed"], json!(false));
         let msg = parsed["response"]["status"]["message"].as_str().unwrap();
         assert!(msg.starts_with("ServiceProvider is invalid: "));
+    }
+
+    // ── 2.16b S-1: Application.status ownership guard (end-to-end) ────────
+
+    /// AdmissionReview for a status-subresource write, carrying the SSA
+    /// `options.fieldManager` the apiserver forwards for an Apply patch.
+    fn admission_status_write(
+        kind: &str,
+        field_manager: Option<&str>,
+        operation: &str,
+    ) -> serde_json::Value {
+        let options = match field_manager {
+            Some(fm) => json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PatchOptions",
+                "fieldManager": fm,
+            }),
+            None => json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "PatchOptions",
+            }),
+        };
+        json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "deadbeef",
+                "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": kind },
+                "subResource": "status",
+                "operation": operation,
+                "object": {
+                    "metadata": { "name": "web", "namespace": "demo" },
+                    "status": { "lastAppliedSpec": null }
+                },
+                "options": options,
+            }
+        })
+    }
+
+    async fn post_review(body: serde_json::Value) -> serde_json::Value {
+        let router = build_router();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn allows_application_status_write_from_operator_manager() {
+        let parsed = post_review(admission_status_write(
+            "Application",
+            Some("apprafter-operator"),
+            "UPDATE",
+        ))
+        .await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(true),
+            "the operator's own SSA status write must pass, or the reconcile breaks"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_application_status_write_from_other_manager() {
+        let parsed = post_review(admission_status_write(
+            "Application",
+            Some("kubectl-client-side-apply"),
+            "UPDATE",
+        ))
+        .await;
+        assert_eq!(parsed["response"]["allowed"], json!(false));
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("operator-owned"),
+            "expected ownership message, got {msg:?}"
+        );
+        assert!(
+            msg.contains("kubectl-client-side-apply"),
+            "expected the offending fieldManager in the message, got {msg:?}"
+        );
+        assert!(
+            msg.contains("lastAppliedSpec"),
+            "expected the baseline reference in the message, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_application_status_write_with_no_field_manager() {
+        let parsed = post_review(admission_status_write("Application", None, "UPDATE")).await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(false),
+            "an absent fieldManager must be denied (only the operator writes Application.status)"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_application_main_resource_write_regardless_of_manager() {
+        // A write to the MAIN Application resource (no subResource) is NOT
+        // status-gated — a valid spec from any writer passes as before.
+        let body = admission_review_for_kind(
+            "Application",
+            json!({ "spec": { "base": { "image": "ghcr.io/acme/web:1.0" } } }),
+        );
+        let parsed = post_review(body).await;
+        assert_eq!(parsed["response"]["allowed"], json!(true));
     }
 
     #[tokio::test]

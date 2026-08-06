@@ -21,6 +21,19 @@ webhooks:
         path: /validate
         port: 443
     rules:
+      # 2.16b (S-1): `applications` + `applications/status` BOTH listed.
+      # `Application.status` (specifically `status.lastAppliedSpec`) is the
+      # root of trust for the app-migration gate — every destructive-change
+      # detection diffs the incoming spec against that stamped baseline. A
+      # status-subresource write (`kubectl patch --subresource=status` or a
+      # direct `patch applications/status` API call) routes through a
+      # DIFFERENT URL from the main resource, so without `applications/status`
+      # here it BYPASSES admission entirely: any subject with `patch
+      # applications/status` RBAC could zero `lastAppliedSpec` and silently
+      # disarm the gate with no diff. Listing the subresource routes those
+      # writes through the validator, which rejects any writer other than the
+      # operator's SSA field manager (`apprafter-operator`). Mirrors the
+      # `migrationplans` + `migrationplans/status` shape (walk-fix #6).
       - apiGroups:
           - apprafter.io
         apiVersions:
@@ -30,6 +43,7 @@ webhooks:
           - UPDATE
         resources:
           - applications
+          - applications/status
         scope: Namespaced
   - name: platformstacks.apprafter.io
     sideEffects: None
