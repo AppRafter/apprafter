@@ -224,20 +224,48 @@ impl ApplicationMigrationStrategy {
             });
         }
 
-        // #11 public-hostname-add: adding the FIRST public hostname (old empty/
-        // None, new non-empty) on a `network: public` app publishes a new
-        // externally-reachable name. CO-FIRES with #10 when internal→public also
-        // adds a hostname — both land in `changes[]`, deliberately not merged.
-        // Gated on `new_net == "public"` (the hostname is inert until public);
-        // an existing-hostname CHANGE on a public app is the `domain-change` op
-        // above (requires-restart), so #11 covers only the None → Some add.
-        if new_net == "public" && old_host.as_deref().unwrap_or("").is_empty() {
-            if let Some(h) = new_host.as_deref().filter(|h| !h.is_empty()) {
+        // #11 public-hostname-add: publishing a NEW externally-reachable public
+        // name. The renderer routes EVERY entry of `expose.hostname`
+        // (`operator-rendering::render_httproute` puts the whole `as_slice_vec()`
+        // into `HTTPRoute.spec.hostnames` — 2.16b review Fix 2, verified at
+        // operator-rendering/src/lib.rs:200-207 + :536), so a SECOND hostname is
+        // just as public as the first. #11 therefore gates when the PUBLIC
+        // hostname SET GAINS any member — the None → Some FIRST-hostname add AND
+        // a One(h) → Many([h, h2]) SECOND-hostname add both qualify.
+        //
+        // Gated on `new_net == "public"` (a hostname is inert until public).
+        // CO-FIRES with #10 when internal→public also adds a hostname — both land
+        // in `changes[]`, deliberately not merged.
+        //
+        // De-duped against `domain-change` (requires-restart, above), which owns
+        // a CHANGE/removal of the FIRST hostname: the added members counted here
+        // EXCLUDE any host that is the new first hostname when domain-change is
+        // already firing (`old_host.is_some() && old_host != new_host`). So a
+        // pure `One(a) → One(b)` first-host swap stays domain-change ONLY, while a
+        // `One(a) → Many([a, b])` add fires #11 for the genuinely new `b`. The
+        // None → Some first add has no `domain-change` (old_host is None) so its
+        // new host is a legit #11 member.
+        if new_net == "public" {
+            let old_set = all_hostnames(old);
+            let domain_change_fired = old_host.is_some() && old_host != new_host;
+            let added: Vec<String> = all_hostnames(new)
+                .into_iter()
+                .filter(|h| !old_set.contains(h))
+                // The new first host is domain-change's territory when it fired —
+                // don't also count it as a #11 add.
+                .filter(|h| !(domain_change_fired && Some(h) == new_host.as_ref()))
+                .collect();
+            if !added.is_empty() {
+                let from = if old_set.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    old_set.join(",")
+                };
                 candidates.push(DestructiveChange {
                     trigger_type: "public-hostname-add".to_string(),
                     field: "expose.hostname".to_string(),
-                    from: Some(json!("(none)")),
-                    to: Some(json!(h)),
+                    from: Some(json!(from)),
+                    to: Some(json!(added.join(","))),
                     classification: "security-boundary".to_string(),
                 });
             }
@@ -635,15 +663,35 @@ fn needs_keys(needs: Option<&Needs>) -> Vec<String> {
 /// The first declared public hostname of a spec, or `None` when the
 /// Application declares no `expose.hostname`. `OneOrMany::One(h)` → `h`;
 /// `OneOrMany::Many(v)` → the first element (`None` for an empty vec).
-/// Only the first hostname participates in domain-change detection — a
-/// multi-hostname edit still gates on the primary, which is enough to
-/// flag the route change (the full hostname-set diff is render-side).
+/// The FIRST hostname participates in `domain-change` detection (a change
+/// or removal of the first-listed public route); the FULL set participates
+/// in the #11 `public-hostname-add` add-detection ([`all_hostnames`]).
 fn first_hostname(s: &ApplicationBaseSpec) -> Option<String> {
     match s.expose.as_ref().and_then(|e| e.hostname.as_ref()) {
         Some(OneOrMany::One(h)) => Some(h.clone()),
         Some(OneOrMany::Many(v)) => v.first().cloned(),
         None => None,
     }
+}
+
+/// EVERY declared hostname of a spec, in declared order, empties dropped.
+/// `None`/absent `expose.hostname` → empty vec; `OneOrMany::One(h)` → `[h]`;
+/// `OneOrMany::Many(v)` → `v`. 2.16b review Fix 2: the operator renderer
+/// exposes an externally-reachable route for ALL entries of
+/// `expose.hostname` (`operator-rendering::render_httproute` puts the whole
+/// `as_slice_vec()` into `HTTPRoute.spec.hostnames`), so adding a SECOND
+/// hostname publishes a new public name that #11 `public-hostname-add` must
+/// gate — not just the first. Empty strings are filtered so a blank entry
+/// is never treated as a routable name.
+fn all_hostnames(s: &ApplicationBaseSpec) -> Vec<String> {
+    s.expose
+        .as_ref()
+        .and_then(|e| e.hostname.as_ref())
+        .map(|h| h.as_slice_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|h| !h.is_empty())
+        .collect()
 }
 
 /// Render an `EnvRef` to a stable human string sentinel for a
@@ -662,8 +710,8 @@ fn render_env_ref(r: &EnvRef) -> String {
 }
 
 /// Whether an image reference is already pinned to a content digest
-/// (`repo@sha256:…`) rather than a floating tag. A pure, borrowing check
-/// mirroring the `@sha256:`-suffix detection in
+/// (`repo@<algo>:<hex>`) rather than a floating tag. A pure, borrowing check
+/// mirroring the digest detection in
 /// `operator-controllers-application::oci_resolve::parse_image_ref`
 /// (whose `ImageRef.is_digest` is set when `Reference::digest()` is
 /// present) and `operator-core::image_repo`'s `split('@')` — reimplemented
@@ -672,12 +720,21 @@ fn render_env_ref(r: &EnvRef) -> String {
 /// crate must not take a crate-cycle dependency on it (it depends only on
 /// `operator-core`). Used ONLY by the 2.16b Task 7 #13 carve-out: an
 /// already-digest image makes an `off → digest` policy flip a no-op, so it
-/// is NOT gated. Matches on the canonical `@sha256:` marker; a bare tag or
-/// nameless reference is not a digest.
+/// is NOT gated.
+///
+/// 2.16b review Fix 1: recognise ANY OCI digest algorithm, not just
+/// `sha256`. A reference is a digest when it carries an `@<algo>:<hex>`
+/// part with a non-empty `algo` and a non-empty `hex` after the `@` — so a
+/// `@sha512:…`/`@sha384:…`-pinned image is correctly seen as pinned and its
+/// `off → digest` flip is NOT false-positive-gated. A bare tag
+/// (`repo:v1` — the `:` is before any `@`), a nameless reference, or a `@`
+/// with no `algo:hex` after it is NOT a digest.
 fn image_is_digest(image: &str) -> bool {
-    image
-        .rsplit_once('@')
-        .is_some_and(|(_, digest)| digest.starts_with("sha256:"))
+    image.rsplit_once('@').is_some_and(|(_, digest)| {
+        digest
+            .split_once(':')
+            .is_some_and(|(algo, hex)| !algo.is_empty() && !hex.is_empty())
+    })
 }
 
 /// Keys present in `old` but absent from `new` — i.e. the `needs`
@@ -2126,6 +2183,146 @@ mod application_detect_destructive_tests {
             .any(|c| c.trigger_type == "network-visibility-escalation"));
     }
 
+    // ---- 2.16b review Fix 2: multi-hostname add (renderer routes ALL) ----
+
+    /// Build an `expose` with a MULTI-hostname (`OneOrMany::Many`) set on a
+    /// given network. `expose` (the scalar helper) only builds `One`.
+    fn expose_hosts(network: &str, hosts: &[&str]) -> ApplicationExpose {
+        ApplicationExpose {
+            network: Some(network.into()),
+            hostname: Some(OneOrMany::Many(
+                hosts.iter().map(|h| h.to_string()).collect(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    // Fix 2 CORE: on a PUBLIC app, adding a SECOND hostname with the FIRST
+    // unchanged (`One(a) → Many([a, b])`) publishes a new externally-reachable
+    // name — the renderer routes ALL hostnames (operator-rendering
+    // render_httproute → HTTPRoute.spec.hostnames = full as_slice_vec()) — so it
+    // MUST gate as #11 public-hostname-add for the genuinely-new `b`, WITHOUT
+    // double-firing domain-change (the first host `a` is unchanged).
+    #[test]
+    fn adding_second_public_hostname_gates_hostname_add_only() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(
+                base(),
+                expose_hosts("public", &["a.example.com", "b.example.com"]),
+            ),
+        );
+        let hn = cs
+            .iter()
+            .find(|c| c.trigger_type == "public-hostname-add")
+            .expect("public-hostname-add candidate");
+        assert_eq!(hn.classification, "security-boundary");
+        assert_eq!(hn.field, "expose.hostname");
+        // `from` = the pre-existing set; `to` = the ADDED host(s) only.
+        assert_eq!(hn.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+        assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        // The first host is UNCHANGED → domain-change must NOT co-fire.
+        assert!(!cs.iter().any(|c| c.trigger_type == "domain-change"));
+    }
+
+    // Fix 2: the None → Some FIRST add still gates (regression of the original
+    // #11 behaviour — the broadened set-gain logic subsumes it).
+    #[test]
+    fn none_to_some_first_hostname_still_gates_hostname_add() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", None)),
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+        );
+        let hn = cs
+            .iter()
+            .find(|c| c.trigger_type == "public-hostname-add")
+            .expect("public-hostname-add candidate");
+        assert_eq!(hn.from.as_ref().unwrap().as_str().unwrap(), "(none)");
+        assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+    }
+
+    // Fix 2: removing a hostname (`Many([a, b]) → One(a)`) is NOT a #11 add —
+    // the set only LOST a member. It also does not disturb the first host, so
+    // domain-change stays quiet too (a soft edit). (First-host REMOVAL is
+    // covered by `hostname_removal_on_public_app_gates_with_removed_sentinel`.)
+    #[test]
+    fn removing_a_non_first_public_hostname_does_not_gate_hostname_add() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(
+                base(),
+                expose_hosts("public", &["a.example.com", "b.example.com"]),
+            ),
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+        );
+        assert!(!cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
+        // First host unchanged (a) → domain-change does not fire either.
+        assert!(!cs.iter().any(|c| c.trigger_type == "domain-change"));
+    }
+
+    // Fix 2: Many → One where the FIRST host is REMOVED (`Many([a, b]) → One(b)`)
+    // stays domain-change (first-host change), and does NOT also fire #11 — `b`
+    // was already in the old set (no new public name), so nothing is added.
+    #[test]
+    fn many_to_one_first_host_removed_stays_domain_change_only() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(
+                base(),
+                expose_hosts("public", &["a.example.com", "b.example.com"]),
+            ),
+            &with_expose(base(), expose("public", Some("b.example.com"))),
+        );
+        // First host changed a → b → domain-change fires.
+        let dc = cs
+            .iter()
+            .find(|c| c.trigger_type == "domain-change")
+            .expect("domain-change candidate");
+        assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        // `b` was already exposed → no NEW public name → #11 must NOT fire.
+        assert!(!cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
+    }
+
+    // Fix 2: a first-host SWAP that ALSO adds a net-new host
+    // (`One(a) → Many([b, c])`) fires domain-change for the first-host change
+    // (a → b) AND #11 for the genuinely-new `c` — but NOT double-count `b` (it
+    // is domain-change's new first host).
+    #[test]
+    fn first_host_swap_plus_new_host_fires_both_without_double_counting_first() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(
+                base(),
+                expose_hosts("public", &["b.example.com", "c.example.com"]),
+            ),
+        );
+        let dc = cs
+            .iter()
+            .find(|c| c.trigger_type == "domain-change")
+            .expect("domain-change candidate");
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        let hn = cs
+            .iter()
+            .find(|c| c.trigger_type == "public-hostname-add")
+            .expect("public-hostname-add candidate");
+        // Only `c` — `b` is domain-change's new first host, not a #11 add.
+        assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "c.example.com");
+    }
+
+    // Fix 2: on an INTERNAL app the renderer emits NO HTTPRoute, so a
+    // multi-hostname add is inert — #11 must NOT gate (its trigger is
+    // new_net == "public").
+    #[test]
+    fn adding_second_hostname_on_internal_app_does_not_gate() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("internal", Some("a.example.com"))),
+            &with_expose(
+                base(),
+                expose_hosts("internal", &["a.example.com", "b.example.com"]),
+            ),
+        );
+        assert!(cs.is_empty());
+    }
+
     // #12 public-port-retarget: on a PUBLIC app a port change is gated; on a
     // non-public app the same port change is soft (no public surface).
     #[test]
@@ -2220,6 +2417,51 @@ mod application_detect_destructive_tests {
         assert!(!image_is_digest("ghcr.io/a/b:v1"));
         assert!(!image_is_digest("ghcr.io/a/b")); // bare, no tag/digest
         assert!(!image_is_digest("localhost:5000/app:dev")); // registry-port colon, not a digest
+    }
+
+    // 2.16b review Fix 1: a digest can use ANY OCI algo, not just sha256.
+    // A `@sha512:…`/`@sha384:…`-pinned image is a digest, so #13's off→digest
+    // carve-out must fire (no FALSE-POSITIVE gate); a floating tag / bare ref
+    // is still NOT a digest (so #13 still gates it).
+    #[test]
+    fn image_is_digest_detects_non_sha256_algos() {
+        // sha512 / sha384 pins are digests (not floating tags).
+        assert!(image_is_digest(&format!(
+            "ghcr.io/a/b@sha512:{}",
+            "a".repeat(128)
+        )));
+        assert!(image_is_digest(&format!(
+            "ghcr.io/a/b@sha384:{}",
+            "a".repeat(96)
+        )));
+        // A tagged reference that ALSO carries a digest is a digest.
+        assert!(image_is_digest(&format!(
+            "ghcr.io/a/b:v1@sha512:{}",
+            "a".repeat(128)
+        )));
+        // NOT digests: floating tag / latest / bare — these still GATE on off→resolve.
+        assert!(!image_is_digest("ghcr.io/a/b:v1"));
+        assert!(!image_is_digest("ghcr.io/a/b:latest"));
+        assert!(!image_is_digest("nginx"));
+        // Malformed `@` parts are not digests (empty algo or empty hex).
+        assert!(!image_is_digest("ghcr.io/a/b@")); // nothing after @
+        assert!(!image_is_digest("ghcr.io/a/b@sha256:")); // empty hex
+        assert!(!image_is_digest("ghcr.io/a/b@:deadbeef")); // empty algo
+    }
+
+    // 2.16b review Fix 1: end-to-end through #13 — an `off → digest` flip on a
+    // sha512-pinned image must NOT gate (the pin is immutable content, so the
+    // policy change is inert), where the pre-fix `@sha256:`-only check would
+    // have false-positive-gated it.
+    #[test]
+    fn imagepolicy_off_to_resolve_on_sha512_pinned_image_is_noop() {
+        let sha512 = format!("ghcr.io/a/b@sha512:{}", "a".repeat(128));
+        assert!(!ApplicationMigrationStrategy::detect_all(
+            &with_image_policy(base(), &sha512, "off"),
+            &with_image_policy(base(), &sha512, "digest"),
+        )
+        .iter()
+        .any(|c| c.trigger_type == "image-policy-relaxation"));
     }
 }
 
