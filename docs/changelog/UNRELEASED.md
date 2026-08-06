@@ -9,6 +9,76 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator/webhook vX / cue-cmp vY / platform-stack Z — 2.16b security-axis (2026-08-06)
+
+<!-- TODO(release): fill versions X/Y/Z at the coordinated release step (operator+webhook bump — functional operator + webhook change; cue-cmp bump — schemas/v1alpha1/migrationplan.cue + meta.cue gained the classifications[]/changes[] rollup fields; platform-stack currentVersion bump — chart-source component_argocd.cue health-Lua changed + re-pins the new operator/cue-cmp). No CLI change in this slice unless a CLI verb was touched. -->
+
+Extends the app-scope destructive classifier (ADR 0051) along the **security
+axis** and hardens the gate against being disarmed (ADR 0052). ADR 0051 gates
+the *availability / data-loss* axis (removals break a running service); the
+inverted threat model is an actor with manifest write access who **adds and
+escalates** (public exposure, secret references, image-policy relaxation).
+Almost the entire soft column was soft *because* it is additive — which is the
+attack direction.
+
+### Added
+
+- **`security-boundary` class (severity 4)** — ranked **above** `data-migration`
+  (a data-loss change is coverable by restic backups; a leaked credential is
+  irreversible and uncoverable), so it wins the plan primary in a multi-op edit.
+  `image-path-change` is **reclassified** from `requires-restart` to
+  `security-boundary` (a different repository can serve different content).
+- **Seven additive / escalation triggers** (all `security-boundary`, all pause
+  for approval, none a webhook reject): `env-secret-ref-add` (#7, `secret:` only
+  — `claim.*` is self-scoped and stays soft), `env-ref-downgrade` (#8, ref →
+  literal), `env-secret-ref-retarget` (#9, secret → different secret),
+  `network-visibility-escalation` (#10, internal → public),
+  `public-hostname-add` (#11, a public hostname set gains a member),
+  `public-port-retarget` (#12, public app port change), and
+  `image-policy-relaxation` (#13, `imagePolicy.resolve` off → digest on a
+  floating tag). `from`/`to` carry only string sentinels — never a literal env
+  value.
+- **Plan rollup** — `spec.risks.classifications[]` (distinct classes present,
+  sorted severity-descending) and `spec.changes[]` (every detected change:
+  `type`, `field`, `classification`, `severity`, `from`, `to`). The rollup kills
+  approve-laundering — a `security-boundary` op can no longer hide behind a
+  benign-looking primary. (Wire field for the trigger kind is `type`;
+  `MigrationChange.trigger` is `#[serde(rename = "type")]`, so drill-in
+  consumers read `.spec.changes[*].type`.)
+- **`apprafter_soft_destructive_total{trigger,namespace}`** — increments on every
+  soft destructive op; **`apprafter_claim_retained_total{backend,namespace}`** —
+  ends the previously silent `RetainedClaim` creation (review S-3 observability).
+- **`needs.*.selector` multi-provider tripwire** — a soft selector change becomes
+  dangerous once a second `ServiceProvider` of the same type is registered; the
+  application controller best-effort counts providers and, if more than one,
+  emits a loud error log + a Warning Event + the soft-destructive metric
+  (list-failure tolerant — never fails the reconcile).
+- **Argo CD health-Lua drill-in** — the `MigrationPlan` health message now renders
+  `spec.risks.classifications` as badges and iterates `spec.changes[]` as a
+  per-change drill-in list (additive; all values string-coerced with nil guards).
+
+### Changed
+
+- **S-4 — approval bound to a content hash.** The plan stamps
+  `spec.trigger.approvedSpecHash` over the **full** candidate set; at consume time
+  the operator re-verifies it, so an approval for one edit cannot be applied to a
+  different edit and any drift re-gates the change as a fresh pending-approval
+  plan (a legacy plan with no hash still consumes).
+- **`SoftDestructiveChange` Events escalate to `Warning`** for three ops
+  (`needs.*.selector` change, env-literal removal, scale-down N→M); other soft
+  ops stay `Normal`.
+
+### Fixed / hardened
+
+- **S-1 — `Application.status` write protection.** The admission webhook now
+  registers `applications/status` and rejects any status write whose SSA field
+  manager is not `apprafter-operator`, so the diff baseline
+  (`status.lastAppliedSpec`) can no longer be zeroed to disarm the gate.
+- **§7.2 — `spec.environment` immutable on UPDATE.** The webhook rejects any
+  change to `spec.environment` (flipping it swaps the entire effective spec — a
+  laundering vector; a different environment is a different deployment
+  `<name>-<env>`).
+
 ## cli v0.2.34 / operator v0.2.34 / platform-stack 0.2.43 / cue-cmp v0.1.15 — 2.16b app-scope migration (auto-detect + Argo approval) (2026-07-18)
 
 Turns a **destructive edit to a user `Application`** into a gated,

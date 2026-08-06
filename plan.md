@@ -3615,6 +3615,89 @@ Storage-примитивы поверх 2.6b owned-disk пайплайна. Жё
 
 ---
 
+### 2.16b-sec — App-migration security axis
+> 🏁 SR: A · order 3.7 (расширение 2.16b — та же машина, вторая ось) — гейт **аддитивных/эскалационных** правок манифеста (инвертированная модель угроз) + структурное упрочнение самого гейта.
+> ✅ **ЗАКРЫТО 2026-08-06** (order-3.7, SR:A; ADR 0052 + spec `docs/superpowers/specs/2026-08-06-2.16b-security-axis-design.md`, ветка `feat/2.16b-security-axis`). 2.16b гейтит ось **availability/data-loss** (removal ломает работающий сервис). Инвертированная модель — актор с write-доступом к манифесту (человек ИЛИ агент, ADR 0036) **не удаляет, а ДОБАВЛЯЕТ/ЭСКАЛИРУЕТ**: почти вся soft-колонка soft именно потому, что аддитивна = это и есть направление атаки. Добавлены: (a) новый класс **`security-boundary` (severity 4, выше `data-migration`=3** — потеря данных покрывается restic-бэкапами, утёкший креденшл — нет; irreversible+uncoverable → бьёт primary в мульти-op правке); (b) **семь триггеров** #7–#13 (все `security-boundary`, все PAUSE-for-approval, ни один — не webhook-reject): #7 `env-secret-ref-add` (только `secret:`, `claim.*` self-scoped → soft), #8 `env-ref-downgrade` (ref→литерал), #9 `env-secret-ref-retarget` (secret→secret), #10 `network-visibility-escalation` (не-public→public), #11 `public-hostname-add` (любой новый public-хост в наборе), #12 `public-port-retarget` (смена public-порта), #13 `image-policy-relaxation` (`imagePolicy.resolve` off→не-off на плавающем теге; already-digest = no-op, `digest→off` = hardening/soft); `image-path-change` **переклассифицирован** requires-restart→`security-boundary`; (c) **rollup** `spec.risks.classifications[]` + drill-in `spec.changes[]` (каждый change: `type`/`field`/`classification`/`severity`/`from`/`to` — wire-поле триггера = **`.type`**, т.к. `MigrationChange.trigger` это `#[serde(rename="type")]`) — убивает approve-laundering (класс не может спрятаться за benign primary). **Три структурных фикса:** **S-4** — approve привязан к контент-хешу `spec.trigger.approvedSpecHash` (полный candidate-set, collision-free; approve-X-нельзя-apply-Y, re-gate при дрейфе; legacy-план без хеша всё ещё consume'ится); **S-1** — `applications/status` под webhook-защитой (только fieldManager `apprafter-operator` пишет `Application.status` → нельзя обнулить `lastAppliedSpec` baseline); **§7.2** — `spec.environment` immutable на UPDATE (флип env свопает всю эффективную спеку → laundering-вектор, режется на webhook до классификатора). **Tripwire** `needs.*.selector`: классификатор чистый (не читает кластер), но контроллер best-effort считает `ServiceProvider`'ов этого типа — если >1 → LOUD `error!` + Warning Event + `apprafter_soft_destructive_total` (list-tolerant, никогда не роняет reconcile). **Soft-observability:** `EventType::Warning` для трёх (`needs.*.selector`, env-литерал removal, scale-down N→M) + метрика `apprafter_soft_destructive_total{trigger,namespace}` на КАЖДЫЙ soft-op; `apprafter_claim_retained_total{backend,namespace}` заканчивает тихое создание RetainedClaim (review S-3 — метрика зашипилась, gate — нет, отдельный item ниже). **Live walk GREEN** (security-эскалация → план → `classifications` содержит `security-boundary` → approve → applied; S-4 stale-approval re-gates; S-1 status-patch отклонён; §7.2 env-флип отклонён; tripwire на 2 провайдерах; негативы не гейтятся). ADR 0052 + spec.md §3.8 (Revision 12→13) актуализированы; Argo health-Lua (`component_argocd.cue`) расширен drill-in'ом classifications+changes[]. **Отложено отдельными plan-items** (ниже): S-2 (authority-модель), S-3 (delete-finalizer), §5 (pre-registration новых полей), §10 (deny-by-default `@mp`).
+
+**Контекст:** 2.16b (ADR 0051) закрыл ось «removal ломает running-сервис». Мотивирующая гейт угроза (ADR 0036) — **не** случайное удаление, а актор с manifest-write, который **эскалирует** (public-exposure, secret-refs, image-policy relaxation). Плюс review нашёл 3 структурных дыры, обезоруживающих сам гейт независимо от набора триггеров: (S-4) approve переносим между правками (сравнивался только `(trigger,field)`, не `from/to`), (S-1) `Application.status` не защищён (любой с `patch applications/status` обнуляет baseline), (§7.2) `spec.environment` мутабелен (флип свопает всю эффективную спеку).
+
+**Поставка:**
+- [x] Класс `security-boundary` (sev 4) + переклассификация `image-path-change`; `classification_severity` + `pick_primary`-тесты.
+- [x] Триггеры #7–#13 (полная юнит-таблица + негативы: claim-ref add НЕ гейт, literal→literal НЕ гейт, non-public port НЕ гейт, `digest→off` НЕ гейт).
+- [x] Rollup `classifications[]` + `changes[]` (+ 4 инварианта: primary∈changes; classifications=distinct(changes)-sorted; changes непусто ⟺ план создан; primary.severity=max).
+- [x] S-4 `approvedSpecHash` (полный candidate-set, consume-time re-verify, re-gate при дрейфе) + regression-тест.
+- [x] S-1 `applications/status` webhook rule + fieldManager-reject.
+- [x] §7.2 `spec.environment` immutable-on-UPDATE (oldObject в валидатор).
+- [x] Tripwire `needs.*.selector` (>1 провайдер → loud+event+метрика, list-tolerant) + инвариант-тест.
+- [x] Warning-events для 3 soft-op + `apprafter_soft_destructive_total`; `apprafter_claim_retained_total` (S-3 observability).
+- [x] Health-Lua drill-in (classifications badges + `changes[]` list, всё строками, nil-guards).
+- [x] Live kind+Argo security walk (эскалация → план → approve; S-4/S-1/§7.2/tripwire/негативы).
+
+**Acceptance:** эскалационная правка (`internal→public`+hostname, `secret:`-ref add, image-policy off→digest, image-repo change) → авто-план с классом `security-boundary`, `changes[]` несёт весь набор; approve снимает паузу; approve НЕ переносится на другую правку (S-4); status-обнуление не-оператором отклонено (S-1); env-флип отклонён (§7.2); `claim.*`-ref add / literal→literal / non-public-port / `digest→off` НЕ гейтятся.
+
+**Зависит от:** 2.16b / ADR 0051 (машина классификатора + app-scope MigrationPlan), ADR 0046 (`claim.*` vs `secret:`), ADR 0036 (agent-модель угроз), 1.83 (expose/public), 2.4h (imagePolicy). **Связан с** [[project_argo_approval_surface]].
+
+**Размер:** M-L · упрочнение (S-1/S-4/§7.2) + вторая ось классификатора + rollup. SR:A order 3.7.
+
+---
+
+#### 2.16b-sec-S2 — Approve-authority hardening (manifest-write ≠ approve)
+> 🏁 SR: A · doc-first, отложено из 2.16b-sec §E — задокументировано в spec.md §3.8 (S-2), но **RBAC-scoping status-write требует ревизии**.
+
+**Контекст:** SSA-fieldManager — это **метка владения, не токен аутентификации**. S-1 отклоняет `Application.status`-запись, если fieldManager ≠ `apprafter-operator`, но целостность этого держится только на RBAC: `patch applications/status` ДОЛЖЕН быть scoped на SA оператора, иначе другой subject предъявит тот же fieldManager. Авторитетный approve-путь — k8s `kubectl patch --subresource=status` (RBAC на MigrationPlan/status), Argo-кнопка — convenience поверх Argo-RBAC. Git-write в одиночку approve'ить не должен.
+
+- [ ] Аудит + scoping RBAC: подтвердить, что `patch applications/status` и `patch migrationplans/status` даны ТОЛЬКО SA оператора (и approve-субъектам явно) — не широким ролям.
+- [ ] Документировать authority-модель в operator-guide (write ≠ approve; кто может approve и через что).
+- [ ] (открытое решение) рассмотреть userInfo-гейт как defense-in-depth поверх fieldManager, если найдётся subject с легитимным SSA под тем же менеджером.
+
+**Зависит от:** 2.16b-sec (S-1 shipped). **Размер:** S · doc + RBAC-аудит.
+
+---
+
+#### 2.16b-sec-S3 — Application-delete finalizer (reattach-by-name gate)
+> 🏁 SR: A · order 3.7+ — метрика `apprafter_claim_retained_total` зашипилась в 2.16b-sec, GATE — нет.
+
+**Контекст:** удаление `Application` с `needs` НЕ гейтится: RetainedClaim создаётся тихо (теперь под метрикой), а reattach использует `cnpg::k8s_name(ns,name)` **без UID-проверки** → повторное имя re-адоптит данные в пределах 7-дневного grace → adoption-вектор. Метрика 2.16b-sec ends «тихое» создание, но не закрывает сам вектор.
+
+- [ ] Finalizer на `Application`: при delete, если `spec.needs` непуст → создать `data-migration` MigrationPlan (gate до фактического GC/retain claim'а), по образцу app-scope ns/ownerRef/CLI (ADR 0051).
+- [ ] Reattach-by-name: UID-check или explicit-adopt подтверждение, чтобы same-name не re-адоптил чужие данные молча.
+- [ ] Юнит + walk: delete app с needs → план создан → approve → GC; reattach другого app с тем же именем → не тихая адопция.
+
+**Зависит от:** 2.16b-sec (метрика), 2.4f (RetainedClaim/GC), ADR 0051 (scope-паттерн). **Размер:** M.
+
+---
+
+#### 2.16b-sec-S5 — Pre-registration новых полей в таксономию (каждое — с gate-решением)
+> 🏁 SR: A · «each must land WITH a gate decision» — новые/растущие поля схемы не должны попадать в gate-слепую зону.
+
+**Контекст:** несколько полей ещё не классифицированы (нет ни gate, ни явного soft-решения) — при добавлении/изменении проходят без разбора. Каждое надо явно отнести к hard/security/soft ПРИ приземлении соответствующего поля.
+
+- [ ] `connects.egress.external` (изменение egress-allowlist) — gate-решение.
+- [ ] `expose.rewrites` / `expose.paths` (path-роутинг) — gate-решение.
+- [ ] `expose.tls` → `#TlsOptions` (когда 4.1b раскроет полный TLS) — gate-решение.
+- [ ] `confidential: true → false` (де-эскалация конфиденциальности) — вероятно `security-boundary`.
+- [ ] `egressIP.pool` (смена исходящего IP) — gate-решение.
+- [ ] `needs.*.version` major (major-upgrade сервиса) — вероятно `data-migration`/`breaking`.
+- [ ] `needs.disk.class` (смена storage-класса) — вероятно `data-migration`.
+
+**Зависит от:** 2.16b/2.16b-sec (таксономия), приземление соответствующих полей (1.83/4.1b/2.4). **Размер:** S каждое · чекбоксы-заметки в соответствующих plan-items.
+
+---
+
+#### 2.16b-sec-S10 — Deny-by-default `@mp` CUE-атрибут + CI-coverage-gate
+> 🏁 SR: A · **ADR-first** — архитектурный сдвиг: каждое поле схемы обязано нести явный `@mp(...)` классификатор, иначе CI падает.
+
+**Контекст:** сейчас таксономия — allowlist в коде классификатора; новое поле схемы по умолчанию **не** классифицировано (slip-through, см. S5). Deny-by-default: `@mp` на КАЖДОМ поле `schemas/v1alpha1/**` (`gate`/`soft`/`security` + класс) + CI-гейт, проверяющий 100%-покрытие полей атрибутом — новое поле без `@mp` роняет CI, заставляя принять gate-решение до merge.
+
+- [ ] ADR: модель `@mp`-атрибута (значения, семантика, как классификатор его читает vs хардкод-таблица).
+- [ ] `@mp(...)` на всех полях `schemas/v1alpha1/**`.
+- [ ] CI-coverage-gate: каждое поле схемы несёт `@mp` (иначе fail).
+- [ ] (опц.) классификатор читает `@mp` как источник истины вместо/поверх хардкод-таблицы.
+
+**Зависит от:** 2.16b/2.16b-sec (таксономия), ADR 0047 (CUE как единственный источник схемы). **Размер:** L · ADR + туча аннотаций + CI-гейт.
+
+---
+
 ### 2.16b-sc — SourceCredential-scope MigrationPlan wiring
 > 🏁 SR: A · order 3.7 (следом за 2.16b — тот же «флип», другой scope) — включить live-создание MigrationPlan при деструктивной правке `SourceCredential` (ре-анкор co-отложенного 1.79c S5).
 
