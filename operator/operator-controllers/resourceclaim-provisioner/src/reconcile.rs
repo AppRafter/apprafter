@@ -1179,6 +1179,21 @@ async fn snapshot_retained_claim(
     api.patch(&object_name, &apply_params(), &Patch::Apply(&payload))
         .await?;
 
+    // 2.16b S3: count every RetainedClaim snapshot so the (previously
+    // silent) grace-retention creation is observable. Labelled by the
+    // claim's backend (empty for a never-scheduled claim → the CNPG-shape
+    // default) and its source namespace. The `shared-disk` arm returned
+    // above WITHOUT snapshotting, so it is correctly never counted here.
+    let backend_label = if backend.is_empty() {
+        "unknown"
+    } else {
+        backend.as_str()
+    };
+    ctx.metrics
+        .claim_retained_total
+        .with_label_values(&[backend_label, ns])
+        .inc();
+
     info!(
         %name, %ns, snapshot = %object_name, %retain_until,
         "RetainedClaim snapshot applied"

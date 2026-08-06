@@ -13,6 +13,12 @@
 //!   - apprafter_claim_gc_total{result,namespace} — RetainedClaim
 //!     GC sweeps (role/DB/Secret drop after the 7-day grace), by
 //!     result {success, error}.
+//!   - apprafter_soft_destructive_total{trigger,namespace} — soft
+//!     (un-gated but potentially-disruptive) Application edits that
+//!     rolled through, by trigger label (2.16b S7.1).
+//!   - apprafter_claim_retained_total{backend,namespace} —
+//!     RetainedClaim snapshots created on claim delete, by backend
+//!     (2.16b S3 — ends the silent RetainedClaim creation).
 //!
 //! Metrics are registered into a single `Registry` that the HTTP
 //! `/metrics` handler in `apprafter-operator` encodes.
@@ -28,6 +34,8 @@ pub struct Metrics {
     pub claim_provisioned_total: CounterVec,
     pub claim_gc_total: CounterVec,
     pub image_resolve_total: CounterVec,
+    pub soft_destructive_total: CounterVec,
+    pub claim_retained_total: CounterVec,
 }
 
 impl Default for Metrics {
@@ -103,6 +111,24 @@ impl Metrics {
         )
         .expect("CounterVec must build with a non-empty name");
 
+        let soft_destructive_total = CounterVec::new(
+            opts!(
+                "apprafter_soft_destructive_total",
+                "Soft (un-gated but potentially-disruptive) Application edits that rolled through, by trigger and namespace"
+            ),
+            &["trigger", "namespace"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
+        let claim_retained_total = CounterVec::new(
+            opts!(
+                "apprafter_claim_retained_total",
+                "RetainedClaim snapshots created on claim delete, by backend and namespace"
+            ),
+            &["backend", "namespace"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
         registry
             .register(Box::new(reconcile_total.clone()))
             .expect("reconcile_total registers cleanly");
@@ -124,6 +150,12 @@ impl Metrics {
         registry
             .register(Box::new(image_resolve_total.clone()))
             .expect("image_resolve_total registers cleanly");
+        registry
+            .register(Box::new(soft_destructive_total.clone()))
+            .expect("soft_destructive_total registers cleanly");
+        registry
+            .register(Box::new(claim_retained_total.clone()))
+            .expect("claim_retained_total registers cleanly");
 
         Self {
             registry,
@@ -134,6 +166,8 @@ impl Metrics {
             claim_provisioned_total,
             claim_gc_total,
             image_resolve_total,
+            soft_destructive_total,
+            claim_retained_total,
         }
     }
 
@@ -177,6 +211,12 @@ mod tests {
             .with_label_values(&["success", "apprafter-system"])
             .inc();
         m.image_resolve_total.with_label_values(&["ok"]).inc();
+        m.soft_destructive_total
+            .with_label_values(&["scale-down", "demo"])
+            .inc();
+        m.claim_retained_total
+            .with_label_values(&["cloudnative-pg", "demo"])
+            .inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -188,6 +228,8 @@ mod tests {
         assert!(body.contains("apprafter_claim_provisioned_total"), "{body}");
         assert!(body.contains("apprafter_claim_gc_total"), "{body}");
         assert!(body.contains("apprafter_image_resolve_total"), "{body}");
+        assert!(body.contains("apprafter_soft_destructive_total"), "{body}");
+        assert!(body.contains("apprafter_claim_retained_total"), "{body}");
     }
 
     #[test]
