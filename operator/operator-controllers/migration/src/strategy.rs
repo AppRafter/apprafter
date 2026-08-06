@@ -1636,6 +1636,34 @@ mod application_detect_destructive_tests {
             ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap()
         );
     }
+
+    // ---- 2.16b S1.4: no secret material ever enters a plan-readable field ----
+
+    // A classifier-produced `from`/`to` must NEVER contain a literal env
+    // VALUE — only ref SENTINELS (`claim.<type>.<field>`, `secret:<name>/<key>`)
+    // and structural markers reach the MigrationPlan, which is world-readable to
+    // any principal with plan-read RBAC. This holds today via the type guard:
+    // only `EnvValue::Ref` gates (env-ref-removal), while a `Literal` removal /
+    // change is SOFT (no candidate). This is the regression guard so a future
+    // change can't leak a secret into a plan-readable field.
+    #[test]
+    fn from_to_never_contain_literal_env_values() {
+        let secret = "sup3r-s3cret-token-xyz";
+        // (a) literal removed (soft) — no candidate should carry the value.
+        let old_a = with_env(base(), "TOKEN", EnvValue::Literal(secret.into()));
+        let new_a = base();
+        // (b) literal changed to another literal (soft).
+        let new_b = with_env(base(), "TOKEN", EnvValue::Literal("other".into()));
+        for (old, new) in [(&old_a, &new_a), (&old_a, &new_b)] {
+            for c in ApplicationMigrationStrategy::detect_all(old, new) {
+                let s = format!("{:?}{:?}", c.from, c.to);
+                assert!(
+                    !s.contains(secret),
+                    "classifier leaked a literal env value into from/to: {s}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
