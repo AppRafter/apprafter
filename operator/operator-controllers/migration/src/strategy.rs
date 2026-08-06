@@ -207,6 +207,66 @@ impl ApplicationMigrationStrategy {
             });
         }
 
+        // 2.16b Task 7 (#10/#11/#12): expose-escalation security-boundary
+        // triggers. All PAUSE for approval (never a webhook reject).
+
+        // #10 network-visibility-escalation: a non-public → public flip widens
+        // the app's blast radius from cluster-internal to the public Gateway.
+        // The reverse (public → non-public) is the soft `network-visibility-change`
+        // (requires-restart) op above — a DE-escalation, not gated here.
+        if old_net != "public" && new_net == "public" {
+            candidates.push(DestructiveChange {
+                trigger_type: "network-visibility-escalation".to_string(),
+                field: "expose.network".to_string(),
+                from: Some(json!(old_net)),
+                to: Some(json!("public")),
+                classification: "security-boundary".to_string(),
+            });
+        }
+
+        // #11 public-hostname-add: adding the FIRST public hostname (old empty/
+        // None, new non-empty) on a `network: public` app publishes a new
+        // externally-reachable name. CO-FIRES with #10 when internal→public also
+        // adds a hostname — both land in `changes[]`, deliberately not merged.
+        // Gated on `new_net == "public"` (the hostname is inert until public);
+        // an existing-hostname CHANGE on a public app is the `domain-change` op
+        // above (requires-restart), so #11 covers only the None → Some add.
+        if new_net == "public" && old_host.as_deref().unwrap_or("").is_empty() {
+            if let Some(h) = new_host.as_deref().filter(|h| !h.is_empty()) {
+                candidates.push(DestructiveChange {
+                    trigger_type: "public-hostname-add".to_string(),
+                    field: "expose.hostname".to_string(),
+                    from: Some(json!("(none)")),
+                    to: Some(json!(h)),
+                    classification: "security-boundary".to_string(),
+                });
+            }
+        }
+
+        // #12 public-port-retarget: on a PUBLIC app, changing the exposed port
+        // moves the public Service's target — a reachability/security surface
+        // change. `expose.port` is a required field read verbatim by the
+        // renderer (no render-time default), so the comparison is a direct
+        // `i32` diff. A port change on a non-public app is soft (no public
+        // surface). We require `new_net == "public"` — the app is publicly
+        // routed AFTER the edit; a same-edit internal→public port move is
+        // already covered by #10's escalation.
+        if new_net == "public" {
+            let old_port = old.expose.as_ref().map(|e| e.port);
+            let new_port = new.expose.as_ref().map(|e| e.port);
+            if let (Some(op), Some(np)) = (old_port, new_port) {
+                if op != np {
+                    candidates.push(DestructiveChange {
+                        trigger_type: "public-port-retarget".to_string(),
+                        field: "expose.port".to_string(),
+                        from: Some(json!(op.to_string())),
+                        to: Some(json!(np.to_string())),
+                        classification: "security-boundary".to_string(),
+                    });
+                }
+            }
+        }
+
         // Scale-to-zero. `replicas` is optional and resolves to 1 at
         // render time (application.cue), so an absent value is the
         // effective `1`. Only the `>0 -> 0` transition is destructive
@@ -244,6 +304,43 @@ impl ApplicationMigrationStrategy {
                     field: "spec.image".to_string(),
                     from: Some(json!(old_repo)),
                     to: Some(json!(new_repo)),
+                    classification: "security-boundary".to_string(),
+                });
+            }
+        }
+
+        // 2.16b Task 7 (#13) image-policy-relaxation: turning `imagePolicy.resolve`
+        // OFF → not-off (i.e. re-enabling tag→digest resolution) relaxes a PINNED
+        // reference back to a floating, mutable pull surface — a security-boundary
+        // change (a moved tag can now serve different content without a spec
+        // edit). Two carve-outs keep this from firing on non-relaxations:
+        //   * an already-DIGEST image is a no-op — `off`/`digest` both render the
+        //     verbatim digest, so re-enabling resolution changes nothing.
+        //   * `digest → off` is HARDENING (pinning the tag verbatim), NOT a
+        //     relaxation — soft.
+        // `resolve` is optional and defaults to `digest` (ADR 0040); an absent
+        // NEW policy is therefore treated as `digest` (relaxation when old was
+        // `off`), and an absent OLD policy is `digest` (never `off`, so no
+        // relaxation). We read the new image (the reference that will be pulled)
+        // for the digest carve-out.
+        let old_resolve = old
+            .image_policy
+            .as_ref()
+            .and_then(|p| p.resolve.as_deref())
+            .unwrap_or("digest");
+        let new_resolve = new
+            .image_policy
+            .as_ref()
+            .and_then(|p| p.resolve.as_deref())
+            .unwrap_or("digest");
+        if old_resolve == "off" && new_resolve != "off" {
+            let new_is_digest = new.image.as_deref().map(image_is_digest).unwrap_or(false);
+            if !new_is_digest {
+                candidates.push(DestructiveChange {
+                    trigger_type: "image-policy-relaxation".to_string(),
+                    field: "imagePolicy.resolve".to_string(),
+                    from: Some(json!("off")),
+                    to: Some(json!(new_resolve)),
                     classification: "security-boundary".to_string(),
                 });
             }
@@ -562,6 +659,25 @@ fn render_env_ref(r: &EnvRef) -> String {
         EnvRef::Claim(target) => format!("claim.{target}"),
         EnvRef::Secret(target) => format!("secret:{target}"),
     }
+}
+
+/// Whether an image reference is already pinned to a content digest
+/// (`repo@sha256:…`) rather than a floating tag. A pure, borrowing check
+/// mirroring the `@sha256:`-suffix detection in
+/// `operator-controllers-application::oci_resolve::parse_image_ref`
+/// (whose `ImageRef.is_digest` is set when `Reference::digest()` is
+/// present) and `operator-core::image_repo`'s `split('@')` — reimplemented
+/// here (rather than calling `parse_image_ref`) because that validated
+/// parser lives in the application-controller crate, and the migration
+/// crate must not take a crate-cycle dependency on it (it depends only on
+/// `operator-core`). Used ONLY by the 2.16b Task 7 #13 carve-out: an
+/// already-digest image makes an `off → digest` policy flip a no-op, so it
+/// is NOT gated. Matches on the canonical `@sha256:` marker; a bare tag or
+/// nameless reference is not a digest.
+fn image_is_digest(image: &str) -> bool {
+    image
+        .rsplit_once('@')
+        .is_some_and(|(_, digest)| digest.starts_with("sha256:"))
 }
 
 /// Keys present in `old` but absent from `new` — i.e. the `needs`
@@ -1178,7 +1294,7 @@ mod change_hash_tests {
 #[cfg(test)]
 mod application_detect_destructive_tests {
     use super::*;
-    use operator_core::{ApplicationExpose, EnvRef, EnvValue, OneOrMany, ServiceNeed};
+    use operator_core::{ApplicationExpose, EnvRef, EnvValue, ImagePolicy, OneOrMany, ServiceNeed};
 
     fn base() -> ApplicationBaseSpec {
         ApplicationBaseSpec::default()
@@ -1343,17 +1459,33 @@ mod application_detect_destructive_tests {
     }
 
     #[test]
-    fn internal_to_vpn_and_to_public_are_soft() {
+    fn internal_to_vpn_is_soft() {
+        // internal → vpn is a soft visibility move (no public surface).
+        // NOTE (2.16b Task 7 #10): internal → PUBLIC is NO LONGER soft — it is
+        // the `network-visibility-escalation` security-boundary op (see
+        // `network_internal_to_public_escalates_and_hostname_add_cofires` /
+        // `internal_to_public_no_hostname_escalates`). Only the vpn move stays
+        // soft here.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("internal", None)),
             &with_expose(base(), expose("vpn", None))
         )
         .is_none());
-        assert!(ApplicationMigrationStrategy::detect_destructive(
+    }
+
+    // 2.16b Task 7 #10: internal → public WITHOUT a hostname still escalates
+    // (the public Gateway surface is opened even before a hostname is added).
+    #[test]
+    fn internal_to_public_no_hostname_escalates() {
+        let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("internal", None)),
-            &with_expose(base(), expose("public", None))
-        )
-        .is_none());
+            &with_expose(base(), expose("public", None)),
+        );
+        assert!(cs
+            .iter()
+            .any(|c| c.trigger_type == "network-visibility-escalation"));
+        // No hostname added → no #11 candidate.
+        assert!(!cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
     }
 
     // ---- Task 4: scale-to-zero + image-path ----
@@ -1365,6 +1497,19 @@ mod application_detect_destructive_tests {
 
     fn with_image(mut s: ApplicationBaseSpec, i: &str) -> ApplicationBaseSpec {
         s.image = Some(i.into());
+        s
+    }
+
+    /// Set `image` + `imagePolicy.resolve` in one call (2.16b Task 7 #13).
+    fn with_image_policy(
+        mut s: ApplicationBaseSpec,
+        image: &str,
+        resolve: &str,
+    ) -> ApplicationBaseSpec {
+        s.image = Some(image.into());
+        s.image_policy = Some(ImagePolicy {
+            resolve: Some(resolve.into()),
+        });
         s
     }
 
@@ -1707,16 +1852,22 @@ mod application_detect_destructive_tests {
         assert_eq!(c1, c2); // deterministic
     }
 
-    // Fix B — adding a hostname to a public app is NOT destructive.
+    // Fix B — adding a hostname to a public app does NOT emit a `domain-change`
+    // (no existing route is disrupted). NOTE (2.16b Task 7 #11): the None → Some
+    // FIRST-hostname add IS now gated as a `public-hostname-add` security-boundary
+    // op (a new externally-reachable name is published — see
+    // `public_hostname_add_on_already_public_app_gates`). Fix B's invariant
+    // survives as "no `domain-change` on an add"; the op that fires is #11.
     #[test]
-    fn adding_hostname_to_public_app_is_soft() {
-        // public app, no hostname -> public app WITH a hostname = adding exposure
-        // detail, not destructive (no existing route is disrupted).
-        assert!(ApplicationMigrationStrategy::detect_destructive(
+    fn adding_hostname_to_public_app_emits_no_domain_change() {
+        let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", None)),
-            &with_expose(base(), expose("public", Some("a.example.com")))
-        )
-        .is_none());
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+        );
+        // Fix B: the requires-restart `domain-change` op must NOT fire on an add.
+        assert!(!cs.iter().any(|c| c.trigger_type == "domain-change"));
+        // 2.16b Task 7 #11: the add IS gated as public-hostname-add.
+        assert!(cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
     }
 
     // Fix C — a pure needs.*.selector change stays DEFERRED → None (R1-M5).
@@ -1916,7 +2067,12 @@ mod application_detect_destructive_tests {
         let new_a = base();
         // (b) literal changed to another literal (soft).
         let new_b = with_env(base(), "TOKEN", EnvValue::Literal("other".into()));
-        for (old, new) in [(&old_a, &new_a), (&old_a, &new_b)] {
+        // (c) 2.16b Task 6 #8: a Ref → LITERAL downgrade DOES gate, but its `to`
+        // must be the `"(literal)"` SENTINEL — the literal VALUE (which may be
+        // freshly-inlined secret material) must NEVER reach the plan.
+        let old_c = with_env(base(), "TOKEN", EnvValue::Ref(EnvRef::Secret("v/k".into())));
+        let new_c = with_env(base(), "TOKEN", EnvValue::Literal(secret.into()));
+        for (old, new) in [(&old_a, &new_a), (&old_a, &new_b), (&old_c, &new_c)] {
             for c in ApplicationMigrationStrategy::detect_all(old, new) {
                 let s = format!("{:?}{:?}", c.from, c.to);
                 assert!(
@@ -1925,6 +2081,145 @@ mod application_detect_destructive_tests {
                 );
             }
         }
+    }
+
+    // ---- 2.16b Task 7: expose-escalation #10/#11/#12 + imagePolicy #13 ----
+
+    // #10 network-visibility-escalation + #11 public-hostname-add CO-FIRE when
+    // an internal app flips to public WITH a new hostname. Both land in
+    // `changes[]` (via detect_all); they are NOT merged.
+    #[test]
+    fn network_internal_to_public_escalates_and_hostname_add_cofires() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("internal", None)),
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+        );
+        let esc = cs
+            .iter()
+            .find(|c| c.trigger_type == "network-visibility-escalation")
+            .expect("escalation candidate");
+        assert_eq!(esc.classification, "security-boundary");
+        assert_eq!(esc.field, "expose.network");
+        assert_eq!(esc.from.as_ref().unwrap().as_str().unwrap(), "internal");
+        assert_eq!(esc.to.as_ref().unwrap().as_str().unwrap(), "public");
+        let hn = cs
+            .iter()
+            .find(|c| c.trigger_type == "public-hostname-add")
+            .expect("hostname-add candidate");
+        assert_eq!(hn.classification, "security-boundary");
+        assert_eq!(hn.from.as_ref().unwrap().as_str().unwrap(), "(none)");
+        assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+    }
+
+    // #11 fires even without a visibility flip: an already-public app that
+    // ADDS its first hostname (None → Some) escalates its public surface.
+    #[test]
+    fn public_hostname_add_on_already_public_app_gates() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", None)),
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+        );
+        assert!(cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
+        // No escalation (already public → public).
+        assert!(!cs
+            .iter()
+            .any(|c| c.trigger_type == "network-visibility-escalation"));
+    }
+
+    // #12 public-port-retarget: on a PUBLIC app a port change is gated; on a
+    // non-public app the same port change is soft (no public surface).
+    #[test]
+    fn public_port_retarget_gates_internal_soft() {
+        let po = |p| {
+            let mut e = expose("public", Some("h"));
+            e.port = p;
+            e
+        };
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), po(8080)),
+            &with_expose(base(), po(9090)),
+        );
+        let pr = cs
+            .iter()
+            .find(|c| c.trigger_type == "public-port-retarget")
+            .expect("port-retarget candidate");
+        assert_eq!(pr.classification, "security-boundary");
+        assert_eq!(pr.field, "expose.port");
+        assert_eq!(pr.from.as_ref().unwrap().as_str().unwrap(), "8080");
+        assert_eq!(pr.to.as_ref().unwrap().as_str().unwrap(), "9090");
+        // internal port change → soft.
+        let io = |p| {
+            let mut e = expose("internal", None);
+            e.port = p;
+            e
+        };
+        assert!(!ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), io(8080)),
+            &with_expose(base(), io(9090))
+        )
+        .iter()
+        .any(|c| c.trigger_type == "public-port-retarget"));
+    }
+
+    // #13 image-policy-relaxation: `resolve: off` → not-off ONLY gates when the
+    // new image is a FLOATING TAG (a mutable pull surface). An already-digest
+    // image is a no-op (pin is unchanged in practice), and a `digest → off`
+    // move is HARDENING (soft).
+    #[test]
+    fn imagepolicy_off_to_digest_gates_only_floating_tag() {
+        // off → digest on a floating tag: gated security-boundary.
+        let c = ApplicationMigrationStrategy::detect_all(
+            &with_image_policy(base(), "ghcr.io/a/b:v1", "off"),
+            &with_image_policy(base(), "ghcr.io/a/b:v1", "digest"),
+        );
+        let r = c
+            .iter()
+            .find(|c| c.trigger_type == "image-policy-relaxation")
+            .expect("relaxation candidate");
+        assert_eq!(r.classification, "security-boundary");
+        assert_eq!(r.field, "imagePolicy.resolve");
+        assert_eq!(r.from.as_ref().unwrap().as_str().unwrap(), "off");
+        assert_eq!(r.to.as_ref().unwrap().as_str().unwrap(), "digest");
+        // off → digest but the image is ALREADY a digest → NOT gated (no-op).
+        let digest = format!("ghcr.io/a/b@sha256:{}", "a".repeat(64));
+        assert!(!ApplicationMigrationStrategy::detect_all(
+            &with_image_policy(base(), &digest, "off"),
+            &with_image_policy(base(), &digest, "digest")
+        )
+        .iter()
+        .any(|c| c.trigger_type == "image-policy-relaxation"));
+        // digest → off is HARDENING → soft.
+        assert!(!ApplicationMigrationStrategy::detect_all(
+            &with_image_policy(base(), "ghcr.io/a/b:v1", "digest"),
+            &with_image_policy(base(), "ghcr.io/a/b:v1", "off")
+        )
+        .iter()
+        .any(|c| c.trigger_type == "image-policy-relaxation"));
+    }
+
+    // #10 must NOT fire on a public → internal move (that's a DE-escalation,
+    // already the soft/requires-restart `network-visibility-change` op).
+    #[test]
+    fn public_to_internal_does_not_escalate() {
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", Some("h"))),
+            &with_expose(base(), expose("internal", None)),
+        );
+        assert!(!cs
+            .iter()
+            .any(|c| c.trigger_type == "network-visibility-escalation"));
+    }
+
+    // image_is_digest pure helper: floating tag vs digest suffix.
+    #[test]
+    fn image_is_digest_detects_sha256_suffix() {
+        assert!(image_is_digest(&format!(
+            "ghcr.io/a/b@sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(!image_is_digest("ghcr.io/a/b:v1"));
+        assert!(!image_is_digest("ghcr.io/a/b")); // bare, no tag/digest
+        assert!(!image_is_digest("localhost:5000/app:dev")); // registry-port colon, not a digest
     }
 }
 
