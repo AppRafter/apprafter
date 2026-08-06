@@ -30,6 +30,17 @@ pub struct MigrationPlanSpec {
     pub trigger: MigrationTrigger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risks: Option<MigrationRisks>,
+    /// 2.16b S1.2: EVERY destructive candidate this spec edit produced —
+    /// not just the `pick_primary` headline carried by `spec.trigger`. An
+    /// approver reads this to see the FULL blast radius so a dangerous op
+    /// can't be laundered behind a benign-looking primary. The approval
+    /// content hash (`spec.trigger.approvedSpecHash`) covers this WHOLE set
+    /// (S-4 gap close), so attaching a lower-severity destructive op that
+    /// rides along changes the hash and re-gates the edit. Sorted the same
+    /// way `pick_primary` orders candidates (severity desc, then
+    /// trigger/field asc) so the list is deterministic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<MigrationChange>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Vec<MigrationStep>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,10 +117,36 @@ pub struct MigrationTrigger {
     pub approved_spec_hash: Option<String>,
 }
 
+/// 2.16b S1.2: one detected destructive candidate. `spec.changes[]` carries
+/// every candidate an edit produced (`spec.trigger` carries only the primary
+/// `pick_primary` picks). `severity` is the ordinal from
+/// `migration::classification_severity` so an approval UI can sort/threshold
+/// without re-deriving the vocabulary; `from`/`to` mirror the trigger's
+/// free-form JSON payload.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct MigrationChange {
+    #[serde(rename = "type")]
+    pub trigger: String,
+    pub field: String,
+    pub classification: String,
+    pub severity: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct MigrationRisks {
     /// Mirrors `compatibility.cue` change-class vocabulary.
     pub classification: String,
+    /// 2.16b S1.2: the DISTINCT classification vocabulary across every
+    /// detected candidate (`spec.changes[]`), sorted severity desc then
+    /// name asc. `classification` above is the primary's (the max); this
+    /// list surfaces the full set so an approver sees that e.g. a
+    /// `data-migration` primary also carries a `requires-restart` op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifications: Option<Vec<String>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

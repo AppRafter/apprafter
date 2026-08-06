@@ -31,12 +31,12 @@ use kube::Client;
 use serde_json::{json, Value};
 use tracing::info;
 
-use operator_core::migration::classification_severity;
+use operator_core::migration::{change_hash, classification_severity};
 use operator_core::{
     image_repo, Application, ApplicationBaseSpec, DestructiveChange, EnvRef, EnvValue,
-    MigrationApplicationRef, MigrationApplicationScope, MigrationError, MigrationPlan,
-    MigrationPlanScope, MigrationPlanSpec, MigrationStep, MigrationStrategy, MigrationTrigger,
-    Needs, OneOrMany, SourceCredentialSpec, StepOutcome,
+    MigrationApplicationRef, MigrationApplicationScope, MigrationChange, MigrationError,
+    MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationStep, MigrationStrategy,
+    MigrationTrigger, Needs, OneOrMany, SourceCredentialSpec, StepOutcome,
 };
 
 /// Render-time default for `Application.spec.*.replicas` (application.cue:
@@ -105,10 +105,33 @@ impl ApplicationMigrationStrategy {
     /// When an edit carries several destructive ops the classifier
     /// collects every candidate and `pick_primary` returns the single
     /// highest-severity one (2.16b spec: highest-severity wins).
+    ///
+    /// Wraps [`detect_all`](Self::detect_all) (the full candidate set) with
+    /// `pick_primary` — kept as the single-primary API for callers that only
+    /// need the headline (`spec.trigger`). The MigrationPlan-creation +
+    /// consume paths use `detect_all` directly so the approval content hash
+    /// and `spec.changes[]` rollup cover EVERY candidate (2.16b S1.2 / S-4).
     pub fn detect_destructive(
         old: &ApplicationBaseSpec,
         new: &ApplicationBaseSpec,
     ) -> Option<DestructiveChange> {
+        pick_primary(Self::detect_all(old, new))
+    }
+
+    /// 2.16b S1.2: EVERY destructive candidate the `old` → `new` edit
+    /// produces, in `pick_primary`'s canonical order (severity desc, then
+    /// `trigger_type` asc, `field` asc) so the list is deterministic and
+    /// independent of detection push-order. `detect_destructive` is
+    /// `pick_primary(detect_all(..))` — the single headline; the plan-creation
+    /// path (`create_plan_for`) and the consume-time hash check
+    /// (`plan_state`) both operate on this FULL set so an approver sees the
+    /// complete blast radius (`spec.changes[]`) AND the approval hash binds
+    /// the whole candidate set (a lower-severity op can't ride along
+    /// unhashed — S-4 gap close).
+    pub fn detect_all(
+        old: &ApplicationBaseSpec,
+        new: &ApplicationBaseSpec,
+    ) -> Vec<DestructiveChange> {
         let mut candidates: Vec<DestructiveChange> = Vec::new();
 
         // Needs handling gates only REMOVAL of a `needs.<type>` entry
@@ -249,7 +272,8 @@ impl ApplicationMigrationStrategy {
             }
         }
 
-        pick_primary(candidates)
+        sort_candidates(&mut candidates);
+        candidates
     }
 
     /// Build a `MigrationPlan` CR for an application-scope
@@ -270,14 +294,66 @@ impl ApplicationMigrationStrategy {
     /// so the resulting CR has a stable, human-readable name.
     /// The Application reconciler synthesises one from
     /// `<app>-<env>-migration-<timestamp>`.
+    ///
+    /// 2.16b S1.2 / S-4: `candidates` is the FULL set of destructive changes
+    /// the edit produced (from [`detect_all`](Self::detect_all)), not just the
+    /// primary. The plan's `spec.trigger` carries the `pick_primary` headline,
+    /// but `spec.changes[]` rolls up EVERY candidate and
+    /// `spec.risks.classifications` lists the distinct classification
+    /// vocabulary — so an approver sees the complete blast radius and a
+    /// dangerous op can't be laundered behind a benign primary. Critically the
+    /// approval content hash (`trigger.approvedSpecHash`) covers the WHOLE
+    /// `candidates` set, so attaching a lower-severity destructive op changes
+    /// the hash and re-gates the edit at consume time (closes the S-4
+    /// primary-only gap).
+    ///
+    /// Panics if `candidates` is empty — the caller only reaches the
+    /// CreatePlan arm when detection produced at least one change.
     pub fn create_plan_for(
-        change: &DestructiveChange,
+        candidates: &[DestructiveChange],
         plan_name: &str,
         application_namespace: &str,
         application_name: &str,
         environment: &str,
         app_uid: &str,
     ) -> MigrationPlan {
+        let primary =
+            pick_primary(candidates.to_vec()).expect("create_plan_for called with >=1 candidate");
+        let change = &primary;
+
+        // Distinct classification vocabulary across every candidate, sorted
+        // severity desc then name asc — the approver-facing summary of the
+        // full set's risk classes. Deterministic (same key `pick_primary`
+        // uses on the primary), so the emitted list is stable.
+        let mut distinct_classifications: Vec<String> = Vec::new();
+        for c in candidates {
+            if !distinct_classifications.contains(&c.classification) {
+                distinct_classifications.push(c.classification.clone());
+            }
+        }
+        distinct_classifications.sort_by(|a, b| {
+            classification_severity(b)
+                .cmp(&classification_severity(a))
+                .then(a.cmp(b))
+        });
+
+        // Every candidate → a MigrationChange rollup row. Candidates already
+        // arrive sorted from `detect_all`, but re-sort a borrowed slice
+        // defensively so the emitted order is canonical regardless of caller.
+        let mut ordered = candidates.to_vec();
+        sort_candidates(&mut ordered);
+        let changes: Vec<MigrationChange> = ordered
+            .iter()
+            .map(|c| MigrationChange {
+                trigger: c.trigger_type.clone(),
+                field: c.field.clone(),
+                classification: c.classification.clone(),
+                severity: classification_severity(&c.classification) as u32,
+                from: c.from.clone(),
+                to: c.to.clone(),
+            })
+            .collect();
+
         let spec = MigrationPlanSpec {
             scope: MigrationPlanScope {
                 type_: "application".into(),
@@ -295,28 +371,33 @@ impl ApplicationMigrationStrategy {
                 field: change.field.clone(),
                 from: change.from.clone(),
                 to: change.to.clone(),
-                // 2.16b S-4: bind this app-scope plan (and thus its
-                // approval) to a content hash of the change it gates, so
-                // the approval is never transferable across a different
-                // spec edit. `plan_state` re-verifies this at consume
-                // time (hash mismatch → the completed plan is a relic,
-                // re-gated as a fresh pending-approval plan).
-                //
-                // 2.16b S1.2: hash the full candidate set once
-                // create_plan_for takes all candidates (today the caller
-                // passes the single `pick_primary` change, so the plan is
-                // bound to the primary op's content).
-                approved_spec_hash: Some(operator_core::migration::change_hash(
-                    std::slice::from_ref(change),
-                )),
+                // 2.16b S-4 / S1.2: bind this app-scope plan (and thus its
+                // approval) to a content hash of the FULL candidate set — not
+                // just the primary. `plan_state` re-verifies this at consume
+                // time against the CURRENT full candidate set (hash mismatch →
+                // the completed plan is a relic, re-gated as a fresh
+                // pending-approval plan). Hashing all candidates closes the
+                // S-4 primary-only gap: an attacker can no longer attach a
+                // lower-severity destructive op that rides along UNHASHED
+                // behind a benign-looking primary — every candidate is in the
+                // hash, so adding/dropping one changes it and re-gates.
+                approved_spec_hash: Some(change_hash(candidates)),
             },
             risks: Some(operator_core::MigrationRisks {
                 classification: change.classification.clone(),
+                // 2.16b S1.2: the distinct classification vocabulary across
+                // the full candidate set (primary's is the max above). Always
+                // `Some` when non-empty (create_plan_for always has >=1
+                // candidate) for a consistent approver-facing summary — even a
+                // single-candidate plan surfaces its one classification here.
+                classifications: (!distinct_classifications.is_empty())
+                    .then_some(distinct_classifications),
                 estimated_downtime: None,
                 data_volume: None,
                 reversible: None,
                 requires_full_backup: None,
             }),
+            changes: Some(changes),
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,
@@ -426,23 +507,33 @@ fn removed_needs_keys(old: Option<&Needs>, new: Option<&Needs>) -> Vec<String> {
         .collect()
 }
 
-/// Pick the single primary `DestructiveChange` from the candidates an
-/// edit produced: highest `classification_severity` wins (2.16b spec).
-///
-/// Deterministic (Task 6, R3-mn-b): sort by
-/// `(classification_severity desc, trigger_type asc, field asc)` and take
-/// the head. The tie-break on `trigger_type` then `field` makes the
-/// primary stable across runs and independent of candidate-push order —
-/// two equal-severity ops (e.g. two `requires-restart` changes in one
-/// edit) always resolve to the same primary, so the same edit never
-/// yields a flapping MigrationPlan trigger.
-fn pick_primary(mut v: Vec<DestructiveChange>) -> Option<DestructiveChange> {
+/// Sort candidates into the canonical primary order:
+/// `(classification_severity desc, trigger_type asc, field asc)`. Shared by
+/// [`detect_all`](ApplicationMigrationStrategy::detect_all) (so the emitted
+/// `spec.changes[]` rollup is deterministic) and [`pick_primary`] (so the head
+/// is the stable primary). The tie-break on `trigger_type` then `field` makes
+/// the ordering independent of candidate push-order — two equal-severity ops
+/// always resolve identically.
+fn sort_candidates(v: &mut [DestructiveChange]) {
     v.sort_by(|a, b| {
         classification_severity(&b.classification)
             .cmp(&classification_severity(&a.classification))
             .then(a.trigger_type.cmp(&b.trigger_type))
             .then(a.field.cmp(&b.field))
     });
+}
+
+/// Pick the single primary `DestructiveChange` from the candidates an
+/// edit produced: highest `classification_severity` wins (2.16b spec).
+///
+/// Deterministic (Task 6, R3-mn-b): sorts by
+/// [`sort_candidates`]' `(severity desc, trigger_type asc, field asc)` and
+/// takes the head. Sorting here (rather than assuming the caller pre-sorted)
+/// keeps `pick_primary` correct for any candidate slice — `detect_all`
+/// already emits sorted, `create_plan_for` re-derives the primary from a
+/// borrowed slice, and the sort is idempotent on already-sorted input.
+fn pick_primary(mut v: Vec<DestructiveChange>) -> Option<DestructiveChange> {
+    sort_candidates(&mut v);
     v.into_iter().next()
 }
 
@@ -781,6 +872,7 @@ mod tests {
                 approved_spec_hash: None,
             },
             risks: None,
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,
@@ -805,6 +897,7 @@ mod tests {
                 approved_spec_hash: None,
             },
             risks: None,
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: snapshot,
@@ -1428,7 +1521,7 @@ mod application_detect_destructive_tests {
             classification: "data-migration".into(),
         };
         let mp = ApplicationMigrationStrategy::create_plan_for(
-            &change,
+            std::slice::from_ref(&change),
             "myapp-dev-migration-1",
             "team-a",
             "myapp",
@@ -1446,6 +1539,81 @@ mod application_detect_destructive_tests {
         assert_eq!(mp.spec.scope.type_, "application");
         assert!(mp.spec.scope.platform.is_none()); // webhook: no platform block
         assert!(mp.spec.previous_spec_snapshot.is_none()); // app scope: no snapshot
+    }
+
+    // ---- 2.16b S1.2: MigrationPlan rollup invariants ----
+
+    // A MigrationPlan must carry the FULL blast radius, not just the
+    // `pick_primary` headline, so an approver can't be laundered by hiding a
+    // dangerous op behind a benign-looking primary. This asserts the four
+    // rollup invariants over a real multi-op edit.
+    #[test]
+    fn rollup_invariants_hold() {
+        // an edit that removes needs.pg (data-migration) AND scales to zero
+        // (requires-restart) — two distinct destructive candidates.
+        let old = with_replicas(with_pg(base()), Some(2));
+        let new = with_replicas(base(), Some(0));
+        let candidates = ApplicationMigrationStrategy::detect_all(&old, &new);
+        // Two ops detected (needs-removal + scale-to-zero).
+        assert_eq!(candidates.len(), 2, "expected both destructive ops");
+        let plan = ApplicationMigrationStrategy::create_plan_for(
+            &candidates,
+            "p",
+            "ns",
+            "app",
+            "dev",
+            "uid",
+        );
+        let risks = plan.spec.risks.as_ref().unwrap();
+        let changes = plan.spec.changes.as_ref().unwrap();
+
+        // (1) the primary (spec.trigger) is present in changes[].
+        assert!(changes
+            .iter()
+            .any(|c| c.trigger == plan.spec.trigger.type_ && c.field == plan.spec.trigger.field));
+
+        // (2) classifications == distinct(changes.classification), sorted
+        // severity desc. Highest-severity class first; all distinct.
+        let cls = risks.classifications.as_ref().unwrap();
+        assert_eq!(cls[0], "data-migration"); // highest severity first
+        assert_eq!(
+            cls.iter().collect::<std::collections::HashSet<_>>().len(),
+            cls.len(),
+            "classifications must be distinct"
+        );
+        // It IS the distinct set of the candidates' classifications.
+        let distinct: std::collections::HashSet<&String> =
+            changes.iter().map(|c| &c.classification).collect();
+        assert_eq!(cls.len(), distinct.len());
+        assert!(cls.iter().all(|c| distinct.contains(c)));
+
+        // (4) the primary's severity == the max over all candidate severities.
+        assert_eq!(
+            classification_severity(&risks.classification) as u32,
+            changes.iter().map(|c| c.severity).max().unwrap()
+        );
+
+        // (3) non-empty changes <=> plan created (we created the plan, so
+        // changes must be non-empty).
+        assert!(!changes.is_empty());
+
+        // S-4: the stamped approval hash covers the FULL candidate set — NOT
+        // just the primary. Hashing only the primary would let a lower-severity
+        // op ride along unhashed; assert the stamp equals the all-candidate
+        // hash and differs from the primary-only hash.
+        let full_hash = change_hash(&candidates);
+        let primary_only_hash = change_hash(std::slice::from_ref(
+            &pick_primary(candidates.clone()).unwrap(),
+        ));
+        assert_eq!(
+            plan.spec.trigger.approved_spec_hash.as_deref(),
+            Some(full_hash.as_str()),
+            "approval hash must cover ALL candidates"
+        );
+        assert_ne!(
+            full_hash, primary_only_hash,
+            "full-set hash must differ from the primary-only hash"
+        );
     }
 
     // ---- Task 8 Part 2: classifier tie-break (review gap A) ----

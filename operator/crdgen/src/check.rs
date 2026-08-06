@@ -227,6 +227,26 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          renders as an untyped node. Both accept any object; neither constrains its shape.",
     ),
     (
+        "MigrationPlan",
+        "spec.changes.[].from",
+        "free-form JSON change-rollup payload (2.16b S1.2): same shape as \
+         spec.trigger.from — the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque, restored via a `changes[].from` \
+         schemaPatch since CUE's `from?: _` top type exports as a bare node), the kube-rs \
+         `MigrationChange.from` declares it `Option<serde_json::Value>` which schemars \
+         renders as an untyped node. Both accept any value; neither constrains its shape.",
+    ),
+    (
+        "MigrationPlan",
+        "spec.changes.[].to",
+        "free-form JSON change-rollup payload (2.16b S1.2): same shape as \
+         spec.trigger.to — the CUE-derived CRD marks it \
+         x-kubernetes-preserve-unknown-fields (opaque, restored via a `changes[].to` \
+         schemaPatch since CUE's `to?: _` top type exports as a bare node), the kube-rs \
+         `MigrationChange.to` declares it `Option<serde_json::Value>` which schemars \
+         renders as an untyped node. Both accept any value; neither constrains its shape.",
+    ),
+    (
         "SourceCredential",
         "status",
         "operator-written status: the CUE-derived CRD marks it \

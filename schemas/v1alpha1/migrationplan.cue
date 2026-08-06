@@ -39,6 +39,17 @@ package v1alpha1
 	scope:   #MigrationPlanScope
 	trigger: #MigrationTrigger
 	risks?:  #MigrationRisks
+
+	// 2.16b S1.2: EVERY destructive candidate this spec edit produced —
+	// not just the `pick_primary` headline carried by `trigger`. An
+	// approver reads this to see the full blast radius so a dangerous op
+	// can't be laundered behind a benign-looking primary. The approval
+	// content hash (`trigger.approvedSpecHash`) covers this WHOLE set, so
+	// attaching a lower-severity destructive op changes the hash and
+	// re-gates the edit. App-scope only (platform plans carry one
+	// classification with no set to roll up).
+	changes?: [...#MigrationChange]
+
 	plan?: [...#MigrationStep]
 	approvers?: [...string]
 
@@ -109,6 +120,34 @@ package v1alpha1
 	approvedSpecHash?: string
 }
 
+// 2.16b S1.2: one detected destructive candidate in the full rollup
+// (`spec.changes[]`). `spec.trigger` carries only the primary
+// `pick_primary` picks; this row type carries every candidate so an
+// approver sees the complete blast radius. `severity` is the ordinal
+// from `migration::classification_severity` (data-migration=3,
+// breaking=2, requires-restart=1, safe=0) so an approval UI can
+// sort/threshold without re-deriving the vocabulary.
+#MigrationChange: {
+	// Trigger kind, e.g. "needs-removal", "scale-to-zero". Same open
+	// string set as `#MigrationTrigger.type`.
+	type: string
+
+	// JSON Pointer-ish path of the changed field, e.g. "needs.pg",
+	// "replicas". Same vocabulary as `#MigrationTrigger.field`.
+	field: string
+
+	// Same change-class enum as `#MigrationRisks.classification`.
+	classification: "safe" | "requires-restart" | "data-migration" | "breaking"
+
+	// Ordinal severity of `classification` (0..3). Non-negative.
+	severity: int & >=0
+
+	// Old / new values — free-form JSON, mirrors
+	// `#MigrationTrigger.from` / `.to`.
+	from?: _
+	to?:   _
+}
+
 // Risk classification + impact metadata. Operators read
 // this to decide whether to approve.
 #MigrationRisks: {
@@ -117,6 +156,13 @@ package v1alpha1
 	// a consistent vocabulary across application + platform
 	// migrations.
 	classification: "safe" | "requires-restart" | "data-migration" | "breaking"
+
+	// 2.16b S1.2: the DISTINCT classification vocabulary across every
+	// detected candidate (`spec.changes[]`), sorted severity desc then
+	// name asc. `classification` above is the primary's (the max); this
+	// list surfaces the full set so an approver sees that e.g. a
+	// data-migration primary also carries a requires-restart op.
+	classifications?: [...string]
 
 	// Free-form text — human estimate, not a parseable
 	// duration. Reconciler-supplied or webhook-supplied;

@@ -249,11 +249,24 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // `SoftDestructiveChange` Event so operators notice. Computed here where
     // both effective specs are in scope; emitted best-effort after the apply
     // succeeds (only when `change.is_none()`).
+    //
+    // 2.16b S1.2 / S-4: `candidates` is the FULL set of destructive ops the
+    // edit produced; `change` is the `pick_primary` headline (used for the
+    // trigger tuple + logging). Both the plan-creation path
+    // (`create_plan_for(&candidates, ..)`) and the consume-time hash check
+    // (`plan_state(.., current_change, &candidates)`) operate on the whole
+    // set, so an approver sees every op AND the approval hash binds them all
+    // (a lower-severity op can't ride along unhashed behind the primary).
+    let mut candidates: Vec<DestructiveChange> = Vec::new();
     let mut change: Option<DestructiveChange> = None;
     let mut soft_notes: Vec<String> = Vec::new();
     if let Some(baseline_spec) = &baseline_spec {
         let old_eff = effective_baseline(baseline_spec);
-        change = ApplicationMigrationStrategy::detect_destructive(&old_eff, &new_eff);
+        candidates = ApplicationMigrationStrategy::detect_all(&old_eff, &new_eff);
+        // `detect_all` returns candidates in `pick_primary` order (severity
+        // desc, then tuple asc), so the head IS the primary headline — no need
+        // to re-run detection via `detect_destructive`.
+        change = candidates.first().cloned();
         if change.is_none() {
             soft_notes = soft_destructive_notes(&old_eff, &new_eff);
         }
@@ -264,9 +277,10 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // load-bearing: the state machine must SEE a `completed` plan (→
     // ConsumeApply) and a `rejected`/relic plan (→ cleanup), not just live
     // gating ones. It searches the app namespace (2.16b) and wildcards on a
-    // `None` environment. `plan_state` needs a `DestructiveChange` to
-    // compare triggers, so the detect=None arm buckets by presence only
-    // (`plan_state_no_change`).
+    // `None` environment. `plan_state` needs a `DestructiveChange` (the
+    // primary, for the trigger-TUPLE match) PLUS the full `candidates` slice
+    // (for the S-4 content-HASH match over ALL current ops); the detect=None
+    // arm buckets by presence only (`plan_state_no_change`).
     let plan = find_any_key_plan(
         &ctx.client,
         &name,
@@ -275,7 +289,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     )
     .await?;
     let state = match &change {
-        Some(c) => plan_state(plan.as_ref(), c),
+        Some(c) => plan_state(plan.as_ref(), c, &candidates),
         None => plan_state_no_change(plan.as_ref()),
     };
 
@@ -293,8 +307,12 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         }
         MigrationDecision::CreatePlan => {
             let change = change.expect("CreatePlan implies a detected change");
+            // 2.16b S1.2 / S-4: hand the FULL candidate set to create_plan_for
+            // so spec.changes[] rolls up every op and the approval hash covers
+            // them all. `candidates` is non-empty here (CreatePlan implies a
+            // detected change → detect_all returned >=1).
             let mp = ApplicationMigrationStrategy::create_plan_for(
-                &change,
+                &candidates,
                 &plan_name(&name, env, Utc::now()),
                 &namespace,
                 &name,
@@ -336,8 +354,10 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
             // relic) → delete every key plan, then create the right one.
             let change = change.expect("DeleteThenCreate implies a detected change");
             delete_all_key_plans_except(&ctx.client, &namespace, &key, None).await?;
+            // 2.16b S1.2 / S-4: full candidate set → rollup + all-candidate
+            // approval hash (same as the CreatePlan arm).
             let mp = ApplicationMigrationStrategy::create_plan_for(
-                &change,
+                &candidates,
                 &plan_name(&name, env, Utc::now()),
                 &namespace,
                 &name,
@@ -1672,11 +1692,24 @@ pub fn decide(has_change: bool, state: PlanState) -> MigrationDecision {
 
 /// Bucket a plan (if any) against the current change into a
 /// `PlanState`. Blocking/terminal is decided by phase (via
-/// `plan_is_blocking`); "match" compares the plan's trigger
-/// `(type, field)` to the current change's `(trigger_type,
-/// field)` — the two-tuple that identifies WHICH destructive
-/// change a plan was cut for.
-pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveChange) -> PlanState {
+/// `plan_is_blocking`); the trigger-TUPLE "match" compares the plan's
+/// trigger `(type, field)` to the current PRIMARY change's `(trigger_type,
+/// field)` — the two-tuple that identifies WHICH destructive change a plan
+/// was cut for.
+///
+/// 2.16b S1.2 / S-4: the consume-time CONTENT-hash match is computed over
+/// the FULL set of CURRENT destructive candidates (`current_changes`), NOT
+/// just the primary. Hashing only the primary would let an attacker attach a
+/// lower-severity destructive op that rides along UNHASHED — the plan was
+/// cut (and its approval hash stamped) over the whole set at creation, so
+/// consume must re-derive the hash over the whole current set too. `current`
+/// is the primary (its `(type, field)` is the trigger-tuple match);
+/// `current_changes` is every candidate this reconcile detected.
+pub fn plan_state(
+    plan: Option<&MigrationPlan>,
+    current: &DestructiveChange,
+    current_changes: &[DestructiveChange],
+) -> PlanState {
     let Some(plan) = plan else {
         return PlanState::None;
     };
@@ -1685,8 +1718,8 @@ pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveCha
         .as_ref()
         .and_then(|s| s.phase.as_deref())
         .unwrap_or("pending-approval");
-    let trigger_matches = plan.spec.trigger.type_ == current_trigger.trigger_type
-        && plan.spec.trigger.field == current_trigger.field;
+    let trigger_matches =
+        plan.spec.trigger.type_ == current.trigger_type && plan.spec.trigger.field == current.field;
 
     if phase == "failed" {
         return PlanState::Failed;
@@ -1702,21 +1735,25 @@ pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveCha
     // Terminal (completed | rejected). A `completed` plan whose trigger
     // TUPLE `(type, field)` matches is a candidate to consume — but
     // 2.16b S-4 additionally requires the plan's stamped CONTENT hash to
-    // match the CURRENT change's hash. Without that, an approval for
+    // match the CURRENT change set's hash. Without that, an approval for
     // `replicas 2->0` would consume against a DIFFERENT `replicas 1->0`
     // (same tuple, different payload), fully defeating the gate for a
-    // security-boundary op. On a hash MISMATCH — including a
-    // MISSING/EMPTY stamped hash — we demote the completed plan to a
-    // `Relic`, so `decide` yields `DeleteThenCreate` and the edit is
-    // re-gated as a fresh `pending-approval` plan. App-scope migration is
-    // brand-new (no legacy hashless plans exist), so consume REQUIRES a
-    // non-empty stamped hash that matches (`plan_hash_matches`); a
-    // hashless completed plan never consumes a destructive change.
+    // security-boundary op. S1.2 widens the hash to the FULL candidate set:
+    // if the approver signed off on {needs-removal + scale-to-zero} and the
+    // spec now carries ONLY scale-to-zero (the needs-removal op dropped, or
+    // a NEW lower-severity op was added), the full-set hash differs → no
+    // match → re-gate. On a hash MISMATCH — including a MISSING/EMPTY stamped
+    // hash — we demote the completed plan to a `Relic`, so `decide` yields
+    // `DeleteThenCreate` and the edit is re-gated as a fresh
+    // `pending-approval` plan. App-scope migration is brand-new (no legacy
+    // hashless plans exist), so consume REQUIRES a non-empty stamped hash
+    // that matches (`plan_hash_matches`); a hashless completed plan never
+    // consumes a destructive change.
     if phase == "completed"
         && trigger_matches
         && plan_hash_matches(
             plan,
-            &operator_core::migration::change_hash(std::slice::from_ref(current_trigger)),
+            &operator_core::migration::change_hash(current_changes),
         )
     {
         PlanState::CompletedMatch
@@ -2818,6 +2855,7 @@ mod tests {
                 approved_spec_hash: None,
             },
             risks: None,
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,
@@ -2852,6 +2890,7 @@ mod tests {
                 approved_spec_hash: None,
             },
             risks: None,
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,
@@ -5029,6 +5068,7 @@ mod tests {
                 approved_spec_hash: None,
             },
             risks: None,
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,
@@ -5046,15 +5086,20 @@ mod tests {
     #[test]
     fn plan_state_buckets_by_phase_and_trigger_match() {
         let cur = change("selector-change", "needs.pg.selector");
+        // Single-op edit: the current change set is just `cur`.
+        let cur_set = std::slice::from_ref(&cur);
         // No plan → None.
-        assert_eq!(plan_state(None, &cur), PlanState::None);
+        assert_eq!(plan_state(None, &cur, cur_set), PlanState::None);
         // Blocking (pending) + trigger matches → BlockingMatch.
         let matching = plan_with_trigger(
             "selector-change",
             "needs.pg.selector",
             Some("pending-approval"),
         );
-        assert_eq!(plan_state(Some(&matching), &cur), PlanState::BlockingMatch);
+        assert_eq!(
+            plan_state(Some(&matching), &cur, cur_set),
+            PlanState::BlockingMatch
+        );
         // Blocking (pending) + trigger differs → BlockingMismatch.
         let mismatch = plan_with_trigger(
             "storage-class-change",
@@ -5062,30 +5107,35 @@ mod tests {
             Some("pending-approval"),
         );
         assert_eq!(
-            plan_state(Some(&mismatch), &cur),
+            plan_state(Some(&mismatch), &cur, cur_set),
             PlanState::BlockingMismatch
         );
         // Phase failed → Failed (regardless of trigger match).
         let failed = plan_with_trigger("selector-change", "needs.pg.selector", Some("failed"));
-        assert_eq!(plan_state(Some(&failed), &cur), PlanState::Failed);
+        assert_eq!(plan_state(Some(&failed), &cur, cur_set), PlanState::Failed);
         // Completed + trigger matches → CompletedMatch. Post-S-4-review the
         // completed plan MUST carry the matching stamped content hash to
-        // consume (a hashless completed plan re-gates), so stamp it.
+        // consume (a hashless completed plan re-gates), so stamp it — over the
+        // FULL current change set (here a single op).
         let mut done = plan_with_trigger("selector-change", "needs.pg.selector", Some("completed"));
-        done.spec.trigger.approved_spec_hash = Some(operator_core::migration::change_hash(
-            std::slice::from_ref(&cur),
-        ));
-        assert_eq!(plan_state(Some(&done), &cur), PlanState::CompletedMatch);
+        done.spec.trigger.approved_spec_hash = Some(operator_core::migration::change_hash(cur_set));
+        assert_eq!(
+            plan_state(Some(&done), &cur, cur_set),
+            PlanState::CompletedMatch
+        );
         // Completed + trigger differs → Relic.
         let done_other = plan_with_trigger(
             "storage-class-change",
             "needs.pg.storage",
             Some("completed"),
         );
-        assert_eq!(plan_state(Some(&done_other), &cur), PlanState::Relic);
+        assert_eq!(
+            plan_state(Some(&done_other), &cur, cur_set),
+            PlanState::Relic
+        );
         // Rejected → Relic.
         let rejected = plan_with_trigger("selector-change", "needs.pg.selector", Some("rejected"));
-        assert_eq!(plan_state(Some(&rejected), &cur), PlanState::Relic);
+        assert_eq!(plan_state(Some(&rejected), &cur, cur_set), PlanState::Relic);
     }
 
     // ---- 2.16b S-4: app approval is NON-transferable across a spec change ----
@@ -5119,6 +5169,7 @@ mod tests {
                 approved_spec_hash,
             },
             risks: None,
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,
@@ -5147,12 +5198,13 @@ mod tests {
             to: Some(serde_json::json!("0")),
             classification: "requires-restart".into(),
         };
-        let current_hash = operator_core::migration::change_hash(std::slice::from_ref(&current));
+        let cur_set = std::slice::from_ref(&current);
+        let current_hash = operator_core::migration::change_hash(cur_set);
 
         // (a) hash matches → CompletedMatch.
         let matched = completed_plan_with_hash(&current, Some(current_hash.clone()));
         assert_eq!(
-            plan_state(Some(&matched), &current),
+            plan_state(Some(&matched), &current, cur_set),
             PlanState::CompletedMatch
         );
 
@@ -5170,7 +5222,10 @@ mod tests {
         assert_eq!(transferable.spec.trigger.type_, current.trigger_type);
         assert_eq!(transferable.spec.trigger.field, current.field);
         // … but the content hash differs → Relic, NOT CompletedMatch.
-        assert_eq!(plan_state(Some(&transferable), &current), PlanState::Relic);
+        assert_eq!(
+            plan_state(Some(&transferable), &current, cur_set),
+            PlanState::Relic
+        );
 
         // (c) THE S-4 REVIEW ATTACK: a completed plan carrying NO stamped
         // hash (forged or otherwise) must NOT consume. App-scope migration
@@ -5178,11 +5233,17 @@ mod tests {
         // former `None => true` "legacy safety" bypass is gone: a hashless
         // completed plan re-gates (Relic), never applies the change.
         let hashless = completed_plan_with_hash(&current, None);
-        assert_eq!(plan_state(Some(&hashless), &current), PlanState::Relic);
+        assert_eq!(
+            plan_state(Some(&hashless), &current, cur_set),
+            PlanState::Relic
+        );
 
         // (d) an EMPTY stamped hash is likewise no match → Relic.
         let empty_hash = completed_plan_with_hash(&current, Some(String::new()));
-        assert_eq!(plan_state(Some(&empty_hash), &current), PlanState::Relic);
+        assert_eq!(
+            plan_state(Some(&empty_hash), &current, cur_set),
+            PlanState::Relic
+        );
     }
 
     // The state machine as a whole must yield DeleteThenCreate (re-gate),
@@ -5203,11 +5264,105 @@ mod tests {
         };
         let approved_hash = operator_core::migration::change_hash(std::slice::from_ref(&approved));
         let transferable = completed_plan_with_hash(&approved, Some(approved_hash));
-        let state = plan_state(Some(&transferable), &current);
+        let state = plan_state(
+            Some(&transferable),
+            &current,
+            std::slice::from_ref(&current),
+        );
         assert_eq!(state, PlanState::Relic);
         // has_change=true × Relic → DeleteThenCreate (re-gate as a fresh
         // pending-approval plan), NOT ConsumeApply.
         assert_eq!(decide(true, state), MigrationDecision::DeleteThenCreate);
+    }
+
+    // 2.16b S1.2 / S-4 close: the approval hash covers the FULL candidate set,
+    // so DROPPING one of the approved ops (or adding a new one) re-gates the
+    // edit — the whole point of hashing all candidates rather than just the
+    // primary. Approve for {needs-removal (data-migration) + scale-to-zero
+    // (requires-restart)}; then the spec carries ONLY scale-to-zero. The
+    // trigger TUPLE still matches (the primary of the single-op set is
+    // scale-to-zero, but the plan's trigger is the data-migration primary — so
+    // even the tuple differs here). Regardless: the full-set content hash the
+    // plan was cut over ≠ the single-op current hash → Relic, NOT consume.
+    #[test]
+    fn dropping_an_approved_op_re_gates_not_consume() {
+        // The two ops the plan was approved for (full candidate set).
+        let needs_removal = DestructiveChange {
+            trigger_type: "needs-removal".into(),
+            field: "needs.pg".into(),
+            from: Some(serde_json::json!("needs.pg")),
+            to: Some(serde_json::json!("(removed)")),
+            classification: "data-migration".into(),
+        };
+        let scale_to_zero = DestructiveChange {
+            trigger_type: "scale-to-zero".into(),
+            field: "replicas".into(),
+            from: Some(serde_json::json!("2")),
+            to: Some(serde_json::json!("0")),
+            classification: "requires-restart".into(),
+        };
+        // The plan was cut over BOTH ops; its stamped approval hash is the
+        // full-set hash and its trigger is the primary (data-migration wins).
+        let approved_set = [needs_removal.clone(), scale_to_zero.clone()];
+        let approved_hash = operator_core::migration::change_hash(&approved_set);
+        let mut plan = completed_plan_with_hash(&needs_removal, Some(approved_hash.clone()));
+        // Make the plan a data-migration primary explicitly (completed_plan_
+        // with_hash already copied needs_removal's tuple).
+        assert_eq!(plan.spec.trigger.type_, "needs-removal");
+        plan.spec.changes = None; // rollup rows don't affect consume-time hash
+
+        // (a) SANITY: if the CURRENT set is still both ops, the plan consumes.
+        let current_primary = &needs_removal; // data-migration is the primary
+        assert_eq!(
+            plan_state(Some(&plan), current_primary, &approved_set),
+            PlanState::CompletedMatch,
+            "unchanged full set must still consume"
+        );
+
+        // (b) THE DROP: the spec now carries ONLY scale-to-zero — the
+        // needs-removal op was dropped (or never re-declared). The current
+        // candidate set is a single op → its full-set hash ≠ the approved
+        // two-op hash → Relic, so decide() re-gates instead of consuming.
+        let current_set_after_drop = [scale_to_zero.clone()];
+        let current_after_drop = &scale_to_zero;
+        assert_ne!(
+            operator_core::migration::change_hash(&current_set_after_drop),
+            approved_hash,
+            "dropping an op must change the full-set hash"
+        );
+        let state = plan_state(Some(&plan), current_after_drop, &current_set_after_drop);
+        assert_eq!(
+            state,
+            PlanState::Relic,
+            "dropped op → full-set hash mismatch → re-gate, not consume"
+        );
+        assert_eq!(decide(true, state), MigrationDecision::DeleteThenCreate);
+
+        // (c) THE ADD-ALONG (the actual S-4 laundering vector): the approver
+        // signed off on scale-to-zero ALONE, but the attacker rides a
+        // needs-removal (data drop!) along. If we hashed only the primary the
+        // add would be unhashed and consume; hashing the full set means the
+        // current two-op hash ≠ the approved one-op hash → re-gate.
+        let approved_one = [scale_to_zero.clone()];
+        let approved_one_hash = operator_core::migration::change_hash(&approved_one);
+        let plan_one = completed_plan_with_hash(&scale_to_zero, Some(approved_one_hash.clone()));
+        // Now the spec carries scale-to-zero + a smuggled needs-removal.
+        // detect_all sorts data-migration first, so the primary is
+        // needs-removal — but even keeping the tuple aside, the hash differs.
+        let smuggled_set = [scale_to_zero.clone(), needs_removal.clone()];
+        assert_ne!(
+            operator_core::migration::change_hash(&smuggled_set),
+            approved_one_hash,
+            "a smuggled op must change the full-set hash"
+        );
+        // Consume-time primary of the smuggled set is needs-removal; its tuple
+        // differs from the plan's scale-to-zero trigger → Relic anyway, and
+        // the hash confirms it. Assert re-gate.
+        assert_eq!(
+            plan_state(Some(&plan_one), &needs_removal, &smuggled_set),
+            PlanState::Relic,
+            "smuggled lower/other op → re-gate, never consume unhashed"
+        );
     }
 
     // ---- 2.16b Task 11: reconcile-wiring pure seams ----

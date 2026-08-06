@@ -26,9 +26,9 @@ pub use matching::{matches, select_provider, Candidate};
 pub use metrics::Metrics;
 pub use migration::{DestructiveChange, MigrationError, MigrationStrategy, StepOutcome};
 pub use migration_plan::{
-    ExecutedStep, MigrationApplicationRef, MigrationApplicationScope, MigrationPlan,
-    MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus, MigrationPlatformScope,
-    MigrationRisks, MigrationStep, MigrationTrigger,
+    ExecutedStep, MigrationApplicationRef, MigrationApplicationScope, MigrationChange,
+    MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus,
+    MigrationPlatformScope, MigrationRisks, MigrationStep, MigrationTrigger,
 };
 pub use platform_stack::{
     resolve_egress_profile, EgressConfig, EgressProfile, NetworkConfig, PlatformStack,

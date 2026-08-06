@@ -1950,11 +1950,19 @@ fn build_platform_migration_plan_cr(
         },
         risks: Some(MigrationRisks {
             classification,
+            // 2.16b S1.2 is an app-scope rollup (multiple destructive ops in a
+            // single Application spec edit). A platform-classification plan
+            // carries exactly one classification, so the distinct-list is left
+            // unset (the primary `classification` above is authoritative).
+            classifications: None,
             estimated_downtime: None,
             data_volume: None,
             reversible: None,
             requires_full_backup: None,
         }),
+        // 2.16b S1.2 rollup is app-scope only; platform plans have a single
+        // classification with no candidate set to roll up.
+        changes: None,
         plan: None,
         approvers: None,
         previous_spec_snapshot: Some(serde_json::json!({ "pin": snapshot_pin })),
@@ -3195,11 +3203,13 @@ mod tests {
             },
             risks: Some(MigrationRisks {
                 classification: "breaking".into(),
+                classifications: None,
                 estimated_downtime: None,
                 data_volume: None,
                 reversible: None,
                 requires_full_backup: None,
             }),
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,
@@ -3229,6 +3239,7 @@ mod tests {
                 approved_spec_hash: None,
             },
             risks: None,
+            changes: None,
             plan: None,
             approvers: None,
             previous_spec_snapshot: None,

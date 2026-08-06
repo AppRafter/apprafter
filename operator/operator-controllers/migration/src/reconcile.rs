@@ -369,6 +369,7 @@ mod tests {
                 approved_spec_hash: None,
             },
             risks: None,
+            changes: None,
             plan: Some(steps),
             approvers: None,
             previous_spec_snapshot: None,

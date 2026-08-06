@@ -51,6 +51,34 @@ spec:
                 items:
                   type: string
                 type: array
+              changes:
+                items:
+                  properties:
+                    classification:
+                      enum:
+                      - safe
+                      - requires-restart
+                      - data-migration
+                      - breaking
+                      type: string
+                    field:
+                      type: string
+                    from:
+                      x-kubernetes-preserve-unknown-fields: true
+                    severity:
+                      minimum: 0
+                      type: integer
+                    to:
+                      x-kubernetes-preserve-unknown-fields: true
+                    type:
+                      type: string
+                  required:
+                  - type
+                  - field
+                  - classification
+                  - severity
+                  type: object
+                type: array
               plan:
                 items:
                   properties:
@@ -81,6 +109,10 @@ spec:
                     - data-migration
                     - breaking
                     type: string
+                  classifications:
+                    items:
+                      type: string
+                    type: array
                   dataVolume:
                     type: string
                   estimatedDowntime:

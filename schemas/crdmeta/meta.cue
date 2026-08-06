@@ -154,9 +154,9 @@ _crdMetas: MigrationPlan: {
 
 	// CRD-only SPEC constraints CUE deliberately omits (CUE-validation
 	// philosophy — no half-measure stubs). Paths are relative to `spec`;
-	// `[*]` descends into a map's additionalProperties. `[]` for array
-	// items is NOT supported, so a dropped constraint inside an array's
-	// items is restored by merging an `items:` object onto the array node.
+	// `name[*]` descends into a map's additionalProperties, `name[]` into an
+	// array's items (2.16b S1.2). A whole-array patch can still merge an
+	// `items:` object onto the array node directly.
 	schemaPatches: {
 		// `trigger.from` / `trigger.to` are the CUE top type (`from?: _`,
 		// `to?: _`), which `cue export --out openapi` emits as bare,
@@ -166,6 +166,15 @@ _crdMetas: MigrationPlan: {
 		// omitted to match the hand-rolled mirror exactly.
 		"trigger.from": {"x-kubernetes-preserve-unknown-fields": true}
 		"trigger.to": {"x-kubernetes-preserve-unknown-fields": true}
+
+		// 2.16b S1.2: `changes[].from` / `changes[].to` are the same CUE
+		// top type (`from?: _`, `to?: _`) as the trigger's — restore the
+		// same `{x-kubernetes-preserve-unknown-fields: true}` so the array
+		// items' free-form JSON payloads survive apiserver structural
+		// validation. `[]` descends into the array `items` (`changes` is an
+		// array of #MigrationChange, unlike the map-valued `[*]` fields).
+		"changes[].from": {"x-kubernetes-preserve-unknown-fields": true}
+		"changes[].to": {"x-kubernetes-preserve-unknown-fields": true}
 
 		// `previousSpecSnapshot?: {...}` is an open struct; `cue export`
 		// emits `{type: object}` with no additionalProperties, which the

@@ -116,9 +116,12 @@ fn resolve_inner(node: &Value, schemas: &Map<String, Value>, seen: &mut Vec<Stri
 /// `image` non-empty `pattern`, per the CUE-validation policy) so the
 /// generated CRD still enforces them. Path mini-language, relative to the
 /// spec node: a `name` segment descends into `properties.name`; a
-/// `name[*]` segment descends into `properties.name.additionalProperties`;
-/// the empty path `""` targets the spec root node itself (e.g. to attach a
-/// spec-level `x-kubernetes-validations` CEL rule).
+/// `name[*]` segment descends into `properties.name.additionalProperties`
+/// (a map's value schema); a `name[]` segment descends into
+/// `properties.name.items` (an array's item schema — mirrors the `[]`
+/// convention `check.rs`'s field walker already uses); the empty path `""`
+/// targets the spec root node itself (e.g. to attach a spec-level
+/// `x-kubernetes-validations` CEL rule).
 pub fn apply_patches(spec: &mut Value, patches: &Map<String, Value>) -> Result<()> {
     for (path, patch) in patches {
         let node =
@@ -141,15 +144,28 @@ fn navigate<'a>(root: &'a mut Value, path: &str) -> Option<&'a mut Value> {
     if path.is_empty() {
         return Some(root);
     }
+    // A segment may end in `[*]` (descend into a map's `additionalProperties`)
+    // or `[]` (descend into an array's `items`). `[]` is checked first because
+    // `[*]` is not a suffix of `[]`.
+    enum Descend {
+        None,
+        Map,
+        Array,
+    }
     let mut cur = root;
     for seg in path.split('.') {
-        let (name, additional) = match seg.strip_suffix("[*]") {
-            Some(n) => (n, true),
-            None => (seg, false),
+        let (name, descend) = if let Some(n) = seg.strip_suffix("[*]") {
+            (n, Descend::Map)
+        } else if let Some(n) = seg.strip_suffix("[]") {
+            (n, Descend::Array)
+        } else {
+            (seg, Descend::None)
         };
         cur = cur.get_mut("properties")?.get_mut(name)?;
-        if additional {
-            cur = cur.get_mut("additionalProperties")?;
+        match descend {
+            Descend::Map => cur = cur.get_mut("additionalProperties")?,
+            Descend::Array => cur = cur.get_mut("items")?,
+            Descend::None => {}
         }
     }
     Some(cur)
@@ -255,6 +271,28 @@ mod tests {
             spec["properties"]["environments"]["additionalProperties"]["properties"]["image"]
                 ["pattern"],
             json!("^.+$")
+        );
+    }
+
+    #[test]
+    fn apply_patches_descends_into_array_items_with_bracket_suffix() {
+        // 2.16b S1.2: `name[]` descends into an array's `items` (mirrors the
+        // MigrationPlan `changes[].from` / `.to` preserve-unknown patch).
+        let mut spec = json!({
+            "type": "object",
+            "properties": {
+                "changes": { "type": "array", "items": {
+                    "type": "object", "properties": { "from": {} } } }
+            }
+        });
+        let patches = schemas(json!({
+            "changes[].from": { "x-kubernetes-preserve-unknown-fields": true }
+        }));
+        apply_patches(&mut spec, &patches).unwrap();
+        assert_eq!(
+            spec["properties"]["changes"]["items"]["properties"]["from"]
+                ["x-kubernetes-preserve-unknown-fields"],
+            json!(true)
         );
     }
 
