@@ -516,6 +516,28 @@ sec_wait_plan() {
 # sec_jp <kind> <name> <jsonpath> — read one value from $SEC_NS.
 sec_jp() { kubectl -n "$SEC_NS" get "$1" "$2" -o jsonpath="$3" 2>/dev/null || true; }
 
+# sec_wait_non_paused <name> [timeout] — the $SEC_NS analogue of
+# wait_non_paused (which hardcodes $APP_NS): poll until <name> leaves the
+# AwaitingMigrationApproval phase (settles to Ready/Progressing/…).
+sec_wait_non_paused() {
+    local name="$1" timeout="${2:-120}" deadline phase
+    deadline=$(( $(date +%s) + timeout ))
+    printf '  wait %s (in %s) to leave AwaitingMigrationApproval (timeout %ss) ...\n' \
+        "$name" "$SEC_NS" "$timeout"
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        phase=$(sec_jp "$APP_RES" "$name" '{.status.phase}')
+        if [ -n "$phase" ] && [ "$phase" != "AwaitingMigrationApproval" ]; then
+            printf '  ok: %s left the paused phase (phase=%q)\n' "$name" "$phase"
+            return 0
+        fi
+        sleep 5
+    done
+    printf 'FAILED: %s never left AwaitingMigrationApproval within %ss (last=%q)\n' \
+        "$name" "$timeout" "${phase:-<empty>}" >&2
+    kubectl -n "$SEC_NS" describe "$APP_RES" "$name" >&2 2>&1 || true
+    return 1
+}
+
 # ===============================================================
 # Phase 0: cluster up + bootstrap + branch CRD/RBAC + local operator
 # ===============================================================
@@ -552,8 +574,14 @@ kubectl -n argocd get appproject.argoproj.io apps >/dev/null 2>&1 || {
 # apprafter-operator Applications, so disable automated sync on them (else Argo
 # reverts the branch CRD drift), then apply the BRANCH-rendered CRDs +
 # ClusterRole/ClusterRoleBinding server-side.
-printf '  disabling Argo automated-sync on platform + apprafter-operator ...\n'
-for _app in platform apprafter-operator; do
+# `admission-webhook` is ALSO disabled (2.16b security axis): its
+# ValidatingWebhookConfiguration is the released one, whose `applications` rule
+# LACKS the `applications/status` subresource — so an S-1 status-subresource
+# write bypasses admission entirely. We side-load the BRANCH-rendered VWC (which
+# lists `applications/status`) after the webhook build below, and Argo's
+# selfHeal would otherwise revert that drift instantly.
+printf '  disabling Argo automated-sync on platform + apprafter-operator + admission-webhook ...\n'
+for _app in platform apprafter-operator admission-webhook; do
     kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
         -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
 done
@@ -622,6 +650,50 @@ while [ "$(date +%s)" -lt "$_wh_deadline" ]; do
     sleep 3
 done
 printf '  ok: admission-webhook now running the working-tree (2.16b) build\n'
+
+# 2.16b S-1: side-load the BRANCH-rendered ValidatingWebhookConfiguration. The
+# released VWC's `applications` rule lists only `applications` — NOT
+# `applications/status`. In Kubernetes, a status-subresource write
+# (`kubectl patch --subresource=status`) routes through a DIFFERENT admission
+# URL, so without the `applications/status` subresource listed the S-1 guard in
+# the webhook (status_write_allowed) is NEVER invoked — the write bypasses
+# admission entirely. The branch chart's VWC template lists both (verified at
+# operator/charts/apprafter-admission-webhook/templates/
+# validatingwebhookconfiguration.yaml:44-46), so we render + apply it. Argo
+# selfHeal on the `admission-webhook` app was disabled above so this drift
+# survives.
+#
+# The template carries `cert-manager.io/inject-ca-from`, so cert-manager's
+# ca-injector repopulates `clientConfig.caBundle` after the apply. We wait for
+# the caBundle to reappear on the applications webhook (else a failurePolicy
+# request could hit an empty-CA webhook) AND for the `applications/status`
+# subresource to be listed before proceeding.
+printf '  applying branch admission-webhook ValidatingWebhookConfiguration (S-1: adds applications/status) ...\n'
+helm template admission-webhook "${REPO_ROOT}/operator/charts/apprafter-admission-webhook" \
+    --namespace "$PROVIDER_NS" \
+    | _yq 'select(.kind == "ValidatingWebhookConfiguration")' \
+    | kubectl apply -f -
+printf '  waiting for the branch VWC to list applications/status + cert-manager to re-inject the caBundle ...\n'
+_vwc_deadline=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$_vwc_deadline" ]; do
+    _vwc_res=$(kubectl get validatingwebhookconfiguration admission-webhook.apprafter.io \
+        -o jsonpath='{range .webhooks[?(@.name=="applications.apprafter.io")]}{.rules[*].resources}{"|"}{.clientConfig.caBundle}{end}' 2>/dev/null || true)
+    # Require BOTH: applications/status present AND a non-empty caBundle.
+    if printf '%s' "$_vwc_res" | grep -q "applications/status" \
+        && [ -n "${_vwc_res##*|}" ]; then
+        break
+    fi
+    sleep 3
+done
+if kubectl get validatingwebhookconfiguration admission-webhook.apprafter.io \
+    -o jsonpath='{range .webhooks[?(@.name=="applications.apprafter.io")]}{.rules[*].resources}{end}' 2>/dev/null \
+    | grep -q "applications/status"; then
+    printf '  ok: branch VWC live — applications/status subresource intercepted (S-1 guard reachable)\n'
+else
+    printf 'FAILED: branch VWC did not take (applications/status still not listed) — S-1 guard unreachable\n' >&2
+    kubectl get validatingwebhookconfiguration admission-webhook.apprafter.io -o yaml >&2 2>&1 || true
+    exit 1
+fi
 
 # The admission webhook must be Available before any Application apply (it
 # validates the CR on CREATE — network/hostname invariants).
@@ -996,7 +1068,7 @@ fi
 # the escalated (public) spec applies. The plan consumes (deletes).
 printf '  approving %s via apprafter migration approve ...\n' "$SEC1_PLAN"
 apprafter migration approve "$SEC1_PLAN"
-wait_non_paused "$SEC_INT" 120
+sec_wait_non_paused "$SEC_INT" 120
 wait_gone "$PLAN_RES" "$SEC_NS" "$SEC1_PLAN" 90
 # The approved escalation applied: the baseline is now public.
 wait_jsonpath "$APP_RES" "$SEC_NS" "$SEC_INT" '{.status.lastAppliedSpec.base.expose.network}' public 120
