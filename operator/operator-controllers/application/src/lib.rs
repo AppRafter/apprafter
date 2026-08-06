@@ -768,13 +768,32 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // means a soft-destructive, un-gated edit was applied. Best-effort: a
     // publish failure is logged, never fatal.
     if !soft_notes.is_empty() {
+        // 2.16b S7.1: derive the stable trigger label per note and count each
+        // in `apprafter_soft_destructive_total{trigger,namespace}` — so every
+        // soft op is individually observable even though ONE aggregate Event
+        // is published. The Event severity ESCALATES to `Warning` if ANY note
+        // is one of the review's three data-loss / disruption-prone ops
+        // (selector change, env-literal removal, scale-down); otherwise it
+        // stays `Normal`. Keeping a single event (vs one-per-note) avoids
+        // Event-spam on a multi-op edit while the metric carries the detail.
+        let mut event_type = EventType::Normal;
+        for soft_note in &soft_notes {
+            let trigger = soft_note_trigger(soft_note);
+            ctx.metrics
+                .soft_destructive_total
+                .with_label_values(&[trigger, &namespace])
+                .inc();
+            if soft_event_type(trigger) == EventType::Warning {
+                event_type = EventType::Warning;
+            }
+        }
         let note = format!(
             "soft-destructive changes applied (not gated): {}",
             soft_notes.join("; ")
         );
         let recorder = build_recorder(&ctx.client, &app);
         let ev = KubeEvent {
-            type_: EventType::Normal,
+            type_: event_type,
             reason: "SoftDestructiveChange".into(),
             note: Some(note),
             action: "Reconcile".into(),
@@ -1446,6 +1465,51 @@ fn soft_destructive_notes(old: &ApplicationBaseSpec, new: &ApplicationBaseSpec) 
     }
 
     notes
+}
+
+/// 2.16b S7.1: classify a `soft_destructive_notes` note-string into a STABLE
+/// machine trigger label (distinct from the human note). The label is what
+/// tags the `apprafter_soft_destructive_total` metric and drives
+/// [`soft_event_type`]'s Warning-vs-Normal escalation. The mapping mirrors
+/// the note prefixes `soft_destructive_notes` emits, in the same order:
+///
+///   * `removed env <KEY> (literal)` → `env-literal-removal`
+///   * `changed <key> selector`      → `needs-selector-change`
+///   * `changed <key> size`          → `needs-size-change`
+///   * `image tag <old>→<new>`       → `image-tag-change`
+///   * `scaled down <N>→<M>`         → `scale-down`
+///
+/// An unrecognised note (should never happen — every note is one of the
+/// above) maps to `soft-other`, which is treated as Normal.
+fn soft_note_trigger(note: &str) -> &'static str {
+    if note.starts_with("removed env ") {
+        "env-literal-removal"
+    } else if note.ends_with(" selector") {
+        "needs-selector-change"
+    } else if note.ends_with(" size") {
+        "needs-size-change"
+    } else if note.starts_with("image tag ") {
+        "image-tag-change"
+    } else if note.starts_with("scaled down ") {
+        "scale-down"
+    } else {
+        "soft-other"
+    }
+}
+
+/// 2.16b S7.1: escalate the Kubernetes Event severity for a soft-destructive
+/// trigger. The review's THREE data-loss / disruption-prone soft ops —
+/// `needs.*.selector` change (backend re-route → data-residency move),
+/// env-literal removal (a workload may silently lose a required value), and
+/// scale-DOWN N→M (capacity/availability drop) — publish a `Warning`; every
+/// other soft op (image-tag change, needs.*.size change) stays `Normal`.
+/// Pure over the [`soft_note_trigger`] label so it is unit-tested without a
+/// cluster.
+fn soft_event_type(trigger: &str) -> EventType {
+    match trigger {
+        "needs-selector-change" | "env-literal-removal" | "scale-down" => EventType::Warning,
+        _ => EventType::Normal,
+    }
 }
 
 /// 2.16b: build a per-reconcile `Recorder` publishing Events against the
@@ -3122,6 +3186,37 @@ mod tests {
     }
 
     // ---- 2.16b (R3-mn-d): soft-destructive notes (SoftDestructiveChange) ----
+
+    #[test]
+    fn soft_event_type_escalates_the_review_three() {
+        for op in ["needs-selector-change", "env-literal-removal", "scale-down"] {
+            assert_eq!(soft_event_type(op), EventType::Warning);
+        }
+        assert_eq!(soft_event_type("image-tag-change"), EventType::Normal);
+        // `needs.*.size` is soft but not one of the review's three → Normal.
+        assert_eq!(soft_event_type("needs-size-change"), EventType::Normal);
+    }
+
+    #[test]
+    fn soft_note_trigger_maps_every_note_shape() {
+        assert_eq!(
+            soft_note_trigger("removed env DATABASE_URL (literal)"),
+            "env-literal-removal"
+        );
+        assert_eq!(
+            soft_note_trigger("changed needs.pg selector"),
+            "needs-selector-change"
+        );
+        assert_eq!(
+            soft_note_trigger("changed needs.pg.main size"),
+            "needs-size-change"
+        );
+        assert_eq!(
+            soft_note_trigger("image tag app:v1→app:v2"),
+            "image-tag-change"
+        );
+        assert_eq!(soft_note_trigger("scaled down 3→1"), "scale-down");
+    }
 
     #[test]
     fn soft_destructive_notes_lists_soft_ops() {
