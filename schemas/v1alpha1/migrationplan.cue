@@ -124,9 +124,9 @@ package v1alpha1
 // (`spec.changes[]`). `spec.trigger` carries only the primary
 // `pick_primary` picks; this row type carries every candidate so an
 // approver sees the complete blast radius. `severity` is the ordinal
-// from `migration::classification_severity` (data-migration=3,
-// breaking=2, requires-restart=1, safe=0) so an approval UI can
-// sort/threshold without re-deriving the vocabulary.
+// from `migration::classification_severity` (security-boundary=4,
+// data-migration=3, breaking=2, requires-restart=1, safe=0) so an
+// approval UI can sort/threshold without re-deriving the vocabulary.
 #MigrationChange: {
 	// Trigger kind, e.g. "needs-removal", "scale-to-zero". Same open
 	// string set as `#MigrationTrigger.type`.
@@ -137,9 +137,9 @@ package v1alpha1
 	field: string
 
 	// Same change-class enum as `#MigrationRisks.classification`.
-	classification: "safe" | "requires-restart" | "data-migration" | "breaking"
+	classification: "safe" | "requires-restart" | "data-migration" | "breaking" | "security-boundary"
 
-	// Ordinal severity of `classification` (0..3). Non-negative.
+	// Ordinal severity of `classification` (0..4). Non-negative.
 	severity: int & >=0
 
 	// Old / new values — free-form JSON, mirrors
@@ -154,8 +154,9 @@ package v1alpha1
 	// Mirrors the platform-stack change-class enum from
 	// `platform-stack/cue/compatibility.cue` so users see
 	// a consistent vocabulary across application + platform
-	// migrations.
-	classification: "safe" | "requires-restart" | "data-migration" | "breaking"
+	// migrations. Plus the app-scope `security-boundary` class
+	// (2.16b S1.1) — the most severe, for pull-source / boundary changes.
+	classification: "safe" | "requires-restart" | "data-migration" | "breaking" | "security-boundary"
 
 	// 2.16b S1.2: the DISTINCT classification vocabulary across every
 	// detected candidate (`spec.changes[]`), sorted severity desc then

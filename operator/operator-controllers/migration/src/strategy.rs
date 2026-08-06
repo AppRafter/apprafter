@@ -228,6 +228,11 @@ impl ApplicationMigrationStrategy {
         // pull-source change we gate. Only when BOTH sides carry an image
         // — a None on either side is an image add/remove, out of scope
         // here. `image_repo` mirrors the 2.4h `image_repo_path` heuristic.
+        //
+        // 2.16b S1.1: classified `security-boundary` (the most severe class) —
+        // a different repository / registry path can serve entirely different
+        // content, so it's a pull-source/security change, not a mere restart.
+        // It thus OUTRANKS a co-occurring data-migration for the plan primary.
         if let (Some(old_img), Some(new_img)) = (old.image.as_deref(), new.image.as_deref()) {
             let old_repo = image_repo(old_img);
             let new_repo = image_repo(new_img);
@@ -237,7 +242,7 @@ impl ApplicationMigrationStrategy {
                     field: "spec.image".to_string(),
                     from: Some(json!(old_repo)),
                     to: Some(json!(new_repo)),
-                    classification: "requires-restart".to_string(),
+                    classification: "security-boundary".to_string(),
                 });
             }
         }
@@ -1354,12 +1359,27 @@ mod application_detect_destructive_tests {
         )
         .unwrap();
         assert_eq!(c.trigger_type, "image-path-change");
-        assert_eq!(c.classification, "requires-restart");
+        assert_eq!(c.classification, "security-boundary");
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_image(base(), "ghcr.io/acme/api:v1"),
             &with_image(base(), "ghcr.io/acme/api:v2")
         )
         .is_none()); // tag soft
+    }
+
+    // 2.16b S1.1: moving the image to a DIFFERENT repository is a pull-source /
+    // security-boundary change (a different registry path can serve different
+    // content), so it's the most severe class — outranking a data-migration in
+    // a multi-op edit.
+    #[test]
+    fn image_repo_change_is_security_boundary() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_image(base(), "ghcr.io/acme/api:v1"),
+            &with_image(base(), "ghcr.io/acme/OTHER:v1"),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "image-path-change");
+        assert_eq!(c.classification, "security-boundary");
     }
 
     #[test]
@@ -1624,15 +1644,41 @@ mod application_detect_destructive_tests {
     // lexicographically-smaller `trigger_type` wins.
     #[test]
     fn tie_break_between_two_requires_restart_ops_is_deterministic() {
-        // scale-to-zero + image-path-change, both requires-restart
-        let old = with_replicas(with_image(base(), "ghcr.io/acme/api:v1"), Some(2));
-        let new = with_replicas(with_image(base(), "ghcr.io/acme/other:v1"), Some(0));
+        // env-ref-removal + scale-to-zero, both requires-restart. (image-path
+        // is now `security-boundary` — sev4 — so it wouldn't tie; env-ref
+        // removal keeps a genuine same-severity tie against scale-to-zero.)
+        let old = with_replicas(with_env(base(), "DB", claim_ref()), Some(2));
+        let new = with_replicas(base(), Some(0));
         let c = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
-        // "image-path-change" < "scale-to-zero" (trigger_type asc) → image-path wins, stably
-        assert_eq!(c.trigger_type, "image-path-change");
+        // both requires-restart; "env-ref-removal" < "scale-to-zero"
+        // (trigger_type asc) → env-ref-removal wins, stably.
+        assert_eq!(c.classification, "requires-restart");
+        assert_eq!(c.trigger_type, "env-ref-removal");
         // and it's stable across calls
         assert_eq!(
             c,
+            ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap()
+        );
+    }
+
+    // 2.16b S1.1: in a multi-op edit that carries BOTH an image-repository
+    // change (security-boundary, sev4) AND a needs-removal (data-migration,
+    // sev3), the security-boundary op is the plan primary — it OUTRANKS the
+    // data-migration. This is the reclassify's headline behaviour.
+    #[test]
+    fn image_repo_change_outranks_data_migration_as_primary() {
+        // remove needs.pg (data-migration) AND move the image repo
+        // (security-boundary).
+        let old = with_image(with_pg(base()), "ghcr.io/acme/api:v1");
+        let new = with_image(base(), "ghcr.io/acme/other:v1");
+        let candidates = ApplicationMigrationStrategy::detect_all(&old, &new);
+        assert_eq!(candidates.len(), 2, "both destructive ops detected");
+        let primary = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        assert_eq!(primary.trigger_type, "image-path-change");
+        assert_eq!(primary.classification, "security-boundary");
+        // stable across calls.
+        assert_eq!(
+            primary,
             ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap()
         );
     }

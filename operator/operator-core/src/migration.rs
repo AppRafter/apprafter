@@ -60,10 +60,10 @@ pub struct DestructiveChange {
     pub from: Option<serde_json::Value>,
     /// New value, serialised as JSON.
     pub to: Option<serde_json::Value>,
-    /// One of `"safe" | "requires-restart" | "data-migration" | "breaking"`.
-    /// Mirrors the platform-stack compatibility classification
-    /// vocabulary so users see consistent terminology across
-    /// scopes.
+    /// One of `"safe" | "requires-restart" | "data-migration" | "breaking"
+    /// | "security-boundary"`. Mirrors the platform-stack compatibility
+    /// classification vocabulary (plus the app-scope `security-boundary`
+    /// class, 2.16b S1.1) so users see consistent terminology across scopes.
     pub classification: String,
 }
 
@@ -87,6 +87,11 @@ pub enum MigrationError {
 /// carries several destructive ops (2.16b spec: highest-severity wins).
 pub fn classification_severity(classification: &str) -> u8 {
     match classification {
+        // 2.16b S1.1: a change that alters the app's security boundary (e.g.
+        // moving the image to a different repository / pull source) is the most
+        // severe class — it OUTRANKS a data-migration so it wins primary in a
+        // multi-op edit.
+        "security-boundary" => 4,
         "data-migration" => 3,
         "breaking" => 2,
         "requires-restart" => 1,
@@ -171,5 +176,18 @@ mod tests {
         assert!(classification_severity("requires-restart") > classification_severity("safe"));
         // unknown classifications sort lowest (defensive)
         assert_eq!(classification_severity("bogus"), 0);
+    }
+
+    // 2.16b S1.1: the `security-boundary` class is the most severe — a change
+    // that alters the app's security boundary (e.g. moving the image to a
+    // different repository / pull source) OUTRANKS a data-migration, so in a
+    // multi-op edit it becomes the plan's primary.
+    #[test]
+    fn security_boundary_outranks_data_migration() {
+        assert_eq!(classification_severity("security-boundary"), 4);
+        assert!(
+            classification_severity("security-boundary")
+                > classification_severity("data-migration")
+        );
     }
 }

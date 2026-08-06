@@ -60,6 +60,7 @@ spec:
                       - requires-restart
                       - data-migration
                       - breaking
+                      - security-boundary
                       type: string
                     field:
                       type: string
@@ -108,6 +109,7 @@ spec:
                     - requires-restart
                     - data-migration
                     - breaking
+                    - security-boundary
                     type: string
                   classifications:
                     items:
