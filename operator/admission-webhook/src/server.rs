@@ -144,6 +144,54 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
         }
     }
 
+    // 2.16b (S7.2): `Application.spec.environment` is IMMUTABLE on UPDATE.
+    // It selects which `environments.<env>` override the operator unifies
+    // onto `base` (ADR 0044); flipping it (dev→prod) swaps the ENTIRE
+    // effective spec at once (image/replicas/expose/env/needs, override-wins)
+    // — a gate-laundering vector that would never be audited as the
+    // destructive change it is. A different environment is a DIFFERENT
+    // deployment (`<name>-<env>` is its own Argo Application / Application
+    // CR), not an edit to an existing CR. Mirrors the RetainedClaim
+    // spec-immutability guard. Runs ONLY on an UPDATE to the MAIN resource:
+    // CREATE has no `oldObject` (each per-env CR is created once, allowed),
+    // and a status-subresource write carries no `spec` (skip — the
+    // operator-ownership guard above is the whole check for it).
+    if kind == "Application" && sub_resource != Some("status") && operation == "UPDATE" {
+        let old_env = old_object
+            .as_ref()
+            .and_then(|o| o.pointer("/spec/environment"))
+            .and_then(Value::as_str);
+        let new_env = object.pointer("/spec/environment").and_then(Value::as_str);
+        if !crate::validator::environment_update_allowed(old_env, new_env) {
+            let was = old_env.unwrap_or("<unset>");
+            let to = new_env.unwrap_or("<unset>");
+            let message = format!(
+                "spec.environment is immutable on UPDATE (was '{was}', cannot change to '{to}') — a different environment is a different deployment (<name>-<env>), not an edit"
+            );
+            warn!(
+                target: "admission_webhook",
+                was = %was,
+                to = %to,
+                "rejected Application spec.environment change on UPDATE"
+            );
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "apiVersion": api_version,
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": uid,
+                        "allowed": false,
+                        "status": {
+                            "code": 403,
+                            "message": message
+                        }
+                    }
+                })),
+            );
+        }
+    }
+
     let errors = match kind {
         // A status-subresource write carries no meaningful spec change to
         // validate — the operator-ownership guard above is the whole check
@@ -594,6 +642,134 @@ mod tests {
         );
         let parsed = post_review(body).await;
         assert_eq!(parsed["response"]["allowed"], json!(true));
+    }
+
+    // ── 2.16b S7.2: Application.spec.environment immutable on UPDATE ──────
+
+    /// AdmissionReview for an Application UPDATE carrying both `object` (new)
+    /// and `oldObject` (prior). `old_env`/`new_env` set each side's
+    /// `spec.environment` (omitted when `None`). Both specs carry a valid
+    /// `base.image` so the spec validator itself passes — the only variable
+    /// under test is the environment transition.
+    fn application_update(
+        old_env: Option<&str>,
+        new_env: Option<&str>,
+        new_extra: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut old_spec = json!({ "base": { "image": "ghcr.io/acme/web:1.0" }, "environments": { "dev": {}, "prod": {} } });
+        if let Some(e) = old_env {
+            old_spec["environment"] = json!(e);
+        }
+        let mut new_spec = json!({ "base": { "image": "ghcr.io/acme/web:1.0" }, "environments": { "dev": {}, "prod": {} } });
+        if let Some(e) = new_env {
+            new_spec["environment"] = json!(e);
+        }
+        // Merge any extra new-spec fields (a legit spec edit) over new_spec.
+        if let Some(extra) = new_extra.as_object() {
+            for (k, v) in extra {
+                new_spec[k] = v.clone();
+            }
+        }
+        json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "deadbeef",
+                "kind": { "group": "apprafter.io", "version": "v1alpha1", "kind": "Application" },
+                "operation": "UPDATE",
+                "object": { "metadata": { "name": "web", "namespace": "demo" }, "spec": new_spec },
+                "oldObject": { "metadata": { "name": "web", "namespace": "demo" }, "spec": old_spec },
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn rejects_application_environment_change_on_update() {
+        let parsed = post_review(application_update(Some("dev"), Some("prod"), json!({}))).await;
+        assert_eq!(parsed["response"]["allowed"], json!(false));
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("spec.environment is immutable"),
+            "expected the immutability message, got {msg:?}"
+        );
+        assert!(
+            msg.contains("dev") && msg.contains("prod"),
+            "expected both the old and new environment in the message, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_clearing_a_set_environment_on_update() {
+        let parsed = post_review(application_update(Some("dev"), None, json!({}))).await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(false),
+            "clearing a concretely-set environment still swaps the effective spec back to base-only — a rejected change"
+        );
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("spec.environment is immutable"));
+    }
+
+    #[tokio::test]
+    async fn allows_application_update_with_same_environment() {
+        let parsed = post_review(application_update(Some("dev"), Some("dev"), json!({}))).await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(true),
+            "an UPDATE keeping the same environment must pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_application_update_setting_environment_first_time() {
+        // An existing default-env CR (old environment unset) may set its
+        // environment for the first time — old is None → allowed.
+        let parsed = post_review(application_update(None, Some("dev"), json!({}))).await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(true),
+            "first-set of environment on a CR that had none must pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_application_update_that_does_not_touch_environment() {
+        // A legit spec edit (bump the image) on a CR with a fixed environment,
+        // keeping the environment identical, must pass.
+        let parsed = post_review(application_update(
+            Some("prod"),
+            Some("prod"),
+            json!({ "base": { "image": "ghcr.io/acme/web:2.0" } }),
+        ))
+        .await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(true),
+            "a spec edit that keeps the environment must pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_application_create_with_any_environment() {
+        // A CREATE has no oldObject — each `<name>-<env>` CR is created once
+        // with its environment, which must always be allowed. (No `operation`
+        // UPDATE, and no oldObject → the immutability block does not fire.)
+        let body = admission_review_for_kind(
+            "Application",
+            json!({
+                "spec": {
+                    "base": { "image": "ghcr.io/acme/web:1.0" },
+                    "environments": { "prod": {} },
+                    "environment": "prod"
+                }
+            }),
+        );
+        let parsed = post_review(body).await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(true),
+            "a CREATE carrying an environment must pass (per-env CRs are created once)"
+        );
     }
 
     #[tokio::test]

@@ -1437,6 +1437,45 @@ fn validate_spec_environment(
     }
 }
 
+/// 2.16b (S7.2): whether an UPDATE may carry the given `spec.environment`
+/// transition. `spec.environment` selects which `environments.<env>`
+/// override the operator unifies onto `base` (ADR 0044) — flipping it
+/// (dev→prod) swaps the ENTIRE effective spec at once (image/replicas/
+/// expose/env/needs, override-wins), a gate-laundering vector that would
+/// never be audited as the destructive change it is. Changing environment
+/// is a DIFFERENT deployment (each `<name>-<env>` is its own Argo
+/// Application / Application CR), never an edit to an existing CR — so
+/// `spec.environment` is IMMUTABLE once concretely set. Mirrors the
+/// RetainedClaim spec-immutability precedent.
+///
+/// The rule (empty string is treated as UNSET, matching the codebase
+/// convention in `validate_spec_environment`):
+///   - `old` unset (CREATE — no oldObject — or an existing CR that never
+///     set an environment): ALLOW. This lets a per-env CR be created (no
+///     oldObject) and lets an existing default-env CR set its environment
+///     for the first time. `environment_update_allowed(None, _) == true`.
+///   - `old` concretely set:
+///       - `new` equal → ALLOW (an unrelated spec edit / metadata tweak);
+///       - `new` a different concrete env → REJECT (dev→prod laundering);
+///       - `new` cleared (None/empty) → REJECT (dropping a set env still
+///         swaps the effective spec back to base-only — a change).
+///
+/// Safe for per-env deploys: each `<name>-<env>` CR is CREATEd exactly once
+/// (old is `None` → allowed); the rule only blocks CHANGING a concrete env
+/// on a CR that already has one, which is the laundering path.
+pub fn environment_update_allowed(old_env: Option<&str>, new_env: Option<&str>) -> bool {
+    // Empty string ≡ unset (codebase convention).
+    let old = old_env.filter(|s| !s.is_empty());
+    let new = new_env.filter(|s| !s.is_empty());
+    match old {
+        // Old unset (CREATE, or first-set on an existing CR) → always allowed.
+        None => true,
+        // Old concretely set → the new value must equal it exactly. A
+        // different concrete env, or clearing it, is a rejected change.
+        Some(o) => new == Some(o),
+    }
+}
+
 fn validate_env_keys(
     path: &str,
     env: &serde_json::Map<String, Value>,
@@ -3079,5 +3118,15 @@ mod tests {
                                   "hostname": "app.demo.dev", "tls": true } }
         });
         assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    // ── 2.16b S7.2: spec.environment immutable on UPDATE ──────────────────
+    #[test]
+    fn environment_change_on_update_is_rejected() {
+        assert!(environment_update_allowed(None, Some("dev"))); // CREATE (no old) -> ok
+        assert!(environment_update_allowed(Some("dev"), Some("dev"))); // unchanged -> ok
+        assert!(environment_update_allowed(Some(""), Some("dev"))); // old absent-as-empty -> first set ok
+        assert!(!environment_update_allowed(Some("dev"), Some("prod"))); // change -> rejected
+        assert!(!environment_update_allowed(Some("dev"), None)); // clearing a set env -> rejected
     }
 }
