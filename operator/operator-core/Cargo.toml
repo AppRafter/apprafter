@@ -24,3 +24,4 @@ tokio        = { workspace = true }
 tracing      = { workspace = true }
 thiserror    = { workspace = true }
 async-trait  = { workspace = true }
+sha2         = { workspace = true }

@@ -51,6 +51,7 @@ flate2             = "1.0"
 tar                = "0.4"
 rand               = "0.8"
 anyhow             = "1"
+sha2               = "0.10"
 
 [profile.release]
 lto           = "thin"

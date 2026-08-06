@@ -295,6 +295,20 @@ impl ApplicationMigrationStrategy {
                 field: change.field.clone(),
                 from: change.from.clone(),
                 to: change.to.clone(),
+                // 2.16b S-4: bind this app-scope plan (and thus its
+                // approval) to a content hash of the change it gates, so
+                // the approval is never transferable across a different
+                // spec edit. `plan_state` re-verifies this at consume
+                // time (hash mismatch → the completed plan is a relic,
+                // re-gated as a fresh pending-approval plan).
+                //
+                // 2.16b S1.2: hash the full candidate set once
+                // create_plan_for takes all candidates (today the caller
+                // passes the single `pick_primary` change, so the plan is
+                // bound to the primary op's content).
+                approved_spec_hash: Some(operator_core::migration::change_hash(
+                    std::slice::from_ref(change),
+                )),
             },
             risks: Some(operator_core::MigrationRisks {
                 classification: change.classification.clone(),
@@ -764,6 +778,7 @@ mod tests {
                 field: "needs.pg.selector".into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: None,
             plan: None,
@@ -787,6 +802,7 @@ mod tests {
                 field: "spec.pin".into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: None,
             plan: None,
@@ -925,6 +941,42 @@ mod tests {
         // Missing field also distinct from a concrete string.
         assert!(!pins_equal(None, Some(&s)));
         assert!(!pins_equal(Some(&s), None));
+    }
+}
+
+#[cfg(test)]
+mod change_hash_tests {
+    use operator_core::migration::change_hash;
+    use operator_core::DestructiveChange;
+    use serde_json::json;
+
+    // 2.16b S-4: an app-scope MigrationPlan approval must NOT be
+    // transferable across a spec change. The plan is bound to a
+    // content hash of the detected change(s); the hash has to be
+    // stable for identical content AND sensitive to the from/to
+    // payload (not just the `(trigger_type, field)` tuple) — else
+    // an approval for `replicas 2->0` would consume against a
+    // DIFFERENT `replicas 1->0`, defeating the gate.
+    #[test]
+    fn spec_hash_is_stable_and_content_sensitive() {
+        let a = DestructiveChange {
+            trigger_type: "scale-to-zero".into(),
+            field: "replicas".into(),
+            from: Some(json!("2")),
+            to: Some(json!("0")),
+            classification: "requires-restart".into(),
+        };
+        let b = DestructiveChange {
+            from: Some(json!("1")),
+            ..a.clone()
+        }; // 1->0, different content, same tuple
+           // stable: identical content hashes identically.
+        assert_eq!(
+            change_hash(std::slice::from_ref(&a)),
+            change_hash(std::slice::from_ref(&a))
+        );
+        // sensitive: same tuple, different from/to → different hash.
+        assert_ne!(change_hash(&[a]), change_hash(&[b]));
     }
 }
 

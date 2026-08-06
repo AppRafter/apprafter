@@ -1699,11 +1699,42 @@ pub fn plan_state(plan: Option<&MigrationPlan>, current_trigger: &DestructiveCha
             PlanState::BlockingMismatch
         };
     }
-    // Terminal (completed | rejected).
-    if phase == "completed" && trigger_matches {
+    // Terminal (completed | rejected). A `completed` plan whose trigger
+    // TUPLE `(type, field)` matches is a candidate to consume — but
+    // 2.16b S-4 additionally requires the plan's stamped CONTENT hash to
+    // match the CURRENT change's hash. Without that, an approval for
+    // `replicas 2->0` would consume against a DIFFERENT `replicas 1->0`
+    // (same tuple, different payload), fully defeating the gate for a
+    // security-boundary op. On a hash MISMATCH we demote the completed
+    // plan to a `Relic`, so `decide` yields `DeleteThenCreate` and the
+    // edit is re-gated as a fresh `pending-approval` plan. A legacy plan
+    // with no stamped hash (`None`) still consumes (`plan_hash_matches`
+    // returns `true`) — S-4 must not break plans cut before this change.
+    if phase == "completed"
+        && trigger_matches
+        && plan_hash_matches(
+            plan,
+            &operator_core::migration::change_hash(std::slice::from_ref(current_trigger)),
+        )
+    {
         PlanState::CompletedMatch
     } else {
         PlanState::Relic
+    }
+}
+
+/// 2.16b S-4: does the plan's stamped `approvedSpecHash` match the
+/// current detected change's content hash? A legacy plan carrying no
+/// stamped hash (`None`) matches unconditionally so S-4 never breaks a
+/// plan cut before the hash field existed. A stamped hash matches iff it
+/// equals `current_hash` — this is what makes an app-scope approval
+/// non-transferable across a different spec edit (the security fix): the
+/// approver signed off on ONE `from->to`, and swapping the payload before
+/// consume now yields a different hash → no match → re-gate.
+fn plan_hash_matches(plan: &MigrationPlan, current_hash: &str) -> bool {
+    match plan.spec.trigger.approved_spec_hash.as_deref() {
+        Some(h) => h == current_hash,
+        None => true, // legacy plan: don't break existing approvals
     }
 }
 
@@ -2775,6 +2806,7 @@ mod tests {
                 field: "f".into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: None,
             plan: None,
@@ -2808,6 +2840,7 @@ mod tests {
                 field: "f".into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: None,
             plan: None,
@@ -4984,6 +5017,7 @@ mod tests {
                 field: field.into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: None,
             plan: None,
@@ -5038,6 +5072,123 @@ mod tests {
         // Rejected → Relic.
         let rejected = plan_with_trigger("selector-change", "needs.pg.selector", Some("rejected"));
         assert_eq!(plan_state(Some(&rejected), &cur), PlanState::Relic);
+    }
+
+    // ---- 2.16b S-4: app approval is NON-transferable across a spec change ----
+
+    // Build a `completed` app-scope plan whose trigger carries a specific
+    // `(type, field, from, to)` and stamped `approvedSpecHash`. Lets a test
+    // build a plan whose trigger TUPLE matches the current change but whose
+    // stamped CONTENT hash differs (the S-4 attack: approve a benign
+    // `from->to`, then swap the payload before consume).
+    fn completed_plan_with_hash(
+        change: &DestructiveChange,
+        approved_spec_hash: Option<String>,
+    ) -> MigrationPlan {
+        let spec = MigrationPlanSpec {
+            scope: MigrationPlanScope {
+                type_: "application".into(),
+                application: Some(MigrationApplicationScope {
+                    ref_: MigrationApplicationRef {
+                        name: "parser".into(),
+                        namespace: "demo".into(),
+                    },
+                    environment: "prod".into(),
+                }),
+                platform: None,
+            },
+            trigger: MigrationTrigger {
+                type_: change.trigger_type.clone(),
+                field: change.field.clone(),
+                from: change.from.clone(),
+                to: change.to.clone(),
+                approved_spec_hash,
+            },
+            risks: None,
+            plan: None,
+            approvers: None,
+            previous_spec_snapshot: None,
+        };
+        let mut plan = MigrationPlan::new("parser-pg", spec);
+        plan.status = Some(MigrationPlanStatus {
+            phase: Some("completed".into()),
+            ..MigrationPlanStatus::default()
+        });
+        plan
+    }
+
+    // A completed plan whose stamped hash matches the CURRENT change's hash
+    // → CompletedMatch (consume + apply). A completed plan whose tuple
+    // matches but whose stamped hash is for a DIFFERENT change → Relic (NOT
+    // CompletedMatch), so `decide` re-gates it as a fresh plan and the
+    // approval does NOT transfer. A legacy plan (no stamped hash) still
+    // consumes (don't break existing approvals).
+    #[test]
+    fn completed_plan_consumes_only_on_matching_content_hash() {
+        // The change actually pending this reconcile: replicas 1 -> 0.
+        let current = DestructiveChange {
+            trigger_type: "scale-to-zero".into(),
+            field: "replicas".into(),
+            from: Some(serde_json::json!("1")),
+            to: Some(serde_json::json!("0")),
+            classification: "requires-restart".into(),
+        };
+        let current_hash = operator_core::migration::change_hash(std::slice::from_ref(&current));
+
+        // (a) hash matches → CompletedMatch.
+        let matched = completed_plan_with_hash(&current, Some(current_hash.clone()));
+        assert_eq!(
+            plan_state(Some(&matched), &current),
+            PlanState::CompletedMatch
+        );
+
+        // (b) THE ATTACK: the approver signed off on a DIFFERENT change
+        // (replicas 2 -> 0) — same `(type, field)` tuple, different
+        // content. Its stamped hash must NOT transfer to `current`.
+        let approved = DestructiveChange {
+            from: Some(serde_json::json!("2")),
+            ..current.clone()
+        };
+        let approved_hash = operator_core::migration::change_hash(std::slice::from_ref(&approved));
+        assert_ne!(approved_hash, current_hash); // sanity: different content
+        let transferable = completed_plan_with_hash(&approved, Some(approved_hash));
+        // Tuple STILL matches (both scale-to-zero/replicas) …
+        assert_eq!(transferable.spec.trigger.type_, current.trigger_type);
+        assert_eq!(transferable.spec.trigger.field, current.field);
+        // … but the content hash differs → Relic, NOT CompletedMatch.
+        assert_eq!(plan_state(Some(&transferable), &current), PlanState::Relic);
+
+        // (c) legacy plan (no stamped hash) still consumes.
+        let legacy = completed_plan_with_hash(&current, None);
+        assert_eq!(
+            plan_state(Some(&legacy), &current),
+            PlanState::CompletedMatch
+        );
+    }
+
+    // The state machine as a whole must yield DeleteThenCreate (re-gate),
+    // NOT ConsumeApply, when a completed plan's tuple matches but its
+    // content hash does not — i.e. the approval is refused transfer.
+    #[test]
+    fn state_machine_re_gates_on_hash_mismatch_not_consume() {
+        let current = DestructiveChange {
+            trigger_type: "scale-to-zero".into(),
+            field: "replicas".into(),
+            from: Some(serde_json::json!("1")),
+            to: Some(serde_json::json!("0")),
+            classification: "requires-restart".into(),
+        };
+        let approved = DestructiveChange {
+            from: Some(serde_json::json!("2")),
+            ..current.clone()
+        };
+        let approved_hash = operator_core::migration::change_hash(std::slice::from_ref(&approved));
+        let transferable = completed_plan_with_hash(&approved, Some(approved_hash));
+        let state = plan_state(Some(&transferable), &current);
+        assert_eq!(state, PlanState::Relic);
+        // has_change=true × Relic → DeleteThenCreate (re-gate as a fresh
+        // pending-approval plan), NOT ConsumeApply.
+        assert_eq!(decide(true, state), MigrationDecision::DeleteThenCreate);
     }
 
     // ---- 2.16b Task 11: reconcile-wiring pure seams ----

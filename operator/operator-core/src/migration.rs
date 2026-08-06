@@ -20,6 +20,7 @@
 //! wire them in at the call sites.
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{MigrationPlan, MigrationStep};
@@ -91,6 +92,56 @@ pub fn classification_severity(classification: &str) -> u8 {
         "requires-restart" => 1,
         _ => 0, // "safe" / unknown
     }
+}
+
+/// 2.16b S-4: a stable, content-sensitive hash of the destructive
+/// change(s) a spec edit produced. Used to BIND an app-scope
+/// MigrationPlan approval to the *exact* change it was approved for,
+/// so an approval is never transferable across a different spec edit.
+///
+/// Without this binding, `plan_state`'s trigger-match compared only the
+/// `(trigger_type, field)` tuple — never the `from`/`to` CONTENT — so an
+/// approval for `replicas 2->0` would consume against a DIFFERENT
+/// `replicas 1->0`. For a security-boundary op that fully defeats the
+/// gate (approve a benign `from->to`, swap the payload before consume).
+/// The stamped hash is re-verified at consume time; a mismatch demotes
+/// the completed plan to a relic and re-gates the edit as a fresh
+/// pending-approval plan.
+///
+/// Determinism: each change is canonicalised to
+/// `"<trigger_type>|<field>|<from>|<to>"` (from/to = the JSON value's
+/// string form, or `""` when `None`), the lines are SORTED (so the hash
+/// is independent of candidate discovery/push order), joined with `\n`,
+/// and SHA-256'd to a lowercase hex string.
+pub fn change_hash(changes: &[DestructiveChange]) -> String {
+    /// Render a `from`/`to` JSON value to a stable string. A JSON string
+    /// contributes its inner text (`json!("2")` -> `2`); any other value
+    /// (number, object, array, bool, null) contributes its compact JSON
+    /// form so structured `from`/`to` payloads (e.g. SourceCredential's
+    /// object diffs) still participate in the hash. `None` -> `""`.
+    fn value_str(v: &Option<serde_json::Value>) -> String {
+        match v {
+            None => String::new(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        }
+    }
+
+    let mut lines: Vec<String> = changes
+        .iter()
+        .map(|c| {
+            format!(
+                "{}|{}|{}|{}",
+                c.trigger_type,
+                c.field,
+                value_str(&c.from),
+                value_str(&c.to),
+            )
+        })
+        .collect();
+    lines.sort();
+    let joined = lines.join("\n");
+    format!("{:x}", Sha256::digest(joined.as_bytes()))
 }
 
 /// Per-scope behaviour shared between application + platform

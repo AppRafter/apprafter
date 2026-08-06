@@ -134,6 +134,8 @@ spec:
                 type: object
               trigger:
                 properties:
+                  approvedSpecHash:
+                    type: string
                   field:
                     type: string
                   from:

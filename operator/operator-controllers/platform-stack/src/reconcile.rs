@@ -1941,6 +1941,12 @@ fn build_platform_migration_plan_cr(
             field: "spec.pin".into(),
             from: Some(Value::String(from_version.to_string())),
             to: Some(Value::String(to_version.to_string())),
+            // 2.16b S-4 is app-scope: an app approval must not transfer
+            // across a different spec edit. Platform-scope plans revert
+            // via `previousSpecSnapshot` (a separate, version-anchored
+            // mechanism) and are not consumed by the Application
+            // reconciler's hash gate, so no content hash is stamped here.
+            approved_spec_hash: None,
         },
         risks: Some(MigrationRisks {
             classification,
@@ -3185,6 +3191,7 @@ mod tests {
                 field: "f".into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: Some(MigrationRisks {
                 classification: "breaking".into(),
@@ -3219,6 +3226,7 @@ mod tests {
                 field: "f".into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: None,
             plan: None,

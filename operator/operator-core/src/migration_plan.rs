@@ -89,6 +89,21 @@ pub struct MigrationTrigger {
     pub from: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<serde_json::Value>,
+    /// 2.16b S-4: SHA-256 of the destructive change(s) this plan was cut
+    /// (and thus approved) for. Binds an app-scope approval to the exact
+    /// `from`/`to` CONTENT — not just the `(type, field)` tuple — so an
+    /// approval is never transferable across a different spec edit. The
+    /// Application reconciler re-verifies it at consume time; a mismatch
+    /// demotes the completed plan to a relic and re-gates the edit as a
+    /// fresh pending-approval plan. Absent (`None`) on legacy plans
+    /// cut before S-4 — those still consume (the reconciler treats a
+    /// missing hash as "don't break existing plans").
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "approvedSpecHash"
+    )]
+    pub approved_spec_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]

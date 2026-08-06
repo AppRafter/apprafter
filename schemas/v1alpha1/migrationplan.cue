@@ -100,6 +100,13 @@ package v1alpha1
 	// field types.
 	from?: _
 	to?:   _
+
+	// 2.16b S-4: SHA-256 hex of the destructive change(s) this
+	// plan was cut (and approved) for. Binds an app-scope
+	// approval to the exact from/to CONTENT so it is never
+	// transferable across a different spec edit. Absent on
+	// legacy plans (they still consume).
+	approvedSpecHash?: string
 }
 
 // Risk classification + impact metadata. Operators read

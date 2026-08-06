@@ -366,6 +366,7 @@ mod tests {
                 field: "f".into(),
                 from: None,
                 to: None,
+                approved_spec_hash: None,
             },
             risks: None,
             plan: Some(steps),
