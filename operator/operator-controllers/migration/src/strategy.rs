@@ -21,6 +21,8 @@
 //! and SSA produces a byte-identical patch (no resource-version
 //! bump, no watch fan-out).
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -274,6 +276,67 @@ impl ApplicationMigrationStrategy {
                         classification: "requires-restart".to_string(),
                     });
                 }
+            }
+        }
+
+        // 2.16b Task 6 (#7/#8/#9): env-ref security-boundary triggers. Iterate
+        // the UNION of env keys once and classify each key's `old → new`
+        // transition. Every candidate here is `security-boundary` (sev 4) and
+        // PAUSES for approval — none is a webhook reject. Load-bearing invariant
+        // (S1.4): `from`/`to` carry only ref SENTINELS (`render_env_ref`) or
+        // structural markers (`(absent)` / `(literal)`), NEVER a literal env
+        // VALUE — a MigrationPlan is world-readable to any plan-read principal.
+        let empty_env = BTreeMap::new();
+        let old_env = old.env.as_ref().unwrap_or(&empty_env);
+        let new_env = new.env.as_ref().unwrap_or(&empty_env);
+        for (key, new_val) in new_env {
+            match old_env.get(key) {
+                // Key ADDED. Only a `secret:` ref add is gated (#7): the
+                // container gains a fresh external-secret dependency. A claim
+                // ref add is self-scoped (ADR 0046 — provider-derived) → soft.
+                None => {
+                    if let EnvValue::Ref(r @ EnvRef::Secret(_)) = new_val {
+                        candidates.push(DestructiveChange {
+                            trigger_type: "env-secret-ref-add".to_string(),
+                            field: format!("env.{key}"),
+                            from: Some(json!("(absent)")),
+                            to: Some(json!(render_env_ref(r))),
+                            classification: "security-boundary".to_string(),
+                        });
+                    }
+                }
+                // Key present BOTH sides. Two security-boundary transitions:
+                //   #8 downgrade: `Ref(_)` → `Literal(_)` — a resolved-at-
+                //      runtime reference replaced by an inline value. `to` is
+                //      the `"(literal)"` SENTINEL, never the literal VALUE.
+                //   #9 retarget: `Ref(Secret(a))` → `Ref(Secret(b))`, a≠b — a
+                //      different external secret. A claim→claim retarget is
+                //      self-scoped (not #9); a secret↔claim variant change is
+                //      neither #8 (still a Ref) nor #9 (not secret→secret).
+                Some(old_val) => match (old_val, new_val) {
+                    (EnvValue::Ref(old_r), EnvValue::Literal(_)) => {
+                        candidates.push(DestructiveChange {
+                            trigger_type: "env-ref-downgrade".to_string(),
+                            field: format!("env.{key}"),
+                            from: Some(json!(render_env_ref(old_r))),
+                            to: Some(json!("(literal)")),
+                            classification: "security-boundary".to_string(),
+                        });
+                    }
+                    (
+                        EnvValue::Ref(old_r @ EnvRef::Secret(a)),
+                        EnvValue::Ref(new_r @ EnvRef::Secret(b)),
+                    ) if a != b => {
+                        candidates.push(DestructiveChange {
+                            trigger_type: "env-secret-ref-retarget".to_string(),
+                            field: format!("env.{key}"),
+                            from: Some(json!(render_env_ref(old_r))),
+                            to: Some(json!(render_env_ref(new_r))),
+                            classification: "security-boundary".to_string(),
+                        });
+                    }
+                    _ => {}
+                },
             }
         }
 
@@ -1467,14 +1530,167 @@ mod application_detect_destructive_tests {
     }
 
     #[test]
-    fn changing_env_ref_value_is_soft() {
-        // Task 5 gates only REMOVAL of a ref-valued env; a key that stays
-        // present (ref → ref, or ref → literal) is a soft rollout.
+    fn changing_env_ref_to_same_ref_is_soft() {
+        // Task 5 gates only REMOVAL of a ref-valued env. A key that stays
+        // present with an UNCHANGED ref (claim → same claim) is a soft rollout.
+        // NOTE (2.16b Task 6 #8): a ref → LITERAL change is NO LONGER soft — it
+        // is an `env-ref-downgrade` security-boundary op (see
+        // `env_ref_to_literal_downgrade_gates_no_leak`). Only the same-ref /
+        // self-scoped-retarget cases remain soft.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "DB", claim_ref()),
-            &with_env(base(), "DB", EnvValue::Literal("postgres://…".into()))
+            &with_env(base(), "DB", claim_ref())
         )
         .is_none());
+    }
+
+    // ---- 2.16b Task 6: env-ref security-boundary triggers #7/#8/#9 ----
+
+    // #7 env-secret-ref-add: a NEW key whose value is a `secret:` ref is a
+    // security-boundary op — the container gains a fresh external-secret
+    // dependency. A `claim.` ref add is self-scoped (ADR 0046) and stays SOFT.
+    #[test]
+    fn env_secret_ref_add_gates_but_claim_add_soft() {
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &base(),
+            &with_env(
+                base(),
+                "S",
+                EnvValue::Ref(EnvRef::Secret("stripe/key".into())),
+            ),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "env-secret-ref-add");
+        assert_eq!(c.classification, "security-boundary");
+        assert_eq!(c.field, "env.S");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "(absent)");
+        assert_eq!(
+            c.to.as_ref().unwrap().as_str().unwrap(),
+            "secret:stripe/key"
+        );
+        // A claim-ref ADD is NOT gated (self-scoped).
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &base(),
+            &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.url".into())))
+        )
+        .is_none());
+    }
+
+    // #8 env-ref-downgrade: a key present both sides moving from a `Ref`
+    // (claim OR secret) to a `Literal` is a security-boundary downgrade — a
+    // resolved-at-runtime reference is replaced by an inline value. `to` is
+    // the SENTINEL `"(literal)"`, NEVER the literal value (no leak).
+    #[test]
+    fn env_ref_to_literal_downgrade_gates_no_leak() {
+        let old = with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.url".into())));
+        let new = with_env(
+            base(),
+            "D",
+            EnvValue::Literal("postgres://attacker/db".into()),
+        );
+        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        assert_eq!(c.trigger_type, "env-ref-downgrade");
+        assert_eq!(c.classification, "security-boundary");
+        assert_eq!(c.field, "env.D");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "claim.pg.url");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "(literal)"); // no value leak
+    }
+
+    // A secret-ref → literal downgrade gates the same way (still #8).
+    #[test]
+    fn env_secret_ref_to_literal_downgrade_gates() {
+        let old = with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into())));
+        let new = with_env(base(), "K", EnvValue::Literal("hardcoded".into()));
+        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        assert_eq!(c.trigger_type, "env-ref-downgrade");
+        assert_eq!(c.classification, "security-boundary");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "secret:a/k");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "(literal)");
+    }
+
+    // A literal → literal change is NOT a downgrade (both sides inline) — soft.
+    #[test]
+    fn env_literal_to_literal_is_not_a_downgrade() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "X", EnvValue::Literal("a".into())),
+            &with_env(base(), "X", EnvValue::Literal("b".into()))
+        )
+        .is_none());
+    }
+
+    // #9 env-secret-ref-retarget: a key present both sides pointing at a
+    // DIFFERENT `secret:` target is a security-boundary retarget. A same-target
+    // secret ref (unchanged) is soft; a claim→claim retarget is self-scoped and
+    // NOT gated as #9.
+    #[test]
+    fn secret_ref_retarget_gates_same_soft() {
+        let old = with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into())));
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &old,
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("b/k".into()))),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "env-secret-ref-retarget");
+        assert_eq!(c.classification, "security-boundary");
+        assert_eq!(c.field, "env.K");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "secret:a/k");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "secret:b/k");
+        // Same secret target on both sides → soft.
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &old,
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into())))
+        )
+        .is_none());
+    }
+
+    // A claim→claim retarget is self-scoped (ADR 0046) — NOT gated as #9.
+    #[test]
+    fn claim_ref_retarget_is_soft() {
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
+            &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.host".into())))
+        )
+        .is_none());
+    }
+
+    // secret→claim / claim→secret are NOT #9 (only secret→secret different
+    // target retargets). A secret→claim change is a self-scoping move (the
+    // claim ref is provider-derived), and a claim→secret ADD-of-secret-surface
+    // reuses an existing key so it isn't #7 either — both stay SOFT here.
+    #[test]
+    fn secret_to_claim_and_claim_to_secret_crossovers_are_soft() {
+        // secret → claim (both sides Ref, different variant): not a retarget,
+        // not a downgrade (new is still a Ref).
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into()))),
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Claim("pg.url".into())))
+        )
+        .is_none());
+        // claim → secret (both sides Ref): existing key, so not #7; different
+        // variant, so not #9; new is a Ref, so not #8 downgrade.
+        assert!(ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into())))
+        )
+        .is_none());
+    }
+
+    // Composite: adding `needs.pg` together with an `env DB=claim.pg.url` (the
+    // canonical 2.4-flow app add) produces NO security-boundary candidate — a
+    // claim-ref add is soft and a needs ADD is soft.
+    #[test]
+    fn needs_pg_plus_claim_env_add_is_soft_composite() {
+        let old = base();
+        let new = with_env(
+            with_pg(base()),
+            "DB",
+            EnvValue::Ref(EnvRef::Claim("pg.url".into())),
+        );
+        assert!(ApplicationMigrationStrategy::detect_all(&old, &new)
+            .iter()
+            .all(|c| c.classification != "security-boundary"));
+        // and nothing gates overall (needs ADD + claim env ADD are both soft).
+        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new).is_none());
     }
 
     // ---- Task 6: finalize the classifier ----
