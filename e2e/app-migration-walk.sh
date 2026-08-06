@@ -1209,58 +1209,47 @@ fi
 #
 # The tripwire fires a `SelectorChangeUnderMultipleProviders` Warning Event
 # when a soft needs.*.selector change lands while >1 ServiceProvider of that
-# type exists. Standing up a 2nd real pg provider (CNPG) is heavy on kind, so
-# we create two BARE `pg` ServiceProvider CRs (the tripwire counts CRs of the
-# type; it does not require them to be Ready) and drive a selector change. If
-# the ServiceProvider CRD/webhook path is unavailable, SOFT-skip with a note.
+# type exists (selector_multiprovider_tripwire — it lists ServiceProviders by
+# spec.type and counts them; it does NOT require them to be Ready). The
+# platform already ships one `pg` ServiceProvider (`pg-integrated`), so we add
+# ONE more (a 2nd `pg` CR with the correct {type,backend,config} shape) to make
+# the count >=2, deploy an app with `needs.pg` + an initial selector, wait for
+# its baseline, then CHANGE the selector (a soft, ungated edit). If any step is
+# infeasible on kind, SOFT-skip with a note — this phase NEVER fails the walk.
 # ===============================================================
 
 phase "P-SEC-5: (soft) needs.selector multi-provider tripwire"
 
 sec5_done=0
 if kubectl get crd serviceproviders.apprafter.io >/dev/null 2>&1; then
-    # Two pg ServiceProviders of the SAME type. Bare shells — the tripwire's
-    # selector_multiprovider_tripwire lists ServiceProviders by type and counts
-    # them; it does not require readiness. Apply best-effort; if the webhook
-    # rejects the shape, fall through to the soft-skip.
+    # A 2nd pg ServiceProvider (correct shape: {type,backend,config} — the CRD
+    # strict-decodes, so a bogus field like `tier` is rejected). The config is a
+    # never-provisioned shell; the tripwire only COUNTS CRs of spec.type=pg.
     sec5_applied=1
-    for i in 1 2; do
-        if ! kubectl apply -f - >/dev/null 2>&1 <<YAML
+    kubectl apply -f - >/dev/null 2>&1 <<YAML || sec5_applied=0
 apiVersion: apprafter.io/v1alpha1
 kind: ServiceProvider
 metadata:
-  name: sec-pg-${i}
+  name: sec-pg-2
   namespace: ${PROVIDER_NS}
 spec:
   type: pg
-  tier: integrated
+  backend: cloudnative-pg
+  config:
+    cluster: sec-pg-2-cluster
+    namespace: cnpg-system
+    instances: 1
+    storage: 1Gi
 YAML
-        then
-            sec5_applied=0
-            break
-        fi
-    done
 
     if [ "$sec5_applied" -eq 1 ] && \
        [ "$(kubectl -n "$PROVIDER_NS" get serviceprovider.apprafter.io \
             -o jsonpath='{range .items[?(@.spec.type=="pg")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
             | grep -c .)" -ge 2 ]; then
         printf '  ok: >=2 pg ServiceProviders present\n'
-        # An app with needs.pg, then a soft selector change on it. Adding
-        # needs.pg needs the claim to provision (CNPG) to become Ready, but the
-        # tripwire fires on the SOFT selector-change reconcile regardless of
-        # readiness. Deploy with a selector, wait for a baseline, then change it.
-        apply_sec_app "$SEC_ENV-sel" dev internal needs_pg=1
-        # Baseline may not stamp if the claim never provisions on this bare kind;
-        # give it a bounded chance, else drive the selector edit anyway and read
-        # the operator log for the tripwire line.
-        _sel_deadline=$(( $(date +%s) + 120 ))
-        while [ "$(date +%s)" -lt "$_sel_deadline" ]; do
-            [ -n "$(sec_jp "$APP_RES" "$SEC_ENV-sel" '{.status.lastAppliedSpec.base.image}')" ] && break
-            sleep 5
-        done
-        # Soft selector change on the existing needs.pg (selector edits are
-        # ungated/soft; the tripwire escalates to a Warning under >1 provider).
+        # An app with needs.pg carrying an INITIAL selector. The baseline stamps
+        # on the first render (no CNPG round-trip needed — the render + stamp
+        # precedes claim readiness), so give it a bounded chance to stamp.
         kubectl apply -f - >/dev/null 2>&1 <<YAML || true
 apiVersion: apprafter.io/v1alpha1
 kind: Application
@@ -1277,7 +1266,40 @@ spec:
     needs:
       pg:
         selector:
-          tier: integrated
+          zone: a
+    expose:
+      port: 80
+      network: internal
+  environments:
+    dev:
+      replicas: 1
+YAML
+        _sel_deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "$_sel_deadline" ]; do
+            [ -n "$(sec_jp "$APP_RES" "$SEC_ENV-sel" '{.status.lastAppliedSpec.base.needs}')" ] && break
+            sleep 5
+        done
+        # Soft selector CHANGE (zone: a -> b) on the existing needs.pg. A
+        # selector-only edit is ungated/soft; the tripwire escalates it to a
+        # Warning under >1 provider (soft_destructive_notes emits
+        # `changed needs.pg selector`, then selector_multiprovider_tripwire fires).
+        kubectl apply -f - >/dev/null 2>&1 <<YAML || true
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${SEC_ENV}-sel
+  namespace: ${SEC_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  environment: dev
+  base:
+    image: ${APP_IMAGE}
+    replicas: 1
+    needs:
+      pg:
+        selector:
+          zone: b
     expose:
       port: 80
       network: internal
@@ -1295,7 +1317,7 @@ YAML
                 -o jsonpath='{range .items[*]}{.reason}{"\n"}{end}' 2>/dev/null \
                 | grep -x SelectorChangeUnderMultipleProviders || true)
             [ -n "$sec5_hit" ] && break
-            if kubectl -n "$PROVIDER_NS" logs deploy/apprafter-operator --tail=400 2>/dev/null \
+            if kubectl -n "$PROVIDER_NS" logs deploy/apprafter-operator --tail=600 2>/dev/null \
                 | grep -q "SelectorChangeUnderMultipleProviders"; then
                 sec5_hit="log"
                 break
@@ -1307,10 +1329,10 @@ YAML
                 "$([ "$sec5_hit" = log ] && echo operator-log || echo Event)"
             sec5_done=1
         else
-            printf '  note: (soft) no tripwire Event/log observed — selector edit may not have re-reconciled as soft on this bare-provider kind; NOT failing.\n'
+            printf '  note: (soft) no tripwire Event/log observed — the selector edit may not have re-reconciled as soft on this bare-provider kind (e.g. baseline never stamped because the claim gate blocked the render); NOT failing.\n'
         fi
     else
-        printf '  note: (soft) could not stand up 2 pg ServiceProviders on kind — SOFT-skipping the tripwire.\n'
+        printf '  note: (soft) could not stand up a 2nd pg ServiceProvider on kind — SOFT-skipping the tripwire.\n'
     fi
 else
     printf '  note: (soft) ServiceProvider CRD not present — SOFT-skipping the tripwire.\n'
