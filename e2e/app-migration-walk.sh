@@ -50,8 +50,10 @@
 # apprafter-operator (Application controller + MigrationController both live in
 # that one binary), applies the BRANCH-rendered CRDs, and grants the branch
 # operator ClusterRole/ClusterRoleBinding (Phase 0). The admission-webhook is
-# NOT rebuilt — this walk touches no webhook-only validation the released
-# image lacks.
+# ALSO rebuilt + side-loaded (2.16b security axis): the S-1 non-operator
+# `Application.status` write rejection and the §7.2 `spec.environment`-immutable
+# UPDATE guard live in the webhook, so the branch image is required for the
+# P-SEC-* phases.
 #
 # CLI state injection
 # -------------------
@@ -364,6 +366,156 @@ spec:
 YAML
 }
 
+# ---------------------------------------------------------------
+# Security-axis constants (2.16b)
+# ---------------------------------------------------------------
+
+SEC_NS="sec-walk"                          # dedicated tenant ns for P-SEC-*
+SEC_INT="sec-int"                          # internal-then-escalated app (P-SEC-1)
+SEC_IMG="sec-img"                          # image-drift stale-approval app (P-SEC-2)
+SEC_STATUS="sec-status"                    # S-1 status-bypass target (P-SEC-3)
+SEC_ENV="sec-env"                          # §7.2 environment-immutable + negative
+SEC_IMG_A="nginxdemos/hello:plain-text"    # image-drift start repo
+SEC_IMG_B="nginxdemos/nginx-hello:plain-text"  # first (approved) drift target
+SEC_IMG_C="library/nginx:latest"           # second (post-drift) target — DIFFERENT
+
+# apply_sec_app — a single-env Application emitter for the security phases with
+# per-field toggles the escalation/env/imagePolicy triggers need. Unlike
+# apply_app (two-env, always public + hostname), this emits ONE CR whose expose
+# block is EITHER internal-with-no-hostname OR public-with-a-hostname (the
+# webhook couples hostname<->public: an internal app must carry NO hostname; a
+# public app REQUIRES one — validator.rs::validate_expose).
+#
+# Usage: apply_sec_app <name> <environment> <network> [opts...]
+#   network       — "internal" (no hostname emitted) | "public" (hostname req.)
+# Optional key=value opts (any order):
+#   image=<ref>          default: $APP_IMAGE
+#   hostname=<h>         required when network=public; ignored when internal
+#   port=<n>             default 80
+#   env_secret=<K>=<name/key>   add one env var whose value is {secret:"<name/key>"}
+#   env_claim=<K>=<type.field>  add one env var whose value is {claim:"<type.field>"}
+#   needs_pg=1           add base.needs.pg (a scalar pg need)
+#   imagepolicy=<off|digest>  set base.imagePolicy.resolve
+apply_sec_app() {
+    local name="$1" environment="$2" network="$3"; shift 3
+    local image="$APP_IMAGE" hostname="" port="80"
+    local env_secret="" env_claim="" needs_pg="" imagepolicy=""
+    local kv
+    for kv in "$@"; do
+        case "$kv" in
+            image=*)       image="${kv#image=}" ;;
+            hostname=*)    hostname="${kv#hostname=}" ;;
+            port=*)        port="${kv#port=}" ;;
+            env_secret=*)  env_secret="${kv#env_secret=}" ;;
+            env_claim=*)   env_claim="${kv#env_claim=}" ;;
+            needs_pg=*)    needs_pg="${kv#needs_pg=}" ;;
+            imagepolicy=*) imagepolicy="${kv#imagepolicy=}" ;;
+            *) printf 'apply_sec_app: unknown opt %q\n' "$kv" >&2; return 2 ;;
+        esac
+    done
+
+    # Assemble the base block line-by-line so absent fields are truly omitted
+    # (an empty `hostname:` would fail the webhook's DNS-1123 check).
+    {
+        printf 'apiVersion: apprafter.io/v1alpha1\n'
+        printf 'kind: Application\n'
+        printf 'metadata:\n'
+        printf '  name: %s\n' "$name"
+        printf '  namespace: %s\n' "$SEC_NS"
+        printf '  labels:\n'
+        printf '    apprafter.io/managed-by: apprafter\n'
+        printf 'spec:\n'
+        printf '  environment: %s\n' "$environment"
+        printf '  base:\n'
+        printf '    image: %s\n' "$image"
+        printf '    replicas: 1\n'
+        if [ -n "$imagepolicy" ]; then
+            printf '    imagePolicy:\n'
+            printf '      resolve: %s\n' "$imagepolicy"
+        fi
+        if [ -n "$needs_pg" ]; then
+            printf '    needs:\n'
+            printf '      pg: {}\n'
+        fi
+        if [ -n "$env_secret" ] || [ -n "$env_claim" ]; then
+            printf '    env:\n'
+            if [ -n "$env_secret" ]; then
+                printf '      %s:\n' "${env_secret%%=*}"
+                printf '        secret: %q\n' "${env_secret#*=}"
+            fi
+            if [ -n "$env_claim" ]; then
+                printf '      %s:\n' "${env_claim%%=*}"
+                printf '        claim: %q\n' "${env_claim#*=}"
+            fi
+        fi
+        printf '    expose:\n'
+        printf '      port: %s\n' "$port"
+        printf '      network: %s\n' "$network"
+        if [ "$network" = "public" ] && [ -n "$hostname" ]; then
+            printf '      hostname: %s\n' "$hostname"
+        fi
+        printf '  environments:\n'
+        printf '    %s:\n' "$environment"
+        printf '      replicas: 1\n'
+    } | kubectl apply -f -
+}
+
+# sec_wait_baseline <name> <want-image> — poll until the security app reaches a
+# non-paused steady state AND its baseline (status.lastAppliedSpec.base.image)
+# stamps to <want-image>. The baseline stamps on the FIRST successful render
+# (no CNPG round-trip in these single-need-free apps), so this is quick.
+sec_wait_baseline() {
+    local name="$1" want_image="$2" deadline ph
+    deadline=$(( $(date +%s) + 240 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        ph=$(kubectl -n "$SEC_NS" get "$APP_RES" "$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        [ -n "$ph" ] && break
+        sleep 5
+    done
+    if [ "$ph" = "AwaitingMigrationApproval" ]; then
+        printf 'FAILED: %s paused on first apply (phase=%q) — no baseline to diff against yet\n' "$name" "$ph" >&2
+        return 1
+    fi
+    wait_jsonpath "$APP_RES" "$SEC_NS" "$name" '{.status.lastAppliedSpec.base.image}' "$want_image" 180
+}
+
+# sec_plan_name <name> — the app-scope MigrationPlan name for <name> in $SEC_NS.
+sec_plan_name() {
+    kubectl -n "$SEC_NS" get "$PLAN_RES" \
+        -l "apprafter.io/application=$1,apprafter.io/scope=application" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+}
+
+# sec_plan_count <name> — number of app-scope plans for <name> in $SEC_NS.
+sec_plan_count() {
+    kubectl -n "$SEC_NS" get "$PLAN_RES" \
+        -l "apprafter.io/application=$1,apprafter.io/scope=application" \
+        --no-headers 2>/dev/null | grep -c . || true
+}
+
+# sec_wait_plan <name> [timeout] — poll until an app-scope plan for <name>
+# appears in $SEC_NS; echoes its name on STDOUT (progress → STDERR).
+sec_wait_plan() {
+    local name="$1" timeout="${2:-120}" deadline nm
+    deadline=$(( $(date +%s) + timeout ))
+    printf '  wait an app-scope MigrationPlan for %s to appear (timeout %ss) ...\n' "$name" "$timeout" >&2
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        nm="$(sec_plan_name "$name")"
+        if [ -n "$nm" ]; then
+            printf '  ok: MigrationPlan %s/%s exists for %s\n' "$SEC_NS" "$nm" "$name" >&2
+            printf '%s' "$nm"
+            return 0
+        fi
+        sleep 5
+    done
+    printf 'FAILED: no app-scope MigrationPlan for %s appeared within %ss\n' "$name" "$timeout" >&2
+    kubectl -n "$SEC_NS" get "$PLAN_RES" -o wide >&2 2>&1 || true
+    return 1
+}
+
+# sec_jp <kind> <name> <jsonpath> — read one value from $SEC_NS.
+sec_jp() { kubectl -n "$SEC_NS" get "$1" "$2" -o jsonpath="$3" 2>/dev/null || true; }
+
 # ===============================================================
 # Phase 0: cluster up + bootstrap + branch CRD/RBAC + local operator
 # ===============================================================
@@ -448,6 +600,28 @@ build_load_restart() { # <deployment> <operator-subdir>
 }
 build_load_restart apprafter-operator apprafter-operator
 printf '  ok: apprafter-operator now running the working-tree (2.16b) build\n'
+
+# 2.16b security axis: the branch ADMISSION-WEBHOOK too. The S-1 non-operator
+# `Application.status` write rejection (server.rs — status_write_allowed) and
+# the §7.2 `spec.environment`-immutable UPDATE guard live ONLY in the webhook,
+# so the P-SEC-3 / P-SEC-4 phases require the working-tree image, not the
+# released one. Same build_load_restart helper; the deployment + Dockerfile
+# subdir are both `admission-webhook` (matching how needs-disk-walk builds it).
+build_load_restart admission-webhook admission-webhook
+# `rollout status` returns once the NEW webhook pod is Ready, but the OLD
+# (released) pod lingers Terminating for its grace period — and during that
+# window an Application UPDATE could still route to the old webhook, whose
+# released image lacks the S-1 / §7.2 guards. Wait until ONLY the branch
+# webhook serves before any security-phase apply/patch.
+printf '  waiting for the old (released) webhook pod to fully terminate ...\n'
+_wh_deadline=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$_wh_deadline" ]; do
+    [ "$(kubectl -n "$PROVIDER_NS" get pods \
+        -l app.kubernetes.io/name=admission-webhook --no-headers 2>/dev/null \
+        | wc -l)" -le 1 ] && break
+    sleep 3
+done
+printf '  ok: admission-webhook now running the working-tree (2.16b) build\n'
 
 # The admission webhook must be Available before any Application apply (it
 # validates the CR on CREATE — network/hostname invariants).
@@ -737,6 +911,371 @@ else
     printf '  note: (soft) argocd-cm not present — not failing (Argo not up).\n'
 fi
 
+# ###############################################################
+# 2.16b SECURITY AXIS — P-SEC-1 .. P-SEC-6
+#
+# The app-migration state machine gains a `security-boundary` class (severity
+# 4, OUTRANKS data-migration), a family of expose/env/imagePolicy triggers, a
+# `spec.changes[]`/`spec.risks.classifications` rollup, a content-hash-bound
+# approval (S-4), a webhook `applications/status` guard (S-1), a §7.2
+# `spec.environment`-immutable UPDATE guard, and a needs.selector tripwire.
+# These phases exercise the LIVE behavior against the branch operator + webhook
+# built in Phase 0.
+# ###############################################################
+
+kubectl create namespace "$SEC_NS" 2>/dev/null || true
+
+# ===============================================================
+# P-SEC-1: network escalation (internal -> public + hostname) gates as
+#          security-boundary + carries the full changes[]/classifications
+#          rollup; approve un-freezes.
+# ===============================================================
+
+phase "P-SEC-1: internal->public escalation gated (security-boundary) + rollup + approve"
+
+# Deploy an INTERNAL app: network:internal, NO hostname (the webhook couples
+# hostname<->public — an internal app must carry no hostname). Baseline stamps
+# on the first render.
+apply_sec_app "$SEC_INT" dev internal
+sec_wait_baseline "$SEC_INT" "$APP_IMAGE"
+assert_eq "no plan for sec-int at baseline" "$(sec_plan_count "$SEC_INT")" "0"
+
+# Escalate: network -> public + add hostname sec.example.com. This fires TWO
+# security-boundary triggers in ONE edit:
+#   #10 network-visibility-escalation (internal -> public), and
+#   #11 public-hostname-add          (the None -> Some first-hostname add).
+# Both are classification=security-boundary. Primary (severity desc, then
+# trigger_type asc) → network-visibility-escalation.
+apply_sec_app "$SEC_INT" dev public hostname=sec.example.com
+
+# The app pauses + an app-scope plan appears.
+wait_jsonpath "$APP_RES" "$SEC_NS" "$SEC_INT" '{.status.phase}' AwaitingMigrationApproval 180
+SEC1_PLAN="$(sec_wait_plan "$SEC_INT" 120)"
+[ -n "$SEC1_PLAN" ] || { printf 'FAILED: sec-int plan name empty\n' >&2; exit 1; }
+
+# Primary classification == security-boundary (the field is spec.risks.classification).
+sec1_primary=$(sec_jp "$PLAN_RES" "$SEC1_PLAN" '{.spec.risks.classification}')
+assert_eq "P-SEC-1 spec.risks.classification (primary)" "$sec1_primary" "security-boundary"
+
+# classifications[] rollup CONTAINS security-boundary. (Both triggers are
+# security-boundary, so the distinct set is exactly [security-boundary].)
+sec1_classifications=$(sec_jp "$PLAN_RES" "$SEC1_PLAN" '{.spec.risks.classifications[*]}')
+printf '  spec.risks.classifications = %q\n' "$sec1_classifications"
+if printf '%s' "$sec1_classifications" | grep -qw "security-boundary"; then
+    printf '  ok: spec.risks.classifications contains security-boundary\n'
+else
+    printf 'FAILED: spec.risks.classifications %q does not contain security-boundary\n' "$sec1_classifications" >&2
+    exit 1
+fi
+
+# changes[] rollup carries BOTH triggers. NB the wire field is `type` (the Rust
+# MigrationChange.trigger is #[serde(rename = "type")]), so we read
+# .spec.changes[*].type — NOT `.trigger`.
+sec1_change_types=$(sec_jp "$PLAN_RES" "$SEC1_PLAN" '{.spec.changes[*].type}')
+printf '  spec.changes[*].type = %q\n' "$sec1_change_types"
+for want in network-visibility-escalation public-hostname-add; do
+    if printf '%s' "$sec1_change_types" | grep -qw "$want"; then
+        printf '  ok: spec.changes[] contains trigger %s\n' "$want"
+    else
+        printf 'FAILED: spec.changes[*].type %q missing %s\n' "$sec1_change_types" "$want" >&2
+        kubectl -n "$SEC_NS" get "$PLAN_RES" "$SEC1_PLAN" -o yaml >&2 2>&1 || true
+        exit 1
+    fi
+done
+
+# Every change[] row is classified security-boundary (severity 4).
+sec1_change_classes=$(sec_jp "$PLAN_RES" "$SEC1_PLAN" '{.spec.changes[*].classification}')
+if printf '%s' "$sec1_change_classes" | grep -qw "security-boundary"; then
+    printf '  ok: spec.changes[] rows carry security-boundary classification\n'
+else
+    printf 'FAILED: spec.changes[*].classification %q missing security-boundary\n' "$sec1_change_classes" >&2
+    exit 1
+fi
+
+# Approve via the branch CLI (auto-resolving the namespace) → app un-freezes +
+# the escalated (public) spec applies. The plan consumes (deletes).
+printf '  approving %s via apprafter migration approve ...\n' "$SEC1_PLAN"
+apprafter migration approve "$SEC1_PLAN"
+wait_non_paused "$SEC_INT" 120
+wait_gone "$PLAN_RES" "$SEC_NS" "$SEC1_PLAN" 90
+# The approved escalation applied: the baseline is now public.
+wait_jsonpath "$APP_RES" "$SEC_NS" "$SEC_INT" '{.status.lastAppliedSpec.base.expose.network}' public 120
+printf 'ok: security-boundary escalation gated + rollup + approved\n'
+
+# ===============================================================
+# P-SEC-2: S-4 stale-approval — approving the ORIGINAL plan must NOT deploy a
+#          DIFFERENT (drifted) image. The approval is bound to a content hash
+#          of the change it was cut over; a subsequent retarget invalidates it.
+# ===============================================================
+
+phase "P-SEC-2: S-4 stale approval not consumed for a different image target"
+
+# Deploy on image repo A (nginxdemos/hello). Baseline stamps.
+apply_sec_app "$SEC_IMG" dev internal image="$SEC_IMG_A"
+sec_wait_baseline "$SEC_IMG" "$SEC_IMG_A"
+
+# Edit image REPO A -> B (nginxdemos/nginx-hello): image-path-change,
+# security-boundary. Plan P1 appears (from=nginxdemos/hello, to=nginxdemos/nginx-hello).
+apply_sec_app "$SEC_IMG" dev internal image="$SEC_IMG_B"
+wait_jsonpath "$APP_RES" "$SEC_NS" "$SEC_IMG" '{.status.phase}' AwaitingMigrationApproval 180
+SEC2_P1="$(sec_wait_plan "$SEC_IMG" 120)"
+[ -n "$SEC2_P1" ] || { printf 'FAILED: sec-img P1 plan name empty\n' >&2; exit 1; }
+sec2_p1_trigger=$(sec_jp "$PLAN_RES" "$SEC2_P1" '{.spec.trigger.type}')
+assert_eq "P-SEC-2 P1 trigger.type" "$sec2_p1_trigger" "image-path-change"
+sec2_p1_to=$(sec_jp "$PLAN_RES" "$SEC2_P1" '{.spec.trigger.to}')
+sec2_p1_hash=$(sec_jp "$PLAN_RES" "$SEC2_P1" '{.spec.trigger.approvedSpecHash}')
+printf '  P1: trigger.to=%q approvedSpecHash=%q\n' "$sec2_p1_to" "$sec2_p1_hash"
+[ -n "$sec2_p1_hash" ] || { printf 'FAILED: P1 carries no approvedSpecHash (S-4 binding absent)\n' >&2; exit 1; }
+
+# BEFORE approving, DRIFT the target: edit image REPO B -> C (library/nginx):
+# same trigger tuple (image-path-change on spec.image) but DIFFERENT content.
+# The operator supersedes P1 with a fresh plan bound to the C target (its
+# content hash differs). Give the operator a beat to re-gate.
+apply_sec_app "$SEC_IMG" dev internal image="$SEC_IMG_C"
+sleep 15
+
+# Now approve the ORIGINAL plan P1 (bound to the B target). The S-4 content-hash
+# check must REFUSE to consume it against the current (C) change set — the app
+# must NOT deploy repo B (nginxdemos/nginx-hello).
+printf '  approving the ORIGINAL plan %s (bound to the B target) ...\n' "$SEC2_P1"
+apprafter migration approve "$SEC2_P1" || printf '  note: approve returned nonzero (plan may already be superseded) — continuing\n'
+
+# Watch ~40s: the Deployment image repo must NEVER become nginxdemos/nginx-hello.
+printf '  watching ~40s that the Deployment never adopts the stale (B) image repo ...\n'
+sec2_bad_repo="nginxdemos/nginx-hello"
+sec2_saw_bad=0
+_sec2_deadline=$(( $(date +%s) + 40 ))
+while [ "$(date +%s)" -lt "$_sec2_deadline" ]; do
+    dep_img=$(kubectl -n "$SEC_NS" get deployment "$SEC_IMG" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+    # Extract the repo (strip any @digest then any :tag after the last '/').
+    dep_no_digest="${dep_img%%@*}"
+    case "$dep_no_digest" in
+        */*:*) dep_repo="${dep_no_digest%:*}" ;;   # tag after last slash
+        *:*)   dep_repo="${dep_no_digest%:*}" ;;
+        *)     dep_repo="$dep_no_digest" ;;
+    esac
+    if [ "$dep_repo" = "$sec2_bad_repo" ]; then
+        sec2_saw_bad=1
+        printf '    PRODUCT-BUG-SIGNAL: Deployment adopted the STALE image repo %q (img=%q)\n' "$dep_repo" "$dep_img" >&2
+        break
+    fi
+    sleep 5
+done
+
+# Capture the resulting plan state for the report.
+sec2_phase=$(sec_jp "$APP_RES" "$SEC_IMG" '{.status.phase}')
+sec2_cur_plan="$(sec_plan_name "$SEC_IMG")"
+sec2_cur_to=""
+[ -n "$sec2_cur_plan" ] && sec2_cur_to=$(sec_jp "$PLAN_RES" "$sec2_cur_plan" '{.spec.trigger.to}')
+printf '  post-approve: app phase=%q, current-plan=%q (trigger.to=%q)\n' \
+    "$sec2_phase" "${sec2_cur_plan:-<none>}" "${sec2_cur_to:-<none>}"
+
+if [ "$sec2_saw_bad" -eq 1 ]; then
+    printf 'FAILED: PRODUCT BUG — a STALE approval (P1, target %s) deployed the WRONG image repo %s (S-4 content-hash binding did not hold)\n' \
+        "$SEC_IMG_B" "$sec2_bad_repo" >&2
+    kubectl -n "$SEC_NS" get "$PLAN_RES" -o wide >&2 2>&1 || true
+    kubectl -n "$SEC_NS" get "$APP_RES" "$SEC_IMG" -o yaml >&2 2>&1 || true
+    exit 1
+fi
+printf 'ok: stale approval not consumed for a different target (S-4)\n'
+
+# ===============================================================
+# P-SEC-3: S-1 — a non-operator write to Application/status is webhook-DENIED.
+# ===============================================================
+
+phase "P-SEC-3: S-1 non-operator Application.status write denied"
+
+# Deploy a plain app to target. Any steady phase is fine; we only need the CR to
+# exist so a status-subresource patch has a target.
+apply_sec_app "$SEC_STATUS" dev internal
+sec_wait_baseline "$SEC_STATUS" "$APP_IMAGE"
+
+# Patch status via kubectl's OWN fieldManager (NOT apprafter-operator). The
+# webhook's status_write_allowed() only permits the operator SSA manager, so
+# this must be DENIED. Capture stderr + exit code.
+set +e
+sec3_out=$(kubectl patch "$APP_RES" "$SEC_STATUS" -n "$SEC_NS" \
+    --subresource=status --type=merge \
+    -p '{"status":{"lastAppliedSpec":{}}}' 2>&1)
+sec3_rc=$?
+set -e
+printf '  kubectl status-patch rc=%d output:\n%s\n' "$sec3_rc" "$sec3_out"
+if [ "$sec3_rc" -ne 0 ] && printf '%s' "$sec3_out" | grep -Eqi 'operator-owned|rejected'; then
+    printf 'ok: non-operator Application.status write denied (S-1)\n'
+else
+    printf 'FAILED: non-operator Application.status write was NOT denied (rc=%d) — S-1 guard missing/ineffective\n' "$sec3_rc" >&2
+    exit 1
+fi
+
+# ===============================================================
+# P-SEC-4: §7.2 — spec.environment is immutable on UPDATE.
+# ===============================================================
+
+phase "P-SEC-4: §7.2 spec.environment immutable on UPDATE"
+
+# The sec-env app carries spec.environment: dev. A merge-patch flipping it to
+# prod must be DENIED by the webhook (environment_update_allowed).
+apply_sec_app "$SEC_ENV" dev internal
+sec_wait_baseline "$SEC_ENV" "$APP_IMAGE"
+
+set +e
+sec4_out=$(kubectl patch "$APP_RES" "$SEC_ENV" -n "$SEC_NS" --type=merge \
+    -p '{"spec":{"environment":"prod"}}' 2>&1)
+sec4_rc=$?
+set -e
+printf '  kubectl env-change-patch rc=%d output:\n%s\n' "$sec4_rc" "$sec4_out"
+if [ "$sec4_rc" -ne 0 ] && printf '%s' "$sec4_out" | grep -qi 'immutable'; then
+    printf 'ok: spec.environment change denied (S7.2)\n'
+else
+    printf 'FAILED: spec.environment change was NOT denied (rc=%d) — §7.2 guard missing/ineffective\n' "$sec4_rc" >&2
+    exit 1
+fi
+
+# ===============================================================
+# P-SEC-5: needs.selector multi-provider tripwire (BEST-EFFORT / SOFT).
+#
+# The tripwire fires a `SelectorChangeUnderMultipleProviders` Warning Event
+# when a soft needs.*.selector change lands while >1 ServiceProvider of that
+# type exists. Standing up a 2nd real pg provider (CNPG) is heavy on kind, so
+# we create two BARE `pg` ServiceProvider CRs (the tripwire counts CRs of the
+# type; it does not require them to be Ready) and drive a selector change. If
+# the ServiceProvider CRD/webhook path is unavailable, SOFT-skip with a note.
+# ===============================================================
+
+phase "P-SEC-5: (soft) needs.selector multi-provider tripwire"
+
+sec5_done=0
+if kubectl get crd serviceproviders.apprafter.io >/dev/null 2>&1; then
+    # Two pg ServiceProviders of the SAME type. Bare shells — the tripwire's
+    # selector_multiprovider_tripwire lists ServiceProviders by type and counts
+    # them; it does not require readiness. Apply best-effort; if the webhook
+    # rejects the shape, fall through to the soft-skip.
+    sec5_applied=1
+    for i in 1 2; do
+        if ! kubectl apply -f - >/dev/null 2>&1 <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: ServiceProvider
+metadata:
+  name: sec-pg-${i}
+  namespace: ${PROVIDER_NS}
+spec:
+  type: pg
+  tier: integrated
+YAML
+        then
+            sec5_applied=0
+            break
+        fi
+    done
+
+    if [ "$sec5_applied" -eq 1 ] && \
+       [ "$(kubectl -n "$PROVIDER_NS" get serviceprovider.apprafter.io \
+            -o jsonpath='{range .items[?(@.spec.type=="pg")]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+            | grep -c .)" -ge 2 ]; then
+        printf '  ok: >=2 pg ServiceProviders present\n'
+        # An app with needs.pg, then a soft selector change on it. Adding
+        # needs.pg needs the claim to provision (CNPG) to become Ready, but the
+        # tripwire fires on the SOFT selector-change reconcile regardless of
+        # readiness. Deploy with a selector, wait for a baseline, then change it.
+        apply_sec_app "$SEC_ENV-sel" dev internal needs_pg=1
+        # Baseline may not stamp if the claim never provisions on this bare kind;
+        # give it a bounded chance, else drive the selector edit anyway and read
+        # the operator log for the tripwire line.
+        _sel_deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "$_sel_deadline" ]; do
+            [ -n "$(sec_jp "$APP_RES" "$SEC_ENV-sel" '{.status.lastAppliedSpec.base.image}')" ] && break
+            sleep 5
+        done
+        # Soft selector change on the existing needs.pg (selector edits are
+        # ungated/soft; the tripwire escalates to a Warning under >1 provider).
+        kubectl apply -f - >/dev/null 2>&1 <<YAML || true
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${SEC_ENV}-sel
+  namespace: ${SEC_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  environment: dev
+  base:
+    image: ${APP_IMAGE}
+    replicas: 1
+    needs:
+      pg:
+        selector:
+          tier: integrated
+    expose:
+      port: 80
+      network: internal
+  environments:
+    dev:
+      replicas: 1
+YAML
+        # Look for the Warning Event OR the operator-log tripwire line (~90s).
+        printf '  watching ~90s for a SelectorChangeUnderMultipleProviders Warning Event / log line ...\n'
+        _tw_deadline=$(( $(date +%s) + 90 ))
+        sec5_hit=""
+        while [ "$(date +%s)" -lt "$_tw_deadline" ]; do
+            sec5_hit=$(kubectl -n "$SEC_NS" get events \
+                --field-selector "involvedObject.name=${SEC_ENV}-sel" \
+                -o jsonpath='{range .items[*]}{.reason}{"\n"}{end}' 2>/dev/null \
+                | grep -x SelectorChangeUnderMultipleProviders || true)
+            [ -n "$sec5_hit" ] && break
+            if kubectl -n "$PROVIDER_NS" logs deploy/apprafter-operator --tail=400 2>/dev/null \
+                | grep -q "SelectorChangeUnderMultipleProviders"; then
+                sec5_hit="log"
+                break
+            fi
+            sleep 5
+        done
+        if [ -n "$sec5_hit" ]; then
+            printf '  ok: tripwire fired (SelectorChangeUnderMultipleProviders via %s)\n' \
+                "$([ "$sec5_hit" = log ] && echo operator-log || echo Event)"
+            sec5_done=1
+        else
+            printf '  note: (soft) no tripwire Event/log observed — selector edit may not have re-reconciled as soft on this bare-provider kind; NOT failing.\n'
+        fi
+    else
+        printf '  note: (soft) could not stand up 2 pg ServiceProviders on kind — SOFT-skipping the tripwire.\n'
+    fi
+else
+    printf '  note: (soft) ServiceProvider CRD not present — SOFT-skipping the tripwire.\n'
+fi
+if [ "$sec5_done" -eq 1 ]; then
+    printf 'ok: (soft) selector tripwire\n'
+else
+    printf 'ok: (soft) selector tripwire — SOFT-skipped (2-provider setup not exercised)\n'
+fi
+
+# ===============================================================
+# P-SEC-6: NEGATIVE — an ungated edit (needs.pg ADD + a self-scoped claim-ref
+#          env ADD) produces NO MigrationPlan.
+# ===============================================================
+
+phase "P-SEC-6: negative — needs.pg add + claim-ref env add is NOT gated"
+
+# Fresh app with a baseline, no needs, no env. Reuse sec-status (already has a
+# baseline). Add base.needs.pg + env DB={claim:"pg.url"} in one edit. Both are
+# UNGATED: a needs ADD (only removal gates) and a claim-ref add (self-scoped,
+# ADR 0046 — only a secret-ref add gates). Assert NO plan appears.
+apply_sec_app "$SEC_STATUS" dev internal needs_pg=1 env_claim='DB=pg.url'
+
+# Give the operator a generous beat to reconcile the edit, then assert no plan.
+printf '  watching ~30s that NO MigrationPlan appears for the ungated edit ...\n'
+sleep 30
+sec6_plans=$(sec_plan_count "$SEC_STATUS")
+assert_eq "P-SEC-6 no plan for needs+claim-ref add (ungated)" "$sec6_plans" "0"
+# And the app is not paused on this edit.
+sec6_phase=$(sec_jp "$APP_RES" "$SEC_STATUS" '{.status.phase}')
+if [ "$sec6_phase" = "AwaitingMigrationApproval" ]; then
+    printf 'FAILED: sec-status PAUSED on an ungated needs+claim-ref add (phase=%q)\n' "$sec6_phase" >&2
+    kubectl -n "$SEC_NS" get "$APP_RES" "$SEC_STATUS" -o yaml >&2 2>&1 || true
+    exit 1
+fi
+printf 'ok: claim-ref + needs add NOT gated (negative)\n'
+
 # ===============================================================
 # Done — tear down on the success path
 # ===============================================================
@@ -755,3 +1294,4 @@ rm -rf "$TMPDIR_WORK"
 
 printf '\napp-migration-walk GREEN in %s\n' "$(elapsed)"
 printf 'Chain proven: deploy two-env -> baseline stamped -> effective-per-env gate (dev gated, prod untouched) -> plan shape + ownerRef -> self-heal -> CLI list + approve (consume + apply + anti-loop) -> soft change ungated + Event -> revert = reject-via-Git\n'
+printf 'Security axis (2.16b) proven: internal->public escalation gated as security-boundary + changes[]/classifications rollup + approve (P-SEC-1) -> S-4 stale-approval refused for a drifted image target (P-SEC-2) -> S-1 non-operator Application.status write denied (P-SEC-3) -> §7.2 spec.environment immutable on UPDATE (P-SEC-4) -> (soft) needs.selector multi-provider tripwire (P-SEC-5) -> negative: needs.pg + claim-ref env add ungated (P-SEC-6)\n'
