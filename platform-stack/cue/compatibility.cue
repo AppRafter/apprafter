@@ -1760,6 +1760,49 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.44": {
+	change:          "safe"
+	operatorVersion: "v0.2.35"
+	notes: """
+		2.16b security-axis extension (ADR 0052). Extends the app-scope
+		destructive classifier along the SECURITY axis — an attacker with
+		manifest write ADDS/escalates (public exposure, secret-refs, image-policy
+		relaxation) rather than removes, so the previously-soft additive edits now
+		gate. Adds a `security-boundary` class (severity 4, ranks ABOVE
+		data-migration — a leaked credential can't be un-leaked) + seven triggers:
+		env-secret-ref add/downgrade/retarget, network internal→public escalation,
+		public-hostname-add, public-port-retarget, imagePolicy off→digest;
+		`image-path-change` is reclassified to security-boundary. A
+		`spec.risks.classifications[]` rollup + `spec.changes[]` drill-in (the wire
+		field for each change's trigger is `type`) carry the full blast radius so a
+		dangerous op can't be laundered behind a benign primary.
+
+		Three structural hardening fixes close gaps that let the gate be disarmed:
+		S-4 binds the approval to a content hash (`spec.trigger.approvedSpecHash`)
+		over the full candidate set — an approval for edit X can't apply a
+		different edit Y (re-gates on any drift); S-1 registers `applications/status`
+		in the webhook + rejects any Application.status write whose fieldManager
+		isn't `apprafter-operator` (the migration baseline can't be silently zeroed);
+		§7.2 makes `spec.environment` immutable on UPDATE (an env flip swaps the
+		whole effective spec). Plus a needs.selector multi-provider tripwire
+		(Warning event + `apprafter_soft_destructive_total` metric), soft-destructive
+		Warning events, and a `apprafter_claim_retained_total` metric.
+
+		change=safe: additive CRD fields (`approvedSpecHash`, `classifications`,
+		`changes`), additive detection, additive webhook denials on genuinely-unsafe
+		writes only; existing Applications are unaffected until their next destructive
+		edit. Ships operator + admission-webhook v0.2.35 (the webhook now enforces
+		S-1 + §7.2) and cue-cmp v0.1.16 (the MigrationPlan schema gained the rollup
+		fields). The two-env kind+Argo walk (`e2e/app-migration-walk.sh`) is GREEN
+		end-to-end incl. the security phases (escalation gated, S-4 stale-approval
+		re-gates, S-1 + §7.2 denials).
+		"""
+	references: [
+		"docs/superpowers/specs/2026-08-06-2.16b-security-axis-design.md",
+		"docs/adr/0052-migration-security-axis.md",
+	]
+}
+
 compatibility: "0.2.43": {
 	change:          "safe"
 	operatorVersion: "v0.2.34"

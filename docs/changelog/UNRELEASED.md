@@ -9,9 +9,7 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## operator/webhook vX / cue-cmp vY / platform-stack Z — 2.16b security-axis (2026-08-06)
-
-<!-- TODO(release): fill versions X/Y/Z at the coordinated release step (operator+webhook bump — functional operator + webhook change; cue-cmp bump — schemas/v1alpha1/migrationplan.cue + meta.cue gained the classifications[]/changes[] rollup fields; platform-stack currentVersion bump — chart-source component_argocd.cue health-Lua changed + re-pins the new operator/cue-cmp). No CLI change in this slice unless a CLI verb was touched. -->
+## operator/webhook v0.2.35 / cue-cmp v0.1.16 / platform-stack 0.2.44 — 2.16b security-axis (2026-08-06)
 
 Extends the app-scope destructive classifier (ADR 0051) along the **security
 axis** and hardens the gate against being disarmed (ADR 0052). ADR 0051 gates
