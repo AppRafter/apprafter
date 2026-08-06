@@ -124,28 +124,59 @@ _components: argocd: #Component & {
 			// fields the operator already populates. `->` (not the
 			// unicode arrow) avoids encoding/lint surprises in
 			// argocd-cm.
+			// 2.16b-sec (ADR 0052): keep the single-trigger headline
+			// (`from->to (class)`) and APPEND a security-axis drill-in
+			// so an approver sees the FULL blast radius, not just the
+			// `pick_primary` headline (kills approve-laundering): the
+			// `spec.risks.classifications[]` rollup as badges + a
+			// per-change list from `spec.changes[]`. Every table access
+			// is nil- + `type(x)=="table"`-guarded and every value is
+			// `tostring`-coerced, so a legacy plan with no rollup
+			// fields falls back cleanly to the headline-only message.
 			"resource.customizations.health.apprafter.io_MigrationPlan": """
 				hs = {}
 				local phase = ""
 				if obj.status ~= nil and obj.status.phase ~= nil then phase = obj.status.phase end
 				local from, to, class = "?", "?", "?"
+				local detail = ""
 				if obj.spec ~= nil then
 				  if obj.spec.trigger ~= nil then
-				    from = obj.spec.trigger.from or from
-				    to   = obj.spec.trigger.to or to
+				    from = tostring(obj.spec.trigger.from or from)
+				    to   = tostring(obj.spec.trigger.to or to)
 				  end
 				  if obj.spec.risks ~= nil and obj.spec.risks.classification ~= nil then
-				    class = obj.spec.risks.classification
+				    class = tostring(obj.spec.risks.classification)
+				  end
+				  -- 2.16b-sec (ADR 0052): classifications[] rollup rendered as badges.
+				  if obj.spec.risks ~= nil and type(obj.spec.risks.classifications) == "table" then
+				    local badges = ""
+				    for _, c in ipairs(obj.spec.risks.classifications) do
+				      badges = badges .. "[" .. tostring(c or "?") .. "]"
+				    end
+				    if badges ~= "" then detail = detail .. " risks: " .. badges end
+				  end
+				  -- changes[] drill-in: per-change type/field/class + from->to. The wire
+				  -- field for the trigger kind is `.type` (MigrationChange.trigger is
+				  -- #[serde(rename="type")]), NOT `.trigger`. All values string-coerced.
+				  if type(obj.spec.changes) == "table" then
+				    local n = 0
+				    for _, ch in ipairs(obj.spec.changes) do
+				      if type(ch) == "table" then
+				        n = n + 1
+				        detail = detail .. " * " .. tostring(ch.type or "?") .. " " .. tostring(ch.field or "?") .. " (" .. tostring(ch.classification or "?") .. "): " .. tostring(ch.from or "?") .. "->" .. tostring(ch.to or "?")
+				      end
+				    end
+				    if n > 0 then detail = " |" .. tostring(n) .. " change(s):" .. detail end
 				  end
 				end
 				if phase == "pending-approval" or phase == "" then
 				  hs.status = "Suspended"
-				  hs.message = "Upgrade " .. from .. "->" .. to .. " (" .. class .. ") awaiting approval - click Approve, or run 'apprafter migration approve " .. (obj.metadata.name or "<name>") .. "'"
+				  hs.message = "Upgrade " .. from .. "->" .. to .. " (" .. class .. ") awaiting approval - click Approve, or run 'apprafter migration approve " .. (obj.metadata.name or "<name>") .. "'" .. detail
 				  return hs
 				end
 				if phase == "approved" or phase == "executing" then
 				  hs.status = "Progressing"
-				  hs.message = "Upgrade " .. from .. "->" .. to .. " approved; applying"
+				  hs.message = "Upgrade " .. from .. "->" .. to .. " approved; applying" .. detail
 				  return hs
 				end
 				if phase == "completed" then
