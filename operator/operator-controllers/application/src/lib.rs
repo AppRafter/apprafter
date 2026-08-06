@@ -23,7 +23,7 @@ use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
 use serde_json::{json, Value};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod oci_resolve;
 mod pull_secret;
@@ -34,7 +34,7 @@ use operator_core::{
     image_repo, resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
     ApplicationSpec, ApplicationStatus, DestructiveChange, DiskClaim, EgressProfile, EnvValue,
     Metrics, MigrationPlan, Needs, PlatformStack, PlatformStackValues, ResourceClaim,
-    SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
+    ServiceProvider, SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
     COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
     PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
 };
@@ -802,6 +802,13 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         if let Err(e) = recorder.publish(ev).await {
             warn!(%name, %namespace, error = %e, "failed to publish SoftDestructiveChange event (continuing)");
         }
+
+        // 2.16b S4: needs.*.selector multi-provider tripwire. A selector change
+        // is soft at launch (single provider per type) but data-loss-prone the
+        // moment a 2nd ServiceProvider of the same type exists. Best-effort
+        // (a ServiceProvider list failure NEVER breaks the reconcile) — the
+        // children are already applied above.
+        selector_multiprovider_tripwire(&ctx, &app, &namespace, &soft_notes).await;
     }
 
     // 2.16b Task 11: `ConsumeApply` — delete the completed plan AFTER the
@@ -1509,6 +1516,115 @@ fn soft_event_type(trigger: &str) -> EventType {
     match trigger {
         "needs-selector-change" | "env-literal-removal" | "scale-down" => EventType::Warning,
         _ => EventType::Normal,
+    }
+}
+
+/// 2.16b S4: the `needs.*.selector` TRIPWIRE predicate. A selector change
+/// stays SOFT at launch (a single-provider-per-type tier, so a re-route can
+/// only land on the same backend). It becomes DANGEROUS the moment a SECOND
+/// `ServiceProvider` of the same `spec.type` exists: the edit can then
+/// re-route the claim to a different backend — moving the data (and its
+/// residency). Pure predicate so the tripwire policy is unit-tested without a
+/// cluster; the controller supplies `provider_count` from a best-effort
+/// ServiceProvider list.
+fn selector_tripwire_should_warn(soft_selector_changed: bool, provider_count: usize) -> bool {
+    soft_selector_changed && provider_count > 1
+}
+
+/// 2.16b S4: parse a `needs.<type>[.<name>] selector` soft note back to its
+/// need TYPE (`pg`, `redis`, …) so the tripwire can count ServiceProviders of
+/// the matching `spec.type`. Returns `None` for a non-selector note.
+///
+/// The note shape is `changed needs.<type>[.<name>] selector` (emitted by
+/// [`soft_destructive_notes`], where the key is `needs.<type>` or
+/// `needs.<type>.<name>`). We strip the fixed `changed ` prefix and ` selector`
+/// suffix, then take the segment after `needs.`.
+fn selector_note_need_type(note: &str) -> Option<String> {
+    let inner = note.strip_prefix("changed ")?.strip_suffix(" selector")?;
+    // inner is `needs.<type>` or `needs.<type>.<name>`.
+    let key = inner.strip_prefix("needs.")?;
+    let ty = key.split('.').next()?;
+    if ty.is_empty() {
+        None
+    } else {
+        Some(ty.to_string())
+    }
+}
+
+/// 2.16b S4: BEST-EFFORT `needs.*.selector` multi-provider tripwire. For each
+/// selector-change soft note, list ServiceProviders cluster-wide, count those
+/// of the need's `spec.type`, and — iff a SECOND provider of that type exists
+/// ([`selector_tripwire_should_warn`]) — `error!`-log, publish a `Warning`
+/// Event (`SelectorChangeUnderMultipleProviders`), and count it in
+/// `apprafter_soft_destructive_total{trigger="needs-selector-multiprovider"}`.
+///
+/// STRICTLY best-effort: a ServiceProvider `list` failure (RBAC / apiserver
+/// fault) is `warn!`-logged and the loop continues — it NEVER propagates, so
+/// it can never fail the app reconcile. The caller has already applied the
+/// child objects; this is a pure observability side-channel.
+///
+/// The list is fetched ONCE and reused across every selector note (an app can
+/// change several needs' selectors in one edit).
+async fn selector_multiprovider_tripwire(
+    ctx: &Arc<Context>,
+    app: &Application,
+    namespace: &str,
+    soft_notes: &[String],
+) {
+    let selector_types: Vec<String> = soft_notes
+        .iter()
+        .filter_map(|n| selector_note_need_type(n))
+        .collect();
+    if selector_types.is_empty() {
+        return; // no selector change in this edit — nothing to probe.
+    }
+
+    // Best-effort list: an error must NEVER break the reconcile (the caller
+    // already applied the children). Warn and bail.
+    let providers = match Api::<ServiceProvider>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await
+    {
+        Ok(list) => list.items,
+        Err(e) => {
+            warn!(
+                %namespace, error = %e,
+                "selector tripwire: ServiceProvider list failed — skipping (best-effort, reconcile unaffected)"
+            );
+            return;
+        }
+    };
+
+    let name = app.name_any();
+    for need_type in selector_types {
+        let count = providers
+            .iter()
+            .filter(|p| p.spec.type_ == need_type)
+            .count();
+        if !selector_tripwire_should_warn(true, count) {
+            continue; // single provider (launch) — the change is genuinely soft.
+        }
+        let message = format!(
+            "needs.{need_type} selector changed while {count} ServiceProviders of type \
+             '{need_type}' exist — this may re-route the claim to a different backend, \
+             moving data and its residency. Review the intended provider."
+        );
+        error!(%name, %namespace, %need_type, count, "{message}");
+        ctx.metrics
+            .soft_destructive_total
+            .with_label_values(&["needs-selector-multiprovider", namespace])
+            .inc();
+        let recorder = build_recorder(&ctx.client, app);
+        let ev = KubeEvent {
+            type_: EventType::Warning,
+            reason: "SelectorChangeUnderMultipleProviders".into(),
+            note: Some(message),
+            action: "Reconcile".into(),
+            secondary: None,
+        };
+        if let Err(e) = recorder.publish(ev).await {
+            warn!(%name, %namespace, error = %e, "failed to publish SelectorChangeUnderMultipleProviders event (continuing)");
+        }
     }
 }
 
@@ -3195,6 +3311,29 @@ mod tests {
         assert_eq!(soft_event_type("image-tag-change"), EventType::Normal);
         // `needs.*.size` is soft but not one of the review's three → Normal.
         assert_eq!(soft_event_type("needs-size-change"), EventType::Normal);
+    }
+
+    #[test]
+    fn selector_tripwire_only_with_multiple_providers() {
+        assert!(selector_tripwire_should_warn(true, 2)); // soft selector change + >1 provider
+        assert!(!selector_tripwire_should_warn(true, 1)); // single provider (launch) -> silent
+        assert!(!selector_tripwire_should_warn(false, 3)); // no selector change -> nothing
+    }
+
+    #[test]
+    fn selector_note_need_type_extracts_the_type() {
+        assert_eq!(
+            selector_note_need_type("changed needs.pg selector").as_deref(),
+            Some("pg")
+        );
+        assert_eq!(
+            selector_note_need_type("changed needs.redis.cache selector").as_deref(),
+            Some("redis")
+        );
+        // a size note (not a selector note) → None
+        assert_eq!(selector_note_need_type("changed needs.pg size"), None);
+        // an env-removal note → None
+        assert_eq!(selector_note_need_type("removed env X (literal)"), None);
     }
 
     #[test]
