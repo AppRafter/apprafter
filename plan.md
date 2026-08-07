@@ -3667,6 +3667,34 @@ Storage-примитивы поверх 2.6b owned-disk пайплайна. Жё
 
 ---
 
+#### 2.16b-sec-S3-approver — Named non-admin approver role (managed-track)
+> 🏁 SR: C · deferred → Tier-2/managed. Сегодня T1 approve'ит через admin-CLI (`apprafter migration approve`, полный kubeconfig) ЛИБО Argo-кнопку (пишет phase-only под RBAC контроллера Argo). Отдельной approve-роли ещё нет.
+
+**Контекст:** approve деструктивной правки сейчас требует ЛИБО admin-уровня доступа (полный kubeconfig → CLI пишет `migrationplans/status`), ЛИБО клика в Argo (действие пишет только `status.phase`, F-1b-совместимо, под RBAC-контроллера Argo — см. S-2). Для managed/multi-tenant нужен **именованный не-admin subject**, который может approve, НЕ имея прав на всё остальное. N-3 (surface hash re-gate to user) уже делает re-gate видимым approve'еру без operator-log — но сам approve-субъект в managed-потоке ещё не смоделирован.
+
+- [ ] Named ClusterRole `apprafter:migration-approver` — verbs: `patch migrationplans/status` (сам approve — flip phase pending-approval→approved) + `get`/`list migrationplans` (увидеть, что approve'ить). Никаких прав на `applications`/`applications/status`/child-ресурсы.
+- [ ] Binding-решение: **Argo-SA vs люди**. Argo-кнопка пишет под controller-RBAC Argo (не под ролью юзера) — привязать роль к Argo-SA ИЛИ к человеческим subject'ам напрямую (для CLI-approve без полного kubeconfig)? Вероятно оба, но с разными bindings (namespaced RoleBinding для tenant-scoped approve).
+- [ ] Multi-tenant / outbound-agent approve-путь: клиент managed-плана approve'ит через hosted-UI / MCP / `apprafter-agent` (ADR 0031/0036) — та же роль+webhook (S3-attribution) ИЛИ отдельная agent-identity? (см. открытый вопрос ниже.)
+
+**Открытый вопрос (общий для S3-approver + S3-attribution):** managed-plan approve-путь — клиент через hosted UI / MCP / outbound-agent: одна и та же `migration-approver` роль + attribution-webhook, ИЛИ отдельная agent-identity, отличимая от человека? Через Argo identity — это Argo-SA, а не реальный человек/агент; для managed это надо развести.
+
+**Зависит от:** 2.16b-sec (S-2 authority-модель), ADRs 0034–0038 (managed-track), ADR 0031 (outbound-agent). **Размер:** S-M · роль + binding-решение + managed-approve-путь. SR:C (managed).
+
+---
+
+#### 2.16b-sec-S3-attribution — Approve-attribution webhook (`approvedBy`/`approvedAt`)
+> 🏁 SR: C · deferred → managed approve-flow, где реальная identity человека/агента имеет значение. Сегодня approve не атрибутируется (кто approve'ил — не пишется).
+
+**Контекст:** при переходе `pending-approval → approved` мы не фиксируем, КТО approve'ил. На T1 это неважно (approve = admin с полным доступом). В managed-потоке (клиент approve'ит через hosted-UI/MCP/agent) реальная identity approve'ера — аудит-критична.
+
+- [ ] Mutating webhook на `migrationplans` UPDATE: при `pending-approval → approved` штампует `status.approvedBy` / `status.approvedAt` из `request.userInfo` (username/uid/groups) — не доверяя клиентскому телу.
+- [ ] Рендер `approvedBy`/`approvedAt` в Argo health-Lua (узел MigrationPlan показывает, кто approve'ил + когда), рядом с существующими upgrade-* аннотациями (ADR 0048).
+- [ ] **Открытый вопрос (см. S3-approver):** через Argo-кнопку `request.userInfo` — это Argo-SA, а не человек, кликнувший в UI. Для реальной attribution в managed нужен либо approve НЕ через Argo-controller-identity, либо проброс user-identity из hosted-UI в webhook. Развести до managed-launch.
+
+**Зависит от:** 2.16b-sec-S3-approver (approve-субъект), 2.16b-sec (S-2), ADR 0048 (Argo health-Lua render-паттерн), ADRs 0035–0036 (Minimal Data Exposure / MCP agentic-safety). **Размер:** M · mutating webhook + Lua-render + identity-проброс. SR:C (managed).
+
+---
+
 #### 2.16b-sec-S5 — Pre-registration новых полей в таксономию (каждое — с gate-решением)
 > 🏁 SR: A · «each must land WITH a gate decision» — новые/растущие поля схемы не должны попадать в gate-слепую зону.
 

@@ -180,6 +180,22 @@ approve path is the Kubernetes `kubectl patch migrationplan … --subresource=st
 the Argo CD resource-action "Approve" button is a convenience layered on top of
 Argo CD's own RBAC. Git write access alone must never approve a plan.
 
+Approve subjects **today** (Tier 1): a plan is approved either via the
+admin-level CLI (`apprafter migration approve`, which patches
+`migrationplans/status` with a full kubeconfig) or via the Argo CD "Approve"
+resource-action, whose action writes **only `status.phase`** (F-1b-compatible)
+under Argo's own controller RBAC. There is deliberately **no named non-admin
+approver role and no approve-attribution** at launch: a named
+`apprafter:migration-approver` ClusterRole (`patch migrationplans/status` +
+`get`/`list migrationplans`, nothing else) and a mutating webhook that stamps
+`status.approvedBy` / `approvedAt` from `request.userInfo` are **deferred to the
+managed track**, where a client approves through the hosted UI / MCP /
+outbound-agent (ADR 0031/0036) and the real human/agent identity — rather than
+the Argo controller ServiceAccount the button acts as — becomes audit-critical.
+Both are filed as `2.16b-sec-S3-approver` / `2.16b-sec-S3-attribution` in
+`plan.md`; the open question of whether the managed approve path reuses that
+role + webhook or carries a separate agent identity is recorded there.
+
 ### 6. §7.2 — `spec.environment` immutable on UPDATE
 
 Thread the old object into the Application validator on UPDATE and reject any
@@ -213,6 +229,19 @@ N→M — now emit an `EventType::Warning` Kubernetes Event (they were
 silent `RetainedClaim` creation (review S-3 observability; the *gate* for the
 reattach-by-name adoption vector is a separate plan-item — the metric ships, the
 finalizer does not).
+
+Migration re-gate observability (review **N-3**): when a completed, trigger-
+matching app-scope plan is demoted to a relic and re-gated because its approval
+hash fails (S-4 spec drift, or a hashless/forged plan), the operator now emits a
+`Warning` Kubernetes Event — with a **distinguishable reason**, `HashMismatch`
+vs `HashMissing` — on **both the `Application` and the superseded
+`MigrationPlan`**, and increments a new
+`apprafter_migration_regate_total{reason,namespace}` counter. The Event note
+names the *action* ("re-approve the new MigrationPlan"), not the internal hash
+state, so a managed-plan user with no operator-log access understands why an
+approval was re-asked (previously the only signal was an operator-log `warn!`).
+The emit is best-effort (a publish failure is logged, never fatal — the re-gate
+itself already landed).
 
 ## Consequences
 
