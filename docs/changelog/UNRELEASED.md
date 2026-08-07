@@ -9,6 +9,56 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator/webhook v0.2.36 / cue-cmp v0.1.17 / cli v0.2.36 / platform-stack 0.2.45 — 2.16b-sc SourceCredential-scope migration (2026-08-07)
+
+Wires SourceCredential-scope `MigrationPlan` creation **live** — the "same flip,
+different scope" of 2.16b (ADR 0051) for a new MigrationPlan scope variant. A
+destructive coverage-narrowing of a `SourceCredential` (removing a
+`git.repoPrefixes` or `registry.hosts` entry — `detect_destructive` →
+`coverage-removal`/`breaking`, shipped inert in 1.79c S5) now gates. Closes
+1.79c acceptance #4.
+
+### Added
+
+- **`sourcecredential` MigrationPlan scope variant** — a new discriminator arm
+  (`MigrationSourceCredentialScope { ref_: {name, namespace} }`, no
+  `environment`) across the kube-rs type, the OpenAPI CRD, the CUE schema
+  (`schemas/v1alpha1/migrationplan.cue`), and the admission webhook
+  (`validate_sourcecredential_scope` — required-fields per scope, mirroring
+  application/platform). `StrategyKey::SourceCredential` routes such plans to the
+  already-shipped `SourceCredentialMigrationStrategy`.
+- **Live plan creation on destructive coverage-narrowing** — `create_plan_for`
+  emits a `sourcecredential`-scope plan in the **credential's own namespace**
+  with a controlling ownerRef → the SourceCredential CR (cascade GC, RBAC stays
+  namespace-scoped), `apprafter.io/source-credential` labels, and
+  `approvedSpecHash = change_hash(candidates)`. The SourceCredential reconciler
+  gate runs before both derivation halves: load baseline → `detect_destructive`
+  → find plan → decide → create-plan / stay-paused / consume / GC-stale.
+- **`SourceCredentialStatus.lastAppliedSpec`** — the diff baseline (preserve-unknown,
+  stamped after a successful non-gated derivation); `None` on first derive never
+  gates.
+
+### Changed
+
+- **Pauses BOTH derived-Secret derivations while a plan is pending** — a single
+  pause state on the SourceCredential (mirrors the Application's
+  `AwaitingMigrationApproval`). The old wider-coverage repo-creds Secret and
+  registry pull-secret are **left untouched** so in-flight apps keep git-clone /
+  image-pull access; approve re-derives the narrowed Secrets and GCs the
+  uncovered coverage.
+- **Approve-only (mirrors app-scope)** — the webhook blocks
+  `sourcecredential → rejected`; to undo, re-widen the spec → no destructive
+  delta → the operator GCs the stale plan (`DeleteThenRender`). No
+  `previousSpecSnapshot` revert (a SourceCredential has no rollback state). The
+  gate is actor-agnostic — a raw `kubectl edit` trips it. CLI `migration
+  list`/`approve` operate scope-agnostically on a sourcecredential plan; the
+  1.79c `repo creds remove` reverse-dep gate stays as a complementary best-effort
+  UX fast-fail.
+- **Hoisted the consume-ticket state machine to `operator-core`** — `decide` /
+  `plan_state` / `MigrationDecision` / `PlanState` / `plan_hash_matches` moved out
+  of the Application controller so both controllers share one copy (reused
+  verbatim, no clone); the app-scope state-machine tests pass unchanged.
+
 ## operator/webhook v0.2.35 / cue-cmp v0.1.16 / platform-stack 0.2.44 — 2.16b security-axis (2026-08-06)
 
 Extends the app-scope destructive classifier (ADR 0051) along the **security

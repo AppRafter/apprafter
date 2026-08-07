@@ -1760,6 +1760,38 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.45": {
+	change:          "safe"
+	operatorVersion: "v0.2.36"
+	notes: """
+		2.16b-sc — wire SourceCredential-scope MigrationPlan creation live
+		(ADR 0051 app-scope flip for a new scope variant). A destructive
+		coverage-narrowing of a SourceCredential (removing a git.repoPrefixes /
+		registry.hosts entry) now auto-creates a `sourcecredential`-scope
+		MigrationPlan in the cred's namespace (ownerRef → the SourceCredential CR),
+		pauses BOTH derived-Secret derivations (the old wider-coverage repo-creds +
+		pull-secret stay untouched so in-flight apps keep access), and consumes on
+		approve (re-derive narrowed + GC the uncovered coverage). Approve-only
+		(reject = re-widen the spec → GC the stale plan). Actor-agnostic (a raw
+		kubectl edit trips it).
+
+		Adds the `sourcecredential` MigrationPlan scope variant (Rust + CUE +
+		webhook validator + approve-only phase rule), `SourceCredentialStatus.
+		lastAppliedSpec` (preserve-unknown baseline), and hoists the shared
+		consume-ticket state machine to operator-core (reused verbatim).
+
+		change=safe: additive CRD scope variant + additive status field + additive
+		detection; existing SourceCredentials are unaffected until their next
+		coverage-narrowing edit. Closes 1.79c acceptance #4. Ships operator +
+		admission-webhook v0.2.36 + cue-cmp v0.1.17. The kind+podman walk
+		`e2e/sourcecredential-migration-walk.sh` is GREEN end-to-end.
+		"""
+	references: [
+		"docs/superpowers/specs/2026-08-07-2.16b-sc-design.md",
+		"docs/adr/0051-app-scope-migration.md",
+	]
+}
+
 compatibility: "0.2.44": {
 	change:          "safe"
 	operatorVersion: "v0.2.35"

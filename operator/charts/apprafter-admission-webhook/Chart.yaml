@@ -7,8 +7,8 @@ description: |
   names DNS-1123, env keys ^[A-Z_][A-Z0-9_]*$). Cert-manager
   issues + rotates the TLS Certificate.
 type: application
-version: v0.2.35
-appVersion: "v0.2.35"
+version: v0.2.36
+appVersion: "v0.2.36"
 kubeVersion: ">= 1.29.0-0"
 home: https://github.com/apprafter/apprafter
 sources:
