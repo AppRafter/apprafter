@@ -81,7 +81,7 @@ pub struct DiskMount {
 /// applied). v0.1.30 entry point — keeps the simple call-site
 /// shape; new code should prefer [`render_application_for_env`]
 /// when the operator knows which environment it represents.
-pub fn render_application(app: &Application) -> RenderedApplication {
+pub fn render_application(app: &Application) -> Result<RenderedApplication, EffectiveSpecError> {
     render_application_for_env(
         app,
         None,
@@ -146,12 +146,12 @@ pub fn render_application_for_env(
     disks: Option<&[DiskMount]>,
     egress_profile: operator_core::EgressProfile,
     needs_targets: Option<&BTreeMap<String, egress::ConnectionTarget>>,
-) -> RenderedApplication {
+) -> Result<RenderedApplication, EffectiveSpecError> {
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
     let owner = owner_reference(app);
     let labels = make_labels(&name, env_name);
-    let effective = effective_spec(app, env_name);
+    let effective = effective_spec(app, env_name)?;
 
     let deployment = render_deployment(
         &name,
@@ -208,12 +208,12 @@ pub fn render_application_for_env(
         .filter(|hosts| !hosts.is_empty())
         .map(|hosts| render_httproute(&name, &labels, &hosts, &name));
 
-    RenderedApplication {
+    Ok(RenderedApplication {
         deployment,
         service,
         network_policy,
         httproute,
-    }
+    })
 }
 
 /// A partial `environments[*]` override produced an effective spec the
@@ -307,13 +307,16 @@ fn merge_image_policy(base: Option<ImagePolicy>, ovr: Option<ImagePolicy>) -> Op
 /// replaces per-key wholesale (→ 2.16i). v1alpha1 doesn't include CUE-only
 /// constructs, so this pure-Rust merge is functionally equivalent to CUE
 /// unification for our schema.
-pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationBaseSpec {
+pub fn effective_spec(
+    app: &Application,
+    env_name: Option<&str>,
+) -> Result<ApplicationBaseSpec, EffectiveSpecError> {
     let mut effective = app.spec.base.clone().unwrap_or_default();
     let Some(name) = env_name else {
-        return effective;
+        return Ok(effective);
     };
     let Some(env_override) = app.spec.environments.as_ref().and_then(|m| m.get(name)) else {
-        return effective;
+        return Ok(effective);
     };
     if env_override.image.is_some() {
         effective.image = env_override.image.clone();
@@ -322,17 +325,14 @@ pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationB
         effective.replicas = env_override.replicas;
     }
     // 2.16c: `expose` deep-merges at the subfield level (override-wins;
-    // `port` inherits the base when the env omits it). Task 5 makes
-    // `effective_spec` fallible and surfaces the base-absent-no-port case as
-    // `InvalidEffectiveSpec`; until then a merge error leaves the base expose
-    // in place (drops the invalid env-only override).
-    match merge_expose(effective.expose.clone(), env_override.expose.clone()) {
-        Ok(merged) => effective.expose = merged,
-        Err(_) => { /* keep base expose; Task 5 surfaces the error */ }
-    }
+    // `port` inherits the base when the env omits it). The base-absent
+    // env-only-expose-without-port case is surfaced as
+    // `EffectiveSpecError::ExposeMissingPort` (reconcile → `Ready=False`
+    // reason `InvalidEffectiveSpec`) rather than silently dropped.
+    effective.expose = merge_expose(effective.expose.take(), env_override.expose.clone())?;
     // 2.16c: `imagePolicy` deep-merges at the subfield level (set-field-wins).
     effective.image_policy =
-        merge_image_policy(effective.image_policy.clone(), env_override.image_policy.clone());
+        merge_image_policy(effective.image_policy.take(), env_override.image_policy.clone());
     if let Some(env_env) = &env_override.env {
         let mut merged = effective.env.unwrap_or_default();
         for (k, v) in env_env {
@@ -371,7 +371,7 @@ pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationB
         }
         effective.needs = Some(merged);
     }
-    effective
+    Ok(effective)
 }
 
 /// Build the `OwnerReference` back to the owning Application
@@ -669,7 +669,7 @@ mod tests {
             "default",
             "abc-123",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         assert_eq!(r.deployment.spec.as_ref().unwrap().replicas, Some(1));
     }
 
@@ -689,7 +689,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         assert_eq!(r.deployment.spec.as_ref().unwrap().replicas, Some(5));
     }
 
@@ -708,7 +708,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         let containers = &r
             .deployment
             .spec
@@ -745,7 +745,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         let envs = r
             .deployment
             .spec
@@ -788,7 +788,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         let ports = r
             .deployment
             .spec
@@ -821,7 +821,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         assert!(r.service.is_none());
     }
 
@@ -846,7 +846,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         let svc = r.service.expect("service rendered");
         let spec = svc.spec.expect("svc spec");
         assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
@@ -880,7 +880,7 @@ mod tests {
             "default",
             "u",
         );
-        assert!(render_application(&app).httproute.is_none());
+        assert!(render_application(&app).unwrap().httproute.is_none());
     }
 
     #[test]
@@ -904,7 +904,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app).httproute.expect("route rendered");
+        let r = render_application(&app).unwrap().httproute.expect("route rendered");
         assert_eq!(r["apiVersion"], "gateway.networking.k8s.io/v1");
         assert_eq!(r["kind"], "HTTPRoute");
         assert_eq!(r["metadata"]["name"], "web");
@@ -949,7 +949,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app).httproute.expect("route rendered");
+        let r = render_application(&app).unwrap().httproute.expect("route rendered");
         assert_eq!(
             r["spec"]["hostnames"],
             serde_json::json!(["a.demo.dev", "b.demo.dev"])
@@ -979,7 +979,7 @@ mod tests {
             "default",
             "u",
         );
-        assert!(render_application(&app).httproute.is_none());
+        assert!(render_application(&app).unwrap().httproute.is_none());
     }
 
     #[test]
@@ -1003,7 +1003,7 @@ mod tests {
             "default",
             "abc-123-uid",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         let dep_owners = r.deployment.metadata.owner_references.unwrap();
         assert_eq!(dep_owners.len(), 1);
         assert_eq!(dep_owners[0].api_version, "apprafter.io/v1alpha1");
@@ -1032,7 +1032,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         let labels = r.deployment.metadata.labels.unwrap();
         assert_eq!(
             labels.get("app.kubernetes.io/name").map(String::as_str),
@@ -1067,7 +1067,7 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app);
+        let r = render_application(&app).unwrap();
         let sel = r
             .deployment
             .spec
@@ -1099,7 +1099,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let sel_env = renv
             .deployment
             .spec
@@ -1135,7 +1136,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let labels = rendered
             .deployment
             .metadata
@@ -1160,7 +1162,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let base_labels = base.deployment.metadata.labels.clone().unwrap_or_default();
         assert_eq!(
             base_labels
@@ -1224,7 +1227,7 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        let s = effective_spec(&app, None);
+        let s = effective_spec(&app, None).unwrap();
         assert_eq!(s.image.as_deref(), Some("base"));
         assert_eq!(s.replicas, Some(2));
     }
@@ -1238,7 +1241,7 @@ mod tests {
             },
             BTreeMap::new(),
         );
-        let s = effective_spec(&app, Some("prod"));
+        let s = effective_spec(&app, Some("prod")).unwrap();
         assert_eq!(s.image.as_deref(), Some("base"));
     }
 
@@ -1261,7 +1264,7 @@ mod tests {
             },
             envs,
         );
-        let s = effective_spec(&app, Some("prod"));
+        let s = effective_spec(&app, Some("prod")).unwrap();
         assert_eq!(s.image.as_deref(), Some("prod-image"));
         assert_eq!(s.replicas, Some(5));
     }
@@ -1294,7 +1297,7 @@ mod tests {
             },
             envs,
         );
-        let s = effective_spec(&app, Some("prod"));
+        let s = effective_spec(&app, Some("prod")).unwrap();
         let expose = s.expose.expect("expose decoded");
         assert_eq!(expose.port, 9000);
         assert_eq!(
@@ -1330,7 +1333,7 @@ mod tests {
             },
             envs,
         );
-        let s = effective_spec(&app, Some("prod"));
+        let s = effective_spec(&app, Some("prod")).unwrap();
         assert_eq!(
             s.image_policy.and_then(|p| p.resolve).as_deref(),
             Some("off")
@@ -1367,7 +1370,7 @@ mod tests {
             },
             envs,
         );
-        let s = effective_spec(&app, Some("prod"));
+        let s = effective_spec(&app, Some("prod")).unwrap();
         let env = s.env.expect("env decoded");
         // override wins:
         assert_eq!(env["LOG_LEVEL"], EnvValue::Literal("warn".into()));
@@ -1428,7 +1431,7 @@ mod tests {
             },
             envs,
         );
-        let s = effective_spec(&app, Some("prod"));
+        let s = effective_spec(&app, Some("prod")).unwrap();
         let needs = s.needs.expect("needs merged");
         // pg replaced wholesale: env selector wins, base size DROPPED.
         let pg = needs.pg.expect("pg need").into_vec();
@@ -1472,7 +1475,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(
             r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
                 .image
@@ -1498,7 +1502,7 @@ mod tests {
             },
             envs,
         );
-        let r = render_application(&app); // no env → base.image wins
+        let r = render_application(&app).unwrap(); // no env → base.image wins
         assert_eq!(
             r.deployment.spec.unwrap().template.spec.unwrap().containers[0]
                 .image
@@ -1573,7 +1577,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         // No spec.env → no env vars regardless of the secrets map.
         assert!(
             container_env(&r).is_none(),
@@ -1604,7 +1609,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let envs = container_env(&r);
         assert!(envs.is_none(), "no env when no spec.env and no secrets map");
     }
@@ -1640,7 +1646,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "DB");
@@ -1691,7 +1698,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let envs = container_env(&r).expect("env present");
         // BTreeMap order: DB < LOG_LEVEL
         assert_eq!(envs.len(), 2);
@@ -1725,7 +1733,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         assert!(
             container_env(&r).is_none(),
             "DATABASE_URL must NOT be auto-injected (2.4e removed)"
@@ -1763,7 +1772,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "REDIS_PFX");
@@ -1829,7 +1839,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "DB_MAIN");
@@ -1876,7 +1887,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let envs = container_env(&r).expect("env present");
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].name, "TOKEN");
@@ -1922,7 +1934,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let c = &rendered
             .deployment
             .spec
@@ -1945,7 +1958,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let c = &rendered
             .deployment
             .spec
@@ -2023,7 +2037,8 @@ mod tests {
             Some(&disks),
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
 
         let mounts = container_volume_mounts(&r).expect("volumeMounts present");
         assert_eq!(mounts.len(), 1);
@@ -2076,7 +2091,8 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         assert!(
             r.deployment.spec.as_ref().unwrap().strategy.is_none(),
             "strategy unchanged (unset) when no disk"
@@ -2110,7 +2126,8 @@ mod tests {
             Some(&[]),
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         assert!(r.deployment.spec.as_ref().unwrap().strategy.is_none());
         assert!(container_volume_mounts(&r).is_none());
         assert!(pod_volumes(&r).is_none());
@@ -2158,7 +2175,8 @@ mod tests {
             Some(&disks),
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let mounts = container_volume_mounts(&r).expect("volumeMounts present");
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].name, "disk-a");
@@ -2203,7 +2221,8 @@ mod tests {
             Some(&disks),
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         // Strategy must remain unset (apiserver default = RollingUpdate).
         assert!(
             r.deployment.spec.as_ref().unwrap().strategy.is_none(),
@@ -2265,7 +2284,8 @@ mod tests {
             Some(&disks),
             operator_core::EgressProfile::Internet,
             None,
-        );
+        )
+        .unwrap();
         let strategy = r
             .deployment
             .spec
@@ -2362,5 +2382,31 @@ mod tests {
             merge_image_policy(base, ovr).unwrap().resolve.as_deref(),
             Some("off")
         );
+    }
+
+    #[test]
+    fn merge_expose_both_none() {
+        assert_eq!(merge_expose(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn merge_image_policy_base_only() {
+        let base = Some(ImagePolicy {
+            resolve: Some("digest".into()),
+        });
+        assert_eq!(merge_image_policy(base.clone(), None), base);
+    }
+
+    #[test]
+    fn merge_image_policy_env_only() {
+        let ovr = Some(ImagePolicy {
+            resolve: Some("off".into()),
+        });
+        assert_eq!(merge_image_policy(None, ovr.clone()), ovr);
+    }
+
+    #[test]
+    fn merge_image_policy_both_none() {
+        assert_eq!(merge_image_policy(None, None), None);
     }
 }
