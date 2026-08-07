@@ -353,6 +353,26 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
             // The lingering plan gates a DIFFERENT change (stale gate /
             // relic) → delete every key plan, then create the right one.
             let change = change.expect("DeleteThenCreate implies a detected change");
+            // 2.16b-sec N-3: BEFORE the delete, if the lingering plan is a
+            // COMPLETED, trigger-matching plan (so `plan_state` demoted it to
+            // a Relic ONLY on an approval-hash failure — the S-4 drift or a
+            // hashless/forged plan), surface the re-gate to the USER via a
+            // Warning Event on both the Application and the plan, + a metric.
+            // Without this the only signal is an operator-log `warn!`, which a
+            // managed-plan user cannot see — externally it looks like "I
+            // approved, and it asks again" with no reason. Emitted while the
+            // plan object is still live (its `object_ref` targets a real
+            // object) and best-effort (never blocks the re-gate).
+            if let Some(relic) = plan.as_ref() {
+                if is_hash_regate(relic, &change) {
+                    let reason = regate_reason(relic);
+                    warn!(
+                        %name, %namespace, plan = %relic.name_any(), reason = reason.as_reason(),
+                        "re-gating an approved-but-hash-failed MigrationPlan — emitting user-facing Warning Event"
+                    );
+                    emit_regate_signal(&ctx, &app, relic, reason).await;
+                }
+            }
             delete_all_key_plans_except(&ctx.client, &namespace, &key, None).await?;
             // 2.16b S1.2 / S-4: full candidate set → rollup + all-candidate
             // approval hash (same as the CreatePlan arm).
@@ -1980,6 +2000,156 @@ fn plan_hash_matches(plan: &MigrationPlan, current_hash: &str) -> bool {
         // non-empty stamped hash; a hashless completed plan must re-gate,
         // never apply a destructive change.
         _ => false,
+    }
+}
+
+/// 2.16b-sec N-3: why a completed, trigger-matching MigrationPlan re-gated
+/// at consume time — the distinguishable reason surfaced on the user-facing
+/// Warning Event (and the `apprafter_migration_regate_total` metric label).
+/// The two cases are qualitatively different for a user reading the Event:
+/// a `HashMissing` plan carried NO approval hash (legacy / forged), while a
+/// `HashMismatch` plan's approval was for a DIFFERENT spec than the one now
+/// pending (the spec drifted after approval — the S-4 vector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegateReason {
+    /// The completed plan has no / an empty `approvedSpecHash`.
+    HashMissing,
+    /// The plan's stamped hash is present but ≠ the current change's hash.
+    HashMismatch,
+}
+
+impl RegateReason {
+    /// The k8s Event `reason` (a distinguishable, machine-greppable token —
+    /// the review wants the reason itself distinguishable, and the Recorder
+    /// takes an arbitrary reason string).
+    pub fn as_reason(self) -> &'static str {
+        match self {
+            RegateReason::HashMissing => "HashMissing",
+            RegateReason::HashMismatch => "HashMismatch",
+        }
+    }
+
+    /// Stable metric label (same token as the Event reason).
+    pub fn as_label(self) -> &'static str {
+        self.as_reason()
+    }
+}
+
+/// 2.16b-sec N-3: classify WHY a re-gating plan failed its approval hash.
+/// Recomputed in the reconcile from the plan object in scope (rather than
+/// threaded through the pure `plan_state` enum, to keep that enum stable) —
+/// but the classification itself is a pure function of the plan's stamped
+/// `approvedSpecHash`: `None` / empty → [`RegateReason::HashMissing`];
+/// present (but, by construction of the `Relic` bucket, ≠ the current hash)
+/// → [`RegateReason::HashMismatch`]. Only meaningful for a completed,
+/// trigger-matching plan that `plan_state` demoted to `Relic` on a hash
+/// failure; a live (blocking) stale gate is NOT a re-gate of an approval and
+/// does not go through this path.
+fn regate_reason(plan: &MigrationPlan) -> RegateReason {
+    let hash_missing = plan
+        .spec
+        .trigger
+        .approved_spec_hash
+        .as_deref()
+        .is_none_or(str::is_empty);
+    if hash_missing {
+        RegateReason::HashMissing
+    } else {
+        RegateReason::HashMismatch
+    }
+}
+
+/// 2.16b-sec N-3: is this completed plan a re-gate CANDIDATE — i.e. did it
+/// complete AND match the current change's trigger tuple, so that
+/// `plan_state` demoting it to `Relic` can ONLY be an approval-hash failure
+/// (S-4 drift or a hashless/forged plan)? A `BlockingMismatch` relic (a live
+/// stale gate) or a plain rejected/completed-different-tuple relic is NOT an
+/// approval re-gate — the user never approved anything to be re-asked, so no
+/// re-gate Event is warranted. Pure: mirrors the completed-branch guard in
+/// `plan_state`.
+fn is_hash_regate(plan: &MigrationPlan, current: &DestructiveChange) -> bool {
+    let phase = plan
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .unwrap_or("pending-approval");
+    let trigger_matches =
+        plan.spec.trigger.type_ == current.trigger_type && plan.spec.trigger.field == current.field;
+    phase == "completed" && trigger_matches
+}
+
+/// 2.16b-sec N-3: build the user-facing re-gate Warning Event. Kept pure (no
+/// client / recorder) so a unit test can assert its shape. The `note`
+/// explains the ACTION a user must take (re-approve the NEW plan), NOT the
+/// internal hash state — a managed-plan user has no operator-log access, so
+/// the Event is their only signal that "I approved and it asks again" has a
+/// legitimate cause. `plan_name` names the OLD (superseded) plan for context.
+fn build_regate_event(reason: RegateReason, plan_name: &str) -> KubeEvent {
+    let note = match reason {
+        RegateReason::HashMismatch => format!(
+            "the change was modified after it was approved — re-approve the new MigrationPlan \
+             (superseded plan {plan_name})"
+        ),
+        RegateReason::HashMissing => format!(
+            "the migration plan carried no approval hash and was re-gated — approve the new \
+             MigrationPlan (superseded plan {plan_name})"
+        ),
+    };
+    KubeEvent {
+        type_: EventType::Warning,
+        reason: reason.as_reason().into(),
+        note: Some(note),
+        action: "Reconcile".into(),
+        secondary: None,
+    }
+}
+
+/// 2.16b-sec N-3: emit the re-gate Warning Event on BOTH the `Application`
+/// (via the existing [`build_recorder`] path) and the superseded
+/// `MigrationPlan` (a recorder referencing `plan.object_ref(&())`), and bump
+/// the `apprafter_migration_regate_total{reason,namespace}` counter. All of
+/// it is BEST-EFFORT: a publish failure is `warn!`-logged and never fatal
+/// (mirrors the `SoftDestructiveChange` emit) — the re-gate itself already
+/// landed via `DeleteThenCreate`, so this is pure observability.
+async fn emit_regate_signal(
+    ctx: &Context,
+    app: &Application,
+    plan: &MigrationPlan,
+    reason: RegateReason,
+) {
+    let name = app.name_any();
+    let namespace = app.namespace().unwrap_or_default();
+    let plan_name = plan.name_any();
+
+    ctx.metrics
+        .migration_regate_total
+        .with_label_values(&[reason.as_label(), &namespace])
+        .inc();
+
+    // On the Application — the object a user watches (`kubectl describe app`,
+    // Argo's Events tab, Backstage).
+    let app_recorder = build_recorder(&ctx.client, app);
+    if let Err(e) = app_recorder
+        .publish(build_regate_event(reason, &plan_name))
+        .await
+    {
+        warn!(%name, %namespace, plan = %plan_name, error = %e,
+            "failed to publish re-gate Event on the Application (continuing)");
+    }
+    // On the superseded MigrationPlan itself — so `kubectl describe
+    // migrationplan` carries the reason too (the plan is about to be deleted;
+    // the Event outlives it briefly / is attached before the supersede).
+    let plan_reporter = Reporter {
+        controller: EVENT_REPORTER_CONTROLLER.into(),
+        instance: std::env::var("POD_NAME").ok(),
+    };
+    let plan_recorder = Recorder::new(ctx.client.clone(), plan_reporter, plan.object_ref(&()));
+    if let Err(e) = plan_recorder
+        .publish(build_regate_event(reason, &plan_name))
+        .await
+    {
+        warn!(%name, %namespace, plan = %plan_name, error = %e,
+            "failed to publish re-gate Event on the MigrationPlan (continuing)");
     }
 }
 
@@ -5528,6 +5698,95 @@ mod tests {
         // has_change=true × Relic → DeleteThenCreate (re-gate as a fresh
         // pending-approval plan), NOT ConsumeApply.
         assert_eq!(decide(true, state), MigrationDecision::DeleteThenCreate);
+    }
+
+    // ---- 2.16b-sec N-3: user-facing re-gate Event + reason classifier ----
+
+    // The reason classifier: a completed plan with NO / empty stamped hash →
+    // HashMissing; a present-but-different hash → HashMismatch. (Same fixtures
+    // as the F-4 completed-plan tests: `completed_plan_with_hash`.)
+    #[test]
+    fn regate_reason_classifies_missing_vs_mismatch() {
+        let current = DestructiveChange {
+            trigger_type: "scale-to-zero".into(),
+            field: "replicas".into(),
+            from: Some(serde_json::json!("1")),
+            to: Some(serde_json::json!("0")),
+            classification: "requires-restart".into(),
+        };
+        // No stamped hash → HashMissing.
+        let hashless = completed_plan_with_hash(&current, None);
+        assert_eq!(regate_reason(&hashless), RegateReason::HashMissing);
+        // Empty stamped hash → HashMissing (an empty string is "no hash").
+        let empty = completed_plan_with_hash(&current, Some(String::new()));
+        assert_eq!(regate_reason(&empty), RegateReason::HashMissing);
+        // A present hash (for a DIFFERENT change) → HashMismatch.
+        let approved = DestructiveChange {
+            from: Some(serde_json::json!("2")),
+            ..current.clone()
+        };
+        let approved_hash = operator_core::migration::change_hash(std::slice::from_ref(&approved));
+        let mismatched = completed_plan_with_hash(&approved, Some(approved_hash));
+        assert_eq!(regate_reason(&mismatched), RegateReason::HashMismatch);
+    }
+
+    // `is_hash_regate` is the gate that keeps the Event scoped to an APPROVAL
+    // re-gate: a completed, trigger-matching plan qualifies (its Relic bucket
+    // can ONLY be a hash failure), but a rejected / different-tuple / live
+    // plan does NOT (the user never approved anything to be re-asked).
+    #[test]
+    fn is_hash_regate_only_for_completed_trigger_match() {
+        let current = DestructiveChange {
+            trigger_type: "scale-to-zero".into(),
+            field: "replicas".into(),
+            from: Some(serde_json::json!("1")),
+            to: Some(serde_json::json!("0")),
+            classification: "requires-restart".into(),
+        };
+        // completed + same tuple → yes.
+        let completed = completed_plan_with_hash(&current, None);
+        assert!(is_hash_regate(&completed, &current));
+        // completed but a DIFFERENT trigger tuple → no (not an approval re-gate
+        // of THIS change; a plain relic cleanup).
+        let other = DestructiveChange {
+            trigger_type: "needs-removal".into(),
+            field: "needs.pg".into(),
+            ..current.clone()
+        };
+        assert!(!is_hash_regate(&completed, &other));
+        // A rejected plan (not completed) → no.
+        let mut rejected = completed_plan_with_hash(&current, None);
+        rejected.status = Some(MigrationPlanStatus {
+            phase: Some("rejected".into()),
+            ..MigrationPlanStatus::default()
+        });
+        assert!(!is_hash_regate(&rejected, &current));
+    }
+
+    // The pure Event builder: a HashMismatch re-gate yields a Warning Event
+    // whose reason is the distinguishable token and whose note names the
+    // ACTION (re-approve), not internal hash state.
+    #[test]
+    fn build_regate_event_names_the_action() {
+        let ev = build_regate_event(RegateReason::HashMismatch, "parser-prod-migration-42");
+        assert_eq!(ev.type_, EventType::Warning);
+        assert_eq!(ev.reason, "HashMismatch");
+        let note = ev.note.expect("re-gate Event carries a note");
+        // Names the action a user must take …
+        assert!(note.contains("re-approve"), "{note}");
+        assert!(note.contains("modified after it was approved"), "{note}");
+        // … and references the superseded plan for context.
+        assert!(note.contains("parser-prod-migration-42"), "{note}");
+        assert_eq!(ev.action, "Reconcile");
+
+        // The HashMissing variant carries its own distinguishable reason +
+        // action ("approve the new MigrationPlan").
+        let missing = build_regate_event(RegateReason::HashMissing, "parser-prod-migration-9");
+        assert_eq!(missing.type_, EventType::Warning);
+        assert_eq!(missing.reason, "HashMissing");
+        let mnote = missing.note.expect("re-gate Event carries a note");
+        assert!(mnote.contains("no approval hash"), "{mnote}");
+        assert!(mnote.contains("approve the new MigrationPlan"), "{mnote}");
     }
 
     // 2.16b S1.2 / S-4 close: the approval hash covers the FULL candidate set,

@@ -19,6 +19,11 @@
 //!   - apprafter_claim_retained_total{backend,namespace} —
 //!     RetainedClaim snapshots created on claim delete, by backend
 //!     (2.16b S3 — ends the silent RetainedClaim creation).
+//!   - apprafter_migration_regate_total{reason,namespace} — app-scope
+//!     MigrationPlans re-gated at consume time because their approval
+//!     hash failed, by reason {HashMissing, HashMismatch} (2.16b-sec
+//!     N-3 — surfaces a stale/forged approval re-gate + measures any
+//!     hashless tail in the wild).
 //!
 //! Metrics are registered into a single `Registry` that the HTTP
 //! `/metrics` handler in `apprafter-operator` encodes.
@@ -36,6 +41,7 @@ pub struct Metrics {
     pub image_resolve_total: CounterVec,
     pub soft_destructive_total: CounterVec,
     pub claim_retained_total: CounterVec,
+    pub migration_regate_total: CounterVec,
 }
 
 impl Default for Metrics {
@@ -129,6 +135,15 @@ impl Metrics {
         )
         .expect("CounterVec must build with a non-empty name");
 
+        let migration_regate_total = CounterVec::new(
+            opts!(
+                "apprafter_migration_regate_total",
+                "App-scope MigrationPlans re-gated at consume time on an approval-hash failure, by reason (HashMissing|HashMismatch) and namespace"
+            ),
+            &["reason", "namespace"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
         registry
             .register(Box::new(reconcile_total.clone()))
             .expect("reconcile_total registers cleanly");
@@ -156,6 +171,9 @@ impl Metrics {
         registry
             .register(Box::new(claim_retained_total.clone()))
             .expect("claim_retained_total registers cleanly");
+        registry
+            .register(Box::new(migration_regate_total.clone()))
+            .expect("migration_regate_total registers cleanly");
 
         Self {
             registry,
@@ -168,6 +186,7 @@ impl Metrics {
             image_resolve_total,
             soft_destructive_total,
             claim_retained_total,
+            migration_regate_total,
         }
     }
 
@@ -217,6 +236,9 @@ mod tests {
         m.claim_retained_total
             .with_label_values(&["cloudnative-pg", "demo"])
             .inc();
+        m.migration_regate_total
+            .with_label_values(&["HashMismatch", "demo"])
+            .inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -230,6 +252,7 @@ mod tests {
         assert!(body.contains("apprafter_image_resolve_total"), "{body}");
         assert!(body.contains("apprafter_soft_destructive_total"), "{body}");
         assert!(body.contains("apprafter_claim_retained_total"), "{body}");
+        assert!(body.contains("apprafter_migration_regate_total"), "{body}");
     }
 
     #[test]

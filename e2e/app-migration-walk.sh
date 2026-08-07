@@ -1399,6 +1399,32 @@ if [ "$sec2_saw_bad" -eq 1 ]; then
 fi
 printf 'ok: stale approval not consumed for a different target (S-4)\n'
 
+# 2.16b-sec N-3: the hash re-gate must be USER-VISIBLE (not operator-log-only).
+# When the drifted (C) reconcile demotes the completed/approved P1 to a Relic on
+# its hash mismatch, the operator emits a Warning Event (reason HashMismatch —
+# or HashMissing) on the Application naming the re-approve action. SOFT
+# assertion: whether P1 reaches `completed` before it is superseded by the C
+# plan is timing-dependent (the approve races the supersede), so a missing Event
+# is a note, NOT a walk failure — the S-4 refusal above is the hard gate.
+printf '  (N-3) polling ~40s for a re-gate Warning Event (HashMismatch/HashMissing) on %s ...\n' "$SEC_IMG"
+_regate_deadline=$(( $(date +%s) + 40 ))
+regate_event=""
+while [ "$(date +%s)" -lt "$_regate_deadline" ]; do
+    regate_event=$(kubectl -n "$SEC_NS" get events \
+        --field-selector "involvedObject.name=${SEC_IMG}" \
+        -o jsonpath='{range .items[*]}{.reason}{"\n"}{end}' 2>/dev/null \
+        | grep -E -x 'HashMismatch|HashMissing|MigrationPlanRegated' || true)
+    [ -n "$regate_event" ] && break
+    sleep 5
+done
+if [ -n "$regate_event" ]; then
+    printf '  ok (N-3): re-gate surfaced as a user-facing Event (reason=%s on %s)\n' \
+        "$(printf '%s' "$regate_event" | tr '\n' ',')" "$SEC_IMG"
+else
+    printf '  note (N-3): no re-gate Event observed in 40s (approve likely raced the supersede — SOFT, not a failure)\n'
+    kubectl -n "$SEC_NS" get events --field-selector "involvedObject.name=${SEC_IMG}" >&2 2>&1 || true
+fi
+
 # ===============================================================
 # P-SEC-3: F-1 — a non-operator write to Application/status is webhook-DENIED
 #          EVEN when it SPOOFS the operator fieldManager.
