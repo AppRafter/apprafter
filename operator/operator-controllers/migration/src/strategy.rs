@@ -38,7 +38,7 @@ use operator_core::{
     image_repo, Application, ApplicationBaseSpec, DestructiveChange, EnvRef, EnvValue,
     MigrationApplicationRef, MigrationApplicationScope, MigrationChange, MigrationError,
     MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationStep, MigrationStrategy,
-    MigrationTrigger, Needs, OneOrMany, SourceCredentialSpec, StepOutcome,
+    MigrationTrigger, Needs, SourceCredentialSpec, StepOutcome,
 };
 
 /// Render-time default for `Application.spec.*.replicas` (application.cue:
@@ -169,8 +169,6 @@ impl ApplicationMigrationStrategy {
             .as_ref()
             .and_then(|e| e.network.as_deref())
             .unwrap_or("internal");
-        let old_host = first_hostname(old);
-        let new_host = first_hostname(new);
 
         // public -> any non-public visibility flip: the app stops being
         // reachable on its public HTTPRoute, so it's gated (requires-restart).
@@ -184,25 +182,36 @@ impl ApplicationMigrationStrategy {
             });
         }
 
-        // Hostname removal / change of a PUBLICLY-ROUTED app ONLY. On a
-        // non-public app the HTTPRoute isn't emitted, so the hostname is
-        // inert and its change is soft. Gating on `old_net == "public"`
-        // (the app was routed before the edit) also covers the
-        // public->internal case where the route is being withdrawn.
+        // #3 domain-change (2.16b-sec F-3 set-algebra): a PUBLICLY-ROUTED app
+        // LOSES any hostname. On a non-public app the HTTPRoute isn't emitted, so
+        // the hostname is inert and its change is soft — the `old_net == "public"`
+        // guard (R3-MODERATE) preserves that (the app WAS routed before the edit;
+        // this also covers public→internal route withdrawal).
         //
-        // `old_host.is_some()` is load-bearing: adding a hostname to a
-        // public app (`None -> Some`) is NOT destructive — no existing
-        // route is disrupted, it's just added exposure detail. We gate
-        // only when there WAS a hostname before (its removal or change of
-        // an existing public route). This also avoids an empty `from`.
-        if old_net == "public" && old_host.is_some() && old_host != new_host {
+        // Pure set difference `old_hosts \ new_hosts` (declared order preserved
+        // for determinism): the set of hostnames the edit REMOVED. #3 is the
+        // "availability" fact (a public name stopped resolving → requires-restart).
+        // It is INDEPENDENT of #11 (a name was GAINED) — a first-host SWAP
+        // `{a}→{b}` LOSES `a` (#3) AND GAINS `b` (#11), so BOTH fire; F-3 removed
+        // the old de-dup that suppressed #11's security-boundary class behind #3.
+        //
+        // Adding a hostname (`{} → {a}`, `{a} → {a,b}`) removes NOTHING → no #3
+        // (its territory is #11). `from` = the lost host(s) joined, `to` =
+        // `(removed)` (the availability of those names is gone regardless of what
+        // replaced them — the retained/gained names are #11's concern).
+        let old_hosts = all_hostnames(old);
+        let new_hosts = all_hostnames(new);
+        let lost_hosts: Vec<String> = old_hosts
+            .iter()
+            .filter(|h| !new_hosts.contains(h))
+            .cloned()
+            .collect();
+        if old_net == "public" && !lost_hosts.is_empty() {
             candidates.push(DestructiveChange {
                 trigger_type: "domain-change".to_string(),
                 field: "expose.hostname".to_string(),
-                from: Some(json!(old_host.clone().unwrap_or_default())),
-                to: Some(json!(new_host
-                    .clone()
-                    .unwrap_or_else(|| "(removed)".to_string()))),
+                from: Some(json!(lost_hosts.join(","))),
+                to: Some(json!("(removed)")),
                 classification: "requires-restart".to_string(),
             });
         }
@@ -224,42 +233,38 @@ impl ApplicationMigrationStrategy {
             });
         }
 
-        // #11 public-hostname-add: publishing a NEW externally-reachable public
-        // name. The renderer routes EVERY entry of `expose.hostname`
-        // (`operator-rendering::render_httproute` puts the whole `as_slice_vec()`
-        // into `HTTPRoute.spec.hostnames` — 2.16b review Fix 2, verified at
-        // operator-rendering/src/lib.rs:200-207 + :536), so a SECOND hostname is
-        // just as public as the first. #11 therefore gates when the PUBLIC
-        // hostname SET GAINS any member — the None → Some FIRST-hostname add AND
-        // a One(h) → Many([h, h2]) SECOND-hostname add both qualify.
+        // #11 public-hostname-add (2.16b-sec F-3 set-algebra): publishing a NEW
+        // externally-reachable public name. The renderer routes EVERY entry of
+        // `expose.hostname` (`operator-rendering::render_httproute` puts the whole
+        // `as_slice_vec()` into `HTTPRoute.spec.hostnames` — 2.16b review Fix 2,
+        // verified at operator-rendering/src/lib.rs:200-207 + :536), so a SECOND
+        // hostname is just as public as the first. #11 gates when the PUBLIC
+        // hostname SET GAINS any member — pure set difference `new_hosts \
+        // old_hosts` (declared order preserved for determinism).
         //
         // Gated on `new_net == "public"` (a hostname is inert until public).
-        // CO-FIRES with #10 when internal→public also adds a hostname — both land
-        // in `changes[]`, deliberately not merged.
+        // CO-FIRES with #10 when internal→public also adds a hostname, and — F-3
+        // — with #3 `domain-change` on a first-host SWAP `{a}→{b}` (a lost AND b
+        // gained): the OLD de-dup filter that dropped #11 whenever domain-change
+        // fired is REMOVED. #3 (a host LOST, requires-restart) and #11 (a host
+        // GAINED, security-boundary) are DIFFERENT facts and must both surface —
+        // suppressing #11 hid the security-boundary class from the rollup, letting
+        // a phishing host in a trusted wildcard zone launder behind a sev-1
+        // availability change (the anti-laundering hole this fix closes).
         //
-        // De-duped against `domain-change` (requires-restart, above), which owns
-        // a CHANGE/removal of the FIRST hostname: the added members counted here
-        // EXCLUDE any host that is the new first hostname when domain-change is
-        // already firing (`old_host.is_some() && old_host != new_host`). So a
-        // pure `One(a) → One(b)` first-host swap stays domain-change ONLY, while a
-        // `One(a) → Many([a, b])` add fires #11 for the genuinely new `b`. The
-        // None → Some first add has no `domain-change` (old_host is None) so its
-        // new host is a legit #11 member.
+        // `from` = `(none)` if the app had no hostnames, else the pre-existing
+        // set joined; `to` = the ADDED delta (`new \ old`), NOT the full new set.
         if new_net == "public" {
-            let old_set = all_hostnames(old);
-            let domain_change_fired = old_host.is_some() && old_host != new_host;
-            let added: Vec<String> = all_hostnames(new)
-                .into_iter()
-                .filter(|h| !old_set.contains(h))
-                // The new first host is domain-change's territory when it fired —
-                // don't also count it as a #11 add.
-                .filter(|h| !(domain_change_fired && Some(h) == new_host.as_ref()))
+            let added: Vec<String> = new_hosts
+                .iter()
+                .filter(|h| !old_hosts.contains(h))
+                .cloned()
                 .collect();
             if !added.is_empty() {
-                let from = if old_set.is_empty() {
+                let from = if old_hosts.is_empty() {
                     "(none)".to_string()
                 } else {
-                    old_set.join(",")
+                    old_hosts.join(",")
                 };
                 candidates.push(DestructiveChange {
                     trigger_type: "public-hostname-add".to_string(),
@@ -696,20 +701,6 @@ fn needs_keys(needs: Option<&Needs>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// The first declared public hostname of a spec, or `None` when the
-/// Application declares no `expose.hostname`. `OneOrMany::One(h)` → `h`;
-/// `OneOrMany::Many(v)` → the first element (`None` for an empty vec).
-/// The FIRST hostname participates in `domain-change` detection (a change
-/// or removal of the first-listed public route); the FULL set participates
-/// in the #11 `public-hostname-add` add-detection ([`all_hostnames`]).
-fn first_hostname(s: &ApplicationBaseSpec) -> Option<String> {
-    match s.expose.as_ref().and_then(|e| e.hostname.as_ref()) {
-        Some(OneOrMany::One(h)) => Some(h.clone()),
-        Some(OneOrMany::Many(v)) => v.first().cloned(),
-        None => None,
-    }
 }
 
 /// EVERY declared hostname of a spec, in declared order, empties dropped.
@@ -1508,17 +1499,42 @@ mod application_detect_destructive_tests {
 
     // ---- Task 3: domain-change (gated on public) + network-visibility ----
 
+    // 2.16b-sec F-3 FLIPPED: a first-host SWAP `{a}→{b}` on a public app now
+    // fires BOTH #3 (lost a) AND #11 (gained b) — pre-fix the de-dup suppressed
+    // #11 so only the sev-1 `domain-change` fired and the security-boundary
+    // class was invisible. The `detect_destructive` PRIMARY is now #11
+    // (`public-hostname-add`, sev4) — it OUTRANKS the sev-1 availability op.
     #[test]
     fn hostname_change_on_public_app_gates() {
-        let c = ApplicationMigrationStrategy::detect_destructive(
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(base(), expose("public", Some("b.example.com"))),
+        );
+        // #3 domain-change: `a` LOST → `(removed)`.
+        let dc = cs
+            .iter()
+            .find(|c| c.trigger_type == "domain-change")
+            .expect("domain-change (host a lost)");
+        assert_eq!(dc.classification, "requires-restart");
+        assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+        // #11 public-hostname-add: `b` GAINED (the security-boundary fact that
+        // pre-fix was suppressed).
+        let hn = cs
+            .iter()
+            .find(|c| c.trigger_type == "public-hostname-add")
+            .expect("public-hostname-add (host b gained)");
+        assert_eq!(hn.classification, "security-boundary");
+        assert_eq!(hn.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+        assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        // primary = the security-boundary op (sev4 > sev1).
+        let primary = ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("public", Some("b.example.com"))),
         )
         .unwrap();
-        assert_eq!(c.trigger_type, "domain-change");
-        assert_eq!(c.classification, "requires-restart");
-        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
-        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        assert_eq!(primary.trigger_type, "public-hostname-add");
+        assert_eq!(primary.classification, "security-boundary");
     }
 
     #[test]
@@ -2440,12 +2456,13 @@ mod application_detect_destructive_tests {
         assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "a.example.com");
     }
 
-    // Fix 2: removing a hostname (`Many([a, b]) → One(a)`) is NOT a #11 add —
-    // the set only LOST a member. It also does not disturb the first host, so
-    // domain-change stays quiet too (a soft edit). (First-host REMOVAL is
-    // covered by `hostname_removal_on_public_app_gates_with_removed_sentinel`.)
+    // 2.16b-sec F-3 FLIPPED: removing a NON-first hostname (`{a,b} → {a}`) is not
+    // a #11 add (the set only LOST a member), but under set algebra it DOES now
+    // fire #3 `domain-change` — `b.example.com` stopped resolving, an
+    // availability fact the pre-fix first-host-only logic missed. `from` = the
+    // lost host `b`, `to` = `(removed)`.
     #[test]
-    fn removing_a_non_first_public_hostname_does_not_gate_hostname_add() {
+    fn removing_a_non_first_public_hostname_gates_domain_change_not_add() {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(
                 base(),
@@ -2453,16 +2470,23 @@ mod application_detect_destructive_tests {
             ),
             &with_expose(base(), expose("public", Some("a.example.com"))),
         );
+        // Nothing gained → no #11.
         assert!(!cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
-        // First host unchanged (a) → domain-change does not fire either.
-        assert!(!cs.iter().any(|c| c.trigger_type == "domain-change"));
+        // `b` lost → #3 domain-change fires (F-3: any host lost, not just first).
+        let dc = cs
+            .iter()
+            .find(|c| c.trigger_type == "domain-change")
+            .expect("domain-change (host b lost)");
+        assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
     }
 
-    // Fix 2: Many → One where the FIRST host is REMOVED (`Many([a, b]) → One(b)`)
-    // stays domain-change (first-host change), and does NOT also fire #11 — `b`
-    // was already in the old set (no new public name), so nothing is added.
+    // 2.16b-sec F-3 FLIPPED: `{a,b} → {b}` LOSES `a` (kept `b`) → #3 fires for the
+    // lost `a` with the `(removed)` sentinel (pre-fix it reported the first-host
+    // change `a → b`; under set algebra the fact is "a stopped resolving"). `b`
+    // was already exposed → nothing GAINED → #11 must NOT fire.
     #[test]
-    fn many_to_one_first_host_removed_stays_domain_change_only() {
+    fn many_to_one_dropping_first_host_gates_domain_change_only() {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(
                 base(),
@@ -2470,23 +2494,24 @@ mod application_detect_destructive_tests {
             ),
             &with_expose(base(), expose("public", Some("b.example.com"))),
         );
-        // First host changed a → b → domain-change fires.
+        // `a` lost → domain-change fires.
         let dc = cs
             .iter()
             .find(|c| c.trigger_type == "domain-change")
             .expect("domain-change candidate");
         assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
-        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
         // `b` was already exposed → no NEW public name → #11 must NOT fire.
         assert!(!cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
     }
 
-    // Fix 2: a first-host SWAP that ALSO adds a net-new host
-    // (`One(a) → Many([b, c])`) fires domain-change for the first-host change
-    // (a → b) AND #11 for the genuinely-new `c` — but NOT double-count `b` (it
-    // is domain-change's new first host).
+    // 2.16b-sec F-3 FLIPPED (was `..._without_double_counting_first`): under set
+    // algebra `{a} → {b, c}` LOSES `a` and GAINS `{b, c}` — the pre-fix
+    // "first host is domain-change's territory" carve-out is gone. #3 reports the
+    // LOST set (`a` → `(removed)`), #11 reports the full GAINED delta
+    // (`b,c` — both are genuinely new public names, neither is pre-existing).
     #[test]
-    fn first_host_swap_plus_new_host_fires_both_without_double_counting_first() {
+    fn first_host_swap_plus_new_hosts_reports_lost_and_full_gained_delta() {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(
@@ -2498,13 +2523,143 @@ mod application_detect_destructive_tests {
             .iter()
             .find(|c| c.trigger_type == "domain-change")
             .expect("domain-change candidate");
-        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "b.example.com");
+        assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "a.example.com"); // a lost
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
         let hn = cs
             .iter()
             .find(|c| c.trigger_type == "public-hostname-add")
             .expect("public-hostname-add candidate");
-        // Only `c` — `b` is domain-change's new first host, not a #11 add.
-        assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "c.example.com");
+        // BOTH `b` and `c` are net-new public names (a was the only old host).
+        assert_eq!(
+            hn.to.as_ref().unwrap().as_str().unwrap(),
+            "b.example.com,c.example.com"
+        );
+    }
+
+    // ---- 2.16b-sec F-3: set-algebra for #3 (domain-change) / #11 ----
+
+    // F-3 (MODERATE): #3 (`domain-change`, requires-restart, sev1) and #11
+    // (`public-hostname-add`, security-boundary, sev4) describe DIFFERENT facts
+    // (a host was LOST vs a host was GAINED) and must both surface. Pre-fix a
+    // de-dup filter suppressed #11 on a first-host SWAP `{a}→{b}` so only the
+    // sev-1 availability op fired — the security-boundary class was invisible
+    // in the rollup, letting a phishing host in a trusted wildcard zone hide
+    // behind a benign restart. This is the case-table oracle (all PUBLIC unless
+    // noted): #3 = any host LOST, #11 = any host GAINED, computed as set diffs.
+    #[test]
+    fn hostname_set_algebra_surfaces_both_facts() {
+        // Helper: the set of trigger_types detect_all emits for old→new hosts on
+        // a given network.
+        fn triggers(old: ApplicationExpose, new: ApplicationExpose) -> Vec<String> {
+            ApplicationMigrationStrategy::detect_all(
+                &with_expose(base(), old),
+                &with_expose(base(), new),
+            )
+            .into_iter()
+            .map(|c| c.trigger_type)
+            .collect()
+        }
+        let has = |v: &[String], t: &str| v.iter().any(|x| x == t);
+
+        // {a}→{b}: a lost, b gained → BOTH #3 and #11; primary = #11 (sev4).
+        let t = triggers(
+            expose("public", Some("a.example.com")),
+            expose("public", Some("b.example.com")),
+        );
+        assert!(has(&t, "domain-change"), "{{a}}→{{b}}: expected #3");
+        assert!(has(&t, "public-hostname-add"), "{{a}}→{{b}}: expected #11");
+        let p = ApplicationMigrationStrategy::detect_destructive(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(base(), expose("public", Some("b.example.com"))),
+        )
+        .unwrap();
+        assert_eq!(p.trigger_type, "public-hostname-add"); // sev4 primary
+        assert_eq!(p.classification, "security-boundary");
+
+        // {a}→{a,b}: nothing lost, b gained → only #11.
+        let t = triggers(
+            expose("public", Some("a.example.com")),
+            expose_hosts("public", &["a.example.com", "b.example.com"]),
+        );
+        assert!(!has(&t, "domain-change"), "{{a}}→{{a,b}}: no #3");
+        assert!(
+            has(&t, "public-hostname-add"),
+            "{{a}}→{{a,b}}: expected #11"
+        );
+
+        // {a,b}→{a}: b lost, nothing gained → only #3.
+        let t = triggers(
+            expose_hosts("public", &["a.example.com", "b.example.com"]),
+            expose("public", Some("a.example.com")),
+        );
+        assert!(has(&t, "domain-change"), "{{a,b}}→{{a}}: expected #3");
+        assert!(!has(&t, "public-hostname-add"), "{{a,b}}→{{a}}: no #11");
+
+        // {a,b}→{a,c}: b lost, c gained → BOTH.
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(
+                base(),
+                expose_hosts("public", &["a.example.com", "b.example.com"]),
+            ),
+            &with_expose(
+                base(),
+                expose_hosts("public", &["a.example.com", "c.example.com"]),
+            ),
+        );
+        let dc = cs
+            .iter()
+            .find(|c| c.trigger_type == "domain-change")
+            .expect("{a,b}→{a,c}: expected #3");
+        assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "b.example.com"); // lost b
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+        let hn = cs
+            .iter()
+            .find(|c| c.trigger_type == "public-hostname-add")
+            .expect("{a,b}→{a,c}: expected #11");
+        assert_eq!(hn.to.as_ref().unwrap().as_str().unwrap(), "c.example.com"); // gained c
+
+        // {a}→{a}: unchanged → nothing.
+        let t = triggers(
+            expose("public", Some("a.example.com")),
+            expose("public", Some("a.example.com")),
+        );
+        assert!(!has(&t, "domain-change") && !has(&t, "public-hostname-add"));
+
+        // {a}→{b} on a NON-public app: both guards fail → nothing.
+        let t = triggers(
+            expose("internal", Some("a.example.com")),
+            expose("internal", Some("b.example.com")),
+        );
+        assert!(!has(&t, "domain-change") && !has(&t, "public-hostname-add"));
+    }
+
+    // F-3: single-host sanity — `{a}→{b}` reports `a` lost (not `b`) in #3, and
+    // `{a}→{}` (full removal) reports `a` lost with the `(removed)` sentinel.
+    #[test]
+    fn set_algebra_single_host_from_reports_lost_host() {
+        // {a}→{b}: #3 `from` is the LOST host `a`, `to` = `(removed)`.
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(base(), expose("public", Some("b.example.com"))),
+        );
+        let dc = cs
+            .iter()
+            .find(|c| c.trigger_type == "domain-change")
+            .expect("#3 candidate");
+        assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+        // {a}→{} full removal: `a` lost.
+        let cs = ApplicationMigrationStrategy::detect_all(
+            &with_expose(base(), expose("public", Some("a.example.com"))),
+            &with_expose(base(), expose("public", None)),
+        );
+        let dc = cs
+            .iter()
+            .find(|c| c.trigger_type == "domain-change")
+            .expect("#3 candidate");
+        assert_eq!(dc.from.as_ref().unwrap().as_str().unwrap(), "a.example.com");
+        assert_eq!(dc.to.as_ref().unwrap().as_str().unwrap(), "(removed)");
+        assert!(!cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
     }
 
     // Fix 2: on an INTERNAL app the renderer emits NO HTTPRoute, so a
