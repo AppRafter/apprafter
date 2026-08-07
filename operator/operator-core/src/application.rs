@@ -26,7 +26,7 @@ pub struct ApplicationSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<ApplicationBaseSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environments: Option<BTreeMap<String, ApplicationBaseSpec>>,
+    pub environments: Option<BTreeMap<String, ApplicationEnvOverride>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
 }
@@ -79,6 +79,43 @@ pub struct ApplicationExpose {
     /// CRD; an `Option<bool>` here (`None` == default true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
+}
+
+/// The per-environment PARTIAL `expose` override (2.16c). Mirrors
+/// `ApplicationExpose` but every field — INCLUDING `port` — is optional,
+/// so an env carries only the diff. `merge_expose` folds it onto the
+/// base `ApplicationExpose`; a base-absent env override with no port
+/// fails `try_into_expose` (surfaced as `InvalidEffectiveSpec`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ExposeOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<OneOrMany<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
+}
+
+/// The per-environment PARTIAL override for `Application.spec.environments[*]`
+/// (2.16c). All-optional mirror of `ApplicationBaseSpec` with `expose` as
+/// the all-optional `ExposeOverride`. `needs`/`imagePolicy` reuse the base
+/// types (needs stays wholesale-per-key → 2.16i; imagePolicy is one field).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ApplicationEnvOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expose: Option<ExposeOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, EnvValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<Needs>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "imagePolicy")]
+    pub image_policy: Option<ImagePolicy>,
 }
 
 /// One declared platform-service dependency under
