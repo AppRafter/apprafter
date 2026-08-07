@@ -1760,6 +1760,43 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.46": {
+	change:          "safe"
+	operatorVersion: "v0.2.36"
+	notes: """
+		Fix the intermittent Source-Type=Directory CMP startup race in
+		argocd-repo-server (chart-only; no operator/CLI/cue-cmp change).
+
+		Root cause: the cue-cmp sidecar (repoServer.extraContainers) had NO
+		readiness probe, so the repo-server POD reported Ready as soon as
+		repo-server's own probe passed — which can be BEFORE the sidecar's
+		argocd-cmp-server has bound its unix socket under the shared `plugins`
+		volume. In that window repo-server silently falls back to its built-in
+		Directory source type: a CUE app repo renders as "zero raw YAML" and
+		Argo reports Synced/Healthy with NOTHING applied — the AppRafter
+		Application CR never materializes and there is no diff to re-render out
+		of the empty-but-Synced state. Manifested as an intermittent gitops-walk
+		red (Phase 5b: "Application.apprafter.io not found after 5 min" while the
+		Argo Application shows `Source Type: Directory`, Synced, Healthy).
+
+		Fix: add a readinessProbe to the cue-cmp sidecar that gates on the SAME
+		`*.sock` predicate repo-server uses for plugin discovery. The pod is now
+		Ready — and only then receives repo-server Service traffic — once the
+		plugin is discoverable, closing the race in-cluster (not only in the e2e
+		harness). Probe-pass ≡ CMP functional, so it cannot brick a working
+		sidecar; if cmp-server dies and the socket vanishes the pod drops out of
+		the repo-server endpoints (GitOps pauses) instead of silently
+		Directory-falling-back — the safe failure mode.
+
+		change=safe: adds a readiness probe to an existing sidecar container; no
+		CRD, RBAC, operator, or API change. operatorVersion pinned unchanged at
+		v0.2.36.
+		"""
+	references: [
+		"e2e/gitops-walk.sh",
+	]
+}
+
 compatibility: "0.2.45": {
 	change:          "safe"
 	operatorVersion: "v0.2.36"

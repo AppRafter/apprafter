@@ -304,6 +304,38 @@ _components: argocd: #Component & {
 					runAsNonRoot: true
 					runAsUser:    999
 				}
+				// Readiness gate on the CMP socket — fixes the
+				// Source-Type=Directory startup race (RCA of the
+				// intermittent gitops-walk red). The upstream
+				// argocd-cmp-server binds a unix socket under the
+				// shared `plugins` volume, and argocd-repo-server
+				// discovers this plugin by globbing `*.sock` in that
+				// same dir. WITHOUT a readiness probe the POD reports
+				// Ready the moment repo-server's own probe passes —
+				// which can be BEFORE this sidecar's socket exists. In
+				// that window repo-server silently falls back to its
+				// built-in Directory source type, renders a CUE app
+				// repo as "zero raw YAML", and reports Synced/Healthy
+				// with NOTHING applied — the AppRafter Application CR
+				// never materializes and Argo has no diff to re-render
+				// out of the empty-but-Synced state. Gating this
+				// sidecar's readiness on the SAME `*.sock` predicate
+				// repo-server uses means the pod is Ready — and only
+				// then receives repo-server Service traffic — once the
+				// plugin is discoverable, closing the race in-cluster
+				// (not just in the e2e harness). Probe-pass ≡ CMP
+				// functional, so it can't brick a working sidecar; if
+				// cmp-server later dies and the socket vanishes the pod
+				// drops out of the repo-server endpoints (GitOps
+				// pauses) instead of silently Directory-falling-back —
+				// the safe failure mode.
+				readinessProbe: {
+					exec: command: ["sh", "-c", "for s in /home/argocd/cmp-server/plugins/*.sock; do [ -S \"$s\" ] && exit 0; done; exit 1"]
+					initialDelaySeconds: 2
+					periodSeconds:       3
+					timeoutSeconds:      2
+					failureThreshold:    30
+				}
 				volumeMounts: [{
 					mountPath: "/var/run/argocd"
 					name:      "var-files"
