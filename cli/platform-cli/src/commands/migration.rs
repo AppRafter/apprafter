@@ -280,6 +280,56 @@ mod tests {
     }
 
     #[test]
+    fn plan_row_renders_sourcecredential_scope_without_hard_assuming_application() {
+        // 2.16b-sc: a sourcecredential-scope plan carries
+        // `scope.type="sourcecredential"` + `scope.sourcecredential.ref`
+        // and NO `scope.application` / `scope.environment`. The SCOPE
+        // column reads `.spec.scope.type` generically, so it renders
+        // `sourcecredential` and never touches the absent app fields —
+        // no panic, no empty misrender. The plan lives in the
+        // SourceCredential's namespace (apprafter-system).
+        let plan = json!({
+            "metadata": { "name": "srccred-acme-narrow-abc123", "namespace": "apprafter-system" },
+            "spec": {
+                "scope": {
+                    "type": "sourcecredential",
+                    "sourcecredential": {
+                        "ref": { "name": "acme", "namespace": "apprafter-system" }
+                    }
+                },
+                "risks": { "classification": "security-boundary" }
+            },
+            "status": { "phase": "pending-approval" }
+        });
+        let row = plan_row(&plan);
+        assert_eq!(row.namespace, "apprafter-system");
+        assert_eq!(row.name, "srccred-acme-narrow-abc123");
+        assert_eq!(row.scope, "sourcecredential");
+        assert_eq!(row.classification, "security-boundary");
+        assert_eq!(row.phase, "pending-approval");
+    }
+
+    #[test]
+    fn resolve_plan_ns_handles_sourcecredential_scope_plan() {
+        // `approve` resolves the plan's namespace purely from the
+        // `(name, namespace)` listing — it never reads `.spec.scope`,
+        // so a sourcecredential-scope plan (which has no
+        // `scope.application`) resolves its namespace exactly like any
+        // other. A sourcecredential plan lives in apprafter-system.
+        let plans = vec![
+            (
+                "srccred-acme-narrow-abc123".to_string(),
+                "apprafter-system".to_string(),
+            ),
+            ("app-web-0-1-to-0-2".to_string(), "team-a".to_string()),
+        ];
+        assert_eq!(
+            resolve_plan_ns(None, "srccred-acme-narrow-abc123", &plans).unwrap(),
+            "apprafter-system"
+        );
+    }
+
+    #[test]
     fn resolve_plan_namespace_prefers_explicit_then_searches() {
         // explicit -n wins even if the name isn't in the list
         assert_eq!(

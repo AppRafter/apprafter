@@ -268,10 +268,15 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
     let prefixes = repo_prefixes_of(&cred);
 
     if !force {
-        // Best-effort reverse-dependency gate: refuse if Argo CD
-        // Application(s) point under one of this credential's repo
-        // prefixes. (The operator's MigrationPlan gate is the
-        // authoritative actor-agnostic check; this is fast UX.)
+        // Best-effort reverse-dependency gate on a FULL delete: refuse
+        // if Argo CD Application(s) point under one of this credential's
+        // repo prefixes. This is a fast, actor-side UX check —
+        // COMPLEMENTARY to the operator's MigrationPlan gate, not a
+        // substitute. The MigrationPlan gate is the authoritative,
+        // actor-agnostic control on a coverage-NARROWING edit (removing
+        // a covered repoPrefix / registry host while keeping the CR);
+        // this one fast-fails the destructive whole-CR delete before it
+        // reaches the cluster.
         let mut deps: Vec<String> = Vec::new();
         for prefix in &prefixes {
             deps.extend(find_dependent_applications(
@@ -284,7 +289,11 @@ pub fn remove(name: &str, force: bool, yes: bool) -> Result<()> {
         if !deps.is_empty() {
             return Err(CliError::Other(format!(
                 "SourceCredential '{name}' is used by {n} Application(s): {names}. \
-                 Re-point them or pass `--force` to delete anyway.",
+                 Re-point them or pass `--force` to delete anyway. \
+                 (Note: this is a fast client-side check on a full delete. \
+                 A coverage-NARROWING edit — dropping a repoPrefix / registry \
+                 host on the CR — is gated instead by an auto-created \
+                 MigrationPlan that you approve with `apprafter migration approve`.)",
                 n = deps.len(),
                 names = deps.join(", ")
             )));
