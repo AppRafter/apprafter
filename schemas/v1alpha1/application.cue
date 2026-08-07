@@ -27,12 +27,12 @@ package v1alpha1
 	spec: {
 		base?: #ApplicationSpec
 
-		environments?: [string]: #ApplicationSpec
+		environments?: [string]: #ApplicationEnvOverride
 
-		// Deploy-time env selector (ADR 0044): injected by the CMP from the
-		// Argo Application's APPRAFTER_APP_ENV plugin env; selects which
-		// `environments.<env>` override unifies onto base. Absent => base
-		// only. Validated `environment in environments` by the webhook.
+		// `environments.<env>` override deep-merges onto base (2.16c,
+		// subfield override-wins). Absent => base only. The env is a
+		// deploy-time per-CR scalar (ADR 0044) and may name an env absent
+		// from `environments` (base-only deploy) — NOT rejected.
 		environment?: string
 	}
 
@@ -121,6 +121,29 @@ package v1alpha1
 	// the admission webhook re-enforces the key enum + the
 	// `(type, name)` uniqueness invariants at the apiserver — that
 	// is the runtime gate.
+	needs?: #Needs
+}
+
+// #ApplicationEnvOverride — the per-environment PARTIAL override type
+// (2.16c). Every field is optional AND `expose.port` is optional, so an
+// env carries only the diff; `effective_spec` deep-merges it onto base
+// and the invariant "effective expose has a port" is enforced by the
+// webhook (base.expose.port is required, so a base-only effective spec is
+// never portless — the webhook only guards the base-absent case).
+// Deliberately a SEPARATE type from #ApplicationSpec (R2-M4): base keeps
+// `expose.port` required so "forgot the port in base" is caught by
+// `cue vet` / `apprafter app validate` locally, not server-side.
+#ApplicationEnvOverride: {
+	image?:       string
+	imagePolicy?: #ImagePolicy
+	replicas?:    int & >=0
+	expose?: {
+		port?:    int & >0 & <=65535
+		network?: "public" | "internal" | "vpn"
+		hostname?: string | [...string]
+		tls?: bool
+	}
+	env?: [string]: #EnvValue
 	needs?: #Needs
 }
 
