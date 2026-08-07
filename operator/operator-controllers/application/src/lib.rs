@@ -1929,14 +1929,33 @@ pub fn plan_state(
     // hashless plans exist), so consume REQUIRES a non-empty stamped hash
     // that matches (`plan_hash_matches`); a hashless completed plan never
     // consumes a destructive change.
-    if phase == "completed"
-        && trigger_matches
-        && plan_hash_matches(
-            plan,
-            &operator_core::migration::change_hash(current_changes),
-        )
-    {
-        PlanState::CompletedMatch
+    if phase == "completed" && trigger_matches {
+        let current_hash = operator_core::migration::change_hash(current_changes);
+        if plan_hash_matches(plan, &current_hash) {
+            return PlanState::CompletedMatch;
+        }
+        // Bucketed as a Relic. Distinguish WHY for observability: a
+        // MISSING/EMPTY stamped hash is qualitatively different from a
+        // content MISMATCH. A legitimate app-scope plan is ALWAYS stamped
+        // with a non-empty `approvedSpecHash` at creation (S-4), so a
+        // completed, trigger-matching plan with NO hash can only be a
+        // forged object or a pre-2.16b-sec artifact — it must never
+        // consume, and its presence is worth surfacing loudly.
+        let hash_missing = plan
+            .spec
+            .trigger
+            .approved_spec_hash
+            .as_deref()
+            .is_none_or(str::is_empty);
+        if hash_missing {
+            warn!(
+                plan = plan.metadata.name.as_deref().unwrap_or("<unknown>"),
+                "completed MigrationPlan has no approvedSpecHash — re-gating; \
+                 a legitimate plan is always stamped, so this is a forged or \
+                 pre-2.16b-sec plan"
+            );
+        }
+        PlanState::Relic
     } else {
         PlanState::Relic
     }
@@ -5465,7 +5484,9 @@ mod tests {
         // hash (forged or otherwise) must NOT consume. App-scope migration
         // is brand-new — there are zero legacy hashless plans — so the
         // former `None => true` "legacy safety" bypass is gone: a hashless
-        // completed plan re-gates (Relic), never applies the change.
+        // completed plan re-gates (Relic), never applies the change. This
+        // hashless-completed case is also `warn!`-logged in `plan_state`
+        // (F-4 observability) to surface a forged/pre-2.16b-sec plan.
         let hashless = completed_plan_with_hash(&current, None);
         assert_eq!(
             plan_state(Some(&hashless), &current, cur_set),
