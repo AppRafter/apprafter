@@ -52,8 +52,81 @@ permissions:
   contents: read
 
 jobs:
+  # Gate the e2e job on the artifact-publishing workflows that this same
+  # push triggered. The gitops-walk bootstraps from PUBLISHED artifacts
+  # (operator + admission-webhook images/charts, cue-cmp image, platform-stack
+  # chart); on a release push those publishers run CONCURRENTLY with e2e, so
+  # without this gate the walk can bootstrap before they finish and pull
+  # not-yet-published images -> ImagePullBackOff -> "no matches for kind
+  # ServiceProvider" -> ~22 min bootstrap-timeout FALSE red (observed on the
+  # 2.16b app-scope, 2.6c and 2.16b-sc release pushes). A cheap runner does
+  # the waiting so the heavy e2e runner only spins up once artifacts exist.
+  # Push-only: on pull_request / workflow_dispatch there are no publishers,
+  # so this job is skipped and e2e runs directly.
+  await-releases:
+    name: await release publishes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Wait for publisher workflows on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # Publishers whose artifacts the gitops-walk consumes. We match
+          # completed runs by WORKFLOW NAME (not by re-declaring each one's
+          # path filter here) so this gate cannot drift from their triggers.
+          publishers="release-operator platform-stack-publish argocd-cue-cmp-publish"
+          api="/repos/${REPO}/actions/runs?event=push&per_page=100"
+
+          # Discover which publishers this push triggered — they share our
+          # head_sha. `gh run list --commit` uses a search index that lags
+          # minutes; the REST head_sha filter is prompt. Early-exit once all
+          # three are seen; a publisher whose path filter did not match simply
+          # never appears (correct to skip — nothing new to wait for).
+          seen=""
+          for _ in $(seq 1 10); do   # ~2.5 min appearance window
+            seen=$(gh api "$api" --jq ".workflow_runs[] | select(.head_sha==\"${SHA}\") | .name" 2>/dev/null | sort -u || true)
+            n=0
+            for p in $publishers; do
+              if printf '%s\n' "$seen" | grep -qx "$p"; then n=$((n + 1)); fi
+            done
+            [ "$n" -eq 3 ] && break
+            sleep 15
+          done
+
+          rc=0
+          for p in $publishers; do
+            if ! printf '%s\n' "$seen" | grep -qx "$p"; then
+              echo "· ${p}: not triggered for this commit — nothing to wait for"
+              continue
+            fi
+            id=$(gh api "$api" --jq ".workflow_runs[] | select(.head_sha==\"${SHA}\" and .name==\"${p}\") | .id" 2>/dev/null | head -1)
+            echo "· ${p}: waiting for run ${id} to finish ..."
+            if gh run watch "$id" --repo "$REPO" --exit-status >/dev/null 2>&1; then
+              echo "  ✓ ${p} (${id}) succeeded — its artifacts are published"
+            else
+              c=$(gh run view "$id" --repo "$REPO" --json conclusion --jq .conclusion 2>/dev/null || echo unknown)
+              echo "::error::${p} (${id}) concluded '${c}'; the gitops-walk would pull missing/broken artifacts — failing the e2e gate."
+              rc=1
+            fi
+          done
+          exit "$rc"
+
   e2e-k3d:
     name: k3d e2e (gitops-walk)
+    # Run after the publisher gate. On push: only if the gate passed (a failed
+    # publisher means broken/missing artifacts, so skip the pointless e2e and
+    # surface the publisher failure). On pull_request / workflow_dispatch the
+    # gate is skipped, so run directly.
+    needs: [await-releases]
+    if: ${{ !cancelled() && (needs.await-releases.result == 'success' || needs.await-releases.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
