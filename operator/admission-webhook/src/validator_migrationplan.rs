@@ -8,10 +8,13 @@
 //!     requires `spec.scope.application` populated with
 //!     `ref.{name,namespace}` + `environment`. `type == "platform"`
 //!     requires `spec.scope.platform.components` non-empty.
+//!     `type == "sourcecredential"` (2.16b-sc) requires
+//!     `spec.scope.sourcecredential.ref.{name,namespace}` (no
+//!     `environment` — a SourceCredential has no per-env dimension).
 //!     The mismatched sub-object is also rejected (a plan
 //!     declaring `type: application` MUST NOT carry a
-//!     `platform:` block — keeps the discriminator clean for
-//!     trait dispatch in B.1.76).
+//!     `platform:`/`sourcecredential:` block — keeps the
+//!     discriminator clean for trait dispatch in B.1.76).
 //!   - **Approver emails.** Light RFC5322 — must contain `@`
 //!     with non-empty local + domain parts and a dot in the
 //!     domain. Surfaces obviously-malformed entries; doesn't
@@ -209,16 +212,17 @@ pub fn validate_migrationplan(object: &Value, old_object: Option<&Value>) -> Vec
     match scope_type {
         "application" => validate_application_scope(scope, typed_scope, &mut errors),
         "platform" => validate_platform_scope(scope, typed_scope, &mut errors),
+        "sourcecredential" => validate_sourcecredential_scope(scope, typed_scope, &mut errors),
         "" => {
             errors.push(ValidationError::new(
                 "spec.scope.type",
-                "scope.type is required (one of application|platform)",
+                "scope.type is required (one of application|platform|sourcecredential)",
             ));
         }
         other => {
             errors.push(ValidationError::new(
                 "spec.scope.type",
-                format!("scope.type must be application|platform (got {other:?})"),
+                format!("scope.type must be application|platform|sourcecredential (got {other:?})"),
             ));
         }
     }
@@ -343,6 +347,12 @@ fn validate_phase_transition(
              revert the Git commit in your application repo and let \
              the Application reconciler supersede this plan (ADR 0027)"
                 .to_string()
+        } else if scope_type == "sourcecredential" && new_phase == "rejected" {
+            "sourcecredential-scope MigrationPlans cannot be rejected; \
+             re-widen the SourceCredential coverage in your spec and let \
+             the SourceCredential reconciler supersede this plan (ADR 0039). \
+             sourcecredential-scope plans are approve-only"
+                .to_string()
         } else {
             format!(
                 "illegal status.phase transition {old_phase:?} → {new_phase:?} \
@@ -362,7 +372,7 @@ fn validate_phase_transition(
 /// ```text
 ///   ""               → pending-approval                  (CREATE; status.phase unset on object)
 ///   ""               → approved | executing | completed | failed   (CREATE-with-status; allow for tooling)
-///   ""               → rejected                          (platform scope only; ADR 0027)
+///   ""               → rejected                          (platform scope only; ADR 0027/0039)
 ///   pending-approval → approved                          (any scope; external)
 ///   pending-approval → rejected                          (platform scope only; external)
 ///   approved         → executing                         (controller)
@@ -372,13 +382,16 @@ fn validate_phase_transition(
 /// ```
 fn is_allowed_phase_transition(old_phase: &str, new_phase: &str, scope_type: &str) -> bool {
     // ADR 0027: application-scope plans cannot be rejected by
-    // any path. This rule MUST apply BEFORE the empty-
-    // old-phase first-write fast-path — otherwise a fresh CR
-    // (CR without status; oldObject.status.phase = "")
-    // patched with `phase=rejected` slips through with the
-    // permissive "allow anything on first write" rule.
-    // Walk-fix #2 post-B.1.77.
-    if new_phase == "rejected" && scope_type == "application" {
+    // any path. ADR 0039 / 2.16b-sc: sourcecredential-scope
+    // plans are likewise approve-only (a coverage removal on a
+    // config object — reject = keep the wider coverage and the
+    // user re-widens the spec, no controller-side state to roll
+    // back). These rules MUST apply BEFORE the empty-old-phase
+    // first-write fast-path — otherwise a fresh CR (CR without
+    // status; oldObject.status.phase = "") patched with
+    // `phase=rejected` slips through with the permissive "allow
+    // anything on first write" rule. Walk-fix #2 post-B.1.77.
+    if new_phase == "rejected" && matches!(scope_type, "application" | "sourcecredential") {
         return false;
     }
 
@@ -586,6 +599,108 @@ fn validate_platform_scope(
     }
 }
 
+/// 2.16b-sc: validate a `sourcecredential`-scope MigrationPlan. Mirrors
+/// `validate_application_scope` — typed-then-raw fallback, mismatched
+/// sub-object rejection, non-empty `ref.{name,namespace}` — minus the
+/// `environment` field (a SourceCredential has no per-env dimension).
+///
+/// `typed` is `Some` only when the whole spec deserialized; it carries the
+/// typed `scope` (`sourcecredential` is `Option`, so a populated `Some`
+/// reads the discriminator sub-object with the compiler gating the field
+/// names). The raw `scope` map is retained for the PRESENCE diagnostics the
+/// non-`Option` typed fields cannot represent.
+fn validate_sourcecredential_scope(
+    scope: &serde_json::Map<String, Value>,
+    typed: Option<&operator_core::MigrationPlanScope>,
+    errors: &mut Vec<ValidationError>,
+) {
+    // Mismatched sub-objects: neither `application` nor `platform` may be set
+    // when scope.type is sourcecredential. Prefer the typed `Option` (gates
+    // the field name); fall back to raw presence.
+    let application_present = match typed {
+        Some(s) => s.application.is_some(),
+        None => scope.contains_key("application"),
+    };
+    if application_present {
+        errors.push(ValidationError::new(
+            "spec.scope.application",
+            "application block must not be set when scope.type is sourcecredential",
+        ));
+    }
+    let platform_present = match typed {
+        Some(s) => s.platform.is_some(),
+        None => scope.contains_key("platform"),
+    };
+    if platform_present {
+        errors.push(ValidationError::new(
+            "spec.scope.platform",
+            "platform block must not be set when scope.type is sourcecredential",
+        ));
+    }
+
+    // `sourcecredential` is `Option` on the typed scope; `None` (or a spec
+    // that did not deserialize and has no `sourcecredential` map) is the
+    // "required" branch. When present, read the typed `ref_`.
+    let typed_sc = typed.and_then(|s| s.sourcecredential.as_ref());
+    let raw_sc = scope.get("sourcecredential").and_then(Value::as_object);
+    if typed_sc.is_none() && raw_sc.is_none() {
+        errors.push(ValidationError::new(
+            "spec.scope.sourcecredential",
+            "scope.sourcecredential is required when scope.type is sourcecredential",
+        ));
+        return;
+    }
+
+    match typed_sc {
+        // Typed happy path: `ref_` is non-`Option` so it is always present;
+        // `name`/`namespace` are non-`Option` `String` so the only failure
+        // the webhook still guards is an empty value (the CRD pattern also
+        // rejects it — defence-in-depth + the unit fixtures).
+        Some(sc) => {
+            if sc.ref_.name.is_empty() {
+                errors.push(ValidationError::new(
+                    "spec.scope.sourcecredential.ref.name",
+                    "name is required",
+                ));
+            }
+            if sc.ref_.namespace.is_empty() {
+                errors.push(ValidationError::new(
+                    "spec.scope.sourcecredential.ref.namespace",
+                    "namespace is required",
+                ));
+            }
+        }
+        // Raw fallback (spec did not deserialize): `ref` may be absent, so
+        // the PRESENCE branch lives here, matching the application-scope raw
+        // fallback semantics.
+        None => {
+            let sc = raw_sc.expect("raw_sc is Some when typed_sc is None and we did not return");
+            match sc.get("ref").and_then(Value::as_object) {
+                None => errors.push(ValidationError::new(
+                    "spec.scope.sourcecredential.ref",
+                    "ref is required (name + namespace)",
+                )),
+                Some(r) => {
+                    let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+                    let namespace = r.get("namespace").and_then(Value::as_str).unwrap_or("");
+                    if name.is_empty() {
+                        errors.push(ValidationError::new(
+                            "spec.scope.sourcecredential.ref.name",
+                            "name is required",
+                        ));
+                    }
+                    if namespace.is_empty() {
+                        errors.push(ValidationError::new(
+                            "spec.scope.sourcecredential.ref.namespace",
+                            "namespace is required",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Loose RFC5322 — must contain exactly one `@`, with a
 /// non-empty local part and a domain that has at least one `.`
 /// with non-empty labels around it. Catches the obvious
@@ -637,6 +752,22 @@ mod tests {
                 },
                 "trigger": { "type": "platform-classification", "field": "spec.pin" },
                 "approvers": ["alice@company.com", "bob@company.com"]
+            }
+        })
+    }
+
+    fn sourcecredential_scope_object() -> Value {
+        json!({
+            "metadata": { "name": "github-org-2026-08-07", "namespace": "apprafter-system" },
+            "spec": {
+                "scope": {
+                    "type": "sourcecredential",
+                    "sourcecredential": {
+                        "ref": { "name": "github-org", "namespace": "apprafter-system" }
+                    }
+                },
+                "trigger": { "type": "coverage-removal", "field": "spec.git.repoPrefixes" },
+                "approvers": ["alice@company.com"]
             }
         })
     }
@@ -768,6 +899,82 @@ mod tests {
         });
         let errors = validate_migrationplan(&obj, None);
         assert!(errors.iter().any(|e| e.field == "spec.scope.application"));
+    }
+
+    // ---------- sourcecredential scope (2.16b-sc) ----------
+
+    #[test]
+    fn accepts_canonical_sourcecredential_scope() {
+        assert!(validate_migrationplan(&sourcecredential_scope_object(), None).is_empty());
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_missing_sourcecredential_block() {
+        let mut obj = sourcecredential_scope_object();
+        obj["spec"]["scope"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sourcecredential");
+        let errors = validate_migrationplan(&obj, None);
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.scope.sourcecredential"));
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_missing_ref() {
+        let mut obj = sourcecredential_scope_object();
+        obj["spec"]["scope"]["sourcecredential"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ref");
+        let errors = validate_migrationplan(&obj, None);
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.scope.sourcecredential.ref"));
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_empty_ref_name() {
+        let mut obj = sourcecredential_scope_object();
+        obj["spec"]["scope"]["sourcecredential"]["ref"]["name"] = json!("");
+        let errors = validate_migrationplan(&obj, None);
+        // An empty-string ref name deserializes fine (a valid `String`), so
+        // it flows through the TYPED branch and hits the `name.is_empty()`
+        // guard. The CRD pattern also rejects it; the webhook is the
+        // load-bearing message here.
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.scope.sourcecredential.ref.name"));
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_empty_ref_namespace() {
+        let mut obj = sourcecredential_scope_object();
+        obj["spec"]["scope"]["sourcecredential"]["ref"]["namespace"] = json!("");
+        let errors = validate_migrationplan(&obj, None);
+        assert!(errors
+            .iter()
+            .any(|e| e.field == "spec.scope.sourcecredential.ref.namespace"));
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_with_application_block() {
+        let mut obj = sourcecredential_scope_object();
+        obj["spec"]["scope"]["application"] = json!({
+            "ref": { "name": "x", "namespace": "y" },
+            "environment": "z"
+        });
+        let errors = validate_migrationplan(&obj, None);
+        assert!(errors.iter().any(|e| e.field == "spec.scope.application"));
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_with_platform_block() {
+        let mut obj = sourcecredential_scope_object();
+        obj["spec"]["scope"]["platform"] = json!({ "components": ["x"] });
+        let errors = validate_migrationplan(&obj, None);
+        assert!(errors.iter().any(|e| e.field == "spec.scope.platform"));
     }
 
     // ---------- approver emails ----------
@@ -922,6 +1129,45 @@ mod tests {
         assert!(
             msg.contains("application-scope") && msg.contains("ADR 0027"),
             "error message should explain why application reject is blocked; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn allows_sourcecredential_scope_pending_to_approved() {
+        // 2.16b-sc: the approval signal on a sourcecredential-scope plan
+        // must go through, exactly like application/platform.
+        let new = with_phase(sourcecredential_scope_object(), "approved");
+        let old = with_phase(sourcecredential_scope_object(), "pending-approval");
+        assert!(validate_migrationplan(&new, Some(&old)).is_empty());
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_pending_to_rejected() {
+        // 2.16b-sc: sourcecredential-scope plans are approve-only — like
+        // application scope (ADR 0027/0039), reject is not a path; the
+        // user re-widens the SourceCredential spec instead. The webhook
+        // is the load-bearing guard.
+        let new = with_phase(sourcecredential_scope_object(), "rejected");
+        let old = with_phase(sourcecredential_scope_object(), "pending-approval");
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(
+            errors.iter().any(|e| e.field == "status.phase"),
+            "sourcecredential reject must trip the FSM guard; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_sourcecredential_scope_first_write_to_rejected() {
+        // The empty-old-phase first-write path must also block a
+        // sourcecredential-scope `"" → rejected` (mirror the app-scope
+        // walk-fix #2 hardening).
+        let mut new = sourcecredential_scope_object();
+        new["status"] = json!({ "phase": "rejected" });
+        let old = sourcecredential_scope_object();
+        let errors = validate_migrationplan(&new, Some(&old));
+        assert!(
+            errors.iter().any(|e| e.field == "status.phase"),
+            "first-write to rejected on sourcecredential scope must trip the FSM guard; got {errors:?}"
         );
     }
 
