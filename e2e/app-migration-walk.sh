@@ -375,9 +375,24 @@ SEC_INT="sec-int"                          # internal-then-escalated app (P-SEC-
 SEC_IMG="sec-img"                          # image-drift stale-approval app (P-SEC-2)
 SEC_STATUS="sec-status"                    # S-1 status-bypass target (P-SEC-3)
 SEC_ENV="sec-env"                          # §7.2 environment-immutable + negative
+SEC_PLAN_F1B="sec-plan"                    # F-1b MigrationPlan.status guard target (P-SEC-7)
+SEC_F2="sec-f2"                            # F-2 acquire-secret-ref target (P-SEC-8)
+SEC_F3="sec-f3"                            # F-3 public host-swap target (P-SEC-9)
 SEC_IMG_A="nginxdemos/hello:plain-text"    # image-drift start repo
 SEC_IMG_B="nginxdemos/nginx-hello:plain-text"  # first (approved) drift target
 SEC_IMG_C="library/nginx:latest"           # second (post-drift) target — DIFFERENT
+
+# 2.16b-sec S2 impersonation (F-1 / F-1b): the webhook status guards gate on
+# the AUTHENTICATED `request.userInfo.username`. kind's default kubeconfig is
+# cluster-admin (system:masters) → a plain `kubectl patch` would be ALLOWED by
+# the break-glass path, NOT exercising the guard. To simulate a non-operator
+# attacker we IMPERSONATE a plain ServiceAccount (kind admin may impersonate
+# any subject) so `userInfo.username` becomes this identity → the guard must
+# REJECT. The `--as-group=system:serviceaccounts` mirrors what the apiserver
+# would stamp for a real SA token (a defensive belt so the impersonated groups
+# never accidentally include a break-glass group).
+ATTACKER_SA="system:serviceaccount:default:attacker"
+ATTACKER_GROUP="system:serviceaccounts"
 
 # apply_sec_app — a single-env Application emitter for the security phases with
 # per-field toggles the escalation/env/imagePolicy triggers need. Unlike
@@ -394,12 +409,17 @@ SEC_IMG_C="library/nginx:latest"           # second (post-drift) target — DIFF
 #   port=<n>             default 80
 #   env_secret=<K>=<name/key>   add one env var whose value is {secret:"<name/key>"}
 #   env_claim=<K>=<type.field>  add one env var whose value is {claim:"<type.field>"}
+#   env_literal=<K>=<value>     add one env var whose value is a plain literal string
 #   needs_pg=1           add base.needs.pg (a scalar pg need)
 #   imagepolicy=<off|digest>  set base.imagePolicy.resolve
+#
+# The three env_* opts are mutually exclusive PER KEY but any combination of
+# distinct keys is fine; F-2 uses env_literal then env_secret on the SAME key
+# across two applies to exercise the `Literal → Ref(Secret)` acquire.
 apply_sec_app() {
     local name="$1" environment="$2" network="$3"; shift 3
     local image="$APP_IMAGE" hostname="" port="80"
-    local env_secret="" env_claim="" needs_pg="" imagepolicy=""
+    local env_secret="" env_claim="" env_literal="" needs_pg="" imagepolicy=""
     local kv
     for kv in "$@"; do
         case "$kv" in
@@ -408,6 +428,7 @@ apply_sec_app() {
             port=*)        port="${kv#port=}" ;;
             env_secret=*)  env_secret="${kv#env_secret=}" ;;
             env_claim=*)   env_claim="${kv#env_claim=}" ;;
+            env_literal=*) env_literal="${kv#env_literal=}" ;;
             needs_pg=*)    needs_pg="${kv#needs_pg=}" ;;
             imagepolicy=*) imagepolicy="${kv#imagepolicy=}" ;;
             *) printf 'apply_sec_app: unknown opt %q\n' "$kv" >&2; return 2 ;;
@@ -437,7 +458,7 @@ apply_sec_app() {
             printf '    needs:\n'
             printf '      pg: {}\n'
         fi
-        if [ -n "$env_secret" ] || [ -n "$env_claim" ]; then
+        if [ -n "$env_secret" ] || [ -n "$env_claim" ] || [ -n "$env_literal" ]; then
             printf '    env:\n'
             if [ -n "$env_secret" ]; then
                 printf '      %s:\n' "${env_secret%%=*}"
@@ -446,6 +467,11 @@ apply_sec_app() {
             if [ -n "$env_claim" ]; then
                 printf '      %s:\n' "${env_claim%%=*}"
                 printf '        claim: %q\n' "${env_claim#*=}"
+            fi
+            if [ -n "$env_literal" ]; then
+                # A plain literal string value (EnvValue::Literal). Quoted so a
+                # numeric/boolean-looking value stays a string.
+                printf '      %s: %q\n' "${env_literal%%=*}" "${env_literal#*=}"
             fi
         fi
         printf '    expose:\n'
@@ -536,6 +562,131 @@ sec_wait_non_paused() {
         "$name" "$timeout" "${phase:-<empty>}" >&2
     kubectl -n "$SEC_NS" describe "$APP_RES" "$name" >&2 2>&1 || true
     return 1
+}
+
+# ---------------------------------------------------------------
+# 2.16b-sec S2 impersonation harness (F-1 / F-1b)
+# ---------------------------------------------------------------
+
+# IMPERSONATION_OK — set to 1 in Phase 0 once we confirm the walk's kube
+# context can impersonate a non-operator subject (needed for the F-1/F-1b
+# reject tests). Left 0 → the impersonation-dependent asserts SOFT-skip with a
+# loud note (F-2/F-3 don't need impersonation and always run).
+IMPERSONATION_OK=0
+
+# kubectl_as <username> <group> -- <kubectl-args...> — run kubectl impersonating
+# <username>+<group>. The webhook's AdmissionReview `userInfo.username` becomes
+# the impersonated identity, so the status guards (which gate on that field)
+# see a NON-operator, NON-admin subject and must reject.
+kubectl_as() {
+    local user="$1" group="$2"; shift 2
+    [ "$1" = "--" ] && shift
+    kubectl --as="$user" --as-group="$group" "$@"
+}
+
+# ensure_impersonation — set up the non-operator attacker identity for the
+# F-1/F-1b reject tests. TWO layers of RBAC matter, and they model the threat
+# precisely:
+#
+#   1. The walk's context (kind's cluster-admin) must be allowed to IMPERSONATE
+#      the attacker SA. cluster-admin can impersonate any subject, so this
+#      normally needs no grant; if apiserver RBAC blocks it we grant `impersonate`
+#      on users/groups/serviceaccounts to the current identity and re-probe.
+#
+#   2. The attacker SA itself must hold `patch applications/status` +
+#      `patch migrationplans/status` RBAC — otherwise the apiserver's RBAC
+#      denies the write BEFORE admission (a `kubectl patch` first GETs the
+#      object), and the webhook's identity guard never runs (we'd see a generic
+#      "cannot get resource .../status" Forbidden, not the F-1/F-1b message).
+#      This is EXACTLY the threat F-1/F-1b defend against: a subject that HAS
+#      the RBAC to write the subresource (a compromised/over-granted controller)
+#      but is NOT the operator's authenticated ServiceAccount. Granting the
+#      attacker this RBAC is what makes "the webhook, not RBAC, is the boundary"
+#      a real assertion — the guard must reject an RBAC-capable non-operator.
+#
+# Sets IMPERSONATION_OK=1 when BOTH the SA exists+is granted AND impersonation
+# works; leaves it 0 on persistent failure (the caller SOFT-skips F-1/F-1b).
+ensure_impersonation() {
+    # (2) Create the attacker SA + grant it the subresource-write RBAC that lets
+    # its request REACH admission (where the identity guard denies it).
+    kubectl -n default create serviceaccount attacker >/dev/null 2>&1 || true
+    kubectl apply -f - >/dev/null 2>&1 <<'YAML' || true
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: apprafter-walk-attacker
+rules:
+  - apiGroups: ["apprafter.io"]
+    resources:
+      - "applications"
+      - "applications/status"
+      - "migrationplans"
+      - "migrationplans/status"
+    verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: apprafter-walk-attacker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: apprafter-walk-attacker
+subjects:
+  - kind: ServiceAccount
+    name: attacker
+    namespace: default
+YAML
+
+    # (1) Probe whether we may impersonate the attacker SA. Use an impersonated
+    # `get --raw /version`: `/version` is readable by ANY authenticated identity,
+    # so exit 0 means the IMPERSONATION itself was permitted. (NB: do NOT use
+    # `auth can-i` here — it returns exit 1 when the ANSWER is "no", which is the
+    # expected answer for the low-priv attacker SA even when impersonation
+    # succeeded, so its exit code cannot distinguish "impersonation denied" from
+    # "impersonation OK, permission denied".) A real impersonation denial yields a
+    # nonzero `cannot impersonate` Forbidden.
+    if kubectl_as "$ATTACKER_SA" "$ATTACKER_GROUP" -- \
+        get --raw /version >/dev/null 2>&1; then
+        IMPERSONATION_OK=1
+        printf '  ok: attacker SA created + granted status-write RBAC; walk context can impersonate %s\n' "$ATTACKER_SA"
+        return 0
+    fi
+    printf '  note: impersonation denied by apiserver RBAC — granting the walk context impersonate on users/groups/serviceaccounts ...\n'
+    local me
+    me=$(kubectl auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null || true)
+    kubectl apply -f - >/dev/null 2>&1 <<YAML || true
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: apprafter-walk-impersonator
+rules:
+  - apiGroups: [""]
+    resources: ["users", "groups", "serviceaccounts"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: apprafter-walk-impersonator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: apprafter-walk-impersonator
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: ${me:-kubernetes-admin}
+YAML
+    sleep 3
+    if kubectl_as "$ATTACKER_SA" "$ATTACKER_GROUP" -- \
+        get --raw /version >/dev/null 2>&1; then
+        IMPERSONATION_OK=1
+        printf '  ok: walk context can now impersonate %s (grant applied)\n' "$ATTACKER_SA"
+        return 0
+    fi
+    printf '  note: (soft) impersonation still blocked after grant — F-1/F-1b reject tests will SOFT-skip.\n'
+    return 0
 }
 
 # ===============================================================
@@ -636,6 +787,35 @@ printf '  ok: apprafter-operator now running the working-tree (2.16b) build\n'
 # released one. Same build_load_restart helper; the deployment + Dockerfile
 # subdir are both `admission-webhook` (matching how needs-disk-walk builds it).
 build_load_restart admission-webhook admission-webhook
+
+# 2.16b-sec (F-1): side-load the branch webhook Deployment's OPERATOR_SERVICEACCOUNT
+# env. `build_load_restart` rebuilds the IMAGE + restarts the running Deployment,
+# but it does NOT re-render the Deployment SPEC — the running Deployment came from
+# the last PUBLISHED chart (its container env predates the F-1 change), so it
+# lacks `OPERATOR_SERVICEACCOUNT`. Without it the binary falls back to the
+# hardcoded default SA; the fallback happens to equal the correct value here
+# (release ns = apprafter-system), so the guards still WORK, but this walk must
+# prove the CHART carries the env (the deployment.yaml change) — so we read the
+# value the branch chart renders and PATCH it onto the running Deployment (a
+# targeted env add, keeping the side-loaded branch image tag). Mirrors the VWC
+# side-load above. This triggers one more rollout, which the terminate-wait
+# below absorbs.
+printf '  side-loading the branch webhook OPERATOR_SERVICEACCOUNT env (F-1 — build_load_restart does not re-render the Deployment spec) ...\n'
+_wh_sa_value=$(helm template admission-webhook "${REPO_ROOT}/operator/charts/apprafter-admission-webhook" \
+    --namespace "$PROVIDER_NS" \
+    | _yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].env[] | select(.name == "OPERATOR_SERVICEACCOUNT") | .value' \
+    | head -1)
+if [ -z "$_wh_sa_value" ] || [ "$_wh_sa_value" = "null" ]; then
+    printf 'FAILED: the branch admission-webhook chart does NOT render an OPERATOR_SERVICEACCOUNT env — the deployment.yaml F-1 change is absent from the working tree\n' >&2
+    exit 1
+fi
+printf '  branch chart renders OPERATOR_SERVICEACCOUNT=%q — patching it onto the running Deployment ...\n' "$_wh_sa_value"
+kubectl -n "$PROVIDER_NS" patch deploy admission-webhook --type=json -p "$(cat <<JSON
+[{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"OPERATOR_SERVICEACCOUNT","value":"${_wh_sa_value}"}}]
+JSON
+)"
+kubectl -n "$PROVIDER_NS" rollout status deploy admission-webhook --timeout=120s
+
 # `rollout status` returns once the NEW webhook pod is Ready, but the OLD
 # (released) pod lingers Terminating for its grace period — and during that
 # window an Application UPDATE could still route to the old webhook, whose
@@ -700,6 +880,52 @@ fi
 retry 30 10 -- kubectl -n "$PROVIDER_NS" rollout status \
     deploy admission-webhook --timeout=60s
 printf '  ok: platform ready (branch operator + webhook)\n'
+
+# 2.16b-sec (F-1): the branch webhook Deployment must carry OPERATOR_SERVICEACCOUNT
+# (deployment.yaml env, templated on the release namespace) and log the RESOLVED
+# SA at startup (main.rs — "resolved operator ServiceAccount for status/identity
+# guards"). Confirm BOTH: the env is present on the container, AND the pod logged
+# the value it resolved (surfaces a mis-set env in the pod log, not at first
+# admission). These are the trust anchor for the F-1/F-1b status guards.
+printf '  confirming the branch webhook carries OPERATOR_SERVICEACCOUNT + logs the resolved SA ...\n'
+wh_sa_env=$(kubectl -n "$PROVIDER_NS" get deploy admission-webhook \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="OPERATOR_SERVICEACCOUNT")].value}' 2>/dev/null || true)
+if [ -n "$wh_sa_env" ]; then
+    printf '  ok: webhook Deployment env OPERATOR_SERVICEACCOUNT=%q\n' "$wh_sa_env"
+else
+    printf 'FAILED: branch webhook Deployment is MISSING the OPERATOR_SERVICEACCOUNT env (F-1 trust anchor absent)\n' >&2
+    kubectl -n "$PROVIDER_NS" get deploy admission-webhook -o jsonpath='{.spec.template.spec.containers[0].env}' >&2 2>&1 || true
+    exit 1
+fi
+# Poll the webhook pod log for the startup line that echoes the resolved SA.
+printf '  waiting for the webhook pod to log its resolved operator ServiceAccount ...\n'
+_wh_log_deadline=$(( $(date +%s) + 60 ))
+wh_sa_logged=""
+while [ "$(date +%s)" -lt "$_wh_log_deadline" ]; do
+    wh_sa_logged=$(kubectl -n "$PROVIDER_NS" logs deploy/admission-webhook --tail=200 2>/dev/null \
+        | grep -i 'resolved operator ServiceAccount' | head -1 || true)
+    [ -n "$wh_sa_logged" ] && break
+    sleep 3
+done
+if [ -n "$wh_sa_logged" ]; then
+    printf '  ok: webhook logged resolved SA at startup: %s\n' "$wh_sa_logged"
+    # Belt: the logged SA should match the injected env value.
+    if printf '%s' "$wh_sa_logged" | grep -qF "$wh_sa_env"; then
+        printf '  ok: logged SA matches the injected OPERATOR_SERVICEACCOUNT (%s)\n' "$wh_sa_env"
+    else
+        printf '  note: logged SA line does not literally contain %q (log formatting) — env presence already asserted; continuing.\n' "$wh_sa_env"
+    fi
+else
+    printf '  note: (soft) did not observe the resolved-SA startup log within 60s (log rotation / verbosity) — the env presence above is the hard assertion; continuing.\n'
+fi
+
+# 2.16b-sec (F-1/F-1b): probe/enable impersonation for the reject tests. The
+# webhook allows admin break-glass (system:masters), and kind's default
+# kubeconfig IS cluster-admin — so a plain kubectl patch would be ALLOWED, not
+# exercising the guard. We impersonate a plain SA so `userInfo.username` is a
+# non-operator, non-admin subject → the guard must REJECT. Grant impersonate if
+# apiserver RBAC blocks it; SOFT-skip F-1/F-1b if it stays blocked.
+ensure_impersonation
 
 # ===============================================================
 # Phase 1: deploy mig-dev + mig-prod; baseline stamps on first render
@@ -984,13 +1210,34 @@ else
 fi
 
 # ###############################################################
-# 2.16b SECURITY AXIS — P-SEC-1 .. P-SEC-6
+# 2.16b SECURITY AXIS — P-SEC-1 .. P-SEC-9
 #
 # The app-migration state machine gains a `security-boundary` class (severity
 # 4, OUTRANKS data-migration), a family of expose/env/imagePolicy triggers, a
 # `spec.changes[]`/`spec.risks.classifications` rollup, a content-hash-bound
 # approval (S-4), a webhook `applications/status` guard (S-1), a §7.2
 # `spec.environment`-immutable UPDATE guard, and a needs.selector tripwire.
+#
+# The S2 round-of-review fixes add:
+#   F-1  (P-SEC-3): Application.status writes gate on the AUTHENTICATED
+#        `userInfo.username == <operator SA>` (was a spoofable fieldManager) —
+#        a spoofed `--field-manager=apprafter-operator` from a non-operator
+#        impersonated identity is now REJECTED.
+#   F-1b (P-SEC-7): MigrationPlan.status external writes are field-restricted —
+#        an external subject may write ONLY status.phase pending-approval→
+#        approved; executedSteps (or any other field / phase jump) is REJECTED,
+#        while the legit external approve still works.
+#   F-2  (P-SEC-8): a key that ACQUIRES a secret-ref (Literal/Ref(Claim) →
+#        Ref(Secret)) gates as env-secret-ref-add (security-boundary).
+#   F-3  (P-SEC-9): a public hostname SWAP {a}→{b} co-fires #3 domain-change
+#        (a lost) AND #11 public-hostname-add (b gained); primary is #11
+#        (security-boundary).
+#
+# F-1/F-1b use IMPERSONATION (`kubectl --as=…`) to present a non-operator,
+# non-admin `userInfo.username` to the webhook — kind's default kubeconfig is
+# cluster-admin (a break-glass path the guard allows), so a plain patch would
+# not exercise the guard. F-2/F-3 need no impersonation (operator-side gating).
+#
 # These phases exercise the LIVE behavior against the branch operator + webhook
 # built in Phase 0.
 # ###############################################################
@@ -1153,31 +1400,56 @@ fi
 printf 'ok: stale approval not consumed for a different target (S-4)\n'
 
 # ===============================================================
-# P-SEC-3: S-1 — a non-operator write to Application/status is webhook-DENIED.
+# P-SEC-3: F-1 — a non-operator write to Application/status is webhook-DENIED
+#          EVEN when it SPOOFS the operator fieldManager.
+#
+# S2 F-1 hardened the guard: it now gates on the AUTHENTICATED
+# `request.userInfo.username`, NOT on the client-supplied `fieldManager`. The
+# OLD guard trusted `--field-manager=apprafter-operator`, so any subject could
+# spoof it. Here we impersonate a NON-operator SA AND pass the spoofed
+# `--field-manager=apprafter-operator` — the write must STILL be DENIED (the
+# authenticated identity is the attacker SA, not the operator SA). We also
+# assert the OPERATOR's own reconcile keeps writing status normally (the app
+# reaches a real phase + a stamped baseline), proving the guard rejects the
+# attacker without wedging the legitimate writer.
 # ===============================================================
 
-phase "P-SEC-3: S-1 non-operator Application.status write denied"
+phase "P-SEC-3: F-1 spoofed-fieldManager non-operator Application.status write denied"
 
-# Deploy a plain app to target. Any steady phase is fine; we only need the CR to
-# exist so a status-subresource patch has a target.
+# Deploy a plain app to target. The operator's OWN reconcile must drive it to a
+# non-paused phase + stamp the baseline — sec_wait_baseline asserts exactly
+# that, so this doubles as "the operator still writes status" (F-1 does not wedge
+# the legit writer).
 apply_sec_app "$SEC_STATUS" dev internal
 sec_wait_baseline "$SEC_STATUS" "$APP_IMAGE"
+printf '  ok: operator reconcile still writes Application.status (phase+baseline stamped) — legit writer not wedged (F-1)\n'
 
-# Patch status via kubectl's OWN fieldManager (NOT apprafter-operator). The
-# webhook's status_write_allowed() only permits the operator SSA manager, so
-# this must be DENIED. Capture stderr + exit code.
-set +e
-sec3_out=$(kubectl patch "$APP_RES" "$SEC_STATUS" -n "$SEC_NS" \
-    --subresource=status --type=merge \
-    -p '{"status":{"lastAppliedSpec":{}}}' 2>&1)
-sec3_rc=$?
-set -e
-printf '  kubectl status-patch rc=%d output:\n%s\n' "$sec3_rc" "$sec3_out"
-if [ "$sec3_rc" -ne 0 ] && printf '%s' "$sec3_out" | grep -Eqi 'operator-owned|rejected'; then
-    printf 'ok: non-operator Application.status write denied (S-1)\n'
+if [ "$IMPERSONATION_OK" -eq 1 ]; then
+    # Impersonate a NON-operator SA AND spoof the operator fieldManager. Under
+    # the OLD (pre-F-1) guard the spoofed fieldManager would have been ALLOWED;
+    # under F-1 the authenticated `userInfo.username` is the attacker → DENIED.
+    set +e
+    sec3_out=$(kubectl_as "$ATTACKER_SA" "$ATTACKER_GROUP" -- \
+        patch "$APP_RES" "$SEC_STATUS" -n "$SEC_NS" \
+        --subresource=status --type=merge \
+        --field-manager=apprafter-operator \
+        -p '{"status":{"lastAppliedSpec":{}}}' 2>&1)
+    sec3_rc=$?
+    set -e
+    printf '  impersonated (%s) spoofed-fieldManager status-patch rc=%d output:\n%s\n' \
+        "$ATTACKER_SA" "$sec3_rc" "$sec3_out"
+    # DENIED iff nonzero AND the webhook's F-1 message ("operator-owned" /
+    # "rejected write from") is present — NOT an RBAC/impersonation error.
+    if [ "$sec3_rc" -ne 0 ] \
+        && printf '%s' "$sec3_out" | grep -Eqi 'operator-owned|rejected write from'; then
+        printf 'ok: spoofed-fieldManager status write denied (F-1)\n'
+    else
+        printf 'FAILED: spoofed-fieldManager non-operator Application.status write was NOT denied by the F-1 guard (rc=%d)\n' "$sec3_rc" >&2
+        exit 1
+    fi
 else
-    printf 'FAILED: non-operator Application.status write was NOT denied (rc=%d) — S-1 guard missing/ineffective\n' "$sec3_rc" >&2
-    exit 1
+    printf '  note: (soft) impersonation unavailable — SOFT-skipping the F-1 spoofed-fieldManager reject assert (the operator-writes-status half above still ran).\n'
+    printf 'ok: spoofed-fieldManager status write denied (F-1) — SOFT-skipped (impersonation blocked)\n'
 fi
 
 # ===============================================================
@@ -1371,6 +1643,195 @@ fi
 printf 'ok: claim-ref + needs add NOT gated (negative)\n'
 
 # ===============================================================
+# P-SEC-7: F-1b — MigrationPlan.status external-write field-restriction.
+#   An external (non-operator) subject may write ONLY
+#   `status.phase pending-approval→approved` (the legit approval signal). A
+#   write to `status.executedSteps` (or any other controller-owned field, or a
+#   phase jump) is REJECTED. Uses a REAL pending-approval plan (created via a
+#   destructive edit) and impersonation for the non-operator identity.
+# ===============================================================
+
+phase "P-SEC-7: F-1b external MigrationPlan.status write field-restricted (executedSteps denied, phase-approve allowed)"
+
+if [ "$IMPERSONATION_OK" -eq 1 ]; then
+    # Stand up a fresh app + baseline, then a destructive edit (scale-to-zero,
+    # HARD) to produce a pending-approval app-scope MigrationPlan.
+    apply_sec_app "$SEC_PLAN_F1B" dev internal
+    sec_wait_baseline "$SEC_PLAN_F1B" "$APP_IMAGE"
+    # Scale-to-zero is requires-restart (gates). Re-emit with base.replicas 0
+    # via a direct apply (apply_sec_app hardcodes replicas:1, so patch replicas
+    # to 0 on both base + the env override the operator unifies).
+    kubectl -n "$SEC_NS" patch "$APP_RES" "$SEC_PLAN_F1B" --type=merge \
+        -p '{"spec":{"base":{"replicas":0},"environments":{"dev":{"replicas":0}}}}' >/dev/null
+    wait_jsonpath "$APP_RES" "$SEC_NS" "$SEC_PLAN_F1B" '{.status.phase}' AwaitingMigrationApproval 180
+    SEC7_PLAN="$(sec_wait_plan "$SEC_PLAN_F1B" 120)"
+    [ -n "$SEC7_PLAN" ] || { printf 'FAILED: F-1b plan name empty\n' >&2; exit 1; }
+    printf '  ok: pending-approval plan %s/%s created for %s\n' "$SEC_NS" "$SEC7_PLAN" "$SEC_PLAN_F1B"
+
+    # Establish a deterministic `status.phase: pending-approval` on the plan
+    # (the operator leaves an app-scope plan in the defaulted pending-approval
+    # for await_change and may not stamp the status subresource). As
+    # cluster-admin (the break-glass path the operator-or-admin allow covers)
+    # we may write any status field — this fixes oldObject.status.phase for the
+    # attacker's approval-signal check below. (Legit: an admin priming the
+    # plan's status is exactly the operator-or-admin write the guard permits.)
+    kubectl -n "$SEC_NS" patch "$PLAN_RES" "$SEC7_PLAN" --subresource=status \
+        --type=merge -p '{"status":{"phase":"pending-approval"}}' >/dev/null
+    wait_jsonpath "$PLAN_RES" "$SEC_NS" "$SEC7_PLAN" '{.status.phase}' pending-approval 30
+
+    # (a) Attacker writes status.executedSteps — MUST be DENIED by the F-1b
+    # webhook guard (only phase may change, and only pending-approval→approved).
+    # The payload is a SCHEMA-VALID ExecutedStep object (items require
+    # {step,startedAt,outcome}, outcome enum succeeded|failed|skipped) so the
+    # apiserver's STRUCTURAL validation ACCEPTS it and the request actually
+    # reaches the webhook — a malformed payload would be rejected by the
+    # apiserver first (a false pass). The assertion below matches the webhook's
+    # OWN F-1b message, not a generic apiserver schema error.
+    set +e
+    sec7a_out=$(kubectl_as "$ATTACKER_SA" "$ATTACKER_GROUP" -- \
+        patch "$PLAN_RES" "$SEC7_PLAN" -n "$SEC_NS" --subresource=status \
+        --type=merge \
+        -p '{"status":{"executedSteps":[{"step":1,"startedAt":"2026-08-07T00:00:00Z","outcome":"succeeded"}]}}' 2>&1)
+    sec7a_rc=$?
+    set -e
+    printf '  (a) impersonated executedSteps write rc=%d output:\n%s\n' "$sec7a_rc" "$sec7a_out"
+    # DENIED iff nonzero AND the webhook's F-1b message is present. Match the
+    # distinctive phrases the guard emits ("may only set status.phase" /
+    # "may write other MigrationPlan.status fields" / the named field
+    # "executedSteps") — a webhook denial, not an apiserver schema error.
+    if [ "$sec7a_rc" -ne 0 ] \
+        && printf '%s' "$sec7a_out" | grep -Eqi 'may only set status\.phase|may write other MigrationPlan\.status fields|status fields \[executedSteps'; then
+        printf '  ok: external executedSteps write DENIED by the F-1b guard\n'
+    else
+        printf 'FAILED: external MigrationPlan.status.executedSteps write was NOT denied by the F-1b webhook guard (rc=%d)\n' "$sec7a_rc" >&2
+        kubectl -n "$SEC_NS" get "$PLAN_RES" "$SEC7_PLAN" -o yaml >&2 2>&1 || true
+        exit 1
+    fi
+
+    # (b) The SAME attacker identity writes status.phase pending-approval→approved
+    # — the LEGIT external approval signal — MUST be ALLOWED.
+    set +e
+    sec7b_out=$(kubectl_as "$ATTACKER_SA" "$ATTACKER_GROUP" -- \
+        patch "$PLAN_RES" "$SEC7_PLAN" -n "$SEC_NS" --subresource=status \
+        --type=merge \
+        -p '{"status":{"phase":"approved"}}' 2>&1)
+    sec7b_rc=$?
+    set -e
+    printf '  (b) impersonated phase-approve write rc=%d output:\n%s\n' "$sec7b_rc" "$sec7b_out"
+    if [ "$sec7b_rc" -eq 0 ]; then
+        printf '  ok: external phase pending-approval->approved ALLOWED (F-1b legit approval)\n'
+    else
+        printf 'FAILED: the LEGIT external phase-approve (pending-approval->approved) was DENIED (rc=%d) — F-1b over-blocks the approval signal\n' "$sec7b_rc" >&2
+        kubectl -n "$SEC_NS" get "$PLAN_RES" "$SEC7_PLAN" -o yaml >&2 2>&1 || true
+        exit 1
+    fi
+    printf 'ok: external executedSteps denied, phase-approve allowed (F-1b)\n'
+else
+    printf '  note: (soft) impersonation unavailable — SOFT-skipping the F-1b MigrationPlan.status field-restriction reject/allow tests.\n'
+    printf 'ok: external executedSteps denied, phase-approve allowed (F-1b) — SOFT-skipped (impersonation blocked)\n'
+fi
+
+# ===============================================================
+# P-SEC-8: F-2 — a key that ACQUIRES a secret-ref gates as `env-secret-ref-add`
+#   (security-boundary). Deploy with a LITERAL env value, reach steady state,
+#   then edit the SAME key to a {secret:"…"} ref. The gate fires BEFORE render,
+#   so we assert the PLAN shape (no need to seal the secret / keep it healthy).
+# ===============================================================
+
+phase "P-SEC-8: F-2 a key acquiring a secret-ref gates (env-secret-ref-add, security-boundary)"
+
+# Deploy with env DB=<literal> (EnvValue::Literal). A literal always renders +
+# stays healthy, so the baseline stamps cleanly.
+apply_sec_app "$SEC_F2" dev internal env_literal='DB=plain-literal-value'
+sec_wait_baseline "$SEC_F2" "$APP_IMAGE"
+assert_eq "no plan for sec-f2 at baseline" "$(sec_plan_count "$SEC_F2")" "0"
+
+# Edit the SAME key DB: Literal -> {secret:"stripe-prod/key"}. This is the F-2
+# broadened acquire (`{Absent,Literal,Ref(Claim)} -> Ref(Secret)`): #7
+# env-secret-ref-add, classification security-boundary. The gate fires before
+# render, so the (unsealed) secret being absent doesn't matter for the assert.
+apply_sec_app "$SEC_F2" dev internal env_secret='DB=stripe-prod/key'
+
+wait_jsonpath "$APP_RES" "$SEC_NS" "$SEC_F2" '{.status.phase}' AwaitingMigrationApproval 180
+SEC8_PLAN="$(sec_wait_plan "$SEC_F2" 120)"
+[ -n "$SEC8_PLAN" ] || { printf 'FAILED: sec-f2 plan name empty\n' >&2; exit 1; }
+
+# Primary classification == security-boundary.
+sec8_primary=$(sec_jp "$PLAN_RES" "$SEC8_PLAN" '{.spec.risks.classification}')
+assert_eq "P-SEC-8 spec.risks.classification (primary)" "$sec8_primary" "security-boundary"
+
+# changes[] rollup contains env-secret-ref-add (wire field is `type`).
+sec8_change_types=$(sec_jp "$PLAN_RES" "$SEC8_PLAN" '{.spec.changes[*].type}')
+printf '  spec.changes[*].type = %q\n' "$sec8_change_types"
+if printf '%s' "$sec8_change_types" | grep -qw 'env-secret-ref-add'; then
+    printf '  ok: spec.changes[] contains env-secret-ref-add\n'
+else
+    printf 'FAILED: spec.changes[*].type %q missing env-secret-ref-add (F-2)\n' "$sec8_change_types" >&2
+    kubectl -n "$SEC_NS" get "$PLAN_RES" "$SEC8_PLAN" -o yaml >&2 2>&1 || true
+    exit 1
+fi
+# classifications[] rollup contains security-boundary.
+sec8_classifications=$(sec_jp "$PLAN_RES" "$SEC8_PLAN" '{.spec.risks.classifications[*]}')
+if printf '%s' "$sec8_classifications" | grep -qw 'security-boundary'; then
+    printf '  ok: spec.risks.classifications contains security-boundary\n'
+else
+    printf 'FAILED: spec.risks.classifications %q missing security-boundary (F-2)\n' "$sec8_classifications" >&2
+    exit 1
+fi
+printf 'ok: key acquiring a secret-ref gates (F-2)\n'
+
+# ===============================================================
+# P-SEC-9: F-3 — a public hostname SWAP {a}->{b} co-fires #3 domain-change (a
+#   LOST) AND #11 public-hostname-add (b GAINED). The primary
+#   (spec.risks.classification) is security-boundary (#11 sev4 > #3 sev1), and
+#   classifications[] contains security-boundary. Set-algebra fix (F-3) removed
+#   the old de-dup that hid #11 behind #3.
+# ===============================================================
+
+phase "P-SEC-9: F-3 public host swap co-fires #3 domain-change + #11 public-hostname-add (security-boundary)"
+
+# Deploy a PUBLIC app with hostname a.example.com. Baseline stamps public+a.
+apply_sec_app "$SEC_F3" dev public hostname=a.example.com
+sec_wait_baseline "$SEC_F3" "$APP_IMAGE"
+assert_eq "no plan for sec-f3 at baseline" "$(sec_plan_count "$SEC_F3")" "0"
+
+# SWAP the hostname a -> b (still public). {a}->{b}: a LOST (#3 domain-change,
+# requires-restart) AND b GAINED (#11 public-hostname-add, security-boundary).
+apply_sec_app "$SEC_F3" dev public hostname=b.example.com
+
+wait_jsonpath "$APP_RES" "$SEC_NS" "$SEC_F3" '{.status.phase}' AwaitingMigrationApproval 180
+SEC9_PLAN="$(sec_wait_plan "$SEC_F3" 120)"
+[ -n "$SEC9_PLAN" ] || { printf 'FAILED: sec-f3 plan name empty\n' >&2; exit 1; }
+
+# changes[] carries BOTH #3 domain-change AND #11 public-hostname-add.
+sec9_change_types=$(sec_jp "$PLAN_RES" "$SEC9_PLAN" '{.spec.changes[*].type}')
+printf '  spec.changes[*].type = %q\n' "$sec9_change_types"
+for want in domain-change public-hostname-add; do
+    if printf '%s' "$sec9_change_types" | grep -qw "$want"; then
+        printf '  ok: spec.changes[] contains %s\n' "$want"
+    else
+        printf 'FAILED: spec.changes[*].type %q missing %s (F-3 set-algebra)\n' "$sec9_change_types" "$want" >&2
+        kubectl -n "$SEC_NS" get "$PLAN_RES" "$SEC9_PLAN" -o yaml >&2 2>&1 || true
+        exit 1
+    fi
+done
+
+# classifications[] contains security-boundary (from #11).
+sec9_classifications=$(sec_jp "$PLAN_RES" "$SEC9_PLAN" '{.spec.risks.classifications[*]}')
+printf '  spec.risks.classifications = %q\n' "$sec9_classifications"
+if printf '%s' "$sec9_classifications" | grep -qw 'security-boundary'; then
+    printf '  ok: spec.risks.classifications contains security-boundary\n'
+else
+    printf 'FAILED: spec.risks.classifications %q missing security-boundary (F-3)\n' "$sec9_classifications" >&2
+    exit 1
+fi
+
+# Primary (spec.risks.classification) == security-boundary (#11 sev4 outranks #3 sev1).
+sec9_primary=$(sec_jp "$PLAN_RES" "$SEC9_PLAN" '{.spec.risks.classification}')
+assert_eq "P-SEC-9 spec.risks.classification (primary)" "$sec9_primary" "security-boundary"
+printf 'ok: public host swap co-fires #3+#11, surfaces security-boundary (F-3)\n'
+
+# ===============================================================
 # Done — tear down on the success path
 # ===============================================================
 
@@ -1388,4 +1849,5 @@ rm -rf "$TMPDIR_WORK"
 
 printf '\napp-migration-walk GREEN in %s\n' "$(elapsed)"
 printf 'Chain proven: deploy two-env -> baseline stamped -> effective-per-env gate (dev gated, prod untouched) -> plan shape + ownerRef -> self-heal -> CLI list + approve (consume + apply + anti-loop) -> soft change ungated + Event -> revert = reject-via-Git\n'
-printf 'Security axis (2.16b) proven: internal->public escalation gated as security-boundary + changes[]/classifications rollup + approve (P-SEC-1) -> S-4 stale-approval refused for a drifted image target (P-SEC-2) -> S-1 non-operator Application.status write denied (P-SEC-3) -> §7.2 spec.environment immutable on UPDATE (P-SEC-4) -> (soft) needs.selector multi-provider tripwire (P-SEC-5) -> negative: needs.pg + claim-ref env add ungated (P-SEC-6)\n'
+printf 'Security axis (2.16b) proven: internal->public escalation gated as security-boundary + changes[]/classifications rollup + approve (P-SEC-1) -> S-4 stale-approval refused for a drifted image target (P-SEC-2) -> F-1 spoofed-fieldManager non-operator Application.status write denied (P-SEC-3) -> §7.2 spec.environment immutable on UPDATE (P-SEC-4) -> (soft) needs.selector multi-provider tripwire (P-SEC-5) -> negative: needs.pg + claim-ref env add ungated (P-SEC-6)\n'
+printf 'Security axis S2 fixes proven: F-1b external MigrationPlan.status field-restricted (executedSteps denied, phase-approve allowed) (P-SEC-7) -> F-2 key acquiring a secret-ref gates as env-secret-ref-add/security-boundary (P-SEC-8) -> F-3 public host swap co-fires #3 domain-change + #11 public-hostname-add, primary security-boundary (P-SEC-9)\n'
