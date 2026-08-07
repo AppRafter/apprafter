@@ -14,6 +14,22 @@ use tracing::warn;
 use crate::migration::change_hash;
 use crate::{DestructiveChange, MigrationPlan};
 
+/// Reserved `status.phase`: a scope's reconciler is paused awaiting approval
+/// of a MigrationPlan that gates the destructive change observed on that
+/// object. Originally app-scope-only (walk-fix B.1.77 / ADR 0027); hoisted
+/// here in 2.16b-sc so BOTH the Application and SourceCredential controllers
+/// pause on ONE source-of-truth phase string (the state machine that yields
+/// the pause already lives in this module). Re-exported from the crate root as
+/// `operator_core::PHASE_AWAITING_MIGRATION_APPROVAL`, so existing app-scope
+/// imports are unchanged.
+pub const PHASE_AWAITING_MIGRATION_APPROVAL: &str = "AwaitingMigrationApproval";
+
+/// Condition `type` emitted alongside the `AwaitingMigrationApproval` phase.
+/// `condition.message` carries the gating MigrationPlan name so operators can
+/// `kubectl describe` straight from the gated object's status. Hoisted with
+/// the phase (2.16b-sc) so both scopes emit the identical condition type.
+pub const COND_MIGRATION_PENDING: &str = "MigrationPending";
+
 /// Is this plan still gating (not completed/rejected)? Phase-only bucketing
 /// used by [`plan_state`] to tell a live gate from a terminal relic.
 fn plan_is_blocking(plan: &MigrationPlan) -> bool {

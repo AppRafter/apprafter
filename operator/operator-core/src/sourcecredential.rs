@@ -104,6 +104,29 @@ pub struct SourceCredentialStatus {
         rename = "lastValidated"
     )]
     pub last_validated: Option<String>,
+    /// 2.16b-sc: the last spec the controller successfully DERIVED from
+    /// (repo-creds + pull-secret shipped for this coverage). The reconciler
+    /// diffs an incoming spec against this baseline to decide whether a
+    /// coverage change is safe or needs a gating MigrationPlan — mirrors
+    /// `ApplicationStatus.lastAppliedSpec`. Operator-owned; lives in `status`
+    /// so Argo (which ignores status) never sees it as drift. The CUE-derived
+    /// CRD carries the whole `status` node as
+    /// `x-kubernetes-preserve-unknown-fields`, but a bare `type: object` child
+    /// under that root still PRUNES its own children at the apiserver — so the
+    /// crdmeta `statusSchemaPatches` explicitly re-marks THIS node
+    /// preserve-unknown (same walk-found bug class as the 2.16b app baseline).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "lastAppliedSpec"
+    )]
+    pub last_applied_spec: Option<SourceCredentialSpec>,
+    /// 2.16b-sc: `AwaitingMigrationApproval` while a coverage-removal
+    /// MigrationPlan gates this credential; otherwise absent. Shares the
+    /// hoisted `PHASE_AWAITING_MIGRATION_APPROVAL` phase string with the
+    /// Application scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// Condition `type` values. Per-half presence + validity. `status:
@@ -208,5 +231,59 @@ mod tests {
         // re-serialised JSON instead to prove the round-trip is lossless.
         let back: SourceCredential = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(serde_json::to_value(&back).unwrap(), v);
+    }
+
+    // 2.16b-sc: `SourceCredentialStatus.lastAppliedSpec` carries a FULL
+    // `SourceCredentialSpec` snapshot. This proves the nested spec survives a
+    // serde round-trip through the status (a Rust-side sanity check) AND — via
+    // the crdmeta `statusSchemaPatches` preserve-unknown patch (the CRD gate)
+    // — that the apiserver won't prune the nested node. It's the SAME
+    // walk-found bug class as the 2.16b app-baseline: a bare `type: object`
+    // child under the preserve-unknown status root prunes its children unless
+    // explicitly re-marked preserve-unknown.
+    #[test]
+    fn status_last_applied_spec_round_trips_with_nested_spec_and_phase() {
+        let baseline = SourceCredentialSpec {
+            git: Some(SourceGit {
+                backend: SourceBackend {
+                    sealed_secret_ref: Some(SealedSecretRef {
+                        name: "srccred-acme-material".to_string(),
+                        namespace: Some("team-a".to_string()),
+                    }),
+                    open_bao_path: None,
+                },
+                repo_prefixes: vec!["github.com/acme/".to_string()],
+            }),
+            registry: Some(SourceRegistry {
+                backend: SourceBackend {
+                    sealed_secret_ref: None,
+                    open_bao_path: Some("secret/data/ghcr".to_string()),
+                },
+                hosts: vec!["ghcr.io/acme/".to_string()],
+            }),
+        };
+        let status = SourceCredentialStatus {
+            last_applied_spec: Some(baseline.clone()),
+            phase: Some(
+                super::super::migration_state::PHASE_AWAITING_MIGRATION_APPROVAL.to_string(),
+            ),
+            ..SourceCredentialStatus::default()
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        // The nested spec must serialise under the `lastAppliedSpec` key with
+        // its own children intact (the pruning bug would drop these).
+        assert_eq!(
+            v["lastAppliedSpec"]["git"]["repoPrefixes"][0],
+            "github.com/acme/"
+        );
+        assert_eq!(
+            v["lastAppliedSpec"]["registry"]["backend"]["openBaoPath"],
+            "secret/data/ghcr"
+        );
+        assert_eq!(v["phase"], "AwaitingMigrationApproval");
+        // Full round-trip: the nested spec deserialises back identically.
+        let back: SourceCredentialStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back.last_applied_spec.as_ref(), Some(&baseline));
+        assert_eq!(back.phase.as_deref(), Some("AwaitingMigrationApproval"));
     }
 }

@@ -222,6 +222,20 @@ _crdMetas: SourceCredential: {
 		"git.repoPrefixes": {minItems: 1, items: {type: "string", pattern: "^.+$"}}
 		"registry.hosts": {minItems: 1, items: {type: "string", pattern: "^.+$"}}
 	}
+
+	// `status.lastAppliedSpec` is the 2.16b-sc migration baseline — a raw
+	// `SourceCredentialSpec` snapshot the operator stamps and later diffs
+	// against. CUE's `lastAppliedSpec?: {...}` open struct exports as a closed
+	// `{type: object}`; nested under the status root's
+	// x-kubernetes-preserve-unknown-fields that bare `type: object` is a
+	// STRUCTURAL PRUNING BOUNDARY — the apiserver strips every key inside it,
+	// so the baseline round-trips as `{}` and gating never fires (the same
+	// walk-found bug class as Application's baseline). Restore
+	// `{type: object, x-kubernetes-preserve-unknown-fields: true}` ON the node
+	// itself so its children survive. Paths are relative to the `status` node.
+	statusSchemaPatches: {
+		"lastAppliedSpec": {type: "object", "x-kubernetes-preserve-unknown-fields": true}
+	}
 }
 
 _crdMetas: PlatformStack: {

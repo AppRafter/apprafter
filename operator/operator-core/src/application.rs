@@ -436,17 +436,12 @@ pub struct ApplicationStatus {
     pub last_applied_spec: Option<ApplicationSpec>,
 }
 
-/// Reserved phase: Application reconciler is paused awaiting
-/// approval of a MigrationPlan that gates the destructive
-/// change observed on this Application. Walk-fix B.1.77 / ADR
-/// 0027.
-pub const PHASE_AWAITING_MIGRATION_APPROVAL: &str = "AwaitingMigrationApproval";
-
-/// Condition type emitted alongside the
-/// `AwaitingMigrationApproval` phase. `condition.message`
-/// carries the MigrationPlan name so operators can `kubectl
-/// describe` straight from the Application status.
-pub const COND_MIGRATION_PENDING: &str = "MigrationPending";
+// `PHASE_AWAITING_MIGRATION_APPROVAL` + `COND_MIGRATION_PENDING` moved to
+// `operator_core::migration_state` in 2.16b-sc so the Application AND
+// SourceCredential controllers share one source of truth (the state machine
+// that yields the pause lives there). Both are re-exported from the crate
+// root, so `operator_core::{PHASE_AWAITING_MIGRATION_APPROVAL,
+// COND_MIGRATION_PENDING}` imports are unchanged.
 
 /// Reserved phase: the Application reconciler is paused awaiting a
 /// generated `ResourceClaim` (from `spec.*.needs`) to be provisioned

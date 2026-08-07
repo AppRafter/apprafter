@@ -18,9 +18,8 @@ pub mod sourcecredential;
 pub use application::{
     image_repo, Application, ApplicationBaseSpec, ApplicationCondition, ApplicationExpose,
     ApplicationSpec, ApplicationStatus, DiskClaim, EnvRef, EnvValue, ImagePolicy, NeedEntry, Needs,
-    OneOrMany, ServiceNeed, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
-    COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
-    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
+    OneOrMany, ServiceNeed, StatusImage, COND_IMAGE_RESOLVED, COND_PUBLIC_ROUTE_READY,
+    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use matching::{matches, select_provider, Candidate};
@@ -32,7 +31,10 @@ pub use migration_plan::{
     MigrationPlatformScope, MigrationRisks, MigrationSourceCredentialRef,
     MigrationSourceCredentialScope, MigrationStep, MigrationTrigger,
 };
-pub use migration_state::{decide, plan_state, plan_state_no_change, MigrationDecision, PlanState};
+pub use migration_state::{
+    decide, plan_state, plan_state_no_change, MigrationDecision, PlanState, COND_MIGRATION_PENDING,
+    PHASE_AWAITING_MIGRATION_APPROVAL,
+};
 pub use platform_stack::{
     resolve_egress_profile, EgressConfig, EgressProfile, NetworkConfig, PlatformStack,
     PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,

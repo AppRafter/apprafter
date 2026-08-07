@@ -595,6 +595,10 @@ fn build_status(
             Some(covered_hosts)
         },
         last_validated,
+        // 2.16b-sc migration baseline + pause phase are managed by the gate
+        // (Task 7), not the coverage-derivation status writer; default them to
+        // absent so this SSA patch never clobbers a gate-written value.
+        ..SourceCredentialStatus::default()
     }
 }
 

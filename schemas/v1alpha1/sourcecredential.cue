@@ -76,4 +76,18 @@ package v1alpha1
 
 	// RFC3339 timestamp of the last validity probe.
 	lastValidated?: string
+
+	// `AwaitingMigrationApproval` while a coverage-removal MigrationPlan
+	// gates this credential; otherwise absent. Shares the phase string with
+	// the Application scope (2.16b-sc).
+	phase?: string
+
+	// Full spec snapshot the operator stamps after a successful derivation
+	// (2.16b-sc). The SourceCredential-scope migration classifier diffs the
+	// incoming spec against this baseline. Free-form JSON here — the whole
+	// `status` node is emitted x-kubernetes-preserve-unknown-fields by crdgen,
+	// but a bare `type: object` child under that root is a STRUCTURAL PRUNING
+	// BOUNDARY at the apiserver, so the crdmeta `statusSchemaPatches` re-marks
+	// THIS node preserve-unknown (same as Application's `lastAppliedSpec`).
+	lastAppliedSpec?: {...}
 }
