@@ -37,8 +37,9 @@ use operator_core::migration::{change_hash, classification_severity};
 use operator_core::{
     image_repo, Application, ApplicationBaseSpec, DestructiveChange, EnvRef, EnvValue,
     MigrationApplicationRef, MigrationApplicationScope, MigrationChange, MigrationError,
-    MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationStep, MigrationStrategy,
-    MigrationTrigger, Needs, SourceCredentialSpec, StepOutcome,
+    MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationSourceCredentialRef,
+    MigrationSourceCredentialScope, MigrationStep, MigrationStrategy, MigrationTrigger, Needs,
+    SourceCredentialSpec, StepOutcome,
 };
 
 /// Render-time default for `Application.spec.*.replicas` (application.cue:
@@ -553,42 +554,10 @@ impl ApplicationMigrationStrategy {
         environment: &str,
         app_uid: &str,
     ) -> MigrationPlan {
-        let primary =
-            pick_primary(candidates.to_vec()).expect("create_plan_for called with >=1 candidate");
-        let change = &primary;
-
-        // Distinct classification vocabulary across every candidate, sorted
-        // severity desc then name asc — the approver-facing summary of the
-        // full set's risk classes. Deterministic (same key `pick_primary`
-        // uses on the primary), so the emitted list is stable.
-        let mut distinct_classifications: Vec<String> = Vec::new();
-        for c in candidates {
-            if !distinct_classifications.contains(&c.classification) {
-                distinct_classifications.push(c.classification.clone());
-            }
-        }
-        distinct_classifications.sort_by(|a, b| {
-            classification_severity(b)
-                .cmp(&classification_severity(a))
-                .then(a.cmp(b))
-        });
-
-        // Every candidate → a MigrationChange rollup row. Candidates already
-        // arrive sorted from `detect_all`, but re-sort a borrowed slice
-        // defensively so the emitted order is canonical regardless of caller.
-        let mut ordered = candidates.to_vec();
-        sort_candidates(&mut ordered);
-        let changes: Vec<MigrationChange> = ordered
-            .iter()
-            .map(|c| MigrationChange {
-                trigger: c.trigger_type.clone(),
-                field: c.field.clone(),
-                classification: c.classification.clone(),
-                severity: classification_severity(&c.classification) as u32,
-                from: c.from.clone(),
-                to: c.to.clone(),
-            })
-            .collect();
+        // Trigger (primary + S-4 hash) + risks rollup + changes[] rows are
+        // scope-INDEPENDENT — factored into `plan_body` so the
+        // SourceCredential scope shares the identical build (2.16b-sc Task 6).
+        let (trigger, risks, changes) = plan_body(candidates);
 
         let spec = MigrationPlanSpec {
             scope: MigrationPlanScope {
@@ -603,37 +572,8 @@ impl ApplicationMigrationStrategy {
                 platform: None,
                 sourcecredential: None,
             },
-            trigger: MigrationTrigger {
-                type_: change.trigger_type.clone(),
-                field: change.field.clone(),
-                from: change.from.clone(),
-                to: change.to.clone(),
-                // 2.16b S-4 / S1.2: bind this app-scope plan (and thus its
-                // approval) to a content hash of the FULL candidate set — not
-                // just the primary. `plan_state` re-verifies this at consume
-                // time against the CURRENT full candidate set (hash mismatch →
-                // the completed plan is a relic, re-gated as a fresh
-                // pending-approval plan). Hashing all candidates closes the
-                // S-4 primary-only gap: an attacker can no longer attach a
-                // lower-severity destructive op that rides along UNHASHED
-                // behind a benign-looking primary — every candidate is in the
-                // hash, so adding/dropping one changes it and re-gates.
-                approved_spec_hash: Some(change_hash(candidates)),
-            },
-            risks: Some(operator_core::MigrationRisks {
-                classification: change.classification.clone(),
-                // 2.16b S1.2: the distinct classification vocabulary across
-                // the full candidate set (primary's is the max above). Always
-                // `Some` when non-empty (create_plan_for always has >=1
-                // candidate) for a consistent approver-facing summary — even a
-                // single-candidate plan surfaces its one classification here.
-                classifications: (!distinct_classifications.is_empty())
-                    .then_some(distinct_classifications),
-                estimated_downtime: None,
-                data_volume: None,
-                reversible: None,
-                requires_full_backup: None,
-            }),
+            trigger,
+            risks: Some(risks),
             changes: Some(changes),
             plan: None,
             approvers: None,
@@ -683,6 +623,94 @@ impl ApplicationMigrationStrategy {
         };
         mp
     }
+}
+
+/// Build the scope-INDEPENDENT body of a MigrationPlan spec from a candidate
+/// set: the `(primary trigger + S-4 approval hash)`, the risk rollup (primary
+/// classification + distinct classification vocabulary), and the per-candidate
+/// `changes[]` rows. Shared by BOTH `ApplicationMigrationStrategy` and
+/// `SourceCredentialMigrationStrategy` `create_plan_for` (2.16b-sc Task 6) so
+/// the two scopes never drift on the S-4 hashing / rollup semantics — only
+/// their `spec.scope` + ObjectMeta differ.
+///
+/// The trigger carries the `pick_primary` headline; `approvedSpecHash` binds
+/// the plan (and thus its approval) to a content hash of the FULL `candidates`
+/// set — not just the primary — so an attacker can't ride a lower-severity op
+/// along UNHASHED behind a benign primary (`plan_state` re-verifies this at
+/// consume time; a mismatch re-gates). Panics if `candidates` is empty — the
+/// caller only reaches the CreatePlan arm with >=1 detected change.
+fn plan_body(
+    candidates: &[DestructiveChange],
+) -> (
+    MigrationTrigger,
+    operator_core::MigrationRisks,
+    Vec<MigrationChange>,
+) {
+    let primary = pick_primary(candidates.to_vec()).expect("plan_body called with >=1 candidate");
+
+    // Distinct classification vocabulary across every candidate, sorted
+    // severity desc then name asc — the approver-facing summary of the full
+    // set's risk classes. Deterministic (same key `pick_primary` uses on the
+    // primary), so the emitted list is stable.
+    let mut distinct_classifications: Vec<String> = Vec::new();
+    for c in candidates {
+        if !distinct_classifications.contains(&c.classification) {
+            distinct_classifications.push(c.classification.clone());
+        }
+    }
+    distinct_classifications.sort_by(|a, b| {
+        classification_severity(b)
+            .cmp(&classification_severity(a))
+            .then(a.cmp(b))
+    });
+
+    // Every candidate → a MigrationChange rollup row. Candidates already
+    // arrive sorted from `detect_all`, but re-sort a borrowed slice
+    // defensively so the emitted order is canonical regardless of caller.
+    let mut ordered = candidates.to_vec();
+    sort_candidates(&mut ordered);
+    let changes: Vec<MigrationChange> = ordered
+        .iter()
+        .map(|c| MigrationChange {
+            trigger: c.trigger_type.clone(),
+            field: c.field.clone(),
+            classification: c.classification.clone(),
+            severity: classification_severity(&c.classification) as u32,
+            from: c.from.clone(),
+            to: c.to.clone(),
+        })
+        .collect();
+
+    let trigger = MigrationTrigger {
+        type_: primary.trigger_type.clone(),
+        field: primary.field.clone(),
+        from: primary.from.clone(),
+        to: primary.to.clone(),
+        // 2.16b S-4 / S1.2: bind the plan (and thus its approval) to a content
+        // hash of the FULL candidate set — not just the primary. `plan_state`
+        // re-verifies this at consume time against the CURRENT full candidate
+        // set (hash mismatch → the completed plan is a relic, re-gated as a
+        // fresh pending-approval plan), closing the S-4 primary-only gap: a
+        // lower-severity op can no longer ride along UNHASHED behind a benign
+        // primary — every candidate is in the hash.
+        approved_spec_hash: Some(change_hash(candidates)),
+    };
+
+    let risks = operator_core::MigrationRisks {
+        classification: primary.classification.clone(),
+        // 2.16b S1.2: the distinct classification vocabulary across the full
+        // candidate set (primary's is the max above). Always `Some` when
+        // non-empty (there is always >=1 candidate) for a consistent
+        // approver-facing summary — even a single-candidate plan surfaces its
+        // one classification here.
+        classifications: (!distinct_classifications.is_empty()).then_some(distinct_classifications),
+        estimated_downtime: None,
+        data_volume: None,
+        reversible: None,
+        requires_full_backup: None,
+    };
+
+    (trigger, risks, changes)
 }
 
 /// Expand a `Needs` block into the set of stable `(type, name)` keys it
@@ -1091,6 +1119,103 @@ impl SourceCredentialMigrationStrategy {
             })),
             classification: "breaking".to_string(),
         })
+    }
+
+    /// Build a `MigrationPlan` CR for a SourceCredential-scope coverage
+    /// change (2.16b-sc Task 6). Mirrors
+    /// [`ApplicationMigrationStrategy::create_plan_for`]: the plan lands in
+    /// the **credential's own namespace** (`sc_namespace`) with a controller
+    /// `ownerReference` back to the SourceCredential so it cascades on
+    /// SourceCredential delete and keeps RBAC namespace-scoped to the team.
+    ///
+    /// The plan-spec body (`spec.trigger` from `pick_primary`,
+    /// `spec.risks.{classification,classifications}`, `spec.changes[]`, and the
+    /// S-4 `approvedSpecHash` over the FULL `candidates` set) is IDENTICAL to
+    /// the app scope — both call the shared [`plan_body`] — so the two scopes
+    /// never drift on the hashing / rollup semantics. Only `spec.scope`
+    /// (`sourcecredential` discriminator) and the ObjectMeta labels differ:
+    /// the plan carries the `apprafter.io/source-credential` label the
+    /// SourceCredential controller already uses to select its derived Secrets.
+    ///
+    /// `sc_uid` is the SourceCredential CR's `metadata.uid`, threaded from the
+    /// caller (the Task 7 reconciler) for the ownerRef; a plain `&str`
+    /// suffices — a missing-UID guard, if any, belongs at the call site.
+    ///
+    /// Panics if `candidates` is empty — the caller only reaches the
+    /// CreatePlan arm when detection produced at least one change.
+    pub fn create_plan_for(
+        candidates: &[DestructiveChange],
+        plan_name: &str,
+        sc_namespace: &str,
+        sc_name: &str,
+        sc_uid: &str,
+    ) -> MigrationPlan {
+        let (trigger, risks, changes) = plan_body(candidates);
+
+        let spec = MigrationPlanSpec {
+            scope: MigrationPlanScope {
+                type_: "sourcecredential".into(),
+                application: None,
+                platform: None,
+                sourcecredential: Some(MigrationSourceCredentialScope {
+                    ref_: MigrationSourceCredentialRef {
+                        name: sc_name.to_string(),
+                        namespace: sc_namespace.to_string(),
+                    },
+                }),
+            },
+            trigger,
+            risks: Some(risks),
+            changes: Some(changes),
+            plan: None,
+            approvers: None,
+            // Reject is a no-op for the SourceCredential scope (the change is
+            // config; the user re-widens the spec) — no snapshot to revert.
+            previous_spec_snapshot: None,
+        };
+
+        // Explicit ObjectMeta (not `MigrationPlan::new`) so we set the
+        // credential namespace + controller ownerRef. The plan lands in the
+        // SourceCredential's own namespace and cascades on its delete.
+        let mut mp = MigrationPlan::new(plan_name, spec);
+        mp.metadata = ObjectMeta {
+            name: Some(plan_name.to_string()),
+            namespace: Some(sc_namespace.to_string()),
+            owner_references: Some(vec![OwnerReference {
+                api_version: "apprafter.io/v1alpha1".to_string(),
+                kind: "SourceCredential".to_string(),
+                name: sc_name.to_string(),
+                uid: sc_uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]),
+            labels: Some(
+                [
+                    (
+                        "apprafter.io/scope".to_string(),
+                        "sourcecredential".to_string(),
+                    ),
+                    // Same selector key the SourceCredential controller uses on
+                    // its derived repo-creds / pull Secrets, so a plan is
+                    // list-selectable per credential.
+                    (
+                        "apprafter.io/source-credential".to_string(),
+                        sc_name.to_string(),
+                    ),
+                    (
+                        "apprafter.io/source-credential-namespace".to_string(),
+                        sc_namespace.to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                Utc::now(),
+            )),
+            ..ObjectMeta::default()
+        };
+        mp
     }
 }
 
@@ -2936,5 +3061,85 @@ mod sourcecredential_strategy_tests {
         let change =
             SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
         assert_eq!(change.field, "spec.git.repoPrefixes,spec.registry.hosts");
+    }
+
+    // 2.16b-sc Task 6: the SourceCredential-scope plan lands in the
+    // credential's OWN namespace, carries a controller ownerRef back to the
+    // SourceCredential (cascade on delete), scopes as `sourcecredential`, is
+    // selectable by the same `apprafter.io/source-credential` label the SC
+    // controller uses for its derived Secrets, and stamps the S-4 approval
+    // content hash over the candidate set. Mirrors the app-scope create path;
+    // only ObjectMeta + `spec.scope` differ.
+    #[test]
+    fn sc_create_plan_lands_in_cred_ns_with_ownerref_and_scope() {
+        // A coverage-removal DestructiveChange straight from the SC classifier.
+        let old = spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let change =
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
+
+        let mp = SourceCredentialMigrationStrategy::create_plan_for(
+            std::slice::from_ref(&change),
+            "sc-migration-1",
+            "team-a",
+            "gh-creds",
+            "uid-9",
+        );
+
+        // ObjectMeta: cred namespace + controller ownerRef to the SC.
+        assert_eq!(mp.metadata.namespace.as_deref(), Some("team-a"));
+        assert_eq!(mp.metadata.name.as_deref(), Some("sc-migration-1"));
+        let o = &mp.metadata.owner_references.as_ref().unwrap()[0];
+        assert_eq!(o.api_version, "apprafter.io/v1alpha1");
+        assert_eq!(o.kind, "SourceCredential");
+        assert_eq!(o.name, "gh-creds");
+        assert_eq!(o.uid, "uid-9");
+        assert_eq!(o.controller, Some(true));
+        assert_eq!(o.block_owner_deletion, Some(true));
+
+        // Scope: `sourcecredential` discriminator + ref, other variants None.
+        assert_eq!(mp.spec.scope.type_, "sourcecredential");
+        assert_eq!(
+            mp.spec.scope.sourcecredential.as_ref().unwrap().ref_.name,
+            "gh-creds"
+        );
+        assert_eq!(
+            mp.spec
+                .scope
+                .sourcecredential
+                .as_ref()
+                .unwrap()
+                .ref_
+                .namespace,
+            "team-a"
+        );
+        assert!(mp.spec.scope.application.is_none() && mp.spec.scope.platform.is_none());
+
+        // Label selector: same key the SC controller uses on derived Secrets.
+        assert_eq!(
+            mp.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get("apprafter.io/source-credential")
+                .map(String::as_str),
+            Some("gh-creds")
+        );
+
+        // Trigger from the primary + the S-4 approval hash over the set.
+        assert_eq!(mp.spec.trigger.type_, "coverage-removal");
+        assert!(mp.spec.trigger.approved_spec_hash.is_some());
+        assert_eq!(
+            mp.spec.trigger.approved_spec_hash.as_deref(),
+            Some(change_hash(std::slice::from_ref(&change)).as_str())
+        );
+
+        // Risk rollup + change rows present; no snapshot (reject is a no-op).
+        assert_eq!(mp.spec.risks.as_ref().unwrap().classification, "breaking");
+        assert_eq!(mp.spec.changes.as_ref().unwrap().len(), 1);
+        assert!(mp.spec.previous_spec_snapshot.is_none());
     }
 }
