@@ -43,6 +43,15 @@ spec:
               value: /tls/tls.crt
             - name: TLS_KEY_PATH
               value: /tls/tls.key
+            # 2.16b-sec (F-1): the AUTHENTICATED operator ServiceAccount the
+            # status guards + ResourceClaim/RetainedClaim identity gates check
+            # `request.userInfo.username` against. Templated on the actual
+            # release namespace so a namespace change cannot silently open or
+            # close writes (the reviewer's F-1 footgun); the binary falls back
+            # to `system:serviceaccount:apprafter-system:apprafter-operator`
+            # when unset (keeps a mis-deploy + tests safe).
+            - name: OPERATOR_SERVICEACCOUNT
+              value: "system:serviceaccount:{{ .Release.Namespace }}:apprafter-operator"
           # The webhook binary is a pure-Rust musl-static image
           # that boots in ms; the previous 10s/5s initial delays
           # added pointless wait to every cold start. The

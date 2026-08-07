@@ -11,7 +11,11 @@ pub mod validator_serviceprovider;
 pub mod validator_sourcecredential;
 
 pub use server::build_router;
-pub use validator::{validate_application_spec, ValidationError};
+pub use validator::{
+    application_status_write_allowed, is_operator, is_operator_or_admin, operator_service_account,
+    validate_application_spec, ValidationError,
+};
+pub use validator_migrationplan::migrationplan_status_write_allowed;
 pub use validator_sourcecredential::validate_sourcecredential;
 
 /// Install `aws-lc-rs` as the process-level rustls

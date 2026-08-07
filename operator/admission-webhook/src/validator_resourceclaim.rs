@@ -34,13 +34,8 @@
 use operator_core::ResourceClaimSpec;
 use serde_json::Value;
 
-use crate::validator::ValidationError;
+use crate::validator::{is_operator_or_admin, operator_service_account, ValidationError};
 
-/// The operator's ServiceAccount username (default Helm release name
-/// `apprafter-operator` in namespace `apprafter-system`). Re-verify in
-/// 2.4 when the Application controller actually creates claims, and if
-/// HA changes the SA naming.
-const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
 /// Mirrors `#PlatformServiceType` in `schemas/v1alpha1/types.cue`.
 const BUILTIN_TYPES: [&str; 8] = [
     "pg",
@@ -68,8 +63,10 @@ pub fn validate_resourceclaim(
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    // 1. Identity gate — CREATE only.
-    if operation == "CREATE" && !is_operator_or_admin(user_info) {
+    // 1. Identity gate — CREATE only. 2.16b-sec (F-1): the operator SA is
+    // resolved ONCE from `OPERATOR_SERVICEACCOUNT` (env-driven, one source of
+    // truth shared with the status guards), not a per-validator hardcoded const.
+    if operation == "CREATE" && !is_operator_or_admin(user_info, operator_service_account()) {
         let username = user_info
             .get("username")
             .and_then(Value::as_str)
@@ -227,28 +224,14 @@ fn is_k8s_quantity(s: &str) -> bool {
     suffix_ok(suffix)
 }
 
-fn is_operator_or_admin(user_info: &Value) -> bool {
-    let is_operator = user_info.get("username").and_then(Value::as_str) == Some(OPERATOR_SA);
-    // Cluster-admin break-glass — `system:masters` or, on kubeadm >= 1.29
-    // (k8s 1.35 / kind), `kubeadm:cluster-admins`; either is omnipotent.
-    let is_admin = user_info
-        .get("groups")
-        .and_then(Value::as_array)
-        .is_some_and(|groups| {
-            groups.iter().any(|g| {
-                matches!(
-                    g.as_str(),
-                    Some("system:masters" | "kubeadm:cluster-admins")
-                )
-            })
-        });
-    is_operator || is_admin
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The default operator SA (`operator_service_account()` resolves to this
+    /// when `OPERATOR_SERVICEACCOUNT` is unset — the in-test fallback).
+    const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
 
     fn claim() -> Value {
         json!({

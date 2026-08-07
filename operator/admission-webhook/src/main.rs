@@ -11,7 +11,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use admission_webhook::{build_router, install_rustls_crypto_provider};
+use admission_webhook::{build_router, install_rustls_crypto_provider, operator_service_account};
 use axum_server::tls_rustls::RustlsConfig;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -37,6 +37,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cert_path = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/tls/tls.crt".into());
     let key_path = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/tls/tls.key".into());
+
+    // 2.16b-sec (F-1): resolve the operator ServiceAccount ONCE at startup
+    // (from `OPERATOR_SERVICEACCOUNT`, injected by the Helm chart on the
+    // release namespace; falls back to the hardcoded default when unset). The
+    // status guards + identity gates all read this single value. Priming +
+    // logging it here surfaces a mis-set env in the pod log rather than at
+    // first admission.
+    let operator_sa = operator_service_account();
+    info!(%operator_sa, "resolved operator ServiceAccount for status/identity guards");
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 

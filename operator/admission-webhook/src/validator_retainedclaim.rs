@@ -50,12 +50,7 @@
 use operator_core::RetainedClaimSpec;
 use serde_json::Value;
 
-use crate::validator::ValidationError;
-
-/// The operator's ServiceAccount username (default Helm release name
-/// `apprafter-operator` in namespace `apprafter-system`). Duplicated per
-/// the current per-validator style (matches `validator_resourceclaim.rs`).
-const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
+use crate::validator::{is_operator_or_admin, operator_service_account, ValidationError};
 
 /// CNPG-backend `spec` string fields that must be non-empty — the
 /// GC-load-bearing set for a `cloudnative-pg` snapshot.
@@ -124,8 +119,10 @@ pub fn validate_retainedclaim(
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    // 1. Identity gate — CREATE only.
-    if operation == "CREATE" && !is_operator_or_admin(user_info) {
+    // 1. Identity gate — CREATE only. 2.16b-sec (F-1): the operator SA is
+    // resolved ONCE from `OPERATOR_SERVICEACCOUNT` (env-driven, one source of
+    // truth shared with the status guards), not a per-validator hardcoded const.
+    if operation == "CREATE" && !is_operator_or_admin(user_info, operator_service_account()) {
         let username = user_info
             .get("username")
             .and_then(Value::as_str)
@@ -325,30 +322,14 @@ fn typed_or_raw_str<'a>(
     spec.get(name).and_then(Value::as_str)
 }
 
-fn is_operator_or_admin(user_info: &Value) -> bool {
-    let is_operator = user_info.get("username").and_then(Value::as_str) == Some(OPERATOR_SA);
-    // Cluster-admin break-glass. `system:masters` is the classic admin group;
-    // kubeadm >= 1.29 issues admin.conf under `kubeadm:cluster-admins`
-    // instead (k8s 1.35 nodes, e.g. kind, surface that), so accept both —
-    // either group is already omnipotent on the cluster.
-    let is_admin = user_info
-        .get("groups")
-        .and_then(Value::as_array)
-        .is_some_and(|groups| {
-            groups.iter().any(|g| {
-                matches!(
-                    g.as_str(),
-                    Some("system:masters" | "kubeadm:cluster-admins")
-                )
-            })
-        });
-    is_operator || is_admin
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The default operator SA (`operator_service_account()` resolves to this
+    /// when `OPERATOR_SERVICEACCOUNT` is unset — the in-test fallback).
+    const OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
 
     fn retained() -> Value {
         json!({

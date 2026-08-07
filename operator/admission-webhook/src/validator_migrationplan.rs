@@ -52,7 +52,108 @@
 use operator_core::MigrationPlanSpec;
 use serde_json::Value;
 
-use crate::validator::ValidationError;
+use crate::validator::{is_operator_or_admin, ValidationError};
+
+/// 2.16b-sec (F-1b): field-level allowlist for an EXTERNAL write to the
+/// `MigrationPlan/status` subresource. `status` has no ownership guard at the
+/// CRD layer — only the FSM phase-order — so a subject holding
+/// `patch migrationplans/status` RBAC could forge `phase→approved`
+/// (self-approve) OR write `executedSteps`/`approvedBy`/other controller-owned
+/// status fields. Today only the operator SA holds the verb (RBAC-contained),
+/// but this is the defence-in-depth webhook guard.
+///
+/// Layered ON TOP of the FSM phase-order validator (which still runs) — this
+/// adds a WRITER/FIELD restriction the FSM does not express:
+///   - The operator SA (or a cluster-admin break-glass) may write ANY status
+///     field (the controller stamps phase/executedSteps/approvedAt/…). Returns
+///     `Ok(())`.
+///   - Any OTHER (external) subject — the human approver — may change ONLY the
+///     approval signal: `status.phase` from `pending-approval` to `approved`,
+///     touching NO other status field. Every other write is rejected:
+///       * setting `executedSteps`, `approvedAt`, `approvedBy`, `rejectedAt`,
+///         or any status key other than `phase`;
+///       * a `phase` transition other than `pending-approval → approved`
+///         (e.g. `→ completed` skip, approving an already-`approved`/sealed
+///         plan, or `→ rejected` — rejection is platform-controller work).
+///
+/// `approvedBy` handling: an external approver must NOT be able to forge
+/// `approvedBy` to a false identity. Since the only external write we permit
+/// is the bare `phase` flip, ANY external `approvedBy` write is rejected here
+/// (it is not `phase`, so it fails the "only phase changed" check) — the
+/// operator/controller stamps `approvedBy` from the authenticated approver
+/// identity in the audit path, never the client. See the field-diff below.
+///
+/// The diff is computed structurally: gather the union of status keys across
+/// `old_status` and `new_status`, and for each key compare the two values. The
+/// allowed external write has EXACTLY one changed key (`phase`) with the exact
+/// `pending-approval → approved` values; anything else is a rejection naming
+/// the offending field(s).
+pub fn migrationplan_status_write_allowed(
+    user_info: &Value,
+    expected_sa: &str,
+    old_status: &Value,
+    new_status: &Value,
+) -> Result<(), String> {
+    // The operator SA (or cluster-admin break-glass) writes anything — the
+    // controller owns phase/executedSteps/approvedAt/approvedBy/rejectedAt.
+    if is_operator_or_admin(user_info, expected_sa) {
+        return Ok(());
+    }
+
+    let username = user_info
+        .get("username")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+
+    // Collect the union of status keys (old ∪ new) and record every key whose
+    // value changed. An absent key on one side is treated as `Null`, so
+    // ADDING `executedSteps` (absent → set) or REMOVING `phase` both register
+    // as a change on that key.
+    let empty = serde_json::Map::new();
+    let old_map = old_status.as_object().unwrap_or(&empty);
+    let new_map = new_status.as_object().unwrap_or(&empty);
+    let null = Value::Null;
+    let mut changed_fields: Vec<&str> = Vec::new();
+    for key in old_map.keys().chain(new_map.keys()) {
+        if changed_fields.contains(&key.as_str()) {
+            continue;
+        }
+        let old_val = old_map.get(key).unwrap_or(&null);
+        let new_val = new_map.get(key).unwrap_or(&null);
+        if old_val != new_val {
+            changed_fields.push(key.as_str());
+        }
+    }
+
+    // The ONLY allowed external change is `phase` alone.
+    let only_phase_changed = changed_fields == ["phase"];
+    let old_phase = old_map.get("phase").and_then(Value::as_str).unwrap_or("");
+    let new_phase = new_map.get("phase").and_then(Value::as_str).unwrap_or("");
+    let is_approval_signal = old_phase == "pending-approval" && new_phase == "approved";
+
+    if only_phase_changed && is_approval_signal {
+        return Ok(());
+    }
+
+    // Reject — name the offending field(s) / transition. When only `phase`
+    // changed but it was not the approval signal, surface the transition;
+    // otherwise list the non-phase fields the external subject tried to write.
+    let detail = if only_phase_changed {
+        format!("status.phase {old_phase:?}→{new_phase:?}")
+    } else {
+        let fields: Vec<&str> = changed_fields
+            .iter()
+            .copied()
+            .filter(|f| *f != "phase")
+            .collect();
+        format!("status fields [{}]", fields.join(", "))
+    };
+    Err(format!(
+        "external approval may only set status.phase pending-approval→approved; \
+         rejected write to {detail} by {username:?} (only the operator ServiceAccount \
+         may write other MigrationPlan.status fields)"
+    ))
+}
 
 /// Validate a MigrationPlan AdmissionReview object.
 ///
@@ -958,5 +1059,144 @@ mod tests {
         old["status"] = json!({ "phase": "approved" });
         let errors = validate_migrationplan(&new, Some(&old));
         assert!(errors.iter().any(|e| e.field == "status.phase"));
+    }
+
+    // ── 2.16b-sec F-1b: MigrationPlan.status field-level allowlist ────────
+
+    const TEST_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
+
+    fn operator_user() -> Value {
+        json!({ "username": TEST_SA, "groups": ["system:serviceaccounts"] })
+    }
+    fn admin_user() -> Value {
+        json!({ "username": "kubernetes-admin", "groups": ["system:masters", "system:authenticated"] })
+    }
+    fn external_user() -> Value {
+        json!({ "username": "alice", "groups": ["system:authenticated"] })
+    }
+
+    #[test]
+    fn f1b_external_approval_pending_to_approved_is_allowed() {
+        // The legit human-approver path: flip ONLY phase pending→approved.
+        let old = json!({ "phase": "pending-approval" });
+        let new = json!({ "phase": "approved" });
+        assert!(
+            migrationplan_status_write_allowed(&external_user(), TEST_SA, &old, &new).is_ok(),
+            "external phase→approved must still pass — the whole approve flow depends on it"
+        );
+    }
+
+    #[test]
+    fn f1b_operator_may_write_any_status_field() {
+        // The controller stamps phase + executedSteps + approvedAt etc.
+        let old = json!({ "phase": "approved" });
+        let new = json!({
+            "phase": "executing",
+            "executedSteps": [{ "step": 1, "startedAt": "2026-08-07T00:00:00Z", "outcome": "ok" }],
+            "approvedAt": "2026-08-07T00:00:00Z",
+            "approvedBy": "alice@company.com"
+        });
+        assert!(
+            migrationplan_status_write_allowed(&operator_user(), TEST_SA, &old, &new).is_ok(),
+            "the operator's own status write must pass, or the reconcile breaks"
+        );
+    }
+
+    #[test]
+    fn f1b_admin_break_glass_may_write_any_status_field() {
+        let old = json!({ "phase": "pending-approval" });
+        let new = json!({ "phase": "rejected", "rejectedAt": "2026-08-07T00:00:00Z" });
+        assert!(
+            migrationplan_status_write_allowed(&admin_user(), TEST_SA, &old, &new).is_ok(),
+            "cluster-admin break-glass may write any status field"
+        );
+    }
+
+    #[test]
+    fn f1b_external_write_to_executed_steps_is_rejected() {
+        // Forging executedSteps (even alongside a legit phase flip) is denied.
+        let old = json!({ "phase": "pending-approval" });
+        let new = json!({
+            "phase": "approved",
+            "executedSteps": [{ "step": 1, "startedAt": "2026-08-07T00:00:00Z", "outcome": "ok" }]
+        });
+        let err = migrationplan_status_write_allowed(&external_user(), TEST_SA, &old, &new)
+            .expect_err("external executedSteps write must be rejected");
+        assert!(
+            err.contains("executedSteps"),
+            "message should name the field: {err}"
+        );
+        assert!(
+            err.contains("alice"),
+            "message should name the requester: {err}"
+        );
+    }
+
+    #[test]
+    fn f1b_external_forged_approved_by_is_rejected() {
+        // approvedBy: an external approver must not stamp an identity — any
+        // external approvedBy write is denied (only phase may change).
+        let old = json!({ "phase": "pending-approval" });
+        let new = json!({ "phase": "approved", "approvedBy": "ceo@company.com" });
+        let err = migrationplan_status_write_allowed(&external_user(), TEST_SA, &old, &new)
+            .expect_err("external approvedBy write must be rejected");
+        assert!(
+            err.contains("approvedBy"),
+            "message should name approvedBy: {err}"
+        );
+    }
+
+    #[test]
+    fn f1b_external_phase_skip_to_completed_is_rejected() {
+        // Skipping straight to a terminal phase (self-executing) is denied —
+        // only pending-approval→approved is the external approval signal.
+        let old = json!({ "phase": "pending-approval" });
+        let new = json!({ "phase": "completed" });
+        let err = migrationplan_status_write_allowed(&external_user(), TEST_SA, &old, &new)
+            .expect_err("external phase→completed skip must be rejected");
+        assert!(
+            err.contains("pending-approval"),
+            "message should reference the allowed transition: {err}"
+        );
+    }
+
+    #[test]
+    fn f1b_external_approve_of_already_approved_plan_is_rejected() {
+        // Re-approving an already-approved plan is not the pending→approved
+        // signal (old phase is not pending-approval) → rejected.
+        let old = json!({ "phase": "approved" });
+        let new = json!({ "phase": "approved", "approvedAt": "2026-08-07T00:00:00Z" });
+        let err = migrationplan_status_write_allowed(&external_user(), TEST_SA, &old, &new)
+            .expect_err("external write to an already-approved plan must be rejected");
+        assert!(
+            err.contains("approvedAt"),
+            "message should name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn f1b_external_approve_of_completed_plan_is_rejected() {
+        // Approving a sealed/terminal plan is not pending→approved → rejected.
+        let old = json!({ "phase": "completed" });
+        let new = json!({ "phase": "approved" });
+        let err = migrationplan_status_write_allowed(&external_user(), TEST_SA, &old, &new)
+            .expect_err("external approve of a completed plan must be rejected");
+        assert!(
+            err.contains("completed"),
+            "message should surface the bad transition: {err}"
+        );
+    }
+
+    #[test]
+    fn f1b_external_phase_to_rejected_is_denied() {
+        // Rejection is platform-controller work (the FSM allows platform-scope
+        // pending→rejected but that is a CONTROLLER write); an external subject
+        // flipping to rejected is not the approval signal → denied here.
+        let old = json!({ "phase": "pending-approval" });
+        let new = json!({ "phase": "rejected" });
+        assert!(
+            migrationplan_status_write_allowed(&external_user(), TEST_SA, &old, &new).is_err(),
+            "external phase→rejected must be denied (only pending→approved is external)"
+        );
     }
 }

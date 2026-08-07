@@ -45,6 +45,7 @@
 //! semantics exactly.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use operator_core::{
     ApplicationBaseSpec, ApplicationSpec, DiskClaim, EnvRef, EnvValue, Needs, OneOrMany,
@@ -67,27 +68,92 @@ impl ValidationError {
     }
 }
 
-/// 2.16b (S-1): the ONLY legitimate writer of `Application.status`.
-/// The operator's Application controller applies status via SSA with
-/// `PatchParams::apply("apprafter-operator")` — see
-/// `operator-controllers/application/src/lib.rs:58` (`FIELD_MANAGER`).
-/// `admission-webhook` deliberately does NOT depend on that controller
-/// crate (it avoids the heavy `kube` stack — see `server.rs`), so the
-/// value is duplicated here; keep the two in sync.
-pub const APPLICATION_STATUS_FIELD_MANAGER: &str = "apprafter-operator";
+/// 2.16b-sec (F-1): the fallback operator ServiceAccount username when the
+/// `OPERATOR_SERVICEACCOUNT` env var is unset. Matches the default Helm
+/// release (`apprafter-operator` in namespace `apprafter-system`). The
+/// deployment (`apprafter-admission-webhook/templates/deployment.yaml`)
+/// injects `OPERATOR_SERVICEACCOUNT` templated on the actual release
+/// namespace so a namespace change cannot silently open/close writes; this
+/// constant only keeps unit tests + a mis-deploy safe. Mirrors the const in
+/// `validator_resourceclaim.rs` / `validator_retainedclaim.rs` (now all read
+/// through [`operator_service_account`] — one source of truth).
+pub const DEFAULT_OPERATOR_SA: &str = "system:serviceaccount:apprafter-system:apprafter-operator";
 
-/// 2.16b (S-1): whether a write to the `Application/status` subresource is
-/// allowed, given the request's `fieldManager`. `Application.status` is the
-/// root of trust for the app-migration gate — `status.lastAppliedSpec` is the
-/// baseline every destructive-change detection diffs against. The ONLY
-/// legitimate writer is the operator's SSA field manager
-/// (`apprafter-operator`); any other subject (or an absent fieldManager) is
-/// rejected so a direct `patch applications/status` cannot zero the baseline
-/// and silently disarm the gate. Unlike `MigrationPlan.status` (which
-/// legitimately accepts an external `phase→approved` approval signal),
-/// `Application.status` has no external writer.
-pub fn status_write_allowed(field_manager: Option<&str>) -> bool {
-    field_manager == Some(APPLICATION_STATUS_FIELD_MANAGER)
+/// 2.16b-sec (F-1): the resolved operator ServiceAccount username — read
+/// ONCE from the `OPERATOR_SERVICEACCOUNT` env var at first call, falling back
+/// to [`DEFAULT_OPERATOR_SA`] when unset/empty. This is the single source of
+/// truth for "is this write from the operator's authenticated identity",
+/// replacing the per-validator hardcoded `OPERATOR_SA` const and the
+/// client-supplied `fieldManager` guard (which was trivially spoofable —
+/// `--field-manager=apprafter-operator` is unauthenticated). Threaded into
+/// the status guards + the ResourceClaim/RetainedClaim identity gates.
+///
+/// The env is deliberately captured once (`OnceLock`): the value cannot
+/// change over a pod's lifetime, and reading it per-request would let a
+/// late `set_var` race the guards. Tests that need a specific value pass it
+/// explicitly to the pure helpers below (which take `expected_sa`), so this
+/// resolver is only exercised through the default fallback in-process.
+pub fn operator_service_account() -> &'static str {
+    static RESOLVED: OnceLock<String> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            std::env::var("OPERATOR_SERVICEACCOUNT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_OPERATOR_SA.to_string())
+        })
+        .as_str()
+}
+
+/// 2.16b-sec (F-1): whether `user_info.username` is the operator's
+/// authenticated ServiceAccount (`expected_sa`). Unlike the old
+/// `fieldManager` check this reads the AUTHENTICATED identity the apiserver
+/// stamps into `request.userInfo` — a client cannot forge it. Pure +
+/// unit-testable (the caller passes the resolved SA).
+pub fn is_operator(user_info: &Value, expected_sa: &str) -> bool {
+    user_info.get("username").and_then(Value::as_str) == Some(expected_sa)
+}
+
+/// 2.16b-sec (F-1): whether a request's authenticated identity is the operator
+/// ServiceAccount OR a cluster-admin break-glass group (`system:masters`, or
+/// `kubeadm:cluster-admins` on kubeadm >= 1.29 / k8s 1.35 / kind — either is
+/// already omnipotent on the cluster). Shared by the Application.status /
+/// MigrationPlan.status guards and the ResourceClaim/RetainedClaim identity
+/// gates so there is ONE definition of "the operator or an admin".
+pub fn is_operator_or_admin(user_info: &Value, expected_sa: &str) -> bool {
+    if is_operator(user_info, expected_sa) {
+        return true;
+    }
+    user_info
+        .get("groups")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                matches!(
+                    g.as_str(),
+                    Some("system:masters" | "kubeadm:cluster-admins")
+                )
+            })
+        })
+}
+
+/// 2.16b-sec (F-1): whether a write to the `Application/status` subresource
+/// is allowed, given the request's AUTHENTICATED `userInfo`. `Application.status`
+/// is the root of trust for the app-migration gate — `status.lastAppliedSpec`
+/// is the baseline every destructive-change detection diffs against. The ONLY
+/// legitimate writer is the operator's ServiceAccount (`expected_sa`) or a
+/// cluster-admin break-glass; any other subject is rejected so a direct
+/// `patch applications/status` cannot zero the baseline and silently disarm
+/// the gate.
+///
+/// F-1: this gates on `request.userInfo.username` (which the apiserver
+/// authenticates), NOT on the `fieldManager` (a client-supplied
+/// `--field-manager=...` string that anyone can set to `apprafter-operator`).
+/// Unlike `MigrationPlan.status` (which legitimately accepts an external
+/// `phase→approved` approval signal), `Application.status` has no external
+/// writer.
+pub fn application_status_write_allowed(user_info: &Value, expected_sa: &str) -> bool {
+    is_operator_or_admin(user_info, expected_sa)
 }
 
 /// Validate the `spec` block of a v1alpha1 Application. Returns
@@ -1573,12 +1639,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── 2.16b S-1: Application.status is operator-owned ──────────────────
+    // ── 2.16b-sec F-1: Application.status is operator-owned (userInfo) ────
     #[test]
-    fn application_status_write_only_from_operator_manager() {
-        assert!(status_write_allowed(Some("apprafter-operator")));
-        assert!(!status_write_allowed(Some("kubectl-client-side-apply")));
-        assert!(!status_write_allowed(None));
+    fn application_status_write_only_from_operator_user() {
+        let sa = DEFAULT_OPERATOR_SA;
+        let operator = json!({ "username": sa, "groups": ["system:serviceaccounts"] });
+        let external = json!({ "username": "alice", "groups": ["system:authenticated"] });
+        let admin = json!({ "username": "kubernetes-admin", "groups": ["system:masters"] });
+        // F-1: the operator's AUTHENTICATED identity passes; a fieldManager
+        // string is irrelevant to the gate now.
+        assert!(application_status_write_allowed(&operator, sa));
+        // A cluster-admin break-glass passes.
+        assert!(application_status_write_allowed(&admin, sa));
+        // A non-operator user is rejected — even if it were to set
+        // `--field-manager=apprafter-operator`, that string is not consulted.
+        assert!(!application_status_write_allowed(&external, sa));
+        // Empty userInfo fails closed.
+        assert!(!application_status_write_allowed(&json!({}), sa));
+    }
+
+    #[test]
+    fn is_operator_reads_authenticated_username() {
+        let sa = DEFAULT_OPERATOR_SA;
+        assert!(is_operator(&json!({ "username": sa }), sa));
+        assert!(!is_operator(&json!({ "username": "alice" }), sa));
+        assert!(!is_operator(&json!({}), sa));
     }
 
     #[test]
