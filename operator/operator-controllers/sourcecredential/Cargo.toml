@@ -14,6 +14,11 @@ path = "src/lib.rs"
 
 [dependencies]
 operator-core = { path = "../../operator-core" }
+# 2.16b-sc Task 7: the SourceCredential migration pause-gate calls
+# `SourceCredentialMigrationStrategy::{detect_destructive, create_plan_for}`.
+# The migration crate depends only on operator-core (not on this crate), so
+# this edge is acyclic.
+operator-controllers-migration = { path = "../migration" }
 
 kube        = { workspace = true }
 k8s-openapi = { workspace = true }

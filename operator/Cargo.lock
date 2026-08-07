@@ -1661,6 +1661,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "oci-distribution",
+ "operator-controllers-migration",
  "operator-core",
  "reqwest",
  "serde",

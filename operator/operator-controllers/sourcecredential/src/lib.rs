@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
@@ -59,9 +59,15 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{info, warn};
 
+// 2.16b-sc Task 7: the scope-agnostic migration state machine (hoisted in
+// Task 1/5) + the SourceCredential-scope classifier / plan builder (Task 6).
+use operator_controllers_migration::SourceCredentialMigrationStrategy;
+use operator_core::migration_state::{decide, plan_state, plan_state_no_change, MigrationDecision};
 use operator_core::{
-    Metrics, SourceCredential, SourceCredentialCondition, SourceCredentialStatus, COND_GIT_PRESENT,
-    COND_GIT_VALID, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID, REASON_UNVERIFIED,
+    DestructiveChange, Metrics, MigrationPlan, SourceCredential, SourceCredentialCondition,
+    SourceCredentialSpec, SourceCredentialStatus, COND_GIT_PRESENT, COND_GIT_VALID,
+    COND_MIGRATION_PENDING, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID,
+    PHASE_AWAITING_MIGRATION_APPROVAL, REASON_UNVERIFIED,
 };
 
 mod validity;
@@ -86,6 +92,14 @@ const DERIVED_SECRETS_FINALIZER: &str = "apprafter.io/derived-secrets-cleanup";
 /// SourceCredential — the GC selector and the human "who made this".
 const SOURCE_CREDENTIAL_LABEL: &str = "apprafter.io/source-credential";
 
+/// 2.16b-sc Task 7: label `create_plan_for` stamps on the gating
+/// MigrationPlan, marking a SourceCredential-scope plan. Paired with
+/// [`SOURCE_CREDENTIAL_LABEL`] it selects the (≤1) plan for a given
+/// credential from its namespace — the SC-scope analogue of the app
+/// controller's `find_any_key_plan`.
+const SCOPE_LABEL: &str = "apprafter.io/scope";
+const SCOPE_SOURCECREDENTIAL: &str = "sourcecredential";
+
 /// Keys in the unsealed material Secret.
 const MATERIAL_USERNAME_KEY: &str = "username";
 const MATERIAL_PASSWORD_KEY: &str = "password";
@@ -101,6 +115,15 @@ pub enum ReconcileError {
 
     #[error("serde_json error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// 2.16b-sc Task 7: a SourceCredential without a `metadata.uid` reached
+    /// the MigrationPlan-creation path. The uid is required for the plan's
+    /// controller `ownerReference` (so the plan cascades on SourceCredential
+    /// delete); the apiserver always assigns one, so this is defensive —
+    /// surface it rather than emit an owner-less plan. Mirrors the app-scope
+    /// `ReconcileError::MissingUid`.
+    #[error("SourceCredential {0} has no metadata.uid; cannot own a MigrationPlan")]
+    MissingUid(String),
 }
 
 /// Per-controller reconcile context.
@@ -113,9 +136,17 @@ pub struct Context {
 /// `apprafter.io/v1alpha1` `SourceCredential` resources cluster-wide.
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
     let creds: Api<SourceCredential> = Api::all(client.clone());
+    // 2.16b-sc Task 7: watch the SC-scope MigrationPlan children so a plan
+    // reaching `completed` (a same-ns child with a controlling ownerRef → the
+    // SourceCredential, set by `create_plan_for`) re-fires the owning
+    // SourceCredential reconcile IMMEDIATELY (instant consume → ConsumeApply →
+    // derive with the narrowed coverage), instead of waiting for the 60s
+    // requeue. Mirrors the Application controller's `.owns(plans)`.
+    let plans: Api<MigrationPlan> = Api::all(client.clone());
     let context = Arc::new(Context { client, metrics });
 
     Controller::new(creds, watcher::Config::default())
+        .owns(plans, watcher::Config::default())
         .run(reconcile, error_policy, context)
         .for_each(|res| async move {
             match res {
@@ -168,6 +199,166 @@ pub async fn reconcile(
         set_finalizers(&ctx.client, &namespace, &name, with_finalizer(&finalizers)).await?;
         // The patch re-triggers reconcile; derivation proceeds below
         // anyway so the first pass is not wasted.
+    }
+
+    // ---- 2.16b-sc Task 7: coverage-narrowing migration pause-gate ----
+    // Sits BEFORE both derivation halves (git repo-creds + registry
+    // pull-secret), mirroring the app-scope gate. A destructive coverage
+    // change (a removed `repoPrefix`/`host`, a dropped half) pauses BOTH
+    // halves — the old, wider-coverage derived Secrets are LEFT IN PLACE so
+    // in-flight apps keep git-clone / image-pull access — until the operator
+    // approves the gating MigrationPlan. On approve/consume the reconcile
+    // falls through and derives BOTH halves with the narrowed spec + stamps
+    // the new baseline. On re-widen (the user un-does the narrowing) the stale
+    // plan is GC'd and derivation proceeds. The machine is a pure function of
+    // "did we detect a destructive change vs the stamped baseline?" × the live
+    // plan's `PlanState` (see `decide`).
+    //
+    // A missing baseline (first derive, or a pre-2.16b-sc credential) does NOT
+    // gate — detection is skipped and the first baseline is stamped after a
+    // successful derive below.
+    let old_spec: Option<SourceCredentialSpec> = cred
+        .status
+        .as_ref()
+        .and_then(|s| s.last_applied_spec.clone());
+    // `detect_destructive` returns a SINGLE `Option<DestructiveChange>` for the
+    // SC scope (not a Vec); wrap it into a 0-or-1-element slice so it feeds the
+    // same `create_plan_for(&candidates, ..)` / `plan_state(.., &candidates)`
+    // API the app scope uses (both hash / roll up over a slice).
+    let change: Option<DestructiveChange> =
+        SourceCredentialMigrationStrategy::detect_destructive(old_spec.as_ref(), &cred.spec);
+    let candidates: Vec<DestructiveChange> = change.clone().into_iter().collect();
+
+    let plan = find_sc_plan(&ctx.client, &namespace, &name).await?;
+    let state = match candidates.first() {
+        Some(c) => plan_state(plan.as_ref(), c, &candidates),
+        None => plan_state_no_change(plan.as_ref()),
+    };
+
+    // On the render arms (`Render` / `ConsumeApply` / `DeleteThenRender`) fall
+    // through to the derivation below and stamp the baseline after; the paused
+    // arms write a paused status and return HERE (so no derivation SSA runs —
+    // the old Secrets stay put). `consume_plan` names the plan to delete AFTER
+    // the render+stamp (crash-ordering: derive → stamp → delete) — set only by
+    // `ConsumeApply`.
+    let mut consume_plan: Option<String> = None;
+    match decide(!candidates.is_empty(), state) {
+        MigrationDecision::Render => {
+            // No change + no plan → derive normally, stamp the (possibly first)
+            // baseline below.
+        }
+        MigrationDecision::CreatePlan => {
+            let change = change
+                .clone()
+                .expect("CreatePlan implies a detected change");
+            let sc_uid = sc_uid_or(&cred)?;
+            let mp = SourceCredentialMigrationStrategy::create_plan_for(
+                &candidates,
+                &sc_plan_name(&name, Utc::now()),
+                &namespace,
+                &name,
+                sc_uid,
+            );
+            let plan_name = mp.name_any();
+            info!(
+                %name, %namespace, plan = %plan_name, trigger = %change.trigger_type,
+                "destructive coverage change detected — creating gating MigrationPlan, pausing both derivation halves"
+            );
+            ssa_apply_plan(&ctx.client, &namespace, &mp, &name).await?;
+            let status = build_paused_status(&cred, &namespace, &plan_name);
+            patch_status(&ctx.client, &namespace, &name, &status).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            // Return BEFORE either derivation half → the wider-coverage Secrets
+            // stay in place.
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        MigrationDecision::NoOp => {
+            // Change + a matching blocking plan already gates → stay paused,
+            // derive nothing.
+            let plan_name = plan.as_ref().map(|p| p.name_any()).unwrap_or_default();
+            info!(
+                %name, %namespace, plan = %plan_name,
+                "coverage change already gated by a matching MigrationPlan — staying paused"
+            );
+            let status = build_paused_status(&cred, &namespace, &plan_name);
+            patch_status(&ctx.client, &namespace, &name, &status).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        MigrationDecision::DeleteThenCreate => {
+            // A lingering plan gates a DIFFERENT change (stale gate / relic /
+            // approval-hash mismatch) → delete every SC plan, then create the
+            // right one and stay paused.
+            let change = change
+                .clone()
+                .expect("DeleteThenCreate implies a detected change");
+            let sc_uid = sc_uid_or(&cred)?;
+            delete_sc_plans(&ctx.client, &namespace, &name).await?;
+            let mp = SourceCredentialMigrationStrategy::create_plan_for(
+                &candidates,
+                &sc_plan_name(&name, Utc::now()),
+                &namespace,
+                &name,
+                sc_uid,
+            );
+            let plan_name = mp.name_any();
+            info!(
+                %name, %namespace, plan = %plan_name, trigger = %change.trigger_type,
+                "superseding stale/relic MigrationPlan with a fresh gating plan — staying paused"
+            );
+            ssa_apply_plan(&ctx.client, &namespace, &mp, &name).await?;
+            let status = build_paused_status(&cred, &namespace, &plan_name);
+            patch_status(&ctx.client, &namespace, &name, &status).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        MigrationDecision::ConsumeApply => {
+            // The change's plan completed (operator approved → the
+            // MigrationController drove it to `completed`) → consume: derive
+            // BOTH halves with the narrowed spec, stamp the new baseline, THEN
+            // delete the plan (crash-order derive → stamp → delete).
+            consume_plan = plan.as_ref().and_then(|p| p.metadata.name.clone());
+            info!(
+                %name, %namespace, plan = ?consume_plan,
+                "MigrationPlan completed — consuming: deriving with narrowed coverage"
+            );
+        }
+        MigrationDecision::DeleteThenRender => {
+            // No change but a plan lingers (the user re-widened the spec → the
+            // destructive delta vanished) → delete the stale plan(s), then
+            // derive normally and re-stamp the baseline below.
+            info!(
+                %name, %namespace,
+                "no destructive coverage change but a stale MigrationPlan lingers — cleaning up before derive"
+            );
+            delete_sc_plans(&ctx.client, &namespace, &name).await?;
+        }
+        MigrationDecision::BlockFailed => {
+            // The change's plan is `failed` → keep gating; surface a
+            // `MigrationFailed=True` condition requiring manual delete. Derive
+            // nothing (both Secrets stay put).
+            let plan_name = plan.as_ref().map(|p| p.name_any()).unwrap_or_default();
+            warn!(
+                %name, %namespace, plan = %plan_name,
+                "gating MigrationPlan is in phase=failed — staying paused, manual delete required"
+            );
+            let status = build_migration_failed_status(&cred, &plan_name);
+            patch_status(&ctx.client, &namespace, &name, &status).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
     }
 
     let previous = cred
@@ -330,13 +521,49 @@ pub async fn reconcile(
         }
     }
 
+    // 2.16b-sc Task 7: stamp the migration baseline. Only reached on a render
+    // arm (`Render` / `ConsumeApply` / `DeleteThenRender`) — every paused arm
+    // returned early above. Stamp `lastAppliedSpec = spec` (the current spec)
+    // ONLY when BOTH applicable halves derived successfully (`!pending`); when a
+    // half is still pending (material unsealing) we did NOT actually derive, so
+    // CARRY the prior baseline forward instead of stamping the (possibly
+    // narrowed) new spec — otherwise a coverage-narrowing edit made while
+    // material is still unsealing would move the baseline without the gate ever
+    // running its full derivation. Carrying (never `None`) also avoids the
+    // SSA-prune self-cancel: the field manager keeps ownership of the field.
+    let stamped_baseline = if pending {
+        old_spec.clone()
+    } else {
+        Some(cred.spec.clone())
+    };
     patch_status(
         &ctx.client,
         &namespace,
         &name,
-        &build_status(conditions, covered_prefixes, covered_hosts, last_validated),
+        &build_status(
+            conditions,
+            covered_prefixes,
+            covered_hosts,
+            last_validated,
+            stamped_baseline,
+        ),
     )
     .await?;
+
+    // 2.16b-sc Task 7: `ConsumeApply` — delete the completed plan AFTER the
+    // derive + baseline stamp landed (crash-order derive → stamp → delete). A
+    // crash between the stamp and this delete re-enters as detect=None ×
+    // completed-plan → `DeleteThenRender`, which cleans the relic up; so the
+    // delete is safe to be the last step. Best-effort (404-tolerant). Skipped
+    // when a half is still `pending` — the plan stays until the derive fully
+    // lands, so a crashed/partial derive re-consumes on the next pass.
+    if !pending {
+        if let Some(plan_to_delete) = &consume_plan {
+            delete_sc_plans(&ctx.client, &namespace, &name).await?;
+            info!(%name, %namespace, plan = %plan_to_delete, "consumed MigrationPlan deleted after derive");
+        }
+    }
+
     let outcome = if pending { "pending" } else { "ok" };
     ctx.metrics
         .reconcile_total
@@ -581,6 +808,7 @@ fn build_status(
     covered_prefixes: Vec<String>,
     covered_hosts: Vec<String>,
     last_validated: Option<String>,
+    last_applied_spec: Option<SourceCredentialSpec>,
 ) -> SourceCredentialStatus {
     SourceCredentialStatus {
         conditions: Some(conditions),
@@ -595,10 +823,262 @@ fn build_status(
             Some(covered_hosts)
         },
         last_validated,
-        // 2.16b-sc migration baseline + pause phase are managed by the gate
-        // (Task 7), not the coverage-derivation status writer; default them to
-        // absent so this SSA patch never clobbers a gate-written value.
-        ..SourceCredentialStatus::default()
+        // 2.16b-sc Task 7: the migration baseline. `patch_status` is a
+        // server-side apply under a SINGLE field manager (`FIELD_MANAGER`,
+        // `.force()`), so OMITTING a field the manager previously owned makes
+        // the apiserver PRUNE it — NOT "leave it untouched". The pause arms
+        // stamp `lastAppliedSpec` via `build_paused_status`; if this render-path
+        // writer emitted `None`, the next reconcile would read no baseline, skip
+        // destructive detection, and the gate would self-cancel (the same
+        // SSA-prune bug the app scope hit). So the caller threads the baseline
+        // through: `Some(cred.spec)` on a successful derive (stamp), or the
+        // carried-forward existing baseline when a half is still pending.
+        last_applied_spec,
+        // 2.16b-sc Task 7: reaching the render path means the credential is NOT
+        // paused → clear the `AwaitingMigrationApproval` phase (a prior pause
+        // may have set it; omitting it prunes it, which is what we want here).
+        phase: None,
+    }
+}
+
+// ---------------- 2.16b-sc Task 7: migration pause-gate helpers ----------------
+
+/// The SourceCredential's `metadata.uid`, required for the gating
+/// MigrationPlan's controller ownerRef (cascade on SC delete). The apiserver
+/// always assigns one — a missing uid is a defensive error, never surfaced in
+/// practice. Mirrors the app-scope `app_uid_or`.
+fn sc_uid_or(cred: &SourceCredential) -> Result<&str, ReconcileError> {
+    cred.metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| ReconcileError::MissingUid(cred.name_any()))
+}
+
+/// Deterministic, DNS-1123-safe MigrationPlan name for a SourceCredential.
+/// SourceCredentials have no environment (unlike Applications), so the name is
+/// `<sc-name>-migration-<unix-secs>`. The timestamp gives each superseding plan
+/// a fresh name so a delete-then-create never collides with the object it just
+/// deleted (which may still be terminating). Folded per-char to a valid
+/// `metadata.name`. Mirrors the app-scope `plan_name` (minus the env segment).
+fn sc_plan_name(sc_name: &str, now: DateTime<Utc>) -> String {
+    let raw = format!("{sc_name}-migration-{}", now.timestamp());
+    let mut out = String::with_capacity(raw.len().min(63));
+    for ch in raw.chars() {
+        out.push(if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        });
+    }
+    out.truncate(63);
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Pure: pick the (≤1) SC-scope MigrationPlan for `sc_name` from a list. Matches
+/// on the `sourcecredential` scope discriminator + the plan's
+/// `scope.sourcecredential.ref.name`, ignoring plans for other credentials (or
+/// other scopes). Mirrors the app-scope `pick_any_key_plan`; unit-testable
+/// without a client. Returns plans of ANY phase (blocking / completed / relic)
+/// so the state machine can bucket them for `ConsumeApply` / cleanup.
+fn pick_sc_plan(plans: Vec<MigrationPlan>, sc_name: &str) -> Option<MigrationPlan> {
+    plans.into_iter().find(|plan| {
+        plan.spec.scope.type_ == SCOPE_SOURCECREDENTIAL
+            && plan
+                .spec
+                .scope
+                .sourcecredential
+                .as_ref()
+                .is_some_and(|s| s.ref_.name == sc_name)
+    })
+}
+
+/// Find the (≤1) SC-scope MigrationPlan for this credential in its own
+/// namespace (where `create_plan_for` lands it). Best-effort list narrowed by
+/// the `apprafter.io/scope=sourcecredential` + `apprafter.io/source-credential`
+/// labels the plan carries, then `pick_sc_plan` applies the exact scope match.
+/// A list error propagates (the reconcile retries).
+async fn find_sc_plan(
+    client: &Client,
+    sc_namespace: &str,
+    sc_name: &str,
+) -> Result<Option<MigrationPlan>, ReconcileError> {
+    let api: Api<MigrationPlan> = Api::namespaced(client.clone(), sc_namespace);
+    let selector =
+        format!("{SCOPE_LABEL}={SCOPE_SOURCECREDENTIAL},{SOURCE_CREDENTIAL_LABEL}={sc_name}");
+    let lp = ListParams::default().labels(&selector);
+    let list = api.list(&lp).await?;
+    Ok(pick_sc_plan(list.items, sc_name))
+}
+
+/// SSA-apply a freshly-built SC-scope MigrationPlan into the credential's own
+/// namespace under field manager [`FIELD_MANAGER`] (`apprafter-sourcecredential`
+/// — the SC controller owns the plan, matching the SSA split). The plan already
+/// carries its `metadata.name`/`namespace` + controller-ownerRef (from
+/// `create_plan_for`); this serializes it, injects the `apiVersion`/`kind` SSA
+/// requires, and applies. `_sc_name` documents the owning credential.
+async fn ssa_apply_plan(
+    client: &Client,
+    sc_namespace: &str,
+    plan: &MigrationPlan,
+    _sc_name: &str,
+) -> Result<(), ReconcileError> {
+    let plan_name = plan.metadata.name.clone().unwrap_or_default();
+    let mut payload = serde_json::to_value(plan)?;
+    if let Value::Object(map) = &mut payload {
+        map.insert(
+            "apiVersion".to_string(),
+            Value::String("apprafter.io/v1alpha1".to_string()),
+        );
+        map.insert(
+            "kind".to_string(),
+            Value::String("MigrationPlan".to_string()),
+        );
+    }
+    let api: Api<MigrationPlan> = Api::namespaced(client.clone(), sc_namespace);
+    let pp = PatchParams::apply(FIELD_MANAGER).force();
+    api.patch(&plan_name, &pp, &Patch::Apply(&payload)).await?;
+    Ok(())
+}
+
+/// Delete every SC-scope MigrationPlan for this credential in its namespace
+/// (the supersede / consume / cleanup delete — the SC scope enforces "≤1 live
+/// plan per credential"). Best-effort: a 404 is tolerated (the plan already
+/// cascaded / a concurrent reconcile removed it); a non-404 delete error
+/// propagates so a genuine RBAC / apiserver fault surfaces rather than silently
+/// leaving a stale gate.
+async fn delete_sc_plans(
+    client: &Client,
+    sc_namespace: &str,
+    sc_name: &str,
+) -> Result<(), ReconcileError> {
+    let api: Api<MigrationPlan> = Api::namespaced(client.clone(), sc_namespace);
+    let selector =
+        format!("{SCOPE_LABEL}={SCOPE_SOURCECREDENTIAL},{SOURCE_CREDENTIAL_LABEL}={sc_name}");
+    let lp = ListParams::default().labels(&selector);
+    for plan in api.list(&lp).await?.items {
+        // Belt-and-braces exact scope match — a stray label shouldn't delete a
+        // different credential's plan.
+        if plan
+            .spec
+            .scope
+            .sourcecredential
+            .as_ref()
+            .is_none_or(|s| s.ref_.name != sc_name)
+        {
+            continue;
+        }
+        let Some(plan_name) = plan.metadata.name.as_deref() else {
+            continue;
+        };
+        match api.delete(plan_name, &DeleteParams::default()).await {
+            Ok(_) => {
+                info!(%sc_name, plan = %plan_name, "deleted superseded/consumed MigrationPlan")
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Build the paused status for the `CreatePlan` / `NoOp` / `DeleteThenCreate`
+/// arms: `phase = AwaitingMigrationApproval` + a `Ready=False/MigrationPending`
+/// condition and a `MigrationPending=True` condition naming the gating plan.
+/// PRESERVES the covered lists, `lastValidated`, and the migration BASELINE
+/// (`lastAppliedSpec`) from the prior status — the pause is skip-derive, the
+/// old wider-coverage Secrets stay in place, so their coverage lists and the
+/// baseline they derived from remain accurate. Carrying the baseline forward is
+/// LOAD-BEARING under SSA: omitting it would prune it and self-cancel the gate
+/// (the walk-found app-scope bug), so the pause would evaporate in one requeue.
+fn build_paused_status(
+    cred: &SourceCredential,
+    plan_ns: &str,
+    plan_name: &str,
+) -> SourceCredentialStatus {
+    let previous = cred
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let ready = condition(
+        "Ready",
+        "False",
+        "MigrationPending",
+        &format!("paused awaiting approval of MigrationPlan {plan_ns}/{plan_name}"),
+        previous,
+    );
+    let pending = condition(
+        COND_MIGRATION_PENDING,
+        "True",
+        "MigrationPending",
+        &format!("coverage-narrowing gated by MigrationPlan {plan_ns}/{plan_name}"),
+        previous,
+    );
+    carry_forward_status(
+        cred,
+        vec![ready, pending],
+        Some(PHASE_AWAITING_MIGRATION_APPROVAL),
+    )
+}
+
+/// Build the paused status for the `BlockFailed` arm — the gating plan is in
+/// phase `failed` and needs manual resolution. Mirrors [`build_paused_status`]
+/// but emits `Ready=False/MigrationFailed` + a `MigrationFailed=True` condition
+/// so consumers distinguish "awaiting approval" from "failed, manual delete
+/// required". Preserves the covered lists + baseline the same way.
+fn build_migration_failed_status(
+    cred: &SourceCredential,
+    plan_name: &str,
+) -> SourceCredentialStatus {
+    let previous = cred
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let ready = condition(
+        "Ready",
+        "False",
+        "MigrationFailed",
+        &format!("paused: MigrationPlan {plan_name} failed — manual delete required"),
+        previous,
+    );
+    let failed = condition(
+        "MigrationFailed",
+        "True",
+        "MigrationPlanFailed",
+        &format!("MigrationPlan {plan_name} failed — manual delete required to unblock derivation"),
+        previous,
+    );
+    carry_forward_status(
+        cred,
+        vec![ready, failed],
+        Some(PHASE_AWAITING_MIGRATION_APPROVAL),
+    )
+}
+
+/// Shared paused-status builder: carry the prior `coveredRepoPrefixes` /
+/// `coveredHosts` / `lastValidated` / `lastAppliedSpec` forward UNCHANGED (the
+/// pause left the derived Secrets in place, so none of those recompute) while
+/// swapping in the paused `conditions` + `phase`. Carrying every un-recomputed
+/// field is the SSA-prune guard: `patch_status` writes under a single forced
+/// field manager, so any field this payload OMITS is pruned — including the
+/// migration baseline, whose loss self-cancels the gate.
+fn carry_forward_status(
+    cred: &SourceCredential,
+    conditions: Vec<SourceCredentialCondition>,
+    phase: Option<&str>,
+) -> SourceCredentialStatus {
+    let prior = cred.status.as_ref();
+    SourceCredentialStatus {
+        conditions: Some(conditions),
+        covered_repo_prefixes: prior.and_then(|s| s.covered_repo_prefixes.clone()),
+        covered_hosts: prior.and_then(|s| s.covered_hosts.clone()),
+        last_validated: prior.and_then(|s| s.last_validated.clone()),
+        last_applied_spec: prior.and_then(|s| s.last_applied_spec.clone()),
+        phase: phase.map(str::to_string),
     }
 }
 
@@ -714,19 +1194,36 @@ mod tests {
 
     #[test]
     fn build_status_omits_empty_covered_lists() {
-        let s = build_status(vec![], vec![], vec![], None);
+        let s = build_status(vec![], vec![], vec![], None, None);
         assert!(s.covered_repo_prefixes.is_none());
         assert!(s.covered_hosts.is_none());
         assert!(s.last_validated.is_none());
+        assert!(s.last_applied_spec.is_none());
+        assert!(s.phase.is_none());
         let s = build_status(
             vec![],
             vec!["github.com/acme/".to_string()],
             vec!["ghcr.io/acme/".to_string()],
             Some("2026-05-31T00:00:00+00:00".to_string()),
+            None,
         );
         assert_eq!(s.covered_repo_prefixes.unwrap(), vec!["github.com/acme/"]);
         assert_eq!(s.covered_hosts.unwrap(), vec!["ghcr.io/acme/"]);
         assert!(s.last_validated.is_some());
+    }
+
+    // 2.16b-sc Task 7: the render-path baseline stamp threads the current spec
+    // into `build_status` as `lastAppliedSpec` and clears the paused phase.
+    #[test]
+    fn build_status_stamps_baseline_and_clears_phase() {
+        let spec = SourceCredentialSpec {
+            git: None,
+            registry: None,
+        };
+        let s = build_status(vec![], vec![], vec![], None, Some(spec.clone()));
+        assert_eq!(s.last_applied_spec.as_ref(), Some(&spec));
+        // Reaching the render path clears any prior AwaitingMigrationApproval.
+        assert!(s.phase.is_none());
     }
 
     #[test]
@@ -809,5 +1306,397 @@ mod tests {
             "acme"
         );
         assert_eq!(p["stringData"][".dockerconfigjson"], "{\"auths\":{}}");
+    }
+
+    // ---------------- 2.16b-sc Task 7: migration pause-gate tests ----------------
+
+    use operator_core::migration::change_hash;
+    use operator_core::{
+        MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus, MigrationSourceCredentialRef,
+        MigrationSourceCredentialScope, MigrationTrigger, SealedSecretRef, SourceBackend,
+        SourceGit, SourceRegistry,
+    };
+
+    fn sc_backend() -> SourceBackend {
+        SourceBackend {
+            sealed_secret_ref: Some(SealedSecretRef {
+                name: "srccred-acme-material".to_string(),
+                namespace: None,
+            }),
+            open_bao_path: None,
+        }
+    }
+
+    /// A SourceCredentialSpec with the given repo prefixes + registry hosts
+    /// (empty slice → that half is absent).
+    fn sc_spec(prefixes: &[&str], hosts: &[&str]) -> SourceCredentialSpec {
+        SourceCredentialSpec {
+            git: if prefixes.is_empty() {
+                None
+            } else {
+                Some(SourceGit {
+                    backend: sc_backend(),
+                    repo_prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+                })
+            },
+            registry: if hosts.is_empty() {
+                None
+            } else {
+                Some(SourceRegistry {
+                    backend: sc_backend(),
+                    hosts: hosts.iter().map(|s| s.to_string()).collect(),
+                })
+            },
+        }
+    }
+
+    /// An SC-scope MigrationPlan for `sc_name` with the given trigger tuple,
+    /// phase, and optional approval hash — mirrors `create_plan_for`'s scope +
+    /// label shape enough for the finder/state-machine tests.
+    fn sc_plan(
+        sc_name: &str,
+        trigger_type: &str,
+        field: &str,
+        phase: Option<&str>,
+        approved_hash: Option<String>,
+    ) -> MigrationPlan {
+        let spec = MigrationPlanSpec {
+            scope: MigrationPlanScope {
+                type_: "sourcecredential".into(),
+                application: None,
+                platform: None,
+                sourcecredential: Some(MigrationSourceCredentialScope {
+                    ref_: MigrationSourceCredentialRef {
+                        name: sc_name.into(),
+                        namespace: "apprafter-system".into(),
+                    },
+                }),
+            },
+            trigger: MigrationTrigger {
+                type_: trigger_type.into(),
+                field: field.into(),
+                from: None,
+                to: None,
+                approved_spec_hash: approved_hash,
+            },
+            risks: None,
+            changes: None,
+            plan: None,
+            approvers: None,
+            previous_spec_snapshot: None,
+        };
+        let mut mp = MigrationPlan::new(&format!("{sc_name}-migration-1"), spec);
+        mp.metadata.namespace = Some("apprafter-system".into());
+        if let Some(p) = phase {
+            mp.status = Some(MigrationPlanStatus {
+                phase: Some(p.into()),
+                ..MigrationPlanStatus::default()
+            });
+        }
+        mp
+    }
+
+    #[test]
+    fn sc_plan_name_is_deterministic_dns_safe_and_env_free() {
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            sc_plan_name("gh-creds", now),
+            "gh-creds-migration-1784246400"
+        );
+        // Same input → same name (deterministic given the timestamp).
+        assert_eq!(sc_plan_name("gh-creds", now), sc_plan_name("gh-creds", now));
+        // Non-DNS chars fold to '-', trailing '-' trimmed.
+        let folded = sc_plan_name("Team_A.Creds", now);
+        assert!(folded
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(!folded.ends_with('-'));
+        assert!(folded.starts_with("team-a-creds-migration-"));
+    }
+
+    #[test]
+    fn pick_sc_plan_selects_this_creds_plan_and_ignores_others() {
+        let mine = sc_plan(
+            "gh-creds",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            None,
+            None,
+        );
+        let other_cred = sc_plan(
+            "dh-creds",
+            "coverage-removal",
+            "spec.registry.hosts",
+            None,
+            None,
+        );
+        // An application-scope plan that (impossibly) shares the label must be
+        // rejected by the scope-type guard.
+        let mut app_scope = sc_plan(
+            "gh-creds",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            None,
+            None,
+        );
+        app_scope.spec.scope.type_ = "application".into();
+        app_scope.spec.scope.sourcecredential = None;
+
+        let plans = vec![other_cred.clone(), app_scope, mine.clone()];
+        let picked = pick_sc_plan(plans, "gh-creds").expect("gh-creds plan found");
+        assert_eq!(
+            picked.spec.scope.sourcecredential.unwrap().ref_.name,
+            "gh-creds"
+        );
+        // No plan for a credential with none.
+        assert!(pick_sc_plan(vec![other_cred], "gh-creds").is_none());
+        assert!(pick_sc_plan(vec![], "gh-creds").is_none());
+    }
+
+    #[test]
+    fn sc_uid_or_returns_uid_or_errors() {
+        let mut cred = SourceCredential::new("acme", sc_spec(&["github.com/acme/"], &[]));
+        cred.metadata.uid = Some("uid-1".into());
+        assert_eq!(sc_uid_or(&cred).unwrap(), "uid-1");
+        cred.metadata.uid = None;
+        assert!(matches!(
+            sc_uid_or(&cred),
+            Err(ReconcileError::MissingUid(_))
+        ));
+    }
+
+    // The gate DECISION over a mocked (old, new, plan), reusing the hoisted
+    // `detect_destructive` → `plan_state`/`plan_state_no_change` → `decide`
+    // exactly as the reconcile does. This exercises the SC-specific wiring
+    // without a cluster.
+    fn gate_decision(
+        old: Option<&SourceCredentialSpec>,
+        new: &SourceCredentialSpec,
+        plan: Option<&MigrationPlan>,
+    ) -> MigrationDecision {
+        let change = SourceCredentialMigrationStrategy::detect_destructive(old, new);
+        let candidates: Vec<DestructiveChange> = change.into_iter().collect();
+        let state = match candidates.first() {
+            Some(c) => plan_state(plan, c, &candidates),
+            None => plan_state_no_change(plan),
+        };
+        decide(!candidates.is_empty(), state)
+    }
+
+    #[test]
+    fn gate_first_derive_no_baseline_renders_without_gating() {
+        // old = None (first reconcile / pre-2.16b-sc credential): no detection,
+        // no plan → Render (derive + stamp the first baseline).
+        let new = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        assert_eq!(gate_decision(None, &new, None), MigrationDecision::Render);
+    }
+
+    #[test]
+    fn gate_coverage_removal_with_no_plan_creates_plan() {
+        // A repoPrefix removed vs the baseline + no plan yet → CreatePlan (pause
+        // BOTH halves).
+        let old = sc_spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        assert_eq!(
+            gate_decision(Some(&old), &new, None),
+            MigrationDecision::CreatePlan
+        );
+    }
+
+    #[test]
+    fn gate_coverage_removal_with_matching_blocking_plan_is_noop() {
+        // Same removal, a matching pending plan already gates → NoOp (stay
+        // paused, derive nothing).
+        let old = sc_spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let plan = sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("pending-approval"),
+            None,
+        );
+        assert_eq!(
+            gate_decision(Some(&old), &new, Some(&plan)),
+            MigrationDecision::NoOp
+        );
+    }
+
+    #[test]
+    fn gate_coverage_removal_with_completed_matching_plan_consumes() {
+        // The operator approved → the MigrationController drove the plan to
+        // `completed`. Its stamped approval hash covers the current candidate
+        // set → ConsumeApply (derive with the narrowed coverage + stamp).
+        let old = sc_spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let change =
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
+        let candidate_set = std::slice::from_ref(&change);
+        let plan = sc_plan(
+            "acme",
+            &change.trigger_type,
+            &change.field,
+            Some("completed"),
+            Some(change_hash(candidate_set)),
+        );
+        assert_eq!(
+            gate_decision(Some(&old), &new, Some(&plan)),
+            MigrationDecision::ConsumeApply
+        );
+    }
+
+    #[test]
+    fn gate_completed_plan_with_wrong_hash_re_gates_not_consumes() {
+        // S-4: a completed, tuple-matching plan whose stamped hash is for a
+        // DIFFERENT change must NOT transfer → DeleteThenCreate (re-gate), never
+        // ConsumeApply.
+        let old = sc_spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let change =
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new).unwrap();
+        // A hash over a different candidate (removing a host instead) — same
+        // trigger family but different content.
+        let other = DestructiveChange {
+            trigger_type: change.trigger_type.clone(),
+            field: change.field.clone(),
+            from: Some(json!({ "removedRepoPrefixes": ["github.com/x/"] })),
+            to: None,
+            classification: "breaking".into(),
+        };
+        let plan = sc_plan(
+            "acme",
+            &change.trigger_type,
+            &change.field,
+            Some("completed"),
+            Some(change_hash(std::slice::from_ref(&other))),
+        );
+        assert_eq!(
+            gate_decision(Some(&old), &new, Some(&plan)),
+            MigrationDecision::DeleteThenCreate
+        );
+    }
+
+    #[test]
+    fn gate_widen_back_with_stale_plan_deletes_then_renders() {
+        // The user re-widened: the baseline is the NARROW spec (what was
+        // derived), and the new spec re-adds the prefix → no destructive delta
+        // (widening is not destructive). A stale plan from the earlier narrowing
+        // lingers → DeleteThenRender (GC the plan, derive, re-stamp).
+        let baseline = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let widened = sc_spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        // sanity: widening is not destructive
+        assert!(
+            SourceCredentialMigrationStrategy::detect_destructive(Some(&baseline), &widened)
+                .is_none()
+        );
+        let stale = sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("completed"),
+            None,
+        );
+        assert_eq!(
+            gate_decision(Some(&baseline), &widened, Some(&stale)),
+            MigrationDecision::DeleteThenRender
+        );
+        // …and with no lingering plan, a widen just renders.
+        assert_eq!(
+            gate_decision(Some(&baseline), &widened, None),
+            MigrationDecision::Render
+        );
+    }
+
+    #[test]
+    fn gate_coverage_removal_with_failed_plan_blocks() {
+        // The gating plan is in phase=failed → BlockFailed (stay paused, manual
+        // delete required).
+        let old = sc_spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let plan = sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("failed"),
+            None,
+        );
+        assert_eq!(
+            gate_decision(Some(&old), &new, Some(&plan)),
+            MigrationDecision::BlockFailed
+        );
+    }
+
+    #[test]
+    fn build_paused_status_gates_and_preserves_baseline_and_covered_lists() {
+        // A prior status carrying a baseline + covered lists must survive the
+        // pause write (SSA-prune guard): the pause skips derivation, so nothing
+        // recomputes and everything is carried forward.
+        let baseline = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let mut cred = SourceCredential::new("acme", baseline.clone());
+        cred.metadata.namespace = Some("apprafter-system".into());
+        cred.status = Some(SourceCredentialStatus {
+            covered_repo_prefixes: Some(vec!["github.com/acme/".into()]),
+            covered_hosts: Some(vec!["ghcr.io/acme/".into()]),
+            last_validated: Some("2026-07-01T00:00:00+00:00".into()),
+            last_applied_spec: Some(baseline.clone()),
+            ..SourceCredentialStatus::default()
+        });
+        let s = build_paused_status(&cred, "apprafter-system", "acme-migration-1");
+        // Phase flipped, conditions present.
+        assert_eq!(s.phase.as_deref(), Some(PHASE_AWAITING_MIGRATION_APPROVAL));
+        let conds = s.conditions.unwrap();
+        assert!(conds
+            .iter()
+            .any(|c| c.type_ == "Ready" && c.status == "False"));
+        assert!(conds
+            .iter()
+            .any(|c| c.type_ == COND_MIGRATION_PENDING && c.status == "True"));
+        // Baseline + covered lists carried forward UNCHANGED (not pruned).
+        assert_eq!(s.last_applied_spec.as_ref(), Some(&baseline));
+        assert_eq!(s.covered_repo_prefixes.unwrap(), vec!["github.com/acme/"]);
+        assert_eq!(s.covered_hosts.unwrap(), vec!["ghcr.io/acme/"]);
+        assert!(s.last_validated.is_some());
+    }
+
+    #[test]
+    fn build_migration_failed_status_surfaces_failed_condition_and_carries_baseline() {
+        let baseline = sc_spec(&["github.com/acme/"], &[]);
+        let mut cred = SourceCredential::new("acme", baseline.clone());
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(baseline.clone()),
+            ..SourceCredentialStatus::default()
+        });
+        let s = build_migration_failed_status(&cred, "acme-migration-1");
+        assert_eq!(s.phase.as_deref(), Some(PHASE_AWAITING_MIGRATION_APPROVAL));
+        let conds = s.conditions.unwrap();
+        assert!(conds
+            .iter()
+            .any(|c| c.type_ == "MigrationFailed" && c.status == "True"));
+        assert!(conds
+            .iter()
+            .any(|c| c.type_ == "Ready" && c.status == "False"));
+        // The failed gate does NOT re-stamp — the credential is still on the
+        // prior baseline; carry it forward (SSA-prune guard).
+        assert_eq!(s.last_applied_spec.as_ref(), Some(&baseline));
     }
 }

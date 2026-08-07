@@ -62,6 +62,14 @@ rules:
   # that — without it the GC's delete 403s (best-effort, logged) and
   # completed plans pile up (walk-found: the GC shipped in 0.2.29/0.2.30
   # but the delete verb did not, so it never cleaned anything).
+  #
+  # 2.16b-sc extension: the SourceCredential controller (same operator
+  # binary) gates a destructive coverage-narrowing behind an SC-scope
+  # MigrationPlan — it lists (finder), creates (gate), and deletes
+  # (supersede / consume / cleanup) migrationplans in the credential's
+  # namespace. All those verbs are already granted below cluster-wide,
+  # so no new rule is needed; documented here so the "RBAC matches code
+  # verbs" audit finds the new consumer.
   - apiGroups:
       - apprafter.io
     resources:
