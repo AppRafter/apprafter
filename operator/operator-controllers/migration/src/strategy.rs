@@ -415,30 +415,68 @@ impl ApplicationMigrationStrategy {
         let old_env = old.env.as_ref().unwrap_or(&empty_env);
         let new_env = new.env.as_ref().unwrap_or(&empty_env);
         for (key, new_val) in new_env {
-            match old_env.get(key) {
-                // Key ADDED. Only a `secret:` ref add is gated (#7): the
-                // container gains a fresh external-secret dependency. A claim
-                // ref add is self-scoped (ADR 0046 — provider-derived) → soft.
-                None => {
-                    if let EnvValue::Ref(r @ EnvRef::Secret(_)) = new_val {
-                        candidates.push(DestructiveChange {
-                            trigger_type: "env-secret-ref-add".to_string(),
-                            field: format!("env.{key}"),
-                            from: Some(json!("(absent)")),
-                            to: Some(json!(render_env_ref(r))),
-                            classification: "security-boundary".to_string(),
-                        });
+            let baseline = old_env.get(key);
+            // #7 env-secret-ref-add (2.16b-sec F-2 broadened): a key whose NEW
+            // value is a `secret:` ref, ACQUIRED from any non-Secret baseline —
+            // `Absent`, `Literal`, or `Ref(Claim)`. This is the exfil primitive:
+            // the container gains a fresh external-secret dependency. Pre-F-2 the
+            // gate only covered the `Absent → Secret` (new-key) case; a caller
+            // could dodge it by REUSING an existing key (`Literal → Secret`,
+            // `Ref(Claim) → Secret`), which fell through #8 (wants → Literal) and
+            // #9 (wants Secret → Secret) into SOFT. The gate now fires for the
+            // whole `{Absent, Literal, Ref(Claim)} → Ref(Secret)` set.
+            //
+            // Disjoint from #9 by construction: #9 is `Ref(Secret) → Ref(Secret)`
+            // (a ≠ b), which is EXCLUDED here (baseline is a Secret ref) and
+            // handled in the `Some` arm below — so exactly one of #7/#9 fires for
+            // any `→ Ref(Secret)` transition (no double-fire, no gap).
+            //
+            // `from` is a structural SENTINEL by baseline shape (S1.4 — NEVER a
+            // literal env VALUE): Absent → `"(absent)"`, Literal → `"(literal)"`,
+            // Ref(Claim) → the `render_env_ref` claim sentinel. `to` is the
+            // secret ref sentinel.
+            if let EnvValue::Ref(new_r @ EnvRef::Secret(_)) = new_val {
+                let from = match baseline {
+                    None => Some("(absent)".to_string()),
+                    Some(EnvValue::Literal(_)) => Some("(literal)".to_string()),
+                    Some(EnvValue::Ref(EnvRef::Claim(_))) => {
+                        // safe: matched Ref(Claim).
+                        if let Some(EnvValue::Ref(old_r)) = baseline {
+                            Some(render_env_ref(old_r))
+                        } else {
+                            unreachable!("baseline matched Ref(Claim)")
+                        }
                     }
+                    // Baseline is already a Secret ref — that's #9 territory
+                    // (retarget), handled in the `Some` arm; not #7.
+                    Some(EnvValue::Ref(EnvRef::Secret(_))) => None,
+                };
+                if let Some(from) = from {
+                    candidates.push(DestructiveChange {
+                        trigger_type: "env-secret-ref-add".to_string(),
+                        field: format!("env.{key}"),
+                        from: Some(json!(from)),
+                        to: Some(json!(render_env_ref(new_r))),
+                        classification: "security-boundary".to_string(),
+                    });
+                    // The #7 gate owns this key's transition; #8/#9 below only
+                    // match a non-Secret new value or a Secret→Secret retarget,
+                    // neither of which overlaps a `→ Ref(Secret)` acquire from a
+                    // non-Secret baseline. Continue to keep the arms disjoint.
+                    continue;
                 }
-                // Key present BOTH sides. Two security-boundary transitions:
-                //   #8 downgrade: `Ref(_)` → `Literal(_)` — a resolved-at-
-                //      runtime reference replaced by an inline value. `to` is
-                //      the `"(literal)"` SENTINEL, never the literal VALUE.
-                //   #9 retarget: `Ref(Secret(a))` → `Ref(Secret(b))`, a≠b — a
-                //      different external secret. A claim→claim retarget is
-                //      self-scoped (not #9); a secret↔claim variant change is
-                //      neither #8 (still a Ref) nor #9 (not secret→secret).
-                Some(old_val) => match (old_val, new_val) {
+            }
+
+            // Key present BOTH sides. Two more security-boundary transitions:
+            //   #8 downgrade: `Ref(_)` → `Literal(_)` — a resolved-at-runtime
+            //      reference replaced by an inline value. `to` is the
+            //      `"(literal)"` SENTINEL, never the literal VALUE.
+            //   #9 retarget: `Ref(Secret(a))` → `Ref(Secret(b))`, a≠b — a
+            //      different external secret. A claim→claim retarget is
+            //      self-scoped (not #9); a secret↔claim variant change is
+            //      neither #8 (still a Ref) nor #9 (not secret→secret).
+            if let Some(old_val) = baseline {
+                match (old_val, new_val) {
                     (EnvValue::Ref(old_r), EnvValue::Literal(_)) => {
                         candidates.push(DestructiveChange {
                             trigger_type: "env-ref-downgrade".to_string(),
@@ -461,7 +499,7 @@ impl ApplicationMigrationStrategy {
                         });
                     }
                     _ => {}
-                },
+                }
             }
         }
 
@@ -1855,26 +1893,187 @@ mod application_detect_destructive_tests {
         .is_none());
     }
 
-    // secret→claim / claim→secret are NOT #9 (only secret→secret different
-    // target retargets). A secret→claim change is a self-scoping move (the
-    // claim ref is provider-derived), and a claim→secret ADD-of-secret-surface
-    // reuses an existing key so it isn't #7 either — both stay SOFT here.
+    // secret → claim is a NARROWING (self-scoping) move → SOFT; but 2.16b-sec
+    // F-2 FLIPPED the claim → secret crossover: reusing an existing key to
+    // ACQUIRE a secret ref is the same exfil primitive as an absent → secret
+    // add, so it now GATES as the broadened #7 (`env-secret-ref-add`). This
+    // test asserts the corrected asymmetry.
     #[test]
-    fn secret_to_claim_and_claim_to_secret_crossovers_are_soft() {
-        // secret → claim (both sides Ref, different variant): not a retarget,
-        // not a downgrade (new is still a Ref).
+    fn secret_to_claim_narrowing_soft_but_claim_to_secret_gates() {
+        // secret → claim (both sides Ref, different variant): a narrowing to a
+        // self-scoped provider-derived ref — not a retarget, not a downgrade
+        // (new is still a Ref) → SOFT.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into()))),
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Claim("pg.url".into())))
         )
         .is_none());
-        // claim → secret (both sides Ref): existing key, so not #7; different
-        // variant, so not #9; new is a Ref, so not #8 downgrade.
-        assert!(ApplicationMigrationStrategy::detect_destructive(
+        // claim → secret (2.16b-sec F-2): the key ACQUIRES an external-secret
+        // dependency by reusing an existing key — now gated as the broadened #7.
+        let c = ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
-            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into())))
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into()))),
         )
-        .is_none());
+        .unwrap();
+        assert_eq!(c.trigger_type, "env-secret-ref-add");
+        assert_eq!(c.classification, "security-boundary");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "claim.pg.url");
+        assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "secret:a/k");
+    }
+
+    // ---- 2.16b-sec F-2: a key that ACQUIRES a secret-ref is gated (#7) ----
+
+    // F-2 (HIGH): a key that ALREADY EXISTS in baseline and changes to a
+    // `secret:` ref (`Ref(Claim) → Ref(Secret)` or `Literal → Ref(Secret)`)
+    // is the SAME exfil primitive #7 was built for — the container gains a
+    // fresh external-secret dependency — just reached by reusing an existing
+    // key rather than adding a new one. Pre-fix it fell through ALL gates
+    // (#7 wants absent→secret, #8 wants →literal, #9 wants secret→secret) and
+    // went SOFT. The broadened #7 gates it. `from` is a structural SENTINEL
+    // by baseline (NEVER the literal value — S1.4), `to` is the secret sentinel.
+    #[test]
+    fn key_acquiring_secret_ref_gates_from_claim_or_literal() {
+        // claim -> secret
+        let c = ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "DB", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
+            &with_env(
+                base(),
+                "DB",
+                EnvValue::Ref(EnvRef::Secret("stripe-prod/key".into())),
+            ),
+        )
+        .unwrap();
+        assert_eq!(c.trigger_type, "env-secret-ref-add");
+        assert_eq!(c.classification, "security-boundary");
+        assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "claim.pg.url");
+        assert_eq!(
+            c.to.as_ref().unwrap().as_str().unwrap(),
+            "secret:stripe-prod/key"
+        );
+        // literal -> secret (from = "(literal)", NEVER the value)
+        let c2 = ApplicationMigrationStrategy::detect_destructive(
+            &with_env(base(), "K", EnvValue::Literal("s3cr3t-value".into())),
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/b".into()))),
+        )
+        .unwrap();
+        assert_eq!(c2.trigger_type, "env-secret-ref-add");
+        assert_eq!(c2.from.as_ref().unwrap().as_str().unwrap(), "(literal)");
+        assert!(!format!("{c2:?}").contains("s3cr3t-value"));
+    }
+
+    // Property: for any (baseline, new) where `new == Ref(Secret)` and
+    // `baseline != new`, EXACTLY ONE of #7 (env-secret-ref-add) / #9
+    // (env-secret-ref-retarget) fires — they are disjoint (#7 owns
+    // Absent/Literal/Ref(Claim)→Secret, #9 owns Secret(a)→Secret(b), a≠b) and
+    // neither is missed. This is the "no double-fire, no gap" oracle.
+    #[test]
+    fn exactly_one_gate_when_key_acquires_secret_ref() {
+        let target = EnvValue::Ref(EnvRef::Secret("stripe/key".into()));
+        // Enumerate the four baseline shapes (Secret uses a DIFFERENT target so
+        // it's a genuine retarget, not a no-op).
+        let baselines: Vec<Option<EnvValue>> = vec![
+            None,                                                    // Absent
+            Some(EnvValue::Literal("inline".into())),                // Literal
+            Some(EnvValue::Ref(EnvRef::Claim("pg.url".into()))),     // Ref(Claim)
+            Some(EnvValue::Ref(EnvRef::Secret("other/tok".into()))), // Ref(Secret), different
+        ];
+        for base_val in baselines {
+            let old = match &base_val {
+                None => base(),
+                Some(v) => with_env(base(), "K", v.clone()),
+            };
+            let new = with_env(base(), "K", target.clone());
+            let sec: Vec<_> = ApplicationMigrationStrategy::detect_all(&old, &new)
+                .into_iter()
+                .filter(|c| {
+                    c.trigger_type == "env-secret-ref-add"
+                        || c.trigger_type == "env-secret-ref-retarget"
+                })
+                .collect();
+            assert_eq!(
+                sec.len(),
+                1,
+                "exactly one secret-gate must fire for baseline {base_val:?}"
+            );
+            match base_val {
+                Some(EnvValue::Ref(EnvRef::Secret(_))) => {
+                    assert_eq!(sec[0].trigger_type, "env-secret-ref-retarget");
+                }
+                _ => assert_eq!(sec[0].trigger_type, "env-secret-ref-add"),
+            }
+        }
+    }
+
+    // The full 16-cell transition matrix (baseline × new), asserting the
+    // GATED trigger (or None) for each. This is the F-2 test oracle — the
+    // GAP cells (Literal→Secret, Ref(Claim)→Secret) now resolve to #7.
+    // (`(⚡)` cells that ALSO carry an env-ref-removal are asserted by their
+    // primary/trigger below; here we assert the secret/downgrade gate that F-2
+    // touches. Absent→{Literal,Claim} and Literal→{Absent,Literal,Claim} etc.
+    // that carry NO env security-boundary op assert `None`.)
+    #[test]
+    fn full_env_transition_matrix() {
+        let absent = || None::<EnvValue>;
+        let lit = || Some(EnvValue::Literal("v".into()));
+        let claim = || Some(EnvValue::Ref(EnvRef::Claim("pg.url".into())));
+        let sec_a = || Some(EnvValue::Ref(EnvRef::Secret("a/k".into())));
+        let sec_b = || Some(EnvValue::Ref(EnvRef::Secret("b/k".into())));
+
+        // (baseline, new, expected primary env trigger over the "K" key)
+        // None => no env candidate at all.
+        let cases: Vec<(Option<EnvValue>, Option<EnvValue>, Option<&str>)> = vec![
+            // baseline Absent
+            (absent(), lit(), None),
+            (absent(), claim(), None),
+            (absent(), sec_a(), Some("env-secret-ref-add")), // #7
+            // baseline Literal
+            (lit(), absent(), None), // literal removal soft
+            (lit(), lit(), None),    // literal→literal soft
+            (lit(), claim(), None),  // literal→claim soft
+            (lit(), sec_a(), Some("env-secret-ref-add")), // GAP → #7
+            // baseline Ref(Claim)
+            (claim(), absent(), Some("env-ref-removal")), // #6
+            (claim(), lit(), Some("env-ref-downgrade")),  // #8
+            (claim(), claim(), None),                     // self-scoped retarget soft
+            (claim(), sec_a(), Some("env-secret-ref-add")), // GAP → #7
+            // baseline Ref(Secret)
+            (sec_a(), absent(), Some("env-ref-removal")), // #6
+            (sec_a(), lit(), Some("env-ref-downgrade")),  // #8
+            (sec_a(), claim(), None),                     // narrowing → soft
+            (sec_a(), sec_b(), Some("env-secret-ref-retarget")), // #9 (a≠b)
+        ];
+
+        for (old_v, new_v, expected) in cases {
+            let old = match &old_v {
+                None => base(),
+                Some(v) => with_env(base(), "K", v.clone()),
+            };
+            let new = match &new_v {
+                None => base(),
+                Some(v) => with_env(base(), "K", v.clone()),
+            };
+            let env_cands: Vec<_> = ApplicationMigrationStrategy::detect_all(&old, &new)
+                .into_iter()
+                .filter(|c| c.field == "env.K")
+                .collect();
+            match expected {
+                None => assert!(
+                    env_cands.is_empty(),
+                    "expected NO env gate for {old_v:?} -> {new_v:?}, got {env_cands:?}"
+                ),
+                Some(t) => {
+                    assert_eq!(
+                        env_cands.len(),
+                        1,
+                        "expected exactly one env gate for {old_v:?} -> {new_v:?}, got {env_cands:?}"
+                    );
+                    assert_eq!(
+                        env_cands[0].trigger_type, t,
+                        "wrong gate for {old_v:?} -> {new_v:?}"
+                    );
+                }
+            }
+        }
     }
 
     // Composite: adding `needs.pg` together with an `env DB=claim.pg.url` (the
