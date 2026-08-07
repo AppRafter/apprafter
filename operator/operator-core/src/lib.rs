@@ -7,6 +7,7 @@ pub mod matching;
 pub mod metrics;
 pub mod migration;
 pub mod migration_plan;
+pub mod migration_state;
 pub mod platform_stack;
 pub mod resourceclaim;
 pub mod retainedclaim;
@@ -30,6 +31,7 @@ pub use migration_plan::{
     MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus,
     MigrationPlatformScope, MigrationRisks, MigrationStep, MigrationTrigger,
 };
+pub use migration_state::{decide, plan_state, plan_state_no_change, MigrationDecision, PlanState};
 pub use platform_stack::{
     resolve_egress_profile, EgressConfig, EgressProfile, NetworkConfig, PlatformStack,
     PlatformStackComponent, PlatformStackComponentOverride, PlatformStackCondition,
