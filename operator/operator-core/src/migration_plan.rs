@@ -58,14 +58,16 @@ pub struct MigrationPlanSpec {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct MigrationPlanScope {
-    /// `"application"` or `"platform"`. The webhook enforces
-    /// that the matching sub-object is populated.
+    /// `"application"`, `"platform"`, or `"sourcecredential"`. The
+    /// webhook enforces that the matching sub-object is populated.
     #[serde(rename = "type")]
     pub type_: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application: Option<MigrationApplicationScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<MigrationPlatformScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sourcecredential: Option<MigrationSourceCredentialScope>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -89,6 +91,22 @@ pub struct MigrationPlatformScope {
     /// Webhook rejects the platform-scope plan when this list
     /// is empty.
     pub components: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct MigrationSourceCredentialScope {
+    // CRD field is `ref` (Kubernetes convention) but `ref` is
+    // a reserved word in Rust — rename via serde. SourceCredential
+    // has no per-env dimension, so there is no `environment` field
+    // here (unlike the application scope).
+    #[serde(rename = "ref")]
+    pub ref_: MigrationSourceCredentialRef,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct MigrationSourceCredentialRef {
+    pub name: String,
+    pub namespace: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -239,4 +257,49 @@ pub struct ExecutedStep {
     pub outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sourcecredential_scope_round_trips() {
+        // 2.16b-sc: a `sourcecredential`-scope MigrationPlan spec
+        // deserializes into the typed struct with the discriminator +
+        // `sourcecredential.ref.{name,namespace}` populated and the
+        // `application` / `platform` sub-objects both `None`. It then
+        // serializes back to the same JSON shape (serde `rename = "ref"`
+        // and the `skip_serializing_if` guards preserve byte-identity).
+        let raw = json!({
+            "scope": {
+                "type": "sourcecredential",
+                "sourcecredential": {
+                    "ref": { "name": "github-org", "namespace": "apprafter-system" }
+                }
+            },
+            "trigger": { "type": "coverage-removal", "field": "spec.git.repoPrefixes" }
+        });
+
+        let spec: MigrationPlanSpec =
+            serde_json::from_value(raw.clone()).expect("sourcecredential scope must deserialize");
+
+        assert_eq!(spec.scope.type_, "sourcecredential");
+        assert!(spec.scope.application.is_none());
+        assert!(spec.scope.platform.is_none());
+        let sc = spec
+            .scope
+            .sourcecredential
+            .as_ref()
+            .expect("sourcecredential sub-object must be present");
+        assert_eq!(sc.ref_.name, "github-org");
+        assert_eq!(sc.ref_.namespace, "apprafter-system");
+
+        let round = serde_json::to_value(&spec).expect("re-serialize");
+        assert_eq!(
+            round, raw,
+            "sourcecredential scope must round-trip byte-identically"
+        );
+    }
 }

@@ -360,6 +360,7 @@ mod tests {
                     environment: "prod".into(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: "t".into(),

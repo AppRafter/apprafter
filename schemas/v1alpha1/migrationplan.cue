@@ -71,7 +71,7 @@ package v1alpha1
 // because CUE cannot express a conditional-required-field
 // in a way that round-trips through OpenAPI v3 cleanly.
 #MigrationPlanScope: {
-	type: "application" | "platform"
+	type: "application" | "platform" | "sourcecredential"
 
 	application?: {
 		ref: {
@@ -87,6 +87,20 @@ package v1alpha1
 		// admission webhook — a platform-scope plan that
 		// touches zero components is nonsensical.
 		components: [...string]
+	}
+
+	// 2.16b-sc: gates a destructive coverage change on a
+	// SourceCredential (removing a covered repoPrefix / registry
+	// host) behind approval. `ref` names the SourceCredential CR
+	// being edited. Unlike application scope there is NO
+	// `environment` field — a SourceCredential has no per-env
+	// dimension. The webhook enforces "if type=sourcecredential,
+	// scope.sourcecredential is present with a non-empty ref".
+	sourcecredential?: {
+		ref: {
+			name:      string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
+			namespace: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
+		}
 	}
 }
 

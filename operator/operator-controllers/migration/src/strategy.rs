@@ -601,6 +601,7 @@ impl ApplicationMigrationStrategy {
                     environment: environment.to_string(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: change.trigger_type.clone(),
@@ -1133,6 +1134,7 @@ mod tests {
                     environment: "prod".into(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: "selector-change".into(),
@@ -1158,6 +1160,7 @@ mod tests {
                 platform: Some(operator_core::MigrationPlatformScope {
                     components: vec!["apprafter-operator".into()],
                 }),
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: "platform-classification".into(),

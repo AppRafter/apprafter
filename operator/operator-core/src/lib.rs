@@ -29,7 +29,8 @@ pub use migration::{DestructiveChange, MigrationError, MigrationStrategy, StepOu
 pub use migration_plan::{
     ExecutedStep, MigrationApplicationRef, MigrationApplicationScope, MigrationChange,
     MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationPlanStatus,
-    MigrationPlatformScope, MigrationRisks, MigrationStep, MigrationTrigger,
+    MigrationPlatformScope, MigrationRisks, MigrationSourceCredentialRef,
+    MigrationSourceCredentialScope, MigrationStep, MigrationTrigger,
 };
 pub use migration_state::{decide, plan_state, plan_state_no_change, MigrationDecision, PlanState};
 pub use platform_stack::{

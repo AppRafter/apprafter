@@ -1935,6 +1935,7 @@ fn build_platform_migration_plan_cr(
                 // values between the two chart versions.
                 components: vec!["platform-stack".into()],
             }),
+            sourcecredential: None,
         },
         trigger: MigrationTrigger {
             type_: "platform-classification".into(),
@@ -3193,6 +3194,7 @@ mod tests {
                 platform: Some(MigrationPlatformScope {
                     components: vec!["x".into()],
                 }),
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: "t".into(),
@@ -3230,6 +3232,7 @@ mod tests {
                 platform: Some(MigrationPlatformScope {
                     components: vec!["x".into()],
                 }),
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: "t".into(),

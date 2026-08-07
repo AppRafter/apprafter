@@ -158,10 +158,28 @@ spec:
                     required:
                     - components
                     type: object
+                  sourcecredential:
+                    properties:
+                      ref:
+                        properties:
+                          name:
+                            pattern: ^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$
+                            type: string
+                          namespace:
+                            pattern: ^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
+                    required:
+                    - ref
+                    type: object
                   type:
                     enum:
                     - application
                     - platform
+                    - sourcecredential
                     type: string
                 required:
                 - type

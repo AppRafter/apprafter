@@ -3008,6 +3008,7 @@ mod tests {
                     environment: environment.into(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: "t".into(),
@@ -3043,6 +3044,7 @@ mod tests {
                 platform: Some(operator_core::MigrationPlatformScope {
                     components: vec!["apprafter-operator".into()],
                 }),
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: "t".into(),
@@ -5244,6 +5246,7 @@ mod tests {
                     environment: "prod".into(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: trigger_type.into(),
@@ -5290,6 +5293,7 @@ mod tests {
                     environment: "prod".into(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: change.trigger_type.clone(),

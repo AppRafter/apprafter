@@ -283,6 +283,7 @@ mod tests {
                     environment: "prod".into(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: trigger_type.into(),
@@ -384,6 +385,7 @@ mod tests {
                     environment: "prod".into(),
                 }),
                 platform: None,
+                sourcecredential: None,
             },
             trigger: MigrationTrigger {
                 type_: change.trigger_type.clone(),
