@@ -23,7 +23,9 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use operator_core::{Application, ApplicationBaseSpec};
+use operator_core::{
+    Application, ApplicationBaseSpec, ApplicationExpose, ExposeOverride, ImagePolicy,
+};
 
 /// Output of `render_application`. Always carries a Deployment;
 /// `service` is `Some(...)` only when the Application sets
@@ -214,12 +216,97 @@ pub fn render_application_for_env(
     }
 }
 
+/// A partial `environments[*]` override produced an effective spec the
+/// renderer cannot use. Surfaced by the reconcile as `Ready=False` reason
+/// `InvalidEffectiveSpec` (nothing applied). Should be unreachable in
+/// practice — the webhook guards the base-absent env-only-expose case.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum EffectiveSpecError {
+    #[error("effective expose has no port (env-only expose override without a port, and no base.expose)")]
+    ExposeMissingPort,
+}
+
+/// Promote a base-absent [`ExposeOverride`] to a full [`ApplicationExpose`]
+/// (2.16c). `port` is required on the target, so an override with no port
+/// and no base to inherit from is `EffectiveSpecError::ExposeMissingPort`.
+/// A free function rather than an inherent method — `ExposeOverride` lives
+/// in `operator-core` (orphan rule) and `EffectiveSpecError` lives here.
+fn try_into_expose(o: ExposeOverride) -> Result<ApplicationExpose, EffectiveSpecError> {
+    Ok(ApplicationExpose {
+        port: o.port.ok_or(EffectiveSpecError::ExposeMissingPort)?,
+        network: o.network,
+        hostname: o.hostname,
+        tls: o.tls,
+    })
+}
+
+/// Fold a partial per-environment [`ExposeOverride`] onto the base
+/// [`ApplicationExpose`] (2.16c) — subfield-level override-wins. Set
+/// override fields replace the corresponding base field; unset override
+/// fields inherit the base (so `port`, which is required on
+/// `ApplicationExpose` but optional on the override, is inherited when the
+/// env omits it). When there is no base and the env override omits `port`,
+/// there is no effective port → `EffectiveSpecError::ExposeMissingPort`.
+fn merge_expose(
+    base: Option<ApplicationExpose>,
+    ovr: Option<ExposeOverride>,
+) -> Result<Option<ApplicationExpose>, EffectiveSpecError> {
+    match (base, ovr) {
+        (b, None) => Ok(b),
+        (None, Some(o)) => Ok(Some(try_into_expose(o)?)),
+        (Some(mut b), Some(o)) => {
+            // Destructure the override so a new field added later is a
+            // compile error here (forces the merge to consider it).
+            let ExposeOverride {
+                port,
+                network,
+                hostname,
+                tls,
+            } = o;
+            if let Some(p) = port {
+                b.port = p;
+            }
+            if network.is_some() {
+                b.network = network;
+            }
+            if hostname.is_some() {
+                b.hostname = hostname;
+            }
+            if tls.is_some() {
+                b.tls = tls;
+            }
+            Ok(Some(b))
+        }
+    }
+}
+
+/// Fold a per-environment [`ImagePolicy`] onto the base (2.16c) —
+/// subfield-level override-wins. `imagePolicy` reuses the base type (it is
+/// a single-field struct today), so this is a set-field-wins merge rather
+/// than a wholesale replace: an env with `imagePolicy: {}` (no `resolve`)
+/// inherits the base `resolve` instead of blanking it.
+fn merge_image_policy(base: Option<ImagePolicy>, ovr: Option<ImagePolicy>) -> Option<ImagePolicy> {
+    match (base, ovr) {
+        (b, None) => b,
+        (None, o) => o,
+        (Some(mut b), Some(o)) => {
+            let ImagePolicy { resolve } = o;
+            if resolve.is_some() {
+                b.resolve = resolve;
+            }
+            Some(b)
+        }
+    }
+}
+
 /// Compute the effective spec — `base` unified with the named
 /// environment override (when present). Fields set in the override
 /// replace base fields; the env map merges with override-wins on
-/// conflict. v1alpha1 doesn't include CUE-only constructs, so this
-/// pure-Rust merge is functionally equivalent to CUE unification
-/// for our schema.
+/// conflict. `expose` and `imagePolicy` deep-merge at the subfield level
+/// (2.16c — [`merge_expose`] / [`merge_image_policy`]); `needs` still
+/// replaces per-key wholesale (→ 2.16i). v1alpha1 doesn't include CUE-only
+/// constructs, so this pure-Rust merge is functionally equivalent to CUE
+/// unification for our schema.
 pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationBaseSpec {
     let mut effective = app.spec.base.clone().unwrap_or_default();
     let Some(name) = env_name else {
@@ -234,12 +321,18 @@ pub fn effective_spec(app: &Application, env_name: Option<&str>) -> ApplicationB
     if env_override.replicas.is_some() {
         effective.replicas = env_override.replicas;
     }
-    if env_override.expose.is_some() {
-        effective.expose = env_override.expose.clone();
+    // 2.16c: `expose` deep-merges at the subfield level (override-wins;
+    // `port` inherits the base when the env omits it). Task 5 makes
+    // `effective_spec` fallible and surfaces the base-absent-no-port case as
+    // `InvalidEffectiveSpec`; until then a merge error leaves the base expose
+    // in place (drops the invalid env-only override).
+    match merge_expose(effective.expose.clone(), env_override.expose.clone()) {
+        Ok(merged) => effective.expose = merged,
+        Err(_) => { /* keep base expose; Task 5 surfaces the error */ }
     }
-    if env_override.image_policy.is_some() {
-        effective.image_policy = env_override.image_policy.clone();
-    }
+    // 2.16c: `imagePolicy` deep-merges at the subfield level (set-field-wins).
+    effective.image_policy =
+        merge_image_policy(effective.image_policy.clone(), env_override.image_policy.clone());
     if let Some(env_env) = &env_override.env {
         let mut merged = effective.env.unwrap_or_default();
         for (k, v) in env_env {
@@ -544,7 +637,10 @@ fn render_httproute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use operator_core::{ApplicationExpose, ApplicationSpec, EnvValue};
+    use operator_core::{
+        ApplicationEnvOverride, ApplicationExpose, ApplicationSpec, EnvValue, ExposeOverride,
+        ImagePolicy,
+    };
 
     fn make_app_with_uid(
         spec: ApplicationSpec,
@@ -1075,10 +1171,36 @@ mod tests {
         assert!(!base_labels.contains_key("apprafter.io/environment"));
     }
 
+    /// Convert a full [`ApplicationBaseSpec`] into the all-optional
+    /// per-environment [`ApplicationEnvOverride`] (2.16c). The env-override
+    /// tests author their overrides as base specs for brevity; this maps
+    /// each field across, promoting the base `ApplicationExpose` to the
+    /// all-optional `ExposeOverride`. (Task 5 will rewrite these tests to
+    /// author overrides natively; this keeps the crate compiling now.)
+    fn env_override_from_base(b: ApplicationBaseSpec) -> ApplicationEnvOverride {
+        ApplicationEnvOverride {
+            image: b.image,
+            replicas: b.replicas,
+            expose: b.expose.map(|e| ExposeOverride {
+                port: Some(e.port),
+                network: e.network,
+                hostname: e.hostname,
+                tls: e.tls,
+            }),
+            env: b.env,
+            needs: b.needs,
+            image_policy: b.image_policy,
+        }
+    }
+
     fn make_app_with_envs(
         base: ApplicationBaseSpec,
         envs: BTreeMap<String, ApplicationBaseSpec>,
     ) -> Application {
+        let envs: BTreeMap<String, ApplicationEnvOverride> = envs
+            .into_iter()
+            .map(|(k, v)| (k, env_override_from_base(v)))
+            .collect();
         let mut app = Application::new(
             "web",
             ApplicationSpec {
@@ -1184,7 +1306,6 @@ mod tests {
 
     #[test]
     fn effective_spec_env_override_replaces_image_policy() {
-        use operator_core::ImagePolicy;
         // 2.4h Fix A: a per-environment `imagePolicy.resolve` override
         // must replace the base policy (REPLACEMENT semantics, like
         // image/replicas/expose) — otherwise an env-scoped opt-out is
@@ -2154,5 +2275,66 @@ mod tests {
             .as_ref()
             .expect("strategy set when owned disk present");
         assert_eq!(strategy.type_.as_deref(), Some("Recreate"));
+    }
+
+    // ---- 2.16c: subfield deep-merge helpers (merge_expose / merge_image_policy) ----
+
+    #[test]
+    fn merge_expose_base_only() {
+        let base = Some(ApplicationExpose {
+            port: 8080,
+            network: Some("public".into()),
+            hostname: Some(OneOrMany::One("x.example".into())),
+            tls: Some(true),
+        });
+        assert_eq!(merge_expose(base.clone(), None).unwrap(), base);
+    }
+
+    #[test]
+    fn merge_expose_env_only_with_port() {
+        let ovr = Some(ExposeOverride {
+            port: Some(9090),
+            network: Some("internal".into()),
+            hostname: None,
+            tls: None,
+        });
+        let got = merge_expose(None, ovr).unwrap().unwrap();
+        assert_eq!(got.port, 9090);
+        assert_eq!(got.network.as_deref(), Some("internal"));
+    }
+
+    #[test]
+    fn merge_expose_env_only_without_port_errors() {
+        let ovr = Some(ExposeOverride {
+            port: None,
+            network: Some("internal".into()),
+            hostname: None,
+            tls: None,
+        });
+        assert!(matches!(
+            merge_expose(None, ovr),
+            Err(EffectiveSpecError::ExposeMissingPort)
+        ));
+    }
+
+    #[test]
+    fn merge_expose_subfield_override_wins_port_inherited() {
+        let base = Some(ApplicationExpose {
+            port: 8080,
+            network: Some("public".into()),
+            hostname: Some(OneOrMany::One("x.example".into())),
+            tls: Some(true),
+        });
+        let ovr = Some(ExposeOverride {
+            port: None,
+            network: Some("internal".into()),
+            hostname: None,
+            tls: None,
+        });
+        let got = merge_expose(base, ovr).unwrap().unwrap();
+        assert_eq!(got.port, 8080);
+        assert_eq!(got.network.as_deref(), Some("internal"));
+        assert_eq!(got.hostname, Some(OneOrMany::One("x.example".into())));
+        assert_eq!(got.tls, Some(true));
     }
 }
