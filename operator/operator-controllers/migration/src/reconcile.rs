@@ -33,7 +33,9 @@ use operator_core::{
     StepOutcome,
 };
 
-use crate::strategy::{ApplicationMigrationStrategy, PlatformMigrationStrategy};
+use crate::strategy::{
+    ApplicationMigrationStrategy, PlatformMigrationStrategy, SourceCredentialMigrationStrategy,
+};
 
 /// SSA field manager owning `MigrationPlan.status.*` writes.
 /// Mirrors the operator's other field-manager constants
@@ -66,6 +68,7 @@ pub struct Context {
     pub client: Client,
     pub application_strategy: ApplicationMigrationStrategy,
     pub platform_strategy: PlatformMigrationStrategy,
+    pub sourcecredential_strategy: SourceCredentialMigrationStrategy,
 }
 
 /// Spawn the controller. Returns when the underlying watcher
@@ -76,6 +79,7 @@ pub async fn run(client: Client) -> Result<(), Error> {
         client: client.clone(),
         application_strategy: ApplicationMigrationStrategy,
         platform_strategy: PlatformMigrationStrategy::new(client.clone()),
+        sourcecredential_strategy: SourceCredentialMigrationStrategy,
     });
 
     let api: Api<MigrationPlan> = Api::all(client);
@@ -189,6 +193,7 @@ fn pick_strategy_key(scope_type: &str) -> Result<StrategyKey, Error> {
     match scope_type {
         "application" => Ok(StrategyKey::Application),
         "platform" => Ok(StrategyKey::Platform),
+        "sourcecredential" => Ok(StrategyKey::SourceCredential),
         other => Err(Error::UnknownScope(other.to_string())),
     }
 }
@@ -197,12 +202,14 @@ fn pick_strategy_key(scope_type: &str) -> Result<StrategyKey, Error> {
 enum StrategyKey {
     Application,
     Platform,
+    SourceCredential,
 }
 
 fn pick_strategy(plan: &MigrationPlan, ctx: &Context) -> Result<Arc<dyn MigrationStrategy>, Error> {
     match pick_strategy_key(&plan.spec.scope.type_)? {
         StrategyKey::Application => Ok(Arc::new(ctx.application_strategy.clone())),
         StrategyKey::Platform => Ok(Arc::new(ctx.platform_strategy.clone())),
+        StrategyKey::SourceCredential => Ok(Arc::new(ctx.sourcecredential_strategy.clone())),
     }
 }
 
@@ -441,6 +448,16 @@ mod tests {
         assert_eq!(
             pick_strategy_key("platform").unwrap(),
             StrategyKey::Platform
+        );
+    }
+
+    #[test]
+    fn pick_strategy_key_sourcecredential_scope_returns_sourcecredential_key() {
+        // 2.16b-sc: a sourcecredential-scope plan routes to the
+        // SourceCredential strategy.
+        assert_eq!(
+            pick_strategy_key("sourcecredential").unwrap(),
+            StrategyKey::SourceCredential
         );
     }
 
