@@ -61,21 +61,50 @@ attack direction.
   `spec.trigger.approvedSpecHash` over the **full** candidate set; at consume time
   the operator re-verifies it, so an approval for one edit cannot be applied to a
   different edit and any drift re-gates the change as a fresh pending-approval
-  plan (a legacy plan with no hash still consumes).
+  plan. An app-scope plan **requires** a non-empty hash to consume — a missing or
+  empty hash re-gates, so a forged or pre-2.16b-sec hashless plan can never apply
+  a destructive change.
 - **`SoftDestructiveChange` Events escalate to `Warning`** for three ops
   (`needs.*.selector` change, env-literal removal, scale-down N→M); other soft
   ops stay `Normal`.
 
 ### Fixed / hardened
 
-- **S-1 — `Application.status` write protection.** The admission webhook now
-  registers `applications/status` and rejects any status write whose SSA field
-  manager is not `apprafter-operator`, so the diff baseline
-  (`status.lastAppliedSpec`) can no longer be zeroed to disarm the gate.
+- **S-1 — `Application.status` write protection.** The admission webhook
+  registers `applications/status` and rejects any status write whose
+  **authenticated identity** (`request.userInfo.username`) is not the operator
+  ServiceAccount, so the diff baseline (`status.lastAppliedSpec`) can no longer be
+  zeroed to disarm the gate.
 - **§7.2 — `spec.environment` immutable on UPDATE.** The webhook rejects any
   change to `spec.environment` (flipping it swaps the entire effective spec — a
   laundering vector; a different environment is a different deployment
   `<name>-<env>`).
+
+### Hardened (post-implementation security review, round S2)
+
+- **F-1 — status guards are identity-authenticated, not fieldManager.** The S-1
+  guard was originally keyed on the client-supplied `fieldManager` string
+  (spoofable with `--field-manager=apprafter-operator`); it now checks the
+  apiserver-authenticated `request.userInfo.username` against the operator
+  ServiceAccount, threaded from a `OPERATOR_SERVICEACCOUNT` env
+  (`system:serviceaccount:{{ .Release.Namespace }}:apprafter-operator`) so the
+  identity tracks the deploy namespace. Unified with the existing
+  ResourceClaim/RetainedClaim identity gates (one source of truth).
+- **F-1b — `MigrationPlan.status` field-level approve allowlist.** A non-operator
+  subject may write **only** `status.phase` (transition `pending-approval →
+  approved`); any write to `status.executedSteps` or other fields, a phase jump,
+  or approving a non-pending plan is rejected (the operator writes anything). This
+  makes the external approval signal forge-resistant. (RBAC already restricts the
+  `migrationplans/status` verb to the operator; this is defense-in-depth.)
+- **F-2 — gate a key that ACQUIRES a secret reference.** An `env` key changing
+  `claim.*` or a literal → `secret:*` (the exfil primitive #7 targets, reached by
+  reusing an existing key) now gates as `env-secret-ref-add` (`security-boundary`);
+  the `from` sentinel for a literal is `"(literal)"`, never the value.
+- **F-3 — a public hostname swap surfaces `security-boundary`.** `#3 domain-change`
+  (host lost) and `#11 public-hostname-add` (host gained) now use set algebra and
+  **co-fire** on a swap `{a}→{b}` instead of the de-dup suppressing `#11` — so a
+  phishing host in a trusted wildcard zone can no longer hide behind a sev-1
+  availability change in the rollup.
 
 ## cli v0.2.34 / operator v0.2.34 / platform-stack 0.2.43 / cue-cmp v0.1.15 — 2.16b app-scope migration (auto-detect + Argo approval) (2026-07-18)
 

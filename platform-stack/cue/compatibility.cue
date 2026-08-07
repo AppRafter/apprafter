@@ -1796,6 +1796,16 @@ compatibility: "0.2.44": {
 		fields). The two-env kind+Argo walk (`e2e/app-migration-walk.sh`) is GREEN
 		end-to-end incl. the security phases (escalation gated, S-4 stale-approval
 		re-gates, S-1 + §7.2 denials).
+
+		Post-implementation security review (round S2) hardened before ship: the
+		status guards now authenticate on `request.userInfo.username` (not the
+		spoofable fieldManager string) via an `OPERATOR_SERVICEACCOUNT` env
+		(F-1); `MigrationPlan.status` external writes are restricted to the
+		`phase pending-approval→approved` approval signal only (F-1b); an env key
+		acquiring a secret-ref (`claim`/`literal → secret:`) now gates (F-2); a
+		public hostname swap co-fires domain-change + public-hostname-add so
+		`security-boundary` surfaces in the rollup (F-3). All four validated by
+		new walk phases (impersonated non-operator writes denied).
 		"""
 	references: [
 		"docs/superpowers/specs/2026-08-06-2.16b-security-axis-design.md",
