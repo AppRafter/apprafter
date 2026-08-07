@@ -144,9 +144,24 @@ join). At consume time the reconciler recomputes the hash of the currently
 detected change set; if it differs from the plan's stored hash the completed
 plan is demoted to a relic and the edit is **re-gated** as a fresh
 pending-approval plan. This binds an approval to the *exact* change it was
-approved for — approve-X-can-no-longer-apply-Y — and re-gates on any drift. A
-legacy plan cut before S-4 carries no hash and still consumes (so existing
-plans do not break).
+approved for — approve-X-can-no-longer-apply-Y — and re-gates on any drift.
+
+An app-scope plan **requires a non-empty `approvedSpecHash` to consume**: a
+missing or empty stamped hash is treated as *no match* and re-gates, never
+applies. App-scope migration is brand-new and was never shipped without the
+hash, so there are no legacy hashless plans to protect — and treating a
+hashless completed plan as consumable would hand a forger a free bypass. The
+operator's `plan_state`/`plan_hash_matches` therefore bucket a completed,
+trigger-matching plan with no hash as a `Relic` (re-gate), and `warn!`-log it
+as a forged or pre-2.16b-sec artifact. So a forged or pre-2.16b-sec hashless
+plan can **never** apply a destructive change.
+
+The approval hash binds the **gated candidate-set** (the `type|field|from|to`
+of each detected *gated* change), **not the full effective spec**; soft
+(non-gated) changes may accompany the execution of an approved plan and do not
+trigger a re-gate — by definition a soft change applies without approval, so
+there is nothing to bind. Binding a soft change into the hash would only
+manufacture spurious re-gates without adding any security guarantee.
 
 ### 5. S-1 — `Application.status` write protection
 
