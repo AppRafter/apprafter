@@ -2337,4 +2337,30 @@ mod tests {
         assert_eq!(got.hostname, Some(OneOrMany::One("x.example".into())));
         assert_eq!(got.tls, Some(true));
     }
+
+    #[test]
+    fn merge_image_policy_override_wins() {
+        let base = Some(ImagePolicy {
+            resolve: Some("digest".into()),
+        });
+        let ovr = Some(ImagePolicy {
+            resolve: Some("off".into()),
+        });
+        assert_eq!(
+            merge_image_policy(base, ovr).unwrap().resolve.as_deref(),
+            Some("off")
+        );
+    }
+
+    #[test]
+    fn merge_image_policy_env_empty_inherits_base() {
+        let base = Some(ImagePolicy {
+            resolve: Some("off".into()),
+        });
+        let ovr = Some(ImagePolicy { resolve: None });
+        assert_eq!(
+            merge_image_policy(base, ovr).unwrap().resolve.as_deref(),
+            Some("off")
+        );
+    }
 }
