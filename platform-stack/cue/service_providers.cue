@@ -39,6 +39,20 @@ _serviceProviders: {
 			namespace: "cnpg-system"
 			instances: int | *1
 			storage:   string | *"10Gi"
+			// Guaranteed backend resources (2.16d). The 2.4c
+			// provisioner reads each field independently from
+			// `/resources/*` (see resourceclaim-provisioner
+			// reconcile) and emits a Guaranteed (req==limit) CNPG
+			// Cluster; `sharedBuffers` must stay coherent with
+			// `memory`. These T1 seeds equal the code fallbacks —
+			// making them explicit lets a tier overlay raise them
+			// (like the `instances: 3` HA bump) without a code change.
+			resources: {
+				cpu:              string | *"100m"
+				memory:           string | *"256Mi"
+				ephemeralStorage: string | *"1Gi"
+				sharedBuffers:    string | *"32MB"
+			}
 		}
 	}
 	"redis-integrated": #ServiceProviderSeed & {
@@ -65,6 +79,19 @@ _serviceProviders: {
 			// dragonfly-operator does not default replicas, so 0 means no
 			// instance pod. Tier-1 = 1; HA tiers raise it via a tier overlay.
 			replicas: int | *1
+			// Guaranteed backend resources (2.16d). The 2.6-3 provisioner
+			// reads each field independently from `/resources/*` (see
+			// resourceclaim-provisioner reconcile) and emits a Guaranteed
+			// (req==limit) Dragonfly with a `--maxmemory` RSS cap below the
+			// memory limit. The T1 memory seed (320Mi) sits above the
+			// ADR-0042 ~287MB structural floor at the 1024-claim cap. These
+			// equal the code fallbacks — explicit so a tier overlay can raise
+			// them without a code change.
+			resources: {
+				cpu:              string | *"50m"
+				memory:           string | *"320Mi"
+				ephemeralStorage: string | *"1Gi"
+			}
 		}
 	}
 	"disk-local": #ServiceProviderSeed & {
