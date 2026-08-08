@@ -38,6 +38,8 @@ pub struct PlatformStackSpec {
     pub network: Option<NetworkConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceGovernanceConfig>,
     pub source: PlatformStackSource,
     pub values: PlatformStackValues,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +149,58 @@ pub struct RetentionConfig {
     )]
     pub keep_monthly: Option<i64>,
     pub enforce: String,
+}
+
+/// A resource-name → quantity map (cpu/memory → "25m"/"32Mi"). Same shape as
+/// the app-side `AppResources` maps; used for VPA min/maxAllowed floors.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ResourceQuantities(pub std::collections::BTreeMap<String, String>);
+
+impl<const N: usize> From<[(&str, &str); N]> for ResourceQuantities {
+    fn from(pairs: [(&str, &str); N]) -> Self {
+        ResourceQuantities(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+}
+
+/// Cluster-wide VPA enforcement posture (2.16e / ADR 0054). Read-with-fallback
+/// by the operator — NEVER written by the operator (PlatformController owns
+/// spec). `full` is the shipped default: bidirectional in-place right-sizing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoscaleMode {
+    #[default]
+    Full,
+    UpOnly,
+    Off,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct AutoscaleConfig {
+    #[serde(default)]
+    pub mode: AutoscaleMode,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "minAllowed"
+    )]
+    pub min_allowed: Option<ResourceQuantities>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "maxAllowed"
+    )]
+    pub max_allowed: Option<ResourceQuantities>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ResourceGovernanceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscale: Option<AutoscaleConfig>,
 }
 
 /// Resolve the effective backup staging mode from a PlatformStack spec.
@@ -474,6 +528,45 @@ mod tests {
         .unwrap();
         assert!(spec.backup.is_none());
         assert_eq!(resolve_backup_staging_mode(&spec), "monolithic");
+    }
+
+    #[test]
+    fn autoscale_mode_serde_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&AutoscaleMode::Full).unwrap(),
+            "\"full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AutoscaleMode::UpOnly).unwrap(),
+            "\"up-only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AutoscaleMode::Off).unwrap(),
+            "\"off\""
+        );
+        assert_eq!(AutoscaleMode::default(), AutoscaleMode::Full);
+    }
+
+    #[test]
+    fn resources_autoscale_roundtrips_and_is_optional() {
+        let bare: PlatformStackSpec =
+            serde_json::from_value(serde_json::json!({ "source": {}, "values": { "tier": 1 } }))
+                .unwrap_or_default();
+        assert!(bare.resources.is_none());
+        let ac = AutoscaleConfig {
+            mode: AutoscaleMode::Full,
+            min_allowed: Some(ResourceQuantities::from([
+                ("cpu", "25m"),
+                ("memory", "32Mi"),
+            ])),
+            max_allowed: Some(ResourceQuantities::from([
+                ("memory", "512Mi"),
+                ("cpu", "1"),
+            ])),
+        };
+        let back: AutoscaleConfig =
+            serde_json::from_value(serde_json::to_value(&ac).unwrap()).unwrap();
+        assert_eq!(back, ac);
     }
 
     #[test]

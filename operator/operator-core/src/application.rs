@@ -392,6 +392,44 @@ pub struct ImagePolicy {
     pub resolve: Option<String>,
 }
 
+/// One container's VPA recommendation, mirrored read-only from
+/// `VerticalPodAutoscaler.status.recommendation` (2.16e / ADR 0054). `target`
+/// is the applied (capped) recommendation; `uncappedTarget` is the un-capped
+/// estimate — when it exceeds `target` the app's own `limits.memory` is the
+/// wall. `lowerBound`/`upperBound` are intentionally NOT mirrored.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ContainerRecommendation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<BTreeMap<String, String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "uncappedTarget"
+    )]
+    pub uncapped_target: Option<BTreeMap<String, String>>,
+}
+
+/// VPA recommendation mirror + infeasible signal (2.16e). `not_applied` set =
+/// the updater cannot satisfy the recommendation (node capacity) — DISTINCT
+/// from the `uncappedTarget` own-memory-limit case.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct RecommendedResources {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "containerName"
+    )]
+    pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<ContainerRecommendation>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "notApplied"
+    )]
+    pub not_applied: Option<String>,
+}
+
 /// The repository portion of an image reference, with any tag or digest
 /// stripped: `"ghcr.io/acme/app:v1"` → `"ghcr.io/acme/app"`,
 /// `"ghcr.io/acme/app@sha256:…"` → `"ghcr.io/acme/app"`,
@@ -492,6 +530,12 @@ pub struct ApplicationStatus {
         rename = "lastAppliedSpec"
     )]
     pub last_applied_spec: Option<ApplicationSpec>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "recommendedResources"
+    )]
+    pub recommended_resources: Option<RecommendedResources>,
 }
 
 // `PHASE_AWAITING_MIGRATION_APPROVAL` + `COND_MIGRATION_PENDING` moved to
@@ -966,5 +1010,12 @@ mod tests {
     fn image_repo_bare_name_and_tagged_bare_name() {
         assert_eq!(image_repo("nginx"), "nginx");
         assert_eq!(image_repo("nginx:1.27"), "nginx");
+    }
+
+    #[test]
+    fn recommended_resources_skips_when_none() {
+        let s = ApplicationStatus::default();
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("recommendedResources").is_none());
     }
 }

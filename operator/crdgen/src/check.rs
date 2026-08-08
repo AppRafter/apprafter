@@ -546,6 +546,16 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          (The top-level `spec.values` matches on both sides — schemars renders the `#[serde(flatten)] \
          extras` map as a preserve-unknown node, same opaque kind as the CUE patch.)",
     ),
+    (
+        "PlatformStack",
+        "spec.resources",
+        "2.16e VPA autoscaling knob: Rust types (ResourceGovernanceConfig / AutoscaleConfig / \
+         AutoscaleMode / ResourceQuantities) added in T1; the matching CUE schema \
+         (platformstack.cue #ResourceGovernanceConfig) is added in the next task (T2). \
+         This allowlist entry covers the transient Rust-ahead-of-CUE window and will be \
+         removed once `just gen-crds` regenerates the PlatformStack CRD from the updated \
+         CUE schema in T2.",
+    ),
 ];
 
 /// The kube-rs (`CustomResourceExt::crd()`) CRD for a component, or `None`
