@@ -1760,6 +1760,50 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.47": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.37"
+	notes: """
+		2.16c — per-environment deep-merge for `expose`/`imagePolicy`. An env
+		override of `expose`/`imagePolicy` becomes PARTIAL (subfield deep-merge,
+		override-wins): an environment carries only the diff and inherits
+		env-invariant subfields (e.g. `expose.port`) from `base`, instead of
+		re-declaring the whole struct (which today forces duplicating the
+		env-invariant port). A new all-optional `#ApplicationEnvOverride` type backs
+		`environments[*]` (CUE + Rust); `base` keeps `#ApplicationSpec` with
+		`expose.port` required, so "forgot the port in base" is caught locally by
+		`cue vet`.
+
+		The operator's `effective_spec` deep-merges by subfield and is now fallible
+		(a base-absent env-only `expose` without a port → `Ready=False`/
+		`InvalidEffectiveSpec`, nothing applied); the webhook enforces "an env-only
+		`expose` (no `base.expose`) must carry a `port`"; `crd-check` gains a
+		recursive `#ApplicationEnvOverride ⊇ #ApplicationSpec` drift gate + a "no
+		OpenAPI default:" assertion. `needs.*` deep-merge is deferred to 2.16i (it is
+		a provisioning-layer data-loss path). Inherited `expose.hostname`/`tls` are
+		consumed only under `network: "public"` (inert otherwise).
+
+		change=requires-restart: on upgrade, an app with a partial `public`
+		env-override missing a hostname now inherits base's hostname → the (live
+		2.16b) destructive-change gate fires and the app pauses at
+		`AwaitingMigrationApproval` until approved. Two migration one-liners: (1)
+		upgrading ACROSS the 2.16b (0.2.34) release in a single hop leaves
+		`status.lastAppliedSpec` unstamped, so the gate does not fire on the first
+		reconcile; (2) NO downgrade below this release once a partial
+		`environments[*].expose` has been written (the older operator's
+		`ApplicationExpose.port: i32` fails to deserialize it — remedy: re-declare
+		the override fully).
+
+		Self-correction: the `effective_spec_env_override_replaces_expose_block`
+		test was inverted to assert deep-merge. Ships operator + admission-webhook
+		v0.2.37 + cue-cmp v0.1.18. The kind LOCAL-BUILD walk
+		`e2e/expose-deep-merge-walk.sh` is GREEN.
+		"""
+	references: [
+		"docs/superpowers/specs/2026-08-07-2.16c-deep-merge-struct-fields-design.md",
+	]
+}
+
 compatibility: "0.2.46": {
 	change:          "safe"
 	operatorVersion: "v0.2.36"

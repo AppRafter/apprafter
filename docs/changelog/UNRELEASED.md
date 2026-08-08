@@ -9,6 +9,60 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator/webhook v0.2.37 / cue-cmp v0.1.18 / platform-stack 0.2.47 — 2.16c per-environment deep-merge (2026-08-08)
+
+A per-environment override of `expose` / `imagePolicy` becomes **partial**
+(subfield deep-merge, override-wins): an environment carries only the diff and
+inherits env-invariant subfields (e.g. `expose.port`) from `base`, instead of
+re-declaring the whole struct. Chart-only (operator + admission-webhook +
+schema; no CLI change). `needs.*` deep-merge is split out to a new plan item
+2.16i (a provisioning-layer data-loss path). Refines ADR 0044; spec.md §3.1/§4.4
+actualized (Revision 13→14).
+
+### Added
+
+- **`#ApplicationEnvOverride`** — a new all-optional type backing
+  `environments[*]` (CUE + Rust `ApplicationEnvOverride` / `ExposeOverride`),
+  distinct from `#ApplicationSpec`. `base` keeps `#ApplicationSpec` with
+  `expose.port` required-when-present, so "forgot the port in base" is caught
+  locally by `cue vet`; the partial env override carries `port?` (and every
+  other leaf optional).
+- **`crd-check` recursive ⊇ drift gate** — asserts `#ApplicationEnvOverride ⊇
+  #ApplicationSpec` (structural equivalence modulo optionality, recursive over
+  all leaf paths, both directions, with an allowlist for deliberately
+  non-overridable fields), plus a standing "generated CRDs contain no OpenAPI
+  `default:`" assertion (a future `crdgen` change can no longer silently
+  materialize a field on admission).
+
+### Changed
+
+- **`effective_spec` deep-merges `expose` / `imagePolicy` by subfield** (per-field
+  override-wins via destructured merge fns — a new override field is a compile
+  error) instead of replacing the whole struct. It is now **fallible**: a
+  base-absent env-only `expose` without a `port` yields `Ready=False` /
+  `InvalidEffectiveSpec` with nothing applied, and the `Err` is handled BEFORE
+  `detect_all` so it can never skip the migration gate while still applying
+  something.
+- **Webhook enforces "an env-only `expose` (no `base.expose`) must carry a
+  `port`"** (mirrors the existing "image in base OR in every env" rule); the
+  required-when-public hostname rule is unchanged. Validators iterating
+  `environments[*]` (image, env-key patterns, ADR 0046 markers) now read
+  `ApplicationEnvOverride`.
+- **Inherited `expose.hostname` / `tls` are consumed only under `network:
+  "public"`** (inert otherwise) — an inherited hostname under a de-escalated
+  (internal) env does not fire the 2.16b `public-hostname-add` classifier.
+- **Self-correction:** the `effective_spec_env_override_replaces_expose_block`
+  renderer test was inverted to assert deep-merge.
+- **`change: requires-restart`** — on upgrade, an app with a partial `public`
+  env-override missing a hostname now inherits base's hostname → the live 2.16b
+  destructive-change gate fires and the app pauses at `AwaitingMigrationApproval`
+  until approved. Two migration one-liners: (1) upgrading ACROSS the 2.16b
+  (0.2.34) release in a single hop leaves `status.lastAppliedSpec` unstamped, so
+  the gate does not fire on the first reconcile; (2) NO downgrade below this
+  release once a partial `environments[*].expose` has been written (the older
+  operator's `ApplicationExpose.port: i32` fails to deserialize it — remedy:
+  re-declare the override fully).
+
 ## operator/webhook v0.2.36 / cue-cmp v0.1.17 / cli v0.2.36 / platform-stack 0.2.45 — 2.16b-sc SourceCredential-scope migration (2026-08-07)
 
 Wires SourceCredential-scope `MigrationPlan` creation **live** — the "same flip,
