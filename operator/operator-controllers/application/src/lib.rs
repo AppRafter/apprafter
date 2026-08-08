@@ -36,7 +36,7 @@ use operator_core::{
     Metrics, MigrationPlan, Needs, PlatformStack, PlatformStackValues, ResourceClaim,
     ServiceProvider, SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
     COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
-    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
+    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING, PHASE_INVALID_EFFECTIVE_SPEC,
 };
 // 2.16b-sc: the app-scope migration state machine now lives in
 // `operator-core::migration_state` (hoisted verbatim, zero behavior change)
@@ -184,15 +184,9 @@ pub async fn run(
 /// no longer gate (user has either accepted the change or
 /// reverted the source).
 ///
-/// **Detection (`detect_destructive`).** Wired through
-/// `ApplicationMigrationStrategy::detect_destructive` but NOT
-/// invoked from this reconcile loop in B.1.77 — the current
-/// v1alpha1 Application schema (image / replicas / expose /
-/// env) carries no destructive operations per spec.md §3.8, so
-/// detection would always return `None`. Phase 2.x services
-/// (`needs.*`, storage classes, breaking image migrations)
-/// extend both the schema and the detection logic; the call
-/// site lands then.
+/// **Detection.** Live (2.16b, v0.2.34): the reconcile diffs the effective
+/// spec (`detect_all`) against `status.lastAppliedSpec` and creates a
+/// gating MigrationPlan when a destructive change is detected.
 pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     let name = app.name_any();
     let namespace = app.namespace().unwrap_or_default();
@@ -241,7 +235,30 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // A missing baseline (never applied yet, or a pre-2.16b app) does
     // NOT gate — detection is skipped and the render stamps the first
     // baseline below.
-    let new_eff = effective_spec(&app, app.spec.environment.as_deref());
+    //
+    // 2.16c (R4-M6): the effective spec (base ⊕ pinned env) may be invalid —
+    // e.g. an env-only `expose` override with no `port` and no `base.expose`
+    // to inherit from. An invalid spec can't be rendered, so it applies
+    // NOTHING: we surface `Ready=False/InvalidEffectiveSpec` and requeue
+    // BEFORE the detection, plan, needs-claim, and render steps below. This
+    // is a defense-in-depth terminal state — the webhook should reject it at
+    // admission — so a 60s requeue (not a fast retry) is appropriate.
+    let new_eff = match effective_spec(&app, app.spec.environment.as_deref()) {
+        Ok(e) => e,
+        Err(e) => {
+            info!(
+                %name, %namespace, error = %e,
+                "effective spec is invalid — setting Ready=False/InvalidEffectiveSpec, applying nothing"
+            );
+            let status = build_invalid_effective_spec_status(&app, &e.to_string());
+            apply_status(&ctx.client, &namespace, &name, &status, &pp).await?;
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, &namespace, "paused"])
+                .inc();
+            return Ok(Action::requeue(Duration::from_secs(60)));
+        }
+    };
     let baseline_spec = app
         .status
         .as_ref()
@@ -464,7 +481,12 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // below validated (AFTER the gate) — empty unless execution falls
     // through to the render with every claim ready.
     let mut disk_mounts: Vec<DiskMount> = Vec::new();
-    let effective = effective_spec(&app, app.spec.environment.as_deref());
+    // Reuses the SAME (app, env) inputs the migration gate validated above at
+    // step 1 — `effective_spec` is a pure function, so an `Ok` there implies an
+    // `Ok` here. The invalid-spec early return above is the single guard;
+    // `expect` documents that invariant rather than re-handling it.
+    let effective = effective_spec(&app, app.spec.environment.as_deref())
+        .expect("effective_spec validated at the migration gate (step 1) — Ok is invariant here");
     let has_needs = effective.needs.as_ref().is_some_and(|n| !n.is_empty());
     if has_needs {
         let app_uid = app.metadata.uid.clone().unwrap_or_default();
@@ -657,7 +679,12 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         },
         egress_profile,
         Some(&needs_targets),
-    );
+    )
+    // The renderer folds the SAME (app, env) effective spec the migration gate
+    // (step 1) already validated to `Ok`; the only `EffectiveSpecError` it can
+    // raise is the invalid-effective-spec case guarded there. `expect`
+    // documents that invariant — the invalid-spec path never reaches here.
+    .expect("effective_spec validated at the migration gate (step 1) — render Ok is invariant here");
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
     // registry, project its derived pull-secret into the workload
@@ -2005,6 +2032,12 @@ fn plan_name(app: &str, env: &str, now: DateTime<Utc>) -> String {
 /// reconstructed object is sufficient and keeps the diff a pure function of
 /// the two specs. Pure — a seam so the reconstruction is unit-testable
 /// without a client.
+///
+/// 2.16c: `effective_spec` is now fallible, but the stamped baseline was
+/// itself rendered — hence `effective_spec`-validated — before it was
+/// written to `status.lastAppliedSpec`, so an `Err` here is unreachable. The
+/// `expect` documents that invariant; an invalid live spec never reaches
+/// detection (guarded by the invalid-effective-spec early return in step 1).
 fn effective_baseline(baseline_spec: &ApplicationSpec) -> ApplicationBaseSpec {
     let baseline_app = Application {
         metadata: Default::default(),
@@ -2012,6 +2045,7 @@ fn effective_baseline(baseline_spec: &ApplicationSpec) -> ApplicationBaseSpec {
         status: None,
     };
     effective_spec(&baseline_app, baseline_spec.environment.as_deref())
+        .expect("stamped baseline was effective_spec-validated before being written to status")
 }
 
 /// 2.16b Task 11: return the names of app-namespace MigrationPlans that
@@ -2712,6 +2746,36 @@ fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> Ap
         environment: app.spec.environment.clone(),
         // 2.16b (walk-found): carry the baseline forward — omitting it under
         // SSA prunes it. See `existing_baseline`.
+        last_applied_spec: existing_baseline(app),
+    }
+}
+
+/// Build the Application status payload for the invalid-effective-spec path
+/// (2.16c / R4-M6). Mirrors [`build_env_secret_missing_status`]: preserves
+/// `observedGeneration` + `endpointURL`, sets `phase` to
+/// `InvalidEffectiveSpec`, and emits a single `Ready=False/InvalidEffectiveSpec`
+/// condition whose `message` carries the renderer diagnostic (the
+/// `EffectiveSpecError` display). The effective spec is invalid, so NOTHING is
+/// rendered — but the prior baseline is still carried forward (omitting it
+/// under SSA prunes it; see [`existing_baseline`]), so a subsequent fix diffs
+/// cleanly against the last-good spec instead of re-stamping from scratch.
+fn build_invalid_effective_spec_status(app: &Application, message: &str) -> ApplicationStatus {
+    let previous_conditions = app
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let previous_endpoint = app.status.as_ref().and_then(|s| s.endpoint_url.clone());
+
+    let ready = ready_condition("False", "InvalidEffectiveSpec", message, previous_conditions);
+
+    ApplicationStatus {
+        phase: Some(PHASE_INVALID_EFFECTIVE_SPEC.to_string()),
+        observed_generation: app.metadata.generation,
+        conditions: Some(vec![ready]),
+        endpoint_url: previous_endpoint,
+        image: None,
+        environment: app.spec.environment.clone(),
         last_applied_spec: existing_baseline(app),
     }
 }
@@ -4893,7 +4957,8 @@ mod tests {
             None,
             EgressProfile::Internet,
             Some(&targets),
-        );
+        )
+        .expect("valid effective spec renders");
         let cnp = rendered
             .network_policy
             .as_ref()
@@ -5531,7 +5596,7 @@ mod tests {
             environments: Some(
                 [(
                     "prod".to_string(),
-                    ApplicationBaseSpec {
+                    operator_core::ApplicationEnvOverride {
                         replicas: Some(5),
                         ..Default::default()
                     },
@@ -5553,6 +5618,80 @@ mod tests {
             environment: None,
         };
         assert_eq!(effective_baseline(&base_only).replicas, Some(1));
+    }
+
+    // 2.16c (R4-M6): an Application whose effective spec (base ⊕ pinned env) is
+    // invalid — here `base` has NO `expose` and `environments.prod.expose`
+    // sets `network` but NO `port` (nothing to inherit) — must reconcile to
+    // `Ready=False` reason `InvalidEffectiveSpec` and apply NOTHING: no
+    // detection, no MigrationPlan, no rendered children. This is a
+    // decision-unit test (the crate has no fake-apiserver reconcile harness):
+    // it pins the pure `effective_spec` `Err` the reconcile keys on AND the
+    // status the invalid-spec branch stamps.
+    #[test]
+    fn invalid_effective_spec_yields_ready_false_and_applies_nothing() {
+        use operator_core::{ApplicationEnvOverride, ExposeOverride};
+
+        let app = Application::new(
+            "web",
+            ApplicationSpec {
+                // No base.expose — nothing for the env override to inherit a
+                // port from.
+                base: Some(ApplicationBaseSpec {
+                    image: Some("app:1".into()),
+                    ..Default::default()
+                }),
+                environments: Some(
+                    [(
+                        "prod".to_string(),
+                        ApplicationEnvOverride {
+                            expose: Some(ExposeOverride {
+                                port: None,
+                                network: Some("internal".into()),
+                                hostname: None,
+                                tls: None,
+                            }),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                environment: Some("prod".into()),
+            },
+        );
+
+        // (a) The pure unifier the reconcile calls at ~:244 rejects it.
+        let err = effective_spec(&app, Some("prod"))
+            .expect_err("env-only expose with no port and no base.expose must be Err");
+        assert_eq!(err, operator_rendering::EffectiveSpecError::ExposeMissingPort);
+
+        // (b) The reconcile maps that Err to the invalid-effective-spec status:
+        // phase = InvalidEffectiveSpec, a single Ready=False/InvalidEffectiveSpec
+        // condition whose message carries the renderer diagnostic. No
+        // MigrationPlan / child object is implied — this status is the ONLY
+        // side effect the branch produces before its early return.
+        let status = build_invalid_effective_spec_status(&app, &err.to_string());
+        assert_eq!(
+            status.phase.as_deref(),
+            Some(operator_core::PHASE_INVALID_EFFECTIVE_SPEC)
+        );
+        // The invalid spec renders no children, so no NEW baseline is stamped;
+        // this fixture has no prior `status.lastAppliedSpec`, so the carried-
+        // forward baseline is None (a real prior baseline would survive under
+        // SSA — see `existing_baseline`).
+        assert!(status.last_applied_spec.is_none());
+        let conds = status.conditions.as_ref().expect("conditions present");
+        assert_eq!(conds.len(), 1, "exactly one condition");
+        let ready = &conds[0];
+        assert_eq!(ready.type_, "Ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "InvalidEffectiveSpec");
+        assert!(
+            ready.message.contains("port"),
+            "message should carry the renderer diagnostic: {}",
+            ready.message
+        );
     }
 
     // `plan_name` — stable, DNS-1123-safe `<app>-<env>-migration-<secs>`;

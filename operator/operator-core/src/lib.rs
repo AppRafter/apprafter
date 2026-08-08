@@ -20,7 +20,7 @@ pub use application::{
     ApplicationExpose, ApplicationSpec, ApplicationStatus, DiskClaim, EnvRef, EnvValue,
     ExposeOverride, ImagePolicy, NeedEntry, Needs, OneOrMany, ServiceNeed, StatusImage,
     COND_IMAGE_RESOLVED, COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING,
-    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING,
+    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING, PHASE_INVALID_EFFECTIVE_SPEC,
 };
 pub use leader::{LeaderConfig, LeaderElection, LeaderError};
 pub use matching::{matches, select_provider, Candidate};

@@ -494,6 +494,14 @@ pub const COND_RESOURCE_CLAIM_PENDING: &str = "ResourceClaimPending";
 /// namespace. 2.12 / ADR 0046 Decision #4.
 pub const PHASE_ENV_SECRET_MISSING: &str = "EnvSecretMissing";
 
+/// Reserved phase: the effective spec (base ⊕ the pinned environment) is
+/// invalid — the renderer can't materialize it (e.g. an env-only `expose`
+/// override with no port and no `base.expose` to inherit from). 2.16c. The
+/// reconcile applies NOTHING (no detection, no plan, no render) and requeues;
+/// the webhook should reject this at admission, so it is a defense-in-depth
+/// terminal state, not a routine one.
+pub const PHASE_INVALID_EFFECTIVE_SPEC: &str = "InvalidEffectiveSpec";
+
 /// k8s-style condition (mirrors `meta/v1.Condition`). Operator
 /// emits `Ready` of `True` after a successful reconcile.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
