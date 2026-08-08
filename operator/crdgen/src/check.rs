@@ -19,6 +19,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub fn check() -> Result<()> {
+    let root = crate::find_repo_root()?;
+    let schemas = crate::cue::export_schemas(&root)?;
     let rendered = crate::render_all()?;
     let mut problems = Vec::new();
 
@@ -39,18 +41,262 @@ pub fn check() -> Result<()> {
         problems.push(format!("[B Rust↔CUE] {d}"));
     }
 
+    // Assertion R4-M1 — #ApplicationEnvOverride mirrors #ApplicationSpec
+    // (structural superset modulo optionality, both directions), so no
+    // #ApplicationSpec leaf is silently non-overridable and no override-only
+    // leaf is a silent no-op. The two definitions surface in the same
+    // OpenAPI export render_all already consumes (components.schemas keys
+    // ApplicationSpec / ApplicationEnvOverride).
+    let spec = schemas
+        .get("ApplicationSpec")
+        .context("components.schemas missing ApplicationSpec")?;
+    let over = schemas
+        .get("ApplicationEnvOverride")
+        .context("components.schemas missing ApplicationEnvOverride")?;
+    if let Err(errs) = check_env_override_superset(
+        &flatten_leaves(spec),
+        &flatten_leaves(over),
+        ENV_OVERRIDE_ALLOWLIST,
+    ) {
+        for e in errs {
+            problems.push(format!("[R4-M1 envOverride⊇spec] {e}"));
+        }
+    }
+
+    // Assertion R4-M2 — no server-side `default:` survives into a rendered
+    // CRD. structural::resolve strips CUE `*x` defaults; this is the standing
+    // gate that turns the R3-H1 one-time grep into a machine assertion.
+    for r in &rendered {
+        if let Err(errs) = check_no_defaults(&r.crd) {
+            for e in errs {
+                problems.push(format!("[R4-M2 no-default] {}: {e}", r.component));
+            }
+        }
+    }
+
     if !problems.is_empty() {
-        eprintln!("crd-check FAILED (A: run `just gen-crds`; B: reconcile the type or allowlist):");
+        eprintln!(
+            "crd-check FAILED (A: run `just gen-crds`; B: reconcile the type or allowlist; \
+             R4-M1: mirror the leaf in the override / allowlist it; R4-M2: drop the default):"
+        );
         for p in &problems {
             eprintln!("  {p}");
         }
         bail!("{} CRD drift(s)", problems.len());
     }
     eprintln!(
-        "crd-check OK: {} CRD(s) — A (CUE↔committed) + B (Rust↔CUE)",
+        "crd-check OK: {} CRD(s) — A (CUE↔committed) + B (Rust↔CUE) + \
+         R4-M1 (envOverride⊇spec) + R4-M2 (no default)",
         rendered.len()
     );
     Ok(())
+}
+
+// ---- R4-M1: #ApplicationEnvOverride ⊇ #ApplicationSpec (modulo optionality) ----
+
+/// Deliberately-non-overridable #ApplicationSpec leaves — a base leaf that
+/// SHOULD NOT be mirrored in #ApplicationEnvOverride (so it can only be set on
+/// `base`, never diverge per-env). Empty today: the current override mirrors
+/// every base leaf. Each entry MUST carry a reason (enforced by
+/// `env_override_allowlist_entries_carry_reasons`), like the assertion-B
+/// ALLOWLIST.
+const ENV_OVERRIDE_ALLOWLIST: &[(&str, &str)] = &[];
+
+/// One flattened leaf of a CUE-derived OpenAPI type: its coarse type (from
+/// `leaf_type`) and whether it is optional (absent from its IMMEDIATE parent's
+/// `required` list — a local property, not cascaded from ancestors, so
+/// `expose.port` reads REQUIRED even though `expose` itself is optional).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Leaf {
+    optional: bool,
+    ty: String,
+}
+
+/// The coarse type of an OpenAPI node for override-vs-spec comparison. A
+/// `$ref` is keyed by its target (`$ref:Needs`) so two types reusing the SAME
+/// definition compare equal AND a re-typed ref is caught; a union
+/// (`oneOf`/`anyOf`) is `union` so a type-narrowing (`string|[...string]` →
+/// `string`) diverges; otherwise the declared scalar/object/array `type`.
+fn leaf_type(node: &Value) -> String {
+    if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+        let name = reference.rsplit('/').next().unwrap_or(reference);
+        return format!("$ref:{name}");
+    }
+    if node.get("oneOf").is_some() || node.get("anyOf").is_some() {
+        return "union".to_string();
+    }
+    match node.get("type").and_then(Value::as_str) {
+        Some(t) => t.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// Flatten a CUE-derived OpenAPI object schema to `{leaf_path -> Leaf}`,
+/// recursing through `properties` (tracking each level's `required` list),
+/// `additionalProperties` (`[*]`), and array `items` (`[]`). A `$ref` node and
+/// a union node are terminal leaves (keyed by `leaf_type`) — the `$ref` boundary
+/// is where "same underlying type ⇒ identical subtree" holds, so we compare at
+/// the boundary rather than inlining. `optional` is a LOCAL property: absent
+/// from the immediate parent's `required` list (not cascaded from ancestors).
+fn flatten_leaves(schema: &Value) -> BTreeMap<String, Leaf> {
+    fn walk(node: &Value, path: &str, optional: bool, out: &mut BTreeMap<String, Leaf>) {
+        // A $ref or union node is terminal: record it and stop (its subtree is
+        // owned by the referenced definition / validated by the webhook).
+        let is_ref = node.get("$ref").is_some();
+        let is_union = node.get("oneOf").is_some() || node.get("anyOf").is_some();
+        let has_props = node.get("properties").is_some();
+        let has_ap = node
+            .get("additionalProperties")
+            .filter(|v| v.is_object())
+            .is_some();
+        let has_items = node.get("items").filter(|v| v.is_object()).is_some();
+
+        if !path.is_empty() {
+            // Record every non-root node (leaf AND composite) so a
+            // required↔optional flip or a type change on a nested object is
+            // visible, then descend into composites.
+            out.insert(
+                path.to_string(),
+                Leaf {
+                    optional,
+                    ty: leaf_type(node),
+                },
+            );
+        }
+        if is_ref || is_union || !(has_props || has_ap || has_items) {
+            return;
+        }
+
+        let required: Vec<&str> = node
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let child = |seg: &str| {
+            if path.is_empty() {
+                seg.to_string()
+            } else {
+                format!("{path}.{seg}")
+            }
+        };
+        if let Some(props) = node.get("properties").and_then(Value::as_object) {
+            for (k, v) in props {
+                walk(v, &child(k), !required.contains(&k.as_str()), out);
+            }
+        }
+        if let Some(ap) = node.get("additionalProperties").filter(|v| v.is_object()) {
+            // A map value is inherently optional (the map may be empty).
+            walk(ap, &child("[*]"), true, out);
+        }
+        if let Some(items) = node.get("items").filter(|v| v.is_object()) {
+            walk(items, &child("[]"), true, out);
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(schema, "", false, &mut out);
+    out
+}
+
+/// R4-M1 (pure). Assert `#ApplicationEnvOverride` is a structural superset of
+/// `#ApplicationSpec` modulo optionality, both directions. The allowlist
+/// entries are `(leaf_path, reason)` for base leaves that are deliberately
+/// non-overridable. Failures:
+///
+/// - every base leaf must exist in the override (allowing base-required →
+///   override-optional) — a base leaf absent from the override is silently
+///   non-overridable → FAIL, unless allowlisted;
+/// - every override leaf must exist in base (a typo / leftover override-only
+///   leaf is a silent no-op) — FAIL, unless allowlisted;
+/// - a leaf's `ty` must match on both sides (a type-narrowing such as `union`
+///   → `string`, or a re-`$ref`, diverges) → FAIL.
+fn check_env_override_superset(
+    spec: &BTreeMap<String, Leaf>,
+    over: &BTreeMap<String, Leaf>,
+    allowlist: &[(&str, &str)],
+) -> std::result::Result<(), Vec<String>> {
+    let allowed = |p: &str| allowlist.iter().any(|(a, _)| *a == p);
+    let mut errs = Vec::new();
+
+    for (path, sl) in spec {
+        if allowed(path) {
+            continue;
+        }
+        match over.get(path) {
+            None => errs.push(format!(
+                "base leaf `{path}` ({}) is not overridable — mirror it in \
+                 #ApplicationEnvOverride (optional) or add it to ENV_OVERRIDE_ALLOWLIST",
+                sl.ty
+            )),
+            Some(ol) if ol.ty != sl.ty => errs.push(format!(
+                "leaf `{path}` type diverges: base {} vs override {} \
+                 (type-narrowing loses overridability)",
+                sl.ty, ol.ty
+            )),
+            Some(_) => {}
+        }
+    }
+
+    for (path, ol) in over {
+        if allowed(path) {
+            // An allowlisted base leaf that the override nonetheless declares
+            // is a contradiction — flag it so the allowlist stays honest.
+            errs.push(format!(
+                "override-only leaf `{path}` is in ENV_OVERRIDE_ALLOWLIST \
+                 (marked non-overridable) yet present in #ApplicationEnvOverride"
+            ));
+            continue;
+        }
+        if !spec.contains_key(path) {
+            errs.push(format!(
+                "override-only leaf `{path}` ({}) has no #ApplicationSpec counterpart \
+                 (typo / leftover → a silent no-op override)",
+                ol.ty
+            ));
+        }
+    }
+
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        errs.sort();
+        Err(errs)
+    }
+}
+
+// ---- R4-M2: no server-side `default:` in a rendered CRD ----
+
+/// R4-M2 (pure). Assert a rendered CRD carries no OpenAPI `default` key
+/// anywhere in its schema tree. `structural::resolve` drops CUE `*x` defaults
+/// (behavior-neutrality: the renderer, not the apiserver, applies them), so any
+/// `default` reaching a rendered CRD is a regression. Walks the whole `Value`
+/// so nested defaults (e.g. `spec.expose.network.default`) are caught, and
+/// reports the JSON pointer of each offender.
+fn check_no_defaults(crd: &Value) -> std::result::Result<(), Vec<String>> {
+    fn walk(node: &Value, ptr: &str, out: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    if k == "default" {
+                        out.push(format!("{ptr}/default = {v}"));
+                    }
+                    walk(v, &format!("{ptr}/{k}"), out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    walk(v, &format!("{ptr}/{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(crd, "", &mut out);
+    if out.is_empty() {
+        Ok(())
+    } else {
+        Err(out)
+    }
 }
 
 /// The first differing line (1-based) with a short excerpt, or `None` if
@@ -394,6 +640,211 @@ mod tests {
             .iter()
             .map(|(p, k)| (p.to_string(), k.to_string()))
             .collect()
+    }
+
+    // ---- R4-M1: env-override superset ----
+
+    /// A minimal #ApplicationSpec-shaped OpenAPI object with a required nested
+    /// `expose.port` and an optional nested `expose.protocol`.
+    fn spec_fixture() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "image": { "type": "string" },
+                "expose": {
+                    "type": "object",
+                    "required": ["port"],
+                    "properties": {
+                        "port": { "type": "integer" },
+                        "protocol": { "type": "string" }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn env_override_superset_detects_missing_nested_leaf() {
+        // Override mirrors expose but LACKS the nested expose.protocol leaf →
+        // silently non-overridable.
+        let over = json!({
+            "type": "object",
+            "properties": {
+                "image": { "type": "string" },
+                "expose": {
+                    "type": "object",
+                    "properties": { "port": { "type": "integer" } }
+                }
+            }
+        });
+        let errs = check_env_override_superset(
+            &flatten_leaves(&spec_fixture()),
+            &flatten_leaves(&over),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("expose.protocol") && e.contains("not overridable")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_superset_ok_when_only_optionality_differs() {
+        // Identical to spec EXCEPT expose.port is optional in the override
+        // (no `required`) — the intended base-required→override-optional delta.
+        let over = json!({
+            "type": "object",
+            "properties": {
+                "image": { "type": "string" },
+                "expose": {
+                    "type": "object",
+                    "properties": {
+                        "port": { "type": "integer" },
+                        "protocol": { "type": "string" }
+                    }
+                }
+            }
+        });
+        // sanity: the base marks port required, the override does not.
+        assert!(!flatten_leaves(&spec_fixture())["expose.port"].optional);
+        assert!(flatten_leaves(&over)["expose.port"].optional);
+        assert!(check_env_override_superset(
+            &flatten_leaves(&spec_fixture()),
+            &flatten_leaves(&over),
+            &[],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn env_override_superset_detects_override_only_leaf() {
+        // Override adds a leaf the base lacks → a typo / silent no-op override.
+        let over = json!({
+            "type": "object",
+            "properties": {
+                "image": { "type": "string" },
+                "expose": {
+                    "type": "object",
+                    "properties": {
+                        "port": { "type": "integer" },
+                        "protocol": { "type": "string" },
+                        "typo": { "type": "string" }
+                    }
+                }
+            }
+        });
+        let errs = check_env_override_superset(
+            &flatten_leaves(&spec_fixture()),
+            &flatten_leaves(&over),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("expose.typo") && e.contains("no #ApplicationSpec")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_superset_detects_type_narrowing() {
+        // Base hostname is a union (string|[...string]); override narrows it to
+        // a bare string → type diverges.
+        let spec = json!({
+            "type": "object",
+            "properties": {
+                "hostname": { "oneOf": [ { "type": "string" }, { "type": "array", "items": { "type": "string" } } ] }
+            }
+        });
+        let over = json!({
+            "type": "object",
+            "properties": { "hostname": { "type": "string" } }
+        });
+        let errs = check_env_override_superset(
+            &flatten_leaves(&spec),
+            &flatten_leaves(&over),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("hostname") && e.contains("diverges")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn env_override_superset_ref_boundary_is_a_leaf_comparing_by_target() {
+        // #Needs / #ImagePolicy reuse the SAME $ref on both sides → identical
+        // leaf type → OK, without inlining the subtree.
+        let spec = json!({
+            "type": "object",
+            "properties": { "needs": { "$ref": "#/components/schemas/Needs" } }
+        });
+        let over = spec.clone();
+        assert!(check_env_override_superset(
+            &flatten_leaves(&spec),
+            &flatten_leaves(&over),
+            &[],
+        )
+        .is_ok());
+        assert_eq!(flatten_leaves(&spec)["needs"].ty, "$ref:Needs");
+    }
+
+    #[test]
+    fn env_override_superset_allowlist_suppresses_a_base_only_leaf() {
+        // A base leaf deliberately non-overridable: absent from the override,
+        // but allowlisted → OK.
+        let spec = json!({
+            "type": "object",
+            "properties": { "image": { "type": "string" }, "pinned": { "type": "string" } }
+        });
+        let over = json!({
+            "type": "object",
+            "properties": { "image": { "type": "string" } }
+        });
+        assert!(check_env_override_superset(
+            &flatten_leaves(&spec),
+            &flatten_leaves(&over),
+            &[("pinned", "deliberately base-only for the test")],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn env_override_allowlist_entries_carry_reasons() {
+        for (p, reason) in ENV_OVERRIDE_ALLOWLIST {
+            assert!(
+                !reason.trim().is_empty(),
+                "env-override allowlist {p} has no reason"
+            );
+        }
+    }
+
+    // ---- R4-M2: no default in a rendered CRD ----
+
+    #[test]
+    fn no_default_detects_openapi_default() {
+        let crd = json!({
+            "spec": { "versions": [ { "schema": { "openAPIV3Schema": {
+                "properties": { "expose": { "properties": {
+                    "network": { "type": "string", "default": "internal" }
+                } } }
+            } } } ] }
+        });
+        let errs = check_no_defaults(&crd).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("default") && e.contains("internal")), "{errs:?}");
+    }
+
+    #[test]
+    fn no_default_passes_on_clean_crd() {
+        let crd = json!({
+            "spec": { "versions": [ { "schema": { "openAPIV3Schema": {
+                "properties": { "expose": { "properties": {
+                    "network": { "type": "string", "enum": ["internal", "public", "vpn"] }
+                } } }
+            } } } ] }
+        });
+        assert!(check_no_defaults(&crd).is_ok());
     }
 
     #[test]
