@@ -48,6 +48,12 @@ _components: "vpa": #Component & {
 				}]
 			}
 			extraArgs: ["--feature-gates=InPlaceOrRecreate=true"]
+			// 2.16d: no platform pod BestEffort (the admission controller is a
+			// lightweight webhook).
+			resources: {
+				requests: {cpu: "25m", memory: "32Mi"}
+				limits: memory: "128Mi"
+			}
 		}
 		recommender: {
 			extraArgs: [
@@ -57,11 +63,13 @@ _components: "vpa": #Component & {
 				"--memory-saver=true",
 			]
 			resources: {
+				// measured idle ~12Mi (2.16e T13 walk); sized above that for the
+				// recommender's per-VPA histogram growth on larger clusters.
 				requests: {
 					cpu:    "50m"
-					memory: "100Mi"
+					memory: "64Mi"
 				}
-				limits: memory: "300Mi"
+				limits: memory: "256Mi"
 			}
 		}
 		updater: {
@@ -70,6 +78,11 @@ _components: "vpa": #Component & {
 				"--in-place-skip-disruption-budget=true",
 				"--feature-gates=InPlaceOrRecreate=true",
 			]
+			// 2.16d: no platform pod BestEffort (the updater watches + patches).
+			resources: {
+				requests: {cpu: "25m", memory: "32Mi"}
+				limits: memory: "128Mi"
+			}
 		}
 	}
 

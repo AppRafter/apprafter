@@ -1760,6 +1760,22 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.50": {
+	change:          "safe"
+	operatorVersion: "v0.2.39"
+	notes: """
+		2.16e follow-up (chart-only) — resources on all three VPA controllers
+		(recommender/updater/admission), so no VPA component pod is BestEffort
+		(2.16d principle). Surfaced by the T13 walk measurement: the recommender
+		idles at ~12Mi (its 100Mi/300Mi seed was over-provisioned → right-sized to
+		64Mi/256Mi), and the updater + admission controller carried no resources at
+		all (chart default {} → BestEffort → now 32Mi/128Mi each). No operator /
+		webhook / CLI change (same v0.2.39). change=safe: Argo auto-syncs; only the
+		three VPA controller pods roll. ADR 0054.
+		"""
+	references: ["docs/adr/0054-vpa-vertical-autoscaling.md"]
+}
+
 compatibility: "0.2.49": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.39"
