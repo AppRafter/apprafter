@@ -263,6 +263,34 @@ async fn provision_cloudnativepg(
         .and_then(Value::as_str)
         .unwrap_or("10Gi")
         .to_string();
+    // Guaranteed backend resources (2.16d). Read tier-aware overrides from
+    // the ServiceProvider `config.resources` (each field independent), else
+    // fall back to the T1 Guaranteed baseline. requests==limits (Guaranteed
+    // QoS) and `shared_buffers` must stay coherent with `memory` — CNPG
+    // >=1.19's webhook rejects an incoherent pair.
+    let default_res = cnpg::BackendResources::cnpg_t1();
+    let res = cnpg::BackendResources {
+        cpu: cfg
+            .pointer("/resources/cpu")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.cpu)
+            .to_string(),
+        memory: cfg
+            .pointer("/resources/memory")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.memory)
+            .to_string(),
+        ephemeral_storage: cfg
+            .pointer("/resources/ephemeralStorage")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.ephemeral_storage)
+            .to_string(),
+        shared_buffers: cfg
+            .pointer("/resources/sharedBuffers")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.shared_buffers)
+            .to_string(),
+    };
 
     info!(%name, %ns, %cluster, %cnpg_ns, "provisioning cloudnative-pg claim");
 
@@ -270,7 +298,7 @@ async fn provision_cloudnativepg(
     //    creates `platform-postgres`; later claims no-op the apply.
     let cluster_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &cnpg_ns, &cluster_ar());
-    let cluster_body = cnpg::cluster_object(&cluster, &cnpg_ns, instances, &storage);
+    let cluster_body = cnpg::cluster_object(&cluster, &cnpg_ns, instances, &storage, &res);
     cluster_api
         .patch(&cluster, &apply_params(), &Patch::Apply(&cluster_body))
         .await?;

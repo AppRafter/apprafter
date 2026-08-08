@@ -84,11 +84,42 @@ pub fn dsn(role: &str, password: &str, db: &str, cluster: &str, ns: &str) -> Str
     format!("postgresql://{role}:{password}@{cluster}-rw.{ns}.svc:5432/{db}")
 }
 
+/// Guaranteed backend resources (2.16d). requests==limits (Guaranteed QoS);
+/// shared_buffers must be coherent with `memory` (CNPG >=1.19 webhook).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackendResources {
+    pub cpu: String,
+    pub memory: String,
+    pub ephemeral_storage: String,
+    pub shared_buffers: String,
+}
+impl BackendResources {
+    /// T1 Guaranteed fallback for CNPG Postgres (docs/measurements/2.16d-baseline-2026-08-08.md).
+    pub fn cnpg_t1() -> Self {
+        Self {
+            cpu: "100m".into(),
+            memory: "256Mi".into(),
+            ephemeral_storage: "1Gi".into(),
+            shared_buffers: "32MB".into(),
+        }
+    }
+}
+
 /// Build the CNPG `Cluster` SSA apply body. Sole-owned by the
 /// provisioner's field manager — `spec.managed.roles` is appended to via
 /// a read-modify-write loop, NOT through this body (the unkeyed list
 /// would clobber co-owned entries under SSA).
-pub fn cluster_object(name: &str, ns: &str, instances: i64, storage: &str) -> Value {
+///
+/// `res` gives the pod Guaranteed QoS (requests==limits, incl.
+/// `ephemeral-storage`) and a `shared_buffers` that must be coherent with
+/// the memory limit — CNPG >=1.19's webhook rejects an incoherent pair.
+pub fn cluster_object(
+    name: &str,
+    ns: &str,
+    instances: i64,
+    storage: &str,
+    res: &BackendResources,
+) -> Value {
     json!({
         "apiVersion": "postgresql.cnpg.io/v1",
         "kind": "Cluster",
@@ -100,6 +131,23 @@ pub fn cluster_object(name: &str, ns: &str, instances: i64, storage: &str) -> Va
             "instances": instances,
             "storage": {
                 "size": storage,
+            },
+            "resources": {
+                "requests": {
+                    "cpu": res.cpu,
+                    "memory": res.memory,
+                    "ephemeral-storage": res.ephemeral_storage,
+                },
+                "limits": {
+                    "cpu": res.cpu,
+                    "memory": res.memory,
+                    "ephemeral-storage": res.ephemeral_storage,
+                },
+            },
+            "postgresql": {
+                "parameters": {
+                    "shared_buffers": res.shared_buffers,
+                },
             },
         },
     })
@@ -312,13 +360,45 @@ mod tests {
 
     #[test]
     fn cluster_object_has_the_cnpg_apply_shape() {
-        let c = cluster_object("platform-postgres", "cnpg-system", 1, "10Gi");
+        let c = cluster_object(
+            "platform-postgres",
+            "cnpg-system",
+            1,
+            "10Gi",
+            &BackendResources::cnpg_t1(),
+        );
         assert_eq!(c["apiVersion"], "postgresql.cnpg.io/v1");
         assert_eq!(c["kind"], "Cluster");
         assert_eq!(c["metadata"]["name"], "platform-postgres");
         assert_eq!(c["metadata"]["namespace"], "cnpg-system");
         assert_eq!(c["spec"]["instances"], 1);
         assert_eq!(c["spec"]["storage"]["size"], "10Gi");
+    }
+
+    #[test]
+    fn cluster_object_emits_guaranteed_resources_and_coherent_shared_buffers() {
+        let res = BackendResources::cnpg_t1();
+        let v = cluster_object("pg", "ns", 1, "10Gi", &res);
+        // Guaranteed: requests == limits
+        assert_eq!(
+            v["spec"]["resources"]["requests"]["memory"],
+            v["spec"]["resources"]["limits"]["memory"]
+        );
+        assert_eq!(
+            v["spec"]["resources"]["requests"]["cpu"],
+            v["spec"]["resources"]["limits"]["cpu"]
+        );
+        assert_eq!(v["spec"]["resources"]["limits"]["memory"], "256Mi");
+        // coherent shared_buffers
+        assert_eq!(
+            v["spec"]["postgresql"]["parameters"]["shared_buffers"],
+            "32MB"
+        );
+        // ephemeral-storage present on requests+limits
+        assert_eq!(
+            v["spec"]["resources"]["limits"]["ephemeral-storage"],
+            "1Gi"
+        );
     }
 
     // --- database_object() ---
