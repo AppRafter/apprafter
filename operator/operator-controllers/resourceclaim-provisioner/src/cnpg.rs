@@ -103,6 +103,23 @@ impl BackendResources {
             shared_buffers: "32MB".into(),
         }
     }
+
+    /// T1 Guaranteed fallback for the shared Dragonfly (redis) pool instance
+    /// (docs/measurements/2.16d-baseline-2026-08-08.md). `memory` (320Mi,
+    /// req==limit → Guaranteed QoS) sits ABOVE the ADR-0042 ~287MB structural
+    /// floor at the 1024-claim cap; `--maxmemory=256mb` (the Dragonfly server
+    /// flag, emitted by `dragonfly_object`) is set BELOW that cgroup limit so
+    /// the process caps its own RSS with headroom before the kernel OOM-kills
+    /// it. `shared_buffers` is unused (a Postgres-ism Dragonfly ignores) and
+    /// left empty here.
+    pub fn dragonfly_t1() -> Self {
+        Self {
+            cpu: "50m".into(),
+            memory: "320Mi".into(),
+            ephemeral_storage: "1Gi".into(),
+            shared_buffers: String::new(),
+        }
+    }
 }
 
 /// Build the CNPG `Cluster` SSA apply body. Sole-owned by the

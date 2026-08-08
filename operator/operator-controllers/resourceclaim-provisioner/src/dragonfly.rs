@@ -12,7 +12,16 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use crate::cnpg::BackendResources;
 use operator_core::{ResourceClaim, RetainedClaim};
+
+/// Dragonfly's self-imposed RSS cap (`--maxmemory` server flag), sized BELOW
+/// the `BackendResources::dragonfly_t1` 320Mi cgroup limit so the process
+/// caps itself with headroom before the kernel OOM-kills the pod (ADR 0042 /
+/// docs/measurements/2.16d-baseline-2026-08-08.md). This is the real Dragonfly
+/// memory-limit flag — distinct from the rejected `--maxmemory-policy` /
+/// `--maxmemory_policy` Redis-ism that crash-loops the binary.
+const DRAGONFLY_MAXMEMORY: &str = "256mb";
 
 /// Lowest free DB number `< max` not in `used`, or None if the instance
 /// is full (the signal to grow the pool — ADR 0042 §3). DB 0 is
@@ -177,6 +186,7 @@ pub fn dragonfly_object(
     num_shards: u16,
     replicas: u16,
     persistent: bool,
+    res: &BackendResources,
 ) -> Value {
     // `replicas` is MANDATORY: the dragonfly-operator sets
     // `StatefulSet.spec.replicas = &df.Spec.Replicas` with NO default, so an
@@ -188,12 +198,32 @@ pub fn dragonfly_object(
     // Dragonfly does not evict by default (`--cache_mode=false`) — which IS the
     // noeviction behaviour queue/lock libraries need — so omitting it is the
     // fix, not a gap.
+    //
+    // `--maxmemory` (2.16d) IS a valid Dragonfly server flag (distinct from the
+    // rejected `--maxmemory-policy`): it caps the process RSS BELOW the
+    // Guaranteed cgroup memory limit (`res.memory`), giving headroom so
+    // Dragonfly rejects writes at its own ceiling rather than being OOM-killed.
     let mut spec = json!({
         "replicas": replicas,
         "args": [
             format!("--dbnum={dbnum}"),
             format!("--num_shards={num_shards}"),
+            format!("--maxmemory={DRAGONFLY_MAXMEMORY}"),
         ],
+        // Guaranteed QoS: requests == limits on cpu + memory. The
+        // dragonfly-operator propagates `spec.resources` (standard k8s
+        // ResourceRequirements) onto the StatefulSet pod. `shared_buffers` on
+        // `res` is a Postgres-ism Dragonfly ignores and is not emitted here.
+        "resources": {
+            "requests": {
+                "cpu": res.cpu,
+                "memory": res.memory,
+            },
+            "limits": {
+                "cpu": res.cpu,
+                "memory": res.memory,
+            },
+        },
         "authentication": {
             "passwordFromSecret": { "name": admin_secret_name(name), "key": "password" }
         },
@@ -299,6 +329,7 @@ pub fn used_dbnums(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cnpg::BackendResources;
     use operator_core::{ResourceClaimStatus, RetainedClaim};
     use std::collections::BTreeSet;
 
@@ -376,6 +407,7 @@ mod tests {
             1,
             1,
             true,
+            &BackendResources::dragonfly_t1(),
         );
         assert_eq!(cr["apiVersion"], "dragonflydb.io/v1alpha1");
         assert_eq!(cr["kind"], "Dragonfly");
@@ -387,11 +419,15 @@ mod tests {
         let args = cr["spec"]["args"].as_array().unwrap();
         assert!(args.iter().any(|a| a == "--dbnum=1024"));
         assert!(args.iter().any(|a| a == "--num_shards=1"));
-        // NO --maxmemory_policy: Dragonfly rejects that flag; noeviction is its
-        // default. Guard against a regression re-adding it.
+        // `--maxmemory` (the RSS cap, 2.16d) IS emitted and valid.
+        assert!(args.iter().any(|a| a == "--maxmemory=256mb"));
+        // NO --maxmemory-policy / --maxmemory_policy: Dragonfly rejects those
+        // Redis-isms (crash-loop); noeviction is its default. Guard against a
+        // regression re-adding either policy flag (but allow `--maxmemory=…`).
         assert!(!args
             .iter()
-            .any(|a| a.as_str().unwrap_or("").contains("maxmemory")));
+            .any(|a| a.as_str().unwrap_or("").contains("maxmemory-policy")
+                || a.as_str().unwrap_or("").contains("maxmemory_policy")));
         // The admin password Secret is referenced by name.
         assert_eq!(
             cr["spec"]["authentication"]["passwordFromSecret"]["name"],
@@ -410,8 +446,35 @@ mod tests {
             1,
             1,
             false,
+            &BackendResources::dragonfly_t1(),
         );
         assert!(eph["spec"].get("snapshot").is_none());
+    }
+
+    #[test]
+    fn dragonfly_object_emits_guaranteed_resources() {
+        let res = BackendResources::dragonfly_t1();
+        let v = dragonfly_object("r", "ns", 0, 1, 1, false, &res);
+        // requests == limits on cpu + memory → Guaranteed QoS.
+        assert_eq!(
+            v["spec"]["resources"]["requests"]["memory"],
+            v["spec"]["resources"]["limits"]["memory"]
+        );
+        assert_eq!(
+            v["spec"]["resources"]["requests"]["cpu"],
+            v["spec"]["resources"]["limits"]["cpu"]
+        );
+        assert_eq!(v["spec"]["resources"]["limits"]["memory"], "320Mi");
+        assert_eq!(v["spec"]["resources"]["limits"]["cpu"], "50m");
+        // Dragonfly caps its own RSS via the `--maxmemory` server flag, sized
+        // BELOW the 320Mi cgroup limit (RSS headroom). This is the real
+        // Dragonfly memory-limit flag — distinct from the rejected
+        // `--maxmemory-policy` Redis-ism.
+        let args = v["spec"]["args"].as_array().unwrap();
+        assert!(
+            args.iter().any(|a| a == "--maxmemory=256mb"),
+            "expected --maxmemory=256mb in args, got {args:?}"
+        );
     }
 
     // --- admin_secret_object() ---

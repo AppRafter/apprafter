@@ -472,6 +472,32 @@ async fn provision_dragonfly(
         .filter(|n| *n >= 1)
         .unwrap_or(1) as u16;
 
+    // Guaranteed backend resources (2.16d): per-field override from the
+    // provider config (`/resources/*`), else the T1 Guaranteed baseline
+    // (cpu 50m, memory 320Mi req==limit above the ADR-0042 ~287MB floor).
+    // `dragonfly_object` emits `spec.resources` (requests==limits) and the
+    // `--maxmemory` RSS cap; `shared_buffers` on `BackendResources` is a
+    // Postgres-ism Dragonfly ignores and is left at its default.
+    let default_res = cnpg::BackendResources::dragonfly_t1();
+    let res = cnpg::BackendResources {
+        cpu: cfg
+            .pointer("/resources/cpu")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.cpu)
+            .to_string(),
+        memory: cfg
+            .pointer("/resources/memory")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.memory)
+            .to_string(),
+        ephemeral_storage: cfg
+            .pointer("/resources/ephemeralStorage")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.ephemeral_storage)
+            .to_string(),
+        shared_buffers: default_res.shared_buffers.clone(),
+    };
+
     // Persistence class is carried on the claim (the Application controller
     // copies `needs.<type>.persistent` onto the generated claim spec, 2.4d).
     let persistent = claim.spec.persistent.unwrap_or(false);
@@ -506,7 +532,7 @@ async fn provision_dragonfly(
     let df_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
     let df_body = dragonfly::dragonfly_object(
-        &instance, &df_ns, dbnum_max, num_shards, replicas, persistent,
+        &instance, &df_ns, dbnum_max, num_shards, replicas, persistent, &res,
     );
     df_api
         .patch(&instance, &apply_params(), &Patch::Apply(&df_body))
