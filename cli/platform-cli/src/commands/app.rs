@@ -879,6 +879,11 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                     if let Some(image_line) = format_image_line(&cr, &chrono::Utc::now()) {
                         println!("{image_line}");
                     }
+                    // 2.16e: VPA recommendation — only printed when the
+                    // operator has written status.recommendedResources.
+                    if let Some(reco_line) = format_recommendation_line(&cr) {
+                        println!("{reco_line}");
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -2624,6 +2629,66 @@ pub(crate) fn format_image_line(cr: &Value, now: &chrono::DateTime<chrono::Utc>)
     Some(line)
 }
 
+/// Pure helper — format the VPA recommendation line from
+/// `Application.status.recommendedResources` for display in `app status`.
+///
+/// Returns `None` when the field is absent (VPA not installed, first
+/// reconcile not yet done, or autoscale.mode == off with no prior run).
+/// When `uncappedTarget` differs from `target` on a resource (i.e. VPA
+/// would recommend higher but a VPA `ResourcePolicy.maxAllowed` cap is
+/// in effect), the line appends a `· uncapped <v> — raise limits.memory`
+/// hint. When `notApplied` is present (recommendation recorded but the
+/// updater was told not to apply it), the reason is appended.
+pub(crate) fn format_recommendation_line(cr: &Value) -> Option<String> {
+    let reco = cr.pointer("/status/recommendedResources")?;
+    let target = reco.pointer("/recommendation/target")?;
+
+    // Collect resource entries from the `target` object.
+    let target_obj = target.as_object()?;
+
+    let uncapped = reco.pointer("/recommendation/uncappedTarget");
+    let not_applied = reco.get("notApplied").and_then(Value::as_str);
+
+    let mut parts: Vec<String> = Vec::new();
+    for (resource, value) in target_obj {
+        let target_val = value.as_str().unwrap_or("?");
+
+        // Build the base entry: "limits.memory: 512Mi"
+        let display_key = match resource.as_str() {
+            "memory" => "limits.memory".to_string(),
+            "cpu" => "limits.cpu".to_string(),
+            other => other.to_string(),
+        };
+        let mut entry = format!("{display_key}: {target_val}");
+
+        // Append uncapped hint when it differs from the capped target.
+        if let Some(uncapped_val) = uncapped
+            .and_then(|u| u.get(resource))
+            .and_then(Value::as_str)
+        {
+            if uncapped_val != target_val {
+                entry.push_str(&format!(
+                    " · uncapped {uncapped_val} — raise `resources.limits.memory`"
+                ));
+            }
+        }
+
+        parts.push(entry);
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut line = format!("  VPA reco:      {}", parts.join(", "));
+
+    if let Some(reason) = not_applied {
+        line.push_str(&format!(" · not applied — {reason}"));
+    }
+
+    Some(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3542,6 +3607,69 @@ mod tests {
         assert!(!line.contains("@sha256"));
         assert!(!line.contains("->"));
         assert!(!line.contains("resolved"));
+    }
+
+    // ── format_recommendation_line (T10 / 2.16e) ──────────────────────
+
+    #[test]
+    fn format_reco_line_shows_capped_and_uncapped() {
+        // When uncappedTarget differs from target the line must surface
+        // both values + the "raise limits.memory" hint so operators know
+        // to loosen the VPA ResourcePolicy cap.
+        let cr = serde_json::json!({ "status": { "recommendedResources": {
+            "recommendation": {
+                "target": { "memory": "512Mi" },
+                "uncappedTarget": { "memory": "900Mi" }
+            }
+        }}});
+        let line = format_recommendation_line(&cr).unwrap();
+        assert!(line.contains("512Mi"), "must show capped target: {line}");
+        assert!(line.contains("900Mi"), "must show uncapped target: {line}");
+        assert!(
+            line.to_lowercase().contains("limits.memory"),
+            "must reference limits.memory: {line}"
+        );
+    }
+
+    #[test]
+    fn format_reco_line_not_applied() {
+        // When notApplied is set the reason must appear in the line
+        // (e.g. operator chose not to apply due to node-capacity safety).
+        let cr = serde_json::json!({ "status": { "recommendedResources": {
+            "recommendation": { "target": { "memory": "400Mi" } },
+            "notApplied": "recommendation not applied — node capacity"
+        }}});
+        let line = format_recommendation_line(&cr).unwrap();
+        assert!(
+            line.contains("not applied — node capacity"),
+            "must surface notApplied reason: {line}"
+        );
+    }
+
+    #[test]
+    fn format_reco_line_none_when_absent() {
+        // No recommendedResources field → None (VPA not installed or
+        // first reconcile not yet done). Must not panic.
+        assert!(format_recommendation_line(&serde_json::json!({ "status": {} })).is_none());
+        assert!(format_recommendation_line(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn format_reco_line_no_uncapped_suffix_when_equal() {
+        // When uncappedTarget matches target (no cap in effect) the
+        // "uncapped … — raise limits.memory" hint must NOT appear.
+        let cr = serde_json::json!({ "status": { "recommendedResources": {
+            "recommendation": {
+                "target": { "memory": "256Mi" },
+                "uncappedTarget": { "memory": "256Mi" }
+            }
+        }}});
+        let line = format_recommendation_line(&cr).unwrap();
+        assert!(line.contains("256Mi"), "must show target: {line}");
+        assert!(
+            !line.contains("uncapped"),
+            "must NOT show uncapped hint when values match: {line}"
+        );
     }
 
     #[test]
