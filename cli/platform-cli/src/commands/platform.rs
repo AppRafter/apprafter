@@ -868,6 +868,81 @@ pub fn env_set(env: &str) -> Result<()> {
     Ok(())
 }
 
+/// The path-scoped JSON merge-patch body for
+/// `spec.resources.autoscale.mode`. Pure (unit-tested without a cluster).
+fn autoscale_patch_body(mode: &str) -> String {
+    serde_json::json!({ "spec": { "resources": { "autoscale": { "mode": mode } } } }).to_string()
+}
+
+/// Validate the autoscale mode string client-side so the user gets a
+/// clear rejection rather than a raw apiserver/webhook error.
+fn validate_autoscale_mode(mode: &str) -> Result<&str> {
+    match mode {
+        "full" | "up-only" | "off" => Ok(mode),
+        other => Err(CliError::Other(format!(
+            "invalid autoscale mode '{other}' (expected full|up-only|off)"
+        ))),
+    }
+}
+
+/// `apprafter platform autoscale show` — print the current VPA autoscale mode.
+pub fn autoscale_show() -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let stack = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?;
+    let mode = stack
+        .as_ref()
+        .and_then(|s| s.pointer("/spec/resources/autoscale/mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("full (default)");
+    println!("Autoscale mode: {mode}");
+    println!(
+        "\nModes:\n\
+         \u{2022} full      VPA applies both CPU and memory recommendations (up and down)\n\
+         \u{2022} up-only   VPA scales resources up but never below the platform seed\n\
+         \u{2022} off       VPA recommendations recorded but NOT applied to pods\n\
+         \n\
+         Set with: apprafter platform autoscale set <full|up-only|off>"
+    );
+    Ok(())
+}
+
+/// `apprafter platform autoscale set <mode>` — set the cluster-wide VPA
+/// autoscale mode via merge-patch on the singleton PlatformStack. Uses
+/// merge-patch (not SSA) for the same reason as `env set` / `target domain`:
+/// the path is nested under `spec.resources` which may contain other fields
+/// the CLI doesn't own; a scoped merge-patch touches only the leaf.
+pub fn autoscale_set(mode: &str) -> Result<()> {
+    let mode = validate_autoscale_mode(mode)?;
+    let kc = ensure_kubeconfig_tempfile()?;
+    let body = autoscale_patch_body(mode);
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+    println!("✓ Autoscale mode set to '{mode}'.");
+    if mode == "off" {
+        println!(
+            "⚠ off freezes live pods but does NOT restore them: the next deploy/recreation \
+             reverts each pod to the platform seed (32Mi). Set explicit `resources` on apps \
+             you want to keep at their current sizing."
+        );
+    }
+    println!(
+        "Note: if an infra-repo declares spec.resources.autoscale, Argo CD becomes \
+         authoritative and wins on the next sync."
+    );
+    Ok(())
+}
+
 /// Best-effort: does any `metadata.managedFields` entry owned by a
 /// manager OTHER than `apprafter-cli` whose name looks like Argo CD
 /// (`argocd`, `argo-cd-*`, `application-controller`) carry the
@@ -1304,5 +1379,33 @@ mod tests {
                 "egress field manager must not contain Argo-shaped substring {needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn autoscale_patch_body_is_path_scoped() {
+        // The merge-patch must touch ONLY the autoscale.mode leaf — a
+        // shallow `spec: { mode }` body would clobber other spec fields
+        // on the PlatformStack that the CLI doesn't own.
+        assert_eq!(
+            autoscale_patch_body("up-only"),
+            r#"{"spec":{"resources":{"autoscale":{"mode":"up-only"}}}}"#
+        );
+    }
+
+    #[test]
+    fn autoscale_validates_mode() {
+        // All three documented presets must pass; anything else is
+        // rejected client-side before touching the apiserver.
+        assert!(validate_autoscale_mode("full").is_ok());
+        assert!(validate_autoscale_mode("up-only").is_ok());
+        assert!(validate_autoscale_mode("off").is_ok());
+        assert!(validate_autoscale_mode("bogus").is_err());
+        // Error must echo the bad value.
+        let err = validate_autoscale_mode("auto").unwrap_err().to_string();
+        assert!(err.contains("auto"), "must echo bad value: {err}");
+        assert!(
+            err.contains("full") && err.contains("up-only") && err.contains("off"),
+            "must list valid presets: {err}"
+        );
     }
 }

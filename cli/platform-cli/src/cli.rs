@@ -519,6 +519,14 @@ pub enum PlatformCommand {
         #[command(subcommand)]
         action: EnvCommand,
     },
+    /// Inspect or set the cluster-wide VPA autoscale mode
+    /// (`PlatformStack.spec.resources.autoscale.mode`). Controls
+    /// whether the Vertical Pod Autoscaler applies recommendations to
+    /// Application pods automatically. 2.16e.
+    Autoscale {
+        #[command(subcommand)]
+        action: AutoscaleCommand,
+    },
 }
 
 /// `apprafter platform env …` subcommands.
@@ -530,6 +538,19 @@ pub enum EnvCommand {
     Set {
         /// Environment name (e.g. prod, staging).
         env: String,
+    },
+}
+
+/// `apprafter platform autoscale …` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum AutoscaleCommand {
+    /// Show the cluster's current VPA autoscale mode and available presets.
+    Show,
+    /// Set the cluster-wide VPA autoscale mode.
+    Set {
+        /// One of `full` (apply up and down), `up-only` (scale up only),
+        /// or `off` (record recommendations but do not apply them).
+        mode: String,
     },
 }
 
