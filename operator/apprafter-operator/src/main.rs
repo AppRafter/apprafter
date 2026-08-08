@@ -60,6 +60,21 @@ async fn gateway_api_available(client: &Client) -> bool {
         .is_some()
 }
 
+/// Probe whether the `verticalpodautoscalers.autoscaling.k8s.io` CRD is served
+/// on this cluster (2.16e / ADR 0054). Run ONCE at startup and threaded into
+/// the Application controller's `Context` so the reconcile loop can gate the
+/// VPA SSA apply: on a cluster without the VPA operator the CRD is unserved and
+/// applying a `VerticalPodAutoscaler` 404s every reconcile. Best-effort: any
+/// read error degrades to `false` (skip the apply).
+async fn vpa_available(client: &Client) -> bool {
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    api.get_opt("verticalpodautoscalers.autoscaling.k8s.io")
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -132,6 +147,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "probed Gateway-API HTTPRoute CRD availability"
     );
 
+    // 2.16e (ADR 0054): probe ONCE whether the VPA CRD is served, and thread
+    // the result into the Application controller. On a cluster without the VPA
+    // operator the `verticalpodautoscalers.autoscaling.k8s.io` CRD is absent
+    // and applying a VPA would 404 every reconcile.
+    let vpa = vpa_available(&client).await;
+    info!(
+        vpa_available = vpa,
+        "probed VerticalPodAutoscaler CRD availability"
+    );
+
     // 2.9 (ADR 0044): the active environment is now a PER-CR property
     // (`Application.spec.environment`), resolved inside the reconcile
     // loop — there is no cluster-wide `APPRAFTER_ENV` selector anymore.
@@ -140,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics = metrics.clone();
         async move {
             if let Err(err) =
-                application_controller::run(client, metrics, cilium, gateway_api).await
+                application_controller::run(client, metrics, cilium, gateway_api, vpa).await
             {
                 error!(%err, "Application controller error");
             }

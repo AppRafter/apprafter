@@ -32,11 +32,12 @@ use pull_secret::{app_pull_secret_name, pick_pull_credential};
 use operator_controllers_sourcecredential::pull_secret_name;
 use operator_core::{
     image_repo, resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
-    ApplicationSpec, ApplicationStatus, DestructiveChange, DiskClaim, EgressProfile, EnvValue,
-    Metrics, MigrationPlan, Needs, PlatformStack, PlatformStackValues, ResourceClaim,
-    ServiceProvider, SourceCredential, StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING,
-    COND_PUBLIC_ROUTE_READY, COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL,
-    PHASE_AWAITING_RESOURCE_CLAIM, PHASE_ENV_SECRET_MISSING, PHASE_INVALID_EFFECTIVE_SPEC,
+    ApplicationSpec, ApplicationStatus, ContainerRecommendation, DestructiveChange, DiskClaim,
+    EgressProfile, EnvValue, Metrics, MigrationPlan, Needs, PlatformStack, PlatformStackValues,
+    RecommendedResources, ResourceClaim, ServiceProvider, SourceCredential, StatusImage,
+    COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
+    COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
+    PHASE_ENV_SECRET_MISSING, PHASE_INVALID_EFFECTIVE_SPEC,
 };
 // 2.16b-sc: the app-scope migration state machine now lives in
 // `operator-core::migration_state` (hoisted verbatim, zero behavior change)
@@ -95,6 +96,12 @@ pub struct Context {
     /// cluster (1.83b). Probed ONCE at startup; gates the HTTPRoute SSA apply +
     /// prune (a non-Gateway-API cluster renders the route but skips the apply).
     pub gateway_api_available: bool,
+    /// Whether the `verticalpodautoscalers.autoscaling.k8s.io` CRD is served on
+    /// this cluster (2.16e / ADR 0054). Probed ONCE at startup; gates the VPA
+    /// SSA apply + prune: a cluster without the VPA operator would 404 every
+    /// reconcile. When `false`, the controller renders the VPA the same way but
+    /// skips the apply.
+    pub vpa_available: bool,
 }
 
 #[derive(Debug, Error)]
@@ -123,6 +130,7 @@ pub async fn run(
     metrics: Arc<Metrics>,
     cilium_available: bool,
     gateway_api_available: bool,
+    vpa_available: bool,
 ) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
@@ -142,6 +150,7 @@ pub async fn run(
         oci_http: oci_resolve::ReqwestHttp::new(),
         cilium_available,
         gateway_api_available,
+        vpa_available,
     });
 
     Controller::new(apps, watcher::Config::default())
@@ -663,6 +672,11 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         .unwrap_or_default();
     let needs_targets = resolve_needs_targets(&service_types, &BTreeMap::new());
 
+    // ---- 2.16e (ADR 0054): resolve the VPA autoscale config ----
+    // Best-effort read from the singleton PlatformStack (absent / unreadable →
+    // compiled-in defaults: Full, 25m/32Mi min, 1/512Mi max). Never writes spec.
+    let autoscale = read_autoscale_config(&ctx.client).await;
+
     let mut rendered = render_application_for_env(
         &app,
         app.spec.environment.as_deref(),
@@ -679,7 +693,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         },
         egress_profile,
         Some(&needs_targets),
-        None, // autoscale: threaded in by 2.16e controller task
+        Some(&autoscale),
     )
     // The renderer folds the SAME (app, env) effective spec the migration gate
     // (step 1) already validated to `Ok`; the only `EffectiveSpecError` it can
@@ -739,6 +753,24 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
             prune_http_route(&ctx.client, &namespace, &name).await?;
         }
     }
+
+    // 2.16e (ADR 0054): SSA-apply the per-Application VPA — but ONLY when the
+    // VPA CRD is served (probed once at startup). When NOT a managed env
+    // (renderer emits no VPA) PRUNE any stale VPA (the app switched to
+    // pro-mode / explicit resources). The VPA carries the SAME Application
+    // ownerRef → cascades on app delete.
+    let vpa_applied = if ctx.vpa_available {
+        if let Some(vpa) = rendered.vpa.take() {
+            let owner = owner_reference(&app);
+            apply_vpa(&ctx.client, &namespace, &owner, vpa).await?;
+            true
+        } else {
+            prune_vpa(&ctx.client, &namespace, &name).await?;
+            false
+        }
+    } else {
+        false
+    };
 
     // 1.83b: a public app's endpoint is its public HTTPS URL (the first
     // hostname); otherwise the internal cluster-DNS Service URL.
@@ -802,6 +834,27 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     }
     let mut status = build_status(&app, "Ready", conditions, endpoint_url);
     status.image = image_status;
+
+    // 2.16e (ADR 0054): if the VPA is available AND we applied one for this
+    // reconcile, GET the live VPA CR and mirror its recommendation into the
+    // status. A missing or not-yet-populated VPA is OK (best-effort read; the
+    // recommendation is advisory). Flows into the SINGLE apply_status below —
+    // no second status patch.
+    if ctx.vpa_available && vpa_applied {
+        let vpa_api = Api::<DynamicObject>::namespaced_with(
+            ctx.client.clone(),
+            &namespace,
+            &vpa_api_resource(),
+        );
+        if let Ok(Some(live_vpa)) = vpa_api.get_opt(&name).await {
+            // `infeasible` conservatively false — the exact updater-infeasible
+            // signal source is a walk-time detail; a follow-up can wire the
+            // VPA condition type `NoPodsMatched` / `FetchingHistory` into the
+            // updater-infeasible probe.
+            status.recommended_resources = map_vpa_recommendation(&live_vpa.data, false);
+        }
+    }
+
     // 2.16b Task 11: stamp `status.lastAppliedSpec = spec` (the RAW current
     // spec) after the successful render+apply. Only the render arms
     // (`Render` / `ConsumeApply` / `DeleteThenRender`) reach here — every
@@ -1141,6 +1194,153 @@ async fn read_allowed_domains(client: &Client) -> Vec<String> {
         Ok(Some(ps)) => allowed_domains_from_values(&ps.spec.values),
         _ => Vec::new(),
     }
+}
+
+// ---- 2.16e (ADR 0054): VPA apply / prune / autoscale config read ----
+
+/// `ApiResource` for the externally-installed VPA `VerticalPodAutoscaler` CRD
+/// (group `autoscaling.k8s.io`, version `v1`). Gated by
+/// [`Context::vpa_available`] on clusters without the VPA operator.
+fn vpa_api_resource() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "autoscaling.k8s.io",
+        "v1",
+        "VerticalPodAutoscaler",
+    ))
+}
+
+/// SSA-apply the per-Application `VerticalPodAutoscaler` as a `DynamicObject`
+/// (autoscaling.k8s.io/v1), mirroring `apply_network_policy`: inject
+/// `metadata.namespace` (the app's) + `ownerReferences` (the SAME Application
+/// ownerRef the Deployment/Service carry → cascade on delete), then apply under
+/// [`FIELD_MANAGER`]. 2.16e.
+async fn apply_vpa(
+    client: &Client,
+    namespace: &str,
+    owner: &OwnerReference,
+    mut body: Value,
+) -> Result<(), ReconcileError> {
+    let name = body
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    body["metadata"]["namespace"] = json!(namespace);
+    body["metadata"]["ownerReferences"] = json!([owner]);
+
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &vpa_api_resource());
+    api.patch(
+        &name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&body),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Best-effort delete of a stale `VerticalPodAutoscaler` named `name` (the app
+/// switched to pro-mode / explicit resources). 404-tolerant (a missing VPA is a
+/// no-op — it may never have existed, or already cascaded). 2.16e.
+async fn prune_vpa(client: &Client, namespace: &str, name: &str) -> Result<(), ReconcileError> {
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &vpa_api_resource());
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The compiled-in VPA autoscale floor defaults (2.16e / ADR 0054).
+/// Tier-invariant: `Full` mode, 25m/32Mi min, 1/512Mi max. When the
+/// PlatformStack `spec.resources.autoscale` knob is absent or only overrides
+/// the `mode`, these floors are preserved as-is via `resolve_autoscale_config`.
+fn default_autoscale_config() -> operator_core::AutoscaleConfig {
+    operator_core::AutoscaleConfig {
+        mode: operator_core::AutoscaleMode::Full,
+        min_allowed: Some(operator_core::ResourceQuantities::from([
+            ("cpu", "25m"),
+            ("memory", "32Mi"),
+        ])),
+        max_allowed: Some(operator_core::ResourceQuantities::from([
+            ("memory", "512Mi"),
+            ("cpu", "1"),
+        ])),
+    }
+}
+
+/// Resolve the effective autoscale config from an optional `PlatformStackSpec`
+/// (2.16e). The knob overrides `mode`; ABSENT floors fall back to the compiled-in
+/// defaults — so an off-knob that omits floors still gets 32Mi/512Mi. Never
+/// writes spec.
+fn resolve_autoscale_config(
+    spec: Option<&operator_core::PlatformStackSpec>,
+) -> operator_core::AutoscaleConfig {
+    let mut cfg = default_autoscale_config();
+    if let Some(ac) = spec
+        .and_then(|s| s.resources.as_ref())
+        .and_then(|r| r.autoscale.as_ref())
+    {
+        cfg.mode = ac.mode;
+        if ac.min_allowed.is_some() {
+            cfg.min_allowed = ac.min_allowed.clone();
+        }
+        if ac.max_allowed.is_some() {
+            cfg.max_allowed = ac.max_allowed.clone();
+        }
+    }
+    cfg
+}
+
+/// Read the cluster-wide autoscale config from the singleton PlatformStack
+/// (2.16e). Best-effort: a missing CR (`get_opt` → `None`) or any read error
+/// degrades to the compiled-in defaults — the VPA posture must never break a
+/// reconcile, and "absent" is the documented default. Never writes spec.
+async fn read_autoscale_config(client: &Client) -> operator_core::AutoscaleConfig {
+    let api: Api<PlatformStack> = Api::namespaced(client.clone(), PLATFORM_STACK_NAMESPACE);
+    match api.get_opt(PLATFORM_STACK_NAME).await {
+        Ok(Some(ps)) => resolve_autoscale_config(Some(&ps.spec)),
+        Ok(None) => resolve_autoscale_config(None),
+        Err(e) => {
+            warn!(error = %e, "could not read PlatformStack autoscale config; using compiled-in defaults");
+            default_autoscale_config()
+        }
+    }
+}
+
+/// Extract a `BTreeMap<String, String>` of resource quantities from a VPA
+/// container recommendation sub-object (e.g. `/target` or `/uncappedTarget`).
+fn quantities(v: Option<&Value>) -> Option<BTreeMap<String, String>> {
+    v.and_then(|m| m.as_object()).map(|m| {
+        m.iter()
+            .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect()
+    })
+}
+
+/// Map a live VPA CR's `.status.recommendation.containerRecommendations[0]`
+/// into an [`operator_core::RecommendedResources`] for the Application status.
+/// Returns `None` when there is no recommendation AND `infeasible` is false
+/// (VPA not yet populated — omit the field rather than emit an empty struct).
+/// When `infeasible` is true the `not_applied` message is always set.
+fn map_vpa_recommendation(vpa: &Value, infeasible: bool) -> Option<RecommendedResources> {
+    let cr = vpa.pointer("/status/recommendation/containerRecommendations/0");
+    let recommendation = cr.map(|c| ContainerRecommendation {
+        target: quantities(c.pointer("/target")),
+        uncapped_target: quantities(c.pointer("/uncappedTarget")),
+    });
+    if recommendation.is_none() && !infeasible {
+        return None;
+    }
+    Some(RecommendedResources {
+        container_name: cr
+            .and_then(|c| c.pointer("/containerName"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        recommendation,
+        not_applied: infeasible.then(|| "recommendation not applied — node capacity".to_string()),
+    })
 }
 
 /// Resolve the connection-target catalog for the effective needs' network
@@ -3255,6 +3455,7 @@ mod tests {
             image: None,
             environment: None,
             last_applied_spec: None,
+            recommended_resources: None,
         });
         let status = build_paused_status(&app, "team-a", "web-prod-migration-1");
 
@@ -3330,6 +3531,7 @@ mod tests {
             image: None,
             environment: Some("dev".into()),
             last_applied_spec: Some(baseline.clone()),
+            recommended_resources: None,
         });
 
         // All four production pause/awaiting builders must preserve it.
@@ -4165,6 +4367,7 @@ mod tests {
             image: None,
             environment: None,
             last_applied_spec: None,
+            recommended_resources: None,
         });
         let status = build_resource_claim_paused_status(&app, &["parser-pg".to_string()]);
         assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));
@@ -5158,6 +5361,7 @@ mod tests {
             image: None,
             environment: None,
             last_applied_spec: None,
+            recommended_resources: None,
         });
         let messages = vec![
             "env STRIPE_KEY → secret \"stripe/api-key\": Secret \"stripe\" not found or missing key \"api-key\"".to_string(),
@@ -5217,6 +5421,7 @@ mod tests {
             image: None,
             environment: None,
             last_applied_spec: None,
+            recommended_resources: None,
         });
         let status = build_env_secret_missing_status(
             &app,
@@ -5516,6 +5721,7 @@ mod tests {
             }),
             environment: Some("prod".into()),
             last_applied_spec: None,
+            recommended_resources: None,
         };
         let spec = ApplicationSpec {
             base: Some(ApplicationBaseSpec {
@@ -5771,6 +5977,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            recommended_resources: None,
         });
         let status = build_migration_failed_status(&app, "web-prod-migration-3");
         assert_eq!(
@@ -5806,5 +6013,80 @@ mod tests {
             .expect("migration failed");
         assert_eq!(failed.status, "True");
         assert!(failed.message.contains("web-prod-migration-3"));
+    }
+
+    // ---- 2.16e VPA autoscale config resolution + recommendation mapping ----
+
+    #[test]
+    fn resolve_autoscale_falls_back_to_tier_default_when_absent() {
+        let ac = resolve_autoscale_config(None);
+        assert_eq!(ac.mode, operator_core::AutoscaleMode::Full);
+        assert_eq!(ac.min_allowed.as_ref().unwrap().0["memory"], "32Mi");
+        assert_eq!(ac.max_allowed.as_ref().unwrap().0["memory"], "512Mi");
+    }
+
+    #[test]
+    fn resolve_autoscale_uses_mode_keeps_default_floors() {
+        let spec = operator_core::PlatformStackSpec {
+            resources: Some(operator_core::ResourceGovernanceConfig {
+                autoscale: Some(operator_core::AutoscaleConfig {
+                    mode: operator_core::AutoscaleMode::Off,
+                    min_allowed: None,
+                    max_allowed: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let ac = resolve_autoscale_config(Some(&spec));
+        assert_eq!(ac.mode, operator_core::AutoscaleMode::Off);
+        assert_eq!(ac.min_allowed.as_ref().unwrap().0["memory"], "32Mi");
+    }
+
+    #[test]
+    fn map_vpa_reco_extracts_target_and_uncapped() {
+        let vpa = serde_json::json!({
+            "status": {
+                "recommendation": {
+                    "containerRecommendations": [{
+                        "containerName": "*",
+                        "target": { "memory": "300Mi" },
+                        "uncappedTarget": { "memory": "900Mi" }
+                    }]
+                }
+            }
+        });
+        let r = map_vpa_recommendation(&vpa, false).unwrap();
+        assert_eq!(
+            r.recommendation.as_ref().unwrap().target.as_ref().unwrap()["memory"],
+            "300Mi"
+        );
+        assert_eq!(
+            r.recommendation
+                .as_ref()
+                .unwrap()
+                .uncapped_target
+                .as_ref()
+                .unwrap()["memory"],
+            "900Mi"
+        );
+        assert!(r.not_applied.is_none());
+    }
+
+    #[test]
+    fn map_vpa_reco_not_applied_on_infeasible() {
+        let vpa = serde_json::json!({
+            "status": {
+                "recommendation": {
+                    "containerRecommendations": []
+                }
+            }
+        });
+        assert_eq!(
+            map_vpa_recommendation(&vpa, true)
+                .unwrap()
+                .not_applied
+                .as_deref(),
+            Some("recommendation not applied — node capacity")
+        );
     }
 }
