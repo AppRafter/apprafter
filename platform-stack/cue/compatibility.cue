@@ -1760,6 +1760,35 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.49": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.39"
+	notes: """
+		2.16e — vertical autoscaling via VPA (InPlace). The operator emits one
+		VerticalPodAutoscaler per managed app-env (containerName "*", RequestsOnly,
+		minReplicas 1, minAllowed=seed 32Mi/25m, maxAllowed.memory=512Mi), prunes it
+		on the managed→pro transition, and mirrors status.recommendation (target +
+		uncappedTarget) into Application.status.recommendedResources. A cluster knob
+		spec.resources.autoscale.mode (full|up-only|off, default full) selects the
+		update policy; `apprafter platform autoscale set` flips it.
+
+		Adds the `vpa` component (official upstream vertical-pod-autoscaler 0.11.0,
+		VPA 1.7.1) — recommender + updater + admission controller, self-managed cert
+		(certGen, no cert-manager), failurePolicy Ignore, syncWave -4. In-place resize
+		is an upstream ALPHA gate (`--feature-gates=InPlaceOrRecreate=true` on updater
+		+ admission) enabled fleet-wide by default; metrics-server is a hard
+		prerequisite. Memory corrects only within [32Mi, 512Mi] (RequestsOnly caps at
+		the seed limit) — raising it is a user override.
+
+		change=requires-restart: installs a cluster-wide mutating admission webhook on
+		pod CREATE + an updater that resizes live pods. ADR 0054.
+		"""
+	references: [
+		"docs/superpowers/specs/2026-08-08-2.16e-vpa-design.md",
+		"docs/adr/0054-vpa-vertical-autoscaling.md",
+	]
+}
+
 compatibility: "0.2.48": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.38"
