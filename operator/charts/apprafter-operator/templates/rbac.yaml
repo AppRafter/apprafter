@@ -433,6 +433,30 @@ rules:
       - create
       - patch
       - delete
+  # 2.16e (ADR 0054): the operator emits one VerticalPodAutoscaler per managed
+  # app-env, prunes it on the managed→pro transition, and reads its
+  # `status.recommendation` to mirror into Application.status. VPACheckpoint is
+  # read-only (durability is the recommender's concern, not the operator's).
+  - apiGroups:
+      - autoscaling.k8s.io
+    resources:
+      - verticalpodautoscalers
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - autoscaling.k8s.io
+    resources:
+      - verticalpodautoscalercheckpoints
+    verbs:
+      - get
+      - list
+      - watch
   # The operator probes ONCE at startup whether the
   # `ciliumnetworkpolicies.cilium.io` CRD is served (a single CRD GET) to
   # decide whether to apply egress CNPs — on a non-Cilium cluster (e2e /
