@@ -48,6 +48,11 @@ package v1alpha1
 		// this nested #ApplicationSpec snapshot is opaque in the CRD and
 		// needs no structural schema (no crdmeta patch).
 		lastAppliedSpec?: {...}
+
+		// VPA recommendation mirror (2.16e). Opaque like the rest of status
+		// (preserve-unknown) — { containerName, recommendation: { target,
+		// uncappedTarget }, notApplied }.
+		recommendedResources?: {...}
 	}
 }
 

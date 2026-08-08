@@ -56,6 +56,18 @@ package v1alpha1
 		}
 	}
 
+	// Cluster-wide vertical-autoscaling posture (2.16e / ADR 0054). Absent =
+	// operator uses compiled-in tier defaults (read-with-fallback; the operator
+	// never writes this back). `mode` selects the VPA update policy the operator
+	// stamps on every managed app's VerticalPodAutoscaler.
+	resources?: {
+		autoscale?: {
+			mode: "full" | "up-only" | "off" | *"full"
+			minAllowed?: [string]: string
+			maxAllowed?: [string]: string
+		}
+	}
+
 	// Opt-in automated off-site backup (2.6d-4). Absent = disabled. The
 	// platform-stack `backup` component is templated from this + gated on
 	// `enabled`. Credentials are NEVER here — only a `credentialRef` name.

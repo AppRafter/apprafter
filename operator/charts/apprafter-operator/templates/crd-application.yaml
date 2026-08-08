@@ -188,6 +188,8 @@ spec:
                 x-kubernetes-preserve-unknown-fields: true
               phase:
                 type: string
+              recommendedResources:
+                type: object
             type: object
             x-kubernetes-preserve-unknown-fields: true
         required:

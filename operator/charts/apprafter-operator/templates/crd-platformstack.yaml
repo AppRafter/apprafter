@@ -146,6 +146,28 @@ spec:
               pin:
                 pattern: ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$
                 type: string
+              resources:
+                properties:
+                  autoscale:
+                    properties:
+                      maxAllowed:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      minAllowed:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      mode:
+                        enum:
+                        - full
+                        - up-only
+                        - 'off'
+                        type: string
+                    required:
+                    - mode
+                    type: object
+                type: object
               source:
                 properties:
                   checkInterval:
