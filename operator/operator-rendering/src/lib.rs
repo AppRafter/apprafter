@@ -301,6 +301,20 @@ fn merge_image_policy(base: Option<ImagePolicy>, ovr: Option<ImagePolicy>) -> Op
     }
 }
 
+/// The default Burstable resource seed for an application container (2.16d).
+/// Generous-but-PRESENT memory limit (R4-H5) + low request + NO cpu limit
+/// (compressible). Values from the 2026-08-08 baseline measurement
+/// (docs/measurements/2.16d-baseline-2026-08-08.md); refine via 2.16e/VPA.
+fn seed_app_resources() -> AppResources {
+    AppResources {
+        requests: Some(BTreeMap::from([
+            ("cpu".to_string(), "25m".to_string()),
+            ("memory".to_string(), "32Mi".to_string()),
+        ])),
+        limits: Some(BTreeMap::from([("memory".to_string(), "512Mi".to_string())])),
+    }
+}
+
 /// Fold a per-env AppResources onto base — MAP-of-map leaf merge (2.16d).
 /// requests and limits each merge key-by-key (override-wins, base survivors
 /// inherit); a level deeper than merge_expose (struct) — like the `env` map.
@@ -535,16 +549,17 @@ fn render_deployment(
     };
 
     // 2.16d: translate the effective `AppResources` into a k8s
-    // `ResourceRequirements`. `None` today (the seed lands in Task 4) → no
-    // resources block, unchanged from before.
-    let resources = spec.resources.as_ref().map(|ar| ResourceRequirements {
-        requests: ar
+    // `ResourceRequirements`. When `effective.resources` is omitted, apply the
+    // measured Burstable seed (`seed_app_resources`) so no app pod is
+    // BestEffort; an explicit `Application.spec.*.resources` is used verbatim
+    // (override-wins — the seed applies ONLY at the effective None level).
+    let effective_resources = spec.resources.clone().unwrap_or_else(seed_app_resources);
+    let resources = Some(ResourceRequirements {
+        requests: effective_resources
             .requests
-            .clone()
             .map(|m| m.into_iter().map(|(k, v)| (k, Quantity(v))).collect()),
-        limits: ar
+        limits: effective_resources
             .limits
-            .clone()
             .map(|m| m.into_iter().map(|(k, v)| (k, Quantity(v))).collect()),
         ..Default::default()
     });
@@ -2513,5 +2528,131 @@ mod tests {
             limits: Some(BTreeMap::from([("memory".into(), "128Mi".into())])),
         });
         assert_eq!(merge_resources(None, ovr.clone()).unwrap(), ovr);
+    }
+
+    #[test]
+    fn seed_app_resources_is_generous_but_present_burstable() {
+        let r = seed_app_resources();
+        assert_eq!(r.requests.as_ref().unwrap().get("cpu").unwrap(), "25m");
+        assert_eq!(r.requests.as_ref().unwrap().get("memory").unwrap(), "32Mi");
+        assert_eq!(r.limits.as_ref().unwrap().get("memory").unwrap(), "512Mi");
+        assert!(!r.limits.as_ref().unwrap().contains_key("cpu")); // no cpu limit
+    }
+
+    /// An Application with NO `resources` renders the measured Burstable seed:
+    /// requests memory 32Mi, limits memory 512Mi, and NO cpu limit (2.16d).
+    #[test]
+    fn deployment_container_resources_default_to_seed_when_omitted() {
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "u",
+        );
+        let r = render_application(&app).unwrap();
+        let resources = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .resources
+            .as_ref()
+            .expect("seed resources present");
+        assert_eq!(
+            resources
+                .requests
+                .as_ref()
+                .unwrap()
+                .get("memory")
+                .unwrap()
+                .0,
+            "32Mi"
+        );
+        assert_eq!(
+            resources.requests.as_ref().unwrap().get("cpu").unwrap().0,
+            "25m"
+        );
+        assert_eq!(
+            resources.limits.as_ref().unwrap().get("memory").unwrap().0,
+            "512Mi"
+        );
+        assert!(!resources.limits.as_ref().unwrap().contains_key("cpu"));
+    }
+
+    /// An Application WITH explicit `resources` renders them verbatim — the
+    /// seed does NOT apply (override-wins at the effective level, 2.16d).
+    #[test]
+    fn deployment_container_resources_use_explicit_verbatim() {
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    resources: Some(AppResources {
+                        requests: Some(BTreeMap::from([
+                            ("cpu".into(), "100m".into()),
+                            ("memory".into(), "256Mi".into()),
+                        ])),
+                        limits: Some(BTreeMap::from([
+                            ("cpu".into(), "500m".into()),
+                            ("memory".into(), "1Gi".into()),
+                        ])),
+                    }),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "u",
+        );
+        let r = render_application(&app).unwrap();
+        let resources = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .resources
+            .as_ref()
+            .expect("explicit resources present");
+        assert_eq!(
+            resources.requests.as_ref().unwrap().get("cpu").unwrap().0,
+            "100m"
+        );
+        assert_eq!(
+            resources
+                .requests
+                .as_ref()
+                .unwrap()
+                .get("memory")
+                .unwrap()
+                .0,
+            "256Mi"
+        );
+        assert_eq!(
+            resources.limits.as_ref().unwrap().get("cpu").unwrap().0,
+            "500m"
+        );
+        assert_eq!(
+            resources.limits.as_ref().unwrap().get("memory").unwrap().0,
+            "1Gi"
+        );
     }
 }
