@@ -17,11 +17,11 @@ mod env;
 pub use env::resolve_env;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
+use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
     Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
-use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -311,7 +311,10 @@ fn seed_app_resources() -> AppResources {
             ("cpu".to_string(), "25m".to_string()),
             ("memory".to_string(), "32Mi".to_string()),
         ])),
-        limits: Some(BTreeMap::from([("memory".to_string(), "512Mi".to_string())])),
+        limits: Some(BTreeMap::from([(
+            "memory".to_string(),
+            "512Mi".to_string(),
+        )])),
     }
 }
 
@@ -2510,10 +2513,7 @@ mod tests {
         assert_eq!(got.requests.as_ref().unwrap().get("cpu").unwrap(), "100m");
         assert_eq!(got.requests.as_ref().unwrap().get("memory").unwrap(), "1Gi");
         assert_eq!(got.limits.as_ref().unwrap().get("cpu").unwrap(), "2");
-        assert_eq!(
-            got.limits.as_ref().unwrap().get("memory").unwrap(),
-            "512Mi"
-        );
+        assert_eq!(got.limits.as_ref().unwrap().get("memory").unwrap(), "512Mi");
     }
 
     #[test]

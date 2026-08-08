@@ -412,10 +412,7 @@ mod tests {
             "32MB"
         );
         // ephemeral-storage present on requests+limits
-        assert_eq!(
-            v["spec"]["resources"]["limits"]["ephemeral-storage"],
-            "1Gi"
-        );
+        assert_eq!(v["spec"]["resources"]["limits"]["ephemeral-storage"], "1Gi");
     }
 
     // --- database_object() ---
