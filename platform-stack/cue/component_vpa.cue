@@ -36,7 +36,17 @@ _components: "vpa": #Component & {
 			replicas:        1
 			registerWebhook: false
 			certGen: enabled: true
-			mutatingWebhookConfiguration: failurePolicy: "Ignore"
+			mutatingWebhookConfiguration: {
+				failurePolicy: "Ignore"
+				// H3: never intercept control-plane pod CREATEs — a down
+				// admission pod there could deadlock the cluster (failurePolicy
+				// Ignore already fails open, this narrows the surface too).
+				namespaceSelector: matchExpressions: [{
+					key:      "kubernetes.io/metadata.name"
+					operator: "NotIn"
+					values: ["kube-system"]
+				}]
+			}
 			extraArgs: ["--feature-gates=InPlaceOrRecreate=true"]
 		}
 		recommender: {
