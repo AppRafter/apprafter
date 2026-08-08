@@ -9,6 +9,30 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator/webhook v0.2.39 / cue-cmp 0.1.20 / platform-stack 0.2.49 / cli 0.2.39 — 2.16e VPA vertical autoscaling (2026-08-08)
+
+The operator right-sizes app requests in-place via upstream VPA. It emits one
+`VerticalPodAutoscaler` per managed app-env (`updateMode: InPlace`,
+`containerName: "*"`, `controlledValues: RequestsOnly`, `minReplicas: 1`,
+`minAllowed` = the 2.16d seed 32Mi/25m, `maxAllowed.memory` = the 512Mi seed
+limit), prunes it on the managed→pro transition, and mirrors
+`status.recommendation` (target + uncappedTarget) into
+`Application.status.recommendedResources`. A cluster knob
+`PlatformStack.spec.resources.autoscale.mode` (`full` default | `up-only` |
+`off`) selects the update policy — `apprafter platform autoscale set` flips it,
+`apprafter app status` shows the recommendation. In-place resize is an upstream
+alpha gate enabled fleet-wide by default; metrics-server is a hard prerequisite;
+memory corrects only within `[32Mi, 512Mi]` (RequestsOnly caps at the seed
+limit). ADR 0054.
+
+### Added
+- `vpa` platform-stack component (upstream `vertical-pod-autoscaler` 0.11.0 / VPA
+  1.7.1; self-managed `certGen` cert, `failurePolicy: Ignore`, syncWave -4).
+- `PlatformStack.spec.resources.autoscale` (typed) + `Application.status.recommendedResources`.
+- `apprafter platform autoscale set|show`; `apprafter app status` recommendation line.
+- Operator per-app VPA emit/apply/prune (gated on a `vpa_available` probe),
+  recommendation mirror, `autoscaling.k8s.io` RBAC.
+
 ## operator/webhook v0.2.38 / cue-cmp 0.1.19 / platform-stack 0.2.48 / cli 0.2.38 — 2.16d resource baseline (2026-08-08)
 
 No pod — platform or app — is BestEffort any more. QoS is chosen by role from a
