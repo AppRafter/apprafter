@@ -1760,6 +1760,41 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.48": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.38"
+	notes: """
+		2.16d — resource requests baseline. No pod is BestEffort. App containers
+		get a measured Burstable seed (generous-but-present memory limit + no cpu
+		limit) via the operator renderer, override-wins if `Application.spec.*.
+		resources` is set (deep-merged MAP-of-map onto base — `requests`/`limits`
+		merge independently by key, an env override of `limits.memory` does not
+		drop base `limits.cpu`).
+
+		Stateful backends are Guaranteed (requests==limits): CNPG Postgres with a
+		coherent `shared_buffers` + ephemeral-storage; Dragonfly with `--maxmemory`
+		below the cgroup limit. Platform components (argocd, cilium, cert-manager,
+		cnpg-operator, dragonfly-operator, the cue-cmp sidecar, + a limit added to
+		sealed-secrets) all get requests/limits.
+
+		Node-level reservations (`kube-reserved`/`system-reserved`/`eviction-hard`
+		+ a k3s `OOMScoreAdjust=-999` drop-in) land via the CLI k3s-installer at
+		bootstrap, plus an `apprafter node reserve-headroom` retrofit subcommand
+		for existing nodes. The admission webhook validates resource quantities +
+		request<=limit. Values pinned from a real-cpx-solo baseline measurement
+		(docs/measurements/2.16d-baseline-2026-08-08.md; the D2 budget closes).
+
+		change=requires-restart: the node-reservation retrofit restarts k3s (~30s
+		API outage), and re-render adds limits → rolls pods. LimitRange deferred to
+		the Capsule policy layer. ADR 0053 (resource governance). Ships operator +
+		admission-webhook v0.2.38 + cue-cmp 0.1.19 + cli 0.2.38.
+		"""
+	references: [
+		"docs/superpowers/specs/2026-08-08-2.16d-resource-baseline-respec.md",
+		"docs/adr/0053-resource-governance.md",
+	]
+}
+
 compatibility: "0.2.47": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.37"

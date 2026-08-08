@@ -9,6 +9,53 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## operator/webhook v0.2.38 / cue-cmp 0.1.19 / platform-stack 0.2.48 / cli 0.2.38 — 2.16d resource baseline (2026-08-08)
+
+No pod — platform or app — is BestEffort any more. QoS is chosen by role from a
+real solo-node measurement (Hetzner solo-tier, ~4GB;
+`docs/measurements/2.16d-baseline-2026-08-08.md`), and the D2 memory budget
+closes with headroom. ADR 0053 (resource governance); spec.md §3.1/§4.5/§4.12
+actualized (Revision 15).
+
+### Added
+
+- **`resources` field on `Application`** (`base` + per-env on the 2.16c
+  `#ApplicationEnvOverride`) — CUE + Rust + generated CRD. `requests`/`limits`
+  are `map[string]Quantity`; the operator renderer **deep-merges MAP-of-map**
+  (each key merges independently, override-wins), modelled on the `env` merge
+  rather than whole-struct replace.
+- **App-seed Burstable** — a container with no explicit `resources` gets a
+  measured seed (`requests {cpu: 25m, memory: 32Mi}`, `limits {memory: 512Mi}`,
+  **no cpu limit**): a generous-but-present memory limit (an absent one breaks
+  2.4e render determinism / T2 well-formedness / 2.12 local↔in-cluster parity; a
+  low 128Mi deterministically OOMKills Node/JVM/Python). An explicit
+  `spec.resources` is honoured verbatim (seed only fills what is omitted).
+- **`apprafter node reserve-headroom`** — retrofit subcommand for existing nodes
+  (SSH + kubelet-reservation config + `systemctl restart k3s`, ~30s API outage
+  behind a confirmation prompt).
+- **Admission-webhook `validate_resources`** — quantity validity + per-key
+  `request <= limit` with real quantity comparison.
+
+### Changed
+
+- **Stateful backends are Guaranteed** (`requests==limits`) with coherent DB
+  params — CNPG Postgres (256Mi, `shared_buffers=32MB`, ephemeral-storage) and
+  Dragonfly (320Mi, `--maxmemory=256mb` below the cgroup limit). The measurement
+  asserts `status.qosClass==Guaranteed` on the live pod.
+- **Platform components get requests/limits** — argocd, cilium, cert-manager,
+  cnpg-operator, dragonfly-operator, the cue-cmp sidecar, + a limit **added to
+  sealed-secrets** (it was requests-only → BestEffort).
+- **Node reservations at bootstrap** via the CLI/k3s-installer
+  (`system-reserved` covers the out-of-`kubepods` `k3s.service` in
+  `system.slice`, `kube-reserved`, `eviction-hard`, + a k3s `OOMScoreAdjust=-999`
+  drop-in).
+- **`change: requires-restart`** — the node-reservation retrofit restarts k3s
+  (~30s API outage) and the re-render adds limits → rolls pods. **No
+  PriorityClass** (kernel OOM-score is QoS-derived, not priority-derived);
+  **LimitRange deferred** to the Capsule policy layer (the renderer + provisioner
+  already cover every AppRafter-owned pod). Ships operator + admission-webhook
+  v0.2.38 + cue-cmp 0.1.19 + cli 0.2.38.
+
 ## operator/webhook v0.2.37 / cue-cmp v0.1.18 / platform-stack 0.2.47 — 2.16c per-environment deep-merge (2026-08-08)
 
 A per-environment override of `expose` / `imagePolicy` becomes **partial**
