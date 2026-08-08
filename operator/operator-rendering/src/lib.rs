@@ -331,8 +331,10 @@ pub fn effective_spec(
     // reason `InvalidEffectiveSpec`) rather than silently dropped.
     effective.expose = merge_expose(effective.expose.take(), env_override.expose.clone())?;
     // 2.16c: `imagePolicy` deep-merges at the subfield level (set-field-wins).
-    effective.image_policy =
-        merge_image_policy(effective.image_policy.take(), env_override.image_policy.clone());
+    effective.image_policy = merge_image_policy(
+        effective.image_policy.take(),
+        env_override.image_policy.clone(),
+    );
     if let Some(env_env) = &env_override.env {
         let mut merged = effective.env.unwrap_or_default();
         for (k, v) in env_env {
@@ -904,7 +906,10 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app).unwrap().httproute.expect("route rendered");
+        let r = render_application(&app)
+            .unwrap()
+            .httproute
+            .expect("route rendered");
         assert_eq!(r["apiVersion"], "gateway.networking.k8s.io/v1");
         assert_eq!(r["kind"], "HTTPRoute");
         assert_eq!(r["metadata"]["name"], "web");
@@ -949,7 +954,10 @@ mod tests {
             "default",
             "u",
         );
-        let r = render_application(&app).unwrap().httproute.expect("route rendered");
+        let r = render_application(&app)
+            .unwrap()
+            .httproute
+            .expect("route rendered");
         assert_eq!(
             r["spec"]["hostnames"],
             serde_json::json!(["a.demo.dev", "b.demo.dev"])

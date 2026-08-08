@@ -114,7 +114,11 @@ pub struct ApplicationEnvOverride {
     pub env: Option<BTreeMap<String, EnvValue>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs: Option<Needs>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "imagePolicy")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "imagePolicy"
+    )]
     pub image_policy: Option<ImagePolicy>,
 }
 

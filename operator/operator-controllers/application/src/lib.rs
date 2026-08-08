@@ -684,7 +684,9 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // (step 1) already validated to `Ok`; the only `EffectiveSpecError` it can
     // raise is the invalid-effective-spec case guarded there. `expect`
     // documents that invariant — the invalid-spec path never reaches here.
-    .expect("effective_spec validated at the migration gate (step 1) — render Ok is invariant here");
+    .expect(
+        "effective_spec validated at the migration gate (step 1) — render Ok is invariant here",
+    );
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
     // registry, project its derived pull-secret into the workload
@@ -2767,7 +2769,12 @@ fn build_invalid_effective_spec_status(app: &Application, message: &str) -> Appl
         .unwrap_or(&[]);
     let previous_endpoint = app.status.as_ref().and_then(|s| s.endpoint_url.clone());
 
-    let ready = ready_condition("False", "InvalidEffectiveSpec", message, previous_conditions);
+    let ready = ready_condition(
+        "False",
+        "InvalidEffectiveSpec",
+        message,
+        previous_conditions,
+    );
 
     ApplicationStatus {
         phase: Some(PHASE_INVALID_EFFECTIVE_SPEC.to_string()),
@@ -5664,7 +5671,10 @@ mod tests {
         // (a) The pure unifier the reconcile calls at ~:244 rejects it.
         let err = effective_spec(&app, Some("prod"))
             .expect_err("env-only expose with no port and no base.expose must be Err");
-        assert_eq!(err, operator_rendering::EffectiveSpecError::ExposeMissingPort);
+        assert_eq!(
+            err,
+            operator_rendering::EffectiveSpecError::ExposeMissingPort
+        );
 
         // (b) The reconcile maps that Err to the invalid-effective-spec status:
         // phase = InvalidEffectiveSpec, a single Ready=False/InvalidEffectiveSpec

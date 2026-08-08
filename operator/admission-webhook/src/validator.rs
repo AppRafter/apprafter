@@ -375,7 +375,11 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         } else if let Some(envs_obj) = envs {
             for (name, val) in envs_obj {
                 // raw fallback: an env that sets `expose` (a JSON object) without a `port` key
-                if let Some(exp) = val.as_object().and_then(|o| o.get("expose")).and_then(Value::as_object) {
+                if let Some(exp) = val
+                    .as_object()
+                    .and_then(|o| o.get("expose"))
+                    .and_then(Value::as_object)
+                {
                     if !exp.contains_key("port") {
                         errors.push(ValidationError::new(
                             format!("spec.environments.{name}.expose.port"),

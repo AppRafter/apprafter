@@ -684,7 +684,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("expose.protocol") && e.contains("not overridable")),
+            errs.iter()
+                .any(|e| e.contains("expose.protocol") && e.contains("not overridable")),
             "{errs:?}"
         );
     }
@@ -741,7 +742,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("expose.typo") && e.contains("no #ApplicationSpec")),
+            errs.iter()
+                .any(|e| e.contains("expose.typo") && e.contains("no #ApplicationSpec")),
             "{errs:?}"
         );
     }
@@ -760,14 +762,11 @@ mod tests {
             "type": "object",
             "properties": { "hostname": { "type": "string" } }
         });
-        let errs = check_env_override_superset(
-            &flatten_leaves(&spec),
-            &flatten_leaves(&over),
-            &[],
-        )
-        .unwrap_err();
+        let errs = check_env_override_superset(&flatten_leaves(&spec), &flatten_leaves(&over), &[])
+            .unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("hostname") && e.contains("diverges")),
+            errs.iter()
+                .any(|e| e.contains("hostname") && e.contains("diverges")),
             "{errs:?}"
         );
     }
@@ -781,12 +780,10 @@ mod tests {
             "properties": { "needs": { "$ref": "#/components/schemas/Needs" } }
         });
         let over = spec.clone();
-        assert!(check_env_override_superset(
-            &flatten_leaves(&spec),
-            &flatten_leaves(&over),
-            &[],
-        )
-        .is_ok());
+        assert!(
+            check_env_override_superset(&flatten_leaves(&spec), &flatten_leaves(&over), &[],)
+                .is_ok()
+        );
         assert_eq!(flatten_leaves(&spec)["needs"].ty, "$ref:Needs");
     }
 
@@ -832,7 +829,11 @@ mod tests {
             } } } ] }
         });
         let errs = check_no_defaults(&crd).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("default") && e.contains("internal")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("default") && e.contains("internal")),
+            "{errs:?}"
+        );
     }
 
     #[test]

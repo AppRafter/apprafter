@@ -1684,11 +1684,9 @@ mod application_detect_destructive_tests {
         let old = with_expose(base(), expose("internal", None));
         let new = with_expose(base(), expose("internal", Some("x.example.com")));
         let cands = ApplicationMigrationStrategy::detect_all(&old, &new);
-        assert!(
-            !cands
-                .iter()
-                .any(|c| c.trigger_type == "public-hostname-add")
-        );
+        assert!(!cands
+            .iter()
+            .any(|c| c.trigger_type == "public-hostname-add"));
     }
 
     // The public counterpart: the SAME hostname-add (None→Some) under a PUBLIC
@@ -1700,7 +1698,9 @@ mod application_detect_destructive_tests {
         let old = with_expose(base(), expose("public", None));
         let new = with_expose(base(), expose("public", Some("x.example.com")));
         let cands = ApplicationMigrationStrategy::detect_all(&old, &new);
-        assert!(cands.iter().any(|c| c.trigger_type == "public-hostname-add"));
+        assert!(cands
+            .iter()
+            .any(|c| c.trigger_type == "public-hostname-add"));
     }
 
     #[test]
