@@ -256,6 +256,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             } => commands::secret::run_remove(&name, &namespace, yes)?,
         },
         Commands::Volume { action } => commands::volume::run(action)?,
+        Commands::Node { action } => commands::node_reservations::run(action)?,
         Commands::Export {
             namespace,
             select,

@@ -138,6 +138,74 @@ impl KubeconfigFetcher for SshKubeconfigFetcher {
     }
 }
 
+/// Runs an arbitrary shell command on a cluster node over SSH as
+/// `root@<host>`, using the same connection posture as
+/// [`SshKubeconfigFetcher`] (per-cluster `known_hosts`,
+/// `accept-new`, `BatchMode`, `IdentitiesOnly`, `ConnectTimeout=5`).
+///
+/// This is the shared SSH seam for node-level retrofits (e.g.
+/// `apprafter node reserve-headroom`) — it reuses the exact same
+/// identity + known-hosts resolution as the kubeconfig fetch so the
+/// two never drift on host-key handling.
+pub struct SshCommandRunner {
+    pub identity_path: PathBuf,
+    pub known_hosts_path: PathBuf,
+}
+
+impl SshCommandRunner {
+    pub fn new<I: Into<PathBuf>, K: Into<PathBuf>>(identity_path: I, known_hosts_path: K) -> Self {
+        Self {
+            identity_path: identity_path.into(),
+            known_hosts_path: known_hosts_path.into(),
+        }
+    }
+
+    /// Builds the `ssh` invocation that runs `remote_command` on
+    /// `host`. `remote_command` is passed as a single argv slot, so
+    /// the remote login shell (`sh -c`) parses it — embed a full
+    /// script here (heredocs, `&&` chains) and it runs verbatim.
+    pub fn build_command(&self, host: &str, remote_command: &str) -> Command {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o")
+            .arg("StrictHostKeyChecking=accept-new")
+            .arg("-o")
+            .arg(format!(
+                "UserKnownHostsFile={}",
+                self.known_hosts_path.display()
+            ))
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=5")
+            .arg("-i")
+            .arg(&self.identity_path)
+            .arg(format!("root@{host}"))
+            .arg(remote_command);
+        cmd
+    }
+
+    /// Runs `remote_command` on `host`, returning captured stdout on
+    /// success or a `CliError` carrying the exit code + stderr.
+    pub fn run(&self, host: &str, remote_command: &str) -> Result<String> {
+        let output = self
+            .build_command(host, remote_command)
+            .output()
+            .map_err(|e| {
+                CliError::Other(format!("failed to spawn ssh (is the binary in PATH?): {e}"))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(CliError::Other(format!(
+                "ssh root@{host} command failed (exit {:?}). stderr: {stderr}",
+                output.status.code()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
 /// Path to the SSH private key used by the fetcher. Resolves
 /// `APPRAFTER_SSH_PRIVATE_KEY` first, then falls back to
 /// `$HOME/.ssh/id_ed25519`.
@@ -250,6 +318,41 @@ clusters:\n\
         assert!(
             argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"),
             "accept-new + per-cluster file: silent on first contact, blocks on key change → still defends against unexpected key swap mid-cluster.\n{argv:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_command_runner_builds_expected_argv() {
+        // The retrofit SSH seam (Task 11) must carry the SAME
+        // connection posture as the kubeconfig fetch (per-cluster
+        // known_hosts, accept-new, BatchMode, IdentitiesOnly,
+        // ConnectTimeout=5) so the two never drift on host-key
+        // handling — and pass the remote command as one argv slot.
+        let r = SshCommandRunner::new("/tmp/key", "/tmp/.apprafter/known_hosts");
+        let cmd = r.build_command("198.51.100.5", "systemctl restart k3s");
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(argv.iter().any(|a| a == "BatchMode=yes"), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "IdentitiesOnly=yes"), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "ConnectTimeout=5"), "{argv:?}");
+        assert!(
+            argv.iter()
+                .any(|a| a == "UserKnownHostsFile=/tmp/.apprafter/known_hosts"),
+            "{argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "StrictHostKeyChecking=accept-new"),
+            "{argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "/tmp/key"), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "root@198.51.100.5"), "{argv:?}");
+        // Remote command is one argv slot (the login shell parses it).
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("systemctl restart k3s"),
+            "{argv:?}"
         );
     }
 

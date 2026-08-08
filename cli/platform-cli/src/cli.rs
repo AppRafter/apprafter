@@ -231,6 +231,14 @@ pub enum Commands {
         #[command(subcommand)]
         action: VolumeCommand,
     },
+    /// Node-level operations on the active target's cluster node
+    /// (2.16d). Currently: retrofit the kubelet node reservations +
+    /// k3s OOM-protection onto a cluster provisioned before the
+    /// reservations shipped at bootstrap.
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
+    },
     /// Native data export (Kind 1) — pull pg dumps, volume tars, redis
     /// snapshots to a plain local folder + `manifest.json`. No CRs, no
     /// secrets, no encryption. A debugging / one-off-recovery convenience.
@@ -1200,6 +1208,30 @@ pub enum VolumeCommand {
     },
 }
 
+/// `apprafter node …` subcommands (2.16d node-reservation layer).
+#[derive(Debug, Subcommand)]
+pub enum NodeAction {
+    /// Retrofit the kubelet node reservations + k3s OOM-protection
+    /// onto the active target's cluster node.
+    ///
+    /// Clusters provisioned before 2.16d have no `system-reserved`
+    /// / `kube-reserved` / `eviction-hard` and leave `k3s.service`
+    /// (in system.slice, outside kubepods) OOM-killable at the
+    /// default score. This SSHes the node, writes the same
+    /// `/etc/rancher/k3s/config.yaml` + `k3s.service.d/oom.conf` the
+    /// bootstrap path ships, then restarts k3s (the API is briefly
+    /// unavailable, ~30s) and waits for it to come back. New
+    /// clusters bake the reservations in at bootstrap and don't
+    /// need this.
+    #[command(name = "reserve-headroom")]
+    ReserveHeadroom {
+        /// Skip the confirmation prompt (k3s restart briefly takes
+        /// the API offline). Required in non-interactive shells.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+}
+
 /// `apprafter backup …` subcommands (2.6d).
 #[derive(Debug, Subcommand)]
 pub enum BackupAction {
@@ -1458,6 +1490,31 @@ mod tests {
             cli.command,
             Commands::Target {
                 action: TargetCommand::Ip
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_node_reserve_headroom() {
+        let cli = Cli::parse_from(["apprafter", "node", "reserve-headroom"]);
+        assert!(
+            matches!(
+                cli.command,
+                Commands::Node {
+                    action: NodeAction::ReserveHeadroom { yes: false }
+                }
+            ),
+            "`apprafter node reserve-headroom` must parse to NodeAction::ReserveHeadroom with yes defaulting to false"
+        );
+    }
+
+    #[test]
+    fn parses_node_reserve_headroom_with_yes() {
+        let cli = Cli::parse_from(["apprafter", "node", "reserve-headroom", "--yes"]);
+        assert!(matches!(
+            cli.command,
+            Commands::Node {
+                action: NodeAction::ReserveHeadroom { yes: true }
             }
         ));
     }

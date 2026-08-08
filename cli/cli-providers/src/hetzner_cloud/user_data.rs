@@ -181,7 +181,10 @@ pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
     out.push_str("packages:\n");
     out.push_str("  - fail2ban\n");
     out.push_str("write_files:\n");
-    out.push_str(&write_files_entry(K3S_CONFIG_PATH, &k3s_reservation_config()));
+    out.push_str(&write_files_entry(
+        K3S_CONFIG_PATH,
+        &k3s_reservation_config(),
+    ));
     out.push_str(&write_files_entry(K3S_OOM_DROPIN_PATH, K3S_OOM_DROPIN));
     out.push_str("runcmd:\n");
     out.push_str("  - systemctl enable --now fail2ban\n");
@@ -334,4 +337,3 @@ mod tests {
         assert!(s.contains("--disable-kube-proxy"), "{s}");
     }
 }
-
