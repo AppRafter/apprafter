@@ -194,6 +194,22 @@ e2e-env-refs:
 e2e-per-env:
     APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/gitops-walk-per-env.sh
 
+# Run the per-environment `expose` DEEP-MERGE k3d/kind e2e (2.16c): the
+# SAME repo deployed per env, where the dev override carries ONLY the diff
+# `expose:{network:"internal"}` -> the operator effective_spec DEEP-MERGES it
+# onto base.expose so the dev Deployment/Service INHERIT the base port (8080)
+# and, being internal, emit NO public HTTPRoute (the inherited hostname is
+# inert), while base/prod keeps the public HTTPRoute on x.example.com. Also
+# asserts H1: the STORED dev CR's env-override expose stays partial
+# ({network:internal} only, no defaulted keys). 2.16c is UNRELEASED, so the
+# walk FORCES APPRAFTER_E2E_LOCAL_OPERATOR=1 internally (builds + side-loads
+# the working-tree operator + admission-webhook + cue-cmp, applies branch
+# CRDs). Uses the DEFAULT CNI (no Cilium → no sandbox-run microVM needed).
+# Like the other walk targets it is NOT a dependency of `e2e`; requires a
+# container runtime (docker→k3d / podman→kind), git, cargo, kubectl.
+e2e-expose-deep-merge:
+    bash e2e/expose-deep-merge-walk.sh
+
 # Run the needs.networkpolicy egress-enforcement kind+Cilium walk (2.10, ADR
 # 0045): the operator derives one per-Application egress CiliumNetworkPolicy
 # from declared needs -> a needs.pg app CAN reach pg (Hubble FORWARDED) while
