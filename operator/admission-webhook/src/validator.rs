@@ -48,8 +48,8 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use operator_core::{
-    ApplicationBaseSpec, ApplicationEnvOverride, ApplicationSpec, DiskClaim, EnvRef, EnvValue,
-    Needs, OneOrMany, ServiceNeed,
+    AppResources, ApplicationBaseSpec, ApplicationEnvOverride, ApplicationSpec, DiskClaim, EnvRef,
+    EnvValue, Needs, OneOrMany, ServiceNeed,
 };
 use serde_json::Value;
 
@@ -74,6 +74,7 @@ trait ScopeView {
     fn expose_network(&self) -> Option<&str>;
     fn expose_hostname(&self) -> Option<&OneOrMany<String>>;
     fn expose_tls(&self) -> Option<bool>;
+    fn resources(&self) -> Option<&AppResources>;
 }
 
 impl ScopeView for ApplicationBaseSpec {
@@ -98,6 +99,9 @@ impl ScopeView for ApplicationBaseSpec {
     fn expose_tls(&self) -> Option<bool> {
         self.expose.as_ref().and_then(|e| e.tls)
     }
+    fn resources(&self) -> Option<&AppResources> {
+        self.resources.as_ref()
+    }
 }
 
 impl ScopeView for ApplicationEnvOverride {
@@ -121,6 +125,9 @@ impl ScopeView for ApplicationEnvOverride {
     }
     fn expose_tls(&self) -> Option<bool> {
         self.expose.as_ref().and_then(|e| e.tls)
+    }
+    fn resources(&self) -> Option<&AppResources> {
+        self.resources.as_ref()
     }
 }
 
@@ -395,6 +402,7 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     validate_env_refs(typed_base, typed_envs, base, envs, &mut errors);
     validate_disk_claims(typed_base, typed_envs, base, envs, &mut errors);
     validate_expose(typed_base, typed_envs, base, envs, &mut errors);
+    validate_resources(typed_base, typed_envs, base, envs, &mut errors);
 
     errors
 }
@@ -700,6 +708,72 @@ fn is_k8s_quantity(s: &str) -> bool {
         return false;
     }
     suffix_ok(suffix)
+}
+
+/// 2.16d: parse a Kubernetes quantity string to a normalized f64 of base units
+/// (bytes for memory-style / cores for cpu-style). Handles decimal SI
+/// (k,M,G,T,P), binary SI (Ki,Mi,Gi,Ti,Pi), milli (m), and bare numbers.
+/// Returns None on malformed input. Used only for the `request <= limit`
+/// magnitude comparison; the FORMAT of each quantity is validated separately
+/// by [`is_k8s_quantity`].
+fn quantity_to_f64(q: &str) -> Option<f64> {
+    let q = q.trim();
+    if q.is_empty() {
+        return None;
+    }
+    // split trailing unit (letters + 'i')
+    let idx = q.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(q.len());
+    let (num, unit) = q.split_at(idx);
+    let n: f64 = num.parse().ok()?;
+    let mul = match unit {
+        "" => 1.0,
+        "m" => 1e-3,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "Ki" => 1024.0,
+        "Mi" => 1024f64.powi(2),
+        "Gi" => 1024f64.powi(3),
+        "Ti" => 1024f64.powi(4),
+        "Pi" => 1024f64.powi(5),
+        _ => return None,
+    };
+    Some(n * mul)
+}
+
+/// 2.16d: `request <= limit` (both valid quantities). If either is
+/// unparseable, return true (defer to the apiserver — the quantity-format
+/// check already flagged it separately, so a comparison error here would
+/// double-report a single malformed value).
+fn quantity_le(req: &str, limit: &str) -> bool {
+    match (quantity_to_f64(req), quantity_to_f64(limit)) {
+        (Some(r), Some(l)) => r <= l,
+        _ => true,
+    }
+}
+
+/// 2.16d: whether a `resources.{requests|limits}[k]` value is a valid
+/// Kubernetes resource quantity. Broader than [`is_k8s_quantity`] (the disk
+/// `size` grammar, which never sees CPU) because a resource quantity also
+/// covers the CPU `m` (milli-core) suffix: `100m`, `0.5`, `2`. A value is
+/// accepted when EITHER the disk grammar accepts it (memory/binary/decimal SI
+/// forms, reusing `is_k8s_quantity` so the shape rules — trailing-dot / bare
+/// magnitude — stay in one place) OR it normalizes via [`quantity_to_f64`] to
+/// a non-negative magnitude (which additionally admits the `m` suffix). The
+/// trailing-dot / negative edge cases `quantity_to_f64` would otherwise let
+/// through are rejected here so the two callers agree on validity.
+fn is_resource_quantity(s: &str) -> bool {
+    if is_k8s_quantity(s) {
+        return true;
+    }
+    // CPU milli/core and other quantity_to_f64-parseable forms, minus the
+    // laxer edges (`quantity_to_f64` accepts a trailing `.` and negatives).
+    if s.trim().ends_with('.') || s.trim().starts_with('-') {
+        return false;
+    }
+    quantity_to_f64(s).is_some_and(|v| v >= 0.0)
 }
 
 /// 2.6b-4 (ADR 0043): the `needs.disk` VALUE a scope literally declares,
@@ -1129,6 +1203,124 @@ fn validate_expose(
             ));
         }
     }
+
+    check_scope(
+        "spec.base",
+        typed_base.map(|b| b as &dyn ScopeView),
+        base,
+        errors,
+    );
+    if let Some(envs_obj) = envs {
+        for (env_name, val) in envs_obj {
+            check_scope(
+                &format!("spec.environments.{env_name}"),
+                typed_envs
+                    .and_then(|m| m.get(env_name))
+                    .map(|e| e as &dyn ScopeView),
+                val.as_object(),
+                errors,
+            );
+        }
+    }
+}
+
+/// 2.16d: validate `spec.base.resources` AND every
+/// `spec.environments.*.resources`. This is value-INDEPENDENT — a purely
+/// syntactic check, mirroring `validate_expose`:
+///   1. every `requests[k]` / `limits[k]` value must be a Kubernetes quantity
+///      (`is_resource_quantity`, which reuses the disk-`size` `is_k8s_quantity`
+///      grammar and additionally admits the CPU `m` suffix) — an error on
+///      `<scope>.resources.{requests|limits}.<key>` per malformed value;
+///   2. for each key present in BOTH `requests` and `limits`, the request must
+///      be `<= limit` (`quantity_le`) — an error on `<scope>.resources`.
+///
+/// The apiserver's structural CRD validation and the deep-merge at render
+/// happen elsewhere; this only rejects locally-inconsistent quantities.
+///
+/// Typed-first via `ScopeView::resources` (compiler-gated `resources` field);
+/// a scope that failed to deserialize (test / misconfigured apiserver) falls
+/// back to reading the raw `resources` object — matching the pattern of the
+/// other per-scope rules.
+fn validate_resources(
+    typed_base: Option<&ApplicationBaseSpec>,
+    typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
+    base: Option<&serde_json::Map<String, Value>>,
+    envs: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    // One (map-name, map) pair for the two resource kinds, in a fixed order.
+    fn check_maps(
+        prefix: &str,
+        requests: &BTreeMap<String, String>,
+        limits: &BTreeMap<String, String>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        for (kind, map) in [("requests", requests), ("limits", limits)] {
+            for (key, val) in map {
+                if !is_resource_quantity(val) {
+                    errors.push(ValidationError::new(
+                        format!("{prefix}.resources.{kind}.{key}"),
+                        format!(
+                            "resources.{kind}.{key} value {val:?} must be a Kubernetes quantity (e.g. \"256Mi\", \"100m\", \"1Gi\")"
+                        ),
+                    ));
+                }
+            }
+        }
+        // Cross-field: for each key in BOTH maps, request must be <= limit.
+        for (key, req_val) in requests {
+            if let Some(lim_val) = limits.get(key) {
+                if !quantity_le(req_val, lim_val) {
+                    errors.push(ValidationError::new(
+                        format!("{prefix}.resources"),
+                        format!(
+                            "requests.{key} {req_val:?} > limits.{key} {lim_val:?}; a resource request must not exceed its limit"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Read a scope's `requests`/`limits` maps typed-first, raw as fallback.
+    // Returns owned `BTreeMap`s so the two sources share one code path
+    // (the raw fallback string-clones; the typed path clones the field maps).
+    fn scope_maps(
+        typed: Option<&dyn ScopeView>,
+        raw: Option<&serde_json::Map<String, Value>>,
+    ) -> Option<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+        // Extract a `{k: quantity-string}` map from a raw JSON object, keeping
+        // only string values (non-string values are rejected by the CRD layer).
+        fn raw_map(v: Option<&Value>) -> BTreeMap<String, String> {
+            v.and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        match typed.and_then(ScopeView::resources) {
+            Some(res) => Some((
+                res.requests.clone().unwrap_or_default(),
+                res.limits.clone().unwrap_or_default(),
+            )),
+            None => raw
+                .and_then(|o| o.get("resources"))
+                .and_then(Value::as_object)
+                // No `resources` key at all → nothing to check.
+                .map(|o| (raw_map(o.get("requests")), raw_map(o.get("limits")))),
+        }
+    }
+
+    let check_scope = |prefix: &str,
+                       typed: Option<&dyn ScopeView>,
+                       raw: Option<&serde_json::Map<String, Value>>,
+                       errors: &mut Vec<ValidationError>| {
+        if let Some((requests, limits)) = scope_maps(typed, raw) {
+            check_maps(prefix, &requests, &limits, errors);
+        }
+    };
 
     check_scope(
         "spec.base",
@@ -2420,6 +2612,62 @@ mod tests {
             }
         });
         assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    // ---- 2.16d: resources quantity + request <= limit ----
+    #[test]
+    fn rejects_malformed_resource_quantity() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "resources": { "limits": { "memory": "12x" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.resources.limits.memory");
+        assert!(errors[0].message.contains("quantity"));
+    }
+
+    #[test]
+    fn rejects_request_greater_than_limit() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "resources": {
+                    "requests": { "memory": "1Gi" },
+                    "limits":   { "memory": "256Mi" }
+                }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.base.resources");
+        assert!(errors[0].message.contains("requests.memory"));
+        assert!(errors[0].message.contains("limits.memory"));
+    }
+
+    #[test]
+    fn accepts_valid_resources_and_request_leq_limit() {
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "resources": {
+                    "requests": { "cpu": "100m", "memory": "256Mi" },
+                    "limits":   { "cpu": "500m", "memory": "512Mi" }
+                }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn quantity_le_unit_tests() {
+        assert!(quantity_le("256Mi", "1Gi"));
+        assert!(quantity_le("100m", "1"));
+        assert!(quantity_le("512Mi", "512Mi"));
+        assert!(!quantity_le("2Gi", "1Gi"));
+        assert!(!quantity_le("600m", "500m"));
     }
 
     #[test]
