@@ -21,10 +21,12 @@ use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
     Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
+use k8s_openapi::api::core::v1::ResourceRequirements;
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use operator_core::{
-    Application, ApplicationBaseSpec, ApplicationExpose, ExposeOverride, ImagePolicy,
+    AppResources, Application, ApplicationBaseSpec, ApplicationExpose, ExposeOverride, ImagePolicy,
 };
 
 /// Output of `render_application`. Always carries a Deployment;
@@ -299,6 +301,39 @@ fn merge_image_policy(base: Option<ImagePolicy>, ovr: Option<ImagePolicy>) -> Op
     }
 }
 
+/// Fold a per-env AppResources onto base — MAP-of-map leaf merge (2.16d).
+/// requests and limits each merge key-by-key (override-wins, base survivors
+/// inherit); a level deeper than merge_expose (struct) — like the `env` map.
+/// Fallible for signature consistency with the other merges (cannot fail today).
+fn merge_resources(
+    base: Option<AppResources>,
+    ovr: Option<AppResources>,
+) -> Result<Option<AppResources>, EffectiveSpecError> {
+    fn merge_map(
+        b: Option<BTreeMap<String, String>>,
+        o: Option<BTreeMap<String, String>>,
+    ) -> Option<BTreeMap<String, String>> {
+        match (b, o) {
+            (b, None) => b,
+            (None, o) => o,
+            (Some(mut b), Some(o)) => {
+                for (k, v) in o {
+                    b.insert(k, v);
+                }
+                Some(b)
+            }
+        }
+    }
+    match (base, ovr) {
+        (b, None) => Ok(b),
+        (None, o) => Ok(o),
+        (Some(b), Some(o)) => Ok(Some(AppResources {
+            requests: merge_map(b.requests, o.requests),
+            limits: merge_map(b.limits, o.limits),
+        })),
+    }
+}
+
 /// Compute the effective spec — `base` unified with the named
 /// environment override (when present). Fields set in the override
 /// replace base fields; the env map merges with override-wins on
@@ -335,6 +370,11 @@ pub fn effective_spec(
         effective.image_policy.take(),
         env_override.image_policy.clone(),
     );
+    // 2.16d: `resources` MAP-of-map leaf merge — `requests`/`limits` each merge
+    // key-by-key (override-wins; base survivors inherit), so an env setting
+    // `limits.memory` does not drop base `limits.cpu`.
+    effective.resources =
+        merge_resources(effective.resources.take(), env_override.resources.clone())?;
     if let Some(env_env) = &env_override.env {
         let mut merged = effective.env.unwrap_or_default();
         for (k, v) in env_env {
@@ -494,6 +534,21 @@ fn render_deployment(
         None
     };
 
+    // 2.16d: translate the effective `AppResources` into a k8s
+    // `ResourceRequirements`. `None` today (the seed lands in Task 4) → no
+    // resources block, unchanged from before.
+    let resources = spec.resources.as_ref().map(|ar| ResourceRequirements {
+        requests: ar
+            .requests
+            .clone()
+            .map(|m| m.into_iter().map(|(k, v)| (k, Quantity(v))).collect()),
+        limits: ar
+            .limits
+            .clone()
+            .map(|m| m.into_iter().map(|(k, v)| (k, Quantity(v))).collect()),
+        ..Default::default()
+    });
+
     let container = Container {
         name: name.to_string(),
         image: Some(image),
@@ -508,6 +563,7 @@ fn render_deployment(
         } else {
             Some(volume_mounts)
         },
+        resources,
         ..Default::default()
     };
 
@@ -640,8 +696,8 @@ fn render_httproute(
 mod tests {
     use super::*;
     use operator_core::{
-        ApplicationEnvOverride, ApplicationExpose, ApplicationSpec, EnvValue, ExposeOverride,
-        ImagePolicy,
+        AppResources, ApplicationEnvOverride, ApplicationExpose, ApplicationSpec, EnvValue,
+        ExposeOverride, ImagePolicy,
     };
 
     fn make_app_with_uid(
@@ -1201,6 +1257,7 @@ mod tests {
             env: b.env,
             needs: b.needs,
             image_policy: b.image_policy,
+            resources: b.resources,
         }
     }
 
@@ -2416,5 +2473,45 @@ mod tests {
     #[test]
     fn merge_image_policy_both_none() {
         assert_eq!(merge_image_policy(None, None), None);
+    }
+
+    #[test]
+    fn merge_resources_env_map_merge_keeps_base_keys() {
+        let base = Some(AppResources {
+            requests: Some(BTreeMap::from([
+                ("cpu".into(), "100m".into()),
+                ("memory".into(), "256Mi".into()),
+            ])),
+            limits: Some(BTreeMap::from([
+                ("cpu".into(), "500m".into()),
+                ("memory".into(), "512Mi".into()),
+            ])),
+        });
+        let ovr = Some(AppResources {
+            requests: Some(BTreeMap::from([("memory".into(), "1Gi".into())])),
+            limits: Some(BTreeMap::from([("cpu".into(), "2".into())])),
+        });
+        let got = merge_resources(base, ovr).unwrap().unwrap();
+        assert_eq!(got.requests.as_ref().unwrap().get("cpu").unwrap(), "100m");
+        assert_eq!(got.requests.as_ref().unwrap().get("memory").unwrap(), "1Gi");
+        assert_eq!(got.limits.as_ref().unwrap().get("cpu").unwrap(), "2");
+        assert_eq!(
+            got.limits.as_ref().unwrap().get("memory").unwrap(),
+            "512Mi"
+        );
+    }
+
+    #[test]
+    fn merge_resources_base_only_and_env_only() {
+        let base = Some(AppResources {
+            requests: Some(BTreeMap::from([("cpu".into(), "10m".into())])),
+            limits: None,
+        });
+        assert_eq!(merge_resources(base.clone(), None).unwrap(), base);
+        let ovr = Some(AppResources {
+            requests: None,
+            limits: Some(BTreeMap::from([("memory".into(), "128Mi".into())])),
+        });
+        assert_eq!(merge_resources(None, ovr.clone()).unwrap(), ovr);
     }
 }
