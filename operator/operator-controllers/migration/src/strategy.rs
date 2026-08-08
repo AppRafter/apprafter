@@ -1674,6 +1674,35 @@ mod application_detect_destructive_tests {
         .is_none());
     }
 
+    // 2.16c R4-H1b: #11 `public-hostname-add` is gated on the effective
+    // `network == "public"` (strategy.rs:258). 2.16c deep-merge inheritance now
+    // reaches this classifier, so we LOCK the correctness: adding a hostname
+    // (None→Some) under an INTERNAL app must NOT fire the security-boundary — a
+    // hostname is inert until the surface is public.
+    #[test]
+    fn hostname_add_under_internal_is_not_a_security_boundary() {
+        let old = with_expose(base(), expose("internal", None));
+        let new = with_expose(base(), expose("internal", Some("x.example.com")));
+        let cands = ApplicationMigrationStrategy::detect_all(&old, &new);
+        assert!(
+            !cands
+                .iter()
+                .any(|c| c.trigger_type == "public-hostname-add")
+        );
+    }
+
+    // The public counterpart: the SAME hostname-add (None→Some) under a PUBLIC
+    // app DOES fire `public-hostname-add`. This pairs with the internal test
+    // above — together they prove the gate is load-bearing (the internal case
+    // would fire without the `new_net == "public"` guard).
+    #[test]
+    fn hostname_add_under_public_is_a_security_boundary() {
+        let old = with_expose(base(), expose("public", None));
+        let new = with_expose(base(), expose("public", Some("x.example.com")));
+        let cands = ApplicationMigrationStrategy::detect_all(&old, &new);
+        assert!(cands.iter().any(|c| c.trigger_type == "public-hostname-add"));
+    }
+
     #[test]
     fn hostname_removal_on_public_app_gates_with_removed_sentinel() {
         let c = ApplicationMigrationStrategy::detect_destructive(
