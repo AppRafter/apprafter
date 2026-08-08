@@ -80,6 +80,7 @@ mod tests {
             default_environment: None,
             network: None,
             backup: None,
+            resources: None,
             source: PlatformStackSource::default(),
             values: PlatformStackValues {
                 tier: 1,
