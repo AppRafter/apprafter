@@ -48,10 +48,81 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use operator_core::{
-    ApplicationBaseSpec, ApplicationSpec, DiskClaim, EnvRef, EnvValue, Needs, OneOrMany,
-    ServiceNeed,
+    ApplicationBaseSpec, ApplicationEnvOverride, ApplicationSpec, DiskClaim, EnvRef, EnvValue,
+    Needs, OneOrMany, ServiceNeed,
 };
 use serde_json::Value;
+
+/// The fields SHARED by a scope's typed view — `spec.base`
+/// ([`ApplicationBaseSpec`]) and each `spec.environments[*]`
+/// ([`ApplicationEnvOverride`], the 2.16c all-optional override). The
+/// per-scope validators (`validate_expose`, `validate_disk_claims`,
+/// `validate_needs_names`, `validate_env_refs`, `validate_env_keys_scope`)
+/// read a scope through this trait so ONE code path serves both concrete
+/// types even where a single variable must hold either (e.g. the disk
+/// per-key merge picks base OR the env override). The `expose` accessors
+/// project the DIFFERING expose structs (`ApplicationExpose` with a
+/// required `port` vs `ExposeOverride` with `port: Option<i32>`) onto their
+/// common fields — the webhook never reads `port` on the typed path, so its
+/// absence on the override is transparent here. Every accessor is a field
+/// read, so a renamed operator-core field fails to compile (ADR 0047 #4).
+trait ScopeView {
+    fn replicas(&self) -> Option<i32>;
+    fn env(&self) -> Option<&BTreeMap<String, EnvValue>>;
+    fn needs(&self) -> Option<&Needs>;
+    fn has_expose(&self) -> bool;
+    fn expose_network(&self) -> Option<&str>;
+    fn expose_hostname(&self) -> Option<&OneOrMany<String>>;
+    fn expose_tls(&self) -> Option<bool>;
+}
+
+impl ScopeView for ApplicationBaseSpec {
+    fn replicas(&self) -> Option<i32> {
+        self.replicas
+    }
+    fn env(&self) -> Option<&BTreeMap<String, EnvValue>> {
+        self.env.as_ref()
+    }
+    fn needs(&self) -> Option<&Needs> {
+        self.needs.as_ref()
+    }
+    fn has_expose(&self) -> bool {
+        self.expose.is_some()
+    }
+    fn expose_network(&self) -> Option<&str> {
+        self.expose.as_ref().and_then(|e| e.network.as_deref())
+    }
+    fn expose_hostname(&self) -> Option<&OneOrMany<String>> {
+        self.expose.as_ref().and_then(|e| e.hostname.as_ref())
+    }
+    fn expose_tls(&self) -> Option<bool> {
+        self.expose.as_ref().and_then(|e| e.tls)
+    }
+}
+
+impl ScopeView for ApplicationEnvOverride {
+    fn replicas(&self) -> Option<i32> {
+        self.replicas
+    }
+    fn env(&self) -> Option<&BTreeMap<String, EnvValue>> {
+        self.env.as_ref()
+    }
+    fn needs(&self) -> Option<&Needs> {
+        self.needs.as_ref()
+    }
+    fn has_expose(&self) -> bool {
+        self.expose.is_some()
+    }
+    fn expose_network(&self) -> Option<&str> {
+        self.expose.as_ref().and_then(|e| e.network.as_deref())
+    }
+    fn expose_hostname(&self) -> Option<&OneOrMany<String>> {
+        self.expose.as_ref().and_then(|e| e.hostname.as_ref())
+    }
+    fn expose_tls(&self) -> Option<bool> {
+        self.expose.as_ref().and_then(|e| e.tls)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
@@ -278,17 +349,36 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
         }
     }
 
-    // `spec.environment` selector — typed `Option<String>` on the happy path.
-    let app_environment = match typed.as_ref() {
-        Some(s) => s.environment.as_deref(),
-        None => obj.get("environment").and_then(|v| v.as_str()),
-    };
+    // 2.16c: the EFFECTIVE `expose` must carry a `port`. `base.expose.port`
+    // is required (CRD), so a base-only or base-inheriting effective spec is
+    // never portless; guard only an env override that SETS `expose` while
+    // base has no `expose` (nothing supplies the port). `ExposeOverride.port`
+    // is `Option<i32>` (all-optional per-env override), so a `port`-less env
+    // expose under an absent base expose is the sole reject case here. Typed
+    // on the happy path; the raw map is the deserialize-failure fallback.
+    let base_has_expose = typed_base.map_or_else(
+        || base.and_then(|b| b.get("expose")).is_some(),
+        |b| b.expose.is_some(),
+    );
+    if !base_has_expose {
+        if let Some(env_map) = typed_envs {
+            for (name, env_spec) in env_map {
+                if let Some(exp) = &env_spec.expose {
+                    if exp.port.is_none() {
+                        errors.push(ValidationError::new(
+                            format!("spec.environments.{name}.expose.port"),
+                            "base.expose is absent, so an env override that sets `expose` must include `port`",
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     validate_needs_names(typed_base, typed_envs, base, envs, &mut errors);
     validate_env_refs(typed_base, typed_envs, base, envs, &mut errors);
     validate_disk_claims(typed_base, typed_envs, base, envs, &mut errors);
     validate_expose(typed_base, typed_envs, base, envs, &mut errors);
-    validate_spec_environment(app_environment, typed_envs, envs, &mut errors);
 
     errors
 }
@@ -299,13 +389,13 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
 /// back to the raw map. The key character-set rule itself is on the key
 /// `String` either way — the typed struct constrains the VALUE, not the
 /// key's `^[A-Z_][A-Z0-9_]*$` shape.
-fn validate_env_keys_scope(
+fn validate_env_keys_scope<S: ScopeView>(
     path: &str,
-    typed_scope: Option<&ApplicationBaseSpec>,
+    typed_scope: Option<&S>,
     raw_scope: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
-    match typed_scope.and_then(|s| s.env.as_ref()) {
+    match typed_scope.and_then(|s| s.env()) {
         Some(env_map) => {
             for key in env_map.keys() {
                 if !is_env_var_name(key) {
@@ -357,7 +447,7 @@ fn needs_entry_names(value: &Value) -> Vec<Option<&str>> {
 /// short-circuit (matching the validator contract).
 fn validate_needs_names(
     typed_base: Option<&ApplicationBaseSpec>,
-    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
+    typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
@@ -465,11 +555,13 @@ fn validate_needs_names(
     }
 
     // Dispatch a scope: typed slots on the happy path, raw map as fallback.
+    // The scope's typed `needs` is projected via `ScopeView` before dispatch
+    // so ONE closure serves both `ApplicationBaseSpec` and the env override.
     let check_scope = |path: &str,
-                       typed_scope: Option<&ApplicationBaseSpec>,
+                       typed_needs: Option<&Needs>,
                        raw_scope: Option<&serde_json::Map<String, Value>>,
                        errors: &mut Vec<ValidationError>| {
-        match typed_scope.and_then(|s| s.needs.as_ref()) {
+        match typed_needs {
             Some(needs) => {
                 for (service_type, slot) in service_need_slots(needs) {
                     if let Some(slot) = slot {
@@ -481,13 +573,20 @@ fn validate_needs_names(
         }
     };
 
-    check_scope("spec.base.needs", typed_base, base, errors);
+    check_scope(
+        "spec.base.needs",
+        typed_base.and_then(ScopeView::needs),
+        base,
+        errors,
+    );
     if let Some(envs_obj) = envs {
         for (env_name, val) in envs_obj {
             let path = format!("spec.environments.{env_name}.needs");
             check_scope(
                 &path,
-                typed_envs.and_then(|m| m.get(env_name)),
+                typed_envs
+                    .and_then(|m| m.get(env_name))
+                    .and_then(ScopeView::needs),
                 val.as_object(),
                 errors,
             );
@@ -621,23 +720,28 @@ fn scope_disk_value(scope: Option<&serde_json::Map<String, Value>>) -> Option<&V
 /// (matching the validator contract).
 ///
 /// One disk value-guard scope: (field-path prefix, typed view, raw map).
+/// The typed view is a `&dyn ScopeView` so base ([`ApplicationBaseSpec`])
+/// and env ([`ApplicationEnvOverride`]) scopes coexist in one `Vec`.
 type DiskValueScope<'a> = (
     String,
-    Option<&'a ApplicationBaseSpec>,
+    Option<&'a dyn ScopeView>,
     Option<&'a serde_json::Map<String, Value>>,
 );
 
 fn validate_disk_claims(
     typed_base: Option<&ApplicationBaseSpec>,
-    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
+    typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
     // A scope's typed view if it decoded, else `None` (raw fallback). Carries
     // the raw map too so the cannot-model branches (mountPath/size presence)
-    // and the deserialize-failure fallback read it.
-    let base_replicas = scope_replicas(typed_base, base);
+    // and the deserialize-failure fallback read it. `typed_base` and each env
+    // override are erased to `&dyn ScopeView` so the per-key merge below can
+    // hold EITHER a base or an env view in one variable.
+    let base_view: Option<&dyn ScopeView> = typed_base.map(|b| b as &dyn ScopeView);
+    let base_replicas = scope_replicas(base_view, base);
 
     // ---- replicas guard on the EFFECTIVE-merged view ----
     // base's literal disk-key presence + non-emptiness, inherited by any env
@@ -650,7 +754,7 @@ fn validate_disk_claims(
     // a REFERENCED disk binds a shared SharedVolume (RWX), so it does not
     // constrain the replica count. The guard therefore counts only the
     // owned entries in each scope's effective disk value.
-    let scope_has_owned_disk = |typed_scope: Option<&ApplicationBaseSpec>,
+    let scope_has_owned_disk = |typed_scope: Option<&dyn ScopeView>,
                                 raw_scope: Option<&serde_json::Map<String, Value>>|
      -> bool {
         scope_disk_entries(typed_scope, raw_scope)
@@ -658,21 +762,23 @@ fn validate_disk_claims(
             .any(|e| !e.is_reference())
     };
 
-    let base_disk_present = scope_disk_present(typed_base, base);
-    let base_owned_disk = scope_has_owned_disk(typed_base, base);
+    let base_disk_present = scope_disk_present(base_view, base);
+    let base_owned_disk = scope_has_owned_disk(base_view, base);
 
     let mut replicas_scopes: Vec<(String, bool, Option<i64>)> =
         vec![("spec.base".to_string(), base_owned_disk, base_replicas)];
     if let Some(envs_obj) = envs {
         for env_name in envs_obj.keys() {
-            let typed_env = typed_envs.and_then(|m| m.get(env_name));
+            let env_view: Option<&dyn ScopeView> = typed_envs
+                .and_then(|m| m.get(env_name))
+                .map(|e| e as &dyn ScopeView);
             let raw_env = envs_obj.get(env_name).and_then(|v| v.as_object());
             // Per-key needs merge: the env's disk wins when its `disk` key is
             // present (even empty); else it inherits base's disk.
-            let (eff_typed, eff_raw, eff_present) = if scope_disk_present(typed_env, raw_env) {
-                (typed_env, raw_env, true)
+            let (eff_typed, eff_raw, eff_present) = if scope_disk_present(env_view, raw_env) {
+                (env_view, raw_env, true)
             } else if base_disk_present {
-                (typed_base, base, true)
+                (base_view, base, true)
             } else {
                 (None, None, false)
             };
@@ -680,7 +786,7 @@ fn validate_disk_claims(
                 continue;
             }
             // Env-override replaces base replicas; else inherit base.
-            let effective_replicas = scope_replicas(typed_env, raw_env).or(base_replicas);
+            let effective_replicas = scope_replicas(env_view, raw_env).or(base_replicas);
             replicas_scopes.push((
                 format!("spec.environments.{env_name}"),
                 true,
@@ -710,12 +816,14 @@ fn validate_disk_claims(
 
     // Each scope's own field-path prefix + (typed, raw) scope views.
     let mut value_scopes: Vec<DiskValueScope<'_>> =
-        vec![("spec.base".to_string(), typed_base, base)];
+        vec![("spec.base".to_string(), base_view, base)];
     if let Some(envs_obj) = envs {
         for env_name in envs_obj.keys() {
             value_scopes.push((
                 format!("spec.environments.{env_name}"),
-                typed_envs.and_then(|m| m.get(env_name)),
+                typed_envs
+                    .and_then(|m| m.get(env_name))
+                    .map(|e| e as &dyn ScopeView),
                 envs_obj.get(env_name).and_then(|v| v.as_object()),
             ));
         }
@@ -914,27 +1022,29 @@ pub fn validate_sharedvolume(obj: &serde_json::Value) -> Vec<ValidationError> {
 /// `hostname` `OneOrMany` is normalized (scalar → `[scalar]`) before the check.
 fn validate_expose(
     typed_base: Option<&ApplicationBaseSpec>,
-    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
+    typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
 ) {
     fn check_scope(
         prefix: &str,
-        typed: Option<&ApplicationBaseSpec>,
+        typed: Option<&dyn ScopeView>,
         raw: Option<&serde_json::Map<String, Value>>,
         errors: &mut Vec<ValidationError>,
     ) {
-        // network + hostnames + tls, typed-first with a raw fallback.
+        // network + hostnames + tls, typed-first with a raw fallback. The
+        // typed reads go through `ScopeView`, which projects the differing
+        // expose structs (`ApplicationExpose` / `ExposeOverride`) onto their
+        // common `network`/`hostname`/`tls` fields.
         let (network, hostnames, tls): (Option<String>, Vec<String>, Option<bool>) =
-            match typed.and_then(|s| s.expose.as_ref()) {
-                Some(e) => (
-                    e.network.clone(),
-                    e.hostname
-                        .as_ref()
+            match typed.filter(|s| s.has_expose()) {
+                Some(s) => (
+                    s.expose_network().map(String::from),
+                    s.expose_hostname()
                         .map(|h| h.as_slice_vec())
                         .unwrap_or_default(),
-                    e.tls,
+                    s.expose_tls(),
                 ),
                 None => {
                     let expose = raw
@@ -957,7 +1067,7 @@ fn validate_expose(
                 }
             };
         // expose absent → nothing to check (port-only / no expose).
-        let expose_present = typed.is_some_and(|s| s.expose.is_some())
+        let expose_present = typed.is_some_and(|s| s.has_expose())
             || raw.is_some_and(|o| o.get("expose").is_some_and(|v| v.is_object()));
         if !expose_present {
             return;
@@ -1004,12 +1114,19 @@ fn validate_expose(
         }
     }
 
-    check_scope("spec.base", typed_base, base, errors);
+    check_scope(
+        "spec.base",
+        typed_base.map(|b| b as &dyn ScopeView),
+        base,
+        errors,
+    );
     if let Some(envs_obj) = envs {
         for (env_name, val) in envs_obj {
             check_scope(
                 &format!("spec.environments.{env_name}"),
-                typed_envs.and_then(|m| m.get(env_name)),
+                typed_envs
+                    .and_then(|m| m.get(env_name))
+                    .map(|e| e as &dyn ScopeView),
                 val.as_object(),
                 errors,
             );
@@ -1021,11 +1138,11 @@ fn validate_expose(
 /// path (compiler-gated `replicas` field); the raw `as_i64()` is the
 /// deserialize-failure fallback.
 fn scope_replicas(
-    typed_scope: Option<&ApplicationBaseSpec>,
+    typed_scope: Option<&dyn ScopeView>,
     raw_scope: Option<&serde_json::Map<String, Value>>,
 ) -> Option<i64> {
     match typed_scope {
-        Some(s) => s.replicas.map(i64::from),
+        Some(s) => s.replicas().map(i64::from),
         None => raw_scope
             .and_then(|o| o.get("replicas"))
             .and_then(|v| v.as_i64()),
@@ -1037,11 +1154,11 @@ fn scope_replicas(
 /// being present on the typed path; the raw `scope_disk_value` is the
 /// fallback. The per-key needs merge pivots on this presence.
 fn scope_disk_present(
-    typed_scope: Option<&ApplicationBaseSpec>,
+    typed_scope: Option<&dyn ScopeView>,
     raw_scope: Option<&serde_json::Map<String, Value>>,
 ) -> bool {
     match typed_scope {
-        Some(s) => s.needs.as_ref().is_some_and(|n| n.disk.is_some()),
+        Some(s) => s.needs().is_some_and(|n| n.disk.is_some()),
         None => scope_disk_value(raw_scope).is_some(),
     }
 }
@@ -1130,11 +1247,11 @@ impl DiskEntry<'_> {
 /// `DiskEntry::Typed`, compiler-gating the field reads); the raw
 /// `disk_entries` is the deserialize-failure fallback.
 fn scope_disk_entries<'a>(
-    typed_scope: Option<&'a ApplicationBaseSpec>,
+    typed_scope: Option<&'a dyn ScopeView>,
     raw_scope: Option<&'a serde_json::Map<String, Value>>,
 ) -> Vec<DiskEntry<'a>> {
     match typed_scope {
-        Some(s) => match s.needs.as_ref().and_then(|n| n.disk.as_ref()) {
+        Some(s) => match s.needs().and_then(|n| n.disk.as_ref()) {
             Some(OneOrMany::One(d)) => vec![DiskEntry::Typed(d)],
             Some(OneOrMany::Many(v)) => v.iter().map(DiskEntry::Typed).collect(),
             None => Vec::new(),
@@ -1198,7 +1315,7 @@ fn effective_needs_for_scope(base: Option<&Needs>, env_needs: Option<&Needs>) ->
 /// compile. When a scope did not decode, the raw map is the fallback.
 fn validate_env_refs(
     typed_base: Option<&ApplicationBaseSpec>,
-    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
+    typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
     base: Option<&serde_json::Map<String, Value>>,
     envs: Option<&serde_json::Map<String, Value>>,
     errors: &mut Vec<ValidationError>,
@@ -1476,33 +1593,6 @@ fn is_secret_key(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
 }
 
-/// `spec.environment`, when present and non-empty, must name a declared
-/// `spec.environments` key — you cannot select an env you did not define
-/// (ADR 0044). An empty string is treated as absent (codebase convention).
-fn validate_spec_environment(
-    app_environment: Option<&str>,
-    typed_envs: Option<&BTreeMap<String, ApplicationBaseSpec>>,
-    envs: Option<&serde_json::Map<String, Value>>,
-    errors: &mut Vec<ValidationError>,
-) {
-    let Some(env) = app_environment.filter(|s| !s.is_empty()) else {
-        return;
-    };
-    // Declared <=> the env names a key of `environments`. Typed keys on the
-    // happy path (compiler-gated `environments` field); raw keys are the
-    // deserialize-failure fallback.
-    let declared = match typed_envs {
-        Some(m) => m.contains_key(env),
-        None => envs.is_some_and(|m| m.contains_key(env)),
-    };
-    if !declared {
-        errors.push(ValidationError::new(
-            "spec.environment",
-            format!("'{env}' is not a declared environment; add it under spec.environments or pick an existing one"),
-        ));
-    }
-}
-
 /// 2.16b (S7.2): whether an UPDATE may carry the given `spec.environment`
 /// transition. `spec.environment` selects which `environments.<env>`
 /// override the operator unifies onto `base` (ADR 0044) — flipping it
@@ -1515,7 +1605,7 @@ fn validate_spec_environment(
 /// RetainedClaim spec-immutability precedent.
 ///
 /// The rule (empty string is treated as UNSET, matching the codebase
-/// convention in `validate_spec_environment`):
+/// empty-is-absent convention):
 ///   - `old` unset (CREATE — no oldObject — or an existing CR that never
 ///     set an environment): ALLOW. This lets a per-env CR be created (no
 ///     oldObject) and lets an existing default-env CR set its environment
@@ -2744,18 +2834,23 @@ mod tests {
         assert!(validate_application_spec(&spec).is_empty());
     }
 
-    // ---- 2.9: spec.environment must name a declared spec.environments key ----
+    // ---- 2.16c (R4-H3): the undeclared-`spec.environment` rejection is
+    // REMOVED. It closed nothing and rejected the legitimate base-only +
+    // `--env prod` shape (empty/absent `environments`) on every Argo
+    // UPDATE → a permanent sync-fail loop. `spec.environment` selecting an
+    // env NOT under `spec.environments` is now ACCEPTED (it falls back to
+    // base). The immutability guard (`environment_update_allowed`) still
+    // governs CHANGING a concrete env on UPDATE. ----
 
     #[test]
-    fn rejects_spec_environment_not_in_environments() {
+    fn accepts_spec_environment_not_in_declared_environments() {
+        // R4-H3: previously rejected; now a no-op (selector falls back to base).
         let spec = json!({
             "base": { "image": "x" },
             "environments": { "dev": {}, "prod": {} },
             "environment": "staging"
         });
-        let errors = validate_application_spec(&spec);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].field, "spec.environment");
+        assert!(validate_application_spec(&spec).is_empty());
     }
 
     #[test]
@@ -3201,6 +3296,51 @@ mod tests {
             "base": { "image": "x",
                       "expose": { "port": 8080, "network": "public",
                                   "hostname": "app.demo.dev", "tls": true } }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    // ── 2.16c: an env override that sets `expose` while base has no
+    // `expose` must carry a `port` (the effective expose is otherwise
+    // portless — base cannot supply it). `base.expose.port` is required by
+    // the CRD, so only the base-absent case needs guarding.
+    #[test]
+    fn rejects_env_only_expose_without_port_when_base_has_no_expose() {
+        let spec = json!({
+            "base": { "image": "x" },
+            "environments": {
+                "prod": { "expose": { "network": "internal" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "spec.environments.prod.expose.port");
+        assert!(errors[0].message.contains("port"));
+    }
+
+    #[test]
+    fn accepts_env_expose_without_port_when_base_expose_has_port() {
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "expose": { "port": 8080, "network": "public", "hostname": "app.demo.dev" }
+            },
+            "environments": {
+                "dev": { "expose": { "network": "internal" } }
+            }
+        });
+        assert!(validate_application_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn accepts_base_only_with_deploy_env_scalar() {
+        // R4-H3 regression: base-only (with image) + a `spec.environment`
+        // selector naming an env that is NOT declared under `environments`
+        // is ACCEPTED — no `spec.environment ∈ environments` rejection here,
+        // so base-only + `--env` keeps working.
+        let spec = json!({
+            "base": { "image": "x" },
+            "environment": "prod"
         });
         assert!(validate_application_spec(&spec).is_empty());
     }
