@@ -68,6 +68,11 @@ package v1alpha1
 	// render the reference verbatim, no registry poll.
 	imagePolicy?: #ImagePolicy
 
+	// Container resource requests/limits (2.16d). Keys are resource
+	// names (cpu, memory, ephemeral-storage); values are Kubernetes
+	// quantities. Quantity format + request<=limit are webhook-enforced.
+	resources?: #Resources
+
 	// Replica count. Zero is valid (scale-to-zero); negative is
 	// rejected by CUE.
 	replicas?: int & >=0
@@ -136,6 +141,7 @@ package v1alpha1
 #ApplicationEnvOverride: {
 	image?:       string
 	imagePolicy?: #ImagePolicy
+	resources?:   #Resources
 	replicas?:    int & >=0
 	expose?: {
 		port?:    int & >0 & <=65535
@@ -349,6 +355,16 @@ _mkFields: {
 
 	// Mount the volume read-only (default false).
 	readOnly?: bool | *false
+}
+
+// #Resources — container resource requests/limits (2.16d). Keys are
+// resource names (cpu, memory, ephemeral-storage); values are Kubernetes
+// quantities ("100m", "128Mi", "1Gi"). Quantity format + request<=limit are
+// enforced by the admission webhook; the CRD renders each map as
+// additionalProperties:{type:string} (no preserve-unknown needed).
+#Resources: {
+	requests?: [string]: string
+	limits?: [string]:   string
 }
 
 // #ImagePolicy — image-reference resolution policy under

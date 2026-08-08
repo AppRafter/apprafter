@@ -52,6 +52,8 @@ pub struct ApplicationBaseSpec {
         rename = "imagePolicy"
     )]
     pub image_policy: Option<ImagePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<AppResources>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -120,6 +122,21 @@ pub struct ApplicationEnvOverride {
         rename = "imagePolicy"
     )]
     pub image_policy: Option<ImagePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<AppResources>,
+}
+
+/// Container resource requests/limits (2.16d). NOT k8s_openapi::ResourceRequirements
+/// (its `claims` field + a `ResourceClaim` name-collision with operator-core's own
+/// ResourceClaim). Maps of resource-name -> quantity-string; deep-merges MAP-of-map
+/// at render (requests/limits each merge key-by-key — an env setting limits.memory
+/// keeps base limits.cpu). Mirrors #Resources in application.cue.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct AppResources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<BTreeMap<String, String>>,
 }
 
 /// One declared platform-service dependency under
