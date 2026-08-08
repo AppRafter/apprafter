@@ -45,6 +45,40 @@
 //! - `--disable=servicelb` — Cilium L2 announcements replace the
 //!   k3s default LoadBalancer implementation.
 //!
+//! ## Node reservations (2.16d)
+//!
+//! The k3s process (`k3s.service`, ~1.5 GiB measured on the solo
+//! tier) runs in `system.slice`, **outside** `kubepods` — so
+//! per-pod requests/limits never account for it. Without node
+//! reservations the scheduler treats the whole node's memory as
+//! schedulable and over-commits until the kernel OOM-killer fires,
+//! and `k3s.service` (default `OOMScoreAdjust=0`) is a prime
+//! victim. 2.16d closes both gaps:
+//!
+//! - **kubelet reservations** (`system-reserved`, `kube-reserved`,
+//!   `eviction-hard`) are written to `/etc/rancher/k3s/config.yaml`
+//!   via cloud-init `write_files` rather than passed as
+//!   `--kubelet-arg=…` flags. The config-file form is what k3s
+//!   recommends for values containing shell/YAML metacharacters —
+//!   the `<` in `eviction-hard=memory.available<100Mi` would
+//!   otherwise have to survive both the `INSTALL_K3S_EXEC="…"`
+//!   double-quoting inside the single-quoted `runcmd` entry AND
+//!   cloud-init's own YAML parse. A plain YAML list value sidesteps
+//!   all of that. k3s reads `config.yaml` at install time (the file
+//!   lands via `write_files`, which cloud-init runs before
+//!   `runcmd`), so the reservations apply to the very first boot.
+//! - **`OOMScoreAdjust=-999`** is set via a systemd drop-in at
+//!   `/etc/systemd/system/k3s.service.d/oom.conf`. The k3s
+//!   install-script unit does NOT set `OOMScoreAdjust` (verified
+//!   against k3s `install.sh` — unlike rke2, which does), so the
+//!   default of `0` leaves k3s equally OOM-killable as any pod.
+//!   `-999` puts it just above the kernel's own `-1000` reserve so
+//!   the control plane survives a node-level memory squeeze. A
+//!   `systemctl daemon-reload` in `runcmd` picks the drop-in up
+//!   (the k3s install runs `daemon-reload` itself before starting
+//!   the unit, but we reload again defensively in case the drop-in
+//!   is applied to an already-running unit by the retrofit path).
+//!
 //! The function is pure and side-effect-free; the caller passes
 //! the result to `ServerSpec.user_data`.
 
@@ -76,6 +110,42 @@ impl Default for K3sBootstrapOptions {
 pub const CLUSTER_CIDR_DUAL_STACK: &str = "10.42.0.0/16,fd00:42::/64";
 pub const SERVICE_CIDR_DUAL_STACK: &str = "10.43.0.0/16,fd00:43::/112";
 
+/// Absolute path of the k3s config file that carries the kubelet
+/// node reservations. k3s reads it at install and on every start.
+pub const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
+
+/// Absolute path of the systemd drop-in that pins `k3s.service`
+/// out of the kernel OOM-killer's default reach.
+pub const K3S_OOM_DROPIN_PATH: &str = "/etc/systemd/system/k3s.service.d/oom.conf";
+
+/// The systemd drop-in body applied at [`K3S_OOM_DROPIN_PATH`].
+/// Shared by the bootstrap cloud-init (Task 10) and the
+/// `apprafter node reserve-headroom` retrofit (Task 11) so the two
+/// paths can never diverge.
+pub const K3S_OOM_DROPIN: &str = "[Service]\nOOMScoreAdjust=-999\n";
+
+/// Renders the k3s `config.yaml` body carrying the 2.16d kubelet
+/// node reservations. Pure and side-effect-free.
+///
+/// The three `kubelet-arg` list entries encode:
+/// - `system-reserved=memory=1500Mi` — covers `k3s.service` (in
+///   `system.slice`, outside `kubepods`; ~1.5 GiB measured).
+/// - `kube-reserved=cpu=100m,memory=256Mi` — kubelet + containerd.
+/// - `eviction-hard=memory.available<100Mi` — the hard-eviction
+///   floor. The `<` is why this lives in YAML, not a shell flag.
+///
+/// This is the single source of truth for the reservation values —
+/// [`build_k3s_user_data`] embeds it at bootstrap and the CLI
+/// retrofit subcommand writes the identical body to a live node.
+pub fn k3s_reservation_config() -> String {
+    // Values from docs/measurements/2.16d-baseline-2026-08-08.md.
+    "kubelet-arg:\n\
+     \x20 - \"system-reserved=memory=1500Mi\"\n\
+     \x20 - \"kube-reserved=cpu=100m,memory=256Mi\"\n\
+     \x20 - \"eviction-hard=memory.available<100Mi\"\n"
+        .to_string()
+}
+
 pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
     let install_exec = if opts.dual_stack {
         format!(
@@ -85,17 +155,58 @@ pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
     } else {
         "--flannel-backend=none --disable-network-policy --disable-kube-proxy --disable=traefik --disable=servicelb".to_string()
     };
-    format!(
-        "#cloud-config\n\
-package_update: true\n\
-package_upgrade: false\n\
-packages:\n\
-  - fail2ban\n\
-runcmd:\n\
-  - systemctl enable --now fail2ban\n\
-  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"{}\" sh -'\n",
-        install_exec
-    )
+
+    // Both files ship as cloud-init `write_files` YAML block
+    // literal scalars (`content: |`). A block literal is verbatim —
+    // the `<` in `eviction-hard=memory.available<100Mi`, the inner
+    // double-quotes, and the newlines are all preserved with no
+    // shell or YAML-scalar escaping (this is exactly why the
+    // reservations go in a file, not a `--kubelet-arg=…` flag on
+    // the double-quoted `INSTALL_K3S_EXEC` inside a single-quoted
+    // runcmd entry). cloud-init runs `write_files` before `runcmd`,
+    // so k3s's install script finds /etc/rancher/k3s/config.yaml
+    // already present and folds the reservations into the very
+    // first kubelet start.
+    //
+    // Built by concatenation, NOT a `\`-continued format literal:
+    // Rust's line-continuation escape eats the leading whitespace of
+    // the continuation line, which would silently strip the YAML
+    // indentation the `write_files` mapping keys and block scalars
+    // depend on. List items sit at column 0 under their parent key
+    // (`- path:` → sibling keys at col 2, block content at col 4).
+    let mut out = String::new();
+    out.push_str("#cloud-config\n");
+    out.push_str("package_update: true\n");
+    out.push_str("package_upgrade: false\n");
+    out.push_str("packages:\n");
+    out.push_str("  - fail2ban\n");
+    out.push_str("write_files:\n");
+    out.push_str(&write_files_entry(K3S_CONFIG_PATH, &k3s_reservation_config()));
+    out.push_str(&write_files_entry(K3S_OOM_DROPIN_PATH, K3S_OOM_DROPIN));
+    out.push_str("runcmd:\n");
+    out.push_str("  - systemctl enable --now fail2ban\n");
+    out.push_str(&format!(
+        "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
+    ));
+    out.push_str("  - systemctl daemon-reload\n");
+    out
+}
+
+/// Renders one cloud-init `write_files` list entry (path +
+/// permissions + a `content: |` block literal). `body` is emitted
+/// verbatim as a block scalar indented one level under `content`.
+fn write_files_entry(path: &str, body: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("  - path: {path}\n"));
+    out.push_str("    permissions: '0644'\n");
+    out.push_str("    content: |\n");
+    // Block-scalar lines are indented 6 spaces — two levels past the
+    // `- ` item marker (col 0..2) and the `content:` key (col 4).
+    for line in body.split_inclusive('\n') {
+        out.push_str("      ");
+        out.push_str(line);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -106,6 +217,21 @@ mod tests {
     fn includes_cloud_config_header() {
         let s = build_k3s_user_data(&K3sBootstrapOptions::default());
         assert!(s.starts_with("#cloud-config\n"), "{s}");
+    }
+
+    #[test]
+    fn k3s_user_data_includes_node_reservations() {
+        let ud = build_k3s_user_data(&K3sBootstrapOptions::default());
+        assert!(ud.contains("kube-reserved"), "{ud}");
+        assert!(
+            ud.contains("system-reserved=memory=1500Mi") || ud.contains("system-reserved"),
+            "{ud}"
+        );
+        assert!(ud.contains("eviction-hard"), "{ud}");
+        // k3s's install-script unit does NOT set OOMScoreAdjust (unlike
+        // rke2 — verified against k3s install.sh, R4-N4), so we ship the
+        // drop-in that pins k3s.service out of the kernel OOM-killer's reach.
+        assert!(ud.contains("OOMScoreAdjust=-999"), "{ud}");
     }
 
     #[test]
@@ -208,3 +334,4 @@ mod tests {
         assert!(s.contains("--disable-kube-proxy"), "{s}");
     }
 }
+
