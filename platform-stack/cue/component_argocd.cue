@@ -59,6 +59,33 @@ _components: argocd: #Component & {
 	// fails with `Application referencing project default
 	// which does not exist`. Walk-found bug v0.1.103 → v0.1.104.
 	values: _loaderValues.argocd.values & {
+		// 2.16d resource requests/limits (measured RSS×0.8 request /
+		// tight mem limit / modest cpu request / no cpu limit — see
+		// docs/measurements/2.16d-baseline-*.md). The argo-cd chart
+		// (7.7.7) splits every workload under its own key: the
+		// application-controller is a StatefulSet (`controller.resources`),
+		// the repo-server carries its below (with the cue-cmp sidecar), and
+		// server / applicationSet / redis each take a `resources` key.
+		// No argo pod stays BestEffort.
+		controller: resources: {
+			requests: {
+				cpu:    "50m"
+				memory: "288Mi"
+			}
+			limits: memory: "512Mi"
+		}
+		server: resources: {
+			requests: memory: "24Mi"
+			limits: memory:   "128Mi"
+		}
+		applicationSet: resources: {
+			requests: memory: "24Mi"
+			limits: memory:   "128Mi"
+		}
+		redis: resources: {
+			requests: memory: "16Mi"
+			limits: memory:   "64Mi"
+		}
 		// Custom resource-health Lua scripts merged into
 		// `argocd-cm`. Walk-fix B.1.77: surface the
 		// Application CR's `AwaitingMigrationApproval` phase
@@ -296,6 +323,11 @@ _components: argocd: #Component & {
 		// `_loaderValues.argocd` above; only the chart-only
 		// extras live here.
 		repoServer: {
+			// 2.16d: repo-server resources (measured 82Mi → req 66Mi / limit 256Mi).
+			resources: {
+				requests: memory: "66Mi"
+				limits: memory:   "256Mi"
+			}
 			extraContainers: [{
 				name:  "cue-cmp"
 				image: "\(_components."argocd-cue-cmp".values.image.repository):\(_components."argocd-cue-cmp".values.image.tag)"
@@ -335,6 +367,17 @@ _components: argocd: #Component & {
 					periodSeconds:       3
 					timeoutSeconds:      2
 					failureThreshold:    30
+				}
+				// 2.16d: the cue-cmp CMP sidecar (measured 56Mi). A
+				// resource-less sidecar caps the repo-server pod at
+				// Burstable-without-a-limit for that container; give it its
+				// own request+limit so the whole pod is bounded.
+				resources: {
+					requests: {
+						cpu:    "25m"
+						memory: "48Mi"
+					}
+					limits: memory: "128Mi"
 				}
 				volumeMounts: [{
 					mountPath: "/var/run/argocd"

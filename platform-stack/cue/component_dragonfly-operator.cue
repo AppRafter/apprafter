@@ -26,7 +26,26 @@ _components: "dragonfly-operator": #Component & {
 		chart:   "dragonfly-operator"
 	}
 	version: "v1.5.0" // discovered from the upstream chart's Chart.yaml
-	values: {}
+	values: {
+		// 2.16d resource requests/limits for the operator MANAGER
+		// container (measured 16Mi → req 16Mi / limit 64Mi, cpu 25m,
+		// no cpu limit). The chart nests the manager under `manager.*`
+		// (top-level `resources` is NOT read); its default is `{}`
+		// (BestEffort) so this seed is what lifts the pod to Burstable.
+		// The chart's kube-rbac-proxy sidecar (`rbacProxy.enabled: true`)
+		// already ships its own requests+limits, so it is not BestEffort
+		// and is left at the chart default. This sizes the OPERATOR pod
+		// only; the shared Dragonfly instances the provisioner creates get
+		// their Guaranteed resources from the redis-integrated
+		// ServiceProvider config (service_providers.cue).
+		manager: resources: {
+			requests: {
+				cpu:    "25m"
+				memory: "16Mi"
+			}
+			limits: memory: "64Mi"
+		}
+	}
 
 	// Operator + its CRD bundle must exist before any ServiceProvider CR
 	// or (later) the lazily-created shared Dragonfly instances reference

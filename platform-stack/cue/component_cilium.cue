@@ -68,6 +68,19 @@ _components: cilium: #Component & {
 	// (no real host-netns port binding), so the exact capability
 	// config is validated on a real Hetzner node (T8 e2e).
 	values: _loaderValues.cilium.values & {
+		// 2.16d resource requests/limits (measured RSS×0.8 request /
+		// tight mem limit / modest cpu request / no cpu limit — see
+		// docs/measurements/2.16d-baseline-*.md). Top-level `resources`
+		// is the cilium-AGENT container (chart 1.16.5); the operator and
+		// standalone-envoy DaemonSet carry their own keys below. No
+		// component pod stays BestEffort.
+		resources: {
+			requests: {
+				cpu:    "50m"
+				memory: "106Mi"
+			}
+			limits: memory: "256Mi"
+		}
 		gatewayAPI: {
 			enabled: bool | *true
 			hostNetwork: enabled: bool | *true
@@ -91,10 +104,23 @@ _components: cilium: #Component & {
 		// configuration changes require an agent restart"; the Gateway API
 		// enable guide literally rolls cilium-operator + ds/cilium.
 		rollOutCiliumPods: true
-		operator: rollOutPods: true
+		operator: {
+			rollOutPods: true
+			// 2.16d: cilium-operator resources (measured 58Mi → req 48Mi / limit 128Mi).
+			resources: {
+				requests: memory: "48Mi"
+				limits: memory:   "128Mi"
+			}
+		}
 		envoy: {
 			enabled:     true
 			rollOutPods: true
+			// 2.16d: standalone cilium-envoy DaemonSet resources
+			// (measured 18Mi → req 16Mi / limit 64Mi).
+			resources: {
+				requests: memory: "16Mi"
+				limits: memory:   "64Mi"
+			}
 			securityContext: capabilities: {
 				keepCapNetBindService: true
 				// Cilium 1.16.5 chart default `envoy.securityContext.capabilities.envoy`

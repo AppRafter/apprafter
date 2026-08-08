@@ -33,6 +33,18 @@ _components: "cloudnative-pg": #Component & {
 		// Single operator replica matches the tier-1 baseline
 		// (cpx22, 4 GiB). Tier 2+ overlays may bump for HA.
 		replicaCount: int | *1
+		// 2.16d resource requests/limits for the operator container
+		// (measured 26Mi → req 24Mi / limit 128Mi, cpu 25m, no cpu limit).
+		// This sizes the OPERATOR pod only; the shared platform-postgres
+		// Cluster the provisioner creates gets its Guaranteed resources
+		// from the pg-integrated ServiceProvider config (service_providers.cue).
+		resources: {
+			requests: {
+				cpu:    "25m"
+				memory: "24Mi"
+			}
+			limits: memory: "128Mi"
+		}
 	}
 
 	// The operator + its CRD bundle must exist before any

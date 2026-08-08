@@ -28,6 +28,23 @@ _components: "cert-manager": #Component & {
 		// GiB RAM — three controller replicas is wasteful).
 		// Tier 2+ overlays bump this to 2+.
 		replicaCount: int | *1
+		// 2.16d resource requests/limits (measured RSS×0.8 request /
+		// tight mem limit / modest cpu request / no cpu limit). The chart
+		// splits the three Deployments: top-level `resources` is the
+		// controller; webhook + cainjector carry their own keys. No pod
+		// stays BestEffort.
+		resources: {
+			requests: memory: "24Mi"
+			limits: memory:   "128Mi"
+		}
+		webhook: resources: {
+			requests: memory: "16Mi"
+			limits: memory:   "64Mi"
+		}
+		cainjector: resources: {
+			requests: memory: "32Mi"
+			limits: memory:   "128Mi"
+		}
 	}
 
 	// cert-manager must be Synced before the admission-webhook

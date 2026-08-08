@@ -40,9 +40,16 @@ _components: "sealed-secrets": #Component & {
 		fullnameOverride: "sealed-secrets-controller"
 		// Tier-1 baseline — the controller is a single tiny
 		// reconciler; Tier 2+ overlays may raise this.
-		resources: requests: {
-			cpu:    "50m"
-			memory: "64Mi"
+		// 2.16d: the requests-only block left the pod without a memory
+		// limit (BestEffort-adjacent — no OOM ceiling). Add a memory
+		// limit (measured 22Mi → 128Mi headroom) so the controller is
+		// Burstable with a bounded ceiling, not unbounded.
+		resources: {
+			requests: {
+				cpu:    "50m"
+				memory: "64Mi"
+			}
+			limits: memory: "128Mi"
 		}
 	}
 
