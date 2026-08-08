@@ -679,6 +679,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         },
         egress_profile,
         Some(&needs_targets),
+        None, // autoscale: threaded in by 2.16e controller task
     )
     // The renderer folds the SAME (app, env) effective spec the migration gate
     // (step 1) already validated to `Ok`; the only `EffectiveSpecError` it can
@@ -1436,6 +1437,9 @@ fn build_status(
         // clobber a baseline stamped by the classifier's own apply. The
         // stamp itself lands with a later 2.16b reconcile task.
         last_applied_spec: None,
+        // 2.16e: VPA recommendations are written by a later task; None
+        // here omits the field from the SSA payload (skip_serializing_if).
+        recommended_resources: None,
     }
 }
 
@@ -2169,6 +2173,7 @@ fn build_paused_status(app: &Application, plan_ns: &str, plan_name: &str) -> App
         // 2.16b (walk-found): carry the baseline forward — omitting it under
         // SSA prunes it, self-cancelling the gate. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
+        recommended_resources: None,
     }
 }
 
@@ -2214,6 +2219,7 @@ fn build_migration_failed_status(app: &Application, plan_name: &str) -> Applicat
         // SSA, so omitting the field prunes it (walk-found) rather than leaving
         // it untouched. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
+        recommended_resources: None,
     }
 }
 
@@ -2659,6 +2665,7 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
         // 2.16b (walk-found): carry the baseline forward — omitting it under
         // SSA prunes it. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
+        recommended_resources: None,
     }
 }
 
@@ -2749,6 +2756,7 @@ fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> Ap
         // 2.16b (walk-found): carry the baseline forward — omitting it under
         // SSA prunes it. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
+        recommended_resources: None,
     }
 }
 
@@ -2784,6 +2792,7 @@ fn build_invalid_effective_spec_status(app: &Application, message: &str) -> Appl
         image: None,
         environment: app.spec.environment.clone(),
         last_applied_spec: existing_baseline(app),
+        recommended_resources: None,
     }
 }
 
@@ -4964,6 +4973,7 @@ mod tests {
             None,
             EgressProfile::Internet,
             Some(&targets),
+            None, // autoscale: threaded in by 2.16e controller task
         )
         .expect("valid effective spec renders");
         let cnp = rendered

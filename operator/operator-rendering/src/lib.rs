@@ -50,6 +50,13 @@ pub struct RenderedApplication {
     /// controller SSA-applies it under the platform Gateway and prunes it when
     /// the app flips back to `internal`.
     pub httproute: Option<serde_json::Value>,
+    /// The `VerticalPodAutoscaler` CR (2.16e / ADR 0054), built via
+    /// `serde_json::json!` (external-CR pattern — no hand-rolled VPA type).
+    /// `Some(...)` only for MANAGED envs (no explicit `resources` →
+    /// the seed applies); the controller SSA-applies it gated on
+    /// `vpa_available` and prunes it when the app switches to pro-mode
+    /// (explicit `resources`).
+    pub vpa: Option<serde_json::Value>,
 }
 
 /// One ready `needs.disk` claim resolved into render input (2.6b /
@@ -91,6 +98,7 @@ pub fn render_application(app: &Application) -> Result<RenderedApplication, Effe
         None,
         None,
         operator_core::EgressProfile::Internet,
+        None,
         None,
     )
 }
@@ -140,6 +148,10 @@ pub fn render_application(app: &Application) -> Result<RenderedApplication, Effe
 /// needs carry no network target and add no rule. `effective.needs`'
 /// deterministic [`Needs::entries`] order keeps the rule list byte-stable
 /// (SSA no-op).
+// The render inputs are each an independent, orthogonal threaded param kept
+// separate for the renderer's purity; a bundling struct would only obscure the
+// call site. Mirrors the `render_deployment` allow below.
+#[allow(clippy::too_many_arguments)]
 pub fn render_application_for_env(
     app: &Application,
     env_name: Option<&str>,
@@ -148,6 +160,7 @@ pub fn render_application_for_env(
     disks: Option<&[DiskMount]>,
     egress_profile: operator_core::EgressProfile,
     needs_targets: Option<&BTreeMap<String, egress::ConnectionTarget>>,
+    autoscale: Option<&operator_core::AutoscaleConfig>,
 ) -> Result<RenderedApplication, EffectiveSpecError> {
     let name = app.metadata.name.clone().unwrap_or_default();
     let namespace = app.metadata.namespace.clone();
@@ -210,11 +223,19 @@ pub fn render_application_for_env(
         .filter(|hosts| !hosts.is_empty())
         .map(|hosts| render_httproute(&name, &labels, &hosts, &name));
 
+    // 2.16e (ADR 0054): one VPA CR for this CR's env when MANAGED (no explicit
+    // resources → the seed applies). Pro-mode apps get none.
+    let vpa = match autoscale {
+        Some(ac) if effective.resources.is_none() => Some(render_vpa(&name, &labels, ac)),
+        _ => None,
+    };
+
     Ok(RenderedApplication {
         deployment,
         service,
         network_policy,
         httproute,
+        vpa,
     })
 }
 
@@ -710,6 +731,67 @@ fn render_httproute(
     })
 }
 
+/// Build the per-Application `VerticalPodAutoscaler` CR (2.16e / ADR 0054) as a
+/// `serde_json::Value` — the external-CR pattern (`render_httproute` precedent;
+/// the VPA CRD is cluster-optional so no typed dep). The VPA:
+///   - targets the Deployment by name (`targetRef.kind: Deployment`);
+///   - `updatePolicy.updateMode: InPlace` for `Full` and `UpOnly` (the apiserver
+///     mutates the live pod resource field without eviction when the node can
+///     satisfy the new request; `Off` disables updates, keeping the VPA as a
+///     recommendation-only sensor);
+///   - `updatePolicy.minReplicas: 1` always (VPA must not block single-replica
+///     apps — the webhook rejects eviction when replicas < minReplicas);
+///   - `evictionRequirements` for `UpOnly` (only OOM/scale-up evictions — CPU
+///     and memory downsizes are forbidden);
+///   - `resourcePolicy.containerPolicies[0]` targets `*` (all containers),
+///     `controlledValues: RequestsOnly` (VPA sets requests only; limits are owned
+///     by the operator seed), with the cluster-wide `minAllowed`/`maxAllowed`
+///     floors from `AutoscaleConfig`.
+///
+/// The caller (`render_application_for_env`) emits `None` for pro-mode apps
+/// (explicit `resources`). The controller SSA-applies the VPA gated on
+/// `vpa_available` (a later task wires the controller side).
+fn render_vpa(
+    name: &str,
+    labels: &BTreeMap<String, String>,
+    autoscale: &operator_core::AutoscaleConfig,
+) -> serde_json::Value {
+    use operator_core::AutoscaleMode::{Full, Off, UpOnly};
+    let update_mode = match autoscale.mode {
+        Off => "Off",
+        Full | UpOnly => "InPlace",
+    };
+    let mut update_policy = serde_json::json!({ "updateMode": update_mode, "minReplicas": 1 });
+    if matches!(autoscale.mode, UpOnly) {
+        update_policy["evictionRequirements"] = serde_json::json!([{
+            "resources": ["cpu", "memory"],
+            "changeRequirement": "TargetHigherThanRequests"
+        }]);
+    }
+    let min_allowed = autoscale.min_allowed.as_ref().map(|q| &q.0);
+    let max_allowed = autoscale.max_allowed.as_ref().map(|q| &q.0);
+    serde_json::json!({
+        "apiVersion": "autoscaling.k8s.io/v1",
+        "kind": "VerticalPodAutoscaler",
+        "metadata": { "name": name, "labels": labels },
+        "spec": {
+            "targetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": name
+            },
+            "updatePolicy": update_policy,
+            "resourcePolicy": { "containerPolicies": [{
+                "containerName": "*",
+                "controlledResources": ["cpu", "memory"],
+                "controlledValues": "RequestsOnly",
+                "minAllowed": min_allowed,
+                "maxAllowed": max_allowed
+            }]}
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,6 +1263,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         let sel_env = renv
@@ -1218,6 +1301,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         let labels = rendered
@@ -1243,6 +1327,7 @@ mod tests {
             None,
             None,
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -1558,6 +1643,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1660,6 +1746,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         // No spec.env → no env vars regardless of the secrets map.
@@ -1691,6 +1778,7 @@ mod tests {
             None,
             None,
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -1728,6 +1816,7 @@ mod tests {
             None,
             None,
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -1781,6 +1870,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         let envs = container_env(&r).expect("env present");
@@ -1815,6 +1905,7 @@ mod tests {
             None,
             None,
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -1854,6 +1945,7 @@ mod tests {
             None,
             None,
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -1922,6 +2014,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         let envs = container_env(&r).expect("env present");
@@ -1970,6 +2063,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         let envs = container_env(&r).expect("env present");
@@ -2017,6 +2111,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         let c = &rendered
@@ -2040,6 +2135,7 @@ mod tests {
             None,
             None,
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -2120,6 +2216,7 @@ mod tests {
             Some(&disks),
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
 
@@ -2174,6 +2271,7 @@ mod tests {
             None,
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -2208,6 +2306,7 @@ mod tests {
             None,
             Some(&[]),
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -2258,6 +2357,7 @@ mod tests {
             Some(&disks),
             operator_core::EgressProfile::Internet,
             None,
+            None,
         )
         .unwrap();
         let mounts = container_volume_mounts(&r).expect("volumeMounts present");
@@ -2303,6 +2403,7 @@ mod tests {
             None,
             Some(&disks),
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -2366,6 +2467,7 @@ mod tests {
             None,
             Some(&disks),
             operator_core::EgressProfile::Internet,
+            None,
             None,
         )
         .unwrap();
@@ -2654,5 +2756,148 @@ mod tests {
             resources.limits.as_ref().unwrap().get("memory").unwrap().0,
             "1Gi"
         );
+    }
+
+    // ---- 2.16e: VPA emission ----
+
+    /// An Application whose `spec.base.resources` is explicitly set (pro-mode).
+    fn app_with_explicit_resources() -> Application {
+        make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    expose: Some(ApplicationExpose {
+                        port: 8080,
+                        network: None,
+                        hostname: None,
+                        tls: None,
+                    }),
+                    resources: Some(AppResources {
+                        requests: Some(BTreeMap::from([
+                            ("cpu".into(), "100m".into()),
+                            ("memory".into(), "256Mi".into()),
+                        ])),
+                        limits: Some(BTreeMap::from([("memory".into(), "512Mi".into())])),
+                    }),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "uid-pro",
+        )
+    }
+
+    /// An Application with image + expose but NO `resources` (managed-mode; the
+    /// seed applies and the VPA is eligible to be emitted).
+    fn app_without_resources() -> Application {
+        make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/web:1.0".to_string()),
+                    expose: Some(ApplicationExpose {
+                        port: 8080,
+                        network: None,
+                        hostname: None,
+                        tls: None,
+                    }),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "uid-managed",
+        )
+    }
+
+    fn autoscale_full() -> operator_core::AutoscaleConfig {
+        operator_core::AutoscaleConfig {
+            mode: operator_core::AutoscaleMode::Full,
+            min_allowed: Some(operator_core::ResourceQuantities::from([
+                ("cpu", "25m"),
+                ("memory", "32Mi"),
+            ])),
+            max_allowed: Some(operator_core::ResourceQuantities::from([
+                ("memory", "512Mi"),
+                ("cpu", "1"),
+            ])),
+        }
+    }
+
+    #[test]
+    fn vpa_emitted_for_managed_app_full() {
+        let vpa = render_vpa("web", &make_labels("web", None), &autoscale_full());
+        assert_eq!(vpa["spec"]["targetRef"]["kind"], "Deployment");
+        assert_eq!(vpa["spec"]["targetRef"]["name"], "web");
+        assert_eq!(vpa["spec"]["updatePolicy"]["updateMode"], "InPlace");
+        assert_eq!(vpa["spec"]["updatePolicy"]["minReplicas"], 1);
+        assert!(vpa["spec"]["updatePolicy"]
+            .get("evictionRequirements")
+            .is_none());
+        let cp = &vpa["spec"]["resourcePolicy"]["containerPolicies"][0];
+        assert_eq!(cp["containerName"], "*");
+        assert_eq!(cp["controlledValues"], "RequestsOnly");
+        assert_eq!(cp["minAllowed"]["memory"], "32Mi");
+        assert_eq!(cp["maxAllowed"]["memory"], "512Mi");
+    }
+
+    #[test]
+    fn vpa_up_only_adds_eviction_requirement() {
+        let mut ac = autoscale_full();
+        ac.mode = operator_core::AutoscaleMode::UpOnly;
+        let vpa = render_vpa("web", &make_labels("web", None), &ac);
+        assert_eq!(vpa["spec"]["updatePolicy"]["updateMode"], "InPlace");
+        assert_eq!(
+            vpa["spec"]["updatePolicy"]["evictionRequirements"][0]["changeRequirement"],
+            "TargetHigherThanRequests"
+        );
+    }
+
+    #[test]
+    fn vpa_off_sets_update_mode_off() {
+        let mut ac = autoscale_full();
+        ac.mode = operator_core::AutoscaleMode::Off;
+        assert_eq!(
+            render_vpa("web", &make_labels("web", None), &ac)["spec"]["updatePolicy"]["updateMode"],
+            "Off"
+        );
+    }
+
+    #[test]
+    fn no_vpa_for_pro_mode_app() {
+        let app = app_with_explicit_resources();
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+            Some(&autoscale_full()),
+        )
+        .unwrap();
+        assert!(r.vpa.is_none());
+    }
+
+    #[test]
+    fn vpa_present_for_seeded_app() {
+        let app = app_without_resources();
+        let r = render_application_for_env(
+            &app,
+            None,
+            None,
+            None,
+            None,
+            operator_core::EgressProfile::Internet,
+            None,
+            Some(&autoscale_full()),
+        )
+        .unwrap();
+        assert!(r.vpa.is_some());
     }
 }
