@@ -35,7 +35,15 @@ _components: "vpa": #Component & {
 		admissionController: {
 			replicas:        1
 			registerWebhook: false
-			certGen: enabled: true
+			certGen: {
+				enabled: true
+				// 2.16d: the one-shot cert-generation Job pod must not be
+				// BestEffort either (transient, but the invariant is absolute).
+				resources: {
+					requests: {cpu: "10m", memory: "16Mi"}
+					limits: memory: "64Mi"
+				}
+			}
 			mutatingWebhookConfiguration: {
 				failurePolicy: "Ignore"
 				// H3: never intercept control-plane pod CREATEs — a down
