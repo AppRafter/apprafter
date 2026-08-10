@@ -148,7 +148,7 @@ kubectl -n "$NS" delete pod h3probe --wait=false 2>/dev/null
 # the operator mirrors it into Application.status, and the pod is NOT recreated (in-place, no thrash).
 printf '\n=== #9 mirror + #4 no-thrash (recommendation → Application.status, pod not recreated) ===\n'
 UID0=$(pod_uid "$POD"); R0=$(pod_restarts "$POD")
-deadline=$(( $(date +%s) + 900 ))  # up to 15m for the first recommendation
+deadline=$(( $(date +%s) + 1500 ))  # up to 25m — the recommender's time-to-first-rec varies (12->15m+)
 RECO=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
     RECO=$(vpa_jp "$APP" '{.status.recommendation.containerRecommendations[0].target.memory}')
