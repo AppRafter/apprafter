@@ -151,10 +151,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the result into the Application controller. On a cluster without the VPA
     // operator the `verticalpodautoscalers.autoscaling.k8s.io` CRD is absent
     // and applying a VPA would 404 every reconcile.
-    let vpa = vpa_available(&client).await;
+    // Seed the flag with a startup probe; the Application controller lazily
+    // re-probes while `false` (the startup probe can lose the race with the VPA
+    // component's CRD install), so an `AtomicBool` shared into the reconcile.
+    let vpa = Arc::new(std::sync::atomic::AtomicBool::new(
+        vpa_available(&client).await,
+    ));
     info!(
-        vpa_available = vpa,
-        "probed VerticalPodAutoscaler CRD availability"
+        vpa_available = vpa.load(Ordering::Relaxed),
+        "probed VerticalPodAutoscaler CRD availability (lazily re-probed if false)"
     );
 
     // 2.9 (ADR 0044): the active environment is now a PER-CR property

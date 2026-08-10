@@ -97,11 +97,16 @@ pub struct Context {
     /// prune (a non-Gateway-API cluster renders the route but skips the apply).
     pub gateway_api_available: bool,
     /// Whether the `verticalpodautoscalers.autoscaling.k8s.io` CRD is served on
-    /// this cluster (2.16e / ADR 0054). Probed ONCE at startup; gates the VPA
-    /// SSA apply + prune: a cluster without the VPA operator would 404 every
-    /// reconcile. When `false`, the controller renders the VPA the same way but
-    /// skips the apply.
-    pub vpa_available: bool,
+    /// this cluster (2.16e / ADR 0054). Gates the VPA SSA apply + prune + status
+    /// mirror. Seeded by a startup probe but **lazily re-probed** in the
+    /// reconcile while `false` (see [`vpa_crd_served`]): the startup probe can
+    /// LOSE the race with the VPA component's CRD install — sync-wave ordering
+    /// does not serialise the operator's startup vs the CRD apply (observed the
+    /// operator probing ~0.06s BEFORE the CRD landed), which would otherwise
+    /// silently disable VPA for the operator's lifetime. Latches `true` once the
+    /// CRD is served; an `AtomicBool` so the re-probe result survives across
+    /// reconciles without a per-reconcile probe once served.
+    pub vpa_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Error)]
@@ -130,7 +135,7 @@ pub async fn run(
     metrics: Arc<Metrics>,
     cilium_available: bool,
     gateway_api_available: bool,
-    vpa_available: bool,
+    vpa_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
@@ -755,11 +760,22 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     }
 
     // 2.16e (ADR 0054): SSA-apply the per-Application VPA — but ONLY when the
-    // VPA CRD is served (probed once at startup). When NOT a managed env
-    // (renderer emits no VPA) PRUNE any stale VPA (the app switched to
-    // pro-mode / explicit resources). The VPA carries the SAME Application
+    // VPA CRD is served. LAZILY re-probe while `false` (the startup probe can
+    // lose the race with the VPA component's CRD install → VPA silently off for
+    // the operator's lifetime otherwise); latch `true` once served so we stop
+    // probing. When NOT a managed env (renderer emits no VPA) PRUNE any stale
+    // VPA (pro-mode / explicit resources). The VPA carries the SAME Application
     // ownerRef → cascades on app delete.
-    let vpa_applied = if ctx.vpa_available {
+    let vpa_available = if ctx.vpa_available.load(std::sync::atomic::Ordering::Relaxed) {
+        true
+    } else if vpa_crd_served(&ctx.client).await {
+        ctx.vpa_available
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        false
+    };
+    let vpa_applied = if vpa_available {
         if let Some(vpa) = rendered.vpa.take() {
             let owner = owner_reference(&app);
             apply_vpa(&ctx.client, &namespace, &owner, vpa).await?;
@@ -840,7 +856,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // status. A missing or not-yet-populated VPA is OK (best-effort read; the
     // recommendation is advisory). Flows into the SINGLE apply_status below —
     // no second status patch.
-    if ctx.vpa_available && vpa_applied {
+    if vpa_available && vpa_applied {
         let vpa_api = Api::<DynamicObject>::namespaced_with(
             ctx.client.clone(),
             &namespace,
@@ -1197,6 +1213,20 @@ async fn read_allowed_domains(client: &Client) -> Vec<String> {
 }
 
 // ---- 2.16e (ADR 0054): VPA apply / prune / autoscale config read ----
+
+/// Live check: is the `verticalpodautoscalers.autoscaling.k8s.io` CRD served?
+/// Used to lazily re-probe [`Context::vpa_available`] in the reconcile when the
+/// startup probe lost the race with the VPA component's CRD install. Mirrors
+/// the startup probe in `apprafter-operator::vpa_available`.
+async fn vpa_crd_served(client: &Client) -> bool {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    api.get_opt("verticalpodautoscalers.autoscaling.k8s.io")
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
 
 /// `ApiResource` for the externally-installed VPA `VerticalPodAutoscaler` CRD
 /// (group `autoscaling.k8s.io`, version `v1`). Gated by
