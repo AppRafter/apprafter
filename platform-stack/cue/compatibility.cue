@@ -1760,6 +1760,26 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.53-rc.1": {
+	change:          "safe"
+	operatorVersion: "v0.2.41"
+	notes: """
+		2.16f Argo CD footprint tuning — WALK-VEHICLE PRERELEASE (tuning only, no
+		requests re-pin yet). Three chart-value changes on the argocd component:
+		(1) GOMEMLIMIT/GOGC env on the app-controller (256MiB) + repo-server
+		(128MiB) so Go GCs harder and releases freed heap back to the OS;
+		(2) `resource.exclusions` in argocd-cm so the app-controller stops
+		tracking churny non-app resources (Endpoints/Event/EndpointSlice/Lease/
+		metrics.*/Cilium identity+endpoint/VPACheckpoint) — shrinks the live-
+		resource cache; (3) applicationSet.replicas:0 (the 7.7.7 chart has no
+		`enabled` gate) to drop the unused applicationset-controller. Values-only,
+		no operator/CRD/CLI change → change=safe (Argo auto-syncs; the argocd
+		pods roll). The measured re-pin of the controller request lands in the
+		0.2.53 stable. See docs/measurements/2.16d-baseline-2026-08-08.md.
+		"""
+	references: ["docs/measurements/2.16d-baseline-2026-08-08.md"]
+}
+
 compatibility: "0.2.52": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.41"

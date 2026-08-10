@@ -74,6 +74,14 @@ _components: argocd: #Component & {
 			}
 			limits: memory: "512Mi"
 		}
+		// 2.16f: force Go to GC harder + release freed heap back to the OS.
+		// The controller forks nothing, so 256/512 = 50% of the cgroup is
+		// Go's alone. GOMEMLIMIT accepts only B/KiB/MiB/GiB/TiB - "256Mi"
+		// (k8s spelling) or "256MB" (SI) fatal-error the runtime at startup.
+		controller: env: [
+			{name: "GOMEMLIMIT", value: "256MiB"},
+			{name: "GOGC", value: "50"},
+		]
 		server: resources: {
 			requests: memory: "24Mi"
 			limits: memory:   "128Mi"
@@ -82,6 +90,13 @@ _components: argocd: #Component & {
 			requests: memory: "24Mi"
 			limits: memory:   "128Mi"
 		}
+		// 2.16f: 7.7.7 has no `enabled` gate; replicas:0 keeps the object in
+		// desired under prune:false (no orphan / no permanent OutOfSync). The
+		// applicationSet.resources block above stays inert for a future
+		// multi-env re-enable (a one-line flip that keeps the no-BestEffort
+		// invariant). Verified unused: AppProjects (not ApplicationSets)
+		// provide the platform's grouping.
+		applicationSet: replicas: 0
 		redis: resources: {
 			requests: memory: "16Mi"
 			limits: memory:   "64Mi"
@@ -100,6 +115,30 @@ _components: argocd: #Component & {
 		// is Argo CD's documented schema for custom health
 		// scripts.
 		configs: cm: {
+			// 2.16f: stop the app-controller tracking churny non-app
+			// resources - shrinks the live-resource-cache + kills their
+			// CPU diffs. Kind-scoped (never `*` on cilium.io -> keeps the
+			// operator's per-app egress CiliumNetworkPolicy); never the
+			// VPA CR itself (an app tree-child carrying the 2.16e
+			// recommendation signal). Argo CD 2.13.1 ships no built-in
+			// exclusions -> the savings are additive.
+			"resource.exclusions": """
+				- apiGroups: [""]
+				  kinds: ["Endpoints", "Event"]
+				- apiGroups: ["events.k8s.io"]
+				  kinds: ["Event"]
+				- apiGroups: ["discovery.k8s.io"]
+				  kinds: ["EndpointSlice"]
+				- apiGroups: ["coordination.k8s.io"]
+				  kinds: ["Lease"]
+				- apiGroups: ["metrics.k8s.io"]
+				  kinds: ["*"]
+				- apiGroups: ["cilium.io"]
+				  kinds: ["CiliumIdentity", "CiliumEndpoint"]
+				- apiGroups: ["autoscaling.k8s.io"]
+				  kinds: ["VerticalPodAutoscalerCheckpoint"]
+				"""
+
 			"resource.customizations.health.apprafter.io_Application": """
 				hs = {}
 				if obj.status ~= nil and obj.status.phase ~= nil then
@@ -328,6 +367,13 @@ _components: argocd: #Component & {
 				requests: memory: "66Mi"
 				limits: memory:   "256Mi"
 			}
+			// 2.16f (M2): the repo-server container forks helm + git in the
+			// same 256Mi cap; 128MiB leaves ~128Mi for those forks + Go
+			// non-heap while sitting comfortably above the 82Mi steady set.
+			env: [
+				{name: "GOMEMLIMIT", value: "128MiB"},
+				{name: "GOGC", value: "50"},
+			]
 			extraContainers: [{
 				name:  "cue-cmp"
 				image: "\(_components."argocd-cue-cmp".values.image.repository):\(_components."argocd-cue-cmp".values.image.tag)"
