@@ -165,6 +165,14 @@ if [ -n "$RECO" ]; then
         [ -n "$MIR" ] && break
         sleep 20
     done
+    if [ -z "$MIR" ]; then
+        printf '  --- MIRROR DIAGNOSTIC (2.16e #9) ---\n'
+        printf '  VPA.status.recommendation[0]: %s\n' "$(kubectl -n "$NS" get vpa "$APP" -o jsonpath='{.status.recommendation.containerRecommendations[0]}' 2>/dev/null)"
+        printf '  Application.status FULL: %s\n' "$(kubectl -n "$NS" get application.apprafter.io "$APP" -o jsonpath='{.status}' 2>/dev/null)"
+        printf '  operator log (vpa/recommend/error) tail:\n'
+        kubectl -n apprafter-system logs deploy/apprafter-operator --tail=400 2>/dev/null | grep -iE "vpa|recommend|vertical|reconcile|error|warn|panic" | tail -30 | sed 's/^/    OPLOG /'
+        printf '  --- END DIAGNOSTIC ---\n'
+    fi
     [ -n "$MIR" ] && ok "#9 mirror: Application.status.recommendedResources.target.memory=$MIR (eventually-consistent ~1 reconcile)" || mark_fail "#9 recommendation NOT mirrored into Application.status after 200s"
     grep -qi "Too few replicas" <(kubectl -n vpa logs deploy/vpa-updater --tail=300 2>/dev/null) && mark_fail "#4 'Too few replicas' in updater log (min-replicas skipped the app)" || ok "#4 no 'Too few replicas' (minReplicas:1 works)"
     POD2=$(app_pod "$APP"); UID1=$(pod_uid "$POD2"); R1=$(pod_restarts "$POD2")
