@@ -49,10 +49,20 @@ package v1alpha1
 		// needs no structural schema (no crdmeta patch).
 		lastAppliedSpec?: {...}
 
-		// VPA recommendation mirror (2.16e). Opaque like the rest of status
-		// (preserve-unknown) — { containerName, recommendation: { target,
-		// uncappedTarget }, notApplied }.
-		recommendedResources?: {...}
+		// VPA recommendation mirror (2.16e). STRUCTURAL (typed), NOT a bare
+		// `{...}`: a bare open struct renders as `type:object` with no
+		// properties and no x-kubernetes-preserve-unknown-fields, so the
+		// apiserver PRUNES the nested fields on a status server-side apply
+		// (unlike `lastAppliedSpec`, which carries an explicit preserve-unknown
+		// crdmeta patch). Declaring the full shape keeps them.
+		recommendedResources?: {
+			containerName?: string
+			recommendation?: {
+				target?: [string]:         string
+				uncappedTarget?: [string]: string
+			}
+			notApplied?: string
+		}
 	}
 }
 
