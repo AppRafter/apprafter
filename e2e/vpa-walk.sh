@@ -48,7 +48,11 @@ cleanup() {
     rm -rf "$WORK"
     if [ "$FAIL" -eq 0 ]; then printf '\n=== VPA WALK GREEN ===\n'; else printf '\n=== VPA WALK RED ===\n'; fi
 }
-trap cleanup EXIT INT TERM
+# cleanup runs once on EXIT; INT/TERM just `exit` (which fires the EXIT trap) so
+# a SIGTERM actually STOPS the walk — a bare `trap cleanup TERM` would run cleanup
+# then RESUME the interrupted sleep loop against the now-destroyed cluster.
+trap cleanup EXIT
+trap 'exit 143' INT TERM
 
 NS=default
 APP=vpa-app
