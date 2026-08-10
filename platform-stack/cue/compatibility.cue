@@ -1760,6 +1760,29 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.51": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.40"
+	notes: """
+		2.16e walk-fixes. (1) The VPA recommendation mirror now actually
+		persists: `Application.status.recommendedResources` was declared as a bare
+		`{...}` in the schema → rendered as `type:object` with no properties/
+		preserve-unknown → the apiserver PRUNED the nested fields on every status
+		apply, so the operator's (correct) recommendation never landed. The
+		Application CRD status schema is now STRUCTURAL (typed containerName /
+		recommendation.{target,uncappedTarget} / notApplied). Diagnosed on a local
+		kind harness (isolated GET+map = correct; apply_status = pruned). Operator
+		CODE is unchanged; only the CRD (operator chart) + the CUE schema.
+		(2) The VPA certgen Job pod is no longer BestEffort (resources added), so
+		no VPA component pod is BestEffort at all (2.16d).
+
+		change=requires-restart: the operator image bumps v0.2.39→v0.2.40 (same
+		code, new tag → the operator Deployment rolls) and the Application CRD
+		status schema tightens. No CLI change. ADR 0054.
+		"""
+	references: ["docs/adr/0054-vpa-vertical-autoscaling.md"]
+}
+
 compatibility: "0.2.50": {
 	change:          "safe"
 	operatorVersion: "v0.2.39"
