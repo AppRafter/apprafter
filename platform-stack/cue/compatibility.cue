@@ -1760,6 +1760,25 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.52": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.41"
+	notes: """
+		2.16e walk-fix: the VPA `vpa_available` CRD probe is now LAZILY re-probed
+		in the reconcile instead of one-shot at startup. The startup probe can
+		LOSE the race with the VPA component's CRD install — sync-wave ordering
+		does not serialise the operator's startup vs the CRD apply (a live walk
+		caught the operator probing ~0.06s BEFORE the VPA CRD landed), which
+		silently disabled VPA emission for the operator's ENTIRE lifetime (no CR,
+		no enforcement, no mirror — high severity). The reconcile now re-probes
+		while the flag is false and latches true once the CRD is served (validated
+		on kind: false without the CRD → true after install). Operator code only;
+		no schema / CLI change. change=requires-restart (operator image rolls).
+		ADR 0054.
+		"""
+	references: ["docs/adr/0054-vpa-vertical-autoscaling.md"]
+}
+
 compatibility: "0.2.51": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.40"
