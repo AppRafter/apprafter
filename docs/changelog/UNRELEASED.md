@@ -9,7 +9,18 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## operator/webhook v0.2.39 / cue-cmp 0.1.20 / platform-stack 0.2.49 / cli 0.2.39 — 2.16e VPA vertical autoscaling (2026-08-08)
+## operator/webhook v0.2.41 / cue-cmp 0.1.21 / platform-stack 0.2.52 / cli 0.2.39 — 2.16e VPA vertical autoscaling (2026-08-10, live-walk GREEN)
+
+> Initial cut shipped as op v0.2.39 / cue-cmp 0.1.20 / ps 0.2.49 / cli 0.2.39.
+> The real-Hetzner walk then caught three bugs invisible to unit/CRD/review
+> (all diagnosed on a local kind harness): the recommendation **mirror never
+> persisted** (a bare `{...}` status field rendered `type:object` with no
+> preserve-unknown → the apiserver pruned it; fixed with a structural schema —
+> ps 0.2.51 / op v0.2.40 / cue-cmp 0.1.21), the **`vpa_available` startup probe
+> raced the VPA-CRD install** (0.06s → VPA silently off for the operator's
+> lifetime; fixed with a lazy re-probe — op v0.2.41 / ps 0.2.52), and the VPA
+> **certgen Job was BestEffort** (resources added — ps 0.2.50/0.2.51). No
+> further CLI change, so no additional monorepo tag.
 
 The operator right-sizes app requests in-place via upstream VPA. It emits one
 `VerticalPodAutoscaler` per managed app-env (`updateMode: InPlace`,
