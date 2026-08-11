@@ -39,7 +39,8 @@ use std::time::{Duration, Instant};
 use cli_core::{resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::user_data::{
     k3s_reservation_config, swap_enable_script, swap_kubelet_dropin, K3S_CONFIG_PATH,
-    K3S_OOM_DROPIN, K3S_OOM_DROPIN_PATH, SWAP_KUBELET_DROPIN_PATH,
+    K3S_OOM_DROPIN, K3S_OOM_DROPIN_PATH, SKIP_NODE_SWAP_ENV, SWAP_KUBELET_DROPIN_PATH,
+    SWAP_PROVISION_STATUS_PATH,
 };
 use cli_providers::hetzner_cloud::{default_ssh_identity_path, SshCommandRunner};
 use cli_providers::{node_public_ips, HetznerCloudClient};
@@ -68,10 +69,8 @@ const SWAP_FSTAB_LINE: &str = "/swapfile none swap sw,nofail 0 0";
 
 pub fn run(action: NodeAction) -> Result<()> {
     match action {
-        // Task 6 wires the `Prep` variant + `node status`; today the enum
-        // still carries `ReserveHeadroom`, so `node prep`'s umbrella entry
-        // ([`node_prep`]) is exposed as a pub fn and dispatched here.
-        NodeAction::ReserveHeadroom { yes } => node_prep(yes),
+        NodeAction::Prep { yes } => node_prep(yes),
+        NodeAction::Status => status(),
     }
 }
 
@@ -711,6 +710,475 @@ fn recovery_probe_command() -> &'static str {
     "k3s kubectl get --raw='/readyz'"
 }
 
+// ===========================================================================
+// `apprafter node status` (design decision 6, P15/Q10/Q17/Q18).
+//
+// The state is assembled from TWO sources — the kube-API (no SSH) and a
+// live SSH probe (may be down) — with graceful degradation: if SSH fails
+// the SSH-derived fields render `unknown`, the kube-API fields still show,
+// and each field is labelled `[api]` / `[ssh]` so a partial result reads
+// cleanly. The renderer is PURE ([`render_status`]) over a [`NodeSwapState`]
+// value; the IO ([`probe_node_swap_state`]) is a thin wrapper.
+// ===========================================================================
+
+/// A single reported field: `Known(value)` when the source answered,
+/// `Unknown` when it was unreachable (SSH down, jsonpath empty, …). The
+/// renderer prints `Unknown` as `unknown` so a degraded result is loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Field {
+    /// The source answered with this value.
+    Known(String),
+    /// The source was unreachable / gave no answer.
+    Unknown,
+}
+
+impl Field {
+    /// Renders the field body: the value, or the literal `unknown`.
+    fn render(&self) -> &str {
+        match self {
+            Field::Known(v) => v.as_str(),
+            Field::Unknown => "unknown",
+        }
+    }
+}
+
+/// The classified provision state, derived from the breadcrumb + the live
+/// probes (design decision 6). Drives the leading one-line verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapProvisionState {
+    /// Swap is live (`swapon --show` reports `/swapfile`); carries the size
+    /// column when known.
+    Active { size: Option<String> },
+    /// The undocumented `APPRAFTER_SKIP_NODE_SWAP` hook was set at provision
+    /// — the node was installed one-shot, no swap, deliberately.
+    SkippedByEnv,
+    /// The node's k8s is `<1.34` — the NoSwap GA gate is not met; the fix is
+    /// a k3s upgrade.
+    Ineligible { detail: String },
+    /// The node is eligible (≥1.34 + cgroup2) but no swap is applied yet —
+    /// the actionable state: run `apprafter node prep`.
+    EligibleNotApplied,
+    /// The bootstrap swap step ran and FAILED (the FAIL-SOFT breadcrumb) —
+    /// the node started cushionless.
+    ProvisionFailed { detail: String },
+    /// `/swapfile` exists on disk but is neither active nor in fstab — an
+    /// orphan remnant of a half-provision / partial rollback.
+    OrphanSwapfile,
+    /// Neither the breadcrumb nor the live probes could be read (SSH down and
+    /// no other signal) — the state is genuinely unknown.
+    Unknown,
+}
+
+/// The whole reported node-swap posture — the pure renderer's sole input.
+/// Every field carries its own `Known`/`Unknown` so a partial (SSH-down)
+/// result is representable without failing wholesale (design decision 6 /
+/// Q10). The `state` is the classified verdict; `ssh_available` records
+/// whether the SSH probe connected at all (drives the degradation banner).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeSwapState {
+    /// The node name the status was read for.
+    pub node_name: String,
+    /// Whether the SSH probe reached the node (false ⇒ SSH fields degrade).
+    pub ssh_available: bool,
+    /// The classified verdict.
+    pub state: SwapProvisionState,
+
+    // --- kube-API sourced (`[api]`) — available without SSH. ---
+    /// `failSwapOn` from `configz` (expected `false` when applied).
+    pub fail_swap_on: Field,
+    /// `swapBehavior` from `configz` (expected `NoSwap` when applied ≥1.34).
+    pub swap_behavior: Field,
+    /// `status.nodeInfo.swap.capacity` off the Node object.
+    pub swap_capacity: Field,
+    /// `status.nodeInfo.kubeletVersion` off the Node object.
+    pub kubelet_version: Field,
+
+    // --- SSH sourced (`[ssh]`) — `Unknown` when SSH is down. ---
+    /// Live `swapon --show` summary line for `/swapfile` (name/size/used).
+    pub swapon: Field,
+    /// `vm.swappiness` sysctl.
+    pub swappiness: Field,
+    /// `GOMEMLIMIT` from the k3s.service environment.
+    pub gomemlimit: Field,
+    /// The raw `/var/lib/apprafter/swap-provision.status` breadcrumb line.
+    pub provision_breadcrumb: Field,
+}
+
+/// One-line human verdict for a [`SwapProvisionState`].
+fn state_verdict(state: &SwapProvisionState) -> String {
+    match state {
+        SwapProvisionState::Active { size: Some(sz) } => {
+            format!("swap active ({sz}) — NoSwap for pods")
+        }
+        SwapProvisionState::Active { size: None } => "swap active — NoSwap for pods".to_string(),
+        SwapProvisionState::SkippedByEnv => {
+            format!("swap skipped by env ({SKIP_NODE_SWAP_ENV}) — node runs cushionless by request")
+        }
+        SwapProvisionState::Ineligible { detail } => {
+            format!("ineligible ({detail}) — upgrade k3s to ≥1.34, then run `apprafter node prep`")
+        }
+        SwapProvisionState::EligibleNotApplied => {
+            "eligible, not applied — run `apprafter node prep`".to_string()
+        }
+        SwapProvisionState::ProvisionFailed { detail } => {
+            format!("swap step failed at provision ({detail}) — node started cushionless; re-run `apprafter node prep`")
+        }
+        SwapProvisionState::OrphanSwapfile => {
+            "orphan /swapfile (present but not active and not in fstab) — `apprafter node prep` removes it before a clean re-provision".to_string()
+        }
+        SwapProvisionState::Unknown => {
+            "state unknown — could not reach the node over SSH and no other signal".to_string()
+        }
+    }
+}
+
+/// The PURE renderer (design decision 6): a [`NodeSwapState`] → a
+/// human-readable report. Every field line is labelled with its SOURCE
+/// (`[api]` / `[ssh]`) so a partial (SSH-down) result reads cleanly; the
+/// SSH-derived fields print `unknown` on degradation, with a leading banner
+/// noting SSH was unavailable. No IO — unit-testable in full.
+pub fn render_status(s: &NodeSwapState) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Node swap status for {}\n", s.node_name));
+    out.push_str(&format!("  {}\n", state_verdict(&s.state)));
+    if !s.ssh_available {
+        out.push_str(
+            "  ⚠ SSH unavailable — the [ssh] fields below could not be read (shown as `unknown`); \
+             the [api] fields are still authoritative.\n",
+        );
+    }
+    out.push('\n');
+    // kube-API fields (available without SSH).
+    out.push_str(&format!(
+        "  [api] kubeletVersion : {}\n",
+        s.kubelet_version.render()
+    ));
+    out.push_str(&format!(
+        "  [api] failSwapOn     : {}\n",
+        s.fail_swap_on.render()
+    ));
+    out.push_str(&format!(
+        "  [api] swapBehavior   : {}\n",
+        s.swap_behavior.render()
+    ));
+    out.push_str(&format!(
+        "  [api] swap.capacity  : {}\n",
+        s.swap_capacity.render()
+    ));
+    // SSH fields (unknown when degraded).
+    out.push_str(&format!("  [ssh] swapon         : {}\n", s.swapon.render()));
+    out.push_str(&format!(
+        "  [ssh] vm.swappiness  : {}\n",
+        s.swappiness.render()
+    ));
+    out.push_str(&format!(
+        "  [ssh] GOMEMLIMIT     : {}\n",
+        s.gomemlimit.render()
+    ));
+    out.push_str(&format!(
+        "  [ssh] provision      : {}\n",
+        s.provision_breadcrumb.render()
+    ));
+    out
+}
+
+/// Classifies the [`SwapProvisionState`] from the probed facts (pure). The
+/// ORDER matters: a live `/swapfile` in `swapon` is `Active` regardless of
+/// what the breadcrumb says; then the breadcrumb's `skipped`/`ineligible`/
+/// `failed` verdicts; then an orphan on-disk `/swapfile`; then eligible-vs-
+/// unknown when SSH itself was down.
+fn classify_state(
+    ssh_available: bool,
+    swap_active: bool,
+    swap_size: Option<String>,
+    orphan: bool,
+    breadcrumb: &Field,
+    api_eligible: Option<bool>,
+) -> SwapProvisionState {
+    if swap_active {
+        return SwapProvisionState::Active { size: swap_size };
+    }
+    // The breadcrumb is authoritative for the non-active provision verdicts.
+    if let Field::Known(line) = breadcrumb {
+        let l = line.trim();
+        if l.starts_with("skipped") || l.contains(SKIP_NODE_SWAP_ENV) {
+            return SwapProvisionState::SkippedByEnv;
+        }
+        if let Some(rest) = l.strip_prefix("ineligible:") {
+            return SwapProvisionState::Ineligible {
+                detail: rest.trim().to_string(),
+            };
+        }
+        if let Some(rest) = l.strip_prefix("failed:") {
+            return SwapProvisionState::ProvisionFailed {
+                detail: rest.trim().to_string(),
+            };
+        }
+        // `applied: …` but not currently active ⇒ the swapfile silently did
+        // not reactivate (the `sw,nofail` P9 trap) — treat it as not-applied
+        // if there is no orphan, else fall through to the orphan branch.
+    }
+    if orphan {
+        return SwapProvisionState::OrphanSwapfile;
+    }
+    match api_eligible {
+        Some(true) => SwapProvisionState::EligibleNotApplied,
+        Some(false) => SwapProvisionState::Ineligible {
+            detail: "k8s <1.34".to_string(),
+        },
+        None => {
+            if ssh_available {
+                // SSH is up and there is no swap / breadcrumb / orphan, but the
+                // kube-API eligibility could not be read — still actionable.
+                SwapProvisionState::EligibleNotApplied
+            } else {
+                SwapProvisionState::Unknown
+            }
+        }
+    }
+}
+
+/// The `apprafter node status` entry (design decision 6). Reads the kube-API
+/// fields (over the cached kubeconfig — no SSH) and, best-effort, the live
+/// SSH fields; assembles a [`NodeSwapState`] and prints [`render_status`].
+/// SSH being down degrades gracefully — the SSH fields read `unknown`, the
+/// command still succeeds.
+pub fn status() -> Result<()> {
+    let resolved = resolve_state_paths(None)?;
+    let paths = resolved.paths;
+    let store = resolved.store;
+    let state = State::load_or_default(&paths)?;
+
+    let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
+        return Err(CliError::Other(
+            "no provisioned server for the active target — run `apprafter up` first".into(),
+        ));
+    };
+
+    let token = resolve_hetzner_token(None, &store, None)?;
+    let client = HetznerCloudClient::new(hcloud_base_url(), token);
+    let (v4, _v6) = node_public_ips(&client, server_id)?;
+    let host = v4.ok_or_else(|| {
+        CliError::Other(
+            "the active target's node has no public IPv4 yet — wait for cloud-init".into(),
+        )
+    })?;
+
+    let runner = SshCommandRunner::new(default_ssh_identity_path(), paths.known_hosts_file());
+
+    let node_state = probe_node_swap_state(&runner, &host);
+    print!("{}", render_status(&node_state));
+    Ok(())
+}
+
+/// The IO wrapper (design decision 6): probes the kube-API fields + the live
+/// SSH fields off the node and assembles a [`NodeSwapState`]. Both source
+/// groups are BEST-EFFORT — a missing kube-API field or a down SSH becomes
+/// `Field::Unknown` rather than an error, so the report degrades gracefully.
+///
+/// The kube-API fields are read via the NODE-LOCAL `k3s kubectl` over SSH too
+/// (there is no out-of-cluster kubeconfig assumption here); if SSH is down,
+/// ALL fields — api and ssh alike — degrade to `Unknown`, but the two groups
+/// stay labelled distinctly so the report is still legible.
+fn probe_node_swap_state(runner: &SshCommandRunner, host: &str) -> NodeSwapState {
+    // A single cheap probe decides SSH reachability up-front (`hostname` also
+    // gives us the node name for the configz/Node-object jsonpaths).
+    let node_name = runner
+        .run(host, "hostname")
+        .ok()
+        .map(|s| s.trim().to_string());
+    let ssh_available = node_name.is_some();
+    let node_name = node_name.unwrap_or_else(|| "<unknown>".to_string());
+
+    // --- kube-API fields (node-local k3s kubectl). ---
+    let (fail_swap_on, swap_behavior) = probe_configz(runner, host);
+    let swap_capacity =
+        probe_node_field(runner, host, &node_name, "{.status.nodeInfo.swap.capacity}");
+    let kubelet_version = probe_node_field(
+        runner,
+        host,
+        &node_name,
+        "{.status.nodeInfo.kubeletVersion}",
+    );
+
+    // --- SSH fields (live probes). ---
+    let swapon_raw = runner.run(host, "swapon --show").ok();
+    let fstab_raw = runner.run(host, "cat /etc/fstab").unwrap_or_default();
+    let swapfile_exists = runner
+        .run(host, &format!("test -e {SWAPFILE_PATH}"))
+        .is_ok();
+    let swapon = swapon_summary(swapon_raw.as_deref());
+    let swappiness = field_or_unknown(runner.run(host, "sysctl -n vm.swappiness").ok());
+    let gomemlimit = probe_gomemlimit(runner, host);
+    let provision_breadcrumb = field_or_unknown(
+        runner
+            .run(host, &format!("cat {SWAP_PROVISION_STATUS_PATH}"))
+            .ok(),
+    );
+
+    // --- Classify. ---
+    let swap_active = swapon_raw
+        .as_deref()
+        .map(swap_already_active)
+        .unwrap_or(false);
+    let swap_size = swapon_raw.as_deref().and_then(swapfile_size_column);
+    let orphan = orphan_swapfile(
+        swapfile_exists,
+        swapon_raw.as_deref().unwrap_or(""),
+        &fstab_raw,
+    );
+    // `APPRAFTER_SKIP_NODE_SWAP` at status time also forces the skipped verdict
+    // (the operator asks "what did I get" with the same hook set).
+    let env_skipped = std::env::var_os(SKIP_NODE_SWAP_ENV).is_some();
+    let api_eligible = match &kubelet_version {
+        Field::Known(v) => Some(k8s_ge_134(v)),
+        Field::Unknown => None,
+    };
+    let state = if env_skipped && !swap_active {
+        SwapProvisionState::SkippedByEnv
+    } else {
+        classify_state(
+            ssh_available,
+            swap_active,
+            swap_size,
+            orphan,
+            &provision_breadcrumb,
+            api_eligible,
+        )
+    };
+
+    NodeSwapState {
+        node_name,
+        ssh_available,
+        state,
+        fail_swap_on,
+        swap_behavior,
+        swap_capacity,
+        kubelet_version,
+        swapon,
+        swappiness,
+        gomemlimit,
+        provision_breadcrumb,
+    }
+}
+
+/// Reads `failSwapOn` + `swapBehavior` from the kubelet `configz` endpoint
+/// (`/api/v1/nodes/<n>/proxy/configz`) via node-local `k3s kubectl --raw`.
+/// Both degrade to `Unknown` independently on any failure / absent key.
+fn probe_configz(runner: &SshCommandRunner, host: &str) -> (Field, Field) {
+    let raw = match runner.run(
+        host,
+        "k3s kubectl get --raw \
+         \"/api/v1/nodes/$(hostname)/proxy/configz\"",
+    ) {
+        Ok(r) => r,
+        Err(_) => return (Field::Unknown, Field::Unknown),
+    };
+    (
+        configz_scalar(&raw, "failSwapOn"),
+        configz_scalar(&raw, "swapBehavior"),
+    )
+}
+
+/// Extracts a scalar kubelet-config value from the `configz` JSON blob by
+/// key. Pure over the raw text — a tolerant substring scan (the blob is a
+/// single-line JSON object; a full serde parse is overkill for two scalars).
+fn configz_scalar(configz_json: &str, key: &str) -> Field {
+    // Find `"<key>":` then take the following JSON token (bool / string).
+    let needle = format!("\"{key}\":");
+    let Some(idx) = configz_json.find(&needle) else {
+        return Field::Unknown;
+    };
+    let rest = configz_json[idx + needle.len()..].trim_start();
+    let token: String = rest
+        .chars()
+        .take_while(|c| *c != ',' && *c != '}' && !c.is_whitespace())
+        .collect();
+    let cleaned = token.trim_matches('"');
+    if cleaned.is_empty() {
+        Field::Unknown
+    } else {
+        Field::Known(cleaned.to_string())
+    }
+}
+
+/// Reads a jsonpath field off the Node object via node-local `k3s kubectl`.
+/// An empty / `<unknown>` / errored result degrades to `Unknown`.
+fn probe_node_field(
+    runner: &SshCommandRunner,
+    host: &str,
+    node_name: &str,
+    jsonpath: &str,
+) -> Field {
+    let cmd = format!("k3s kubectl get node {node_name} -o jsonpath='{jsonpath}'");
+    match runner.run(host, &cmd) {
+        Ok(out) => {
+            let v = out.trim();
+            if v.is_empty() || v == "<unknown>" || v == "<none>" {
+                Field::Unknown
+            } else {
+                Field::Known(v.to_string())
+            }
+        }
+        Err(_) => Field::Unknown,
+    }
+}
+
+/// Reads the effective `GOMEMLIMIT` off the running k3s unit's environment
+/// (`systemctl show -p Environment k3s`). `Unknown` when absent / SSH down.
+fn probe_gomemlimit(runner: &SshCommandRunner, host: &str) -> Field {
+    let out = match runner.run(host, "systemctl show -p Environment k3s 2>/dev/null") {
+        Ok(o) => o,
+        Err(_) => return Field::Unknown,
+    };
+    // `Environment=GOMEMLIMIT=2GiB FOO=bar` → pull the GOMEMLIMIT token.
+    for tok in out.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("GOMEMLIMIT=") {
+            if !v.is_empty() {
+                return Field::Known(v.to_string());
+            }
+        }
+    }
+    Field::Unknown
+}
+
+/// Wraps an optional command output as a `Field`, trimming; empty → `Unknown`.
+fn field_or_unknown(out: Option<String>) -> Field {
+    match out {
+        Some(s) if !s.trim().is_empty() => Field::Known(s.trim().to_string()),
+        _ => Field::Unknown,
+    }
+}
+
+/// Renders the `swapon --show` output down to a one-line summary of OUR
+/// `/swapfile` row (`/swapfile file 4G 0B -2`), or `Unknown` when SSH gave
+/// no output / the file is not listed.
+fn swapon_summary(swapon_show: Option<&str>) -> Field {
+    let Some(text) = swapon_show else {
+        return Field::Unknown;
+    };
+    for line in text.lines() {
+        if line.split_whitespace().next() == Some(SWAPFILE_PATH) {
+            let normalised = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Field::Known(normalised);
+        }
+    }
+    Field::Unknown
+}
+
+/// Pulls the SIZE column (3rd) of OUR `/swapfile` row out of `swapon --show`.
+/// `swapon --show` columns are `NAME TYPE SIZE USED PRIO`.
+fn swapfile_size_column(swapon_show: &str) -> Option<String> {
+    swapon_show.lines().find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.first() == Some(&SWAPFILE_PATH) {
+            cols.get(2).map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,5 +1515,246 @@ mod tests {
             !s0.contains("swapBehavior"),
             "<1.34 must not emit swapBehavior\n{s0}"
         );
+    }
+
+    // ---- (d) node status pure renderer (design decision 6) --------------
+
+    /// A fully-populated (SSH-up) `NodeSwapState` in a given `state`.
+    fn full_state(state: SwapProvisionState) -> NodeSwapState {
+        NodeSwapState {
+            node_name: "node-1".into(),
+            ssh_available: true,
+            state,
+            fail_swap_on: Field::Known("false".into()),
+            swap_behavior: Field::Known("NoSwap".into()),
+            swap_capacity: Field::Known("4294967296".into()),
+            kubelet_version: Field::Known("v1.35.5+k3s1".into()),
+            swapon: Field::Known("/swapfile file 4G 0B -2".into()),
+            swappiness: Field::Known("10".into()),
+            gomemlimit: Field::Known("2GiB".into()),
+            provision_breadcrumb: Field::Known("applied: swap 4096 MiB".into()),
+        }
+    }
+
+    #[test]
+    fn render_status_labels_every_field_with_its_source() {
+        let out = render_status(&full_state(SwapProvisionState::Active {
+            size: Some("4G".into()),
+        }));
+        // kube-API fields are `[api]`, SSH fields `[ssh]`.
+        assert!(out.contains("[api] kubeletVersion"), "{out}");
+        assert!(out.contains("[api] failSwapOn"), "{out}");
+        assert!(out.contains("[api] swapBehavior"), "{out}");
+        assert!(out.contains("[api] swap.capacity"), "{out}");
+        assert!(out.contains("[ssh] swapon"), "{out}");
+        assert!(out.contains("[ssh] vm.swappiness"), "{out}");
+        assert!(out.contains("[ssh] GOMEMLIMIT"), "{out}");
+        assert!(out.contains("[ssh] provision"), "{out}");
+    }
+
+    #[test]
+    fn render_status_active_states_size() {
+        let out = render_status(&full_state(SwapProvisionState::Active {
+            size: Some("4G".into()),
+        }));
+        assert!(out.contains("swap active (4G)"), "{out}");
+        assert!(out.contains("NoSwap for pods"), "{out}");
+    }
+
+    #[test]
+    fn render_status_skipped_by_env_names_the_hook() {
+        let out = render_status(&full_state(SwapProvisionState::SkippedByEnv));
+        assert!(out.contains("swap skipped by env"), "{out}");
+        assert!(out.contains(SKIP_NODE_SWAP_ENV), "{out}");
+    }
+
+    #[test]
+    fn render_status_ineligible_tells_upgrade() {
+        let out = render_status(&full_state(SwapProvisionState::Ineligible {
+            detail: "k8s <1.34".into(),
+        }));
+        assert!(out.contains("ineligible"), "{out}");
+        assert!(out.contains("1.34"), "{out}");
+        assert!(
+            out.to_lowercase().contains("upgrade"),
+            "ineligible verdict must tell the user to UPGRADE k3s: {out}"
+        );
+    }
+
+    #[test]
+    fn render_status_eligible_not_applied_points_at_node_prep() {
+        let out = render_status(&full_state(SwapProvisionState::EligibleNotApplied));
+        assert!(out.contains("eligible, not applied"), "{out}");
+        assert!(out.contains("apprafter node prep"), "{out}");
+    }
+
+    #[test]
+    fn render_status_provision_failed_verdict() {
+        let out = render_status(&full_state(SwapProvisionState::ProvisionFailed {
+            detail: "swap step errored at provision".into(),
+        }));
+        assert!(out.contains("swap step failed at provision"), "{out}");
+        assert!(out.contains("cushionless"), "{out}");
+    }
+
+    #[test]
+    fn render_status_orphan_verdict() {
+        let out = render_status(&full_state(SwapProvisionState::OrphanSwapfile));
+        assert!(out.to_lowercase().contains("orphan"), "{out}");
+        assert!(out.contains("/swapfile"), "{out}");
+    }
+
+    #[test]
+    fn render_status_degrades_when_ssh_unavailable() {
+        // SSH down: the [api] fields still render (they are Known), every
+        // [ssh] field is Unknown → `unknown`, and a banner flags it.
+        let s = NodeSwapState {
+            node_name: "node-1".into(),
+            ssh_available: false,
+            state: SwapProvisionState::Unknown,
+            fail_swap_on: Field::Known("false".into()),
+            swap_behavior: Field::Known("NoSwap".into()),
+            swap_capacity: Field::Known("4294967296".into()),
+            kubelet_version: Field::Known("v1.35.5+k3s1".into()),
+            swapon: Field::Unknown,
+            swappiness: Field::Unknown,
+            gomemlimit: Field::Unknown,
+            provision_breadcrumb: Field::Unknown,
+        };
+        let out = render_status(&s);
+        // Degradation banner present.
+        assert!(
+            out.contains("SSH unavailable"),
+            "a degraded result must banner that SSH was unavailable: {out}"
+        );
+        // [api] fields still authoritative.
+        assert!(out.contains("v1.35.5+k3s1"), "{out}");
+        assert!(out.contains("[api] failSwapOn     : false"), "{out}");
+        // Every [ssh] field renders `unknown`.
+        assert!(out.contains("[ssh] swapon         : unknown"), "{out}");
+        assert!(out.contains("[ssh] vm.swappiness  : unknown"), "{out}");
+        assert!(out.contains("[ssh] GOMEMLIMIT     : unknown"), "{out}");
+        assert!(out.contains("[ssh] provision      : unknown"), "{out}");
+    }
+
+    // ---- (e) status classifier + probe helpers --------------------------
+
+    #[test]
+    fn classify_active_beats_breadcrumb() {
+        // A live /swapfile is Active even if the breadcrumb said ineligible.
+        let st = classify_state(
+            true,
+            true,
+            Some("4G".into()),
+            false,
+            &Field::Known("ineligible: k3s v1.33 < 1.34".into()),
+            Some(true),
+        );
+        assert_eq!(
+            st,
+            SwapProvisionState::Active {
+                size: Some("4G".into())
+            }
+        );
+    }
+
+    #[test]
+    fn classify_breadcrumb_ineligible_and_failed_and_skipped() {
+        assert_eq!(
+            classify_state(
+                true,
+                false,
+                None,
+                false,
+                &Field::Known("ineligible: cgroup tmpfs != cgroup2fs".into()),
+                None,
+            ),
+            SwapProvisionState::Ineligible {
+                detail: "cgroup tmpfs != cgroup2fs".into()
+            }
+        );
+        assert_eq!(
+            classify_state(
+                true,
+                false,
+                None,
+                false,
+                &Field::Known("failed: swap step errored at provision".into()),
+                Some(true),
+            ),
+            SwapProvisionState::ProvisionFailed {
+                detail: "swap step errored at provision".into()
+            }
+        );
+        assert_eq!(
+            classify_state(
+                true,
+                false,
+                None,
+                false,
+                &Field::Known(format!("skipped: {SKIP_NODE_SWAP_ENV} set")),
+                Some(true),
+            ),
+            SwapProvisionState::SkippedByEnv
+        );
+    }
+
+    #[test]
+    fn classify_eligible_not_applied_and_orphan_and_unknown() {
+        // No breadcrumb, eligible per api, not active, no orphan → actionable.
+        assert_eq!(
+            classify_state(true, false, None, false, &Field::Unknown, Some(true)),
+            SwapProvisionState::EligibleNotApplied
+        );
+        // Orphan on disk → orphan verdict.
+        assert_eq!(
+            classify_state(true, false, None, true, &Field::Unknown, None),
+            SwapProvisionState::OrphanSwapfile
+        );
+        // SSH down and no signal at all → Unknown.
+        assert_eq!(
+            classify_state(false, false, None, false, &Field::Unknown, None),
+            SwapProvisionState::Unknown
+        );
+    }
+
+    #[test]
+    fn configz_scalar_extracts_bool_and_string() {
+        let json = r#"{"kubeletconfig":{"failSwapOn":false,"swapBehavior":"NoSwap","x":1}}"#;
+        assert_eq!(
+            configz_scalar(json, "failSwapOn"),
+            Field::Known("false".into())
+        );
+        assert_eq!(
+            configz_scalar(json, "swapBehavior"),
+            Field::Known("NoSwap".into())
+        );
+        assert_eq!(configz_scalar(json, "missing"), Field::Unknown);
+    }
+
+    #[test]
+    fn swapon_summary_and_size_pick_our_row() {
+        let show = "NAME      TYPE SIZE USED PRIO\n/swapfile file 4G   0B   -2\n";
+        assert_eq!(
+            swapon_summary(Some(show)),
+            Field::Known("/swapfile file 4G 0B -2".into())
+        );
+        assert_eq!(swapfile_size_column(show), Some("4G".into()));
+        // No SSH output → Unknown.
+        assert_eq!(swapon_summary(None), Field::Unknown);
+        // A different swap area is not our row.
+        let other = "NAME TYPE SIZE\n/dev/sda2 partition 2G\n";
+        assert_eq!(swapon_summary(Some(other)), Field::Unknown);
+        assert_eq!(swapfile_size_column(other), None);
+    }
+
+    #[test]
+    fn field_or_unknown_trims_and_maps_empty() {
+        assert_eq!(
+            field_or_unknown(Some("  10 \n".into())),
+            Field::Known("10".into())
+        );
+        assert_eq!(field_or_unknown(Some("   ".into())), Field::Unknown);
+        assert_eq!(field_or_unknown(None), Field::Unknown);
     }
 }

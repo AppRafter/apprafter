@@ -232,9 +232,9 @@ pub enum Commands {
         action: VolumeCommand,
     },
     /// Node-level operations on the active target's cluster node
-    /// (2.16d). Currently: retrofit the kubelet node reservations +
-    /// k3s OOM-protection onto a cluster provisioned before the
-    /// reservations shipped at bootstrap.
+    /// (2.16g). `prep` retrofits the kubelet node reservations + k3s
+    /// OOM-protection AND provisions host swap (NoSwap for pods) over
+    /// one k3s restart; `status` reports the node's swap posture.
     Node {
         #[command(subcommand)]
         action: NodeAction,
@@ -1231,28 +1231,34 @@ pub enum VolumeCommand {
     },
 }
 
-/// `apprafter node …` subcommands (2.16d node-reservation layer).
+/// `apprafter node …` subcommands (2.16g node-substrate layer).
 #[derive(Debug, Subcommand)]
 pub enum NodeAction {
-    /// Retrofit the kubelet node reservations + k3s OOM-protection
-    /// onto the active target's cluster node.
+    /// Prepare the active target's cluster node: retrofit the kubelet
+    /// node reservations + k3s OOM-protection AND provision host swap.
     ///
-    /// Clusters provisioned before 2.16d have no `system-reserved`
-    /// / `kube-reserved` / `eviction-hard` and leave `k3s.service`
-    /// (in system.slice, outside kubepods) OOM-killable at the
-    /// default score. This SSHes the node, writes the same
-    /// `/etc/rancher/k3s/config.yaml` + `k3s.service.d/oom.conf` the
-    /// bootstrap path ships, then restarts k3s (the API is briefly
-    /// unavailable, ~30s) and waits for it to come back. New
-    /// clusters bake the reservations in at bootstrap and don't
-    /// need this.
-    #[command(name = "reserve-headroom")]
-    ReserveHeadroom {
+    /// Supersedes the 2.16d `reserve-headroom`. Writes the same
+    /// `/etc/rancher/k3s/config.yaml` reservations + `k3s.service.d/
+    /// oom.conf` and — when the node is eligible (k8s ≥1.34 for the
+    /// NoSwap GA gate + cgroup v2) — layers a host swapfile with
+    /// `swapBehavior: NoSwap` so a control-plane spike degrades to swap
+    /// instead of an OOM-kill while pods never swap. Applied atomically
+    /// over one k3s restart (the API is briefly unavailable, ~30s), with
+    /// a whole-step rollback on a `/readyz` timeout. Idempotent — a
+    /// re-run refreshes the drop-in and is otherwise a near no-op.
+    Prep {
         /// Skip the confirmation prompt (k3s restart briefly takes
         /// the API offline). Required in non-interactive shells.
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Report the active target's node swap posture: `swapBehavior` /
+    /// `failSwapOn` / swap capacity / k8s version (kube-API), plus live
+    /// `swapon`, `vm.swappiness`, k3s `GOMEMLIMIT`, and the provision
+    /// breadcrumb (SSH). Each field is labelled with its source
+    /// (`[api]` / `[ssh]`); if SSH is unavailable the SSH-derived fields
+    /// read `unknown` but the kube-API fields still render.
+    Status,
 }
 
 /// `apprafter backup …` subcommands (2.6d).
@@ -1518,28 +1524,64 @@ mod tests {
     }
 
     #[test]
-    fn parses_node_reserve_headroom() {
-        let cli = Cli::parse_from(["apprafter", "node", "reserve-headroom"]);
+    fn parses_node_prep() {
+        let cli = Cli::parse_from(["apprafter", "node", "prep"]);
         assert!(
             matches!(
                 cli.command,
                 Commands::Node {
-                    action: NodeAction::ReserveHeadroom { yes: false }
+                    action: NodeAction::Prep { yes: false }
                 }
             ),
-            "`apprafter node reserve-headroom` must parse to NodeAction::ReserveHeadroom with yes defaulting to false"
+            "`apprafter node prep` must parse to NodeAction::Prep with yes defaulting to false"
         );
     }
 
     #[test]
-    fn parses_node_reserve_headroom_with_yes() {
-        let cli = Cli::parse_from(["apprafter", "node", "reserve-headroom", "--yes"]);
+    fn parses_node_prep_with_yes() {
+        let cli = Cli::parse_from(["apprafter", "node", "prep", "--yes"]);
         assert!(matches!(
             cli.command,
             Commands::Node {
-                action: NodeAction::ReserveHeadroom { yes: true }
+                action: NodeAction::Prep { yes: true }
             }
         ));
+    }
+
+    #[test]
+    fn parses_node_status() {
+        let cli = Cli::parse_from(["apprafter", "node", "status"]);
+        assert!(
+            matches!(
+                cli.command,
+                Commands::Node {
+                    action: NodeAction::Status
+                }
+            ),
+            "`apprafter node status` must parse to NodeAction::Status"
+        );
+    }
+
+    #[test]
+    fn rejects_removed_node_reserve_headroom() {
+        // BREAKING (2.16g): `reserve-headroom` is HARD-REMOVED in favour of
+        // `node prep`. clap must reject the old verb outright.
+        let err = Cli::try_parse_from(["apprafter", "node", "reserve-headroom"]);
+        assert!(
+            err.is_err(),
+            "`apprafter node reserve-headroom` must be UNKNOWN after the rename to `node prep`"
+        );
+    }
+
+    #[test]
+    fn skip_swap_flag_is_not_a_cli_arg() {
+        // `APPRAFTER_SKIP_NODE_SWAP` stays an UNDOCUMENTED env hook — there is
+        // no `--skip-swap` flag on `node prep`.
+        let err = Cli::try_parse_from(["apprafter", "node", "prep", "--skip-swap"]);
+        assert!(
+            err.is_err(),
+            "`node prep` must NOT accept a `--skip-swap` flag (env hook only)"
+        );
     }
 
     #[test]
