@@ -340,6 +340,10 @@ printf '\n=== STEP 5: retrofit (SKIP_NODE_SWAP=1) + node prep + VPA-revert (Q7) 
 # A SECOND node WITHOUT baked-in swap (the test hook forces a cushionless install),
 # so `apprafter node prep` retrofits a LIVE cluster — the path the dogfood node walks.
 export APPRAFTER_SKIP_NODE_SWAP=1
+# env HCLOUD_TOKEN OVERRIDES the target's stored --token (found run 3: e2e-retro's
+# `up` used the exported NEW token → adopted node 1, OTHER project stayed empty).
+# Point the env token at the OTHER project for the whole e2e-retro block.
+export HCLOUD_TOKEN="$OTHER_TOKEN"
 # The 2nd (SKIP) node MUST go in a SEPARATE Hetzner project (OTHER_TOKEN): the
 # `apprafter=true` label anchor is project-wide, so a 2nd target sharing node 1's
 # token makes `up` ADOPT node 1 instead of provisioning a new server (found on run 2 —
@@ -437,6 +441,7 @@ else
     mark_fail "STEP5 retrofit `apprafter up` failed — retrofit + Q7 + idempotency UNTESTED"
 fi
 unset APPRAFTER_SKIP_NODE_SWAP
+export HCLOUD_TOKEN="$TOKEN"   # restore node 1's token for the remaining steps + cleanup destroy
 # Point the kubeconfig/active target back at the FIRST node for steps 6-8.
 "$APPRAFTER" target use e2e >/dev/null 2>&1 || true
 "$APPRAFTER" kubeconfig > "$KUBECONFIG" 2>/dev/null || true
