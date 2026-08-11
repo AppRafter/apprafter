@@ -34,6 +34,8 @@
 //!   [`fstab_has_swap_entry`], [`orphan_swapfile`]) are pure functions of
 //!   remote-command output (design decision D2 / P11 / Q11).
 
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use cli_core::{resolve_hetzner_token, CliError, Result};
@@ -49,6 +51,7 @@ use tracing::info;
 
 use crate::cli::NodeAction;
 use crate::commands::hcloud::hcloud_base_url;
+use crate::commands::k8s_helpers::ensure_kubeconfig_tempfile;
 use crate::commands::state_paths::resolve_state_paths;
 
 /// How long to wait for the k3s API to come back after the restart
@@ -966,40 +969,61 @@ pub fn status() -> Result<()> {
 
     let runner = SshCommandRunner::new(default_ssh_identity_path(), paths.known_hosts_file());
 
-    let node_state = probe_node_swap_state(&runner, &host);
+    // Resolve the cached (age-encrypted) out-of-cluster kubeconfig for the
+    // active target — the kube-API fields read through it, so SSH being down
+    // no longer forces them `Unknown` (Q10). Best-effort: a missing cache
+    // just leaves the `[api]` fields `Unknown`, it is not a hard error.
+    let kubeconfig = ensure_kubeconfig_tempfile().ok();
+
+    let node_state = probe_node_swap_state(&runner, &host, kubeconfig.as_ref().map(|f| f.path()));
     print!("{}", render_status(&node_state));
     Ok(())
 }
 
-/// The IO wrapper (design decision 6): probes the kube-API fields + the live
-/// SSH fields off the node and assembles a [`NodeSwapState`]. Both source
+/// The IO wrapper (design decision 6 / Q10): probes the kube-API fields + the
+/// live SSH fields off the node and assembles a [`NodeSwapState`]. Both source
 /// groups are BEST-EFFORT — a missing kube-API field or a down SSH becomes
 /// `Field::Unknown` rather than an error, so the report degrades gracefully.
 ///
-/// The kube-API fields are read via the NODE-LOCAL `k3s kubectl` over SSH too
-/// (there is no out-of-cluster kubeconfig assumption here); if SSH is down,
-/// ALL fields — api and ssh alike — degrade to `Unknown`, but the two groups
-/// stay labelled distinctly so the report is still legible.
-fn probe_node_swap_state(runner: &SshCommandRunner, host: &str) -> NodeSwapState {
-    // A single cheap probe decides SSH reachability up-front (`hostname` also
-    // gives us the node name for the configz/Node-object jsonpaths).
-    let node_name = runner
+/// The kube-API fields (`configz` → `failSwapOn`/`swapBehavior`, the Node
+/// object's `swap.capacity`/`kubeletVersion`) are read through the CLI's own
+/// cached OUT-OF-CLUSTER kubeconfig (`kubeconfig_path`), NOT over SSH — so SSH
+/// being down no longer forces them `Unknown` (the graceful-degradation intent
+/// of decision 6). When the cached kubeconfig is missing / the API is
+/// unreachable, THOSE fields are `Unknown`; independently, when SSH is down the
+/// `[ssh]` fields are `Unknown`. The two groups stay labelled distinctly.
+fn probe_node_swap_state(
+    runner: &SshCommandRunner,
+    host: &str,
+    kubeconfig_path: Option<&Path>,
+) -> NodeSwapState {
+    // --- kube-API fields (out-of-cluster kubeconfig, no SSH). ---
+    // The node name comes from the kube-API too (k3s uses the hostname as the
+    // single node's name) so the configz/Node-object reads never need SSH.
+    let api_node_name = kubeconfig_path.and_then(kube_node_name);
+    let (fail_swap_on, swap_behavior) = probe_configz(kubeconfig_path, api_node_name.as_deref());
+    let swap_capacity = probe_node_field(
+        kubeconfig_path,
+        api_node_name.as_deref(),
+        "{.status.nodeInfo.swap.capacity}",
+    );
+    let kubelet_version = probe_node_field(
+        kubeconfig_path,
+        api_node_name.as_deref(),
+        "{.status.nodeInfo.kubeletVersion}",
+    );
+
+    // A single cheap SSH probe decides SSH reachability up-front (`hostname`
+    // also gives a node-name fallback for the report header when the kube-API
+    // could not answer it).
+    let ssh_node_name = runner
         .run(host, "hostname")
         .ok()
         .map(|s| s.trim().to_string());
-    let ssh_available = node_name.is_some();
-    let node_name = node_name.unwrap_or_else(|| "<unknown>".to_string());
-
-    // --- kube-API fields (node-local k3s kubectl). ---
-    let (fail_swap_on, swap_behavior) = probe_configz(runner, host);
-    let swap_capacity =
-        probe_node_field(runner, host, &node_name, "{.status.nodeInfo.swap.capacity}");
-    let kubelet_version = probe_node_field(
-        runner,
-        host,
-        &node_name,
-        "{.status.nodeInfo.kubeletVersion}",
-    );
+    let ssh_available = ssh_node_name.is_some();
+    let node_name = api_node_name
+        .or(ssh_node_name)
+        .unwrap_or_else(|| "<unknown>".to_string());
 
     // --- SSH fields (live probes). ---
     let swapon_raw = runner.run(host, "swapon --show").ok();
@@ -1062,17 +1086,53 @@ fn probe_node_swap_state(runner: &SshCommandRunner, host: &str) -> NodeSwapState
     }
 }
 
+/// Runs `kubectl --kubeconfig <path> <args…>` and returns its stdout on
+/// success, or `None` on any failure (no kubeconfig, spawn error, non-zero
+/// exit). The cached out-of-cluster kubeconfig is the source, so the kube-API
+/// fields are readable even when SSH to the node is down (Q10).
+fn kubectl_capture(kubeconfig_path: Option<&Path>, args: &[&str]) -> Option<String> {
+    let path = kubeconfig_path?;
+    let out = Command::new("kubectl")
+        .args(args)
+        .env("KUBECONFIG", path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Reads the single node's name off the kube-API (`kubectl get nodes
+/// -o jsonpath='{.items[0].metadata.name}'`). `None` when the kubeconfig is
+/// absent / the API is unreachable / there is no node. T1 is single-node, so
+/// `items[0]` is the node.
+fn kube_node_name(kubeconfig_path: &Path) -> Option<String> {
+    let out = kubectl_capture(
+        Some(kubeconfig_path),
+        &["get", "nodes", "-o", "jsonpath={.items[0].metadata.name}"],
+    )?;
+    let name = out.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 /// Reads `failSwapOn` + `swapBehavior` from the kubelet `configz` endpoint
-/// (`/api/v1/nodes/<n>/proxy/configz`) via node-local `k3s kubectl --raw`.
-/// Both degrade to `Unknown` independently on any failure / absent key.
-fn probe_configz(runner: &SshCommandRunner, host: &str) -> (Field, Field) {
-    let raw = match runner.run(
-        host,
-        "k3s kubectl get --raw \
-         \"/api/v1/nodes/$(hostname)/proxy/configz\"",
-    ) {
-        Ok(r) => r,
-        Err(_) => return (Field::Unknown, Field::Unknown),
+/// (`/api/v1/nodes/<n>/proxy/configz`) via the cached OUT-OF-CLUSTER
+/// kubeconfig — `kubectl get --raw` (NOT SSH, Q10). Both degrade to `Unknown`
+/// independently on any failure / absent key / absent kubeconfig / unknown
+/// node name.
+fn probe_configz(kubeconfig_path: Option<&Path>, node_name: Option<&str>) -> (Field, Field) {
+    let Some(node) = node_name else {
+        return (Field::Unknown, Field::Unknown);
+    };
+    let path = format!("/api/v1/nodes/{node}/proxy/configz");
+    let raw = match kubectl_capture(kubeconfig_path, &["get", "--raw", &path]) {
+        Some(r) => r,
+        None => return (Field::Unknown, Field::Unknown),
     };
     (
         configz_scalar(&raw, "failSwapOn"),
@@ -1102,17 +1162,21 @@ fn configz_scalar(configz_json: &str, key: &str) -> Field {
     }
 }
 
-/// Reads a jsonpath field off the Node object via node-local `k3s kubectl`.
-/// An empty / `<unknown>` / errored result degrades to `Unknown`.
+/// Reads a jsonpath field off the Node object via the cached OUT-OF-CLUSTER
+/// kubeconfig — `kubectl get node <n> -o jsonpath=…` (NOT SSH, Q10). An empty
+/// / `<unknown>` / `<none>` / errored result — or an absent kubeconfig /
+/// unknown node name — degrades to `Unknown`.
 fn probe_node_field(
-    runner: &SshCommandRunner,
-    host: &str,
-    node_name: &str,
+    kubeconfig_path: Option<&Path>,
+    node_name: Option<&str>,
     jsonpath: &str,
 ) -> Field {
-    let cmd = format!("k3s kubectl get node {node_name} -o jsonpath='{jsonpath}'");
-    match runner.run(host, &cmd) {
-        Ok(out) => {
+    let Some(node) = node_name else {
+        return Field::Unknown;
+    };
+    let jp = format!("jsonpath={jsonpath}");
+    match kubectl_capture(kubeconfig_path, &["get", "node", node, "-o", &jp]) {
+        Some(out) => {
             let v = out.trim();
             if v.is_empty() || v == "<unknown>" || v == "<none>" {
                 Field::Unknown
@@ -1120,7 +1184,7 @@ fn probe_node_field(
                 Field::Known(v.to_string())
             }
         }
-        Err(_) => Field::Unknown,
+        None => Field::Unknown,
     }
 }
 
@@ -1716,6 +1780,66 @@ mod tests {
             classify_state(false, false, None, false, &Field::Unknown, None),
             SwapProvisionState::Unknown
         );
+    }
+
+    #[test]
+    fn api_fields_unknown_without_kubeconfig_never_spawn() {
+        // With no cached kubeconfig the kube-API probes short-circuit to
+        // `Unknown` WITHOUT spawning kubectl (Q10: the api fields come from the
+        // out-of-cluster kubeconfig, so their absence — not SSH — is what makes
+        // them unknown). `None` node name likewise degrades independently.
+        assert_eq!(
+            probe_configz(None, Some("node-1")),
+            (Field::Unknown, Field::Unknown)
+        );
+        assert_eq!(probe_configz(None, None), (Field::Unknown, Field::Unknown));
+        assert_eq!(
+            probe_node_field(None, Some("node-1"), "{.status.nodeInfo.kubeletVersion}"),
+            Field::Unknown
+        );
+        assert_eq!(
+            probe_node_field(None, None, "{.status.nodeInfo.swap.capacity}"),
+            Field::Unknown
+        );
+    }
+
+    #[test]
+    fn render_api_known_ssh_unknown_shows_api_values_not_all_unknown() {
+        // Q10 core: when the kube-API fields (read via the cached out-of-cluster
+        // kubeconfig) are KNOWN but SSH is DOWN, the report renders the api
+        // values — SSH being down no longer forces the api fields unknown, so
+        // the result is NOT all-unknown. This mirrors the shape
+        // `probe_node_swap_state` assembles when the kubeconfig answered but the
+        // SSH probe did not connect.
+        let s = NodeSwapState {
+            node_name: "node-1".into(),
+            ssh_available: false,
+            state: SwapProvisionState::Active {
+                size: Some("4G".into()),
+            },
+            fail_swap_on: Field::Known("false".into()),
+            swap_behavior: Field::Known("NoSwap".into()),
+            swap_capacity: Field::Known("4294967296".into()),
+            kubelet_version: Field::Known("v1.35.5+k3s1".into()),
+            swapon: Field::Unknown,
+            swappiness: Field::Unknown,
+            gomemlimit: Field::Unknown,
+            provision_breadcrumb: Field::Unknown,
+        };
+        let out = render_status(&s);
+        // The [api] fields render their real values (NOT `unknown`).
+        assert!(out.contains("[api] kubeletVersion : v1.35.5+k3s1"), "{out}");
+        assert!(out.contains("[api] failSwapOn     : false"), "{out}");
+        assert!(out.contains("[api] swapBehavior   : NoSwap"), "{out}");
+        assert!(out.contains("[api] swap.capacity  : 4294967296"), "{out}");
+        // No [api] line degraded to `unknown` (the whole point of Q10).
+        assert!(
+            !out.contains("[api] kubeletVersion : unknown"),
+            "api kubeletVersion must NOT be unknown when SSH is down: {out}"
+        );
+        // The [ssh] fields, by contrast, ARE unknown (SSH genuinely down).
+        assert!(out.contains("[ssh] swapon         : unknown"), "{out}");
+        assert!(out.contains("SSH unavailable"), "{out}");
     }
 
     #[test]
