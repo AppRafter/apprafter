@@ -324,8 +324,14 @@ K3S_ACTIVE_AFTER=$(node_ssh "$IP" 'systemctl is-active k3s.service')
 RESTARTS_AFTER=$(kubectl get pods -A -o json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(sum(cs.get('restartCount',0) for p in d.get('items',[]) for cs in (p.get('status',{}).get('containerStatuses') or [])))" 2>/dev/null || echo 0)
 OOMKILLED=$(kubectl get pods -A -o json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print('\n'.join(f\"{p['metadata']['name']}/{cs['name']}\" for p in d.get('items',[]) for cs in (p.get('status',{}).get('containerStatuses') or []) if (cs.get('lastState',{}).get('terminated') or {}).get('reason')=='OOMKilled'))" 2>/dev/null)
 printf '  totalRestarts %s -> %s ; OOMKilled pods: %s\n' "$RESTARTS_BEFORE" "$RESTARTS_AFTER" "${OOMKILLED:-none}"
-[ "${RESTARTS_AFTER:-0}" -le "${RESTARTS_BEFORE:-0}" ] 2>/dev/null && ok "STEP4 no NEW pod restart under pressure" || mark_fail "STEP4 pod restarts rose ($RESTARTS_BEFORE -> $RESTARTS_AFTER — a pod was OOM-killed)"
-[ -z "$OOMKILLED" ] && ok "STEP4 no pod OOMKilled" || mark_fail "STEP4 OOMKilled pods: $OOMKILLED"
+# NoSwap protects the NODE, not workloads (ADR 0055): under an OVERSIZED system.slice
+# hog, a pod (which cannot swap) OOMing is EXPECTED behaviour, not a swap failure. The
+# cushion's job — validated above — is that k3s.service survives + swap engages
+# (pswpout>0) + /readyz stays up. A pod restart/OOM here is a NOTE, not a fail.
+[ "${RESTARTS_AFTER:-0}" -le "${RESTARTS_BEFORE:-0}" ] 2>/dev/null && ok "STEP4 no NEW pod restart under pressure" \
+    || printf '  NOTE STEP4 pod restarts %s->%s under the oversized hog — EXPECTED (NoSwap protects the node, not pods; k3s survived + cushion engaged above)\n' "$RESTARTS_BEFORE" "$RESTARTS_AFTER"
+[ -z "$OOMKILLED" ] && ok "STEP4 no pod OOMKilled" \
+    || printf '  NOTE STEP4 pod OOMKilled under the oversized hog (%s) — EXPECTED (NoSwap: pods do not swap; the cushion protects the node/k3s)\n' "$OOMKILLED"
 [ "$readyz_up_throughout" -eq 1 ] && ok "STEP4 /readyz up throughout the pressure window" || mark_fail "STEP4 /readyz dropped during pressure"
 
 # =============================================================================
@@ -335,14 +341,26 @@ printf '\n=== STEP 5: retrofit (SKIP_NODE_SWAP=1) + node prep + VPA-revert (Q7) 
 export APPRAFTER_SKIP_NODE_SWAP=1
 "$APPRAFTER" target add e2e-retro --provider hetzner-cloud --tier solo --region "$REGION" \
     --token "$TOKEN" --no-interactive --force || mark_fail "STEP5 target add (retrofit)"
+# `target add` does NOT auto-activate — without this, `up` re-converges node 1 (the
+# baked node) and the retrofit/SKIP-gate tests run against the wrong node (a real
+# walk bug found on the first run).
+"$APPRAFTER" target use e2e-retro >/dev/null 2>&1 || mark_fail "STEP5 target use e2e-retro (activate the 2nd target)"
 if timeout 1500 "$APPRAFTER" up; then
     "$APPRAFTER" kubeconfig > "$KUBECONFIG"
     RNODE=$(node_name); RIP=$(target_ipv4)
     printf '  retrofit node=%s ip=%s (provisioned with APPRAFTER_SKIP_NODE_SWAP=1 → no bake)\n' "$RNODE" "${RIP:-?}"
+    # Must be a GENUINELY DIFFERENT node than node 1 — else we retrofit the already-baked
+    # first node and both the transition AND the SKIP-at-bootstrap check are void.
+    { [ -n "$RIP" ] && [ "$RIP" != "$IP" ]; } && ok "STEP5 retrofit is a distinct 2nd node ($RIP != node1 $IP)" \
+        || mark_fail "STEP5 retrofit node IP=$RIP == node1 IP=$IP — target activation failed"
+    NSRV=$(python3 "$HZ" list "$TOKEN" 2>/dev/null | awk '/servers/{print $2}')
+    [ "${NSRV:-0}" = "2" ] && ok "STEP5 2 servers in the project (both swept on cleanup)" || printf '  NOTE STEP5 server count=%s (expected 2)\n' "${NSRV:-?}"
 
-    # Confirm the node came up CUSHIONLESS (no active swap).
+    # SKIP-gate assertion: does APPRAFTER_SKIP_NODE_SWAP=1 actually prevent the bootstrap
+    # bake? The SKIP node must come up CUSHIONLESS (no active swap).
     RSWAP=$(node_ssh "$RIP" 'swapon --show')
-    [[ "$RSWAP" != *"/swapfile"* ]] && ok "STEP5 retrofit node booted cushionless (no /swapfile active)" || printf '  NOTE retrofit node already has /swapfile active (unexpected under SKIP_NODE_SWAP)\n'
+    [[ "$RSWAP" != *"/swapfile"* ]] && ok "STEP5 SKIP_NODE_SWAP=1 node booted cushionless (bootstrap skip-gate works)" \
+        || mark_fail "STEP5 SKIP node has /swapfile active — APPRAFTER_SKIP_NODE_SWAP=1 did NOT skip the bootstrap bake"
 
     # Deploy pg so there is a PRE-EXISTING container before prep (swapBehavior applies
     # at container creation → a pre-prep container keeps swap.max=max until prep sets 0).
@@ -480,7 +498,14 @@ if [ "$back" -eq 1 ]; then
         [ "$ph" = "Running" ] && break
         sleep 8
     done
-    PB_SM=$(kubectl -n "$NS" exec swap-postboot -- sh -c 'cat /sys/fs/cgroup/memory.swap.max 2>/dev/null' 2>/dev/null | tr -d '[:space:]')
+    # Retry — post-reboot the exec can race the container becoming exec-ready (an empty
+    # read on the first run); poll pod_swap_max until it returns a value.
+    PB_SM=""; pbdl=$(( $(date +%s) + 120 ))
+    while [ "$(date +%s)" -lt "$pbdl" ]; do
+        PB_SM=$(pod_swap_max swap-postboot)
+        [ -n "$PB_SM" ] && break
+        sleep 8
+    done
     printf '  post-boot container memory.swap.max = %q\n' "$PB_SM"
     [ "$PB_SM" = "0" ] && ok "STEP7 post-boot container memory.swap.max==0 from the CRI (self-healing)" || mark_fail "STEP7 post-boot memory.swap.max='$PB_SM' (expected 0)"
     kubectl -n "$NS" delete pod swap-postboot --wait=false >/dev/null 2>&1 || true
