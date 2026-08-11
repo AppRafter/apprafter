@@ -119,10 +119,17 @@ pub const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
 pub const K3S_OOM_DROPIN_PATH: &str = "/etc/systemd/system/k3s.service.d/oom.conf";
 
 /// The systemd drop-in body applied at [`K3S_OOM_DROPIN_PATH`].
-/// Shared by the bootstrap cloud-init (Task 10) and the
-/// `apprafter node reserve-headroom` retrofit (Task 11) so the two
-/// paths can never diverge.
-pub const K3S_OOM_DROPIN: &str = "[Service]\nOOMScoreAdjust=-999\n";
+/// Shared by the bootstrap cloud-init and the `apprafter node prep`
+/// retrofit so the two paths can never diverge.
+///
+/// 2.16g (ADR 0055): `GOMEMLIMIT=2GiB` caps the k3s Go-heap component of
+/// a spike. k3s is Go; without it, host swap just lets the GC fault
+/// swapped live-heap pages back in (thrash on 2 vCPU) instead of the
+/// cushion absorbing the spike. This bounds the Go-HEAP component only —
+/// the non-Go residual (cgo, sqlite/kine page cache) is what swap covers
+/// (the coherent story vs `system-reserved=1500Mi`; the ~500Mi overshoot
+/// is what the swap cushion absorbs). Starting value; tune from the walk.
+pub const K3S_OOM_DROPIN: &str = "[Service]\nOOMScoreAdjust=-999\nEnvironment=GOMEMLIMIT=2GiB\n";
 
 /// Renders the k3s `config.yaml` body carrying the 2.16d kubelet
 /// node reservations. Pure and side-effect-free.
@@ -403,6 +410,9 @@ mod tests {
         // rke2 — verified against k3s install.sh, R4-N4), so we ship the
         // drop-in that pins k3s.service out of the kernel OOM-killer's reach.
         assert!(ud.contains("OOMScoreAdjust=-999"), "{ud}");
+        // 2.16g (ADR 0055): GOMEMLIMIT caps the k3s Go-heap so host swap
+        // absorbs a spike instead of the GC thrashing swapped live-heap.
+        assert!(ud.contains("Environment=GOMEMLIMIT="), "{ud}");
     }
 
     #[test]
