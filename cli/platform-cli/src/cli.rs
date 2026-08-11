@@ -262,10 +262,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: BackupAction,
     },
-    /// Restore a backup into a target cluster. Replays the CRs,
-    /// secrets and native data captured by `apprafter backup`.
-    /// Full restore logic lands in 2.6d T11/T13 — today the command
-    /// is wired and accepts flags but exits with a clear error.
+    /// Restore a backup into a target cluster: replays the CRs, secrets and
+    /// native data (pg/redis/volumes) captured by `apprafter backup`. Modes:
+    /// restore-into-running (default; the target must already be bootstrapped),
+    /// `--data-only` (reload native data only, no CR/secret replay), and
+    /// `--reprovision` (provision a fresh cluster first, then replay). Secrets
+    /// are re-sealed against the target cluster's sealed-secrets key.
     Restore {
         /// Path to the restic repository created by `apprafter backup`.
         repo: String,

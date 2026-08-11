@@ -275,8 +275,9 @@ future reader isn't misled:
   re-add); secrets survive a cluster rebuild.
 - **Harder / accepted:** restore ordering is intricate (the H2/R1 invariants
   are the crux); the default path requires the target to be bootstrapped first
-  (clone-to-new is deferred); the operator owns the passphrase and any cloud
-  token, and losing the passphrase makes the backup unrecoverable.
+  (clone-to-new via `--reprovision` is the opt-in mode, delivered in T13); the
+  operator owns the passphrase and any cloud token, and losing the passphrase
+  makes the backup unrecoverable.
 - **Neutral:** restic becomes a runtime dependency of the CLI (resolved on the
   operator machine; the e2e harness wraps a `nix run nixpkgs#restic` fallback).
 
