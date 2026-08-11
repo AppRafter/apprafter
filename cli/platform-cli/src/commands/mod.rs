@@ -22,7 +22,7 @@ pub mod k8s_helpers;
 pub mod kubeconfig;
 pub mod login;
 pub mod migration;
-pub mod node_reservations;
+pub mod node_prep;
 pub mod open;
 pub mod plan;
 pub mod platform;
