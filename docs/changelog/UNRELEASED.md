@@ -9,6 +9,14 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.40 — 2.16g node swap + NoSwap (2026-08-11, real-Hetzner walk GREEN)
+
+**Added:** `apprafter node prep` — an idempotent node-preparation umbrella (SSH to the active target's node): the 2.16d kubelet reservations + host swap `min(RAM,8Gi)` with pod-`NoSwap` (`failSwapOn:false` + `memorySwap.swapBehavior:NoSwap` via a KubeletConfiguration drop-in, kubelet ≥1.34) + `GOMEMLIMIT=2GiB` on `k3s.service`, over one k3s restart with an atomic apply + whole-step rollback (`failSwapOn:false` removed last, never while swap is on). Swap is baked at bootstrap (`INSTALL_K3S_SKIP_START` → k3s-version/cgroup2 gate → write config → `systemctl start k3s`, **fail-soft**: a swap-step failure leaves a working cushionless node, never an unstarted one). `apprafter node status` reports the node's swap posture (live `swapon`, configz `swapBehavior`, Node-object `swap.capacity`, `GOMEMLIMIT`) with per-field `[api]`/`[ssh]` source labels + graceful degradation. On a node <1.34 the swap step refuses with an "upgrade k3s to ≥1.34" hint (reservations still apply). ADR 0055 (amends 0053).
+
+**Removed:** `apprafter node reserve-headroom` — subsumed by `apprafter node prep` (which also provisions swap). Breaking rename.
+
+**Why:** on the narrow live T1 the node runs hot (dogfood observed at 137% of allocatable, no swap); a transient control-plane spike (`k3s.service` peaked ~2.8G vs ~788Mi headroom) OOM-kills with no cushion. Host swap absorbs the spike for `system.slice`/k3s while pods stay in RAM (NoSwap protects the node, not workloads). `GOMEMLIMIT` on the Go k3s process keeps the swap a cushion rather than a GC-thrash source. Validated end-to-end on real Hetzner (`e2e/node-swap-walk.sh`, 8 steps, 2 nodes): the cushion engages (pswpout>0, k3s survives, /readyz up), pods are NoSwap, the retrofit no-swap→swap transition + Q7-survives-resize + idempotency + reboot-persistence all pass. CLI-only release (**cli v0.2.40** + monorepo tag `v0.2.40`); ps/operator/cue-cmp unchanged.
+
 ## platform-stack 0.2.53 — 2.16f Argo CD footprint tuning (2026-08-11, dogfood-validated)
 
 **Changed (platform-stack `component_argocd.cue`, chart-values only, change=safe):** the Argo CD component now sets `GOMEMLIMIT`/`GOGC` env on the app-controller (256MiB) + repo-server (128MiB), `resource.exclusions` in `argocd-cm` (Endpoints/Event + events.k8s.io/Event, EndpointSlice, Lease, metrics.k8s.io/*, cilium.io CiliumIdentity/CiliumEndpoint, autoscaling.k8s.io/VerticalPodAutoscalerCheckpoint — kind-scoped, keeps CiliumNetworkPolicy), and `applicationSet.replicas: 0` (drops the unused applicationset-controller; 7.7.7 has no `enabled` gate, `replicas:0` under `prune:false` avoids an orphan). Released as `platform-stack/v0.2.53` (+ a `0.2.53-rc.1` walk-vehicle prerelease). No operator / cue-cmp / CLI change; no monorepo tag.
