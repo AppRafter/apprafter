@@ -70,6 +70,13 @@ const SWAPFILE_PATH: &str = "/swapfile";
 /// ours.
 const SWAP_FSTAB_LINE: &str = "/swapfile none swap sw,nofail 0 0";
 
+/// Retrofit swap-size cap in MiB — mirrors the private `SWAP_MAX_MIB` in
+/// `cli_providers::hetzner_cloud::user_data` that [`swap_enable_script`]
+/// applies internally (`min(MemTotal_MiB, 8Gi)`). We recompute the same count
+/// here only for the human-readable retrofit breadcrumb (Fix 2); the actual
+/// swapfile size is still owned by `swap_enable_script`.
+const SWAP_MAX_MIB: u64 = 8192;
+
 pub fn run(action: NodeAction) -> Result<()> {
     match action {
         NodeAction::Prep { yes } => node_prep(yes),
@@ -253,6 +260,22 @@ pub fn reservations_only_script() -> String {
     s.push_str("systemctl daemon-reload\n");
     s.push_str("systemctl restart k3s\n");
     s
+}
+
+/// Builds the shell that OVERWRITES the [`SWAP_PROVISION_STATUS_PATH`]
+/// breadcrumb with `state` for the RETROFIT path (`apprafter node prep`).
+/// The bootstrap/cloud-init path drops this breadcrumb itself
+/// ([`build_bootstrap_swap_script`]), but the retrofit never did — so a
+/// retrofitted node reported `provision: unknown` on `node status`.
+///
+/// Mirrors the bootstrap breadcrumb writes: ensure the dir, then a single
+/// `echo … > path`, and BEST-EFFORT (`2>/dev/null || true`) so a breadcrumb
+/// failure never fails the prep. Pure so the shape is unit-testable.
+pub fn provision_breadcrumb_write_script(state: &str) -> String {
+    format!(
+        "mkdir -p /var/lib/apprafter 2>/dev/null || true; \
+         echo \"{state}\" > {SWAP_PROVISION_STATUS_PATH} 2>/dev/null || true"
+    )
 }
 
 // ===========================================================================
@@ -669,6 +692,10 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
     //     cgroup swap.max=0 → fstab). Read MemTotal off the node first so
     //     the shared retrofit builder can pin the count.
     let mem_total_kib = probe_mem_total_kib(runner, host)?;
+    // The retrofit breadcrumb size mirrors `swap_enable_script`'s internal
+    // `min(MemTotal_MiB, 8Gi)` count (Fix 2) — recomputed here only for the
+    // human-readable status line, not to drive the swapfile size.
+    let swap_count_mib = (mem_total_kib / 1024).min(SWAP_MAX_MIB);
     let swap_steps = swap_enable_script(
         mem_total_kib,
         k8s_ge_134,
@@ -689,6 +716,14 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
         Ok(()) => {
             println!("✓ Node reservations + host swap applied and the k3s API is back.");
             println!("  swap active (NoSwap for pods), swappiness=10, fstab sw,nofail.");
+            // Drop the retrofit provision breadcrumb so `node status` shows
+            // `applied (retrofit)` instead of `unknown` (Fix 2). Best-effort.
+            let _ = runner.run(
+                host,
+                &provision_breadcrumb_write_script(&format!(
+                    "applied (retrofit): swap {swap_count_mib} MiB"
+                )),
+            );
             Ok(())
         }
         Err(recovery_err) => {
@@ -700,15 +735,32 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
             );
             let mut ops = SshNodeOps::new(runner, host);
             match rollback(&mut ops)? {
-                RollbackOutcome::Recovered => Err(CliError::Other(format!(
-                    "swap apply failed and was rolled back cleanly (swap removed, kubelet drop-in \
-                     removed, /swapfile deleted, k3s recovered). Original error: {recovery_err}"
-                ))),
-                RollbackOutcome::SwapoffFailedSwapLeft => Err(CliError::Other(format!(
-                    "swap apply failed; rollback could NOT swapoff (swap + failSwapOn:false left \
-                     in place, /swapfile kept — see the runbook line above). Original error: \
-                     {recovery_err}"
-                ))),
+                RollbackOutcome::Recovered => {
+                    // Overwrite the breadcrumb so a rolled-back node does not
+                    // show a stale `applied` (Fix 2). Best-effort.
+                    let _ = runner.run(
+                        host,
+                        &provision_breadcrumb_write_script("rolled-back: swap removed"),
+                    );
+                    Err(CliError::Other(format!(
+                        "swap apply failed and was rolled back cleanly (swap removed, kubelet \
+                         drop-in removed, /swapfile deleted, k3s recovered). Original error: \
+                         {recovery_err}"
+                    )))
+                }
+                RollbackOutcome::SwapoffFailedSwapLeft => {
+                    // Swap could NOT be turned off — the breadcrumb must say so
+                    // (consistent with the runbook: swap left active) (Fix 2).
+                    let _ = runner.run(
+                        host,
+                        &provision_breadcrumb_write_script("rolled-back-partial: swap left active"),
+                    );
+                    Err(CliError::Other(format!(
+                        "swap apply failed; rollback could NOT swapoff (swap + failSwapOn:false \
+                         left in place, /swapfile kept — see the runbook line above). Original \
+                         error: {recovery_err}"
+                    )))
+                }
             }
         }
     }
@@ -1265,12 +1317,26 @@ fn probe_node_field(
 /// Reads the effective `GOMEMLIMIT` off the running k3s unit's environment
 /// (`systemctl show -p Environment k3s`). `Unknown` when absent / SSH down.
 fn probe_gomemlimit(runner: &SshCommandRunner, host: &str) -> Field {
-    let out = match runner.run(host, "systemctl show -p Environment k3s 2>/dev/null") {
-        Ok(o) => o,
-        Err(_) => return Field::Unknown,
-    };
-    // `Environment=GOMEMLIMIT=2GiB FOO=bar` → pull the GOMEMLIMIT token.
-    for tok in out.split_whitespace() {
+    match runner.run(host, "systemctl show -p Environment k3s 2>/dev/null") {
+        Ok(o) => parse_gomemlimit(&o),
+        Err(_) => Field::Unknown,
+    }
+}
+
+/// Extracts `GOMEMLIMIT` from the raw `systemctl show -p Environment k3s`
+/// output. systemd renders the WHOLE space-separated `key=val` list behind a
+/// SINGLE `Environment=` key prefix — so the real shape is
+/// `Environment=GOMEMLIMIT=2GiB` (or `Environment=GOMEMLIMIT=2GiB FOO=bar`,
+/// order-independent), NOT a per-token `GOMEMLIMIT=…`. This also tolerates the
+/// bare `GOMEMLIMIT=2GiB` shape (`systemctl show … --value`) for robustness.
+///
+/// Pure over the raw text so the real shapes are unit-testable without a node.
+fn parse_gomemlimit(systemctl_output: &str) -> Field {
+    for tok in systemctl_output.split_whitespace() {
+        // Strip the OPTIONAL `Environment=` key prefix first — the first token
+        // of the non-`--value` output is `Environment=GOMEMLIMIT=…`, so a raw
+        // `strip_prefix("GOMEMLIMIT=")` on it would miss the real value.
+        let tok = tok.strip_prefix("Environment=").unwrap_or(tok);
         if let Some(v) = tok.strip_prefix("GOMEMLIMIT=") {
             if !v.is_empty() {
                 return Field::Known(v.to_string());
@@ -1352,6 +1418,121 @@ mod tests {
         let s = reservations_only_script();
         assert!(s.contains("systemctl daemon-reload"), "{s}");
         assert!(s.contains("systemctl restart k3s"), "{s}");
+    }
+
+    // ---- GOMEMLIMIT parse (Fix 1: systemd `Environment=` key prefix) -----
+
+    #[test]
+    fn parse_gomemlimit_strips_environment_key_prefix() {
+        // The REAL non-`--value` shape: systemd puts the whole key=val list
+        // behind ONE `Environment=` key prefix.
+        assert_eq!(
+            parse_gomemlimit("Environment=GOMEMLIMIT=2GiB"),
+            Field::Known("2GiB".into())
+        );
+    }
+
+    #[test]
+    fn parse_gomemlimit_first_of_multiple_vars() {
+        assert_eq!(
+            parse_gomemlimit("Environment=GOMEMLIMIT=2GiB FOO=bar"),
+            Field::Known("2GiB".into())
+        );
+    }
+
+    #[test]
+    fn parse_gomemlimit_not_first_of_multiple_vars() {
+        // Order-independent: only the FIRST token carries the `Environment=`
+        // prefix, later tokens are bare `key=val`.
+        assert_eq!(
+            parse_gomemlimit("Environment=FOO=bar GOMEMLIMIT=2GiB"),
+            Field::Known("2GiB".into())
+        );
+    }
+
+    #[test]
+    fn parse_gomemlimit_bare_value_shape() {
+        // The `systemctl show … --value` shape (key prefix already stripped).
+        assert_eq!(
+            parse_gomemlimit("GOMEMLIMIT=2GiB"),
+            Field::Known("2GiB".into())
+        );
+    }
+
+    #[test]
+    fn parse_gomemlimit_absent_is_unknown() {
+        // Empty environment (`Environment=`), an unrelated var, and empty
+        // output all → Unknown.
+        assert_eq!(parse_gomemlimit("Environment="), Field::Unknown);
+        assert_eq!(parse_gomemlimit("Environment=FOO=bar"), Field::Unknown);
+        assert_eq!(parse_gomemlimit(""), Field::Unknown);
+    }
+
+    #[test]
+    fn parse_gomemlimit_empty_value_is_unknown() {
+        // `GOMEMLIMIT=` with no value must NOT report a bogus empty Known.
+        assert_eq!(parse_gomemlimit("Environment=GOMEMLIMIT="), Field::Unknown);
+    }
+
+    #[test]
+    fn parse_gomemlimit_real_world_edge_shapes() {
+        // The REAL `systemctl show` output always carries a trailing newline —
+        // `split_whitespace` absorbs it (the dogfood-facing shape).
+        assert_eq!(
+            parse_gomemlimit("Environment=GOMEMLIMIT=2GiB\n"),
+            Field::Known("2GiB".into())
+        );
+        // A value with an embedded `=` is returned verbatim (strip_prefix stops
+        // at the FIRST `GOMEMLIMIT=`), not truncated.
+        assert_eq!(
+            parse_gomemlimit("Environment=GOMEMLIMIT=KEY=VALUE"),
+            Field::Known("KEY=VALUE".into())
+        );
+        // Case-sensitive: systemd's env key is uppercase `GOMEMLIMIT` — a
+        // lowercased key must NOT match.
+        assert_eq!(
+            parse_gomemlimit("Environment=gomemlimit=2GiB"),
+            Field::Unknown
+        );
+    }
+
+    // ---- retrofit provision breadcrumb (Fix 2) --------------------------
+
+    #[test]
+    fn provision_breadcrumb_write_script_writes_state_to_the_exported_path() {
+        let s = provision_breadcrumb_write_script("applied (retrofit): swap 4096 MiB");
+        // Writes to the canonical const path (not a hardcoded string), the
+        // state verbatim, and ensures the dir first.
+        assert!(s.contains(SWAP_PROVISION_STATUS_PATH), "{s}");
+        assert!(
+            s.contains("echo \"applied (retrofit): swap 4096 MiB\""),
+            "{s}"
+        );
+        assert!(s.contains("mkdir -p /var/lib/apprafter"), "{s}");
+    }
+
+    #[test]
+    fn provision_breadcrumb_write_script_is_best_effort() {
+        // Must never fail the prep: both the mkdir and the echo swallow errors.
+        let s = provision_breadcrumb_write_script("rolled-back: swap removed");
+        assert!(s.contains("echo \"rolled-back: swap removed\""), "{s}");
+        assert!(
+            s.matches("2>/dev/null || true").count() >= 2,
+            "both the mkdir and the echo must be best-effort:\n{s}"
+        );
+    }
+
+    #[test]
+    fn provision_breadcrumb_rollback_states_are_not_the_applied_prefix() {
+        // The rollback breadcrumbs must NOT read as an `applied…` state.
+        for state in [
+            "rolled-back: swap removed",
+            "rolled-back-partial: swap left active",
+        ] {
+            let s = provision_breadcrumb_write_script(state);
+            assert!(s.contains(&format!("echo \"{state}\"")), "{s}");
+            assert!(!state.starts_with("applied"), "{state}");
+        }
     }
 
     #[test]

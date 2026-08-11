@@ -229,6 +229,23 @@ else
     mark_fail "STEP2 k3s.service GOMEMLIMIT not set (grep of unit Environment + drop-in)"
 fi
 
+# `apprafter node status` renders GOMEMLIMIT via the CLI's OWN probe (not raw
+# systemctl). This CATCHES the 2.16 probe bug where systemd's single
+# `Environment=GOMEMLIMIT=…` key prefix made the probe report `unknown` despite
+# GOMEMLIMIT being set. Capture-to-var + bash-match (NEVER `| grep -q` under
+# pipefail — 2.16f lesson). Active target is node 1 (e2e) here.
+NS1=$("$APPRAFTER" node status 2>&1)
+printf '%s\n' "$NS1" >> "$NOTE" 2>&1
+if [[ "$NS1" == *GOMEMLIMIT*2GiB* ]]; then
+    ok "STEP2 node status GOMEMLIMIT rendered as 2GiB via the CLI probe (parse bug guard)"
+elif [[ "$NS1" == *GOMEMLIMIT*unknown* ]]; then
+    mark_fail "STEP2 node status GOMEMLIMIT=unknown — the CLI probe FAILED to parse systemd's Environment= key prefix"
+elif [[ "$NS1" == *GOMEMLIMIT* ]]; then
+    ok "STEP2 node status renders a non-unknown GOMEMLIMIT via the CLI probe"
+else
+    mark_fail "STEP2 node status did not surface a GOMEMLIMIT field at all"
+fi
+
 # ---- step-8 BEFORE snapshot (record while healthy) --------------------------
 { echo "===== BEFORE (step 8) ====="; echo "-- free -m --"; node_ssh "$IP" 'free -m';
   echo "-- swapon --show --"; node_ssh "$IP" 'swapon --show';
@@ -438,6 +455,27 @@ if timeout 1500 "$APPRAFTER" up; then
     { [ "${FSTAB_COUNT:-0}" -le 1 ] && [ "${SWAPON_COUNT:-0}" -le 1 ]; } 2>/dev/null \
         && ok "STEP5 node prep idempotent (single swapfile + single fstab line after 2nd run)" \
         || mark_fail "STEP5 node prep NOT idempotent (fstab=$FSTAB_COUNT active=$SWAPON_COUNT — a 2nd swapfile/line)"
+
+    # `apprafter node status` on the RETROFITTED node (active target e2e-retro):
+    # (a) GOMEMLIMIT must render via the CLI's OWN probe (parse-bug guard, as
+    #     STEP2 but on the retrofit path), and (b) `provision` must read
+    #     `applied (retrofit)` — NOT `unknown` — now that the retrofit drops the
+    #     provision breadcrumb. Capture-to-var + bash-match (never `| grep -q`).
+    NS5=$("$APPRAFTER" node status 2>&1)
+    printf '%s\n' "$NS5" >> "$NOTE" 2>&1
+    if [[ "$NS5" == *GOMEMLIMIT*unknown* ]] || [[ "$NS5" != *GOMEMLIMIT* ]]; then
+        mark_fail "STEP5 node status GOMEMLIMIT not rendered on the retrofit node (probe parse bug)"
+    else
+        ok "STEP5 node status renders a non-unknown GOMEMLIMIT on the retrofit node (CLI probe)"
+    fi
+    if [[ "$NS5" == *applied\ \(retrofit\)* ]]; then
+        ok "STEP5 node status provision=applied (retrofit) — retrofit breadcrumb dropped"
+    elif [[ "$NS5" == *provision*unknown* ]]; then
+        mark_fail "STEP5 node status provision=unknown on a retrofitted node — breadcrumb NOT written"
+    else
+        mark_fail "STEP5 node status provision breadcrumb missing 'applied (retrofit)' on the retrofit node"
+    fi
+
     ok "STEP5 hz.py will sweep BOTH nodes on cleanup (2 servers in the project)"
 else
     mark_fail "STEP5 retrofit `apprafter up` failed — retrofit + Q7 + idempotency UNTESTED"
