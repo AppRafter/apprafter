@@ -15,8 +15,10 @@
 #   5. retrofit + VPA-revert — a 2nd node with APPRAFTER_SKIP_NODE_SWAP=1 (no bake)
 #      → deploy pg → `apprafter node prep` → pre-existing container swap.max==0 →
 #      force a VPA resize → re-read swap.max (Q7) → re-run prep idempotent
-#   6. induced-failure rollback — SKIP-with-TODO: needs a test-only invalid-drop-in
-#      hook that does NOT yet exist in the CLI (see the step-6 block)
+#   6. induced-failure rollback — force an INVALID kubelet drop-in on the retrofit
+#      node 2 (undocumented APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN hook) → k3s
+#      restart fails → /readyz timeout → whole-step rollback → cluster returns →
+#      configz: swapBehavior GONE, failSwapOn:false STILL present (node 1 untouched)
 #   7. reboot persistence — reboot the throwaway node → swap reactivates from
 #      fstab + swappiness persists + a post-boot container gets swap.max=0
 #   8. record free/swapon/vmstat/configz before+after; cleanup both projects → 0
@@ -447,29 +449,92 @@ export HCLOUD_TOKEN="$TOKEN"   # restore node 1's token for the remaining steps 
 "$APPRAFTER" kubeconfig > "$KUBECONFIG" 2>/dev/null || true
 
 # =============================================================================
-printf '\n=== STEP 6: induced-failure rollback — SKIP (test-only invalid-drop-in hook MISSING) ===\n'
-# The design wants: inject an INVALID kubelet drop-in via a test-only builder hook
-# → `apprafter node prep` → k3s fails to come back → assert /readyz TIMEOUT → the
-# whole-step rollback runs → the cluster returns → configz shows `swapBehavior`
-# GONE while `failSwapOn:false` REMAINS; PLUS a stubbed-swapoff-failure case that
-# asserts `rm /swapfile` is NOT reached and swap+failSwapOn are LEFT with a runbook
-# line (design decision 5 / Q1).
+printf '\n=== STEP 6: induced-failure rollback (invalid drop-in → /readyz timeout → whole-step rollback) ===\n'
+# Inject an INVALID kubelet drop-in via the undocumented fault hook
+# (APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN — out of --help, like
+# APPRAFTER_SKIP_NODE_SWAP) → `apprafter node prep` → k3s fails to come back →
+# the /readyz poll TIMES OUT → the whole-step rollback runs → the cluster
+# returns → configz shows `swapBehavior` GONE while `failSwapOn:false` REMAINS
+# (the running config the rollback restarted k3s with keeps failSwapOn:false and
+# drops swapBehavior; the drop-in FILE is deleted last but does not re-take in
+# configz until the next restart). This exercises the P1/Q1 safety net — the
+# unit golden-tests cover the rollback SEQUENCER; this proves it on a LIVE node.
 #
-# TODO(2.16g): the CLI ships NO test-only hook to force an invalid drop-in. The
-# only node-swap env hook is APPRAFTER_SKIP_NODE_SWAP (turns swap OFF — the
-# opposite of what this step needs). There is no APPRAFTER_*_INVALID_DROPIN /
-# fault-injection seam in cli/platform-cli/src/commands/node_prep.rs, so this step
-# CANNOT run end-to-end on a real node yet. Deliberately marked SKIP (NOT silently
-# omitted — the no-silent-skip rule): the rollback STATE MACHINE is instead covered
-# by the unit golden-tests (design decision 5 / Q9 — the pure rollback sequencer +
-# `failSwapOn:false`-last ordering are asserted without a node). To make this step
-# live, add a test-only builder hook (e.g. APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN,
-# undocumented, out of --help) that writes a syntactically-invalid KubeletConfiguration
-# so the k3s restart times out and the rollback fires; then re-read configz here.
-printf '  SKIP: no test-only invalid-drop-in hook in the CLI (APPRAFTER_SKIP_NODE_SWAP is OFF-only).\n'
-printf '  SKIP: rollback state-machine covered by the unit golden-tests (decision 5 / Q9).\n'
-printf '  TODO(2.16g): add an undocumented APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN hook, then wire this step.\n'
-ok "STEP6 documented SKIP-with-TODO (rollback e2e blocked on a missing fault-injection hook)"
+# Node/ordering care: the rollback leaves the node SWAPLESS, which would break
+# STEP 7's reboot-swap-persistence if run on node 1. So STEP 6 targets the
+# RETROFIT node 2 (the OTHER-project node STEP 5 already provisioned + swap-prepped);
+# after the rollback it is DONE (cleanup sweeps the OTHER project). STEP 7's
+# reboot then runs on the still-swapful node 1. We NEVER run STEP 6 on node 1.
+if [ -z "$OTHER_TOKEN" ]; then
+    printf '  SKIP: OTHER_TOKEN unset — STEP 6 needs the retrofit node 2 from STEP 5 (OTHER project).\n'
+    ok "STEP6 SKIP (no OTHER_TOKEN → no node 2 to fault-inject; node 1 must NOT be used)"
+else
+    # Re-activate the retrofit target (node 2 in the OTHER project). STEP 5's tail
+    # switched the active target + token back to node 1 for steps 7-8; STEP 6 flips
+    # to node 2 for its duration and flips BACK at the end.
+    export HCLOUD_TOKEN="$OTHER_TOKEN"
+    "$APPRAFTER" target use e2e-retro >/dev/null 2>&1 || mark_fail "STEP6 target use e2e-retro"
+    "$APPRAFTER" kubeconfig > "$KUBECONFIG" 2>/dev/null || mark_fail "STEP6 retrofit kubeconfig"
+    R6NODE=$(node_name); R6IP=$(target_ipv4)
+    printf '  fault-inject target = node2 %s (%s)\n' "${R6NODE:-<none>}" "${R6IP:-<none>}"
+    if [ -z "$R6IP" ] || [ "$R6IP" = "$IP" ]; then
+        mark_fail "STEP6 could not resolve node2 (got '$R6IP', node1 is '$IP') — refusing to fault-inject node 1"
+    else
+        # Force the INVALID drop-in for this single `node prep` (unset the OFF-only
+        # SKIP hook so the swap step actually runs then fails on the bad drop-in).
+        printf '  running `node prep` with APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN=1 (expect /readyz timeout → rollback)...\n'
+        PREP_OUT=$(env -u APPRAFTER_SKIP_NODE_SWAP APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN=1 \
+            "$APPRAFTER" node prep --yes 2>&1)
+        PREP_RC=$?
+        printf '%s\n' "$PREP_OUT" | tail -12 | sed 's/^/    | /'
+
+        # `node prep` MUST fail (the invalid drop-in bricked the restart) — the
+        # rollback then makes it exit non-zero with the rolled-back diagnostic.
+        [ "$PREP_RC" -ne 0 ] && ok "STEP6 node prep exited non-zero (invalid drop-in → apply failed)" \
+            || mark_fail "STEP6 node prep exited 0 — the invalid drop-in did NOT brick the restart"
+
+        # The /readyz timeout must have been hit (the apply's recovery poll).
+        [[ "$PREP_OUT" == *"did not recover"* ]] && ok "STEP6 /readyz recovery timeout hit (k3s did not come back on the invalid drop-in)" \
+            || mark_fail "STEP6 no '/readyz recovery timeout' in prep output — restart may not have failed"
+
+        # The whole-step rollback must have run and RECOVERED (swapoff succeeded).
+        [[ "$PREP_OUT" == *"rolled back cleanly"* ]] && ok "STEP6 whole-step rollback ran and recovered cleanly" \
+            || mark_fail "STEP6 rollback did not report a clean recovery (see prep output above)"
+
+        # The cluster must be back: poll /readyz until it returns.
+        printf '  polling /readyz until the cluster returns post-rollback...\n'
+        r6back=0; deadline=$(( $(date +%s) + 240 ))
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            RZ=$(kubectl get --raw /readyz 2>/dev/null)
+            [ "$RZ" = "ok" ] && { r6back=1; break; }
+            sleep 10
+        done
+        [ "$r6back" -eq 1 ] && ok "STEP6 cluster returned after rollback (/readyz=ok)" || mark_fail "STEP6 /readyz did not return in 4m after rollback"
+
+        # Rollback correctness via configz (capture then bash-match — never grep -q):
+        # swapBehavior GONE, failSwapOn:false STILL present (the running config the
+        # rollback restarted k3s with keeps failSwapOn:false and dropped swapBehavior).
+        if [ "$r6back" -eq 1 ]; then
+            R6CZ=$(configz "$R6NODE")
+            R6FSW=$(printf '%s' "$R6CZ" | python3 -c "import json,sys;print(json.load(sys.stdin).get('kubeletconfig',{}).get('failSwapOn'))" 2>/dev/null)
+            R6SWB=$(printf '%s' "$R6CZ" | python3 -c "import json,sys;print(json.load(sys.stdin).get('kubeletconfig',{}).get('memorySwap',{}).get('swapBehavior'))" 2>/dev/null)
+            printf '  post-rollback configz failSwapOn=%s memorySwap.swapBehavior=%s\n' "$R6FSW" "$R6SWB"
+            { [ "$R6SWB" = "None" ] || [ -z "$R6SWB" ]; } && ok "STEP6 configz swapBehavior GONE after rollback" \
+                || mark_fail "STEP6 post-rollback configz swapBehavior=$R6SWB (expected gone/None)"
+            [ "$R6FSW" = "False" ] && ok "STEP6 configz failSwapOn:false STILL present after rollback (removed LAST, not while swap on)" \
+                || mark_fail "STEP6 post-rollback configz failSwapOn=$R6FSW (expected False)"
+            # The node is now swapless (rollback swapped off + removed the swapfile) — expected.
+            R6SWAP=$(node_ssh "$R6IP" 'swapon --show')
+            [[ "$R6SWAP" != *"/swapfile"* ]] && ok "STEP6 node2 left swapless after rollback (swapoff + rm /swapfile — expected)" \
+                || printf '  NOTE STEP6 node2 still shows /swapfile after a clean rollback (unexpected but non-fatal — node2 is disposable)\n'
+        fi
+        ok "STEP6 node2 fault-injection done — cleanup sweeps the OTHER project (node2 is disposable)"
+    fi
+    # Flip the active target + token BACK to node 1 for STEP 7 (reboot) + cleanup.
+    export HCLOUD_TOKEN="$TOKEN"
+    "$APPRAFTER" target use e2e >/dev/null 2>&1 || true
+    "$APPRAFTER" kubeconfig > "$KUBECONFIG" 2>/dev/null || true
+fi
 
 # =============================================================================
 printf '\n=== STEP 7: reboot persistence — swap reactivates from fstab + swappiness + CRI NoSwap ===\n'

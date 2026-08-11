@@ -259,14 +259,50 @@ pub fn reservations_only_script() -> String {
 // Swap apply — the drop-in write (Option A) + shared swap steps.
 // ===========================================================================
 
-/// Builds the remote script that writes the Option-A kubelet swap drop-in
-/// (design decision 2). `failSwapOn:false` is UNCONDITIONAL; `swapBehavior:
-/// NoSwap` only on `k8s_ge_134`. Written FIRST in the apply order so a
-/// swap-active-in-fstab / kubelet-refuses-start brick window never opens.
-///
-/// This does NOT swapon anything itself — it only lands the drop-in file.
-pub fn swap_dropin_write_script(k8s_ge_134: bool) -> String {
-    let body = swap_kubelet_dropin(k8s_ge_134);
+/// Undocumented fault-injection hook: `APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN`
+/// (set to ANY value, including empty). When present, the apply path writes a
+/// syntactically-INVALID `KubeletConfiguration` drop-in instead of the valid
+/// one, so the k3s restart FAILS → the `/readyz` poll times out → the existing
+/// whole-step rollback fires. It exists ONLY to make the walk's STEP 6 (the
+/// rollback safety net) executable on a live node (design decision 5 / Q1); it
+/// is intentionally NOT surfaced in `--help`, exactly like [`SKIP_NODE_SWAP_ENV`].
+pub const FORCE_INVALID_DROPIN_ENV: &str = "APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN";
+
+/// `true` when the [`FORCE_INVALID_DROPIN_ENV`] fault hook is set (any value).
+fn force_invalid_dropin() -> bool {
+    std::env::var_os(FORCE_INVALID_DROPIN_ENV).is_some()
+}
+
+/// A deliberately-BROKEN kubelet drop-in body used ONLY by the
+/// [`FORCE_INVALID_DROPIN_ENV`] fault hook. The `apiVersion` is bogus so the
+/// kubelet rejects the config and k3s fails to come back up — driving the
+/// `/readyz` timeout that the whole-step rollback recovers from. It keeps the
+/// `kind: KubeletConfiguration` so it lands in the same code path, but its
+/// group/version is nonexistent and it carries an unparseable field.
+fn invalid_swap_kubelet_dropin() -> String {
+    // A nonexistent apiVersion group + a field that is not a valid kubelet
+    // config key — the kubelet's strict decoder refuses both.
+    "apiVersion: apprafter.invalid/v0\n\
+     kind: KubeletConfiguration\n\
+     thisFieldDoesNotExist: {{{not-yaml\n"
+        .to_string()
+}
+
+/// The drop-in body the apply path writes — the valid
+/// [`swap_kubelet_dropin`], UNLESS `force_invalid` forces the invalid body
+/// (walk STEP 6, Q1). Pure over its `force_invalid` input so the fault path is
+/// unit-testable without touching the environment.
+fn swap_dropin_body(k8s_ge_134: bool, force_invalid: bool) -> String {
+    if force_invalid {
+        invalid_swap_kubelet_dropin()
+    } else {
+        swap_kubelet_dropin(k8s_ge_134)
+    }
+}
+
+/// Wraps a drop-in `body` in the Option-A write script (mkdir + quoted-heredoc
+/// `cat >` into [`SWAP_KUBELET_DROPIN_PATH`]).
+fn dropin_write_script_for_body(body: &str) -> String {
     format!(
         "set -e\n\
          mkdir -p \"$(dirname {path})\"\n\
@@ -276,6 +312,29 @@ pub fn swap_dropin_write_script(k8s_ge_134: bool) -> String {
         path = SWAP_KUBELET_DROPIN_PATH,
         body = body,
     )
+}
+
+/// Builds the remote script that writes the VALID Option-A kubelet swap drop-in
+/// (design decision 2). `failSwapOn:false` is UNCONDITIONAL; `swapBehavior:
+/// NoSwap` only on `k8s_ge_134`. Written FIRST in the apply order so a
+/// swap-active-in-fstab / kubelet-refuses-start brick window never opens.
+///
+/// This does NOT swapon anything itself — it only lands the drop-in file. It is
+/// ALWAYS the valid body — the [`FORCE_INVALID_DROPIN_ENV`] fault hook only
+/// perturbs the INITIAL apply write ([`swap_dropin_write_script_apply`]); the
+/// rollback's rewrite MUST stay valid so recovery works, so it goes through
+/// this builder.
+pub fn swap_dropin_write_script(k8s_ge_134: bool) -> String {
+    dropin_write_script_for_body(&swap_dropin_body(k8s_ge_134, false))
+}
+
+/// The INITIAL-apply drop-in write. Identical to [`swap_dropin_write_script`]
+/// EXCEPT that it honours the undocumented [`FORCE_INVALID_DROPIN_ENV`] fault
+/// hook: when set, it writes a deliberately-invalid body so the k3s restart
+/// fails and the whole-step rollback fires (walk STEP 6 rollback e2e, Q1). Only
+/// the first write of the apply path uses this — the rollback rewrite does not.
+pub fn swap_dropin_write_script_apply(k8s_ge_134: bool) -> String {
+    dropin_write_script_for_body(&swap_dropin_body(k8s_ge_134, force_invalid_dropin()))
 }
 
 // ===========================================================================
@@ -602,7 +661,10 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
     // (1) Reservations (files only — the umbrella owns the single restart).
     runner.run(host, &reservation_files_script())?;
     // (2) Swap drop-in FIRST (failSwapOn:false unconditional; NoSwap ≥1.34).
-    runner.run(host, &swap_dropin_write_script(k8s_ge_134))?;
+    //     The `_apply` variant honours the undocumented FORCE_INVALID_DROPIN_ENV
+    //     fault hook (walk STEP 6 rollback e2e); the rollback rewrite below
+    //     stays valid so recovery works.
+    runner.run(host, &swap_dropin_write_script_apply(k8s_ge_134))?;
     // (3) The shared swap steps (swappiness → dd → mkswap → swapon → inline
     //     cgroup swap.max=0 → fstab). Read MemTotal off the node first so
     //     the shared retrofit builder can pin the count.
@@ -1579,6 +1641,66 @@ mod tests {
             !s0.contains("swapBehavior"),
             "<1.34 must not emit swapBehavior\n{s0}"
         );
+    }
+
+    // ---- fault-injection hook (walk STEP 6 rollback e2e, Q1) ------------
+
+    #[test]
+    fn swap_dropin_body_force_invalid_emits_bogus_kubelet_config() {
+        // With force_invalid set, the body is a syntactically-INVALID
+        // KubeletConfiguration (bogus apiVersion + unparseable field) so the
+        // kubelet rejects it and k3s fails to restart → rollback fires.
+        let bad = swap_dropin_body(true, true);
+        assert!(bad.contains("kind: KubeletConfiguration"), "{bad}");
+        // The apiVersion is a nonexistent group (not kubelet.config.k8s.io).
+        assert!(
+            !bad.contains("kubelet.config.k8s.io"),
+            "invalid body must NOT carry the real kubelet apiVersion group\n{bad}"
+        );
+        assert!(bad.contains("apprafter.invalid/v0"), "{bad}");
+        // And it is NOT the valid body.
+        assert_ne!(bad, swap_kubelet_dropin(true));
+        assert_ne!(bad, swap_kubelet_dropin(false));
+
+        // Without the hook, the body is the normal valid drop-in.
+        assert_eq!(swap_dropin_body(true, false), swap_kubelet_dropin(true));
+        assert_eq!(swap_dropin_body(false, false), swap_kubelet_dropin(false));
+    }
+
+    #[test]
+    fn apply_write_honours_force_invalid_env_but_rollback_write_stays_valid() {
+        // The undocumented APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN hook makes
+        // the INITIAL-apply write emit the invalid body; the rollback-rewrite
+        // builder (swap_dropin_write_script) stays VALID regardless, so
+        // recovery is never sabotaged by the fault hook still being set.
+        let saved = std::env::var_os(FORCE_INVALID_DROPIN_ENV);
+        std::env::set_var(FORCE_INVALID_DROPIN_ENV, "1");
+
+        let apply = swap_dropin_write_script_apply(true);
+        assert!(
+            apply.contains("apprafter.invalid/v0"),
+            "apply write must honour the fault hook and emit the invalid body\n{apply}"
+        );
+        assert!(
+            !apply.contains("swapBehavior: NoSwap"),
+            "the invalid apply body must NOT be the valid NoSwap drop-in\n{apply}"
+        );
+
+        // The rollback-rewrite builder is ALWAYS valid, even with the hook set.
+        let rollback_write = swap_dropin_write_script(true);
+        assert!(
+            rollback_write.contains("failSwapOn: false"),
+            "rollback write must stay a valid drop-in even under the fault hook\n{rollback_write}"
+        );
+        assert!(
+            !rollback_write.contains("apprafter.invalid"),
+            "rollback write must NEVER emit the invalid body\n{rollback_write}"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var(FORCE_INVALID_DROPIN_ENV, v),
+            None => std::env::remove_var(FORCE_INVALID_DROPIN_ENV),
+        }
     }
 
     // ---- (d) node status pure renderer (design decision 6) --------------
