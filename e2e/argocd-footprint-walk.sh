@@ -111,7 +111,13 @@ wait_env_on() {  # <workload-name-obj> <needle> <deadline-secs>
     local obj="$1" needle="$2" deadline; deadline=$(( $(date +%s) + "${3:-180}" ))
     [ -z "$obj" ] && return 1
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        kubectl -n argocd get "$obj" -o json 2>/dev/null | grep -q "$needle" && return 0
+        # Capture then bash-match — NOT `kubectl -o json | grep -q`: under `set -o
+        # pipefail`, grep -q matches EARLY on the large STS JSON, closes the pipe,
+        # SIGPIPEs kubectl (141), and pipefail reports the whole pipeline FAILED →
+        # a false-negative even though the env IS present (DIAG proved it every run;
+        # the small-output exclusions `grep -q` escaped it by finishing before grep).
+        local out; out=$(kubectl -n argocd get "$obj" -o json 2>/dev/null)
+        [[ "$out" == *"$needle"* ]] && return 0
         sleep 15
     done
     return 1
@@ -223,8 +229,8 @@ for p in d.get('items',[]):
 }
 
 assert_tuning_present() {  # exclusions in argocd-cm + env on the two workloads
-    kubectl -n argocd get cm argocd-cm -o jsonpath='{.data.resource\.exclusions}' 2>/dev/null | grep -q 'CiliumIdentity' \
-        && ok "argocd-cm carries resource.exclusions" || mark_fail "resource.exclusions absent from argocd-cm"
+    local excl; excl=$(kubectl -n argocd get cm argocd-cm -o jsonpath='{.data.resource\.exclusions}' 2>/dev/null)
+    [[ "$excl" == *CiliumIdentity* ]] && ok "argocd-cm carries resource.exclusions" || mark_fail "resource.exclusions absent from argocd-cm"
     # The STS/Deployment env roll is async after the rc sync — POLL, don't one-shot.
     local sc; sc=$(sts_appctrl)
     if wait_env_on "$sc" GOMEMLIMIT 600; then ok "app-controller carries GOMEMLIMIT/GOGC env"; else

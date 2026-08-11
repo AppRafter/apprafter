@@ -9,6 +9,12 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.53 — 2.16f Argo CD footprint tuning (2026-08-11, dogfood-validated)
+
+**Changed (platform-stack `component_argocd.cue`, chart-values only, change=safe):** the Argo CD component now sets `GOMEMLIMIT`/`GOGC` env on the app-controller (256MiB) + repo-server (128MiB), `resource.exclusions` in `argocd-cm` (Endpoints/Event + events.k8s.io/Event, EndpointSlice, Lease, metrics.k8s.io/*, cilium.io CiliumIdentity/CiliumEndpoint, autoscaling.k8s.io/VerticalPodAutoscalerCheckpoint — kind-scoped, keeps CiliumNetworkPolicy), and `applicationSet.replicas: 0` (drops the unused applicationset-controller; 7.7.7 has no `enabled` gate, `replicas:0` under `prune:false` avoids an orphan). Released as `platform-stack/v0.2.53` (+ a `0.2.53-rc.1` walk-vehicle prerelease). No operator / cue-cmp / CLI change; no monorepo tag.
+
+**Validated on the real worn-in dogfood** (upgrade 0.2.46→0.2.53): app-controller working set **344→208Mi (−40%)**, CPU **131→15m**, applicationset pod gone, 208 < the 256Mi GOMEMLIMIT cap. A throwaway real-Hetzner walk confirmed the fresh-install SSA convergence (helm writes `replicas:1`, Argo server-side-applies `0` → 0/0) + delivery + no-regression. Fresh-cluster app-controller RSS is noisy (~206Mi even pre-tuning) — the memory win is a worn-in property (GOMEMLIMIT caps long-term growth), so the throwaway walk gates delivery+no-regression while the RSS reduction is validated on the dogfood. The `controller.requests.memory` re-pin (288→~180-200Mi) is a follow-up ps bump from the settled dogfood measurement. See `docs/measurements/2.16f-argocd-footprint-2026-08-11.md`.
+
 ## operator/webhook v0.2.41 / cue-cmp 0.1.21 / platform-stack 0.2.52 / cli 0.2.39 — 2.16e VPA vertical autoscaling (2026-08-10, live-walk GREEN)
 
 > Initial cut shipped as op v0.2.39 / cue-cmp 0.1.20 / ps 0.2.49 / cli 0.2.39.
