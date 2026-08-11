@@ -527,6 +527,84 @@ mod tests {
         assert!(yaml.contains("get.k3s.io"));
     }
 
+    // All swap-eligibility cases live in ONE test: they mutate the
+    // process-wide `APPRAFTER_SKIP_NODE_SWAP` env var, so splitting them into
+    // separate `#[test]`s would let cargo's parallel runner race the var
+    // (exactly the hazard cli-core's TEST_ENV_MUTEX guards against). Save +
+    // restore once, run the three cases sequentially.
+    #[test]
+    fn build_server_spec_threads_swap_eligibility_from_node_count_and_env() {
+        let saved = std::env::var("APPRAFTER_SKIP_NODE_SWAP").ok();
+
+        // (1) Single control-plane node ⇒ eligible ⇒ SKIP_START + swap baked.
+        std::env::remove_var("APPRAFTER_SKIP_NODE_SWAP");
+        let single = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "solo"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "nodes": [{"role": "control-plane", "type": "cpx22", "count": 1}]
+            }
+        }));
+        let yaml = build_server_spec(Some(&single), "solo", "nbg1")
+            .user_data
+            .expect("user_data");
+        assert!(
+            yaml.contains("INSTALL_K3S_SKIP_START=true"),
+            "single-node ⇒ swap-eligible SKIP_START install\n{yaml}"
+        );
+        assert!(
+            yaml.contains("/var/lib/apprafter/swap-provision.status"),
+            "swap breadcrumb baked for a single-node cluster\n{yaml}"
+        );
+
+        // (2) Total node count > 1 ⇒ NOT single-node ⇒ swap NOT baked.
+        let multi = manifest_from(json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "multi"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "nodes": [
+                    {"role": "control-plane", "type": "cpx22", "count": 1},
+                    {"role": "worker", "type": "cpx22", "count": 2}
+                ]
+            }
+        }));
+        let yaml = build_server_spec(Some(&multi), "multi", "nbg1")
+            .user_data
+            .expect("user_data");
+        assert!(
+            !yaml.contains("INSTALL_K3S_SKIP_START"),
+            "multi-node ⇒ one-shot install, no swap bootstrap\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("/swapfile"),
+            "multi-node must not bake swap\n{yaml}"
+        );
+
+        // (3) The undocumented env hook wins over the single-node default.
+        std::env::set_var("APPRAFTER_SKIP_NODE_SWAP", "1");
+        let yaml = build_server_spec(None, "solo", "nbg1")
+            .user_data
+            .expect("user_data");
+        assert!(
+            !yaml.contains("INSTALL_K3S_SKIP_START"),
+            "APPRAFTER_SKIP_NODE_SWAP must force the one-shot (no-swap) install\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("/swapfile"),
+            "APPRAFTER_SKIP_NODE_SWAP must suppress the swap script\n{yaml}"
+        );
+
+        // Restore whatever the outer environment had.
+        match saved {
+            Some(v) => std::env::set_var("APPRAFTER_SKIP_NODE_SWAP", v),
+            None => std::env::remove_var("APPRAFTER_SKIP_NODE_SWAP"),
+        }
+    }
+
     #[test]
     fn build_floating_ip_specs_is_empty_when_no_floating_ips_declared() {
         assert!(build_floating_ip_specs(None, "cl", "nbg1").is_empty());

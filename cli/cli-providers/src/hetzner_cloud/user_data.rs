@@ -264,12 +264,22 @@ pub fn swap_enable_script(mem_total_kib: u64, k8s_ge_134: bool, cgroup_v2: bool)
     }
 
     // count = min(MemTotal_MiB, 8Gi). MemTotal is in KiB; 1 MiB = 1024 KiB.
+    // The retrofit path KNOWS MemTotal at build time (it was read off the live
+    // node before building the script), so it pins the count as a literal.
     let mem_total_mib = mem_total_kib / 1024;
     let count = mem_total_mib.min(SWAP_MAX_MIB);
 
-    // The 2.6c floor as a whole percentage for the human-readable message.
-    let min_free_pct = (SWAP_MIN_FREE_DISK_FRACTION * 100.0) as u64;
+    let mut s = String::new();
+    s.push_str(&swap_script_header());
+    s.push_str(&format!("SWAP_COUNT_MIB={count}\n"));
+    s.push('\n');
+    s.push_str(&swap_steps_body());
+    Some(s)
+}
 
+/// The `#!/bin/sh` header + the "no `set -e`" contract comment, shared by
+/// the retrofit ([`swap_enable_script`]) and the bootstrap in-shell variant.
+fn swap_script_header() -> String {
     // Built by concatenation (not a `\`-continued literal) for the same
     // reason as `build_k3s_user_data`: Rust's line-continuation escape
     // eats leading whitespace, and this script's shell indentation is
@@ -281,8 +291,33 @@ pub fn swap_enable_script(mem_total_kib: u64, k8s_ge_134: bool, cgroup_v2: bool)
     s.push_str("# AppRafter 2.16g: provision host swap + NoSwap-friendly kubelet.\n");
     s.push_str("# NOTE: intentionally no `set -e` — the pod-cgroup swap.max loop\n");
     s.push_str("# tolerates ENOENT/EBUSY per file and must not abort the caller.\n");
-    s.push_str(&format!("SWAP_COUNT_MIB={count}\n"));
-    s.push('\n');
+    s
+}
+
+/// Emits the shell that reads `MemTotal` from `/proc/meminfo` AT RUNTIME and
+/// sets `SWAP_COUNT_MIB=min(MemTotal_MiB, 8192)` in-shell. Used by the
+/// bootstrap path, which — unlike the retrofit — cannot know the node's RAM at
+/// build time (design decision 2 / P13: derive count from `/proc/meminfo`).
+fn swap_count_from_meminfo() -> String {
+    let mut s = String::new();
+    s.push_str("# Read MemTotal (KiB) from /proc/meminfo → MiB → cap at 8Gi.\n");
+    s.push_str("MEM_TOTAL_KIB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)\n");
+    s.push_str("SWAP_COUNT_MIB=$((MEM_TOTAL_KIB / 1024))\n");
+    s.push_str(&format!(
+        "if [ \"$SWAP_COUNT_MIB\" -gt {SWAP_MAX_MIB} ]; then SWAP_COUNT_MIB={SWAP_MAX_MIB}; fi\n"
+    ));
+    s
+}
+
+/// The swap provisioning steps (a)–(g), shared VERBATIM by the retrofit and
+/// the bootstrap. `SWAP_COUNT_MIB` must already be assigned by the caller
+/// (build-time literal for the retrofit, in-shell `/proc/meminfo` read for the
+/// bootstrap) — the single point of divergence between the two paths.
+fn swap_steps_body() -> String {
+    // The 2.6c floor as a whole percentage for the human-readable message.
+    let min_free_pct = (SWAP_MIN_FREE_DISK_FRACTION * 100.0) as u64;
+
+    let mut s = String::new();
 
     // (a) Disk pre-check: refuse if free-after-swapfile < 15% of the disk.
     // `df -Pk /` → 1K-blocks; POSIX `-P` guarantees a single data line.
@@ -350,7 +385,102 @@ capacity floor (${{MIN_FREE_KIB}}KiB of ${{DISK_TOTAL_KIB}}KiB)\" >&2\n"
     s.push_str("  echo '/swapfile none swap sw,nofail 0 0' >> /etc/fstab\n");
     s.push_str("fi\n");
 
-    Some(s)
+    s
+}
+
+/// Absolute path of the FAIL-SOFT breadcrumb the bootstrap swap block drops on
+/// any failure (design decision 2 / Q2). `apprafter node status` reads it to
+/// tell "swap step failed at provision" apart from "ineligible". Its presence
+/// after a boot means the swap block ran and failed but the node was still
+/// started (the cushionless-but-working guarantee).
+pub const SWAP_PROVISION_STATUS_PATH: &str = "/var/lib/apprafter/swap-provision.status";
+
+/// Absolute path of the bootstrap swap script shipped via `write_files` and
+/// invoked FAIL-SOFT from `runcmd`. Shipping it as a file (not an inline
+/// `runcmd` one-liner) sidesteps all the nested-quoting hazards — the script's
+/// bodies use single-quoted `awk`/`find`/`grep` patterns that a one-line
+/// `sh -c '…'` runcmd entry could not carry. cloud-init runs `write_files`
+/// before `runcmd`, so the file is present when the runcmd invokes it.
+pub const SWAP_PROVISION_SCRIPT_PATH: &str = "/var/lib/apprafter/provision-swap.sh";
+
+/// Renders the bootstrap swap SCRIPT body (written verbatim to
+/// [`SWAP_PROVISION_SCRIPT_PATH`] via `write_files`). It runs AT RUNTIME on the
+/// node: reads the k8s version off the SKIP_START-installed `k3s` binary
+/// (≥1.34?) and cgroup v2 via `stat -fc %T /sys/fs/cgroup`; on an ineligible
+/// gate it drops the breadcrumb and exits 0 (skip, not fail); when eligible it
+/// writes the Option-A kubelet drop-in and runs the swap steps (a)–(g) with the
+/// count derived in-shell from `/proc/meminfo`. Pure and side-effect-free.
+///
+/// FAIL-SOFT is the CALLER's job: [`build_k3s_user_data`] invokes this script
+/// from `runcmd` guarded so any non-zero exit only logs + records the
+/// [`SWAP_PROVISION_STATUS_PATH`] breadcrumb and never aborts the runcmd
+/// (design decision 2 / Q2), so `systemctl start k3s` still runs after it.
+fn build_bootstrap_swap_script() -> String {
+    let mut body = String::new();
+    body.push_str(&swap_script_header());
+    body.push('\n');
+
+    // Ensure the breadcrumb directory exists (best-effort).
+    body.push_str("mkdir -p /var/lib/apprafter 2>/dev/null || true\n");
+    body.push('\n');
+
+    // --- Runtime gate (design decision 2). Both must pass or we skip swap. ---
+    body.push_str("# Gate (a): kubelet/k8s version >=1.34 read off the SKIP_START binary.\n");
+    body.push_str("K3S_VER=$(k3s --version 2>/dev/null | awk '/k3s version/ {print $3}')\n");
+    // Strip a leading `v`, then compare major.minor numerically (1.34+).
+    body.push_str("K3S_MAJOR=$(echo \"$K3S_VER\" | sed 's/^v//' | cut -d. -f1)\n");
+    body.push_str("K3S_MINOR=$(echo \"$K3S_VER\" | sed 's/^v//' | cut -d. -f2)\n");
+    body.push('\n');
+    body.push_str("# Gate (b): cgroup v2 -- memory.swap.max is a v2-only knob.\n");
+    body.push_str("CGROUP_FS=$(stat -fc %T /sys/fs/cgroup 2>/dev/null)\n");
+    body.push('\n');
+
+    body.push_str(
+        "if [ -z \"$K3S_MAJOR\" ] || [ -z \"$K3S_MINOR\" ] || \
+[ \"$K3S_MAJOR\" -lt 1 ] || { [ \"$K3S_MAJOR\" -eq 1 ] && [ \"$K3S_MINOR\" -lt 34 ]; }; then\n",
+    );
+    body.push_str(
+        "  echo \"apprafter: swap ineligible -- k3s $K3S_VER < 1.34 (NoSwap GA gate); skipping swap, node starts cushionless\" >&2\n",
+    );
+    body.push_str(&format!(
+        "  echo \"ineligible: k3s $K3S_VER < 1.34\" > {SWAP_PROVISION_STATUS_PATH} 2>/dev/null || true\n"
+    ));
+    body.push_str("  exit 0\n");
+    body.push_str("fi\n");
+    body.push_str("if [ \"$CGROUP_FS\" != \"cgroup2fs\" ]; then\n");
+    body.push_str(
+        "  echo \"apprafter: swap ineligible -- /sys/fs/cgroup is not cgroup v2 ($CGROUP_FS); skipping swap, node starts cushionless\" >&2\n",
+    );
+    body.push_str(&format!(
+        "  echo \"ineligible: cgroup $CGROUP_FS != cgroup2fs\" > {SWAP_PROVISION_STATUS_PATH} 2>/dev/null || true\n"
+    ));
+    body.push_str("  exit 0\n");
+    body.push_str("fi\n");
+    body.push('\n');
+
+    // --- Eligible: write the Option-A kubelet drop-in (>=1.34 → NoSwap). ---
+    body.push_str("# Write the Option-A kubelet drop-in (failSwapOn:false + NoSwap >=1.34).\n");
+    body.push_str(&format!(
+        "mkdir -p \"$(dirname {SWAP_KUBELET_DROPIN_PATH})\"\n"
+    ));
+    // Heredoc the drop-in body (k8s_ge_134 is TRUE here — the gate guaranteed it).
+    body.push_str(&format!(
+        "cat > {SWAP_KUBELET_DROPIN_PATH} <<'APPRAFTER_KUBELET_EOF'\n"
+    ));
+    body.push_str(&swap_kubelet_dropin(true));
+    body.push_str("APPRAFTER_KUBELET_EOF\n");
+    body.push('\n');
+
+    // --- Run the swap steps: count from /proc/meminfo (in-shell), then a–g. ---
+    body.push_str(&swap_count_from_meminfo());
+    body.push('\n');
+    body.push_str(&swap_steps_body());
+    body.push('\n');
+    body.push_str(&format!(
+        "echo \"applied: swap $SWAP_COUNT_MIB MiB\" > {SWAP_PROVISION_STATUS_PATH} 2>/dev/null || true\n"
+    ));
+
+    body
 }
 
 pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
@@ -393,12 +523,46 @@ pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
         &k3s_reservation_config(),
     ));
     out.push_str(&write_files_entry(K3S_OOM_DROPIN_PATH, K3S_OOM_DROPIN));
+    // 2.16g: on a swap-eligible node, ship the FAIL-SOFT swap script alongside
+    // the reservation files. It runs from `runcmd` after the SKIP_START install
+    // but before `systemctl start k3s` (design decision 2). Executable so the
+    // runcmd can invoke it directly.
+    if opts.swap_eligible {
+        out.push_str(&write_files_entry_mode(
+            SWAP_PROVISION_SCRIPT_PATH,
+            &build_bootstrap_swap_script(),
+            "0755",
+        ));
+    }
     out.push_str("runcmd:\n");
     out.push_str("  - systemctl enable --now fail2ban\n");
-    out.push_str(&format!(
-        "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
-    ));
-    out.push_str("  - systemctl daemon-reload\n");
+
+    if opts.swap_eligible {
+        // Swap-eligible flow (design decision 2 / Q2):
+        // 1. Install with SKIP_START — binary + unit present, NOT started; the
+        //    unit is still `enable`d, so `systemctl start k3s` below suffices
+        //    (Q13 — NOT `enable --now`).
+        out.push_str(&format!(
+            "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
+        ));
+        out.push_str("  - systemctl daemon-reload\n");
+        // 2. Run the FAIL-SOFT swap block: a non-zero exit only logs + records
+        //    the breadcrumb, never aborts the runcmd (`|| { … }` swallows it).
+        out.push_str(&format!(
+            "  - 'sh {SWAP_PROVISION_SCRIPT_PATH} || {{ echo \"apprafter: swap provisioning failed; node will start cushionless\" >&2; echo \"failed: swap step errored at provision\" > {SWAP_PROVISION_STATUS_PATH} 2>/dev/null || true; }}'\n"
+        ));
+        // 3. Start k3s UNCONDITIONALLY — a swap failure (or gate-skip) must
+        //    leave a WORKING cushionless node, never an unstarted one (Q2).
+        out.push_str("  - systemctl start k3s\n");
+    } else {
+        // Ineligible (T2+ / env-skip): the pre-2.16g one-shot install — the
+        // install script starts k3s itself. Reservations + OOM drop-in still
+        // apply (they ship via write_files above, unconditionally).
+        out.push_str(&format!(
+            "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
+        ));
+        out.push_str("  - systemctl daemon-reload\n");
+    }
     out
 }
 
@@ -406,9 +570,16 @@ pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
 /// permissions + a `content: |` block literal). `body` is emitted
 /// verbatim as a block scalar indented one level under `content`.
 fn write_files_entry(path: &str, body: &str) -> String {
+    write_files_entry_mode(path, body, "0644")
+}
+
+/// Like [`write_files_entry`] but with an explicit octal `permissions`
+/// string — the swap provisioning script ships `0755` so `runcmd` can
+/// invoke it directly.
+fn write_files_entry_mode(path: &str, body: &str, permissions: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!("  - path: {path}\n"));
-    out.push_str("    permissions: '0644'\n");
+    out.push_str(&format!("    permissions: '{permissions}'\n"));
     out.push_str("    content: |\n");
     // Block-scalar lines are indented 6 spaces — two levels past the
     // `- ` item marker (col 0..2) and the `content:` key (col 4).
@@ -590,6 +761,146 @@ mod tests {
             Some(v) => std::env::set_var("APPRAFTER_SKIP_NODE_SWAP", v),
             None => std::env::remove_var("APPRAFTER_SKIP_NODE_SWAP"),
         }
+    }
+
+    // ---- 2.16g bootstrap swap flow --------------------------------------
+
+    #[test]
+    fn bootstrap_installs_with_skip_start_when_swap_eligible() {
+        let ud = build_k3s_user_data(&K3sBootstrapOptions {
+            dual_stack: true,
+            swap_eligible: true,
+        });
+        assert!(
+            ud.contains("INSTALL_K3S_SKIP_START=true"),
+            "swap-eligible install must SKIP_START so the swap block runs before first kubelet start\n{ud}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_gates_swap_on_version_and_cgroup_at_runtime() {
+        let ud = build_k3s_user_data(&K3sBootstrapOptions {
+            dual_stack: true,
+            swap_eligible: true,
+        });
+        // Version gate read AT RUNTIME on the node off the SKIP_START binary.
+        assert!(
+            ud.contains("k3s --version"),
+            "swap block must read the k8s version at runtime via `k3s --version`\n{ud}"
+        );
+        // cgroup v2 gate: stat -fc %T /sys/fs/cgroup == cgroup2fs.
+        assert!(
+            ud.contains("cgroup2fs"),
+            "swap block must gate on cgroup v2 (cgroup2fs)\n{ud}"
+        );
+        // MemTotal read in-shell (bootstrap can't know it at build time).
+        assert!(
+            ud.contains("/proc/meminfo") || ud.contains("MemTotal"),
+            "swap block must read MemTotal at runtime from /proc/meminfo\n{ud}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_swap_block_is_fail_soft_with_breadcrumb() {
+        let ud = build_k3s_user_data(&K3sBootstrapOptions {
+            dual_stack: true,
+            swap_eligible: true,
+        });
+        // Breadcrumb marker so `node status` can distinguish
+        // "swap step failed at provision" from "ineligible" (Q2).
+        assert!(
+            ud.contains("/var/lib/apprafter/swap-provision.status"),
+            "a swap failure must drop the breadcrumb marker file\n{ud}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_writes_the_kubelet_dropin_and_swap_logic_when_eligible() {
+        let ud = build_k3s_user_data(&K3sBootstrapOptions {
+            dual_stack: true,
+            swap_eligible: true,
+        });
+        // The kubelet drop-in Option-A managed path is written.
+        assert!(
+            ud.contains(SWAP_KUBELET_DROPIN_PATH),
+            "swap block must write the kubelet drop-in to the Option-A path\n{ud}"
+        );
+        assert!(
+            ud.contains("failSwapOn: false"),
+            "kubelet drop-in body must set failSwapOn:false\n{ud}"
+        );
+        // The swapfile logic (reused from Task 1) must be present.
+        assert!(ud.contains("mkswap /swapfile"), "{ud}");
+        assert!(ud.contains("swapon /swapfile"), "{ud}");
+        assert!(ud.contains("vm.swappiness=10"), "{ud}");
+        assert!(
+            ud.contains("/swapfile none swap sw,nofail 0 0"),
+            "swap block must persist the fstab entry\n{ud}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_starts_k3s_unconditionally_after_the_swap_block() {
+        let ud = build_k3s_user_data(&K3sBootstrapOptions {
+            dual_stack: true,
+            swap_eligible: true,
+        });
+        // A swap failure (or gate-skip) must leave a WORKING node — so the
+        // unit is started unconditionally AFTER the fail-soft swap block (Q2).
+        let start_idx = ud
+            .find("systemctl start k3s")
+            .expect("must start k3s explicitly (SKIP_START leaves the unit enabled)");
+        let swap_marker_idx = ud
+            .find("/var/lib/apprafter/swap-provision.status")
+            .expect("swap block present");
+        assert!(
+            swap_marker_idx < start_idx,
+            "systemctl start k3s must come AFTER the fail-soft swap block\n{ud}"
+        );
+        // Q13: NOT `enable --now` — the unit is already enabled by SKIP_START.
+        assert!(
+            !ud.contains("systemctl enable --now k3s"),
+            "must not `enable --now` k3s — the unit is already enabled by SKIP_START\n{ud}"
+        );
+    }
+
+    #[test]
+    fn ineligible_bootstrap_has_no_swap_tokens_but_keeps_reservations_and_starts_node() {
+        let ud = build_k3s_user_data(&K3sBootstrapOptions {
+            dual_stack: true,
+            swap_eligible: false,
+        });
+        // No swap machinery at all.
+        assert!(
+            !ud.contains("/swapfile"),
+            "no swapfile when ineligible\n{ud}"
+        );
+        assert!(
+            !ud.contains("vm.swappiness"),
+            "no swappiness tuning when ineligible\n{ud}"
+        );
+        assert!(
+            !ud.contains(SWAP_KUBELET_DROPIN_PATH),
+            "no kubelet swap drop-in when ineligible\n{ud}"
+        );
+        assert!(
+            !ud.contains("/var/lib/apprafter/swap-provision.status"),
+            "no swap breadcrumb when ineligible\n{ud}"
+        );
+        // Reservations are UNCONDITIONAL.
+        assert!(ud.contains("system-reserved=memory=1500Mi"), "{ud}");
+        assert!(ud.contains("OOMScoreAdjust=-999"), "{ud}");
+        // The node still comes up — k3s ends up running either way. The
+        // ineligible path uses the pre-2.16g one-shot install (NO SKIP_START),
+        // so the install script starts k3s itself — no explicit start needed.
+        assert!(
+            ud.contains("get.k3s.io"),
+            "k3s must still install when ineligible\n{ud}"
+        );
+        assert!(
+            !ud.contains("INSTALL_K3S_SKIP_START"),
+            "ineligible path must use the one-shot install that starts k3s itself\n{ud}"
+        );
     }
 
     // ---- 2.16g swap builders --------------------------------------------
