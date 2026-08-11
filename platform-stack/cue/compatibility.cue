@@ -1760,6 +1760,26 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.53": {
+	change:          "safe"
+	operatorVersion: "v0.2.41"
+	notes: """
+		2.16f Argo CD footprint tuning — STABLE (promotes the 0.2.53-rc.1 tuning;
+		byte-identical chart values). Argocd component: GOMEMLIMIT/GOGC env on the
+		app-controller (256MiB) + repo-server (128MiB), `resource.exclusions` in
+		argocd-cm (Endpoints/Event/EndpointSlice/Lease/metrics.*/Cilium identity+
+		endpoint/VPACheckpoint), and applicationSet.replicas:0 (7.7.7 has no
+		`enabled` gate). Values-only, change=safe (Argo auto-syncs; the argocd pods
+		roll). Live walks confirmed the env reaches both workloads + CPU dropped
+		15.5m->4.4m; the app-controller RSS reduction (the GOMEMLIMIT cap on the
+		worn-in ~359Mi growth -> <=256) is a worn-in property validated on the real
+		dogfood, so the controller-request re-pin is DEFERRED to that measurement
+		(request stays 288Mi here — a safe over-reservation). See
+		docs/measurements/2.16f-argocd-footprint-2026-08-11.md.
+		"""
+	references: ["docs/measurements/2.16f-argocd-footprint-2026-08-11.md"]
+}
+
 compatibility: "0.2.53-rc.1": {
 	change:          "safe"
 	operatorVersion: "v0.2.41"
