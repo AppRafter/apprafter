@@ -3,7 +3,11 @@
 
 ## Status
 
-`Accepted` (2026-08-08).
+`Accepted` (2026-08-08). **§3 (node reservations) superseded in part by
+[ADR 0055](0055-node-swap-policy.md)** (2026-08-11): the retrofit command is
+now `apprafter node prep`, which applies these reservations *and* provisions
+host swap. The reservation values and rationale below stand unchanged; only
+the command name and its now-expanded scope moved.
 
 ADR for subphase 2.16d (`plan.md` §2.16d). Records the resource-governance
 model — pod QoS strategy, node reservations, and what is deferred — since
@@ -104,6 +108,13 @@ config and re-appliable to existing clusters via a retrofit command:
 These are an independent improvement with no coupling gate — no
 reservation-observation loop (a single controlled cluster; and a
 `capacity − allocatable ≈ eviction-hard` default check would misfire).
+
+> **Superseded in part by [ADR 0055](0055-node-swap-policy.md).** The retrofit
+> command named `apprafter node reserve-headroom` above is replaced by
+> `apprafter node prep`, which applies these same reservations *and*
+> provisions host swap over one k3s restart. The reservation values are
+> unchanged — only the command moved. See ADR 0055 for the swap policy and
+> the `reserve-headroom` → `prep` removal.
 
 ### 4. LimitRange deferred until the Capsule policy layer
 
@@ -241,5 +252,8 @@ Andrey Ryahovskiy.
   (quantity validity + `request <= limit`).
 - `cli/cli-providers/src/hetzner_cloud/user_data.rs` +
   `cli/platform-cli/src/commands/` — k3s node reservations at bootstrap and
-  the `apprafter node reserve-headroom` retrofit.
+  the `apprafter node reserve-headroom` retrofit (the retrofit is now
+  `apprafter node prep` — see ADR 0055).
+- [ADR 0055](0055-node-swap-policy.md) — node swap policy; supersedes §3's
+  retrofit command (`reserve-headroom` → `node prep`) and adds host swap.
 - `plan.md` §2.16d — the deliverable decomposition and acceptance.
