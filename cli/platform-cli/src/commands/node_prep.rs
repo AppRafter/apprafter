@@ -770,9 +770,21 @@ fn wait_for_recovery(runner: &SshCommandRunner, host: &str) -> Result<()> {
     }
 }
 
-/// Remote command that succeeds once the k3s API is serving again.
+/// Remote command that succeeds once BOTH the k3s apiserver AND the kubelet
+/// are serving again. `/readyz` alone is only the APISERVER's readiness — in
+/// k3s it stays green even when the kubelet rejected the swap drop-in (the
+/// exact failure the whole-step rollback guards against: a bad drop-in bricks
+/// the kubelet while the control plane keeps serving `/readyz`). So ALSO
+/// require the kubelet to answer through the apiserver node-proxy: on a bad
+/// drop-in the kubelet never serves `configz`, this fails for the whole
+/// [`RECOVERY_TIMEOUT`], and [`wait_for_recovery`] returns `Err` → the whole-
+/// step rollback fires. Walk STEP6 proved `/readyz`-only false-reported
+/// "recovered" while the kubelet was down and NO rollback ran. `$(hostname)`
+/// is the k3s node name (resolved on the node); the node-local `k3s kubectl`
+/// is cluster-admin so `nodes/proxy` is permitted.
 fn recovery_probe_command() -> &'static str {
-    "k3s kubectl get --raw='/readyz'"
+    "k3s kubectl get --raw='/readyz' >/dev/null && \
+     k3s kubectl get --raw=\"/api/v1/nodes/$(hostname)/proxy/configz\" >/dev/null"
 }
 
 // ===========================================================================
@@ -1344,7 +1356,25 @@ mod tests {
 
     #[test]
     fn recovery_probe_uses_node_local_k3s_kubectl() {
-        assert_eq!(recovery_probe_command(), "k3s kubectl get --raw='/readyz'");
+        // Node-local k3s kubectl needs no external creds.
+        assert!(recovery_probe_command().contains("k3s kubectl get --raw"));
+    }
+
+    #[test]
+    fn recovery_probe_verifies_the_kubelet_not_just_the_apiserver() {
+        // Regression guard for the walk-STEP6 blind spot: `/readyz` alone is
+        // the apiserver's readiness and stays green when the kubelet bricked on
+        // a bad swap drop-in, so the whole-step rollback never fired. The probe
+        // MUST also verify the kubelet is back via the apiserver node-proxy so a
+        // kubelet-only failure is detected and the rollback fires.
+        let cmd = recovery_probe_command();
+        assert!(cmd.contains("/readyz"), "still checks the apiserver: {cmd}");
+        assert!(
+            cmd.contains("nodes/$(hostname)/proxy/configz"),
+            "recovery probe must also verify the kubelet through the node-proxy: {cmd}"
+        );
+        // Both probes are joined by `&&` so EITHER being down = not recovered.
+        assert!(cmd.contains("&&"), "both probes must be required: {cmd}");
     }
 
     // ---- (a) version gate — numeric NOT lexical -------------------------
