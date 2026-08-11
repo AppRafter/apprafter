@@ -58,6 +58,7 @@ cleanup() {
     if [ -s "$NOTE" ]; then printf '  --- before/after note (step 8) ---\n'; sed 's/^/  /' "$NOTE"; fi
     "$APPRAFTER" destroy --yes >/dev/null 2>&1 && printf 'apprafter destroy: ok\n' || printf 'apprafter destroy: (non-zero; sweeping)\n'
     python3 "$HZ" sweep "$TOKEN" 2>/dev/null
+    [ -n "$OTHER_TOKEN" ] && python3 "$HZ" sweep "$OTHER_TOKEN" 2>/dev/null   # STEP5's 2nd (SKIP) node lives in the OTHER project
     printf '  VERIFY primary project:\n'; python3 "$HZ" verify "$TOKEN" || FAIL=1
     if [ -n "$OTHER_TOKEN" ]; then printf '  VERIFY other project:\n'; python3 "$HZ" verify "$OTHER_TOKEN" || FAIL=1; fi
     rm -rf "$WORK"
@@ -339,11 +340,13 @@ printf '\n=== STEP 5: retrofit (SKIP_NODE_SWAP=1) + node prep + VPA-revert (Q7) 
 # A SECOND node WITHOUT baked-in swap (the test hook forces a cushionless install),
 # so `apprafter node prep` retrofits a LIVE cluster — the path the dogfood node walks.
 export APPRAFTER_SKIP_NODE_SWAP=1
+# The 2nd (SKIP) node MUST go in a SEPARATE Hetzner project (OTHER_TOKEN): the
+# `apprafter=true` label anchor is project-wide, so a 2nd target sharing node 1's
+# token makes `up` ADOPT node 1 instead of provisioning a new server (found on run 2 —
+# server count stayed 1, RIP==node1). A different project has no such collision.
+# `target add` also does NOT auto-activate → `target use` before `up`.
 "$APPRAFTER" target add e2e-retro --provider hetzner-cloud --tier solo --region "$REGION" \
-    --token "$TOKEN" --no-interactive --force || mark_fail "STEP5 target add (retrofit)"
-# `target add` does NOT auto-activate — without this, `up` re-converges node 1 (the
-# baked node) and the retrofit/SKIP-gate tests run against the wrong node (a real
-# walk bug found on the first run).
+    --token "$OTHER_TOKEN" --no-interactive --force || mark_fail "STEP5 target add (retrofit)"
 "$APPRAFTER" target use e2e-retro >/dev/null 2>&1 || mark_fail "STEP5 target use e2e-retro (activate the 2nd target)"
 if timeout 1500 "$APPRAFTER" up; then
     "$APPRAFTER" kubeconfig > "$KUBECONFIG"
@@ -353,8 +356,8 @@ if timeout 1500 "$APPRAFTER" up; then
     # first node and both the transition AND the SKIP-at-bootstrap check are void.
     { [ -n "$RIP" ] && [ "$RIP" != "$IP" ]; } && ok "STEP5 retrofit is a distinct 2nd node ($RIP != node1 $IP)" \
         || mark_fail "STEP5 retrofit node IP=$RIP == node1 IP=$IP — target activation failed"
-    NSRV=$(python3 "$HZ" list "$TOKEN" 2>/dev/null | awk '/servers/{print $2}')
-    [ "${NSRV:-0}" = "2" ] && ok "STEP5 2 servers in the project (both swept on cleanup)" || printf '  NOTE STEP5 server count=%s (expected 2)\n' "${NSRV:-?}"
+    NSRV=$(python3 "$HZ" list "$OTHER_TOKEN" 2>/dev/null | awk '/servers/{print $2}')
+    [ "${NSRV:-0}" = "1" ] && ok "STEP5 retrofit is a genuine new server in the OTHER project (cleanup sweeps it)" || printf '  NOTE STEP5 OTHER-project server count=%s (expected 1)\n' "${NSRV:-?}"
 
     # SKIP-gate assertion: does APPRAFTER_SKIP_NODE_SWAP=1 actually prevent the bootstrap
     # bake? The SKIP node must come up CUSHIONLESS (no active swap).
