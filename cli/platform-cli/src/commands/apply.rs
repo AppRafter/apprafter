@@ -6,8 +6,8 @@ use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::target::{load_active_target_config, TargetConfig, TargetStorePaths};
 use cli_core::{resolve_hetzner_ssh_public_key, resolve_hetzner_token, CliError, Result};
 use cli_providers::hetzner_cloud::{
-    build_k3s_user_data, FloatingIpSpec, HetznerCloudClient, HetznerCloudProvider,
-    K3sBootstrapOptions, NetworkSpec, ServerSpec, SshKeySpec,
+    build_k3s_user_data, swap_eligible_from_env, FloatingIpSpec, HetznerCloudClient,
+    HetznerCloudProvider, K3sBootstrapOptions, NetworkSpec, ServerSpec, SshKeySpec,
 };
 use cli_providers::Provider;
 use cli_state::{HetznerCloudState, State, StatePaths};
@@ -161,13 +161,27 @@ fn build_server_spec(
         .and_then(|m| m.spec.os_image.clone())
         .unwrap_or_else(|| DEFAULT_OS_IMAGE.into());
 
+    // 2.16g: bake host swap only on a single-node cluster (T1 today — the
+    // only tier that ships swap; design decision 7). Sum every node role's
+    // `count`; ≤1 total node ⇒ single-node ⇒ swap-eligible. A manifest with
+    // no `nodes` block provisions the single default server → eligible.
+    // The undocumented `APPRAFTER_SKIP_NODE_SWAP` hook forces it off (Q17).
+    let total_nodes: u32 = manifest
+        .map(|m| m.spec.nodes.iter().map(|n| n.count).sum())
+        .unwrap_or(0);
+    let single_node = total_nodes <= 1;
+    let swap_eligible = swap_eligible_from_env(single_node);
+
     ServerSpec {
         name: cluster.into(),
         server_type,
         image,
         location: region.into(),
         labels: BTreeMap::new(),
-        user_data: Some(build_k3s_user_data(&K3sBootstrapOptions::default())),
+        user_data: Some(build_k3s_user_data(&K3sBootstrapOptions {
+            swap_eligible,
+            ..Default::default()
+        })),
     }
 }
 

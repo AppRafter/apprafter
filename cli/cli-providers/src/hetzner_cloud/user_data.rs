@@ -92,12 +92,44 @@
 #[derive(Debug, Clone)]
 pub struct K3sBootstrapOptions {
     pub dual_stack: bool,
+    /// 2.16g: whether the provisioned node should bake host swap into
+    /// its bootstrap (the no-swap-forgiving T1 default). `true` on the
+    /// only tier shipped today (T1 single-node); T2+ multi-node is
+    /// deferred (design decision 7), so the caller sets it `false` for
+    /// anything that isn't a single-node cluster. When `true`,
+    /// [`build_k3s_user_data`] installs k3s with `INSTALL_K3S_SKIP_START`
+    /// and runs the FAIL-SOFT swap block before starting the unit
+    /// (design decision 2 / Q2).
+    pub swap_eligible: bool,
 }
 
 impl Default for K3sBootstrapOptions {
     fn default() -> Self {
-        Self { dual_stack: true }
+        Self {
+            dual_stack: true,
+            // T1 single-node is the only tier today → swap on by default.
+            swap_eligible: true,
+        }
     }
+}
+
+/// Undocumented test hook: `APPRAFTER_SKIP_NODE_SWAP` (set to ANY value,
+/// including empty) forces swap ineligible, letting the retrofit walk
+/// provision a deliberately cushionless node without editing a manifest.
+///
+/// This is intentionally NOT surfaced in `--help` (design decision 1 /
+/// Q17) — it exists only to drive the `apprafter node prep` retrofit path
+/// in the e2e walk. Applied at the point the CLI reads/constructs
+/// [`K3sBootstrapOptions`]; `base` is the tier-derived eligibility.
+pub const SKIP_NODE_SWAP_ENV: &str = "APPRAFTER_SKIP_NODE_SWAP";
+
+/// Applies the [`SKIP_NODE_SWAP_ENV`] override: returns `false` when the
+/// env var is present (any value), else the `base` value unchanged.
+pub fn swap_eligible_from_env(base: bool) -> bool {
+    if std::env::var_os(SKIP_NODE_SWAP_ENV).is_some() {
+        return false;
+    }
+    base
 }
 
 /// Dual-stack pod and service CIDRs per ADR 0017 §"Pod network".
@@ -501,7 +533,10 @@ mod tests {
 
     #[test]
     fn single_stack_flag_drops_dual_stack_cidr_args() {
-        let s = build_k3s_user_data(&K3sBootstrapOptions { dual_stack: false });
+        let s = build_k3s_user_data(&K3sBootstrapOptions {
+            dual_stack: false,
+            ..Default::default()
+        });
         assert!(
             !s.contains("--cluster-cidr"),
             "single-stack opt-out must NOT inject cluster-CIDR — k3s falls back to its IPv4-only default.\n{s}"
@@ -513,6 +548,48 @@ mod tests {
         // Other disable flags must remain regardless of stack mode.
         assert!(s.contains("--flannel-backend=none"), "{s}");
         assert!(s.contains("--disable-kube-proxy"), "{s}");
+    }
+
+    // ---- 2.16g swap_eligible + env hook ---------------------------------
+
+    #[test]
+    fn swap_eligible_defaults_true_for_t1_single_node() {
+        // T1 single-node is the only tier today → swap is on by default.
+        assert!(
+            K3sBootstrapOptions::default().swap_eligible,
+            "swap_eligible must default true"
+        );
+    }
+
+    // A single test drives all env-hook cases sequentially under one guard —
+    // `std::env::set_var` is process-wide, so we save/restore and never rely
+    // on cargo's parallel test isolation for the same variable.
+    #[test]
+    fn skip_node_swap_env_hook_forces_ineligible_and_passes_through_when_unset() {
+        let saved = std::env::var("APPRAFTER_SKIP_NODE_SWAP").ok();
+
+        // Set (any value) → forces false regardless of base.
+        std::env::set_var("APPRAFTER_SKIP_NODE_SWAP", "1");
+        assert!(!swap_eligible_from_env(true), "env set must force false");
+        assert!(!swap_eligible_from_env(false), "env set stays false");
+
+        // "Any value" — even an empty string set counts as present.
+        std::env::set_var("APPRAFTER_SKIP_NODE_SWAP", "");
+        assert!(
+            !swap_eligible_from_env(true),
+            "empty-but-set still forces false"
+        );
+
+        // Unset → the base value passes through unchanged.
+        std::env::remove_var("APPRAFTER_SKIP_NODE_SWAP");
+        assert!(swap_eligible_from_env(true), "unset passes base=true");
+        assert!(!swap_eligible_from_env(false), "unset passes base=false");
+
+        // Restore whatever the outer environment had.
+        match saved {
+            Some(v) => std::env::set_var("APPRAFTER_SKIP_NODE_SWAP", v),
+            None => std::env::remove_var("APPRAFTER_SKIP_NODE_SWAP"),
+        }
     }
 
     // ---- 2.16g swap builders --------------------------------------------

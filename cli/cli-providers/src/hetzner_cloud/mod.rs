@@ -33,5 +33,6 @@ pub use types::{
     Subnet,
 };
 pub use user_data::{
-    build_k3s_user_data, K3sBootstrapOptions, CLUSTER_CIDR_DUAL_STACK, SERVICE_CIDR_DUAL_STACK,
+    build_k3s_user_data, swap_eligible_from_env, K3sBootstrapOptions, CLUSTER_CIDR_DUAL_STACK,
+    SERVICE_CIDR_DUAL_STACK, SKIP_NODE_SWAP_ENV,
 };
