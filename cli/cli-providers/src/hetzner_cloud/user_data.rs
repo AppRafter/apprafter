@@ -146,6 +146,174 @@ pub fn k3s_reservation_config() -> String {
         .to_string()
 }
 
+/// Absolute path of the kubelet drop-in that carries the swap
+/// policy (2.16g). This is the **Option-A** managed directory k3s
+/// reads directly (`/var/lib/rancher/k3s/agent/etc/kubelet.conf.d/`),
+/// which exists after a `INSTALL_K3S_SKIP_START` install and before
+/// the first kubelet start — so we write into it verbatim with NO
+/// `--config-dir` kubelet-arg (design decision 2 / Q4). Option B's
+/// `config-dir` would copy this file into the same managed dir and
+/// leave a stale copy live on rollback; Option A has nothing to
+/// copy or prune.
+pub const SWAP_KUBELET_DROPIN_PATH: &str =
+    "/var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-apprafter-swap.conf";
+
+/// The 2.6c capacity threshold: the platform's own capacity signal
+/// warns once free disk drops below 15% of total. The swap disk
+/// pre-check refuses to create a swapfile that would trip it, so we
+/// never succeed here and then immediately degrade the node's
+/// capacity health (design decision 2 / Q8).
+const SWAP_MIN_FREE_DISK_FRACTION: f64 = 0.15;
+
+/// Upper bound on the swapfile size in MiB: `swap = min(RAM, 8Gi)`
+/// (design decision 2). 8 GiB = 8192 MiB.
+const SWAP_MAX_MIB: u64 = 8192;
+
+/// Renders the kubelet drop-in body written at
+/// [`SWAP_KUBELET_DROPIN_PATH`]. Pure and side-effect-free.
+///
+/// `failSwapOn: false` is emitted **unconditionally** — on a
+/// swap-free node it is a harmless no-op, and writing it first
+/// closes the "swap active in fstab / kubelet refuses to start"
+/// brick window (design decision 2, apply order).
+///
+/// The `memorySwap: { swapBehavior: NoSwap }` block is emitted
+/// **only** when `k8s_ge_134` is true: `NoSwap` is the GA behaviour
+/// gated on Kubernetes ≥1.34, and emitting it on an older kubelet
+/// would make the kubelet reject the config.
+pub fn swap_kubelet_dropin(k8s_ge_134: bool) -> String {
+    let mut out = String::new();
+    out.push_str("apiVersion: kubelet.config.k8s.io/v1beta1\n");
+    out.push_str("kind: KubeletConfiguration\n");
+    out.push_str("failSwapOn: false\n");
+    if k8s_ge_134 {
+        out.push_str("memorySwap:\n");
+        out.push_str("  swapBehavior: NoSwap\n");
+    }
+    out
+}
+
+/// Renders the POSIX shell script that provisions host swap for the
+/// no-swap-forgiving node default (2.16g, design decisions 2 & 4).
+/// Pure and side-effect-free — the caller runs the returned script
+/// either from the SKIP_START bootstrap block (FAIL-SOFT) or the
+/// `apprafter node prep` retrofit.
+///
+/// Returns `None` when swap is ineligible — either k8s is <1.34
+/// (no `NoSwap` GA gate) or the node is not on cgroup v2
+/// (`memory.swap.max` is a v2-only knob). The caller turns `None`
+/// into a REFUSE-with-hint at the retrofit and a skip-with-breadcrumb
+/// at bootstrap; this builder emits nothing in that case.
+///
+/// When eligible, the script performs — **in this order** — the
+/// steps locked by design decision 2 (apply order) and 4:
+/// 1. disk pre-check via `df`: refuse (non-zero exit, numeric error)
+///    if free-after-swapfile would drop below the 2.6c 15% floor;
+/// 2. compute `count = min(MemTotal_MiB, 8192)` from `mem_total_kib`;
+/// 3. write `vm.swappiness=10` to a sysctl.d drop-in AND
+///    `sysctl -w` it — BEFORE any swap is created (Q12);
+/// 4. `dd … oflag=direct` under `ionice -c3`, with an
+///    `EINVAL`/failure fallback to buffered `dd … conv=fsync` + warn;
+/// 5. `chmod 600` / `mkswap` / `swapon`;
+/// 6. immediately zero `memory.swap.max` on every existing pod
+///    cgroup depth-agnostically (`find … -path '*kubepods*' -name
+///    memory.swap.max`), tolerating ENOENT/EBUSY (never aborts);
+/// 7. add the idempotent `sw,nofail` fstab entry.
+pub fn swap_enable_script(mem_total_kib: u64, k8s_ge_134: bool, cgroup_v2: bool) -> Option<String> {
+    if !k8s_ge_134 || !cgroup_v2 {
+        return None;
+    }
+
+    // count = min(MemTotal_MiB, 8Gi). MemTotal is in KiB; 1 MiB = 1024 KiB.
+    let mem_total_mib = mem_total_kib / 1024;
+    let count = mem_total_mib.min(SWAP_MAX_MIB);
+
+    // The 2.6c floor as a whole percentage for the human-readable message.
+    let min_free_pct = (SWAP_MIN_FREE_DISK_FRACTION * 100.0) as u64;
+
+    // Built by concatenation (not a `\`-continued literal) for the same
+    // reason as `build_k3s_user_data`: Rust's line-continuation escape
+    // eats leading whitespace, and this script's shell indentation is
+    // load-bearing for readability. The script deliberately does NOT
+    // `set -e` — the cgroup loop must tolerate ENOENT/EBUSY per-file
+    // without aborting the caller (design decision 4).
+    let mut s = String::new();
+    s.push_str("#!/bin/sh\n");
+    s.push_str("# AppRafter 2.16g: provision host swap + NoSwap-friendly kubelet.\n");
+    s.push_str("# NOTE: intentionally no `set -e` — the pod-cgroup swap.max loop\n");
+    s.push_str("# tolerates ENOENT/EBUSY per file and must not abort the caller.\n");
+    s.push_str(&format!("SWAP_COUNT_MIB={count}\n"));
+    s.push('\n');
+
+    // (a) Disk pre-check: refuse if free-after-swapfile < 15% of the disk.
+    // `df -Pk /` → 1K-blocks; POSIX `-P` guarantees a single data line.
+    s.push_str("# (a) Disk pre-check against the 2.6c 15% capacity floor.\n");
+    s.push_str("DISK_TOTAL_KIB=$(df -Pk / | awk 'NR==2 {print $2}')\n");
+    s.push_str("DISK_AVAIL_KIB=$(df -Pk / | awk 'NR==2 {print $4}')\n");
+    s.push_str("SWAP_KIB=$((SWAP_COUNT_MIB * 1024))\n");
+    s.push_str("FREE_AFTER_KIB=$((DISK_AVAIL_KIB - SWAP_KIB))\n");
+    s.push_str(&format!(
+        "MIN_FREE_KIB=$((DISK_TOTAL_KIB * {min_free_pct} / 100))\n"
+    ));
+    s.push_str("if [ \"$FREE_AFTER_KIB\" -lt \"$MIN_FREE_KIB\" ]; then\n");
+    s.push_str(&format!(
+        "  echo \"apprafter: refusing to create a ${{SWAP_COUNT_MIB}}MiB swapfile: \
+free disk after it (${{FREE_AFTER_KIB}}KiB) would fall below the {min_free_pct}%% \
+capacity floor (${{MIN_FREE_KIB}}KiB of ${{DISK_TOTAL_KIB}}KiB)\" >&2\n"
+    ));
+    s.push_str("  exit 1\n");
+    s.push_str("fi\n");
+    s.push('\n');
+
+    // (c) swappiness=10 — persisted drop-in + live sysctl — BEFORE swapon,
+    // so the default-60 window never overlaps `dd`/`swapon` (Q12).
+    s.push_str("# (c) swappiness=10 BEFORE any swap is created (Q12).\n");
+    s.push_str("echo 'vm.swappiness=10' > /etc/sysctl.d/99-apprafter-swap.conf\n");
+    s.push_str("sysctl -w vm.swappiness=10\n");
+    s.push('\n');
+
+    // (d) Allocate the swapfile. Prefer O_DIRECT (bypasses page cache) under
+    // ionice -c3 (idle class — protects the live-cluster IO window on the
+    // retrofit). EINVAL (some filesystems reject O_DIRECT) → buffered fsync.
+    s.push_str("# (d) Allocate /swapfile (O_DIRECT + ionice idle; buffered fallback).\n");
+    s.push_str(
+        "if ! ionice -c3 dd if=/dev/zero of=/swapfile bs=1M count=\"$SWAP_COUNT_MIB\" oflag=direct; then\n",
+    );
+    s.push_str(
+        "  echo 'apprafter: O_DIRECT dd failed (EINVAL?), falling back to buffered dd conv=fsync' >&2\n",
+    );
+    s.push_str(
+        "  ionice -c3 dd if=/dev/zero of=/swapfile bs=1M count=\"$SWAP_COUNT_MIB\" conv=fsync\n",
+    );
+    s.push_str("fi\n");
+    s.push('\n');
+
+    // (e) Format + activate.
+    s.push_str("# (e) chmod / mkswap / swapon.\n");
+    s.push_str("chmod 600 /swapfile\n");
+    s.push_str("mkswap /swapfile\n");
+    s.push_str("swapon /swapfile\n");
+    s.push('\n');
+
+    // (f) Zero swap on every existing pod cgroup IMMEDIATELY after swapon,
+    // depth-agnostically — Burstable/BestEffort pods sit 3 levels deep, so a
+    // fixed-depth glob would miss them. Per-file failures (ENOENT on
+    // non-leaf cgroups, EBUSY) are swallowed; the loop never aborts.
+    s.push_str("# (f) Zero memory.swap.max on existing pod cgroups (depth-agnostic).\n");
+    s.push_str(
+        "find /sys/fs/cgroup -path '*kubepods*' -name memory.swap.max -exec sh -c 'echo 0 > \"$1\" 2>/dev/null || true' _ {} \\;\n",
+    );
+    s.push('\n');
+
+    // (g) Persist to fstab idempotently — never append a duplicate line.
+    s.push_str("# (g) Persist to fstab (sw,nofail) idempotently.\n");
+    s.push_str("if ! grep -qE '^/swapfile[[:space:]]' /etc/fstab; then\n");
+    s.push_str("  echo '/swapfile none swap sw,nofail 0 0' >> /etc/fstab\n");
+    s.push_str("fi\n");
+
+    Some(s)
+}
+
 pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
     let install_exec = if opts.dual_stack {
         format!(
@@ -335,5 +503,214 @@ mod tests {
         // Other disable flags must remain regardless of stack mode.
         assert!(s.contains("--flannel-backend=none"), "{s}");
         assert!(s.contains("--disable-kube-proxy"), "{s}");
+    }
+
+    // ---- 2.16g swap builders --------------------------------------------
+
+    #[test]
+    fn swap_dropin_is_the_option_a_managed_dir_path() {
+        // Option A writes into k3s's managed kubelet.conf.d dir directly,
+        // with NO --config-dir kubelet-arg (design decision 2 / Q4).
+        assert_eq!(
+            SWAP_KUBELET_DROPIN_PATH,
+            "/var/lib/rancher/k3s/agent/etc/kubelet.conf.d/10-apprafter-swap.conf"
+        );
+    }
+
+    #[test]
+    fn swap_dropin_declares_kubelet_configuration_kind_and_api_version() {
+        let d = swap_kubelet_dropin(true);
+        assert!(
+            d.contains("apiVersion: kubelet.config.k8s.io/v1beta1"),
+            "{d}"
+        );
+        assert!(d.contains("kind: KubeletConfiguration"), "{d}");
+    }
+
+    #[test]
+    fn swap_dropin_sets_fail_swap_on_false_in_both_variants() {
+        // failSwapOn:false is UNCONDITIONAL — a no-op on a swap-free node,
+        // but closing the fstab-swap-active / kubelet-refuses-start brick.
+        let with_gate = swap_kubelet_dropin(true);
+        let without_gate = swap_kubelet_dropin(false);
+        assert!(
+            with_gate.contains("failSwapOn: false"),
+            "≥1.34 variant must set failSwapOn:false\n{with_gate}"
+        );
+        assert!(
+            without_gate.contains("failSwapOn: false"),
+            "<1.34 variant must STILL set failSwapOn:false\n{without_gate}"
+        );
+    }
+
+    #[test]
+    fn swap_dropin_emits_noswap_only_on_the_ge_134_variant() {
+        let with_gate = swap_kubelet_dropin(true);
+        let without_gate = swap_kubelet_dropin(false);
+        assert!(
+            with_gate.contains("swapBehavior: NoSwap"),
+            "≥1.34 variant must gate NoSwap behaviour\n{with_gate}"
+        );
+        assert!(
+            with_gate.contains("memorySwap:"),
+            "≥1.34 variant must carry the memorySwap block\n{with_gate}"
+        );
+        assert!(
+            !without_gate.contains("swapBehavior"),
+            "<1.34 variant must NOT emit swapBehavior — an older kubelet rejects it\n{without_gate}"
+        );
+        assert!(
+            !without_gate.contains("memorySwap"),
+            "<1.34 variant must NOT emit the memorySwap block\n{without_gate}"
+        );
+    }
+
+    #[test]
+    fn swap_script_is_none_when_below_134() {
+        // 4 GiB RAM, cgroup v2, but k8s <1.34 → ineligible → skip swap.
+        assert!(swap_enable_script(4 * 1024 * 1024, false, true).is_none());
+    }
+
+    #[test]
+    fn swap_script_is_none_when_not_cgroup_v2() {
+        // memory.swap.max is a cgroup-v2-only knob → cgroup v1 → skip swap.
+        assert!(swap_enable_script(4 * 1024 * 1024, true, false).is_none());
+    }
+
+    #[test]
+    fn swap_script_is_none_when_both_gates_fail() {
+        assert!(swap_enable_script(4 * 1024 * 1024, false, false).is_none());
+    }
+
+    #[test]
+    fn swap_script_present_when_both_gates_true() {
+        assert!(swap_enable_script(4 * 1024 * 1024, true, true).is_some());
+    }
+
+    #[test]
+    fn swap_script_writes_swappiness_before_swapon() {
+        // Apply order (Q12): swappiness=10 must be set BEFORE any swap is on.
+        let s = swap_enable_script(4 * 1024 * 1024, true, true).expect("eligible");
+        let swappiness_idx = s
+            .find("vm.swappiness=10")
+            .expect("must set vm.swappiness=10");
+        let swapon_idx = s.find("swapon /swapfile").expect("must swapon");
+        assert!(
+            swappiness_idx < swapon_idx,
+            "swappiness must be written before swapon so the default-60 window never overlaps dd/swapon\n{s}"
+        );
+        // AND both forms are present: persisted drop-in + live sysctl -w.
+        assert!(s.contains("sysctl -w vm.swappiness=10"), "{s}");
+        assert!(s.contains("/etc/sysctl.d/"), "{s}");
+    }
+
+    #[test]
+    fn swap_script_disk_precheck_precedes_dd() {
+        // The df pre-check must run before the swapfile is allocated (Q8) —
+        // never succeed and then trip the 2.6c capacity signal.
+        let s = swap_enable_script(4 * 1024 * 1024, true, true).expect("eligible");
+        let df_idx = s.find("df -Pk").expect("must pre-check disk via df");
+        let dd_idx = s.find("dd if=/dev/zero").expect("must dd the swapfile");
+        assert!(
+            df_idx < dd_idx,
+            "the df disk pre-check must precede dd\n{s}"
+        );
+        // The refusal names the 15% floor and exits non-zero.
+        assert!(s.contains("15%"), "error must name the 15% floor\n{s}");
+        assert!(s.contains("exit 1"), "pre-check must exit non-zero\n{s}");
+    }
+
+    #[test]
+    fn swap_script_dd_has_odirect_ionice_and_buffered_fallback() {
+        let s = swap_enable_script(4 * 1024 * 1024, true, true).expect("eligible");
+        assert!(
+            s.contains("ionice -c3"),
+            "dd must run under ionice -c3\n{s}"
+        );
+        assert!(s.contains("oflag=direct"), "dd must prefer O_DIRECT\n{s}");
+        assert!(
+            s.contains("conv=fsync"),
+            "must fall back to buffered dd conv=fsync on EINVAL\n{s}"
+        );
+    }
+
+    #[test]
+    fn swap_script_formats_and_activates_the_swapfile() {
+        let s = swap_enable_script(4 * 1024 * 1024, true, true).expect("eligible");
+        assert!(s.contains("chmod 600 /swapfile"), "{s}");
+        assert!(s.contains("mkswap /swapfile"), "{s}");
+        assert!(s.contains("swapon /swapfile"), "{s}");
+    }
+
+    #[test]
+    fn swap_script_zeroes_pod_cgroup_swap_depth_agnostically_after_swapon() {
+        // Depth-agnostic find loop (design decision 4) — a fixed-depth glob
+        // misses 3-level-deep Burstable/BestEffort pods. Must come AFTER
+        // swapon (swap usage is 0 at that instant) and tolerate ENOENT/EBUSY.
+        let s = swap_enable_script(4 * 1024 * 1024, true, true).expect("eligible");
+        assert!(
+            s.contains("find /sys/fs/cgroup -path '*kubepods*' -name memory.swap.max"),
+            "must zero swap.max across all kubepods cgroups depth-agnostically\n{s}"
+        );
+        assert!(
+            !s.contains("*/*/memory.swap.max"),
+            "must NOT use a fixed-depth glob (misses Burstable/BestEffort)\n{s}"
+        );
+        let swapon_idx = s.find("swapon /swapfile").expect("must swapon");
+        let loop_idx = s.find("-path '*kubepods*'").expect("cgroup loop present");
+        assert!(
+            swapon_idx < loop_idx,
+            "the cgroup zero-out must run immediately AFTER swapon\n{s}"
+        );
+        // Tolerate per-file failures (never abort the caller).
+        assert!(s.contains("2>/dev/null || true"), "{s}");
+        // The script must not `set -e`-abort. Check for a `set -e` *command*
+        // line (trimmed), not a mere substring — the explanatory comment
+        // legitimately names the flag.
+        assert!(
+            !s.lines().any(|l| {
+                let t = l.trim();
+                t == "set -e" || t == "set -eu" || t == "set -euo pipefail"
+            }),
+            "the script must not `set -e`-abort on the cgroup loop\n{s}"
+        );
+    }
+
+    #[test]
+    fn swap_script_fstab_entry_is_nofail_and_idempotent() {
+        let s = swap_enable_script(4 * 1024 * 1024, true, true).expect("eligible");
+        assert!(
+            s.contains("/swapfile none swap sw,nofail 0 0"),
+            "fstab entry must be sw,nofail\n{s}"
+        );
+        // Guarded by a grep so a re-run never appends a duplicate line.
+        assert!(
+            s.contains("grep -qE '^/swapfile[[:space:]]' /etc/fstab"),
+            "fstab write must be idempotent (grep-guarded)\n{s}"
+        );
+    }
+
+    #[test]
+    fn swap_script_count_is_full_ram_when_below_8gib() {
+        // 4 GiB RAM = 4 * 1024 * 1024 KiB → count = 4096 MiB (min(4096, 8192)).
+        let s = swap_enable_script(4 * 1024 * 1024, true, true).expect("eligible");
+        assert!(
+            s.contains("SWAP_COUNT_MIB=4096"),
+            "small-RAM node → swap = full RAM (4096 MiB)\n{s}"
+        );
+    }
+
+    #[test]
+    fn swap_script_count_is_capped_at_8gib_for_large_ram() {
+        // 32 GiB RAM = 32 * 1024 * 1024 KiB → count = min(32768, 8192) = 8192.
+        let s = swap_enable_script(32 * 1024 * 1024, true, true).expect("eligible");
+        assert!(
+            s.contains("SWAP_COUNT_MIB=8192"),
+            "large-RAM node → swap capped at 8192 MiB\n{s}"
+        );
+        assert!(
+            !s.contains("SWAP_COUNT_MIB=32768"),
+            "must NOT size swap to full 32 GiB\n{s}"
+        );
     }
 }
