@@ -150,25 +150,29 @@ only, and without `--force` it won't overwrite an existing
 `state.hetzner_cloud`. The backfill on `apply` is what updates an old
 state file in place.
 
-### (g) Split guard — fact-drift (warn) vs deferred intent (info)
+### (g) Fact-drift guard only; no in-place resize (machine change = rebuild)
 
-`apply`'s `refresh_servers()` already has the live server object. Two
-distinct comparisons run on the existing-server branch:
+There is **no in-place machine resize**. Changing the machine of a
+*running* cluster means a rebuild: `apprafter backup create` +
+`apprafter restore --reprovision --server-type <sku>` (a fresh box of the
+new type, data restored from the backup, brief downtime). Given that:
 
-- **Fact drift** — `HetznerCloudState.server_type` (the recorded FACT)
-  vs `server.server_type.name` (live), and `State.region` vs
-  `server.location.name` (live). A mismatch means the machine was
-  changed **outside AppRafter** — a real **warning**.
-- **Deferred intent** — `TargetConfig.server_type` (preference) vs
-  live: a deliberate `target machine` or `target add` change that has
-  not yet been applied through a reprovision. Not an anomaly → printed
-  once per `apply` run as an **info** line phrased as an action ("server
-  type `ccx43` is planned for the next provision — run `apprafter up
-  --reprovision` to apply").
+- `apply` on an existing server carries ONE guard — **fact drift**:
+  `HetznerCloudState.server_type` (the recorded FACT) vs the live
+  `server.server_type.name` (and `State.region` vs `server.location.name`).
+  A mismatch means the machine was changed **outside AppRafter** (e.g. a
+  resize through the Hetzner Console) → a **warning**.
+- `apprafter target machine` **refuses on a provisioned target** (whose
+  state carries a `server_id`), pointing at the backup + reprovision path
+  above. It sets the type only on an **un-provisioned** target — you
+  changed your mind before the first `apply`, or you are reusing a target
+  after its cluster was destroyed (state wiped).
 
-Merging these two into a single "type mismatch" warning would nag the
-operator every `apply` after a deliberate machine-type change with no
-way to silence it short of reprovisioning immediately.
+A provisioned target therefore cannot hold a type preference that differs
+from its live machine, so there is no "deferred intent" to surface. An
+earlier revision printed a second, info-level guard (target *preference*
+vs live) that also pointed at a non-existent `up --reprovision`; both were
+dropped as dead once `target machine` was scoped this way.
 
 ## Consequences
 
@@ -181,9 +185,10 @@ way to silence it short of reprovisioning immediately.
   the Hetzner Cloud Console.
 - Existing clusters self-heal on first `apply` after upgrade —
   zero-action migration for the common case.
-- The fact-drift vs deferred-intent split reduces alert fatigue: only
-  an out-of-band machine change fires a warning; a planned future
-  reprovision does not.
+- A single fact-drift warning fires only on an out-of-band machine change
+  (a Hetzner-Console resize); normal reconciles are silent. Changing a
+  machine on purpose goes through the explicit backup + reprovision path,
+  not a nagging preference guard.
 - Works past 2026-10-01 (`/v1/datacenters` gone, single-endpoint
   design is unaffected).
 
@@ -306,5 +311,8 @@ Andrey Ryahovskiy.
   `ServerTypeUnavailable { kind: UnavailableKind }` error variants.
 - `cli/cli-state/src/state.rs` — `HetznerCloudState.server_type`
   (the provider-specific FACT field).
-- `cli/cli-providers/src/hetzner_cloud/apply.rs` — resolution chain,
-  backfill, fact-drift / deferred-intent guards.
+- `cli/platform-cli/src/commands/apply.rs` — resolution chain, backfill,
+  the fact-drift guard.
+- `cli/platform-cli/src/commands/target_machine.rs` — `target machine`
+  (refuses on a provisioned target; sets the type only pre-provision).
+- `cli/cli-providers/src/backfill.rs` — `backfill_from`, `classify_guard`.

@@ -43,10 +43,13 @@ automatically. Fresh targets need a type supplied via one of:
   Cores ↓ / RAM ↓ / Disk ↓ / Location`). Sold-out rows hidden by default;
   toggle reveals them (non-selectable). Future-deprecated rows selectable with a
   `!` badge. Selecting a row writes both region and server type in one step.
-- `apprafter target machine` — new subcommand. Interactive matrix over the
-  current target; `--server-type <sku>` skips the picker for direct patch.
-  Accepts `--target <name>`. Changing the region on a provisioned target
-  requires confirmation.
+- `apprafter target machine` — new subcommand to set/change the server type on a
+  target that has **not provisioned yet** (changed your mind before the first
+  provision, or reusing a target after its cluster was destroyed). Opens the same
+  `(region × SKU)` matrix, or `--server-type <sku>` patches it directly; accepts
+  `--target <name>`. **Refuses on a provisioned cluster** — there is no in-place
+  resize; move to a different machine via `apprafter backup create` +
+  `apprafter restore --reprovision --server-type <sku>`.
 - `--server-type <sku>` flag on `target add`, `apply`, `up` /
   `bootstrap-all`, and `restore --reprovision`.
 - `APPRAFTER_SERVER_TYPE` environment variable (a distinct, low-precedence rung
@@ -55,16 +58,16 @@ automatically. Fresh targets need a type supplied via one of:
 - `HetznerCloudState.server_type` — the actual provisioned type persisted as a
   fact in `state.json` alongside `server_id`. Enables drift detection and
   same-target reproduce.
-- Fact-drift vs deferred-intent guard split: a machine changed outside
-  AppRafter fires a **warning** on `apply`; a deliberate `target machine` change
-  awaiting a reprovision fires an **info** line once per run (not a recurring
-  warning).
+- Fact-drift guard on `apply`: a machine changed **outside** AppRafter (e.g. a
+  Hetzner-Console resize) fires a **warning**. There is no in-place resize, so a
+  running cluster's type only changes through a reprovision — no "planned change"
+  nag.
 - `apprafter::provider::server_type_not_selected` diagnostic code (see
   `docs/operator-guide/troubleshooting.md`).
 - `UnavailableKind` split in `ServerTypeUnavailable`:
   `Unknown` / `NotOfferedInRegion` / `Retired` (structural, before selection) /
   `OutOfCapacity` (transient, at provision time).
-- `target show` / `whoami` now prints `Server type: <sku or "not selected — run apprafter target machine">`.
+- `target show` / `whoami` now print `Server type: <sku or "not set">`.
 
 **Changed:**
 
