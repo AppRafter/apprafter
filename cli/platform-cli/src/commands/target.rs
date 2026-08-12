@@ -180,6 +180,7 @@ fn run_add(mut args: AddArgs) -> Result<()> {
             cluster_name: args.cluster_name,
             ssh_key_path: args.ssh_key,
             firewall: None,
+            server_type: None,
         },
         credentials: TargetCredentials {
             hetzner_token: Some(token),

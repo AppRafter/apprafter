@@ -247,6 +247,13 @@ pub struct TargetConfig {
     /// 1.83h: cloud-firewall toggles for this target (e.g. the Cloudflare
     /// origin firewall). `#[serde(default)]` keeps legacy configs loading.
     pub firewall: Option<FirewallConfig>,
+    /// 2.16h: preferred Hetzner server type (e.g. `cx22`, `ccx23`). When set,
+    /// this participates in the provisioning-axis resolution chain as the
+    /// "target preference" rung — below an explicit flag or manifest value,
+    /// above the ambient `HCLOUD_SERVER_TYPE` env var. `None` means "not
+    /// configured here; continue down the chain". `#[serde(default)]` keeps
+    /// pre-2.16h `config.yaml` files loading without the key present.
+    pub server_type: Option<String>,
 }
 
 /// Secret target credentials. Stored at mode 0600. **Never** derive
@@ -705,6 +712,7 @@ mod tests {
                 firewall: Some(FirewallConfig {
                     cloudflare_origin: true,
                 }),
+                server_type: None,
             },
             credentials: TargetCredentials {
                 hetzner_token: Some(
@@ -1073,6 +1081,27 @@ mod tests {
         let err =
             validate_hetzner_token_format(&token).expect_err("underscore is non-alphanumeric");
         assert!(err.contains("alphanumeric"), "{err}");
+    }
+
+    #[test]
+    fn target_config_without_server_type_loads_none() {
+        // A pre-2.16h config.yaml that has no `server_type:` key must
+        // still deserialise cleanly — the field defaults to None.
+        let y = "provider: hetzner-cloud\nregion: nbg1\n";
+        let c: TargetConfig = serde_yaml::from_str(y).unwrap();
+        assert!(c.server_type.is_none());
+    }
+
+    #[test]
+    fn target_config_roundtrips_server_type() {
+        let c = TargetConfig {
+            provider: "hetzner-cloud".into(),
+            server_type: Some("ccx23".into()),
+            ..Default::default()
+        };
+        let y = serde_yaml::to_string(&c).unwrap();
+        let back: TargetConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(back.server_type.as_deref(), Some("ccx23"));
     }
 
     #[test]
