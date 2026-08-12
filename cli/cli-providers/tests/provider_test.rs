@@ -267,6 +267,7 @@ fn apply_creates_all_resources_in_order_and_attaches_to_server() {
         .create();
     let _list_types = srv
         .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::Any)
         .with_status(200)
         .with_body(
             r#"{"server_types":[{"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4,"disk":40,"deprecation":null,"locations":[{"name":"nbg1","available":true}]}]}"#,
@@ -426,6 +427,7 @@ fn apply_creates_floating_ip_after_server_with_server_attach() {
         .create();
     let _list_types = srv
         .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::Any)
         .with_status(200)
         .with_body(
             r#"{"server_types":[{"id":104,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4,"disk":40,"deprecation":null,"locations":[{"name":"nbg1","available":true}]}]}"#,
@@ -642,6 +644,7 @@ fn apply_forwards_user_data_into_the_create_server_request() {
         .create();
     server
         .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::Any)
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(
@@ -732,6 +735,7 @@ fn apply_rejects_deprecated_server_type_before_any_post() {
         .create();
     let g_types = server
         .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::Any)
         .with_status(200)
         .with_body(
             r#"{

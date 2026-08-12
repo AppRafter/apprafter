@@ -342,9 +342,26 @@ pub struct ServerTypeLocation {
     pub deprecation: Option<Deprecation>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MetaPagination {
+    /// `null` / absent when there are no more pages.
+    #[serde(default)]
+    pub next_page: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Meta {
+    #[serde(default)]
+    pub pagination: MetaPagination,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerTypeListResponse {
     pub server_types: Vec<ServerType>,
+    /// Hetzner paginates the server-type catalog. `None` when the
+    /// response predates pagination support or when a fixture omits it.
+    #[serde(default)]
+    pub meta: Option<Meta>,
 }
 
 /// One row of `GET /v1/locations`. Hetzner cloud locations are

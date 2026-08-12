@@ -563,6 +563,7 @@ fn list_server_types_decodes_typed_payload() {
     let mut server = mockito::Server::new();
     let m = server
         .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::Any)
         .match_header("Authorization", "Bearer test-token")
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -632,6 +633,7 @@ fn list_server_types_maps_4xx_to_hetzner_error() {
     let mut server = mockito::Server::new();
     server
         .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::Any)
         .with_status(401)
         .with_header("content-type", "application/json")
         .with_body(r#"{"error":{"code":"unauthorized","message":"bad token"}}"#)
@@ -646,6 +648,41 @@ fn list_server_types_maps_4xx_to_hetzner_error() {
         }
         other => panic!("expected Hetzner error, got {other:?}"),
     }
+}
+
+#[test]
+fn list_server_types_follows_pagination() {
+    let mut srv = mockito::Server::new();
+    let base = r#"{"id":%ID%,"name":"%N%","architecture":"x86","cpu_type":"shared","cores":2,"memory":4.0,"disk":40,"deprecation":null,"locations":[],"prices":[]}"#;
+    let p1_body = format!(
+        r#"{{"server_types":[{}],"meta":{{"pagination":{{"page":1,"per_page":50,"next_page":2}}}}}}"#,
+        base.replace("%ID%", "1").replace("%N%", "cx22")
+    );
+    let p2_body = format!(
+        r#"{{"server_types":[{}],"meta":{{"pagination":{{"page":2,"per_page":50,"next_page":null}}}}}}"#,
+        base.replace("%ID%", "2").replace("%N%", "cx32")
+    );
+    let p1 = srv
+        .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::UrlEncoded("page".into(), "1".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(p1_body)
+        .create();
+    let p2 = srv
+        .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::UrlEncoded("page".into(), "2".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(p2_body)
+        .create();
+    let client = HetznerCloudClient::new(srv.url(), "tok");
+    let all = client.list_server_types().expect("should succeed");
+    assert_eq!(all.server_types.len(), 2);
+    assert_eq!(all.server_types[0].name, "cx22");
+    assert_eq!(all.server_types[1].name, "cx32");
+    p1.assert();
+    p2.assert();
 }
 
 /// Standard Hetzner error envelope used in every Err::Status test.
