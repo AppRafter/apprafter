@@ -71,9 +71,9 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 | Status | Feature | plan.md | Checkpoint |
 |---|---|---|---|
-| 🚧 | Live `(region × SKU)` machine-picker matrix — explicit server-type choice at provision time (`apprafter target machine`, `--server-type`, `APPRAFTER_SERVER_TYPE`; no implicit `cpx22` default) | 2.16h + 2.16h-a | CP1 |
+| ✅ | Live `(region × SKU)` machine-picker matrix — explicit server-type choice at provision time (`apprafter target machine`, `--server-type`, `APPRAFTER_SERVER_TYPE`; no implicit `cpx22` default) | 2.16h + 2.16h-a | CP1 |
 
-> **2.16h/2.16h-a:** implementation complete on branch `feat/2.16h-machine-picker`; real-Hetzner walk pending. `🚧` flips to `✅` after the walk is GREEN and the release is tagged.
+> **2.16h/2.16h-a:** released **cli v0.2.43** (monorepo tag `v0.2.43`, CLI-only). Real-Hetzner walk **GREEN 2026-08-12** (`e2e/machine-picker-walk.sh`, non-interactive legs: no-type→error + 0 resources, explicit-type→provisions the exact SKU + records the fact, legacy self-heal backfill, `target machine` refused on a provisioned cluster; swept to zero). Interactive matrix table confirmed live by the owner; the manual-acceptance pass drove three UX corrections (`target machine` refuses on a provisioned cluster → backup + `restore --reprovision`, dead deferred-intent guard removed, stale `run target machine` hint dropped).
 >
 > The machine picker (`2.16h`) and the no-implicit-default breaking change (`2.16h-a` / Decision 0) ship together in one CLI release. BREAKING: `apprafter up` / `apply` / `restore --reprovision` without an explicit type on the create path now errors `apprafter::provider::server_type_not_selected`. **Migration:** existing clusters self-heal on the first `apply` after upgrade (type backfilled from the live server). Fresh targets need a type via `apprafter target machine`, `--server-type`, `APPRAFTER_SERVER_TYPE`, or `nodes[0].kind` in the manifest. See ADR 0056.
 

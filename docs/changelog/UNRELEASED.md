@@ -9,9 +9,9 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## cli vTBD — 2.16h/2.16h-a machine picker + no implicit server-type default (BREAKING) (real-Hetzner walk pending)
+## cli v0.2.43 — 2.16h/2.16h-a machine picker + no implicit server-type default (BREAKING) (2026-08-12, real-Hetzner walk GREEN)
 
-> Implementation landed on branch `feat/2.16h-machine-picker`; release version and walk validation are pending.
+> CLI-only (monorepo tag `v0.2.43`; no operator/chart/cue-cmp change). Non-interactive real-Hetzner walk GREEN (`e2e/machine-picker-walk.sh`); interactive matrix table confirmed live by the owner. The manual-acceptance pass corrected the `target machine` UX: it now refuses on a provisioned cluster (a machine change is a `backup` + `restore --reprovision`, not an in-place resize), the dead deferred-intent guard was removed, and the stale `run target machine` hint dropped from `show`/`whoami`.
 
 **BREAKING:** Provisioning a new machine now requires an explicit server type.
 The implicit `cpx22` default (`DEFAULT_SERVER_TYPE` constant) has been
