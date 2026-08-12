@@ -21,6 +21,7 @@ pub mod init;
 pub mod k8s_helpers;
 pub mod kubeconfig;
 pub mod login;
+pub mod machine_picker;
 pub mod migration;
 pub mod node_prep;
 pub mod open;
