@@ -89,6 +89,17 @@ pub fn run(action: TargetCommand) -> Result<()> {
         TargetCommand::Domain { action } => crate::commands::target_domain::run(action),
         TargetCommand::Firewall { action } => crate::commands::target_firewall::run(action),
         TargetCommand::Ip => run_ip(),
+        TargetCommand::Machine {
+            target,
+            server_type,
+            no_ping,
+        } => crate::commands::target_machine::run_machine(
+            crate::commands::target_machine::MachineArgs {
+                target,
+                server_type,
+                no_ping,
+            },
+        ),
     }
 }
 

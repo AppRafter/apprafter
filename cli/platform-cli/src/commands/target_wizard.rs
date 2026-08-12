@@ -693,7 +693,7 @@ fn fetch_offers_with_retry(
 ///   `(that_region, None)` so `server_type` stays unset.
 /// - Normal path: fetches the full catalog, measures latency to each unique
 ///   location once, builds `MachineRow`s, and delegates to `pick_machine`.
-fn prompt_machine(
+pub fn prompt_machine(
     provider: &str,
     token: &str,
     prefill_region: Option<&str>,

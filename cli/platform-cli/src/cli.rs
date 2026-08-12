@@ -1125,6 +1125,32 @@ pub enum TargetCommand {
     },
     /// Show the cluster node's public IPv4 + IPv6 (for DNS A/AAAA records).
     Ip,
+    /// Set or change the server type (and region) on a target via the
+    /// machine picker. This is the ONLY way to change the server type on an
+    /// existing target — `target add <existing>` errors, and `--renew` is
+    /// credentials-only.
+    Machine {
+        /// Target to modify (defaults to the active target).
+        #[arg(long)]
+        target: Option<String>,
+        /// Set the type non-interactively (skips the picker). When
+        /// `--no-ping` is also passed the SKU is saved without API
+        /// validation; without `--no-ping` the SKU is validated against
+        /// the live Hetzner API for the target's current region.
+        #[arg(long = "server-type")]
+        server_type: Option<String>,
+        /// Skip the provider API. Requires `--server-type` — the picker
+        /// cannot work without the API. Without `--server-type` this flag
+        /// is an error, never a silent no-op. Honours
+        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics.
+        #[arg(
+            long = "no-ping",
+            env = "APPRAFTER_NO_PING",
+            default_value_t = false,
+            value_parser = BoolishValueParser::new(),
+        )]
+        no_ping: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
