@@ -8,6 +8,7 @@ pub mod dry_run;
 pub mod hetzner_cloud;
 pub mod k8s;
 pub mod machine;
+pub mod machine_filter;
 pub mod provider;
 pub mod validators;
 
