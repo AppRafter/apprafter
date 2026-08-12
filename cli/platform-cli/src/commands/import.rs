@@ -140,7 +140,8 @@ fn build_snapshot(client: &HetznerCloudClient, cluster: &str) -> Result<Option<H
 
     Ok(Some(HetznerCloudState {
         server_id: server.id,
-        server_name: server.name,
+        server_name: server.name.clone(),
+        server_type: server.server_type.as_ref().map(|st| st.name.clone()),
         ssh_key_ids,
         network_id,
         firewall_id,
@@ -254,6 +255,57 @@ mod tests {
     }
 
     #[test]
+    fn build_snapshot_captures_server_type_from_live_server() {
+        // M28 / Task 11: `build_snapshot` must read
+        // `server.server_type.name` from the API response into the
+        // `HetznerCloudState.server_type` field so `import` records the
+        // actual provisioned shape for re-provision and self-heal.
+        let mut server = mockito::Server::new();
+        mock_full_project(
+            &mut server,
+            r#"{"servers":[
+                {"id":55,"name":"platform-1","status":"running",
+                 "labels":{"apprafter":"true"},
+                 "server_type":{"name":"ccx23"}}
+            ]}"#,
+        );
+        let client = HetznerCloudClient::new(server.url(), "test-token");
+
+        let snap = build_snapshot(&client, "platform-1")
+            .expect("build_snapshot")
+            .expect("Some(snapshot)");
+        assert_eq!(
+            snap.server_type.as_deref(),
+            Some("ccx23"),
+            "server_type must be read from the live server DTO"
+        );
+        assert_eq!(snap.server_id, 55);
+    }
+
+    #[test]
+    fn build_snapshot_server_type_is_none_when_api_omits_field() {
+        // Old / bare servers that don't return a `server_type` object must
+        // still produce a snapshot — just with `server_type: None`.
+        let mut server = mockito::Server::new();
+        mock_full_project(
+            &mut server,
+            r#"{"servers":[
+                {"id":56,"name":"platform-1","status":"running",
+                 "labels":{"apprafter":"true"}}
+            ]}"#,
+        );
+        let client = HetznerCloudClient::new(server.url(), "test-token");
+
+        let snap = build_snapshot(&client, "platform-1")
+            .expect("build_snapshot")
+            .expect("Some(snapshot)");
+        assert!(
+            snap.server_type.is_none(),
+            "absent server_type in API response must yield None in state"
+        );
+    }
+
+    #[test]
     fn build_snapshot_returns_none_when_server_lacks_apprafter_label() {
         let mut server = mockito::Server::new();
         mock_full_project(
@@ -361,6 +413,7 @@ mod tests {
         let s = HetznerCloudState {
             server_id: 1,
             server_name: "x".into(),
+            server_type: None,
             ssh_key_ids: vec![],
             network_id: None,
             firewall_id: None,

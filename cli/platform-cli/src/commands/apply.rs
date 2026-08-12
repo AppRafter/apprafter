@@ -142,8 +142,8 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
     let region_defaulted = region_resolved.is_none();
     let region = region_resolved.unwrap_or_else(|| "nbg1".into());
 
-    // server type: flag > manifest nodes[0].kind > state (None for now, a later
-    // task records the deployed type) > target preference > APPRAFTER_SERVER_TYPE env.
+    // server type: flag > manifest nodes[0].kind > state (recorded fact from last
+    // provision/import) > target preference > APPRAFTER_SERVER_TYPE env.
     // NO default — provisioning a machine is a spend decision; the type must be
     // chosen explicitly. The create path in the provider will fire
     // `CliError::ServerTypeNotSelected` if `None` reaches it. An existing-cluster
@@ -153,18 +153,22 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
         .and_then(|m| m.spec.nodes.first())
         .map(|n| n.kind.clone());
     let target_server_type = target_config.as_ref().and_then(|t| t.server_type.clone());
+    let state_server_type = state
+        .hetzner_cloud
+        .as_ref()
+        .and_then(|h| h.server_type.clone());
     let env_type = env_server_type();
     let resolved_type: Option<String> = resolve_precedence(
         server_type_flag,
         manifest_node_kind.as_deref(),
-        None, // state fact — added in a later task
+        state_server_type.as_deref(),
         target_server_type.as_deref(),
         env_type.as_deref(),
     );
     let src = source_label(
         server_type_flag,
         manifest_node_kind.as_deref(),
-        None,
+        state_server_type.as_deref(),
         target_server_type.as_deref(),
         env_type.as_deref(),
     );
@@ -406,7 +410,8 @@ fn persist_state(
             .collect();
         state.hetzner_cloud = Some(HetznerCloudState {
             server_id: server.id,
-            server_name: server.name,
+            server_name: server.name.clone(),
+            server_type: server.server_type.as_ref().map(|st| st.name.clone()),
             ssh_key_ids: key_ids,
             network_id: net_id,
             firewall_id: fw_id,

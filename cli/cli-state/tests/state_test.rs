@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 use cli_core::Tier;
-use cli_state::{State, StatePaths};
+use cli_state::{HetznerCloudState, State, StatePaths};
 
 #[test]
 fn load_or_default_returns_default_on_fresh_dir() {
@@ -55,6 +55,7 @@ fn hetzner_cloud_state_round_trips_through_save_load() {
         hetzner_cloud: Some(cli_state::HetznerCloudState {
             server_id: 12345,
             server_name: "platform-1".into(),
+            server_type: None,
             ssh_key_ids: vec![],
             network_id: None,
             firewall_id: None,
@@ -82,6 +83,7 @@ fn hetzner_cloud_state_carries_ssh_key_ids() {
         hetzner_cloud: Some(cli_state::HetznerCloudState {
             server_id: 42,
             server_name: "platform-1".into(),
+            server_type: None,
             ssh_key_ids: vec![7, 9],
             network_id: None,
             firewall_id: None,
@@ -109,6 +111,7 @@ fn hetzner_cloud_state_carries_network_and_firewall_ids() {
         hetzner_cloud: Some(cli_state::HetznerCloudState {
             server_id: 42,
             server_name: "platform-1".into(),
+            server_type: None,
             ssh_key_ids: vec![7],
             network_id: Some(11),
             firewall_id: Some(21),
@@ -136,6 +139,7 @@ fn hetzner_cloud_state_carries_floating_ip_ids() {
         hetzner_cloud: Some(cli_state::HetznerCloudState {
             server_id: 42,
             server_name: "platform-1".into(),
+            server_type: None,
             ssh_key_ids: vec![7],
             network_id: Some(11),
             firewall_id: Some(21),
@@ -157,6 +161,7 @@ fn hetzner_cloud_state_round_trips_cached_kubeconfig_yaml() {
     let s = HetznerCloudState {
         server_id: 42,
         server_name: "platform-1".into(),
+        server_type: None,
         ssh_key_ids: vec![],
         network_id: None,
         firewall_id: None,
@@ -189,6 +194,7 @@ fn hetzner_cloud_state_round_trips_cached_kubeconfig_age() {
     let s = HetznerCloudState {
         server_id: 42,
         server_name: "platform-1".into(),
+        server_type: None,
         ssh_key_ids: vec![],
         network_id: None,
         firewall_id: None,
@@ -228,6 +234,7 @@ fn hetzner_cloud_state_round_trips_argocd_admin_password_age() {
     let s = HetznerCloudState {
         server_id: 42,
         server_name: "platform-1".into(),
+        server_type: None,
         ssh_key_ids: vec![],
         network_id: None,
         firewall_id: None,
@@ -250,7 +257,6 @@ fn hetzner_cloud_state_round_trips_argocd_admin_password_age() {
 
 #[test]
 fn hetzner_cloud_state_argocd_admin_password_age_defaults_to_none_when_absent() {
-    use cli_state::HetznerCloudState;
     let json = r#"{
         "server_id": 1, "server_name": "n",
         "ssh_key_ids": [], "network_id": null,
@@ -259,4 +265,68 @@ fn hetzner_cloud_state_argocd_admin_password_age_defaults_to_none_when_absent() 
     }"#;
     let s: HetznerCloudState = serde_json::from_str(json).unwrap();
     assert!(s.argocd_admin_password_age.is_none());
+}
+
+// ── server_type field (M28 / Task 11) ─────────────────────────────────────────
+
+#[test]
+fn hetzner_cloud_state_round_trips_server_type() {
+    // Serialize with `server_type: Some("ccx23")` and verify it survives
+    // a serde round-trip unchanged.
+    let s = HetznerCloudState {
+        server_id: 42,
+        server_name: "platform-1".into(),
+        server_type: Some("ccx23".into()),
+        ssh_key_ids: vec![],
+        network_id: None,
+        firewall_id: None,
+        floating_ip_ids: vec![],
+        kubeconfig_yaml: None,
+        kubeconfig_age: None,
+        argocd_admin_password_age: None,
+    };
+    let json = serde_json::to_string(&s).unwrap();
+    let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.server_type.as_deref(), Some("ccx23"));
+    assert_eq!(back.server_id, 42);
+}
+
+#[test]
+fn hetzner_cloud_state_server_type_without_it_is_none() {
+    // Serialize without `server_type` (it is `None`) and verify round-trip
+    // keeps it as `None`.
+    let s = HetznerCloudState {
+        server_id: 7,
+        server_name: "platform-1".into(),
+        server_type: None,
+        ssh_key_ids: vec![],
+        network_id: None,
+        firewall_id: None,
+        floating_ip_ids: vec![],
+        kubeconfig_yaml: None,
+        kubeconfig_age: None,
+        argocd_admin_password_age: None,
+    };
+    let json = serde_json::to_string(&s).unwrap();
+    let back: HetznerCloudState = serde_json::from_str(&json).unwrap();
+    assert!(back.server_type.is_none());
+}
+
+#[test]
+fn hetzner_cloud_state_server_type_defaults_to_none_on_old_json() {
+    // Old `state.json` files that predate the `server_type` field must
+    // still deserialize cleanly (serde-default back-compat).
+    let old_json = r#"{
+        "server_id": 99, "server_name": "legacy",
+        "ssh_key_ids": [5], "network_id": null,
+        "firewall_id": null, "floating_ip_ids": []
+    }"#;
+    let s: HetznerCloudState = serde_json::from_str(old_json).unwrap();
+    assert!(
+        s.server_type.is_none(),
+        "old JSON without server_type must deserialize to None, got {:?}",
+        s.server_type
+    );
+    assert_eq!(s.server_id, 99);
+    assert_eq!(s.ssh_key_ids, vec![5]);
 }

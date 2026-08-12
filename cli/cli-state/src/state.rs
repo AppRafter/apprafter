@@ -352,6 +352,13 @@ pub struct State {
 pub struct HetznerCloudState {
     pub server_id: u64,
     pub server_name: String,
+    /// Recorded FACT: the Hetzner server type name (e.g. `"cpx22"`) as
+    /// returned by the live API at provision/import time. Recorded so
+    /// re-provision can reproduce the same machine shape and so legacy
+    /// targets can self-heal via `import`. `#[serde(default)]` keeps old
+    /// `state.json` files (without this field) loading cleanly → `None`.
+    #[serde(default)]
+    pub server_type: Option<String>,
     #[serde(default)]
     pub ssh_key_ids: Vec<u64>,
     #[serde(default)]

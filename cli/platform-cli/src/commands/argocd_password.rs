@@ -181,6 +181,7 @@ mod tests {
         let hetzner = cli_state::HetznerCloudState {
             server_id: 1,
             server_name: "n".into(),
+            server_type: None,
             ssh_key_ids: vec![],
             network_id: None,
             firewall_id: None,
@@ -199,6 +200,7 @@ mod tests {
         let hetzner = cli_state::HetznerCloudState {
             server_id: 1,
             server_name: "n".into(),
+            server_type: None,
             ssh_key_ids: vec![],
             network_id: None,
             firewall_id: None,
