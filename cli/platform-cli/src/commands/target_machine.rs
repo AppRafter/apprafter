@@ -15,6 +15,11 @@
 //! | no          | Some(sku)       | Validate SKU via API, then save |
 //! | no          | None (TTY)      | Interactive picker (fetch + latency + pick_machine) |
 //! | no          | None (no TTY)   | Error — need `--server-type` in non-interactive |
+//!
+//! **Provisioned guard**: when the resolved target already has a live server
+//! (`state.hetzner_cloud` is `Some`), the command hard-refuses BEFORE writing
+//! anything. There is no in-place machine resize; the rebuild path is
+//! `apprafter backup create` + `apprafter restore --reprovision --server-type <sku>`.
 
 use std::io::IsTerminal;
 
@@ -33,6 +38,15 @@ pub struct MachineArgs {
     pub no_ping: bool,
 }
 
+/// Pure helper: returns `true` when the state indicates a server has been
+/// provisioned (i.e. `state.hetzner_cloud` is `Some`).
+///
+/// Used to gate `target machine` so it refuses on a live cluster rather than
+/// silently recording a preference that will never take effect without a rebuild.
+pub fn is_provisioned(state: &cli_state::State) -> bool {
+    state.hetzner_cloud.is_some()
+}
+
 /// Run `apprafter target machine`.
 pub fn run_machine(args: MachineArgs) -> Result<()> {
     // ── Resolve target name + load ───────────────────────────────────────
@@ -43,6 +57,22 @@ pub fn run_machine(args: MachineArgs) -> Result<()> {
     let store = TargetStorePaths::for_root(default_config_root()?);
     let mut target = load_target(&store, &resolved.target_name)?;
     let target_name = &resolved.target_name;
+
+    // ── Provisioned guard (before any write) ─────────────────────────────
+    // There is no in-place machine resize. Attempting to change the type on
+    // a running cluster would silently record a preference that apply() would
+    // shadow with the recorded-fact value. Hard-refuse and guide to the
+    // rebuild path instead.
+    let state = cli_state::State::load_or_default(&resolved.paths)?;
+    if is_provisioned(&state) {
+        return Err(CliError::Other(format!(
+            "`{target_name}` already runs a provisioned cluster — its machine type cannot be \
+             changed in place. To move to a different machine, rebuild from a backup:\n\n    \
+             apprafter backup create\n    \
+             apprafter restore --reprovision --server-type <sku>\n\n\
+             (`target machine` only sets the type on a target that has NOT provisioned yet.)"
+        )));
+    }
 
     // ── Branch on --no-ping ──────────────────────────────────────────────
     match (args.no_ping, args.server_type.as_deref()) {
@@ -121,8 +151,11 @@ pub fn run_machine(args: MachineArgs) -> Result<()> {
 
             // Region-change confirm: only when a server is already provisioned
             // AND the picked region differs from the target's current region.
-            let state = cli_state::State::load_or_default(&resolved.paths)?;
-            let server_provisioned = state.hetzner_cloud.as_ref().map(|h| h.server_id).is_some();
+            // Note: the provisioned guard above already refused when a server
+            // exists, so `server_provisioned` is always false here in practice.
+            // The `needs_region_confirm` call is kept for symmetry / future
+            // use if this path ever runs after a destroy with the state wiped.
+            let server_provisioned = false; // guard above ensures no live server
 
             if needs_region_confirm(
                 target.config.region.as_deref(),
@@ -181,7 +214,44 @@ pub fn needs_region_confirm(
 
 #[cfg(test)]
 mod tests {
-    use super::needs_region_confirm;
+    use super::{is_provisioned, needs_region_confirm};
+    use cli_state::{HetznerCloudState, State};
+
+    // ── is_provisioned ───────────────────────────────────────────────────
+
+    fn state_with_server() -> State {
+        State {
+            hetzner_cloud: Some(HetznerCloudState {
+                server_id: 42,
+                server_name: "platform-1".into(),
+                server_type: Some("cx22".into()),
+                ssh_key_ids: vec![],
+                network_id: None,
+                firewall_id: None,
+                floating_ip_ids: vec![],
+                kubeconfig_yaml: None,
+                kubeconfig_age: None,
+                argocd_admin_password_age: None,
+            }),
+            ..State::default()
+        }
+    }
+
+    fn state_without_server() -> State {
+        State::default()
+    }
+
+    #[test]
+    fn is_provisioned_returns_true_when_hetzner_cloud_present() {
+        assert!(is_provisioned(&state_with_server()));
+    }
+
+    #[test]
+    fn is_provisioned_returns_false_when_hetzner_cloud_absent() {
+        assert!(!is_provisioned(&state_without_server()));
+    }
+
+    // ── needs_region_confirm ─────────────────────────────────────────────
 
     #[test]
     fn provisioned_different_region_needs_confirm() {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! Self-heal backfill helpers and the split fact-drift / deferred-intent guard
-//! for `apprafter apply`. (2.16h)
+//! Self-heal backfill helpers and the fact-drift guard for `apprafter apply`.
+//! (2.16h)
 //!
 //! ## Responsibilities
 //!
@@ -10,11 +10,8 @@
 //!   (preference) when either is currently `None`.
 //!
 //! * [`classify_guard`] — classifies the relationship between the recorded
-//!   fact (`state.server_type`), the operator's preference
-//!   (`target.server_type`), and the live running type, producing one of:
+//!   fact (`state.server_type`) and the live running type, producing one of:
 //!   - [`Guard::FactDriftWarn`]: the machine was changed outside AppRafter.
-//!   - [`Guard::Intent`]: the preference differs from reality — remind the
-//!     operator how to apply it.
 //!   - [`Guard::Silent`]: everything matches; nothing to say.
 //!
 //! Both functions are pure — no I/O, no panics. Tests live at the bottom.
@@ -75,33 +72,28 @@ pub enum Guard {
     /// The *recorded fact* (`state.server_type`) disagrees with the live
     /// running type. The machine was changed outside AppRafter.
     FactDriftWarn,
-    /// The *recorded fact* is absent or matches, but the *preference*
-    /// (`target.server_type`) differs from the live type. The operator has
-    /// asked for a different machine but hasn't re-provisioned yet.
-    Intent,
     /// No mismatch — nothing to say.
     Silent,
 }
 
-/// Classify the relationship between stored fact, operator preference, and
-/// live state.
+/// Classify the relationship between the stored fact and live state.
 ///
 /// Decision table (first matching row wins):
 ///
-/// | `state`     | `target`    | `live` | Result           |
-/// |-------------|-------------|--------|------------------|
-/// | `Some(s)`, `s != live` | any  | any | `FactDriftWarn` |
-/// | None or match | `Some(t)`, `t != live` | any | `Intent` |
-/// | anything    | anything    | any    | `Silent`         |
-pub fn classify_guard(state: Option<&str>, target: Option<&str>, live: &str) -> Guard {
+/// | `state`                 | `live` | Result          |
+/// |-------------------------|--------|-----------------|
+/// | `Some(s)`, `s != live`  | any    | `FactDriftWarn` |
+/// | anything else           | any    | `Silent`        |
+///
+/// The `target` (preference) parameter was dropped: `target machine` now
+/// refuses on a provisioned cluster, so a preference-vs-live mismatch can
+/// only arise from the legacy path, which is better ignored than nagged
+/// about. Only fact-drift (the machine changed outside AppRafter) warrants
+/// a warning.
+pub fn classify_guard(state: Option<&str>, live: &str) -> Guard {
     if let Some(s) = state {
         if s != live {
             return Guard::FactDriftWarn;
-        }
-    }
-    if let Some(t) = target {
-        if t != live {
-            return Guard::Intent;
         }
     }
     Guard::Silent
@@ -201,54 +193,23 @@ mod tests {
 
     #[test]
     fn guard_fact_drift_when_state_differs_from_live() {
-        assert_eq!(
-            classify_guard(Some("cx22"), Some("ccx43"), "ccx23"),
-            Guard::FactDriftWarn
-        );
+        assert_eq!(classify_guard(Some("cx22"), "ccx23"), Guard::FactDriftWarn);
     }
 
     #[test]
-    fn guard_fact_drift_even_when_target_matches_live() {
-        // state disagrees → FactDriftWarn regardless of target.
-        assert_eq!(
-            classify_guard(Some("cx22"), Some("ccx23"), "ccx23"),
-            Guard::FactDriftWarn
-        );
-    }
-
-    #[test]
-    fn guard_intent_when_state_none_and_target_differs_from_live() {
-        assert_eq!(classify_guard(None, Some("ccx43"), "cx22"), Guard::Intent);
-    }
-
-    #[test]
-    fn guard_intent_when_state_matches_and_target_differs_from_live() {
-        assert_eq!(
-            classify_guard(Some("cx22"), Some("ccx43"), "cx22"),
-            Guard::Intent
-        );
+    fn guard_fact_drift_regardless_of_what_live_is() {
+        // state disagrees with live → FactDriftWarn.
+        assert_eq!(classify_guard(Some("cx22"), "ccx43"), Guard::FactDriftWarn);
     }
 
     #[test]
     fn guard_silent_when_state_matches_live() {
-        assert_eq!(
-            classify_guard(Some("cx22"), Some("cx22"), "cx22"),
-            Guard::Silent
-        );
+        assert_eq!(classify_guard(Some("cx22"), "cx22"), Guard::Silent);
     }
 
     #[test]
-    fn guard_silent_when_all_none() {
-        assert_eq!(classify_guard(None, None, "cx22"), Guard::Silent);
-    }
-
-    #[test]
-    fn guard_silent_when_state_matches_and_target_none() {
-        assert_eq!(classify_guard(Some("cx22"), None, "cx22"), Guard::Silent);
-    }
-
-    #[test]
-    fn guard_silent_when_state_none_and_target_matches_live() {
-        assert_eq!(classify_guard(None, Some("cx22"), "cx22"), Guard::Silent);
+    fn guard_silent_when_state_none() {
+        // No recorded fact — nothing to compare, nothing to warn about.
+        assert_eq!(classify_guard(None, "cx22"), Guard::Silent);
     }
 }

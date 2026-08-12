@@ -518,6 +518,13 @@ fn persist_state(
 /// could be resized out-of-band, Hetzner does not allow relocating a running
 /// server.  There is therefore no "region changed under us" scenario to warn
 /// about, so `classify_guard` is intentionally not called for region.
+///
+/// ### Why there is NO deferred-intent guard
+///
+/// `target machine` now refuses on a provisioned cluster, so a
+/// preference-vs-live mismatch cannot arise from normal usage. The former
+/// `Guard::Intent` branch pointed at a non-existent `apprafter up
+/// --reprovision` flag and has been removed.
 fn run_backfill_and_guard(
     live_servers: &[Server],
     server_id: u64,
@@ -585,25 +592,18 @@ fn run_backfill_and_guard(
         }
     }
 
-    // Guard: compare the stable pre-apply fact + preference against live (server
-    // type only — region is immutable on a running server, no drift is possible).
+    // Guard: compare the stable pre-apply fact against live (server type only —
+    // region is immutable on a running server, no drift is possible).
     let live_type = match live_type_opt {
         Some(t) => t,
         None => return, // no type from API — nothing to guard
     };
-    match classify_guard(state_type_at_start, target_type_at_start, &live_type) {
+    match classify_guard(state_type_at_start, &live_type) {
         Guard::FactDriftWarn => {
             eprintln!(
                 "warning: the running machine is `{live_type}` but AppRafter recorded \
                  `{}` — it was changed outside AppRafter",
                 state_type_at_start.unwrap_or("<unknown>")
-            );
-        }
-        Guard::Intent => {
-            eprintln!(
-                "  info: server type `{}` is planned for the next provision — \
-                 run `apprafter up --reprovision` to apply",
-                target_type_at_start.unwrap_or("<unknown>")
             );
         }
         Guard::Silent => {}
