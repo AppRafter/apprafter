@@ -50,6 +50,16 @@ pub struct PublicNet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerTypeRef {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocationRef {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
     pub id: u64,
     pub name: String,
@@ -58,6 +68,10 @@ pub struct Server {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub public_net: Option<PublicNet>,
+    #[serde(default)]
+    pub server_type: Option<ServerTypeRef>,
+    #[serde(default)]
+    pub location: Option<LocationRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,6 +293,19 @@ pub struct FloatingIpCreateResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct HetznerPrice {
+    pub net: String,
+    pub gross: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerTypePrice {
+    pub location: String,
+    pub price_monthly: HetznerPrice,
+    pub price_hourly: HetznerPrice,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerType {
     pub id: u64,
     pub name: String,
@@ -293,6 +320,8 @@ pub struct ServerType {
     pub deprecation: Option<Deprecation>,
     #[serde(default)]
     pub locations: Vec<ServerTypeLocation>,
+    #[serde(default)]
+    pub prices: Vec<ServerTypePrice>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -307,6 +336,10 @@ pub struct Deprecation {
 pub struct ServerTypeLocation {
     pub name: String,
     pub available: bool,
+    #[serde(default)]
+    pub recommended: bool,
+    #[serde(default)]
+    pub deprecation: Option<Deprecation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

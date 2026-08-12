@@ -57,6 +57,8 @@ mod tests {
             status: ServerStatus::Running,
             labels: BTreeMap::new(),
             public_net,
+            server_type: None,
+            location: None,
         }
     }
 

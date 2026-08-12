@@ -406,3 +406,37 @@ fn server_decodes_public_net_with_only_ipv6_when_ipv4_absent() {
     let v6 = pn.ipv6.expect("ipv6 should decode");
     assert_eq!(v6.ip, "2a01:4f8:c0c:abcd::/64");
 }
+
+#[test]
+fn server_type_parses_prices_and_per_location_flags() {
+    use cli_providers::hetzner_cloud::types::ServerTypeListResponse;
+    let json = r#"{"server_types":[{"id":22,"name":"cx22","architecture":"x86","cpu_type":"shared",
+      "cores":2,"memory":4.0,"disk":40,"deprecation":null,
+      "locations":[{"name":"nbg1","available":true,"recommended":true,"deprecation":null}],
+      "prices":[{"location":"nbg1","price_monthly":{"net":"3.9200","gross":"4.66"},
+                 "price_hourly":{"net":"0.0066","gross":"0.0079"}}]}]}"#;
+    let r: ServerTypeListResponse = serde_json::from_str(json).unwrap();
+    let t = &r.server_types[0];
+    assert_eq!(t.prices[0].location, "nbg1");
+    assert_eq!(t.prices[0].price_monthly.net, "3.9200");
+    assert!(t.locations[0].recommended);
+}
+
+#[test]
+fn server_parses_nested_type_and_location_as_refs_not_strings() {
+    use cli_providers::hetzner_cloud::types::Server;
+    // The API returns server_type / location as OBJECTS; Option<String> would panic here.
+    let json = r#"{"id":1,"name":"platform-1","status":"running","labels":{},
+      "server_type":{"id":22,"name":"ccx23","cores":8},"location":{"name":"hel1"}}"#;
+    let s: Server = serde_json::from_str(json).unwrap();
+    assert_eq!(s.server_type.unwrap().name, "ccx23");
+    assert_eq!(s.location.unwrap().name, "hel1");
+}
+
+#[test]
+fn old_server_payload_without_refs_defaults_to_none() {
+    use cli_providers::hetzner_cloud::types::Server;
+    let json = r#"{"id":1,"name":"p","status":"running","labels":{}}"#;
+    let s: Server = serde_json::from_str(json).unwrap();
+    assert!(s.server_type.is_none() && s.location.is_none());
+}

@@ -118,7 +118,10 @@ mod tests {
             locations: vec![ServerTypeLocation {
                 name: region.into(),
                 available: true,
+                recommended: false,
+                deprecation: None,
             }],
+            prices: vec![],
         }
     }
 
@@ -181,6 +184,8 @@ mod tests {
         t.locations.push(ServerTypeLocation {
             name: "nbg1".into(),
             available: false,
+            recommended: false,
+            deprecation: None,
         });
         let types = vec![t, live("cax11", 2, 4.0, 40, "nbg1")];
         let err = validate_server_type(&types, "cpx22", "nbg1").unwrap_err();
