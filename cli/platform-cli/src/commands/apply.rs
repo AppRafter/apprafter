@@ -4,8 +4,12 @@ use std::path::Path;
 
 use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::resolve::resolve_precedence;
-use cli_core::target::{load_active_target_config, TargetConfig, TargetStorePaths};
+use cli_core::target::{
+    load_active_target_config, load_target, save_target, TargetConfig, TargetStorePaths,
+};
 use cli_core::{resolve_hetzner_ssh_public_key, resolve_hetzner_token, CliError, Result};
+use cli_providers::backfill::{backfill_from, classify_guard, BackfillOutcome, Guard};
+use cli_providers::hetzner_cloud::types::Server;
 use cli_providers::hetzner_cloud::{
     build_k3s_user_data, swap_eligible_from_env, FloatingIpSpec, HetznerCloudClient,
     HetznerCloudProvider, K3sBootstrapOptions, NetworkSpec, ServerSpec, SshKeySpec,
@@ -67,6 +71,7 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
     let resolved = resolve_state_paths(target_override)?;
     let paths = resolved.paths;
     let target_store = resolved.store;
+    let target_name = resolved.target_name;
     let mut state = State::load_or_default(&paths)?;
 
     let target_config = load_active_target_config(&target_store, target_override);
@@ -157,6 +162,14 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
         .hetzner_cloud
         .as_ref()
         .and_then(|h| h.server_type.clone());
+
+    // 2.16h: capture the stable, pre-apply values used for the fact-drift /
+    // deferred-intent guard (run after persist_state so they are never
+    // overwritten by the live reconcile before the comparison).
+    let state_server_type_at_start = state_server_type.clone();
+    let target_server_type_at_start = target_server_type.clone();
+    // server_id is only available when a cluster already exists.
+    let existing_server_id: Option<u64> = state.hetzner_cloud.as_ref().map(|h| h.server_id);
     let env_type = env_server_type();
     let resolved_type: Option<String> = resolve_precedence(
         server_type_flag,
@@ -226,7 +239,23 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
     let outcome = provider.apply()?;
     println!("apply complete: {} action(s)", outcome.applied);
 
-    persist_state(&provider, &mut state, &paths, &cluster)?;
+    // persist_state returns the live server list so we can reuse it for the
+    // backfill + guard without an extra API round-trip (M17/N8).
+    let live_servers = persist_state(&provider, &mut state, &paths, &cluster)?;
+
+    // 2.16h: backfill + guard — exists-path only (server was already present
+    // before this apply, i.e. we captured a server_id at apply start).
+    if let Some(server_id) = existing_server_id {
+        run_backfill_and_guard(
+            &live_servers,
+            server_id,
+            state_server_type_at_start.as_deref(),
+            target_server_type_at_start.as_deref(),
+            &target_store,
+            &target_name,
+        );
+    }
+
     Ok(())
 }
 
@@ -374,18 +403,36 @@ fn build_floating_ip_specs(
     }
 }
 
+/// Reconcile `State` against the live Hetzner cloud objects and persist it.
+///
+/// Returns the full live server list fetched during reconciliation so callers
+/// can reuse it for the backfill + guard without an extra API round-trip (M17).
+///
+/// ### Write-once `server_type` (2.16h)
+///
+/// `server_type` is a recorded FACT — the machine type at creation/import time.
+/// It must never be silently overwritten by a subsequent apply (which might be
+/// a no-op and the operator might have used `apprafter target machine` to
+/// *request* a different type without yet re-provisioning). The rule:
+///
+/// * Existing recorded value (`state.hetzner_cloud.server_type = Some(...)`) →
+///   **keep it**. The fact is already known; overwriting it would destroy the
+///   reference point used by the drift guard.
+/// * Recorded value is `None` (legacy state before 2.16h) → adopt from the
+///   live API response. This is the self-heal path for pre-existing clusters.
 fn persist_state(
     provider: &HetznerCloudProvider,
     state: &mut State,
     paths: &StatePaths,
     cluster: &str,
-) -> Result<()> {
-    let live_servers = provider.client.list_servers()?;
+) -> Result<Vec<Server>> {
+    let live_servers_response = provider.client.list_servers()?;
     let live_keys = provider.client.list_ssh_keys()?;
     let live_nets = provider.client.list_networks()?;
     let live_fws = provider.client.list_firewalls()?;
     let live_fips = provider.client.list_floating_ips()?;
-    if let Some(server) = live_servers.servers.into_iter().find(|s| s.name == cluster) {
+    let all_servers: Vec<Server> = live_servers_response.servers;
+    if let Some(server) = all_servers.iter().find(|s| s.name == cluster) {
         let key_ids: Vec<u64> = live_keys
             .ssh_keys
             .iter()
@@ -408,21 +455,122 @@ fn persist_state(
             .filter(|f| f.labels.get("apprafter").map(String::as_str) == Some("true"))
             .map(|f| f.id)
             .collect();
+        // Write-once: preserve an already-recorded server_type fact; adopt from
+        // the live API only when the fact is currently absent (legacy state or
+        // first apply on a freshly-provisioned server).
+        let recorded_type = state
+            .hetzner_cloud
+            .as_ref()
+            .and_then(|h| h.server_type.clone())
+            .or_else(|| server.server_type.as_ref().map(|st| st.name.clone()));
+        // Preserve age-encrypted secrets across the state refresh — they are
+        // written by `kubeconfig` / `argocd-password` and must not be clobbered
+        // by an unrelated `apply`.
+        let (kube_yaml, kube_age, argocd_age) = state
+            .hetzner_cloud
+            .as_ref()
+            .map(|h| {
+                (
+                    h.kubeconfig_yaml.clone(),
+                    h.kubeconfig_age.clone(),
+                    h.argocd_admin_password_age.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
         state.hetzner_cloud = Some(HetznerCloudState {
             server_id: server.id,
             server_name: server.name.clone(),
-            server_type: server.server_type.as_ref().map(|st| st.name.clone()),
+            server_type: recorded_type,
             ssh_key_ids: key_ids,
             network_id: net_id,
             firewall_id: fw_id,
             floating_ip_ids: fip_ids,
-            kubeconfig_yaml: None,
-            kubeconfig_age: None,
-            argocd_admin_password_age: None,
+            kubeconfig_yaml: kube_yaml,
+            kubeconfig_age: kube_age,
+            argocd_admin_password_age: argocd_age,
         });
         state.save(paths)?;
     }
-    Ok(())
+    Ok(all_servers)
+}
+
+/// 2.16h: backfill + guard — runs once on the exists-path after persist_state.
+///
+/// Receives the live server list already fetched by `persist_state` (no extra
+/// API call). Reads the STABLE pre-apply state and target values (captured
+/// before any mutation) so the guard comparison is deterministic.
+///
+/// Both write failures (backfill) are treated as best-effort: they print a
+/// warning but never propagate as errors — a read-only config dir must not
+/// fail `apply`.
+fn run_backfill_and_guard(
+    live_servers: &[Server],
+    server_id: u64,
+    state_type_at_start: Option<&str>,
+    target_type_at_start: Option<&str>,
+    target_store: &TargetStorePaths,
+    target_name: &str,
+) {
+    let outcome = backfill_from(live_servers, server_id);
+    let live_type = match &outcome {
+        BackfillOutcome::Adopt {
+            server_type: Some(t),
+            ..
+        } => t.clone(),
+        BackfillOutcome::AmbiguousSkip => {
+            eprintln!(
+                "warning: multiple servers matched id {server_id} in the live listing — \
+                 skipping backfill and drift guard"
+            );
+            return;
+        }
+        // Skip (no match) or Adopt with no server_type from API — nothing to do.
+        _ => return,
+    };
+
+    // Backfill target.server_type when it is absent (best-effort).
+    if target_type_at_start.is_none() {
+        match load_target(target_store, target_name) {
+            Ok(mut target) => {
+                if target.config.server_type.is_none() {
+                    target.config.server_type = Some(live_type.clone());
+                    if let Err(e) = save_target(target_store, &target) {
+                        eprintln!(
+                            "warning: could not persist server type baseline to target config: {e}"
+                        );
+                    } else {
+                        eprintln!(
+                            "  server type baseline established: {live_type} \
+                             (recorded from live server — run `apprafter target machine` \
+                             to change)"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: could not load target config for backfill: {e}");
+            }
+        }
+    }
+
+    // Guard: compare the stable pre-apply fact + preference against live.
+    match classify_guard(state_type_at_start, target_type_at_start, &live_type) {
+        Guard::FactDriftWarn => {
+            eprintln!(
+                "warning: the running machine is `{live_type}` but AppRafter recorded \
+                 `{}` — it was changed outside AppRafter",
+                state_type_at_start.unwrap_or("<unknown>")
+            );
+        }
+        Guard::Intent => {
+            eprintln!(
+                "  info: server type `{}` is planned for the next provision — \
+                 run `apprafter up --reprovision` to apply",
+                target_type_at_start.unwrap_or("<unknown>")
+            );
+        }
+        Guard::Silent => {}
+    }
 }
 
 #[cfg(test)]
