@@ -97,6 +97,10 @@ struct LoadedCr {
 ///
 /// `--reprovision` (mode a) provisions a fresh cluster in the target first, then
 /// replays; topology + cloud token come from the target's local config.
+// 2.16h: server_type added the 8th argument — allow here instead of introducing
+// an intermediate struct just to satisfy clippy (the function is a direct
+// command entrypoint, not a deeply-called helper).
+#[allow(clippy::too_many_arguments)]
 pub fn run_restore(
     repo: &str,
     target: Option<&str>,
@@ -105,6 +109,7 @@ pub fn run_restore(
     data_only: bool,
     passphrase: Option<&str>,
     credential_file: Option<&Path>,
+    server_type: Option<&str>,
 ) -> Result<()> {
     // Mutually-exclusive modes: `--reprovision` rebuilds the WHOLE cluster from
     // the backup (its step list has no data-only shortcut); `--data-only` reloads
@@ -205,7 +210,7 @@ pub fn run_restore(
                 "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
                 target.unwrap_or("<active>")
             );
-            crate::commands::bootstrap_all::run(target, false)?;
+            crate::commands::bootstrap_all::run(target, false, server_type)?;
             kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
             continue;
         }

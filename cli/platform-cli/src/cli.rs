@@ -94,6 +94,12 @@ pub enum Commands {
         /// multiple targets without `apprafter target use`.
         #[arg(long)]
         target: Option<String>,
+        /// Hetzner server type SKU to provision (e.g. `cpx22`, `cx32`).
+        /// Takes precedence over the manifest `nodes[0].kind`, the saved target
+        /// preference, and `APPRAFTER_SERVER_TYPE`. Omit to let the resolution
+        /// chain decide (default `cpx22`).
+        #[arg(long = "server-type")]
+        server_type: Option<String>,
     },
     /// Print the current cluster status.
     Status,
@@ -174,6 +180,11 @@ pub enum Commands {
         /// invoke and which target it resolves against.
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
+        /// Hetzner server type SKU to provision (e.g. `cpx22`, `cx32`).
+        /// Forwarded to the `apply` phase of bootstrap-all. Omit to
+        /// let the resolution chain decide (default `cpx22`).
+        #[arg(long = "server-type")]
+        server_type: Option<String>,
     },
     /// Inspect and control the cluster's PlatformStack — the
     /// declarative platform-version resource managed by
@@ -296,6 +307,11 @@ pub enum Commands {
         /// creds are read locally, NEVER from the cluster.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
+        /// Hetzner server type SKU to use when `--reprovision` is set
+        /// (e.g. `cpx22`, `cx32`). Forwarded to the `apply` phase.
+        /// Omit to let the resolution chain decide (default `cpx22`).
+        #[arg(long = "server-type")]
+        server_type: Option<String>,
     },
 }
 
@@ -1042,6 +1058,15 @@ pub enum TargetCommand {
             value_parser = BoolishValueParser::new(),
         )]
         no_ping: bool,
+        /// Preferred server type SKU for this target (e.g. `cpx22`, `cx32`).
+        /// Saved as the "target preference" rung in the resolution chain —
+        /// below an explicit `--server-type` flag or manifest value, above
+        /// `APPRAFTER_SERVER_TYPE`. Omit to leave the slot empty (the chain
+        /// continues down to the env var, then the `cpx22` default).
+        /// When set and `--no-ping` is NOT passed, the SKU is validated
+        /// against the live Hetzner API for the target's region.
+        #[arg(long = "server-type")]
+        server_type: Option<String>,
     },
     /// List every configured target, marking the active one. Empty
     /// store prints an onboarding hint pointing at `target add`.

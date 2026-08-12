@@ -42,7 +42,7 @@ const KUBECONFIG_POLL_TIMEOUT: Duration = Duration::from_secs(300);
 /// SSH with reconnects.
 const KUBECONFIG_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-pub fn run(target_override: Option<&str>, dry_run: bool) -> Result<()> {
+pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&str>) -> Result<()> {
     info!(target_override, dry_run, "bootstrap-all invoked");
     let total_start = Instant::now();
 
@@ -60,7 +60,8 @@ pub fn run(target_override: Option<&str>, dry_run: bool) -> Result<()> {
         style::info("→")
     );
     let p1_start = Instant::now();
-    apply::run(target_override).map_err(|e| failed(1, "apply", p1_start.elapsed(), e))?;
+    apply::run(target_override, server_type)
+        .map_err(|e| failed(1, "apply", p1_start.elapsed(), e))?;
     let p1 = p1_start.elapsed();
     println!(
         "{} [1/3] apply        done in {}",

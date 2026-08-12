@@ -23,6 +23,7 @@ use cli_core::target::{
     Target, TargetConfig, TargetCredentials, TargetStorePaths,
 };
 use cli_core::{CliError, Result};
+use cli_providers::hetzner_cloud::validate_server_type;
 use cli_providers::{HetznerCloudClient, HetznerCloudValidator, ProviderValidator};
 use cli_state::State;
 use tabled::{settings::Style, Table, Tabled};
@@ -64,6 +65,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
             renew,
             no_interactive,
             no_ping,
+            server_type,
         } => run_add(AddArgs {
             name,
             provider,
@@ -76,6 +78,7 @@ pub fn run(action: TargetCommand) -> Result<()> {
             renew,
             no_interactive,
             no_ping,
+            server_type,
         }),
         TargetCommand::List => run_list(),
         TargetCommand::Use { name } => run_use(&name),
@@ -108,6 +111,8 @@ pub struct AddArgs {
     pub renew: bool,
     pub no_interactive: bool,
     pub no_ping: bool,
+    /// 2.16h: preferred server type SKU to persist in the target store.
+    pub server_type: Option<String>,
 }
 
 fn run_add(mut args: AddArgs) -> Result<()> {
@@ -171,6 +176,22 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         ping_provider(&provider, &token)?;
     }
 
+    // 2.16h: if a server type SKU was supplied, validate it against the
+    // live API for the resolved region before saving. Skipped when
+    // `--no-ping` is set (same rationale as the token ping above).
+    if let Some(ref sku) = args.server_type {
+        if args.no_ping {
+            println!(
+                "server type `{sku}` NOT validated against the Hetzner API (`--no-ping` was passed)"
+            );
+        } else {
+            let resolved_region = args.region.as_deref().unwrap_or("nbg1");
+            let client = HetznerCloudClient::new(hcloud_base_url(), &token);
+            let types = client.list_server_types()?.server_types;
+            validate_server_type(&types, sku, resolved_region)?;
+        }
+    }
+
     let target = Target {
         name: name.clone(),
         config: TargetConfig {
@@ -180,7 +201,7 @@ fn run_add(mut args: AddArgs) -> Result<()> {
             cluster_name: args.cluster_name,
             ssh_key_path: args.ssh_key,
             firewall: None,
-            server_type: None,
+            server_type: args.server_type,
         },
         credentials: TargetCredentials {
             hetzner_token: Some(token),

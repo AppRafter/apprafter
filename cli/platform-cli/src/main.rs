@@ -66,7 +66,10 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             region,
         } => commands::init::run(&provider, &tier, &region)?,
         Commands::Plan => commands::plan::run()?,
-        Commands::Apply { target } => commands::apply::run(target.as_deref())?,
+        Commands::Apply {
+            target,
+            server_type,
+        } => commands::apply::run(target.as_deref(), server_type.as_deref())?,
         Commands::Status => commands::status::run()?,
         Commands::Login => commands::login::run()?,
         Commands::UpgradeTier { to } => commands::upgrade_tier::run(&to)?,
@@ -81,9 +84,11 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
         }
         Commands::ClusterBootstrap => commands::cluster_bootstrap::run()?,
         Commands::ArgocdPassword { refresh } => commands::argocd_password::run(refresh)?,
-        Commands::BootstrapAll { target, dry_run } => {
-            commands::bootstrap_all::run(target.as_deref(), dry_run)?
-        }
+        Commands::BootstrapAll {
+            target,
+            dry_run,
+            server_type,
+        } => commands::bootstrap_all::run(target.as_deref(), dry_run, server_type.as_deref())?,
         Commands::Platform { action } => match action {
             PlatformCommand::Status { cached } => commands::platform::status(cached)?,
             PlatformCommand::Upgrade { to, cached } => {
@@ -349,6 +354,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             data_only,
             passphrase,
             credential_file,
+            server_type,
         } => commands::restore::run_restore(
             &repo,
             target.as_deref(),
@@ -357,6 +363,7 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             data_only,
             passphrase.as_deref(),
             credential_file.as_deref(),
+            server_type.as_deref(),
         )?,
     }
     Ok(())
