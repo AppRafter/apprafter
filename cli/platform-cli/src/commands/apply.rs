@@ -168,6 +168,10 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
     // overwritten by the live reconcile before the comparison).
     let state_server_type_at_start = state_server_type.clone();
     let target_server_type_at_start = target_server_type.clone();
+    // M27/B2: also capture the pre-apply target region so the backfill can
+    // adopt the live region when target.config.region was absent (legacy
+    // targets). Region is immutable on a running server — no drift guard needed.
+    let target_region_at_start = target_region.clone();
     // server_id is only available when a cluster already exists.
     let existing_server_id: Option<u64> = state.hetzner_cloud.as_ref().map(|h| h.server_id);
     let env_type = env_server_type();
@@ -251,6 +255,7 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
             server_id,
             state_server_type_at_start.as_deref(),
             target_server_type_at_start.as_deref(),
+            target_region_at_start.as_deref(),
             &target_store,
             &target_name,
         );
@@ -503,20 +508,31 @@ fn persist_state(
 /// Both write failures (backfill) are treated as best-effort: they print a
 /// warning but never propagate as errors — a read-only config dir must not
 /// fail `apply`.
+///
+/// Both `server_type` and `region` backfills are combined into one
+/// `load_target` + `save_target` cycle to avoid redundant disk I/O.
+///
+/// ### Why there is NO region drift guard
+///
+/// A server's region is immutable once created — unlike a machine type that
+/// could be resized out-of-band, Hetzner does not allow relocating a running
+/// server.  There is therefore no "region changed under us" scenario to warn
+/// about, so `classify_guard` is intentionally not called for region.
 fn run_backfill_and_guard(
     live_servers: &[Server],
     server_id: u64,
     state_type_at_start: Option<&str>,
     target_type_at_start: Option<&str>,
+    target_region_at_start: Option<&str>,
     target_store: &TargetStorePaths,
     target_name: &str,
 ) {
     let outcome = backfill_from(live_servers, server_id);
-    let live_type = match &outcome {
+    let (live_type_opt, live_region_opt) = match &outcome {
         BackfillOutcome::Adopt {
-            server_type: Some(t),
-            ..
-        } => t.clone(),
+            server_type,
+            region,
+        } => (server_type.clone(), region.clone()),
         BackfillOutcome::AmbiguousSkip => {
             eprintln!(
                 "warning: multiple servers matched id {server_id} in the live listing — \
@@ -524,26 +540,42 @@ fn run_backfill_and_guard(
             );
             return;
         }
-        // Skip (no match) or Adopt with no server_type from API — nothing to do.
-        _ => return,
+        // Skip (no match) — nothing to do.
+        BackfillOutcome::Skip => return,
     };
 
-    // Backfill target.server_type when it is absent (best-effort).
-    if target_type_at_start.is_none() {
+    // Backfill target.server_type and/or target.region when absent (best-effort,
+    // combined into one load+save to avoid double disk I/O).
+    // `region_to_backfill` encodes the rule: adopt only when the pre-apply slot
+    // was empty (see its doc-comment for the full rationale).
+    let need_type_backfill = target_type_at_start.is_none() && live_type_opt.is_some();
+    let region_candidate = region_to_backfill(target_region_at_start, live_region_opt.as_deref());
+    let need_region_backfill = region_candidate.is_some();
+    if need_type_backfill || need_region_backfill {
         match load_target(target_store, target_name) {
             Ok(mut target) => {
-                if target.config.server_type.is_none() {
-                    target.config.server_type = Some(live_type.clone());
+                let mut changed = false;
+                if need_type_backfill && target.config.server_type.is_none() {
+                    let t = live_type_opt.as_deref().unwrap();
+                    target.config.server_type = Some(t.to_string());
+                    eprintln!(
+                        "  server type baseline established: {t} \
+                         (recorded from live server — run `apprafter target machine` \
+                         to change)"
+                    );
+                    changed = true;
+                }
+                if let Some(r) = region_candidate.filter(|_| target.config.region.is_none()) {
+                    target.config.region = Some(r.to_string());
+                    eprintln!(
+                        "  region baseline established: {r} \
+                         (recorded from live server)"
+                    );
+                    changed = true;
+                }
+                if changed {
                     if let Err(e) = save_target(target_store, &target) {
-                        eprintln!(
-                            "warning: could not persist server type baseline to target config: {e}"
-                        );
-                    } else {
-                        eprintln!(
-                            "  server type baseline established: {live_type} \
-                             (recorded from live server — run `apprafter target machine` \
-                             to change)"
-                        );
+                        eprintln!("warning: could not persist baseline to target config: {e}");
                     }
                 }
             }
@@ -553,7 +585,12 @@ fn run_backfill_and_guard(
         }
     }
 
-    // Guard: compare the stable pre-apply fact + preference against live.
+    // Guard: compare the stable pre-apply fact + preference against live (server
+    // type only — region is immutable on a running server, no drift is possible).
+    let live_type = match live_type_opt {
+        Some(t) => t,
+        None => return, // no type from API — nothing to guard
+    };
     match classify_guard(state_type_at_start, target_type_at_start, &live_type) {
         Guard::FactDriftWarn => {
             eprintln!(
@@ -570,6 +607,27 @@ fn run_backfill_and_guard(
             );
         }
         Guard::Silent => {}
+    }
+}
+
+/// Pure helper: returns the region that should be written back to
+/// `target.config.region` during a backfill pass.
+///
+/// Returns `Some(adopted)` only when the pre-apply target region was `None`
+/// (meaning the slot was empty and the live value fills a genuine gap).
+/// When the target already had a region, we leave it alone — the recorded
+/// value might be intentionally different from where the server was placed
+/// (e.g. a migrated cluster whose target still points to the original DC).
+///
+/// Used by `run_backfill_and_guard` and independently unit-tested.
+pub fn region_to_backfill<'a>(
+    pre_apply_region: Option<&str>,
+    adopted: Option<&'a str>,
+) -> Option<&'a str> {
+    if pre_apply_region.is_none() {
+        adopted
+    } else {
+        None
     }
 }
 
@@ -937,5 +995,98 @@ mod tests {
     fn source_label_none_when_all_absent() {
         // No type on any rung → None (no default exists any more).
         assert_eq!(source_label(None, None, None, None, None), None);
+    }
+
+    // ── region_to_backfill unit tests (M27/B2) ───────────────────────────────
+
+    #[test]
+    fn region_to_backfill_adopts_live_region_when_pre_apply_is_none() {
+        // Core case: legacy target with no recorded region + live server in fsn1
+        // → backfill should write "fsn1".
+        assert_eq!(region_to_backfill(None, Some("fsn1")), Some("fsn1"));
+    }
+
+    #[test]
+    fn region_to_backfill_returns_none_when_pre_apply_region_already_set() {
+        // Target already recorded a region — don't overwrite it even if the
+        // live server reports a different value.
+        assert_eq!(region_to_backfill(Some("nbg1"), Some("fsn1")), None);
+        assert_eq!(region_to_backfill(Some("nbg1"), Some("nbg1")), None);
+    }
+
+    #[test]
+    fn region_to_backfill_returns_none_when_adopted_is_none() {
+        // Live API didn't return a region (shouldn't happen in practice, but
+        // the helper must handle it gracefully: no backfill).
+        assert_eq!(region_to_backfill(None, None), None);
+    }
+
+    #[test]
+    fn run_backfill_and_guard_sets_region_on_target_when_previously_absent() {
+        // Integration-style test: build a temp target store with region=None,
+        // run `run_backfill_and_guard` against a fake live-server list, and
+        // confirm the saved target has region="fsn1" afterwards.
+        use cli_core::target::{
+            load_target, save_target, Target, TargetConfig, TargetCredentials, TargetStorePaths,
+        };
+        use cli_providers::hetzner_cloud::types::{
+            LocationRef, Server, ServerStatus, ServerTypeRef,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TargetStorePaths::for_root(tmp.path().to_path_buf());
+
+        // Save a target with no server_type and no region.
+        let target_name = "test-backfill-region";
+        let t = Target {
+            name: target_name.to_string(),
+            config: TargetConfig {
+                provider: "hetzner-cloud".into(),
+                server_type: None,
+                region: None,
+                ..Default::default()
+            },
+            credentials: TargetCredentials::default(),
+        };
+        save_target(&store, &t).expect("save target");
+
+        // Build a fake live server list for server id=42 in fsn1.
+        let servers = vec![Server {
+            id: 42,
+            name: "platform-1".into(),
+            status: ServerStatus::Running,
+            server_type: Some(ServerTypeRef {
+                name: "cx22".to_string(),
+            }),
+            location: Some(LocationRef {
+                name: "fsn1".to_string(),
+            }),
+            public_net: None,
+            labels: Default::default(),
+        }];
+
+        // server existed before apply → server_id is Some(42).
+        // pre-apply target had region=None → target_region_at_start=None.
+        run_backfill_and_guard(
+            &servers,
+            42,
+            None, // state_type_at_start
+            None, // target_type_at_start
+            None, // target_region_at_start (absent — triggers backfill)
+            &store,
+            target_name,
+        );
+
+        let saved = load_target(&store, target_name).expect("load after backfill");
+        assert_eq!(
+            saved.config.region.as_deref(),
+            Some("fsn1"),
+            "region should have been backfilled from live server"
+        );
+        assert_eq!(
+            saved.config.server_type.as_deref(),
+            Some("cx22"),
+            "server_type should also have been backfilled in the same pass"
+        );
     }
 }

@@ -94,10 +94,12 @@ pub enum Commands {
         /// multiple targets without `apprafter target use`.
         #[arg(long)]
         target: Option<String>,
-        /// Hetzner server type SKU to provision (e.g. `cpx22`, `cx32`).
-        /// Takes precedence over the manifest `nodes[0].kind`, the saved target
-        /// preference, and `APPRAFTER_SERVER_TYPE`. Omit to let the resolution
-        /// chain decide (default `cpx22`).
+        /// Server type (SKU) to provision (e.g. `cx22`, `cx32`). Resolution:
+        /// this flag > manifest `nodes[0].kind` > recorded state > target
+        /// default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default —
+        /// if none is set, provisioning a new cluster fails with
+        /// `apprafter::provider::server_type_not_selected` (pick one via the
+        /// `target add` picker or `apprafter target machine`).
         #[arg(long = "server-type")]
         server_type: Option<String>,
     },
@@ -180,9 +182,12 @@ pub enum Commands {
         /// invoke and which target it resolves against.
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
-        /// Hetzner server type SKU to provision (e.g. `cpx22`, `cx32`).
-        /// Forwarded to the `apply` phase of bootstrap-all. Omit to
-        /// let the resolution chain decide (default `cpx22`).
+        /// Server type (SKU) to provision (e.g. `cx22`, `cx32`). Forwarded
+        /// to the `apply` phase of bootstrap-all. Resolution: this flag >
+        /// manifest `nodes[0].kind` > recorded state > target default >
+        /// `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is
+        /// set, provisioning fails with
+        /// `apprafter::provider::server_type_not_selected`.
         #[arg(long = "server-type")]
         server_type: Option<String>,
     },
@@ -307,9 +312,12 @@ pub enum Commands {
         /// creds are read locally, NEVER from the cluster.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
-        /// Hetzner server type SKU to use when `--reprovision` is set
-        /// (e.g. `cpx22`, `cx32`). Forwarded to the `apply` phase.
-        /// Omit to let the resolution chain decide (default `cpx22`).
+        /// Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`,
+        /// `cx32`). Forwarded to the `apply` phase. Resolution: this flag >
+        /// manifest `nodes[0].kind` > recorded state > target default >
+        /// `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is
+        /// set, provisioning fails with
+        /// `apprafter::provider::server_type_not_selected`.
         #[arg(long = "server-type")]
         server_type: Option<String>,
     },
@@ -1058,11 +1066,13 @@ pub enum TargetCommand {
             value_parser = BoolishValueParser::new(),
         )]
         no_ping: bool,
-        /// Preferred server type SKU for this target (e.g. `cpx22`, `cx32`).
+        /// Preferred server type SKU for this target (e.g. `cx22`, `cx32`).
         /// Saved as the "target preference" rung in the resolution chain —
         /// below an explicit `--server-type` flag or manifest value, above
         /// `APPRAFTER_SERVER_TYPE`. Omit to leave the slot empty (the chain
-        /// continues down to the env var, then the `cpx22` default).
+        /// continues down to the env var; there is NO implicit default — a
+        /// fresh provision without any rung set fails with
+        /// `apprafter::provider::server_type_not_selected`).
         /// When set and `--no-ping` is NOT passed, the SKU is validated
         /// against the live Hetzner API for the target's region.
         #[arg(long = "server-type")]

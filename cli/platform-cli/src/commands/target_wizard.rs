@@ -703,8 +703,9 @@ pub fn prompt_machine(
     // H1: --no-ping shunt — do NOT hit the API.
     if no_ping {
         eprintln!(
-            "  machine picker skipped (--no-ping); server type falls back to the default — \
-             pass --server-type to choose"
+            "  machine picker skipped (--no-ping); no server type chosen — \
+             pass --server-type or set one via `apprafter target machine`, \
+             or a fresh provision will fail"
         );
         let region = prompt_region(provider, token, prefill_region, "--region flag", true)?;
         return Ok((region, None));
