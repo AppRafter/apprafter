@@ -70,16 +70,68 @@ failure families:
 After fixing the root cause, run `apprafter doctor` to confirm
 reachability.
 
+### `apprafter::provider::server_type_not_selected`
+
+Provisioning a new machine requires an explicit server type, and
+none was found in the resolution chain (`--server-type` flag >
+`nodes[0].kind` in the manifest > `HetznerCloudState.server_type`
+in state > `TargetConfig.server_type` in the target store >
+`APPRAFTER_SERVER_TYPE` env). The error fires only on the **create
+path** (a new machine is about to be provisioned); `apply` on an
+already-running cluster does not require the type.
+
+**Fix.** Choose the method that matches your workflow:
+
+- **Interactive / wizard:** run `apprafter target machine` to open
+  the live `(region × SKU)` picker and write the chosen type into the
+  active target. Subsequent `up` / `apply` calls use it automatically.
+- **Non-interactive / CI:** pass `--server-type <sku>` on the
+  provisioning command (`target add`, `apply`, `up`, `restore
+  --reprovision`), or export `APPRAFTER_SERVER_TYPE=<sku>` in the
+  runner environment. This is the recommended path for pipelines.
+- **Declarative (manifest):** add `nodes[0].kind: <sku>` to your
+  `Infrastructure.cue` manifest and point `APPRAFTER_MANIFEST` at it.
+  The manifest rung sits above the target store, so a committed
+  manifest pins the type even if the target default changes.
+- **No saved target (env-credential run):** when provisioning via
+  `HCLOUD_TOKEN` + no target store (the ephemeral CI path), there is no
+  store to persist the fact or backfill into. Pass `--server-type` or
+  `APPRAFTER_SERVER_TYPE` explicitly; use `apprafter target add` for
+  repeatable provisioning with a stored type.
+
+**Migration (existing clusters):** an existing cluster whose state
+predates this field does **not** trigger this error on `apply`
+(the reconcile path never requires the type). The first `apply`
+after upgrading the CLI backfills the type from the live Hetzner
+server automatically.
+
 ### `apprafter::provider::server_type_unavailable`
 
-Pre-flight rejection: the requested Hetzner server type isn't
-available in the requested region (or has been retired entirely
-— e.g. `cx22` was retired in early 2026, replaced by `cpx22`).
+Pre-flight rejection: the requested `(region × SKU)` pair isn't
+valid or available. The error body names the exact kind:
 
-**Fix.** Pick one of the alternatives suggested in the error
-body, or set `APPRAFTER_MANIFEST` to a manifest with a different
-`nodes[0].kind`. Once `--server-type` lands, that flag will be the
-recommended override.
+- **`Unknown`** — the SKU was not found in the Hetzner catalog at
+  all. The alternatives list in the error body shows the nearest
+  known SKUs in the requested region.
+- **`NotOfferedInRegion`** — the SKU exists but is not offered in
+  the requested region. The alternatives list shows which regions
+  stock it, and which alternative SKUs are available in the
+  requested region.
+- **`Retired`** — the SKU's end-of-sale date has passed
+  (`unavailable_after <= today`). The alternatives list shows the
+  recommended replacements in the requested region. (A SKU whose
+  retirement date is still in the future is selectable in the picker
+  with a `!` badge — it is not an error.)
+- **`OutOfCapacity`** — the SKU is offered in the region but
+  Hetzner currently has no available capacity. This is transient;
+  try again later or pick a different type. The picker hides
+  sold-out rows by default; toggle the `Show sold-out` option to
+  see them.
+
+**Fix.** Run `apprafter target machine` to open the live picker and
+choose an available `(region × SKU)` row. For non-interactive
+runs, consult the alternatives list in the error body and pass
+`--server-type <alternative>` with `--region <region>`.
 
 ### `apprafter::state::corrupt`
 
@@ -240,9 +292,11 @@ chart bump.
 `apprafter up` / `apply` surfaces the provider's error directly.
 The common ones:
 
+- `apprafter::provider::server_type_not_selected` — no server type
+  was supplied. See the section above for the fix options.
 - `apprafter::provider::server_type_unavailable` — the requested
-  server type isn't offered in that region. Pick another
-  `--region`, or a server type the location stocks.
+  `(region × SKU)` pair is invalid or unavailable. See the section
+  above for the four `UnavailableKind` variants and their fixes.
 - A `403 forbidden` with a quota message — your Hetzner project
   has hit its server / IP / volume limit. Raise the limit in the
   Hetzner Cloud Console (Project → Limits) or free up resources,

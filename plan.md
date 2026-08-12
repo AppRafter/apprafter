@@ -3924,39 +3924,58 @@ Storage-примитивы поверх 2.6b owned-disk пайплайна. Жё
 ### 2.16h — Machine picker: региональная матрица SKU в CLI (provision-time)
 > 🏁 SR: A · order 3.7. Surfaced в обсуждении «CLI выбор машины и архитектура провайдеров» (2026-06-21). Load-bearing на T1: одна коробка под 1 или под 100 сервисов, размер решает на provision-time. **НЕ 3.1** — та добавляет *per-node* гетерогенность поверх, отдельная штука. Доступность SKU **зависит от региона** ⇒ выбор — матрица `(region × SKU)`, а не две независимых оси.
 
-**Контекст (текущее состояние):** server-type сейчас **не выбирается** через основной CLI-flow. Есть: `DEFAULT_SERVER_TYPE = cpx22` (v0.1.42), override только через CUE-манифест (`APPRAFTER_MANIFEST` → `server_type`, v0.1.5), клиентский `list_server_types()` (`cli-providers/src/hetzner_cloud/client.rs`, v0.1.42) и pre-flight `validate_server_type` (`.../server_type.rs`, v0.1.42 — live `/v1/server_types` + region, `ServerTypeUnavailable` с 3 ближайшими, гейтит `apply` на `needs_server_create` до первого CREATE). A.4b region-picker уже меряет latency с машины оператора. Чего НЕТ: выбора SKU (флаг/wizard), персиста, и — главное — учёта того, что **доступность типа зависит от региона** (два независимых `Select` собрали бы невалидную пару, которую валидатор отверг бы только пост-фактум).
+> 🚧 **Реализация завершена на ветке `feat/2.16h-machine-picker` (Tasks 1–14).** **PENDING = реальный Hetzner walk** (non-interactive automatable) + релиз. Чеки ниже отражают реальное состояние — поставленное отмечено `[x]`. Секция НЕ закрыта: `✅` и §6-бокс переключаются ТОЛЬКО после зелёного walk + тега.
 
-**Цель:** единый machine-picker — матрица валидных `(region × SKU)` строк с ценой, latency и спеками, с fuzzy+numeric-фильтром и переключаемой сортировкой. Каталог/цены/availability тянутся live (новый тип/локация в Hetzner доступны сразу, без релиза CLI). Выбор пишет **обе** оси (region + server_type) в target-defaults. T-shirt-алиас — опционально, сахар сверху.
+> **Уточнения из спека (rev 6, C1/C2):**
+> - `GET /v1/datacenters` — **deprecated 2026-06-02**, `410 Gone` после 2026-10-01. **Не используется.** Вся информация — в `GET /v1/server_types`: `locations[]` (`{available, recommended, deprecation}`) + `prices[]` per-location. Нового `list_datacenters()` нет.
+> - `inquire 0.7.5` использует `with_scorer` (`Fn(&str,&T,&str,usize)->Option<i64>`) вместо `with_filter`. Scorer = filter+rank по одному полю.
+
+**Контекст (текущее состояние до поставки):** server-type сейчас **не выбирался** через основной CLI-flow. Был `DEFAULT_SERVER_TYPE = cpx22` (v0.1.42), override только через CUE-манифест (`APPRAFTER_MANIFEST` → `nodes[0].kind`), + pre-flight `validate_server_type` (`.../server_type.rs`, v0.1.42). Чего не было: выбора SKU (флаг/wizard), персиста, учёта region-зависимости availability.
+
+**Цель:** единый machine-picker — матрица валидных `(region × SKU)` строк с ценой, latency и спеками, с fuzzy+numeric-фильтром и переключаемой сортировкой. Каталог/цены/availability тянутся live. Выбор пишет **обе** оси в target. **2.16h-a (см. ниже): удаление implicit cpx22-дефолта (BREAKING).**
 
 **Поставка — данные:**
-- [ ] **Offer-модель + fetch-join.** `MachineOffer { location, sku, cores, memory_gb, disk_gb, arch, cpu_type, price_monthly_net, price_hourly_net, available, latency_ms }`. Join двух вызовов: `GET /v1/server_types` (спеки + `prices[]` per-location) × `GET /v1/datacenters` (`server_types.available` per-dc → roll-up к location). Строка = каждая `(location, sku)` из каталога (есть в `prices[]`); `available` = доступно хотя бы в одном dc локации. Новый клиентский `list_datacenters()` рядом с `list_server_types()`. Latency переиспользует A.4b-probe — замер **once-per-location**, цепляется к строкам (не per-row-пинг).
-- [ ] **Availability заранее из API (да, вытаскивается).** `datacenter.server_types.available` читается upfront → sold-out строки по дефолту скрыты (toggle раскрывает с маркером `✗ нет ёмкости`, non-selectable). Это **снимок** ⇒ `apply` остаётся authoritative: re-check на CREATE, а `ServerTypeUnavailable` расщепляется на `unknown / deprecated / not-in-region-catalog` (структурная, до выбора) vs `out-of-capacity` (transient, только provision-time — «попробуй позже / другой тип»).
-- [ ] **Единый источник picker↔validator.** `ProviderValidator::list_machine_offers() -> Result<Vec<MachineOffer>>` (надстраивает `list_regions()`; регион теперь измерение матрицы). Picker и `validate_server_type` делят **один** catalog+availability join — иначе picker покажет то, что валидатор отвергнет.
+- [x] **Offer-модель + fetch-join.** `MachineOffer { location, sku, cores, memory_gb, disk_gb, arch, cpu_type, price_monthly_net, price_hourly_net, available, recommended, deprecation }`. Источник: **один** `GET /v1/server_types` (join `locations[]` + `prices[]` per-location). Latency probe once-per-location. Pagination (loop `page`/`per_page=50` до `meta.pagination.next_page==null`).
+- [x] **Availability заранее из API.** `locations[].available` читается upfront → sold-out строки скрыты (toggle раскрывает, non-selectable). `ServerTypeUnavailable` расщеплён на `Unknown / NotOfferedInRegion / Retired` (структурная, до выбора) vs `OutOfCapacity` (transient, provision-time).
+- [x] **Единый источник picker↔validator.** `ProviderValidator::list_machine_offers() -> Result<Vec<MachineOffer>>`. Picker и validator делят один join.
 
 **Поставка — UX (wizard, `inquire`):**
-- [ ] **Fuzzy + numeric filter (`Select::with_filter`).** raw-input парсится в набор предикатов (AND по пробелам), не только substring:
-    - `cpu>=N` / `cores>=N`, `ram>=N` (GB), `disk>=N` (GB) — числовые пороги (для незнакомых с линейкой — фильтр по потребности, а не по знанию SKU);
-    - `arch:arm|x86`, `cpu:shared|dedicated`;
-    - `loc:<prefix>` / голый `hel`, `sku:<prefix>` / голый `ccx` — substring по локации/имени (для знакомых);
-    - свободный текст без ключа → fuzzy по композиту `location+sku+arch`.
-      Плюс toggle «скрыть/показать sold-out».
-- [ ] **Сортировка (переключаемая, НЕ live — ограничение `inquire`).** Фильтр в `inquire` только include/exclude, reorder не умеет ⇒ сорт-по-заголовку невозможен. **Pre-picker sort-key `Select`**: `Price ↑ / Cores ↓ / RAM ↓ / Disk ↓ / Latency ↑ / Location`, дефолт `Latency ↑` (fast-path Enter). Ключ сортирует `Vec` до матрицы; `with_filter` порядок сохраняет.
-- [ ] **Рендер строки (компактный, не «широкий»).** `inquire` — один `Display`-line на опцию, без header-row и колоночного layout ⇒ колонки фейкаются fixed-width паддингом, держим ≤~60 char чтобы пережить 80-кол терминал (иначе truncate): `hel1  12ms  ccx23   8c/32G/240G  x86  €49.90/mo  ✓`. Легенда-заголовок — одним `eprintln` перед `Select` (раз, не per-row); цена net €, пометка про VAT в легенде. `with_page_size` для скролла 50–70 строк.
+- [x] **Fuzzy + numeric filter (`with_scorer`).** Предикаты AND по пробелам: `cpu>=N`/`cores>=N`, `ram>=N`, `disk>=N` (+ `>`,`<`,`<=`,`=`); `arch:arm|x86`, `cpu:shared|dedicated`; `loc:`/bare, `sku:`/bare; свободный текст → case-insensitive substring по композиту (arg2, NOT arg3 rendered string). Toggle `ShowSoldOut` — filter-immune, pinned `Some(i64::MIN)` (bottom), appended last.
+- [x] **Pre-picker sort-key `Select` (не live, не `sort:` токен).** `Latency ↑` (default) / `Price ↑ / Cores ↓ / RAM ↓ / Disk ↓ / Location`. Sортирует `Vec` до матрицы; scorer сохраняет порядок.
+- [x] **ASCII-рендер строки ≤~64 char.** Маркеры: `*`=recommended, `-`=sold-out-mode, `!`=deprecating (без `+`). Легенда — одним `eprintln`; `with_page_size(15)`; `with_help_message` для nav-hint.
 
 **Поставка — persist / flag / resolution:**
-- [ ] **Персист + флаг.** Выбор строки пишет **обе** оси в target — `TargetConfig.{server_type, region}` (`cli-core/src/target.rs`, `#[serde(default)]` для back-compat). Non-interactive `--server-type <sku>` (+ существующий `--region`) → пара валидируется `validate_server_type` (region-aware) **до** `save_target` (невалид не оставляет half-state); матрица в non-interactive не нужна. Env-binding `APPRAFTER_SERVER_TYPE`.
-- [ ] **Резолюция в `apply`.** precedence `манифест server_type` > `TargetConfig.server_type` > `DEFAULT_SERVER_TYPE`; region аналогично. Расширяет A.8 active-target resolution (`apply.rs` читает target-default вместо жёсткого `DEFAULT_SERVER_TYPE`).
-- [ ] **Рефактор A.4b region-step.** standalone region-`Select` в add-wizard **вытесняется** матрицей (регион = измерение строки); `list_regions()` + latency-probe переиспользуются (latency теперь на строках). Не чисто additive — меняет wizard-flow A.4b.
-- [ ] **`target show` / `whoami`.** строка `Server type: <sku or "default (cpx22)">` (регион уже показывается).
-- [ ] *(Опц., может уехать)* T-shirt→SKU алиас-мапа (`small`/`medium`/`large` → куратор-SKU), принимается флагом наравне с сырым именем; сырой SKU всегда escape-hatch.
+- [x] **Персист + флаг.** `TargetConfig.{server_type, region}` (`#[serde(default)]`). `--server-type` на `target add`/`apply`/`up`/`restore --reprovision`/`target machine`. `APPRAFTER_SERVER_TYPE` env (отдельный низкий rung, НЕ привязан к clap-флагу). Валидация ТОЛЬКО явного значения перед `save_target`.
+- [x] **Резолюция в `apply` (обе оси).** `--flag > manifest(nodes[0].kind) > state(HetznerCloudState.server_type) > TargetConfig.server_type > APPRAFTER_SERVER_TYPE env > [default: type=error | region=nbg1]`. Источник типа печатается при provision.
+- [x] **Рефактор A.4b region-step.** Standalone region-`Select` в add-wizard **заменён** матрицей. `--no-ping` shunt сохранён (Text+nbg1 + notice).
+- [x] **`target show` / `whoami`.** `Server type: <sku or "not selected — run apprafter target machine">`.
+- [~] *(Отложено)* T-shirt→SKU алиас-мапа — явно деferred, ADR 0056.
 
-**Acceptance:** матрица показывает валидные `(region × SKU)` с ценой + latency + спеками; `cpu>=8 ram>=32 arch:arm` сужает до подходящих; sort-key меняет порядок; sold-out скрыты по дефолту, раскрываются toggle'ом; выбор строки пишет region+server_type в target; `apply` поднимает коробку выбранного типа (не `cpx22`); тип, ушедший в out-of-capacity между выбором и apply → transient-ошибка на provision (не при выборе); невалидная пара в non-interactive → структурная `ServerTypeUnavailable` с альтернативами до сохранения; старые target'ы без полей — fallback на дефолт.
+**Поставка — `apprafter target machine` (2.16h-a):**
+- [x] Новая подкоманда: interactive → та же матрица над текущим target; `--server-type <sku>` → direct patch (без token re-prompt); пишет **обе** оси. `--target <name>`. `--no-ping` без `--server-type` → explicit error.
+- [x] На provisioned target смена региона → confirm.
 
-**Отложено (опц. upgrade):** полноценный `ratatui`-TUI — настоящий grid с колонками/заголовком и live re-sort по клику на заголовок. Тянуть, только если `inquire`-матрица окажется тесной; это отдельный build, не `inquire`.
+**Поставка — no-default (2.16h-a, BREAKING):**
+- [x] `DEFAULT_SERVER_TYPE` const удалён. `ServerSpec.server_type: Option<String>`. Ошибка `ServerTypeNotSelected` (stable code `apprafter::provider::server_type_not_selected`) ТОЛЬКО на create-пути.
+- [x] `HetznerCloudState.server_type: Option<String>` (#[serde(default)]) — fact при CREATE.
+- [x] Backfill self-heal (legacy targets): при missing state/TargetConfig type → live-read pinned by `server_id` → write both stores. Best-effort.
+- [x] Guards split: fact-drift (state vs live) → WARNING; deferred-intent (target vs live) → INFO once per run.
+- [x] `import` fills `HetznerCloudState.server_type`.
+- [x] `destroy` prints tombstone с type/region.
+- [x] `restore --reprovision` resolves type через цепочку, `ServerTypeNotSelected` если не разрешён.
+- [x] `e2e/mvp.sh` фикс: `--server-type ${APPRAFTER_E2E_SERVER_TYPE:-cpx22}`.
 
-**Зависит от:** 1.2 (Hetzner provider — `list_server_types()` + `validate_server_type` ✅; +новый `list_datacenters()`), 1.66A.3 (`target add` non-interactive флаги), 1.66A.4b (validator-trait + region-picker/latency-probe — переиспользуется **и** рефакторится), 1.66A.5 (`target show`). Резолюция в `apply` — на A.8 (active-target resolution chain).
+**Acceptance (полный — включая walk):** матрица показывает валидные `(region × SKU)` с ценой + latency + спеками; `cpu>=8 ram>=32 arch:arm` сужает; sort-key меняет порядок (default cursor = top row, не toggle); sold-out скрыты по дефолту, toggle сохраняет filter; будущий deprecated selectable с `!`; выбор пишет region+server_type; `apply` поднимает коробку выбранного типа; **fresh provision без типа → `ServerTypeNotSelected`, ни одного CREATE**; **existing cluster `apply` после upgrade → успех + backfill live type (dogfood)**; deliberate `target machine` change → info-once, не warning; out-of-band change → warning; `restore --reprovision` воспроизводит тип или explicit error; невалидная пара → structural error с альтернативами; `--no-ping` interactive работает; zero-selectable → typed error; env-credential provision; старые target'ы загружаются. **⏳ PENDING = real-Hetzner walk (non-interactive automatable).**
 
-**Размер:** M–L · клиент `list_server_types` + `validate_server_type` уже есть; масса — datacenters-join + availability-rollup, numeric-filter-parser, sort-selector, компактный табличный рендер, `TargetConfig` двойной персист, apply-резолюция, рефактор A.4b region-step. Выше прежней оценки M (было два `Select`-а) из-за матрицы и live catalog/availability join.
+**Отложено (зафиксировано в ADR 0056):** T-shirt aliases; `ratatui` TUI; tier-aware SKU filtering; latency-as-filter (sort-only); backup-manifest-carries-type (cross-target clone DR).
+
+**Размер:** L (реализовано). Ветка: `feat/2.16h-machine-picker`.
+
+### 2.16h-a — No implicit server-type default (BREAKING, часть одного релиза с 2.16h)
+
+> 🚧 **Реализация завершена на ветке `feat/2.16h-machine-picker` вместе с 2.16h.** Отдельный план-пункт для учёта — поставляется в ОДНОМ релизе. PENDING = тот же real-Hetzner walk.
+
+Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `cpx22` молча это скрывал. Удалён `DEFAULT_SERVER_TYPE`; create-path без типа → `ServerTypeNotSelected`; reconcile-path (existing server) типа не требует. Backfill + guards описаны выше в 2.16h. BREAKING задокументирован в UNRELEASED.md (migration: existing clusters self-heal на первом `apply`; fresh targets требуют явного типа).
 
 ---
 

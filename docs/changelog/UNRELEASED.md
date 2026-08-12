@@ -9,6 +9,82 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli vTBD — 2.16h/2.16h-a machine picker + no implicit server-type default (BREAKING) (real-Hetzner walk pending)
+
+> Implementation landed on branch `feat/2.16h-machine-picker`; release version and walk validation are pending.
+
+**BREAKING:** Provisioning a new machine now requires an explicit server type.
+The implicit `cpx22` default (`DEFAULT_SERVER_TYPE` constant) has been
+removed. An `apprafter up` / `apply` / `restore --reprovision` that reaches the
+create path with no type in the resolution chain errors with
+`apprafter::provider::server_type_not_selected` — a stable diagnostic code —
+before any API call is made.
+
+**Migration:** existing clusters are unaffected. On the first `apply` after
+upgrading, the reconcile path (no new machine created) detects a missing
+`HetznerCloudState.server_type` and backfills it from the live Hetzner server
+automatically. Fresh targets need a type supplied via one of:
+
+- `apprafter target machine` — interactive `(region × SKU)` picker, writes
+  both axes to the target store.
+- `--server-type <sku>` on `target add`, `apply`, `up`, or `restore --reprovision`.
+- `APPRAFTER_SERVER_TYPE=<sku>` environment variable (lowest-precedence escape
+  for CI runners with no saved target store).
+- `nodes[0].kind: <sku>` in the `Infrastructure.cue` manifest
+  (`APPRAFTER_MANIFEST`).
+
+**Added:**
+
+- Live `(region × SKU)` machine-picker matrix in `target add` wizard (replaces
+  the standalone region `Select`). Each row shows region, SKU, cores, RAM, disk,
+  architecture, CPU class, and net price. Fuzzy + numeric filter (`cpu>=N`,
+  `ram>=N`, `disk>=N`, `arch:arm|x86`, `cpu:shared|dedicated`, `loc:`, `sku:`,
+  free-text substring). Switchable sort (default: `Latency ↑`; also `Price ↑ /
+  Cores ↓ / RAM ↓ / Disk ↓ / Location`). Sold-out rows hidden by default;
+  toggle reveals them (non-selectable). Future-deprecated rows selectable with a
+  `!` badge. Selecting a row writes both region and server type in one step.
+- `apprafter target machine` — new subcommand. Interactive matrix over the
+  current target; `--server-type <sku>` skips the picker for direct patch.
+  Accepts `--target <name>`. Changing the region on a provisioned target
+  requires confirmation.
+- `--server-type <sku>` flag on `target add`, `apply`, `up` /
+  `bootstrap-all`, and `restore --reprovision`.
+- `APPRAFTER_SERVER_TYPE` environment variable (a distinct, low-precedence rung
+  below the target store and manifest — stray shell env cannot silently override
+  committed IaC).
+- `HetznerCloudState.server_type` — the actual provisioned type persisted as a
+  fact in `state.json` alongside `server_id`. Enables drift detection and
+  same-target reproduce.
+- Fact-drift vs deferred-intent guard split: a machine changed outside
+  AppRafter fires a **warning** on `apply`; a deliberate `target machine` change
+  awaiting a reprovision fires an **info** line once per run (not a recurring
+  warning).
+- `apprafter::provider::server_type_not_selected` diagnostic code (see
+  `docs/operator-guide/troubleshooting.md`).
+- `UnavailableKind` split in `ServerTypeUnavailable`:
+  `Unknown` / `NotOfferedInRegion` / `Retired` (structural, before selection) /
+  `OutOfCapacity` (transient, at provision time).
+- `target show` / `whoami` now prints `Server type: <sku or "not selected — run apprafter target machine">`.
+
+**Changed:**
+
+- `target add` wizard: the standalone region `Select` step is replaced by the
+  `(region × SKU)` matrix (region is now a dimension of the row). `--no-ping`
+  shunts the matrix (no provider API available) and keeps a `Text`+`nbg1`
+  fallback with a notice.
+- `apply` prints the resolved server type and its source at provision time
+  (e.g. `server type: ccx23 (from --flag)`) and prints `region: nbg1
+  (default)` when the region default is used, making the asymmetry explicit.
+- `destroy` prints the server type and region in its summary tombstone as a UX
+  safety net.
+- `e2e/mvp.sh` now passes `--server-type "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}"`
+  to `target add` (the removed default broke the script). Override via
+  `APPRAFTER_E2E_SERVER_TYPE`.
+
+**Deferred:** T-shirt aliases (`small`/`medium`/`large` → curated SKUs);
+`ratatui` grid TUI; tier-aware SKU filtering; latency-as-filter (sort-only);
+backup-manifest-carries-type (cross-target clone reproduction). See ADR 0056.
+
 ## cli v0.2.42 — node status GOMEMLIMIT parse fix + retrofit provision breadcrumb (2026-08-11, dogfood-surfaced)
 
 **Fixed:** `apprafter node status` reported `GOMEMLIMIT: unknown` on **every** node even though `GOMEMLIMIT=2GiB` is set — `probe_gomemlimit` parsed `systemctl show -p Environment k3s` (which prints `Environment=GOMEMLIMIT=2GiB`) by doing a per-token `strip_prefix("GOMEMLIMIT=")`, which never matches the `Environment=`-prefixed token. A new pure `parse_gomemlimit` strips the optional `Environment=` key prefix first (9 shape tests: multi-var, GOMEMLIMIT first/last, bare `--value` shape, trailing newline, embedded `=`, case-sensitivity, empty). Purely a reporting bug — GOMEMLIMIT **is** set (the retrofit `reservation_files_script` writes the OOM drop-in + `daemon-reload`+restart). Surfaced by running `node status` on the real dogfood after a retrofit; the walk had masked it — it read GOMEMLIMIT via `systemctl show … --value` (which strips the key) + a substring match, and never invoked `node status`.

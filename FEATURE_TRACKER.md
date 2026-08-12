@@ -67,6 +67,18 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 ---
 
+## order 3.7 — Tier-1 substrate hardening (pull-ups, pre-launch)
+
+| Status | Feature | plan.md | Checkpoint |
+|---|---|---|---|
+| 🚧 | Live `(region × SKU)` machine-picker matrix — explicit server-type choice at provision time (`apprafter target machine`, `--server-type`, `APPRAFTER_SERVER_TYPE`; no implicit `cpx22` default) | 2.16h + 2.16h-a | CP1 |
+
+> **2.16h/2.16h-a:** implementation complete on branch `feat/2.16h-machine-picker`; real-Hetzner walk pending. `🚧` flips to `✅` after the walk is GREEN and the release is tagged.
+>
+> The machine picker (`2.16h`) and the no-implicit-default breaking change (`2.16h-a` / Decision 0) ship together in one CLI release. BREAKING: `apprafter up` / `apply` / `restore --reprovision` without an explicit type on the create path now errors `apprafter::provider::server_type_not_selected`. **Migration:** existing clusters self-heal on the first `apply` after upgrade (type backfilled from the live server). Fresh targets need a type via `apprafter target machine`, `--server-type`, `APPRAFTER_SERVER_TYPE`, or `nodes[0].kind` in the manifest. See ADR 0056.
+
+---
+
 ## order 4 — Tier-2 substrate
 
 | Status | Feature | plan.md | Checkpoint |

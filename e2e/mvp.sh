@@ -28,6 +28,10 @@
 #   APPRAFTER_E2E_SKIP_DESTROY=1  — keep the cluster + state
 #                                   around at the end (for debug)
 #   APPRAFTER_E2E_REGION=nbg1     — Hetzner region; default nbg1
+#   APPRAFTER_E2E_SERVER_TYPE=cpx22 — Hetzner server type; default cpx22
+#                                     (shared vCPU, mass availability;
+#                                      prefer cpx* over ccx* to avoid
+#                                      transient OutOfCapacity errors)
 #
 # Exit codes:
 #   0 — smoke green
@@ -92,10 +96,11 @@ phase "Step 1: target add (Hetzner, tier=solo, region=${REGION})"
 # keeps a re-run on a warm runner idempotent; the API ping verifies the
 # token authenticates against Hetzner Cloud.
 apprafter target add e2e \
-    --provider hetzner-cloud \
-    --tier     solo \
-    --region   "$REGION" \
-    --token    "$HCLOUD_TOKEN" \
+    --provider     hetzner-cloud \
+    --tier         solo \
+    --region       "$REGION" \
+    --server-type  "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}" \
+    --token        "$HCLOUD_TOKEN" \
     --no-interactive --force
 
 # ---------------------------------------------------------------

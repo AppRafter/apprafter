@@ -112,6 +112,17 @@ pass `--force`. It picks the server whose name matches
 `state.cluster_name` (default `platform-1`); if no labelled server
 matches, it prints a friendly message and writes nothing.
 
+`import` also fills the `HetznerCloudState.server_type` fact field
+from the live server — so a state file rebuilt with `import` carries
+the correct type for drift detection and reproduction. However,
+**`import` is not the backfill path** for an old state file that
+merely lacks the field: `--dry-run` only prints and without `--force`
+it won't overwrite an existing `state.hetzner_cloud`. The normal
+backfill for an existing target is a plain `apprafter apply` — on the
+first `apply` after upgrading to a CLI version that tracks server type,
+the reconcile path reads the live server and fills the field in place,
+best-effort (a read-only config dir warns and continues).
+
 ### Reading kubeconfig from the cluster
 
 After `apply` finishes (the cloud-init bootstrap on the new server

@@ -31,6 +31,7 @@ Global env vars:
 | `APPRAFTER_HCLOUD_BASE_URL`    | Hetzner Cloud API base URL override (tests + mockito).                  |
 | `APPRAFTER_MANIFEST`           | Path to an `Infrastructure.cue` manifest used to overlay `apply` defaults. |
 | `APPRAFTER_NO_PING`            | Skip credential-validation API ping. Honours `1` / `true` / `yes`.     |
+| `APPRAFTER_SERVER_TYPE`        | Lowest-precedence server-type rung for non-interactive / CI provisioning. Wins over the built-in default (`none → error`) but loses to `--server-type`, manifest `nodes[0].kind`, `HetznerCloudState`, and `TargetConfig.server_type`. Use for CI runners where no target store is saved. |
 | `NO_COLOR`                     | Strip all ANSI escapes (miette + the `cli_core::style` helpers).        |
 | `RUST_BACKTRACE`               | Set to `1` to enable miette's backtrace rendering (off by default).     |
 

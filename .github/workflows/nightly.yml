@@ -11,10 +11,12 @@ name: nightly
 # clear error — the workflow stays safe to merge before
 # credentials are wired.
 #
-# Cost: each successful run provisions one Hetzner CX22 for ~10
-# minutes (plus tear-down) — single-digit cents per night. The
-# `e2e/mvp.sh` `EXIT` trap auto-destroys on failure, so a crashed
-# run won't leave a server idling.
+# Cost: each successful run provisions one Hetzner cpx22 (shared
+# vCPU, mass availability) for ~10 minutes (plus tear-down) —
+# single-digit cents per night. The `e2e/mvp.sh` `EXIT` trap
+# auto-destroys on failure, so a crashed run won't leave a server
+# idling. Override the type via the `APPRAFTER_E2E_SERVER_TYPE`
+# env var.
 #
 # Security note: this workflow only consumes secrets via the
 # `env:` block (the safe pattern). It does NOT inject any
