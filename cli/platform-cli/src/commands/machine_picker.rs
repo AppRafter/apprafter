@@ -82,12 +82,12 @@ pub fn score_choice(
 /// Units (EUR, ms, /mo) go in the legend printed by the interactive task.
 /// Marker precedence: `!` (deprecating) > `*` (recommended) > ` ` (none).
 pub fn render_row(r: &MachineRow) -> String {
-    let loc = format!("{:<5}", &r.offer.location);
+    let loc = format!("{:<5}", r.offer.location);
     let lat = match r.latency_ms {
         Some(ms) => format!("{:<5}", format!("{}ms", ms)),
         None => format!("{:<5}", "n/a"),
     };
-    let sku = format!("{:<8}", &r.offer.sku);
+    let sku = format!("{:<8}", r.offer.sku);
     let spec = format!(
         "{:<14}",
         format!(
@@ -95,7 +95,7 @@ pub fn render_row(r: &MachineRow) -> String {
             r.offer.cores, r.offer.memory_gb as u32, r.offer.disk_gb
         )
     );
-    let arch = format!("{:<4}", &r.offer.arch);
+    let arch = format!("{:<4}", r.offer.arch);
     let price = format!("{:<7}", r.offer.price_monthly_net.as_deref().unwrap_or("-"));
     let flag = if r.offer.deprecation.is_some() {
         "!"
@@ -141,7 +141,7 @@ pub fn sort_rows(rows: &mut [MachineRow], key: SortKey) {
             });
         }
         SortKey::CoresDesc => {
-            rows.sort_by(|a, b| b.offer.cores.cmp(&a.offer.cores));
+            rows.sort_by_key(|r| std::cmp::Reverse(r.offer.cores));
         }
         SortKey::RamDesc => {
             rows.sort_by(|a, b| {
@@ -152,7 +152,7 @@ pub fn sort_rows(rows: &mut [MachineRow], key: SortKey) {
             });
         }
         SortKey::DiskDesc => {
-            rows.sort_by(|a, b| b.offer.disk_gb.cmp(&a.offer.disk_gb));
+            rows.sort_by_key(|r| std::cmp::Reverse(r.offer.disk_gb));
         }
         SortKey::Location => {
             rows.sort_by(|a, b| a.offer.location.cmp(&b.offer.location));
