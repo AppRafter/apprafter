@@ -156,8 +156,10 @@ impl HetznerCloudClient {
             all_types.extend(page_response.server_types);
 
             match next {
-                Some(n) => page = n,
-                None => break,
+                // Guard against a non-advancing `next_page` (a misbehaving API
+                // returning the current or an earlier page) — never loop forever.
+                Some(n) if n > page => page = n,
+                _ => break,
             }
         }
 

@@ -685,6 +685,25 @@ fn list_server_types_follows_pagination() {
     p2.assert();
 }
 
+#[test]
+fn list_server_types_guards_against_non_advancing_next_page() {
+    // A misbehaving API pointing next_page back at the current page must not hang.
+    let mut srv = mockito::Server::new();
+    let body = r#"{"server_types":[{"id":1,"name":"cx22","architecture":"x86","cpu_type":"shared","cores":2,"memory":4.0,"disk":40,"deprecation":null,"locations":[],"prices":[]}],"meta":{"pagination":{"page":1,"per_page":50,"next_page":1}}}"#;
+    let m = srv
+        .mock("GET", "/v1/server_types")
+        .match_query(mockito::Matcher::UrlEncoded("page".into(), "1".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .expect(1)
+        .create();
+    let client = HetznerCloudClient::new(srv.url(), "tok");
+    let all = client.list_server_types().expect("should succeed");
+    assert_eq!(all.server_types.len(), 1); // fetched once, did not loop forever
+    m.assert(); // exactly one request made
+}
+
 /// Standard Hetzner error envelope used in every Err::Status test.
 fn hetzner_error_body(code: &str, message: &str) -> String {
     format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#)
