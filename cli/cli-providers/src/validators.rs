@@ -49,8 +49,10 @@ impl std::fmt::Display for RegionInfo {
 /// authenticate?" check. `list_regions` drives the wizard's
 /// region picker (Track A.4b) and stays optional for providers
 /// where regions don't apply (returns an empty `Vec` is OK).
-/// Keeping the trait small means each new provider gets a tiny
-/// surface to implement.
+/// `list_machine_offers` returns the joined (SKU × location)
+/// catalog used by the machine picker and the validator so both
+/// surfaces share a single HTTP call path. Keeping the trait
+/// small means each new provider gets a tiny surface to implement.
 pub trait ProviderValidator {
     /// Hit a lightweight, read-only endpoint to confirm the
     /// carried credentials authenticate. Returns `Ok(())` on a
@@ -64,6 +66,14 @@ pub trait ProviderValidator {
     /// answer is sorted by `name` so the picker is alphabetical
     /// without each call site re-sorting.
     fn list_regions(&self) -> Result<Vec<RegionInfo>>;
+
+    /// Return the joined (SKU × location) machine offer catalog.
+    /// Each row is one `MachineOffer` — see `crate::machine` for
+    /// the struct definition. Providers without a typed catalog
+    /// return an empty `Vec`. The picker and any validator that
+    /// needs server-type data call this method so the HTTP path
+    /// is shared and mocked uniformly in tests.
+    fn list_machine_offers(&self) -> Result<Vec<crate::machine::MachineOffer>>;
 }
 
 /// Hetzner Cloud validator. Probes `GET /v1/locations` — Hetzner's
@@ -108,6 +118,11 @@ impl ProviderValidator for HetznerCloudValidator {
             .collect();
         regions.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(regions)
+    }
+
+    fn list_machine_offers(&self) -> Result<Vec<crate::machine::MachineOffer>> {
+        let resp = self.client.list_server_types()?;
+        Ok(crate::machine::offers_from_server_types(&resp.server_types))
     }
 }
 
@@ -219,6 +234,65 @@ mod tests {
             description: String::new(),
         };
         assert_eq!(r.to_string(), "nbg1");
+    }
+
+    #[test]
+    fn list_machine_offers_returns_joined_catalog_from_server_types() {
+        // Single server type with one location+price, one location without price.
+        // Mirrors the join shape exercised in machine::tests so we pin that the
+        // validator wires through `offers_from_server_types` correctly.
+        let body = r#"{
+            "server_types": [
+                {
+                    "id": 1,
+                    "name": "cx22",
+                    "architecture": "x86",
+                    "cpu_type": "shared",
+                    "cores": 2,
+                    "memory": 4.0,
+                    "disk": 40,
+                    "deprecation": null,
+                    "locations": [
+                        {"name": "nbg1", "available": true,  "recommended": true},
+                        {"name": "fsn1", "available": false, "recommended": false}
+                    ],
+                    "prices": [
+                        {
+                            "location": "nbg1",
+                            "price_monthly": {"net": "3.9200", "gross": "4.6648"},
+                            "price_hourly":  {"net": "0.0066", "gross": "0.0079"}
+                        }
+                    ]
+                }
+            ],
+            "meta": {"pagination": {"page": 1, "per_page": 50, "next_page": null}}
+        }"#;
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/v1/server_types")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+        let v = HetznerCloudValidator::new(server.url(), "test-token");
+        let offers = v.list_machine_offers().expect("list_machine_offers ok");
+        assert_eq!(offers.len(), 2, "one row per (sku, location)");
+        let nbg = offers
+            .iter()
+            .find(|o| o.location == "nbg1" && o.sku == "cx22")
+            .expect("nbg1/cx22 row must exist");
+        assert!(nbg.available);
+        assert_eq!(nbg.price_monthly_net.as_deref(), Some("3.9200"));
+        let fsn = offers
+            .iter()
+            .find(|o| o.location == "fsn1" && o.sku == "cx22")
+            .expect("fsn1/cx22 row must exist");
+        assert!(!fsn.available);
+        assert!(
+            fsn.price_monthly_net.is_none(),
+            "no price entry for fsn1 → None"
+        );
     }
 
     #[test]
