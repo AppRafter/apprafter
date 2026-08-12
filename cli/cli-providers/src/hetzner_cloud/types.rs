@@ -324,7 +324,7 @@ pub struct ServerType {
     pub prices: Vec<ServerTypePrice>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Deprecation {
     #[serde(default)]
     pub announced: Option<String>,
