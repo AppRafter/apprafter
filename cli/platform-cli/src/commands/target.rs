@@ -272,6 +272,12 @@ fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
         if args.tier.is_none() {
             args.tier = out.tier;
         }
+        // Merge the wizard's machine-matrix choice for server_type.
+        // The flag (`--server-type`) takes precedence; the matrix
+        // result fills the field only when the flag was absent.
+        if args.server_type.is_none() {
+            args.server_type = out.server_type;
+        }
         // `out.token_already_verified` is collected but currently
         // unused — the save-time ping below re-verifies (~200ms)
         // to keep the on-save check authoritative. A future

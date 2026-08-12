@@ -34,6 +34,7 @@ use inquire::validator::Validation;
 use inquire::{InquireError, Password, PasswordDisplayMode, Select, Text};
 
 use crate::commands::hcloud::hcloud_base_url;
+use crate::commands::machine_picker::{pick_machine, MachineRow};
 use crate::commands::target::AddArgs;
 
 /// `HCLOUD_TOKEN` env-var name. Defined here so the wizard's
@@ -103,6 +104,10 @@ pub struct WizardOutput {
     pub ssh_key: Option<PathBuf>,
     pub region: Option<String>,
     pub tier: Option<String>,
+    /// The server-type SKU chosen by the machine matrix. `None`
+    /// when `--no-ping` was passed (matrix skipped) and no
+    /// `--server-type` flag was given.
+    pub server_type: Option<String>,
     /// Set to `true` when the wizard already ran a successful API
     /// ping (default) — caller can skip a second ping in
     /// `ping_provider`. `false` when `--no-ping` flowed through.
@@ -112,6 +117,10 @@ pub struct WizardOutput {
 /// Render the wizard prompts. Reads from stdin via `inquire`,
 /// writes prompts to stderr (inquire's default), only returns
 /// once every required field has a valid value.
+///
+/// Prompt order (v0.2.42+):
+///  1. name → 2. provider → 3. token → 4. ssh-key → 5. tier
+///     → 6. machine matrix (region × SKU, replaces the old region step)
 pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
     eprintln!();
     eprintln!("Welcome to AppRafter. Let's set up a deployment target.");
@@ -128,14 +137,16 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
     )?;
     let ssh_key_source = classify_ssh_key_source(initial.ssh_key.as_deref());
     let ssh_key = prompt_ssh_key(initial.ssh_key.as_ref(), ssh_key_source)?;
-    let region = prompt_region(
+    // Tier comes BEFORE the machine matrix so a future tier-aware
+    // filter can use the chosen tier to narrow the offer list.
+    let tier = prompt_tier(initial.tier.as_deref(), "--tier flag")?;
+    let (region, server_type) = prompt_machine(
         &provider,
         &token,
         initial.region.as_deref(),
-        "--region flag",
+        initial.server_type.as_deref(),
         initial.no_ping,
     )?;
-    let tier = prompt_tier(initial.tier.as_deref(), "--tier flag")?;
 
     Ok(WizardOutput {
         name,
@@ -144,6 +155,7 @@ pub fn run_add_wizard(initial: &AddArgs) -> Result<WizardOutput> {
         ssh_key,
         region,
         tier,
+        server_type,
         token_already_verified,
     })
 }
@@ -633,6 +645,122 @@ pub fn probe_region_latency(region: &str, timeout: Duration) -> Option<u32> {
     Some(start.elapsed().as_millis().min(u32::MAX as u128) as u32)
 }
 
+/// Return the distinct `location` values from a slice of `MachineOffer`s,
+/// in first-occurrence order (no duplicates, input order preserved).
+///
+/// Pure helper — unit-tested.
+pub fn unique_locations(offers: &[cli_providers::machine::MachineOffer]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for o in offers {
+        if seen.insert(o.location.clone()) {
+            out.push(o.location.clone());
+        }
+    }
+    out
+}
+
+/// Fetch the machine catalog with an interactive retry loop on failure.
+///
+/// If the API call fails, prints the error and asks the user whether to
+/// retry. Returning `false` from the prompt aborts with the original
+/// error (no silent fallback).
+fn fetch_offers_with_retry(
+    validator: &HetznerCloudValidator,
+) -> Result<Vec<cli_providers::machine::MachineOffer>> {
+    loop {
+        match validator.list_machine_offers() {
+            Ok(o) => return Ok(o),
+            Err(e) => {
+                eprintln!("  could not fetch the machine catalog: {e}");
+                let retry = inquire::Confirm::new("Retry fetching the machine catalog?")
+                    .with_default(true)
+                    .prompt()
+                    .map_err(map_inquire_err)?;
+                if !retry {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Machine-matrix wizard step — replaces the old standalone region picker.
+///
+/// Returns `(region, server_type)`:
+/// - Under `--no-ping`: skips the API entirely, falls back to the text
+///   prompt with the `nbg1` default (reuses `prompt_region`), and returns
+///   `(that_region, None)` so `server_type` stays unset.
+/// - Normal path: fetches the full catalog, measures latency to each unique
+///   location once, builds `MachineRow`s, and delegates to `pick_machine`.
+fn prompt_machine(
+    provider: &str,
+    token: &str,
+    prefill_region: Option<&str>,
+    prefill_sku: Option<&str>,
+    no_ping: bool,
+) -> Result<(Option<String>, Option<String>)> {
+    // H1: --no-ping shunt — do NOT hit the API.
+    if no_ping {
+        eprintln!(
+            "  machine picker skipped (--no-ping); server type falls back to the default — \
+             pass --server-type to choose"
+        );
+        let region = prompt_region(provider, token, prefill_region, "--region flag", true)?;
+        return Ok((region, None));
+    }
+
+    // If both axes are already prefilled, announce and return immediately
+    // (mirrors the pattern used for name / provider / region prefills).
+    if let (Some(r), Some(s)) = (prefill_region, prefill_sku) {
+        eprintln!("  ℹ Default region: {r} (from --region flag)");
+        eprintln!("  ℹ Server type:    {s} (from --server-type flag)");
+        return Ok((Some(r.to_string()), Some(s.to_string())));
+    }
+
+    // Build the validator and fetch the catalog (with retry on failure).
+    let validator = match provider {
+        "hetzner-cloud" => HetznerCloudValidator::new(hcloud_base_url(), token),
+        other => {
+            return Err(CliError::Other(format!(
+                "no machine catalog for provider `{other}` — pass `--no-ping` to fall back to text entry"
+            )));
+        }
+    };
+    let offers = fetch_offers_with_retry(&validator)?;
+
+    // Measure latency to each unique location once.
+    let locations = unique_locations(&offers);
+    eprintln!(
+        "  ⏳ Measuring latency to {} location(s)... (best-effort, ≤2s)",
+        locations.len()
+    );
+    let region_infos: Vec<RegionInfo> = locations
+        .iter()
+        .map(|name| RegionInfo {
+            name: name.clone(),
+            description: name.clone(),
+        })
+        .collect();
+    let measured = measure_region_latencies(region_infos, Duration::from_millis(2000));
+    let latency_map: std::collections::HashMap<String, Option<u32>> = measured
+        .into_iter()
+        .map(|r| (r.info.name.clone(), r.latency_ms))
+        .collect();
+
+    // Build MachineRow vec: pair each offer with its location's latency.
+    let rows: Vec<MachineRow> = offers
+        .into_iter()
+        .map(|offer| {
+            let latency_ms = latency_map.get(&offer.location).copied().flatten();
+            MachineRow { offer, latency_ms }
+        })
+        .collect();
+
+    let (region, sku) = pick_machine(rows, prefill_region, prefill_sku)?;
+    Ok((Some(region), Some(sku)))
+}
+
 fn prompt_tier(prefill: Option<&str>, source: &str) -> Result<Option<String>> {
     if let Some(t) = prefill {
         eprintln!("  ℹ Default tier: {t} (from {source})");
@@ -1044,5 +1172,56 @@ mod tests {
         let s_dead = dead.to_string();
         assert!(s_reach.contains("24 ms"), "{s_reach}");
         assert!(s_dead.contains("n/a"), "{s_dead}");
+    }
+
+    // ---------------------------------------------------------------
+    // unique_locations tests (pure helper, task 9)
+    // ---------------------------------------------------------------
+
+    fn make_offer(loc: &str, sku: &str) -> cli_providers::machine::MachineOffer {
+        cli_providers::machine::MachineOffer {
+            location: loc.into(),
+            sku: sku.into(),
+            cores: 2,
+            memory_gb: 4.0,
+            disk_gb: 40,
+            arch: "x86".into(),
+            cpu_type: "shared".into(),
+            price_monthly_net: None,
+            price_hourly_net: None,
+            available: true,
+            recommended: false,
+            deprecation: None,
+        }
+    }
+
+    #[test]
+    fn unique_locations_deduplicates_preserving_first_occurrence_order() {
+        let offers = vec![
+            make_offer("hel1", "cx22"),
+            make_offer("nbg1", "cx22"),
+            make_offer("hel1", "ccx23"), // duplicate location
+            make_offer("fsn1", "cx22"),
+            make_offer("nbg1", "cx42"), // duplicate location
+        ];
+        let locs = unique_locations(&offers);
+        assert_eq!(locs, vec!["hel1", "nbg1", "fsn1"]);
+    }
+
+    #[test]
+    fn unique_locations_empty_input_returns_empty() {
+        let locs = unique_locations(&[]);
+        assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn unique_locations_single_location_returns_once() {
+        let offers = vec![
+            make_offer("nbg1", "cx22"),
+            make_offer("nbg1", "cx32"),
+            make_offer("nbg1", "cx42"),
+        ];
+        let locs = unique_locations(&offers);
+        assert_eq!(locs, vec!["nbg1"]);
     }
 }

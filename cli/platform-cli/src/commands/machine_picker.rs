@@ -6,10 +6,6 @@
 //! unit-tested. The interactive `pick_machine` function uses `inquire` and is
 //! exercised by the real-Hetzner walk.
 
-// The public API in this module is intentionally unused until the interactive
-// picker wires it into the CLI command graph.
-#![allow(dead_code)]
-
 use std::cmp::Ordering;
 
 use cli_core::{CliError, Result};
