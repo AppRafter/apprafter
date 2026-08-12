@@ -27,6 +27,34 @@ use std::path::PathBuf;
 use miette::Diagnostic;
 use thiserror::Error;
 
+/// Classifies WHY a server type is unavailable, so callers can give
+/// context-appropriate alternatives and help text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableKind {
+    /// The SKU is not in the provider's catalog at all.
+    Unknown,
+    /// The SKU exists globally but is not offered in the requested region.
+    NotOfferedInRegion,
+    /// The SKU's `unavailable_after` timestamp has passed.
+    Retired,
+    /// The offer exists and is not retired, but capacity is currently exhausted.
+    OutOfCapacity,
+}
+
+impl UnavailableKind {
+    /// Short human-readable reason clause used in the error `Display`.
+    pub fn human_reason(self) -> &'static str {
+        match self {
+            UnavailableKind::Unknown => "unknown server type",
+            UnavailableKind::NotOfferedInRegion => "not offered in this region",
+            UnavailableKind::Retired => "retired (no longer orderable)",
+            UnavailableKind::OutOfCapacity => {
+                "out of capacity right now — try a different type or region, or retry later"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum CliError {
     /// The `cue` binary was not found on `PATH`.
@@ -78,11 +106,12 @@ pub enum CliError {
     /// Pre-flight rejection: the requested Hetzner server type is
     /// unknown / deprecated / unavailable in the requested region.
     /// `alternatives` carries up to 3 suggested live names for the
-    /// same region.
+    /// same region (may contain newlines for multi-axis suggestions).
     #[error(
-        "server type `{requested}` is unavailable in region `{location}`: {reason}\n  \
-         try one of: {alternatives}\n  \
-         (override via APPRAFTER_MANIFEST or `--server-type` once it lands)"
+        "server type `{requested}` is unavailable in region `{location}`: {}\n  \
+         {alternatives}\n  \
+         (override via APPRAFTER_MANIFEST or `--server-type` once it lands)",
+        kind.human_reason()
     )]
     #[diagnostic(
         code(apprafter::provider::server_type_unavailable),
@@ -96,11 +125,24 @@ pub enum CliError {
     ServerTypeUnavailable {
         requested: String,
         location: String,
-        reason: String,
-        /// Comma-separated list of suggestions (already formatted
-        /// for the error message).
+        /// Structured reason — replaces the old free-form `reason: String`.
+        kind: UnavailableKind,
+        /// Formatted suggestions (may contain newlines for multi-axis output).
         alternatives: String,
     },
+
+    /// No server type has been chosen yet.
+    #[error("no server type selected")]
+    #[diagnostic(
+        code(apprafter::provider::server_type_not_selected),
+        help(
+            "No server type selected. Choose one:\n\
+             • interactive: `apprafter target machine` (opens the machine picker)\n\
+             • non-interactive / CI: `--server-type <sku>` or `APPRAFTER_SERVER_TYPE`\n\
+             • declaratively: set `nodes[0].kind` in your Infrastructure manifest"
+        )
+    )]
+    ServerTypeNotSelected,
 
     /// State file present but unparseable.
     #[error("state file at {path}: {message}")]
@@ -355,7 +397,7 @@ mod tests {
         let err = CliError::ServerTypeUnavailable {
             requested: "cx22".into(),
             location: "nbg1".into(),
-            reason: "server type was retired".into(),
+            kind: UnavailableKind::Retired,
             alternatives: "cpx22, cpx21".into(),
         };
         assert_eq!(
@@ -368,6 +410,37 @@ mod tests {
         // explicit so the error speaks for itself.
         assert!(help.contains("cx22"), "missing cx22 context: {help}");
         assert!(help.contains("cpx22"), "missing cpx22 context: {help}");
+    }
+
+    #[test]
+    fn server_type_not_selected_has_stable_code_and_actionable_help() {
+        let err = CliError::ServerTypeNotSelected;
+        assert_eq!(
+            code_of(&err),
+            "apprafter::provider::server_type_not_selected"
+        );
+        let help = help_of(&err);
+        assert!(
+            help.contains("apprafter target machine"),
+            "missing interactive hint: {help}"
+        );
+        assert!(help.contains("--server-type"), "missing CI hint: {help}");
+        assert!(
+            help.contains("nodes[0].kind"),
+            "missing manifest hint: {help}"
+        );
+    }
+
+    #[test]
+    fn unavailable_kind_human_reason_covers_all_variants() {
+        assert!(UnavailableKind::Unknown.human_reason().contains("unknown"));
+        assert!(UnavailableKind::NotOfferedInRegion
+            .human_reason()
+            .contains("not offered"));
+        assert!(UnavailableKind::Retired.human_reason().contains("retired"));
+        assert!(UnavailableKind::OutOfCapacity
+            .human_reason()
+            .contains("capacity"));
     }
 
     #[test]

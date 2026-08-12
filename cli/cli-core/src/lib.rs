@@ -15,7 +15,7 @@ pub use credentials::{
     read_ssh_public_key_body, resolve_hetzner_ssh_public_key, resolve_hetzner_token,
     HCLOUD_TOKEN_ENV, SSH_PUBLIC_KEY_ENV,
 };
-pub use error::{CliError, Result};
+pub use error::{CliError, Result, UnavailableKind};
 pub use target::{
     default_config_root, list_target_names, load_active_target_config, load_global_config,
     load_target, remove_target, rename_target, resolve_active_target_name, save_global_config,
