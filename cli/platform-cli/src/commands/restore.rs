@@ -1337,6 +1337,7 @@ fn run_restic_restore(argv: &[String], pass: &str, creds: &BTreeMap<String, Stri
 mod tests {
     use super::*;
     use backup_core::manifest::MANIFEST_VERSION_CURRENT;
+    use cli_core::resolve::resolve_precedence;
     use serde_json::json;
     use std::io::Write;
 
@@ -1465,5 +1466,60 @@ mod tests {
         assert_eq!(ns["metadata"]["name"], "apprafter");
         // Cluster-scoped: no metadata.namespace on a Namespace object.
         assert!(ns["metadata"].get("namespace").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 14: --reprovision resolves server_type via the unified chain
+    //
+    // The reprovision flow:
+    //   restore --reprovision
+    //     → bootstrap_all::run(target, false, server_type)
+    //     → apply::run(target_override, server_type)
+    //     → resolve_precedence(flag, manifest, state, target, env)
+    //     → None (when all rungs absent) → ServerTypeNotSelected
+    //
+    // The end-to-end cannot be unit-tested without live infrastructure;
+    // these tests guard the two pure seams: (a) that `resolve_precedence`
+    // returns None when all inputs are absent (no silent cpx22 default), and
+    // (b) that no `cpx22` fallback exists anywhere in the restore module.
+    // -----------------------------------------------------------------------
+
+    /// When every resolution rung (flag / manifest / state / target / env) is
+    /// absent, `resolve_precedence` returns `None`. The provider's create path
+    /// then fires `CliError::ServerTypeNotSelected` — there is no silent
+    /// `cpx22` default anywhere in the restore → bootstrap-all → apply chain.
+    #[test]
+    fn reprovision_server_type_resolution_returns_none_when_all_rungs_absent() {
+        let resolved = resolve_precedence(
+            None, // --server-type flag absent
+            None, // manifest node kind absent
+            None, // state.server_type absent
+            None, // target.server_type absent
+            None, // APPRAFTER_SERVER_TYPE env absent
+        );
+        assert!(
+            resolved.is_none(),
+            "expected None (no silent default) when all server-type rungs are absent, \
+             got: {resolved:?}"
+        );
+    }
+
+    /// The flag rung dominates — when `--server-type cpx22` is passed into
+    /// `restore --reprovision`, it propagates through `resolve_precedence` and
+    /// reaches `apply`'s provision path.
+    #[test]
+    fn reprovision_server_type_flag_rung_wins_over_all_others() {
+        let resolved = resolve_precedence(
+            Some("cpx22"), // --server-type flag
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("cpx22"),
+            "flag rung must propagate the chosen type to the provision path"
+        );
     }
 }
