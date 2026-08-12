@@ -47,7 +47,7 @@ fn create_then_destroy_real_cpx22() {
         client: HetznerCloudClient::new(DEFAULT_BASE_URL, token),
         spec: ServerSpec {
             name: name.clone(),
-            server_type: "cpx22".into(),
+            server_type: Some("cpx22".into()),
             image: "ubuntu-24.04".into(),
             location: "nbg1".into(),
             labels,

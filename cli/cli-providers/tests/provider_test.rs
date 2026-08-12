@@ -14,7 +14,7 @@ fn spec(name: &str) -> ServerSpec {
     labels.insert("apprafter".into(), "true".into());
     ServerSpec {
         name: name.into(),
-        server_type: "cx22".into(),
+        server_type: Some("cx22".into()),
         image: "ubuntu-24.04".into(),
         location: "nbg1".into(),
         labels,
@@ -686,7 +686,7 @@ fn apply_forwards_user_data_into_the_create_server_request() {
         client: HetznerCloudClient::new(server.url(), "test-token"),
         spec: ServerSpec {
             name: "cl".into(),
-            server_type: "cx22".into(),
+            server_type: Some("cx22".into()),
             image: "ubuntu-24.04".into(),
             location: "nbg1".into(),
             labels: BTreeMap::new(),
@@ -774,7 +774,7 @@ fn apply_rejects_deprecated_server_type_before_any_post() {
         client: HetznerCloudClient::new(server.url(), "test-token"),
         spec: ServerSpec {
             name: "platform-1".into(),
-            server_type: "cx22".into(), // ← retired upstream
+            server_type: Some("cx22".into()), // ← retired upstream
             image: "ubuntu-24.04".into(),
             location: "nbg1".into(),
             labels: BTreeMap::new(),
@@ -809,6 +809,68 @@ fn apply_rejects_deprecated_server_type_before_any_post() {
     g_servers.assert();
     g_types.assert();
     no_post.assert(); // proves nothing was POSTed
+}
+
+#[test]
+fn apply_rejects_missing_server_type_on_create_path() {
+    // Task 10 / D0.1: when server_type is None and the server does NOT exist
+    // yet (create path), apply() must return ServerTypeNotSelected BEFORE any
+    // POST call — no cloud resources may be mutated.
+    let mut server = mockito::Server::new();
+    let _g_keys = server
+        .mock("GET", "/v1/ssh_keys")
+        .with_status(200)
+        .with_body(r#"{"ssh_keys":[]}"#)
+        .create();
+    let _g_nets = server
+        .mock("GET", "/v1/networks")
+        .with_status(200)
+        .with_body(r#"{"networks":[]}"#)
+        .create();
+    let _g_fws = server
+        .mock("GET", "/v1/firewalls")
+        .with_status(200)
+        .with_body(r#"{"firewalls":[]}"#)
+        .create();
+    // Server is absent → create path triggered.
+    let _g_servers = server
+        .mock("GET", "/v1/servers")
+        .with_status(200)
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+    // server_types must NOT be consulted (error fires before the lookup).
+    let no_types = server.mock("GET", "/v1/server_types").expect(0).create();
+    let no_post = server
+        .mock("POST", mockito::Matcher::Any)
+        .expect(0)
+        .create();
+
+    use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
+    use std::collections::BTreeMap;
+
+    let provider = HetznerCloudProvider {
+        client: HetznerCloudClient::new(server.url(), "test-token"),
+        spec: ServerSpec {
+            name: "platform-1".into(),
+            server_type: None, // ← no type — must fire ServerTypeNotSelected
+            image: "ubuntu-24.04".into(),
+            location: "nbg1".into(),
+            labels: BTreeMap::new(),
+            user_data: None,
+        },
+        ssh_keys: vec![],
+        networks: vec![],
+        firewalls: vec![],
+        floating_ips: vec![],
+    };
+
+    let err = cli_providers::Provider::apply(&provider).unwrap_err();
+    assert!(
+        matches!(err, cli_core::CliError::ServerTypeNotSelected),
+        "expected ServerTypeNotSelected, got {err:?}"
+    );
+    no_types.assert(); // server_types lookup never happened
+    no_post.assert(); // no cloud resource was touched
 }
 
 #[test]
@@ -847,11 +909,14 @@ fn apply_skips_server_types_lookup_when_server_already_exists() {
     use cli_providers::hetzner_cloud::{HetznerCloudClient, HetznerCloudProvider, ServerSpec};
     use std::collections::BTreeMap;
 
+    // Use server_type: None to prove the exists-path never consults it.
+    // An existing cluster must reconcile successfully even when no type
+    // has been selected (the dogfood non-regression for this task).
     let provider = HetznerCloudProvider {
         client: HetznerCloudClient::new(server.url(), "test-token"),
         spec: ServerSpec {
             name: "platform-1".into(),
-            server_type: "cpx22".into(),
+            server_type: None, // ← no type selected — must NOT fire ServerTypeNotSelected
             image: "ubuntu-24.04".into(),
             location: "nbg1".into(),
             labels: BTreeMap::new(),
@@ -943,7 +1008,7 @@ fn destroy_waits_for_server_async_cleanup_before_deleting_network() {
         client: HetznerCloudClient::new(srv.url(), "tok"),
         spec: ServerSpec {
             name: "platform-1".into(),
-            server_type: "cpx22".into(),
+            server_type: None, // destroy path does not need the type
             image: "ubuntu-24.04".into(),
             location: "nbg1".into(),
             labels: BTreeMap::new(),

@@ -63,9 +63,11 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
         client: HetznerCloudClient::new(hcloud_base_url(), token),
         spec: ServerSpec {
             name: cluster,
-            server_type: "cpx22".into(),
+            // destroy() reads live state from the API — server_type is not
+            // consulted on the destroy path (no validation, no create call).
+            server_type: None,
             image: "ubuntu-24.04".into(),
-            location: region,
+            location: region.clone(),
             labels: BTreeMap::new(),
             user_data: None,
         },
@@ -76,11 +78,30 @@ pub fn run(yes: bool, target_override: Option<&str>) -> Result<()> {
         floating_ips: Vec::new(),
     };
 
+    // Print a best-effort summary of what was destroyed so the operator can
+    // note the type + region for a later `restore --reprovision`.
+    // Read from the live API response — the first tagged server carries the
+    // server_type name via the Hetzner types response if available.
+    let live_before = provider.client.list_servers().ok();
+    let server_summary: Option<String> = live_before.as_ref().and_then(|r| {
+        r.servers
+            .iter()
+            .find(|s| s.labels.get("apprafter").map(String::as_str) == Some("true"))
+            .and_then(|s| {
+                s.server_type
+                    .as_ref()
+                    .map(|st| format!("type={} region={}", st.name, region))
+            })
+    });
+
     let outcome = provider.destroy()?;
     println!(
         "destroy complete: {} resource(s) removed",
         outcome.destroyed
     );
+    if let Some(summary) = server_summary {
+        println!("  (destroyed server: {summary} — note for restore --reprovision)");
+    }
 
     state.hetzner_cloud = None;
     state.save(&paths)?;

@@ -120,12 +120,13 @@ impl HetznerCloudProvider {
         ssh_key_ids: &[u64],
         network_ids: &[u64],
         firewall_ids: &[u64],
+        server_type: &str,
     ) -> ServerCreateRequest {
         let mut labels = self.spec.labels.clone();
         labels.insert(APPRAFTER_LABEL.into(), APPRAFTER_LABEL_VALUE.into());
         ServerCreateRequest {
             name: self.spec.name.clone(),
-            server_type: self.spec.server_type.clone(),
+            server_type: server_type.to_string(),
             image: self.spec.image.clone(),
             location: self.spec.location.clone(),
             labels,
@@ -310,20 +311,27 @@ impl Provider for HetznerCloudProvider {
         let live_servers = self.refresh_servers()?;
         let needs_server_create =
             !self.spec.name.is_empty() && !live_servers.iter().any(|s| s.name == self.spec.name);
-        if needs_server_create {
+        // Unwrap the server type here — ONLY on the create path.
+        // An existing cluster (no-op apply) never reaches this block
+        // and must succeed even with `server_type: None`.
+        let create_server_type: Option<&str> = if needs_server_create {
+            let st = self
+                .spec
+                .server_type
+                .as_deref()
+                .ok_or(CliError::ServerTypeNotSelected)?;
             info!(
                 server = %self.spec.name,
-                server_type = %self.spec.server_type,
+                server_type = %st,
                 location = %self.spec.location,
                 "validating server_type pre-flight"
             );
             let types = self.client.list_server_types()?;
-            validate_server_type(
-                &types.server_types,
-                &self.spec.server_type,
-                &self.spec.location,
-            )?;
-        }
+            validate_server_type(&types.server_types, st, &self.spec.location)?;
+            Some(st)
+        } else {
+            None
+        };
 
         // 1) SSH keys.
         let live_keys = self.refresh_ssh_keys()?;
@@ -383,8 +391,11 @@ impl Provider for HetznerCloudProvider {
         if let Some(existing) = live_servers.iter().find(|s| s.name == self.spec.name) {
             server_id = Some(existing.id);
         } else if !self.spec.name.is_empty() {
+            // SAFETY: `create_server_type` is `Some` iff `needs_server_create`
+            // is true, which is exactly the condition for this else-branch.
+            let st = create_server_type.expect("server_type unwrapped above");
             info!(server = %self.spec.name, "creating Hetzner server");
-            let req = self.create_request(&ssh_ids, &net_ids, &fw_ids);
+            let req = self.create_request(&ssh_ids, &net_ids, &fw_ids, st);
             let resp = self.client.create_server(&req)?;
             info!(server = %self.spec.name, id = resp.server.id, "server created");
             server_id = Some(resp.server.id);

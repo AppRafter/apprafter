@@ -21,7 +21,6 @@ use crate::commands::state_paths::resolve_state_paths;
 const DEFAULT_NETWORK_IP_RANGE: &str = "10.0.0.0/16";
 const DEFAULT_SUBNET_IP_RANGE: &str = "10.0.0.0/24";
 const DEFAULT_NETWORK_ZONE: &str = "eu-central";
-const DEFAULT_SERVER_TYPE: &str = "cpx22";
 const DEFAULT_OS_IMAGE: &str = "ubuntu-24.04";
 
 /// Read `APPRAFTER_SERVER_TYPE` from the environment. Returns `None` when the
@@ -35,26 +34,27 @@ pub fn env_server_type() -> Option<String> {
 
 /// Which precedence rung resolved the server type, for the source-print.
 /// Pure — takes the same inputs as `resolve_precedence` and returns the
-/// first non-None rung's label, or "default" when all are None.
+/// first non-None rung's label, or `None` when all inputs are None (meaning
+/// no type has been selected yet).
 pub fn source_label(
     flag: Option<&str>,
     manifest: Option<&str>,
     state: Option<&str>,
     target: Option<&str>,
     env: Option<&str>,
-) -> &'static str {
+) -> Option<&'static str> {
     if flag.is_some() {
-        "--server-type flag"
+        Some("--server-type flag")
     } else if manifest.is_some() {
-        "manifest"
+        Some("manifest")
     } else if state.is_some() {
-        "state"
+        Some("state")
     } else if target.is_some() {
-        "target"
+        Some("target")
     } else if env.is_some() {
-        "env"
+        Some("env")
     } else {
-        "default"
+        None
     }
 }
 
@@ -144,13 +144,17 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
 
     // server type: flag > manifest nodes[0].kind > state (None for now, a later
     // task records the deployed type) > target preference > APPRAFTER_SERVER_TYPE env.
+    // NO default — provisioning a machine is a spend decision; the type must be
+    // chosen explicitly. The create path in the provider will fire
+    // `CliError::ServerTypeNotSelected` if `None` reaches it. An existing-cluster
+    // (no-op) apply succeeds regardless.
     let manifest_node_kind = manifest
         .as_ref()
         .and_then(|m| m.spec.nodes.first())
         .map(|n| n.kind.clone());
     let target_server_type = target_config.as_ref().and_then(|t| t.server_type.clone());
     let env_type = env_server_type();
-    let resolved_type_opt = resolve_precedence(
+    let resolved_type: Option<String> = resolve_precedence(
         server_type_flag,
         manifest_node_kind.as_deref(),
         None, // state fact — added in a later task
@@ -164,9 +168,12 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
         target_server_type.as_deref(),
         env_type.as_deref(),
     );
-    let resolved_type = resolved_type_opt.unwrap_or_else(|| DEFAULT_SERVER_TYPE.to_string());
-
-    eprintln!("  server type: {resolved_type} ({src})");
+    match &resolved_type {
+        Some(t) => eprintln!("  server type: {t} ({})", src.unwrap_or("unknown")),
+        None => eprintln!(
+            "  server type: (not selected — will fail on provision; run `apprafter target machine`)"
+        ),
+    }
     eprintln!(
         "  region: {region}{}",
         if region_defaulted { " (default)" } else { "" }
@@ -187,7 +194,7 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
         state.region = Some(region.clone());
     }
 
-    let server_spec = build_server_spec(manifest.as_ref(), &cluster, &region, &resolved_type);
+    let server_spec = build_server_spec(manifest.as_ref(), &cluster, &region, resolved_type);
     let ssh_keys = build_ssh_specs(manifest.as_ref(), &cluster, &target_store, target_override)?;
     let networks = vec![build_network_spec(manifest.as_ref(), &cluster)];
     // 1.83d/1.83h: opt-in Cloudflare origin firewall. The manifest field wins,
@@ -223,7 +230,7 @@ fn build_server_spec(
     manifest: Option<&InfrastructureManifest>,
     cluster: &str,
     region: &str,
-    server_type: &str,
+    server_type: Option<String>,
 ) -> ServerSpec {
     let image = manifest
         .and_then(|m| m.spec.os_image.clone())
@@ -242,7 +249,7 @@ fn build_server_spec(
 
     ServerSpec {
         name: cluster.into(),
-        server_type: server_type.into(),
+        server_type,
         image,
         location: region.into(),
         labels: BTreeMap::new(),
@@ -486,14 +493,32 @@ mod tests {
     }
 
     #[test]
-    fn build_server_spec_uses_defaults_when_manifest_is_absent() {
-        // server_type is now pre-resolved by the caller; pass the default.
-        let s = build_server_spec(None, "platform-1", "nbg1", DEFAULT_SERVER_TYPE);
+    fn build_server_spec_stores_none_when_type_not_resolved() {
+        // No type is passed — the spec stores None; the provider create-path
+        // will fire ServerTypeNotSelected if a provision is attempted.
+        let s = build_server_spec(None, "platform-1", "nbg1", None);
         assert_eq!(s.name, "platform-1");
-        assert_eq!(s.server_type, DEFAULT_SERVER_TYPE);
+        assert!(
+            s.server_type.is_none(),
+            "expected None, got {:?}",
+            s.server_type
+        );
         assert_eq!(s.image, DEFAULT_OS_IMAGE);
         assert_eq!(s.location, "nbg1");
         assert!(s.labels.is_empty());
+    }
+
+    #[test]
+    fn build_server_spec_stores_resolved_type_when_provided() {
+        let s = build_server_spec(None, "platform-1", "nbg1", Some("cpx22".into()));
+        assert_eq!(s.server_type.as_deref(), Some("cpx22"));
+    }
+
+    #[test]
+    fn resolve_precedence_returns_none_when_all_inputs_absent() {
+        // No type on any rung → None (no default is applied).
+        let result = resolve_precedence(None, None, None, None, None);
+        assert!(result.is_none(), "expected None, got {:?}", result);
     }
 
     #[test]
@@ -513,8 +538,8 @@ mod tests {
         }));
         // The caller resolves the type via resolve_precedence; here we pass
         // the manifest-derived type directly, which is what run() would do.
-        let s = build_server_spec(Some(&m), "cluster-x", "fsn1", "cpx21");
-        assert_eq!(s.server_type, "cpx21");
+        let s = build_server_spec(Some(&m), "cluster-x", "fsn1", Some("cpx21".into()));
+        assert_eq!(s.server_type.as_deref(), Some("cpx21"));
         assert_eq!(s.image, "debian-12");
         assert_eq!(s.name, "cluster-x");
         assert_eq!(s.location, "fsn1");
@@ -591,7 +616,7 @@ mod tests {
 
     #[test]
     fn build_server_spec_attaches_cloud_init_user_data_by_default() {
-        let s = build_server_spec(None, "platform-1", "nbg1", DEFAULT_SERVER_TYPE);
+        let s = build_server_spec(None, "platform-1", "nbg1", Some("cpx22".into()));
         let yaml = s.user_data.expect("user_data set by default");
         assert!(yaml.starts_with("#cloud-config"), "{yaml}");
         assert!(yaml.contains("get.k3s.io"));
@@ -617,7 +642,7 @@ mod tests {
                 "nodes": [{"role": "control-plane", "type": "cpx22", "count": 1}]
             }
         }));
-        let yaml = build_server_spec(Some(&single), "solo", "nbg1", DEFAULT_SERVER_TYPE)
+        let yaml = build_server_spec(Some(&single), "solo", "nbg1", Some("cpx22".into()))
             .user_data
             .expect("user_data");
         assert!(
@@ -642,7 +667,7 @@ mod tests {
                 ]
             }
         }));
-        let yaml = build_server_spec(Some(&multi), "multi", "nbg1", DEFAULT_SERVER_TYPE)
+        let yaml = build_server_spec(Some(&multi), "multi", "nbg1", Some("cpx22".into()))
             .user_data
             .expect("user_data");
         assert!(
@@ -656,7 +681,7 @@ mod tests {
 
         // (3) The undocumented env hook wins over the single-node default.
         std::env::set_var("APPRAFTER_SKIP_NODE_SWAP", "1");
-        let yaml = build_server_spec(None, "solo", "nbg1", DEFAULT_SERVER_TYPE)
+        let yaml = build_server_spec(None, "solo", "nbg1", Some("cpx22".into()))
             .user_data
             .expect("user_data");
         assert!(
@@ -713,7 +738,7 @@ mod tests {
                 Some("cpx52"),
                 Some("cpx62")
             ),
-            "--server-type flag"
+            Some("--server-type flag")
         );
     }
 
@@ -727,7 +752,7 @@ mod tests {
                 Some("cpx52"),
                 Some("cpx62")
             ),
-            "manifest"
+            Some("manifest")
         );
     }
 
@@ -735,7 +760,7 @@ mod tests {
     fn source_label_state_when_flag_and_manifest_absent() {
         assert_eq!(
             source_label(None, None, Some("cpx42"), Some("cpx52"), Some("cpx62")),
-            "state"
+            Some("state")
         );
     }
 
@@ -743,17 +768,21 @@ mod tests {
     fn source_label_target_when_flag_manifest_state_absent() {
         assert_eq!(
             source_label(None, None, None, Some("cpx52"), Some("cpx62")),
-            "target"
+            Some("target")
         );
     }
 
     #[test]
     fn source_label_env_when_only_env_set() {
-        assert_eq!(source_label(None, None, None, None, Some("cpx62")), "env");
+        assert_eq!(
+            source_label(None, None, None, None, Some("cpx62")),
+            Some("env")
+        );
     }
 
     #[test]
-    fn source_label_default_when_all_absent() {
-        assert_eq!(source_label(None, None, None, None, None), "default");
+    fn source_label_none_when_all_absent() {
+        // No type on any rung → None (no default exists any more).
+        assert_eq!(source_label(None, None, None, None, None), None);
     }
 }

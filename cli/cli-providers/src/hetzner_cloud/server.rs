@@ -8,7 +8,12 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone)]
 pub struct ServerSpec {
     pub name: String,
-    pub server_type: String,
+    /// The Hetzner server type (SKU) to provision, e.g. `"cpx22"`.
+    /// `None` when no type has been selected yet — the provider's
+    /// create path will reject provisioning with
+    /// `CliError::ServerTypeNotSelected`. The exists path (no-op
+    /// apply against an already-running cluster) ignores this field.
+    pub server_type: Option<String>,
     pub image: String,
     pub location: String,
     pub labels: BTreeMap<String, String>,

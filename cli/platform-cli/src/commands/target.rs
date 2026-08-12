@@ -803,6 +803,14 @@ fn run_show(name: Option<&str>) -> Result<()> {
         target.config.region.as_deref().unwrap_or("not set")
     );
     println!(
+        "  Server type: {}",
+        target
+            .config
+            .server_type
+            .as_deref()
+            .unwrap_or("not selected — run `apprafter target machine`")
+    );
+    println!(
         "  Default tier: {}",
         target.config.default_tier.as_deref().unwrap_or("not set")
     );
