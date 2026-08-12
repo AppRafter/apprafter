@@ -336,15 +336,11 @@ mod tests {
             CliError::ServerTypeUnavailable {
                 kind, alternatives, ..
             } => {
-                // The `dead` fixture marks available=false + global deprecation=Some
-                // with no unavailable_after → classify sees available=false → OutOfCapacity
-                // (global deprecation sets available=false at the location level).
-                assert!(
-                    kind == UnavailableKind::OutOfCapacity
-                        || kind == UnavailableKind::Retired
-                        || kind == UnavailableKind::NotOfferedInRegion,
-                    "unexpected kind: {kind:?}"
-                );
+                // The `dead` fixture marks the location available=false with no
+                // per-location unavailable_after → classify sees available=false and
+                // no retirement timestamp → OutOfCapacity. Pin it exactly so a future
+                // misclassification of this fixture is caught.
+                assert_eq!(kind, UnavailableKind::OutOfCapacity);
                 assert!(
                     alternatives.contains("cpx22"),
                     "alternatives should mention cpx22: {alternatives}"
