@@ -18,8 +18,8 @@
 #   Leg 3  legacy self-heal: blank the type in config+state on the running
 #          box → `apply` succeeds (no error) AND backfills the live type
 #          into the target (the dogfood non-regression, H8/backfill).
-#   Leg 4  `target machine --server-type <other>` patches the target
-#          preference without re-provisioning.
+#   Leg 4  `target machine` is REFUSED on the provisioned cluster (no in-place
+#          resize — a machine change means backup + restore --reprovision).
 #   (DR `restore --reprovision` reproduction is inherited + unit-tested;
 #    it needs a backup repo and is out of scope for this cost-bounded run.)
 #
@@ -189,14 +189,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-phase "Leg 4: target machine --server-type ${SKU2} patches the preference (no re-provision)"
-apprafter target machine --server-type "$SKU2" --no-ping || fail "Leg 4: target machine --server-type ${SKU2} failed"
+phase "Leg 4: target machine is REFUSED on a provisioned cluster (no in-place resize)"
+# There is no live machine migration — changing a running cluster's type means a
+# backup + restore --reprovision. So `target machine` must refuse here and point
+# there, leaving the target + the running box untouched. (The un-provisioned
+# positive case is covered by Leg 1, where `target machine` set the type before
+# any cluster existed.)
+if apprafter target machine --server-type "$SKU2" 2> "${WORK}/leg4.err"; then
+    fail "Leg 4: target machine SUCCEEDED on a provisioned cluster (expected refuse)"
+else
+    if grep -qiE "provisioned|restore --reprovision" "${WORK}/leg4.err"; then
+        ok "Leg 4: target machine refused on the provisioned cluster (points to backup + restore --reprovision)"
+    else
+        fail "Leg 4: target machine failed but NOT with the provisioned-refuse message:"; sed 's/^/    | /' "${WORK}/leg4.err" >&2
+    fi
+fi
+# the target preference must be UNCHANGED (still ${SKU} from Leg 3's backfill, not ${SKU2})
 CFG="$(find "$APPRAFTER_CONFIG_DIR" -path '*targets*/config.yaml' | head -1)"
-if grep -qE "^server_type: *\"?${SKU2}\"?" "$CFG"; then ok "Leg 4: target preference now ${SKU2}"; else fail "Leg 4: preference not updated to ${SKU2}"; fi
-# the running server must be UNCHANGED (patch is a preference, not a resize)
+if grep -qE "^server_type: *\"?${SKU}\"?" "$CFG"; then ok "Leg 4: preference unchanged (still ${SKU})"; else fail "Leg 4: preference was modified despite the refuse"; fi
+# the running server must be UNCHANGED
 read -r stype _ cnt < <(hz_server_facts)
 if [ "$stype" = "$SKU" ] && [ "$cnt" = "1" ]; then
-    ok "Leg 4: running server still ${SKU} (preference change did not touch the box)"
+    ok "Leg 4: running server still ${SKU} (untouched)"
 else
     fail "Leg 4: running server changed unexpectedly (type='${stype}', count=${cnt})"
 fi
