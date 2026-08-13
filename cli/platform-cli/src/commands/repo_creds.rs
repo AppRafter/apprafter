@@ -348,7 +348,8 @@ fn parse_auth_type(raw: &str) -> Result<AuthType> {
         "pat" => Ok(AuthType::Pat),
         "basic" => Ok(AuthType::Basic),
         "ssh" => Err(CliError::Other(
-            "SSH-key auth deferred to Phase 2 — pass `--type pat` or `--type basic` for now".into(),
+            "SSH-key auth is not supported yet — pass `--type pat` or `--type basic` for now"
+                .into(),
         )),
         other => Err(CliError::Other(format!(
             "Unknown `--type {other}` — accepted values are `pat` / `basic`."
@@ -854,9 +855,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_auth_type_rejects_ssh_with_phase2_hint() {
+    fn parse_auth_type_rejects_ssh_as_unsupported() {
         let err = parse_auth_type("ssh").unwrap_err().to_string();
-        assert!(err.contains("Phase 2"), "{err}");
+        // Neutral phrasing — no internal roadmap/phase reference leaks.
+        assert!(err.contains("not supported"), "{err}");
+        assert!(err.contains("--type pat"), "{err}");
+        assert!(!err.contains("Phase"), "roadmap ref leaked: {err}");
     }
 
     #[test]

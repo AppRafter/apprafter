@@ -403,8 +403,7 @@ pub enum RepoCredsCommand {
         /// Auth type. Default `pat` — a personal access
         /// token (GitHub `github_pat_*` / `ghp_*`, GitLab
         /// `glpat-*`, etc). `basic` — username + password
-        /// pair. SSH-key auth deferred to Phase 2 (Argo CD
-        /// supports it, but CLI prompts get involved).
+        /// pair. SSH-key auth is not supported yet.
         #[arg(long = "type", default_value = "pat")]
         auth_type: String,
         /// Username. When `--type pat` — usually the token

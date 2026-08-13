@@ -17,6 +17,6 @@ pub fn run() -> Result<()> {
     println!("  cluster: {:?}", state.cluster_name);
     println!("  tier:    {:?}", state.tier);
     println!("  provider:{:?}", state.provider);
-    println!("(skeleton — live status arrives with a real provider in phase 1.2+)");
+    println!("(skeleton — live status is not yet implemented for this provider)");
     Ok(())
 }
