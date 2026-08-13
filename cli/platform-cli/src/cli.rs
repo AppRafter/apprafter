@@ -326,6 +326,10 @@ pub enum SecretCommand {
     /// bitnami `SealedSecret`. Fetches the controller's public
     /// cert over the TLS-authenticated kube API (strict scope:
     /// the sealed blob only unseals as `<namespace>/<name>`).
+    ///
+    /// Re-sealing an existing name REPLACES its keys — it does not
+    /// merge; pass all keys in one command. Use `--yes` to skip the
+    /// overwrite prompt.
     Seal {
         /// SealedSecret `metadata.name` (and the resulting
         /// Secret's name). DNS-1123.
@@ -347,6 +351,13 @@ pub enum SecretCommand {
         /// to a config repo).
         #[arg(long, default_value_t = false)]
         stdout: bool,
+        /// Skip the overwrite confirmation prompt when a secret
+        /// of the same name already exists. In non-interactive
+        /// shells this flag is required to replace an existing
+        /// secret (without it the command errors instead of
+        /// silently overwriting).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
     /// Delete a `SealedSecret` and the `Secret` the controller
     /// unsealed from it, by name — so you don't `kubectl delete

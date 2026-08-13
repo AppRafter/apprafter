@@ -255,9 +255,15 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                 namespace,
                 secret_type,
                 stdout,
-            } => {
-                commands::secret::run_seal(&name, &namespace, &from_literal, &secret_type, stdout)?
-            }
+                yes,
+            } => commands::secret::run_seal(
+                &name,
+                &namespace,
+                &from_literal,
+                &secret_type,
+                stdout,
+                yes,
+            )?,
             SecretCommand::Remove {
                 name,
                 namespace,

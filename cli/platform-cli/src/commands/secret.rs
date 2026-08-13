@@ -14,7 +14,36 @@ use cli_providers::k8s::kubectl::KubectlCli;
 use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::Value;
 
-use crate::commands::k8s_helpers::ensure_kubeconfig_tempfile;
+use crate::commands::k8s_helpers::{ensure_kubeconfig_tempfile, kubectl_get_json};
+
+/// What the caller should do when a secret with the same name already exists.
+/// Pure (no I/O) — the interactive prompt + cluster check are wired in
+/// `run_seal`; this type is factored out so all three branches are unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OverwriteDecision {
+    /// Proceed silently (--yes was set, or the resource is absent).
+    Proceed,
+    /// Show an interactive TTY confirmation prompt.
+    Prompt,
+    /// Return an error — non-interactive shell without --yes.
+    ErrorNonInteractive,
+}
+
+/// Decide what to do when asked to re-seal over an existing resource.
+/// Pure: takes `exists`, `yes`, `is_tty` and returns the action.
+pub fn overwrite_decision(exists: bool, yes: bool, is_tty: bool) -> OverwriteDecision {
+    if !exists {
+        return OverwriteDecision::Proceed;
+    }
+    if yes {
+        return OverwriteDecision::Proceed;
+    }
+    if is_tty {
+        OverwriteDecision::Prompt
+    } else {
+        OverwriteDecision::ErrorNonInteractive
+    }
+}
 
 /// Parse repeatable `KEY=VALUE` literals into a byte map. The value may
 /// contain `=` (only the first splits the pair) and may be empty.
@@ -36,12 +65,18 @@ pub fn parse_literals(items: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
 
 /// Seal `--from-literal` pairs and either print the `SealedSecret` YAML
 /// (`--stdout`) or `kubectl apply` it.
+///
+/// When applying to the cluster (not `--stdout`), checks whether a
+/// `SealedSecret` or `Secret` named `name` already exists in `namespace`
+/// and gates overwrite on `yes`/TTY — sealing REPLACES keys, it does not
+/// merge, so silent overwrites can destroy data.
 pub fn run_seal(
     name: &str,
     namespace: &str,
     from_literal: &[String],
     secret_type: &str,
     stdout: bool,
+    yes: bool,
 ) -> Result<()> {
     let data = parse_literals(from_literal)?;
     if data.is_empty() {
@@ -51,6 +86,45 @@ pub fn run_seal(
     }
 
     let kc = ensure_kubeconfig_tempfile()?;
+
+    // Existence check — only relevant when we are about to apply to the
+    // cluster. `--stdout` is a local rendering path; skip the network check.
+    if !stdout {
+        let exists = secret_exists(name, namespace, kc.path())?;
+        match overwrite_decision(exists, yes, std::io::stdin().is_terminal()) {
+            OverwriteDecision::Proceed => {
+                if exists {
+                    println!(
+                        "note: replacing existing secret '{name}' in '{namespace}' \
+                         (all keys will be replaced)"
+                    );
+                }
+            }
+            OverwriteDecision::Prompt => {
+                println!(
+                    "A secret named '{name}' already exists in '{namespace}'. \
+                     Sealing REPLACES its keys (it does NOT merge — keys not in \
+                     this command are dropped). Continue? [y/N]"
+                );
+                let confirmed = inquire::Confirm::new("Continue?")
+                    .with_default(false)
+                    .prompt()
+                    .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+                if !confirmed {
+                    println!("Aborted — no changes made.");
+                    return Ok(());
+                }
+            }
+            OverwriteDecision::ErrorNonInteractive => {
+                return Err(CliError::Other(format!(
+                    "secret '{name}' already exists in '{namespace}' — \
+                     re-run with --yes to replace it (sealing does NOT merge keys), \
+                     or choose a different name"
+                )));
+            }
+        }
+    }
+
     let pub_key = fetch_controller_public_key(&KubectlCli, kc.path())?;
     let cr = build_sealed_secret(&pub_key, namespace, name, &data, secret_type)?;
 
@@ -63,6 +137,19 @@ pub fn run_seal(
         println!("sealedsecret/{name} applied to namespace {namespace}");
     }
     Ok(())
+}
+
+/// Returns `true` when a `SealedSecret` OR a `Secret` named `name` exists
+/// in `namespace`. Any non-404 kubectl error is propagated.
+fn secret_exists(name: &str, namespace: &str, kubeconfig_path: &Path) -> Result<bool> {
+    // Check SealedSecret first (the source of truth), then plain Secret
+    // (a user may have created one directly without sealing).
+    for kind in ["sealedsecret", "secret"] {
+        if kubectl_get_json(kind, Some(name), Some(namespace), kubeconfig_path)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn apply_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
@@ -201,5 +288,56 @@ mod tests {
     fn rejects_empty_key() {
         let err = parse_literals(&["=value".to_string()]).unwrap_err();
         assert!(format!("{err}").contains("key is empty"));
+    }
+
+    // --- overwrite_decision pure branch coverage ---
+
+    #[test]
+    fn no_existing_secret_always_proceeds() {
+        // exists=false → Proceed regardless of yes/tty
+        assert_eq!(
+            overwrite_decision(false, false, false),
+            OverwriteDecision::Proceed
+        );
+        assert_eq!(
+            overwrite_decision(false, false, true),
+            OverwriteDecision::Proceed
+        );
+        assert_eq!(
+            overwrite_decision(false, true, false),
+            OverwriteDecision::Proceed
+        );
+        assert_eq!(
+            overwrite_decision(false, true, true),
+            OverwriteDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn existing_secret_with_yes_proceeds() {
+        assert_eq!(
+            overwrite_decision(true, true, false),
+            OverwriteDecision::Proceed
+        );
+        assert_eq!(
+            overwrite_decision(true, true, true),
+            OverwriteDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn existing_secret_no_yes_tty_prompts() {
+        assert_eq!(
+            overwrite_decision(true, false, true),
+            OverwriteDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn existing_secret_no_yes_non_tty_errors() {
+        assert_eq!(
+            overwrite_decision(true, false, false),
+            OverwriteDecision::ErrorNonInteractive
+        );
     }
 }
