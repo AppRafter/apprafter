@@ -317,10 +317,13 @@ _gatewayTemplate: """
 // enable`, which flips `PlatformStack.spec.backup.enabled` and the
 // PlatformController projects it onto `.Values.backup`.
 //
-// Credentials NEVER live in chart values — the CronJobs mount the
+// Credentials NEVER live in chart values — the CronJobs receive the
 // operator-sealed Secret named `.Values.backup.credentialRef.name` via
-// `envFrom: secretRef`; restic reads `RESTIC_PASSWORD` + `AWS_*` from
-// it natively.
+// explicit `env[*].valueFrom.secretKeyRef` entries. The Secret holds
+// NEUTRAL canonical keys (`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`,
+// `RESTIC_PASSWORD`, and optionally `S3_REGION`); the template maps
+// them to the `AWS_*` / `RESTIC_PASSWORD` names restic expects. Region
+// is `optional: true` — many S3-compatible stores don't need one.
 //
 // RBAC is scoped to the runner's ACTUAL read-set (chunk-2 code:
 // `kube_rs_exec.rs` + `status.rs`): list/get the AppRafter + Argo
@@ -350,9 +353,10 @@ _backupTemplate: """
 	     nightly backup CronJob (runner binary), a weekly `restic check` CronJob
 	     (restic directly), and a CiliumNetworkPolicy fixing the runner pods'
 	     egress (DNS + kube-apiserver + world:443 for S3/webhook). Credentials come
-	     ONLY from the operator-sealed Secret via envFrom: secretRef — never chart
-	     values. RBAC matches the chunk-2 runner's actual reads and MUST NOT grant
-	     write on platformstacks. */}}
+	     ONLY from the operator-sealed Secret via explicit env secretKeyRef — never
+	     chart values; Secret holds neutral S3_* keys mapped to AWS_* for restic.
+	     RBAC matches the chunk-2 runner's actual reads and MUST NOT grant write on
+	     platformstacks. */}}
 	{{- if .Values.backup.enabled }}
 	{{- $b := .Values.backup }}
 	---
@@ -462,10 +466,28 @@ _backupTemplate: """
 	          containers:
 	          - name: runner
 	            image: {{ $b.image | quote }}
-	            envFrom:
-	            - secretRef:
-	                name: {{ $b.credentialRef.name | quote }}
 	            env:
+	            - name: RESTIC_PASSWORD
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: RESTIC_PASSWORD
+	            - name: AWS_ACCESS_KEY_ID
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: S3_ACCESS_KEY_ID
+	            - name: AWS_SECRET_ACCESS_KEY
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: S3_SECRET_ACCESS_KEY
+	            - name: AWS_DEFAULT_REGION
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: S3_REGION
+	                  optional: true
 	            - name: APPRAFTER_BACKUP_REPO
 	              value: {{ $b.bucket | quote }}
 	            - name: APPRAFTER_CLUSTER_ID
@@ -531,17 +553,36 @@ _backupTemplate: """
 	            image: {{ $b.image | quote }}
 	            # The chunk-2 runner binary has no check-only mode, so the check Job
 	            # runs restic directly (the runner image bundles restic + a shell).
-	            # restic reads RESTIC_PASSWORD + AWS_* from the mounted creds and the
-	            # s3: repo from APPRAFTER_BACKUP_REPO.
+	            # restic reads RESTIC_PASSWORD + AWS_* from the explicit secretKeyRef
+	            # entries below (Secret holds neutral S3_* keys) and the s3: repo from
+	            # APPRAFTER_BACKUP_REPO.
 	            command: ["sh", "-c"]
 	            args:
 	            - >-
 	              restic -r "$APPRAFTER_BACKUP_REPO" unlock;
 	              restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ end }}
-	            envFrom:
-	            - secretRef:
-	                name: {{ $b.credentialRef.name | quote }}
 	            env:
+	            - name: RESTIC_PASSWORD
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: RESTIC_PASSWORD
+	            - name: AWS_ACCESS_KEY_ID
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: S3_ACCESS_KEY_ID
+	            - name: AWS_SECRET_ACCESS_KEY
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: S3_SECRET_ACCESS_KEY
+	            - name: AWS_DEFAULT_REGION
+	              valueFrom:
+	                secretKeyRef:
+	                  name: {{ $b.credentialRef.name | quote }}
+	                  key: S3_REGION
+	                  optional: true
 	            - name: APPRAFTER_BACKUP_REPO
 	              value: {{ $b.bucket | quote }}
 	            resources:

@@ -1760,6 +1760,25 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.54": {
+	change:          "safe"
+	operatorVersion: "v0.2.41"
+	notes: """
+		fix/backup-ux: backup CronJobs switch from `envFrom: secretRef` to
+		explicit `env[*].valueFrom.secretKeyRef` entries. The operator-sealed
+		Secret now holds NEUTRAL canonical keys (`S3_ACCESS_KEY_ID`,
+		`S3_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optionally `S3_REGION`)
+		instead of AWS-branded keys; the template maps them to the `AWS_*` /
+		`RESTIC_PASSWORD` names restic expects. `S3_REGION` is `optional: true`
+		so S3-compatible stores that need no region key don't crash the Job.
+		Applies to both the nightly backup CronJob and the weekly `restic check`
+		CronJob. Values-only chart change (no CRD/operator change) — safe to
+		auto-sync. Existing clusters that used the old AWS_*-keyed Secret must
+		re-run `apprafter backup enable` (or re-seal credentials) after upgrade
+		to populate the new S3_* key names.
+		"""
+	references: ["platform-stack/cue/render_tool.cue"]
+}
 compatibility: "0.2.53": {
 	change:          "safe"
 	operatorVersion: "v0.2.41"
