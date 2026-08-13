@@ -1426,9 +1426,22 @@ pub enum BackupAction {
     /// (optional: S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
     /// AWS_DEFAULT_REGION are accepted as aliases.
     Enable {
-        /// Restic S3 repository URL, e.g. `s3:s3.eu-central-1.amazonaws.com/bucket/prefix`.
+        /// Bucket name (with `--endpoint`), or a full restic repo URL
+        /// (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a
+        /// bare name, pass `--endpoint` and the CLI builds the
+        /// `s3:https://<endpoint>/<bucket>` URL for you.
         #[arg(long)]
         bucket: String,
+        /// S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a
+        /// bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>`
+        /// repo URL for you. Omit when passing a full restic URL in `--bucket`.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Optional path prefix inside the bucket (e.g. `backups/prod`). Only
+        /// used together with a bare `--bucket` name and `--endpoint`; omit
+        /// when passing a full restic URL in `--bucket`.
+        #[arg(long)]
+        prefix: Option<String>,
         /// Name of the credential Secret in apprafter-system.
         /// With --credential-file: the name to create (default: apprafter-backup-s3).
         /// Without --credential-file: an existing Secret to read creds from (required).

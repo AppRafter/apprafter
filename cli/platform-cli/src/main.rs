@@ -322,6 +322,8 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
             } => commands::backup::run_backup_unlock(repo.as_deref(), credential_file.as_deref())?,
             BackupAction::Enable {
                 bucket,
+                endpoint,
+                prefix,
                 credential,
                 credential_file,
                 cron,
@@ -346,6 +348,8 @@ fn dispatch(args: Cli) -> cli_core::Result<()> {
                     check_cron,
                     failure_webhook,
                 },
+                endpoint.as_deref(),
+                prefix.as_deref(),
                 credential_file.as_deref(),
                 i_have_saved_credentials,
             )?,

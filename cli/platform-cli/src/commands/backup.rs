@@ -207,6 +207,74 @@ pub fn sourcecred_material_refs(sc: &Value) -> Vec<(String, String)> {
 // 2a. `apprafter backup enable` / `disable` — spec.backup patch builders (pure)
 // ---------------------------------------------------------------------------
 
+/// Construct the restic S3 repo URL from either a full URL or a bare bucket
+/// name + endpoint.
+///
+/// If `bucket` already carries a restic backend scheme — starts with one of
+/// `s3:`, `b2:`, `gs:`, `azure:`, `swift:`, `sftp:`, `rest:`, `rclone:` —
+/// OR is an explicit local path (`/…`, `./…`) → return it VERBATIM. If
+/// `endpoint` (or `prefix`) is also given in that case → error.
+///
+/// Otherwise `bucket` is a bare name:
+/// * `endpoint` is REQUIRED — else error naming `--endpoint`.
+/// * Strip a leading `https://` / `http://` scheme from the endpoint and strip
+///   trailing `/`. Default scheme is `https`; `http://` is honored.
+/// * Build `s3:<scheme>://<endpoint>/<bucket>` and append `/<prefix>` when
+///   `prefix` is `Some` (leading/trailing slashes trimmed on the prefix).
+pub(crate) fn construct_repo_url(
+    bucket: &str,
+    endpoint: Option<&str>,
+    prefix: Option<&str>,
+) -> Result<String> {
+    // Recognised restic backend scheme prefixes.
+    const SCHEMES: &[&str] = &[
+        "s3:", "b2:", "gs:", "azure:", "swift:", "sftp:", "rest:", "rclone:",
+    ];
+    let is_full_url = SCHEMES.iter().any(|s| bucket.starts_with(s))
+        || bucket.starts_with('/')
+        || bucket.starts_with("./");
+
+    if is_full_url {
+        if endpoint.is_some() || prefix.is_some() {
+            return Err(CliError::Other(
+                "pass EITHER a full repo URL in --bucket OR --bucket <name> + --endpoint, not both"
+                    .into(),
+            ));
+        }
+        return Ok(bucket.to_string());
+    }
+
+    // Bare bucket name — endpoint is required.
+    let raw_endpoint = endpoint.ok_or_else(|| {
+        CliError::Other(format!(
+            "bare bucket name '{bucket}' needs --endpoint <host> \
+             (e.g. --endpoint nbg1.your-objectstorage.com), \
+             or pass a full restic URL like s3:https://<host>/<bucket>"
+        ))
+    })?;
+
+    // Normalise the endpoint: detect and strip leading scheme; remember whether
+    // the user explicitly wrote http:// (honour it) or not (default https).
+    let (scheme, host_rest) = if let Some(rest) = raw_endpoint.strip_prefix("http://") {
+        ("http", rest)
+    } else if let Some(rest) = raw_endpoint.strip_prefix("https://") {
+        ("https", rest)
+    } else {
+        ("https", raw_endpoint)
+    };
+    let host = host_rest.trim_end_matches('/');
+
+    let mut url = format!("s3:{scheme}://{host}/{bucket}");
+    if let Some(p) = prefix {
+        let trimmed = p.trim_matches('/');
+        if !trimmed.is_empty() {
+            url.push('/');
+            url.push_str(trimmed);
+        }
+    }
+    Ok(url)
+}
+
 /// Options for `apprafter backup enable`, mapped 1:1 onto the
 /// `PlatformStack.spec.backup` CRD block (camelCase). `bucket` + `credential`
 /// are mandatory; every other field is an override the operator may leave to
@@ -1652,9 +1720,14 @@ const DEFAULT_BACKUP_CREDENTIAL_NAME: &str = "apprafter-backup-s3";
 /// will mount to get its S3 credentials.
 pub fn run_backup_enable(
     mut opts: EnableOpts,
+    endpoint: Option<&str>,
+    prefix: Option<&str>,
     credential_file: Option<&Path>,
     i_have_saved: bool,
 ) -> Result<()> {
+    // 0. Build the canonical restic repo URL from bucket + optional endpoint/prefix.
+    opts.bucket = construct_repo_url(&opts.bucket, endpoint, prefix)?;
+
     // 1. Validate enum-valued options before touching the cluster.
     if let Some(enforce) = &opts.enforce {
         if enforce != "operator" && enforce != "cluster" {
@@ -2210,6 +2283,84 @@ pub fn run_backup_status() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ------------------------------------------------------------------
+    // construct_repo_url — pure URL construction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn construct_repo_url_bare_and_endpoint_builds_s3_https() {
+        let url = construct_repo_url("apprafter", Some("nbg1.your-objectstorage.com"), None)
+            .expect("should succeed");
+        assert_eq!(url, "s3:https://nbg1.your-objectstorage.com/apprafter");
+    }
+
+    #[test]
+    fn construct_repo_url_bare_endpoint_prefix_appended() {
+        let url = construct_repo_url(
+            "mybucket",
+            Some("nbg1.your-objectstorage.com"),
+            Some("backups/prod"),
+        )
+        .expect("should succeed");
+        assert_eq!(
+            url,
+            "s3:https://nbg1.your-objectstorage.com/mybucket/backups/prod"
+        );
+    }
+
+    #[test]
+    fn construct_repo_url_endpoint_with_https_scheme_stripped() {
+        // User passed https://host — strip it, default scheme is https.
+        let url = construct_repo_url("bucket", Some("https://nbg1.your-objectstorage.com"), None)
+            .expect("should succeed");
+        assert_eq!(url, "s3:https://nbg1.your-objectstorage.com/bucket");
+    }
+
+    #[test]
+    fn construct_repo_url_endpoint_with_http_scheme_honoured() {
+        let url = construct_repo_url("bucket", Some("http://my-minio.internal"), None)
+            .expect("should succeed");
+        assert_eq!(url, "s3:http://my-minio.internal/bucket");
+    }
+
+    #[test]
+    fn construct_repo_url_full_s3_url_passthrough() {
+        let full = "s3:https://s3.eu-central-1.amazonaws.com/mybucket/prefix";
+        let url = construct_repo_url(full, None, None).expect("should succeed");
+        assert_eq!(url, full);
+    }
+
+    #[test]
+    fn construct_repo_url_full_url_plus_endpoint_is_error() {
+        let err = construct_repo_url(
+            "s3:https://host/bucket",
+            Some("other-host.example.com"),
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("EITHER"),
+            "error should mention 'EITHER': {msg}"
+        );
+    }
+
+    #[test]
+    fn construct_repo_url_bare_name_without_endpoint_is_error() {
+        let err = construct_repo_url("mybucket", None, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--endpoint"),
+            "error should mention '--endpoint': {msg}"
+        );
+    }
+
+    #[test]
+    fn construct_repo_url_local_path_passthrough() {
+        let url = construct_repo_url("/tmp/myrepo", None, None).expect("should succeed");
+        assert_eq!(url, "/tmp/myrepo");
+    }
 
     #[test]
     fn app_namespaces_derive_from_apprafter_applications_not_all_ns() {
