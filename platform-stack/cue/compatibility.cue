@@ -1761,7 +1761,7 @@ compatibility: "0.2.39": {
 }
 
 compatibility: "0.2.54": {
-	change:          "safe"
+	change:          "breaking"
 	operatorVersion: "v0.2.41"
 	notes: """
 		fix/backup-ux: backup CronJobs switch from `envFrom: secretRef` to
@@ -1772,10 +1772,12 @@ compatibility: "0.2.54": {
 		`RESTIC_PASSWORD` names restic expects. `S3_REGION` is `optional: true`
 		so S3-compatible stores that need no region key don't crash the Job.
 		Applies to both the nightly backup CronJob and the weekly `restic check`
-		CronJob. Values-only chart change (no CRD/operator change) — safe to
-		auto-sync. Existing clusters that used the old AWS_*-keyed Secret must
-		re-run `apprafter backup enable` (or re-seal credentials) after upgrade
-		to populate the new S3_* key names.
+		CronJob. BREAKING for a cluster that ALREADY had backup enabled on an
+		older chart (its Secret still holds the old `AWS_*` keys): both backup
+		CronJobs fail to start until the operator re-runs `apprafter backup
+		enable` (or re-seals the credential with the `S3_*` keys). Clusters
+		WITHOUT backup enabled are unaffected (the CronJobs aren't rendered).
+		Values-only chart change (no CRD/operator binary change).
 		"""
 	references: ["platform-stack/cue/render_tool.cue"]
 }

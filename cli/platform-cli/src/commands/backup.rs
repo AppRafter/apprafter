@@ -1737,8 +1737,9 @@ pub fn run_backup_enable(
     // 5. If path A, auto-seal the creds into apprafter-system.
     if seal_from_file {
         let pub_key = fetch_controller_public_key(&KubectlCli, kc.path())?;
-        // Seal the canonical S3_* keys. The in-cluster CronJob translates
-        // S3_*→AWS_* before invoking restic (a later, separate change).
+        // Seal the canonical S3_* keys. The in-cluster backup CronJob maps
+        // S3_*→AWS_* (via secretKeyRef) before invoking restic — see
+        // platform-stack/cue/render_tool.cue.
         let secret_data: BTreeMap<String, Vec<u8>> = creds
             .iter()
             .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
