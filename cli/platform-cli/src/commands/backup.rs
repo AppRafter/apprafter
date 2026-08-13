@@ -69,6 +69,8 @@ use cli_providers::backup::images::pg_helper_image;
 use cli_providers::backup::manifest::BackupManifest;
 use cli_providers::backup::restic::restic_snapshots_argv;
 use cli_providers::backup::ResourceRef;
+use cli_providers::k8s::kubectl::KubectlCli;
+use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::Value;
 
 use crate::commands::k8s_helpers::{
@@ -1123,23 +1125,146 @@ pub(crate) fn parse_credential_file(contents: &str) -> BTreeMap<String, String> 
     map
 }
 
-/// The S3 / restic credential keys consumed by the off-site backup verbs.
-const OPERATOR_S3_CRED_KEYS: &[&str] = &[
+/// Canonical internal credential key set (stored in Secrets + used internally).
+/// The in-cluster CronJob also reads these canonical names and maps them to
+/// `AWS_*` before invoking restic.
+///
+/// `RESTIC_PASSWORD` is already S3-vendor-neutral so it keeps its name.
+/// `S3_REGION` is optional — many S3-compatible stores don't need it.
+const REQUIRED_CRED_KEYS: &[&str] = &[
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "RESTIC_PASSWORD",
+];
+
+/// Human-readable description of the required credential keys, with alias note.
+/// Referenced by every error that needs to enumerate the keys.
+const CRED_KEYS_HELP: &str =
+    "the backup credential needs these keys: S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, \
+     RESTIC_PASSWORD (optional: S3_REGION). \
+     AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION are accepted as aliases. \
+     Provide them via --credential-file <dotenv> (KEY=VALUE lines), or point --credential at \
+     a Secret already sealed with those keys (canonical S3_* or AWS_* aliases).";
+
+/// All env keys probed in the fallback env-lookup path (both canonical + aliases).
+/// The alias lookup is used ONLY for the env-var path; the file path normalises
+/// after parsing.
+const ALL_S3_ENV_KEYS: &[&str] = &[
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "S3_REGION",
+    "RESTIC_PASSWORD",
+    // AWS aliases:
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
-    "RESTIC_PASSWORD",
     "AWS_DEFAULT_REGION",
 ];
 
+/// Normalise a raw `KEY → VALUE` map (from a dotenv file or env-var lookup) to
+/// the canonical `S3_*` internal key set.
+///
+/// Accepted input forms:
+/// * `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` — kept as-is.
+/// * `AWS_ACCESS_KEY_ID` → `S3_ACCESS_KEY_ID`
+/// * `AWS_SECRET_ACCESS_KEY` → `S3_SECRET_ACCESS_KEY`
+/// * `AWS_DEFAULT_REGION` → `S3_REGION`
+/// * `RESTIC_PASSWORD` — kept as-is (already neutral).
+/// * Any other key is passed through unchanged (dotenv files may carry extras).
+///
+/// When both the canonical and alias form are present, the canonical form wins.
+/// Two-pass: first insert alias→canonical mappings, then overwrite with any
+/// explicit canonical (`S3_*`) keys so they always beat aliases regardless of
+/// iteration order.
+pub(crate) fn normalize_s3_creds(raw: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+
+    // Pass 1: insert everything, translating alias keys to their canonical name.
+    for (k, v) in &raw {
+        let canonical = match k.as_str() {
+            "AWS_ACCESS_KEY_ID" => "S3_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY" => "S3_SECRET_ACCESS_KEY",
+            "AWS_DEFAULT_REGION" => "S3_REGION",
+            _ => k.as_str(),
+        };
+        out.insert(canonical.to_string(), v.clone());
+    }
+
+    // Pass 2: canonical (S3_*) keys always overwrite any alias value that
+    // landed in the same slot during pass 1.
+    for (k, v) in &raw {
+        match k.as_str() {
+            "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY" | "S3_REGION" | "RESTIC_PASSWORD" => {
+                out.insert(k.clone(), v.clone());
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+/// Translate the canonical `S3_*` credential map to the `AWS_*` names that
+/// `restic` expects on its subprocess environment.
+///
+/// * `S3_ACCESS_KEY_ID` → `AWS_ACCESS_KEY_ID`
+/// * `S3_SECRET_ACCESS_KEY` → `AWS_SECRET_ACCESS_KEY`
+/// * `S3_REGION` → `AWS_DEFAULT_REGION`
+/// * `RESTIC_PASSWORD` — passed through unchanged.
+/// * Any other key — passed through unchanged (for extra env entries).
+pub(crate) fn translate_creds_for_restic(
+    canonical: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in canonical {
+        let restic_key = match k.as_str() {
+            "S3_ACCESS_KEY_ID" => "AWS_ACCESS_KEY_ID",
+            "S3_SECRET_ACCESS_KEY" => "AWS_SECRET_ACCESS_KEY",
+            "S3_REGION" => "AWS_DEFAULT_REGION",
+            _ => k.as_str(),
+        };
+        out.insert(restic_key.to_string(), v.clone());
+    }
+    out
+}
+
+/// Validate that all required canonical credential keys are present and
+/// non-empty. Returns `Err` naming any missing key plus the full help text.
+pub(crate) fn validate_required_cred_keys(canonical: &BTreeMap<String, String>) -> Result<()> {
+    let missing: Vec<&str> = REQUIRED_CRED_KEYS
+        .iter()
+        .copied()
+        .filter(|k| {
+            canonical
+                .get(*k)
+                .map(String::as_str)
+                .unwrap_or("")
+                .is_empty()
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(CliError::Other(format!(
+            "missing credential key(s): {} — {CRED_KEYS_HELP}",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve operator-side S3 credentials for restic off-site backup verbs.
 ///
-/// * `cred_file = Some(path)` — read and parse that dotenv file.
-/// * `cred_file = None` — build the map from `env_lookup` for the four
-///   canonical keys; keys not returned by the lookup are omitted.
+/// * `cred_file = Some(path)` — read and parse that dotenv file; normalises
+///   `AWS_*` aliases to canonical `S3_*` keys.
+/// * `cred_file = None` — probes `env_lookup` for both canonical (`S3_*`) and
+///   alias (`AWS_*`) names; normalises to canonical.
 ///
-/// In both cases, returns an error when `RESTIC_PASSWORD` is absent or empty
-/// (a restic repo with no password would hold decrypted cluster secrets in the
-/// clear).
+/// In both cases the result uses canonical `S3_*` key names. Callers that drive
+/// a local `restic` subprocess MUST call [`translate_creds_for_restic`] before
+/// injecting the map as env vars.
+///
+/// Returns an error when any of the required canonical keys
+/// (`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`) is absent
+/// or empty. The error message names the missing keys and explains both input
+/// paths.
 ///
 /// The `env_lookup` parameter is an injectable seam for testing; production
 /// callers pass `&|k| std::env::var(k).ok()`.
@@ -1147,14 +1272,14 @@ pub(crate) fn resolve_operator_s3_creds(
     cred_file: Option<&std::path::Path>,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<BTreeMap<String, String>> {
-    let map = if let Some(path) = cred_file {
+    let raw = if let Some(path) = cred_file {
         let contents = std::fs::read_to_string(path).map_err(|e| {
             CliError::Other(format!("read credential file {}: {e}", path.display()))
         })?;
         parse_credential_file(&contents)
     } else {
         let mut m = BTreeMap::new();
-        for &key in OPERATOR_S3_CRED_KEYS {
+        for &key in ALL_S3_ENV_KEYS {
             if let Some(val) = env_lookup(key) {
                 m.insert(key.to_string(), val);
             }
@@ -1162,27 +1287,19 @@ pub(crate) fn resolve_operator_s3_creds(
         m
     };
 
-    match map.get("RESTIC_PASSWORD").map(String::as_str) {
-        None | Some("") => {
-            return Err(CliError::Other(
-                "RESTIC_PASSWORD not set — pass --credential-file or export RESTIC_PASSWORD \
-                 for an s3: repo"
-                    .into(),
-            ));
-        }
-        Some(_) => {}
-    }
-
-    Ok(map)
+    let canonical = normalize_s3_creds(raw);
+    validate_required_cred_keys(&canonical)?;
+    Ok(canonical)
 }
 
-/// Inject all entries from `creds` as environment variables on `cmd`.
+/// Inject all entries from `creds` as environment variables on `cmd`,
+/// translating canonical `S3_*` keys to the `AWS_*` names restic expects.
 ///
 /// Used by the backup operator verbs (prune / check / unlock / restore) to
 /// forward S3 + restic credentials to the subprocess without persisting them
 /// in shell history or temporary files.
 pub(crate) fn apply_creds_to_command(cmd: &mut Command, creds: &BTreeMap<String, String>) {
-    for (k, v) in creds {
+    for (k, v) in translate_creds_for_restic(creds) {
         cmd.env(k, v);
     }
 }
@@ -1496,27 +1613,45 @@ fn restic_version_too_old(v: (u64, u64, u64)) -> bool {
     (major, minor) < (MIN_RESTIC_MAJOR, MIN_RESTIC_MINOR)
 }
 
-/// `apprafter backup enable` — validate the repo + credential Secret + operator
-/// intent, then merge-patch `PlatformStack.spec.backup` to turn on scheduled
-/// off-site backup.
+/// Default name used when sealing the backup credential Secret and no
+/// `--credential` override is given.
+const DEFAULT_BACKUP_CREDENTIAL_NAME: &str = "apprafter-backup-s3";
+
+/// `apprafter backup enable` — validate the repo + credential material +
+/// operator intent, then merge-patch `PlatformStack.spec.backup` to turn on
+/// scheduled off-site backup.
 ///
-/// Preflight (fail-closed, in order):
-/// 1. Validate `--enforce` / `--staging-mode` enum values (pure).
-/// 2. Resolve operator S3 creds (`--credential-file` → env); errors without
-///    `RESTIC_PASSWORD` (the preflight repo probe needs it).
-/// 3. `restic version` ≥ 0.14 (not-on-PATH → error; unparseable → warn+continue;
-///    confidently-lower → error).
-/// 4. The cluster credential Secret exists in `apprafter-system` (else the
-///    operator would have no creds to run scheduled backups).
-/// 5. Repo reachability: `restic cat config` succeeds, else `restic init`; if
-///    both fail the repo is unreachable / creds are bad → error with stderr.
-/// 6. DR confirmation: `--i-have-saved-credentials`, else a TTY prompt, else a
-///    non-interactive error (never patches without the operator confirming the
-///    passphrase + creds live OUTSIDE the cluster).
+/// ## Two mutually-exclusive credential input paths (one is REQUIRED)
 ///
-/// Only after all six pass does it merge-patch `spec.backup`.
+/// ### Path A — `--credential-file <dotenv>` given (fresh setup)
+/// 1. Parse + normalise the dotenv → canonical `S3_*` map.
+/// 2. Validate required keys.
+/// 3. `restic version` preflight.
+/// 4. Probe repo reachability (`restic cat config` → `restic init`).
+/// 5. **Auto-seal** the creds as a `SealedSecret` in `apprafter-system` with
+///    the canonical `S3_*` keys (name = `--credential` when given, else
+///    `apprafter-backup-s3`).
+/// 6. DR confirmation.
+/// 7. Merge-patch `spec.backup` (credentialRef → sealed Secret name).
+///
+/// ### Path B — no `--credential-file`, `--credential <name>` given (secret already exists)
+/// 1. Read the live Secret's `.data` from the cluster (base64-decoded).
+/// 2. Normalise (accept `S3_*` or `AWS_*` aliases).
+/// 3. Validate required keys.
+/// 4. `restic version` preflight.
+/// 5. Probe repo reachability using the live creds.
+/// 6. DR confirmation.
+/// 7. Merge-patch `spec.backup` (credentialRef → the named Secret).
+///
+/// ### Neither path
+/// If no `--credential-file` AND no `--credential` → clear error with key
+/// enumeration.
+///
+/// The credential name stored in `spec.backup.credentialRef.name` is always
+/// the name of the in-cluster Secret (sealed or plain) the operator's CronJob
+/// will mount to get its S3 credentials.
 pub fn run_backup_enable(
-    opts: EnableOpts,
+    mut opts: EnableOpts,
     credential_file: Option<&Path>,
     i_have_saved: bool,
 ) -> Result<()> {
@@ -1536,34 +1671,91 @@ pub fn run_backup_enable(
         }
     }
 
-    // 2. Resolve operator S3 creds (errors if RESTIC_PASSWORD is absent — the
-    //    repo probe below needs it to read/init an encrypted repo).
-    let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
+    // 2. Resolve creds via one of the two paths.
+    //    `creds` is always the canonical S3_* map.
+    //    `seal_from_file` tracks whether we must seal a new Secret.
+    let kc = ensure_kubeconfig_tempfile()?;
+    let (creds, seal_from_file, effective_credential_name) = if let Some(path) = credential_file {
+        // PATH A: parse the dotenv file, normalise to canonical S3_*.
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            CliError::Other(format!("read credential file {}: {e}", path.display()))
+        })?;
+        let raw = parse_credential_file(&contents);
+        let canonical = normalize_s3_creds(raw);
+        validate_required_cred_keys(&canonical)?;
+
+        // Credential name: explicit --credential, else the platform default.
+        let name = if opts.credential.is_empty() {
+            DEFAULT_BACKUP_CREDENTIAL_NAME.to_string()
+        } else {
+            opts.credential.clone()
+        };
+        (canonical, true, name)
+    } else if !opts.credential.is_empty() {
+        // PATH B: read the live Secret from the cluster.
+        let secret_data = read_secret_data(&opts.credential, PLATFORMSTACK_NAMESPACE, kc.path())?;
+        let Some((raw_bytes, _)) = secret_data else {
+            return Err(CliError::Other(format!(
+                "credential Secret '{}' not found in {PLATFORMSTACK_NAMESPACE} — \
+                 either pass --credential-file <dotenv> to create it automatically, or \
+                 seal the Secret first.\n\n{CRED_KEYS_HELP}",
+                opts.credential
+            )));
+        };
+        // Base64 has already been decoded by read_secret_data; values are bytes.
+        let raw_str: BTreeMap<String, String> = raw_bytes
+            .into_iter()
+            .filter_map(|(k, v)| {
+                String::from_utf8(v)
+                    .ok()
+                    .map(|s| (k, s.trim_end_matches('\n').to_string()))
+            })
+            .collect();
+        let canonical = normalize_s3_creds(raw_str);
+        validate_required_cred_keys(&canonical)?;
+        let name = opts.credential.clone();
+        (canonical, false, name)
+    } else {
+        // NEITHER: no file and no credential name → explicit error.
+        return Err(CliError::Other(format!(
+            "no credential source — provide one of:\n  \
+             --credential-file <dotenv>  (creates + seals the Secret automatically)\n  \
+             --credential <name>         (names an existing Secret in {PLATFORMSTACK_NAMESPACE})\n\n\
+             {CRED_KEYS_HELP}"
+        )));
+    };
+
+    // Update opts.credential to the effective name (may be the default).
+    opts.credential = effective_credential_name.clone();
 
     // 3. restic version preflight.
     preflight_restic_version()?;
 
-    // Kubeconfig for the Secret-existence probe + the merge-patch. Keep it
-    // alive across both kubectl shell-outs (drop deletes the tempfile).
-    let kc = ensure_kubeconfig_tempfile()?;
-
-    // 4. Cluster credential Secret must already exist (sealed) in apprafter-system.
-    let secret = kubectl_get_json(
-        "secret",
-        Some(&opts.credential),
-        Some(PLATFORMSTACK_NAMESPACE),
-        kc.path(),
-    )?;
-    if secret.is_none() {
-        return Err(CliError::Other(format!(
-            "credential Secret '{}' not found in {PLATFORMSTACK_NAMESPACE} — seal it first: \
-             apprafter secret seal {} ... --namespace {PLATFORMSTACK_NAMESPACE}",
-            opts.credential, opts.credential
-        )));
-    }
-
-    // 5. Repo reachability: cat config → init → error.
+    // 4. Repo reachability probe (uses translated AWS_* env for restic subprocess).
     preflight_repo_reachable(&opts.bucket, &creds)?;
+
+    // 5. If path A, auto-seal the creds into apprafter-system.
+    if seal_from_file {
+        let pub_key = fetch_controller_public_key(&KubectlCli, kc.path())?;
+        // Seal the canonical S3_* keys. The in-cluster CronJob translates
+        // S3_*→AWS_* before invoking restic (a later, separate change).
+        let secret_data: BTreeMap<String, Vec<u8>> = creds
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .collect();
+        let cr = build_sealed_secret(
+            &pub_key,
+            PLATFORMSTACK_NAMESPACE,
+            &effective_credential_name,
+            &secret_data,
+            "Opaque",
+        )?;
+        apply_sealed_secret_manifest(&cr, kc.path())?;
+        println!(
+            "  ✓ Sealed credential Secret '{effective_credential_name}' in \
+             {PLATFORMSTACK_NAMESPACE}."
+        );
+    }
 
     // 6. DR credential confirmation.
     if !i_have_saved {
@@ -1611,6 +1803,40 @@ pub fn run_backup_enable(
         opts.bucket, opts.credential
     );
     println!("{BACKUP_GITOPS_ADVISORY}");
+    Ok(())
+}
+
+/// Apply a `SealedSecret` manifest via `kubectl apply -f <tempfile>`.
+/// Reuses the same approach as `commands::secret::apply_manifest` but is
+/// inlined here to avoid a cross-module private function reference.
+fn apply_sealed_secret_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
+    use std::io::Write as _;
+    let mut file = tempfile::Builder::new()
+        .prefix("apprafter-sealed-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|e| CliError::Other(format!("create SealedSecret tempfile: {e}")))?;
+    let body = serde_json::to_vec_pretty(manifest)
+        .map_err(|e| CliError::Other(format!("serialise SealedSecret: {e}")))?;
+    file.write_all(&body)
+        .map_err(|e| CliError::Other(format!("write SealedSecret tempfile: {e}")))?;
+    file.flush()
+        .map_err(|e| CliError::Other(format!("flush SealedSecret tempfile: {e}")))?;
+
+    let out = std::process::Command::new("kubectl")
+        .arg("apply")
+        .arg("-f")
+        .arg(file.path())
+        .env("KUBECONFIG", kubeconfig_path)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl apply (SealedSecret): {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "kubectl apply SealedSecret failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
     Ok(())
 }
 
@@ -2056,6 +2282,7 @@ mod tests {
 
     #[test]
     fn credential_file_parses_dotenv_keys() {
+        // parse_credential_file returns the RAW map (no normalisation yet).
         let m = parse_credential_file(
             "# creds\nAWS_ACCESS_KEY_ID=AK\nAWS_SECRET_ACCESS_KEY=sk\nRESTIC_PASSWORD=p\n\n\
              AWS_DEFAULT_REGION = eu \n",
@@ -2073,15 +2300,212 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 1b. resolve_operator_s3_creds
+    // 1b. normalize_s3_creds — FIX A: AWS_* input → S3_* canonical
     // ------------------------------------------------------------------
 
     #[test]
-    fn resolve_creds_from_env_lookup_when_no_file() {
-        let env: BTreeMap<&str, &str> =
-            [("AWS_ACCESS_KEY_ID", "AK"), ("RESTIC_PASSWORD", "p")].into();
+    fn normalize_aws_aliases_to_canonical_s3_keys() {
+        let raw: BTreeMap<String, String> = [
+            ("AWS_ACCESS_KEY_ID", "AKID"),
+            ("AWS_SECRET_ACCESS_KEY", "SKEY"),
+            ("AWS_DEFAULT_REGION", "eu-central-1"),
+            ("RESTIC_PASSWORD", "pass"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let canonical = normalize_s3_creds(raw);
+        assert_eq!(
+            canonical.get("S3_ACCESS_KEY_ID").map(String::as_str),
+            Some("AKID")
+        );
+        assert_eq!(
+            canonical.get("S3_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("SKEY")
+        );
+        assert_eq!(
+            canonical.get("S3_REGION").map(String::as_str),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            canonical.get("RESTIC_PASSWORD").map(String::as_str),
+            Some("pass")
+        );
+        // Original AWS_* keys must NOT be in the output.
+        assert!(!canonical.contains_key("AWS_ACCESS_KEY_ID"));
+        assert!(!canonical.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!canonical.contains_key("AWS_DEFAULT_REGION"));
+    }
+
+    #[test]
+    fn normalize_canonical_s3_keys_unchanged() {
+        let raw: BTreeMap<String, String> = [
+            ("S3_ACCESS_KEY_ID", "AKID"),
+            ("S3_SECRET_ACCESS_KEY", "SKEY"),
+            ("S3_REGION", "eu-central-1"),
+            ("RESTIC_PASSWORD", "pass"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let canonical = normalize_s3_creds(raw);
+        assert_eq!(
+            canonical.get("S3_ACCESS_KEY_ID").map(String::as_str),
+            Some("AKID")
+        );
+        assert_eq!(
+            canonical.get("S3_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("SKEY")
+        );
+        assert_eq!(
+            canonical.get("S3_REGION").map(String::as_str),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            canonical.get("RESTIC_PASSWORD").map(String::as_str),
+            Some("pass")
+        );
+    }
+
+    #[test]
+    fn normalize_canonical_wins_over_alias_when_both_present() {
+        // Explicit S3_ACCESS_KEY_ID wins over AWS_ACCESS_KEY_ID alias.
+        let raw: BTreeMap<String, String> = [
+            ("S3_ACCESS_KEY_ID", "canonical-key"),
+            ("AWS_ACCESS_KEY_ID", "alias-key"),
+            ("S3_SECRET_ACCESS_KEY", "SKEY"),
+            ("RESTIC_PASSWORD", "pass"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let canonical = normalize_s3_creds(raw);
+        // The canonical form (S3_ACCESS_KEY_ID) must win.
+        assert_eq!(
+            canonical.get("S3_ACCESS_KEY_ID").map(String::as_str),
+            Some("canonical-key")
+        );
+        assert!(!canonical.contains_key("AWS_ACCESS_KEY_ID"));
+    }
+
+    // ------------------------------------------------------------------
+    // 1c. translate_creds_for_restic — FIX A: S3_* → AWS_* for restic subprocess
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn translate_canonical_to_restic_aws_names() {
+        let canonical: BTreeMap<String, String> = [
+            ("S3_ACCESS_KEY_ID", "AKID"),
+            ("S3_SECRET_ACCESS_KEY", "SKEY"),
+            ("S3_REGION", "eu-central-1"),
+            ("RESTIC_PASSWORD", "pass"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let restic_env = translate_creds_for_restic(&canonical);
+        assert_eq!(
+            restic_env.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            Some("AKID")
+        );
+        assert_eq!(
+            restic_env.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("SKEY")
+        );
+        assert_eq!(
+            restic_env.get("AWS_DEFAULT_REGION").map(String::as_str),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            restic_env.get("RESTIC_PASSWORD").map(String::as_str),
+            Some("pass")
+        );
+        // S3_* keys must NOT be in the restic-facing env.
+        assert!(!restic_env.contains_key("S3_ACCESS_KEY_ID"));
+        assert!(!restic_env.contains_key("S3_SECRET_ACCESS_KEY"));
+        assert!(!restic_env.contains_key("S3_REGION"));
+    }
+
+    // ------------------------------------------------------------------
+    // 1d. validate_required_cred_keys — FIX C: missing key → error naming it
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn validate_required_keys_missing_key_names_it_in_error() {
+        // Map with S3_ACCESS_KEY_ID + S3_SECRET_ACCESS_KEY but NO RESTIC_PASSWORD
+        let canonical: BTreeMap<String, String> = [
+            ("S3_ACCESS_KEY_ID", "AKID"),
+            ("S3_SECRET_ACCESS_KEY", "SKEY"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let err = validate_required_cred_keys(&canonical).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("RESTIC_PASSWORD"),
+            "error must name the missing key: {msg}"
+        );
+        // Must also contain the full help text pointing to both input paths.
+        assert!(
+            msg.contains("S3_ACCESS_KEY_ID"),
+            "error must name canonical keys: {msg}"
+        );
+        assert!(
+            msg.contains("--credential-file"),
+            "error must mention --credential-file: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_required_keys_all_present_ok() {
+        let canonical: BTreeMap<String, String> = [
+            ("S3_ACCESS_KEY_ID", "AKID"),
+            ("S3_SECRET_ACCESS_KEY", "SKEY"),
+            ("RESTIC_PASSWORD", "pass"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert!(validate_required_cred_keys(&canonical).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // 1e. resolve_operator_s3_creds — FIX A + FIX C: normalises + validates
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_creds_from_env_lookup_when_no_file_normalises_aws_aliases() {
+        // AWS_* aliases in env → canonical S3_* output.
+        let env: BTreeMap<&str, &str> = [
+            ("AWS_ACCESS_KEY_ID", "AK"),
+            ("AWS_SECRET_ACCESS_KEY", "SK"),
+            ("RESTIC_PASSWORD", "p"),
+        ]
+        .into();
         let m = resolve_operator_s3_creds(None, &|k| env.get(k).map(|s| s.to_string())).unwrap();
-        assert_eq!(m.get("AWS_ACCESS_KEY_ID").map(String::as_str), Some("AK"));
+        // Result must be in canonical S3_* form.
+        assert_eq!(m.get("S3_ACCESS_KEY_ID").map(String::as_str), Some("AK"));
+        assert_eq!(
+            m.get("S3_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("SK")
+        );
+        assert_eq!(m.get("RESTIC_PASSWORD").map(String::as_str), Some("p"));
+        // AWS_* must NOT leak into the canonical output.
+        assert!(!m.contains_key("AWS_ACCESS_KEY_ID"));
+    }
+
+    #[test]
+    fn resolve_creds_from_env_lookup_canonical_s3_keys_passthrough() {
+        // S3_* canonical keys in env → unchanged canonical S3_* output.
+        let env: BTreeMap<&str, &str> = [
+            ("S3_ACCESS_KEY_ID", "AK"),
+            ("S3_SECRET_ACCESS_KEY", "SK"),
+            ("RESTIC_PASSWORD", "p"),
+        ]
+        .into();
+        let m = resolve_operator_s3_creds(None, &|k| env.get(k).map(|s| s.to_string())).unwrap();
+        assert_eq!(m.get("S3_ACCESS_KEY_ID").map(String::as_str), Some("AK"));
         assert_eq!(m.get("RESTIC_PASSWORD").map(String::as_str), Some("p"));
     }
 
@@ -2089,20 +2513,55 @@ mod tests {
     fn resolve_creds_errors_when_no_password() {
         let err = resolve_operator_s3_creds(None, &|_| None);
         assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        // FIX C: error must enumerate the required keys.
+        assert!(
+            msg.contains("RESTIC_PASSWORD") || msg.contains("S3_ACCESS_KEY_ID"),
+            "error must enumerate required keys: {msg}"
+        );
     }
 
     #[test]
-    fn resolve_creds_from_credential_file() {
+    fn resolve_creds_from_credential_file_normalises_aws_aliases() {
         use std::io::Write as _;
         let mut f = tempfile::NamedTempFile::new().unwrap();
+        // File uses AWS_* aliases — must be normalised to S3_* canonical.
         writeln!(
             f,
             "AWS_ACCESS_KEY_ID=FILEKEY\nAWS_SECRET_ACCESS_KEY=FILESEC\nRESTIC_PASSWORD=filepass\n"
         )
         .unwrap();
         let m = resolve_operator_s3_creds(Some(f.path()), &|_| None).unwrap();
+        // Must be in canonical S3_* form.
         assert_eq!(
-            m.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            m.get("S3_ACCESS_KEY_ID").map(String::as_str),
+            Some("FILEKEY")
+        );
+        assert_eq!(
+            m.get("S3_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("FILESEC")
+        );
+        assert_eq!(
+            m.get("RESTIC_PASSWORD").map(String::as_str),
+            Some("filepass")
+        );
+        // AWS_* must NOT appear in the canonical output.
+        assert!(!m.contains_key("AWS_ACCESS_KEY_ID"));
+    }
+
+    #[test]
+    fn resolve_creds_from_credential_file_canonical_s3_keys_passthrough() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        // File uses S3_* canonical keys — must be kept as-is.
+        writeln!(
+            f,
+            "S3_ACCESS_KEY_ID=FILEKEY\nS3_SECRET_ACCESS_KEY=FILESEC\nRESTIC_PASSWORD=filepass\n"
+        )
+        .unwrap();
+        let m = resolve_operator_s3_creds(Some(f.path()), &|_| None).unwrap();
+        assert_eq!(
+            m.get("S3_ACCESS_KEY_ID").map(String::as_str),
             Some("FILEKEY")
         );
         assert_eq!(
@@ -2112,20 +2571,23 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 1c. apply_creds_to_command — trivial but exercises pub(crate) fn
+    // 1f. apply_creds_to_command — translates S3_* → AWS_* for restic process
     // ------------------------------------------------------------------
 
     #[test]
-    fn apply_creds_to_command_sets_env_vars() {
+    fn apply_creds_to_command_translates_canonical_to_aws_for_restic() {
+        // Use canonical S3_* keys (as stored in the canonical map).
         let mut creds = BTreeMap::new();
         creds.insert("RESTIC_PASSWORD".to_string(), "testpass".to_string());
-        creds.insert("AWS_ACCESS_KEY_ID".to_string(), "AKID".to_string());
+        creds.insert("S3_ACCESS_KEY_ID".to_string(), "AKID".to_string());
+        creds.insert("S3_SECRET_ACCESS_KEY".to_string(), "SKEY".to_string());
         // Just construct a Command and call apply_creds_to_command — we can't
         // easily inspect the env map directly, so we exercise the code path
         // via a no-op echo (or true) call and verify it doesn't panic.
         let mut cmd = Command::new("true");
         apply_creds_to_command(&mut cmd, &creds);
         // If we reach here without panic the function is wired correctly.
+        // The translation (S3_*→AWS_*) is covered by translate_creds_for_restic test above.
     }
 
     // ------------------------------------------------------------------

@@ -1418,14 +1418,34 @@ pub enum BackupAction {
         credential_file: Option<std::path::PathBuf>,
     },
     /// Enable scheduled off-site S3 backup by patching PlatformStack.spec.backup.
+    ///
+    /// Credential input — exactly ONE of the following is required:
+    ///
+    ///   --credential-file <dotenv>  Parse the dotenv file (KEY=VALUE lines), probe
+    ///                               the repo, and auto-seal the creds as a SealedSecret
+    ///                               in apprafter-system. --credential names the Secret
+    ///                               (optional; defaults to "apprafter-backup-s3").
+    ///
+    ///   --credential <name>         Name an existing Secret already in apprafter-system.
+    ///                               The Secret's keys are read from the cluster and used
+    ///                               to probe the repo. No sealing step.
+    ///
+    /// Accepted credential keys: S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD
+    /// (optional: S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+    /// AWS_DEFAULT_REGION are accepted as aliases.
     Enable {
         /// Restic S3 repository URL, e.g. `s3:s3.eu-central-1.amazonaws.com/bucket/prefix`.
         #[arg(long)]
         bucket: String,
-        /// Name of the (sealed) cluster credential Secret in apprafter-system → credentialRef.name.
-        #[arg(long)]
+        /// Name of the credential Secret in apprafter-system.
+        /// With --credential-file: the name to create (default: apprafter-backup-s3).
+        /// Without --credential-file: an existing Secret to read creds from (required).
+        #[arg(long, default_value = "")]
         credential: String,
-        /// Operator's full S3 creds (dotenv) for the preflight repo init; falls back to env.
+        /// Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID,
+        /// S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION).
+        /// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases.
+        /// When given, the creds are probed against the repo and then auto-sealed into the cluster.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
         #[arg(long)]

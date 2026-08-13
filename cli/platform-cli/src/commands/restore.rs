@@ -144,9 +144,10 @@ pub fn run_restore(
             let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())
                 .map_err(|e| {
                     CliError::Other(format!(
-                        "restore from a remote repo '{repo}' needs the operator's S3 \
-                         credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / \
-                         RESTIC_PASSWORD) via --credential-file or the environment: {e}"
+                        "restore from a remote repo '{repo}' needs S3 + restic credentials \
+                         (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / RESTIC_PASSWORD; \
+                         AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION \
+                         are accepted as aliases) via --credential-file or the environment: {e}"
                     ))
                 })?;
             let pass = creds
