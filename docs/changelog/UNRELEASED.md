@@ -9,6 +9,63 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.44 / platform-stack 0.2.54 — S3 backup UX fixes (2026-08-13)
+
+> CLI bump (monorepo tag `v0.2.44`) + platform-stack chart bump to `0.2.54`
+> (values-only CronJob change, no operator/cue-cmp binary change).
+> **cli v0.2.44 requires platform-stack ≥ 0.2.54** — the CLI seals `S3_*`
+> canonical keys that the new CronJob reads; running cli v0.2.44 against a
+> cluster still on platform-stack ≤ 0.2.53 will cause both backup CronJobs to
+> fail to start because they still expect the old `AWS_*`-keyed Secret.
+
+**BREAKING (platform-stack 0.2.54):** The backup credential Secret's keys were
+renamed from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+`AWS_DEFAULT_REGION` to the neutral `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+/ `S3_REGION`. A cluster that **already had backup enabled** on platform-stack
+≤ 0.2.53 must re-run `apprafter backup enable` (or re-seal the credential with
+`S3_*` keys) after upgrading — both the nightly backup CronJob and the weekly
+integrity-check CronJob fail to start until then. Clusters without backup
+enabled are unaffected (the CronJobs are not rendered until `spec.backup.enabled
+= true`).
+
+### Fixed
+
+- **`backup enable` one-input flow.** The previous flow required two separate
+  commands: `apprafter secret seal … --namespace apprafter-system` followed by
+  `apprafter backup enable --credential <name>`. The new flow collapses this to
+  one command: `apprafter backup enable --credential-file <dotenv>` parses the
+  dotenv, probes the repository, and auto-seals the credential Secret into
+  `apprafter-system` in a single preflight sequence. The separate `secret seal`
+  step is no longer needed for initial setup. The two input forms are mutually
+  exclusive: `--credential-file <dotenv>` (creates and seals) or
+  `--credential <name>` (names an existing Secret for the probe).
+- **Neutral `S3_*` credential names; `AWS_*` accepted as aliases.** The
+  canonical credential key names are now `S3_ACCESS_KEY_ID`,
+  `S3_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD` (required), and `S3_REGION`
+  (optional). The `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+  `AWS_DEFAULT_REGION` forms are accepted as aliases in `--credential-file`
+  dotenvs and in the environment — the CLI normalises them to canonical names
+  before sealing. These are restic's own env names and are accepted for
+  S3-compatible stores that are not Amazon AWS. The in-cluster backup CronJob
+  now uses `secretKeyRef` entries that map `S3_*` keys to the `AWS_*` names
+  restic expects, instead of `envFrom: secretRef` with already-`AWS_*`-named
+  keys.
+- **Credential error messages enumerate required keys.** Missing or empty
+  credential keys produce an error that names the specific missing key(s) and
+  explains both input paths (`--credential-file` vs `--credential`).
+- **`apprafter secret seal` warns before replacing an existing secret.** Re-sealing
+  a name REPLACES its keys — it does not merge; keys not in the current command
+  are dropped. On an interactive terminal the CLI prompts for confirmation
+  before proceeding. In non-interactive shells the command errors instead of
+  silently overwriting; pass `--yes` to skip the prompt.
+
+### Changed
+
+- **Internal ADR / plan references removed from user-facing `--help` and CLI
+  output.** About 28 internal parentheticals (ADR numbers, plan-item codes,
+  track codenames, walk-fix notes, version-provenance tags) were removed from
+  clap doc-comments and runtime output. All help text remains descriptive.
+
 ## cli v0.2.43 — 2.16h/2.16h-a machine picker + no implicit server-type default (BREAKING) (2026-08-12, real-Hetzner walk GREEN)
 
 > CLI-only (monorepo tag `v0.2.43`; no operator/chart/cue-cmp change). Non-interactive real-Hetzner walk GREEN (`e2e/machine-picker-walk.sh`); interactive matrix table confirmed live by the owner. The manual-acceptance pass corrected the `target machine` UX: it now refuses on a provisioned cluster (a machine change is a `backup` + `restore --reprovision`, not an in-place resize), the dead deferred-intent guard was removed, and the stale `run target machine` hint dropped from `show`/`whoami`.

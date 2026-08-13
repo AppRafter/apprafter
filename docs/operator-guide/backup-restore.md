@@ -271,43 +271,23 @@ cluster gets a reduced copy.**
   scoped-credentials ladder below). On Tier 1 this is a SealedSecret you seal;
   on Tier 2+ it is OpenBao via the same `credentialRef`.
 
-restic consumes `AWS_*` + `RESTIC_PASSWORD` + the `s3:` repo URL natively, so
-there is no AppRafter-specific credential format on the restic side.
+The in-cluster backup CronJobs read credentials from a Kubernetes Secret in
+`apprafter-system` via explicit `secretKeyRef` entries. The Secret holds
+**neutral canonical keys** (`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`,
+`RESTIC_PASSWORD`, optionally `S3_REGION`); the chart template maps them to the
+`AWS_*` names that restic expects. This means the credential format is
+**S3-vendor-neutral** — the key names do not imply any Amazon product.
 
 ### Enabling
 
-First, **seal the in-cluster credential Secret into `apprafter-system`.** The
-scheduled Jobs read their S3 credentials from a Secret named by
-`credentialRef.name`; it must already exist, sealed into `apprafter-system`,
-before you enable — `backup enable` fails fast otherwise. The Secret holds:
-
-- `RESTIC_PASSWORD` — the repository passphrase (the same one you save
-  out-of-band).
-- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` — the S3 keys.
-- `AWS_DEFAULT_REGION` — optional, if your provider needs it.
-
-> **Namespace matters.** The backup credential Secret is a **platform** secret
-> and must live in `apprafter-system` — that is where `apprafter secret seal`
-> already defaults `--namespace`, so leave it at the default (a SealedSecret only
-> unseals as `<namespace>/<name>`, so sealing it into an app namespace by mistake
-> means the runner never finds it). Keep the `--namespace apprafter-system`
-> explicit as a guard:
->
-> ```
-> apprafter secret seal backup-s3-creds \
->   --from-literal RESTIC_PASSWORD=… \
->   --from-literal AWS_ACCESS_KEY_ID=… \
->   --from-literal AWS_SECRET_ACCESS_KEY=… \
->   --from-literal AWS_DEFAULT_REGION=… \
->   --namespace apprafter-system
-> ```
-
-Then enable:
+`backup enable` is a **single command** — it seals the credential Secret into
+the cluster and enables the scheduled backup in one step, with no separate
+`apprafter secret seal` required:
 
 ```
 apprafter backup enable --bucket s3:<endpoint>/<bucket>/<prefix> \
-                        --credential <sealed-secret-name> \
-                        [--credential-file <dotenv>] \
+                        --credential-file <dotenv> \
+                        [--credential apprafter-backup-s3] \
                         [--cron "0 3 * * *"] \
                         [--staging-mode monolithic|sequential] \
                         [--enforce operator|cluster] \
@@ -317,25 +297,76 @@ apprafter backup enable --bucket s3:<endpoint>/<bucket>/<prefix> \
                         --i-have-saved-credentials
 ```
 
-`enable` does **not** blindly patch the CR. It runs a **fail-closed preflight
-with the operator's own credentials** (not the cluster's), in order:
+Exactly **one** of the following credential input forms is required:
 
-1. **restic version** — the operator's system `restic` must be **≥ 0.14** (repo
+- **`--credential-file <dotenv>`** (fresh setup — the common path). The CLI
+  parses the file, probes the repository, then **auto-seals** the credentials as
+  a `SealedSecret` in `apprafter-system`. The sealed Secret's name is set by
+  `--credential` (default: `apprafter-backup-s3`). No separate
+  `apprafter secret seal` step is needed.
+
+- **`--credential <name>`** (Secret already exists). The CLI reads the named
+  Secret from the cluster to obtain the credentials for the repository probe.
+  No sealing step — the Secret must already exist.
+
+#### Credential file format
+
+Create a plain `KEY=VALUE` dotenv file. The canonical key names are
+S3-vendor-neutral; the `AWS_*` forms are accepted as aliases:
+
+```dotenv
+# Canonical form (preferred)
+S3_ACCESS_KEY_ID=your-access-key
+S3_SECRET_ACCESS_KEY=your-secret-key
+RESTIC_PASSWORD=your-restic-passphrase
+S3_REGION=eu-central-1       # optional — many S3-compatible stores don't need it
+
+# AWS_* aliases are also accepted (any S3-compatible store; these are restic's
+# own env names and do not imply Amazon-specific services):
+# AWS_ACCESS_KEY_ID     → same as S3_ACCESS_KEY_ID
+# AWS_SECRET_ACCESS_KEY → same as S3_SECRET_ACCESS_KEY
+# AWS_DEFAULT_REGION    → same as S3_REGION
+```
+
+Required keys: `S3_ACCESS_KEY_ID` (or alias), `S3_SECRET_ACCESS_KEY` (or
+alias), `RESTIC_PASSWORD`. `S3_REGION` is optional. When both the canonical and
+alias form of a key appear, the canonical form wins. The CLI normalises aliases
+to canonical names before sealing — the in-cluster Secret always holds the `S3_*`
+keys regardless of what the dotenv file used.
+
+> **Namespace matters.** The backup credential Secret is a **platform** secret
+> and must live in `apprafter-system`. `backup enable --credential-file` seals
+> it there automatically. If you seal manually (the `--credential <name>` path),
+> the default `--namespace apprafter-system` in `apprafter secret seal` is
+> correct — leave it at the default (a SealedSecret only unseals as
+> `<namespace>/<name>`, so sealing into an app namespace means the runner never
+> finds it).
+
+> **Re-sealing a Secret replaces its keys — it does not merge.** If you run
+> `apprafter secret seal` on a name that already exists, all keys in the sealed
+> Secret are replaced by the new ones. Pass all keys in a single command. On an
+> interactive terminal the CLI prompts for confirmation; in non-interactive
+> shells pass `--yes` to skip the prompt (without it the command errors instead
+> of silently overwriting).
+
+`enable` does **not** blindly patch the CR. It runs a **fail-closed preflight**
+in order:
+
+1. **Credential source resolved** — from `--credential-file` (parsed, normalised
+   to canonical `S3_*` keys) or from the live cluster Secret named by
+   `--credential`. Missing or empty required keys produce an error that names
+   the specific missing key(s) and explains both input paths.
+2. **restic version** — the operator's system `restic` must be **≥ 0.14** (repo
    format v2). Not on `PATH` is an error; a confidently-lower version is an
    error.
-2. **Operator S3 creds resolve** — from `--credential-file <dotenv>` (a
-   `KEY=VALUE` file with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-   `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`), falling back to the
-   matching environment variables. `RESTIC_PASSWORD` is required — the repo
-   probe below needs it.
-3. **The credential Secret exists** in `apprafter-system` — else the error tells
-   you to seal it first.
-4. **Repo reachability** — `restic cat config` against `--bucket` (an existing
+3. **Repo reachability** — `restic cat config` against `--bucket` (an existing
    repo) or, if that fails on an empty bucket, `restic init`. This validates the
    endpoint, credentials, and passphrase **now**, and it means a typo in
    `--bucket` can't silently create a second empty repo. The runner **never**
    auto-inits at run time — an unreadable repo is an honest failure that points
    back at `backup enable`.
+4. **Auto-seal** (only when `--credential-file` is given) — the CLI seals the
+   canonical `S3_*` credential map into `apprafter-system` as a `SealedSecret`.
 5. **DR confirmation** — `--i-have-saved-credentials` (or an interactive
    confirm; non-interactive without the flag is an error). This makes the
    operator-owns-the-keys rule *material*: you physically cannot enable without
@@ -555,16 +586,18 @@ apprafter restore s3:<endpoint>/<bucket>/<prefix> \
                   [--snapshot <id>]
 ```
 
-`--credential-file` (or `AWS_*` + `RESTIC_PASSWORD` in the environment) is
+`--credential-file` (or `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` /
+`RESTIC_PASSWORD` in the environment — `AWS_*` aliases are also accepted) is
 **required** for an `s3:` repo; the operator's full credentials are read locally.
 The DR steps:
 
 1. **Obtain the passphrase + S3 credentials you saved out-of-band** — from your
    password manager, the artifacts the `--i-have-saved-credentials` gate made
    you save. Confirm your operator machine has `restic ≥ 0.14`.
-2. **Put them in a dotenv file** (`RESTIC_PASSWORD`, `AWS_ACCESS_KEY_ID`,
-   `AWS_SECRET_ACCESS_KEY`, optional `AWS_DEFAULT_REGION`) and pass it as
-   `--credential-file`, or export the matching env vars.
+2. **Put them in a dotenv file** (`RESTIC_PASSWORD`, `S3_ACCESS_KEY_ID`,
+   `S3_SECRET_ACCESS_KEY`, optional `S3_REGION`) and pass it as
+   `--credential-file`, or export the matching env vars (`AWS_ACCESS_KEY_ID` /
+   `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` are accepted as aliases).
 3. **Choose the mode** (the same modes as the local-pull restore above — see
    [Target modes](#target-modes)):
    - `--reprovision` — the source cluster is dead: provision **and** bootstrap a
