@@ -8,6 +8,6 @@ pub fn run(to: &str) -> Result<()> {
     let target = Tier::from_str(to)?;
     info!(target = %target, "upgrade-tier invoked");
     println!("would upgrade tier to {target}");
-    println!("(skeleton — tier upgrades land in plan.md phase 3.10 / 5.7)");
+    println!("(tier upgrades are not yet available in this release)");
     Ok(())
 }

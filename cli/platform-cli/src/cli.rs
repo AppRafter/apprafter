@@ -193,15 +193,14 @@ pub enum Commands {
     },
     /// Inspect and control the cluster's PlatformStack — the
     /// declarative platform-version resource managed by
-    /// PlatformController. Track B.1.79 thin wrapper.
+    /// PlatformController.
     Platform {
         #[command(subcommand)]
         action: PlatformCommand,
     },
-    /// Inspect and approve / reject MigrationPlans. Track B.1.79
-    /// thin wrapper. Application-scope rejects denied by the
-    /// admission webhook per ADR 0027 — surface the denial
-    /// verbatim.
+    /// Inspect and approve / reject MigrationPlans. Application-scope
+    /// rejects denied by the admission webhook — the CLI surfaces
+    /// the denial message verbatim.
     Migration {
         #[command(subcommand)]
         action: MigrationCommand,
@@ -216,8 +215,7 @@ pub enum Commands {
     },
     /// Manage user Applications — Argo CD Applications scoped to
     /// the `apps` AppProject, labeled `apprafter.io/managed-by:
-    /// apprafter`. Track B.1.79a thin wrapper over Argo CD CR
-    /// patching.
+    /// apprafter`.
     #[command(alias = "a")]
     App {
         #[command(subcommand)]
@@ -225,8 +223,7 @@ pub enum Commands {
     },
     /// Manage git-repo creds Argo CD uses to pull private user
     /// repos. Writes `repo-creds`-typed Secrets in the `argocd`
-    /// namespace per Argo CD's documented contract. Track
-    /// B.1.79a part 5.
+    /// namespace per Argo CD's documented contract.
     Repo {
         #[command(subcommand)]
         action: RepoCommand,
@@ -235,20 +232,20 @@ pub enum Commands {
     /// controller's public cert. The CLI cannot decrypt what it
     /// seals (no cluster private key), so the output is safe to
     /// print, commit to Git, or apply. Backs the private-repo
-    /// credential flow (1.79c / ADR 0039).
+    /// credential flow.
     Secret {
         #[command(subcommand)]
         action: SecretCommand,
     },
     /// Manage SharedVolume CRs — persistent volumes shared across
-    /// multiple Applications (2.6c). Volumes are namespaced;
+    /// multiple Applications. Volumes are namespaced;
     /// `rm` is refused while any Application references the volume.
     Volume {
         #[command(subcommand)]
         action: VolumeCommand,
     },
-    /// Node-level operations on the active target's cluster node
-    /// (2.16g). `prep` retrofits the kubelet node reservations + k3s
+    /// Node-level operations on the active target's cluster node.
+    /// `prep` retrofits the kubelet node reservations + k3s
     /// OOM-protection AND provisions host swap (NoSwap for pods) over
     /// one k3s restart; `status` reports the node's swap posture.
     Node {
@@ -535,12 +532,12 @@ pub enum PlatformCommand {
     /// Inspect / set the cluster-wide egress posture
     /// (`PlatformStack.spec.network.egress.profile`). Gates which
     /// baseline egress allows the operator derives per Application
-    /// (DNS / same-namespace / world / declared needs). 2.10.
+    /// (DNS / same-namespace / world / declared needs).
     Egress {
         #[command(subcommand)]
         action: EgressCommand,
     },
-    /// Show or set the cluster's soft default environment (ADR 0044).
+    /// Show or set the cluster's soft default environment.
     Env {
         #[command(subcommand)]
         action: EnvCommand,
@@ -548,7 +545,7 @@ pub enum PlatformCommand {
     /// Inspect or set the cluster-wide VPA autoscale mode
     /// (`PlatformStack.spec.resources.autoscale.mode`). Controls
     /// whether the Vertical Pod Autoscaler applies recommendations to
-    /// Application pods automatically. 2.16e.
+    /// Application pods automatically.
     Autoscale {
         #[command(subcommand)]
         action: AutoscaleCommand,
@@ -601,8 +598,8 @@ pub enum EgressCommand {
 pub enum MigrationCommand {
     /// List MigrationPlans across all namespaces — namespace,
     /// name, scope, classification, phase. Platform-scope plans
-    /// live in `apprafter-system`; app-scope plans (2.16b) live
-    /// in the Application's own namespace.
+    /// live in `apprafter-system`; app-scope plans live in
+    /// the Application's own namespace.
     #[command(alias = "ls")]
     List,
     /// Patch status.phase=approved on a MigrationPlan.
@@ -622,10 +619,9 @@ pub enum MigrationCommand {
         namespace: Option<String>,
     },
     /// Patch status.phase=rejected. The admission webhook
-    /// denies application-scope rejects per ADR 0027 — the
-    /// CLI surfaces the denial message verbatim. Platform-
-    /// scope rejects succeed and PlatformMigrationStrategy.reject
-    /// reverts `spec.pin`.
+    /// denies application-scope rejects — the CLI surfaces the
+    /// denial message verbatim. Platform-scope rejects succeed
+    /// and PlatformMigrationStrategy.reject reverts `spec.pin`.
     Reject {
         /// MigrationPlan name.
         name: String,
@@ -663,10 +659,9 @@ pub enum AppCommand {
         #[arg(long, default_value = "/")]
         path: String,
         /// AppProject the Application joins. Default `apps`
-        /// matches the AppProject created in chart 0.1.40
-        /// (Track B.1.79a part 1). Pass `--project platform`
-        /// for platform-internal apps, `platform-providers`
-        /// for ServiceProvider operators.
+        /// matches the AppProject for user apps. Pass
+        /// `--project platform` for platform-internal apps,
+        /// `platform-providers` for ServiceProvider operators.
         #[arg(long, default_value = "apps")]
         project: String,
         /// Destination namespace — Argo CD's
@@ -674,11 +669,7 @@ pub enum AppCommand {
         /// true` in syncOptions, Argo CD creates this namespace
         /// on first sync if it doesn't exist. Default `apprafter`
         /// matches the namespace where AppRafter operator watches
-        /// for Application CRs and where landing-web /
-        /// landing-cms manifests declare their CR. Walk-fix #12
-        /// (v0.1.160) replaced the prior `<app-name>` default
-        /// which created an orphan destination namespace
-        /// mismatched with the manifest's own metadata.namespace.
+        /// for Application CRs.
         #[arg(long = "namespace", default_value = "apprafter")]
         namespace: String,
         /// Git remote name when detecting origin from cwd.
@@ -713,11 +704,11 @@ pub enum AppCommand {
         /// matters in `--no-interactive` mode where it gates
         /// silent scaffold (without the flag, the command
         /// refuses with a pointer to `apprafter app scaffold`).
-        /// Walk-fix-able non-interactive convenience for CI
-        /// scripts that want one-shot scaffold + register.
+        /// Non-interactive convenience for CI scripts that want
+        /// one-shot scaffold + register.
         #[arg(long, default_value_t = false)]
         scaffold: bool,
-        /// Environment to deploy (ADR 0044). Selects which
+        /// Environment to deploy. Selects which
         /// `spec.environments.<env>` override unifies onto base for THIS
         /// deployment; the Argo Application is named `<name>-<env>`. Must be
         /// one of the manifest's declared environments. Omit for a base-only
@@ -762,19 +753,17 @@ pub enum AppCommand {
     /// reach Running.
     Status {
         /// LOGICAL application name (as passed to `apprafter app add`,
-        /// listed via `apprafter app list`). ADR 0044 (2.9): the same
-        /// app is deployed per environment as separate Argo CD
-        /// Applications named `<name>-<env>`; `status` aggregates ALL of
-        /// them, grouped by the `apprafter.io/application=<name>` label,
-        /// and renders a per-environment section for each. A pre-2.9 /
-        /// base-only app (one Application named exactly `<name>`) still
-        /// resolves via the no-label fallback.
+        /// listed via `apprafter app list`). When an app is deployed to
+        /// multiple environments, `status` aggregates all of them
+        /// grouped by the `apprafter.io/application=<name>` label and
+        /// renders a per-environment section for each. A base-only app
+        /// (one Application named exactly `<name>`) still resolves via
+        /// the no-label fallback.
         name: String,
         /// Show child workload state — Argo CD's
         /// `status.resources[]` plus pods in the destination
         /// namespace matching `app.kubernetes.io/name=<inner-
-        /// app-name>` (the AppRafter operator's label). Walk-fix
-        /// #3 post-B.1.79b closure of §1.79a line 2257.
+        /// app-name>` (the AppRafter operator's label).
         #[arg(long, short = 'r', default_value_t = false)]
         resources: bool,
     },
@@ -789,7 +778,7 @@ pub enum AppCommand {
     Logs {
         /// Application name.
         name: String,
-        /// Select the env-deployment `<name>-<env>` (ADR 0044 / 2.9).
+        /// Select the env-deployment `<name>-<env>`.
         /// Omit for a base/single-env app; if the app is deployed
         /// per-env and `--env` is omitted, the command errors with the
         /// available environments.
@@ -824,7 +813,7 @@ pub enum AppCommand {
     Rollback {
         /// Application name.
         name: String,
-        /// Select the env-deployment `<name>-<env>` (ADR 0044 / 2.9).
+        /// Select the env-deployment `<name>-<env>`.
         /// Omit for a base/single-env app; if the app is deployed
         /// per-env and `--env` is omitted, the command errors with the
         /// available environments.
@@ -844,8 +833,7 @@ pub enum AppCommand {
     /// pyproject.toml / etc.). Writes to `<--path>/apprafter/
     /// Application.cue` and appends `.apprafter/local/` to the
     /// repo's `.gitignore` when present. Refuses to overwrite
-    /// an existing manifest without `--force`. Track B.1.79b
-    /// Part 3.
+    /// an existing manifest without `--force`.
     Scaffold {
         /// Force-pick a runtime instead of detecting from
         /// cwd. Slugs: bun, node-pnpm, node-yarn, node-npm,
@@ -875,10 +863,10 @@ pub enum AppCommand {
         needs: Vec<String>,
     },
     /// Validate an AppRafter `Application.cue` manifest LOCALLY,
-    /// reproducing the cluster's render-time `cue` pipeline (ADR
-    /// 0046, 2.12g). Lays the CLI's bundled schema + a generated
-    /// `claim` binding into a temp workspace and runs `cue vet`,
-    /// so bare `claim.<type>.<field>` selectors and braceless
+    /// reproducing the cluster's render-time `cue` pipeline.
+    /// Lays the CLI's bundled schema + a generated `claim` binding
+    /// into a temp workspace and runs `cue vet`, so bare
+    /// `claim.<type>.<field>` selectors and braceless
     /// `secret: "name/key"` refs resolve EXACTLY as the cue-cmp
     /// resolves them at sync time — a plain `cue vet` on the repo
     /// can't (the `claim` binding is never committed). Requires
@@ -899,8 +887,7 @@ pub enum AppCommand {
     /// `--container-port` override). Picks a free local port
     /// starting at 8080 with auto-increment to 8090 if busy.
     /// Blocks on Ctrl+C — the port-forward dies with the
-    /// command. Walk-fix #1 post-B.1.79 (Go SIGPIPE drainer
-    /// pattern) is inherited from `commands::port_forward`.
+    /// command.
     Open {
         /// Application name (as listed via `apprafter app list`).
         name: String,
@@ -928,11 +915,11 @@ pub enum AppCommand {
     /// Delete an Application and cascade-remove the Argo CD CR
     /// (which Argo CD then tears down child resources for).
     /// Interactive: prompts for confirmation; non-interactive
-    /// requires `--yes` to skip the prompt. ADR 0044 (2.9):
-    /// `--env <env>` removes ONE per-environment deployment
-    /// (`<name>-<env>`); without `--env`, ALL environment
-    /// deployments grouped under `apprafter.io/application=<name>`
-    /// are removed (a single confirmation covers the batch).
+    /// requires `--yes` to skip the prompt. `--env <env>` removes
+    /// ONE per-environment deployment (`<name>-<env>`); without
+    /// `--env`, ALL environment deployments grouped under
+    /// `apprafter.io/application=<name>` are removed (a single
+    /// confirmation covers the batch).
     #[command(alias = "rm")]
     Remove {
         /// LOGICAL application name. Without `--env` this removes every
@@ -946,16 +933,15 @@ pub enum AppCommand {
         /// Preserve PVCs / `ResourceClaim`s when tearing down.
         /// Implemented as a post-delete cleanup that strips
         /// the destructive child-prune from the cascading
-        /// delete. Phase 2 ServiceProvider-backed claims need
-        /// this to survive a user app teardown when the
-        /// operator wants to re-attach the data later.
+        /// delete. Useful when the operator wants to re-attach
+        /// the data after a teardown.
         #[arg(long = "keep-data", default_value_t = false)]
         keep_data: bool,
-        /// Environment to remove (ADR 0044). Selects ONE per-environment
+        /// Environment to remove. Selects ONE per-environment
         /// deployment — the Argo Application named `<name>-<env>`
         /// registered by `app add --env <env>`. Omit to remove ALL
         /// environment deployments of `<name>` (grouped by the
-        /// `apprafter.io/application` label); a pre-2.9 / base-only app
+        /// `apprafter.io/application` label); a base-only app
         /// with no env label resolves to the single `<name>` Application.
         #[arg(long)]
         env: Option<String>,
@@ -1005,8 +991,8 @@ pub enum TargetCommand {
         /// asks for it with a `default` default. Required on a
         /// non-TTY / `--no-interactive` run.
         name: Option<String>,
-        /// Provider identifier. Only `hetzner-cloud` is wired in
-        /// v0.1.73; AWS / Managed Cloud follow in later tracks.
+        /// Provider identifier. Only `hetzner-cloud` is wired
+        /// today; AWS / Managed Cloud are planned for later.
         #[arg(long)]
         provider: Option<String>,
         /// Hetzner Cloud API token. Required when `--provider
@@ -1044,19 +1030,15 @@ pub enum TargetCommand {
         /// token).
         #[arg(long, default_value_t = false, conflicts_with = "force")]
         renew: bool,
-        /// Reserved for the upcoming interactive wizard (v0.1.74 /
-        /// Track A.4). v0.1.73 only ships the non-interactive
-        /// flag-driven path; accepting `--no-interactive` here is
-        /// forward-compat — every Track A.3 invocation is already
-        /// non-interactive regardless of TTY.
+        /// Skip the interactive wizard even when stdin + stdout
+        /// are TTYs. The wizard fires by default on TTY shells
+        /// and asks for any field not supplied via flag.
         #[arg(long = "no-interactive", default_value_t = false)]
         no_interactive: bool,
         /// Skip the Hetzner Cloud API ping that confirms the token
         /// authenticates (`GET /v1/locations`). Useful in CI when
         /// the network sandbox blocks outbound calls, or when
-        /// pre-seeding a target store offline. v0.1.75 wired the
-        /// ping in by default; this opt-out keeps the previous
-        /// (format-only) behaviour available. Also honours
+        /// pre-seeding a target store offline. Also honours
         /// `APPRAFTER_NO_PING=1` for shell-script ergonomics —
         /// any non-empty value flips the flag.
         #[arg(
@@ -1084,8 +1066,7 @@ pub enum TargetCommand {
     List,
     /// Switch the active target. Fails when the named target does
     /// not exist; subsequent operational commands (`apply`,
-    /// `cluster-bootstrap`, ...) act on the new active target
-    /// once Track A.8 wires the resolution chain in.
+    /// `cluster-bootstrap`, ...) act on the new active target.
     Use {
         /// Name of the target to make active.
         name: String,
@@ -1251,7 +1232,7 @@ pub enum AuthCommand {
 }
 
 #[derive(Debug, Subcommand)]
-/// `apprafter volume …` subcommands (2.6c SharedVolume CRs).
+/// `apprafter volume …` subcommands.
 pub enum VolumeCommand {
     /// Create a SharedVolume CR in the cluster.
     Create {
@@ -1292,21 +1273,21 @@ pub enum VolumeCommand {
     },
 }
 
-/// `apprafter node …` subcommands (2.16g node-substrate layer).
+/// `apprafter node …` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum NodeAction {
     /// Prepare the active target's cluster node: retrofit the kubelet
     /// node reservations + k3s OOM-protection AND provision host swap.
     ///
-    /// Supersedes the 2.16d `reserve-headroom`. Writes the same
-    /// `/etc/rancher/k3s/config.yaml` reservations + `k3s.service.d/
-    /// oom.conf` and — when the node is eligible (k8s ≥1.34 for the
-    /// NoSwap GA gate + cgroup v2) — layers a host swapfile with
-    /// `swapBehavior: NoSwap` so a control-plane spike degrades to swap
-    /// instead of an OOM-kill while pods never swap. Applied atomically
-    /// over one k3s restart (the API is briefly unavailable, ~30s), with
-    /// a whole-step rollback on a `/readyz` timeout. Idempotent — a
-    /// re-run refreshes the drop-in and is otherwise a near no-op.
+    /// Writes `/etc/rancher/k3s/config.yaml` reservations +
+    /// `k3s.service.d/oom.conf` and — when the node is eligible
+    /// (k8s ≥1.34 for the NoSwap GA gate + cgroup v2) — layers a host
+    /// swapfile with `swapBehavior: NoSwap` so a control-plane spike
+    /// degrades to swap instead of an OOM-kill while pods never swap.
+    /// Applied atomically over one k3s restart (the API is briefly
+    /// unavailable, ~30s), with a whole-step rollback on a `/readyz`
+    /// timeout. Idempotent — a re-run refreshes the drop-in and is
+    /// otherwise a near no-op.
     Prep {
         /// Skip the confirmation prompt (k3s restart briefly takes
         /// the API offline). Required in non-interactive shells.
@@ -1322,7 +1303,7 @@ pub enum NodeAction {
     Status,
 }
 
-/// `apprafter backup …` subcommands (2.6d).
+/// `apprafter backup …` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum BackupAction {
     /// Create a full encrypted backup of the cluster (default scope:
