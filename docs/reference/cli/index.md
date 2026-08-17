@@ -14,8 +14,27 @@ alias below is projected straight from the parser, so this page cannot describe
 a flag the binary does not have. Run `apprafter <command> --help` for the same
 information shell-formatted.
 
-Aliases are accepted on the command line but are not listed in `--help`; they
-are documented here because the guides use them.
+## Start here
+
+A first cluster, in the order the commands are actually run:
+
+1. **Register a target** — [`apprafter target add`](target.md#apprafter-target-add)
+   saves the provider, region and credentials under a name. Everything
+   below resolves against the active one.
+2. **Provision and bootstrap** — [`apprafter bootstrap-all`](bootstrap-all.md)
+   (alias `up`) creates the infrastructure and installs the platform in
+   one command. [`apprafter kubeconfig`](kubeconfig.md) hands you the
+   cluster's kubeconfig afterwards.
+3. **Deploy an application** — [`apprafter app scaffold`](app.md#apprafter-app-scaffold)
+   writes an `Application.cue`, [`apprafter app validate`](app.md#apprafter-app-validate)
+   checks it, and [`apprafter app add`](app.md#apprafter-app-add)
+   registers it with Argo CD.
+4. **Run it** — [`apprafter app status`](app.md#apprafter-app-status) and
+   [`apprafter app logs`](app.md#apprafter-app-logs) for a single
+   application, [`apprafter doctor`](doctor.md) when the problem looks
+   like the cluster rather than the app.
+
+## Every command
 
 In the flag tables, a Value of `flag` means the flag takes no value; an em dash
 means it takes one whose name adds nothing beyond the flag itself.
@@ -53,3 +72,40 @@ specific release rather than scraping these pages.
 | [`apprafter upgrade-tier`](upgrade-tier.md) | — | Upgrade the cluster from one tier to the next — NOT IMPLEMENTED, it validates `--to` and prints the move it would make. |
 | [`apprafter volume`](volume.md) | — | Manage SharedVolume CRs — persistent volumes shared across multiple Applications. |
 | [`apprafter whoami`](whoami.md) | — | One-line summary of the operator's current shell context: identity + active target + provider-verified status + key config fields. |
+
+## Aliases
+
+Aliases are accepted on the command line but are not listed in
+`--help`; they are documented here because the guides use them. They
+chain: every segment of a path can take its own alias independently,
+which is what makes `apprafter t ls` work.
+
+| Canonical | Alias | Example |
+| --- | --- | --- |
+| [`apprafter app`](app.md#apprafter-app) | `a` | `apprafter a <COMMAND>` |
+| [`apprafter app list`](app.md#apprafter-app-list) | `ls` | `apprafter a ls` |
+| [`apprafter app remove`](app.md#apprafter-app-remove) | `rm` | `apprafter a rm` |
+| [`apprafter backup list`](backup.md#apprafter-backup-list) | `ls` | `apprafter backup ls` |
+| [`apprafter bootstrap-all`](bootstrap-all.md#apprafter-bootstrap-all) | `up` | `apprafter up` |
+| [`apprafter cluster-bootstrap`](cluster-bootstrap.md#apprafter-cluster-bootstrap) | `cb` | `apprafter cb` |
+| [`apprafter kubeconfig`](kubeconfig.md#apprafter-kubeconfig) | `kc` | `apprafter kc` |
+| [`apprafter migration list`](migration.md#apprafter-migration-list) | `ls` | `apprafter migration ls` |
+| [`apprafter repo creds list`](repo.md#apprafter-repo-creds-list) | `ls` | `apprafter repo creds ls` |
+| [`apprafter repo creds remove`](repo.md#apprafter-repo-creds-remove) | `rm` | `apprafter repo creds rm` |
+| [`apprafter target`](target.md#apprafter-target) | `t` | `apprafter t <COMMAND>` |
+| [`apprafter target domain list`](target.md#apprafter-target-domain-list) | `ls` | `apprafter t domain ls` |
+| [`apprafter target list`](target.md#apprafter-target-list) | `ls` | `apprafter t ls` |
+| [`apprafter target remove`](target.md#apprafter-target-remove) | `rm` | `apprafter t rm` |
+| [`apprafter target show`](target.md#apprafter-target-show) | `info` | `apprafter t info` |
+| [`apprafter volume list`](volume.md#apprafter-volume-list) | `ls` | `apprafter volume ls` |
+
+## See also
+
+- [Environment variables](../environment.md) — the variables the CLI
+  reads that are not flag fallbacks, so cannot appear above.
+- [Quickstart](../../operator-guide/quickstart.md) — the "start here"
+  path above, with output and explanation.
+- [Target store](../../operator-guide/target-store.md) — the on-disk
+  layout and the credential-resolution chain behind `--target`.
+- [Troubleshooting](../../operator-guide/troubleshooting.md) — the
+  diagnostic-code catalogue.

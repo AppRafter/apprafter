@@ -204,28 +204,40 @@ fn usage_carries_positional_order_which_the_sorted_table_loses() {
     );
 }
 
+/// The usage line is byte-compared in CI, so anything width-sensitive
+/// in it would drift between a wide local terminal and a CI runner.
+///
+/// Nothing in it can be. Terminal width reaches clap through exactly
+/// one function, `clap_builder::output::help_template::dimensions()`,
+/// and the only two callers are in the HELP template renderer. Usage
+/// is built by a different path — `Command::render_usage` →
+/// `Usage::create_usage_with_title` — which concatenates the arg specs
+/// and never consults it. On top of that, `dimensions()` is behind
+/// clap's `wrap_help` feature, and `cli/Cargo.toml` enables only
+/// `derive` + `env`.
+///
+/// So this asserts the STRUCTURE that follows: one line, no wrapping,
+/// and no run of padding spaces. A previous version of this test set
+/// `COLUMNS` to 20 and to 400 and compared the two renders. That could
+/// never fail: it poked the one mechanism already proven inert, so it
+/// would have passed identically had usage become width-sensitive by
+/// any other route.
 #[test]
-fn usage_does_not_depend_on_terminal_width() {
-    // The usage line is byte-compared in CI, so a width-sensitive
-    // render would drift between a wide local terminal and a CI
-    // runner. clap only consults the terminal under its `wrap_help`
-    // feature, which this workspace does not enable — this asserts
-    // that, rather than trusting it.
-    let narrow = {
-        std::env::set_var("COLUMNS", "20");
-        tree()
-    };
-    let wide = {
-        std::env::set_var("COLUMNS", "400");
-        tree()
-    };
-    std::env::remove_var("COLUMNS");
-    let usages = |t: &Tree| {
-        t.commands
-            .iter()
-            .map(|c| c.usage.clone())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(usages(&narrow), usages(&wide));
-    assert!(narrow.commands.iter().all(|c| !c.usage.contains('\n')));
+fn usage_is_a_single_unwrapped_line() {
+    let t = tree();
+    for c in &t.commands {
+        assert!(
+            !c.usage.contains('\n'),
+            "usage for {:?} wrapped onto a second line: {:?}",
+            c.path,
+            c.usage
+        );
+        assert!(
+            !c.usage.contains("  "),
+            "usage for {:?} carries padding, which a width-aware renderer \
+             would size differently: {:?}",
+            c.path,
+            c.usage
+        );
+    }
 }

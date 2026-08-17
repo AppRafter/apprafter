@@ -31,18 +31,6 @@ exclude_docs: |
   # banner. Excluding it from the SITE does not hide it from
   # literate-nav, which reads the docs tree, not the build output.
   reference/cli/SUMMARY.md
-  # The hand-written CLI reference, superseded by the generated
-  # reference/cli/ tree. With use_directory_urls it and
-  # reference/cli/index.md build to the SAME /reference/cli/ URL;
-  # mkdocs does not warn, and the generated index wins — so the page
-  # cannot be served. `not_in_nav` would only silence the nav warning:
-  # the page would still be BUILT, putting its body and its 26 dead
-  # anchors into search_index.json (site search would offer "Aliases
-  # reference" and land on a page with no such anchor) and listing
-  # /reference/cli/ twice in sitemap.xml. Excluding it removes all
-  # three. The file itself waits for the next change, which deletes it
-  # and retargets its four inbound links.
-  reference/cli.md
 
 # Pages deliberately reachable by URL but absent from nav. Anything
 # NOT on this list that is missing from nav fails the build — an
@@ -167,10 +155,15 @@ nav:
       - Image iteration: dev-guide/image-iteration.md
   - Reference:
       - Overview: reference/index.md
-      # Expanded by literate-nav from reference/cli/SUMMARY.md — see
-      # the exclude_docs note above for why the hand-written
-      # reference/cli.md is no longer listed here.
+      # Expanded by literate-nav from reference/cli/SUMMARY.md, which
+      # docsgen writes — a new top-level command needs no edit here.
       - CLI: reference/cli/
+      # Hand-written on purpose: only four of these variables are
+      # declared through clap (`#[arg(env = …)]`), so the generated
+      # tree cannot carry the rest — they are read by `std::env::var`
+      # in command code, or by a dependency (miette, owo-colors,
+      # tracing-subscriber).
+      - Environment variables: reference/environment.md
   - Contributing:
       - Setup: contributing/setup.md
       - License Headers: contributing/license-headers.md

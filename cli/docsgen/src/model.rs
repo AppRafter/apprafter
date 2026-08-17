@@ -47,9 +47,12 @@ pub struct CommandNode {
     /// the rendered table is sorted by id — so without this the
     /// reference cannot answer "which one comes first?". Taken from
     /// clap rather than assembled here so it cannot disagree with
-    /// `--help`. It is width-independent: the `wrap_help` feature is
-    /// off, so clap never consults the terminal (asserted in
-    /// `usage_does_not_depend_on_terminal_width`).
+    /// `--help`. It is width-independent: usage is built by
+    /// `Usage::create_usage_with_title`, which never reaches the
+    /// terminal-width lookup that the help-template renderer uses, and
+    /// that lookup is behind the `wrap_help` feature this workspace
+    /// does not enable. The resulting structure — one line, no padding
+    /// — is asserted in `usage_is_a_single_unwrapped_line`.
     pub usage: String,
     /// Hidden from `--help`, directly or via an ancestor; the gate
     /// still resolves these paths. clap sets `hide` on the node it is

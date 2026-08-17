@@ -278,6 +278,68 @@ fn join_sentence(description: &str, addition: &str) -> String {
     }
 }
 
+/// The index's authored sections.
+///
+/// Everything else on every page is derived from the clap tree; these
+/// paragraphs are not, because no parser knows which four commands a
+/// newcomer needs first or which guide explains a concept. They live
+/// here rather than in a hand-edited `index.md` so the byte-compare
+/// gate still owns the file: `docsgen check` would flag an edit made
+/// directly to `docs/reference/cli/index.md`, and a reviewer reading
+/// this constant can see the whole authored surface in one place.
+///
+/// Links are resolved relative to `docs/reference/cli/index.md`, so a
+/// guide is `../../operator-guide/…` and the environment reference is
+/// `../environment.md`. `mkdocs build --strict` fails on a dead one.
+const START_HERE: &str = "\
+## Start here
+
+A first cluster, in the order the commands are actually run:
+
+1. **Register a target** — [`apprafter target add`](target.md#apprafter-target-add)
+   saves the provider, region and credentials under a name. Everything
+   below resolves against the active one.
+2. **Provision and bootstrap** — [`apprafter bootstrap-all`](bootstrap-all.md)
+   (alias `up`) creates the infrastructure and installs the platform in
+   one command. [`apprafter kubeconfig`](kubeconfig.md) hands you the
+   cluster's kubeconfig afterwards.
+3. **Deploy an application** — [`apprafter app scaffold`](app.md#apprafter-app-scaffold)
+   writes an `Application.cue`, [`apprafter app validate`](app.md#apprafter-app-validate)
+   checks it, and [`apprafter app add`](app.md#apprafter-app-add)
+   registers it with Argo CD.
+4. **Run it** — [`apprafter app status`](app.md#apprafter-app-status) and
+   [`apprafter app logs`](app.md#apprafter-app-logs) for a single
+   application, [`apprafter doctor`](doctor.md) when the problem looks
+   like the cluster rather than the app.
+
+";
+
+/// Authored preamble for the alias table. The table itself is derived
+/// (see [`render_aliases`]) — a hand-written alias list is exactly the
+/// claim that rots when a `#[command(alias = …)]` moves.
+const ALIASES_INTRO: &str = "\
+## Aliases
+
+Aliases are accepted on the command line but are not listed in
+`--help`; they are documented here because the guides use them. They
+chain: every segment of a path can take its own alias independently,
+which is what makes `apprafter t ls` work.
+
+";
+
+const SEE_ALSO: &str = "\
+## See also
+
+- [Environment variables](../environment.md) — the variables the CLI
+  reads that are not flag fallbacks, so cannot appear above.
+- [Quickstart](../../operator-guide/quickstart.md) — the \"start here\"
+  path above, with output and explanation.
+- [Target store](../../operator-guide/target-store.md) — the on-disk
+  layout and the credential-resolution chain behind `--target`.
+- [Troubleshooting](../../operator-guide/troubleshooting.md) — the
+  diagnostic-code catalogue.
+";
+
 fn render_index(tree: &Tree) -> String {
     let mut s = frontmatter(
         "CLI reference",
@@ -290,10 +352,8 @@ fn render_index(tree: &Tree) -> String {
          a flag the binary does not have. Run `apprafter <command> --help` for the same\n\
          information shell-formatted.\n\n",
     );
-    s.push_str(
-        "Aliases are accepted on the command line but are not listed in `--help`; they\n\
-         are documented here because the guides use them.\n\n",
-    );
+    s.push_str(START_HERE);
+    s.push_str("## Every command\n\n");
     s.push_str(
         "In the flag tables, a Value of `flag` means the flag takes no value; an em dash\n\
          means it takes one whose name adds nothing beyond the flag itself.\n\n",
@@ -315,6 +375,59 @@ fn render_index(tree: &Tree) -> String {
         s.push_str(&format!(
             "| [`apprafter {name}`]({name}.md) | {aliases} | {} |\n",
             cell(&summary(&node.about))
+        ));
+    }
+    s.push('\n');
+    s.push_str(ALIASES_INTRO);
+    s.push_str(&render_aliases(tree));
+    s.push('\n');
+    s.push_str(SEE_ALSO);
+    s
+}
+
+/// The consolidated alias table: every visible command that declares
+/// one, at any depth, with a worked invocation.
+///
+/// The invocation is DERIVED, not authored — each segment of the path
+/// is replaced by its own first alias where it has one, so `target
+/// list` renders as `apprafter t ls` and `backup list`, whose parent
+/// has no alias, as `apprafter backup ls`. A group node gets clap's
+/// own `<COMMAND>` placeholder appended, because the aliased path
+/// alone is not a runnable command line.
+///
+/// Deriving all of it is what keeps the "aliases chain" claim above
+/// honest. A hand-written table is the one thing on this page the
+/// byte-compare gate could not check: it compares the committed file
+/// against a fresh render, so an authored alias row would agree with
+/// itself forever while the parser moved underneath it.
+fn render_aliases(tree: &Tree) -> String {
+    let mut s = String::from("| Canonical | Alias | Example |\n| --- | --- | --- |\n");
+    for node in tree.commands.iter().filter(|c| !c.hidden) {
+        if node.aliases.is_empty() {
+            continue;
+        }
+        let mut worked: Vec<String> = node
+            .path
+            .iter()
+            .enumerate()
+            .map(|(i, segment)| {
+                node_at(tree, &node.path[..=i])
+                    .aliases
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| segment.clone())
+            })
+            .collect();
+        if !children_of(tree, node).is_empty() {
+            worked.push("<COMMAND>".to_string());
+        }
+        s.push_str(&format!(
+            "| [`apprafter {canonical}`]({page}.md#{anchor}) | {aliases} | `apprafter {}` |\n",
+            worked.join(" "),
+            canonical = node.path.join(" "),
+            page = node.path[0],
+            anchor = anchor(&node.path),
+            aliases = code_list(&node.aliases),
         ));
     }
     s
