@@ -3,6 +3,7 @@
 resolver = "2"
 members = [
     "platform-cli",
+    "docsgen",
     "cli-core",
     "cli-state",
     "cli-providers",

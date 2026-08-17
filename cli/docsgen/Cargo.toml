@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+[package]
+name         = "docsgen"
+description  = "Generate and drift-check the AppRafter documentation reference"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "docsgen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "docsgen"
+path = "src/main.rs"
+
+[dependencies]
+apprafter  = { path = "../platform-cli" }
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
