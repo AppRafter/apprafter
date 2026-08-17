@@ -21,7 +21,7 @@
 //! `commands.json`, because the documentation snippet gate must still
 //! resolve `apprafter auth …` as a real path.
 
-use crate::model::{one_line, tree_from, CommandNode, Tree};
+use crate::model::{one_line, tree_from, ArgSpec, CommandNode, PositionalSpec, Tree};
 use clap::Command;
 use std::path::{Path, PathBuf};
 
@@ -128,29 +128,26 @@ fn yaml_scalar(s: &str) -> String {
 /// page.
 const ABBREVIATIONS: [&str; 6] = ["e.g.", "i.e.", "etc.", "vs.", "cf.", "approx."];
 
-/// A summary is grown one sentence at a time until it reaches this
-/// many bytes. A lead sentence is almost always the right summary, so
-/// this is set low enough to catch only genuine stubs: `doctor` opens
-/// with "Self-diagnostic." (16 bytes), which tells an overview-table
-/// reader nothing, while the shortest useful lead sentence in the
-/// current surface is 43.
-const MIN_SUMMARY: usize = 32;
-
-/// The lead sentence (or two) of an `about`, for the frontmatter
-/// description and the index table.
+/// The lead sentence of an `about`, for the frontmatter description
+/// and the index table.
 ///
 /// Several `about`s run to 400 characters (`restore`), which makes an
 /// unreadable overview row and a meta description search engines
 /// truncate anyway. Nothing is lost either way: the command's own page
 /// prints the full text below its H1.
+///
+/// A lead sentence that is too terse to be a summary is a defect in
+/// the doc comment, not something to paper over here: a length
+/// threshold would be a magic number tuned against today's 26
+/// top-level `about`s, and would silently glue a second sentence onto
+/// the many legitimately short ones (`target use`, `volume remove`)
+/// the moment this is reused for subcommands.
 fn summary(about: &str) -> String {
     let one = one_line(about);
     let mut from = 0;
     while let Some(rel) = one[from..].find(". ") {
         let end = from + rel + 1;
-        // Sentence boundaries only, and only once there is enough of a
-        // sentence to be worth reading.
-        if end >= MIN_SUMMARY && !ABBREVIATIONS.iter().any(|a| one[..end].ends_with(a)) {
+        if !ABBREVIATIONS.iter().any(|a| one[..end].ends_with(a)) {
             return one[..end].to_string();
         }
         from = end;
@@ -158,14 +155,22 @@ fn summary(about: &str) -> String {
     one
 }
 
-/// Escape a table cell: collapse whitespace, neutralise the column
-/// separator, and protect placeholders (see [`escape_prose`]).
+/// Escape a table cell: collapse whitespace, protect placeholders and
+/// neutralise the column separator — the last two outside code spans
+/// only.
+///
+/// Python-Markdown (what MkDocs runs) resolves backtick regions
+/// *before* it splits a row on `|`, so a pipe inside a code span is
+/// already safe and escaping it there would print a literal backslash:
+/// a doc comment mentioning `` `app logs -f | grep ERROR` `` would
+/// render as `-f \| grep`. Outside a code span the opposite holds — an
+/// unescaped pipe silently truncates the row at that point. Both
+/// directions were checked against `markdown_py -x tables`; GFM/cmark
+/// behave differently here, so intuition from GitHub does not transfer.
 fn cell(s: &str) -> String {
-    // The pipe is escaped after the prose pass, and inside code spans
-    // as well as outside them: Markdown splits a table row on `|`
-    // before it ever looks for backticks, so `` `a|b` `` would still
-    // spill into the next column.
-    escape_prose(&one_line(s)).replace('|', "\\|")
+    outside_code_spans(&one_line(s), |text| {
+        text.replace('<', "&lt;").replace('|', "\\|")
+    })
 }
 
 /// Protect angle-bracket placeholders that sit outside a code span.
@@ -176,29 +181,61 @@ fn cell(s: &str) -> String {
 /// sees `--credential-file  Parse the dotenv file…`. Inside a code
 /// span the same text is already literal, and escaping it there would
 /// print `&lt;` verbatim — hence the scan rather than a blanket
-/// `replace`.
+/// `replace`. Pipes are left alone: outside a table they are literal.
 fn escape_prose(s: &str) -> String {
+    outside_code_spans(s, |text| text.replace('<', "&lt;"))
+}
+
+/// Apply `escape` to everything except the code spans, which are
+/// copied through verbatim.
+///
+/// Spans are delimited by a run of backticks closed by a run of the
+/// same length, per CommonMark: a single-backtick scan would read
+/// ` ``--foo=<bar>`` ` as two empty spans with unprotected prose
+/// between them. An unterminated run is not a span at all, so the
+/// remainder is treated as prose.
+fn outside_code_spans(s: &str, escape: impl Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(open) = rest.find('`') {
         let (before, from_tick) = rest.split_at(open);
-        out.push_str(&before.replace('<', "&lt;"));
-        // An unbalanced backtick is not a code span: treat the
-        // remainder as prose rather than silently trusting it.
-        match from_tick[1..].find('`') {
-            Some(close) => {
-                let end = 1 + close + 1;
+        out.push_str(&escape(before));
+
+        let fence = from_tick.len() - from_tick.trim_start_matches('`').len();
+        match closing_run(&from_tick[fence..], fence) {
+            Some(offset) => {
+                let end = fence + offset + fence;
                 out.push_str(&from_tick[..end]);
                 rest = &from_tick[end..];
             }
             None => {
-                out.push_str(&from_tick.replace('<', "&lt;"));
+                out.push_str(&escape(from_tick));
                 return out;
             }
         }
     }
-    out.push_str(&rest.replace('<', "&lt;"));
+    out.push_str(&escape(rest));
     out
+}
+
+/// Byte offset of the first backtick run of exactly `len` backticks.
+fn closing_run(body: &str, len: usize) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'`' {
+            i += 1;
+        }
+        if i - start == len {
+            return Some(start);
+        }
+    }
+    None
 }
 
 /// A `long_about` keeps its blank-line paragraph breaks (four commands
@@ -213,11 +250,32 @@ fn prose(node: &CommandNode) -> String {
 }
 
 fn code_list(items: &[String]) -> String {
+    code_list_sep(items, ", ")
+}
+
+/// `code_list` with an explicit separator — the flag table's Value
+/// column needs an escaped pipe (`` `enable` \| `disable` ``) because
+/// that pipe sits outside the code spans this builds.
+fn code_list_sep(items: &[String], sep: &str) -> String {
     items
         .iter()
         .map(|i| format!("`{i}`"))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(sep)
+}
+
+/// Append a sentence to a description, repairing the seam.
+///
+/// `clap_derive` strips the full stop off a one-line doc comment, so a
+/// naive join reads "enable \| disable One of `enable`…".
+fn join_sentence(description: &str, addition: &str) -> String {
+    match description.chars().last() {
+        None => addition.to_string(),
+        Some(c) if c.is_alphanumeric() || c == '`' || c == ')' => {
+            format!("{description}. {addition}")
+        }
+        Some(_) => format!("{description} {addition}"),
+    }
 }
 
 fn render_index(tree: &Tree) -> String {
@@ -294,38 +352,7 @@ fn render_body(node: &CommandNode) -> String {
     if !node.positionals.is_empty() {
         s.push_str("| Argument | Required | Description |\n| --- | --- | --- |\n");
         for p in &node.positionals {
-            let name = if p.multiple {
-                format!("`<{}>…`", p.value_name)
-            } else {
-                format!("`<{}>`", p.value_name)
-            };
-            let mut description = cell(&p.help);
-            if !p.possible_values.is_empty() {
-                // A `ValueEnum` positional carries its accepted set in
-                // the model; leaving it to the doc comment would let a
-                // renamed variant byte-compare clean.
-                let values = p
-                    .possible_values
-                    .iter()
-                    .map(|v| format!("`{v}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                description = match description.chars().last() {
-                    None => format!("One of {values}."),
-                    // `clap_derive` strips the full stop off a
-                    // one-line doc comment, so joining naively yields
-                    // "enable \| disable One of `enable`…".
-                    Some(c) if c.is_alphanumeric() || c == '`' || c == ')' => {
-                        format!("{description}. One of {values}.")
-                    }
-                    Some(_) => format!("{description} One of {values}."),
-                };
-            }
-            s.push_str(&format!(
-                "| {name} | {} | {} |\n",
-                yes_no(p.required),
-                or_dash(description)
-            ));
+            s.push_str(&positional_row(p));
         }
         s.push('\n');
     }
@@ -335,39 +362,7 @@ fn render_body(node: &CommandNode) -> String {
             "| Flag | Value | Default | Required | Description |\n| --- | --- | --- | --- | --- |\n",
         );
         for a in &node.args {
-            let flag = match (&a.long, a.short) {
-                (Some(l), Some(c)) => format!("`--{l}`, `-{c}`"),
-                (Some(l), None) => format!("`--{l}`"),
-                (None, Some(c)) => format!("`-{c}`"),
-                (None, None) => format!("`{}`", a.id),
-            };
-            let value = if !a.possible_values.is_empty() {
-                a.possible_values
-                    .iter()
-                    .map(|v| format!("`{v}`"))
-                    .collect::<Vec<_>>()
-                    .join(" \\| ")
-            } else if a.takes_value {
-                format!(
-                    "`<{}>`",
-                    a.value_name.clone().unwrap_or_else(|| "VALUE".into())
-                )
-            } else {
-                "flag".to_string()
-            };
-            // An em dash, not "None": a switch has no default at all,
-            // and `false` is a clap-synthesised artefact the model
-            // already drops.
-            let default = a
-                .default
-                .as_deref()
-                .map(|d| format!("`{d}`"))
-                .unwrap_or_else(|| "—".into());
-            s.push_str(&format!(
-                "| {flag} | {value} | {default} | {} | {} |\n",
-                yes_no(a.required),
-                or_dash(cell(&a.help))
-            ));
+            s.push_str(&flag_row(a));
         }
         s.push('\n');
     }
@@ -381,6 +376,79 @@ fn render_body(node: &CommandNode) -> String {
     }
 
     s
+}
+
+fn positional_row(p: &PositionalSpec) -> String {
+    // A trailing ellipsis is how `--help` spells a repeatable
+    // positional, so the reference spells it the same way.
+    let name = if p.multiple {
+        format!("`<{}>…`", p.value_name)
+    } else {
+        format!("`<{}>`", p.value_name)
+    };
+
+    let mut description = cell(&p.help);
+    if !p.possible_values.is_empty() {
+        // A `ValueEnum` positional carries its accepted set in the
+        // model; leaving it to the doc comment would let a renamed
+        // variant byte-compare clean.
+        description = join_sentence(
+            &description,
+            &format!("One of {}.", code_list(&p.possible_values)),
+        );
+    }
+
+    format!(
+        "| {name} | {} | {} |\n",
+        yes_no(p.required),
+        or_dash(description)
+    )
+}
+
+fn flag_row(a: &ArgSpec) -> String {
+    let flag = match (&a.long, a.short) {
+        (Some(l), Some(c)) => format!("`--{l}`, `-{c}`"),
+        (Some(l), None) => format!("`--{l}`"),
+        (None, Some(c)) => format!("`-{c}`"),
+        (None, None) => format!("`{}`", a.id),
+    };
+
+    let value = if !a.possible_values.is_empty() {
+        code_list_sep(&a.possible_values, " \\| ")
+    } else if a.takes_value {
+        format!(
+            "`<{}>`",
+            a.value_name.clone().unwrap_or_else(|| "VALUE".into())
+        )
+    } else {
+        "flag".to_string()
+    };
+
+    // An em dash, not "None": a switch has no default at all, and
+    // `false` is a clap-synthesised artefact the model already drops.
+    // An empty-string default (`backup enable --credential`) is the
+    // same case — `--help` prints nothing for it, and a `` `` `` cell
+    // would render as two stray backticks rather than a code span.
+    let default = a
+        .default
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("`{d}`"))
+        .unwrap_or_else(|| "—".into());
+
+    let mut description = cell(&a.help);
+    if let Some(env) = &a.env {
+        // Appended rather than given a sixth column: only 8 of ~200
+        // flags read an environment variable, so a column would be an
+        // em dash on every other row and widen every table on the site.
+        description = join_sentence(&description, &format!("Env: `{env}`."));
+    }
+
+    format!(
+        "| {flag} | {value} | {default} | {} | {} |\n",
+        yes_no(a.required),
+        or_dash(description)
+    )
 }
 
 /// An em dash for an empty cell. Seven flags carry no doc comment in
@@ -414,10 +482,57 @@ fn render_summary(tree: &Tree) -> String {
 mod tests {
     use super::*;
 
+    fn arg(long: &str) -> ArgSpec {
+        ArgSpec {
+            id: long.replace('-', "_"),
+            long: Some(long.to_string()),
+            short: None,
+            takes_value: true,
+            value_name: Some(long.to_uppercase().replace('-', "_")),
+            default: None,
+            env: None,
+            required: false,
+            possible_values: vec![],
+            help: String::new(),
+        }
+    }
+
+    fn positional(value_name: &str) -> PositionalSpec {
+        PositionalSpec {
+            id: value_name.to_lowercase(),
+            value_name: value_name.to_string(),
+            required: true,
+            multiple: false,
+            possible_values: vec![],
+            help: String::new(),
+        }
+    }
+
+    fn node(args: Vec<ArgSpec>, positionals: Vec<PositionalSpec>) -> CommandNode {
+        CommandNode {
+            path: vec!["backup".into(), "enable".into()],
+            aliases: vec![],
+            about: String::new(),
+            long_about: None,
+            hidden: false,
+            examples: vec![],
+            args,
+            positionals,
+        }
+    }
+
     #[test]
-    fn a_pipe_in_a_cell_cannot_spill_into_the_next_column() {
+    fn a_prose_pipe_is_escaped_but_one_inside_a_code_span_is_not() {
         assert_eq!(cell("a | b"), "a \\| b");
-        assert_eq!(cell("`a|b`"), "`a\\|b`");
+        // Python-Markdown resolves backtick regions before splitting
+        // the row, so this pipe is already safe; escaping it would
+        // print the backslash. Verified against `markdown_py -x
+        // tables` — GFM differs, which is the trap here.
+        assert_eq!(cell("`a|b`"), "`a|b`");
+        assert_eq!(
+            cell("run `logs -f | grep E` now | ok"),
+            "run `logs -f | grep E` now \\| ok"
+        );
     }
 
     #[test]
@@ -434,8 +549,19 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_backtick_span_is_one_span_not_two_empty_ones() {
+        // A single-backtick scan reads ``x`` as two empty spans and
+        // escapes the prose between them.
+        assert_eq!(
+            escape_prose("try ``--foo=<bar>`` then <baz>"),
+            "try ``--foo=<bar>`` then &lt;baz>"
+        );
+    }
+
+    #[test]
     fn an_unbalanced_backtick_does_not_swallow_the_rest_of_the_line() {
         assert_eq!(escape_prose("a `b <c>"), "a `b &lt;c>");
+        assert_eq!(escape_prose("a ``b <c>`"), "a ``b &lt;c>`");
     }
 
     #[test]
@@ -446,7 +572,12 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_stops_at_the_first_real_sentence() {
+    fn frontmatter_escapes_a_quote() {
+        assert!(frontmatter("t", "say \"hi\"").contains("description: \"say \\\"hi\\\"\""));
+    }
+
+    #[test]
+    fn a_summary_is_the_lead_sentence() {
         let about = "Seal secret material with the sealed-secrets public cert. \
                      The CLI cannot decrypt it. And more.";
         assert_eq!(
@@ -458,16 +589,9 @@ mod tests {
             summary("Apply the desired state"),
             "Apply the desired state"
         );
-    }
-
-    #[test]
-    fn a_stub_lead_sentence_borrows_the_next_one() {
-        // `doctor` opens "Self-diagnostic." — a row reading just that
-        // is worse than no summary at all.
-        assert_eq!(
-            summary("Self-diagnostic. Walks the target's stored config and credentials. Exits 1."),
-            "Self-diagnostic. Walks the target's stored config and credentials."
-        );
+        // A short lead sentence is kept as-is: padding it from the
+        // next sentence would run away on `target use`-style abouts.
+        assert_eq!(summary("Remove a target. It is gone."), "Remove a target.");
     }
 
     #[test]
@@ -480,57 +604,64 @@ mod tests {
 
     #[test]
     fn an_enum_positional_lists_its_values_as_its_own_sentence() {
-        let node = CommandNode {
-            path: vec!["target".into(), "firewall".into()],
-            aliases: vec![],
-            about: String::new(),
-            long_about: None,
-            hidden: false,
-            examples: vec![],
-            args: vec![],
-            positionals: vec![crate::model::PositionalSpec {
-                id: "state".into(),
-                value_name: "STATE".into(),
-                required: true,
-                multiple: false,
-                possible_values: vec!["enable".into(), "disable".into()],
-                help: "enable | disable".into(),
-            }],
-        };
+        let mut state = positional("STATE");
+        state.possible_values = vec!["enable".into(), "disable".into()];
+        state.help = "enable | disable".into();
+        let body = render_body(&node(vec![], vec![state]));
         assert!(
-            render_body(&node)
-                .contains("| `<STATE>` | yes | enable \\| disable. One of `enable`, `disable`. |"),
-            "{}",
-            render_body(&node)
+            body.contains("| `<STATE>` | yes | enable \\| disable. One of `enable`, `disable`. |"),
+            "{body}"
         );
     }
 
     #[test]
     fn an_undocumented_flag_gets_a_dash_not_a_blank_cell() {
-        let node = CommandNode {
-            path: vec!["backup".into(), "enable".into()],
-            aliases: vec![],
-            about: String::new(),
-            long_about: None,
-            hidden: false,
-            examples: vec![],
-            args: vec![crate::model::ArgSpec {
-                id: "cron".into(),
-                long: Some("cron".into()),
-                short: None,
-                takes_value: true,
-                value_name: Some("CRON".into()),
-                default: None,
-                required: false,
-                possible_values: vec![],
-                help: String::new(),
-            }],
-            positionals: vec![],
-        };
+        let body = render_body(&node(vec![arg("cron")], vec![]));
         assert!(
-            render_body(&node).contains("| `--cron` | `<CRON>` | — | no | — |"),
+            body.contains("| `--cron` | `<CRON>` | — | no | — |"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_empty_string_default_is_not_a_default() {
+        // `backup enable --credential` is `default_value = ""`.
+        // Rendering it as a code span emits two stray backticks, which
+        // Python-Markdown prints literally; `--help` shows nothing
+        // there either.
+        let mut credential = arg("credential");
+        credential.default = Some(String::new());
+        let body = render_body(&node(vec![credential], vec![]));
+        assert!(
+            body.contains("| `--credential` | `<CREDENTIAL>` | — | no | — |"),
+            "{body}"
+        );
+        assert!(!body.contains("``"), "stray backticks: {body}");
+    }
+
+    #[test]
+    fn an_env_backed_flag_names_its_variable() {
+        let mut token = arg("token");
+        token.help = "Hetzner Cloud API token".into();
+        token.env = Some("HCLOUD_TOKEN".into());
+        let body = render_body(&node(vec![token], vec![]));
+        assert!(
+            body.contains("Hetzner Cloud API token. Env: `HCLOUD_TOKEN`."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn examples_render_as_a_shell_fence() {
+        // Dead until a later task populates `examples`; pinning the
+        // format now stops that task from inventing another one.
+        let mut n = node(vec![], vec![]);
+        n.examples = vec!["apprafter backup enable --bucket b".into()];
+        assert!(
+            render_body(&n)
+                .ends_with("Examples:\n\n```sh\napprafter backup enable --bucket b\n```\n\n"),
             "{}",
-            render_body(&node)
+            render_body(&n)
         );
     }
 
@@ -538,10 +669,5 @@ mod tests {
     fn a_page_ends_with_exactly_one_newline() {
         assert_eq!(page("a\n\n\n".to_string()), "a\n");
         assert_eq!(page("a".to_string()), "a\n");
-    }
-
-    #[test]
-    fn frontmatter_escapes_a_quote() {
-        assert!(frontmatter("t", "say \"hi\"").contains("description: \"say \\\"hi\\\"\""));
     }
 }

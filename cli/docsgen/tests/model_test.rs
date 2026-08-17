@@ -57,6 +57,32 @@ fn required_positionals_are_marked_required() {
 }
 
 #[test]
+fn env_backed_flags_carry_their_variable() {
+    let t = tree();
+    // `apprafter target add --token` reads HCLOUD_TOKEN. The
+    // hand-written reference page documented the env surface in a
+    // table of its own; once that page is retired this projection is
+    // the only place it survives.
+    let token = node(&t, &["target", "add"])
+        .args
+        .iter()
+        .find(|a| a.long.as_deref() == Some("token"))
+        .expect("target add has --token");
+    assert_eq!(token.env.as_deref(), Some("HCLOUD_TOKEN"));
+
+    // ...and a flag without one stays None rather than empty-string.
+    let seal = node(&t, &["secret", "seal"]);
+    assert_eq!(
+        seal.args
+            .iter()
+            .find(|a| a.long.as_deref() == Some("namespace"))
+            .expect("secret seal has --namespace")
+            .env,
+        None
+    );
+}
+
+#[test]
 fn hidden_commands_are_present_but_flagged() {
     let t = tree();
     assert!(

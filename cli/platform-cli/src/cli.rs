@@ -52,11 +52,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: AuthCommand,
     },
-    /// Self-diagnostic. Walks the active target's stored config,
-    /// credentials, and reachability checks plus the surrounding
-    /// shell environment (kubectl, helm, ssh, DNS). Prints PASS /
-    /// WARN / FAIL per check; exits 1 if any FAIL fires so CI
-    /// gates can wire `apprafter doctor` in directly.
+    /// Self-diagnostic over the active target's config, credentials
+    /// and reachability plus the surrounding shell environment
+    /// (kubectl, helm, ssh, DNS). Prints PASS / WARN / FAIL per
+    /// check; exits 1 if any FAIL fires so CI gates can wire
+    /// `apprafter doctor` in directly.
     Doctor {
         /// Inspect a target other than the active one. Defaults
         /// to the active target.

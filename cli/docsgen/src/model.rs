@@ -63,6 +63,12 @@ pub struct ArgSpec {
     pub takes_value: bool,
     pub value_name: Option<String>,
     pub default: Option<String>,
+    /// The environment variable this arg also reads, if any
+    /// (`#[arg(env = "HCLOUD_TOKEN")]`). Eight declarations across four
+    /// variables exist, and the hand-written reference page that used
+    /// to document them is being retired — without this the env
+    /// surface would simply disappear from the docs.
+    pub env: Option<String>,
     pub required: bool,
     pub possible_values: Vec<String>,
     pub help: String,
@@ -175,6 +181,13 @@ fn arg_from(arg: &Arg) -> ArgSpec {
         takes_value: takes_value(arg),
         value_name: first_value_name(arg),
         default: default_of(arg),
+        // `hide_env_values` hides the value, not the name, so the
+        // variable is still documentable for a secret-bearing flag
+        // like `--token`.
+        env: arg
+            .get_env()
+            .map(|e| e.to_string_lossy().into_owned())
+            .filter(|_| !arg.is_hide_env_set()),
         required: arg.is_required_set(),
         possible_values: possible_values_of(arg),
         help: arg.get_help().map(styled_one_line).unwrap_or_default(),
