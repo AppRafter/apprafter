@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
 # ADR 0056: machine-picker — live (region × SKU) matrix and no implicit server-type default
 
 ## Status

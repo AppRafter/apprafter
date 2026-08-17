@@ -116,5 +116,6 @@ AppRafter is **open core**:
 
 - **Platform core** (`cli/`, `operator/`, `schemas/`, `manifests/`) — **FSL-1.1-Apache-2.0**: the Functional Source License, which auto-converts to **Apache 2.0** two years after each release. It permits any use — personal, internal business, and commercial workloads — **except offering AppRafter itself as a managed service to third parties**. Once a release reaches its two-year conversion date, that restriction lifts.
 - **Plugins** (`providers/*`, `backstage-plugins/*`, community SDKs) — **MIT** from day one.
+- **Documentation** (`docs/`) — **CC-BY-4.0** for prose, **Apache-2.0** for code samples in guides. See [`docs/license.md`](./docs/license.md).
 
-See [`LICENSE`](./LICENSE), [`LICENSE-APACHE`](./LICENSE-APACHE), [`LICENSE-MIT`](./LICENSE-MIT), [`NOTICE`](./NOTICE), and ADRs [0001](./docs/adr/0001-license-fsl-1-1-mit.md) (original FSL choice) and [0032](./docs/adr/0032-license-fsl-1-1-apache-2-0.md) (current core license) for the rationale.
+See [`LICENSE`](./LICENSE), [`LICENSE-APACHE`](./LICENSE-APACHE), [`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-CC-BY-4.0`](./LICENSE-CC-BY-4.0), [`NOTICE`](./NOTICE), and ADRs [0001](./docs/adr/0001-license-fsl-1-1-mit.md) (original FSL choice) and [0032](./docs/adr/0032-license-fsl-1-1-apache-2-0.md) (current core license) for the rationale.

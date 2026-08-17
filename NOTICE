@@ -43,6 +43,14 @@ the InfrastructureProviderPlugin / ServiceProviderPlugin SDKs are licensed
 under the MIT License from day one (no FSL window). Each such directory
 carries its own LICENSE file.
 
+Documentation
+-------------
+
+Prose under docs/ (guides, reference pages, ADRs) is licensed under the
+Creative Commons Attribution 4.0 license (CC-BY-4.0). Code samples
+embedded in those pages are licensed under Apache 2.0. See
+LICENSE-CC-BY-4.0 and docs/license.md.
+
 Why FSL-1.1-Apache-2.0?
 -----------------------
 

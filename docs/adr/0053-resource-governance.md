@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
 # ADR 0053: resource governance (requests/limits, QoS, node reservations)
 
 ## Status

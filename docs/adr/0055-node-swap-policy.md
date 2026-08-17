@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
 # ADR 0055: node swap policy (provisioned host swap + pod NoSwap, Tier-1)
 
 ## Status

@@ -2,6 +2,9 @@
 site_name: AppRafter
 site_description: Opinionated, vertically-integrated PaaS on Kubernetes
 site_url: https://apprafter.dev/docs
+copyright: >
+  © 2026 AppRafter Authors. Documentation licensed CC-BY-4.0;
+  code samples Apache-2.0. Platform core FSL-1.1-Apache-2.0.
 docs_dir: docs
 
 repo_url: https://github.com/apprafter/apprafter

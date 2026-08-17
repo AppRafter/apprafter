@@ -42,11 +42,17 @@ YAML / Bash / Dockerfile (hash comments):
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 ```
 
-HTML / Markdown (HTML comment, optional):
+HTML / Markdown outside `docs/` (HTML comment, optional):
 
 ```html
 <!-- SPDX-License-Identifier: FSL-1.1-Apache-2.0 -->
 ```
+
+Markdown under `docs/` takes **no** per-file header. That whole tree is
+covered by `docs/license.md` + `LICENSE-CC-BY-4.0` — prose is CC-BY-4.0,
+code samples embedded in the pages are Apache-2.0. A per-file
+`FSL-1.1-Apache-2.0` header on a `docs/` Markdown file is wrong; remove it
+if you find one.
 
 ## Generated files
 

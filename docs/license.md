@@ -16,6 +16,13 @@ ADR 0032 base-license migration.
 - **Plugins** — `providers/`, `backstage-plugins/`, and the future
   `InfrastructureProviderPlugin` / `ServiceProviderPlugin` SDKs are
   licensed under the **MIT License** from day one. See `LICENSE-MIT`.
+- **Documentation** — everything under `docs/` (the prose, including
+  the generated reference pages, and — once published — the
+  `llms.txt` / `llms-full.txt` exports) is licensed under
+  **`CC-BY-4.0`** — see `LICENSE-CC-BY-4.0`. Reuse, translation and
+  machine ingestion are allowed with attribution. The **code samples
+  inside** those pages are licensed under **Apache-2.0** so they can
+  be pasted into any project without attribution obligations.
 
 ## How the FSL conversion works
 
@@ -79,6 +86,7 @@ SDK files declare `SPDX-License-Identifier: MIT`. See
 - `LICENSE` — the FSL-1.1-Apache-2.0 text.
 - `LICENSE-APACHE` — the Apache 2.0 conversion target (full text).
 - `LICENSE-MIT` — the MIT text (plugins + pre-ADR-0032 conversion target).
+- `LICENSE-CC-BY-4.0` — the CC-BY-4.0 text covering documentation prose.
 - `NOTICE` — short licensing notice in the repository root.
 - `docs/adr/0001-license-fsl-1-1-mit.md` — original license decision
   (superseded for the base choice).
