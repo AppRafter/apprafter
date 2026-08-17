@@ -243,26 +243,18 @@ e2e-up:
 e2e-down:
     k3d cluster delete apprafter-dev
 
-# Serve the TechDocs site locally for preview.
+# Live docs preview. Always goes through the flake so the mkdocs
+# version, theme and plugins are the flake.lock-pinned ones — the
+# old `command -v mkdocs || nix shell …` fallback could not work
+# (two python envs; see flake.nix comment).
 docs-serve:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if command -v mkdocs >/dev/null 2>&1; then
-        mkdocs serve
-    else
-        echo "mkdocs not on PATH; running via Nix..."
-        nix shell nixpkgs#python3Packages.mkdocs-material -c mkdocs serve
-    fi
+    nix develop --command mkdocs serve
 
-# Build the TechDocs site (output to ./site/).
+# Strict docs build. `--strict` turns every mkdocs warning into a
+# build failure; `mkdocs.yml` decides which checks warn (dead links,
+# dead anchors, pages missing from nav).
 docs-build:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if command -v mkdocs >/dev/null 2>&1; then
-        mkdocs build --strict
-    else
-        nix shell nixpkgs#python3Packages.mkdocs-material -c mkdocs build --strict
-    fi
+    nix develop --command mkdocs build --strict
 
 # Render the platform-stack umbrella chart from CUE source into
 # `platform-stack/dist/platform-stack-<version>/`. Wrapper over

@@ -62,8 +62,18 @@
             jq
             git
 
-            # Documentation site (TechDocs / mkdocs-material).
-            python3Packages.mkdocs-material
+            # Documentation site. ONE python env — `nix shell
+            # nixpkgs#python3Packages.mkdocs-material` ships no `mkdocs`
+            # binary, and adding `python3Packages.mkdocs` alongside it
+            # yields a second env whose site-packages lacks the theme
+            # ("Unrecognised theme name: 'material'"). literate-nav
+            # renders the generated CLI reference nav (docsgen SUMMARY.md);
+            # redirects is installed for the W5 IA move.
+            (python3.withPackages (ps: [
+              ps.mkdocs-material
+              ps.mkdocs-literate-nav
+              ps.mkdocs-redirects
+            ]))
           ];
 
           shellHook = ''
