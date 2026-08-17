@@ -9,6 +9,10 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+[lib]
+doctest = false   # no Rust examples here; a bare ``` fence in any
+                  # pub(crate) doc comment would otherwise compile
+
 [[bin]]
 name = "apprafter"
 path = "src/main.rs"

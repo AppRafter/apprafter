@@ -11,7 +11,10 @@ on:
     paths:
       - 'docs/**'
       - 'mkdocs.yml'
-      - 'cli/platform-cli/src/cli.rs'
+      # Wider than cli.rs: the clap tree pulls in ValueEnums defined
+      # under commands/ (e.g. app::CoverageGate), whose variants
+      # render in --help and therefore in the generated reference.
+      - 'cli/platform-cli/src/**'
       - 'cli/docsgen/**'
       - 'scripts/docs-check.sh'
       - 'flake.nix'
@@ -22,7 +25,10 @@ on:
     paths:
       - 'docs/**'
       - 'mkdocs.yml'
-      - 'cli/platform-cli/src/cli.rs'
+      # Wider than cli.rs: the clap tree pulls in ValueEnums defined
+      # under commands/ (e.g. app::CoverageGate), whose variants
+      # render in --help and therefore in the generated reference.
+      - 'cli/platform-cli/src/**'
       - 'cli/docsgen/**'
       - 'scripts/docs-check.sh'
       - 'flake.nix'

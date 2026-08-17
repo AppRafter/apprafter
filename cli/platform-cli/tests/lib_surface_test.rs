@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! The lib target exists so `docsgen` can project the clap tree
-//! (spec §3.3). These assertions are the contract that refactor
-//! must keep.
+//! (`docs/superpowers/specs/2026-08-17-documentation-system-design.md`
+//! §3.3). These assertions are the contract that refactor must keep.
 
 use clap::CommandFactory;
 
@@ -23,5 +23,9 @@ fn docs_api_exposes_the_cue_validator() {
     // Same entry point `apprafter app validate` uses — the snippet
     // gate calls exactly this.
     let missing = std::path::Path::new("/nonexistent/Application.cue");
-    assert!(apprafter::docs_api::validate_manifest(missing).is_err());
+    // Bind the error type: a bare `.is_err()` compiles against any
+    // `Result<_, _>`, so it would stay green if the diagnostics type
+    // changed under the future consumer's feet.
+    let diagnostics: Vec<String> = apprafter::docs_api::validate_manifest(missing).unwrap_err();
+    assert!(!diagnostics.is_empty());
 }
