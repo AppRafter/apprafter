@@ -186,3 +186,46 @@ fn projection_is_sorted_and_stable() {
     sorted.sort();
     assert_eq!(paths, sorted, "byte-compare needs a deterministic order");
 }
+
+#[test]
+fn usage_carries_positional_order_which_the_sorted_table_loses() {
+    let t = tree();
+    // `target rename <FROM> <TO>`: the arg table is sorted by id, so
+    // "from" and "to" happen to come out in order — `<TO> <FROM>`
+    // would render identically. Only the usage line pins it.
+    assert_eq!(
+        node(&t, &["target", "rename"]).usage,
+        "Usage: apprafter target rename <FROM> <TO>"
+    );
+    // A group node still gets one, and it names the binary path.
+    assert_eq!(
+        node(&t, &["target", "cert"]).usage,
+        "Usage: apprafter target cert <COMMAND>"
+    );
+}
+
+#[test]
+fn usage_does_not_depend_on_terminal_width() {
+    // The usage line is byte-compared in CI, so a width-sensitive
+    // render would drift between a wide local terminal and a CI
+    // runner. clap only consults the terminal under its `wrap_help`
+    // feature, which this workspace does not enable — this asserts
+    // that, rather than trusting it.
+    let narrow = {
+        std::env::set_var("COLUMNS", "20");
+        tree()
+    };
+    let wide = {
+        std::env::set_var("COLUMNS", "400");
+        tree()
+    };
+    std::env::remove_var("COLUMNS");
+    let usages = |t: &Tree| {
+        t.commands
+            .iter()
+            .map(|c| c.usage.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(usages(&narrow), usages(&wide));
+    assert!(narrow.commands.iter().all(|c| !c.usage.contains('\n')));
+}

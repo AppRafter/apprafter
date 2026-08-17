@@ -11,10 +11,14 @@ status: stable
 
 One-command provisioning: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap` for a freshly-provisioned cluster. Convenience wrapper — each phase still has its own subcommand for re-runs
 
+```text
+Usage: apprafter bootstrap-all [OPTIONS]
+```
+
 Aliases: `up` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--dry-run` | flag | — | no | Print the phase plan without touching the provider or cluster. Useful for previewing what the wrapper would invoke and which target it resolves against |
-| `--server-type` | `<SERVER_TYPE>` | — | no | Server type (SKU) to provision (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase of bootstrap-all. Resolution: this flag > manifest `nodes[0].kind` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected` |
-| `--target` | `<TARGET>` | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
+| `--server-type` | — | — | no | Server type (SKU) to provision (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase of bootstrap-all. Resolution: this flag > manifest `nodes[0].kind` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected` |
+| `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |

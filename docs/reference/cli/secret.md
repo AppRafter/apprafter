@@ -11,9 +11,22 @@ status: stable
 
 Seal secret material with the in-cluster sealed-secrets controller's public cert. The CLI cannot decrypt what it seals (no cluster private key), so the output is safe to print, commit to Git, or apply. Backs the private-repo credential flow
 
+```text
+Usage: apprafter secret <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter secret remove`](#apprafter-secret-remove) — Delete a `SealedSecret` and the `Secret` the controller unsealed from it, by name — so you don't `kubectl delete sealedsecret,secret` by hand.
+- [`apprafter secret seal`](#apprafter-secret-seal) — Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`.
+
 ## `apprafter secret remove`
 
 Delete a `SealedSecret` and the `Secret` the controller unsealed from it, by name — so you don't `kubectl delete sealedsecret,secret` by hand. Idempotent (absent objects are fine). Prompts unless `--yes`
+
+```text
+Usage: apprafter secret remove [OPTIONS] <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -21,7 +34,7 @@ Delete a `SealedSecret` and the `Secret` the controller unsealed from it, by nam
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace`, `-n` | `<NAMESPACE>` | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system` (matches `secret seal`); pass the app's namespace for app secrets |
+| `--namespace`, `-n` | — | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system` (matches `secret seal`); pass the app's namespace for app secrets |
 | `--yes` | flag | — | no | Skip the confirmation prompt |
 
 ## `apprafter secret seal`
@@ -30,14 +43,18 @@ Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`.
 
 Re-sealing an existing name REPLACES its keys — it does not merge; pass all keys in one command. Use `--yes` to skip the overwrite prompt.
 
+```text
+Usage: apprafter secret seal [OPTIONS] --from-literal <FROM_LITERAL> <NAME>
+```
+
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | SealedSecret `metadata.name` (and the resulting Secret's name). DNS-1123 |
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--from-literal` | `<FROM_LITERAL>` | — | yes | Repeatable `KEY=VALUE`. The value may be empty or contain `=` (only the first `=` splits the pair) |
-| `--namespace`, `-n` | `<NAMESPACE>` | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system`, where platform credential material lives |
-| `--type` | `<SECRET_TYPE>` | `Opaque` | no | Resulting Secret `type` (e.g. `Opaque`, `kubernetes.io/dockerconfigjson`) |
+| `--from-literal` | — | — | yes | Repeatable `KEY=VALUE`. The value may be empty or contain `=` (only the first `=` splits the pair) |
+| `--namespace`, `-n` | — | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system`, where platform credential material lives |
+| `--type` | — | `Opaque` | no | Resulting Secret `type` (e.g. `Opaque`, `kubernetes.io/dockerconfigjson`) |
 | `--stdout` | flag | — | no | Print the SealedSecret YAML to stdout instead of applying it (for `kubectl apply -f -` or committing to a config repo) |
 | `--yes` | flag | — | no | Skip the overwrite confirmation prompt when a secret of the same name already exists. In non-interactive shells this flag is required to replace an existing secret (without it the command errors instead of silently overwriting) |

@@ -11,9 +11,23 @@ status: stable
 
 Inspect and approve / reject MigrationPlans. Application-scope rejects denied by the admission webhook — the CLI surfaces the denial message verbatim
 
+```text
+Usage: apprafter migration <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter migration approve`](#apprafter-migration-approve) — Patch status.phase=approved on a MigrationPlan.
+- [`apprafter migration list`](#apprafter-migration-list) — List MigrationPlans across all namespaces — namespace, name, scope, classification, phase.
+- [`apprafter migration reject`](#apprafter-migration-reject) — Patch status.phase=rejected.
+
 ## `apprafter migration approve`
 
 Patch status.phase=approved on a MigrationPlan. MigrationController transitions through executing → completed. The plan's namespace is resolved automatically (app-scope plans live in the app's namespace); pass `-n` only to disambiguate a name that exists in multiple namespaces
+
+```text
+Usage: apprafter migration approve [OPTIONS] <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -21,17 +35,25 @@ Patch status.phase=approved on a MigrationPlan. MigrationController transitions 
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace`, `-n` | `<NAMESPACE>` | — | no | Namespace of the MigrationPlan. Omit to auto-resolve from `apprafter migration list`; required only when the same name exists in more than one namespace |
+| `--namespace`, `-n` | — | — | no | Namespace of the MigrationPlan. Omit to auto-resolve from `apprafter migration list`; required only when the same name exists in more than one namespace |
 
 ## `apprafter migration list`
 
 List MigrationPlans across all namespaces — namespace, name, scope, classification, phase. Platform-scope plans live in `apprafter-system`; app-scope plans live in the Application's own namespace
+
+```text
+Usage: apprafter migration list
+```
 
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
 
 ## `apprafter migration reject`
 
 Patch status.phase=rejected. The admission webhook denies application-scope rejects — the CLI surfaces the denial message verbatim. Platform-scope rejects succeed and PlatformMigrationStrategy.reject reverts `spec.pin`
+
+```text
+Usage: apprafter migration reject <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |

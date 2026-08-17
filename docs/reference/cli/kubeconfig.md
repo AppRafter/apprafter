@@ -11,9 +11,13 @@ status: stable
 
 Print the cached k3s kubeconfig (decrypted), fetching it over SSH on first use. Intended pipe target: `KUBECONFIG= /dev/stdin kubectl ...`
 
+```text
+Usage: apprafter kubeconfig [OPTIONS]
+```
+
 Aliases: `kc` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--refresh` | flag | — | no | Force a re-fetch over SSH even if a cached kubeconfig is already in state |
-| `--target` | `<TARGET>` | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
+| `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |

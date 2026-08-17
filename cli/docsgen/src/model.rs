@@ -40,6 +40,17 @@ pub struct CommandNode {
     pub aliases: Vec<String>,
     pub about: String,
     pub long_about: Option<String>,
+    /// clap's own usage line, e.g.
+    /// `Usage: apprafter target rename <FROM> <TO>`.
+    ///
+    /// Argument ORDER is meaning for a multi-positional command, and
+    /// the rendered table is sorted by id — so without this the
+    /// reference cannot answer "which one comes first?". Taken from
+    /// clap rather than assembled here so it cannot disagree with
+    /// `--help`. It is width-independent: the `wrap_help` feature is
+    /// off, so clap never consults the terminal (asserted in
+    /// `usage_does_not_depend_on_terminal_width`).
+    pub usage: String,
     /// Hidden from `--help`, directly or via an ancestor; the gate
     /// still resolves these paths. clap sets `hide` on the node it is
     /// declared on, so this is inherited explicitly — otherwise
@@ -166,6 +177,7 @@ fn node_from(cmd: &Command, path: Vec<String>, hidden: bool) -> CommandNode {
         aliases,
         about: cmd.get_about().map(styled_one_line).unwrap_or_default(),
         long_about: cmd.get_long_about().map(|s| reflow(&s.to_string())),
+        usage: cmd.clone().render_usage().to_string(),
         hidden,
         examples: Vec::new(),
         args,
@@ -259,6 +271,17 @@ fn styled_one_line(styled: &clap::builder::StyledStr) -> String {
 ///
 /// clap doc comments are hard-wrapped in the source, so every run of
 /// whitespace — newlines included — becomes a single space.
+///
+/// A wrap that falls INSIDE a token (`workload-` / `specific`) cannot
+/// be repaired here, and the attempt was reverted: `clap_derive`
+/// collapses each paragraph's hard wraps to spaces before clap — let
+/// alone docsgen — ever sees the text, so the line boundary a repair
+/// would key on does not exist by then (`get_about()` for `app
+/// scaffold` returns one line, no `\n`). Wrapping mid-token is
+/// therefore a defect in the doc comment, and
+/// `a_hard_wrap_never_falls_inside_a_token` in `render_test.rs` fails
+/// the build when one appears — over the REAL rendered artefacts,
+/// which is the only place the evidence survives.
 pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }

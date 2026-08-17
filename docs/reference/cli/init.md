@@ -11,8 +11,12 @@ status: stable
 
 Bootstrap a fresh cluster on the given provider/tier
 
+```text
+Usage: apprafter init --provider <PROVIDER> --tier <TIER> --region <REGION>
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--provider` | `<PROVIDER>` | — | yes | Infrastructure provider identifier |
-| `--region` | `<REGION>` | — | yes | Provider-specific region |
-| `--tier` | `<TIER>` | — | yes | Deployment tier |
+| `--provider` | — | — | yes | Infrastructure provider identifier |
+| `--region` | — | — | yes | Provider-specific region |
+| `--tier` | — | — | yes | Deployment tier |

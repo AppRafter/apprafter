@@ -1,6 +1,6 @@
 ---
 title: "apprafter upgrade-tier"
-description: "Upgrade the cluster from one tier to the next"
+description: "Upgrade the cluster from one tier to the next — NOT IMPLEMENTED, it validates `--to` and prints the move it would make."
 audience: reference
 status: stable
 ---
@@ -9,8 +9,12 @@ status: stable
 
 # `apprafter upgrade-tier`
 
-Upgrade the cluster from one tier to the next
+Upgrade the cluster from one tier to the next — NOT IMPLEMENTED, it validates `--to` and prints the move it would make. No infrastructure and no platform config change; the tier is chosen at `apprafter init` time until this lands
+
+```text
+Usage: apprafter upgrade-tier --to <TO>
+```
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--to` | `<TO>` | — | yes | Target tier (solo/team/prod/regulated) |
+| `--to` | — | — | yes | Target tier (solo/team/prod/regulated) |

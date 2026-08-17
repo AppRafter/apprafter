@@ -11,13 +11,41 @@ status: stable
 
 Inspect and control the cluster's PlatformStack — the declarative platform-version resource managed by PlatformController
 
+```text
+Usage: apprafter platform <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter platform autoscale`](#apprafter-platform-autoscale) — Inspect or set the cluster-wide VPA autoscale mode (`PlatformStack.spec.resources.autoscale.mode`).
+- [`apprafter platform egress`](#apprafter-platform-egress) — Inspect / set the cluster-wide egress posture (`PlatformStack.spec.network.egress.profile`).
+- [`apprafter platform env`](#apprafter-platform-env) — Show or set the cluster's soft default environment
+- [`apprafter platform freeze`](#apprafter-platform-freeze) — Freeze a specific component's version through `PlatformStack.spec.overrides.<component>.pin`.
+- [`apprafter platform rescue`](#apprafter-platform-rescue) — Emergency recovery: re-run the loader's cluster-bootstrap path (Cilium → Argo CD → CRDs → operator) against the active target.
+- [`apprafter platform status`](#apprafter-platform-status) — Print PlatformStack/default summary — versions, conditions, recent history.
+- [`apprafter platform unfreeze`](#apprafter-platform-unfreeze) — Remove a previously-set `PlatformStack.spec.overrides.<component>` entry — component falls back to the umbrella chart's curated pin
+- [`apprafter platform upgrade`](#apprafter-platform-upgrade) — Patch PlatformStack.spec.pin.
+
 ## `apprafter platform autoscale`
 
 Inspect or set the cluster-wide VPA autoscale mode (`PlatformStack.spec.resources.autoscale.mode`). Controls whether the Vertical Pod Autoscaler applies recommendations to Application pods automatically
 
+```text
+Usage: apprafter platform autoscale <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter platform autoscale set`](#apprafter-platform-autoscale-set) — Set the cluster-wide VPA autoscale mode
+- [`apprafter platform autoscale show`](#apprafter-platform-autoscale-show) — Show the cluster's current VPA autoscale mode and available presets
+
 ### `apprafter platform autoscale set`
 
 Set the cluster-wide VPA autoscale mode
+
+```text
+Usage: apprafter platform autoscale set <MODE>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -27,13 +55,30 @@ Set the cluster-wide VPA autoscale mode
 
 Show the cluster's current VPA autoscale mode and available presets
 
+```text
+Usage: apprafter platform autoscale show
+```
+
 ## `apprafter platform egress`
 
 Inspect / set the cluster-wide egress posture (`PlatformStack.spec.network.egress.profile`). Gates which baseline egress allows the operator derives per Application (DNS / same-namespace / world / declared needs)
 
+```text
+Usage: apprafter platform egress <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter platform egress set`](#apprafter-platform-egress-set) — Set the cluster-wide egress profile via server-side apply (field manager `apprafter-cli`), so the value survives Argo CD self-heal on a Tier-1 no-infra-repo cluster
+- [`apprafter platform egress show`](#apprafter-platform-egress-show) — Print the current egress profile and what each profile allows.
+
 ### `apprafter platform egress set`
 
 Set the cluster-wide egress profile via server-side apply (field manager `apprafter-cli`), so the value survives Argo CD self-heal on a Tier-1 no-infra-repo cluster
+
+```text
+Usage: apprafter platform egress set <PROFILE>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -43,13 +88,30 @@ Set the cluster-wide egress profile via server-side apply (field manager `appraf
 
 Print the current egress profile and what each profile allows. Reads the singleton PlatformStack; an absent field reports the documented default (`internet`)
 
+```text
+Usage: apprafter platform egress show
+```
+
 ## `apprafter platform env`
 
 Show or set the cluster's soft default environment
 
+```text
+Usage: apprafter platform env <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter platform env set`](#apprafter-platform-env-set) — Set the cluster's default environment (a soft `app add` preselect)
+- [`apprafter platform env show`](#apprafter-platform-env-show) — Show the cluster's default environment
+
 ### `apprafter platform env set`
 
 Set the cluster's default environment (a soft `app add` preselect)
+
+```text
+Usage: apprafter platform env set <ENV>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -59,9 +121,17 @@ Set the cluster's default environment (a soft `app add` preselect)
 
 Show the cluster's default environment
 
+```text
+Usage: apprafter platform env show
+```
+
 ## `apprafter platform freeze`
 
-Freeze a specific component's version through `PlatformStack.spec.overrides.<component>.pin`. Useful for out-of-band security backports or when the curated bundle's pinned version regresses a workload- specific shape. Without `--version` — uses the component's current effective version (read from status), reading the chart's own pin and locking that in
+Freeze a specific component's version through `PlatformStack.spec.overrides.<component>.pin`. Useful for out-of-band security backports or when the curated bundle's pinned version regresses a workload-specific shape. Without `--version` — uses the component's current effective version (read from status), reading the chart's own pin and locking that in
+
+```text
+Usage: apprafter platform freeze <COMPONENT>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -71,6 +141,10 @@ Freeze a specific component's version through `PlatformStack.spec.overrides.<com
 
 Emergency recovery: re-run the loader's cluster-bootstrap path (Cilium → Argo CD → CRDs → operator) against the active target. Useful when Argo CD itself is unable to self-adopt — a stale chart, a corrupted ConfigMap, or a pod-eviction loop that no `apprafter platform upgrade` can resolve. Thin wrapper around `apprafter cluster-bootstrap` with the recovery banner
 
+```text
+Usage: apprafter platform rescue [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
@@ -78,6 +152,10 @@ Emergency recovery: re-run the loader's cluster-bootstrap path (Cilium → Argo 
 ## `apprafter platform status`
 
 Print PlatformStack/default summary — versions, conditions, recent history. By default first asks the operator for an immediate upstream re-check (stamps `apprafter.io/recheck-requested` and waits up to 30s for `status.lastUpstreamCheck` to advance) so the reported `available` version is fresh rather than up to 6h stale
+
+```text
+Usage: apprafter platform status [OPTIONS]
+```
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
@@ -87,6 +165,10 @@ Print PlatformStack/default summary — versions, conditions, recent history. By
 
 Remove a previously-set `PlatformStack.spec.overrides.<component>` entry — component falls back to the umbrella chart's curated pin
 
+```text
+Usage: apprafter platform unfreeze <COMPONENT>
+```
+
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<COMPONENT>` | yes | Component name |
@@ -95,7 +177,11 @@ Remove a previously-set `PlatformStack.spec.overrides.<component>` entry — com
 
 Patch PlatformStack.spec.pin. With `--to <version>` — pin to that version. Without `--to` — clear pin and enable autoUpgrade (channel-following mode). By default forces a fresh upstream re-check first (see `platform status`) so the upgrade decision acts on the latest availableVersion
 
+```text
+Usage: apprafter platform upgrade [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--cached` | flag | — | no | Skip the upstream re-check and act on the last-known status immediately (no wait) |
-| `--to` | `<TO>` | — | no | — |
+| `--to` | `<version>` | — | no | Platform-stack version to pin, e.g. `0.2.33` — written to `PlatformStack.spec.pin`, which the operator then holds the cluster at. Omit to clear the pin and follow the channel (autoUpgrade) |

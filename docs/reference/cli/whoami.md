@@ -11,6 +11,10 @@ status: stable
 
 One-line summary of the operator's current shell context: identity + active target + provider-verified status + key config fields. Pings the provider API by default; pass `--no-ping` to skip the network round-trip
 
+```text
+Usage: apprafter whoami [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping that confirms the active target's token still authenticates. Honours `APPRAFTER_NO_PING=1` for shell-script ergonomics. Env: `APPRAFTER_NO_PING`. |

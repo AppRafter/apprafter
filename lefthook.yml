@@ -26,8 +26,10 @@ pre-commit:
     # sees "the docs drifted" for a file they were never asked to
     # edit — the gate in docs-check then only fires for a hand-edited
     # generated page.
+    # `cli/Cargo.toml` is in the glob because commands.json embeds
+    # `cli_version` — a release bump is a reference change.
     docsgen:
-      glob: "cli/platform-cli/src/**"
+      glob: "{cli/platform-cli/src/**,cli/Cargo.toml}"
       run: just docsgen-generate && git add docs/reference/cli
 
 commit-msg:

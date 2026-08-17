@@ -11,13 +11,37 @@ status: stable
 
 Manage git-repo creds Argo CD uses to pull private user repos. Writes `repo-creds`-typed Secrets in the `argocd` namespace per Argo CD's documented contract
 
+```text
+Usage: apprafter repo <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter repo creds`](#apprafter-repo-creds) — Repository credentials subcommands
+
 ## `apprafter repo creds`
 
 Repository credentials subcommands
 
+```text
+Usage: apprafter repo creds <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter repo creds add`](#apprafter-repo-creds-add) — Register a git-repo credential.
+- [`apprafter repo creds list`](#apprafter-repo-creds-list) — List registered creds
+- [`apprafter repo creds remove`](#apprafter-repo-creds-remove) — Delete a creds entry.
+- [`apprafter repo creds rotate`](#apprafter-repo-creds-rotate) — Rotate a creds entry's token in-place.
+- [`apprafter repo creds show`](#apprafter-repo-creds-show) — Show a creds entry; token is masked
+
 ### `apprafter repo creds add`
 
 Register a git-repo credential. Creates an Argo CD `repo-creds`-typed Secret in the `argocd` namespace. All Applications with a `repoURL` starting with the registered `--url-prefix` inherit these creds
+
+```text
+Usage: apprafter repo creds add [OPTIONS] --url-prefix <URL_PREFIX> <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -25,22 +49,30 @@ Register a git-repo credential. Creates an Argo CD `repo-creds`-typed Secret in 
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--type` | `<AUTH_TYPE>` | `pat` | no | Auth type. Default `pat` — a personal access token (GitHub `github_pat_*` / `ghp_*`, GitLab `glpat-*`, etc). `basic` — username + password pair. SSH-key auth is not supported yet |
+| `--type` | — | `pat` | no | Auth type. Default `pat` — a personal access token (GitHub `github_pat_*` / `ghp_*`, GitLab `glpat-*`, etc). `basic` — username + password pair. SSH-key auth is not supported yet |
 | `--no-interactive` | flag | — | no | Skip the interactive wizard even when stdin + stdout are TTYs. Wizard fires by default and walks through name / URL prefix / type / username / token (token prompt is masked) |
 | `--no-validate` | flag | — | no | Skip provider-specific token format regex check (GitHub: `github_pat_*` / `ghp_*`; GitLab: `glpat-*`). Useful for self-hosted Gitea / Forgejo where token formats are arbitrary |
-| `--token` | `<TOKEN>` | — | no | Token / password. Required. Reads from stdin via `inquire::Password` (masked entry) when omitted and stdin is a TTY; required as flag in non-interactive shells. Env: `APPRAFTER_REPO_TOKEN`. |
-| `--url-prefix` | `<URL_PREFIX>` | — | yes | URL prefix for which these creds apply (e.g. `https://github.com/myorg`). Required |
-| `--username` | `<USERNAME>` | `git` | no | Username. When `--type pat` — usually the token holder's git username (GitHub: any non-empty string works; GitLab requires the username). Defaults to `git` for PAT auth which works across most providers |
+| `--token` | — | — | no | Token / password. Required. Reads from stdin via `inquire::Password` (masked entry) when omitted and stdin is a TTY; required as flag in non-interactive shells. Env: `APPRAFTER_REPO_TOKEN`. |
+| `--url-prefix` | — | — | yes | URL prefix for which these creds apply (e.g. `https://github.com/myorg`). Required |
+| `--username` | — | `git` | no | Username. When `--type pat` — usually the token holder's git username (GitHub: any non-empty string works; GitLab requires the username). Defaults to `git` for PAT auth which works across most providers |
 
 ### `apprafter repo creds list`
 
 List registered creds
+
+```text
+Usage: apprafter repo creds list
+```
 
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
 
 ### `apprafter repo creds remove`
 
 Delete a creds entry. Refuses by default when Applications depending on the `urlPrefix` are registered; `--force` overrides
+
+```text
+Usage: apprafter repo creds remove [OPTIONS] <NAME>
+```
 
 Aliases: `rm` — accepted on the command line, not listed in `--help`.
 
@@ -57,6 +89,10 @@ Aliases: `rm` — accepted on the command line, not listed in `--help`.
 
 Rotate a creds entry's token in-place. Patches the existing Secret rather than recreating it — Argo CD repo-server holds a cached reference to the Secret's resourceVersion and a recreate would cause a brief reconnect window
 
+```text
+Usage: apprafter repo creds rotate [OPTIONS] <NAME>
+```
+
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | Creds name |
@@ -64,11 +100,15 @@ Rotate a creds entry's token in-place. Patches the existing Secret rather than r
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--no-validate` | flag | — | no | Skip token format validation. See `repo creds add --no-validate` |
-| `--token` | `<TOKEN>` | — | no | New token. Reads from stdin (masked) when omitted and stdin is a TTY. Env: `APPRAFTER_REPO_TOKEN`. |
+| `--token` | — | — | no | New token. Reads from stdin (masked) when omitted and stdin is a TTY. Env: `APPRAFTER_REPO_TOKEN`. |
 
 ### `apprafter repo creds show`
 
 Show a creds entry; token is masked
+
+```text
+Usage: apprafter repo creds show <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |

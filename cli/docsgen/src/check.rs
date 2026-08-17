@@ -25,12 +25,14 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-/// The remedy for a drifted or missing artefact — the common case, so
-/// it leads the report. A stray is the exception: regenerating cannot
-/// delete a file `generate` no longer writes, so those lines carry
-/// their own `git rm` remedy rather than silently inheriting one that
-/// would not work.
-const REMEDY: &str = "run `just docsgen-generate` (the clap tree is the source of truth)";
+/// The remedy for a drifted or missing artefact.
+const REGENERATE: &str = "regenerate with `just docsgen-generate` (the clap tree is the source)";
+
+/// The remedy for a stray. Regenerating cannot delete a file
+/// `generate` no longer writes, so a report containing strays must not
+/// lead with [`REGENERATE`] — the header is composed from the classes
+/// actually present.
+const DELETE: &str = "delete the stray file(s) — each line gives the `git rm`";
 
 /// Byte-compare the committed CLI reference against a fresh render of
 /// `root_cmd`. Every artefact is compared before reporting, so one run
@@ -38,6 +40,7 @@ const REMEDY: &str = "run `just docsgen-generate` (the clap tree is the source o
 pub fn check(root_cmd: &Command, repo_root: &Path) -> Result<(), Box<dyn Error>> {
     let rendered = render_all(root_cmd, repo_root);
     let mut problems = Vec::new();
+    let mut strays = 0usize;
 
     // Assertion A — every rendered artefact matches the committed file.
     for artefact in &rendered {
@@ -60,6 +63,7 @@ pub fn check(root_cmd: &Command, repo_root: &Path) -> Result<(), Box<dyn Error>>
     for path in committed_files(&repo_root.join(DIR)) {
         if !expected.contains(path.as_path()) {
             let shown = relative(repo_root, &path);
+            strays += 1;
             problems.push(format!(
                 "[B stray] {shown}: committed but no longer generated — a removed \
                  command leaves a page that still publishes; delete it (`git rm {shown}`)"
@@ -74,9 +78,21 @@ pub fn check(root_cmd: &Command, repo_root: &Path) -> Result<(), Box<dyn Error>>
         );
         return Ok(());
     }
+    // One remedy per class actually present: a strays-only run must
+    // not lead with "regenerate", which cannot delete anything, and a
+    // drift-only run must not send the reader hunting for a file to
+    // remove.
+    let mut remedies = Vec::new();
+    if problems.len() > strays {
+        remedies.push(REGENERATE);
+    }
+    if strays > 0 {
+        remedies.push(DELETE);
+    }
     Err(format!(
-        "docs-check FAILED: {} CLI-reference drift(s) — {REMEDY}:\n  {}",
+        "docs-check FAILED: {} CLI-reference problem(s) in {DIR} — {}:\n  {}",
         problems.len(),
+        remedies.join("; "),
         problems.join("\n  ")
     )
     .into())
@@ -132,15 +148,57 @@ fn first_diff(committed: &str, generated: &str) -> Option<String> {
         match (cl.next(), gl.next()) {
             (Some(a), Some(b)) if a == b => continue,
             (Some(a), Some(b)) => {
-                return Some(format!("line {n}: committed {a:?} != generated {b:?}"))
+                let col = common_prefix_chars(a, b);
+                return Some(format!(
+                    "line {n}, col {}: committed {:?} != generated {:?}",
+                    col + 1,
+                    window(a, col),
+                    window(b, col)
+                ));
             }
-            (Some(a), None) => return Some(format!("line {n}: committed has extra {a:?}")),
-            (None, Some(b)) => return Some(format!("line {n}: generated has extra {b:?}")),
+            (Some(a), None) => {
+                return Some(format!("line {n}: committed has extra {:?}", window(a, 0)))
+            }
+            (None, Some(b)) => {
+                return Some(format!("line {n}: generated has extra {:?}", window(b, 0)))
+            }
             // `lines()` ignores a trailing-newline difference, so equal
             // line sequences with unequal bytes land here.
             (None, None) => return Some("content equal but byte length differs".into()),
         }
     }
+}
+
+/// How many leading CHARS the two lines share. Char-counted, not
+/// byte-counted: the rendered tables are full of em dashes, and a byte
+/// offset would both mis-report the column and risk slicing one in
+/// half.
+fn common_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+/// A `…`-elided window of `line` around char index `col`.
+///
+/// A generated table row runs to ~600 characters, so quoting two of
+/// them in full produced a ~1200-character diagnostic in which the one
+/// changed token was invisible — the reader had to diff the diagnostic.
+/// The asymmetric window keeps enough left context to locate the row
+/// and enough right context to see what changed.
+fn window(line: &str, col: usize) -> String {
+    const BEFORE: usize = 30;
+    const AFTER: usize = 50;
+    let chars: Vec<char> = line.chars().collect();
+    let start = col.saturating_sub(BEFORE);
+    let end = col.saturating_add(AFTER).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(chars[start..end].iter());
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -156,7 +214,42 @@ mod tests {
     fn a_changed_line_is_reported_with_both_sides() {
         let d = first_diff("a\nb\nc\n", "a\nX\nc\n").unwrap();
         assert!(d.contains("line 2"), "{d}");
+        assert!(d.contains("col 1"), "{d}");
         assert!(d.contains("\"b\"") && d.contains("\"X\""), "{d}");
+    }
+
+    #[test]
+    fn a_long_row_is_elided_around_the_change() {
+        // A real table row is ~600 chars; quoting two in full buried
+        // the one changed token in ~1200 characters of identical text.
+        let committed = format!("{} NEEDLE {}", "x".repeat(400), "y".repeat(400));
+        let generated = committed.replace("NEEDLE", "CHANGED");
+        let d = first_diff(&committed, &generated).unwrap();
+        assert!(
+            d.len() < 300,
+            "diagnostic must stay readable: {} chars",
+            d.len()
+        );
+        assert!(d.contains("NEEDLE") && d.contains("CHANGED"), "{d}");
+        // 400 `x`s + the space before the token.
+        assert!(d.contains("col 402"), "the column locates it: {d}");
+        assert!(d.contains('…'), "elision must be visible: {d}");
+    }
+
+    #[test]
+    fn the_window_is_char_safe_around_an_em_dash() {
+        // The tables are full of em dashes; a byte-sliced window would
+        // panic on a char boundary or mis-count the column.
+        let committed = format!("{} — a", "—".repeat(60));
+        let generated = format!("{} — b", "—".repeat(60));
+        let d = first_diff(&committed, &generated).unwrap();
+        assert!(d.contains("col 64"), "{d}");
+    }
+
+    #[test]
+    fn a_short_line_is_not_elided() {
+        let d = first_diff("a\nshort line\n", "a\nshort lime\n").unwrap();
+        assert!(!d.contains('…'), "{d}");
     }
 
     #[test]

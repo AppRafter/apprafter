@@ -31,6 +31,18 @@ exclude_docs: |
   # banner. Excluding it from the SITE does not hide it from
   # literate-nav, which reads the docs tree, not the build output.
   reference/cli/SUMMARY.md
+  # The hand-written CLI reference, superseded by the generated
+  # reference/cli/ tree. With use_directory_urls it and
+  # reference/cli/index.md build to the SAME /reference/cli/ URL;
+  # mkdocs does not warn, and the generated index wins — so the page
+  # cannot be served. `not_in_nav` would only silence the nav warning:
+  # the page would still be BUILT, putting its body and its 26 dead
+  # anchors into search_index.json (site search would offer "Aliases
+  # reference" and land on a page with no such anchor) and listing
+  # /reference/cli/ twice in sitemap.xml. Excluding it removes all
+  # three. The file itself waits for the next change, which deletes it
+  # and retargets its four inbound links.
+  reference/cli.md
 
 # Pages deliberately reachable by URL but absent from nav. Anything
 # NOT on this list that is missing from nav fails the build — an
@@ -39,17 +51,6 @@ not_in_nav: |
   adr/*
   license.md
   contributing/README.md
-  # The hand-written CLI reference, superseded by the generated
-  # reference/cli/ tree. With use_directory_urls both reference/cli.md
-  # and reference/cli/index.md build to /reference/cli/, so the
-  # generated index takes the URL and this page cannot be served —
-  # mkdocs does NOT warn about that collision (verified: only the
-  # generated page reaches site/reference/cli/index.html). Listing a
-  # nav entry for an unreachable page would be the exact kind of lie
-  # this generated reference exists to remove, so the entry is gone
-  # while the file waits for the next change, which deletes it and
-  # retargets its four inbound links.
-  reference/cli.md
 
 # NOTE: mkdocs 1.6.1's validation levels are warn/info/ignore only —
 # there is no literal "error" level. `--strict` (see the Justfile) is
@@ -167,7 +168,7 @@ nav:
   - Reference:
       - Overview: reference/index.md
       # Expanded by literate-nav from reference/cli/SUMMARY.md — see
-      # the not_in_nav note above for why the hand-written
+      # the exclude_docs note above for why the hand-written
       # reference/cli.md is no longer listed here.
       - CLI: reference/cli/
   - Contributing:

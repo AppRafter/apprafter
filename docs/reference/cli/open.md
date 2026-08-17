@@ -11,11 +11,23 @@ status: stable
 
 Open a platform UI (Argo CD today; Backstage / Grafana / Hubble follow in later sub-phases). Spawns a local port-forward, prints credentials, opens the default browser, blocks until Ctrl+C
 
+```text
+Usage: apprafter open <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter open argocd`](#apprafter-open-argocd) — Open the Argo CD web UI on `https://localhost:8080` via `kubectl port-forward`, prefilling the admin username and printing the password
+
 ## `apprafter open argocd`
 
 Open the Argo CD web UI on `https://localhost:8080` via `kubectl port-forward`, prefilling the admin username and printing the password
 
+```text
+Usage: apprafter open argocd [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--all-projects` | flag | — | no | Drop the `?proj=<name>` filter — UI shows all AppProjects |
-| `--project` | `<PROJECT>` | `apps,default` | no | AppProject filter applied to the opened URL — Argo CD's UI honours `?proj=<name>` (comma-separated list) to scope the Applications list. Defaults to `apps,default` so the operator lands on their own apps plus the platform root Application (in `default`), while the platform component apps stay hidden; pass `--project platform` to inspect chart-managed components, or `--all-projects` to drop the filter entirely |
+| `--project` | — | `apps,default` | no | AppProject filter applied to the opened URL — Argo CD's UI honours `?proj=<name>` (comma-separated list) to scope the Applications list. Defaults to `apps,default` so the operator lands on their own apps plus the platform root Application (in `default`), while the platform component apps stay hidden; pass `--project platform` to inspect chart-managed components, or `--all-projects` to drop the filter entirely |

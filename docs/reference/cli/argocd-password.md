@@ -11,6 +11,10 @@ status: stable
 
 Print the Argo CD admin password (decrypted), fetching it from the cluster on first use. The plaintext is cached age-encrypted in state for subsequent O(1) reads
 
+```text
+Usage: apprafter argocd-password [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--refresh` | flag | — | no | Force a re-fetch of the secret even if a cached password is already in state |

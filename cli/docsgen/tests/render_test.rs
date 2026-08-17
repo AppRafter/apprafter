@@ -91,3 +91,53 @@ fn commands_json_is_pretty_and_ends_with_a_newline() {
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
     assert!(parsed["commands"].as_array().unwrap().len() > 50);
 }
+
+/// A doc comment wrapped mid-token publishes a broken word.
+///
+/// `clap_derive` collapses each paragraph's hard wraps to spaces
+/// before clap sees the text, so `/// … a workload-` + `/// specific
+/// shape` reaches docsgen as `workload- specific` with no line
+/// boundary left to repair. The only durable defence is to catch it in
+/// the OUTPUT and make the author rewrap the source — a renderer-side
+/// heuristic on the joined string could not tell this from a
+/// legitimate suspended hyphen ("read- and write-paths"), and would
+/// corrupt it silently.
+///
+/// The pattern: a `-`, `=` or `/` welded to the end of a word, then a
+/// single space, then a word character. A delimiter with space on both
+/// sides (`bun.lock / Cargo.toml`) is a separator and is fine.
+#[test]
+fn a_hard_wrap_never_falls_inside_a_token() {
+    let mut broken = Vec::new();
+    for artefact in render_all(
+        &apprafter::docs_api::Cli::command(),
+        std::path::Path::new("/repo"),
+    ) {
+        let chars: Vec<char> = artefact.text.chars().collect();
+        for i in 1..chars.len().saturating_sub(2) {
+            // Welded to a WORD, not merely to a non-space: the
+            // generated banner (`<!-- generated`) and a table's `| ---
+            // |` separator both put a delimiter after punctuation.
+            let welded = chars[i - 1].is_alphanumeric();
+            let delimiter = matches!(chars[i], '-' | '=' | '/');
+            let split = chars[i + 1] == ' ' && chars[i + 2].is_alphanumeric();
+            if welded && delimiter && split {
+                let from = i.saturating_sub(25);
+                let to = (i + 25).min(chars.len());
+                broken.push(format!(
+                    "{}: …{}…",
+                    artefact.path.file_name().unwrap().to_string_lossy(),
+                    chars[from..to].iter().collect::<String>()
+                ));
+            }
+        }
+    }
+    broken.sort();
+    broken.dedup();
+    assert!(
+        broken.is_empty(),
+        "a doc comment in cli.rs wraps inside a token — rewrap the line so the \
+         token stays whole:\n  {}",
+        broken.join("\n  ")
+    );
+}

@@ -11,11 +11,31 @@ status: stable
 
 Manage user Applications — Argo CD Applications scoped to the `apps` AppProject, labeled `apprafter.io/managed-by: apprafter`
 
+```text
+Usage: apprafter app <COMMAND>
+```
+
 Aliases: `a` — accepted on the command line, not listed in `--help`.
+
+Subcommands:
+
+- [`apprafter app add`](#apprafter-app-add) — Register a user Application.
+- [`apprafter app list`](#apprafter-app-list) — List Applications scoped to the `apps` AppProject (or `--project <name>`).
+- [`apprafter app logs`](#apprafter-app-logs) — Stream logs from the app's workload pods.
+- [`apprafter app open`](#apprafter-app-open) — Port-forward the app's primary Service to localhost and open it in a browser.
+- [`apprafter app remove`](#apprafter-app-remove) — Delete an Application and cascade-remove the Argo CD CR (which Argo CD then tears down child resources for).
+- [`apprafter app rollback`](#apprafter-app-rollback) — Roll back to a previous revision.
+- [`apprafter app scaffold`](#apprafter-app-scaffold) — Generate a starter `apprafter/Application.cue` based on the cwd's runtime markers (bun.lock / Cargo.toml / pyproject.toml / etc.).
+- [`apprafter app status`](#apprafter-app-status) — Show detail view for one Application: sync state, health, source repo + revision, destinations, recent sync history (last 3 revisions).
+- [`apprafter app validate`](#apprafter-app-validate) — Validate an AppRafter `Application.cue` manifest LOCALLY, reproducing the cluster's render-time `cue` pipeline.
 
 ## `apprafter app add`
 
 Register a user Application. Without `<git-url>`, detects the git origin remote of the current working directory. Writes an Argo CD Application CR in namespace `argocd` joined to AppProject `apps` (or `--project`), labeled `apprafter.io/managed-by: apprafter` so `app list` can surface only apprafter-managed Applications
+
+```text
+Usage: apprafter app add [OPTIONS] [GIT_URL]
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -23,21 +43,25 @@ Register a user Application. Without `<git-url>`, detects the git origin remote 
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--branch` | `<BRANCH>` | — | no | Git branch / tag / commit SHA passed verbatim to `spec.source.targetRevision`. Defaults to the cwd's current branch when detected; `main` for explicit `<git-url>` without cwd context |
+| `--branch` | — | — | no | Git branch / tag / commit SHA passed verbatim to `spec.source.targetRevision`. Defaults to the cwd's current branch when detected; `main` for explicit `<git-url>` without cwd context |
 | `--coverage-gate` | `present` \| `confirmed` | `present` | no | Credential coverage gate. `present` (default) only warns, post-registration, when no `SourceCredential` declares a covering prefix. `confirmed` pre-flight-blocks a private (`https`) repo unless a `SourceCredential` whose status reports `GitValid=True` covers it — fail-fast for clusters whose operator has egress to validate. Restricted-egress clusters keep `present` (validity stays `Unverified`) |
-| `--env` | `<ENV>` | — | no | Environment to deploy. Selects which `spec.environments.<env>` override unifies onto base for THIS deployment; the Argo Application is named `<name>-<env>`. Must be one of the manifest's declared environments. Omit for a base-only deployment |
-| `--name` | `<NAME>` | — | no | Application name. Defaults to the repo's basename (last path segment after stripping `.git`) |
-| `--namespace` | `<NAMESPACE>` | `apprafter` | no | Destination namespace — Argo CD's `spec.destination.namespace`. With `CreateNamespace= true` in syncOptions, Argo CD creates this namespace on first sync if it doesn't exist. Default `apprafter` matches the namespace where AppRafter operator watches for Application CRs |
+| `--env` | — | — | no | Environment to deploy. Selects which `spec.environments.<env>` override unifies onto base for THIS deployment; the Argo Application is named `<name>-<env>`. Must be one of the manifest's declared environments. Omit for a base-only deployment |
+| `--name` | — | — | no | Application name. Defaults to the repo's basename (last path segment after stripping `.git`) |
+| `--namespace` | — | `apprafter` | no | Destination namespace — Argo CD's `spec.destination.namespace`. With `CreateNamespace=true` in syncOptions, Argo CD creates this namespace on first sync if it doesn't exist. Default `apprafter` matches the namespace where AppRafter operator watches for Application CRs |
 | `--no-interactive` | flag | — | no | Skip the interactive wizard even when stdin + stdout are TTYs. The wizard fires by default on TTY shells and asks for any field not supplied via flag, pre-filling defaults from the cwd's git remote + the current branch where available |
 | `--no-ping` | flag | — | no | Skip the `git ls-remote` reachability check. Useful for CI where network isolation blocks external git hosts, or when the repo is freshly created and does not yet have an `HEAD` ref |
-| `--path` | `<PATH>` | `/` | no | Path under the repo to render. Defaults to `/` — matches the cue-cmp plugin's `discover.find.glob: **/apprafter*.cue` rule (sidecar walks the entire repo for matching files when path is `/`) |
-| `--project` | `<PROJECT>` | `apps` | no | AppProject the Application joins. Default `apps` matches the AppProject for user apps. Pass `--project platform` for platform-internal apps, `platform-providers` for ServiceProvider operators |
-| `--remote` | `<REMOTE>` | `origin` | no | Git remote name when detecting origin from cwd. Defaults to `origin` |
+| `--path` | — | `/` | no | Path under the repo to render. Defaults to `/` — matches the cue-cmp plugin's `discover.find.glob: **/apprafter*.cue` rule (sidecar walks the entire repo for matching files when path is `/`) |
+| `--project` | — | `apps` | no | AppProject the Application joins. Default `apps` matches the AppProject for user apps. Pass `--project platform` for platform-internal apps, `platform-providers` for ServiceProvider operators |
+| `--remote` | — | `origin` | no | Git remote name when detecting origin from cwd. Defaults to `origin` |
 | `--scaffold` | flag | — | no | Auto-scaffold `<cwd>/apprafter/Application.cue` when missing, before registering. In a TTY the step-0 wizard fires regardless of this flag; the flag only matters in `--no-interactive` mode where it gates silent scaffold (without the flag, the command refuses with a pointer to `apprafter app scaffold`). Non-interactive convenience for CI scripts that want one-shot scaffold + register |
 
 ## `apprafter app list`
 
 List Applications scoped to the `apps` AppProject (or `--project <name>`). Filters to Applications labeled `apprafter.io/managed-by: apprafter` by default; `--all-managed` drops that filter (shows ALL Applications in the project regardless of management label — useful for debugging stray applications that bypassed `app add`)
+
+```text
+Usage: apprafter app list [OPTIONS]
+```
 
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
 
@@ -45,11 +69,15 @@ Aliases: `ls` — accepted on the command line, not listed in `--help`.
 | --- | --- | --- | --- | --- |
 | `--all-managed` | flag | — | no | Drop the `apprafter.io/managed-by: apprafter` label filter — list every Application in the resolved project scope, not just apprafter-managed ones |
 | `--all-projects` | flag | — | no | Drop the `--project` filter; list Applications in EVERY AppProject (subject to the managed-by label filter unless `--all-managed` is also set) |
-| `--project` | `<PROJECT>` | `apps` | no | AppProject filter. Defaults to `apps`. Use `--all-projects` to drop the filter |
+| `--project` | — | `apps` | no | AppProject filter. Defaults to `apps`. Use `--all-projects` to drop the filter |
 
 ## `apprafter app logs`
 
 Stream logs from the app's workload pods. Wraps `kubectl logs` with a label selector derived from the Argo CD `Application` (the workload namespace is a known property of the CR). Default: aggregate across pods. `--pod <name>` narrows to a single pod; `--container <c>` picks the container in multi-container pods; `--follow` enables tail; `--tail <N>` caps the initial backlog
+
+```text
+Usage: apprafter app logs [OPTIONS] <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -57,15 +85,19 @@ Stream logs from the app's workload pods. Wraps `kubectl logs` with a label sele
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--container` | `<CONTAINER>` | — | no | Pick a specific container in multi-container pods. Without the flag `kubectl` fails on a pod with two containers (requires an explicit choice); the CLI surface proxies that error verbatim |
-| `--env` | `<ENV>` | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
+| `--container` | — | — | no | Pick a specific container in multi-container pods. Without the flag `kubectl` fails on a pod with two containers (requires an explicit choice); the CLI surface proxies that error verbatim |
+| `--env` | — | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
 | `--follow`, `-f` | flag | — | no | Stream new log lines as they appear (`kubectl logs -f`) |
-| `--pod` | `<POD>` | — | no | Narrow to a single pod instead of all matching the app's destination namespace |
-| `--tail` | `<TAIL>` | `-1` | no | Show only the last `N` lines per pod / container (`kubectl logs --tail`). `-1` means no limit (`kubectl`'s default) |
+| `--pod` | — | — | no | Narrow to a single pod instead of all matching the app's destination namespace |
+| `--tail` | — | `-1` | no | Show only the last `N` lines per pod / container (`kubectl logs --tail`). `-1` means no limit (`kubectl`'s default) |
 
 ## `apprafter app open`
 
 Port-forward the app's primary Service to localhost and open it in a browser. Wraps `kubectl port-forward` with AppRafter-aware resolution: Application name → Argo CD CR → `spec.destination.namespace` → child Service via the `app.kubernetes.io/instance=<name>` label → container port (Service.spec.ports[0] OR `--container-port` override). Picks a free local port starting at 8080 with auto-increment to 8090 if busy. Blocks on Ctrl+C — the port-forward dies with the command
+
+```text
+Usage: apprafter app open [OPTIONS] <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -73,14 +105,18 @@ Port-forward the app's primary Service to localhost and open it in a browser. Wr
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--container-port` | `<CONTAINER_PORT>` | — | no | Container port to forward to. Defaults to the Service's first declared `spec.ports[]` entry. Required when the Service declares no ports or when the operator wants a secondary port |
-| `--env` | `<ENV>` | — | no | Target a specific environment's deployment (`<name>-<env>`). Optional — a single-env app resolves without it; needed only to disambiguate when the app is deployed to several environments |
+| `--container-port` | — | — | no | Container port to forward to. Defaults to the Service's first declared `spec.ports[]` entry. Required when the Service declares no ports or when the operator wants a secondary port |
+| `--env` | — | — | no | Target a specific environment's deployment (`<name>-<env>`). Optional — a single-env app resolves without it; needed only to disambiguate when the app is deployed to several environments |
 | `--no-browser` | flag | — | no | Skip opening the browser; just print the URL and block on the port-forward. Useful for CI / scripts that want to forward in the background |
-| `--port` | `<PORT>` | — | no | Local port to bind. Defaults to 8080; if busy, the command probes 8081…8090 before giving up |
+| `--port` | — | — | no | Local port to bind. Defaults to 8080; if busy, the command probes 8081…8090 before giving up |
 
 ## `apprafter app remove`
 
 Delete an Application and cascade-remove the Argo CD CR (which Argo CD then tears down child resources for). Interactive: prompts for confirmation; non-interactive requires `--yes` to skip the prompt. `--env <env>` removes ONE per-environment deployment (`<name>-<env>`); without `--env`, ALL environment deployments grouped under `apprafter.io/application=<name>` are removed (a single confirmation covers the batch)
+
+```text
+Usage: apprafter app remove [OPTIONS] <NAME>
+```
 
 Aliases: `rm` — accepted on the command line, not listed in `--help`.
 
@@ -90,7 +126,7 @@ Aliases: `rm` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--env` | `<ENV>` | — | no | Environment to remove. Selects ONE per-environment deployment — the Argo Application named `<name>-<env>` registered by `app add --env <env>`. Omit to remove ALL environment deployments of `<name>` (grouped by the `apprafter.io/application` label); a base-only app with no env label resolves to the single `<name>` Application |
+| `--env` | — | — | no | Environment to remove. Selects ONE per-environment deployment — the Argo Application named `<name>-<env>` registered by `app add --env <env>`. Omit to remove ALL environment deployments of `<name>` (grouped by the `apprafter.io/application` label); a base-only app with no env label resolves to the single `<name>` Application |
 | `--keep-data` | flag | — | no | Preserve PVCs / `ResourceClaim`s when tearing down. Implemented as a post-delete cleanup that strips the destructive child-prune from the cascading delete. Useful when the operator wants to re-attach the data after a teardown |
 | `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells (no TTY) — there's no silent destruction path |
 
@@ -98,32 +134,44 @@ Aliases: `rm` — accepted on the command line, not listed in `--help`.
 
 Roll back to a previous revision. Reads `status.history` from the Argo CD `Application`, patches `spec.source.targetRevision` to the target; Argo CD's auto-sync picks up the change on the next reconcile cycle. Without `--to` — rollback to the previous entry in history (offset -1)
 
+```text
+Usage: apprafter app rollback [OPTIONS] <NAME>
+```
+
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | Application name |
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--env` | `<ENV>` | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
-| `--to` | `<TO>` | — | no | Explicit revision (commit SHA / tag / branch). Without the flag: previous entry in `status.history` |
+| `--env` | — | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
+| `--to` | — | — | no | Explicit revision (commit SHA / tag / branch). Without the flag: previous entry in `status.history` |
 | `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
 
 ## `apprafter app scaffold`
 
-Generate a starter `apprafter/Application.cue` based on the cwd's runtime markers (bun.lock / Cargo.toml / pyproject.toml / etc.). Writes to `<--path>/apprafter/ Application.cue` and appends `.apprafter/local/` to the repo's `.gitignore` when present. Refuses to overwrite an existing manifest without `--force`
+Generate a starter `apprafter/Application.cue` based on the cwd's runtime markers (bun.lock / Cargo.toml / pyproject.toml / etc.). Writes to `<--path>/apprafter/Application.cue` and appends `.apprafter/local/` to the repo's `.gitignore` when present. Refuses to overwrite an existing manifest without `--force`
+
+```text
+Usage: apprafter app scaffold [OPTIONS]
+```
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--force` | flag | — | no | Overwrite an existing `apprafter/Application.cue` |
-| `--name` | `<NAME>` | — | no | Application name (DNS-1123 lowercase). Default = cwd basename |
-| `--namespace` | `<NAMESPACE>` | — | no | Destination namespace for `metadata.namespace`. Default `apprafter` matches `app add --namespace` |
-| `--needs` | `<NEEDS>` | — | no | Declare a workload dependency to scaffold (repeatable). One of `pg` (needs.pg), `redis` (needs.redis), `disk` (needs.disk). Emits a `needs:` block in the generated Application.cue |
-| `--path` | `<PATH>` | `.` | no | Working directory the scaffold writes into. Default = current cwd |
-| `--runtime` | `<RUNTIME>` | — | no | Force-pick a runtime instead of detecting from cwd. Slugs: bun, node-pnpm, node-yarn, node-npm, python-poetry, python-uv, python-pipenv, python- pip, rust, go, docker, blank |
+| `--name` | — | — | no | Application name (DNS-1123 lowercase). Default = cwd basename |
+| `--namespace` | — | — | no | Destination namespace for `metadata.namespace`. Default `apprafter` matches `app add --namespace` |
+| `--needs` | — | — | no | Declare a workload dependency to scaffold (repeatable). One of `pg` (needs.pg), `redis` (needs.redis), `disk` (needs.disk). Emits a `needs:` block in the generated Application.cue |
+| `--path` | — | `.` | no | Working directory the scaffold writes into. Default = current cwd |
+| `--runtime` | — | — | no | Force-pick a runtime instead of detecting from cwd. Slugs: bun, node-pnpm, node-yarn, node-npm, python-poetry, python-uv, python-pipenv, python-pip, rust, go, docker, blank |
 
 ## `apprafter app status`
 
 Show detail view for one Application: sync state, health, source repo + revision, destinations, recent sync history (last 3 revisions). With `--resources`: additionally lists Argo CD's tracked resources + workload pod states (READY, STATUS, RESTARTS, AGE) — surfaces image-pull / crash-loop issues that Argo CD's app-level Healthy aggregation hides when the operator marks the CR `phase=Ready` before pods reach Running
+
+```text
+Usage: apprafter app status [OPTIONS] <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -131,11 +179,15 @@ Show detail view for one Application: sync state, health, source repo + revision
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--resources`, `-r` | flag | — | no | Show child workload state — Argo CD's `status.resources[]` plus pods in the destination namespace matching `app.kubernetes.io/name=<inner- app-name>` (the AppRafter operator's label) |
+| `--resources`, `-r` | flag | — | no | Show child workload state — Argo CD's `status.resources[]` plus pods in the destination namespace matching `app.kubernetes.io/name=<inner-app-name>` (the AppRafter operator's label) |
 
 ## `apprafter app validate`
 
 Validate an AppRafter `Application.cue` manifest LOCALLY, reproducing the cluster's render-time `cue` pipeline. Lays the CLI's bundled schema + a generated `claim` binding into a temp workspace and runs `cue vet`, so bare `claim.<type>.<field>` selectors and braceless `secret: "name/key"` refs resolve EXACTLY as the cue-cmp resolves them at sync time — a plain `cue vet` on the repo can't (the `claim` binding is never committed). Requires `cue` on PATH. Without `[manifest]`: defaults to `<cwd>/apprafter/Application.cue`, then a single `*.cue` in the cwd; otherwise pass the path explicitly
+
+```text
+Usage: apprafter app validate [MANIFEST]
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |

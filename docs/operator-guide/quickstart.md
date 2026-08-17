@@ -249,7 +249,7 @@ byte-identical to the pre-colour baseline.
   repository for GitOps deployment of your applications.
 - [`platform-management.md`](./platform-management.md) — platform
   version lifecycle, release channels, upgrade and freeze.
-- [`docs/reference/cli.md`](../reference/cli.md) — full subcommand
+- [`docs/reference/cli/`](../reference/cli/index.md) — full subcommand
   reference with every flag + alias.
 - [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md) —
   scaffold and deploy a first Application.

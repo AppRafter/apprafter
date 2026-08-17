@@ -2,7 +2,7 @@
 
 Field-by-field reference for everything the platform exposes:
 
-- **`apprafter` CLI** — [`cli.md`](cli.md) covers every
+- **`apprafter` CLI** — [`cli/`](cli/index.md) covers every
   subcommand, every flag, every alias, plus the global env var
   surface. Authoritative source remains
   `cli/platform-cli/src/cli.rs`; this page is the
@@ -20,7 +20,7 @@ Field-by-field reference for everything the platform exposes:
   `InfrastructureProviderInterface`. Stub today; lands in
   Phase 7 (plugin sidecar lifecycle).
 
-For the immediate operator-facing surface, [`cli.md`](cli.md) is
+For the immediate operator-facing surface, [`cli/`](cli/index.md) is
 canonical. Cross-reference with `apprafter <subcmd> --help` for
 shell-formatted output, and
 [`operator-guide/troubleshooting.md`](../operator-guide/troubleshooting.md)

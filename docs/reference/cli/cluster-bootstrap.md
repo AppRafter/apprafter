@@ -11,4 +11,8 @@ status: stable
 
 Install Cilium (CNI + kube-proxy replacement) and apply the Gateway API standard-install CRDs into the cluster pointed to by the cached kubeconfig
 
+```text
+Usage: apprafter cluster-bootstrap
+```
+
 Aliases: `cb` — accepted on the command line, not listed in `--help`.

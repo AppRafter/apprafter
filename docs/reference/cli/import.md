@@ -11,8 +11,12 @@ status: stable
 
 Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. Read-only — never deletes or creates
 
+```text
+Usage: apprafter import [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--dry-run` | flag | — | no | Print what would be imported without writing state |
 | `--force` | flag | — | no | Overwrite an already-populated `state.hetzner_cloud` |
-| `--target` | `<TARGET>` | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
+| `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |

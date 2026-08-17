@@ -1,6 +1,6 @@
 ---
 title: "apprafter status"
-description: "Print the current cluster status"
+description: "Print the current cluster status — SKELETON, it reads local state and never contacts the cluster."
 audience: reference
 status: stable
 ---
@@ -9,4 +9,8 @@ status: stable
 
 # `apprafter status`
 
-Print the current cluster status
+Print the current cluster status — SKELETON, it reads local state and never contacts the cluster. What it prints: the active target, cluster name, tier and provider recorded in `.apprafter/state.json`. For live state use `apprafter platform status` (platform components and versions) or `apprafter app status <name>` (a workload)
+
+```text
+Usage: apprafter status
+```

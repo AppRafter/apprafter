@@ -11,7 +11,11 @@ status: stable
 
 Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). Prints PASS / WARN / FAIL per check; exits 1 if any FAIL fires so CI gates can wire `apprafter doctor` in directly
 
+```text
+Usage: apprafter doctor [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping. Honours `APPRAFTER_NO_PING=1` for shell-script ergonomics. Env: `APPRAFTER_NO_PING`. |
-| `--target` | `<TARGET>` | — | no | Inspect a target other than the active one. Defaults to the active target |
+| `--target` | — | — | no | Inspect a target other than the active one. Defaults to the active target |

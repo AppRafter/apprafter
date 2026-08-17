@@ -11,11 +11,24 @@ status: stable
 
 Node-level operations on the active target's cluster node. `prep` retrofits the kubelet node reservations + k3s OOM-protection AND provisions host swap (NoSwap for pods) over one k3s restart; `status` reports the node's swap posture
 
+```text
+Usage: apprafter node <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter node prep`](#apprafter-node-prep) — Prepare the active target's cluster node: retrofit the kubelet node reservations + k3s OOM-protection AND provision host swap
+- [`apprafter node status`](#apprafter-node-status) — Report the active target's node swap posture: `swapBehavior` / `failSwapOn` / swap capacity / k8s version (kube-API), plus live `swapon`, `vm.swappiness`, k3s `GOMEMLIMIT`, and the provision breadcrumb (SSH).
+
 ## `apprafter node prep`
 
 Prepare the active target's cluster node: retrofit the kubelet node reservations + k3s OOM-protection AND provision host swap.
 
 Writes `/etc/rancher/k3s/config.yaml` reservations + `k3s.service.d/oom.conf` and — when the node is eligible (k8s ≥1.34 for the NoSwap GA gate + cgroup v2) — layers a host swapfile with `swapBehavior: NoSwap` so a control-plane spike degrades to swap instead of an OOM-kill while pods never swap. Applied atomically over one k3s restart (the API is briefly unavailable, ~30s), with a whole-step rollback on a `/readyz` timeout. Idempotent — a re-run refreshes the drop-in and is otherwise a near no-op.
+
+```text
+Usage: apprafter node prep [OPTIONS]
+```
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
@@ -24,3 +37,7 @@ Writes `/etc/rancher/k3s/config.yaml` reservations + `k3s.service.d/oom.conf` an
 ## `apprafter node status`
 
 Report the active target's node swap posture: `swapBehavior` / `failSwapOn` / swap capacity / k8s version (kube-API), plus live `swapon`, `vm.swappiness`, k3s `GOMEMLIMIT`, and the provision breadcrumb (SSH). Each field is labelled with its source (`[api]` / `[ssh]`); if SSH is unavailable the SSH-derived fields read `unknown` but the kube-API fields still render
+
+```text
+Usage: apprafter node status
+```

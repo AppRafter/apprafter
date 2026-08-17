@@ -11,7 +11,11 @@ status: stable
 
 Destroy infrastructure managed by this state
 
+```text
+Usage: apprafter destroy [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--target` | `<TARGET>` | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
+| `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
 | `--yes` | flag | — | no | Confirm without prompting |

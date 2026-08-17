@@ -11,31 +11,58 @@ status: stable
 
 Encrypted backup (Kind 2, restic local-pull): native extraction + serialized config/app CRs + decrypted user secrets, all wrapped into a restic repository. Use `apprafter restore` to replay
 
+```text
+Usage: apprafter backup <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter backup check`](#apprafter-backup-check) — Verify the structural integrity of an S3-backed restic repository (`restic check`).
+- [`apprafter backup create`](#apprafter-backup-create) — Create a full encrypted backup of the cluster (default scope: whole cluster).
+- [`apprafter backup disable`](#apprafter-backup-disable) — Disable scheduled backup (sets spec.backup.enabled=false; keeps config)
+- [`apprafter backup enable`](#apprafter-backup-enable) — Enable scheduled off-site S3 backup by patching PlatformStack.spec.backup
+- [`apprafter backup list`](#apprafter-backup-list) — List snapshots stored in a backup repo
+- [`apprafter backup prune`](#apprafter-backup-prune) — Remove old snapshots from an S3-backed restic repository according to the configured retention policy.
+- [`apprafter backup status`](#apprafter-backup-status) — Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
+- [`apprafter backup unlock`](#apprafter-backup-unlock) — Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched).
+
 ## `apprafter backup check`
 
 Verify the structural integrity of an S3-backed restic repository (`restic check`). Run OUTSIDE the cluster with the operator's full S3 credentials
 
+```text
+Usage: apprafter backup check [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--credential-file` | `<CREDENTIAL_FILE>` | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars |
+| `--credential-file` | — | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars |
 | `--read-data` | flag | — | no | Deep verify: download and re-hash every pack (`--read-data`) |
-| `--repo` | `<REPO>` | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
+| `--repo` | — | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
 
 ## `apprafter backup create`
 
 Create a full encrypted backup of the cluster (default scope: whole cluster). Wraps native data + CRs + secrets into a restic repository
 
+```text
+Usage: apprafter backup create [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace` | `<NAMESPACE>` | — | no | Narrow scope to these namespaces (repeatable). Ignored unless `--select` is also passed |
-| `--passphrase` | `<PASSPHRASE>` | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
-| `--repo` | `<REPO>` | — | no | Path to the restic repository. Defaults to `<config>/backups/<target>` |
+| `--namespace` | — | — | no | Narrow scope to these namespaces (repeatable). Ignored unless `--select` is also passed |
+| `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
+| `--repo` | — | — | no | Path to the restic repository. Defaults to `<config>/backups/<target>` |
 | `--select` | flag | — | no | When set, only the namespaces given via `--namespace` are backed up |
-| `--staging-mode` | `<STAGING_MODE>` | — | no | Staging strategy: `monolithic` (default — stage every namespace's native data at once, one snapshot) or `sequential` (stage + snapshot one namespace at a time, bounding peak staging disk on large clusters) |
+| `--staging-mode` | — | — | no | Staging strategy: `monolithic` (default — stage every namespace's native data at once, one snapshot) or `sequential` (stage + snapshot one namespace at a time, bounding peak staging disk on large clusters) |
 
 ## `apprafter backup disable`
 
 Disable scheduled backup (sets spec.backup.enabled=false; keeps config)
+
+```text
+Usage: apprafter backup disable
+```
 
 ## `apprafter backup enable`
 
@@ -49,55 +76,75 @@ Credential input — exactly ONE of the following is required:
 
 Accepted credential keys: S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD (optional: S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION are accepted as aliases.
 
+```text
+Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--bucket` | `<BUCKET>` | — | yes | Bucket name (with `--endpoint`), or a full restic repo URL (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a bare name, pass `--endpoint` and the CLI builds the `s3:https://<endpoint>/<bucket>` URL for you |
-| `--check-cron` | `<CHECK_CRON>` | — | no | — |
-| `--credential` | `<CREDENTIAL>` | — | no | Name of the credential Secret in apprafter-system. With --credential-file: the name to create (default: apprafter-backup-s3). Without --credential-file: an existing Secret to read creds from (required) |
-| `--credential-file` | `<CREDENTIAL_FILE>` | — | no | Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster |
-| `--cron` | `<CRON>` | — | no | — |
-| `--endpoint` | `<ENDPOINT>` | — | no | S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>` repo URL for you. Omit when passing a full restic URL in `--bucket` |
-| `--enforce` | `<ENFORCE>` | — | no | `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune) |
-| `--failure-webhook` | `<FAILURE_WEBHOOK>` | — | no | — |
+| `--bucket` | — | — | yes | Bucket name (with `--endpoint`), or a full restic repo URL (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a bare name, pass `--endpoint` and the CLI builds the `s3:https://<endpoint>/<bucket>` URL for you |
+| `--check-cron` | `<cron>` | — | no | Five-field cron schedule for the periodic `restic check` Job, which verifies repository integrity. Default `0 6 * * 0` — Sundays at 06:00, staggered clear of the nightly backup. The check is metadata-only; it does not re-download the data |
+| `--credential` | — | — | no | Name of the credential Secret in apprafter-system. With --credential-file: the name to create (default: apprafter-backup-s3). Without --credential-file: an existing Secret to read creds from (required) |
+| `--credential-file` | — | — | no | Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster |
+| `--cron` | `<cron>` | — | no | Five-field cron schedule for the full backup Job. Default `0 3 * * *` — nightly at 03:00 |
+| `--endpoint` | — | — | no | S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>` repo URL for you. Omit when passing a full restic URL in `--bucket` |
+| `--enforce` | — | — | no | `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune) |
+| `--failure-webhook` | `<url>` | — | no | URL the runner POSTs a JSON failure report to when a backup or check Job fails. Egress to this host is opened automatically in the platform network policy. No default — unset means failures surface only in `backup status` and the Job logs |
 | `--i-have-saved-credentials` | flag | — | no | Confirm you have saved the restic passphrase + S3 credentials OUTSIDE the cluster |
-| `--keep-daily` | `<KEEP_DAILY>` | — | no | — |
-| `--keep-monthly` | `<KEEP_MONTHLY>` | — | no | — |
-| `--keep-weekly` | `<KEEP_WEEKLY>` | — | no | — |
-| `--prefix` | `<PREFIX>` | — | no | Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket` |
-| `--staging-mode` | `<STAGING_MODE>` | — | no | `monolithic` (default) or `sequential` |
+| `--keep-daily` | `<count>` | — | no | How many daily snapshots `restic forget` keeps. Default 7. Retention is only APPLIED when `--enforce cluster` is set or you run `apprafter backup prune`; under the default `--enforce operator` the scheduled Job never forgets |
+| `--keep-monthly` | `<count>` | — | no | How many monthly snapshots `restic forget` keeps. Default 6. Applied under the same rule as `--keep-daily` |
+| `--keep-weekly` | `<count>` | — | no | How many weekly snapshots `restic forget` keeps. Default 4. Applied under the same rule as `--keep-daily` |
+| `--prefix` | — | — | no | Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket` |
+| `--staging-mode` | — | — | no | `monolithic` (default) or `sequential` |
 
 ## `apprafter backup list`
 
 List snapshots stored in a backup repo
 
+```text
+Usage: apprafter backup list [OPTIONS]
+```
+
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--passphrase` | `<PASSPHRASE>` | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
-| `--repo` | `<REPO>` | — | no | Path to the restic repository. Defaults to `<config>/backups/<target>` |
+| `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
+| `--repo` | — | — | no | Path to the restic repository. Defaults to `<config>/backups/<target>` |
 
 ## `apprafter backup prune`
 
 Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials
 
+```text
+Usage: apprafter backup prune [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--credential-file` | `<CREDENTIAL_FILE>` | — | no | Path to a dotenv credential file containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`). Falls back to the matching environment variables |
-| `--keep-daily` | `<KEEP_DAILY>` | — | no | Keep-daily retention override (else spec.backup.retention, else 7) |
-| `--keep-monthly` | `<KEEP_MONTHLY>` | — | no | Keep-monthly retention override (else spec.backup.retention, else 6) |
-| `--keep-weekly` | `<KEEP_WEEKLY>` | — | no | Keep-weekly retention override (else spec.backup.retention, else 4) |
-| `--repo` | `<REPO>` | — | no | S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`). Defaults to `PlatformStack.spec.backup.bucket` |
+| `--credential-file` | — | — | no | Path to a dotenv credential file containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`). Falls back to the matching environment variables |
+| `--keep-daily` | — | — | no | Keep-daily retention override (else spec.backup.retention, else 7) |
+| `--keep-monthly` | — | — | no | Keep-monthly retention override (else spec.backup.retention, else 6) |
+| `--keep-weekly` | — | — | no | Keep-weekly retention override (else spec.backup.retention, else 4) |
+| `--repo` | — | — | no | S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`). Defaults to `PlatformStack.spec.backup.bucket` |
 
 ## `apprafter backup status`
 
 Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
 
+```text
+Usage: apprafter backup status
+```
+
 ## `apprafter backup unlock`
 
 Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched). Run OUTSIDE the cluster with the operator's full S3 credentials
 
+```text
+Usage: apprafter backup unlock [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--credential-file` | `<CREDENTIAL_FILE>` | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars |
-| `--repo` | `<REPO>` | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
+| `--credential-file` | — | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars |
+| `--repo` | — | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |

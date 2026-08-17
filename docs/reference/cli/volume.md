@@ -11,9 +11,24 @@ status: stable
 
 Manage SharedVolume CRs — persistent volumes shared across multiple Applications. Volumes are namespaced; `rm` is refused while any Application references the volume
 
+```text
+Usage: apprafter volume <COMMAND>
+```
+
+Subcommands:
+
+- [`apprafter volume create`](#apprafter-volume-create) — Create a SharedVolume CR in the cluster
+- [`apprafter volume list`](#apprafter-volume-list) — List SharedVolumes with refCount and used/free capacity
+- [`apprafter volume rm`](#apprafter-volume-rm) — Delete a SharedVolume.
+- [`apprafter volume status`](#apprafter-volume-status) — Show detail for one SharedVolume (pvcRef, refCount, capacity)
+
 ## `apprafter volume create`
 
 Create a SharedVolume CR in the cluster
+
+```text
+Usage: apprafter volume create [OPTIONS] --size <SIZE> <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -21,22 +36,30 @@ Create a SharedVolume CR in the cluster
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace`, `-n` | `<NAMESPACE>` | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system` |
-| `--size` | `<SIZE>` | — | yes | Requested storage size (e.g. `5Gi`, `100Mi`) |
+| `--namespace`, `-n` | — | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system` |
+| `--size` | — | — | yes | Requested storage size (e.g. `5Gi`, `100Mi`) |
 
 ## `apprafter volume list`
 
 List SharedVolumes with refCount and used/free capacity
 
+```text
+Usage: apprafter volume list [OPTIONS]
+```
+
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace`, `-n` | `<NAMESPACE>` | — | no | Namespace to list. Omit for cluster-wide listing |
+| `--namespace`, `-n` | — | — | no | Namespace to list. Omit for cluster-wide listing |
 
 ## `apprafter volume rm`
 
 Delete a SharedVolume. Refused while still referenced by apps
+
+```text
+Usage: apprafter volume rm [OPTIONS] <NAME>
+```
 
 | Argument | Required | Description |
 | --- | --- | --- |
@@ -44,17 +67,21 @@ Delete a SharedVolume. Refused while still referenced by apps
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace`, `-n` | `<NAMESPACE>` | `apprafter-system` | no | Namespace. Defaults to `apprafter-system` |
+| `--namespace`, `-n` | — | `apprafter-system` | no | Namespace. Defaults to `apprafter-system` |
 | `--yes` | flag | — | no | Skip the confirmation prompt |
 
 ## `apprafter volume status`
 
 Show detail for one SharedVolume (pvcRef, refCount, capacity)
 
+```text
+Usage: apprafter volume status [OPTIONS] <NAME>
+```
+
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | SharedVolume `metadata.name` |
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace`, `-n` | `<NAMESPACE>` | `apprafter-system` | no | Namespace. Defaults to `apprafter-system` |
+| `--namespace`, `-n` | — | `apprafter-system` | no | Namespace. Defaults to `apprafter-system` |

@@ -200,7 +200,7 @@ tightened.
 
 - [`troubleshooting.md`](./troubleshooting.md) — diagnostic-code
   catalogue, including every credential-chain failure surface.
-- [`docs/reference/cli.md`](../reference/cli.md) — full
+- [`docs/reference/cli/`](../reference/cli/index.md) — full
   `apprafter target …` subcommand reference.
 - [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
   — design rationale.

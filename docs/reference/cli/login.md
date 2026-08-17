@@ -1,6 +1,6 @@
 ---
 title: "apprafter login"
-description: "Obtain an OIDC-backed kubeconfig"
+description: "Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints what it would do and writes nothing."
 audience: reference
 status: stable
 ---
@@ -9,4 +9,8 @@ status: stable
 
 # `apprafter login`
 
-Obtain an OIDC-backed kubeconfig
+Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints what it would do and writes nothing. The device flow is not wired up in this release; to get a working kubeconfig today run `apprafter kubeconfig`, which fetches the cluster's admin credentials into the age-encrypted local cache
+
+```text
+Usage: apprafter login
+```

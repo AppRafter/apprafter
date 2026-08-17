@@ -11,8 +11,12 @@ status: stable
 
 Native data export (Kind 1) — pull pg dumps, volume tars, redis snapshots to a plain local folder + `manifest.json`. No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience
 
+```text
+Usage: apprafter export [OPTIONS]
+```
+
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--namespace` | `<NAMESPACE>` | — | no | Narrow scope to these namespaces (repeatable). Ignored unless `--select` is also passed |
-| `--out` | `<OUT>` | — | no | Output directory. Defaults to `./apprafter-export` |
+| `--namespace` | — | — | no | Narrow scope to these namespaces (repeatable). Ignored unless `--select` is also passed |
+| `--out` | — | — | no | Output directory. Defaults to `./apprafter-export` |
 | `--select` | flag | — | no | When set, only the namespaces given via `--namespace` are exported. Without `--select` the scope is the whole cluster |

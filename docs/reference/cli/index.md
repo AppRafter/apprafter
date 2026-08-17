@@ -17,6 +17,14 @@ information shell-formatted.
 Aliases are accepted on the command line but are not listed in `--help`; they
 are documented here because the guides use them.
 
+In the flag tables, a Value of `flag` means the flag takes no value; an em dash
+means it takes one whose name adds nothing beyond the flag itself.
+
+The same tree is published as [`commands.json`](commands.json) — every command
+path, flag, default and value enum as data, including the hidden ones, with the
+CLI version it was generated from. Use it to check a command line against a
+specific release rather than scraping these pages.
+
 | Command | Aliases | Summary |
 | --- | --- | --- |
 | [`apprafter app`](app.md) | `a` | Manage user Applications — Argo CD Applications scoped to the `apps` AppProject, labeled `apprafter.io/managed-by: apprafter` |
@@ -31,7 +39,7 @@ are documented here because the guides use them.
 | [`apprafter import`](import.md) | — | Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. |
 | [`apprafter init`](init.md) | — | Bootstrap a fresh cluster on the given provider/tier |
 | [`apprafter kubeconfig`](kubeconfig.md) | `kc` | Print the cached k3s kubeconfig (decrypted), fetching it over SSH on first use. |
-| [`apprafter login`](login.md) | — | Obtain an OIDC-backed kubeconfig |
+| [`apprafter login`](login.md) | — | Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints what it would do and writes nothing. |
 | [`apprafter migration`](migration.md) | — | Inspect and approve / reject MigrationPlans. |
 | [`apprafter node`](node.md) | — | Node-level operations on the active target's cluster node. |
 | [`apprafter open`](open.md) | — | Open a platform UI (Argo CD today; Backstage / Grafana / Hubble follow in later sub-phases). |
@@ -40,8 +48,8 @@ are documented here because the guides use them.
 | [`apprafter repo`](repo.md) | — | Manage git-repo creds Argo CD uses to pull private user repos. |
 | [`apprafter restore`](restore.md) | — | Restore a backup into a target cluster: replays the CRs, secrets and native data (pg/redis/volumes) captured by `apprafter backup`. |
 | [`apprafter secret`](secret.md) | — | Seal secret material with the in-cluster sealed-secrets controller's public cert. |
-| [`apprafter status`](status.md) | — | Print the current cluster status |
+| [`apprafter status`](status.md) | — | Print the current cluster status — SKELETON, it reads local state and never contacts the cluster. |
 | [`apprafter target`](target.md) | `t` | Manage deployment targets — persistent named bundles of `(provider, region, credentials, defaults)`. |
-| [`apprafter upgrade-tier`](upgrade-tier.md) | — | Upgrade the cluster from one tier to the next |
+| [`apprafter upgrade-tier`](upgrade-tier.md) | — | Upgrade the cluster from one tier to the next — NOT IMPLEMENTED, it validates `--to` and prints the move it would make. |
 | [`apprafter volume`](volume.md) | — | Manage SharedVolume CRs — persistent volumes shared across multiple Applications. |
 | [`apprafter whoami`](whoami.md) | — | One-line summary of the operator's current shell context: identity + active target + provider-verified status + key config fields. |

@@ -16,6 +16,11 @@ on:
       # render in --help and therefore in the generated reference.
       - 'cli/platform-cli/src/**'
       - 'cli/docsgen/**'
+      # commands.json embeds `cli_version`, so a release bump is a
+      # reference change: without this a bumped-but-not-regenerated
+      # tree lands on master and fails the NEXT contributor's
+      # unrelated docs PR.
+      - 'cli/Cargo.toml'
       - 'scripts/docs-check.sh'
       - 'flake.nix'
       - 'flake.lock'
@@ -30,6 +35,11 @@ on:
       # render in --help and therefore in the generated reference.
       - 'cli/platform-cli/src/**'
       - 'cli/docsgen/**'
+      # commands.json embeds `cli_version`, so a release bump is a
+      # reference change: without this a bumped-but-not-regenerated
+      # tree lands on master and fails the NEXT contributor's
+      # unrelated docs PR.
+      - 'cli/Cargo.toml'
       - 'scripts/docs-check.sh'
       - 'flake.nix'
       - 'flake.lock'
@@ -47,5 +57,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Nix (flake toolchain — mkdocs + cargo)
         uses: DeterminateSystems/nix-installer-action@main
+      # `docsgen check` links the whole CLI (459 crates) to read its
+      # clap tree, so an uncached docs-only PR spent minutes compiling
+      # dependencies that had not changed. Keyed on the lockfile (it
+      # decides the dependency graph) plus flake.lock: the compiler
+      # doing the work comes from the flake, not from the runner's
+      # preinstalled toolchain that rust-cache reads for its own key.
+      - name: Cache cargo build (docsgen links the CLI)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+          key: docsgen-${{ hashFiles('cli/Cargo.lock', 'flake.lock') }}
       - name: docs-check
         run: bash scripts/docs-check.sh

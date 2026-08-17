@@ -294,6 +294,16 @@ fn render_index(tree: &Tree) -> String {
         "Aliases are accepted on the command line but are not listed in `--help`; they\n\
          are documented here because the guides use them.\n\n",
     );
+    s.push_str(
+        "In the flag tables, a Value of `flag` means the flag takes no value; an em dash\n\
+         means it takes one whose name adds nothing beyond the flag itself.\n\n",
+    );
+    s.push_str(
+        "The same tree is published as [`commands.json`](commands.json) — every command\n\
+         path, flag, default and value enum as data, including the hidden ones, with the\n\
+         CLI version it was generated from. Use it to check a command line against a\n\
+         specific release rather than scraping these pages.\n\n",
+    );
     s.push_str("| Command | Aliases | Summary |\n| --- | --- | --- |\n");
     for name in top_level(tree) {
         let node = node_at(tree, std::slice::from_ref(&name));
@@ -319,7 +329,7 @@ fn render_command_page(tree: &Tree, top: &str) -> String {
     // The H1 already carries this command's own anchor, so its aliases
     // and tables follow it directly instead of under a repeated
     // heading; descendants start at `##`.
-    s.push_str(&render_body(root));
+    s.push_str(&render_body(root, &children_of(tree, root)));
 
     for node in tree
         .commands
@@ -332,21 +342,68 @@ fn render_command_page(tree: &Tree, top: &str) -> String {
             node.path.join(" ")
         ));
         s.push_str(&format!("{}\n\n", prose(node)));
-        s.push_str(&render_body(node));
+        s.push_str(&render_body(node, &children_of(tree, node)));
     }
     s
 }
 
-/// Aliases, argument tables and examples — everything below a
-/// command's heading and description.
-fn render_body(node: &CommandNode) -> String {
+/// A node's direct visible subcommands, in `tree.commands` order
+/// (sorted by path, so alphabetical).
+fn children_of<'a>(tree: &'a Tree, node: &CommandNode) -> Vec<&'a CommandNode> {
+    tree.commands
+        .iter()
+        .filter(|c| {
+            !c.hidden && c.path.len() == node.path.len() + 1 && c.path.starts_with(&node.path)
+        })
+        .collect()
+}
+
+/// The in-page anchor of a command's heading.
+///
+/// Headings are rendered as `` ### `apprafter target cert import` ``,
+/// and Python-Markdown's toc slugifier drops the backticks and joins
+/// the words with hyphens. Getting this wrong is not silent: the
+/// strict build validates anchors (`validation.links.anchors`), so a
+/// mismatch fails `just docs-build`.
+fn anchor(path: &[String]) -> String {
+    format!("apprafter-{}", path.join("-"))
+}
+
+/// Usage, aliases, argument tables and examples — everything below a
+/// command's heading and description. `children` are the node's direct
+/// visible subcommands, used only for a group node that has nothing
+/// else to show.
+fn render_body(node: &CommandNode, children: &[&CommandNode]) -> String {
     let mut s = String::new();
+
+    // The usage line leads, as it does in `--help`. It is the only
+    // place positional ORDER survives: the argument table is sorted by
+    // id, so `target rename <FROM> <TO>` and `<TO> <FROM>` render the
+    // same table.
+    s.push_str(&format!("```text\n{}\n```\n\n", node.usage));
 
     if !node.aliases.is_empty() {
         s.push_str(&format!(
             "Aliases: {} — accepted on the command line, not listed in `--help`.\n\n",
             code_list(&node.aliases)
         ));
+    }
+
+    // A pure group (`target cert`, `repo creds`) has no args of its
+    // own, so the tables below render nothing and the heading is
+    // followed by one sentence and silence — 30 such headings. List
+    // what it routes to instead.
+    if node.args.is_empty() && node.positionals.is_empty() && !children.is_empty() {
+        s.push_str("Subcommands:\n\n");
+        for child in children {
+            s.push_str(&format!(
+                "- [`apprafter {}`](#{}) — {}\n",
+                child.path.join(" "),
+                anchor(&child.path),
+                cell(&summary(&child.about))
+            ));
+        }
+        s.push('\n');
     }
 
     if !node.positionals.is_empty() {
@@ -416,10 +473,17 @@ fn flag_row(a: &ArgSpec) -> String {
     let value = if !a.possible_values.is_empty() {
         code_list_sep(&a.possible_values, " \\| ")
     } else if a.takes_value {
-        format!(
-            "`<{}>`",
-            a.value_name.clone().unwrap_or_else(|| "VALUE".into())
-        )
+        // A value name clap synthesised from the field name says
+        // nothing the flag has not already said (`--keep-daily
+        // <KEEP_DAILY>` — 99 of 150 rows), so it gets the same em dash
+        // as any other empty cell. A hand-written `value_name` in
+        // `cli.rs` (`<cron>`, `<count>`, `<url>`) does carry
+        // information and is printed. Teaching the renderer to invent
+        // one would put the CLI's vocabulary in the wrong file.
+        match a.value_name.as_deref() {
+            Some(name) if !is_synthesised(name, a) => format!("`<{name}>`"),
+            _ => "—".to_string(),
+        }
     } else {
         "flag".to_string()
     };
@@ -449,6 +513,19 @@ fn flag_row(a: &ArgSpec) -> String {
         yes_no(a.required),
         or_dash(description)
     )
+}
+
+/// Whether a value name is clap's own derivation from the argument
+/// rather than something an author chose.
+///
+/// `clap_derive` names the value after the field — `keep_daily` →
+/// `KEEP_DAILY` — which is also the long flag uppercased with dashes
+/// turned to underscores. Both spellings are checked because an
+/// explicit `long = "…"` can differ from the field name.
+fn is_synthesised(value_name: &str, a: &ArgSpec) -> bool {
+    let from_id = a.id.to_uppercase();
+    let from_long = a.long.as_ref().map(|l| l.to_uppercase().replace('-', "_"));
+    value_name == from_id || from_long.as_deref() == Some(value_name)
 }
 
 /// An em dash for an empty cell. Seven flags carry no doc comment in
@@ -514,6 +591,7 @@ mod tests {
             aliases: vec![],
             about: String::new(),
             long_about: None,
+            usage: "Usage: apprafter backup enable".into(),
             hidden: false,
             examples: vec![],
             args,
@@ -607,7 +685,7 @@ mod tests {
         let mut state = positional("STATE");
         state.possible_values = vec!["enable".into(), "disable".into()];
         state.help = "enable | disable".into();
-        let body = render_body(&node(vec![], vec![state]));
+        let body = render_body(&node(vec![], vec![state]), &[]);
         assert!(
             body.contains("| `<STATE>` | yes | enable \\| disable. One of `enable`, `disable`. |"),
             "{body}"
@@ -616,10 +694,37 @@ mod tests {
 
     #[test]
     fn an_undocumented_flag_gets_a_dash_not_a_blank_cell() {
-        let body = render_body(&node(vec![arg("cron")], vec![]));
+        let body = render_body(&node(vec![arg("cron")], vec![]), &[]);
+        assert!(body.contains("| `--cron` | — | — | no | — |"), "{body}");
+    }
+
+    #[test]
+    fn a_clap_derived_value_name_is_dropped_but_a_chosen_one_is_kept() {
+        // `--keep-daily <KEEP_DAILY>` repeats the flag; `<count>` does
+        // not. Both spellings of the derivation are recognised, since
+        // an explicit `long =` can differ from the field name.
+        let mut synthesised = arg("keep-daily");
+        synthesised.id = "keep_daily".into();
+        synthesised.value_name = Some("KEEP_DAILY".into());
+        let body = render_body(&node(vec![synthesised], vec![]), &[]);
+        assert!(body.contains("| `--keep-daily` | — |"), "{body}");
+
+        let mut chosen = arg("keep-daily");
+        chosen.id = "keep_daily".into();
+        chosen.value_name = Some("count".into());
+        let body = render_body(&node(vec![chosen], vec![]), &[]);
+        assert!(body.contains("| `--keep-daily` | `<count>` |"), "{body}");
+    }
+
+    #[test]
+    fn a_switch_is_distinguishable_from_a_flag_with_an_unnamed_value() {
+        // Both cells are terse; they must not be the SAME terse.
+        let mut switch = arg("yes");
+        switch.takes_value = false;
+        switch.value_name = None;
         assert!(
-            body.contains("| `--cron` | `<CRON>` | — | no | — |"),
-            "{body}"
+            render_body(&node(vec![switch], vec![]), &[]).contains("| `--yes` | flag |"),
+            "a switch must say so"
         );
     }
 
@@ -631,12 +736,18 @@ mod tests {
         // there either.
         let mut credential = arg("credential");
         credential.default = Some(String::new());
-        let body = render_body(&node(vec![credential], vec![]));
+        let body = render_body(&node(vec![credential], vec![]), &[]);
         assert!(
-            body.contains("| `--credential` | `<CREDENTIAL>` | — | no | — |"),
+            body.contains("| `--credential` | — | — | no | — |"),
             "{body}"
         );
-        assert!(!body.contains("``"), "stray backticks: {body}");
+        // Scoped to the row: the body now opens with a ```text usage
+        // fence, whose backtick run is not a stray empty code span.
+        let row = body
+            .lines()
+            .find(|l| l.contains("`--credential`"))
+            .expect("flag row");
+        assert!(!row.contains("``"), "stray backticks: {row}");
     }
 
     #[test]
@@ -644,7 +755,7 @@ mod tests {
         let mut token = arg("token");
         token.help = "Hetzner Cloud API token".into();
         token.env = Some("HCLOUD_TOKEN".into());
-        let body = render_body(&node(vec![token], vec![]));
+        let body = render_body(&node(vec![token], vec![]), &[]);
         assert!(
             body.contains("Hetzner Cloud API token. Env: `HCLOUD_TOKEN`."),
             "{body}"
@@ -658,11 +769,46 @@ mod tests {
         let mut n = node(vec![], vec![]);
         n.examples = vec!["apprafter backup enable --bucket b".into()];
         assert!(
-            render_body(&n)
+            render_body(&n, &[])
                 .ends_with("Examples:\n\n```sh\napprafter backup enable --bucket b\n```\n\n"),
             "{}",
-            render_body(&n)
+            render_body(&n, &[])
         );
+    }
+
+    #[test]
+    fn the_usage_line_leads_the_body() {
+        let body = render_body(&node(vec![], vec![]), &[]);
+        assert!(
+            body.starts_with("```text\nUsage: apprafter backup enable\n```\n\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_group_with_no_args_lists_its_children_instead_of_nothing() {
+        let mut child = node(vec![], vec![]);
+        child.path = vec!["target".into(), "cert".into(), "import".into()];
+        child.about = "Import a TLS certificate. And more prose.".into();
+        let group = node(vec![], vec![]);
+        let body = render_body(&group, &[&child]);
+        assert!(
+            body.contains(
+                "- [`apprafter target cert import`](#apprafter-target-cert-import) — \
+                 Import a TLS certificate."
+            ),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_command_with_its_own_args_does_not_list_children() {
+        // `app` has both flags and subcommands; the flag table is the
+        // useful thing there, and the subcommands follow as sections.
+        let mut child = node(vec![], vec![]);
+        child.path = vec!["app".into(), "add".into()];
+        let body = render_body(&node(vec![arg("cron")], vec![]), &[&child]);
+        assert!(!body.contains("Subcommands:"), "{body}");
     }
 
     #[test]

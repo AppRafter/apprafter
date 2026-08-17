@@ -103,11 +103,28 @@ pub enum Commands {
         #[arg(long = "server-type")]
         server_type: Option<String>,
     },
-    /// Print the current cluster status.
+    // The caveat sits in the FIRST sentence of each of these three,
+    // not below it: the generated reference uses the lead sentence as
+    // the overview-table summary and the page description, so a
+    // caveat in sentence two is invisible exactly where a reader
+    // decides whether the command does what they need.
+    /// Print the current cluster status — SKELETON, it reads local
+    /// state and never contacts the cluster. What it prints: the
+    /// active target, cluster name, tier and provider recorded in
+    /// `.apprafter/state.json`. For live state use `apprafter platform
+    /// status` (platform components and versions) or `apprafter app
+    /// status <name>` (a workload).
     Status,
-    /// Obtain an OIDC-backed kubeconfig.
+    /// Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints
+    /// what it would do and writes nothing. The device flow is not
+    /// wired up in this release; to get a working kubeconfig today run
+    /// `apprafter kubeconfig`, which fetches the cluster's admin
+    /// credentials into the age-encrypted local cache.
     Login,
-    /// Upgrade the cluster from one tier to the next.
+    /// Upgrade the cluster from one tier to the next — NOT
+    /// IMPLEMENTED, it validates `--to` and prints the move it would
+    /// make. No infrastructure and no platform config change; the tier
+    /// is chosen at `apprafter init` time until this lands.
     #[command(name = "upgrade-tier")]
     UpgradeTier {
         /// Target tier (solo/team/prod/regulated).
@@ -495,7 +512,11 @@ pub enum PlatformCommand {
     /// fresh upstream re-check first (see `platform status`) so the
     /// upgrade decision acts on the latest availableVersion.
     Upgrade {
-        #[arg(long = "to")]
+        /// Platform-stack version to pin, e.g. `0.2.33` — written to
+        /// `PlatformStack.spec.pin`, which the operator then holds the
+        /// cluster at. Omit to clear the pin and follow the channel
+        /// (autoUpgrade).
+        #[arg(long = "to", value_name = "version")]
         to: Option<String>,
         /// Skip the upstream re-check and act on the last-known
         /// status immediately (no wait).
@@ -504,9 +525,9 @@ pub enum PlatformCommand {
     },
     /// Freeze a specific component's version through
     /// `PlatformStack.spec.overrides.<component>.pin`. Useful
-    /// for out-of-band security backports or when the
-    /// curated bundle's pinned version regresses a workload-
-    /// specific shape. Without `--version` — uses the component's
+    /// for out-of-band security backports or when the curated
+    /// bundle's pinned version regresses a workload-specific
+    /// shape. Without `--version` — uses the component's
     /// current effective version (read from status), reading the
     /// chart's own pin and locking that in.
     Freeze {
@@ -675,8 +696,8 @@ pub enum AppCommand {
         #[arg(long, default_value = "apps")]
         project: String,
         /// Destination namespace — Argo CD's
-        /// `spec.destination.namespace`. With `CreateNamespace=
-        /// true` in syncOptions, Argo CD creates this namespace
+        /// `spec.destination.namespace`. With
+        /// `CreateNamespace=true` in syncOptions, Argo CD creates this namespace
         /// on first sync if it doesn't exist. Default `apprafter`
         /// matches the namespace where AppRafter operator watches
         /// for Application CRs.
@@ -772,8 +793,9 @@ pub enum AppCommand {
         name: String,
         /// Show child workload state — Argo CD's
         /// `status.resources[]` plus pods in the destination
-        /// namespace matching `app.kubernetes.io/name=<inner-
-        /// app-name>` (the AppRafter operator's label).
+        /// namespace matching
+        /// `app.kubernetes.io/name=<inner-app-name>` (the AppRafter
+        /// operator's label).
         #[arg(long, short = 'r', default_value_t = false)]
         resources: bool,
     },
@@ -840,15 +862,15 @@ pub enum AppCommand {
     },
     /// Generate a starter `apprafter/Application.cue` based
     /// on the cwd's runtime markers (bun.lock / Cargo.toml /
-    /// pyproject.toml / etc.). Writes to `<--path>/apprafter/
-    /// Application.cue` and appends `.apprafter/local/` to the
+    /// pyproject.toml / etc.). Writes to
+    /// `<--path>/apprafter/Application.cue` and appends `.apprafter/local/` to the
     /// repo's `.gitignore` when present. Refuses to overwrite
     /// an existing manifest without `--force`.
     Scaffold {
         /// Force-pick a runtime instead of detecting from
         /// cwd. Slugs: bun, node-pnpm, node-yarn, node-npm,
-        /// python-poetry, python-uv, python-pipenv, python-
-        /// pip, rust, go, docker, blank.
+        /// python-poetry, python-uv, python-pipenv,
+        /// python-pip, rust, go, docker, blank.
         #[arg(long)]
         runtime: Option<String>,
         /// Application name (DNS-1123 lowercase). Default =
@@ -1452,13 +1474,23 @@ pub enum BackupAction {
         /// When given, the creds are probed against the repo and then auto-sealed into the cluster.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
-        #[arg(long)]
+        /// Five-field cron schedule for the full backup Job.
+        /// Default `0 3 * * *` — nightly at 03:00.
+        #[arg(long, value_name = "cron")]
         cron: Option<String>,
-        #[arg(long)]
+        /// How many daily snapshots `restic forget` keeps. Default 7.
+        /// Retention is only APPLIED when `--enforce cluster` is set
+        /// or you run `apprafter backup prune`; under the default
+        /// `--enforce operator` the scheduled Job never forgets.
+        #[arg(long, value_name = "count")]
         keep_daily: Option<u32>,
-        #[arg(long)]
+        /// How many weekly snapshots `restic forget` keeps. Default 4.
+        /// Applied under the same rule as `--keep-daily`.
+        #[arg(long, value_name = "count")]
         keep_weekly: Option<u32>,
-        #[arg(long)]
+        /// How many monthly snapshots `restic forget` keeps. Default
+        /// 6. Applied under the same rule as `--keep-daily`.
+        #[arg(long, value_name = "count")]
         keep_monthly: Option<u32>,
         /// `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune).
         #[arg(long)]
@@ -1466,9 +1498,19 @@ pub enum BackupAction {
         /// `monolithic` (default) or `sequential`.
         #[arg(long)]
         staging_mode: Option<String>,
-        #[arg(long)]
+        /// Five-field cron schedule for the periodic `restic check`
+        /// Job, which verifies repository integrity. Default
+        /// `0 6 * * 0` — Sundays at 06:00, staggered clear of the
+        /// nightly backup. The check is metadata-only; it does not
+        /// re-download the data.
+        #[arg(long, value_name = "cron")]
         check_cron: Option<String>,
-        #[arg(long)]
+        /// URL the runner POSTs a JSON failure report to when a
+        /// backup or check Job fails. Egress to this host is opened
+        /// automatically in the platform network policy. No default —
+        /// unset means failures surface only in `backup status` and
+        /// the Job logs.
+        #[arg(long, value_name = "url")]
         failure_webhook: Option<String>,
         /// Confirm you have saved the restic passphrase + S3 credentials OUTSIDE the cluster.
         #[arg(long)]
