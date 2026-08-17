@@ -128,19 +128,29 @@ fn yaml_scalar(s: &str) -> String {
 /// page.
 const ABBREVIATIONS: [&str; 6] = ["e.g.", "i.e.", "etc.", "vs.", "cf.", "approx."];
 
-/// The lead sentence of an `about`, for the frontmatter description
-/// and the index table.
+/// A summary is grown one sentence at a time until it reaches this
+/// many bytes. A lead sentence is almost always the right summary, so
+/// this is set low enough to catch only genuine stubs: `doctor` opens
+/// with "Self-diagnostic." (16 bytes), which tells an overview-table
+/// reader nothing, while the shortest useful lead sentence in the
+/// current surface is 43.
+const MIN_SUMMARY: usize = 32;
+
+/// The lead sentence (or two) of an `about`, for the frontmatter
+/// description and the index table.
 ///
 /// Several `about`s run to 400 characters (`restore`), which makes an
 /// unreadable overview row and a meta description search engines
-/// truncate anyway. Nothing is lost: the command's own page prints the
-/// full text below its H1.
+/// truncate anyway. Nothing is lost either way: the command's own page
+/// prints the full text below its H1.
 fn summary(about: &str) -> String {
     let one = one_line(about);
     let mut from = 0;
     while let Some(rel) = one[from..].find(". ") {
         let end = from + rel + 1;
-        if !ABBREVIATIONS.iter().any(|a| one[..end].ends_with(a)) {
+        // Sentence boundaries only, and only once there is enough of a
+        // sentence to be worth reading.
+        if end >= MIN_SUMMARY && !ABBREVIATIONS.iter().any(|a| one[..end].ends_with(a)) {
             return one[..end].to_string();
         }
         from = end;
@@ -437,11 +447,26 @@ mod tests {
 
     #[test]
     fn a_summary_stops_at_the_first_real_sentence() {
-        assert_eq!(summary("Seal it. Then apply it."), "Seal it.");
+        let about = "Seal secret material with the sealed-secrets public cert. \
+                     The CLI cannot decrypt it. And more.";
+        assert_eq!(
+            summary(about),
+            "Seal secret material with the sealed-secrets public cert."
+        );
         // No sentence break at all — the whole thing is the summary.
         assert_eq!(
             summary("Apply the desired state"),
             "Apply the desired state"
+        );
+    }
+
+    #[test]
+    fn a_stub_lead_sentence_borrows_the_next_one() {
+        // `doctor` opens "Self-diagnostic." — a row reading just that
+        // is worse than no summary at all.
+        assert_eq!(
+            summary("Self-diagnostic. Walks the target's stored config and credentials. Exits 1."),
+            "Self-diagnostic. Walks the target's stored config and credentials."
         );
     }
 
