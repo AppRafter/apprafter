@@ -66,12 +66,70 @@ fn hidden_commands_are_present_but_flagged() {
 }
 
 #[test]
-fn visible_aliases_are_captured() {
+fn hidden_is_inherited_by_descendants() {
     let t = tree();
+    // clap sets `hide` only on the node it is declared on, so without
+    // explicit inheritance `auth login` reads as public and a renderer
+    // filtering on `hidden` would emit pages for a subtree that
+    // `apprafter --help` does not show.
     assert!(
-        node(&t, &["target"]).aliases.contains(&"t".to_string()),
-        "docs use `apprafter t use <name>`; without aliases the gate would fail correct docs"
+        node(&t, &["auth", "login"]).hidden,
+        "auth login sits under a hide=true parent"
     );
+}
+
+#[test]
+fn switches_report_no_default_even_though_clap_synthesises_one() {
+    let t = tree();
+    let seal = node(&t, &["secret", "seal"]);
+    let flag = |long: &str| {
+        seal.args
+            .iter()
+            .find(|a| a.long.as_deref() == Some(long))
+            .unwrap_or_else(|| panic!("secret seal has --{long}"))
+    };
+
+    // `Arg::_build` injects a synthetic "false" default for every
+    // ArgAction::SetTrue. Reporting it would print `default: false`
+    // on a switch where `--help` prints nothing — drift baked into a
+    // byte-compared artefact.
+    let stdout = flag("stdout");
+    assert!(!stdout.takes_value);
+    assert_eq!(stdout.default, None, "a bare switch has no default");
+
+    // ...while a genuine value-taking option keeps its default.
+    assert_eq!(
+        flag("namespace").default.as_deref(),
+        Some("apprafter-system")
+    );
+}
+
+#[test]
+fn value_enum_positionals_keep_their_accepted_values() {
+    let t = tree();
+    let state = node(&t, &["target", "firewall", "cloudflare-origin"])
+        .positionals
+        .iter()
+        .find(|p| p.id == "state")
+        .expect("positional state");
+    assert_eq!(
+        state.possible_values,
+        vec!["enable".to_string(), "disable".to_string()],
+        "renaming a ValueEnum variant must not byte-compare clean"
+    );
+}
+
+#[test]
+fn aliases_are_captured() {
+    let t = tree();
+    // These are `alias = ` (HIDDEN) aliases, not `visible_alias`, so
+    // `get_visible_aliases()` returns nothing for any of them. The
+    // docs use them anyway (`apprafter t use <name>`, `apprafter cb`),
+    // so a visible-only projection would fail correct docs.
+    assert!(node(&t, &["target"]).aliases.contains(&"t".to_string()));
+    assert!(node(&t, &["cluster-bootstrap"])
+        .aliases
+        .contains(&"cb".to_string()));
 }
 
 #[test]

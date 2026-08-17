@@ -40,6 +40,10 @@ pub struct CommandNode {
     pub aliases: Vec<String>,
     pub about: String,
     pub long_about: Option<String>,
+    /// Hidden from `--help`, directly or via an ancestor; the gate
+    /// still resolves these paths. clap sets `hide` on the node it is
+    /// declared on, so this is inherited explicitly — otherwise
+    /// `auth login` would look public while `auth` did not.
     pub hidden: bool,
     /// Empty today; a later package fills these in.
     pub examples: Vec<String>,
@@ -71,6 +75,12 @@ pub struct PositionalSpec {
     pub value_name: String,
     pub required: bool,
     pub multiple: bool,
+    /// `ValueEnum` variants, same as [`ArgSpec::possible_values`].
+    /// `target firewall cloudflare-origin <STATE>` accepts only
+    /// `enable`/`disable`; without this the accepted set survives
+    /// solely as prose in `help`, so renaming a variant would change
+    /// the real CLI surface and still byte-compare clean.
+    pub possible_values: Vec<String>,
     pub help: String,
 }
 
@@ -85,7 +95,7 @@ pub fn tree_from(root: &Command, cli_version: &str) -> Tree {
     built.build();
 
     let mut commands = Vec::new();
-    collect(&built, &mut Vec::new(), &mut commands);
+    collect(&built, &mut Vec::new(), false, &mut commands);
     // Sorting by path makes the projection independent of declaration
     // order, so reordering an enum variant is not spurious drift.
     commands.sort_by(|a, b| a.path.cmp(&b.path));
@@ -97,7 +107,16 @@ pub fn tree_from(root: &Command, cli_version: &str) -> Tree {
 }
 
 /// Walk every subcommand depth-first, accumulating full paths.
-fn collect(cmd: &Command, prefix: &mut Vec<String>, out: &mut Vec<CommandNode>) {
+///
+/// `ancestor_hidden` carries `hide` down the tree: a subtree under a
+/// hidden parent is itself absent from `--help`, so a renderer that
+/// filters on `hidden` must see that.
+fn collect(
+    cmd: &Command,
+    prefix: &mut Vec<String>,
+    ancestor_hidden: bool,
+    out: &mut Vec<CommandNode>,
+) {
     let mut subs: Vec<&Command> = cmd
         .get_subcommands()
         // `build()` materialises clap's own `help` subcommand at every
@@ -107,14 +126,15 @@ fn collect(cmd: &Command, prefix: &mut Vec<String>, out: &mut Vec<CommandNode>) 
     subs.sort_by(|a, b| a.get_name().cmp(b.get_name()));
 
     for sub in subs {
+        let hidden = ancestor_hidden || sub.is_hide_set();
         prefix.push(sub.get_name().to_string());
-        out.push(node_from(sub, prefix.clone()));
-        collect(sub, prefix, out);
+        out.push(node_from(sub, prefix.clone(), hidden));
+        collect(sub, prefix, hidden, out);
         prefix.pop();
     }
 }
 
-fn node_from(cmd: &Command, path: Vec<String>) -> CommandNode {
+fn node_from(cmd: &Command, path: Vec<String>, hidden: bool) -> CommandNode {
     let mut aliases: Vec<String> = cmd.get_all_aliases().map(str::to_string).collect();
     aliases.sort();
     aliases.dedup();
@@ -140,7 +160,7 @@ fn node_from(cmd: &Command, path: Vec<String>) -> CommandNode {
         aliases,
         about: cmd.get_about().map(styled_one_line).unwrap_or_default(),
         long_about: cmd.get_long_about().map(|s| reflow(&s.to_string())),
-        hidden: cmd.is_hide_set(),
+        hidden,
         examples: Vec::new(),
         args,
         positionals,
@@ -156,12 +176,7 @@ fn arg_from(arg: &Arg) -> ArgSpec {
         value_name: first_value_name(arg),
         default: default_of(arg),
         required: arg.is_required_set(),
-        possible_values: arg
-            .get_possible_values()
-            .iter()
-            .map(PossibleValue::get_name)
-            .map(str::to_string)
-            .collect(),
+        possible_values: possible_values_of(arg),
         help: arg.get_help().map(styled_one_line).unwrap_or_default(),
     }
 }
@@ -172,19 +187,23 @@ fn positional_from(arg: &Arg) -> PositionalSpec {
         value_name: first_value_name(arg).unwrap_or_else(|| arg.get_id().as_str().to_uppercase()),
         required: arg.is_required_set(),
         multiple: arg.get_num_args().is_some_and(|r| r.max_values() > 1),
+        possible_values: possible_values_of(arg),
         help: arg.get_help().map(styled_one_line).unwrap_or_default(),
     }
 }
 
-/// Whether the arg consumes a value. Post-`build()` `num_args` is
-/// authoritative; the action is a defensive fallback so an unbuilt
-/// tree degrades to a sane answer rather than claiming every flag is
-/// a bare switch.
+fn possible_values_of(arg: &Arg) -> Vec<String> {
+    arg.get_possible_values()
+        .iter()
+        .map(PossibleValue::get_name)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether the arg consumes a value. `tree_from` always builds, so
+/// `num_args` is populated and authoritative.
 fn takes_value(arg: &Arg) -> bool {
-    match arg.get_num_args() {
-        Some(range) => range.takes_values(),
-        None => arg.get_action().takes_values(),
-    }
+    arg.get_num_args().is_some_and(|range| range.takes_values())
 }
 
 fn first_value_name(arg: &Arg) -> Option<String> {
@@ -193,7 +212,19 @@ fn first_value_name(arg: &Arg) -> Option<String> {
         .map(|name| name.to_string())
 }
 
+/// The arg's default, or `None` when it has none *or* takes no value.
+///
+/// The `takes_value` gate is load-bearing, not defensive: `Arg::_build`
+/// materialises a synthetic `"false"` default for every
+/// `ArgAction::SetTrue`, so without it all 48 boolean switches
+/// (`--yes`, `--stdout`, `--force`, …) would project
+/// `default: Some("false")` and the rendered reference would claim a
+/// default where `apprafter --help` prints none. clap's own help
+/// writer gates the same way (`is_takes_value_set()`).
 fn default_of(arg: &Arg) -> Option<String> {
+    if !takes_value(arg) {
+        return None;
+    }
     let defaults = arg.get_default_values();
     if defaults.is_empty() {
         return None;
