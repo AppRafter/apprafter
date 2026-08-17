@@ -17,6 +17,9 @@ pre-commit:
     crd-check:
       glob: "{schemas/v1alpha1/*.cue,operator/operator-core/src/*.rs,operator/charts/apprafter-operator/templates/crd-*.yaml}"
       run: ./scripts/crd-check.sh
+    docs-check:
+      glob: "{docs/**/*.md,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh}"
+      run: ./scripts/docs-check.sh
 
 commit-msg:
   commands:

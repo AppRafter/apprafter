@@ -56,7 +56,7 @@ After dependencies are present:
 
 ```sh
 just bootstrap     # installs lefthook git hooks
-just lint          # CUE + SPDX + conditional Rust/TS
+just lint          # CUE + SPDX + docs + conditional Rust/TS
 just test          # conditional Rust/TS
 ```
 
@@ -85,3 +85,7 @@ in `plan.md`).
   Desktop's daemon in its settings.
 - **Lefthook hooks not running**: run `just bootstrap` once after
   installing lefthook; the hooks live in `.git/hooks/`.
+- **`just lint` fails with "docs-check needs nix"** on Path B/C: the
+  docs gate needs the flake.lock-pinned mkdocs (no system fallback),
+  even from a non-Nix install path. Either install Nix (Path A), or
+  skip it locally and rely on the `docs` workflow to gate the PR.

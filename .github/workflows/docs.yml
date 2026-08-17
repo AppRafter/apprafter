@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: docs
+
+# Documentation gate. Runs under the repo flake (nix) so mkdocs, the
+# material theme and the plugins are the flake.lock-pinned versions —
+# the generated-reference byte-compare needs ONE toolchain across
+# local and CI. Before this workflow existed a docs-only PR ran zero
+# jobs (lint.yml's paths-filter had no docs entry).
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'cli/platform-cli/src/cli.rs'
+      - 'cli/docsgen/**'
+      - 'scripts/docs-check.sh'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/docs.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'cli/platform-cli/src/cli.rs'
+      - 'cli/docsgen/**'
+      - 'scripts/docs-check.sh'
+      - 'flake.nix'
+      - 'flake.lock'
+      - '.github/workflows/docs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  docs-check:
+    name: docs gate (strict build + reference drift)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix (flake toolchain — mkdocs + cargo)
+        uses: DeterminateSystems/nix-installer-action@main
+      - name: docs-check
+        run: bash scripts/docs-check.sh

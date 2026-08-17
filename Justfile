@@ -28,6 +28,7 @@ lint:
     ./scripts/lint-cue.sh
     ./scripts/check-spdx-headers.sh
     ./scripts/check-no-cyrillic.sh
+    ./scripts/docs-check.sh
     ./scripts/check-crd-structural.sh
     ./scripts/check-operator-version-bump.sh
     # cli/ and operator/ are SEPARATE Cargo workspaces (no top-level
@@ -255,6 +256,12 @@ docs-serve:
 # dead anchors, pages missing from nav).
 docs-build:
     nix develop --command mkdocs build --strict
+
+# Documentation drift gate: strict build + generated-reference
+# byte-compare. Same script the lefthook hook and the docs.yml
+# workflow run.
+docs-check:
+    bash scripts/docs-check.sh
 
 # Render the platform-stack umbrella chart from CUE source into
 # `platform-stack/dist/platform-stack-<version>/`. Wrapper over
