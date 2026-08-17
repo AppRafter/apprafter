@@ -81,10 +81,24 @@ plugins:
   - search
 
 markdown_extensions:
-  - attr_list
+  - attr_list          # explicit {#stable-anchor} ids — the docs cross-reference gate resolves against these
   - admonition
   - pymdownx.details
+  - pymdownx.highlight # explicit: a build hook registers a CUE pygments lexer and needs this extension present to attach to
   - pymdownx.superfences
+  - pymdownx.snippets: # guides include REAL files instead of carrying copies
+      # Snippet paths are written repo-root-relative (e.g.
+      # "examples/applications/redis-app.cue"). `!relative $config_dir`
+      # anchors that root to this file's directory rather than to the
+      # caller's CWD — a bare `base_path: ["."]` silently depends on
+      # every caller cd-ing to the repo root first.
+      base_path: !relative $config_dir
+      # Traversal above the base is blocked (this is the default; pinned
+      # here because a repo-root base is worth being explicit about).
+      restrict_base_path: true
+      # A missing include is a hard build failure, not a literal
+      # "--8<--" line nobody notices.
+      check_paths: true
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.tasklist:
