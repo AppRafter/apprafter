@@ -5,21 +5,48 @@ site_url: https://apprafter.dev/docs
 docs_dir: docs
 
 repo_url: https://github.com/apprafter/apprafter
-edit_uri: edit/main/docs/
+edit_uri: edit/master/docs/
 
-# Local-only artefacts (gitignored) physically present in docs/
-# during development. Skip them at build time.
+# Internal artefacts that live under docs/ but are NOT part of the
+# published site: the release-note working file (also parsed by
+# release-cli.yml — excluded from the SITE, never moved), the plan
+# ledger, RSS measurements, and the gitignored superpowers tree.
+#
+# A markdown link INTO one of these paths resolves locally but 404s on
+# the published site — mkdocs logs only INFO for that case, so --strict
+# will not catch it. Reference these files by path in backticks, never
+# as a link.
 exclude_docs: |
   superpowers/
+  changelog/UNRELEASED.md
+  changelog/plan-history.md
+  measurements/
 
-# Tone down the "page exists but not in nav" message for ADR pages
-# we deliberately keep accessible by URL only — the ADR index is
-# linked from nav as a single page.
+# Pages deliberately reachable by URL but absent from nav. Anything
+# NOT on this list that is missing from nav fails the build — an
+# orphaned guide (node-prep.md was invisible for months) is a bug.
+not_in_nav: |
+  adr/*
+  license.md
+  contributing/README.md
+
+# NOTE: mkdocs 1.6.1's validation levels are warn/info/ignore only —
+# there is no literal "error" level. `--strict` (see the Justfile) is
+# what promotes "warn" to a build failure, so "warn" here is the
+# strictest real setting and is what actually enforces these checks.
+# `just docs-build` passes --strict; `just docs-serve` (local preview)
+# does not, so there a warn is only a printed line — the enforcement
+# point is the build, not the live-reload server.
 validation:
   nav:
-    omitted_files: info
+    omitted_files: warn
     not_found: warn
     absolute_links: ignore
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+    absolute_links: warn
 
 theme:
   name: material
@@ -74,6 +101,7 @@ nav:
       - Overview: operator-guide/index.md
       - Quickstart: operator-guide/quickstart.md
       - Target store: operator-guide/target-store.md
+      - Node preparation: operator-guide/node-prep.md
       - GitOps walk: operator-guide/gitops-walk.md
       - needs.pg walk: operator-guide/needs-pg-walk.md
       - needs.redis walk: operator-guide/needs-redis-walk.md
