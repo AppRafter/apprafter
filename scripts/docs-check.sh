@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
-# Local-first documentation gate. Today: the strict mkdocs build
-# (dead links, dead anchors, unlisted pages, missing snippet
-# includes). A later change appends `docsgen check` — the
-# byte-compare of the generated CLI reference against the clap tree.
+# Local-first documentation gate: the strict mkdocs build (dead
+# links, dead anchors, unlisted pages, missing snippet includes)
+# followed by `docsgen check` — the byte-compare of the generated CLI
+# reference under docs/reference/cli/ against the clap tree.
+#
+# Order matters: the mkdocs build reports on what is committed, so it
+# runs first and its failures (a dead link a contributor wrote) are
+# not hidden behind a regeneration reminder.
 #
 # Runs under `nix develop` so mkdocs, the theme and the plugins are
 # the flake.lock-pinned versions: a byte-compare needs ONE toolchain
@@ -28,4 +32,5 @@ exec nix develop --command bash -c '
   out="$(mktemp -d)"
   trap '"'"'rm -rf "$out"'"'"' EXIT
   mkdocs build --strict --site-dir "$out/site"
+  cd cli && cargo run --quiet -p docsgen -- check
 '

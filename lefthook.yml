@@ -20,6 +20,15 @@ pre-commit:
     docs-check:
       glob: "{docs/**/*.md,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh}"
       run: ./scripts/docs-check.sh
+    # The CLI reference is generated from the clap tree, so a touched
+    # cli.rs (or anything else under platform-cli) is a docs change
+    # too. Regenerating and staging it here means a contributor never
+    # sees "the docs drifted" for a file they were never asked to
+    # edit — the gate in docs-check then only fires for a hand-edited
+    # generated page.
+    docsgen:
+      glob: "cli/platform-cli/src/**"
+      run: just docsgen-generate && git add docs/reference/cli
 
 commit-msg:
   commands:

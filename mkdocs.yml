@@ -24,6 +24,13 @@ exclude_docs: |
   changelog/UNRELEASED.md
   changelog/plan-history.md
   measurements/
+  # The literate-nav fragment is nav data, not a page. literate-nav
+  # already keeps it out of the nav and out of search, but it still
+  # rendered at /reference/cli/SUMMARY/ and appeared in sitemap.xml —
+  # a crawlable page that is just a link list under a "do not edit"
+  # banner. Excluding it from the SITE does not hide it from
+  # literate-nav, which reads the docs tree, not the build output.
+  reference/cli/SUMMARY.md
 
 # Pages deliberately reachable by URL but absent from nav. Anything
 # NOT on this list that is missing from nav fails the build — an
@@ -32,6 +39,17 @@ not_in_nav: |
   adr/*
   license.md
   contributing/README.md
+  # The hand-written CLI reference, superseded by the generated
+  # reference/cli/ tree. With use_directory_urls both reference/cli.md
+  # and reference/cli/index.md build to /reference/cli/, so the
+  # generated index takes the URL and this page cannot be served —
+  # mkdocs does NOT warn about that collision (verified: only the
+  # generated page reaches site/reference/cli/index.html). Listing a
+  # nav entry for an unreachable page would be the exact kind of lie
+  # this generated reference exists to remove, so the entry is gone
+  # while the file waits for the next change, which deletes it and
+  # retargets its four inbound links.
+  reference/cli.md
 
 # NOTE: mkdocs 1.6.1's validation levels are warn/info/ignore only —
 # there is no literal "error" level. `--strict` (see the Justfile) is
@@ -82,6 +100,13 @@ theme:
 
 plugins:
   - search
+  # The CLI reference is generated (`just docsgen-generate`), so its
+  # nav is generated with it: `docs/reference/cli/SUMMARY.md` is a nav
+  # fragment docsgen emits alongside the pages. Listing 26 command
+  # pages by hand here would be a second source of truth that drifts
+  # the first time a command is added.
+  - literate-nav:
+      nav_file: SUMMARY.md
 
 markdown_extensions:
   - attr_list          # explicit {#stable-anchor} ids — the docs cross-reference gate resolves against these
@@ -141,7 +166,10 @@ nav:
       - Image iteration: dev-guide/image-iteration.md
   - Reference:
       - Overview: reference/index.md
-      - CLI: reference/cli.md
+      # Expanded by literate-nav from reference/cli/SUMMARY.md — see
+      # the not_in_nav note above for why the hand-written
+      # reference/cli.md is no longer listed here.
+      - CLI: reference/cli/
   - Contributing:
       - Setup: contributing/setup.md
       - License Headers: contributing/license-headers.md

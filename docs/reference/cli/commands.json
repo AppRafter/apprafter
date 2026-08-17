@@ -1,0 +1,3419 @@
+{
+  "cli_version": "0.2.44",
+  "commands": [
+    {
+      "path": [
+        "app"
+      ],
+      "aliases": [
+        "a"
+      ],
+      "about": "Manage user Applications — Argo CD Applications scoped to the `apps` AppProject, labeled `apprafter.io/managed-by: apprafter`",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "app",
+        "add"
+      ],
+      "aliases": [],
+      "about": "Register a user Application. Without `<git-url>`, detects the git origin remote of the current working directory. Writes an Argo CD Application CR in namespace `argocd` joined to AppProject `apps` (or `--project`), labeled `apprafter.io/managed-by: apprafter` so `app list` can surface only apprafter-managed Applications",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "branch",
+          "long": "branch",
+          "short": null,
+          "takes_value": true,
+          "value_name": "BRANCH",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Git branch / tag / commit SHA passed verbatim to `spec.source.targetRevision`. Defaults to the cwd's current branch when detected; `main` for explicit `<git-url>` without cwd context"
+        },
+        {
+          "id": "coverage_gate",
+          "long": "coverage-gate",
+          "short": null,
+          "takes_value": true,
+          "value_name": "COVERAGE_GATE",
+          "default": "present",
+          "env": null,
+          "required": false,
+          "possible_values": [
+            "present",
+            "confirmed"
+          ],
+          "help": "Credential coverage gate. `present` (default) only warns, post-registration, when no `SourceCredential` declares a covering prefix. `confirmed` pre-flight-blocks a private (`https`) repo unless a `SourceCredential` whose status reports `GitValid=True` covers it — fail-fast for clusters whose operator has egress to validate. Restricted-egress clusters keep `present` (validity stays `Unverified`)"
+        },
+        {
+          "id": "env",
+          "long": "env",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENV",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Environment to deploy. Selects which `spec.environments.<env>` override unifies onto base for THIS deployment; the Argo Application is named `<name>-<env>`. Must be one of the manifest's declared environments. Omit for a base-only deployment"
+        },
+        {
+          "id": "name",
+          "long": "name",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Application name. Defaults to the repo's basename (last path segment after stripping `.git`)"
+        },
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "apprafter",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Destination namespace — Argo CD's `spec.destination.namespace`. With `CreateNamespace= true` in syncOptions, Argo CD creates this namespace on first sync if it doesn't exist. Default `apprafter` matches the namespace where AppRafter operator watches for Application CRs"
+        },
+        {
+          "id": "no_interactive",
+          "long": "no-interactive",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_INTERACTIVE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the interactive wizard even when stdin + stdout are TTYs. The wizard fires by default on TTY shells and asks for any field not supplied via flag, pre-filling defaults from the cwd's git remote + the current branch where available"
+        },
+        {
+          "id": "no_ping",
+          "long": "no-ping",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_PING",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the `git ls-remote` reachability check. Useful for CI where network isolation blocks external git hosts, or when the repo is freshly created and does not yet have an `HEAD` ref"
+        },
+        {
+          "id": "path",
+          "long": "path",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PATH",
+          "default": "/",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path under the repo to render. Defaults to `/` — matches the cue-cmp plugin's `discover.find.glob: **/apprafter*.cue` rule (sidecar walks the entire repo for matching files when path is `/`)"
+        },
+        {
+          "id": "project",
+          "long": "project",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PROJECT",
+          "default": "apps",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "AppProject the Application joins. Default `apps` matches the AppProject for user apps. Pass `--project platform` for platform-internal apps, `platform-providers` for ServiceProvider operators"
+        },
+        {
+          "id": "remote",
+          "long": "remote",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REMOTE",
+          "default": "origin",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Git remote name when detecting origin from cwd. Defaults to `origin`"
+        },
+        {
+          "id": "scaffold",
+          "long": "scaffold",
+          "short": null,
+          "takes_value": false,
+          "value_name": "SCAFFOLD",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Auto-scaffold `<cwd>/apprafter/Application.cue` when missing, before registering. In a TTY the step-0 wizard fires regardless of this flag; the flag only matters in `--no-interactive` mode where it gates silent scaffold (without the flag, the command refuses with a pointer to `apprafter app scaffold`). Non-interactive convenience for CI scripts that want one-shot scaffold + register"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "git_url",
+          "value_name": "GIT_URL",
+          "required": false,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Explicit git URL. Required when cwd is not a git repo. Accepted forms: `https://…`, `git@host:org/repo.git` (SSH normalised to HTTPS), `ssh://git@host/repo`. Any trailing `.git` stripped when normalising"
+        }
+      ]
+    },
+    {
+      "path": [
+        "app",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List Applications scoped to the `apps` AppProject (or `--project <name>`). Filters to Applications labeled `apprafter.io/managed-by: apprafter` by default; `--all-managed` drops that filter (shows ALL Applications in the project regardless of management label — useful for debugging stray applications that bypassed `app add`)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "all_managed",
+          "long": "all-managed",
+          "short": null,
+          "takes_value": false,
+          "value_name": "ALL_MANAGED",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Drop the `apprafter.io/managed-by: apprafter` label filter — list every Application in the resolved project scope, not just apprafter-managed ones"
+        },
+        {
+          "id": "all_projects",
+          "long": "all-projects",
+          "short": null,
+          "takes_value": false,
+          "value_name": "ALL_PROJECTS",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Drop the `--project` filter; list Applications in EVERY AppProject (subject to the managed-by label filter unless `--all-managed` is also set)"
+        },
+        {
+          "id": "project",
+          "long": "project",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PROJECT",
+          "default": "apps",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "AppProject filter. Defaults to `apps`. Use `--all-projects` to drop the filter"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "app",
+        "logs"
+      ],
+      "aliases": [],
+      "about": "Stream logs from the app's workload pods. Wraps `kubectl logs` with a label selector derived from the Argo CD `Application` (the workload namespace is a known property of the CR). Default: aggregate across pods. `--pod <name>` narrows to a single pod; `--container <c>` picks the container in multi-container pods; `--follow` enables tail; `--tail <N>` caps the initial backlog",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "container",
+          "long": "container",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CONTAINER",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Pick a specific container in multi-container pods. Without the flag `kubectl` fails on a pod with two containers (requires an explicit choice); the CLI surface proxies that error verbatim"
+        },
+        {
+          "id": "env",
+          "long": "env",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENV",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments"
+        },
+        {
+          "id": "follow",
+          "long": "follow",
+          "short": "f",
+          "takes_value": false,
+          "value_name": "FOLLOW",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Stream new log lines as they appear (`kubectl logs -f`)"
+        },
+        {
+          "id": "pod",
+          "long": "pod",
+          "short": null,
+          "takes_value": true,
+          "value_name": "POD",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Narrow to a single pod instead of all matching the app's destination namespace"
+        },
+        {
+          "id": "tail",
+          "long": "tail",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TAIL",
+          "default": "-1",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Show only the last `N` lines per pod / container (`kubectl logs --tail`). `-1` means no limit (`kubectl`'s default)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Application name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "app",
+        "open"
+      ],
+      "aliases": [],
+      "about": "Port-forward the app's primary Service to localhost and open it in a browser. Wraps `kubectl port-forward` with AppRafter-aware resolution: Application name → Argo CD CR → `spec.destination.namespace` → child Service via the `app.kubernetes.io/instance=<name>` label → container port (Service.spec.ports[0] OR `--container-port` override). Picks a free local port starting at 8080 with auto-increment to 8090 if busy. Blocks on Ctrl+C — the port-forward dies with the command",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "container_port",
+          "long": "container-port",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CONTAINER_PORT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Container port to forward to. Defaults to the Service's first declared `spec.ports[]` entry. Required when the Service declares no ports or when the operator wants a secondary port"
+        },
+        {
+          "id": "env",
+          "long": "env",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENV",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Target a specific environment's deployment (`<name>-<env>`). Optional — a single-env app resolves without it; needed only to disambiguate when the app is deployed to several environments"
+        },
+        {
+          "id": "no_browser",
+          "long": "no-browser",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_BROWSER",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip opening the browser; just print the URL and block on the port-forward. Useful for CI / scripts that want to forward in the background"
+        },
+        {
+          "id": "port",
+          "long": "port",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PORT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Local port to bind. Defaults to 8080; if busy, the command probes 8081…8090 before giving up"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Application name (as listed via `apprafter app list`)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "app",
+        "remove"
+      ],
+      "aliases": [
+        "rm"
+      ],
+      "about": "Delete an Application and cascade-remove the Argo CD CR (which Argo CD then tears down child resources for). Interactive: prompts for confirmation; non-interactive requires `--yes` to skip the prompt. `--env <env>` removes ONE per-environment deployment (`<name>-<env>`); without `--env`, ALL environment deployments grouped under `apprafter.io/application=<name>` are removed (a single confirmation covers the batch)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "env",
+          "long": "env",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENV",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Environment to remove. Selects ONE per-environment deployment — the Argo Application named `<name>-<env>` registered by `app add --env <env>`. Omit to remove ALL environment deployments of `<name>` (grouped by the `apprafter.io/application` label); a base-only app with no env label resolves to the single `<name>` Application"
+        },
+        {
+          "id": "keep_data",
+          "long": "keep-data",
+          "short": null,
+          "takes_value": false,
+          "value_name": "KEEP_DATA",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Preserve PVCs / `ResourceClaim`s when tearing down. Implemented as a post-delete cleanup that strips the destructive child-prune from the cascading delete. Useful when the operator wants to re-attach the data after a teardown"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip confirmation prompt. Required in non-interactive shells (no TTY) — there's no silent destruction path"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "LOGICAL application name. Without `--env` this removes every environment deployment of the app; with `--env` just the one"
+        }
+      ]
+    },
+    {
+      "path": [
+        "app",
+        "rollback"
+      ],
+      "aliases": [],
+      "about": "Roll back to a previous revision. Reads `status.history` from the Argo CD `Application`, patches `spec.source.targetRevision` to the target; Argo CD's auto-sync picks up the change on the next reconcile cycle. Without `--to` — rollback to the previous entry in history (offset -1)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "env",
+          "long": "env",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENV",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments"
+        },
+        {
+          "id": "to",
+          "long": "to",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Explicit revision (commit SHA / tag / branch). Without the flag: previous entry in `status.history`"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip confirmation prompt. Required in non-interactive shells"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Application name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "app",
+        "scaffold"
+      ],
+      "aliases": [],
+      "about": "Generate a starter `apprafter/Application.cue` based on the cwd's runtime markers (bun.lock / Cargo.toml / pyproject.toml / etc.). Writes to `<--path>/apprafter/ Application.cue` and appends `.apprafter/local/` to the repo's `.gitignore` when present. Refuses to overwrite an existing manifest without `--force`",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "force",
+          "long": "force",
+          "short": null,
+          "takes_value": false,
+          "value_name": "FORCE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Overwrite an existing `apprafter/Application.cue`"
+        },
+        {
+          "id": "name",
+          "long": "name",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Application name (DNS-1123 lowercase). Default = cwd basename"
+        },
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Destination namespace for `metadata.namespace`. Default `apprafter` matches `app add --namespace`"
+        },
+        {
+          "id": "needs",
+          "long": "needs",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NEEDS",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Declare a workload dependency to scaffold (repeatable). One of `pg` (needs.pg), `redis` (needs.redis), `disk` (needs.disk). Emits a `needs:` block in the generated Application.cue"
+        },
+        {
+          "id": "path",
+          "long": "path",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PATH",
+          "default": ".",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Working directory the scaffold writes into. Default = current cwd"
+        },
+        {
+          "id": "runtime",
+          "long": "runtime",
+          "short": null,
+          "takes_value": true,
+          "value_name": "RUNTIME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Force-pick a runtime instead of detecting from cwd. Slugs: bun, node-pnpm, node-yarn, node-npm, python-poetry, python-uv, python-pipenv, python- pip, rust, go, docker, blank"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "app",
+        "status"
+      ],
+      "aliases": [],
+      "about": "Show detail view for one Application: sync state, health, source repo + revision, destinations, recent sync history (last 3 revisions). With `--resources`: additionally lists Argo CD's tracked resources + workload pod states (READY, STATUS, RESTARTS, AGE) — surfaces image-pull / crash-loop issues that Argo CD's app-level Healthy aggregation hides when the operator marks the CR `phase=Ready` before pods reach Running",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "resources",
+          "long": "resources",
+          "short": "r",
+          "takes_value": false,
+          "value_name": "RESOURCES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Show child workload state — Argo CD's `status.resources[]` plus pods in the destination namespace matching `app.kubernetes.io/name=<inner- app-name>` (the AppRafter operator's label)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "LOGICAL application name (as passed to `apprafter app add`, listed via `apprafter app list`). When an app is deployed to multiple environments, `status` aggregates all of them grouped by the `apprafter.io/application=<name>` label and renders a per-environment section for each. A base-only app (one Application named exactly `<name>`) still resolves via the no-label fallback"
+        }
+      ]
+    },
+    {
+      "path": [
+        "app",
+        "validate"
+      ],
+      "aliases": [],
+      "about": "Validate an AppRafter `Application.cue` manifest LOCALLY, reproducing the cluster's render-time `cue` pipeline. Lays the CLI's bundled schema + a generated `claim` binding into a temp workspace and runs `cue vet`, so bare `claim.<type>.<field>` selectors and braceless `secret: \"name/key\"` refs resolve EXACTLY as the cue-cmp resolves them at sync time — a plain `cue vet` on the repo can't (the `claim` binding is never committed). Requires `cue` on PATH. Without `[manifest]`: defaults to `<cwd>/apprafter/Application.cue`, then a single `*.cue` in the cwd; otherwise pass the path explicitly",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "manifest",
+          "value_name": "MANIFEST",
+          "required": false,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Manifest file (or directory holding `*.cue`) to validate. Omit to auto-discover"
+        }
+      ]
+    },
+    {
+      "path": [
+        "apply"
+      ],
+      "aliases": [],
+      "about": "Apply the desired state",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "server_type",
+          "long": "server-type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SERVER_TYPE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Server type (SKU) to provision (e.g. `cx22`, `cx32`). Resolution: this flag > manifest `nodes[0].kind` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning a new cluster fails with `apprafter::provider::server_type_not_selected` (pick one via the `target add` picker or `apprafter target machine`)"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Inspect a target other than the active one for the resolution chain (`--token` flag / `HCLOUD_TOKEN` env / target store). Useful when scripting against multiple targets without `apprafter target use`"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "argocd-password"
+      ],
+      "aliases": [],
+      "about": "Print the Argo CD admin password (decrypted), fetching it from the cluster on first use. The plaintext is cached age-encrypted in state for subsequent O(1) reads",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "refresh",
+          "long": "refresh",
+          "short": null,
+          "takes_value": false,
+          "value_name": "REFRESH",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Force a re-fetch of the secret even if a cached password is already in state"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "auth"
+      ],
+      "aliases": [],
+      "about": "Reserved for AppRafter Cloud (Managed) authentication. Not available yet — subcommands print a friendly redirect to `apprafter target add`. Hidden from `--help` until Managed lands so it doesn't crowd the new-user discovery surface",
+      "long_about": null,
+      "hidden": true,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "auth",
+        "login"
+      ],
+      "aliases": [],
+      "about": "Authenticate to AppRafter Cloud (Managed). Stub until the Managed offering lands; today prints the self-hosted redirect",
+      "long_about": null,
+      "hidden": true,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "auth",
+        "logout"
+      ],
+      "aliases": [],
+      "about": "Sign out of AppRafter Cloud (Managed). Stub",
+      "long_about": null,
+      "hidden": true,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "auth",
+        "status"
+      ],
+      "aliases": [],
+      "about": "Report current AppRafter Cloud (Managed) authentication status. Stub",
+      "long_about": null,
+      "hidden": true,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup"
+      ],
+      "aliases": [],
+      "about": "Encrypted backup (Kind 2, restic local-pull): native extraction + serialized config/app CRs + decrypted user secrets, all wrapped into a restic repository. Use `apprafter restore` to replay",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "check"
+      ],
+      "aliases": [],
+      "about": "Verify the structural integrity of an S3-backed restic repository (`restic check`). Run OUTSIDE the cluster with the operator's full S3 credentials",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "credential_file",
+          "long": "credential-file",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CREDENTIAL_FILE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars"
+        },
+        {
+          "id": "read_data",
+          "long": "read-data",
+          "short": null,
+          "takes_value": false,
+          "value_name": "READ_DATA",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Deep verify: download and re-hash every pack (`--read-data`)"
+        },
+        {
+          "id": "repo",
+          "long": "repo",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REPO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket`"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "create"
+      ],
+      "aliases": [],
+      "about": "Create a full encrypted backup of the cluster (default scope: whole cluster). Wraps native data + CRs + secrets into a restic repository",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Narrow scope to these namespaces (repeatable). Ignored unless `--select` is also passed"
+        },
+        {
+          "id": "passphrase",
+          "long": "passphrase",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PASSPHRASE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY"
+        },
+        {
+          "id": "repo",
+          "long": "repo",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REPO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to the restic repository. Defaults to `<config>/backups/<target>`"
+        },
+        {
+          "id": "select",
+          "long": "select",
+          "short": null,
+          "takes_value": false,
+          "value_name": "SELECT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "When set, only the namespaces given via `--namespace` are backed up"
+        },
+        {
+          "id": "staging_mode",
+          "long": "staging-mode",
+          "short": null,
+          "takes_value": true,
+          "value_name": "STAGING_MODE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Staging strategy: `monolithic` (default — stage every namespace's native data at once, one snapshot) or `sequential` (stage + snapshot one namespace at a time, bounding peak staging disk on large clusters)"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "disable"
+      ],
+      "aliases": [],
+      "about": "Disable scheduled backup (sets spec.backup.enabled=false; keeps config)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "enable"
+      ],
+      "aliases": [],
+      "about": "Enable scheduled off-site S3 backup by patching PlatformStack.spec.backup",
+      "long_about": "Enable scheduled off-site S3 backup by patching PlatformStack.spec.backup.\n\nCredential input — exactly ONE of the following is required:\n\n--credential-file <dotenv> Parse the dotenv file (KEY=VALUE lines), probe the repo, and auto-seal the creds as a SealedSecret in apprafter-system. --credential names the Secret (optional; defaults to \"apprafter-backup-s3\").\n\n--credential <name> Name an existing Secret already in apprafter-system. The Secret's keys are read from the cluster and used to probe the repo. No sealing step.\n\nAccepted credential keys: S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD (optional: S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION are accepted as aliases.",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "bucket",
+          "long": "bucket",
+          "short": null,
+          "takes_value": true,
+          "value_name": "BUCKET",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Bucket name (with `--endpoint`), or a full restic repo URL (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a bare name, pass `--endpoint` and the CLI builds the `s3:https://<endpoint>/<bucket>` URL for you"
+        },
+        {
+          "id": "check_cron",
+          "long": "check-cron",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CHECK_CRON",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": ""
+        },
+        {
+          "id": "credential",
+          "long": "credential",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CREDENTIAL",
+          "default": "",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Name of the credential Secret in apprafter-system. With --credential-file: the name to create (default: apprafter-backup-s3). Without --credential-file: an existing Secret to read creds from (required)"
+        },
+        {
+          "id": "credential_file",
+          "long": "credential-file",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CREDENTIAL_FILE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster"
+        },
+        {
+          "id": "cron",
+          "long": "cron",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CRON",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": ""
+        },
+        {
+          "id": "endpoint",
+          "long": "endpoint",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENDPOINT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>` repo URL for you. Omit when passing a full restic URL in `--bucket`"
+        },
+        {
+          "id": "enforce",
+          "long": "enforce",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENFORCE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "`operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune)"
+        },
+        {
+          "id": "failure_webhook",
+          "long": "failure-webhook",
+          "short": null,
+          "takes_value": true,
+          "value_name": "FAILURE_WEBHOOK",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": ""
+        },
+        {
+          "id": "i_have_saved_credentials",
+          "long": "i-have-saved-credentials",
+          "short": null,
+          "takes_value": false,
+          "value_name": "I_HAVE_SAVED_CREDENTIALS",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Confirm you have saved the restic passphrase + S3 credentials OUTSIDE the cluster"
+        },
+        {
+          "id": "keep_daily",
+          "long": "keep-daily",
+          "short": null,
+          "takes_value": true,
+          "value_name": "KEEP_DAILY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": ""
+        },
+        {
+          "id": "keep_monthly",
+          "long": "keep-monthly",
+          "short": null,
+          "takes_value": true,
+          "value_name": "KEEP_MONTHLY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": ""
+        },
+        {
+          "id": "keep_weekly",
+          "long": "keep-weekly",
+          "short": null,
+          "takes_value": true,
+          "value_name": "KEEP_WEEKLY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": ""
+        },
+        {
+          "id": "prefix",
+          "long": "prefix",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PREFIX",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket`"
+        },
+        {
+          "id": "staging_mode",
+          "long": "staging-mode",
+          "short": null,
+          "takes_value": true,
+          "value_name": "STAGING_MODE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "`monolithic` (default) or `sequential`"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List snapshots stored in a backup repo",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "passphrase",
+          "long": "passphrase",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PASSPHRASE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY"
+        },
+        {
+          "id": "repo",
+          "long": "repo",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REPO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to the restic repository. Defaults to `<config>/backups/<target>`"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "prune"
+      ],
+      "aliases": [],
+      "about": "Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "credential_file",
+          "long": "credential-file",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CREDENTIAL_FILE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to a dotenv credential file containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`). Falls back to the matching environment variables"
+        },
+        {
+          "id": "keep_daily",
+          "long": "keep-daily",
+          "short": null,
+          "takes_value": true,
+          "value_name": "KEEP_DAILY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Keep-daily retention override (else spec.backup.retention, else 7)"
+        },
+        {
+          "id": "keep_monthly",
+          "long": "keep-monthly",
+          "short": null,
+          "takes_value": true,
+          "value_name": "KEEP_MONTHLY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Keep-monthly retention override (else spec.backup.retention, else 6)"
+        },
+        {
+          "id": "keep_weekly",
+          "long": "keep-weekly",
+          "short": null,
+          "takes_value": true,
+          "value_name": "KEEP_WEEKLY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Keep-weekly retention override (else spec.backup.retention, else 4)"
+        },
+        {
+          "id": "repo",
+          "long": "repo",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REPO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`). Defaults to `PlatformStack.spec.backup.bucket`"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "status"
+      ],
+      "aliases": [],
+      "about": "Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "backup",
+        "unlock"
+      ],
+      "aliases": [],
+      "about": "Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched). Run OUTSIDE the cluster with the operator's full S3 credentials",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "credential_file",
+          "long": "credential-file",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CREDENTIAL_FILE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars"
+        },
+        {
+          "id": "repo",
+          "long": "repo",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REPO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket`"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "bootstrap-all"
+      ],
+      "aliases": [
+        "up"
+      ],
+      "about": "One-command provisioning: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap` for a freshly-provisioned cluster. Convenience wrapper — each phase still has its own subcommand for re-runs",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "dry_run",
+          "long": "dry-run",
+          "short": null,
+          "takes_value": false,
+          "value_name": "DRY_RUN",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Print the phase plan without touching the provider or cluster. Useful for previewing what the wrapper would invoke and which target it resolves against"
+        },
+        {
+          "id": "server_type",
+          "long": "server-type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SERVER_TYPE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Server type (SKU) to provision (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase of bootstrap-all. Resolution: this flag > manifest `nodes[0].kind` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected`"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Override the active target for the credential resolution chain (see `apprafter apply --target`)"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "cluster-bootstrap"
+      ],
+      "aliases": [
+        "cb"
+      ],
+      "about": "Install Cilium (CNI + kube-proxy replacement) and apply the Gateway API standard-install CRDs into the cluster pointed to by the cached kubeconfig",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "destroy"
+      ],
+      "aliases": [],
+      "about": "Destroy infrastructure managed by this state",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Override the active target for the credential resolution chain (see `apprafter apply --target`)"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Confirm without prompting"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "doctor"
+      ],
+      "aliases": [],
+      "about": "Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). Prints PASS / WARN / FAIL per check; exits 1 if any FAIL fires so CI gates can wire `apprafter doctor` in directly",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "no_ping",
+          "long": "no-ping",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_PING",
+          "default": null,
+          "env": "APPRAFTER_NO_PING",
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the Hetzner Cloud API ping. Honours `APPRAFTER_NO_PING=1` for shell-script ergonomics"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Inspect a target other than the active one. Defaults to the active target"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "export"
+      ],
+      "aliases": [],
+      "about": "Native data export (Kind 1) — pull pg dumps, volume tars, redis snapshots to a plain local folder + `manifest.json`. No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Narrow scope to these namespaces (repeatable). Ignored unless `--select` is also passed"
+        },
+        {
+          "id": "out",
+          "long": "out",
+          "short": null,
+          "takes_value": true,
+          "value_name": "OUT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Output directory. Defaults to `./apprafter-export`"
+        },
+        {
+          "id": "select",
+          "long": "select",
+          "short": null,
+          "takes_value": false,
+          "value_name": "SELECT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "When set, only the namespaces given via `--namespace` are exported. Without `--select` the scope is the whole cluster"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "import"
+      ],
+      "aliases": [],
+      "about": "Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. Read-only — never deletes or creates",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "dry_run",
+          "long": "dry-run",
+          "short": null,
+          "takes_value": false,
+          "value_name": "DRY_RUN",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Print what would be imported without writing state"
+        },
+        {
+          "id": "force",
+          "long": "force",
+          "short": null,
+          "takes_value": false,
+          "value_name": "FORCE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Overwrite an already-populated `state.hetzner_cloud`"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Override the active target for the credential resolution chain (see `apprafter apply --target`)"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "init"
+      ],
+      "aliases": [],
+      "about": "Bootstrap a fresh cluster on the given provider/tier",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "provider",
+          "long": "provider",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PROVIDER",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Infrastructure provider identifier"
+        },
+        {
+          "id": "region",
+          "long": "region",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REGION",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Provider-specific region"
+        },
+        {
+          "id": "tier",
+          "long": "tier",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TIER",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Deployment tier"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "kubeconfig"
+      ],
+      "aliases": [
+        "kc"
+      ],
+      "about": "Print the cached k3s kubeconfig (decrypted), fetching it over SSH on first use. Intended pipe target: `KUBECONFIG= /dev/stdin kubectl ...`",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "refresh",
+          "long": "refresh",
+          "short": null,
+          "takes_value": false,
+          "value_name": "REFRESH",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Force a re-fetch over SSH even if a cached kubeconfig is already in state"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Override the active target for the credential resolution chain (see `apprafter apply --target`)"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "login"
+      ],
+      "aliases": [],
+      "about": "Obtain an OIDC-backed kubeconfig",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "migration"
+      ],
+      "aliases": [],
+      "about": "Inspect and approve / reject MigrationPlans. Application-scope rejects denied by the admission webhook — the CLI surfaces the denial message verbatim",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "migration",
+        "approve"
+      ],
+      "aliases": [],
+      "about": "Patch status.phase=approved on a MigrationPlan. MigrationController transitions through executing → completed. The plan's namespace is resolved automatically (app-scope plans live in the app's namespace); pass `-n` only to disambiguate a name that exists in multiple namespaces",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace of the MigrationPlan. Omit to auto-resolve from `apprafter migration list`; required only when the same name exists in more than one namespace"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "MigrationPlan name (as listed via `apprafter migration list`)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "migration",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List MigrationPlans across all namespaces — namespace, name, scope, classification, phase. Platform-scope plans live in `apprafter-system`; app-scope plans live in the Application's own namespace",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "migration",
+        "reject"
+      ],
+      "aliases": [],
+      "about": "Patch status.phase=rejected. The admission webhook denies application-scope rejects — the CLI surfaces the denial message verbatim. Platform-scope rejects succeed and PlatformMigrationStrategy.reject reverts `spec.pin`",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "MigrationPlan name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "node"
+      ],
+      "aliases": [],
+      "about": "Node-level operations on the active target's cluster node. `prep` retrofits the kubelet node reservations + k3s OOM-protection AND provisions host swap (NoSwap for pods) over one k3s restart; `status` reports the node's swap posture",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "node",
+        "prep"
+      ],
+      "aliases": [],
+      "about": "Prepare the active target's cluster node: retrofit the kubelet node reservations + k3s OOM-protection AND provision host swap",
+      "long_about": "Prepare the active target's cluster node: retrofit the kubelet node reservations + k3s OOM-protection AND provision host swap.\n\nWrites `/etc/rancher/k3s/config.yaml` reservations + `k3s.service.d/oom.conf` and — when the node is eligible (k8s ≥1.34 for the NoSwap GA gate + cgroup v2) — layers a host swapfile with `swapBehavior: NoSwap` so a control-plane spike degrades to swap instead of an OOM-kill while pods never swap. Applied atomically over one k3s restart (the API is briefly unavailable, ~30s), with a whole-step rollback on a `/readyz` timeout. Idempotent — a re-run refreshes the drop-in and is otherwise a near no-op.",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the confirmation prompt (k3s restart briefly takes the API offline). Required in non-interactive shells"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "node",
+        "status"
+      ],
+      "aliases": [],
+      "about": "Report the active target's node swap posture: `swapBehavior` / `failSwapOn` / swap capacity / k8s version (kube-API), plus live `swapon`, `vm.swappiness`, k3s `GOMEMLIMIT`, and the provision breadcrumb (SSH). Each field is labelled with its source (`[api]` / `[ssh]`); if SSH is unavailable the SSH-derived fields read `unknown` but the kube-API fields still render",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "open"
+      ],
+      "aliases": [],
+      "about": "Open a platform UI (Argo CD today; Backstage / Grafana / Hubble follow in later sub-phases). Spawns a local port-forward, prints credentials, opens the default browser, blocks until Ctrl+C",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "open",
+        "argocd"
+      ],
+      "aliases": [],
+      "about": "Open the Argo CD web UI on `https://localhost:8080` via `kubectl port-forward`, prefilling the admin username and printing the password",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "all_projects",
+          "long": "all-projects",
+          "short": null,
+          "takes_value": false,
+          "value_name": "ALL_PROJECTS",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Drop the `?proj=<name>` filter — UI shows all AppProjects"
+        },
+        {
+          "id": "project",
+          "long": "project",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PROJECT",
+          "default": "apps,default",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "AppProject filter applied to the opened URL — Argo CD's UI honours `?proj=<name>` (comma-separated list) to scope the Applications list. Defaults to `apps,default` so the operator lands on their own apps plus the platform root Application (in `default`), while the platform component apps stay hidden; pass `--project platform` to inspect chart-managed components, or `--all-projects` to drop the filter entirely"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "plan"
+      ],
+      "aliases": [],
+      "about": "Show the diff between the desired state and what is live",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform"
+      ],
+      "aliases": [],
+      "about": "Inspect and control the cluster's PlatformStack — the declarative platform-version resource managed by PlatformController",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "autoscale"
+      ],
+      "aliases": [],
+      "about": "Inspect or set the cluster-wide VPA autoscale mode (`PlatformStack.spec.resources.autoscale.mode`). Controls whether the Vertical Pod Autoscaler applies recommendations to Application pods automatically",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "autoscale",
+        "set"
+      ],
+      "aliases": [],
+      "about": "Set the cluster-wide VPA autoscale mode",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "mode",
+          "value_name": "MODE",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "One of `full` (apply up and down), `up-only` (scale up only), or `off` (record recommendations but do not apply them)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "platform",
+        "autoscale",
+        "show"
+      ],
+      "aliases": [],
+      "about": "Show the cluster's current VPA autoscale mode and available presets",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "egress"
+      ],
+      "aliases": [],
+      "about": "Inspect / set the cluster-wide egress posture (`PlatformStack.spec.network.egress.profile`). Gates which baseline egress allows the operator derives per Application (DNS / same-namespace / world / declared needs)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "egress",
+        "set"
+      ],
+      "aliases": [],
+      "about": "Set the cluster-wide egress profile via server-side apply (field manager `apprafter-cli`), so the value survives Argo CD self-heal on a Tier-1 no-infra-repo cluster",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "profile",
+          "value_name": "PROFILE",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "One of `internet` (DNS + same-ns + world + needs), `internal` (DNS + same-ns + needs), or `strict` (DNS + needs; same-namespace also denied)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "platform",
+        "egress",
+        "show"
+      ],
+      "aliases": [],
+      "about": "Print the current egress profile and what each profile allows. Reads the singleton PlatformStack; an absent field reports the documented default (`internet`)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "env"
+      ],
+      "aliases": [],
+      "about": "Show or set the cluster's soft default environment",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "env",
+        "set"
+      ],
+      "aliases": [],
+      "about": "Set the cluster's default environment (a soft `app add` preselect)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "env",
+          "value_name": "ENV",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Environment name (e.g. prod, staging)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "platform",
+        "env",
+        "show"
+      ],
+      "aliases": [],
+      "about": "Show the cluster's default environment",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "freeze"
+      ],
+      "aliases": [],
+      "about": "Freeze a specific component's version through `PlatformStack.spec.overrides.<component>.pin`. Useful for out-of-band security backports or when the curated bundle's pinned version regresses a workload- specific shape. Without `--version` — uses the component's current effective version (read from status), reading the chart's own pin and locking that in",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "component",
+          "value_name": "COMPONENT",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Component name (must match a key in the umbrella chart's `values.components` map; e.g. `cilium`, `argocd`, `cert-manager`, `apprafter-operator`)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "platform",
+        "rescue"
+      ],
+      "aliases": [],
+      "about": "Emergency recovery: re-run the loader's cluster-bootstrap path (Cilium → Argo CD → CRDs → operator) against the active target. Useful when Argo CD itself is unable to self-adopt — a stale chart, a corrupted ConfigMap, or a pod-eviction loop that no `apprafter platform upgrade` can resolve. Thin wrapper around `apprafter cluster-bootstrap` with the recovery banner",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip confirmation prompt. Required in non-interactive shells"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "status"
+      ],
+      "aliases": [],
+      "about": "Print PlatformStack/default summary — versions, conditions, recent history. By default first asks the operator for an immediate upstream re-check (stamps `apprafter.io/recheck-requested` and waits up to 30s for `status.lastUpstreamCheck` to advance) so the reported `available` version is fresh rather than up to 6h stale",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "cached",
+          "long": "cached",
+          "short": null,
+          "takes_value": false,
+          "value_name": "CACHED",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the upstream re-check and render the last-known status immediately (no wait). For scripting / when the 6h-cadence snapshot is good enough"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "platform",
+        "unfreeze"
+      ],
+      "aliases": [],
+      "about": "Remove a previously-set `PlatformStack.spec.overrides.<component>` entry — component falls back to the umbrella chart's curated pin",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "component",
+          "value_name": "COMPONENT",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Component name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "platform",
+        "upgrade"
+      ],
+      "aliases": [],
+      "about": "Patch PlatformStack.spec.pin. With `--to <version>` — pin to that version. Without `--to` — clear pin and enable autoUpgrade (channel-following mode). By default forces a fresh upstream re-check first (see `platform status`) so the upgrade decision acts on the latest availableVersion",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "cached",
+          "long": "cached",
+          "short": null,
+          "takes_value": false,
+          "value_name": "CACHED",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the upstream re-check and act on the last-known status immediately (no wait)"
+        },
+        {
+          "id": "to",
+          "long": "to",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": ""
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "repo"
+      ],
+      "aliases": [],
+      "about": "Manage git-repo creds Argo CD uses to pull private user repos. Writes `repo-creds`-typed Secrets in the `argocd` namespace per Argo CD's documented contract",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "repo",
+        "creds"
+      ],
+      "aliases": [],
+      "about": "Repository credentials subcommands",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "repo",
+        "creds",
+        "add"
+      ],
+      "aliases": [],
+      "about": "Register a git-repo credential. Creates an Argo CD `repo-creds`-typed Secret in the `argocd` namespace. All Applications with a `repoURL` starting with the registered `--url-prefix` inherit these creds",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "auth_type",
+          "long": "type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "AUTH_TYPE",
+          "default": "pat",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Auth type. Default `pat` — a personal access token (GitHub `github_pat_*` / `ghp_*`, GitLab `glpat-*`, etc). `basic` — username + password pair. SSH-key auth is not supported yet"
+        },
+        {
+          "id": "no_interactive",
+          "long": "no-interactive",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_INTERACTIVE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the interactive wizard even when stdin + stdout are TTYs. Wizard fires by default and walks through name / URL prefix / type / username / token (token prompt is masked)"
+        },
+        {
+          "id": "no_validate",
+          "long": "no-validate",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_VALIDATE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip provider-specific token format regex check (GitHub: `github_pat_*` / `ghp_*`; GitLab: `glpat-*`). Useful for self-hosted Gitea / Forgejo where token formats are arbitrary"
+        },
+        {
+          "id": "token",
+          "long": "token",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TOKEN",
+          "default": null,
+          "env": "APPRAFTER_REPO_TOKEN",
+          "required": false,
+          "possible_values": [],
+          "help": "Token / password. Required. Reads from stdin via `inquire::Password` (masked entry) when omitted and stdin is a TTY; required as flag in non-interactive shells"
+        },
+        {
+          "id": "url_prefix",
+          "long": "url-prefix",
+          "short": null,
+          "takes_value": true,
+          "value_name": "URL_PREFIX",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "URL prefix for which these creds apply (e.g. `https://github.com/myorg`). Required"
+        },
+        {
+          "id": "username",
+          "long": "username",
+          "short": null,
+          "takes_value": true,
+          "value_name": "USERNAME",
+          "default": "git",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Username. When `--type pat` — usually the token holder's git username (GitHub: any non-empty string works; GitLab requires the username). Defaults to `git` for PAT auth which works across most providers"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Friendly name. Used as the Secret's `metadata.name` (DNS-1123) and surfaces in `apprafter repo creds list`"
+        }
+      ]
+    },
+    {
+      "path": [
+        "repo",
+        "creds",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List registered creds",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "repo",
+        "creds",
+        "remove"
+      ],
+      "aliases": [
+        "rm"
+      ],
+      "about": "Delete a creds entry. Refuses by default when Applications depending on the `urlPrefix` are registered; `--force` overrides",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "force",
+          "long": "force",
+          "short": null,
+          "takes_value": false,
+          "value_name": "FORCE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip confirmation + the dependency check"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip confirmation prompt only (still runs dependency check)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Creds name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "repo",
+        "creds",
+        "rotate"
+      ],
+      "aliases": [],
+      "about": "Rotate a creds entry's token in-place. Patches the existing Secret rather than recreating it — Argo CD repo-server holds a cached reference to the Secret's resourceVersion and a recreate would cause a brief reconnect window",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "no_validate",
+          "long": "no-validate",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_VALIDATE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip token format validation. See `repo creds add --no-validate`"
+        },
+        {
+          "id": "token",
+          "long": "token",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TOKEN",
+          "default": null,
+          "env": "APPRAFTER_REPO_TOKEN",
+          "required": false,
+          "possible_values": [],
+          "help": "New token. Reads from stdin (masked) when omitted and stdin is a TTY"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Creds name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "repo",
+        "creds",
+        "show"
+      ],
+      "aliases": [],
+      "about": "Show a creds entry; token is masked",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Creds name (as listed via `repo creds list`)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "restore"
+      ],
+      "aliases": [],
+      "about": "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg/redis/volumes) captured by `apprafter backup`. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "credential_file",
+          "long": "credential-file",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CREDENTIAL_FILE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to a dotenv credential file containing the operator's S3 credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). REQUIRED to restore from a remote `s3:`/`b2:`/`gs:`/`azure:` repo (falls back to the matching env vars); the operator's full creds are read locally, NEVER from the cluster"
+        },
+        {
+          "id": "data_only",
+          "long": "data-only",
+          "short": null,
+          "takes_value": false,
+          "value_name": "DATA_ONLY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Replay only native data (pg/redis/volumes); skip CR + secret replay. Useful when the cluster is already configured"
+        },
+        {
+          "id": "passphrase",
+          "long": "passphrase",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PASSPHRASE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY"
+        },
+        {
+          "id": "reprovision",
+          "long": "reprovision",
+          "short": null,
+          "takes_value": false,
+          "value_name": "REPROVISION",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Re-provision the target cluster before replaying data"
+        },
+        {
+          "id": "server_type",
+          "long": "server-type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SERVER_TYPE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase. Resolution: this flag > manifest `nodes[0].kind` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected`"
+        },
+        {
+          "id": "snapshot",
+          "long": "snapshot",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SNAPSHOT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Snapshot id to restore (defaults to the latest)"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Target name to restore into (defaults to the active target)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "repo",
+          "value_name": "REPO",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Path to the restic repository created by `apprafter backup`"
+        }
+      ]
+    },
+    {
+      "path": [
+        "secret"
+      ],
+      "aliases": [],
+      "about": "Seal secret material with the in-cluster sealed-secrets controller's public cert. The CLI cannot decrypt what it seals (no cluster private key), so the output is safe to print, commit to Git, or apply. Backs the private-repo credential flow",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "secret",
+        "remove"
+      ],
+      "aliases": [],
+      "about": "Delete a `SealedSecret` and the `Secret` the controller unsealed from it, by name — so you don't `kubectl delete sealedsecret,secret` by hand. Idempotent (absent objects are fine). Prompts unless `--yes`",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "apprafter-system",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Target namespace. Defaults to `apprafter-system` (matches `secret seal`); pass the app's namespace for app secrets"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the confirmation prompt"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SealedSecret / Secret `metadata.name`. DNS-1123"
+        }
+      ]
+    },
+    {
+      "path": [
+        "secret",
+        "seal"
+      ],
+      "aliases": [],
+      "about": "Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`. Fetches the controller's public cert over the TLS-authenticated kube API (strict scope: the sealed blob only unseals as `<namespace>/<name>`)",
+      "long_about": "Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`. Fetches the controller's public cert over the TLS-authenticated kube API (strict scope: the sealed blob only unseals as `<namespace>/<name>`).\n\nRe-sealing an existing name REPLACES its keys — it does not merge; pass all keys in one command. Use `--yes` to skip the overwrite prompt.",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "from_literal",
+          "long": "from-literal",
+          "short": null,
+          "takes_value": true,
+          "value_name": "FROM_LITERAL",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Repeatable `KEY=VALUE`. The value may be empty or contain `=` (only the first `=` splits the pair)"
+        },
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "apprafter-system",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Target namespace. Defaults to `apprafter-system`, where platform credential material lives"
+        },
+        {
+          "id": "secret_type",
+          "long": "type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SECRET_TYPE",
+          "default": "Opaque",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Resulting Secret `type` (e.g. `Opaque`, `kubernetes.io/dockerconfigjson`)"
+        },
+        {
+          "id": "stdout",
+          "long": "stdout",
+          "short": null,
+          "takes_value": false,
+          "value_name": "STDOUT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Print the SealedSecret YAML to stdout instead of applying it (for `kubectl apply -f -` or committing to a config repo)"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the overwrite confirmation prompt when a secret of the same name already exists. In non-interactive shells this flag is required to replace an existing secret (without it the command errors instead of silently overwriting)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SealedSecret `metadata.name` (and the resulting Secret's name). DNS-1123"
+        }
+      ]
+    },
+    {
+      "path": [
+        "status"
+      ],
+      "aliases": [],
+      "about": "Print the current cluster status",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target"
+      ],
+      "aliases": [
+        "t"
+      ],
+      "about": "Manage deployment targets — persistent named bundles of `(provider, region, credentials, defaults)`. One target is active at a time; operational commands (`apply`, `cluster-bootstrap`, …) act on it unless overridden",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "add"
+      ],
+      "aliases": [],
+      "about": "Add (or update, with `--renew`) a deployment target",
+      "long_about": "Add (or update, with `--renew`) a deployment target.\n\nOn a TTY without `--no-interactive` the command launches a wizard that prompts for whatever flags were not provided. On a non-TTY (CI, pipe) the command is purely flag-driven and missing required inputs error out fast.",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "cluster_name",
+          "long": "cluster-name",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CLUSTER_NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Default cluster name; falls back to `platform-1`"
+        },
+        {
+          "id": "force",
+          "long": "force",
+          "short": null,
+          "takes_value": false,
+          "value_name": "FORCE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Overwrite an existing target. Without `--force`, the command fails when the target name is taken"
+        },
+        {
+          "id": "no_interactive",
+          "long": "no-interactive",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_INTERACTIVE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the interactive wizard even when stdin + stdout are TTYs. The wizard fires by default on TTY shells and asks for any field not supplied via flag"
+        },
+        {
+          "id": "no_ping",
+          "long": "no-ping",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_PING",
+          "default": null,
+          "env": "APPRAFTER_NO_PING",
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the Hetzner Cloud API ping that confirms the token authenticates (`GET /v1/locations`). Useful in CI when the network sandbox blocks outbound calls, or when pre-seeding a target store offline. Also honours `APPRAFTER_NO_PING=1` for shell-script ergonomics — any non-empty value flips the flag"
+        },
+        {
+          "id": "provider",
+          "long": "provider",
+          "short": null,
+          "takes_value": true,
+          "value_name": "PROVIDER",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Provider identifier. Only `hetzner-cloud` is wired today; AWS / Managed Cloud are planned for later"
+        },
+        {
+          "id": "region",
+          "long": "region",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REGION",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Default provider region (e.g. Hetzner `nbg1`)"
+        },
+        {
+          "id": "renew",
+          "long": "renew",
+          "short": null,
+          "takes_value": false,
+          "value_name": "RENEW",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Update only the credentials of an existing target. Errors when the target does not exist. Mutually exclusive with `--force` (use `--force` if you want to replace the whole target, not just rotate the token)"
+        },
+        {
+          "id": "server_type",
+          "long": "server-type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SERVER_TYPE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Preferred server type SKU for this target (e.g. `cx22`, `cx32`). Saved as the \"target preference\" rung in the resolution chain — below an explicit `--server-type` flag or manifest value, above `APPRAFTER_SERVER_TYPE`. Omit to leave the slot empty (the chain continues down to the env var; there is NO implicit default — a fresh provision without any rung set fails with `apprafter::provider::server_type_not_selected`). When set and `--no-ping` is NOT passed, the SKU is validated against the live Hetzner API for the target's region"
+        },
+        {
+          "id": "ssh_key",
+          "long": "ssh-key",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SSH_KEY",
+          "default": null,
+          "env": "APPRAFTER_SSH_PUBLIC_KEY_PATH",
+          "required": false,
+          "possible_values": [],
+          "help": "Path to the SSH public key used for server provisioning. Stays a path (not the key body) so the user's `~/.ssh/` remains the source of truth"
+        },
+        {
+          "id": "tier",
+          "long": "tier",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TIER",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Default tier identifier (`solo` / `team` / `prod` / `regulated`). Hint for `init` / `bootstrap-all`; can always be overridden per-command"
+        },
+        {
+          "id": "token",
+          "long": "token",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TOKEN",
+          "default": null,
+          "env": "HCLOUD_TOKEN",
+          "required": false,
+          "possible_values": [],
+          "help": "Hetzner Cloud API token. Required when `--provider hetzner-cloud`. Format `hcloud_<64+ alphanumeric>`; passed via `--token` or env `HCLOUD_TOKEN` (the env fallback is for CI ergonomics — interactive use should prefer the flag so the token doesn't linger in shell history's env-leak surface)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": false,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Target name. Must match `[A-Za-z0-9-]+`, max 64 chars. The first target created on a fresh store is auto-set as the active target. Optional on a TTY — the wizard asks for it with a `default` default. Required on a non-TTY / `--no-interactive` run"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "cert"
+      ],
+      "aliases": [],
+      "about": "Manage imported TLS certificates for the platform Gateway",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "cert",
+        "import"
+      ],
+      "aliases": [],
+      "about": "Import a TLS cert + key as a kubernetes.io/tls Secret in apprafter-system. The platform Gateway terminates TLS from it once a `target domain add --cert <name>` references it",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "cert",
+          "long": "cert",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CERT",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Path to the PEM-encoded certificate (chain ok)"
+        },
+        {
+          "id": "key",
+          "long": "key",
+          "short": null,
+          "takes_value": true,
+          "value_name": "KEY",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Path to the PEM-encoded private key (RSA only in this slice)"
+        },
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "apprafter-system",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace for the cert Secret (the platform Gateway reads certs from apprafter-system)"
+        },
+        {
+          "id": "replace",
+          "long": "replace",
+          "short": null,
+          "takes_value": false,
+          "value_name": "REPLACE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Update an existing cert Secret in place (no downtime — the Gateway picks up the new cert). Without this, importing over an existing name is rejected"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Cert name (DNS-1123 label, e.g. cf-origin-cert-apprafter-dev). Becomes the Secret name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "domain"
+      ],
+      "aliases": [],
+      "about": "Manage public-ingress zones (domains) on the platform Gateway",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "domain",
+        "add"
+      ],
+      "aliases": [],
+      "about": "Register an apex zone, pointing it at an imported cert",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "added_by",
+          "long": "added-by",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ADDED_BY",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Audit \"added by\" (defaults to $USER)"
+        },
+        {
+          "id": "cert",
+          "long": "cert",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CERT",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Imported cert name (the Secret from `target cert import`)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "domain",
+          "value_name": "DOMAIN",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Apex domain (RFC-1123, no \"*.\" prefix), e.g. apprafter.dev"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "domain",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List registered zones + the apps using each",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "domain",
+        "remove"
+      ],
+      "aliases": [],
+      "about": "Unregister a zone. Blocked if apps use it (unless --force)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "force",
+          "long": "force",
+          "short": null,
+          "takes_value": false,
+          "value_name": "FORCE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Remove even if applications still reference the domain"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "domain",
+          "value_name": "DOMAIN",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Apex domain to unregister"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "firewall"
+      ],
+      "aliases": [],
+      "about": "Manage the cluster's cloud firewall (origin-firewall toggle)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "firewall",
+        "cloudflare-origin"
+      ],
+      "aliases": [],
+      "about": "Restrict the node's 80/443 to Cloudflare's IP ranges (origin firewall)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "state",
+          "value_name": "STATE",
+          "required": true,
+          "multiple": false,
+          "possible_values": [
+            "enable",
+            "disable"
+          ],
+          "help": "enable | disable"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "ip"
+      ],
+      "aliases": [],
+      "about": "Show the cluster node's public IPv4 + IPv6 (for DNS A/AAAA records)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List every configured target, marking the active one. Empty store prints an onboarding hint pointing at `target add`",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "machine"
+      ],
+      "aliases": [],
+      "about": "Set or change the server type (and region) on a target via the machine picker. This is the ONLY way to change the server type on an existing target — `target add <existing>` errors, and `--renew` is credentials-only",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "no_ping",
+          "long": "no-ping",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_PING",
+          "default": null,
+          "env": "APPRAFTER_NO_PING",
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the provider API. Requires `--server-type` — the picker cannot work without the API. Without `--server-type` this flag is an error, never a silent no-op. Honours `APPRAFTER_NO_PING=1` for shell-script ergonomics"
+        },
+        {
+          "id": "server_type",
+          "long": "server-type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SERVER_TYPE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Set the type non-interactively (skips the picker). When `--no-ping` is also passed the SKU is saved without API validation; without `--no-ping` the SKU is validated against the live Hetzner API for the target's current region"
+        },
+        {
+          "id": "target",
+          "long": "target",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TARGET",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Target to modify (defaults to the active target)"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "target",
+        "remove"
+      ],
+      "aliases": [
+        "rm"
+      ],
+      "about": "Remove a target. Interactive runs prompt for confirmation unless `--yes` is passed; non-interactive runs always require `--yes` (no silent destruction)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the confirmation prompt"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Target name to remove"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "rename"
+      ],
+      "aliases": [],
+      "about": "Rename a target, moving its config + credentials + state cache to the new name. Updates `active_target` when needed",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "from",
+          "value_name": "FROM",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Source target name (must exist)"
+        },
+        {
+          "id": "to",
+          "value_name": "TO",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Destination target name (must not exist)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "show"
+      ],
+      "aliases": [
+        "info"
+      ],
+      "about": "Show details of a target (defaults to the active one). The stored token is summarised as `set` / `not set` without echoing the value; read `credentials.yaml` directly if you need the raw bytes",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": false,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Target name. Defaults to the active target"
+        }
+      ]
+    },
+    {
+      "path": [
+        "target",
+        "use"
+      ],
+      "aliases": [],
+      "about": "Switch the active target. Fails when the named target does not exist; subsequent operational commands (`apply`, `cluster-bootstrap`, ...) act on the new active target",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Name of the target to make active"
+        }
+      ]
+    },
+    {
+      "path": [
+        "upgrade-tier"
+      ],
+      "aliases": [],
+      "about": "Upgrade the cluster from one tier to the next",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "to",
+          "long": "to",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TO",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Target tier (solo/team/prod/regulated)"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "volume"
+      ],
+      "aliases": [],
+      "about": "Manage SharedVolume CRs — persistent volumes shared across multiple Applications. Volumes are namespaced; `rm` is refused while any Application references the volume",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "volume",
+        "create"
+      ],
+      "aliases": [],
+      "about": "Create a SharedVolume CR in the cluster",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "apprafter-system",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Target namespace. Defaults to `apprafter-system`"
+        },
+        {
+          "id": "size",
+          "long": "size",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SIZE",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [],
+          "help": "Requested storage size (e.g. `5Gi`, `100Mi`)"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SharedVolume `metadata.name` (DNS-1123)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "volume",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List SharedVolumes with refCount and used/free capacity",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace to list. Omit for cluster-wide listing"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "volume",
+        "rm"
+      ],
+      "aliases": [],
+      "about": "Delete a SharedVolume. Refused while still referenced by apps",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "apprafter-system",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace. Defaults to `apprafter-system`"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the confirmation prompt"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SharedVolume `metadata.name`"
+        }
+      ]
+    },
+    {
+      "path": [
+        "volume",
+        "status"
+      ],
+      "aliases": [],
+      "about": "Show detail for one SharedVolume (pvcRef, refCount, capacity)",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "apprafter-system",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace. Defaults to `apprafter-system`"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SharedVolume `metadata.name`"
+        }
+      ]
+    },
+    {
+      "path": [
+        "whoami"
+      ],
+      "aliases": [],
+      "about": "One-line summary of the operator's current shell context: identity + active target + provider-verified status + key config fields. Pings the provider API by default; pass `--no-ping` to skip the network round-trip",
+      "long_about": null,
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "no_ping",
+          "long": "no-ping",
+          "short": null,
+          "takes_value": false,
+          "value_name": "NO_PING",
+          "default": null,
+          "env": "APPRAFTER_NO_PING",
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the Hetzner Cloud API ping that confirms the active target's token still authenticates. Honours `APPRAFTER_NO_PING=1` for shell-script ergonomics"
+        }
+      ],
+      "positionals": []
+    }
+  ]
+}

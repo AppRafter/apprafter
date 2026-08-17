@@ -263,6 +263,25 @@ docs-build:
 docs-check:
     bash scripts/docs-check.sh
 
+# Regenerate `docs/reference/cli/**` from the clap definitions.
+#
+# MUST be run (and the result committed) after ANY change to the CLI
+# surface — a new command, a renamed or removed flag, a changed
+# default, an edited doc comment on anything under
+# `cli/platform-cli/src/`. `docsgen check` byte-compares the committed
+# tree against a fresh render, so forgetting this fails `just lint`,
+# the pre-commit hook and the docs workflow.
+#
+# ALSO run it on a release commit: `commands.json` carries
+# `cli_version`, so bumping `cli/Cargo.toml` changes a byte-compared
+# artefact. That is deliberate — a consumer of the machine-readable
+# surface needs to know which CLI it describes.
+#
+# Goes through the flake for the same pinned toolchain as the docs
+# build; `cli/` is its own Cargo workspace, hence the `cd`.
+docsgen-generate:
+    nix develop --command bash -c 'cd cli && cargo run -q -p docsgen -- generate'
+
 # Render the platform-stack umbrella chart from CUE source into
 # `platform-stack/dist/platform-stack-<version>/`. Wrapper over
 # `make -C platform-stack render`. Used by the publish workflow
