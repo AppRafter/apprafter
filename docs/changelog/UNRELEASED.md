@@ -9,6 +9,119 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## docs tooling (no release) — 2.19a/2.19b documentation system: a validated site build + a generated CLI reference (2026-08-17)
+
+> No version bump and no monorepo tag. Shipped CLI behaviour is unchanged
+> (a lib target plus doc-comment corrections); no chart, operator or
+> cue-cmp artefact moved; the site is still unpublished (that is 2.19g).
+> Two of the documentation track's ten subphases — branch
+> `feat/2.19-docs-system`, design
+> `docs/superpowers/specs/2026-08-17-documentation-system-design.md`.
+
+### Added
+
+- **One Nix python environment for the docs site.** `flake.nix` now
+  provides a single `python3.withPackages` env (mkdocs-material +
+  mkdocs-literate-nav + mkdocs-redirects), and the `Justfile` docs targets
+  route through `nix develop`. The previous
+  `nix shell nixpkgs#python3Packages.mkdocs-material` fallback could never
+  have worked — that closure ships no `mkdocs` binary, and adding
+  `python3Packages.mkdocs` beside it yields a second env whose
+  site-packages lacks the theme (`Unrecognised theme name: 'material'`).
+  One env is also the only shape a byte-compared generated reference can
+  use: local and CI must run the same `flake.lock`-pinned toolchain.
+- **`just docs-check` — the documentation gate.** A strict mkdocs build
+  followed by the generated-reference byte-compare, wired into
+  `just lint`, a lefthook pre-commit hook, and a new
+  `.github/workflows/docs.yml`. Before this a docs-only pull request ran
+  **zero** jobs — `lint.yml`'s paths-filter has no docs entry.
+- **A generated CLI reference under `docs/reference/cli/`.** The new
+  `cli/docsgen` crate projects the clap tree into 26 top-level command
+  pages, an index, a literate-nav `SUMMARY.md`, and a machine-readable
+  `commands.json` covering all 95 command paths. `just docsgen-generate`
+  regenerates it; `docsgen check` byte-compares the committed tree against
+  a fresh render in `just lint`, the pre-commit hook and CI — so a renamed
+  flag, a changed default or an edited doc comment now fails the build
+  until the reference is regenerated.
+- **`docs/reference/environment.md`** — the 20+ environment variables the
+  generator cannot see. Only four are declared through clap
+  (`#[arg(env = …)]`); the rest are read by `std::env::var` in command
+  code or by a dependency (miette, owo-colors, tracing-subscriber).
+- **A lib target on `cli/platform-cli`.** `dispatch` moved into
+  `src/dispatch.rs` and `main.rs` is a thin shim over `apprafter::run()`.
+  The public surface is `run()` plus a two-item `docs_api` facade (the
+  clap root, and the injected-schema manifest validator), so widening it
+  is a deliberate act rather than a side effect of a refactor. Shipped
+  behaviour is unchanged.
+- **A named documentation licence.** Prose under `docs/` is **CC-BY-4.0**
+  (new `LICENSE-CC-BY-4.0`); the code samples embedded in those pages are
+  **Apache-2.0**, so they can be pasted into any project without
+  attribution obligations. Stated in `docs/license.md`, `README.md`,
+  `NOTICE` and the site footer.
+
+### Changed
+
+- **The strict build validates for the first time.** `mkdocs build
+  --strict` passed before this change while checking almost nothing. It
+  now enforces a `not_in_nav` allow-list (ADRs, `license.md`,
+  `contributing/README.md`), `validation.links.not_found`,
+  `validation.links.anchors`, `validation.links.unrecognized_links`, and
+  `validation.nav.omitted_files: warn` (was `info`). 64 pages were
+  silently unlisted — among them `operator-guide/node-prep.md`, a real
+  user guide that was invisible on the site. It is back in nav.
+- **Internal pages no longer publish.** `changelog/UNRELEASED.md`,
+  `changelog/plan-history.md` and `measurements/` are excluded from the
+  site. `UNRELEASED.md` stays exactly where it is — `release-cli.yml`
+  parses it for release notes — it is excluded from the *site*, never
+  moved.
+- **`edit_uri`** pointed at `edit/main/docs/`; the branch is `master`, so
+  every "edit this page" link 404ed.
+- **Markdown under `docs/` takes no per-file SPDX header.** Five stray
+  `FSL-1.1-Apache-2.0` headers on `docs/` Markdown were removed — they
+  contradicted the new documentation licence — and
+  `contributing/license-headers.md` now states the rule.
+
+### Fixed
+
+Doc comments the generator turned into published-documentation bugs:
+
+- **`status`, `login` and `upgrade-tier` are skeletons, and now say so in
+  their first sentence.** `status` reads local state and never contacts
+  the cluster; `login` prints what it would do and writes nothing;
+  `upgrade-tier` validates `--to` and changes nothing. The generated
+  reference uses the lead sentence as both the overview-table summary and
+  the page description, so a caveat in sentence two is invisible exactly
+  where a reader decides whether the command does what they need. Each
+  now names the command that works today (`apprafter platform status` /
+  `apprafter app status`, `apprafter kubeconfig`).
+- **Seven flags had no documentation at all** and would have published as
+  blank description cells: `--cron`, `--keep-daily`, `--keep-weekly`,
+  `--keep-monthly`, `--check-cron` and `--failure-webhook` on
+  `backup enable`, plus `--to` on `platform upgrade`. The retention flags
+  now also carry the non-obvious part — retention is only *applied* under
+  `--enforce cluster` or an explicit `apprafter backup prune`; under the
+  default `--enforce operator` the scheduled Job never forgets.
+- **`--no-ping`'s environment variable was documented wrongly.** Three doc
+  comments offered `APPRAFTER_NO_PING=1` "for shell-script ergonomics",
+  one of them adding that "any non-empty value flips the flag". clap
+  parses it as a bool: `1 true yes y t on` skip the ping, `0 false no n f
+  off` keep it, and anything else — including the empty string — is an
+  **error**, not a no-op.
+- **`nodes[0].kind` is not a manifest key.** It is the internal Rust field
+  name; the `Infrastructure.cue` key is `type`, on an entry under
+  `spec.nodes`. It appeared in three `--help` strings describing the
+  server-type resolution chain and in
+  `docs/operator-guide/troubleshooting.md`, where the
+  `server_type_not_selected` runbook was telling operators to write a key
+  that does not parse.
+
+### Removed
+
+- **`docs/reference/cli.md`** — hand-written, documented 15 of the 27
+  top-level commands, and presented itself as complete. Superseded by the
+  generated tree; its four inbound links were retargeted at
+  `reference/cli/index.md`.
+
 ## cli v0.2.44 / platform-stack 0.2.54 — S3 backup UX fixes (2026-08-13)
 
 > CLI bump (monorepo tag `v0.2.44`) + platform-stack chart bump to `0.2.54`
