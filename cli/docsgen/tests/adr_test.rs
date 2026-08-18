@@ -10,6 +10,10 @@
 //! as wrong.
 
 use docsgen::adr::{references, statuses, verdict, Verdict};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
 
 #[test]
 fn both_spellings_are_found() {
@@ -73,6 +77,11 @@ fn a_verdict_the_vocabulary_does_not_hold_is_not_guessed() {
     assert_eq!(verdict("Ratified 2026-05-12."), Verdict::Unknown);
     assert_eq!(verdict(""), Verdict::Unknown);
     assert_eq!(verdict("   \n\n"), Verdict::Unknown);
+    // The one decoration that is still a token of its own: `1` is
+    // alphanumeric, so it survives trimming. Skipping numeric tokens
+    // to reach the word behind them would make `2026-05-06 Accepted`
+    // read as a verdict, which is the worse answer of the two.
+    assert_eq!(verdict("1. Accepted"), Verdict::Unknown);
     // The template's enum menu — read, it would say `Proposed` for every
     // ADR that copied it. It is excluded by filename instead, which
     // `the_register_skips_the_template` pins.
@@ -88,11 +97,24 @@ fn the_vocabulary_is_read_whatever_the_case_and_the_decoration() {
     // `Accepted`, Accepted, `Accepted` (date), **bold** in the amended
     // ones — and a reader adding a sixth must not silently produce
     // `Unknown`.
+    //
+    // The blockquote and list forms are here because they were the
+    // counter-example: reading the FIRST token and trimming afterwards
+    // left `>` and `-` trimmed to the empty string, so `> Accepted`
+    // fell through to `Unknown` — a hard finding, with no ignore key,
+    // on every page citing that ADR, sent to fix a vocabulary that was
+    // never the problem. The property this test claims is the one the
+    // module doc claims: a new way of writing `Accepted` costs nothing.
     for body in [
         "accepted",
         "ACCEPTED.",
         "**`Accepted`**, see below",
         "_Accepted_:",
+        "> Accepted.",
+        ">  `Accepted` (2026-05-12).",
+        "- Accepted",
+        "* `Accepted`",
+        "(Accepted)",
     ] {
         assert_eq!(verdict(body), Verdict::Accepted, "{body:?}");
     }
@@ -121,7 +143,6 @@ fn a_number_that_is_not_exactly_four_digits_is_not_a_reference() {
     assert!(references("ADR 00461 is not one.\n").is_empty(), "too long");
     assert!(references("ADR 046 is not one.\n").is_empty(), "too short");
     assert!(references("ADR 0046a is not one.\n").is_empty(), "suffixed");
-    assert!(references("ADRs 0034 and 0038.\n").is_empty(), "plural");
     // And the boundary that must still resolve: punctuation after the
     // number is how every corpus reference ends.
     for text in ["ADR 0046.", "ADR 0046,", "[ADR 0046](x.md)", "(ADR-0046)"] {
@@ -129,6 +150,66 @@ fn a_number_that_is_not_exactly_four_digits_is_not_a_reference() {
         assert_eq!(r.len(), 1, "{text:?}: {r:?}");
         assert_eq!(r[0].number, "0046", "{text:?}");
     }
+}
+
+#[test]
+fn the_separator_may_be_a_run_of_spaces_or_a_tab() {
+    // Added because a second space was a one-keystroke way to take a
+    // citation out of sight — the same suppression the wrap rule exists
+    // to close, left open by a grammar that accepted exactly one space.
+    // The corpus writes neither of these; the point is that it cannot
+    // start to.
+    for text in ["ADR  0046", "ADR\t0046", "ADR \t 0046."] {
+        let r = references(text);
+        assert_eq!(r.len(), 1, "{text:?}: {r:?}");
+        assert_eq!(r[0].number, "0046", "{text:?}");
+    }
+    // The hyphen form stays exactly one hyphen: `Pre-ADR-0032` depends
+    // on it, and a run of hyphens is a rule, not a separator.
+    assert!(references("ADR--0046").is_empty());
+}
+
+#[test]
+fn the_plural_cites_its_first_number() {
+    // The justification for excluding `ADRs` used to be that it is "a
+    // plural noun with a list after it rather than a citation". It is
+    // not: `README.md:121` writes `and ADRs [0001](…) and [0032](…)`,
+    // `spec.md:1306` writes "ADRs 0025–0029 reframe cluster-bootstrap"
+    // and `docs/adr/0029-cue-cmp.md:9` writes "ADRs 0025–0028 address
+    // the platform-stack side". Excluding it also made a trailing `s` a
+    // suppression.
+    let r = references("ADRs 0034 and 0038.\n");
+    let numbers: Vec<&str> = r.iter().map(|found| found.number.as_str()).collect();
+    // Only the first: continuing the list would mean reading a bare
+    // four-digit run in prose as a citation, and the commonest
+    // four-digit run in this corpus is a year.
+    assert_eq!(numbers, ["0034"], "{r:?}");
+}
+
+#[test]
+fn a_citation_written_only_as_a_link_or_a_path_is_a_reference() {
+    // Added because four corpus citations carry no `ADR NNNN` text at
+    // all, and they are exactly the form the first version of this
+    // check's remedy told authors to write. The number is in every
+    // ADR's filename, so this costs one more scan.
+    let link = references("See [the original shim](../adr/0011-hybrid-rust-sdk-tofu-shim.md).\n");
+    assert_eq!(link.len(), 1, "{link:?}");
+    assert_eq!(link[0].number, "0011");
+
+    let span = references("- `docs/adr/0032-license-fsl-1-1-apache-2-0.md` — base license\n");
+    assert_eq!(span.len(), 1, "{span:?}");
+    assert_eq!(span[0].number, "0032");
+
+    // One citation spelled both ways on one line is ONE reference —
+    // otherwise the corpus's ordinary link shape reports every problem
+    // twice.
+    let both = references("- [ADR 0046](../adr/0046-env-value-references.md) — env values\n");
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert_eq!(both[0].number, "0046");
+
+    // `README.md` is the index of the ADR directory, not a decision,
+    // and has no number to key it by.
+    assert!(references("[the ADRs](../adr/README.md)").is_empty());
 }
 
 #[test]
@@ -147,10 +228,70 @@ fn a_reference_wrapped_across_a_line_break_is_still_a_reference() {
     // On the line the citation starts, as an invocation's flags are
     // reported on the line its command started.
     assert_eq!(r[0].line, 1);
+    // And exactly one: the continuation line IS the link target, so the
+    // filename shape must not report the same citation a second time,
+    // on the line below.
 
     // A wrap that is not one: the next line has to open on the number.
     let prose = "The decision is an ADR\nand it lives in 0030-something.md\n";
     assert!(references(prose).is_empty(), "{prose:?}");
+
+    // The other bracket: a citation whose number carries the `]`.
+    let closing =
+        "Rationale: see ADR\n0030](../adr/0030-cli-target-store-and-credential-chain.md).\n";
+    let r = references(closing);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].line, 1);
+}
+
+#[test]
+fn a_line_ending_on_the_word_adr_does_not_swallow_the_next_number() {
+    // The negative control the wrap rule was missing. `ADR` is an
+    // ordinary English noun in this corpus —
+    // `docs/operator-guide/index.md:54` writes "An ADR describes the
+    // world as it was when it was ratified" — and a year is the
+    // commonest four-digit run in it, so an unanchored join reported
+    // `ADR 2026`: no such ADR, a hard finding on a correct sentence.
+    let year = "- Every decision is recorded as an ADR\n  2026-05-06 is the earliest one.\n";
+    assert!(references(year).is_empty(), "{:?}", references(year));
+
+    let port = "The exporter is reached through the ADR\n9090 is the port.\n";
+    assert!(references(port).is_empty(), "{:?}", references(port));
+
+    // The join is bracketed on one side or the other, so an
+    // unbracketed prose wrap is given up with it. That is the trade:
+    // the corpus writes the bracketed shape, and a false positive is a
+    // page the gate is wrong about while this is one it is quiet about.
+    let bare = "Storage follows ADR\n0011.\n";
+    assert!(references(bare).is_empty(), "{:?}", references(bare));
+}
+
+#[test]
+fn the_corpus_citations_that_carry_no_adr_text_are_found() {
+    // The one case that has to be anchored on real pages: `README.md`
+    // cites two ADRs and writes neither as `ADR NNNN` — it writes
+    // `and ADRs [0001](./docs/adr/0001-…md) … and [0032](…)`. Under a
+    // grammar that reads the `ADR NNNN` text alone, `README.md` held
+    // zero citations and reported clean, which is what a blind spot
+    // looks like from the outside.
+    let root = docsgen::repo_root().unwrap();
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    let numbers: BTreeSet<String> = references(&readme)
+        .into_iter()
+        .map(|found| found.number)
+        .collect();
+    assert!(numbers.contains("0001"), "{numbers:?}");
+    assert!(numbers.contains("0032"), "{numbers:?}");
+
+    // `docs/license.md` writes the same two as bare paths in code
+    // spans, alongside the `Pre-ADR-0032` text form.
+    let license = std::fs::read_to_string(root.join("docs/license.md")).unwrap();
+    let cited: BTreeSet<String> = references(&license)
+        .into_iter()
+        .map(|found| found.number)
+        .collect();
+    assert!(cited.contains("0001"), "{cited:?}");
+    assert!(cited.contains("0032"), "{cited:?}");
 }
 
 #[test]
@@ -199,14 +340,157 @@ fn the_register_reads_this_repositorys_own_adrs() {
 }
 
 #[test]
-fn the_register_skips_the_template() {
+fn the_register_holds_every_tracked_adr_and_nothing_else() {
     // `0000-template.md`'s Status body is the literal enum menu, so
     // reading it would put a `Proposed` ADR 0000 in the register and
-    // make the menu look like a decision.
+    // make the menu look like a decision. `README.md` is the index, and
+    // has no number to key it by.
+    //
+    // Asserted as a set derived from the listing the register is built
+    // from, rather than as `len() > 50`: that bound would still have
+    // passed after a bug that dropped six real ADRs, which is not the
+    // property this test is here for.
     let root = docsgen::repo_root().unwrap();
     let register = statuses(&root).unwrap();
-    assert_eq!(register.get("0000"), None, "{register:?}");
-    // The index page is not an ADR either, and it has no number to key
-    // it by — the shape rule that drops it drops nothing else.
-    assert!(register.len() > 50, "{}", register.len());
+    let expected: BTreeSet<String> = tracked(&root, "docs/adr")
+        .iter()
+        .filter_map(|path| path.rsplit('/').next())
+        .filter(|name| name.ends_with(".md") && *name != "0000-template.md")
+        .filter_map(number_of)
+        .collect();
+    assert!(!expected.is_empty(), "the listing is empty — helper broken");
+    let keys: BTreeSet<String> = register.keys().cloned().collect();
+    assert_eq!(keys, expected);
+    assert_eq!(register.get("0000"), None, "the template is not a decision");
+}
+
+// ---- the register as breakage ------------------------------------------
+
+#[test]
+fn a_register_holding_no_adrs_is_an_error() {
+    // The branch that keeps a moved or emptied `docs/adr/` from reading
+    // as "every citation in the corpus names a nonexistent ADR" —
+    // dozens of findings, all false, none fixable by editing a page.
+    // Untested until now, which is how a whole-module argument comes to
+    // rest on a branch nobody ran.
+    let repo = register_repo(&[
+        ("0000-template.md", "## Status\n\n`Proposed` | `Draft`\n"),
+        ("README.md", "# Index\n"),
+    ]);
+    let e = statuses(repo.path()).unwrap_err().to_string();
+    assert!(e.contains("docs/adr"), "{e}");
+    assert!(e.contains("holds no ADRs"), "{e}");
+}
+
+#[test]
+fn a_register_directory_that_is_not_there_is_an_error() {
+    let repo = register_repo(&[]);
+    let e = statuses(repo.path()).unwrap_err().to_string();
+    assert!(e.contains("docs/adr"), "{e}");
+}
+
+#[test]
+fn two_files_claiming_one_number_is_an_error() {
+    // `read_dir` returned entries in an unspecified order, so a
+    // scratch copy beside the original resolved to whichever came
+    // last — and when that was `Accepted`, every citation of a
+    // superseded decision quietly stopped being reported, with nothing
+    // saying so. A register that cannot say what a number names is the
+    // gate being broken: exit 2, not a finding.
+    let repo = register_repo(&[
+        (
+            "0011-original.md",
+            "## Status\n\n`Superseded by ADR 0016`.\n",
+        ),
+        ("0011-zz-scratch-copy.md", "## Status\n\n`Accepted`.\n"),
+    ]);
+    let e = statuses(repo.path()).unwrap_err().to_string();
+    assert!(e.contains("0011-original.md"), "{e}");
+    assert!(e.contains("0011-zz-scratch-copy.md"), "{e}");
+}
+
+#[test]
+fn an_adr_that_is_not_staged_is_not_in_the_register() {
+    // The reason the register reads `git ls-files` and not the
+    // directory: everything else the gate resolves against comes from
+    // the index, and a register read off the worktree would resolve a
+    // citation in the pre-commit hook and not in CI — the page passing
+    // locally and failing on the pull request, with the citation named
+    // as the defect rather than the missing `git add`.
+    let repo = register_repo(&[("0011-staged.md", "## Status\n\n`Accepted`.\n")]);
+    std::fs::write(
+        repo.path().join("docs/adr/0056-unstaged.md"),
+        "## Status\n\n`Accepted`.\n",
+    )
+    .unwrap();
+    let register = statuses(repo.path()).unwrap();
+    assert_eq!(register.get("0011"), Some(&Verdict::Accepted));
+    assert_eq!(register.get("0056"), None, "{register:?}");
+}
+
+// ---- helpers -----------------------------------------------------------
+
+/// The four digits an ADR filename opens on, by the same shape rule the
+/// register uses — four digits, then anything that is not alphanumeric.
+fn number_of(name: &str) -> Option<String> {
+    let bytes = name.as_bytes();
+    if bytes.len() < 4 || !bytes[..4].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.get(4).is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    Some(name[..4].to_string())
+}
+
+/// Every path `git` tracks under `dir`, repo-relative.
+fn tracked(repo: &Path, dir: &str) -> Vec<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-z", "--", dir])
+        .output()
+        .expect("git must be on PATH");
+    assert!(out.status.success(), "git ls-files failed");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A throwaway repository whose `docs/adr/` holds `files`, all staged.
+///
+/// Staged rather than merely written, because the register is
+/// `git ls-files`: an unstaged file is deliberately not in it.
+fn register_repo(files: &[(&str, &str)]) -> TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    run_git(repo.path(), &["init", "-q"]);
+    if !files.is_empty() {
+        std::fs::create_dir_all(repo.path().join("docs/adr")).unwrap();
+        for (name, body) in files {
+            std::fs::write(repo.path().join("docs/adr").join(name), body).unwrap();
+        }
+        run_git(repo.path(), &["add", "--", "docs"]);
+    }
+    repo
+}
+
+fn run_git(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        // Hermetic: the developer's global config, hooks and templates
+        // must not decide whether this passes.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(args)
+        .output()
+        .expect("git must be on PATH");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

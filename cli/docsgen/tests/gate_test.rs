@@ -647,11 +647,16 @@ fn a_reference_to_a_superseded_adr_is_reported() {
 #[test]
 fn a_reference_to_a_partly_superseded_adr_is_not_reported() {
     // The negative control that matters: a blind "superseded" match
-    // fires on ADRs 0001, 0042 and 0053 — seven in-scope references,
-    // none of them defects, against zero true positives in scope.
+    // fires on ADRs 0001, 0042, 0043 and 0053 — 11 in-scope references,
+    // none of them defects, against zero true positives in scope. (0043
+    // was missing from this list, and from the figure: its `## Status`
+    // reads "§1's env-injection naming superseded in part by ADR 0046"
+    // and it carries 2 references.) Widen the substring to `supersed`
+    // and it is 27 references across 6 cited ADRs, still with no true
+    // positive among them.
     let (repo, now) = tag_repo();
     let gate = gate_with(repo.path(), now);
-    let page = "# Page\n\nSee ADR 0042, ADR 0053 and ADR 0001.\n";
+    let page = "# Page\n\nSee ADR 0042, ADR 0053, ADR 0043 and ADR 0001.\n";
     let found = of(
         &gate.check_source("docs/t.md", page).unwrap(),
         gate::ADR_REFERENCE,
@@ -737,6 +742,161 @@ fn a_citation_wrapped_across_a_line_break_is_still_judged() {
     assert_eq!(found.len(), 1, "{found:?}");
     // On the line the citation starts.
     assert!(found[0].starts_with("3: "), "{found:?}");
+}
+
+#[test]
+fn a_citation_written_only_as_a_link_is_judged() {
+    // The blind spot this class shipped with, and the one its own first
+    // remedy recommended writing into: no `ADR NNNN` text anywhere, and
+    // 0011 is `Superseded`. Four corpus citations are written this way.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [0011](../adr/0011-hybrid-rust-sdk-tofu-shim.md) for the shim.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("0011"), "{found:?}");
+}
+
+#[test]
+fn a_prose_line_ending_on_the_word_adr_is_not_a_citation() {
+    // The false positive the wrap rule manufactured, through the real
+    // gate: `ADR` is an ordinary noun in this corpus's register —
+    // `docs/operator-guide/index.md:54` writes "An ADR describes the
+    // world as it was when it was ratified" — and this reported
+    // "`ADR 2026`: no such ADR", a hard finding on a correct sentence,
+    // with a remedy that named neither cause.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page =
+        "# Page\n\n- Every decision is recorded as an ADR\n  2026-05-06 is the earliest one.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn citing_the_template_says_so_rather_than_no_such_adr() {
+    // `0000-template.md` is skipped by name, so the register has no
+    // `0000` — and "docs/adr/ holds no 0000-*.md" would be false about
+    // a file sitting right there, sending the reader to hunt a typo.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nCopy the shape of ADR 0000.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("template"), "{found:?}");
+    assert!(!found[0].contains("no such ADR"), "{found:?}");
+}
+
+// ---- the ADR exemption channel -----------------------------------------
+
+#[test]
+fn an_adr_citation_is_exempted_in_front_matter_like_any_other_claim() {
+    // Citing a reversed decision on purpose is legitimate and is this
+    // repository's idiom — `spec.md` writes "superseded ADR 0011" and
+    // "see superseded ADR 0011". Shipped without a channel, the remedy
+    // told the author to delink the citation instead, which is a
+    // permanent, unreviewable silencing invisible in a diff.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "---\n\
+                adr-check-ignore:\n  \
+                - adr: \"ADR 0011\"\n    \
+                reason: historical\n    \
+                since: v0.9.0\n    \
+                note: the sentence is about the shim we replaced, and says so\n\
+                ---\n\n\
+                The superseded ADR 0011 shim is described here for readers on \
+                old clusters.\n\n\
+                Autoscaling is settled in ADR 0013.\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    let found = of(&findings, gate::ADR_REFERENCE);
+    // Exactly the citation it names, and nothing else on the page.
+    assert_eq!(found.len(), 1, "{findings:?}");
+    assert!(found[0].contains("0013"), "{found:?}");
+    assert!(
+        of(&findings, gate::EXEMPTION_UNUSED).is_empty(),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn one_adr_exemption_covers_every_spelling_of_that_citation() {
+    // The one place this channel differs from the span channel, and
+    // deliberately: a span's two spellings are two claims, a citation's
+    // are not. `ADR-0011` and `../adr/0011-….md` name one decision, so
+    // an exemption keyed `ADR 0011` covers both — otherwise a page
+    // would silence its prose citation and still be reported for the
+    // link in the same sentence.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "---\n\
+                adr-check-ignore:\n  \
+                - adr: \"ADR 0011\"\n    \
+                reason: historical\n    \
+                since: v0.9.0\n\
+                ---\n\n\
+                Pre-ADR-0011 clusters ran the shim.\n\n\
+                See [the original](../adr/0011-hybrid-rust-sdk-tofu-shim.md).\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    assert!(
+        of(&findings, gate::ADR_REFERENCE).is_empty(),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn an_expired_adr_exemption_is_void_and_the_citation_is_reported() {
+    // The window applies here exactly as it does everywhere else: an
+    // exemption that can no longer be dated, or that is past its
+    // window, silences nothing — otherwise a two-year-old `historical`
+    // keeps hiding a citation nobody has re-read.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "---\n\
+                adr-check-ignore:\n  \
+                - adr: \"ADR 0011\"\n    \
+                reason: historical\n    \
+                since: v0.1.0\n\
+                ---\n\n\
+                Storage follows ADR 0011.\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    assert_eq!(
+        of(&findings, gate::EXEMPTION_EXPIRED).len(),
+        1,
+        "{findings:?}"
+    );
+    assert_eq!(of(&findings, gate::ADR_REFERENCE).len(), 1, "{findings:?}");
+    // Void, but matched — one problem, one finding.
+    assert!(
+        of(&findings, gate::EXEMPTION_UNUSED).is_empty(),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn an_adr_exemption_that_silences_nothing_is_reported() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "---\n\
+                adr-check-ignore:\n  \
+                - adr: \"ADR 0011\"\n    \
+                reason: historical\n    \
+                since: v0.9.0\n\
+                ---\n\n\
+                This page cites the ADR that replaced it, ADR 0016.\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    let unused = of(&findings, gate::EXEMPTION_UNUSED);
+    assert_eq!(unused.len(), 1, "{findings:?}");
+    assert!(unused[0].contains("ADR 0011"), "{unused:?}");
 }
 
 // ---- helpers -----------------------------------------------------------

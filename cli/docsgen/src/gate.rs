@@ -63,16 +63,48 @@
 //!     reason: external-tool
 //!     since: v0.2.44
 //!     note: Argo CD's Application, which our field set does not model
+//!
+//! adr-check-ignore:
+//!   - adr: "ADR 0011"
+//!     reason: historical
+//!     since: v0.2.44
+//!     note: the sentence is about the shim we replaced, and says so
 //! ```
 //!
 //! [`SPAN_IGNORE`] carries the literal span text; [`PATH_IGNORE`] the
-//! literal schema path, page-wide. Both are matched by **exact
-//! equality** on the trimmed text, never by substring: an exemption for
+//! literal schema path, page-wide; [`ADR_IGNORE`] the citation, also
+//! page-wide. All three are matched by **exact equality** on the trimmed
+//! text, never by substring: an exemption for
 //! `apprafter node reserve-headroom` does not cover
 //! `apprafter node reserve-headroom --dry-run`, which is a different
-//! claim. Both go through [`marker::parse_marker`] rather than a second
-//! grammar, so the closed [`Reason`] vocabulary, the `vMAJOR.MINOR.PATCH`
-//! shape of `since` and the expiry window are one implementation.
+//! claim. All three go through [`marker::parse_marker`] rather than a
+//! second grammar, so the closed [`Reason`] vocabulary, the
+//! `vMAJOR.MINOR.PATCH` shape of `since` and the expiry window are one
+//! implementation.
+//!
+//! [`ADR_IGNORE`] is keyed on the citation's **canonical** form,
+//! `ADR NNNN`, and that is the one place this channel differs from the
+//! other two. A span's two spellings are two different claims; a
+//! citation's two spellings are not. `ADR-0011`, `ADRs 0011` and
+//! `../adr/0011-hybrid-rust-sdk-tofu-shim.md` all cite one decision, so
+//! one key covers all of them — and it is the text the finding's own
+//! message quotes, which is what a reader copies. Keying on the literal
+//! bytes instead would mean an exemption that silences the prose form
+//! and leaves the link form reported, on the same sentence.
+//!
+//! # Why the ADR class has a channel at all
+//!
+//! It shipped without one, and the remedy told an author to link the
+//! ADR's file instead of naming its number. Citing a reversed decision
+//! on purpose is legitimate and is this repository's idiom —
+//! `spec.md:1454` writes "superseded ADR 0011 → ADR 0016" and
+//! `spec.md:1574` "see superseded ADR 0011", sentences that announce
+//! the supersession in the same breath — so
+//! that remedy was the gate's own advice to write the citation in a
+//! form the gate could not see. Permanent, unreviewable, and invisible
+//! in a diff, which is what every other exemption in this crate is
+//! designed not to be. (It is also now moot: [`adr::references`] reads
+//! the link form.)
 //!
 //! Front matter is excluded from the prose scan by [`crate::scan`],
 //! which is what makes this possible at all: scanned as prose, the
@@ -200,6 +232,10 @@ pub const SPAN_IGNORE: &str = "cli-check-ignore";
 /// Front-matter key exempting a schema path from the identifier check,
 /// page-wide, by the path's literal text.
 pub const PATH_IGNORE: &str = "schema-check-ignore";
+/// Front-matter key exempting an ADR citation from the ADR check,
+/// page-wide, by the citation's canonical text (`ADR 0011`) — see the
+/// module docs on why this one key covers every spelling of it.
+pub const ADR_IGNORE: &str = "adr-check-ignore";
 
 /// What to do about a finding, named per class. A report that leads
 /// with one remedy for everything sends most of its readers to the
@@ -257,10 +293,9 @@ fn remedy(code: &str) -> &'static str {
         ADR_REFERENCE => {
             "cite the decision that stands — a superseded ADR's own `## Status` \
              names the one that replaced it, and `docs/adr/README.md` indexes the \
-             rest; citing a reversed decision on purpose is legitimate when the \
-             prose says so, and this class has no ignore key, so write that \
-             sentence and link the file (`[the original choice](../adr/0011-….md)`) \
-             instead of naming it as `ADR NNNN`"
+             rest; if the sentence is deliberately about the superseded decision, \
+             say so in the sentence and why, then declare an `adr-check-ignore` \
+             entry (keyed `ADR NNNN`) in the page's front matter"
         }
         _ => "see cli/docsgen/src/gate.rs",
     }
@@ -399,6 +434,51 @@ impl Exemption {
     }
 }
 
+/// Everything a page's front matter declares, one list per channel.
+///
+/// A struct rather than a tuple of `Vec<Exemption>`: three anonymous
+/// lists at a call site are three chances to silence the wrong check,
+/// and the compiler cannot tell them apart.
+#[derive(Default)]
+struct Exemptions {
+    spans: Vec<Exemption>,
+    paths: Vec<Exemption>,
+    adrs: Vec<Exemption>,
+}
+
+impl Exemptions {
+    /// Every declared exemption, whichever channel it came from —
+    /// aging, counting and the unused audit apply to all three
+    /// identically, and each one of those written per-channel is a
+    /// channel somebody forgets to add.
+    fn all(&self) -> impl Iterator<Item = &Exemption> {
+        self.spans.iter().chain(&self.paths).chain(&self.adrs)
+    }
+
+    fn all_mut(&mut self) -> impl Iterator<Item = &mut Exemption> {
+        self.spans
+            .iter_mut()
+            .chain(&mut self.paths)
+            .chain(&mut self.adrs)
+    }
+}
+
+/// Whether an exemption in `declared` covers `literal`, marking it
+/// matched if one does.
+///
+/// Matched is recorded even when the exemption is void, so a void
+/// exemption is reported once (expired or unaged) rather than twice
+/// (and unused).
+fn covered_by(declared: &mut [Exemption], literal: &str) -> bool {
+    match declared.iter_mut().find(|e| e.literal == literal) {
+        Some(exemption) => {
+            exemption.matched = true;
+            exemption.silences()
+        }
+        None => false,
+    }
+}
+
 /// The gate, with everything it resolves against loaded once.
 pub struct Gate {
     tree: Tree,
@@ -507,28 +587,39 @@ impl Gate {
 
     /// What is wrong with citing this ADR, if anything.
     ///
-    /// `Draft` and `Proposed` are silent on purpose: 9 of the 62
+    /// `Draft` and `Proposed` are silent on purpose: 9 of the 66
     /// in-scope citations name ADRs 0025–0029, all Draft, and
     /// documentation legitimately cites a decision the project is
-    /// working to. `Accepted` covers the three ADRs (0001, 0042, 0053)
-    /// that are superseded *in part* and still stand — see
-    /// [`adr::verdict`] on why only the leading token is read.
+    /// working to. `Accepted` covers the four ADRs (0001, 0042, 0043,
+    /// 0053) that are superseded *in part* and still stand — see
+    /// [`adr::verdict`] on why only the leading token is read, and on
+    /// the 11 correct references a substring rule would report.
     ///
     /// Every verdict is spelled out rather than defaulted with `_`, so
     /// a word added to [`adr::Verdict`] later is a compile error here
     /// instead of a silent "not a finding".
     fn adr_problem(&self, number: &str) -> Option<String> {
+        // Named before the register is consulted: the template IS in
+        // `docs/adr/`, so "holds no `0000-*.md`" would be false, and
+        // the reader would go looking for a typo in the number.
+        if number == adr::TEMPLATE_NUMBER {
+            return Some(format!(
+                "`ADR {number}`: `{}` is the template, not a decision — cite the ADR \
+                 you mean",
+                adr::TEMPLATE
+            ));
+        }
         match self.adrs.get(number) {
             None => Some(format!(
-                "`ADR {number}`: no such ADR — `docs/adr/` holds no `{number}-*.md`"
+                "`ADR {number}`: names no decision in the register — `docs/adr/` holds \
+                 no tracked `{number}-*.md` (a new ADR has to be `git add`ed before \
+                 the gate can resolve a citation of it)"
             )),
-            Some(adr::Verdict::Superseded | adr::Verdict::Deprecated) => {
-                let status = self.adrs[number].as_str();
-                Some(format!(
-                    "`ADR {number}`: its `## Status` opens `{status}`, so this cites a \
-                     decision that no longer stands"
-                ))
-            }
+            Some(status @ (adr::Verdict::Superseded | adr::Verdict::Deprecated)) => Some(format!(
+                "`ADR {number}`: its `## Status` opens `{}`, so this cites a decision \
+                 that no longer stands",
+                status.as_str()
+            )),
             Some(adr::Verdict::Unused) => Some(format!(
                 "`ADR {number}`: the slot is marked `Unused` — the number was reserved \
                  during early planning and names no decision"
@@ -625,11 +716,11 @@ impl Gate {
         let front = blocks
             .iter()
             .find(|block| block.kind == BlockKind::FrontMatter);
-        let (mut spans, mut paths) = match front {
+        let mut declared = match front {
             Some(block) => self.exemptions(file, &block.body, &mut findings),
-            None => (Vec::new(), Vec::new()),
+            None => Exemptions::default(),
         };
-        for exemption in spans.iter_mut().chain(paths.iter_mut()) {
+        for exemption in declared.all_mut() {
             stats.exemptions.push(exemption.reason);
             self.age(file, exemption, &mut findings);
         }
@@ -785,15 +876,7 @@ impl Gate {
                         }
                     }
                     if !problems.is_empty() {
-                        let literal = block.body.trim();
-                        let exempt = spans.iter_mut().find(|e| e.literal == literal);
-                        let silenced = match exempt {
-                            Some(exemption) => {
-                                exemption.matched = true;
-                                exemption.silences()
-                            }
-                            None => false,
-                        };
+                        let silenced = covered_by(&mut declared.spans, block.body.trim());
                         if !silenced {
                             for message in problems {
                                 findings.push(finding(CLI_INVOCATION, file, block.line, message));
@@ -823,15 +906,7 @@ impl Gate {
                 }
             };
             let Some(message) = problem else { continue };
-            let exempt = paths.iter_mut().find(|e| e.literal == token);
-            let silenced = match exempt {
-                Some(exemption) => {
-                    exemption.matched = true;
-                    exemption.silences()
-                }
-                None => false,
-            };
-            if !silenced {
+            if !covered_by(&mut declared.paths, &token) {
                 findings.push(finding(SCHEMA_IDENTIFIER, file, line, message));
             }
         }
@@ -892,17 +967,36 @@ impl Gate {
         // stop a citation being checked. It is the identifier check's
         // rule — a claim is a claim in a fence and in a span alike —
         // rather than the invocation check's, which is fence-scoped only
-        // because a fence is what a marker can annotate. There is no
-        // marker channel here, so there is nothing for a block boundary
-        // to carry.
-        for reference in adr::references(source) {
+        // because a fence is what a marker can annotate. The exemption
+        // channel is the page's front matter for the same reason a
+        // span's is: a citation can sit mid-sentence, where a comment is
+        // unreadable as prose and unreviewable as an exemption.
+        //
+        // Which is exactly why the front matter is masked out first.
+        // `scan` takes it off the block stream so that an exemption list
+        // is never read as the claim it exempts; this scan reads the raw
+        // source, so it has to do the same thing itself. Read as prose,
+        // `adr: "ADR 0011"` is a citation of ADR 0011 — one that matches
+        // its own exemption, so the entry can never be reported as
+        // unused, and that is reported as a finding of its own the day
+        // the exemption goes void.
+        let prose = mask_front_matter(source, front);
+        for reference in adr::references(&prose) {
             let Some(message) = self.adr_problem(&reference.number) else {
                 continue;
             };
-            findings.push(finding(ADR_REFERENCE, file, reference.line, message));
+            // The canonical spelling, not the bytes on the page: the
+            // same decision is cited `ADR-0011` and `../adr/0011-….md`,
+            // and one exemption covers the decision. It is also what
+            // the message quotes, so a reader copies the key out of the
+            // report.
+            let literal = format!("ADR {}", reference.number);
+            if !covered_by(&mut declared.adrs, &literal) {
+                findings.push(finding(ADR_REFERENCE, file, reference.line, message));
+            }
         }
 
-        for exemption in spans.iter().chain(paths.iter()) {
+        for exemption in declared.all() {
             if !exemption.matched {
                 findings.push(finding(
                     EXEMPTION_UNUSED,
@@ -1013,12 +1107,7 @@ impl Gate {
     }
 
     /// Read a page's front-matter exemption lists.
-    fn exemptions(
-        &self,
-        file: &str,
-        body: &str,
-        findings: &mut Vec<Finding>,
-    ) -> (Vec<Exemption>, Vec<Exemption>) {
+    fn exemptions(&self, file: &str, body: &str, findings: &mut Vec<Finding>) -> Exemptions {
         let document: serde_yaml::Value = match serde_yaml::from_str(body) {
             Ok(value) => value,
             Err(e) => {
@@ -1028,18 +1117,19 @@ impl Gate {
                     1,
                     format!("the page's front matter is not valid YAML: {e}"),
                 ));
-                return (Vec::new(), Vec::new());
+                return Exemptions::default();
             }
         };
         let Some(map) = document.as_mapping() else {
             // Empty front matter parses to `null`, which is fine and
             // declares nothing.
-            return (Vec::new(), Vec::new());
+            return Exemptions::default();
         };
-        (
-            read_list(file, body, map, SPAN_IGNORE, "span", findings),
-            read_list(file, body, map, PATH_IGNORE, "path", findings),
-        )
+        Exemptions {
+            spans: read_list(file, body, map, SPAN_IGNORE, "span", findings),
+            paths: read_list(file, body, map, PATH_IGNORE, "path", findings),
+            adrs: read_list(file, body, map, ADR_IGNORE, "adr", findings),
+        }
     }
 }
 
@@ -1099,6 +1189,31 @@ fn normalise(dir: &str, target: &str) -> Option<String> {
 /// The directory a page sits in, empty for one at the repository root.
 fn page_directory(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// `source` with the page's front matter blanked out, line for line.
+///
+/// Blanked rather than removed so that every line below it keeps its
+/// number: a finding is reported where it was written, and shifting a
+/// page's lines by the length of its own exemption list would send
+/// every reader of every finding to the wrong place.
+///
+/// The extent comes from the block [`scan`] already parsed — its two
+/// `---` delimiters around its body — rather than from a second copy of
+/// that grammar here.
+fn mask_front_matter(source: &str, front: Option<&scan::Block>) -> String {
+    let Some(front) = front else {
+        return source.to_string();
+    };
+    let masked = 2 + front.body.lines().count();
+    let mut out = String::new();
+    for (index, line) in source.lines().enumerate() {
+        if index >= masked {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Whether a marker claims something this gate cannot do on this block.
