@@ -7,12 +7,21 @@
 # `pre-commit` uses the `jobs` form (lefthook >= 1.10) rather than
 # `commands`, because only a job can carry a `group` — and the
 # docsgen/docs-check pair needs one. See the comment on that group.
+#
+# GLOB SHAPE, once, because two globs here got it wrong: in lefthook's
+# matcher `**` does NOT match zero directories when a separator
+# follows it, so `docs/**/*.md` silently skips `docs/index.md` and
+# `{cue.mod/**}/*.cue` silently skips `cue.mod/module.cue`. Any glob
+# that must cover a tree AND its top level spells both out —
+# `dir/{*.ext,**/*.ext}`. A TRAILING `/**` (no separator after) is
+# fine and does match direct children, which is why the `docsgen` and
+# `docs/hooks/**` globs need no such treatment.
 
 pre-commit:
   parallel: true
   jobs:
     - name: cue
-      glob: "{cue.mod/**,schemas/**,examples/**}/*.cue"
+      glob: "{cue.mod,schemas,examples}/{*.cue,**/*.cue}"
       run: ./scripts/lint-cue.sh
     - name: spdx
       run: ./scripts/check-spdx-headers.sh
@@ -25,8 +34,8 @@ pre-commit:
     #
     # `docsgen` WRITES docs/reference/cli/; `docs-check` READS it (the
     # strict mkdocs build, then the byte-compare). A commit touching
-    # both `cli/platform-cli/src/**` and `docs/**/*.md` matches both
-    # globs — and that is the prescribed shape for a CLI change, which
+    # both `cli/platform-cli/src/**` and a documentation page matches
+    # both globs — and that is the prescribed shape for a CLI change, which
     # regenerates the reference in the same commit — so under the
     # hook's `parallel: true` they would race: docs-check could read a
     # half-written tree, or the pre-regeneration one, and fail or pass
@@ -75,7 +84,7 @@ pre-commit:
               }
               just docsgen-generate && git add docs/reference/cli
           - name: docs-check
-            glob: "{docs/**/*.md,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh}"
+            glob: "{docs/{*.md,**/*.md},mkdocs.yml,docs/hooks/**,scripts/docs-check.sh}"
             run: ./scripts/docs-check.sh
 
 commit-msg:
