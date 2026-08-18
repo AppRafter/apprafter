@@ -9,6 +9,119 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## docs tooling (no release) — 2.19c documentation drift gate (2026-08-18)
+
+> No version bump and no monorepo tag. No chart, operator or cue-cmp
+> artefact moved, and the CLI binary is unchanged — `docsgen` is a
+> dev/CI-only crate; nothing here reaches a shipped binary. Third of the
+> documentation track's ten subphases — design
+> `docs/superpowers/specs/2026-08-17-documentation-system-design.md`
+> (rev 3), plan
+> `docs/superpowers/plans/2026-08-18-docs-2.19c-drift-gate.md`.
+
+### Added
+
+- **The documentation drift gate.** `cli/docsgen gate` runs three checks
+  over the 32 in-scope guide pages (`spec.md` is out of scope by decision —
+  it is the roadmap, not a description of what ships today; the generated
+  `docs/reference/cli/**` is out because 2.19b already byte-compares it) and
+  is wired into `just lint`, the pre-commit hook and CI via
+  `scripts/docs-check.sh`:
+  - A **CLI invocation check** resolves the command path and flag names —
+    never values, never whether a required argument is present — against
+    `commands.json`, over both fenced and inline code spans. 384 invocations
+    were checked this run. A stricter, value-parsing resolver was measured
+    to reject correct documentation en masse: 38 in-scope invocations are
+    usage synopsis (`[--namespace <ns> ...]`), `|` inside brackets is
+    alternation as often as it is a real pipe, and 161 of 213 inline spans
+    are bare command paths with no arguments at all.
+  - A **schema identifier check** resolves backticked schema paths against
+    the CRD field set plus the five CUE-only kinds; `Kind.spec.…` resolves
+    against that kind alone, closing a silent-pass a flat union would have.
+    234 identifiers resolved this run — 115 of them (a shade under half)
+    only under an `x-kubernetes-preserve-unknown-fields` subtree, where
+    membership proves nothing about what's actually written there. The gate
+    reports that split every run rather than folding it into one green
+    number.
+  - A **CUE document check** batches complete manifests found in the docs
+    through a single `cue vet -c -i` (2 documents this run). Fragments are
+    out of scope — one skeleton can't serve every anchor depth a fragment
+    might sit at.
+  Obligations are derived from a fence's **content**, never its language
+  tag: hand-written shell carries four different tags and 14 fences in
+  scope carried none, so a tag-keyed gate could be silenced by deleting a
+  tag. The only way to silence a finding is a typed, dated exemption marker
+  (`<!-- docs: check=none since=vX.Y.Z reason=… -->`); it ages against the
+  real git-tag date (not the commit date), is void when unaged, and is
+  itself reported when it matches nothing in the page.
+
+### Fixed
+
+Drift the gate found — 33 sites across the guides, all fixed:
+
+- **`apprafter promote` and other unshipped promises** removed from
+  `dev-guide/index.md` — it advertised a command, `connects`, notifications
+  and an SBOM pipeline alongside things that actually ship, none of which
+  exist.
+- **`--env`/`--namespace` examples** in `dev-guide/quickstart.md` and
+  `operator-guide/shared-volumes.md` corrected against where those flags
+  actually live in `cli.rs` (`--namespace` exists on twelve commands, not
+  `app status`/`app rm`; `--env` lives on `logs`/`rollback`/`remove`, not
+  `app status`, which deliberately aggregates every environment).
+- **`expose.public` → `expose.network`** at eight sites across three files
+  — three fences, a field-table row and a prose bullet in
+  `dev-guide/application-cue.md`, plus one line each in
+  `operator-guide/gitops-walk.md` and
+  `operator-guide/needs-networkpolicy-walk.md`. Two of the eight sit inside
+  `kubectl apply` heredocs, where the apiserver silently **prunes** the
+  unknown key — a reader following the old doc got a workload that is not
+  exposed and no error telling them why. Only the schema-identifier check
+  catches that shape; it runs page-wide, not just inside fences, for
+  exactly this reason.
+- **14 fences given a language info string** they were missing.
+- **The `DATABASE_URL`/`REDIS_URL` connection-Secret model**, removed by
+  ADR 0046 in favour of decomposed `url`/`user`/`pass`/`host`/`port`/`db`
+  keys (redis adds `channelPrefix`), corrected on 31 of 33 lines across four
+  files — the other two were already right and are left alone.
+- **The `dev-guide/application-cue.md` field table** completed with the
+  rows the census found missing: `resources`, `imagePolicy`, `needs`,
+  `environments`, `expose.hostname`, `expose.tls`.
+
+Two lines are **exempted rather than edited**, each with a typed, dated
+reason: `operator-guide/node-prep.md` documents a command that was
+**removed** (`reason=historical` — a fifth reason added to the marker's
+closed vocabulary for exactly this case, since none of the other four
+fits and forcing it into `known-broken` would be a lie), and
+`dev-guide/application-cue.md:28` correctly documents **Argo CD's** own
+`Application` schema, not ours (`reason=external-tool`).
+
+20 fixtures with paired negative controls
+(`cli/docsgen/testdata/drift/`) pin every historical drift and prove each
+check stays quiet on the lexically-similar-but-correct neighbour.
+
+### Known gaps (recorded, not fixed)
+
+- **CUE fragments are not validated.** 13 of the 14 `cue`-tagged fences in
+  scope are fragments, not complete documents; the batched validator only
+  covers complete manifests.
+- **`requires`/`conflicts` (the "`--namespace` without `--select`" class) is
+  unimplementable.** clap 4.6 keeps them `pub(crate)` with no getter.
+  Withdrawn from the design, not deferred.
+- **A stale connection-Secret key inside a `jsonpath` is a known hole no
+  check sees** — ADR 0046 renamed the pg connection-Secret's keys, so
+  `jsonpath='{.data.DATABASE_URL}'` returns empty against a live cluster,
+  and nothing in the gate looks at Secret keys. A fixture
+  (`08-stale-secret-key.md`) pins the silence and names what would have to
+  change: a new check resolving a documented Secret key against what the
+  provisioner actually writes.
+- **ADR 0042 §7 and ADR 0043 §1 are marked superseded in part** by ADR
+  0046 — each described the composed `REDIS_URL`/`REDIS_CHANNEL_PREFIX`
+  connection-Secret keys and the auto-injected, disambiguated env-var
+  naming (`<VAR>_<NAME>`) that 0046 replaced with explicit
+  `claim.<type>[.<name>].<field>` references. Neither ADR's other content
+  (Dragonfly `$N` isolation; the named multi-claim `needs` format) is
+  affected.
+
 ## docs tooling (no release) — 2.19a/2.19b documentation system: a validated site build + a generated CLI reference (2026-08-17)
 
 > No version bump and no monorepo tag. No chart, operator or cue-cmp

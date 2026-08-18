@@ -2,7 +2,20 @@
 
 ## Status
 
-Accepted (2026-06-06). ADR-first for Phase 2.6b. `plan.md` 2.6b is restructured to match this ADR — the launch decomposition (2.6b-1…2.6b-6) plus a **Deferred** section moving the broad sketch's StatefulSet pivot / `class: replicated|shared` / `shareMode` / CSI-snapshot backup / `autoExpand` / multi-tier StorageClass out of launch scope.
+`Accepted` (2026-06-06). ADR-first for Phase 2.6b. `plan.md` 2.6b is restructured to match this ADR — the launch decomposition (2.6b-1…2.6b-6) plus a **Deferred** section moving the broad sketch's StatefulSet pivot / `class: replicated|shared` / `shareMode` / CSI-snapshot backup / `autoExpand` / multi-tier StorageClass out of launch scope.
+
+**§1's env-injection naming superseded in part by [ADR 0046](0046-env-value-references.md)**
+(2026-06-10): the disambiguated auto-injected env names described below
+(`DATABASE_URL`/`REDIS_URL` for the unnamed default, `<VAR>_<NAME>` for a
+named claim) are gone along with the 2.4e auto-injection they extended —
+every env var, named claim or not, is now bound by an explicit
+`claim.<type>[.<name>].<field>` reference the developer writes, not a
+platform-derived name. The `(type, name)` claim identity and the named
+multi-claim `needs` format this ADR introduces are **not** superseded —
+ADR 0046 §2 explicitly extends this ADR's `claim.<type>[.<name>].<field>`
+grammar rather than replacing it — and neither is anything else here (disk
+as a `ResourceClaim`, the standalone-PVC/no-StatefulSet design, tier
+`StorageClass` via `disk-local`, RetainedClaim reattach).
 
 ## Context
 
@@ -44,6 +57,15 @@ The struct enumerates **all** `#PlatformServiceType` members (pg, jetstream, cli
 - The scalar/unnamed form is the **default** claim and stays valid (zero migration): claim `<app>-<type>`, env `DATABASE_URL`/`REDIS_URL`.
 - A named entry yields claim `<app>-<type>-<name>` and a disambiguated env `<VAR>_<NAME>`, where `<NAME>` is the entry name **folded to a valid env-var segment** (uppercased, `-` → `_`). Names are unique within a type; at most one unnamed default per type. The webhook validates `name` is env-foldable (DNS-1123-label `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, which folds to a valid `[A-Z_][A-Z0-9_]*` suffix).
 - The format is implemented end-to-end for all types in 2.6b (pg/redis multi-claim provisioning + disambiguated injection), validated on pg/redis arrays before disk.
+
+> **Superseded in part by [ADR 0046](0046-env-value-references.md).** The
+> two auto-injection env names above (`DATABASE_URL`/`REDIS_URL` for the
+> unnamed default, `<VAR>_<NAME>` for a named entry) go away with the 2.4e
+> auto-injection they built on. Post-0046, a named claim is addressed as
+> `claim.<type>.<name>.<field>` and the developer chooses the env var name
+> in their own `env` map — there is no platform-derived name to disambiguate.
+> The `(type, name)` claim identity and the CUE shape above are unchanged;
+> only the env-injection convention moved.
 
 ### 2. `needs.disk` is a ResourceClaim, not a renderer-only volume
 

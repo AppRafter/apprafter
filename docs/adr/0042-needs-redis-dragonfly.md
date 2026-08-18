@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted (2026-06-05).
+`Accepted` (2026-06-05). **§7 (connection contract) superseded in part by
+[ADR 0046](0046-env-value-references.md)** (2026-06-10): the connection
+Secret carries decomposed keys (`url`, `host`, `port`, `user`, `pass`, `db`,
+`channelPrefix`) instead of the composed `REDIS_URL`/`REDIS_CHANNEL_PREFIX`
+keys described below, and apps bind them via explicit `claim.redis.<field>`
+env references rather than platform auto-injection. §§1–6 and §8 (pool
+architecture, `$N` ACL isolation, DB-number allocation/recycling, the
+reconcile loop, scripting policy, GC) are unaffected and remain in effect.
 
 ## Context
 
@@ -95,6 +102,19 @@ The per-claim connection Secret (claim namespace, owner-ref'd → cascades on de
 The renderer's needs→env table (2.4e) generalises to a list of `(env-var, secret-key)` pairs: `pg → [(DATABASE_URL, DATABASE_URL)]`; `redis → [(REDIS_URL, REDIS_URL), (REDIS_CHANNEL_PREFIX, REDIS_CHANNEL_PREFIX)]`. The webhook's reserved-env guard rejects an app literally setting `REDIS_URL`/`REDIS_CHANNEL_PREFIX` when `needs.redis` is present (mirrors the `DATABASE_URL` guard).
 
 Keyspace notifications, previously out of scope, become **viable per-tenant**: because they are DB-scoped (`__keyevent@N__` / `__keyspace@N__`), an instance can enable `notify-keyspace-events` and a tenant on DB N can be granted `&__keyevent@<N>__:* &__keyspace@<N>__:*` safely (those channels carry only DB N's events). Off by default; a per-tier knob.
+
+> **Superseded in part by [ADR 0046](0046-env-value-references.md).** The
+> connection Secret's shape described above — a composed `REDIS_URL` plus a
+> separate `REDIS_CHANNEL_PREFIX`, auto-injected by the renderer's
+> needs→env table — is replaced by decomposed keys (`url`, `host`, `port`,
+> `user`, `pass`, `db`, `channelPrefix`) with no auto-injection: an app binds
+> whichever field it needs via an explicit `claim.redis.<field>` (or
+> `claim.redis.<name>.<field>`) reference in its own `env` map. `acl_reconcile`
+> reads the `pass` key directly instead of parsing it out of the `REDIS_URL`
+> DSN. The reserved-env guard rejecting a literal `REDIS_URL`/
+> `REDIS_CHANNEL_PREFIX` is also gone (see ADR 0046 §5). The DB-pinning and
+> channel-prefix isolation mechanics themselves are unchanged — only the
+> Secret's key names and how an app gets to them moved.
 
 ### 8. GC — per-DB `FLUSHDB`
 
