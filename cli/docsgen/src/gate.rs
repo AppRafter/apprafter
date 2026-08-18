@@ -161,12 +161,28 @@
 //!   ([`remedy`]), so a caller that prints codes and swallows text
 //!   will mislead its reader.
 //!
+//! # What this module cannot see on its own
+//!
+//! Every check above resolves a claim that is **present**. None of them
+//! can notice a claim that is gone: delete a page and the gate reports
+//! nothing, because there is nothing left to be wrong. [`Stats`] prints
+//! a census on every run, and a run finding 20 pages where the last one
+//! found 33 prints its 20 as calmly as its predecessor printed 33.
+//!
+//! [`health`] closes that by committing the census and comparing the
+//! next run against it by value — the obligation counts may only grow,
+//! the exemption count may not move at all. [`HEALTH_BASELINE`] is the
+//! resulting finding class. Its limits, and the three ratchets that
+//! were rejected before these seven fields were chosen, are argued
+//! there rather than repeated here.
+//!
 //! # Exit codes
 //!
 //! `main` maps this module's three outcomes to **0** (no findings),
 //! **1** (findings) and **2** (the gate itself broke — no `cue` on
 //! `PATH`, an unreadable page, a `cue` diagnostic naming none of the
-//! documents under test). Reporting our own breakage as a clean run is
+//! documents under test, a missing or unparseable
+//! [`health::FILE`]). Reporting our own breakage as a clean run is
 //! the worst available outcome, and reporting it as documentation drift
 //! is the second worst; both are why [`cuedoc::validate_documents`]'s
 //! `Err` is propagated here rather than folded into the finding list.
@@ -174,6 +190,7 @@
 use crate::adr;
 use crate::codepath;
 use crate::cuedoc::{self, Document};
+use crate::health::{self, Baseline};
 use crate::identifier::{self, FieldSet};
 use crate::invocation::{self, Tree};
 use crate::marker::{self, Age, Check, Marker, Reason};
@@ -225,6 +242,8 @@ pub const EXEMPTION_UNUSED: &str = "exemption-unused";
 pub const CODE_PATH: &str = "code-path";
 /// A referenced ADR does not exist, or its decision no longer stands.
 pub const ADR_REFERENCE: &str = "adr-reference";
+/// The corpus lost surface the committed census recorded.
+pub const HEALTH_BASELINE: &str = "health-baseline";
 
 /// Front-matter key exempting an inline span from the CLI check, by the
 /// span's literal text.
@@ -297,6 +316,12 @@ fn remedy(code: &str) -> &'static str {
              say so in the sentence and why, then declare an `adr-check-ignore` \
              entry (keyed `ADR NNNN`) in the page's front matter"
         }
+        HEALTH_BASELINE => {
+            "put the deleted documentation back if the loss was accidental — otherwise \
+             re-record the census with `docsgen metrics` in the SAME commit as the \
+             deletion, and say in the commit message what went and why, because the \
+             re-recorded number is the only trace that remains"
+        }
         _ => "see cli/docsgen/src/gate.rs",
     }
 }
@@ -358,6 +383,15 @@ pub struct Stats {
     /// third number to keep in step with the corpus and with
     /// [`identifier`]'s module docs. See [`identifier::Verdict::opaque`].
     pub opaque: usize,
+    /// Repository paths named on the page, code spans and link targets
+    /// alike — every one seen, resolved or not, the way
+    /// [`Stats::invocations`] counts every invocation. Counted for
+    /// [`health`]: it is one of the numbers a deleted page takes with
+    /// it, and a committed number nobody prints is a number nobody
+    /// reviews, so it goes through [`Stats::line`] too.
+    pub code_paths: usize,
+    /// ADR citations seen, on the same terms.
+    pub adr_references: usize,
     /// One entry per exemption declared, so they can be counted by kind
     /// — which is the whole point of the closed [`Reason`] vocabulary.
     pub exemptions: Vec<Reason>,
@@ -368,6 +402,8 @@ impl Stats {
         self.invocations += other.invocations;
         self.identifiers += other.identifiers;
         self.opaque += other.opaque;
+        self.code_paths += other.code_paths;
+        self.adr_references += other.adr_references;
         self.exemptions.extend(other.exemptions);
     }
 
@@ -393,9 +429,46 @@ impl Stats {
         format!(
             "docsgen gate: {pages} page(s), {} invocation(s), {} identifier(s) resolved \
              ({} of them only under an opaque subtree), {documents} complete CUE \
-             document(s), {exemptions}",
-            self.invocations, self.identifiers, self.opaque
+             document(s), {} code path(s), {} ADR reference(s), {exemptions}",
+            self.invocations, self.identifiers, self.opaque, self.code_paths, self.adr_references
         )
+    }
+}
+
+/// One run's measurement of the corpus.
+///
+/// The pair [`Stats`] cannot carry on its own: a page count belongs to
+/// the file listing and a document count to the batch `cue` vetted, so
+/// neither accumulates per page. Bundled rather than returned as a
+/// tuple because `docsgen metrics` commits all three and two bare
+/// `usize`s at a call site are two chances to swap them.
+pub struct Census {
+    /// In-scope pages walked, as [`scan::in_scope`] listed them.
+    pub pages: usize,
+    /// Complete CUE documents found, and so vetted in the one batch.
+    pub documents: usize,
+    /// Everything accumulated per page.
+    pub stats: Stats,
+}
+
+impl Census {
+    /// The value `docsgen metrics` commits and [`Gate::corpus`]
+    /// compares against.
+    ///
+    /// The opaque share and the exemption kinds are deliberately
+    /// dropped here rather than being absent from [`Stats`]: they are
+    /// printed on every run and belong in no value comparison. See
+    /// [`health`]'s module docs on why.
+    pub fn baseline(&self) -> Baseline {
+        Baseline {
+            pages: self.pages,
+            invocations: self.stats.invocations,
+            identifiers: self.stats.identifiers,
+            cue_documents: self.documents,
+            code_paths: self.stats.code_paths,
+            adr_references: self.stats.adr_references,
+            exemptions: self.stats.exemptions.len(),
+        }
     }
 }
 
@@ -633,11 +706,52 @@ impl Gate {
         }
     }
 
-    /// Run every check over the whole in-scope corpus.
+    /// Run every check over the whole in-scope corpus, and compare what
+    /// it measured against the committed census.
     ///
     /// `Err` is the gate's own breakage, never a page's — see the
-    /// module docs on exit codes.
+    /// module docs on exit codes. A missing or unreadable census is one
+    /// of those: a checkout without [`health::FILE`] is a checkout to
+    /// repair, and carrying on without it would silently disable the
+    /// one check that notices deletion.
     pub fn corpus(&self) -> Result<Vec<Finding>, Box<dyn Error>> {
+        // Read BEFORE the walk, though nothing here needs it yet: a
+        // broken checkout should cost a file read rather than the whole
+        // corpus plus a `cue` batch, and `main`'s BROKEN message says
+        // "nothing was judged" — which would be false if the walk had
+        // already run and had its findings thrown away.
+        let committed = health::read(&self.repo_root).map_err(|e| {
+            format!(
+                "the committed corpus census could not be read, so no loss of \
+                 documented surface could be judged — this is the gate being broken, \
+                 not the documentation:\n{e}"
+            )
+        })?;
+        let (mut findings, census) = self.walk()?;
+        for message in health::compare(&committed, &census.baseline()) {
+            // Line 1: the census is seven numbers and no prose, so
+            // there is nothing to anchor on, and a reader who opens it
+            // sees the whole file at once. The message names the field.
+            findings.push(finding(HEALTH_BASELINE, health::FILE, 1, message));
+        }
+        sort(&mut findings);
+        Ok(findings)
+    }
+
+    /// What the corpus measures, with the findings discarded.
+    ///
+    /// The same walk `corpus` runs, deliberately: `docsgen metrics`
+    /// must record the numbers the gate will later compare, and two
+    /// code paths over one corpus can disagree — which is the argument
+    /// [`Stats`] already carries for existing at all. It does **not**
+    /// read the committed census, because the first run of `metrics`
+    /// is the one that creates it.
+    pub fn census(&self) -> Result<Census, Box<dyn Error>> {
+        Ok(self.walk()?.1)
+    }
+
+    /// Every check over the corpus, plus the census the run measured.
+    fn walk(&self) -> Result<(Vec<Finding>, Census), Box<dyn Error>> {
         // Named rather than propagated bare: the failure mode is `git`
         // missing from PATH, and the io error alone is "No such file or
         // directory (os error 2)" with nothing to act on.
@@ -665,7 +779,12 @@ impl Gate {
         findings.extend(self.vet(&documents)?);
         sort(&mut findings);
         eprintln!("{}", stats.line(files.len(), documents.len()));
-        Ok(findings)
+        let census = Census {
+            pages: files.len(),
+            documents: documents.len(),
+            stats,
+        };
+        Ok((findings, census))
     }
 
     /// Every finding on one page, CUE documents included — the shape a
@@ -947,7 +1066,14 @@ impl Gate {
         } else {
             format!("`{directory}/`")
         };
-        for reference in codepath::references(&prose, &self.tops) {
+        let paths = codepath::references(&prose, &self.tops);
+        // Counted before the loop, so the census records every claim
+        // made rather than every claim that failed to resolve — the
+        // rule `stats.invocations` already follows. Counting only the
+        // survivors would let a page hold its number by leaving a
+        // broken reference in place.
+        stats.code_paths += paths.len();
+        for reference in paths {
             let resolved = if reference.page_relative {
                 normalise(directory, &reference.path)
             } else {
@@ -996,7 +1122,10 @@ impl Gate {
         // ADR 0011 — one that matches its own exemption, so the entry
         // can never be reported as unused, and that is reported as a
         // finding of its own the day the exemption goes void.
-        for reference in adr::references(&prose) {
+        let citations = adr::references(&prose);
+        // Counted like the paths above, and for the same reason.
+        stats.adr_references += citations.len();
+        for reference in citations {
             let Some(message) = self.adr_problem(&reference.number) else {
                 continue;
             };
@@ -1473,6 +1602,7 @@ mod tests {
             EXEMPTION_UNUSED,
             CODE_PATH,
             ADR_REFERENCE,
+            HEALTH_BASELINE,
         ] {
             assert_ne!(remedy(code), remedy("no-such-code"), "{code}");
         }

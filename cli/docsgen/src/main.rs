@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! `docsgen generate | check | gate` — write the CLI reference, gate
-//! it, or gate the hand-written documentation against the product.
+//! `docsgen generate | check | gate | metrics` — write the CLI
+//! reference, gate it, gate the hand-written documentation against the
+//! product, or re-record the corpus census that gate compares against.
 //!
 //! Argument parsing here is hand-rolled rather than clap-derived: this
 //! binary reads the `apprafter` clap tree, and a second clap parser in
@@ -16,7 +17,8 @@ use std::process::ExitCode;
 /// `gate` failed on the documentation: findings to fix.
 const FINDINGS: u8 = 1;
 /// The gate itself broke — no `cue` on `PATH`, an unreadable page, a
-/// diagnostic naming none of the documents under test.
+/// diagnostic naming none of the documents under test, a missing or
+/// unparseable `docs/measurements/docs-health.json`.
 ///
 /// A separate code because the two are different work: one is a page to
 /// edit, the other is a checkout or a toolchain to repair, and a caller
@@ -26,7 +28,10 @@ const BROKEN: u8 = 2;
 
 fn main() -> ExitCode {
     // `gate` owns its exit codes, so it is dispatched before the
-    // Ok/Err-to-0/1 wrapper the other two share.
+    // Ok/Err-to-0/1 wrapper the other three share. `metrics` is NOT
+    // dispatched here: it produces no findings, so it has nothing to
+    // put in the 1/2 split, and routing it through `run` keeps the
+    // rule visible — exactly one subcommand has its own codes.
     if std::env::args().nth(1).as_deref() == Some("gate") {
         return gate();
     }
@@ -45,11 +50,32 @@ fn run() -> Result<(), Box<dyn Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("generate") => generate(&cli, &root),
         Some("check") => docsgen::check::check(&cli, &root),
+        Some("metrics") => metrics(&root),
         other => {
             let got = other.unwrap_or("(nothing)");
-            Err(format!("docsgen: usage: docsgen <generate|check|gate> (got {got})").into())
+            Err(format!("docsgen: usage: docsgen <generate|check|gate|metrics> (got {got})").into())
         }
     }
+}
+
+/// Re-record the corpus census `gate` compares against.
+///
+/// Runs the same walk `gate` runs — so the recorded numbers are the
+/// ones the next gate will measure — and prints the census line on the
+/// way through, because a number committed unseen is a number nobody
+/// reviews.
+///
+/// It is a **deliberate** act, never a hook's side effect: see the
+/// comment on the `docs-check` job in `lefthook.yml` for why running
+/// this from `pre-commit` would turn the ratchet into a no-op.
+fn metrics(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let census = docsgen::gate::Gate::new(root)?.census()?;
+    let path = docsgen::health::write(root, &census.baseline())?;
+    println!(
+        "docsgen metrics: wrote {}",
+        path.strip_prefix(root).unwrap_or(&path).display()
+    );
+    Ok(())
 }
 
 /// Run the documentation drift gate and report it.

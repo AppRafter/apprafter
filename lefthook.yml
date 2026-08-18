@@ -106,8 +106,27 @@ pre-commit:
           # commit that matched neither glob used to leave the finding
           # for the next contributor's unrelated docs commit to hit.
           # Mirrors the `paths:` filter in .github/workflows/docs.yml.
+          #
+          # `docs/measurements/docs-health.json` is in the glob as a
+          # TRIGGER — editing the committed corpus census must re-run
+          # the gate that compares against it — and it is spelled out
+          # because the `.md` globs beside it do not cover a `.json`.
+          #
+          # It must NEVER be regenerated here, the way the `docsgen`
+          # job above regenerates docs/reference/cli and `git add`s it.
+          # That job is safe only because its TRIGGER (`cli/**`) and its
+          # ARTEFACT (`docs/reference/cli/**`) live in different trees,
+          # so a docs-only commit never rewrites it. This file's trigger
+          # IS `docs/**`: a `docsgen metrics && git add` step here would
+          # rewrite and stage the census on every documentation commit,
+          # so the committed numbers would always equal the current
+          # ones, every deletion would be recorded as intended, and the
+          # ratchet would report success on exactly the change it exists
+          # to catch. Re-recording is a deliberate act — run `docsgen
+          # metrics` by hand, in the same commit, and say why in the
+          # commit message.
           - name: docs-check
-            glob: "{docs/{*.md,**/*.md},mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
+            glob: "{docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
             run: ./scripts/docs-check.sh
 
 commit-msg:
