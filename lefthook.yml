@@ -96,8 +96,18 @@ pre-commit:
                 exit 2
               }
               just docsgen-generate && git add docs/reference/cli
+          # Wider than the pages themselves, because `docs-check` runs
+          # the 2.19c drift gate and the gate resolves what the docs
+          # CLAIM against what the tree SHIPS. Its two inputs are the
+          # clap tree (`cli/**`, same files as the `docsgen` job above)
+          # and the schemas (`schemas/v1alpha1` plus the CRDs generated
+          # from them). Renaming a field or a flag is therefore a
+          # documentation change even when no page is touched, and a
+          # commit that matched neither glob used to leave the finding
+          # for the next contributor's unrelated docs commit to hit.
+          # Mirrors the `paths:` filter in .github/workflows/docs.yml.
           - name: docs-check
-            glob: "{docs/{*.md,**/*.md},mkdocs.yml,docs/hooks/**,scripts/docs-check.sh}"
+            glob: "{docs/{*.md,**/*.md},mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
             run: ./scripts/docs-check.sh
 
 commit-msg:

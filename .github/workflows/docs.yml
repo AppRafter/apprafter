@@ -21,6 +21,15 @@ on:
       # tree lands on master and fails the NEXT contributor's
       # unrelated docs PR.
       - 'cli/Cargo.toml'
+      # The gate's schema-identifier check resolves every documented
+      # field path against these two, so renaming a schema field is a
+      # documentation change even when the pull request touches no page
+      # and no CLI source. Without them the job never runs on that pull
+      # request and the finding lands on master, to be discovered by the
+      # NEXT contributor's unrelated docs PR — exactly the failure the
+      # `cli/Cargo.toml` entry above exists to prevent.
+      - 'schemas/v1alpha1/**'
+      - 'operator/charts/apprafter-operator/templates/crd-*.yaml'
       - 'scripts/docs-check.sh'
       - 'flake.nix'
       - 'flake.lock'
@@ -40,6 +49,9 @@ on:
       # tree lands on master and fails the NEXT contributor's
       # unrelated docs PR.
       - 'cli/Cargo.toml'
+      # See the identical entry on the pull_request trigger above.
+      - 'schemas/v1alpha1/**'
+      - 'operator/charts/apprafter-operator/templates/crd-*.yaml'
       - 'scripts/docs-check.sh'
       - 'flake.nix'
       - 'flake.lock'
