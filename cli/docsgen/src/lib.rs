@@ -20,6 +20,7 @@ pub mod marker;
 pub mod model;
 pub mod render;
 pub mod scan;
+pub mod shipped;
 
 use std::error::Error;
 use std::path::PathBuf;
