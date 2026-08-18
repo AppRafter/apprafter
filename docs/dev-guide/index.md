@@ -35,4 +35,8 @@ Canonical references:
   — a worked multi-environment manifest.
 - [ADR 0046](../adr/0046-env-value-references.md) — how env values
   reference claim fields and sealed secrets.
-- `spec.md` §3.1 (Application), §4.6 (Platform Services).
+- [Reference](../reference/index.md) — the generated CLI pages, the
+  environment variables, and where each CRD's field list lives.
+- [ADR index](../adr/README.md) — the decision behind each behaviour.
+  An ADR describes the world as it was when it was ratified, so read
+  it for *why*, and the pages above for *what ships*.

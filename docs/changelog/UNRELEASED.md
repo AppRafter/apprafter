@@ -11,10 +11,11 @@ patch of each phase.
 
 ## docs tooling (no release) — 2.19c documentation drift gate (2026-08-18)
 
-> No version bump and no monorepo tag. No chart, operator or cue-cmp
-> artefact moved, and the CLI binary is unchanged — `docsgen` is a
-> dev/CI-only crate; nothing here reaches a shipped binary. Third of the
-> documentation track's ten subphases — design
+> No version bump and no monorepo tag: no chart, operator or cue-cmp
+> artefact moved, and `docsgen` itself is a dev/CI-only crate. The
+> shipped CLI is **not** untouched, though — `apprafter app validate`
+> gained twelve schema kinds it used to reject (see Fixed, below).
+> Third of the documentation track's ten subphases — design
 > `docs/superpowers/specs/2026-08-17-documentation-system-design.md`
 > (rev 3), plan
 > `docs/superpowers/plans/2026-08-18-docs-2.19c-drift-gate.md`.
@@ -22,7 +23,7 @@ patch of each phase.
 ### Added
 
 - **The documentation drift gate.** `cli/docsgen gate` runs three checks
-  over the 32 in-scope guide pages (`spec.md` is out of scope by decision —
+  over the 33 in-scope guide pages (`spec.md` is out of scope by decision —
   it is the roadmap, not a description of what ships today; the generated
   `docs/reference/cli/**` is out because 2.19b already byte-compares it) and
   is wired into `just lint`, the pre-commit hook and CI via
@@ -34,11 +35,12 @@ patch of each phase.
     to reject correct documentation en masse: 38 in-scope invocations are
     usage synopsis (`[--namespace <ns> ...]`), `|` inside brackets is
     alternation as often as it is a real pipe, and 161 of 213 inline spans
-    are bare command paths with no arguments at all.
+    were bare command paths with no arguments at all (the corpus as found;
+    165 of 219 after this subphase's edits, 75 %).
   - A **schema identifier check** resolves backticked schema paths against
     the CRD field set plus the five CUE-only kinds; `Kind.spec.…` resolves
     against that kind alone, closing a silent-pass a flat union would have.
-    234 identifiers resolved this run — 115 of them (a shade under half)
+    236 identifiers resolved this run — 115 of them (a shade under half)
     only under an `x-kubernetes-preserve-unknown-fields` subtree, where
     membership proves nothing about what's actually written there. The gate
     reports that split every run rather than folding it into one green
@@ -54,6 +56,13 @@ patch of each phase.
   (`<!-- docs: check=none since=vX.Y.Z reason=… -->`); it ages against the
   real git-tag date (not the commit date), is void when unaged, and is
   itself reported when it matches nothing in the page.
+- **`contributing/documentation-gate.md`** — a contributor reference for
+  the gate: what each finding code means, the marker grammar, the
+  front-matter exemption channel, the five typed reasons, and the
+  180-day window (including the two ways a contributor meets it by
+  surprise — both current exemptions share a `since:`, so they expire
+  together; and a checkout with no tags voids every exemption at once,
+  which is a `git fetch --tags`, not a documentation fix).
 
 ### Fixed
 
@@ -73,26 +82,63 @@ Drift the gate found — 33 sites across the guides, all fixed:
   `dev-guide/application-cue.md`, plus one line each in
   `operator-guide/gitops-walk.md` and
   `operator-guide/needs-networkpolicy-walk.md`. Two of the eight sit inside
-  `kubectl apply` heredocs, where the apiserver silently **prunes** the
-  unknown key — a reader following the old doc got a workload that is not
-  exposed and no error telling them why. Only the schema-identifier check
-  catches that shape; it runs page-wide, not just inside fences, for
-  exactly this reason.
+  `kubectl apply` heredocs and a third
+  (`operator-guide/gitops-walk.md:80`) inside a manifest committed to a
+  GitOps repository, where the apiserver silently **prunes** the unknown
+  key — a reader following the old doc got a workload that is not exposed
+  and no error telling them why, and in the GitOps case with nobody at a
+  terminal to see it. Only the schema-identifier check catches that shape;
+  it runs page-wide, not just inside fences, for exactly this reason.
 - **14 fences given a language info string** they were missing.
 - **The `DATABASE_URL`/`REDIS_URL` connection-Secret model**, removed by
   ADR 0046 in favour of decomposed `url`/`user`/`pass`/`host`/`port`/`db`
-  keys (redis adds `channelPrefix`), corrected on 31 of 33 lines across four
-  files — the other two were already right and are left alone.
+  keys (redis adds `channelPrefix`), corrected on **25 of 30 lines across
+  three files** — `dev-guide/application-cue.md` (5),
+  `operator-guide/needs-pg-walk.md` (11) and
+  `operator-guide/needs-redis-walk.md` (14), counted over the in-scope
+  corpus at `dc4c5de`. The other five were already right (they name the
+  variable an app reads, not a Secret key) and are left alone.
 - **The `dev-guide/application-cue.md` field table** completed with the
   rows the census found missing: `resources`, `imagePolicy`, `needs`,
   `environments`, `expose.hostname`, `expose.tls`.
+
+One fix reaches the **shipped CLI**, which is why the note at the top of
+this entry says the binary is not untouched:
+
+- **`apprafter app validate` accepts every `v1alpha1` kind.** It lays the
+  schemas into a temporary workspace so a manifest's
+  `import "apprafter.io/schemas/v1alpha1"` resolves against the schema
+  this CLI ships with (ADR 0046 Decision #7), but it embedded only
+  `types.cue` and `application.cue`. The import is of the *package*, so a
+  manifest naming any other kind in it — `#SharedVolume`,
+  `#SourceCredential` and ten more — failed with "undefined field": an
+  error about our workspace, not about the user's file. All fourteen files
+  are embedded now, which is also what lets the gate's CUE check vet
+  documented manifests through the same bundle rather than a second copy
+  of it. Measured cost ~2 ms.
+
+Two more fixes are about the gate's own reach rather than a page:
+
+- **The gate's schema half had no trigger.** The identifier check
+  resolves against `schemas/v1alpha1/**` and the generated
+  `crd-*.yaml`, but neither was in `.github/workflows/docs.yml`'s
+  `paths:` filter or lefthook's `docs-check` glob — so a PR renaming a
+  schema field ran no docs job and left the finding for the next
+  contributor's unrelated docs PR. Both are triggers now, and the
+  lefthook glob covers the gate's full input set.
+- **`spec.md` and `plan.md` removed as canonical references** from
+  `dev-guide/index.md` and `operator-guide/index.md`, and a `plan.md`
+  section number from `operator-guide/migration-plans.md`. Neither file
+  is published to the site, and `spec.md` is the roadmap — the same
+  reason it is out of the gate's scope. Readers are pointed at the
+  reference index and the ADR index instead.
 
 Two lines are **exempted rather than edited**, each with a typed, dated
 reason: `operator-guide/node-prep.md` documents a command that was
 **removed** (`reason=historical` — a fifth reason added to the marker's
 closed vocabulary for exactly this case, since none of the other four
 fits and forcing it into `known-broken` would be a lie), and
-`dev-guide/application-cue.md:28` correctly documents **Argo CD's** own
+`dev-guide/application-cue.md:36` correctly documents **Argo CD's** own
 `Application` schema, not ours (`reason=external-tool`).
 
 20 fixtures with paired negative controls
@@ -101,9 +147,11 @@ check stays quiet on the lexically-similar-but-correct neighbour.
 
 ### Known gaps (recorded, not fixed)
 
-- **CUE fragments are not validated.** 13 of the 14 `cue`-tagged fences in
+- **CUE fragments are not validated.** 15 of the 17 `cue`-tagged fences in
   scope are fragments, not complete documents; the batched validator only
-  covers complete manifests.
+  covers complete manifests. (The tag is not what selects them — a
+  complete document owes the check whatever its fence says — but it is the
+  cheapest way to state the ratio.)
 - **`requires`/`conflicts` (the "`--namespace` without `--select`" class) is
   unimplementable.** clap 4.6 keeps them `pub(crate)` with no getter.
   Withdrawn from the design, not deferred.

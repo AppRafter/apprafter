@@ -20,6 +20,12 @@ Thanks for considering a contribution.
 - Source files declare an `SPDX-License-Identifier` header
   (see [`docs/contributing/license-headers.md`](docs/contributing/license-headers.md)).
 - CUE schemas pass `./scripts/lint-cue.sh`.
+- Documentation under `docs/` is gated: `just lint` resolves every
+  `apprafter` invocation and every schema field path a page writes
+  against what the tree actually ships. If you meet a finding, see
+  [`docs/contributing/documentation-gate.md`](docs/contributing/documentation-gate.md)
+  — it covers the marker grammar, the front-matter exemption
+  channel, the typed reasons and the 180-day expiry.
 - Architectural decisions are recorded as ADRs under
   [`docs/adr/`](docs/adr/README.md).
 - The `plan.md` in the repository root is updated when a phase is

@@ -79,7 +79,8 @@ pub enum BlockKind {
     /// would see a fraction of the surface. Obligations come from
     /// block content. (The untagged group is 0 today, because the gate
     /// reports an unlabelled fence; that it moved at all is the
-    /// reason not to key on it. `corpus_census` prints the live
+    /// reason not to key on it; `sh` is 165 today. `corpus_census`
+    /// prints the live
     /// distribution.)
     Fence { tag: Option<String> },
     /// A backticked run in prose. Measurement puts most command

@@ -70,7 +70,7 @@ ones emit a `SoftDestructiveChange` Kubernetes Event you can see with
 
 Removal or narrowing of a `SourceCredential` that active applications
 depend on is classified as destructive today; live gating for the
-`sourcecredential` scope is a follow-on (`plan.md` §2.16b-sc).
+`sourcecredential` scope is not implemented yet.
 
 ## Approval semantics by scope
 

@@ -236,7 +236,16 @@ kubectl -n demo get secret parser-pg-conn \
 # -> postgresql://claim_demo_parser_pg:…@platform-postgres-rw.cnpg-system.svc:5432/claim_demo_parser_pg
 kubectl -n demo get secret parser-pg-conn \
   -o jsonpath='{.data}{"\n"}' | tr ',' '\n' | cut -d'"' -f2
-# -> url user pass host port db   (the decomposed fields, ADR 0046)
+# -> one key per line, and alphabetically, because jsonpath
+#    JSON-marshals the map and Go sorts map keys:
+#      db
+#      host
+#      pass
+#      port
+#      url
+#      user
+#    (the decomposed fields, ADR 0046 — `url` is the composed DSN
+#    kept alongside them, not a seventh component)
 kubectl -n demo get secret parser-pg-conn \
   -o jsonpath='{.metadata.ownerReferences[0].kind}{"\n"}'   # -> ResourceClaim
 ```

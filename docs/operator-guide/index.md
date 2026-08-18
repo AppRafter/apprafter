@@ -48,7 +48,8 @@ Canonical references:
   subcommand + flag.
 - [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
   — Track A design rationale.
-- `spec.md` §4.7 (External Surface), §4.8 (Access Plane), §4.12
-  (`apprafter`).
-- `plan.md` Phase 1.5 history table for the version-by-version
-  delivery log.
+- [Reference](../reference/index.md) — the generated CLI pages, the
+  environment variables, and where each CRD's field list lives.
+- [ADR index](../adr/README.md) — the decision behind each behaviour.
+  An ADR describes the world as it was when it was ratified, so read
+  it for *why*, and the pages above for *what ships*.

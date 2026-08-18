@@ -68,13 +68,13 @@
 //!   set. That covers `metadata.*`, `env.*`, `expose.hostname.*` and
 //!   everything under `needs.<type>`, which is where `size`,
 //!   `selector`, `mountPath` and `ref` live. Measured over the
-//!   corpus, **115 of 234** resolved identifiers resolve *only* this
-//!   way — a shade under half. Nobody should read "234 resolved" as
-//!   234 checked, which is exactly what the flag exists to prevent.
+//!   corpus, **115 of 236** resolved identifiers resolve *only* this
+//!   way — a shade under half. Nobody should read "236 resolved" as
+//!   236 checked, which is exactly what the flag exists to prevent.
 //!   ([`crate::gate::Stats::line`] prints the live pair on every run;
 //!   the figures here are a reading of it, not a second source.)
 //! * **`status` is deliberately not a root.** It is real and the docs
-//!   use it eighteen times across fourteen distinct paths —
+//!   use it eighteen times across twelve distinct paths —
 //!   `status.phase`, `status.availableVersion`, `status.dbnum`,
 //!   `status.connectionSecretRef`, `status.refCount`,
 //!   `status.versionHistory`, … — and every one of them is
@@ -108,7 +108,7 @@
 //!
 //! `PlatformStack.spec.pin` is resolved against `PlatformStack` alone,
 //! so it has none of the union's silent-pass class; the corpus already
-//! writes that form nine times across five distinct paths. Bare paths
+//! writes that form ten times across five distinct paths. Bare paths
 //! stay supported because most of the corpus uses them, but a page
 //! naming the kind gets a strictly stronger check for free.
 //!
@@ -160,8 +160,8 @@ pub const STRUCTURE_ROOTS: [&str; 5] = ["base", "environments", "expose", "needs
 /// `PlatformStack.spec.pin` resolves against `PlatformStack` alone.
 ///
 /// This is the notation with no silent-pass hole, and the corpus
-/// already uses it nine times across five distinct paths (see the
-/// module docs). A flat table rather than a lookup into
+/// already uses it (see the module docs for the count — one place
+/// rather than two). A flat table rather than a lookup into
 /// the live [`FieldSet`], for the same reason [`crate::shipped`] keeps
 /// one: [`extract_paths`] is a pure lexer with no schema in the room,
 /// which is what lets its grammar be tested without a repository.
@@ -514,7 +514,7 @@ pub fn span_path(body: &str) -> Option<String> {
 ///
 /// One root — `spec` — is also the stem of a file the docs cite
 /// constantly, so `spec.md` matches the grammar exactly and appears
-/// eleven times in the corpus. `plan.md` and `cue.mod` are already out
+/// ten times in the corpus. `plan.md` and `cue.mod` are already out
 /// because their stems are not roots; this is the same rule reaching
 /// the one case that shares a stem. Deliberately excludes `env`, which
 /// is a real field (`base.env`) before it is an extension.
