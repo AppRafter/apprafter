@@ -296,7 +296,7 @@
 //!
 //! `git ls-files -- docs/adr` is **recursive**, which `read_dir` was
 //! not. An ADR filed at `docs/adr/<subdir>/NNNN-slug.md` therefore
-//! enters the register keyed by its bare filename, and collides with a
+//! enters the register keyed by the number in its bare filename, and collides with a
 //! top-level `NNNN-` file into the hard `Err` below. All 59 tracked
 //! entries sit directly in `docs/adr/` today, so this is scope the
 //! register gained rather than a case it mishandles — but a nested ADR
@@ -721,13 +721,28 @@ fn tracked_adrs(repo_root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
 /// both mean the decision's standing cannot be established from the
 /// file.
 fn status_body(text: &str) -> String {
-    let mut lines = text.lines();
-    if !lines.any(is_status_heading) {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(start) = lines.iter().position(|line| is_status_heading(line)) else {
         return String::new();
-    }
+    };
+    let rest = &lines[start + 1..];
     let mut body = String::new();
-    for line in lines {
+    for (offset, line) in rest.iter().enumerate() {
         if ends_status_section(line) {
+            break;
+        }
+        // A setext heading is declared by the line *below* it, so it is
+        // recognised here rather than in [`ends_status_section`], whose
+        // per-line signature cannot see one. Without this the section
+        // runs on through `Accepted approach` / `===`, and under an
+        // empty `## Status` that swallowed heading becomes the ADR's
+        // verdict — the same defect the ATX widening closed, in the one
+        // spelling of "heading" that widening could not reach.
+        if !line.trim().is_empty()
+            && rest
+                .get(offset + 1)
+                .is_some_and(|next| is_setext_rule(next))
+        {
             break;
         }
         body.push_str(line);
@@ -736,10 +751,27 @@ fn status_body(text: &str) -> String {
     body
 }
 
+/// Whether `line` is a setext underline: nothing but `=` or nothing but
+/// `-`, which makes the non-blank line above it a heading.
+///
+/// One character is enough — CommonMark asks for one or more, and a
+/// lone `-` under a paragraph is an h2, not a list. The rule is only
+/// consulted when the line above is non-blank, which is what keeps a
+/// `---` thematic break (blank line above) and a `|---|---|` table
+/// separator (not all one character) out of it.
+fn is_setext_rule(line: &str) -> bool {
+    let rest = line.trim();
+    !rest.is_empty() && (rest.chars().all(|c| c == '=') || rest.chars().all(|c| c == '-'))
+}
+
 /// Whether a line closes the `## Status` section.
 ///
-/// Any heading ends it — `###` as readily as `##`, and the next `##`
-/// most of all — but "a heading" is not `starts_with('#')`. CommonMark
+/// Any **ATX** heading ends it — `###` as readily as `##`, and the next
+/// `##` most of all — but "a heading" is not `starts_with('#')`. A
+/// setext heading is a heading too and is not judged here, because it
+/// is declared by the line below it and this signature sees one line;
+/// [`status_body`] handles that case with the lookahead it has.
+/// CommonMark
 /// allows an ATX heading up to three spaces of indentation, and a
 /// heading inside a blockquote is still a heading, so
 /// `   ### Accepted approach` and `> ## Accepted approach` were read as
@@ -773,6 +805,14 @@ fn ends_status_section(line: &str) -> bool {
 /// Exact rather than "a heading containing Status", so that a section
 /// named `## Status of the rollout` in some future ADR is not read as
 /// the verdict block.
+///
+/// The scan is line-local and not fence-aware, so a `## Status` quoted
+/// inside a fenced block would open the section — an ADR demonstrating
+/// the template in a fence would take its verdict from whatever prose
+/// followed. Measured rather than assumed: across the 59 tracked files
+/// under `docs/adr/` the first matching line is inside a fence in none
+/// of them, and every numbered ADR has a real Status section. Recorded
+/// because the reach is zero today, not because it cannot change.
 fn is_status_heading(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("##") else {
         return false;
@@ -816,6 +856,13 @@ mod tests {
             "# ADR 0099\n\n## Status\n\n   ### Accepted approach\n\nIt was fine.\n",
             "# ADR 0099\n\n## Status\n\n> ## Accepted approach\n\nIt was fine.\n",
             "# ADR 0099\n\n## Status\n\n   #### Superseded discussion\n\nprose.\n",
+            // Setext: the heading is declared by the line BELOW it, so
+            // no per-line rule can see one. Both underlines, and the
+            // one-character form CommonMark also allows — a lone `-`
+            // under a paragraph is an h2, not a list item.
+            "# ADR 0099\n\n## Status\n\nAccepted approach\n=================\n\nprose.\n",
+            "# ADR 0099\n\n## Status\n\nSuperseded approach\n-------------------\n\nprose.\n",
+            "# ADR 0099\n\n## Status\n\nAccepted approach\n-\n\nprose.\n",
         ] {
             assert!(
                 status_body(empty).trim().is_empty(),
@@ -831,6 +878,13 @@ mod tests {
         for body in [
             "# ADR 0099\n\n## Status\n\n> `Accepted` (2026-05-12).\n",
             "# ADR 0099\n\n## Status\n\n   Accepted (2026-05-12).\n",
+            // A `---` under a BLANK line is a thematic break, not a
+            // setext underline — which is the whole reason the setext
+            // rule only fires when the line above it has content.
+            "# ADR 0099\n\n## Status\n\n`Accepted` (2026-05-12).\n\n---\n\nprose.\n",
+            // A table separator is not all one character, so a Status
+            // body may hold a table without losing its verdict.
+            "# ADR 0099\n\n## Status\n\n`Accepted` (2026-05-12).\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
         ] {
             assert_eq!(verdict(&status_body(body)), Verdict::Accepted, "{body:?}");
         }
