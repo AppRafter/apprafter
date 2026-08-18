@@ -1,8 +1,8 @@
 # The same manifest, using the field that exists
 
-Byte-for-byte the drift fixture with `public: false` replaced by the
-shipped `network:` key. Everything else — the package clause, the import,
-the anchor depth, the fence tag — is identical, so a green run here is
+The drift fixture's manifest with `public: false` replaced by the shipped
+`network:` key. Everything else about the fence — the package clause, the
+import, the anchor depth, the tag — is the same, so a green run here is
 about the field name and nothing else.
 
 ```cue
