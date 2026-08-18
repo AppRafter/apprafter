@@ -42,24 +42,50 @@ use std::process::Command;
 
 use cli_core::{CliError, Result};
 
-/// AppRafter v1alpha1 schema files embedded at compile time —
-/// the SAME `include_str!` sources `app_scaffold` reuses. The
-/// validate path lays these into the temp workspace's
+/// Every AppRafter `v1alpha1` schema file, embedded at compile
+/// time. The validate path lays these into the temp workspace's
 /// `cue.mod/pkg/` (inject-wins) so the manifest's
 /// `import "apprafter.io/schemas/v1alpha1"` resolves against
 /// the schema THIS CLI ships with (no vendored-copy drift —
 /// ADR 0046 Decision #7).
-const SCHEMA_TYPES_CUE: &str = include_str!("../../../../schemas/v1alpha1/types.cue");
-const SCHEMA_APPLICATION_CUE: &str = include_str!("../../../../schemas/v1alpha1/application.cue");
+///
+/// The WHOLE package, not just `types` + `application`: the
+/// import is of the package, so a manifest naming any other kind
+/// in it (`#SharedVolume`, `#SourceCredential`, …) previously hit
+/// "undefined field" from a *partial* injection — an error about
+/// our workspace, not about the user's file. Every file here is
+/// `package v1alpha1` with no imports of its own, so laying all
+/// fourteen unifies exactly as the real `schemas/v1alpha1/`
+/// directory does; measured cost is ~2 ms.
+macro_rules! workspace_schemas {
+    ($($file:literal),+ $(,)?) => {
+        &[$(($file, include_str!(concat!("../../../../schemas/v1alpha1/", $file)))),+]
+    };
+}
 
 /// Schema files written into the temp workspace's
-/// `cue.mod/pkg/apprafter.io/schemas/v1alpha1/`. Only the two
-/// files the `Application` manifest imports are needed (types +
-/// application); the other CRDs in `schemas/v1alpha1/` are not
-/// referenced by a user `Application.cue`.
-const WORKSPACE_SCHEMAS: &[(&str, &str)] = &[
-    ("types.cue", SCHEMA_TYPES_CUE),
-    ("application.cue", SCHEMA_APPLICATION_CUE),
+/// `cue.mod/pkg/apprafter.io/schemas/v1alpha1/`, mirroring the
+/// repository directory of the same name one-for-one.
+///
+/// `pub` because `docsgen`'s CUE-document check lays the SAME
+/// bundle (through `docs_api`) to vet the manifests printed in the
+/// documentation. Two embeddings of the same fourteen files would
+/// be two things to keep in step; one is one.
+pub const WORKSPACE_SCHEMAS: &[(&str, &str)] = workspace_schemas![
+    "accessgrant.cue",
+    "application.cue",
+    "externalsurface.cue",
+    "infrastructure.cue",
+    "infrastructureproviderplugin.cue",
+    "migrationplan.cue",
+    "platformstack.cue",
+    "resourceclaim.cue",
+    "retainedclaim.cue",
+    "serviceprovider.cue",
+    "serviceproviderplugin.cue",
+    "sharedvolume.cue",
+    "sourcecredential.cue",
+    "types.cue",
 ];
 
 /// Minimal render-workspace module file. Mirrors the
@@ -68,7 +94,13 @@ const WORKSPACE_SCHEMAS: &[(&str, &str)] = &[
 /// requires the file to exist. A cwd-local `cue.mod` shadows any
 /// parent module so the import resolves unambiguously through
 /// our injected bundle.
-const WORKSPACE_MODULE_CUE: &str = "module: \"apprafter.io/render-workspace\"
+///
+/// `language.version` is the load-bearing field, and `pub` for the
+/// same reason `WORKSPACE_SCHEMAS` is: it pins which CUE language
+/// semantics the evaluation runs under, so a workspace built by
+/// `docsgen` reaches the same verdict as this one even when the two
+/// run against different `cue` binaries.
+pub const WORKSPACE_MODULE_CUE: &str = "module: \"apprafter.io/render-workspace\"
 
 language: {
 \tversion: \"v0.10.0\"
@@ -679,6 +711,42 @@ mod tests {
         let present: HashSet<PathBuf> = [default.clone()].into();
         let got = resolve_manifest_path(None, cwd, &|p| present.contains(p)).unwrap();
         assert_eq!(got, default);
+    }
+
+    // ── WORKSPACE_SCHEMAS — the injected bundle is the whole package ──
+
+    #[test]
+    fn injected_bundle_mirrors_the_schema_directory() {
+        // The manifest imports the PACKAGE, so a partial bundle makes a
+        // manifest naming a kind we forgot to list fail with "undefined
+        // field" — an error about our workspace, not the user's file.
+        // Adding a file to `schemas/v1alpha1/` must therefore add it here;
+        // this is the machine gate that makes forgetting loud.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("cli/platform-cli is two levels below the repo root")
+            .join("schemas/v1alpha1");
+        let mut on_disk: Vec<String> = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|n| n.ends_with(".cue"))
+            .collect();
+        on_disk.sort();
+        let mut injected: Vec<String> = WORKSPACE_SCHEMAS
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
+        injected.sort();
+        assert_eq!(
+            injected, on_disk,
+            "WORKSPACE_SCHEMAS must list every schemas/v1alpha1/*.cue file"
+        );
     }
 
     // ── union_needs — pure needs union (no cue) ───────────────

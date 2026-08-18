@@ -34,6 +34,12 @@ pub mod docs_api {
     /// pipeline (the CLI no longer vendors a `cue.mod`, so a bare
     /// `cue vet` of a user manifest fails with `no cue.mod`).
     pub use crate::commands::app_validate::validate_manifest;
+    /// The pieces that path builds its temp workspace from, so a
+    /// consumer that must BATCH (the documentation gate vets every
+    /// manifest in the docs in one `cue vet`) reproduces the same
+    /// environment instead of embedding a second copy of the
+    /// schemas that could drift from this one.
+    pub use crate::commands::app_validate::{WORKSPACE_MODULE_CUE, WORKSPACE_SCHEMAS};
 }
 
 /// Parse argv and run the CLI. `main` is a thin wrapper so the whole

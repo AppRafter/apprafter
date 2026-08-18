@@ -23,6 +23,6 @@ clap       = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-
-[dev-dependencies]
+# A runtime dependency, not just a test one: `cuedoc` batches every
+# documented CUE manifest into one throwaway module root.
 tempfile   = { workspace = true }

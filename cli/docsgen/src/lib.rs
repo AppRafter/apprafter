@@ -15,6 +15,7 @@
 //! precedent.
 
 pub mod check;
+pub mod cuedoc;
 pub mod identifier;
 pub mod invocation;
 pub mod marker;
