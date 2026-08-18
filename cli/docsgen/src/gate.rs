@@ -166,6 +166,21 @@ pub const UNLABELLED_FENCE: &str = "unlabelled-fence";
 /// A fence that runs to the end of the file without a closing
 /// delimiter, so everything below it renders as code.
 pub const UNTERMINATED_FENCE: &str = "unterminated-fence";
+/// An HTML `<pre>` that never meets its closing tag.
+///
+/// Its own class rather than [`UNTERMINATED_FENCE`] because the two
+/// remedies are different — one closes backticks, the other a tag — and
+/// the report prints one remedy per class, so folding them together
+/// would send half its readers to the wrong edit.
+///
+/// It is reported at all because a `<pre>` swallows every line to its
+/// closing tag: one stray opener turns the rest of the page into body
+/// text, and every fence below it silently sheds its unlabelled-fence
+/// finding and its marker audit. The claims inside are still checked —
+/// body is body — but the *fence-shaped* obligations lapse, which is
+/// the evasion class this gate's literal-block handling exists to
+/// close, reachable in a single line and invisible to a reader.
+pub const UNCLOSED_PRE: &str = "unclosed-pre";
 /// A `<!-- docs: … -->` marker that is malformed, or that claims a
 /// check this gate cannot run on that block.
 pub const DOCS_MARKER: &str = "docs-marker";
@@ -211,6 +226,10 @@ fn remedy(code: &str) -> &'static str {
              one cannot quietly change what is checked"
         }
         UNTERMINATED_FENCE => "close the fence — everything below it renders as code",
+        UNCLOSED_PRE => {
+            "close the `<pre>` tag — everything below it is inside the block, so it \
+             renders as code and no fence below it is read as a fence"
+        }
         DOCS_MARKER => "fix the marker — the grammar is in cli/docsgen/src/marker.rs",
         FRONT_MATTER => {
             "fix the exemption entry — the keys are span/path, reason, since and \
@@ -518,14 +537,24 @@ impl Gate {
                 // off below.
                 BlockKind::Fence { .. } | BlockKind::Literal => {
                     if block.unterminated {
-                        findings.push(finding(
-                            UNTERMINATED_FENCE,
-                            file,
-                            block.line,
-                            "the fence is never closed, so the rest of the page renders \
-                             as code"
-                                .to_string(),
-                        ));
+                        // Both delimiters, named honestly. A literal
+                        // block is only ever flagged when it is a
+                        // `<pre>`: the indented form has no closing
+                        // delimiter to be missing.
+                        let (code, message) = match &block.kind {
+                            BlockKind::Fence { .. } => (
+                                UNTERMINATED_FENCE,
+                                "the fence is never closed, so the rest of the page \
+                                 renders as code",
+                            ),
+                            _ => (
+                                UNCLOSED_PRE,
+                                "the `<pre>` holding this block is never closed, so the \
+                                 rest of the page is inside it: it renders as code, and \
+                                 no fence below it is read as a fence",
+                            ),
+                        };
+                        findings.push(finding(code, file, block.line, message.to_string()));
                     }
                     // Never reported for a literal block: it has no
                     // fence to label, and the remedy — fence it — is
@@ -1041,6 +1070,7 @@ mod tests {
             CUE_DOCUMENT,
             UNLABELLED_FENCE,
             UNTERMINATED_FENCE,
+            UNCLOSED_PRE,
             DOCS_MARKER,
             FRONT_MATTER,
             EXEMPTION_EXPIRED,

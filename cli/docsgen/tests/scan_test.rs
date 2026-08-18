@@ -427,6 +427,43 @@ fn tabbed_admonition_and_list_content_is_not_a_literal_block() {
 }
 
 #[test]
+fn consecutive_indented_runs_are_one_block_across_a_blank_line() {
+    // A blank line inside an indented block is interior to it, so the
+    // two runs are one block — but a trailing blank is not part of the
+    // body. Both halves of that are held in the same mechanism, and
+    // this is the only thing that asserts either.
+    let src = "Prose.\n\n    a\n\n    b\n\nMore.\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(literal[0].body, "a\n\nb\n");
+    assert_eq!(literal[0].line, 3, "reported where the body starts");
+}
+
+#[test]
+fn a_tab_indented_block_is_dedented_by_columns_not_characters() {
+    // `indent_columns` counts a tab as four columns, so the strip has to
+    // remove four columns too. Taking four CHARACTERS off `\t\tnested`
+    // would dedent it by eight — and only that line, so the block's
+    // internal shape would come out flattened unevenly, which is what
+    // `cue vet` and `identifier::extract_structure` read.
+    let src = "# Page\n\nProse.\n\n\tapprafter promote\n\t\tnested\n    four spaces\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(
+        literal[0].body, "apprafter promote\n\tnested\nfour spaces\n",
+        "each line keeps exactly the indentation beyond the first four columns"
+    );
+}
+
+#[test]
 fn a_pre_block_is_a_literal_block() {
     let src = "# Page\n\n<pre>\napprafter promote\n</pre>\n";
     let all = blocks(src);
@@ -436,6 +473,47 @@ fn a_pre_block_is_a_literal_block() {
         .collect();
     assert_eq!(literal.len(), 1, "{all:?}");
     assert_eq!(literal[0].body, "apprafter promote\n");
+}
+
+#[test]
+fn an_unclosed_pre_yields_a_block_and_is_flagged() {
+    // A `<pre>` runs to its closing tag, so an unclosed one swallows
+    // every line below it — fences included, which is why it has to be
+    // reported rather than quietly absorbed. The flag is the only thing
+    // that distinguishes it from a `<pre>` that closed at the same place.
+    let src = "# Page\n\n<pre>\napprafter promote\n\n```sh\nstill inside\n```\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert!(literal[0].unterminated, "{literal:?}");
+    assert!(
+        literal[0].body.contains("still inside"),
+        "the swallowed fence is body, not a fence: {literal:?}"
+    );
+    assert!(
+        !all.iter()
+            .any(|b| matches!(b.kind, BlockKind::Fence { .. })),
+        "{all:?}"
+    );
+    // A closed one is not flagged, and stops where it says it does.
+    let closed = "# Page\n\n<pre>\napprafter promote\n</pre>\n\n```sh\nafter\n```\n";
+    let all = blocks(closed);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert!(!literal[0].unterminated);
+    assert_eq!(
+        all.iter()
+            .filter(|b| matches!(b.kind, BlockKind::Fence { .. }))
+            .count(),
+        1,
+        "{all:?}"
+    );
 }
 
 #[test]

@@ -186,6 +186,42 @@ fn a_literal_block_owes_no_fence_shaped_finding() {
     assert!(findings.is_empty(), "{findings:?}");
 }
 
+#[test]
+fn an_unclosed_pre_is_reported_rather_than_swallowing_the_page_in_silence() {
+    // A `<pre>` runs to its closing tag, so one stray opener turns every
+    // block below it into body text: the fences below shed their
+    // unlabelled-fence finding and their marker audit, in one line and
+    // with nothing in the diff that reads as suppression. The claims
+    // inside are still judged — body is body — but the reader has to be
+    // told the page renders as code from here down.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n<pre>\napprafter promote\n\n```\nstill inside\n```\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    assert_eq!(of(&findings, gate::UNCLOSED_PRE).len(), 1, "{findings:?}");
+    assert_eq!(
+        of(&findings, gate::CLI_INVOCATION).len(),
+        1,
+        "the claim inside is still judged: {findings:?}"
+    );
+    assert!(
+        of(&findings, gate::UNLABELLED_FENCE).is_empty(),
+        "there is no fence down there any more — which is exactly why the \
+         unclosed `<pre>` itself has to be reported: {findings:?}"
+    );
+    // And its remedy is its own: closing a tag is not closing a fence.
+    assert!(
+        of(&findings, gate::UNTERMINATED_FENCE).is_empty(),
+        "{findings:?}"
+    );
+
+    // Closed, the same page owes only what its blocks owe.
+    let page = "# Page\n\n<pre>\napprafter promote\n</pre>\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    assert!(of(&findings, gate::UNCLOSED_PRE).is_empty(), "{findings:?}");
+    assert_eq!(of(&findings, gate::CLI_INVOCATION).len(), 1, "{findings:?}");
+}
+
 // ---- the marker channel ------------------------------------------------
 
 #[test]

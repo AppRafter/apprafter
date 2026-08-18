@@ -137,8 +137,11 @@ pub struct Block {
     /// number costs the reader a manual search, which is how gates come
     /// to be ignored.
     pub line: usize,
-    /// A fence that ran to the end of the file without a closing
-    /// delimiter. Always false for a span and for a literal block.
+    /// A block that ran to the end of the file without its closing
+    /// delimiter: a fence missing its backticks, or a `<pre>` missing
+    /// its tag. Always false for a span, and for the indented form of a
+    /// literal block, which has no closing delimiter to miss and ends
+    /// at end of file legitimately.
     ///
     /// This is the parse's self-check, and it has to be reported rather
     /// than assumed: a phantom fence closes at EOF like any other, so
@@ -251,7 +254,7 @@ impl Literal {
         self.body.push('\n');
     }
 
-    fn finish(self) -> Block {
+    fn finish(self, unterminated: bool) -> Block {
         Block {
             kind: BlockKind::Literal,
             // There is no line above a literal block to carry a marker:
@@ -259,7 +262,7 @@ impl Literal {
             tag_line: None,
             body: self.body,
             line: self.line,
-            unterminated: false,
+            unterminated,
         }
     }
 }
@@ -267,7 +270,13 @@ impl Literal {
 /// Emit the literal block being accumulated, if there is one.
 fn close_literal(literal: &mut Option<Literal>, out: &mut Vec<Block>) {
     if let Some(block) = literal.take() {
-        out.push(block.finish());
+        // Reachable with `html` still set only at end of file: every
+        // other caller runs downstream of the `<pre>` branch, which
+        // takes the block out of the slot itself. So a `<pre>` that
+        // arrives here is exactly a `<pre>` that never met its closing
+        // tag — and it has swallowed the rest of the page.
+        let unterminated = block.html;
+        out.push(block.finish(unterminated));
     }
 }
 
@@ -352,7 +361,7 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
                             if !before.is_empty() {
                                 block.push(before);
                             }
-                            out.push(block.finish());
+                            out.push(block.finish(false));
                         }
                         None => {
                             block.push(text);
@@ -412,7 +421,7 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
                             if !before.is_empty() {
                                 block.push(before);
                             }
-                            out.push(block.finish());
+                            out.push(block.finish(false));
                         }
                         None => {
                             if !content.is_empty() {
@@ -431,7 +440,7 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
                         continue;
                     }
                     if indent >= 4 {
-                        block.push(strip_indent(text, 4));
+                        block.push(strip_columns(text, 4));
                         continue;
                     }
                     // Outdented: the block has ended, and this line is
@@ -664,6 +673,12 @@ fn fence_closes(line: &str, delimiter: char, run: usize) -> bool {
 /// Remove up to `indent` leading spaces, the fence's own indentation.
 /// Content indented further keeps the difference, so a nested snippet
 /// inside a list item stays shaped the way it was written.
+///
+/// Characters, not columns — and deliberately paired with
+/// [`fence_open`], which measures a fence's indentation in characters
+/// too, so the two ends of the fence path agree. A literal block
+/// measures in columns and strips with [`strip_columns`]; the units
+/// have to match within a path, and mixing them dedents unevenly.
 fn strip_indent(line: &str, indent: usize) -> &str {
     let mut rest = line;
     for _ in 0..indent {
@@ -716,6 +731,36 @@ fn indent_columns(line: &str) -> usize {
         }
     }
     columns
+}
+
+/// Remove exactly `columns` columns of leading indentation, in the unit
+/// [`indent_columns`] measures in.
+///
+/// The two ends have to agree. Measuring in columns and stripping four
+/// *characters* dedents `\t\tapprafter x` by eight columns rather than
+/// four, and does it unevenly down a block whose lines are indented
+/// differently — which corrupts the body handed to `cue vet` and to
+/// `identifier::extract_structure`, where the shape of the indentation
+/// is the structure.
+///
+/// No tab is ever split and nothing is allocated: a tab starting before
+/// column four advances to exactly column four, so a four-column strip
+/// can never land inside one.
+fn strip_columns(line: &str, columns: usize) -> &str {
+    let mut at = 0;
+    let mut column = 0;
+    for character in line.chars() {
+        if column >= columns {
+            break;
+        }
+        match character {
+            ' ' => column += 1,
+            '\t' => column += 4 - column % 4,
+            _ => break,
+        }
+        at += character.len_utf8();
+    }
+    &line[at..]
 }
 
 /// The text after a `<pre …>` opening tag when `line` starts one.
@@ -1016,6 +1061,21 @@ mod tests {
     fn only_the_fences_own_indentation_is_stripped() {
         assert_eq!(strip_indent("     deeper", 4), " deeper");
         assert_eq!(strip_indent("  shallower", 4), "shallower");
+    }
+
+    #[test]
+    fn a_column_strip_takes_four_columns_however_they_are_written() {
+        // The unit `indent_columns` measures in. Stripping CHARACTERS
+        // here would take both tabs off the second case and dedent it
+        // by eight columns instead of four.
+        assert_eq!(strip_columns("    code", 4), "code");
+        assert_eq!(strip_columns("\t\tcode", 4), "\tcode");
+        assert_eq!(strip_columns("  \tcode", 4), "code");
+        assert_eq!(strip_columns("     deeper", 4), " deeper");
+        // A tab starting before column four ends exactly on it, so the
+        // strip never lands inside one and never has to allocate.
+        assert_eq!(strip_columns(" \t code", 4), " code");
+        assert_eq!(strip_columns("code", 4), "code");
     }
 
     #[test]
