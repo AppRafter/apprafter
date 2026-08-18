@@ -1,0 +1,305 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+"""A pygments lexer for CUE, registered at build time — and self-checked.
+
+pygments 2.20.0 (the version `flake.lock` pins) ships no CUE lexer:
+``get_lexer_by_name("cue")`` raises ``ClassNotFound``.  Re-derive both
+halves of that claim with::
+
+    nix develop --command python3 -c "import pygments; print(pygments.__version__)"
+    git grep -cE '^[ >]*```cue$' -- docs | awk -F: '{n+=$2} END {print n}'
+    git grep -cE '^[ >]*```cue$' -- docs ':!docs/changelog' | awk -F: '{n+=$2} END {print n}'
+
+At 2026-08-19 those read 2.20.0, 37 fences across 20 pages, and 31 of
+them on the built site (``exclude_docs`` drops the changelog working
+file).  Without this hook all 31 render as unstyled text.  Note the
+``[ >]*`` prefix in the pattern: four of those fences are indented or
+inside a blockquote, and an ``^```cue$``-anchored count silently misses
+them — it reports 33.
+
+Registering the lexer is the easy half.  The hard half is that the
+registration must not be allowed to fail quietly, and by default it
+does — ``pymdownx.highlight.Highlight.get_lexer`` reads, verbatim::
+
+    try:
+        lexer = get_lexer_by_name(language, **lexer_options)
+    except Exception:
+        lexer = None
+    ...
+    if lexer is None:
+        lexer = get_lexer_by_name(self.default_lang or 'text', **lexer_options)
+
+So a failed registration is a GREEN build: every CUE fence goes through
+the ``text`` lexer, emits no spans, logs nothing, and the pages look
+finished until someone notices that none of the CUE is coloured.  That
+is precisely the failure class the documentation gate exists to remove,
+which is why :func:`on_config` below does not merely register the lexer
+— it resolves the alias and tokenises a sample to prove the
+registration took, and raises when it did not.  Nothing else in the
+toolchain will report this.
+"""
+
+from __future__ import annotations
+
+from mkdocs.exceptions import PluginError
+from pygments.lexer import RegexLexer, bygroups, include, words
+from pygments.lexers import LEXERS, _lexer_cache, get_lexer_by_name
+from pygments.token import (
+    Comment,
+    Keyword,
+    Name,
+    Number,
+    Operator,
+    Punctuation,
+    String,
+    Whitespace,
+)
+
+
+class CueLexer(RegexLexer):
+    """Tokenise CUE (https://cuelang.org).
+
+    Scoped to what this corpus actually writes — package and import
+    clauses, definitions (``#Application``), optional fields
+    (``replicas?:``), unification ``&``, disjunction ``|`` with its
+    ``*`` default marker, bounds (``>=0``), regex constraints (``=~``),
+    ellipsis (``[...string]``), strings including the ``\"\"\"`` form,
+    ``//`` comments and numbers with CUE's IEC multipliers (``200Gi``).
+
+    It is deliberately not a complete CUE grammar: the job is to make a
+    struct read as a struct, not to decide validity — ``cue vet``
+    already does that, and the documentation gate already runs it over
+    the complete manifests in these pages.
+    """
+
+    name = "CUE"
+    url = "https://cuelang.org"
+    # `get_lexer_by_name` lowercases its argument before matching, so a
+    # ```CUE fence resolves through this same alias — no second entry.
+    aliases = ["cue"]
+    filenames = ["*.cue"]
+    mimetypes = ["text/x-cue"]
+
+    tokens = {
+        "root": [
+            (r"\s+", Whitespace),
+            (r"//[^\n]*", Comment.Single),
+            # An attribute: @tag(foo), @embed(file=…).
+            (r"@[A-Za-z_]\w*", Name.Decorator),
+            # Strings first, so nothing below can claim an opening quote.
+            (r'"""', String, "multiline-string"),
+            (r"'''", String.Other, "multiline-bytes"),
+            (r'"', String, "string"),
+            (r"'", String.Other, "bytes"),
+            # A definition (#Application) or a hidden one (_#Backend).
+            # Leading `#` is a definition in CUE, never a comment.
+            (r"_?#[A-Za-z_][\w$]*", Name.Class),
+            # A field name: an identifier before `:`, optionally marked
+            # optional (`image?:`).  This rule is what makes a CUE block
+            # read as a struct rather than a wall of identifiers, and it
+            # tokenises to Name.Tag so a CUE block and the YAML block
+            # next to it colour their keys alike.  It precedes the
+            # keyword rules on purpose: a lookahead colon settles the
+            # question of what the token is.
+            (
+                r"([A-Za-z_$][\w$]*)([ \t]*)(\??)(?=[ \t]*:)",
+                bygroups(Name.Tag, Whitespace, Punctuation),
+            ),
+            (words(("package", "import", "let", "if", "for", "in"), suffix=r"\b"), Keyword),
+            (
+                words(
+                    ("bool", "bytes", "float", "int", "number", "rune", "string", "uint"),
+                    suffix=r"\b",
+                ),
+                Keyword.Type,
+            ),
+            (words(("false", "null", "true"), suffix=r"\b"), Keyword.Constant),
+            (
+                words(("and", "close", "div", "len", "mod", "or", "quo", "rem"), suffix=r"\b"),
+                Name.Builtin,
+            ),
+            # Numbers.  Radix-prefixed forms first, then the float form
+            # (which needs its dot to win over the selector dot below),
+            # then integers.  The trailing group is CUE's multiplier
+            # suffix, as in `memory: 200Gi`.
+            (r"0[xX][0-9a-fA-F_]+", Number.Hex),
+            (r"0[bB][01_]+", Number.Bin),
+            (r"0[oO][0-7_]+", Number.Oct),
+            (r"[0-9][\d_]*\.[\d_]*([eE][+-]?[\d_]+)?([KMGTPE]i?)?", Number.Float),
+            (r"\.[0-9][\d_]*([eE][+-]?[\d_]+)?", Number.Float),
+            (r"[0-9][\d_]*([eE][+-]?[\d_]+)?([KMGTPE]i?)?", Number.Integer),
+            # `...` before the selector `.`, or an ellipsis lexes as
+            # three selectors.
+            (r"\.\.\.", Operator),
+            (r"=~|!~|==|!=|<=|>=|&&|\|\||[&|*+\-/<>=!]", Operator),
+            (r"[{}\[\](),;:.?]", Punctuation),
+            # A hidden field (_needs); reached only when no colon
+            # follows, since the field rule above claims that case.
+            (r"_[\w$]*", Name.Variable),
+            (r"[A-Za-z_$][\w$]*", Name),
+        ],
+        # A quoted CUE string cannot span a line — only the `"""` form
+        # can — so an unterminated one pops at the newline instead of
+        # swallowing the rest of the block.  A truncated snippet then
+        # costs one mis-coloured line, not a whole page.
+        "string": [
+            (r'"', String, "#pop"),
+            (r"\n", String, "#pop"),
+            (r"\\\(", String.Interpol, "interpolation"),
+            include("escapes"),
+            (r'[^"\\\n]+', String),
+            (r"\\", String),
+        ],
+        "bytes": [
+            (r"'", String.Other, "#pop"),
+            (r"\n", String.Other, "#pop"),
+            (r"\\\(", String.Interpol, "interpolation"),
+            include("escapes"),
+            (r"[^'\\\n]+", String.Other),
+            (r"\\", String.Other),
+        ],
+        "multiline-string": [
+            (r'"""', String, "#pop"),
+            (r"\\\(", String.Interpol, "interpolation"),
+            include("escapes"),
+            (r'[^"\\]+', String),
+            (r'["\\]', String),
+        ],
+        "multiline-bytes": [
+            (r"'''", String.Other, "#pop"),
+            (r"\\\(", String.Interpol, "interpolation"),
+            include("escapes"),
+            (r"[^'\\]+", String.Other),
+            (r"['\\]", String.Other),
+        ],
+        "escapes": [
+            (r"\\u[0-9a-fA-F]{4}", String.Escape),
+            (r"\\U[0-9a-fA-F]{8}", String.Escape),
+            (r"\\x[0-9a-fA-F]{2}", String.Escape),
+            (r"\\[0-7]{3}", String.Escape),
+            (r"""\\[abfnrtv\\/'"]""", String.Escape),
+        ],
+        # An interpolation holds an expression, so it lexes as one; the
+        # closing paren pops before `root` can call it punctuation.
+        "interpolation": [
+            (r"\)", String.Interpol, "#pop"),
+            include("root"),
+        ],
+    }
+
+
+# Exercises, in order: a comment, the `package` keyword, an import with
+# a string, a definition reference, the unification operator, field
+# names (plain and optional), a nested string, an integer and a bound.
+# Every token kind the self-check demands appears here, and the check is
+# only as good as this sample — extend it before relaxing the check.
+SAMPLE = """\
+// A sample, not an example: this is what proves the lexer resolved.
+package apprafter
+
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+app: v1alpha1.#Application & {
+    metadata: name: "sample"
+    spec: base: {
+        image:     "ghcr.io/my-org/my-service:1.0.0"
+        replicas?: int & >=1
+    }
+}
+"""
+
+# (label, token family) pairs the sample must produce.  Membership uses
+# pygments' token hierarchy (`Token.Comment.Single in Token.Comment`),
+# so retokenising a construct to a sibling subtype does not fire this;
+# only losing the construct entirely does — which is exactly the
+# "everything came back as Text" failure being guarded.
+_REQUIRED_TOKENS = (
+    ("comment", Comment),
+    ("keyword", Keyword),
+    ("string", String),
+    ("name", Name),
+    ("number", Number),
+    ("operator", Operator),
+)
+
+
+def _register() -> None:
+    """Put :class:`CueLexer` where ``get_lexer_by_name`` will find it.
+
+    pygments has no public registration API — third-party lexers are
+    discovered through setuptools entry points, which a build hook
+    loaded from a path in the docs tree does not have.  What it does
+    have is the lookup itself, which in 2.20.0 reads::
+
+        for module_name, name, aliases, _, _ in LEXERS.values():
+            if _alias.lower() in aliases:
+                if name not in _lexer_cache:
+                    _load_lexers(module_name)
+                return _lexer_cache[name](**options)
+
+    ``_lexer_cache`` is keyed by ``cls.name``.  Seeding it first and
+    adding the ``LEXERS`` row second means the row's module path is
+    never imported — which matters, because mkdocs loads this file by
+    path and ``__name__`` need not be importable.  If a future pygments
+    drops that skip, the import fails loudly inside :func:`on_config`
+    rather than silently, because the lookup there is not swallowed.
+    """
+    _lexer_cache[CueLexer.name] = CueLexer
+    LEXERS[CueLexer.__name__] = (
+        __name__,
+        CueLexer.name,
+        tuple(CueLexer.aliases),
+        tuple(CueLexer.filenames),
+        tuple(CueLexer.mimetypes),
+    )
+
+
+def on_config(config):
+    """Register the lexer, then prove it took.
+
+    ``pymdownx.highlight`` swallows a ``ClassNotFound`` and renders the
+    block as plain text, so a failed registration is a green build with
+    every CUE fence unhighlighted and nothing in the log.  The checks
+    below are the only thing standing between that and a reader, so
+    they raise ``PluginError`` — which fails the build with a message
+    instead of a traceback.
+    """
+    _register()
+
+    try:
+        lexer = get_lexer_by_name("cue")
+    except Exception as exc:  # ClassNotFound, or an import raised by _load_lexers
+        raise PluginError(
+            f"the CUE lexer did not register: resolving the `cue` alias still "
+            f"raises {type(exc).__name__}: {exc}. Every ```cue fence would render "
+            f"through the `text` lexer and the build would otherwise stay green "
+            f"— see the module docstring in docs/hooks/cue_lexer.py."
+        ) from exc
+
+    if not isinstance(lexer, CueLexer):
+        raise PluginError(
+            f"the `cue` alias resolves to "
+            f"{type(lexer).__module__}.{type(lexer).__qualname__}, not this "
+            f"hook's CueLexer — something else claimed the alias, and what it "
+            f"makes of CUE is unknown. Check pygments' LEXERS table."
+        )
+
+    kinds = {tok for tok, _ in lexer.get_tokens(SAMPLE)}
+    missing = [
+        label for label, family in _REQUIRED_TOKENS if not any(k in family for k in kinds)
+    ]
+    problems = []
+    if len(kinds) < 3:
+        plural = "" if len(kinds) == 1 else "s"
+        problems.append(f"it produced {len(kinds)} token kind{plural} in all")
+    if missing:
+        problems.append("it produced no " + ", ".join(missing))
+    if problems:
+        raise PluginError(
+            f"the CUE lexer registered but tokenised the sample into nothing "
+            f"usable: {'; and '.join(problems)}. It would render as plain text, "
+            f"which is what a missing lexer looks like — and `pymdownx.highlight` "
+            f"catches the failure itself, so nothing else would report this. "
+            f"See SAMPLE and _REQUIRED_TOKENS in docs/hooks/cue_lexer.py."
+        )
+
+    return config

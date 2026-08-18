@@ -31,6 +31,14 @@ exclude_docs: |
   # banner. Excluding it from the SITE does not hide it from
   # literate-nav, which reads the docs tree, not the build output.
   reference/cli/SUMMARY.md
+  # Build hooks (see `hooks:` below). They live under docs/ to sit
+  # beside what they act on, but they are build machinery, not
+  # content: without this, mkdocs copies them to the site as static
+  # files — verified, it published both hooks/cue_lexer.py and the
+  # hooks/__pycache__/ directory CPython left there. Excluding them
+  # from the SITE does not stop `hooks:` loading them, which reads the
+  # path directly, not the docs tree.
+  hooks/
 
 # Pages deliberately reachable by URL but absent from nav. Anything
 # NOT on this list that is missing from nav fails the build — an
@@ -96,6 +104,22 @@ plugins:
   # the first time a command is added.
   - literate-nav:
       nav_file: SUMMARY.md
+
+# Build hooks. mkdocs loads these by PATH (not as importable modules)
+# and calls the same event API a plugin gets, so a hook can do what no
+# packaged plugin here can — pygments ships no CUE lexer, and nixpkgs
+# has no llms.txt plugin (ADR 0057 §"Keep MkDocs-Material" records both
+# as accepted costs).
+#
+# Hooks live under docs/ so they sit beside what they act on; that also
+# puts them inside docs_dir, where mkdocs would otherwise copy them to
+# the site as static files — hence the exclude_docs entry above.
+hooks:
+  # Registers a CUE lexer and FAILS THE BUILD if the registration did
+  # not take. pymdownx.highlight catches a lexer-lookup failure and
+  # falls back to `text`, so without that self-check a broken hook is a
+  # green build with every ```cue fence silently unhighlighted.
+  - docs/hooks/cue_lexer.py
 
 markdown_extensions:
   - attr_list          # explicit {#stable-anchor} ids — the docs cross-reference gate resolves against these

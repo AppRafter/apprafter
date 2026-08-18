@@ -26,6 +26,13 @@ target/
 # CUE
 cue.out/
 
+# Python — the MkDocs build hooks under docs/hooks/ are the only Python
+# source here, and importing them leaves a __pycache__ beside them.
+# Without this, a `git add docs` picks it up (mkdocs.yml already keeps
+# it out of the built site, which is a different problem).
+__pycache__/
+*.py[cod]
+
 # MkDocs build output
 site/
 

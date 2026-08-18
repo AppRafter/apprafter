@@ -56,6 +56,12 @@ PATTERNS=(
   'mise.toml'
   'Justfile'
   'mkdocs.yml'
+  # MkDocs build hooks. These are source, not documentation: they live
+  # under docs/ to sit beside what they act on, and mkdocs.yml excludes
+  # them from the built site. The "no SPDX on docs/" note above is
+  # about markdown pages, so name them explicitly rather than widening
+  # the exclusion's meaning.
+  'docs/hooks/*.py'
   'cli/**/Cargo.toml'
   'cli/**/rust-toolchain.toml'
 )
