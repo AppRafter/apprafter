@@ -25,6 +25,6 @@ Usage: apprafter restore [OPTIONS] <REPO>
 | `--data-only` | flag | — | no | Replay only native data (pg/redis/volumes); skip CR + secret replay. Useful when the cluster is already configured |
 | `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
 | `--reprovision` | flag | — | no | Re-provision the target cluster before replaying data |
-| `--server-type` | — | — | no | Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase. Resolution: this flag > manifest `nodes[0].kind` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected` |
+| `--server-type` | — | — | no | Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase. Resolution: this flag > manifest `spec.nodes[0].type` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected` |
 | `--snapshot` | — | — | no | Snapshot id to restore (defaults to the latest) |
 | `--target` | — | — | no | Target name to restore into (defaults to the active target) |

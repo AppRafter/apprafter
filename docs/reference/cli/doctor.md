@@ -17,5 +17,5 @@ Usage: apprafter doctor [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping. Honours `APPRAFTER_NO_PING=1` for shell-script ergonomics. Env: `APPRAFTER_NO_PING`. |
+| `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping. Also settable via `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no` `n` `f` `off` keep it. Any other value, including the empty string, is an error rather than a no-op. Env: `APPRAFTER_NO_PING`. |
 | `--target` | — | — | no | Inspect a target other than the active one. Defaults to the active target |

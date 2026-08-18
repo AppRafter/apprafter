@@ -74,7 +74,7 @@ reachability.
 
 Provisioning a new machine requires an explicit server type, and
 none was found in the resolution chain (`--server-type` flag >
-`nodes[0].kind` in the manifest > `HetznerCloudState.server_type`
+`spec.nodes[0].type` in the manifest > `HetznerCloudState.server_type`
 in state > `TargetConfig.server_type` in the target store >
 `APPRAFTER_SERVER_TYPE` env). The error fires only on the **create
 path** (a new machine is about to be provisioned); `apply` on an
@@ -89,8 +89,9 @@ already-running cluster does not require the type.
   provisioning command (`target add`, `apply`, `up`, `restore
   --reprovision`), or export `APPRAFTER_SERVER_TYPE=<sku>` in the
   runner environment. This is the recommended path for pipelines.
-- **Declarative (manifest):** add `nodes[0].kind: <sku>` to your
-  `Infrastructure.cue` manifest and point `APPRAFTER_MANIFEST` at it.
+- **Declarative (manifest):** set `type: "<sku>"` on the entry in
+  `spec.nodes` in your `Infrastructure.cue` manifest and point
+  `APPRAFTER_MANIFEST` at it.
   The manifest rung sits above the target store, so a committed
   manifest pins the type even if the target default changes.
 - **No saved target (env-credential run):** when provisioning via

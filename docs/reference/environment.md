@@ -24,18 +24,35 @@ state, is stated per row — the CLI has no single global rule.
 
 ## Target store and credentials
 
+Since v0.1.154 both the target store and the state cache are anchored
+to the config root, not to the current directory:
+
+```text
+<config-root>/targets/<target>/config.yaml
+<config-root>/targets/<target>/credentials.yaml
+<config-root>/state/<target>/.apprafter/state.json
+<config-root>/state/<target>/.apprafter/known_hosts
+```
+
+A bare `.apprafter/state.json` beside your project is the pre-v0.1.154
+layout; the CLI migrates it into the per-target slot on first run and
+does not write there again.
+
 | Variable | What it does | Default | Read at |
 | --- | --- | --- | --- |
-| `APPRAFTER_CONFIG_DIR` | Target-store root. Used **verbatim** — no `apprafter/` component is appended, so it can point straight at a scratch directory. Honoured ahead of `dirs::config_dir()`, which matters on macOS where that returns `~/Library/Application Support/`. An empty value is ignored. | `dirs::config_dir()/apprafter` (`~/.config/apprafter` on Linux) | `cli-core/src/target.rs`, `default_config_root()` |
+| `APPRAFTER_CONFIG_DIR` | Root of everything the CLI persists — **both** the target store (`<root>/targets/<name>/`) and per-target state (`<root>/state/<name>/.apprafter/`), so it relocates the encrypted kubeconfig cache, the Argo CD password and the SSH `known_hosts` file along with the targets. Used **verbatim**: no `apprafter/` component is appended, so it can point straight at a scratch directory. Honoured ahead of `dirs::config_dir()`, which matters on macOS where that returns `~/Library/Application Support/`. An empty value is ignored. It does **not** move the age key — that stays under `$HOME` (see `APPRAFTER_AGE_KEY`), so pointing this at a fresh directory relocates the ciphertext but keeps the key that opens it. | `dirs::config_dir()/apprafter` (`$XDG_CONFIG_HOME/apprafter`, i.e. `~/.config/apprafter`, on Linux) | `cli-core/src/target.rs`, `default_config_root()`; `platform-cli/src/commands/state_paths.rs`, `resolve_state_paths()` |
+| `XDG_CONFIG_HOME` | What feeds `dirs::config_dir()` on Linux, and therefore the default above — it moves the target store *and* all per-target state. Only consulted when `APPRAFTER_CONFIG_DIR` is unset, which overrides it outright. | unset — `dirs` falls back to `~/.config` | `cli-core/src/target.rs`, `default_config_root()` (via the `dirs` crate) |
 | `APPRAFTER_SSH_PUBLIC_KEY` | SSH public-key **body** inline (the literal `ssh-ed25519 AAAA… you@host` string), for CI that has no key file on disk. Highest rung of the SSH-key chain: it wins over the active target's stored `ssh_key_path`. An empty value is ignored. | unset — the target's stored key path is used, and provisioning is allowed to proceed with no key at all | `cli-core/src/credentials.rs`, `resolve_hetzner_ssh_public_key()` |
-| `APPRAFTER_SSH_PRIVATE_KEY` | Path to the **private** key used for every SSH round-trip to the node: `apprafter kubeconfig`'s cold fetch of the k3s kubeconfig, and `apprafter node prep`. | `$HOME/.ssh/id_ed25519` | `cli-providers/src/hetzner_cloud/kubeconfig.rs`, `default_ssh_identity_path()` |
-| `APPRAFTER_AGE_KEY` | Path to the age identity that encrypts the cached kubeconfig and Argo CD password in `.apprafter/state.json`. The file is created (mode 0600) on first use if absent. Note this default is **not** derived from `APPRAFTER_CONFIG_DIR` and does not go through `dirs::config_dir()` — it is built from `$HOME` directly. | `$HOME/.config/apprafter/age.key` | `cli-core/src/secrets.rs`, `default_age_key_path()` |
+| `APPRAFTER_SSH_PRIVATE_KEY` | Path to the **private** key for the CLI's SSH round-trips to the node. Three call sites: [`kubeconfig`](cli/kubeconfig.md)'s cold fetch of the k3s kubeconfig (which [`bootstrap-all`](cli/bootstrap-all.md) also drives, through the same `fetch_and_cache`), [`node prep`](cli/node.md#apprafter-node-prep) and [`node status`](cli/node.md#apprafter-node-status). | `$HOME/.ssh/id_ed25519` | `cli-providers/src/hetzner_cloud/kubeconfig.rs`, `default_ssh_identity_path()` |
+| `APPRAFTER_AGE_KEY` | Path to the age identity that encrypts the cached kubeconfig and Argo CD password inside the state file. The file is created (mode 0600) on first use if absent. This default is **not** derived from `APPRAFTER_CONFIG_DIR` and does not go through `dirs::config_dir()` — it is built from `$HOME` directly, so moving the config root leaves the key behind. | `$HOME/.config/apprafter/age.key` | `cli-core/src/secrets.rs`, `default_age_key_path()` |
+| `HOME` | Not an AppRafter variable, but load-bearing: it is read **directly** — not through `dirs` — to build the `APPRAFTER_AGE_KEY` and `APPRAFTER_SSH_PRIVATE_KEY` defaults, and both fall back to the literal `/` when it is unset. In a container with no `HOME` that silently yields `/.config/apprafter/age.key` and `/.ssh/id_ed25519` rather than an error. Set `HOME`, or set both variables explicitly. | falls back to `/` | `cli-core/src/secrets.rs`, `default_age_key_path()`; `cli-providers/src/hetzner_cloud/kubeconfig.rs`, `default_ssh_identity_path()` |
+| `XDG_CACHE_HOME` | Feeds `dirs::cache_dir()`, which holds only the once-per-6h "newer CLI available" check cache (`<cache>/apprafter/version-check.json`). No AppRafter override exists. | unset — `dirs` falls back to `~/.cache`; if it resolves to nothing at all, the cache lands in the current directory | `platform-cli/src/commands/version_check.rs`, `cache_path()` |
 
 ## Provisioning
 
 | Variable | What it does | Default | Read at |
 | --- | --- | --- | --- |
-| `APPRAFTER_SERVER_TYPE` | Server-type SKU (e.g. `cx22`) for non-interactive provisioning. **Lowest** rung of the chain: `--server-type` flag → manifest `nodes[0].kind` → saved state → target preference → this variable. There is no built-in default below it — a provision with no rung set fails with `apprafter::provider::server_type_not_selected`. An empty value counts as unset. | unset | `platform-cli/src/commands/apply.rs`, `env_server_type()` |
+| `APPRAFTER_SERVER_TYPE` | Server-type SKU (e.g. `cx22`) for non-interactive provisioning. **Lowest** rung of the chain: `--server-type` flag → the manifest's `spec.nodes[0].type` → saved state → target preference → this variable. There is no built-in default below it — a provision with no rung set fails with `apprafter::provider::server_type_not_selected`. An empty value counts as unset. | unset | `platform-cli/src/commands/apply.rs`, `env_server_type()` |
 | `APPRAFTER_MANIFEST` | Path to an `Infrastructure.cue` manifest whose values overlay `apply`'s built-in defaults (region, node kind, network ranges). Resolved **relative to the current directory**, not to the state file. | unset — `apply` uses its built-in defaults | `platform-cli/src/commands/apply.rs`, `run()` |
 | `APPRAFTER_HCLOUD_BASE_URL` | Hetzner Cloud API base URL. Exists so integration tests can point the CLI at a local `mockito` server; it is not a production knob. | the upstream Hetzner Cloud API | `platform-cli/src/commands/hcloud.rs`, `hcloud_base_url()` |
 
@@ -64,8 +81,10 @@ fall back to the environment.
 | --- | --- | --- | --- |
 | `CUE_BIN` | Path to the `cue` binary the CLI shells out to. Used by [`app validate`](cli/app.md#apprafter-app-validate) and by the manifest parse inside [`app add`](cli/app.md#apprafter-app-add), and by the `Infrastructure.cue` parse that `APPRAFTER_MANIFEST` triggers. For a custom or non-`PATH` install. | `cue`, resolved through `PATH` | `cli-core/src/cue.rs`, `cue_bin()`; `platform-cli/src/commands/app_validate.rs`, `cue_bin()` |
 | `RUST_LOG` | `tracing-subscriber` filter directive. Logs go to **stderr**, so raising the level does not corrupt a piped `apprafter kubeconfig` or `argocd-password`. `RUST_LOG=apprafter=debug` is the useful setting; it is what surfaces why the version-check banner stayed quiet, for example. | `warn,apprafter=info,cli_core=info,cli_state=info,cli_providers=info` | `cli-core/src/logging.rs`, `init()` |
-| `NO_COLOR` | Set it (see [no-color.org](https://no-color.org/)) and every styled string drops its ANSI escapes — `doctor` rows, `bootstrap-all` phase markers, `target list`, `whoami`, and miette's rendered errors. Colour is also dropped automatically when the stream is not a TTY, so a plain pipe needs no opt-out. | unset — colour when the stream is a terminal | `cli-core/src/style.rs` (via `owo-colors`' `supports-colors`), and miette |
-| `RUST_BACKTRACE` | `RUST_BACKTRACE=1` restores backtraces in rendered errors. They are off by default because the miette `help:` line is more actionable for an operator; this is a development knob. | unset — no backtrace, just the diagnostic block | `platform-cli/src/lib.rs`, `run()` (miette handler) |
+| `NO_COLOR` | Any value **except `0`** (see [no-color.org](https://no-color.org/)) drops the ANSI escapes from every styled string — `doctor` check rows, `bootstrap-all` phase markers, and the styled output of `target`, `target domain` and `target firewall` — plus miette's rendered errors. `NO_COLOR=0` is treated as unset. Colour is dropped automatically when the stream is not a terminal, so a plain pipe needs no opt-out. | unset — colour when the stream is a terminal | `cli-core/src/style.rs` (via `owo-colors`' `supports-colors` feature → the `supports-color` crate), and miette |
+| `FORCE_COLOR` `CLICOLOR_FORCE` | Force colour **on** even when the stream is a pipe — what you want feeding a colour-aware pager or CI log viewer. `FORCE_COLOR` takes `true` or empty for basic colour, `false` to disable, or `1`/`2`/`3` for a colour depth; `CLICOLOR_FORCE` is consulted only if `FORCE_COLOR` is unset and treats any value except `0` as force-on. Both are checked **before** `NO_COLOR` and therefore beat it. | unset — colour follows terminal detection | the `supports-color` crate, behind `cli-core/src/style.rs` |
+| `CLICOLOR` | Any value except `0` counts as evidence the terminal supports colour. It contributes to detection only — unlike `CLICOLOR_FORCE` it does not override a pipe. | unset | the `supports-color` crate, behind `cli-core/src/style.rs` |
+| `RUST_BACKTRACE` | **No effect on `apprafter`'s rendered diagnostics.** The miette handler in `run()` sets terminal links, unicode, context lines and the cause chain, and never enables a backtrace; `miette::set_panic_hook()` is not called and `CliError` captures no backtrace. `apprafter target show <missing>` renders byte-identically with the variable unset, `=1` and `=full`. It still reaches the standard library's panic hook, so it would add a trace if the CLI ever panicked — but a panic is a bug, not an operator-facing surface. Listed here only because the source comment claims otherwise. | not applicable | nothing reads it; the intent is described but unimplemented at `platform-cli/src/lib.rs`, `run()` |
 | `USER` | Stamped as the `addedBy` attribution on [`target domain add`](cli/target.md#apprafter-target-domain-add) when `--added-by` is omitted. Falls back to the literal `unknown`. | unset — recorded as `unknown` | `platform-cli/src/commands/target_domain.rs`, `resolve_added_by()` |
 
 ## Declared through clap
@@ -85,8 +104,9 @@ projected from the parser.
 ## Not read: `KUBECONFIG`
 
 `apprafter` does **not** read `KUBECONFIG`. Every cluster-touching
-command decrypts the kubeconfig cached in `.apprafter/state.json`,
-writes it to a temporary file, and sets `KUBECONFIG` on the `kubectl` /
+command decrypts the kubeconfig cached in the active target's
+`state.json` (see the layout above), writes it to a temporary file,
+and sets `KUBECONFIG` on the `kubectl` /
 `helm` subprocesses it spawns. Exporting `KUBECONFIG` in your shell
 therefore changes nothing about which cluster `apprafter` talks to —
 switch clusters with `apprafter target use <name>`, and pipe the

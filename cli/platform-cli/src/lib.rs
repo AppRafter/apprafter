@@ -39,14 +39,20 @@ pub mod docs_api {
 /// Parse argv and run the CLI. `main` is a thin wrapper so the whole
 /// post-argv path is linkable from outside the crate.
 pub fn run() -> Result<()> {
-    // Configure miette's `fancy` reporter as the global panic /
-    // error formatter. `CliError` (defined in cli-core) derives
-    // `miette::Diagnostic`, so unhandled errors render with the
-    // rustc-style `error:` / `help:` / `code:` block instead of
-    // `Debug` output. Disable backtraces in the rendered output
-    // — they're loud and almost never relevant for end users; the
-    // diagnostic `help:` line is more actionable. Backtraces are
-    // still available via `RUST_BACKTRACE=1` for development.
+    // Configure miette's reporter as the global error formatter.
+    // `CliError` (defined in cli-core) derives `miette::Diagnostic`,
+    // so unhandled errors render with the rustc-style `error:` /
+    // `help:` / `code:` block instead of `Debug` output.
+    //
+    // No backtrace is rendered, and there is no knob that turns one
+    // on: nothing below enables it, `CliError` captures no
+    // `Backtrace`, and `miette::set_panic_hook()` is deliberately
+    // not called (a wizard abort should print "wizard aborted", not
+    // a trace). `RUST_BACKTRACE` therefore does NOT affect rendered
+    // diagnostics — an earlier version of this comment said it did,
+    // and that claim reached the published docs before being caught.
+    // If backtraces are ever wanted, they need a real implementation
+    // here, not a comment. See `docs/reference/environment.md`.
     miette::set_hook(Box::new(|_| {
         Box::new(
             miette::MietteHandlerOpts::new()

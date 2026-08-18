@@ -18,14 +18,12 @@ Field-by-field reference for everything the platform exposes:
   `AccessGrant`, `ExternalSurface`, `MigrationPlan`,
   `Infrastructure`, `ServiceProviderPlugin`,
   `InfrastructureProviderPlugin`. Source of truth:
-  `schemas/v1alpha1/` (CUE). Auto-generated field reference lands
-  in phase 8.1.
+  `schemas/v1alpha1/` (CUE). A generated field reference is not
+  yet published.
 - **Notifications HTTP API** — request/response shapes, error
-  codes, idempotency keys. Stub today; lands with the M3
-  notification stack.
+  codes, idempotency keys. Not yet published.
 - **gRPC plugin contracts** — `ServiceProviderInterface`,
-  `InfrastructureProviderInterface`. Stub today; lands in
-  Phase 7 (plugin sidecar lifecycle).
+  `InfrastructureProviderInterface`. Not yet published.
 
 For the immediate operator-facing surface, [`cli/`](cli/index.md) is
 canonical. Cross-reference with `apprafter <subcmd> --help` for

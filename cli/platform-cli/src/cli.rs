@@ -33,8 +33,11 @@ pub enum Commands {
     /// `--no-ping` to skip the network round-trip.
     Whoami {
         /// Skip the Hetzner Cloud API ping that confirms the
-        /// active target's token still authenticates. Honours
-        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics.
+        /// active target's token still authenticates. Also settable
+        /// via `APPRAFTER_NO_PING`, which takes a boolish value:
+        /// `1` `true` `yes` `y` `t` `on` skip the ping, `0` `false`
+        /// `no` `n` `f` `off` keep it. Any other value, including
+        /// the empty string, is an error rather than a no-op.
         #[arg(
             long = "no-ping",
             env = "APPRAFTER_NO_PING",
@@ -62,8 +65,11 @@ pub enum Commands {
         /// to the active target.
         #[arg(long)]
         target: Option<String>,
-        /// Skip the Hetzner Cloud API ping. Honours
-        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics.
+        /// Skip the Hetzner Cloud API ping. Also settable via
+        /// `APPRAFTER_NO_PING`, which takes a boolish value: `1`
+        /// `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no`
+        /// `n` `f` `off` keep it. Any other value, including the
+        /// empty string, is an error rather than a no-op.
         #[arg(
             long = "no-ping",
             env = "APPRAFTER_NO_PING",
@@ -95,7 +101,7 @@ pub enum Commands {
         #[arg(long)]
         target: Option<String>,
         /// Server type (SKU) to provision (e.g. `cx22`, `cx32`). Resolution:
-        /// this flag > manifest `nodes[0].kind` > recorded state > target
+        /// this flag > manifest `spec.nodes[0].type` > recorded state > target
         /// default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default —
         /// if none is set, provisioning a new cluster fails with
         /// `apprafter::provider::server_type_not_selected` (pick one via the
@@ -201,7 +207,7 @@ pub enum Commands {
         dry_run: bool,
         /// Server type (SKU) to provision (e.g. `cx22`, `cx32`). Forwarded
         /// to the `apply` phase of bootstrap-all. Resolution: this flag >
-        /// manifest `nodes[0].kind` > recorded state > target default >
+        /// manifest `spec.nodes[0].type` > recorded state > target default >
         /// `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is
         /// set, provisioning fails with
         /// `apprafter::provider::server_type_not_selected`.
@@ -328,7 +334,7 @@ pub enum Commands {
         credential_file: Option<std::path::PathBuf>,
         /// Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`,
         /// `cx32`). Forwarded to the `apply` phase. Resolution: this flag >
-        /// manifest `nodes[0].kind` > recorded state > target default >
+        /// manifest `spec.nodes[0].type` > recorded state > target default >
         /// `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is
         /// set, provisioning fails with
         /// `apprafter::provider::server_type_not_selected`.
@@ -1070,9 +1076,11 @@ pub enum TargetCommand {
         /// Skip the Hetzner Cloud API ping that confirms the token
         /// authenticates (`GET /v1/locations`). Useful in CI when
         /// the network sandbox blocks outbound calls, or when
-        /// pre-seeding a target store offline. Also honours
-        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics —
-        /// any non-empty value flips the flag.
+        /// pre-seeding a target store offline. Also settable via
+        /// `APPRAFTER_NO_PING`, which takes a boolish value: `1`
+        /// `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no`
+        /// `n` `f` `off` keep it. Any other value, including the
+        /// empty string, is an error rather than a no-op.
         #[arg(
             long = "no-ping",
             env = "APPRAFTER_NO_PING",
@@ -1164,8 +1172,11 @@ pub enum TargetCommand {
         server_type: Option<String>,
         /// Skip the provider API. Requires `--server-type` — the picker
         /// cannot work without the API. Without `--server-type` this flag
-        /// is an error, never a silent no-op. Honours
-        /// `APPRAFTER_NO_PING=1` for shell-script ergonomics.
+        /// is an error, never a silent no-op. Also settable via
+        /// `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true`
+        /// `yes` `y` `t` `on` skip the ping, `0` `false` `no` `n` `f`
+        /// `off` keep it. Any other value, including the empty string,
+        /// is an error rather than a no-op.
         #[arg(
             long = "no-ping",
             env = "APPRAFTER_NO_PING",

@@ -50,7 +50,7 @@ Usage: apprafter target add [OPTIONS] [NAME]
 | `--cluster-name` | — | — | no | Default cluster name; falls back to `platform-1` |
 | `--force` | flag | — | no | Overwrite an existing target. Without `--force`, the command fails when the target name is taken |
 | `--no-interactive` | flag | — | no | Skip the interactive wizard even when stdin + stdout are TTYs. The wizard fires by default on TTY shells and asks for any field not supplied via flag |
-| `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping that confirms the token authenticates (`GET /v1/locations`). Useful in CI when the network sandbox blocks outbound calls, or when pre-seeding a target store offline. Also honours `APPRAFTER_NO_PING=1` for shell-script ergonomics — any non-empty value flips the flag. Env: `APPRAFTER_NO_PING`. |
+| `--no-ping` | flag | — | no | Skip the Hetzner Cloud API ping that confirms the token authenticates (`GET /v1/locations`). Useful in CI when the network sandbox blocks outbound calls, or when pre-seeding a target store offline. Also settable via `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no` `n` `f` `off` keep it. Any other value, including the empty string, is an error rather than a no-op. Env: `APPRAFTER_NO_PING`. |
 | `--provider` | — | — | no | Provider identifier. Only `hetzner-cloud` is wired today; AWS / Managed Cloud are planned for later |
 | `--region` | — | — | no | Default provider region (e.g. Hetzner `nbg1`) |
 | `--renew` | flag | — | no | Update only the credentials of an existing target. Errors when the target does not exist. Mutually exclusive with `--force` (use `--force` if you want to replace the whole target, not just rotate the token) |
@@ -199,7 +199,7 @@ Usage: apprafter target machine [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--no-ping` | flag | — | no | Skip the provider API. Requires `--server-type` — the picker cannot work without the API. Without `--server-type` this flag is an error, never a silent no-op. Honours `APPRAFTER_NO_PING=1` for shell-script ergonomics. Env: `APPRAFTER_NO_PING`. |
+| `--no-ping` | flag | — | no | Skip the provider API. Requires `--server-type` — the picker cannot work without the API. Without `--server-type` this flag is an error, never a silent no-op. Also settable via `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no` `n` `f` `off` keep it. Any other value, including the empty string, is an error rather than a no-op. Env: `APPRAFTER_NO_PING`. |
 | `--server-type` | — | — | no | Set the type non-interactively (skips the picker). When `--no-ping` is also passed the SKU is saved without API validation; without `--no-ping` the SKU is validated against the live Hetzner API for the target's current region |
 | `--target` | — | — | no | Target to modify (defaults to the active target) |
 
