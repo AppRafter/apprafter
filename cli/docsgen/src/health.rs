@@ -81,13 +81,17 @@
 //!
 //! That last point is the one to keep. Against all three rejected
 //! ratchets, deleting a page was free and invisible. Against these
-//! seven a page cannot go **on its own** without one of them falling —
-//! but they are corpus-wide sums, so a deletion still nets out against
-//! unrelated growth in the same commit. Re-run: `git rm docs/index.md`
-//! (which contributes only to `pages`) beside a three-line stub page
-//! printed the committed census byte for byte and exited 0. Sizing a
-//! deletion is the reviewer's job; this file only makes an *unaccompanied*
-//! one loud.
+//! seven a **file** cannot leave `git ls-files` on its own without one
+//! of them falling — which is a narrower guarantee than it first
+//! reads, and the gap section below states how much narrower: what
+//! goes loud is the file's disappearance, not its content's.
+//!
+//! Even that holds only per commit. The seven are corpus-wide sums, so
+//! a deletion nets out against unrelated growth beside it. Re-run:
+//! `git rm docs/index.md` (which contributes only to `pages`) beside a
+//! three-line stub page printed the committed census byte for byte and
+//! exited 0. Sizing a deletion is the reviewer's job; this file only
+//! makes an *unaccompanied* one loud.
 //!
 //! One of the seven is not purely an obligation count, and the
 //! exception is worth naming rather than discovering: `identifiers`
@@ -118,6 +122,20 @@
 //! commit** — which is exactly the review moment a new exemption should
 //! get, and one diff line is a fair price for retiring one.
 //!
+//! Equality guarantees a review line for a **net** change, and only
+//! per commit — the same netting the six sums have, and it was worth
+//! stating there and not here until a reviewer landed it. Declaring
+//! one exemption while retiring another passes green: trading
+//! `docs/dev-guide/application-cue.md`'s narrow one-path
+//! `schema-check-ignore` for a blanket `check=none` over the
+//! four-invocation fence at `docs/operator-guide/quickstart.md:117`
+//! printed `2 exemptions (2 historical)` and exited 0, having widened
+//! the exempted surface from a single identifier to a whole fence's
+//! CLI, CUE and identifier checks. Committing the per-kind breakdown
+//! would not close it either — that reports a retype as a regression,
+//! which the next paragraph rejects — so the answer here is the
+//! statement, not another rule.
+//!
 //! Equality on the **number**, and on nothing else. The kinds are
 //! printed, not committed (below), so re-typing a standing exemption
 //! passes green: flipping the corpus's one `reason: historical` entry
@@ -129,12 +147,30 @@
 //! # Reported, not committed
 //!
 //! [`crate::gate::Stats::line`] prints two things this file does not
-//! hold: the **opaque** share of resolved identifiers, and the
-//! exemption total broken down **by kind**. The opaque share is a
-//! ratio of two numbers already here, so committing it is a third
-//! number to keep in step; the kinds are labels rather than a
-//! magnitude, and a value comparison over them would report a retype
-//! as a regression.
+//! hold: the **opaque** count — identifiers that resolved *only*
+//! because they sit under a subtree the CRDs do not describe — and the
+//! exemption total broken down **by kind**. The kinds are labels
+//! rather than a magnitude, and a value comparison over them would
+//! report a retype as a regression.
+//!
+//! The opaque count is left out for a harder reason than it once said
+//! here. An earlier revision claimed it was "a ratio of two numbers
+//! already here", which is false — [`Baseline`] holds seven fields and
+//! this is not one of them, so only the denominator is committed and
+//! the count is an independent measurement. The gap section below
+//! refutes it outright: its second example moves the opaque count
+//! 115 → 114 while all seven committed numbers hold, which no
+//! derivation of them could do.
+//!
+//! The real reason is that **its direction cannot be read**. It falls
+//! when the documentation degrades — that example replaces a deep
+//! claim with a shallow one, and the opaque claim goes with it — and
+//! it falls just as surely when the *schemas improve*, because a path
+//! the CRDs learn to describe stops resolving opaquely. One number,
+//! two opposite meanings, so neither a ratchet nor an equality rule
+//! over it says anything a reader could act on. It is worth printing
+//! for exactly the reason it is not worth committing: a human can tell
+//! those two cases apart and a comparison cannot.
 //!
 //! Exemption **ages** are printed by neither. They are `now`-derived —
 //! the first refutation above — and they are computed on every run for
@@ -167,6 +203,23 @@
 //!   Rewritten to `cli/docsgen/src`, all seven numbers held and the
 //!   gate exited 0: a directory resolves exactly as a blob does, and
 //!   `code_paths` counts references, not depth.
+//!
+//! And a fourth shape, larger than the three above and the one to read
+//! first: **the counters count claims, not documentation.** Prose that
+//! carries no counted claim is invisible to all seven, so a page can
+//! lose its entire explanation with the census unchanged. Both re-run
+//! through the whole of `scripts/docs-check.sh`, not just the gate:
+//! deleting 145 non-claim prose lines from
+//! `docs/operator-guide/troubleshooting.md` (405 → 261) printed the
+//! committed census byte for byte and exited 0; and `docs/index.md` —
+//! which makes no counted claim at all — can be gutted **in place** to
+//! a single `# AppRafter` heading, with no `git rm` and nothing added
+//! beside it, and all seven numbers still hold. That is the honest
+//! reading of "a file cannot leave on its own" above: the seven notice
+//! a page leaving `git ls-files`, not a page being emptied where it
+//! stands. Sweeping all 33 corpus pages, `docs/index.md` is the only
+//! one that can be gutted for free today — but every one of them can
+//! lose all of its non-claim prose for free.
 //!
 //! **These ratchets defend against the careless, not against the
 //! motivated** — review defends against the motivated, and no

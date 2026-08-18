@@ -972,17 +972,31 @@ fn a_silenced_fence_still_counts_toward_the_census() {
     // silences; `v9.9.9` names no tag, so it is void and silences
     // nothing. The two runs judge the same bytes differently and must
     // still measure them identically.
+    // BOTH fences carry a marker. Marking only the `cue` one leaves the
+    // page's single invocation in an unsilenced fence, so the
+    // `invocations` assertion compares two runs in which nothing was
+    // ever silenced — it reads as coverage and pins nothing. Moving
+    // `stats.invocations` inside the silencing branch then leaves the
+    // whole suite green while the corpus measures 383 against 384 for
+    // identical bytes, which is the exact regression this test is here
+    // to stop.
     for since in ["v0.9.0", "v9.9.9"] {
-        let marked = body.replace(
-            "```cue\n",
-            &format!("<!-- docs: check=none reason=historical since={since} — why -->\n```cue\n"),
-        );
+        let marker = format!("<!-- docs: check=none reason=historical since={since} — why -->\n");
+        let marked = body
+            .replace("```cue\n", &format!("{marker}```cue\n"))
+            .replace("```sh\n", &format!("{marker}```sh\n"));
         let stats = gate.page("docs/t.md", &marked).stats;
         assert_eq!(stats.invocations, open.invocations, "since={since}");
         assert_eq!(stats.identifiers, open.identifiers, "since={since}");
         assert_eq!(stats.cue_documents, open.cue_documents, "since={since}");
         assert_eq!(stats.code_paths, open.code_paths, "since={since}");
+        assert_eq!(stats.adr_references, open.adr_references, "since={since}");
     }
+    // The page must actually hold the things being compared, or every
+    // assertion above is an equality between two zeroes.
+    assert!(open.invocations > 0, "{open:?}");
+    assert!(open.identifiers > 0, "{open:?}");
+    assert!(open.cue_documents > 0, "{open:?}");
 
     // And it really was silencing: the standing marker takes the CUE
     // document out of the batch, so a broken manifest under it reports
@@ -1177,12 +1191,51 @@ fn fixture_repo(census: Option<&docsgen::health::Baseline>) -> TempDir {
 const FIXTURE_PAGE: &str = "docs/t.md";
 const FIXTURE_SOURCE: &str = "# Fixture\n\nA page naming `spec.base.image` and `cli/docsgen`.\n";
 
+#[test]
+fn the_fixture_measures_the_numbers_a_reader_would_count() {
+    // Every other census test compares two runs of the same build, so
+    // all of them stay green if a counter stops counting — the two
+    // sides fall together. Verified: breaking `stats.identifiers` so it
+    // almost never increments made the real corpus report 1 identifier
+    // instead of 236 with the whole suite still passing.
+    //
+    // So one assertion is against numbers a human counted, on a page
+    // small enough to count: FIXTURE_SOURCE names `spec.base.image`
+    // and `cli/docsgen`, and holds no invocation, no CUE document and
+    // no ADR citation.
+    //
+    // `code_paths` is 0, not 1, and the reason is worth pinning rather
+    // than assuming — writing this assertion as 1 is what surfaced it.
+    // A path claim must open on a top-level directory OF THE REPOSITORY
+    // UNDER TEST, and `fixture_repo` stages only `docs`, `schemas` and
+    // `operator`. So `cli/docsgen` anchors on nothing here and is not a
+    // claim, exactly as `apprafter.io/schemas/v1alpha1` is not one in
+    // the real corpus. The number tracks the fixture, not the checkout
+    // the test happens to run in.
+    let (tags, now) = tag_repo();
+    let census = corpus_baseline(&tags, now);
+    assert_eq!(census.pages, 1, "{census:?}");
+    assert_eq!(census.identifiers, 1, "{census:?}");
+    assert_eq!(census.code_paths, 0, "{census:?}");
+    assert_eq!(census.invocations, 0, "{census:?}");
+    assert_eq!(census.cue_documents, 0, "{census:?}");
+    assert_eq!(census.adr_references, 0, "{census:?}");
+    assert_eq!(census.exemptions, 0, "{census:?}");
+}
+
 /// What [`fixture_repo`]'s corpus actually measures, so a test can
 /// perturb one field and leave the other six agreeing.
 ///
 /// Measured rather than written down: a hand-kept copy of six numbers
 /// is a second census to keep in step, and this file's whole subject is
 /// what happens when two of those disagree.
+///
+/// The cost of measuring is that every test built on this helper is
+/// self-consistent under a *magnitude* bug — both sides move together,
+/// so a counter that stopped counting would leave them agreeing.
+/// [`the_fixture_measures_the_numbers_a_reader_would_count`] is the
+/// counterpart: it is the one place a number is checked against a value
+/// a human chose.
 fn corpus_baseline(tags: &TempDir, now: SystemTime) -> docsgen::health::Baseline {
     let repo = fixture_repo(None);
     Gate::pinned(repo.path(), tags.path(), now)
