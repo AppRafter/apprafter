@@ -40,7 +40,14 @@
 //! and it holds no backticks, so nothing is affected — but a future
 //! front-matter value containing one, as the generated pages' `description`
 //! keys do, would be read as an inline code span and checked as a claim.
+//!
+//! That limitation acquires teeth the moment the marker channel grows
+//! the page-level span exemption described on [`Block::tag_line`]: an
+//! exemption list quoting the literal text of a span would be scanned
+//! as that very span, and the page would exempt nothing. Front matter
+//! has to leave the prose scan before exemptions enter it.
 
+use crate::render::DIR;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,12 +55,12 @@ use std::process::Command;
 /// Directory prefixes dropped from the corpus. See the module docs for
 /// why each one is out; the list is deliberately short, because every
 /// entry is a place documentation can drift unobserved.
-const EXCLUDED: [&str; 4] = [
-    "docs/adr/",
-    "docs/changelog/",
-    "docs/measurements/",
-    "docs/reference/cli/",
-];
+///
+/// The generated CLI reference is *not* listed here — it is derived
+/// from [`DIR`] in [`is_in_scope`], so renaming the output directory
+/// moves the exclusion with it instead of silently re-admitting
+/// generated pages into the gate's corpus.
+const EXCLUDED: [&str; 3] = ["docs/adr/", "docs/changelog/", "docs/measurements/"];
 
 /// What kind of code the block held.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,18 +84,38 @@ pub enum BlockKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub kind: BlockKind,
-    /// The HTML comment on the line immediately above a fence, verbatim,
-    /// if there is one. The marker grammar parses it; this module only
-    /// carries it, so the two concerns can be tested apart.
+    /// The HTML comment on the line immediately above a fence,
+    /// verbatim, if there is one. The marker grammar parses it; this
+    /// module only carries it, so the two concerns can be tested apart.
+    ///
+    /// **A marker annotates the fence that follows it and nothing else:
+    /// this is always `None` for a [`BlockKind::InlineSpan`].** Spans
+    /// are the majority surface, so that is a decision rather than an
+    /// oversight. A comment mid-sentence is unreadable as prose and
+    /// unreviewable as an exemption; a span that must be exempted is
+    /// exempted at page level, through front matter carrying the span's
+    /// literal text, which keeps every exemption greppable and
+    /// countable in one place instead of scattered through paragraphs.
     pub tag_line: Option<String>,
     /// The block's content: fence body without the delimiter lines, or
-    /// the span's text. Blockquote markers and the fence's own
-    /// indentation are removed, so the body is directly parseable.
+    /// the span's text. The fence's own indentation and its own
+    /// blockquote depth are removed — and nothing deeper — so the body
+    /// is both directly parseable and byte-faithful to what the author
+    /// wrote inside the fence.
     pub body: String,
     /// 1-based source line of the opening delimiter. A finding without
     /// a real line number costs the reader a manual search, which is
     /// how gates come to be ignored.
     pub line: usize,
+    /// A fence that ran to the end of the file without a closing
+    /// delimiter. Always false for a span.
+    ///
+    /// This is the parse's self-check, and it has to be reported rather
+    /// than assumed: a phantom fence closes at EOF like any other, so
+    /// "every fence closed" proves nothing unless the ones that closed
+    /// *only* because the file ended are counted. `corpus_census`
+    /// asserts that count is zero.
+    pub unterminated: bool,
 }
 
 /// Every in-scope documentation file, as absolute paths, sorted.
@@ -131,7 +158,15 @@ fn is_in_scope(path: &str) -> bool {
     if path == "README.md" {
         return true;
     }
-    path.starts_with("docs/") && !EXCLUDED.iter().any(|dir| path.starts_with(dir))
+    if !path.starts_with("docs/") {
+        return false;
+    }
+    // Spelled once, at its source: `docsgen check` already owns
+    // everything under `render::DIR`.
+    if path.starts_with(DIR) && path[DIR.len()..].starts_with('/') {
+        return false;
+    }
+    !EXCLUDED.iter().any(|dir| path.starts_with(dir))
 }
 
 /// A fence being parsed.
@@ -142,6 +177,10 @@ struct Open {
     run: usize,
     /// Indentation of the opening delimiter, stripped from body lines.
     indent: usize,
+    /// Blockquote depth of the *opening* delimiter. Body lines give up
+    /// at most this many markers and never more, because below that
+    /// depth a `>` is content, not container.
+    depth: usize,
     tag: Option<String>,
     tag_line: Option<String>,
     line: usize,
@@ -168,80 +207,185 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
 
     for (index, raw) in src.lines().enumerate() {
         let line = index + 1;
-        let text = strip_quote_prefix(raw);
         match open.as_mut() {
             Some(fence) => {
+                // Only the container the fence itself opened in comes
+                // off. Stripping unconditionally rewrote fence content:
+                // a shell redirect continued onto its own line
+                // (`  > /tmp/out.txt`) lost the `>` and became a
+                // different, still-plausible command, and a body line
+                // `> ```­` in a quoted-Markdown example closed a fence
+                // that was never quoted — which ends the real block
+                // early and lets a phantom one swallow the rest of the
+                // page.
+                let text = if fence.depth == 0 {
+                    raw
+                } else {
+                    strip_quotes(raw, fence.depth).1
+                };
                 if fence_closes(text, fence.delimiter, fence.run) {
-                    out.push(finish(open.take().expect("checked above")));
+                    out.push(finish(open.take().expect("checked above"), false));
                 } else {
                     fence.body.push_str(strip_indent(text, fence.indent));
                     fence.body.push('\n');
                 }
             }
-            None => match fence_open(text) {
-                Some((delimiter, run, indent, tag)) => {
+            None => {
+                let (depth, text) = strip_quotes(raw, usize::MAX);
+                if let Some((delimiter, run, indent, tag)) = fence_open(text) {
                     flush(&mut region, &mut out);
                     open = Some(Open {
                         delimiter,
                         run,
                         indent,
+                        depth,
                         tag,
                         tag_line: comment.take(),
                         line,
                         body: String::new(),
                     });
+                    continue;
                 }
-                None => {
-                    comment = html_comment(text);
-                    if text.trim().is_empty() {
-                        // A code span cannot contain a blank line, so a
-                        // blank line ends the region and with it any
-                        // unclosed backtick run.
+                if let Some(found) = html_comment(text) {
+                    // The marker channel, not prose. Scanning it as
+                    // both would double-count the first marker that
+                    // quotes a command.
+                    comment = Some(found);
+                    continue;
+                }
+                comment = None;
+                if text.trim().is_empty() {
+                    // A code span cannot contain a blank line, so a
+                    // blank line ends the region and with it any
+                    // unclosed backtick run.
+                    flush(&mut region, &mut out);
+                } else {
+                    let boundary = boundary(text);
+                    if !matches!(boundary, Boundary::Continues) {
                         flush(&mut region, &mut out);
-                    } else {
-                        region.push((line, text.to_string()));
+                    }
+                    region.push((line, text.to_string()));
+                    if matches!(boundary, Boundary::Standalone) {
+                        flush(&mut region, &mut out);
                     }
                 }
-            },
+            }
         }
     }
     // An unclosed fence runs to the end of the document (CommonMark).
     // Emitting it is what makes a truncated page checkable instead of
     // invisible.
     if let Some(fence) = open.take() {
-        out.push(finish(fence));
+        out.push(finish(fence, true));
     }
     flush(&mut region, &mut out);
     out
 }
 
 /// Turn a completed fence into a [`Block`].
-fn finish(fence: Open) -> Block {
+fn finish(fence: Open, unterminated: bool) -> Block {
     Block {
         kind: BlockKind::Fence { tag: fence.tag },
         tag_line: fence.tag_line,
         body: fence.body,
         line: fence.line,
+        unterminated,
     }
 }
 
-/// Drop any blockquote markers from the front of a line.
+/// Drop up to `limit` blockquote markers, returning how many came off
+/// and what is left of the line.
 ///
-/// Seven fences in the corpus live inside a `>` callout, and prose
-/// spans wrap inside them too. Without this, the opening `> ```cue`
+/// Six fences in the corpus live inside a `>` callout, and prose spans
+/// wrap inside them too. Without stripping, the opening `> ```cue`
 /// reads as prose holding an unterminated backtick run and the whole
-/// callout body is mis-scanned.
-fn strip_quote_prefix(line: &str) -> &str {
+/// callout is mis-scanned. `limit` is what keeps that honest once a
+/// fence is open: below the fence's own depth a `>` is content — a
+/// redirect, a heredoc, a quoted Markdown example — and must survive
+/// verbatim.
+fn strip_quotes(line: &str, limit: usize) -> (usize, &str) {
     let mut rest = line;
-    loop {
+    let mut depth = 0;
+    while depth < limit {
         let trimmed = rest.trim_start_matches([' ', '\t']);
         match trimmed.strip_prefix('>') {
             // One optional space after each marker belongs to the
             // marker, not to the content.
-            Some(after) => rest = after.strip_prefix(' ').unwrap_or(after),
-            None => return rest,
+            Some(after) => {
+                rest = after.strip_prefix(' ').unwrap_or(after);
+                depth += 1;
+            }
+            None => break,
         }
     }
+    (depth, rest)
+}
+
+/// How a prose line relates to the lines around it.
+///
+/// A code span cannot cross a block boundary, so the region scan must
+/// not either. Without this, a stray backtick in a heading or a table
+/// cell pairs with the *next* real span and consumes it: the claim
+/// inside disappears from the corpus entirely. That is a silent false
+/// negative — the one failure class a gate must never have, because
+/// nothing about it looks wrong.
+///
+/// The distinction between the two boundary kinds is load-bearing.
+/// Treating a heading merely as a region *start* still leaves it
+/// sharing inline scope with the paragraph below, which is precisely
+/// the swallowing case; a list item, by contrast, must keep sharing
+/// scope with its continuation lines, because that is where every
+/// wrapped invocation in the corpus lives.
+enum Boundary {
+    /// Ordinary prose, continuing whatever came before.
+    Continues,
+    /// Opens a block that following lines continue — a list item.
+    Opens,
+    /// A block complete in itself: a heading, a table row, a setext
+    /// underline. It shares inline scope with nothing.
+    Standalone,
+}
+
+/// Classify a non-blank prose line.
+fn boundary(line: &str) -> Boundary {
+    let text = line.trim_start_matches([' ', '\t']);
+    // A table row, which must both open and close with a pipe.
+    //
+    // Requiring the closing pipe is not pedantry: a shell pipeline
+    // wrapped onto its own line also starts with `|`, and treating one
+    // as a table row splits the span in half and destroys the command
+    // inside it. Measured over the corpus the two forms separate
+    // perfectly — 298 of the 301 `|`-leading lines close with a pipe
+    // and every one is a real row; the 3 that do not are all wrapped
+    // pipelines, one of them `apprafter kubeconfig | tee /tmp/kc`.
+    let trimmed = text.trim_end();
+    if trimmed.starts_with('|') && trimmed.ends_with('|') {
+        return Boundary::Standalone;
+    }
+    // An ATX heading: one to six `#` then a space or end of line.
+    let hashes = text.chars().take_while(|c| *c == '#').count();
+    let after = &text[hashes..];
+    if (1..=6).contains(&hashes) && (after.is_empty() || after.starts_with(' ')) {
+        return Boundary::Standalone;
+    }
+    // A setext underline, which is also the thematic-break shape.
+    if !text.is_empty() && (text.bytes().all(|b| b == b'=') || text.bytes().all(|b| b == b'-')) {
+        return Boundary::Standalone;
+    }
+    // A bullet list item.
+    if let Some(rest) = text.strip_prefix(['-', '*', '+']) {
+        if rest.starts_with(' ') {
+            return Boundary::Opens;
+        }
+    }
+    // An ordered list item.
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    let rest = &text[digits..];
+    if digits > 0 && (rest.starts_with('.') || rest.starts_with(')')) && rest[1..].starts_with(' ')
+    {
+        return Boundary::Opens;
+    }
+    Boundary::Continues
 }
 
 /// Whether `line` opens a fence, and with what: delimiter, run length,
@@ -316,7 +460,19 @@ fn flush(region: &mut Vec<(usize, String)>, out: &mut Vec<Block>) {
     let mut text = String::new();
     // (byte offset of the line's start, its 1-based source line).
     let mut starts: Vec<(usize, usize)> = Vec::with_capacity(region.len());
-    for (line, content) in region.iter() {
+    for (index, (line, content)) in region.iter().enumerate() {
+        // A continuation line's indentation is block structure, not
+        // content — CommonMark's block parser removes it before any
+        // inline parsing. Carrying it through put a list item's indent
+        // *inside* the command: ten spans in the corpus, four of them
+        // invocations, read `apprafter app status my-service --env␣␣␣
+        // staging`, which contradicts this module's own rule that a
+        // padded and an unpadded span are the same claim.
+        let content = if index == 0 {
+            content.as_str()
+        } else {
+            content.trim_start()
+        };
         starts.push((text.len(), *line));
         text.push_str(content);
         text.push('\n');
@@ -350,9 +506,11 @@ fn scan_spans(text: &str, starts: &[(usize, usize)], out: &mut Vec<Block>) {
             Some((from, to)) => {
                 out.push(Block {
                     kind: BlockKind::InlineSpan,
+                    // A marker annotates a fence only — see the field.
                     tag_line: None,
                     body: normalise(&text[after..from]),
                     line: line_of(starts, opened),
+                    unterminated: false,
                 });
                 at = to;
             }
@@ -416,6 +574,17 @@ mod tests {
     }
 
     #[test]
+    fn the_generated_tree_exclusion_follows_render_dir() {
+        // Derived, not re-spelled: renaming `render::DIR` must move the
+        // exclusion with it rather than re-admit generated pages.
+        assert!(!is_in_scope(&format!("{DIR}/app.md")));
+        assert!(!is_in_scope(&format!("{DIR}/nested/app.md")));
+        // Only a real path segment matches — a sibling directory whose
+        // name merely starts with it stays in scope.
+        assert!(is_in_scope(&format!("{DIR}mate.md")));
+    }
+
+    #[test]
     fn scope_drops_the_generated_reference_and_the_records() {
         assert!(!is_in_scope("docs/reference/cli/app.md"));
         assert!(!is_in_scope("docs/adr/0057-documentation-system.md"));
@@ -437,11 +606,63 @@ mod tests {
 
     #[test]
     fn quote_markers_are_stripped_however_deep() {
-        assert_eq!(strip_quote_prefix("> ```cue"), "```cue");
-        assert_eq!(strip_quote_prefix(">   indented"), "  indented");
-        assert_eq!(strip_quote_prefix("  > > nested"), "nested");
-        assert_eq!(strip_quote_prefix("plain"), "plain");
-        assert_eq!(strip_quote_prefix(">"), "");
+        assert_eq!(strip_quotes("> ```cue", usize::MAX), (1, "```cue"));
+        assert_eq!(strip_quotes(">   indented", usize::MAX), (1, "  indented"));
+        assert_eq!(strip_quotes("  > > nested", usize::MAX), (2, "nested"));
+        assert_eq!(strip_quotes("plain", usize::MAX), (0, "plain"));
+        assert_eq!(strip_quotes(">", usize::MAX), (1, ""));
+    }
+
+    #[test]
+    fn the_limit_leaves_markers_below_it_alone() {
+        // Inside a fence, only the fence's own container comes off.
+        assert_eq!(strip_quotes("  > /tmp/out.txt", 0), (0, "  > /tmp/out.txt"));
+        assert_eq!(strip_quotes("> > quoted", 1), (1, "> quoted"));
+    }
+
+    #[test]
+    fn self_contained_blocks_share_scope_with_nothing() {
+        for line in [
+            "## Heading",
+            "#",
+            "###### six",
+            "| cell | cell |",
+            "=====",
+            "---",
+        ] {
+            assert!(
+                matches!(boundary(line), Boundary::Standalone),
+                "{line:?} must not share inline scope"
+            );
+        }
+    }
+
+    #[test]
+    fn a_list_item_opens_a_block_its_continuations_join() {
+        for line in ["- bullet", "* bullet", "+ bullet", "  1. ordered", "12) x"] {
+            assert!(
+                matches!(boundary(line), Boundary::Opens),
+                "{line:?} must keep its continuation lines"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_prose_continues() {
+        for line in [
+            "just a sentence",
+            "#hashtag",
+            "####### seven",
+            "-dash-word",
+            "1.5 is a number",
+            "a | b",
+            "  a continuation line",
+            // A wrapped shell pipeline is not a table row.
+            "  | tee /tmp/kc` and `export KUBECONFIG=/tmp/kc`).",
+            "  | grep claim_demo_parser_pg",
+        ] {
+            assert!(matches!(boundary(line), Boundary::Continues), "{line:?}");
+        }
     }
 
     #[test]
