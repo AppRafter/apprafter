@@ -67,6 +67,12 @@ pub enum Reason {
     /// The documented thing is wrong and tracked elsewhere. The most
     /// expensive reason to leave standing, and the one expiry is for.
     KnownBroken,
+    /// Names surface that deliberately no longer exists — a page
+    /// correctly documenting a removal (e.g. "`node reserve-headroom`
+    /// was removed"). The resolver cannot tell that from drift, and
+    /// forcing it into `known-broken` would claim the documented thing
+    /// is wrong when it is exactly right.
+    Historical,
 }
 
 impl Reason {
@@ -79,6 +85,7 @@ impl Reason {
             Reason::IllustrativeFragment => "illustrative-fragment",
             Reason::ExternalTool => "external-tool",
             Reason::KnownBroken => "known-broken",
+            Reason::Historical => "historical",
         }
     }
 }
@@ -254,6 +261,7 @@ fn parse_reason(value: &str, line: &str) -> Result<Reason, String> {
         Reason::IllustrativeFragment,
         Reason::ExternalTool,
         Reason::KnownBroken,
+        Reason::Historical,
     ] {
         if reason.as_str() == value {
             return Ok(reason);
@@ -261,7 +269,7 @@ fn parse_reason(value: &str, line: &str) -> Result<Reason, String> {
     }
     Err(format!(
         "docs marker: unknown reason `{value}` — one of third-party-output, \
-         illustrative-fragment, external-tool, known-broken (in `{line}`)"
+         illustrative-fragment, external-tool, known-broken, historical (in `{line}`)"
     ))
 }
 
@@ -411,6 +419,17 @@ mod tests {
         // A marker with nothing after the dash keeps no empty string.
         let bare = parse_marker("<!-- docs: check=cli -->").unwrap().unwrap();
         assert_eq!(bare.note, None);
+    }
+
+    #[test]
+    fn historical_names_surface_that_deliberately_no_longer_exists() {
+        let m = parse_marker(
+            "<!-- docs: check=none since=v0.2.44 reason=historical — node reserve-headroom was removed -->",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m.reason, Some(Reason::Historical));
+        assert_eq!(m.reason.map(Reason::as_str), Some("historical"));
     }
 
     #[test]
