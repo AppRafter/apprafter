@@ -36,8 +36,13 @@ A first cluster, in the order the commands are actually run:
 
 ## Every command
 
-In the flag tables, a Value of `flag` means the flag takes no value; an em dash
-means it takes one whose name adds nothing beyond the flag itself.
+In the flag tables, a Value of `flag` means the flag takes no value. A lowercase
+placeholder — `<count>`, `<cron>`, `<url>` — is a value name written by hand in
+the parser, so it names the type the flag expects. An em dash means the only name
+available was one clap derived from the flag itself, which says nothing the flag
+has not already said. Those derived names are uppercase, and they do show up
+where nothing else is available: the usage lines and the positional-argument
+tables (`<NAME>`, `<SERVER_TYPE>`).
 
 The same tree is published as [`commands.json`](commands.json) — every command
 path, flag, default and value enum as data, including the hidden ones, with the

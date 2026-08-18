@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter status`
 
-Print the current cluster status — SKELETON, it reads local state and never contacts the cluster. What it prints: the active target, cluster name, tier and provider recorded in `.apprafter/state.json`. For live state use `apprafter platform status` (platform components and versions) or `apprafter app status <name>` (a workload)
+Print the current cluster status — SKELETON, it reads local state and never contacts the cluster. What it prints: the active target, cluster name, tier and provider recorded in that target's state file, `<config-root>/state/<target>/.apprafter/state.json`. For live state use `apprafter platform status` (platform components and versions) or `apprafter app status <name>` (a workload)
 
 ```text
 Usage: apprafter status

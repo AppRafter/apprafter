@@ -11,9 +11,11 @@ Everything the `apprafter` binary reads from the process environment.
 This page is **hand-written**, unlike the
 [CLI reference](cli/index.md), which is generated from the clap tree —
 only four of the variables below are declared as flag fallbacks
-(`#[arg(env = …)]`); the rest are read with `std::env::var` inside
-command code, or by a dependency (miette, `owo-colors`,
-`tracing-subscriber`), and so are invisible to the generator.
+(`#[arg(env = …)]`) and therefore also appear there. The other **25**
+are invisible to the generator: they are read with `std::env::var`
+inside command code, or by a dependency (miette, `owo-colors`,
+`tracing-subscriber`) — or, in one case (`RUST_BACKTRACE`), listed
+precisely because nothing reads it.
 
 Every row names the file and function that reads it, so a claim here
 can be checked against the source without a search. Paths are relative

@@ -23,7 +23,7 @@ if ! command -v nix >/dev/null 2>&1; then
     echo >&2
     echo "Install nix (flakes enabled) — see docs/contributing/setup.md — or" >&2
     echo "skip the local hook with 'git commit --no-verify'; the docs workflow" >&2
-    echo "still gates the pull request." >&2
+    echo "still runs on the pull request." >&2
     exit 2
 fi
 cd "$(dirname "$0")/.."

@@ -116,10 +116,11 @@ pub enum Commands {
     // decides whether the command does what they need.
     /// Print the current cluster status — SKELETON, it reads local
     /// state and never contacts the cluster. What it prints: the
-    /// active target, cluster name, tier and provider recorded in
-    /// `.apprafter/state.json`. For live state use `apprafter platform
-    /// status` (platform components and versions) or `apprafter app
-    /// status <name>` (a workload).
+    /// active target, cluster name, tier and provider recorded in that
+    /// target's state file, `<config-root>/state/<target>/.apprafter/state.json`.
+    /// For live state use `apprafter platform status` (platform
+    /// components and versions) or `apprafter app status <name>` (a
+    /// workload).
     Status,
     /// Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints
     /// what it would do and writes nothing. The device flow is not

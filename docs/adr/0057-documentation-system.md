@@ -155,9 +155,10 @@ under `docs/reference/cli/` that the generator does not produce fails, with a
 The hand-written `docs/reference/cli.md` is deleted, its inbound links
 retargeted. What the clap tree cannot produce moved to a new hand-written
 `docs/reference/environment.md`: only four environment variables are declared
-through clap and survive in the generated flag tables; the remaining twenty
-are read by `std::env::var` in command code or by a dependency, and are
-invisible to any generator.
+through clap and survive in the generated flag tables; the other **25** that
+page documents are invisible to any generator — read with `std::env::var` in
+command code or by a dependency, or, in one case, documented precisely because
+nothing reads it despite a source comment claiming otherwise.
 
 ### 4. The CLI crate gains a lib target with a narrow `docs_api` facade
 
@@ -223,8 +224,12 @@ not aspirational:
    parsed. A copied snippet cannot be kept honest by any checker; an included
    one cannot drift at all.
 3. **Wire the gate in three places.** `just lint`, a lefthook pre-commit hook,
-   and a required CI job. The audited system's checker existed and ran
-   nowhere; existence is not enforcement.
+   and a CI job (`.github/workflows/docs.yml`) that runs on every pull request
+   touching `docs/`, the CLI sources, the generator or the pinned toolchain.
+   Whether that job is *required* to merge is branch-protection configuration
+   and cannot be asserted from the repository, so this decision claims only
+   that the job runs. The audited system's checker existed and ran nowhere;
+   existence is not enforcement.
 
 ### 7. Drift is prose-shaped, so the gate is prose-shaped
 
@@ -289,7 +294,7 @@ Already real, on the delivered subphases:
 - **`just lint` now requires nix unconditionally.** The documentation gate has
   no system-binary fallback, by decision 2. Without nix it exits with an
   explanatory error; the local hook can be skipped, but the CI job still
-  gates the pull request.
+  runs on the pull request.
 - **Doc comments are published verbatim, which made four inaccurate `///`
   comments into documentation bugs** that had to be fixed before the reference
   could ship:

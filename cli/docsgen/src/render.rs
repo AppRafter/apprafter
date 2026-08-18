@@ -355,8 +355,13 @@ fn render_index(tree: &Tree) -> String {
     s.push_str(START_HERE);
     s.push_str("## Every command\n\n");
     s.push_str(
-        "In the flag tables, a Value of `flag` means the flag takes no value; an em dash\n\
-         means it takes one whose name adds nothing beyond the flag itself.\n\n",
+        "In the flag tables, a Value of `flag` means the flag takes no value. A lowercase\n\
+         placeholder — `<count>`, `<cron>`, `<url>` — is a value name written by hand in\n\
+         the parser, so it names the type the flag expects. An em dash means the only name\n\
+         available was one clap derived from the flag itself, which says nothing the flag\n\
+         has not already said. Those derived names are uppercase, and they do show up\n\
+         where nothing else is available: the usage lines and the positional-argument\n\
+         tables (`<NAME>`, `<SERVER_TYPE>`).\n\n",
     );
     s.push_str(
         "The same tree is published as [`commands.json`](commands.json) — every command\n\

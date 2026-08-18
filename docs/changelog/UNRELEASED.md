@@ -11,10 +11,14 @@ patch of each phase.
 
 ## docs tooling (no release) — 2.19a/2.19b documentation system: a validated site build + a generated CLI reference (2026-08-17)
 
-> No version bump and no monorepo tag. Shipped CLI behaviour is unchanged
-> (a lib target plus doc-comment corrections); no chart, operator or
-> cue-cmp artefact moved; the site is still unpublished (that is 2.19g).
-> Two of the documentation track's ten subphases — branch
+> No version bump and no monorepo tag. No chart, operator or cue-cmp
+> artefact moved, and the site is still unpublished (that is 2.19g).
+> Shipped CLI *behaviour* is unchanged — no command, flag, default,
+> alias or exit code moved. `--help` **rendering** did change in two
+> ways: doc comments were corrected, and seven flags gained a
+> hand-written `value_name`, so `--to <TO>` now prints as
+> `--to <version>` (see Fixed).
+> Two of the documentation track's ten subphases — **ADR 0057**, branch
 > `feat/2.19-docs-system`, design
 > `docs/superpowers/specs/2026-08-17-documentation-system-design.md`.
 
@@ -43,10 +47,12 @@ patch of each phase.
   a fresh render in `just lint`, the pre-commit hook and CI — so a renamed
   flag, a changed default or an edited doc comment now fails the build
   until the reference is regenerated.
-- **`docs/reference/environment.md`** — the 20+ environment variables the
-  generator cannot see. Only four are declared through clap
-  (`#[arg(env = …)]`); the rest are read by `std::env::var` in command
-  code or by a dependency (miette, owo-colors, tracing-subscriber).
+- **`docs/reference/environment.md`** — the **25** environment variables
+  the generator cannot see. Only four are declared through clap
+  (`#[arg(env = …)]`) and so survive in the generated flag tables; the
+  other 25 are read by `std::env::var` in command code or by a
+  dependency (miette, owo-colors, tracing-subscriber) — one,
+  `RUST_BACKTRACE`, is listed precisely because nothing reads it.
 - **A lib target on `cli/platform-cli`.** `dispatch` moved into
   `src/dispatch.rs` and `main.rs` is a thin shim over `apprafter::run()`.
   The public surface is `run()` plus a two-item `docs_api` facade (the
@@ -101,6 +107,15 @@ Doc comments the generator turned into published-documentation bugs:
   now also carry the non-obvious part — retention is only *applied* under
   `--enforce cluster` or an explicit `apprafter backup prune`; under the
   default `--enforce operator` the scheduled Job never forgets.
+  The same seven also gained a hand-written `value_name`, which is a
+  real (if small) change to `--help` output: `--to <TO>` became
+  `--to <version>`, `--cron <CRON>` and `--check-cron <CHECK_CRON>`
+  became `<cron>`, the three `--keep-*` flags `<count>`, and
+  `--failure-webhook` `<url>`. Clap derives a placeholder from the
+  field name when none is given, which restates the flag; a written one
+  names the type. The generated reference prints only the written ones
+  and an em dash for the derived, so the convention is now stated in
+  the reference index.
 - **`--no-ping`'s environment variable was documented wrongly.** Three doc
   comments offered `APPRAFTER_NO_PING=1` "for shell-script ergonomics",
   one of them adding that "any non-empty value flips the flag". clap

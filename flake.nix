@@ -82,7 +82,7 @@
             echo "Useful commands:"
             echo "  just --list      # available targets"
             echo "  just bootstrap   # install git hooks"
-            echo "  just lint        # CUE + SPDX + conditional Rust/TS"
+            echo "  just lint        # CUE + SPDX + docs + conditional Rust/TS"
             echo "  just e2e-up      # local k3d cluster"
             echo
           '';

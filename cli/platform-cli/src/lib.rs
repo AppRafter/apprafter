@@ -68,8 +68,8 @@ pub fn run() -> Result<()> {
     logging::init();
 
     // npm-style courtesy check for a newer CLI release. Best-
-    // effort — never fails the invocation. 24h cache means
-    // the network round-trip happens once a day at most.
+    // effort — never fails the invocation. A 6h cache means the
+    // network round-trip happens four times a day at most.
     commands::version_check::maybe_warn_about_newer_version();
 
     let args = Cli::parse();
