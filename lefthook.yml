@@ -28,7 +28,14 @@ pre-commit:
     - name: cyrillic
       run: ./scripts/check-no-cyrillic.sh
     - name: crd-check
-      glob: "{schemas/v1alpha1/*.cue,operator/operator-core/src/*.rs,operator/charts/apprafter-operator/templates/crd-*.yaml}"
+      # `operator/crdgen/**` is in the glob for the same reason the
+      # docsgen job's glob covers `cli/docsgen/**`: the GENERATOR also
+      # changes what's committed, not just its CUE/Rust input — a
+      # crdgen-only edit (structural.rs, cue.rs, envelope.rs) can
+      # change the rendered CRD YAML with no schema or operator-core
+      # change at all. `.github/workflows/crd-check.yml` already lists
+      # it in `paths:`; this glob was the local half missing it.
+      glob: "{schemas/v1alpha1/*.cue,operator/operator-core/src/*.rs,operator/crdgen/**,operator/charts/apprafter-operator/templates/crd-*.yaml}"
       run: ./scripts/crd-check.sh
     # These two are ORDERED, and the rest of the hook is not.
     #
@@ -63,6 +70,12 @@ pre-commit:
           # contributor never sees "the docs drifted" for a file they
           # were never asked to edit — the gate in docs-check then
           # only fires for a hand-edited generated page.
+          # `cli/docsgen/**` is in the glob for the same reason from
+          # the other side: the GENERATOR also changes the committed
+          # artefacts, not just its input. Editing `model.rs` alone
+          # (no clap change at all) can add or drop a projected node
+          # and change `commands.json` — proven by the root-binary
+          # node this hook's own glob was missing.
           # `cli/Cargo.toml` is in the glob because commands.json
           # embeds `cli_version` — a release bump is a reference
           # change.
@@ -71,7 +84,7 @@ pre-commit:
           # toolchain a byte-compare needs, and without nix a raw
           # "command not found" says nothing about what to do next.
           - name: docsgen
-            glob: "{cli/platform-cli/src/**,cli/Cargo.toml}"
+            glob: "{cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml}"
             run: |
               command -v nix >/dev/null 2>&1 || {
                 echo "ERROR: regenerating the CLI reference needs nix — docsgen runs" >&2
