@@ -177,13 +177,40 @@ fn unfencing_a_block_does_not_shed_its_obligation() {
 #[test]
 fn a_literal_block_owes_no_fence_shaped_finding() {
     // It has no fence to label, so reporting one would name a remedy
-    // that does not apply — and the obligations that DO apply are
-    // asserted above.
+    // that does not apply.
+    //
+    // Asserting an empty finding list would prove nothing here — a gate
+    // that never looked at literal blocks at all would pass it too. So
+    // the block holds a real invocation, and the second half of the
+    // test misspells that same invocation to show the block IS being
+    // read. Silence only means something once noise is reachable.
     let (repo, now) = tag_repo();
     let gate = gate_with(repo.path(), now);
-    let page = "# Page\n\nProse.\n\n    just some output\n";
+    let page = "# Page\n\nProse.\n\n    apprafter app list\n";
     let findings = gate.check_source("docs/t.md", page).unwrap();
-    assert!(findings.is_empty(), "{findings:?}");
+    assert!(
+        of(&findings, gate::UNLABELLED_FENCE).is_empty(),
+        "there is no fence here to label: {findings:?}"
+    );
+    assert!(
+        of(&findings, gate::UNTERMINATED_FENCE).is_empty(),
+        "{findings:?}"
+    );
+    assert!(
+        findings.is_empty(),
+        "a valid invocation resolves: {findings:?}"
+    );
+
+    // The same block, one letter wrong: proof the gate reads it.
+    let page = "# Page\n\nProse.\n\n    apprafter app lst\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    let cli = of(&findings, gate::CLI_INVOCATION);
+    assert_eq!(cli.len(), 1, "{findings:?}");
+    assert!(cli[0].starts_with("5: "), "{cli:?}");
+    assert!(
+        of(&findings, gate::UNLABELLED_FENCE).is_empty(),
+        "still no fence to label: {findings:?}"
+    );
 }
 
 #[test]

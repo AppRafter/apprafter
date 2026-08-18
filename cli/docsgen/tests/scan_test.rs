@@ -446,11 +446,16 @@ fn consecutive_indented_runs_are_one_block_across_a_blank_line() {
 #[test]
 fn a_tab_indented_block_is_dedented_by_columns_not_characters() {
     // `indent_columns` counts a tab as four columns, so the strip has to
-    // remove four columns too. Taking four CHARACTERS off `\t\tnested`
-    // would dedent it by eight — and only that line, so the block's
-    // internal shape would come out flattened unevenly, which is what
-    // `cue vet` and `identifier::extract_structure` read.
-    let src = "# Page\n\nProse.\n\n\tapprafter promote\n\t\tnested\n    four spaces\n";
+    // remove four columns too. Taking four CHARACTERS off `\t\tsecond`
+    // would dedent it by eight — and only the lines written with tabs,
+    // so the block's internal shape comes out flattened unevenly, which
+    // is what `cue vet` and `identifier::extract_structure` read.
+    //
+    // The OPENING line is tab-indented on purpose: a one-tab opener is
+    // a case where the character strip and the column strip agree, so a
+    // fixture built on one cannot fail when only the opener is wrong —
+    // which is how the opener stayed unfixed while this test passed.
+    let src = "# Page\n\nProse.\n\n\t\tapprafter promote\n\t\tsecond\n    four spaces\n";
     let all = blocks(src);
     let literal: Vec<_> = all
         .iter()
@@ -458,8 +463,9 @@ fn a_tab_indented_block_is_dedented_by_columns_not_characters() {
         .collect();
     assert_eq!(literal.len(), 1, "{all:?}");
     assert_eq!(
-        literal[0].body, "apprafter promote\n\tnested\nfour spaces\n",
-        "each line keeps exactly the indentation beyond the first four columns"
+        literal[0].body, "\tapprafter promote\n\tsecond\nfour spaces\n",
+        "every line keeps exactly the indentation beyond the first four columns, \
+         and the first line is no exception"
     );
 }
 
@@ -473,6 +479,118 @@ fn a_pre_block_is_a_literal_block() {
         .collect();
     assert_eq!(literal.len(), 1, "{all:?}");
     assert_eq!(literal[0].body, "apprafter promote\n");
+    assert_eq!(
+        literal[0].line, 4,
+        "the body starts below the tag, and the line has to point at it"
+    );
+}
+
+#[test]
+fn a_pre_on_the_last_line_of_a_file_points_at_the_tag() {
+    // Anchoring on `line + 1` up front would name a line that does not
+    // exist, and the unclosed-`<pre>` finding would be reported past the
+    // end of the file.
+    let src = "# Page\n\n<pre>";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(literal[0].line, 3);
+    assert!(literal[0].body.is_empty(), "{literal:?}");
+    assert!(literal[0].unterminated);
+}
+
+#[test]
+fn an_html_comment_inside_a_literal_block_stays_in_the_body() {
+    // This crate's own marker syntax is `<!-- docs: … -->`, so a page
+    // documenting the marker channel writes one inside a code block.
+    // Read as a marker it would vanish from the body entirely — not
+    // even held as a blank — and `body` is meant to be byte-faithful.
+    // A fence is shielded from this by the arm that owns its lines; a
+    // literal block needs the ordering to say so.
+    let src = "Prose.\n\n    <html>\n    <!-- docs: check=cli -->\n    </html>\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(
+        literal[0].body, "<html>\n<!-- docs: check=cli -->\n</html>\n",
+        "the comment is body text, not the marker channel"
+    );
+    assert_eq!(literal[0].tag_line, None);
+}
+
+#[test]
+fn a_quote_marker_below_a_literal_blocks_own_depth_is_content() {
+    // The fence path's rule, which the literal path has to mirror: a
+    // shell redirect continued onto its own line is a `>` that means
+    // redirect, not blockquote. Stripping it yields a different, still
+    // plausible command — and in the indented form the strip takes the
+    // indentation with it, so the block would also end early.
+    let src = "Prose.\n\n    apprafter kubeconfig \\\n      > /tmp/kc\n    echo done\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(
+        literal[0].body, "apprafter kubeconfig \\\n  > /tmp/kc\necho done\n",
+        "the redirect keeps its `>` and the block does not end on it"
+    );
+
+    // And the same inside a `<pre>`, where the line is swallowed whole.
+    let src = "<pre>\napprafter kubeconfig \\\n  > /tmp/kc\n</pre>\n";
+    let body = blocks(src)
+        .into_iter()
+        .find(|b| b.kind == BlockKind::Literal)
+        .map(|b| b.body)
+        .unwrap();
+    assert_eq!(body, "apprafter kubeconfig \\\n  > /tmp/kc\n");
+}
+
+#[test]
+fn a_literal_block_inside_a_callout_gives_up_only_the_callouts_marker() {
+    // Opened at depth 1, so exactly one `>` comes off each body line
+    // and a second one is content.
+    let src = "> Note:\n>\n>     apprafter app list\n>     > /tmp/out\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(literal[0].body, "apprafter app list\n> /tmp/out\n");
+    assert_eq!(literal[0].line, 3);
+}
+
+#[test]
+fn an_indented_block_directly_below_a_closing_fence_is_still_code() {
+    // Nothing blank separates them, but a closing delimiter is not a
+    // paragraph, so what follows it is not a lazy continuation. Leaving
+    // the flag stale through the fence loses this block — one line of
+    // evasion against the guard this whole feature is.
+    let src = "```sh\napprafter app list\n```\n    apprafter promote\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(literal[0].body, "apprafter promote\n");
+    assert_eq!(literal[0].line, 4);
+
+    // A list item still suppresses it: `container` is the thing that
+    // keeps this from firing on every indented continuation line.
+    let src = "- item\n\n  ```sh\n  apprafter app list\n  ```\n\n    still the list\n";
+    assert!(
+        !blocks(src).iter().any(|b| b.kind == BlockKind::Literal),
+        "{src:?}"
+    );
 }
 
 #[test]
@@ -524,6 +642,14 @@ fn an_indented_line_inside_a_fence_stays_fence_body() {
     let src = "# Page\n\n```sh\napprafter app list\n    indented output\n```\n";
     let all = blocks(src);
     assert!(!all.iter().any(|b| b.kind == BlockKind::Literal), "{all:?}");
+    let fence = all
+        .iter()
+        .find(|b| matches!(b.kind, BlockKind::Fence { .. }))
+        .unwrap();
+    assert_eq!(
+        fence.body, "apprafter app list\n    indented output\n",
+        "the indented line stays in the fence, keeping its indentation"
+    );
 }
 
 /// A tripwire, not an assertion: it prints what the scanner sees across

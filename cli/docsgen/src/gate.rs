@@ -166,20 +166,14 @@ pub const UNLABELLED_FENCE: &str = "unlabelled-fence";
 /// A fence that runs to the end of the file without a closing
 /// delimiter, so everything below it renders as code.
 pub const UNTERMINATED_FENCE: &str = "unterminated-fence";
-/// An HTML `<pre>` that never meets its closing tag.
+/// An HTML `<pre>` that never meets its closing tag, so the rest of the
+/// page is inside it — see the module docs on why a block that renders
+/// as code without a fence is this gate's business at all.
 ///
 /// Its own class rather than [`UNTERMINATED_FENCE`] because the two
 /// remedies are different — one closes backticks, the other a tag — and
 /// the report prints one remedy per class, so folding them together
 /// would send half its readers to the wrong edit.
-///
-/// It is reported at all because a `<pre>` swallows every line to its
-/// closing tag: one stray opener turns the rest of the page into body
-/// text, and every fence below it silently sheds its unlabelled-fence
-/// finding and its marker audit. The claims inside are still checked —
-/// body is body — but the *fence-shaped* obligations lapse, which is
-/// the evasion class this gate's literal-block handling exists to
-/// close, reachable in a single line and invisible to a reader.
 pub const UNCLOSED_PRE: &str = "unclosed-pre";
 /// A `<!-- docs: … -->` marker that is malformed, or that claims a
 /// check this gate cannot run on that block.
@@ -536,23 +530,37 @@ impl Gate {
                 // delimiters a literal block does not have are fenced
                 // off below.
                 BlockKind::Fence { .. } | BlockKind::Literal => {
+                    // Which of the two shapes this arm has. Spelled out
+                    // over every variant rather than defaulted with
+                    // `_`, so that a variant added later and routed
+                    // here is a compile error instead of a silent
+                    // "unclosed `<pre>`".
+                    let fenced = match &block.kind {
+                        BlockKind::Fence { .. } => true,
+                        BlockKind::Literal => false,
+                        BlockKind::FrontMatter | BlockKind::InlineSpan => {
+                            unreachable!("this arm matches Fence and Literal only")
+                        }
+                    };
+
                     if block.unterminated {
                         // Both delimiters, named honestly. A literal
                         // block is only ever flagged when it is a
                         // `<pre>`: the indented form has no closing
                         // delimiter to be missing.
-                        let (code, message) = match &block.kind {
-                            BlockKind::Fence { .. } => (
+                        let (code, message) = if fenced {
+                            (
                                 UNTERMINATED_FENCE,
                                 "the fence is never closed, so the rest of the page \
                                  renders as code",
-                            ),
-                            _ => (
+                            )
+                        } else {
+                            (
                                 UNCLOSED_PRE,
                                 "the `<pre>` holding this block is never closed, so the \
                                  rest of the page is inside it: it renders as code, and \
                                  no fence below it is read as a fence",
-                            ),
+                            )
                         };
                         findings.push(finding(code, file, block.line, message.to_string()));
                     }
@@ -576,13 +584,20 @@ impl Gate {
                     // Content, not tag: both obligations are read off
                     // the body before any marker is consulted.
                     //
-                    // A fence's body opens on the line below its
-                    // delimiter; a literal block has no delimiter, so
-                    // its own line is already the body's first.
-                    let body_line = match &block.kind {
-                        BlockKind::Fence { .. } => block.line + 1,
-                        _ => block.line,
+                    // The block's anchor: the line `vet` adds cue's
+                    // 1-based line number to, and so the line the body
+                    // starts *after*. A fence anchors on its opening
+                    // delimiter; a literal block has none, so it
+                    // anchors on the line above its body. Both derive
+                    // from one value rather than each carrying its own
+                    // ±1, which was correct before only by the two
+                    // cancelling.
+                    let anchor = if fenced {
+                        block.line
+                    } else {
+                        block.line.saturating_sub(1)
                     };
+                    let body_line = anchor + 1;
                     let mut invocations = Vec::new();
                     for (offset, text) in invocation::logical_lines(&block.body) {
                         for found in invocation::extract(&text) {
@@ -621,12 +636,7 @@ impl Gate {
                     }
                     if document {
                         documents.push(Document {
-                            // The line the body is anchored to, which
-                            // `vet` adds cue's 1-based line to. For a
-                            // fence that is its delimiter; for a literal
-                            // block there is none, so it is the line
-                            // above the body.
-                            origin: format!("{file}:{}", body_line - 1),
+                            origin: format!("{file}:{anchor}"),
                             body: block.body.clone(),
                         });
                     }
