@@ -9,6 +9,122 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## docs tooling (no release) — 2.19d xref and health: paths, ADR citations, a corpus census (2026-08-18)
+
+> No version bump and no monorepo tag, without the caveat 2.19c carried:
+> `cli/Cargo.toml` is untouched, no chart, operator or cue-cmp artefact
+> moved, and every line of this subphase lives in `cli/docsgen`, a
+> build-time crate that ships in no release artefact.
+> Fourth of the documentation track's ten subphases — branch
+> `feat/2.19d-docs-xref-health`, **ADR 0057** (see its 2.19d amendment
+> for what was dropped and deferred, and why).
+>
+> **All three new checks find zero defects in the corpus today.** That
+> is measured, not hoped. They are regression guards installed
+> deliberately *before* the content subphase: 2.19i adds roughly fifteen
+> guides that will cite ADRs and repository paths heavily, and a guard
+> installed after the content merely ratifies whatever the content
+> already got wrong.
+
+### Added
+
+- **Obligations survive unfencing a block.** A four-space indented run at
+  the top level, and an HTML `pre` element, now carry everything a fence
+  carries. This closes an evasion the gate shipped with: told to label a
+  fence, a contributor could delete the delimiters and indent the body
+  instead — the page renders identically as code, every content-derived
+  obligation lapses, and nothing in the diff reads as suppression.
+  Container tracking is load-bearing rather than incidental: tabbed
+  blocks, admonitions and list items all indent four spaces, and without
+  it the check reports six false positives on
+  `dev-guide/quickstart.md` alone. A `pre` element that never closes is
+  its own class, `unclosed-pre`, because closing a tag is a different
+  edit from closing a fence.
+- **`code-path` — a repository path the documentation names that does not
+  exist.** Two surfaces resolve against different roots: a code span is
+  prose and resolves from the repository root, a relative link target is
+  a destination and resolves from the page's own directory, and a code
+  span that is a link's *text* is checked as the link's target. Globs are
+  extracted like anything else and suppressed at **resolution**; the
+  pattern set is `*`, `?` and the two braces — deliberately **not** the
+  square brackets, because three tracked files carry brackets in their
+  names and counting those as patterns would suppress exactly those
+  references hardest on the day one of them moves. The class has **no
+  ignore key**: a path belonging to another project is named as theirs in
+  the sentence rather than exempted, because a reader will otherwise grep
+  this repository for it.
+- **`adr-reference` — a citation that names nothing, or names a decision
+  that no longer stands** (`Superseded`, `Deprecated`, or an `Unused`
+  reserved slot). It reads both spellings, the plural, a citation wrapped
+  across a line break, and the number embedded in a link target or a
+  path. The verdict comes from the **leading token** of the `## Status`
+  body, so partial supersession — "§7 superseded in part by …", which
+  four ADRs here carry — is correctly not a finding; a substring rule
+  over the same corpus produced false positives and no true one.
+  `Draft` and `Proposed` are not findings: documentation legitimately
+  cites a decision the project is working to.
+- **`adr-check-ignore` — a front-matter exemption channel for that
+  class**, on the same machinery as `cli-check-ignore` and
+  `schema-check-ignore`: the same typed reasons, the same `since=` aged
+  against real tag dates, the same void-when-unaged rule, the same
+  unused-audit. It is keyed by the canonical `ADR NNNN` form, so one key
+  covers every spelling of one citation. Citing a reversed decision on
+  purpose is legitimate — a sentence that announces the supersession in
+  the same breath is describing history, not relying on it — and the
+  class shipped with no way to say so.
+- **A committed corpus census, and a gate against its regression.**
+  `docs/measurements/docs-health.json` records seven counts and
+  `docsgen gate` compares this run against them **by value**: six
+  obligation counts may not decrease, and `exemptions` is compared for
+  equality in *both* directions so that declaring one and retiring one
+  each produce one reviewable diff line. Growth passes silently and
+  deliberately — a gate that made a contributor re-record a file in order
+  to write a page is a gate contributors route around. `docsgen metrics`
+  re-records it; it is never a hook's side effect. A missing or
+  unparseable census is the gate's **exit 2** (the gate is broken), never
+  exit 1. Two finding classes carry the two events apart, because a
+  contributor who has just declared an exemption must not be told to put
+  back documentation nobody removed.
+- **`contributing/documentation-gate.md` brought current.** It described
+  four finding classes; there are ten, plus five about the exemption
+  machinery. It now documents each new class and the three cases a
+  contributor actually meets — that indenting a block instead of
+  labelling its fence silences nothing and is meant not to, that citing a
+  superseded ADR on purpose is legitimate if the sentence says so, and
+  that a deliberate reduction in documented surface is re-recorded with
+  `docsgen metrics` in the same commit with the reason in the commit
+  message.
+
+### Fixed
+
+- **The gate's exit-code documentation was wrong about a tagless
+  checkout.** `contributing/documentation-gate.md` listed it under exit
+  **2**. It is exit **1**: every exemption reports as `exemption-unaged`,
+  which reads as "the documentation is wrong" when the remedy is
+  `git fetch --tags`. Only the finding's own remedy text carries that
+  distinction, and the page now says so.
+
+### Known gaps (recorded, not fixed)
+
+- **The census counts cardinality, never specificity.** An obligation
+  *substituted* rather than deleted costs nothing: a twelve-flag
+  invocation replaced by a bare one, a deep field path by a shallow one,
+  a file by its parent directory — each holds all seven numbers and exits
+  0, each re-run against the real corpus. Prose carrying no counted claim
+  is invisible to the census entirely, so a page can lose its whole
+  explanation with every number unchanged. These ratchets defend against
+  the careless, not against the motivated.
+- **Crate-relative paths are invisible to `code-path`.** The check anchors
+  on a real top-level directory, so `reference/environment.md`'s 24
+  crate-relative references (`platform-cli/src/…`, `cli-core/src/…`) are
+  dropped — all of them correct today, and one `cli/` prefix away from
+  being exactly the defect the check exists for. Widening the anchor to
+  any slash-shaped token would admit some 70 non-repository tokens the
+  corpus writes in spans, which is a check that gets switched off.
+- **Staleness gating was dropped, `verified-by` bindings deferred, and an
+  anchor checker found unnecessary** — each on measurement rather than on
+  preference. The numbers are in ADR 0057's 2.19d amendment.
+
 ## docs tooling (no release) — 2.19c documentation drift gate (2026-08-18)
 
 > No version bump and no monorepo tag: no chart, operator or cue-cmp

@@ -334,6 +334,112 @@ sequenced before the content work.
 Neutral: generated files are committed, so they stay diff-reviewable; the
 generator lives in the CLI workspace but ships in no release artefact.
 
+## Amendment — 2.19d (xref and health) as delivered, 2026-08-18
+
+The "xref tags and health metrics" bullet under *Deferred* below named five
+mechanisms. Three shipped in a different shape than the bullet described, one
+was dropped on measurement and one was deferred on measurement. Recording
+what was **rejected**, and why, is the point of this amendment: an ADR that
+lists only what was built invites the next person to rebuild what was
+rejected.
+
+No release and no monorepo tag rides it. `cli/Cargo.toml` is untouched, no
+chart, operator or cue-cmp artefact moved, and `docsgen` is a build-time crate
+that ships in no release artefact.
+
+### Delivered
+
+- **Obligations survive unfencing a block.** A four-space indented run at the
+  top level, and an HTML `pre` element, now carry everything a fence carries.
+  This closes an evasion the gate shipped with: a contributor told to label a
+  fence could delete the delimiters and indent the body, which renders
+  identically as code and was invisible to every check. Container tracking is
+  load-bearing rather than incidental — tabbed blocks, admonitions and list
+  items all indent four spaces, and without it the check reports six false
+  positives on `dev-guide/quickstart.md` alone. A `pre` element that never
+  closes is its own finding class, because the remedy is a different edit from
+  closing a fence.
+- **`code-path`** — a repository path named in a code span, or in a relative
+  link target, that does not exist. The two surfaces resolve against different
+  roots (a span from the repository root, a link target from the page's own
+  directory), and a code span that is a link's *text* is checked as the
+  link's target. Globs are suppressed at resolution rather than at
+  extraction, and the pattern set is deliberately `*`, `?` and the braces —
+  **not** the square brackets, because three tracked files carry brackets in
+  their names, and counting those as patterns would suppress those references
+  hardest at exactly the moment one of them moves.
+- **`adr-reference`** — a citation naming no ADR, or naming a decision that is
+  `Superseded`, `Deprecated` or an `Unused` reserved slot. It reads both
+  spellings, the plural, a citation wrapped across a line break, and a number
+  embedded in a link target or a path. The verdict comes from the **leading
+  token** of the `## Status` body, so partial supersession — which four ADRs
+  in this repository carry — is correctly not a finding; a substring rule over
+  the same corpus produced only false positives.
+- **`adr-check-ignore`** — a front-matter exemption channel for that class, on
+  the same machinery as its two siblings: the same typed reasons, the same
+  `since=` aged against real tag dates, the same void-when-unaged rule, the
+  same unused-audit. It is keyed by the citation's canonical form, so one key
+  covers every spelling of one decision. Citing a reversed decision on purpose
+  is legitimate and is this repository's idiom, and the class shipped without
+  any way to say so.
+- **A committed corpus census** at `docs/measurements/docs-health.json`, seven
+  counts, compared **by value**: six obligation counts may not decrease
+  (growth passes silently), and the exemption count is equality in both
+  directions. `docsgen metrics` re-records it. A missing or unparseable census
+  is the gate's BROKEN exit code, never a documentation finding.
+
+### Dropped or deferred, with the measurement behind each
+
+- **Staleness gating: dropped.** Not viable at any threshold, and the numbers
+  say so rather than a preference. The oldest page in the corpus is 104 days
+  old, so a 180-day rule could not fire for months; a 90-day rule fires on the
+  same four abstract pages forever; 24 of the 33 pages share two last-touched
+  dates and therefore cross any threshold together; both clocks reset on
+  non-events such as a licence-header sweep or a formatter pass;
+  `git log -1 -- <path>` does not follow renames and one corpus page has
+  already been renamed; and of the last 100 commits touching `schemas/**` or
+  the CLI's command tree, **three** touched an in-scope page. If staleness
+  returns, its shape is a diff against a published tag under an explicit
+  pathspec — what `scripts/check-operator-version-bump.sh` already does — and
+  not elapsed days.
+- **Typed `verified-by` bindings: deferred.** Most of the e2e walks are run by
+  nothing automated — 17 of the 28 tracked `e2e/*.sh` are named by no workflow
+  and no `Justfile` target — and that set includes `backup-restore-walk.sh`,
+  which a corpus page already cites as its verification. Requiring the field
+  across the roughly twenty developer and operator pages would therefore
+  manufacture about fifteen claims that read as verified and are not, which is
+  worse than the absence it would replace.
+- **A dedicated anchor checker: unnecessary.** `validation.links.anchors: warn`
+  under `--strict` already fails the build on a dead anchor, and all 28
+  in-scope anchored links resolve. A second, less informed opinion could only
+  disagree with the first.
+- **Three earlier-proposed ratchets: replaced.** `blocks_executed` is
+  unimplementable — the marker grammar's `run=` key accepts only `local`, and
+  the gate reports that as a finding because nothing executes a documented
+  block, so the ratchet reads `0 >= 0` forever. `check_none` held at 0
+  prohibits rather than ratchets: at that value it bans the typed, dated,
+  expiring exemption channel this ADR decided to build. And a **byte-compared**
+  census would go red the day after it was committed with no commit in
+  between, because three of the fields originally proposed for it are
+  functions of `now`. The seven kept fields are all obligation counts, and
+  none of them is `now`-derived.
+
+### The three checks find nothing today, and that is the point
+
+All three new checks report **zero** findings on the corpus as it stands. That
+is measured, not hoped, and it is the reason they were built in this order:
+2.19i adds roughly fifteen guides that will cite ADRs and repository paths
+heavily, and a guard installed *after* that content merely ratifies whatever
+the content already got wrong. A regression guard installed on a surface that
+is correct today is the only kind that can be installed honestly.
+
+The census's own limits are stated rather than papered over, because they
+bound what any of this is worth: it counts cardinality and never specificity,
+so an obligation *substituted* rather than deleted costs nothing, and prose
+carrying no counted claim is invisible to all seven numbers. These ratchets
+defend against the careless; review defends against the motivated, and no
+arithmetic over a corpus can take that job.
+
 ## Alternatives considered
 
 - **Port the site to VitePress or Astro Starlight.** Rejected. The 93 existing
@@ -397,7 +503,9 @@ generator lives in the CLI workspace but ships in no release artefact.
   sequence: it is the next subphase.
 - **Xref tags and health metrics** — explicit code-to-docs tags, graded test
   bindings, a committed metrics file and its ratchets. They measure rot; the
-  gate prevents it. Prevention first.
+  gate prevents it. Prevention first. *(Delivered in part by 2.19d — see the
+  amendment above for what shipped, what was dropped on measurement and what
+  was deferred on measurement.)*
 - **The LLM artefacts** — `llms.txt`, `llms-full.txt` and per-page markdown
   twins. They derive from committed content, so they cannot drift and can
   land at any point; the licence they need was named in this decision.

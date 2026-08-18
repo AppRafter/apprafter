@@ -79,6 +79,20 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 ---
 
+## order 3.7 — documentation as a product surface
+
+| Status | Feature | plan.md | Checkpoint |
+|---|---|---|---|
+| 🚧 | Public documentation site (`docs.apprafter.dev`) — generated CLI reference + guides, kept true to the code by a drift gate in `just lint` and CI | 2.19 | CP1 |
+
+> **🚧 — four of ten subphases closed (a–d), and what a user can see is still nothing.** The machinery half has landed: a validating strict site build (**2.19a**), a generated reference over all 95 command paths that is byte-compared against the clap tree (**2.19b**), a content-detected drift gate over the 33 in-scope guides that resolves documented invocations, schema paths and CUE manifests against what ships (**2.19c**), and its xref/health half — repository paths, ADR citations, obligations that survive unfencing a block, and a committed corpus census whose obligation counts may not fall (**2.19d**).
+>
+> Remaining, and each of them user-visible in a way the four above are not: the mkdocs hooks and LLM artefacts (2.19e), the information-architecture restructure (2.19f), **publication** — the site is still unserved and the landing page still renders a "Soon" badge (2.19g), the CLI-UX examples and completions (2.19h), roughly **fifteen missing guides** for capabilities that exist only in `--help` today (2.19i), and the closing walk over every guide (2.19j). The row flips `✅` at 2.19j, not before: a documentation site nobody can open is not a delivered feature.
+>
+> No release and no monorepo tag rides any of a–d. `docsgen` is a build-time crate that ships in no release artefact; a–b touched CLI doc comments only, 2.19c widened the schema bundle `apprafter app validate` embeds, and 2.19d touched the shipped binary not at all.
+
+---
+
 ## order 4 — Tier-2 substrate
 
 | Status | Feature | plan.md | Checkpoint |
