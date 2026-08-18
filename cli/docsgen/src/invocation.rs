@@ -15,10 +15,14 @@
 //!   and `monolithic|sequential` against two genuine
 //!   `apprafter kubeconfig | tee` pipelines. The two do not separate
 //!   lexically without bracket awareness, so [`segments`] has it.
-//! * 161 of the 213 inline spans (76 %) are a bare command path with no
-//!   flags at all. Demanding arguments on those would fail every one,
-//!   including inside the reference this crate itself generates — a
-//!   gate that fails its own output teaches contributors to disable it.
+//! * 161 of the 213 `apprafter …` inline spans (76 %) are a bare
+//!   command path — no flags and no arguments at all. Measured over
+//!   the corpus as **found**, at `dc4c5de`, the commit this check was
+//!   written against; the ratio has not moved since (165 of 218 at the
+//!   time of writing, still 76 %). Demanding arguments on those would
+//!   fail every one, including inside the reference this crate itself
+//!   generates — a gate that fails its own output teaches contributors
+//!   to disable it.
 //!
 //! Path and flag name still catch every confirmed drift in the corpus:
 //! a command that never shipped (`apprafter promote`), and a flag

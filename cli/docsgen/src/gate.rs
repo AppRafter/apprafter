@@ -9,11 +9,16 @@
 //!
 //! # Obligations come from content, never from the language tag
 //!
-//! Hand-written shell in this corpus is tagged `sh` (162), `bash` (11),
-//! `console` (1) and **nothing at all** (14). A tag-keyed gate would
-//! therefore see a fraction of the surface, and — worse — deleting a
-//! tag would turn a finding green with nothing in the diff that reads
-//! as suppression. So:
+//! Hand-written shell in this corpus carries four different tags. As
+//! the corpus was **found**, at `dc4c5de` — the commit this gate was
+//! written against — that was `sh` (162), `bash` (11), `console` (1)
+//! and **nothing at all** (14). The gate's own unlabelled-fence
+//! finding has since taken that last group to 0 (`sh` is now 164),
+//! which is the argument rather than a footnote to it: the
+//! distribution is a moving target, and an obligation keyed on it
+//! would have moved with it. A tag-keyed gate would see a fraction of
+//! the surface, and — worse — deleting a tag would turn a finding
+//! green with nothing in the diff that reads as suppression. So:
 //!
 //! * a fence whose body holds an `apprafter` invocation owes the CLI
 //!   check, whatever its tag;
@@ -93,6 +98,28 @@
 //! once the page is fixed, the exemption is a claim about a problem that
 //! no longer exists, and leaving it standing is how an exemption list
 //! comes to cover things nobody chose.
+//!
+//! Two consequences are recorded here because this is where the next
+//! reader meets them:
+//!
+//! * **Both exemptions in the corpus carry `since: v0.2.44`**, so
+//!   against the 180-day window they go void on the *same day*, and
+//!   from that day `just lint` fails for everyone until each is
+//!   re-justified. That is the window working as designed, but it
+//!   arrives as one event rather than two, and whoever meets it is
+//!   re-reading two pages rather than one. Staggering `since=` across
+//!   exemptions is the only thing that would spread the cost, and it
+//!   is not worth lying about a date to get it.
+//! * **A shallow or tagless checkout produces the same failure.**
+//!   [`marker::age`] cannot distinguish "this tag is 200 days old"
+//!   from "this clone has no tags", so `git clone --depth 1`, a fork
+//!   that never fetched tags, or any CI job without `fetch-depth: 0`
+//!   reports [`EXEMPTION_UNAGED`] for every exemption at once. The
+//!   exit code is **1**, which reads as "the documentation is wrong",
+//!   when the remedy is `git fetch --tags` — a checkout to repair, not
+//!   a page. Only the finding's remedy text carries that distinction
+//!   ([`remedy`]), so a caller that prints codes and swallows text
+//!   will mislead its reader.
 //!
 //! # Exit codes
 //!
@@ -245,9 +272,14 @@ pub struct Stats {
     /// Schema identifiers that resolved.
     pub identifiers: usize,
     /// How many of those resolved **only** because they sit under a
-    /// subtree the CRDs do not describe. Reported because "207
-    /// resolved" read as "207 checked" would be a real overstatement:
-    /// see [`identifier::Verdict::opaque`].
+    /// subtree the CRDs do not describe. Reported because reading the
+    /// resolved total as a *checked* total would be a real
+    /// overstatement — the opaque share is a shade under half.
+    ///
+    /// No figure is repeated in this comment on purpose: [`Stats::line`]
+    /// prints both numbers on every run, and a copy here would be a
+    /// third number to keep in step with the corpus and with
+    /// [`identifier`]'s module docs. See [`identifier::Verdict::opaque`].
     pub opaque: usize,
     /// One entry per exemption declared, so they can be counted by kind
     /// — which is the whole point of the closed [`Reason`] vocabulary.

@@ -15,8 +15,9 @@
 //! **Every drift's lexical shape also occurs legitimately**, and a gate
 //! that fires on the drift *and* on the correct line next to it gets
 //! switched off by the first contributor it inconveniences. From this
-//! corpus alone: `node-prep.md` names a removed command on purpose; two
-//! `DATABASE_URL` lines were correct while thirty-one were stale; a
+//! corpus alone: `node-prep.md` names a removed command on purpose;
+//! five connection-key lines were correct while twenty-five were
+//! stale (30 in all, across three files, as found at `dc4c5de`); a
 //! heading reading "Phase 2 of `bootstrap-all`" is legitimate prose
 //! whose anchor is linked. So each `NN-<slug>-ok.md` writes the *same
 //! lexical shape* as its twin — the same block kind, the same tokens,

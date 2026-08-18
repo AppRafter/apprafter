@@ -6,12 +6,16 @@
 //! A field-table gate would cover one table in the corpus and three
 //! rows. Membership covers those three rows *and* every other place a
 //! field name is written: `expose.public` — a field that does not
-//! exist — sits in eight locations across three files, six of them
-//! fences. Three of those fences are `kubectl apply` YAML, and the
-//! apiserver **prunes** an unknown key rather than rejecting it, so a
-//! reader who copies the block gets a silent no-op and an
-//! apply-and-see check reports success. Membership is the only gate
-//! that sees them.
+//! exist — sat in eight locations across three files, six of them
+//! fences. **Two** of those fences are `kubectl apply -f -` heredocs
+//! (`operator-guide/needs-networkpolicy-walk.md`, lines 118 and 136),
+//! and the apiserver **prunes** an unknown key rather than rejecting
+//! it, so a reader who copies the block gets a silent no-op and an
+//! apply-and-see check reports success. A third
+//! (`operator-guide/gitops-walk.md:80`) is worse in a quieter way: it
+//! is a manifest committed to a GitOps repository and applied by
+//! Argo CD, so the pruning happens with nobody at a terminal at all.
+//! Membership is the only gate that sees any of them.
 //!
 //! # The two surfaces, and why they are extracted differently
 //!
@@ -64,20 +68,23 @@
 //!   set. That covers `metadata.*`, `env.*`, `expose.hostname.*` and
 //!   everything under `needs.<type>`, which is where `size`,
 //!   `selector`, `mountPath` and `ref` live. Measured over the
-//!   corpus, **95 of 198** resolved identifiers resolve *only* this
-//!   way — a shade under half. Nobody should read "198 resolved" as
-//!   198 checked, which is exactly what the flag exists to prevent.
+//!   corpus, **115 of 234** resolved identifiers resolve *only* this
+//!   way — a shade under half. Nobody should read "234 resolved" as
+//!   234 checked, which is exactly what the flag exists to prevent.
+//!   ([`crate::gate::Stats::line`] prints the live pair on every run;
+//!   the figures here are a reading of it, not a second source.)
 //! * **`status` is deliberately not a root.** It is real and the docs
-//!   use it twelve times — `status.phase`, `status.availableVersion`,
-//!   `status.dbnum`, `status.connectionSecretRef`, `status.refCount`,
+//!   use it eighteen times across fourteen distinct paths —
+//!   `status.phase`, `status.availableVersion`, `status.dbnum`,
+//!   `status.connectionSecretRef`, `status.refCount`,
 //!   `status.versionHistory`, … — and every one of them is
 //!   **unchecked** by this module. The reason is the bullet above: the
 //!   `status` node of all eight CRDs is preserve-unknown, so admitting
 //!   the root would resolve every `status.*` unconditionally and add
-//!   twelve to the resolved count while checking nothing. Coverage on
-//!   paper is worse than no coverage, because it is read as assurance.
-//!   If `status` ever becomes structural in the CRDs, admit the root
-//!   then.
+//!   eighteen to the resolved count while checking nothing. Coverage
+//!   on paper is worse than no coverage, because it is read as
+//!   assurance. If `status` ever becomes structural in the CRDs, admit
+//!   the root then.
 //! * **The union can judge a foreign CRD by ours.** Without a kind
 //!   prefix there is nothing in a prose span to say whose `spec` it
 //!   is, so a bare path is resolved against the union of every
@@ -85,7 +92,7 @@
 //!   page is about can resolve against some other kind (a silent
 //!   pass), and a *correct* path belonging to a third-party CRD can be
 //!   reported. The corpus has one of the latter —
-//!   `docs/dev-guide/application-cue.md:28` names Argo CD's
+//!   `docs/dev-guide/application-cue.md:36` names Argo CD's
 //!   `spec.source.path`, and our `SourceCredential` has a
 //!   `spec.source` with no `path`.
 //!
@@ -153,7 +160,8 @@ pub const STRUCTURE_ROOTS: [&str; 5] = ["base", "environments", "expose", "needs
 /// `PlatformStack.spec.pin` resolves against `PlatformStack` alone.
 ///
 /// This is the notation with no silent-pass hole, and the corpus
-/// already uses it six times. A flat table rather than a lookup into
+/// already uses it nine times across five distinct paths (see the
+/// module docs). A flat table rather than a lookup into
 /// the live [`FieldSet`], for the same reason [`crate::shipped`] keeps
 /// one: [`extract_paths`] is a pure lexer with no schema in the room,
 /// which is what lets its grammar be tested without a repository.
@@ -506,7 +514,7 @@ pub fn span_path(body: &str) -> Option<String> {
 ///
 /// One root — `spec` — is also the stem of a file the docs cite
 /// constantly, so `spec.md` matches the grammar exactly and appears
-/// twelve times in the corpus. `plan.md` and `cue.mod` are already out
+/// eleven times in the corpus. `plan.md` and `cue.mod` are already out
 /// because their stems are not roots; this is the same rule reaching
 /// the one case that shares a stem. Deliberately excludes `env`, which
 /// is a real field (`base.env`) before it is an extension.

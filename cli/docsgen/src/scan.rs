@@ -43,10 +43,13 @@
 //! nothing. The same rule keeps a `description:` holding a backtick (as
 //! the generated pages' do) from being checked as a command.
 //!
-//! Exactly one in-scope file has front matter today
-//! (`docs/reference/environment.md`) and it holds no backticks, so the
-//! counts are unchanged by this — it is the mechanism that has to exist
-//! before exemptions can.
+//! Three in-scope files carry front matter. `docs/reference/environment.md`
+//! predates the gate and holds no backticks; the other two
+//! (`docs/dev-guide/application-cue.md`,
+//! `docs/operator-guide/node-prep.md`) carry exemption lists whose
+//! values quote the literal text they exempt — which is precisely the
+//! shape that would exempt nothing if front matter were scanned as
+//! prose.
 
 use crate::render::DIR;
 use std::error::Error;
@@ -70,10 +73,14 @@ pub enum BlockKind {
     /// — `None` when the fence carries no info string.
     ///
     /// The tag is recorded but must never be used to *select* what to
-    /// check: hand-written shell in this corpus is tagged `sh` (162),
-    /// `bash` (11), `console` (1) and nothing at all (14), so a
-    /// tag-keyed gate would see a fraction of the surface. Obligations
-    /// come from block content.
+    /// check: hand-written shell in this corpus carries four different
+    /// tags — as found at `dc4c5de`, `sh` (162), `bash` (11),
+    /// `console` (1) and nothing at all (14) — so a tag-keyed gate
+    /// would see a fraction of the surface. Obligations come from
+    /// block content. (The untagged group is 0 today, because the gate
+    /// reports an unlabelled fence; that it moved at all is the
+    /// reason not to key on it. `corpus_census` prints the live
+    /// distribution.)
     Fence { tag: Option<String> },
     /// A backticked run in prose. Measurement puts most command
     /// invocations here rather than in fences, so this is the primary

@@ -17,11 +17,13 @@
 //! * a key that does not pair with the chosen check is an error, so
 //!   `check=cue run=local` cannot look like it executes something.
 //!
-//! The marker is an HTML comment, which collides with nothing in the
-//! corpus: 29 comments exist and 28 are the identical docsgen banner.
-//! [`parse_marker`] returns `Ok(None)` — not an error — for every
-//! comment that does not open with `docs:`, which is what keeps those
-//! 28 invisible here.
+//! The marker is an HTML comment, which collides with nothing:
+//! `docs/**` holds 31 HTML comments and 28 are the identical docsgen
+//! banner on the generated CLI reference (29 and 28 as the tree was
+//! found at `dc4c5de` — the two added since are the grammar examples
+//! in the changelog). [`parse_marker`] returns `Ok(None)` — not an
+//! error — for every comment that does not open with `docs:`, which is
+//! what keeps those 28 invisible here.
 //!
 //! What this module does *not* do: decide what a marker means. It
 //! parses and ages; the gate applies policy.
