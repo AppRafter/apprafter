@@ -14,6 +14,7 @@
 //! release artefact for every target. `operator/crdgen` is the
 //! precedent.
 
+pub mod adr;
 pub mod check;
 pub mod codepath;
 pub mod cuedoc;

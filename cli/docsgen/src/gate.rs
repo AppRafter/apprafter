@@ -139,6 +139,7 @@
 //! is the second worst; both are why [`cuedoc::validate_documents`]'s
 //! `Err` is propagated here rather than folded into the finding list.
 
+use crate::adr;
 use crate::codepath;
 use crate::cuedoc::{self, Document};
 use crate::identifier::{self, FieldSet};
@@ -190,6 +191,8 @@ pub const EXEMPTION_UNAGED: &str = "exemption-unaged";
 pub const EXEMPTION_UNUSED: &str = "exemption-unused";
 /// A path this documentation names does not exist in the repository.
 pub const CODE_PATH: &str = "code-path";
+/// A referenced ADR does not exist, or its decision no longer stands.
+pub const ADR_REFERENCE: &str = "adr-reference";
 
 /// Front-matter key exempting an inline span from the CLI check, by the
 /// span's literal text.
@@ -250,6 +253,14 @@ fn remedy(code: &str) -> &'static str {
              so a path belonging to someone else's project has to be named as \
              theirs in the sentence rather than exempted, because a reader will \
              otherwise grep this repository for it"
+        }
+        ADR_REFERENCE => {
+            "cite the decision that stands — a superseded ADR's own `## Status` \
+             names the one that replaced it, and `docs/adr/README.md` indexes the \
+             rest; citing a reversed decision on purpose is legitimate when the \
+             prose says so, and this class has no ignore key, so write that \
+             sentence and link the file (`[the original choice](../adr/0011-….md)`) \
+             instead of naming it as `ADR NNNN`"
         }
         _ => "see cli/docsgen/src/gate.rs",
     }
@@ -405,6 +416,10 @@ pub struct Gate {
     /// same listing, so the grammar closes over the tree instead of
     /// over a hand-kept list that can go stale.
     tops: Vec<String>,
+    /// The decision register: ADR number → the verdict its `## Status`
+    /// opens with. Read from `docs/adr/` — which is out of the corpus,
+    /// so the gate resolves citations against pages it never judges.
+    adrs: BTreeMap<String, adr::Verdict>,
     /// Where the corpus and the schemas live.
     repo_root: PathBuf,
     /// The repository whose tags date `since=`.
@@ -455,12 +470,25 @@ impl Gate {
                 tops.insert(components[0].to_string());
             }
         }
+        // Once, here, for the reason the file listing is: the register
+        // is the same for every page, and it costs 57 file reads. The
+        // wrapper is the one this module puts on `cue`'s failure — a
+        // register that cannot be read is the gate being broken, and
+        // carrying on with an empty one would report every citation in
+        // the corpus as naming a nonexistent ADR.
+        let adrs = adr::statuses(repo_root).map_err(|e| {
+            format!(
+                "the ADR half of the gate could not load, so no citation could be \
+                 resolved — this is the gate being broken, not the documentation:\n{e}"
+            )
+        })?;
         Ok(Gate {
             tree: Tree::from_model(model::tree_from(&cli, &version))?,
             fields: FieldSet::from_repo(repo_root)?,
             tracked,
             directories,
             tops: tops.into_iter().collect(),
+            adrs,
             repo_root: repo_root.to_path_buf(),
             tags: tags.to_path_buf(),
             now,
@@ -475,6 +503,43 @@ impl Gate {
     /// normalised string is.
     fn resolves(&self, path: &str) -> bool {
         path.is_empty() || self.tracked.contains(path) || self.directories.contains(path)
+    }
+
+    /// What is wrong with citing this ADR, if anything.
+    ///
+    /// `Draft` and `Proposed` are silent on purpose: 9 of the 62
+    /// in-scope citations name ADRs 0025–0029, all Draft, and
+    /// documentation legitimately cites a decision the project is
+    /// working to. `Accepted` covers the three ADRs (0001, 0042, 0053)
+    /// that are superseded *in part* and still stand — see
+    /// [`adr::verdict`] on why only the leading token is read.
+    ///
+    /// Every verdict is spelled out rather than defaulted with `_`, so
+    /// a word added to [`adr::Verdict`] later is a compile error here
+    /// instead of a silent "not a finding".
+    fn adr_problem(&self, number: &str) -> Option<String> {
+        match self.adrs.get(number) {
+            None => Some(format!(
+                "`ADR {number}`: no such ADR — `docs/adr/` holds no `{number}-*.md`"
+            )),
+            Some(adr::Verdict::Superseded | adr::Verdict::Deprecated) => {
+                let status = self.adrs[number].as_str();
+                Some(format!(
+                    "`ADR {number}`: its `## Status` opens `{status}`, so this cites a \
+                     decision that no longer stands"
+                ))
+            }
+            Some(adr::Verdict::Unused) => Some(format!(
+                "`ADR {number}`: the slot is marked `Unused` — the number was reserved \
+                 during early planning and names no decision"
+            )),
+            Some(adr::Verdict::Unknown) => Some(format!(
+                "`ADR {number}`: its `## Status` opens on no verdict this gate knows, so \
+                 whether the decision still stands cannot be read — fix the ADR's status, \
+                 or widen the vocabulary in cli/docsgen/src/adr.rs"
+            )),
+            Some(adr::Verdict::Accepted | adr::Verdict::Draft | adr::Verdict::Proposed) => None,
+        }
     }
 
     /// Run every check over the whole in-scope corpus.
@@ -815,6 +880,26 @@ impl Gate {
                 ),
             };
             findings.push(finding(CODE_PATH, file, reference.line, message));
+        }
+
+        // Page-wide and off the source, like the paths above, and for a
+        // stronger reason than theirs: an ADR is cited as authority
+        // wherever it is written, and the corpus writes one **inside a
+        // fence** — `docs/operator-guide/needs-pg-walk.md:247`, a
+        // comment in a shell block reading "(the decomposed fields, ADR
+        // 0046 …)". Restricting this to prose would drop that citation,
+        // and would make "move the sentence into the block" a way to
+        // stop a citation being checked. It is the identifier check's
+        // rule — a claim is a claim in a fence and in a span alike —
+        // rather than the invocation check's, which is fence-scoped only
+        // because a fence is what a marker can annotate. There is no
+        // marker channel here, so there is nothing for a block boundary
+        // to carry.
+        for reference in adr::references(source) {
+            let Some(message) = self.adr_problem(&reference.number) else {
+                continue;
+            };
+            findings.push(finding(ADR_REFERENCE, file, reference.line, message));
         }
 
         for exemption in spans.iter().chain(paths.iter()) {
@@ -1248,6 +1333,7 @@ mod tests {
             EXEMPTION_UNAGED,
             EXEMPTION_UNUSED,
             CODE_PATH,
+            ADR_REFERENCE,
         ] {
             assert_ne!(remedy(code), remedy("no-such-code"), "{code}");
         }

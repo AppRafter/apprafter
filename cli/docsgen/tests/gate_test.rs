@@ -626,6 +626,119 @@ fn a_glob_is_silent_even_though_it_never_resolves() {
     assert!(found.is_empty(), "{found:?}");
 }
 
+// ---- the ADRs documentation cites --------------------------------------
+
+#[test]
+fn a_reference_to_a_superseded_adr_is_reported() {
+    // ADR 0011 is `Superseded by ADR 0016`. It has no reference in the
+    // corpus, which is why this is written as a fixture rather than
+    // asserted against real pages.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nStorage follows ADR 0011.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("0011"), "{found:?}");
+}
+
+#[test]
+fn a_reference_to_a_partly_superseded_adr_is_not_reported() {
+    // The negative control that matters: a blind "superseded" match
+    // fires on ADRs 0001, 0042 and 0053 — seven in-scope references,
+    // none of them defects, against zero true positives in scope.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee ADR 0042, ADR 0053 and ADR 0001.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_reference_to_a_draft_adr_is_not_reported() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nThe portal follows ADR 0027.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_reference_to_a_nonexistent_adr_is_reported() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nAs ADR-9999 sets out.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn a_reference_to_an_unused_slot_is_reported() {
+    // `0013` and `0018` were reserved during early planning and
+    // abandoned. The file exists, so "no such ADR" would be the wrong
+    // message, but the number names no decision — which is what a reader
+    // following the citation discovers after opening it.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nAutoscaling is settled in ADR 0013.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("Unused"), "{found:?}");
+}
+
+#[test]
+fn a_citation_inside_a_fence_is_judged_like_any_other() {
+    // The design decision, pinned: ADR references are read page-wide off
+    // the source, not from prose alone. The corpus writes one inside a
+    // fence — `docs/operator-guide/needs-pg-walk.md:247`, a comment in a
+    // shell block — so a prose-only rule would drop a real citation, and
+    // would make "move the sentence into the block" a way to stop one
+    // being checked.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n```sh\n# the shim (ADR 0011) is applied first\napprafter app list\n```\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("4: "), "{found:?}");
+}
+
+#[test]
+fn a_citation_wrapped_across_a_line_break_is_still_judged() {
+    // Three of the cases above assert an EMPTY list, and two more assert
+    // a finding on a shape a scanner could reach by accident. This is
+    // the one that fails if references are dropped on the floor by the
+    // wrap rule specifically: the corpus's only wrapped citation
+    // (`docs/operator-guide/target-store.md:8`) is written exactly like
+    // this, and "wrap the line" must not be a way to hide a citation.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n> Rationale: [ADR\n> 0011](../adr/0011-hybrid-rust-sdk-tofu-shim.md).\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_REFERENCE,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    // On the line the citation starts.
+    assert!(found[0].starts_with("3: "), "{found:?}");
+}
+
 // ---- helpers -----------------------------------------------------------
 
 /// A complete `Application` document with `expose` holding `field`.
