@@ -308,6 +308,67 @@ fn a_comment_above_a_fence_is_carried_but_not_one_further_up() {
     );
 }
 
+// Front matter is where a page will declare its span exemptions. A
+// front matter scanned as prose would be read as the very spans it
+// exempts, so the exemption channel cannot exist until it leaves.
+
+#[test]
+fn front_matter_is_its_own_block_and_never_prose() {
+    let src = "---\ntitle: \"apprafter app\"\ndescription: \"Scoped to the `apps` AppProject\"\n---\n\nRun `apprafter app add` next.\n";
+    let all = blocks(src);
+    assert_eq!(all[0].kind, BlockKind::FrontMatter);
+    assert_eq!(all[0].line, 1);
+    assert!(all[0].body.starts_with("title:"));
+    assert!(
+        !all[0].body.contains("---"),
+        "the delimiters are not part of the block"
+    );
+    let spans: Vec<&str> = all
+        .iter()
+        .filter(|b| matches!(b.kind, BlockKind::InlineSpan))
+        .map(|b| b.body.as_str())
+        .collect();
+    assert_eq!(
+        spans,
+        vec!["apprafter app add"],
+        "a backtick in front matter is metadata, not a claim"
+    );
+}
+
+#[test]
+fn a_break_in_the_middle_of_a_page_is_not_front_matter() {
+    let src = "# Title\n\nBefore.\n\n---\n\nRun `apprafter status` after.\n";
+    let all = blocks(src);
+    assert!(
+        !all.iter().any(|b| b.kind == BlockKind::FrontMatter),
+        "only line 1 can open front matter"
+    );
+    let spans: Vec<&str> = all
+        .iter()
+        .filter(|b| matches!(b.kind, BlockKind::InlineSpan))
+        .map(|b| b.body.as_str())
+        .collect();
+    assert_eq!(spans, vec!["apprafter status"]);
+}
+
+#[test]
+fn a_page_without_front_matter_scans_exactly_as_before() {
+    let src = "# Title\n\nRun `apprafter status`.\n\n```sh\napprafter app list\n```\n";
+    let all = blocks(src);
+    assert!(!all.iter().any(|b| b.kind == BlockKind::FrontMatter));
+    assert_eq!(all.len(), 2);
+    // The span's region flushes when the fence opens, so source order
+    // is preserved: nothing about the emission changed.
+    assert_eq!(all[0].kind, BlockKind::InlineSpan);
+    assert_eq!(all[0].body, "apprafter status");
+    assert_eq!(
+        all[1].kind,
+        BlockKind::Fence {
+            tag: Some("sh".to_string())
+        }
+    );
+}
+
 #[test]
 fn an_unclosed_fence_still_yields_a_block_and_is_flagged() {
     let src = "text\n\n```sh\napprafter status\n";
@@ -339,6 +400,7 @@ fn corpus_census() {
     let mut fences = 0usize;
     let mut spans = 0usize;
     let mut invocations = 0usize;
+    let mut front = 0usize;
     let mut tags: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut readme = false;
     let mut truncated: Vec<String> = Vec::new();
@@ -357,6 +419,7 @@ fn corpus_census() {
                         .entry(tag.clone().unwrap_or_else(|| "(none)".into()))
                         .or_default() += 1;
                 }
+                BlockKind::FrontMatter => front += 1,
                 BlockKind::InlineSpan => {
                     spans += 1;
                     if block.body.starts_with("apprafter ") {
@@ -380,6 +443,7 @@ fn corpus_census() {
     );
     println!("fences:                {fences}");
     println!("inline spans:          {spans}");
+    println!("pages with front matter: {front}");
     println!("spans `apprafter …`:   {invocations}");
     println!("unterminated fences:   {}", truncated.len());
     println!("spans with a gap:      {}", padded.len());

@@ -32,20 +32,21 @@
 //! * `CLAUDE.md` is untracked, so `git ls-files` cannot see it and no
 //!   gate can be enforced on it. It is ungatable, not exempt.
 //!
-//! # Known limitation
+//! # Front matter
 //!
-//! YAML front matter is not special-cased: the delimiting `---` lines
-//! are not fences, so the block is scanned as prose. Exactly one
-//! in-scope file has front matter today (`docs/reference/environment.md`)
-//! and it holds no backticks, so nothing is affected — but a future
-//! front-matter value containing one, as the generated pages' `description`
-//! keys do, would be read as an inline code span and checked as a claim.
+//! A leading `---` … `---` block is emitted as [`BlockKind::FrontMatter`]
+//! and never as prose, so its values cannot become claims. That is not
+//! tidiness: the page-level span exemption described on
+//! [`Block::tag_line`] lives in front matter and quotes the literal text
+//! of the span it exempts, so a front matter scanned as prose would be
+//! read as the very span it is exempting — and the page would exempt
+//! nothing. The same rule keeps a `description:` holding a backtick (as
+//! the generated pages' do) from being checked as a command.
 //!
-//! That limitation acquires teeth the moment the marker channel grows
-//! the page-level span exemption described on [`Block::tag_line`]: an
-//! exemption list quoting the literal text of a span would be scanned
-//! as that very span, and the page would exempt nothing. Front matter
-//! has to leave the prose scan before exemptions enter it.
+//! Exactly one in-scope file has front matter today
+//! (`docs/reference/environment.md`) and it holds no backticks, so the
+//! counts are unchanged by this — it is the mechanism that has to exist
+//! before exemptions can.
 
 use crate::render::DIR;
 use std::error::Error;
@@ -78,6 +79,14 @@ pub enum BlockKind {
     /// invocations here rather than in fences, so this is the primary
     /// surface, not an afterthought.
     InlineSpan,
+    /// The YAML front matter opening the page, delimiters excluded.
+    ///
+    /// A block of its own rather than skipped material, because it is
+    /// where a page declares things *about* the gate — the span
+    /// exemption list — and a caller that cannot see it cannot honour
+    /// them. It is never prose and never holds spans: see the module
+    /// docs for why that is load-bearing rather than cosmetic.
+    FrontMatter,
 }
 
 /// One checkable chunk of a page.
@@ -205,7 +214,22 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
     // The HTML comment on the previous line, if that line was one.
     let mut comment: Option<String> = None;
 
-    for (index, raw) in src.lines().enumerate() {
+    // Front matter first, and taken off the line stream entirely: it is
+    // neither prose nor a fence, and the `---` delimiters would
+    // otherwise read as thematic breaks around a paragraph of YAML.
+    let mut skip = 0;
+    if let Some((consumed, body)) = front_matter(src) {
+        out.push(Block {
+            kind: BlockKind::FrontMatter,
+            tag_line: None,
+            body,
+            line: 1,
+            unterminated: false,
+        });
+        skip = consumed;
+    }
+
+    for (index, raw) in src.lines().enumerate().skip(skip) {
         let line = index + 1;
         match open.as_mut() {
             Some(fence) => {
@@ -280,6 +304,40 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
     }
     flush(&mut region, &mut out);
     out
+}
+
+/// The page's YAML front matter: how many lines it occupies, including
+/// both delimiters, and its body without them.
+///
+/// Three conditions, each one narrowing a shape that is otherwise a
+/// legitimate thematic break:
+///
+/// * it must open on **line 1**, at column 0 — a `---` anywhere else is
+///   a break or a setext underline and stays prose;
+/// * it must close, on a line that is exactly `---` or `...` (both are
+///   accepted by the YAML-meta extensions MkDocs uses). An unterminated
+///   opener is not front matter, so a page that genuinely starts with a
+///   thematic break is scanned as it was before;
+/// * nothing else: the body is handed back verbatim rather than parsed,
+///   because this module's job is where content lives, not what it
+///   means.
+fn front_matter(src: &str) -> Option<(usize, String)> {
+    let mut lines = src.lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    let mut body = String::new();
+    let mut consumed = 1;
+    for line in lines {
+        consumed += 1;
+        let closer = line.trim_end();
+        if closer == "---" || closer == "..." {
+            return Some((consumed, body));
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    None
 }
 
 /// Turn a completed fence into a [`Block`].
@@ -701,6 +759,33 @@ mod tests {
     fn only_the_fences_own_indentation_is_stripped() {
         assert_eq!(strip_indent("     deeper", 4), " deeper");
         assert_eq!(strip_indent("  shallower", 4), "shallower");
+    }
+
+    #[test]
+    fn front_matter_is_the_leading_delimited_block_and_only_that() {
+        assert_eq!(
+            front_matter("---\ntitle: \"x\"\n---\n\n# Heading\n"),
+            Some((3, "title: \"x\"\n".to_string()))
+        );
+        // `...` also closes a YAML document.
+        assert_eq!(
+            front_matter("---\na: 1\n...\nbody\n"),
+            Some((3, "a: 1\n".to_string()))
+        );
+        // Empty front matter is still front matter.
+        assert_eq!(front_matter("---\n---\n"), Some((2, String::new())));
+    }
+
+    #[test]
+    fn a_break_that_is_not_leading_or_not_closed_is_not_front_matter() {
+        // Mid-document: a thematic break, not a header.
+        assert_eq!(front_matter("# Title\n\n---\n\ntext\n"), None);
+        // Never opened at column 0.
+        assert_eq!(front_matter("  ---\na: 1\n---\n"), None);
+        // Opened and never closed — the page is prose that happens to
+        // start with a break, and must scan exactly as it did before.
+        assert_eq!(front_matter("---\na: 1\nb: 2\n"), None);
+        assert_eq!(front_matter(""), None);
     }
 
     #[test]
