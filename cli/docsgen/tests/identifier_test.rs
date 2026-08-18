@@ -3,11 +3,13 @@
 //! row and a prose bullet — and 3 of the fences are `kubectl apply` YAML
 //! where the apiserver silently PRUNES the unknown key. Only membership
 //! catches those, which is why this check runs page-wide.
+//!
+//! The whole-corpus survey that used to live here as an `#[ignore]`d
+//! reporter is now `docsgen::gate`, which prints the same census
+//! (identifiers resolved, and how many only under an opaque subtree) on
+//! every run.
 
-use docsgen::identifier::{
-    extract_paths, extract_structure, resolve_path, span_path, FieldSet, KIND_ROOTS,
-};
-use docsgen::scan::{in_scope, scan_markdown, BlockKind};
+use docsgen::identifier::{extract_paths, extract_structure, resolve_path, FieldSet, KIND_ROOTS};
 
 fn fields() -> FieldSet {
     FieldSet::from_crds(
@@ -186,89 +188,4 @@ fn a_kind_prefix_does_not_excuse_a_drifted_field() {
     let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();
     let err = resolve_path(&f, "Application.spec.base.expose.public").unwrap_err();
     assert!(err.contains("public"), "{err}");
-}
-
-// ---- corpus survey ----------------------------------------------------
-
-/// Every documented identifier the CRDs do not back, as
-/// `file:line  token  reason`.
-///
-/// `#[ignore]`d: it is a survey, not an assertion. Turning it into one
-/// before the corpus is fixed would commit a red gate, and the list it
-/// prints is the input to the page fixes rather than their substitute.
-#[test]
-#[ignore]
-fn corpus_identifiers() {
-    let root = docsgen::repo_root().unwrap();
-    let fields = FieldSet::from_repo(&root).unwrap();
-
-    let mut findings: Vec<(String, usize, String, String)> = Vec::new();
-    let mut resolved = 0usize;
-    let mut opaque = 0usize;
-    let mut files = 0usize;
-
-    for path in in_scope(&root).unwrap() {
-        files += 1;
-        let shown = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
-        let source = std::fs::read_to_string(&path).unwrap();
-
-        // (source line, token) from every surface on the page.
-        let mut seen: Vec<(usize, String)> = Vec::new();
-        for block in scan_markdown(&source) {
-            match &block.kind {
-                // Front matter is the gate's own exemption channel, not
-                // a claim about the product.
-                BlockKind::FrontMatter => {}
-                BlockKind::InlineSpan => {
-                    if let Some(token) = span_path(&block.body) {
-                        seen.push((block.line, token));
-                    }
-                }
-                BlockKind::Fence { .. } => {
-                    for (offset, line) in block.body.lines().enumerate() {
-                        for token in extract_paths(line) {
-                            seen.push((block.line + 1 + offset, token));
-                        }
-                    }
-                    for (offset, token) in extract_structure(&block.body) {
-                        seen.push((block.line + 1 + offset, token));
-                    }
-                }
-            }
-        }
-        seen.sort();
-        seen.dedup();
-
-        for (line, token) in seen {
-            match resolve_path(&fields, &token) {
-                Err(reason) => findings.push((shown.clone(), line, token, reason)),
-                Ok(verdict) if verdict.unshipped => findings.push((
-                    shown.clone(),
-                    line,
-                    token,
-                    "declared in the schema but no provider ships it".to_string(),
-                )),
-                Ok(verdict) => {
-                    resolved += 1;
-                    opaque += usize::from(verdict.opaque);
-                }
-            }
-        }
-    }
-
-    findings.sort();
-    println!("\n=== unresolved / unshipped identifiers ===");
-    for (file, line, token, reason) in &findings {
-        println!("{file}:{line}  {token}  {reason}");
-    }
-    println!(
-        "\n{} files, {resolved} identifiers resolved ({opaque} of them only \
-         because they sit under an opaque subtree), {} flagged",
-        files,
-        findings.len()
-    );
 }

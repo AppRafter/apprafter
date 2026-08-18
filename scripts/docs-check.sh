@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
-# Local-first documentation gate: the strict mkdocs build (dead
-# links, dead anchors, unlisted pages, missing snippet includes)
-# followed by `docsgen check` — the byte-compare of the generated CLI
-# reference under docs/reference/cli/ against the clap tree.
+# Local-first documentation gate, in three passes:
 #
-# Order matters: the mkdocs build reports on what is committed, so it
-# runs first and its failures (a dead link a contributor wrote) are
-# not hidden behind a regeneration reminder.
+#   1. the strict mkdocs build (dead links, dead anchors, unlisted
+#      pages, missing snippet includes);
+#   2. `docsgen check` — the byte-compare of the GENERATED CLI
+#      reference under docs/reference/cli/ against the clap tree;
+#   3. `docsgen gate` — every claim in the HAND-WRITTEN documentation
+#      resolved against the product: `apprafter` invocations against
+#      the clap tree, schema paths against the shipped CRDs, complete
+#      CUE manifests through one batched `cue vet`.
+#
+# Order matters throughout: the mkdocs build reports on what is
+# committed, so it runs first and its failures (a dead link a
+# contributor wrote) are not hidden behind a regeneration reminder;
+# and `check` precedes `gate` because a stale generated reference is
+# a one-command fix that would otherwise be buried under a work-list.
+#
+# `gate` exits 1 for findings and 2 when the gate itself broke (no
+# `cue`, an unreadable page). `set -e` fails the script on either —
+# the codes are for a reader of the log, not for control flow here.
 #
 # Runs under `nix develop` so mkdocs, the theme and the plugins are
 # the flake.lock-pinned versions: a byte-compare needs ONE toolchain
@@ -27,10 +39,13 @@ if ! command -v nix >/dev/null 2>&1; then
     exit 2
 fi
 cd "$(dirname "$0")/.."
+repo_root="$PWD"
+export repo_root
 exec nix develop --command bash -c '
   set -euo pipefail
   out="$(mktemp -d)"
   trap '"'"'rm -rf "$out"'"'"' EXIT
   mkdocs build --strict --site-dir "$out/site"
   cd cli && cargo run --quiet -p docsgen -- check
+  cd "$repo_root/cli" && cargo run --quiet -p docsgen -- gate
 '

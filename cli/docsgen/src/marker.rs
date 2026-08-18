@@ -310,12 +310,19 @@ pub enum Age {
     Days(i64),
     /// The tag is not in this checkout, with git's reason. Two ordinary
     /// causes: the exemption names the release being prepared, whose
-    /// tag does not exist yet (the spec's own example, `v0.2.45`, is
-    /// one), or the clone was fetched without tags.
+    /// tag does not exist yet, or the clone was fetched without tags —
+    /// which is `actions/checkout`'s default.
     ///
     /// **Not expired** — an absent tag is not evidence of an old
     /// exemption — but reported rather than swallowed, so a caller can
     /// say it could not age this one instead of passing it in silence.
+    ///
+    /// Policy is the caller's, and [`crate::gate`] sets it: an
+    /// exemption that cannot be aged is **void and reported**, because
+    /// one that can never expire is exactly what the window exists to
+    /// prevent. Two consequences, both recorded there: the docs job
+    /// carries `fetch-depth: 0`, and `since=` names an already-released
+    /// tag rather than the release being prepared.
     Unresolved(String),
 }
 

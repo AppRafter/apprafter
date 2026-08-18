@@ -16,6 +16,7 @@
 
 pub mod check;
 pub mod cuedoc;
+pub mod gate;
 pub mod identifier;
 pub mod invocation;
 pub mod marker;

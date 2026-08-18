@@ -4,9 +4,16 @@
 //! under nix develop and 599 ms outside it; batched, 34 snippets take
 //! 33 ms. `-i` is mandatory — without it cue stops at the first failing
 //! package and hides the rest, costing one CI round-trip per bad fence.
+//!
+//! The whole-corpus classification survey that used to live here as an
+//! `#[ignore]`d reporter is now `docsgen::gate`, which batches every
+//! documented manifest in one `cue vet` on every run. What the survey
+//! measured and the gate does not — how many fences carry a package
+//! clause without the schema import, and the reverse — is defended by
+//! `a_complete_document_needs_both_a_package_and_the_schema_import` in
+//! `cuedoc.rs` instead, where it is an assertion rather than a printout.
 
-use docsgen::cuedoc::{is_complete_document, validate_documents, Document};
-use docsgen::scan::{in_scope, scan_markdown, BlockKind};
+use docsgen::cuedoc::{validate_documents, Document};
 
 #[test]
 fn a_valid_application_passes() {
@@ -91,114 +98,4 @@ fn a_fragment_is_refused_rather_than_skipped() {
     let findings = validate_documents(&[doc]).unwrap();
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(findings[0].message.contains("package"), "{findings:?}");
-}
-
-/// Classify every fence in the corpus and vet the complete documents.
-///
-/// `#[ignore]`d for the same reason its sibling surveys are: it reports
-/// what is there rather than asserting what should be, and the list it
-/// prints is the input to the page fixes, not a substitute for them.
-///
-/// The census columns exist to defend the classification rule, not to
-/// pad the output. A fence with a package clause but no schema import
-/// unifies against nothing and would vet green whatever it claimed; a
-/// fence with the import but no package clause is a fragment cue would
-/// skip in silence. Both counts being visible is what makes the rule
-/// arguable instead of asserted.
-#[test]
-#[ignore]
-fn corpus_documents() {
-    /// The import that makes a CUE file a claim about AppRafter.
-    const SCHEMA_IMPORT: &str = "\"apprafter.io/schemas/v1alpha1\"";
-
-    /// The package-clause half of the rule on its own. Appending the
-    /// import satisfies the other half without disturbing the first
-    /// non-comment line, which is the only thing the package check
-    /// reads — so what this measures is exactly "has a package clause".
-    fn has_package_clause(body: &str) -> bool {
-        is_complete_document(&format!("{body}\nimport v1alpha1 {SCHEMA_IMPORT}\n"))
-    }
-
-    let root = docsgen::repo_root().unwrap();
-
-    let mut files = 0usize;
-    let mut fences = 0usize;
-    let mut cue_tagged = 0usize;
-    let mut package_only = Vec::new();
-    let mut import_only = Vec::new();
-    let mut documents = Vec::new();
-
-    for path in in_scope(&root).unwrap() {
-        files += 1;
-        let shown = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
-        let source = std::fs::read_to_string(&path).unwrap();
-        for block in scan_markdown(&source) {
-            let BlockKind::Fence { tag } = &block.kind else {
-                continue;
-            };
-            fences += 1;
-            let tagged = tag.as_deref() == Some("cue");
-            cue_tagged += usize::from(tagged);
-            let origin = format!("{shown}:{}", block.line);
-
-            // The two halves of the rule, counted apart so the corpus
-            // can say whether either alone would have been enough.
-            let has_import = block.body.contains(SCHEMA_IMPORT);
-
-            if is_complete_document(&block.body) {
-                documents.push((origin, tagged, block.body.clone()));
-            } else if has_package_clause(&block.body) {
-                package_only.push(origin);
-            } else if has_import {
-                import_only.push(origin);
-            }
-        }
-    }
-
-    println!("\n=== corpus ===");
-    println!("{files} files, {fences} fences, {cue_tagged} of them tagged `cue`");
-    println!(
-        "{} complete documents ({} of them tagged `cue`)",
-        documents.len(),
-        documents.iter().filter(|(_, tagged, _)| *tagged).count()
-    );
-    println!(
-        "{} fences with a package clause but no schema import: {package_only:?}",
-        package_only.len()
-    );
-    println!(
-        "{} fences with the schema import but no package clause: {import_only:?}",
-        import_only.len()
-    );
-
-    println!("\n=== documents under test ===");
-    for (origin, tagged, _) in &documents {
-        println!("{origin}  tag={}", if *tagged { "cue" } else { "other" });
-    }
-
-    let batch: Vec<Document> = documents
-        .iter()
-        .map(|(origin, _, body)| Document {
-            origin: origin.clone(),
-            body: body.clone(),
-        })
-        .collect();
-    let started = std::time::Instant::now();
-    let findings = validate_documents(&batch).unwrap();
-    let elapsed = started.elapsed();
-
-    println!("\n=== findings ===");
-    for finding in &findings {
-        println!("{finding}");
-    }
-    println!(
-        "\n{} document(s) validated in {:?} ({} finding(s))",
-        batch.len(),
-        elapsed,
-        findings.len()
-    );
 }

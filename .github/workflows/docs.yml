@@ -55,6 +55,15 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `docsgen gate` ages every documentation exemption by
+          # resolving its `since=vX.Y.Z` to that tag's commit date, and
+          # an exemption it cannot age is VOID (cli/docsgen/src/gate.rs).
+          # The default `fetch-depth: 1` fetches no tags at all, so
+          # without this every exemption would go void here while
+          # expiring correctly on a developer's machine — the gate
+          # would be loudest in the one place nobody wrote it for.
+          fetch-depth: 0
       - name: Install Nix (flake toolchain — mkdocs + cargo)
         uses: DeterminateSystems/nix-installer-action@main
       # `docsgen check` links the whole CLI (459 crates) to read its

@@ -2,10 +2,13 @@
 //! Every case here is a real line from the corpus. The `resolves`
 //! cases are correct documentation that a naive resolver rejects; the
 //! `rejects` cases are drift that exists in the tree today.
+//!
+//! The whole-corpus sweep that used to live here as an `#[ignore]`d
+//! reporter is now `docsgen::gate` — two code paths over one corpus can
+//! disagree, and the one nobody runs is the one that drifts.
 
-use docsgen::invocation::{extract, logical_lines, resolve, Tree};
+use docsgen::invocation::{extract, resolve, Tree};
 use docsgen::model;
-use docsgen::scan::{in_scope, scan_markdown, BlockKind};
 use std::collections::{HashMap, HashSet};
 
 fn commands_json() -> std::path::PathBuf {
@@ -218,61 +221,5 @@ fn every_branch_node_is_a_pure_branch() {
                 node.path.join(" ")
             );
         }
-    }
-}
-
-// ---- the whole corpus, as a report ------------------------------------
-
-/// Resolve every invocation in the corpus and print the failures.
-///
-/// Ignored by default: this is the *input* to fixing the pages, not a
-/// gate — the gate is assembled in a later package, once the pages it
-/// would fail have been dealt with.
-#[test]
-#[ignore = "reports over the whole corpus; run with --ignored --nocapture"]
-fn corpus_resolution() {
-    let root = docsgen::repo_root().unwrap();
-    let t = tree();
-    let mut files = 0usize;
-    let mut total = 0usize;
-    let mut failures = Vec::new();
-
-    for path in in_scope(&root).unwrap() {
-        files += 1;
-        let shown = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
-        let src = std::fs::read_to_string(&path).unwrap();
-        for block in scan_markdown(&src) {
-            // Front matter is not prose and holds no claims.
-            let first = match block.kind {
-                BlockKind::FrontMatter => continue,
-                // A fence's body starts on the line after its opener.
-                BlockKind::Fence { .. } => block.line + 1,
-                BlockKind::InlineSpan => block.line,
-            };
-            for (offset, text) in logical_lines(&block.body) {
-                for invocation in extract(&text) {
-                    total += 1;
-                    if let Err(e) = resolve(&t, &invocation) {
-                        failures.push(format!(
-                            "{shown}:{}  {}  — {e}",
-                            first + offset,
-                            invocation.raw
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    println!(
-        "\ncorpus: {files} files, {total} invocations, {} failing",
-        failures.len()
-    );
-    for line in &failures {
-        println!("{line}");
     }
 }
