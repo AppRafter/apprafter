@@ -4,7 +4,9 @@
 //! where the apiserver silently PRUNES the unknown key. Only membership
 //! catches those, which is why this check runs page-wide.
 
-use docsgen::identifier::{extract_paths, extract_structure, resolve_path, span_path, FieldSet};
+use docsgen::identifier::{
+    extract_paths, extract_structure, resolve_path, span_path, FieldSet, KIND_ROOTS,
+};
 use docsgen::scan::{in_scope, scan_markdown, BlockKind};
 
 fn fields() -> FieldSet {
@@ -123,6 +125,67 @@ fn a_cue_only_schema_still_backs_the_docs_that_name_it() {
     // Harvesting it must not turn the subtree into a free pass.
     assert!(resolve_path(&f, "spec.argocd.bootstrapRepoo").is_err());
     assert!(resolve_path(&f, "spec.nodez").is_err());
+}
+
+// ---- kind-prefixed paths ----------------------------------------------
+
+#[test]
+fn the_kind_table_matches_the_shipped_schemas() {
+    // A flat table is only safe while something forces a new kind into
+    // it — otherwise adding a CRD silently stops its documented paths
+    // from being extracted at all.
+    let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();
+    assert_eq!(f.kinds(), KIND_ROOTS, "KIND_ROOTS is out of date");
+}
+
+#[test]
+fn a_kind_prefix_is_extracted_but_a_filename_sharing_the_stem_is_not() {
+    assert_eq!(
+        extract_paths("`PlatformStack.spec.pin`"),
+        vec!["PlatformStack.spec.pin"]
+    );
+    // Both corpus filenames whose stem is also a kind.
+    assert!(extract_paths("`Application.cue`").is_empty());
+    assert!(extract_paths("`Infrastructure.cue`").is_empty());
+    // Not a kind, and `server_type` is not a field-name shape either.
+    assert!(extract_paths("`HetznerCloudState.server_type`").is_empty());
+}
+
+#[test]
+fn every_kind_prefixed_corpus_token_resolves() {
+    // All six, verbatim from the tree.
+    let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();
+    for token in [
+        "PlatformStack.spec.pin",
+        "PlatformStack.spec.backup",
+        "PlatformStack.spec.backup.bucket",
+        "PlatformStack.spec.network.egress.profile",
+        "Application.spec.base.image",
+    ] {
+        resolve_path(&f, token).unwrap_or_else(|e| panic!("{token}: {e}"));
+    }
+}
+
+#[test]
+fn a_kind_prefix_closes_the_unions_silent_pass() {
+    // `spec.nodes` is real — on `Infrastructure`. Bare, the union
+    // resolves it for any page; named against `PlatformStack`, which
+    // has no `nodes`, it is correctly rejected. That difference is the
+    // whole point of the prefix.
+    let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();
+    resolve_path(&f, "spec.nodes").expect("bare: resolves through the union");
+    let err = resolve_path(&f, "PlatformStack.spec.nodes").unwrap_err();
+    assert!(err.contains("PlatformStack"), "{err}");
+    // Same for `expose`, which is Application's and not PlatformStack's.
+    assert!(resolve_path(&f, "PlatformStack.spec.base.expose.port").is_err());
+    resolve_path(&f, "Application.spec.base.expose.port").expect("Application's");
+}
+
+#[test]
+fn a_kind_prefix_does_not_excuse_a_drifted_field() {
+    let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();
+    let err = resolve_path(&f, "Application.spec.base.expose.public").unwrap_err();
+    assert!(err.contains("public"), "{err}");
 }
 
 // ---- corpus survey ----------------------------------------------------

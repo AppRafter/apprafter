@@ -16,11 +16,11 @@
 //! # The two surfaces, and why they are extracted differently
 //!
 //! * **Text** — [`extract_paths`] takes a *backticked* token and only
-//!   one whose first component is in [`TEXT_ROOTS`]. A backticked
-//!   `expose.public` in prose or a table cell is a deliberate
-//!   reference to our schema, so a strict, closed-root grammar is
-//!   enough to separate it from `apprafter.io/hostname`, `cue.mod`,
-//!   `bun.lock` and `v0.2.44` — every one of which a broad
+//!   one whose first component is in [`TEXT_ROOTS`] or [`KIND_ROOTS`].
+//!   A backticked `expose.public` in prose or a table cell is a
+//!   deliberate reference to our schema, so a strict, closed-root
+//!   grammar is enough to separate it from `apprafter.io/hostname`,
+//!   `cue.mod`, `bun.lock` and `v0.2.44` — every one of which a broad
 //!   dotted-token regex would drag in.
 //! * **Structure** — [`extract_structure`] reads a fence body as
 //!   nested `key: value` and flattens it. The six `expose.public`
@@ -50,30 +50,60 @@
 //! [`span_path`] reads the first. Prose outside a span holds nothing
 //! this check could resolve.
 //!
-//! # Known holes, named rather than hidden
+//! # What "resolved" does and does not mean
 //!
-//! * **Opaque subtrees.** `x-kubernetes-preserve-unknown-fields` and
-//!   bare `type: object` nodes describe nothing below themselves, so
-//!   membership cannot judge there and [`resolve_path`] passes with
-//!   [`Verdict::opaque`] set. That covers `metadata.*`, `env.*`,
-//!   `expose.hostname.*` and — the big one — everything under
-//!   `needs.<type>`, which is where `size`, `selector`, `mountPath`
-//!   and `ref` live. Measured over the corpus, **95 of 189** resolved
-//!   identifiers resolve only this way. The flag exists so that number
-//!   can be counted instead of being mistaken for coverage.
-//! * **`status` is not a root, deliberately.** It is real and the docs
-//!   use it twelve times (`status.phase`, `status.availableVersion`,
-//!   `status.dbnum`, …), but the `status` node of all eight CRDs is
-//!   preserve-unknown, so admitting the root would resolve every
-//!   `status.*` unconditionally — coverage on paper and none in fact.
-//! * **One flat union, so a foreign CRD can be judged by ours.** The
-//!   corpus writes Argo CD's `spec.source.path`; `spec.source` also
-//!   exists on our `SourceCredential`, which has no `path`, so the
-//!   check reports it. Nothing in a prose span says whose `spec` it
-//!   is. The corpus also writes the *unambiguous* form —
-//!   `PlatformStack.spec.pin`, `Application.spec.base.image` — six
-//!   times; teaching the grammar that kind prefix would both close
-//!   this and add the six, and is the obvious next move.
+//! **A resolved identifier is not a verified one.** Read the counts
+//! with these three limits in view; none of them is a defect to be
+//! fixed away, and all three are why the survey reports an opaque
+//! ratio next to its total.
+//!
+//! * **Opaque subtrees — the big one.**
+//!   `x-kubernetes-preserve-unknown-fields` and bare `type: object`
+//!   nodes describe nothing below themselves, so membership cannot
+//!   judge there and [`resolve_path`] passes with [`Verdict::opaque`]
+//!   set. That covers `metadata.*`, `env.*`, `expose.hostname.*` and
+//!   everything under `needs.<type>`, which is where `size`,
+//!   `selector`, `mountPath` and `ref` live. Measured over the
+//!   corpus, **95 of 198** resolved identifiers resolve *only* this
+//!   way — a shade under half. Nobody should read "198 resolved" as
+//!   198 checked, which is exactly what the flag exists to prevent.
+//! * **`status` is deliberately not a root.** It is real and the docs
+//!   use it twelve times — `status.phase`, `status.availableVersion`,
+//!   `status.dbnum`, `status.connectionSecretRef`, `status.refCount`,
+//!   `status.versionHistory`, … — and every one of them is
+//!   **unchecked** by this module. The reason is the bullet above: the
+//!   `status` node of all eight CRDs is preserve-unknown, so admitting
+//!   the root would resolve every `status.*` unconditionally and add
+//!   twelve to the resolved count while checking nothing. Coverage on
+//!   paper is worse than no coverage, because it is read as assurance.
+//!   If `status` ever becomes structural in the CRDs, admit the root
+//!   then.
+//! * **The union can judge a foreign CRD by ours.** Without a kind
+//!   prefix there is nothing in a prose span to say whose `spec` it
+//!   is, so a bare path is resolved against the union of every
+//!   AppRafter kind. Two consequences: a path wrong for the kind a
+//!   page is about can resolve against some other kind (a silent
+//!   pass), and a *correct* path belonging to a third-party CRD can be
+//!   reported. The corpus has one of the latter —
+//!   `docs/dev-guide/application-cue.md:28` names Argo CD's
+//!   `spec.source.path`, and our `SourceCredential` has a
+//!   `spec.source` with no `path`.
+//!
+//!   **Its disposition is an exemption carrying the typed reason
+//!   `external-tool`** ([`crate::marker::Reason::ExternalTool`]),
+//!   which is what that reason exists for: a foreign tool's schema,
+//!   correctly documented, that our field set cannot and should not
+//!   model. It is not drift and the page must not be edited to
+//!   "fix" it. Note a kind prefix does **not** help here — the doc is
+//!   naming Argo CD's `Application`, not ours.
+//!
+//! # Prefer the kind-prefixed notation
+//!
+//! `PlatformStack.spec.pin` is resolved against `PlatformStack` alone,
+//! so it has none of the union's silent-pass class; the corpus already
+//! writes that form nine times across five distinct paths. Bare paths
+//! stay supported because most of the corpus uses them, but a page
+//! naming the kind gets a strictly stronger check for free.
 //!
 //! # Where the field set comes from
 //!
@@ -92,7 +122,7 @@
 //! reason [`crate::shipped`] scans rather than evaluates.
 
 use crate::shipped;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::Path;
 
@@ -119,6 +149,31 @@ pub const TEXT_ROOTS: [&str; 9] = [
 /// a key means the fence is ours. See the module docs.
 pub const STRUCTURE_ROOTS: [&str; 5] = ["base", "environments", "expose", "needs", "imagePolicy"];
 
+/// Kinds a dotted path may open with instead of a field name, so that
+/// `PlatformStack.spec.pin` resolves against `PlatformStack` alone.
+///
+/// This is the notation with no silent-pass hole, and the corpus
+/// already uses it six times. A flat table rather than a lookup into
+/// the live [`FieldSet`], for the same reason [`crate::shipped`] keeps
+/// one: [`extract_paths`] is a pure lexer with no schema in the room,
+/// which is what lets its grammar be tested without a repository.
+/// `kind_roots_match_the_shipped_schemas` is what keeps it honest.
+pub const KIND_ROOTS: [&str; 13] = [
+    "AccessGrant",
+    "Application",
+    "ExternalSurface",
+    "Infrastructure",
+    "InfrastructureProviderPlugin",
+    "MigrationPlan",
+    "PlatformStack",
+    "ResourceClaim",
+    "RetainedClaim",
+    "ServiceProvider",
+    "ServiceProviderPlugin",
+    "SharedVolume",
+    "SourceCredential",
+];
+
 /// What resolving a path established beyond "it exists".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verdict {
@@ -136,24 +191,37 @@ pub struct Verdict {
     pub opaque: bool,
 }
 
-/// Every dotted field path the shipped CRDs declare.
+/// One kind's declared field paths.
 ///
 /// `*` stands for one component matched by an `additionalProperties`
 /// map — `spec.environments.*.expose.port` is how
 /// `environments.prod.expose.port` resolves.
-///
-/// A union across all eight CRDs, deliberately flat: a documented
-/// `spec.values.tier` is checked against "does any AppRafter CRD
-/// declare this", not "does the CRD this page is about declare this".
-/// Pages name a kind inconsistently (or not at all), so keying by kind
-/// would mean guessing, and a wrong guess is a false failure — the one
-/// outcome that gets a gate switched off.
-pub struct FieldSet {
+#[derive(Default)]
+struct Schema {
     /// Paths with a schema node behind them.
     paths: BTreeSet<String>,
     /// Paths below which nothing can be validated. Anything under one
     /// of these resolves, flagged [`Verdict::opaque`].
     opaque: BTreeSet<String>,
+}
+
+/// Every dotted field path the shipped schemas declare, held twice.
+///
+/// * **Per kind**, which is how a documented `PlatformStack.spec.pin`
+///   is resolved: against `PlatformStack` and nothing else.
+/// * **As a flat union**, which is how a bare `spec.pin` is resolved,
+///   because nothing in a prose span says whose `spec` it is.
+///
+/// The union is the imprecise half and is kept only because most of
+/// the corpus writes the bare form. Its cost is a silent pass: a path
+/// that is wrong for the kind the page is about can still resolve
+/// against some *other* kind that happens to declare it. The
+/// kind-prefixed notation has no such hole, which is why the grammar
+/// admits it ([`KIND_ROOTS`]) and why it is the form to prefer when
+/// writing docs.
+pub struct FieldSet {
+    union: Schema,
+    kinds: BTreeMap<String, Schema>,
 }
 
 impl FieldSet {
@@ -186,23 +254,34 @@ impl FieldSet {
         }
 
         let mut set = FieldSet {
-            paths: BTreeSet::new(),
-            opaque: BTreeSet::new(),
+            union: Schema::default(),
+            kinds: BTreeMap::new(),
         };
         for file in &files {
             let raw = std::fs::read_to_string(file)
                 .map_err(|e| format!("reading {}: {e}", file.display()))?;
             let doc: serde_yaml::Value = serde_yaml::from_str(&without_helm_actions(&raw))
                 .map_err(|e| format!("parsing {}: {e}", file.display()))?;
-            let versions = doc
+            let spec = doc
                 .get("spec")
-                .and_then(|spec| spec.get("versions"))
+                .ok_or_else(|| format!("{}: no spec", file.display()))?;
+            // The kind is what a doc page writes as a prefix, so read it
+            // from the CRD rather than inferring it from the filename.
+            let kind = spec
+                .get("names")
+                .and_then(|names| names.get("kind"))
+                .and_then(|kind| kind.as_str())
+                .ok_or_else(|| format!("{}: no spec.names.kind", file.display()))?
+                .to_string();
+            let versions = spec
+                .get("versions")
                 .and_then(|versions| versions.as_sequence())
                 .ok_or_else(|| format!("{}: no spec.versions", file.display()))?;
+            let mut own = Schema::default();
             let mut found = false;
             for version in versions {
                 if let Some(schema) = version.get("schema").and_then(|s| s.get("openAPIV3Schema")) {
-                    walk(schema, "", &mut set);
+                    walk(schema, "", &mut own);
                     found = true;
                 }
             }
@@ -213,8 +292,18 @@ impl FieldSet {
                 )
                 .into());
             }
+            set.absorb(&kind, own);
         }
         Ok(set)
+    }
+
+    /// Fold one kind's schema into both halves of the set.
+    fn absorb(&mut self, kind: &str, own: Schema) {
+        self.union.paths.extend(own.paths.iter().cloned());
+        self.union.opaque.extend(own.opaque.iter().cloned());
+        let slot = self.kinds.entry(kind.to_string()).or_default();
+        slot.paths.extend(own.paths);
+        slot.opaque.extend(own.opaque);
     }
 
     /// The whole shipped `v1alpha1` surface: the CRDs, plus the `spec`
@@ -253,25 +342,38 @@ impl FieldSet {
             }
             let source = std::fs::read_to_string(&path)
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
+            let Some(kind) = declared_kind(&source) else {
+                // `types.cue` holds `#TypeMeta` / `#ObjectMeta` and
+                // declares no kind of its own. Nothing to attribute.
+                continue;
+            };
+            let mut own = Schema::default();
             for (_, found) in flatten(&source) {
                 if found == "spec" || found.starts_with("spec.") {
-                    set.paths.insert(found);
+                    own.paths.insert(found);
                 }
             }
+            set.absorb(&kind, own);
         }
         Ok(set)
+    }
+
+    /// Every kind this set can resolve a prefix against, sorted.
+    /// [`KIND_ROOTS`] is pinned against it by test.
+    pub fn kinds(&self) -> Vec<&str> {
+        self.kinds.keys().map(String::as_str).collect()
     }
 
     /// How many concrete paths were read. Only a sanity handle for
     /// tests — a set that silently shrank to a handful would otherwise
     /// look like a working gate.
     pub fn len(&self) -> usize {
-        self.paths.len()
+        self.union.paths.len()
     }
 
     /// Whether the set is empty, which is always a bug here.
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.union.paths.is_empty()
     }
 }
 
@@ -290,7 +392,7 @@ fn without_helm_actions(raw: &str) -> String {
 }
 
 /// Record one schema node and recurse into everything it declares.
-fn walk(node: &serde_yaml::Value, prefix: &str, set: &mut FieldSet) {
+fn walk(node: &serde_yaml::Value, prefix: &str, set: &mut Schema) {
     let Some(map) = node.as_mapping() else {
         return;
     };
@@ -343,6 +445,27 @@ fn walk(node: &serde_yaml::Value, prefix: &str, set: &mut FieldSet) {
     if preserves || (!described && !scalar) {
         set.opaque.insert(prefix.to_string());
     }
+}
+
+/// The `kind: "X"` a CUE schema declares, by scan.
+///
+/// The kind is a literal in every one of these files, so reading it is
+/// exact — no inference from the filename, which would get
+/// `infrastructureproviderplugin.cue` wrong.
+fn declared_kind(source: &str) -> Option<String> {
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("kind:") else {
+            continue;
+        };
+        let value = rest.trim();
+        if let Some(name) = value.strip_prefix('"').and_then(|v| v.split('"').next()) {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn join(prefix: &str, name: &str) -> String {
@@ -400,9 +523,14 @@ fn is_schema_path(token: &str) -> bool {
     let Some((root, rest)) = parts.split_first() else {
         return false;
     };
-    if !TEXT_ROOTS.contains(root) || rest.is_empty() {
+    if !TEXT_ROOTS.contains(root) && !KIND_ROOTS.contains(root) {
         return false;
     }
+    if rest.is_empty() {
+        return false;
+    }
+    // `Application.cue` and `Infrastructure.cue` are files, and both
+    // stems are kinds — the same collision `spec.md` has, one level up.
     if rest.len() == 1 && FILE_SUFFIXES.contains(&rest[0]) {
         return false;
     }
@@ -743,30 +871,48 @@ fn emit(stack: &[Frame], keys: &[String], index: usize, out: &mut Vec<Located>) 
 
 // ---- resolution -------------------------------------------------------
 
-/// Resolve a documented path against the CRDs.
+/// Resolve a documented path against the shipped schemas.
 ///
 /// The path may be written from any depth: docs say `expose.port` and
 /// `spec.base.expose.port` for the same field, so a query matches as a
-/// **component-aligned suffix** of a CRD path. Alignment is what keeps
-/// that from becoming "contains": a Deployment's `spec.replicas` does
-/// not resolve, because no CRD path ends with those two components in
-/// that order even though `spec` and `replicas` both occur.
+/// **component-aligned suffix** of a schema path. Alignment is what
+/// keeps that from becoming "contains": a Deployment's `spec.replicas`
+/// does not resolve, because no schema path ends with those two
+/// components in that order even though `spec` and `replicas` both
+/// occur.
+///
+/// A leading **kind** narrows the search to that kind alone —
+/// `PlatformStack.spec.pin` is resolved against `PlatformStack` and
+/// nothing else. That is what removes the union's silent-pass class,
+/// where a path wrong for the kind a page is about resolves anyway
+/// because some other kind declares it. Without a kind prefix the
+/// union is all there is: a prose span does not say whose `spec` it is.
 pub fn resolve_path(fields: &FieldSet, path: &str) -> Result<Verdict, String> {
-    let query: Vec<&str> = path.split('.').collect();
+    let mut query: Vec<&str> = path.split('.').collect();
+    let mut schema = &fields.union;
+    let mut kind = None;
+    if let Some(named) = fields.kinds.get(query[0]) {
+        // A kind alone is not a field path; `Application` on its own
+        // never reaches here because the grammar demands a `.`.
+        if query.len() > 1 {
+            kind = Some(query.remove(0));
+            schema = named;
+        }
+    }
     let unshipped = declared_but_unshipped(&query);
 
-    if let Some(matched) = fields.paths.iter().find(|c| suffix_of(c, &query)) {
+    if let Some(matched) = schema.paths.iter().find(|c| suffix_of(c, &query)) {
         return Ok(Verdict {
             unshipped,
-            opaque: fields.opaque.contains(matched.as_str())
-                || fields.opaque.iter().any(|o| suffix_of(o, &query)),
+            opaque: schema.opaque.contains(matched.as_str())
+                || schema.opaque.iter().any(|o| suffix_of(o, &query)),
         });
     }
 
     // Nothing describes what is below an opaque node, so anything under
     // one has to pass — flagged, not hidden.
     for depth in (1..query.len()).rev() {
-        if fields.opaque.iter().any(|o| suffix_of(o, &query[..depth])) {
+        if schema.opaque.iter().any(|o| suffix_of(o, &query[..depth])) {
             return Ok(Verdict {
                 unshipped,
                 opaque: true,
@@ -774,7 +920,7 @@ pub fn resolve_path(fields: &FieldSet, path: &str) -> Result<Verdict, String> {
         }
     }
 
-    Err(explain(fields, &query))
+    Err(explain(schema, kind, &query))
 }
 
 /// Whether `candidate` (a stored CRD path, `*` matching any single
@@ -808,15 +954,24 @@ fn declared_but_unshipped(query: &[&str]) -> bool {
         .any(|pair| shipped::status(pair[1]) == Some(shipped::Status::Declared))
 }
 
-/// Name the component that failed and what the CRD offers instead.
-fn explain(fields: &FieldSet, query: &[&str]) -> String {
-    let written = query.join(".");
+/// Name the component that failed and what the schema offers instead.
+fn explain(schema: &Schema, kind: Option<&str>, query: &[&str]) -> String {
+    let written = match kind {
+        Some(kind) => format!("{kind}.{}", query.join(".")),
+        None => query.join("."),
+    };
+    // Which schema said so — without it, a kind-scoped rejection reads
+    // as if no kind at all declared the field.
+    let scope = match kind {
+        Some(kind) => format!(" on `{kind}`"),
+        None => String::new(),
+    };
     for depth in (1..query.len()).rev() {
         let prefix = &query[..depth];
-        if !fields.paths.iter().any(|c| suffix_of(c, prefix)) {
+        if !schema.paths.iter().any(|c| suffix_of(c, prefix)) {
             continue;
         }
-        let mut known: Vec<&str> = fields
+        let mut known: Vec<&str> = schema
             .paths
             .iter()
             .filter_map(|candidate| {
@@ -833,12 +988,12 @@ fn explain(fields: &FieldSet, query: &[&str]) -> String {
             format!("`{}` has {}", prefix.join("."), known.join(", "))
         };
         return format!(
-            "`{written}`: no such field — `{}` is not under `{}` ({offered})",
+            "`{written}`: no such field — `{}` is not under `{}`{scope} ({offered})",
             query[depth],
             prefix.join(".")
         );
     }
-    format!("`{written}`: no CRD declares a field path ending in it")
+    format!("`{written}`: no schema{scope} declares a field path ending in it")
 }
 
 /// The prefix extended by `parts`' last component — used to ask "is
