@@ -84,3 +84,4 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0054 | [Vertical autoscaling of application requests via VPA (InPlace)](./0054-vpa-vertical-autoscaling.md) | Accepted |
 | 0055 | [node swap policy — provisioned host swap + pod NoSwap, Tier-1](./0055-node-swap-policy.md) | Accepted |
 | 0056 | [machine-picker — live (region × SKU) matrix and no implicit server-type default](./0056-machine-picker.md) | Accepted |
+| 0057 | [documentation system — MkDocs-Material retained, generated CLI reference, content-detected drift gate](./0057-documentation-system.md) | Accepted |
