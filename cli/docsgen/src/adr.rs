@@ -24,8 +24,9 @@
 //! * 4 carrying **no `ADR NNNN` text at all**, where the number is
 //!   readable only inside an ADR's filename: `README.md:121` writes
 //!   `and ADRs [0001](./docs/adr/0001-license-fsl-1-1-mit.md) … and
-//!   [0032](…)`, and `docs/license.md:91` and `:93` name
-//!   `` `docs/adr/0001-license-fsl-1-1-mit.md` `` in a code span.
+//!   [0032](…)`, and `docs/license.md` names one ADR per line in a code
+//!   span — `:91` `` `docs/adr/0001-license-fsl-1-1-mit.md` `` and
+//!   `:93` `` `docs/adr/0032-license-fsl-1-1-apache-2-0.md` ``.
 //!
 //! The first three are the `ADR NNNN` grammar — **62 of the 66**. An
 //! earlier revision of this module measured those 62 and presented the
@@ -77,9 +78,14 @@
 //! and `docs/adr/0029-cue-cmp.md:9` writes "ADRs 0025–0028 address the
 //! platform-stack side"; every one of those cites. Excluding the plural
 //! also made a trailing `s` a one-keystroke suppression, the same hole
-//! the wrap rule is here to close. It is worth 8 references over the
-//! tracked `*.md` and none in scope: of the corpus's 4 `ADRs`, one is
-//! a bare plural noun, two link the directory index, and the fourth is
+//! the wrap rule is here to close. Over the tracked `*.md` the plural
+//! is worth **8 raw occurrences** (the space-spelled scan goes 952 →
+//! 960) but **7 references** — the unit [`references`] returns, and the
+//! unit the 66/62/57/4 figures above are in — because `spec.md:7`
+//! writes both `ADRs 0034–0038` and `ADR 0034`, and per-line
+//! deduplication collapses those two spellings of one citation into
+//! one. In scope it is worth none: of the corpus's 4 `ADRs`, one is a
+//! bare plural noun, two link the directory index, and the fourth is
 //! `README.md:121`, whose numbers are links the filename rule reads.
 //!
 //! Only the **first** number after `ADRs` is read. Continuing the list
@@ -137,14 +143,27 @@
 //! sentence boundaries silently whenever the number happened to
 //! resolve.
 //!
+//! Either bracket satisfies the condition, so the accept set is larger
+//! than either alone and one year-shaped false positive survives it: a
+//! line ending on the bare word `ADR` followed by a line opening
+//! `2026]` is read as a citation of 2026. It is kept as an `||` even
+//! so, because the corpus's one wrap is bracketed on the *left* and the
+//! closing bracket is what catches the reverse-direction wrap; the
+//! residual needs a `]` immediately after a four-digit run opening a
+//! line, which the corpus writes nowhere.
+//!
 //! What the narrowing gives up is the unbracketed prose wrap:
-//! `follows ADR` / `0011.` is no longer joined. That is the right side
-//! of the trade twice over. The shape the corpus actually writes is the
-//! bracketed one; and a false positive is a page the gate is *wrong*
-//! about — unfixable except by rewording a correct sentence — while a
-//! missed citation is one it is merely quiet about. A citation worth
-//! hiding is one a reader can still follow, and following it means a
-//! link.
+//! `follows ADR` / `0011.` is no longer joined. Three measurements
+//! decide that trade. The corpus's only wrapped citation is the
+//! bracketed one above. The unanchored join manufactured a hard
+//! finding on correct prose (`ADR` / `2026-05-06`), and a false
+//! positive is a page the gate is *wrong* about — unfixable except by
+//! rewording a correct sentence — while a missed citation is one it is
+//! merely quiet about. And what is given up is real rather than
+//! hypothetical: **26 of the 66** in-scope citations are bare
+//! `ADR NNNN` prose with no path anywhere on the line, so a
+//! deliberately wrapped bare-prose citation goes unseen. That cost is
+//! accepted, not argued away.
 //!
 //! # A leading token, not a substring
 //!
@@ -192,6 +211,14 @@
 //! list under `## Status` still reads `Unknown`. Skipping numeric
 //! tokens would make `2026-05-06 Accepted` read as a verdict, which is
 //! a worse answer than the one this leaves.
+//!
+//! The class holds `#` like every other non-alphanumeric character,
+//! which couples this rule to where the Status section *ends*: a
+//! heading the section wrongly swallowed becomes the verdict, `###`
+//! trimming away to leave `Accepted`. That is answered where it
+//! belongs, in [`ends_status_section`], and not by carving `#` out of
+//! the class here — the mis-scoping is a defect on its own terms, and
+//! an exception list is what this class exists not to be.
 //!
 //! # What is a finding, and what is not
 //!
@@ -258,6 +285,23 @@
 //! *citation* named as the defect rather than the missing `git add`.
 //! That is the asymmetry [`crate::gate::Gate`]'s tag handling already
 //! exists to close, and it costs one `git` call to close here.
+//!
+//! Only the **listing** comes from the index. [`statuses`] then reads
+//! each listed file's bytes from the **worktree**, so an ADR staged as
+//! `Accepted` and edited to `Superseded` without staging registers as
+//! `Superseded`. That is the same split the gate applies to the pages
+//! it checks — `git ls-files` for what is in scope, the worktree for
+//! what each page says — so a citation and the decision it names are
+//! read at the same moment in the same tree.
+//!
+//! `git ls-files -- docs/adr` is **recursive**, which `read_dir` was
+//! not. An ADR filed at `docs/adr/<subdir>/NNNN-slug.md` therefore
+//! enters the register keyed by its bare filename, and collides with a
+//! top-level `NNNN-` file into the hard `Err` below. All 59 tracked
+//! entries sit directly in `docs/adr/` today, so this is scope the
+//! register gained rather than a case it mishandles — but a nested ADR
+//! is now visible to it, and a duplicate number across the two levels
+//! stops the gate rather than resolving to one of them.
 //!
 //! Two files claiming one number is an **`Err`**, not last-write-wins.
 //! `read_dir` hands entries back in an unspecified order, so
@@ -413,13 +457,20 @@ pub fn references(src: &str) -> Vec<AdrRef> {
         }
         // The wrapped shape, joined rather than missed: see the module
         // docs. Only a line whose LAST token is a bare `ADR` can start
-        // one, so this never re-reads a reference `scan_line` took.
+        // one, so this never re-reads the same TEXT `scan_line` took —
+        // but it can read the same NUMBER, and it goes through the same
+        // per-line `seen` gate for it. `See ADR 0030 and also [ADR` /
+        // `0030](…)` is one citation of one decision on one line, and
+        // pushing it twice is two identical findings a reader cannot
+        // tell apart or fix separately.
         wrapped = wrapped_number(text, lines.get(index + 1).copied());
         if let Some(number) = &wrapped {
-            out.push(AdrRef {
-                line,
-                number: number.clone(),
-            });
+            if !seen.contains(number) {
+                out.push(AdrRef {
+                    line,
+                    number: number.clone(),
+                });
+            }
         }
     }
     out
@@ -482,6 +533,18 @@ fn scan_line(text: &str, out: &mut Vec<String>) {
 /// Not restricted to a link target or a code span: distinguishing them
 /// would mean an inline-markdown parser, and `adr/NNNN-` is a citation
 /// wherever it is written, because that is a path to the decision.
+///
+/// Not restricted to *this repository's* `docs/adr/` either, and that
+/// is the cost of the same simplicity: `https://example.com/adr/1234-foo`
+/// links **another** project's decision record, and this reads it as a
+/// citation of our 1234 — "names no decision in the register", on a
+/// page that is correct. Anchoring on `docs/adr/` instead would drop
+/// the corpus's own relative links (`../adr/0046-….md`), which are the
+/// shape this scan exists for. So the answer is the exemption channel
+/// rather than the grammar: an external ADR link is exactly what a
+/// [`crate::gate::ADR_IGNORE`] entry is for, dated and expiring like
+/// every other exemption in this crate. No page in scope links one
+/// today.
 fn scan_filenames(text: &str, out: &mut Vec<String>) {
     let bytes = text.as_bytes();
     let mut at = 0;
@@ -664,15 +727,44 @@ fn status_body(text: &str) -> String {
     }
     let mut body = String::new();
     for line in lines {
-        // Any heading ends the section — `###` as readily as `##`, and
-        // the next `##` most of all.
-        if line.starts_with('#') {
+        if ends_status_section(line) {
             break;
         }
         body.push_str(line);
         body.push('\n');
     }
     body
+}
+
+/// Whether a line closes the `## Status` section.
+///
+/// Any heading ends it — `###` as readily as `##`, and the next `##`
+/// most of all — but "a heading" is not `starts_with('#')`. CommonMark
+/// allows an ATX heading up to three spaces of indentation, and a
+/// heading inside a blockquote is still a heading, so
+/// `   ### Accepted approach` and `> ## Accepted approach` were read as
+/// *body*. Under a `## Status` that is empty that swallowed heading
+/// became the ADR's verdict, because [`verdict`] trims `#` as
+/// decoration like every other Markdown character: an ADR with no
+/// status read `Accepted`, and one followed by
+/// `   #### Superseded discussion` read `Superseded` — a hard finding
+/// on every page citing it. Widening the *section* rule is the fix
+/// rather than carving `#` out of [`verdict`]'s trim class, because the
+/// mis-scoping is real on its own (the body genuinely ends there) and
+/// because listing an exception to that class is the thing the class
+/// exists not to do — a sixth spelling of `Accepted` must stay free.
+///
+/// Four or more leading spaces is an indented code block rather than a
+/// heading, and ends the section here anyway. The cost is a body
+/// truncated early, whose verdict is [`Verdict::Unknown`] — a finding,
+/// and so loud — while the cost of the other answer is a wrong verdict
+/// read in silence.
+fn ends_status_section(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    while let Some(stripped) = rest.strip_prefix('>') {
+        rest = stripped.trim_start();
+    }
+    rest.starts_with('#')
 }
 
 /// `^##\s+Status\s*$`, spelled out: exactly two hashes, whitespace, and
@@ -699,22 +791,49 @@ mod tests {
     fn a_status_section_ends_at_the_next_heading() {
         // The body must not swallow the sections below it. `verdict`
         // reads the first token, so this matters most where the Status
-        // section is EMPTY: with `#` now trimmed as decoration like any
-        // other, a swallowed `### Accepted approach` heading — or the
-        // prose under it — would be read as the verdict of an ADR whose
-        // status is in fact missing.
+        // section is EMPTY: with `#` trimmed as decoration like any
+        // other, a swallowed heading — or the prose under it — is read
+        // as the verdict of an ADR whose status is in fact missing.
         let text = "# ADR 0011\n\n## Status\n\n`Superseded by ADR 0016`.\n\n\
                     ## Context\n\nAccepted 2026-05-06 as the shim.\n";
         assert_eq!(status_body(text).trim(), "`Superseded by ADR 0016`.");
         assert_eq!(verdict(&status_body(text)), Verdict::Superseded);
 
-        let empty = "# ADR 0099\n\n## Status\n\n### Accepted approach\n\nIt was fine.\n";
-        assert!(
-            status_body(empty).trim().is_empty(),
-            "{:?}",
-            status_body(empty)
-        );
-        assert_eq!(verdict(&status_body(empty)), Verdict::Unknown);
+        // The heading shapes `starts_with('#')` missed, and they are
+        // the ones that matter: an unindented `### Accepted approach`
+        // was already stopped at, so pinning the hazard on THAT form
+        // passed for a reason unrelated to the hazard. CommonMark takes
+        // up to three spaces of indentation on an ATX heading, and a
+        // heading in a blockquote is a heading.
+        //
+        // Both directions are pinned, because they fail differently: a
+        // swallowed `Accepted` reads as a decision that was never
+        // recorded (silence where a finding belongs), and a swallowed
+        // `Superseded` reports a hard finding on every page citing an
+        // ADR that is merely missing its status.
+        for empty in [
+            "# ADR 0099\n\n## Status\n\n### Accepted approach\n\nIt was fine.\n",
+            "# ADR 0099\n\n## Status\n\n   ### Accepted approach\n\nIt was fine.\n",
+            "# ADR 0099\n\n## Status\n\n> ## Accepted approach\n\nIt was fine.\n",
+            "# ADR 0099\n\n## Status\n\n   #### Superseded discussion\n\nprose.\n",
+        ] {
+            assert!(
+                status_body(empty).trim().is_empty(),
+                "{empty:?}: {:?}",
+                status_body(empty)
+            );
+            assert_eq!(verdict(&status_body(empty)), Verdict::Unknown, "{empty:?}");
+        }
+
+        // And the negative control the widening must not cost: a
+        // blockquoted or indented verdict is still a verdict, because
+        // the section ends on a heading, not on decoration.
+        for body in [
+            "# ADR 0099\n\n## Status\n\n> `Accepted` (2026-05-12).\n",
+            "# ADR 0099\n\n## Status\n\n   Accepted (2026-05-12).\n",
+        ] {
+            assert_eq!(verdict(&status_body(body)), Verdict::Accepted, "{body:?}");
+        }
     }
 
     #[test]

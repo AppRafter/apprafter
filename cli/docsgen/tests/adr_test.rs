@@ -218,7 +218,8 @@ fn a_reference_wrapped_across_a_line_break_is_still_a_reference() {
     // be the single reference nobody checks:
     // `docs/operator-guide/target-store.md:8` wraps `[ADR` / `> 0030]`
     // across a blockquote line break. A line-local scan alone reports 61
-    // of the 62 references in the corpus and is silent about the 62nd —
+    // of the 62 IN-GRAMMAR citations and is silent about the 62nd — the
+    // corpus holds 66, the other 4 carrying no `ADR NNNN` text at all —
     // and "wrap the line" is a one-keystroke way to hide a citation.
     let src = "> Authoritative design rationale: [ADR\n\
                > 0030](../adr/0030-cli-target-store-and-credential-chain.md).\n";
@@ -231,6 +232,17 @@ fn a_reference_wrapped_across_a_line_break_is_still_a_reference() {
     // And exactly one: the continuation line IS the link target, so the
     // filename shape must not report the same citation a second time,
     // on the line below.
+
+    // The other half of that dedup, on ONE line rather than across two:
+    // a line may cite a number inline and also open a wrap for the same
+    // number. The wrapped push sat outside the per-line `seen` gate, so
+    // this yielded two identical `AdrRef`s — two findings a reader
+    // cannot tell apart or fix separately. Zero corpus occurrences; it
+    // is the shape of the bug that makes it worth pinning.
+    let twice = "See ADR 0030 and also [ADR\n0030](../adr/0030-x.md).\n";
+    let r = references(twice);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].line, r[0].number.as_str()), (1, "0030"));
 
     // A wrap that is not one: the next line has to open on the number.
     let prose = "The decision is an ADR\nand it lives in 0030-something.md\n";
@@ -320,8 +332,11 @@ fn the_register_reads_this_repositorys_own_adrs() {
     assert_eq!(register.get("0013"), Some(&Verdict::Unused), "0013");
     assert_eq!(register.get("0018"), Some(&Verdict::Unused), "0018");
     assert_eq!(register.get("0027"), Some(&Verdict::Draft), "0027");
-    // The three the "superseded in part" rule exists for.
-    for number in ["0001", "0042", "0053"] {
+    // The four the "superseded in part" rule exists for — 0043's
+    // Status reads "§1's env-injection naming superseded in part by
+    // [ADR 0046]" and it carries 2 in-scope references, so leaving it
+    // out let this file contradict the two docs that name all four.
+    for number in ["0001", "0042", "0043", "0053"] {
         assert_eq!(
             register.get(number),
             Some(&Verdict::Accepted),
@@ -384,9 +399,18 @@ fn a_register_holding_no_adrs_is_an_error() {
 
 #[test]
 fn a_register_directory_that_is_not_there_is_an_error() {
+    // A missing directory has no branch of its own: `git ls-files`
+    // returns nothing for it, exactly as it does for one holding only
+    // the template, so both land on the empty-register `Err`. That is
+    // deliberate — the reader's problem is identical either way, and
+    // the message names the path so they can see which it is — but it
+    // means this test walks its sibling's code path, and asserting only
+    // that the path is mentioned would be satisfied by any unrelated
+    // error that happened to name it.
     let repo = register_repo(&[]);
     let e = statuses(repo.path()).unwrap_err().to_string();
     assert!(e.contains("docs/adr"), "{e}");
+    assert!(e.contains("holds no ADRs"), "{e}");
 }
 
 #[test]

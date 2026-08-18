@@ -475,6 +475,32 @@ fn ordinary_front_matter_declares_nothing_and_is_never_a_claim() {
     assert!(findings.is_empty(), "{findings:?}");
 }
 
+#[test]
+fn the_page_wide_scans_do_not_read_the_front_matter_either() {
+    // The test above covers the checks that read the block stream, from
+    // which `scan` removes the front matter. Two checks do not read that
+    // stream — the ADR scan and the code-path scan — because the shapes
+    // they look for are inline syntax a block cannot carry, and both go
+    // back to the raw page. Each therefore has to re-do by hand what
+    // `scan` does for everything else, and a scan that forgets makes an
+    // exemption entry into a claim that MATCHES ITS OWN EXEMPTION: it
+    // can never be reported as unused, and the day the exemption expires
+    // the gate reports a defect in a sentence nobody wrote.
+    //
+    // Both are pinned here rather than only the ADR one, because they
+    // are one masked copy and one mistake: the ADR scan was masked when
+    // it shipped and the code-path scan beside it was not.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "---\n\
+                title: Environment\n\
+                note: \"`cli/does/not/exist.rs`, and ADR 0011, are named here\"\n\
+                ---\n\n\
+                # Page\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
 // ---- the paths documentation names -------------------------------------
 
 #[test]

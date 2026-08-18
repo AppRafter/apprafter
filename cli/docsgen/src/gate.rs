@@ -911,12 +911,31 @@ impl Gate {
             }
         }
 
+        // The page's own text, with its front matter blanked out line
+        // for line. Both page-wide scans below read it rather than
+        // `source`: they are the two checks that look at the raw page
+        // instead of at the block stream `scan` produced, and `scan`
+        // takes the front matter off that stream precisely so an
+        // exemption list is never read as the claim it exempts. A scan
+        // that goes back to the raw source has to do the same thing
+        // itself or it re-opens the hole. Blanked, not removed, so
+        // every line below keeps its number — see [`mask_front_matter`].
+        let prose = mask_front_matter(source, front);
+
         // Page-wide and read off the source rather than off a block,
         // because the two shapes a path claim takes — a code span and a
         // link target — are inline syntax that `scan` deliberately does
         // not distinguish: it hands back a span's text with no offset
         // and no idea whether that span was a link's label. See
         // [`codepath`] for why the distinction decides the answer.
+        //
+        // Off the MASKED source for the reason the ADR scan below is:
+        // an exemption entry is prose to a raw scan, and a
+        // `- span: "cli/docsgen/src/adr.rs"` entry read as a path claim
+        // is a claim that matches its own exemption — so it can never
+        // be reported unused, and the day the exemption goes void it is
+        // reported as a defect of its own.
+        //
         // Loop-invariant: every reference on this page resolves from the
         // same directory.
         let directory = page_directory(file);
@@ -928,7 +947,7 @@ impl Gate {
         } else {
             format!("`{directory}/`")
         };
-        for reference in codepath::references(source, &self.tops) {
+        for reference in codepath::references(&prose, &self.tops) {
             let resolved = if reference.page_relative {
                 normalise(directory, &reference.path)
             } else {
@@ -972,15 +991,11 @@ impl Gate {
         // span's is: a citation can sit mid-sentence, where a comment is
         // unreadable as prose and unreviewable as an exemption.
         //
-        // Which is exactly why the front matter is masked out first.
-        // `scan` takes it off the block stream so that an exemption list
-        // is never read as the claim it exempts; this scan reads the raw
-        // source, so it has to do the same thing itself. Read as prose,
-        // `adr: "ADR 0011"` is a citation of ADR 0011 — one that matches
-        // its own exemption, so the entry can never be reported as
-        // unused, and that is reported as a finding of its own the day
-        // the exemption goes void.
-        let prose = mask_front_matter(source, front);
+        // Which is exactly why this reads the masked `prose` above and
+        // not `source`. Read raw, `adr: "ADR 0011"` is a citation of
+        // ADR 0011 — one that matches its own exemption, so the entry
+        // can never be reported as unused, and that is reported as a
+        // finding of its own the day the exemption goes void.
         for reference in adr::references(&prose) {
             let Some(message) = self.adr_problem(&reference.number) else {
                 continue;
@@ -1197,6 +1212,15 @@ fn page_directory(file: &str) -> &str {
 /// number: a finding is reported where it was written, and shifting a
 /// page's lines by the length of its own exemption list would send
 /// every reader of every finding to the wrong place.
+///
+/// Every page-wide scan reads this, not `source` — the ADR scan and the
+/// code-path scan alike. Both go back to the raw page because the
+/// shapes they read are inline syntax the block stream cannot carry,
+/// and both therefore have to re-do by hand what [`scan`] does for
+/// every other check: keep an exemption list out of the claim stream.
+/// An entry read as a claim is a claim that matches its own exemption,
+/// which makes the entry permanently un-reportable as unused and turns
+/// its expiry into a finding about a sentence nobody wrote.
 ///
 /// The extent comes from the block [`scan`] already parsed — its two
 /// `---` delimiters around its body — rather than from a second copy of
