@@ -31,6 +31,15 @@
 //!   capability into a build failure.
 //! * `CLAUDE.md` is untracked, so `git ls-files` cannot see it and no
 //!   gate can be enforced on it. It is ungatable, not exempt.
+//!
+//! # Known limitation
+//!
+//! YAML front matter is not special-cased: the delimiting `---` lines
+//! are not fences, so the block is scanned as prose. Exactly one
+//! in-scope file has front matter today (`docs/reference/environment.md`)
+//! and it holds no backticks, so nothing is affected — but a future
+//! front-matter value containing one, as the generated pages' `description`
+//! keys do, would be read as an inline code span and checked as a claim.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
