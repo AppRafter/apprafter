@@ -107,6 +107,16 @@ pre-commit:
           # for the next contributor's unrelated docs commit to hit.
           # Mirrors the `paths:` filter in .github/workflows/docs.yml.
           #
+          # The corpus is `docs/**` PLUS the root `README.md`, which is
+          # what `scan::in_scope` lists (`git ls-files -- docs
+          # README.md`) and page 1 of the 33 the census counts. It is
+          # named here because no `docs/` glob can reach it: without
+          # the entry, deleting or rewriting the README moved four
+          # census fields and fired nothing on that commit, leaving the
+          # finding to land on the NEXT contributor's unrelated docs
+          # pull request — the failure the wide globs below exist
+          # against.
+          #
           # `docs/measurements/docs-health.json` is in the glob as a
           # TRIGGER — editing the committed corpus census must re-run
           # the gate that compares against it — and it is spelled out
@@ -126,7 +136,7 @@ pre-commit:
           # metrics` by hand, in the same commit, and say why in the
           # commit message.
           - name: docs-check
-            glob: "{docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
+            glob: "{README.md,docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
             run: ./scripts/docs-check.sh
 
 commit-msg:

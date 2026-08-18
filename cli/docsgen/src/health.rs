@@ -23,6 +23,22 @@
 //!   rule [`crate::render`] already keeps for the generated pages (a
 //!   timestamp would turn unrelated commits into CI failures), applied
 //!   to the one file that would have broken it.
+//!
+//!   None of the seven kept here is such a number, and that is
+//!   **maintained rather than assumed**. Exemptions are aged against
+//!   `now` and this checkout's tags on every run, so the obvious
+//!   implementation — let a `check=none` fence drop out of the walk —
+//!   would put both back in: the same page bytes would measure one way
+//!   with the tag present and another way on a `git clone --depth 1`,
+//!   and a census recorded on a shallow clone would report a loss on
+//!   every full one. So a marker silences **findings, never counts**:
+//!   [`crate::gate::Gate::page`] accumulates a silenced block's
+//!   invocations, identifiers and CUE documents before it stops
+//!   reporting on them. Re-run over one `check=none` fence on a corpus
+//!   page, with `since=` naming a tag this checkout has and then one it
+//!   does not: both runs printed the same seven numbers, and only the
+//!   findings differed. Any change that moves a count inside a
+//!   silencing branch re-opens this.
 //! * **It would move the comparison into the wrong command.**
 //!   `docsgen check` is a pure walk of the clap tree: no `git`, no
 //!   tags, no `cue`. Byte-comparing a census means recomputing it,
@@ -40,7 +56,9 @@
 //!
 //! Every field here is an **obligation count** — a number that falls
 //! when documented surface is deleted. That is the whole selection
-//! rule, and it came from watching three earlier candidates fail it:
+//! rule (with one caveat on `identifiers`, below, which falls for a
+//! second reason too), and it came from watching three earlier
+//! candidates fail it:
 //!
 //! * `blocks_executed` **cannot be implemented.** The marker grammar's
 //!   `run=` key accepts only `local` ([`crate::marker`]), and
@@ -63,7 +81,26 @@
 //!
 //! That last point is the one to keep. Against all three rejected
 //! ratchets, deleting a page was free and invisible. Against these
-//! seven it is not.
+//! seven a page cannot go **on its own** without one of them falling —
+//! but they are corpus-wide sums, so a deletion still nets out against
+//! unrelated growth in the same commit. Re-run: `git rm docs/index.md`
+//! (which contributes only to `pages`) beside a three-line stub page
+//! printed the committed census byte for byte and exited 0. Sizing a
+//! deletion is the reviewer's job; this file only makes an *unaccompanied*
+//! one loud.
+//!
+//! One of the seven is not purely an obligation count, and the
+//! exception is worth naming rather than discovering: `identifiers`
+//! counts the paths that **resolved**, so it also falls when a path
+//! stops resolving — a field renamed in `schemas/v1alpha1`, a CRD
+//! regenerated, or a broken path silenced by a `schema-check-ignore`
+//! entry (which moves `exemptions` too, so one edit reports twice). No
+//! deletion happened in any of those. It is kept anyway because the
+//! alternative — counting every path written — lets a page hold its
+//! number by leaving a broken reference in place, which is the worse
+//! failure; [`crate::gate::HEALTH_BASELINE`]'s remedy opens by sending
+//! the reader to the other findings in the same run for exactly this
+//! reason.
 //!
 //! Growth passes silently and deliberately. A content phase adds
 //! guides — 2.19i adds roughly fifteen — and each one adds
@@ -81,26 +118,59 @@
 //! commit** — which is exactly the review moment a new exemption should
 //! get, and one diff line is a fair price for retiring one.
 //!
+//! Equality on the **number**, and on nothing else. The kinds are
+//! printed, not committed (below), so re-typing a standing exemption
+//! passes green: flipping the corpus's one `reason: historical` entry
+//! to `reason: known-broken` printed the new kind on the census line,
+//! held `exemptions` at 2 and exited 0. A retype is a re-justification
+//! and belongs to review, which sees the diff line either way — the
+//! count is here to make sure there *is* a diff line.
+//!
 //! # Reported, not committed
 //!
-//! Three numbers [`crate::gate::Stats::line`] prints stay out of the
-//! file: the **opaque** share of resolved identifiers, and the
-//! exemptions' **kinds** and **ages**. The opaque share is a ratio of
-//! two numbers already here, so committing it is a third number to keep
-//! in step; the ages are `now`-derived, which is the first refutation
-//! above. They are printed on every run because they are worth reading,
-//! and not committed because neither belongs in a value comparison.
+//! [`crate::gate::Stats::line`] prints two things this file does not
+//! hold: the **opaque** share of resolved identifiers, and the
+//! exemption total broken down **by kind**. The opaque share is a
+//! ratio of two numbers already here, so committing it is a third
+//! number to keep in step; the kinds are labels rather than a
+//! magnitude, and a value comparison over them would report a retype
+//! as a regression.
+//!
+//! Exemption **ages** are printed by neither. They are `now`-derived —
+//! the first refutation above — and they are computed on every run for
+//! the expiry rule, so they surface only inside an
+//! [`crate::gate::EXEMPTION_EXPIRED`] or
+//! [`crate::gate::EXEMPTION_UNAGED`] finding: a passing run prints no
+//! age at all.
 //!
 //! # The gap, stated rather than papered over
 //!
-//! Obligations derive from a block's **content**, so a change that
-//! rewords an `apprafter` invocation until it stops looking like one,
-//! or drops the `package` clause that makes a fence a complete CUE
-//! document, deletes the obligation without moving any counter here.
-//! The count is unchanged; the check is gone. **These ratchets defend
-//! against the careless, not against the motivated** — review defends
-//! against the motivated, and no arithmetic over a corpus can take that
-//! job.
+//! Every counter here measures **cardinality, never specificity**. An
+//! obligation that is *substituted* rather than deleted therefore costs
+//! nothing at all: the count holds, the gate exits 0, and the check
+//! that went leaves no line in the census to show for it. Three shapes
+//! of that, each one re-run against the corpus these numbers describe:
+//!
+//! * **A rich invocation for a trivially-resolving one.**
+//!   `docs/operator-guide/backup-restore.md` documents `apprafter
+//!   backup enable` with twelve flags. Replaced by the bare `apprafter
+//!   backup enable`, all seven numbers held and the gate exited 0 —
+//!   `invocations` counts invocations, never the flags inside one.
+//! * **A deep identifier for a shallow one.**
+//!   `docs/operator-guide/needs-pg-walk.md` claims `spec.base.needs.pg`
+//!   in its opening sentence. Rewritten to `spec.base`, `identifiers`
+//!   held at 236 and the gate exited 0. The one number that moved was
+//!   the opaque share (115 → 114) — which is printed and not committed,
+//!   so nothing compared it.
+//! * **A specific path for its parent directory.**
+//!   `docs/reference/index.md` names `cli/docsgen/src/render.rs`.
+//!   Rewritten to `cli/docsgen/src`, all seven numbers held and the
+//!   gate exited 0: a directory resolves exactly as a blob does, and
+//!   `code_paths` counts references, not depth.
+//!
+//! **These ratchets defend against the careless, not against the
+//! motivated** — review defends against the motivated, and no
+//! arithmetic over a corpus can take that job.
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -138,6 +208,16 @@ pub struct Baseline {
     /// Schema identifiers that resolved. Not the total written: an
     /// unresolved one is already a finding, and counting it here would
     /// let a page keep its number by leaving the error in place.
+    ///
+    /// This is the **opposite** rule from [`Baseline::invocations`] and
+    /// [`Baseline::code_paths`], which count every claim written. The
+    /// divergence is a decision, not an oversight: those two have no
+    /// per-claim silencing channel that would let a page swap a
+    /// resolving claim for a broken-but-exempted one, and this one
+    /// does. The cost is that this field is not purely an obligation
+    /// count — see the module docs, and
+    /// [`crate::gate::HEALTH_BASELINE`]'s remedy, on what else moves
+    /// it.
     pub identifiers: usize,
     /// Fenced blocks that are complete CUE documents, and so go
     /// through `cue vet`.
@@ -147,9 +227,42 @@ pub struct Baseline {
     pub code_paths: usize,
     /// ADR citations, every spelling of one counted once per sentence.
     pub adr_references: usize,
-    /// Declared exemptions across every channel. Compared for
-    /// equality — see the module docs.
+    /// Declared exemptions across every channel — a fence's
+    /// `check=none` marker and all three front-matter lists
+    /// (`cli-check-ignore`, `schema-check-ignore`, `adr-check-ignore`).
+    /// Compared for equality — see the module docs.
+    ///
+    /// "Every channel" is load-bearing and was once false: the fence
+    /// marker is the **first** channel
+    /// `docs/contributing/documentation-gate.md` documents, and while
+    /// it went uncounted a page could take one out with the committed
+    /// number unchanged. `Gate::fence_marker` counts it where it builds
+    /// it, for that reason.
     pub exemptions: usize,
+}
+
+/// Which of the two events a divergence is.
+///
+/// The census carries one comparison rule per field but **two** kinds
+/// of news, and [`crate::gate`] prints one remedy per finding class: a
+/// reader who has just declared an exemption must not be told
+/// to put back documentation nobody removed. So the caller keys the
+/// class off this rather than off the field name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// An obligation count fell — documented surface went.
+    Loss,
+    /// The exemption count moved, in either direction.
+    Exemptions,
+}
+
+/// One field's disagreement with the committed census.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Divergence {
+    /// What kind of event it is, which decides the finding class.
+    pub kind: Kind,
+    /// The one-line message, naming the field and both numbers.
+    pub message: String,
 }
 
 /// Every way the current corpus differs from the committed census, one
@@ -163,7 +276,7 @@ pub struct Baseline {
 /// Both numbers appear in every message. "The census regressed" is not
 /// actionable; a reader has to know whether one page went or fifteen
 /// did before they can tell whether it was theirs.
-pub fn compare(committed: &Baseline, current: &Baseline) -> Vec<String> {
+pub fn compare(committed: &Baseline, current: &Baseline) -> Vec<Divergence> {
     let mut out = Vec::new();
     for (field, was, now) in [
         ("pages", committed.pages, current.pages),
@@ -182,11 +295,14 @@ pub fn compare(committed: &Baseline, current: &Baseline) -> Vec<String> {
         ),
     ] {
         if now < was {
-            out.push(format!(
-                "`{field}`: the committed census records {was}, this run found {now} — \
-                 {} fewer, so the documentation lost surface it used to have",
-                was - now
-            ));
+            out.push(Divergence {
+                kind: Kind::Loss,
+                message: format!(
+                    "`{field}`: the committed census records {was}, this run found {now} — \
+                     {} fewer, so the documentation lost surface it used to have",
+                    was - now
+                ),
+            });
         }
     }
     if current.exemptions != committed.exemptions {
@@ -199,12 +315,15 @@ pub fn compare(committed: &Baseline, current: &Baseline) -> Vec<String> {
         } else {
             "an exemption was retired"
         };
-        out.push(format!(
-            "`exemptions`: the committed census records {}, this run found {} — \
-             {direction}, and this count is compared for equality in BOTH directions \
-             so that either shows up as one reviewable line",
-            committed.exemptions, current.exemptions
-        ));
+        out.push(Divergence {
+            kind: Kind::Exemptions,
+            message: format!(
+                "`exemptions`: the committed census records {}, this run found {} — \
+                 {direction}, and this count is compared for equality in BOTH directions \
+                 so that either shows up as one reviewable line",
+                committed.exemptions, current.exemptions
+            ),
+        });
     }
     out
 }
@@ -261,7 +380,7 @@ mod tests {
 
     #[test]
     fn a_message_carries_the_field_and_both_numbers() {
-        let committed = Baseline {
+        let mut committed = Baseline {
             pages: 33,
             invocations: 384,
             identifiers: 236,
@@ -271,14 +390,22 @@ mod tests {
             exemptions: 2,
         };
         let mut current = committed.clone();
-        current.cue_documents = 1;
+        // 41 and 40, not the live 2 and 1: a single-digit assertion
+        // passes on any message that happens to hold that digit, and
+        // every other field in this census holds one.
+        committed.cue_documents = 41;
+        current.cue_documents = 40;
         let found = compare(&committed, &current);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].contains("cue_documents"), "{}", found[0]);
+        assert_eq!(found[0].kind, Kind::Loss, "{found:?}");
+        assert!(found[0].message.contains("cue_documents"), "{found:?}");
         assert!(
-            found[0].contains('2') && found[0].contains('1'),
-            "{}",
-            found[0]
+            found[0].message.contains("records 41"),
+            "the committed number: {found:?}"
+        );
+        assert!(
+            found[0].message.contains("found 40"),
+            "this run's number: {found:?}"
         );
     }
 }

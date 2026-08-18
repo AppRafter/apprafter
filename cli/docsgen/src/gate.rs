@@ -242,8 +242,18 @@ pub const EXEMPTION_UNUSED: &str = "exemption-unused";
 pub const CODE_PATH: &str = "code-path";
 /// A referenced ADR does not exist, or its decision no longer stands.
 pub const ADR_REFERENCE: &str = "adr-reference";
-/// The corpus lost surface the committed census recorded.
+/// An obligation count fell below the committed census: the corpus
+/// lost documented surface it used to have.
+///
+/// **Loss only.** The exemption count is compared for equality and so
+/// fires in both directions, for a different reason and with a
+/// different edit behind it; it carries [`HEALTH_EXEMPTIONS`] instead.
+/// One class covering both would tell a contributor who has just
+/// declared an exemption to put back documentation nobody removed.
 pub const HEALTH_BASELINE: &str = "health-baseline";
+/// The declared-exemption count no longer equals the committed census —
+/// one was declared, or one was retired.
+pub const HEALTH_EXEMPTIONS: &str = "health-exemptions";
 
 /// Front-matter key exempting an inline span from the CLI check, by the
 /// span's literal text.
@@ -317,10 +327,20 @@ fn remedy(code: &str) -> &'static str {
              entry (keyed `ADR NNNN`) in the page's front matter"
         }
         HEALTH_BASELINE => {
-            "put the deleted documentation back if the loss was accidental — otherwise \
-             re-record the census with `docsgen metrics` in the SAME commit as the \
-             deletion, and say in the commit message what went and why, because the \
-             re-recorded number is the only trace that remains"
+            "read this run's OTHER findings first: `identifiers` counts the paths that \
+             RESOLVED, so a renamed schema field, a regenerated CRD or a fresh \
+             `schema-check-ignore` entry lowers it with nothing deleted, and the \
+             schema-identifier findings beside this one are the edit to make. If \
+             documentation did go, put it back when the loss was accidental — \
+             otherwise re-record the census with `docsgen metrics` in the SAME commit \
+             as the deletion, and say in the commit message what went and why, \
+             because the re-recorded number is the only trace that remains"
+        }
+        HEALTH_EXEMPTIONS => {
+            "nothing was deleted: this count is compared for equality, so declaring an \
+             exemption and retiring one both land here. Re-record the census with \
+             `docsgen metrics` in the SAME commit, so the new total is reviewed on the \
+             same diff as the exemption that moved it"
         }
         _ => "see cli/docsgen/src/gate.rs",
     }
@@ -392,8 +412,20 @@ pub struct Stats {
     pub code_paths: usize,
     /// ADR citations seen, on the same terms.
     pub adr_references: usize,
-    /// One entry per exemption declared, so they can be counted by kind
-    /// — which is the whole point of the closed [`Reason`] vocabulary.
+    /// Blocks that are complete CUE documents.
+    ///
+    /// Counted here rather than taken from the length of the vetted
+    /// batch, because the two are deliberately different sets: a
+    /// `check=none` fence is still a complete CUE document and still
+    /// belongs to the census, and it is precisely the block `cue` must
+    /// not be handed. Deriving the census number from the batch would
+    /// make it a function of `now` and of this checkout's tags — see
+    /// [`health`]'s module docs.
+    pub cue_documents: usize,
+    /// One entry per exemption declared, whichever channel declared it:
+    /// a fence's `check=none` marker or any of the three front-matter
+    /// lists. A [`Reason`] rather than a count so they can be reported
+    /// by kind — which is the whole point of the closed vocabulary.
     pub exemptions: Vec<Reason>,
 }
 
@@ -404,11 +436,15 @@ impl Stats {
         self.opaque += other.opaque;
         self.code_paths += other.code_paths;
         self.adr_references += other.adr_references;
+        self.cue_documents += other.cue_documents;
         self.exemptions.extend(other.exemptions);
     }
 
     /// The one-line census, printed whether the gate passes or fails.
-    pub fn line(&self, pages: usize, documents: usize) -> String {
+    ///
+    /// Everything but the page count comes off `self`: the file listing
+    /// is the one measurement no page can contribute to.
+    pub fn line(&self, pages: usize) -> String {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for reason in &self.exemptions {
             *counts.entry(reason.as_str()).or_default() += 1;
@@ -428,25 +464,28 @@ impl Stats {
         };
         format!(
             "docsgen gate: {pages} page(s), {} invocation(s), {} identifier(s) resolved \
-             ({} of them only under an opaque subtree), {documents} complete CUE \
+             ({} of them only under an opaque subtree), {} complete CUE \
              document(s), {} code path(s), {} ADR reference(s), {exemptions}",
-            self.invocations, self.identifiers, self.opaque, self.code_paths, self.adr_references
+            self.invocations,
+            self.identifiers,
+            self.opaque,
+            self.cue_documents,
+            self.code_paths,
+            self.adr_references
         )
     }
 }
 
 /// One run's measurement of the corpus.
 ///
-/// The pair [`Stats`] cannot carry on its own: a page count belongs to
-/// the file listing and a document count to the batch `cue` vetted, so
-/// neither accumulates per page. Bundled rather than returned as a
-/// tuple because `docsgen metrics` commits all three and two bare
-/// `usize`s at a call site are two chances to swap them.
+/// The one number [`Stats`] cannot carry: a page count belongs to the
+/// file listing, so it accumulates nowhere per page. Bundled rather
+/// than returned as a `(usize, Stats)` tuple because `docsgen metrics`
+/// commits both and a bare `usize` at a call site is one more thing to
+/// get the wrong way round.
 pub struct Census {
     /// In-scope pages walked, as [`scan::in_scope`] listed them.
     pub pages: usize,
-    /// Complete CUE documents found, and so vetted in the one batch.
-    pub documents: usize,
     /// Everything accumulated per page.
     pub stats: Stats,
 }
@@ -464,7 +503,7 @@ impl Census {
             pages: self.pages,
             invocations: self.stats.invocations,
             identifiers: self.stats.identifiers,
-            cue_documents: self.documents,
+            cue_documents: self.stats.cue_documents,
             code_paths: self.stats.code_paths,
             adr_references: self.stats.adr_references,
             exemptions: self.stats.exemptions.len(),
@@ -720,6 +759,17 @@ impl Gate {
         // corpus plus a `cue` batch, and `main`'s BROKEN message says
         // "nothing was judged" — which would be false if the walk had
         // already run and had its findings thrown away.
+        //
+        // The trade, named where it is made: one absent JSON file now
+        // silences the other five checks as well, which a walk-first
+        // order would have kept running. That is the right way round
+        // only because the answer is BROKEN either way — a checkout
+        // this far off is repaired before its findings are worth
+        // reading, and half a report from a checkout nobody trusts is
+        // worse than none. Move the read below `walk` and "nothing was
+        // judged" becomes a lie; keep both and the census check has to
+        // become a finding, which is the exit-code collapse
+        // [`health`]'s module docs reject.
         let committed = health::read(&self.repo_root).map_err(|e| {
             format!(
                 "the committed corpus census could not be read, so no loss of \
@@ -728,11 +778,19 @@ impl Gate {
             )
         })?;
         let (mut findings, census) = self.walk()?;
-        for message in health::compare(&committed, &census.baseline()) {
+        for divergence in health::compare(&committed, &census.baseline()) {
+            // Two classes, because the two events want opposite
+            // remedies — see [`HEALTH_BASELINE`]. Matched exhaustively
+            // rather than defaulted, so a third kind is a compile error
+            // here instead of a silent "put the documentation back".
+            let code = match divergence.kind {
+                health::Kind::Loss => HEALTH_BASELINE,
+                health::Kind::Exemptions => HEALTH_EXEMPTIONS,
+            };
             // Line 1: the census is seven numbers and no prose, so
             // there is nothing to anchor on, and a reader who opens it
             // sees the whole file at once. The message names the field.
-            findings.push(finding(HEALTH_BASELINE, health::FILE, 1, message));
+            findings.push(finding(code, health::FILE, 1, divergence.message));
         }
         sort(&mut findings);
         Ok(findings)
@@ -778,10 +836,9 @@ impl Gate {
 
         findings.extend(self.vet(&documents)?);
         sort(&mut findings);
-        eprintln!("{}", stats.line(files.len(), documents.len()));
+        eprintln!("{}", stats.line(files.len()));
         let census = Census {
             pages: files.len(),
-            documents: documents.len(),
             stats,
         };
         Ok((findings, census))
@@ -839,16 +896,28 @@ impl Gate {
             Some(block) => self.exemptions(file, &block.body, &mut findings),
             None => Exemptions::default(),
         };
+        // The three front-matter channels. Counted and aged together,
+        // exactly as `fence_marker` counts and ages the fourth: every
+        // site that builds an exemption does both, so a channel added
+        // later cannot reach the report while staying out of the
+        // census — which is what happened to the fence marker.
         for exemption in declared.all_mut() {
             stats.exemptions.push(exemption.reason);
             self.age(file, exemption, &mut findings);
         }
 
-        // (source line, token) from every surface on the page. The
-        // identifier check is page-wide, not fence-scoped: a field name
-        // is written in a fence, a table cell and a prose span, and the
-        // same token in two places is one claim.
-        let mut seen: Vec<(usize, String)> = Vec::new();
+        // (source line, token, silenced) from every surface on the
+        // page. The identifier check is page-wide, not fence-scoped: a
+        // field name is written in a fence, a table cell and a prose
+        // span, and the same token in two places is one claim.
+        //
+        // The flag rides along instead of the token being dropped at
+        // its block, because a `check=none` fence silences FINDINGS and
+        // not the census: its tokens are still resolved and still
+        // counted, and only the report is suppressed. See [`health`]'s
+        // module docs on why a count inside a silencing branch would
+        // make the census a function of `now`.
+        let mut seen: Vec<(usize, String, bool)> = Vec::new();
 
         for block in &blocks {
             match &block.kind {
@@ -910,8 +979,13 @@ impl Gate {
 
                     // Always `None` for a literal block, so a marker can
                     // neither annotate nor silence one.
-                    let marker =
-                        self.fence_marker(file, block.line, &block.tag_line, &mut findings);
+                    let marker = self.fence_marker(
+                        file,
+                        block.line,
+                        &block.tag_line,
+                        &mut findings,
+                        &mut stats,
+                    );
 
                     // Content, not tag: both obligations are read off
                     // the body before any marker is consulted.
@@ -937,7 +1011,16 @@ impl Gate {
                         }
                     }
                     let document = cuedoc::is_complete_document(&block.body);
+                    // Both counts are taken here, above the silencing
+                    // test, and neither may move below it: a marker
+                    // says "do not report on this block", never "this
+                    // block is not in the corpus". A census that shrank
+                    // when a fence was exempted would be a function of
+                    // `now` and of this checkout's tags, because that
+                    // is what decides whether an exemption still
+                    // stands — see [`health`]'s module docs.
                     stats.invocations += invocations.len();
+                    stats.cue_documents += usize::from(document);
 
                     if let Some((marker, _)) = &marker {
                         findings.extend(audit(
@@ -952,33 +1035,36 @@ impl Gate {
                         m.check == Check::None
                             && exemption.as_ref().is_some_and(Exemption::silences)
                     });
-                    if silenced {
-                        continue;
-                    }
 
-                    for (line, found) in &invocations {
-                        if let Err(e) = invocation::resolve(&self.tree, found) {
-                            findings.push(finding(
-                                CLI_INVOCATION,
-                                file,
-                                *line,
-                                format!("`{}` — {e}", found.raw),
-                            ));
+                    if !silenced {
+                        for (line, found) in &invocations {
+                            if let Err(e) = invocation::resolve(&self.tree, found) {
+                                findings.push(finding(
+                                    CLI_INVOCATION,
+                                    file,
+                                    *line,
+                                    format!("`{}` — {e}", found.raw),
+                                ));
+                            }
                         }
-                    }
-                    if document {
-                        documents.push(Document {
-                            origin: format!("{file}:{anchor}"),
-                            body: block.body.clone(),
-                        });
+                        // Counted above, vetted only here: `cue` reports
+                        // on what it is handed, so a silenced document
+                        // has to stay out of the batch even though the
+                        // census already holds it.
+                        if document {
+                            documents.push(Document {
+                                origin: format!("{file}:{anchor}"),
+                                body: block.body.clone(),
+                            });
+                        }
                     }
                     for (offset, line) in block.body.lines().enumerate() {
                         for token in identifier::extract_paths(line) {
-                            seen.push((body_line + offset, token));
+                            seen.push((body_line + offset, token, silenced));
                         }
                     }
                     for (offset, token) in identifier::extract_structure(&block.body) {
-                        seen.push((body_line + offset, token));
+                        seen.push((body_line + offset, token, silenced));
                     }
                 }
                 BlockKind::InlineSpan => {
@@ -1003,15 +1089,23 @@ impl Gate {
                         }
                     }
                     if let Some(token) = identifier::span_path(&block.body) {
-                        seen.push((block.line, token));
+                        // Never silenced: an inline span carries no
+                        // marker, and its own channel is the page's
+                        // front matter, applied below.
+                        seen.push((block.line, token, false));
                     }
                 }
             }
         }
 
         seen.sort();
-        seen.dedup();
-        for (line, token) in seen {
+        // Deduplicated on (line, token) and NOT on the flag: one claim
+        // written once is one claim however it was reached. `false`
+        // sorts before `true`, so a token that is both silenced and
+        // reported somewhere keeps the reported entry — silencing one
+        // block must not silence the same claim made in another.
+        seen.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        for (line, token, silenced) in seen {
             let problem = match identifier::resolve_path(&self.fields, &token) {
                 Err(reason) => Some(reason),
                 Ok(verdict) if verdict.unshipped => Some(format!(
@@ -1019,12 +1113,21 @@ impl Gate {
                      claim of this type never leaves AwaitingResourceClaim"
                 )),
                 Ok(verdict) => {
+                    // Above the silencing test on purpose: a silenced
+                    // block's resolving identifiers stay in the census.
                     stats.identifiers += 1;
                     stats.opaque += usize::from(verdict.opaque);
                     None
                 }
             };
             let Some(message) = problem else { continue };
+            // Only the report is suppressed, and before `covered_by`:
+            // the fence marker already accounts for this claim, so
+            // letting it mark a front-matter entry matched would let one
+            // exemption keep another alive.
+            if silenced {
+                continue;
+            }
             if !covered_by(&mut declared.paths, &token) {
                 findings.push(finding(SCHEMA_IDENTIFIER, file, line, message));
             }
@@ -1067,11 +1170,21 @@ impl Gate {
             format!("`{directory}/`")
         };
         let paths = codepath::references(&prose, &self.tops);
-        // Counted before the loop, so the census records every claim
-        // made rather than every claim that failed to resolve — the
-        // rule `stats.invocations` already follows. Counting only the
-        // survivors would let a page hold its number by leaving a
-        // broken reference in place.
+        // Counted before the loop, so the census records every path
+        // this page WRITES — resolved or not — which is the rule
+        // `stats.invocations` follows. The number then tracks how much
+        // the page claims, and does not move when a claim breaks or is
+        // fixed: a run that reported a code-path finding would
+        // otherwise also report a census loss, sending the reader to
+        // two places for one edit.
+        //
+        // `stats.identifiers` deliberately does NOT follow this rule —
+        // it counts only what resolved. That divergence is a decision,
+        // not an oversight: the identifier check has a per-claim
+        // silencing channel (`schema-check-ignore`), so counting every
+        // path written would let a page swap a resolving claim for a
+        // broken-but-exempted one at no cost. Neither of these two has
+        // such a channel. See [`Baseline::identifiers`].
         stats.code_paths += paths.len();
         for reference in paths {
             let resolved = if reference.page_relative {
@@ -1123,7 +1236,9 @@ impl Gate {
         // can never be reported as unused, and that is reported as a
         // finding of its own the day the exemption goes void.
         let citations = adr::references(&prose);
-        // Counted like the paths above, and for the same reason.
+        // Every citation written, like the paths above and for the same
+        // reason: the count says how much authority this page invokes,
+        // not how much of it currently stands.
         stats.adr_references += citations.len();
         for reference in citations {
             let Some(message) = self.adr_problem(&reference.number) else {
@@ -1170,12 +1285,22 @@ impl Gate {
     /// every obligation its content gives it. Reading a broken marker as
     /// an exemption would make a typo the cheapest way to switch a check
     /// off.
+    ///
+    /// `stats` is taken because this is where a fence exemption is
+    /// **built**, and the rule the census depends on is that every site
+    /// which builds and ages an exemption also counts it. It was once
+    /// counted only from the front-matter lists, which left the first
+    /// channel `docs/contributing/documentation-gate.md` documents
+    /// invisible to the one field compared for equality: a page could
+    /// take out a `check=none` and the committed number would not
+    /// move.
     fn fence_marker(
         &self,
         file: &str,
         fence_line: usize,
         tag_line: &Option<String>,
         findings: &mut Vec<Finding>,
+        stats: &mut Stats,
     ) -> Option<(Marker, Option<Exemption>)> {
         let text = tag_line.as_ref()?;
         // The comment sits on the line immediately above the fence.
@@ -1196,6 +1321,7 @@ impl Gate {
                         matched: true,
                         void: false,
                     };
+                    stats.exemptions.push(exemption.reason);
                     self.age(file, &mut exemption, findings);
                     exemption
                 });
@@ -1603,9 +1729,38 @@ mod tests {
             CODE_PATH,
             ADR_REFERENCE,
             HEALTH_BASELINE,
+            HEALTH_EXEMPTIONS,
         ] {
             assert_ne!(remedy(code), remedy("no-such-code"), "{code}");
         }
+    }
+
+    #[test]
+    fn the_two_census_classes_do_not_share_a_remedy() {
+        // The failure this pins is a class added to the list above and
+        // routed to an existing arm, which the sweep cannot see: both
+        // codes would have a remedy, and it would be the wrong one for
+        // one of them. A contributor who has just declared an exemption
+        // must not be told to put documentation back.
+        assert_ne!(remedy(HEALTH_BASELINE), remedy(HEALTH_EXEMPTIONS));
+        assert!(
+            !remedy(HEALTH_EXEMPTIONS).contains("put the deleted"),
+            "{}",
+            remedy(HEALTH_EXEMPTIONS)
+        );
+        assert!(
+            remedy(HEALTH_EXEMPTIONS).contains("nothing was deleted"),
+            "{}",
+            remedy(HEALTH_EXEMPTIONS)
+        );
+        // The identifiers caveat is the remedy's opening move, because
+        // re-recording a fall that was never a deletion lowers the
+        // ratchet floor for good.
+        assert!(
+            remedy(HEALTH_BASELINE).contains("OTHER findings first"),
+            "{}",
+            remedy(HEALTH_BASELINE)
+        );
     }
 
     #[test]
@@ -1667,10 +1822,40 @@ mod tests {
             exemptions: vec![Reason::Historical, Reason::ExternalTool, Reason::Historical],
             ..Stats::default()
         };
-        let line = stats.line(32, 2);
+        let line = stats.line(32);
         assert!(line.contains("3 exemptions"), "{line}");
         assert!(line.contains("1 external-tool"), "{line}");
         assert!(line.contains("2 historical"), "{line}");
-        assert!(Stats::default().line(1, 0).contains("0 exemptions"));
+        assert!(Stats::default().line(1).contains("0 exemptions"));
+    }
+
+    #[test]
+    fn the_census_line_prints_every_committed_counter() {
+        // The line is where a reviewer reads the numbers before
+        // committing them, so a counter that reaches the file without
+        // reaching the line is a number nobody reviews. Seven distinct
+        // values, so a field printed in the wrong slot fails here.
+        let stats = Stats {
+            invocations: 11,
+            identifiers: 22,
+            opaque: 33,
+            cue_documents: 44,
+            code_paths: 55,
+            adr_references: 66,
+            exemptions: vec![Reason::Historical],
+        };
+        let line = stats.line(77);
+        for expected in [
+            "77 page(s)",
+            "11 invocation(s)",
+            "22 identifier(s)",
+            "33 of them only under an opaque subtree",
+            "44 complete CUE document(s)",
+            "55 code path(s)",
+            "66 ADR reference(s)",
+            "1 exemptions",
+        ] {
+            assert!(line.contains(expected), "{expected} missing from: {line}");
+        }
     }
 }

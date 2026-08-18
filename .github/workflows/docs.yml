@@ -10,6 +10,15 @@ on:
   pull_request:
     paths:
       - 'docs/**'
+      # The corpus is `docs/**` PLUS the root README: `scan::in_scope`
+      # lists `git ls-files -- docs README.md`, and the README is page
+      # 1 of the 33 the census counts. No `docs/` pattern reaches it,
+      # so without this entry a commit that rewrote or deleted it moved
+      # four census fields and ran this job zero times — landing the
+      # finding on master, to be discovered by the NEXT contributor's
+      # unrelated docs pull request. Same failure as the
+      # `cli/Cargo.toml` entry below, from the other direction.
+      - 'README.md'
       # Redundant under `docs/**` above, and listed anyway: the gate
       # compares this committed census by value, so it is an INPUT to
       # the job and not just another page. Spelling it out means a
@@ -47,6 +56,8 @@ on:
     branches: [master]
     paths:
       - 'docs/**'
+      # See the identical entry on the pull_request trigger above.
+      - 'README.md'
       # See the identical entry on the pull_request trigger above.
       - 'docs/measurements/docs-health.json'
       - 'mkdocs.yml'

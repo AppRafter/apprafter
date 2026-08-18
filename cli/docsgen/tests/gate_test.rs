@@ -925,7 +925,272 @@ fn an_adr_exemption_that_silences_nothing_is_reported() {
     assert!(unused[0].contains("ADR 0011"), "{unused:?}");
 }
 
+// ---- the census: what a page contributes, and what `corpus` does with it ----
+
+#[test]
+fn a_fence_exemption_raises_the_census_like_any_other() {
+    // The channel `docs/contributing/documentation-gate.md` documents
+    // FIRST. It was once the only one `Stats` could not see, so a page
+    // could take a `check=none` out and the committed number would not
+    // move — on the one field compared for equality precisely so that
+    // either direction is a reviewable line.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+
+    let plain = "# Page\n\n```sh\napprafter app status writer\n```\n";
+    assert!(
+        gate.page("docs/t.md", plain).stats.exemptions.is_empty(),
+        "a page declaring nothing declares nothing"
+    );
+
+    let exempted = "# Page\n\n\
+                    <!-- docs: check=none reason=historical since=v0.9.0 — why -->\n\
+                    ```sh\napprafter app status writer\n```\n";
+    let stats = gate.page("docs/t.md", exempted).stats;
+    assert_eq!(stats.exemptions.len(), 1, "{:?}", stats.exemptions);
+    assert!(stats.line(1).contains("1 exemptions"), "{}", stats.line(1));
+}
+
+#[test]
+fn a_silenced_fence_still_counts_toward_the_census() {
+    // A marker silences FINDINGS, never counts. If it silenced counts,
+    // the census would be a function of `now` and of this checkout's
+    // tags — the same page bytes would measure one way where `since=`
+    // resolves and another on a shallow clone, and a census recorded on
+    // one would report a loss on the other.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let body = format!(
+        "# Page\n\n`spec.base.needs.pg` and:\n\n```cue\n{}```\n\n\
+         ```sh\napprafter promote\n```\n",
+        document("network: \"internal\"")
+    );
+
+    let open = gate.page("docs/t.md", &body).stats;
+
+    // `v0.9.0` is inside the window, so this exemption STANDS and
+    // silences; `v9.9.9` names no tag, so it is void and silences
+    // nothing. The two runs judge the same bytes differently and must
+    // still measure them identically.
+    for since in ["v0.9.0", "v9.9.9"] {
+        let marked = body.replace(
+            "```cue\n",
+            &format!("<!-- docs: check=none reason=historical since={since} — why -->\n```cue\n"),
+        );
+        let stats = gate.page("docs/t.md", &marked).stats;
+        assert_eq!(stats.invocations, open.invocations, "since={since}");
+        assert_eq!(stats.identifiers, open.identifiers, "since={since}");
+        assert_eq!(stats.cue_documents, open.cue_documents, "since={since}");
+        assert_eq!(stats.code_paths, open.code_paths, "since={since}");
+    }
+
+    // And it really was silencing: the standing marker takes the CUE
+    // document out of the batch, so a broken manifest under it reports
+    // nothing while still counting as a document.
+    let broken = format!(
+        "# Page\n\n<!-- docs: check=none reason=historical since=v0.9.0 — why -->\n\
+         ```cue\n{}```\n",
+        document("publik: false")
+    );
+    let page = gate.page("docs/t.md", &broken);
+    assert_eq!(page.stats.cue_documents, 1, "{:?}", page.stats);
+    assert!(page.documents.is_empty(), "the batch must not see it");
+}
+
+#[test]
+fn the_census_reaches_the_report_as_a_finding_on_the_census_file() {
+    // Nothing else pins the wiring: `compare` is exercised on its own
+    // in `health_test.rs`, and `page` is exercised on synthetic pages
+    // here, but the line joining them lives in `Gate::corpus` — and
+    // deleting it left every test in this crate green.
+    let (tags, now) = tag_repo();
+    let mut census = corpus_baseline(&tags, now);
+    census.pages += 4;
+    let repo = fixture_repo(Some(&census));
+    let findings = Gate::pinned(repo.path(), tags.path(), now)
+        .unwrap()
+        .corpus()
+        .unwrap();
+
+    let health: Vec<&gate::Finding> = findings
+        .iter()
+        .filter(|f| f.code == gate::HEALTH_BASELINE)
+        .collect();
+    assert_eq!(health.len(), 1, "{findings:?}");
+    assert_eq!(health[0].file, docsgen::health::FILE);
+    assert_eq!(health[0].line, 1);
+    assert!(health[0].message.contains("pages"), "{:?}", health[0]);
+}
+
+#[test]
+fn an_exemption_divergence_is_its_own_class_not_a_deletion() {
+    // One `compare` message, two opposite events. A contributor who has
+    // just DECLARED an exemption reads this finding's remedy, and
+    // "put the deleted documentation back" is the wrong instruction —
+    // nothing was deleted.
+    let (tags, now) = tag_repo();
+    let mut census = corpus_baseline(&tags, now);
+    census.exemptions += 1;
+    let repo = fixture_repo(Some(&census));
+    let findings = Gate::pinned(repo.path(), tags.path(), now)
+        .unwrap()
+        .corpus()
+        .unwrap();
+
+    let health: Vec<&gate::Finding> = findings
+        .iter()
+        .filter(|f| f.code.starts_with("health-"))
+        .collect();
+    assert_eq!(health.len(), 1, "{findings:?}");
+    assert_eq!(health[0].code, gate::HEALTH_EXEMPTIONS, "{:?}", health[0]);
+    assert!(
+        !health[0].remedy.contains("put the deleted"),
+        "{}",
+        health[0].remedy
+    );
+}
+
+#[test]
+fn an_absent_census_breaks_the_gate_rather_than_failing_the_documentation() {
+    // Exit 2, not 1: a checkout without the file is a checkout to
+    // repair. Reported as a finding it would read as "the docs are
+    // wrong again", and re-recording would be the obvious fix — which
+    // writes whatever the broken checkout happened to measure.
+    let (tags, now) = tag_repo();
+    let repo = fixture_repo(None);
+    let broken = Gate::pinned(repo.path(), tags.path(), now)
+        .unwrap()
+        .corpus()
+        .unwrap_err()
+        .to_string();
+    assert!(broken.contains(docsgen::health::FILE), "{broken}");
+    assert!(broken.contains("the gate being broken"), "{broken}");
+
+    // Unparseable is the same class of breakage, not a different one.
+    let path = repo.path().join(docsgen::health::FILE);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{ not json").unwrap();
+    assert!(Gate::pinned(repo.path(), tags.path(), now)
+        .unwrap()
+        .corpus()
+        .is_err());
+}
+
+#[test]
+fn the_baseline_maps_every_stat_to_its_own_field() {
+    // Seven distinct values, because a swap between two fields of the
+    // same type COMPILES: `code_paths` into `adr_references` is caught
+    // in the live corpus today only by 73 happening not to equal 66.
+    let census = gate::Census {
+        pages: 1,
+        stats: gate::Stats {
+            invocations: 2,
+            identifiers: 3,
+            // Not committed, so it must not land in a field: a
+            // baseline that picked this up would ratchet a ratio.
+            opaque: 99,
+            cue_documents: 4,
+            code_paths: 5,
+            adr_references: 6,
+            exemptions: vec![
+                docsgen::marker::Reason::Historical,
+                docsgen::marker::Reason::ExternalTool,
+                docsgen::marker::Reason::KnownBroken,
+                docsgen::marker::Reason::ThirdPartyOutput,
+                docsgen::marker::Reason::IllustrativeFragment,
+                docsgen::marker::Reason::Historical,
+                docsgen::marker::Reason::Historical,
+            ],
+        },
+    };
+    assert_eq!(
+        census.baseline(),
+        docsgen::health::Baseline {
+            pages: 1,
+            invocations: 2,
+            identifiers: 3,
+            cue_documents: 4,
+            code_paths: 5,
+            adr_references: 6,
+            exemptions: 7,
+        }
+    );
+}
+
 // ---- helpers -----------------------------------------------------------
+
+/// A repository the gate can walk: the real schemas and CRDs (the field
+/// set has to load from somewhere, and a hand-rolled CRD would test the
+/// fixture rather than the product), an empty ADR register, and a
+/// corpus of exactly one page.
+///
+/// A fixture rather than this repository, because these cases are about
+/// a census that DISAGREES with the corpus — and the only census this
+/// repository has is the committed one, which agrees with it by
+/// construction.
+fn fixture_repo(census: Option<&docsgen::health::Baseline>) -> TempDir {
+    let real = docsgen::repo_root().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+
+    for tree in [
+        "schemas/v1alpha1",
+        "operator/charts/apprafter-operator/templates",
+    ] {
+        std::fs::create_dir_all(repo.path().join(tree)).unwrap();
+        for entry in std::fs::read_dir(real.join(tree)).unwrap() {
+            let from = entry.unwrap().path();
+            let name = from.file_name().unwrap().to_string_lossy().to_string();
+            let wanted =
+                name.ends_with(".cue") || (name.starts_with("crd-") && name.ends_with(".yaml"));
+            if from.is_file() && wanted {
+                std::fs::copy(&from, repo.path().join(tree).join(&name)).unwrap();
+            }
+        }
+    }
+
+    std::fs::create_dir_all(repo.path().join("docs/adr")).unwrap();
+    // One tracked decision: `adr::statuses` refuses an empty register
+    // as the gate being broken, and rightly — every citation in a real
+    // corpus would otherwise resolve to "no such ADR". Out of the
+    // corpus (`docs/adr/` is excluded), so it moves no census number.
+    std::fs::write(
+        repo.path().join("docs/adr/0001-a-fixture-decision.md"),
+        "# 1. A fixture decision\n\n## Status\n\nAccepted\n",
+    )
+    .unwrap();
+    std::fs::write(repo.path().join(FIXTURE_PAGE), FIXTURE_SOURCE).unwrap();
+    if let Some(baseline) = census {
+        docsgen::health::write(repo.path(), baseline).unwrap();
+    }
+    // `git ls-files` reads the index, so staging is enough — no commit,
+    // and no `-A`: the paths are named. The census is staged with the
+    // rest and stays out of the corpus twice over, being neither `.md`
+    // nor outside `scan`'s excluded trees.
+    git(repo.path(), &["add", "docs", "schemas", "operator"]);
+    repo
+}
+
+/// The one page [`fixture_repo`] holds — no invocation, no CUE
+/// document and no ADR citation, so its census is small and every
+/// number in these tests moves because a test moved it.
+const FIXTURE_PAGE: &str = "docs/t.md";
+const FIXTURE_SOURCE: &str = "# Fixture\n\nA page naming `spec.base.image` and `cli/docsgen`.\n";
+
+/// What [`fixture_repo`]'s corpus actually measures, so a test can
+/// perturb one field and leave the other six agreeing.
+///
+/// Measured rather than written down: a hand-kept copy of six numbers
+/// is a second census to keep in step, and this file's whole subject is
+/// what happens when two of those disagree.
+fn corpus_baseline(tags: &TempDir, now: SystemTime) -> docsgen::health::Baseline {
+    let repo = fixture_repo(None);
+    Gate::pinned(repo.path(), tags.path(), now)
+        .unwrap()
+        .census()
+        .unwrap()
+        .baseline()
+}
 
 /// A complete `Application` document with `expose` holding `field`.
 fn document(field: &str) -> String {

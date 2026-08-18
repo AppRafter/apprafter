@@ -6,7 +6,13 @@
 //! corpus's, so a reader of a failure sees the shape of a real run
 //! rather than a toy one.
 
-use docsgen::health::{compare, read, write, Baseline, FILE};
+use docsgen::health::{compare, read, write, Baseline, Divergence, Kind, FILE};
+
+/// Every message, so an assertion reads the text without unwrapping a
+/// [`Divergence`] at each site.
+fn messages(found: &[Divergence]) -> Vec<&str> {
+    found.iter().map(|d| d.message.as_str()).collect()
+}
 
 /// The corpus as `docsgen metrics` measures it today. Used as both
 /// sides of the comparison, so each test perturbs exactly one field
@@ -84,13 +90,16 @@ fn a_lost_page_is_reported_naming_both_numbers() {
     shift(&mut current, "pages", -1);
     let found = compare(&census(), &current);
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].contains("pages"), "{}", found[0]);
+    assert_eq!(found[0].kind, Kind::Loss, "{found:?}");
+    assert!(found[0].message.contains("pages"), "{found:?}");
     assert!(
-        found[0].contains("33"),
-        "the committed number: {}",
-        found[0]
+        found[0].message.contains("records 33"),
+        "the committed number: {found:?}"
     );
-    assert!(found[0].contains("32"), "this run's number: {}", found[0]);
+    assert!(
+        found[0].message.contains("found 32"),
+        "this run's number: {found:?}"
+    );
 }
 
 #[test]
@@ -102,26 +111,61 @@ fn a_lost_invocation_is_reported() {
     shift(&mut current, "invocations", -1);
     let found = compare(&census(), &current);
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].contains("invocations"), "{}", found[0]);
+    assert_eq!(found[0].kind, Kind::Loss, "{found:?}");
+    assert!(found[0].message.contains("invocations"), "{found:?}");
     assert!(
-        found[0].contains("384") && found[0].contains("383"),
-        "{}",
-        found[0]
+        found[0].message.contains("records 384"),
+        "the committed number: {found:?}"
+    );
+    assert!(
+        found[0].message.contains("found 383"),
+        "this run's number: {found:?}"
     );
 }
 
 #[test]
 fn every_obligation_count_is_ratcheted() {
-    // A sweep rather than six near-identical tests: the failure this
-    // guards is a seventh field added to `Baseline` and left out of
-    // `compare`, which no single-field test can see.
+    // A sweep rather than six near-identical tests, and no more than
+    // that: it enumerates [`OBLIGATIONS`] by hand, so it says nothing
+    // about a field NOT in that list. Completeness is
+    // `the_census_holds_exactly_the_fields_this_file_sweeps`'s job.
     for field in OBLIGATIONS {
         let mut current = census();
         shift(&mut current, field, -1);
         let found = compare(&census(), &current);
         assert_eq!(found.len(), 1, "{field}: {found:?}");
-        assert!(found[0].contains(field), "{field}: {}", found[0]);
+        assert_eq!(found[0].kind, Kind::Loss, "{field}: {found:?}");
+        assert!(found[0].message.contains(field), "{field}: {found:?}");
     }
+}
+
+#[test]
+fn the_census_holds_exactly_the_fields_this_file_sweeps() {
+    // The guard the sweep above cannot be: an eighth field added to
+    // `Baseline` and left out of `compare` would be a ratchet nobody
+    // ratchets, and the sweep would keep passing because it never
+    // names it. The committed file is the source read here rather than
+    // the struct, because the file is what a reviewer and a future
+    // `read` both see — and it is the only listing of the fields that
+    // cannot go stale without this failing.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &census()).unwrap();
+    let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+
+    let mut written: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"'))
+        .filter_map(|rest| rest.split_once("\":"))
+        .map(|(key, _)| key.to_string())
+        .collect();
+    let mut expected: Vec<String> = OBLIGATIONS.iter().map(|f| f.to_string()).collect();
+    expected.push("exemptions".to_string());
+    written.sort();
+    expected.sort();
+    assert_eq!(
+        written, expected,
+        "a census field this file does not sweep, or a swept field the census dropped: {text}"
+    );
 }
 
 #[test]
@@ -133,11 +177,15 @@ fn a_new_exemption_is_reported_even_though_it_is_growth() {
     shift(&mut current, "exemptions", 1);
     let found = compare(&census(), &current);
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].contains("exemptions"), "{}", found[0]);
+    // Its OWN kind, so the gate can print a remedy that does not tell
+    // the reader to restore documentation nobody removed.
+    assert_eq!(found[0].kind, Kind::Exemptions, "{found:?}");
+    assert!(found[0].message.contains("exemptions"), "{found:?}");
+    assert!(found[0].message.contains("records 2"), "{found:?}");
+    assert!(found[0].message.contains("found 3"), "{found:?}");
     assert!(
-        found[0].contains('2') && found[0].contains('3'),
-        "{}",
-        found[0]
+        found[0].message.contains("an exemption was declared"),
+        "{found:?}"
     );
 }
 
@@ -151,11 +199,13 @@ fn a_retired_exemption_is_reported_too() {
     shift(&mut current, "exemptions", -1);
     let found = compare(&census(), &current);
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].contains("exemptions"), "{}", found[0]);
+    assert_eq!(found[0].kind, Kind::Exemptions, "{found:?}");
+    assert!(found[0].message.contains("exemptions"), "{found:?}");
+    assert!(found[0].message.contains("records 2"), "{found:?}");
+    assert!(found[0].message.contains("found 1"), "{found:?}");
     assert!(
-        found[0].contains('2') && found[0].contains('1'),
-        "{}",
-        found[0]
+        found[0].message.contains("an exemption was retired"),
+        "{found:?}"
     );
 }
 
@@ -173,10 +223,23 @@ fn several_regressions_are_all_reported_in_one_run() {
     assert_eq!(found.len(), 4, "{found:?}");
     for field in ["pages", "invocations", "adr_references", "exemptions"] {
         assert!(
-            found.iter().any(|m| m.contains(field)),
+            messages(&found).iter().any(|m| m.contains(field)),
             "{field} missing from {found:?}"
         );
     }
+    // One run, two kinds: three losses and the exemption that grew. A
+    // run that reported them all as one kind would print the deletion
+    // remedy above a line about an exemption nobody deleted.
+    assert_eq!(
+        found.iter().filter(|d| d.kind == Kind::Loss).count(),
+        3,
+        "{found:?}"
+    );
+    assert_eq!(
+        found.iter().filter(|d| d.kind == Kind::Exemptions).count(),
+        1,
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -191,7 +254,7 @@ fn growth_beside_a_regression_reports_only_the_regression() {
     shift(&mut current, "identifiers", -1);
     let found = compare(&census(), &current);
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].contains("identifiers"), "{}", found[0]);
+    assert!(found[0].message.contains("identifiers"), "{found:?}");
 }
 
 #[test]
