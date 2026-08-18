@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Enumerate the documentation the gate may judge, and split each page
-//! into the two places a claim about the product hides: a fenced block
-//! and an inline code span.
+//! into the places a claim about the product hides: a fenced block, an
+//! inline code span, and a block that renders as code while carrying no
+//! fence at all ([`BlockKind::Literal`]).
 //!
 //! Everything downstream resolves what this module hands it, so a blind
 //! spot here is a blind spot in the gate — a command the scanner never
@@ -83,6 +84,15 @@ pub enum BlockKind {
     /// prints the live
     /// distribution.)
     Fence { tag: Option<String> },
+    /// A code block that renders as code but carries no fence: a
+    /// four-space indented run at top level, or an HTML `<pre>`.
+    ///
+    /// It exists so that unfencing a block cannot shed the block's
+    /// obligation. There are none in the corpus, and the check is a
+    /// regression guard rather than a source of findings — but the
+    /// gate reports an unlabelled fence, and "delete the delimiters"
+    /// is the shortest way to make that report go away.
+    Literal,
     /// A backticked run in prose. Measurement puts most command
     /// invocations here rather than in fences, so this is the primary
     /// surface, not an afterthought.
@@ -114,18 +124,21 @@ pub struct Block {
     /// literal text, which keeps every exemption greppable and
     /// countable in one place instead of scattered through paragraphs.
     pub tag_line: Option<String>,
-    /// The block's content: fence body without the delimiter lines, or
-    /// the span's text. The fence's own indentation and its own
-    /// blockquote depth are removed — and nothing deeper — so the body
-    /// is both directly parseable and byte-faithful to what the author
-    /// wrote inside the fence.
+    /// The block's content: fence body without the delimiter lines, a
+    /// literal block's text without its four-space indent or its
+    /// `<pre>` tags, or the span's text. The fence's own indentation and
+    /// its own blockquote depth are removed — and nothing deeper — so
+    /// the body is both directly parseable and byte-faithful to what the
+    /// author wrote inside the fence.
     pub body: String,
-    /// 1-based source line of the opening delimiter. A finding without
-    /// a real line number costs the reader a manual search, which is
-    /// how gates come to be ignored.
+    /// 1-based source line of the opening delimiter — and, for a
+    /// [`BlockKind::Literal`], of the first line of the body, because
+    /// there is no delimiter to point at. A finding without a real line
+    /// number costs the reader a manual search, which is how gates come
+    /// to be ignored.
     pub line: usize,
     /// A fence that ran to the end of the file without a closing
-    /// delimiter. Always false for a span.
+    /// delimiter. Always false for a span and for a literal block.
     ///
     /// This is the parse's self-check, and it has to be reported rather
     /// than assumed: a phantom fence closes at EOF like any other, so
@@ -204,8 +217,62 @@ struct Open {
     body: String,
 }
 
-/// Split a Markdown source into its fences and inline code spans, in
-/// source order.
+/// A literal code block being accumulated — see [`BlockKind::Literal`].
+struct Literal {
+    /// Source line the body starts on; there is no delimiter line.
+    line: usize,
+    body: String,
+    /// Blank lines seen since the last content line. A blank is interior
+    /// to the block only if another indented line follows, so it is held
+    /// rather than written: a trailing blank must not end up in the body.
+    held: usize,
+    /// A `<pre>`, which ends on its closing tag rather than on an
+    /// outdent, and so swallows blank lines and fence-shaped lines alike.
+    html: bool,
+}
+
+impl Literal {
+    fn opened(line: usize, html: bool) -> Literal {
+        Literal {
+            line,
+            body: String::new(),
+            held: 0,
+            html,
+        }
+    }
+
+    /// Append one content line, releasing any blanks held before it.
+    fn push(&mut self, text: &str) {
+        for _ in 0..self.held {
+            self.body.push('\n');
+        }
+        self.held = 0;
+        self.body.push_str(text);
+        self.body.push('\n');
+    }
+
+    fn finish(self) -> Block {
+        Block {
+            kind: BlockKind::Literal,
+            // There is no line above a literal block to carry a marker:
+            // the remedy for one is to fence it, not to exempt it.
+            tag_line: None,
+            body: self.body,
+            line: self.line,
+            unterminated: false,
+        }
+    }
+}
+
+/// Emit the literal block being accumulated, if there is one.
+fn close_literal(literal: &mut Option<Literal>, out: &mut Vec<Block>) {
+    if let Some(block) = literal.take() {
+        out.push(block.finish());
+    }
+}
+
+/// Split a Markdown source into its fences, literal code blocks and
+/// inline code spans, in source order.
 ///
 /// A line state machine rather than a Markdown library: the crate has
 /// no parser dependency, the grammar needed is small, and — decisively
@@ -221,6 +288,15 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
     let mut open: Option<Open> = None;
     // The HTML comment on the previous line, if that line was one.
     let mut comment: Option<String> = None;
+    // The literal code block being accumulated, and the two facts that
+    // decide whether an indented line may start one: whether a
+    // four-space container is open, and whether the line above was
+    // blank. An indented line under a paragraph is a lazy continuation
+    // of it, never code — which is also why a document starts as if a
+    // blank line preceded it.
+    let mut literal: Option<Literal> = None;
+    let mut container = false;
+    let mut previous_blank = true;
 
     // Front matter first, and taken off the line stream entirely: it is
     // neither prose nor a fence, and the `---` delimiters would
@@ -264,7 +340,42 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
             }
             None => {
                 let (depth, text) = strip_quotes(raw, usize::MAX);
+
+                // An open `<pre>` swallows every line up to its closing
+                // tag, fence-shaped ones included: inside it they are
+                // content, and reading one as a delimiter would end the
+                // block somewhere the page does not.
+                if literal.as_ref().is_some_and(|block| block.html) {
+                    let mut block = literal.take().expect("checked above");
+                    match pre_close(text) {
+                        Some(before) => {
+                            if !before.is_empty() {
+                                block.push(before);
+                            }
+                            out.push(block.finish());
+                        }
+                        None => {
+                            block.push(text);
+                            literal = Some(block);
+                        }
+                    }
+                    continue;
+                }
+
+                let indent = indent_columns(text);
+                let blank = text.trim().is_empty();
+                let after_blank = std::mem::replace(&mut previous_blank, blank);
+                // The container rule, in one place: an unindented,
+                // non-blank line either opens a four-space container or
+                // ends the one that was open. See
+                // `opens_indented_container` for why the distinction has
+                // to be drawn at all.
+                if !blank && indent == 0 {
+                    container = opens_indented_container(text);
+                }
+
                 if let Some((delimiter, run, indent, tag)) = fence_open(text) {
+                    close_literal(&mut literal, &mut out);
                     flush(&mut region, &mut out);
                     open = Some(Open {
                         delimiter,
@@ -286,7 +397,59 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
                     continue;
                 }
                 comment = None;
-                if text.trim().is_empty() {
+
+                // A `<pre>` is code whatever its indentation and
+                // whatever is above it, so it is answered before the
+                // indented form and its conditions.
+                if let Some(content) = pre_open(text) {
+                    close_literal(&mut literal, &mut out);
+                    flush(&mut region, &mut out);
+                    let starts = if content.is_empty() { line + 1 } else { line };
+                    let mut block = Literal::opened(starts, true);
+                    match pre_close(content) {
+                        // `<pre>x</pre>` on one line.
+                        Some(before) => {
+                            if !before.is_empty() {
+                                block.push(before);
+                            }
+                            out.push(block.finish());
+                        }
+                        None => {
+                            if !content.is_empty() {
+                                block.push(content);
+                            }
+                            literal = Some(block);
+                        }
+                    }
+                    continue;
+                }
+
+                if literal.is_some() {
+                    let block = literal.as_mut().expect("checked above");
+                    if blank {
+                        block.held += 1;
+                        continue;
+                    }
+                    if indent >= 4 {
+                        block.push(strip_indent(text, 4));
+                        continue;
+                    }
+                    // Outdented: the block has ended, and this line is
+                    // prose like any other.
+                    close_literal(&mut literal, &mut out);
+                } else if !container && after_blank && !blank && indent >= 4 {
+                    // The region is empty here — a blank line above is
+                    // what flushed it — but flushing keeps source order
+                    // a property of the code rather than of the
+                    // conditions above it.
+                    flush(&mut region, &mut out);
+                    let mut block = Literal::opened(line, false);
+                    block.push(strip_indent(text, 4));
+                    literal = Some(block);
+                    continue;
+                }
+
+                if blank {
                     // A code span cannot contain a blank line, so a
                     // blank line ends the region and with it any
                     // unclosed backtick run.
@@ -310,6 +473,7 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
     if let Some(fence) = open.take() {
         out.push(finish(fence, true));
     }
+    close_literal(&mut literal, &mut out);
     flush(&mut region, &mut out);
     out
 }
@@ -509,6 +673,91 @@ fn strip_indent(line: &str, indent: usize) -> &str {
         }
     }
     rest
+}
+
+/// Whether an unindented `line` opens a container whose content is
+/// indented four spaces: a `pymdownx.tabbed` tab, an admonition, or a
+/// list item.
+///
+/// Without this the check reports six false positives in
+/// `dev-guide/quickstart.md`, whose install instructions are tabbed —
+/// so container tracking is not a refinement of the literal-block rule
+/// but a precondition for it being right at all. The corpus holds three
+/// tab openers, three admonitions and 427 top-level list items, and
+/// every one of them indents exactly the way an indented code block
+/// does.
+///
+/// The list grammar is [`boundary`]'s rather than a second one, so
+/// "a bare `-` is not a list item" and "`1.` needs a following space"
+/// cannot come to mean two different things in one file.
+fn opens_indented_container(line: &str) -> bool {
+    // `=== "Tab"`, `!!! note`, and the collapsible `??? note` /
+    // `???+ note`.
+    let markers = ["=== ", "!!! ", "??? ", "???+ "];
+    if markers.iter().any(|marker| line.starts_with(marker)) {
+        return true;
+    }
+    matches!(boundary(line), Boundary::Opens)
+}
+
+/// Indentation of `line` in columns, a tab advancing to the next
+/// multiple of four.
+///
+/// Columns rather than characters because a tab-indented block renders
+/// as code exactly as a four-space one does, and counting characters
+/// would leave this check one keystroke from being bypassed.
+fn indent_columns(line: &str) -> usize {
+    let mut columns = 0;
+    for character in line.chars() {
+        match character {
+            ' ' => columns += 1,
+            '\t' => columns += 4 - columns % 4,
+            _ => break,
+        }
+    }
+    columns
+}
+
+/// The text after a `<pre …>` opening tag when `line` starts one.
+///
+/// `Some("")` for the usual `<pre>` on a line of its own, so an empty
+/// opening line is still an opening line.
+fn pre_open(line: &str) -> Option<&str> {
+    let text = line.trim_start_matches([' ', '\t']);
+    if find_ignore_case(text, "<pre") != Some(0) {
+        return None;
+    }
+    // `<prefix>` is not a `<pre>`: the tag name has to end here.
+    let rest = &text["<pre".len()..];
+    let ends = rest.is_empty() || rest.starts_with('>') || rest.starts_with(char::is_whitespace);
+    if !ends {
+        return None;
+    }
+    // Attributes are the tag's, not the block's; content starts after
+    // the tag closes.
+    Some(rest.split_once('>').map_or("", |(_, after)| after))
+}
+
+/// The text before a `</pre>` closing tag when `line` holds one.
+fn pre_close(line: &str) -> Option<&str> {
+    find_ignore_case(line, "</pre").map(|at| &line[..at])
+}
+
+/// Byte offset of the first case-insensitive occurrence of an ASCII
+/// `needle`.
+///
+/// Written out rather than lowercasing the haystack because
+/// `str::to_lowercase` can change a string's length, so an offset into
+/// the lowered copy is not an offset into the original — and the
+/// callers here slice on it. Case-insensitive at all because HTML is:
+/// `<PRE>` renders as code just as `<pre>` does, and a check that reads
+/// only one of them is a check with a shift-key evasion.
+fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// The line verbatim when it is a whole HTML comment, else `None`.
@@ -794,6 +1043,78 @@ mod tests {
         // start with a break, and must scan exactly as it did before.
         assert_eq!(front_matter("---\na: 1\nb: 2\n"), None);
         assert_eq!(front_matter(""), None);
+    }
+
+    #[test]
+    fn every_four_space_container_in_the_corpus_is_recognised() {
+        for line in [
+            "=== \"Install with mise\"",
+            "!!! note",
+            "!!! warning \"Read this\"",
+            "??? tip",
+            "???+ tip",
+            "- bullet",
+            "* bullet",
+            "+ bullet",
+            "1. ordered",
+            "12) ordered",
+        ] {
+            assert!(opens_indented_container(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_prose_opens_no_container() {
+        for line in [
+            "just a sentence",
+            "## Heading",
+            // A bare marker with nothing after it is not a list item,
+            // and `===` alone is a setext underline.
+            "-",
+            "===",
+            "1.5 is a number",
+            "!!!",
+            "",
+        ] {
+            assert!(!opens_indented_container(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_tab_is_worth_four_columns() {
+        assert_eq!(indent_columns("    code"), 4);
+        assert_eq!(indent_columns("\tcode"), 4);
+        assert_eq!(indent_columns(" \tcode"), 4);
+        assert_eq!(indent_columns("  two"), 2);
+        assert_eq!(indent_columns("none"), 0);
+        assert_eq!(indent_columns(""), 0);
+    }
+
+    #[test]
+    fn a_pre_tag_is_found_whatever_its_case_or_attributes() {
+        assert_eq!(pre_open("<pre>"), Some(""));
+        assert_eq!(pre_open("  <PRE>"), Some(""));
+        assert_eq!(pre_open("<pre class=\"x\">code"), Some("code"));
+        assert_eq!(pre_open("<pre>code</pre>"), Some("code</pre>"));
+        // The tag name ends at the `>` or the whitespace, so a longer
+        // element name is a different element.
+        assert_eq!(pre_open("<prefix>"), None);
+        assert_eq!(pre_open("text <pre>"), None);
+        assert_eq!(pre_open("plain"), None);
+
+        assert_eq!(pre_close("</pre>"), Some(""));
+        assert_eq!(pre_close("code</PRE>"), Some("code"));
+        assert_eq!(pre_close("no tag here"), None);
+    }
+
+    #[test]
+    fn a_case_insensitive_search_reports_offsets_into_the_original() {
+        // A lowercased copy can change length, so the offset has to come
+        // from the original bytes — this is the shape that would slice
+        // in the wrong place if it did not.
+        assert_eq!(find_ignore_case("İ</PRE>", "</pre"), Some("İ".len()));
+        assert_eq!(find_ignore_case("abc", "d"), None);
+        assert_eq!(find_ignore_case("ab", "abcd"), None);
     }
 
     #[test]

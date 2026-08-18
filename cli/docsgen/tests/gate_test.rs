@@ -149,6 +149,43 @@ fn an_untagged_fence_is_a_finding() {
     assert!(findings.is_empty(), "{findings:?}");
 }
 
+#[test]
+fn unfencing_a_block_does_not_shed_its_obligation() {
+    // The whole reason `BlockKind::Literal` exists. If this ever goes
+    // green by reporting nothing, the `unlabelled-fence` finding has
+    // become a suggestion to indent instead of to label.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let fenced = "# Page\n\n```sh\napprafter promote\n```\n";
+    let unfenced = "# Page\n\nProse.\n\n    apprafter promote\n";
+    let a = of(
+        &gate.check_source("docs/t.md", fenced).unwrap(),
+        gate::CLI_INVOCATION,
+    );
+    let b = of(
+        &gate.check_source("docs/t.md", unfenced).unwrap(),
+        gate::CLI_INVOCATION,
+    );
+    assert_eq!(a.len(), 1, "fenced: {a:?}");
+    assert_eq!(b.len(), 1, "unfenced: {b:?}");
+    assert!(b[0].contains("promote"), "{b:?}");
+    // On the line the command is written on, not the line after it: a
+    // literal block has no delimiter above its body.
+    assert!(b[0].starts_with("5: "), "{b:?}");
+}
+
+#[test]
+fn a_literal_block_owes_no_fence_shaped_finding() {
+    // It has no fence to label, so reporting one would name a remedy
+    // that does not apply — and the obligations that DO apply are
+    // asserted above.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nProse.\n\n    just some output\n";
+    let findings = gate.check_source("docs/t.md", page).unwrap();
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
 // ---- the marker channel ------------------------------------------------
 
 #[test]

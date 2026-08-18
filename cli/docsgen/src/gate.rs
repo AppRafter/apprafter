@@ -29,7 +29,15 @@
 //!   alike, because a field name is written in both;
 //! * an **unlabelled fence is itself a finding**. The tag is needed for
 //!   highlighting regardless, and requiring it removes the one edit
-//!   ("drop the tag") that could otherwise look innocent.
+//!   ("drop the tag") that could otherwise look innocent;
+//! * a block that renders as code while carrying no fence at all — an
+//!   indented run, an HTML `<pre>` ([`BlockKind::Literal`]) — owes
+//!   everything a fence owes. Without that, the remedy for an
+//!   unlabelled fence reads as "indent it instead of labelling it": the
+//!   finding vanishes, the page renders identically, and every
+//!   content-derived obligation lapses with nothing in the diff that
+//!   looks like suppression. The corpus holds none, so this is a
+//!   regression guard rather than a source of findings.
 //!
 //! A marker never *narrows* an obligation. `check=cli` on a fence that
 //! is also a complete CUE document does not switch the CUE check off —
@@ -462,11 +470,11 @@ impl Gate {
         Ok(raw
             .into_iter()
             .map(|found| {
-                let (file, fence) = split_origin(&found.origin);
+                let (file, anchor) = split_origin(&found.origin);
                 // The document is laid out unwrapped, so cue's line is a
-                // 1-based offset into the fence body, which starts on
-                // the line after the opening delimiter.
-                let line = fence + found.line.unwrap_or(0);
+                // 1-based offset into the block body, which starts on
+                // the line after the anchor the origin carries.
+                let line = anchor + found.line.unwrap_or(0);
                 finding(CUE_DOCUMENT, &file, line, found.message)
             })
             .collect())
@@ -502,7 +510,13 @@ impl Gate {
                 // Never a claim: it is where the page addresses the
                 // gate, and it was read above.
                 BlockKind::FrontMatter => {}
-                BlockKind::Fence { tag } => {
+                // A literal block owes exactly what a fence owes: the
+                // obligation is read off `body`, which both carry, and
+                // any other rule would make "delete the delimiters" a
+                // way to shed it. Only the two findings keyed to
+                // delimiters a literal block does not have are fenced
+                // off below.
+                BlockKind::Fence { .. } | BlockKind::Literal => {
                     if block.unterminated {
                         findings.push(finding(
                             UNTERMINATED_FENCE,
@@ -513,7 +527,10 @@ impl Gate {
                                 .to_string(),
                         ));
                     }
-                    if tag.is_none() {
+                    // Never reported for a literal block: it has no
+                    // fence to label, and the remedy — fence it — is
+                    // not what this finding's text asks for.
+                    if matches!(&block.kind, BlockKind::Fence { tag } if tag.is_none()) {
                         findings.push(finding(
                             UNLABELLED_FENCE,
                             file,
@@ -522,12 +539,21 @@ impl Gate {
                         ));
                     }
 
+                    // Always `None` for a literal block, so a marker can
+                    // neither annotate nor silence one.
                     let marker =
                         self.fence_marker(file, block.line, &block.tag_line, &mut findings);
 
                     // Content, not tag: both obligations are read off
                     // the body before any marker is consulted.
-                    let body_line = block.line + 1;
+                    //
+                    // A fence's body opens on the line below its
+                    // delimiter; a literal block has no delimiter, so
+                    // its own line is already the body's first.
+                    let body_line = match &block.kind {
+                        BlockKind::Fence { .. } => block.line + 1,
+                        _ => block.line,
+                    };
                     let mut invocations = Vec::new();
                     for (offset, text) in invocation::logical_lines(&block.body) {
                         for found in invocation::extract(&text) {
@@ -566,7 +592,12 @@ impl Gate {
                     }
                     if document {
                         documents.push(Document {
-                            origin: format!("{file}:{}", block.line),
+                            // The line the body is anchored to, which
+                            // `vet` adds cue's 1-based line to. For a
+                            // fence that is its delimiter; for a literal
+                            // block there is none, so it is the line
+                            // above the body.
+                            origin: format!("{file}:{}", body_line - 1),
                             body: block.body.clone(),
                         });
                     }

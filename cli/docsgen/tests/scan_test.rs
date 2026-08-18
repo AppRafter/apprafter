@@ -388,6 +388,66 @@ fn an_unclosed_fence_still_yields_a_block_and_is_flagged() {
     assert!(!fence.unterminated);
 }
 
+// ---- literal code blocks: a fence's obligation must survive unfencing ----
+
+#[test]
+fn a_four_space_block_at_top_level_is_a_literal_block() {
+    // The evasion this closes: delete a fence's delimiters, indent the
+    // body, and the block still renders as code while every
+    // content-derived obligation silently lapses.
+    let src = "# Page\n\nProse.\n\n    apprafter promote\n\nMore prose.\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(literal[0].body, "apprafter promote\n");
+    assert_eq!(literal[0].line, 5);
+}
+
+#[test]
+fn tabbed_admonition_and_list_content_is_not_a_literal_block() {
+    // All three indent by four spaces. The corpus has three tab
+    // openers, three admonitions and 427 top-level list items; without
+    // container tracking `quickstart.md` alone yields six false
+    // positives, and the check would be wrong on the only page in the
+    // corpus that could trip it.
+    let src = concat!(
+        "# Page\n\n",
+        "=== \"Tab\"\n\n    tab content here\n\n",
+        "!!! note\n\n    admonition content here\n\n",
+        "- list item\n\n    list continuation here\n",
+    );
+    let literal: Vec<_> = blocks(src)
+        .into_iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert!(literal.is_empty(), "{literal:?}");
+}
+
+#[test]
+fn a_pre_block_is_a_literal_block() {
+    let src = "# Page\n\n<pre>\napprafter promote\n</pre>\n";
+    let all = blocks(src);
+    let literal: Vec<_> = all
+        .iter()
+        .filter(|b| b.kind == BlockKind::Literal)
+        .collect();
+    assert_eq!(literal.len(), 1, "{all:?}");
+    assert_eq!(literal[0].body, "apprafter promote\n");
+}
+
+#[test]
+fn an_indented_line_inside_a_fence_stays_fence_body() {
+    // The fence branch must win: a fence body is arbitrary text, and
+    // re-reading part of it as a literal block would double-count
+    // every indented line in every shell transcript in the corpus.
+    let src = "# Page\n\n```sh\napprafter app list\n    indented output\n```\n";
+    let all = blocks(src);
+    assert!(!all.iter().any(|b| b.kind == BlockKind::Literal), "{all:?}");
+}
+
 /// A tripwire, not an assertion: it prints what the scanner sees across
 /// the whole corpus so a later reader can tell "the docs changed" from
 /// "the scanner changed". Ignored because it shells out to `git` and
@@ -405,6 +465,7 @@ fn corpus_census() {
     let mut readme = false;
     let mut truncated: Vec<String> = Vec::new();
     let mut padded: Vec<String> = Vec::new();
+    let mut literals: Vec<String> = Vec::new();
     for path in &files {
         readme |= path.ends_with("README.md");
         let src = std::fs::read_to_string(path).unwrap();
@@ -419,6 +480,11 @@ fn corpus_census() {
                         .entry(tag.clone().unwrap_or_else(|| "(none)".into()))
                         .or_default() += 1;
                 }
+                // Not asserted empty: a literal block is checked, not
+                // rejected. It is printed because the measurement this
+                // check was built on says there are none, and the day
+                // that changes is the day to look at the page.
+                BlockKind::Literal => literals.push(format!("{}:{}", path.display(), block.line)),
                 BlockKind::FrontMatter => front += 1,
                 BlockKind::InlineSpan => {
                     spans += 1;
@@ -445,6 +511,7 @@ fn corpus_census() {
     println!("inline spans:          {spans}");
     println!("pages with front matter: {front}");
     println!("spans `apprafter …`:   {invocations}");
+    println!("literal code blocks:   {} {literals:?}", literals.len());
     println!("unterminated fences:   {}", truncated.len());
     println!("spans with a gap:      {}", padded.len());
     println!("fence tags:            {tags:?}");
