@@ -90,9 +90,19 @@ pub struct Finding {
     pub message: String,
     /// 1-based line **within the fence body**, when cue reported one.
     /// The absolute source line is the fence's line plus this, because
-    /// the document is laid out unwrapped and unshifted.
+    /// the document is laid out unwrapped and unshifted — nothing is
+    /// prepended, so no offset correction is needed and none can be got
+    /// wrong.
     pub line: Option<usize>,
     /// 1-based column within that line.
+    ///
+    /// Exact for a fence at column 0, which is every documented manifest
+    /// today. `scan` strips a fence's own indentation and blockquote
+    /// depth from its body, so for a fence indented under a list item or
+    /// quoted in a callout the column is relative to the **stripped**
+    /// body and the reader's editor will show it that many characters
+    /// further right. The line is unaffected either way, which is the
+    /// number that finds the place.
     pub column: Option<usize>,
 }
 

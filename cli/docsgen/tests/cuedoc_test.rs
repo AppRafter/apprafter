@@ -64,6 +64,21 @@ app: v1alpha1.#Application & {
 }
 
 #[test]
+fn a_kind_that_does_not_exist_is_a_finding_not_a_pass() {
+    // The rejected `#`-definition wrapper would have vetted
+    // `#x: v1alpha1.#TotallyBogusKind & {}` GREEN. Concrete documents do
+    // not: an unknown kind is an undefined field, and it is named.
+    let doc = Document {
+        origin: "guide.md:9".into(),
+        body: "package example\nimport v1alpha1 \"apprafter.io/schemas/v1alpha1\"\nt: v1alpha1.#Tenant & {\n\tmetadata: name: \"acme\"\n}\n".into(),
+    };
+    let findings = validate_documents(&[doc]).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].message.contains("#Tenant"), "{findings:?}");
+    assert_eq!(findings[0].line, Some(3), "{findings:?}");
+}
+
+#[test]
 fn a_fragment_is_refused_rather_than_skipped() {
     // `cue vet ./...` skips a directory whose file has no package
     // clause without a word, so a fragment reaching the batch would
