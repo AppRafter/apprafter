@@ -139,6 +139,7 @@
 //! is the second worst; both are why [`cuedoc::validate_documents`]'s
 //! `Err` is propagated here rather than folded into the finding list.
 
+use crate::codepath;
 use crate::cuedoc::{self, Document};
 use crate::identifier::{self, FieldSet};
 use crate::invocation::{self, Tree};
@@ -147,9 +148,10 @@ use crate::model;
 use crate::scan::{self, BlockKind};
 
 use clap::CommandFactory;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 /// A documented `apprafter …` line that does not resolve against the
@@ -186,6 +188,8 @@ pub const EXEMPTION_EXPIRED: &str = "exemption-expired";
 pub const EXEMPTION_UNAGED: &str = "exemption-unaged";
 /// An exemption that silences nothing.
 pub const EXEMPTION_UNUSED: &str = "exemption-unused";
+/// A path this documentation names does not exist in the repository.
+pub const CODE_PATH: &str = "code-path";
 
 /// Front-matter key exempting an inline span from the CLI check, by the
 /// span's literal text.
@@ -240,6 +244,12 @@ fn remedy(code: &str) -> &'static str {
         EXEMPTION_UNUSED => {
             "the exemption silences nothing — delete it, or fix the literal text it \
              names (matching is exact, not substring)"
+        }
+        CODE_PATH => {
+            "A path named here is not in the repository. Correct it, \
+             or — if it is a path in someone else's project — say whose \
+             it is in the sentence, because a reader will otherwise \
+             grep this repository for it."
         }
         _ => "see cli/docsgen/src/gate.rs",
     }
@@ -382,6 +392,19 @@ impl Exemption {
 pub struct Gate {
     tree: Tree,
     fields: FieldSet,
+    /// Every tracked path, as `git ls-files` spells it.
+    tracked: BTreeSet<String>,
+    /// Every directory one of those paths passes through. Derived
+    /// rather than listed, because `git ls-files` reports blobs and
+    /// pages name directories constantly — "the crates under
+    /// `cli/docsgen/src`". Resolving only blobs would report every one
+    /// of them.
+    directories: BTreeSet<String>,
+    /// The repository's top-level directory names, which is what makes
+    /// a slash-shaped code span a path claim at all. Derived from the
+    /// same listing, so the grammar closes over the tree instead of
+    /// over a hand-kept list that can go stale.
+    tops: Vec<String>,
     /// Where the corpus and the schemas live.
     repo_root: PathBuf,
     /// The repository whose tags date `since=`.
@@ -411,13 +434,47 @@ impl Gate {
         // cannot make the gate agree with it.
         let cli = apprafter::docs_api::Cli::command();
         let version = cli.get_version().unwrap_or("unknown").to_string();
+        // Once, here, rather than once per page: the listing is the
+        // same for every page, and shelling out 33 times would put a
+        // subprocess per page in a pre-commit path.
+        let tracked = tracked_files(repo_root)?;
+        let mut directories = BTreeSet::new();
+        let mut tops = BTreeSet::new();
+        for path in &tracked {
+            let components: Vec<&str> = path.split('/').collect();
+            // Every component but the last: the last is the blob.
+            let mut prefix = String::new();
+            for component in &components[..components.len() - 1] {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(component);
+                directories.insert(prefix.clone());
+            }
+            if components.len() > 1 {
+                tops.insert(components[0].to_string());
+            }
+        }
         Ok(Gate {
             tree: Tree::from_model(model::tree_from(&cli, &version))?,
             fields: FieldSet::from_repo(repo_root)?,
+            tracked,
+            directories,
+            tops: tops.into_iter().collect(),
             repo_root: repo_root.to_path_buf(),
             tags: tags.to_path_buf(),
             now,
         })
+    }
+
+    /// Whether the repository holds this path — as a file, as a
+    /// directory, or as the root itself.
+    ///
+    /// The root is reachable: a page in `docs/` writing `[the
+    /// repository](..)` names it, and it exists however empty the
+    /// normalised string is.
+    fn resolves(&self, path: &str) -> bool {
+        path.is_empty() || self.tracked.contains(path) || self.directories.contains(path)
     }
 
     /// Run every check over the whole in-scope corpus.
@@ -714,6 +771,36 @@ impl Gate {
             }
         }
 
+        // Page-wide and read off the source rather than off a block,
+        // because the two shapes a path claim takes — a code span and a
+        // link target — are inline syntax that `scan` deliberately does
+        // not distinguish: it hands back a span's text with no offset
+        // and no idea whether that span was a link's label. See
+        // [`codepath`] for why the distinction decides the answer.
+        for reference in codepath::references(source, &self.tops) {
+            let directory = page_directory(file);
+            let resolved = if reference.page_relative {
+                normalise(directory, &reference.path)
+            } else {
+                Some(reference.path.clone())
+            };
+            let message = match resolved {
+                Some(target) if self.resolves(&target) => continue,
+                Some(target) if reference.page_relative => format!(
+                    "`{}`: no such path — from `{directory}/` it resolves to `{target}`, \
+                     which is not in the repository",
+                    reference.path
+                ),
+                Some(target) => format!("`{target}`: no such path in the repository"),
+                None => format!(
+                    "`{}`: no such path — from `{directory}/` it climbs above the \
+                     repository root",
+                    reference.path
+                ),
+            };
+            findings.push(finding(CODE_PATH, file, reference.line, message));
+        }
+
         for exemption in spans.iter().chain(paths.iter()) {
             if !exemption.matched {
                 findings.push(finding(
@@ -853,6 +940,64 @@ impl Gate {
             read_list(file, body, map, PATH_IGNORE, "path", findings),
         )
     }
+}
+
+/// Every path `git` tracks in `repo_root`, as repo-relative strings.
+///
+/// The same call, the same flags and the same error wrapping as
+/// [`scan::in_scope`] — `-z` because git C-quotes unusual names
+/// otherwise, which would silently drop them from the set and turn a
+/// correct reference into a finding. Named rather than propagated bare
+/// for the reason [`Gate::corpus`] names its own: the failure mode is
+/// `git` missing from `PATH`, and the io error alone is "No such file
+/// or directory (os error 2)", which reads as the documentation being
+/// wrong rather than the gate being broken.
+fn tracked_files(repo_root: &Path) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|e| format!("could not list the repository (is `git` on PATH?): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files failed in {}: {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8(out.stdout)?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Resolve `target` against the directory `dir`, **lexically**.
+///
+/// No filesystem call is made and none may be: an answer that came from
+/// the disk would depend on a checkout's case sensitivity and on
+/// whatever untracked file happens to sit there, so the same page would
+/// pass on one machine and fail on another. `..` pops a component and
+/// `.` drops out; popping above the root is unresolvable and says so.
+fn normalise(dir: &str, target: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in dir.split('/').chain(target.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// The directory a page sits in, empty for one at the repository root.
+fn page_directory(file: &str) -> &str {
+    file.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
 /// Whether a marker claims something this gate cannot do on this block.
@@ -1086,6 +1231,7 @@ mod tests {
             EXEMPTION_EXPIRED,
             EXEMPTION_UNAGED,
             EXEMPTION_UNUSED,
+            CODE_PATH,
         ] {
             assert_ne!(remedy(code), remedy("no-such-code"), "{code}");
         }

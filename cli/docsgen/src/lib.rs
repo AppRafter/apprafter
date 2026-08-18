@@ -15,6 +15,7 @@
 //! precedent.
 
 pub mod check;
+pub mod codepath;
 pub mod cuedoc;
 pub mod gate;
 pub mod identifier;

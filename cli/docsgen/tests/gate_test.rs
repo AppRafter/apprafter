@@ -475,6 +475,82 @@ fn ordinary_front_matter_declares_nothing_and_is_never_a_claim() {
     assert!(findings.is_empty(), "{findings:?}");
 }
 
+// ---- the paths documentation names -------------------------------------
+
+#[test]
+fn a_path_that_does_not_exist_is_reported() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee `cli/cli-providers/src/hetzner_cloud/validators.rs`.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("3: "), "{found:?}");
+}
+
+#[test]
+fn a_path_that_exists_is_not_reported() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee `cli/docsgen/src/gate.rs`.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_directory_resolves_as_readily_as_a_file() {
+    // Pages name directories constantly ("the crates under
+    // `cli/docsgen/src`"). Resolving only blobs would report every one.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nThe rules live under `cli/docsgen/src`.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_page_relative_link_resolves_against_the_page() {
+    // The `docs/reference/index.md:10` shape: read as a repo-root path
+    // this fails, and reporting it would be the check's first false
+    // positive on the day it shipped.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nships as [`cli/commands.json`](cli/commands.json), which\n";
+    let found = of(
+        &gate.check_source("docs/reference/index.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn the_same_link_from_a_page_one_directory_over_does_not_resolve() {
+    // Three of the four cases above assert an EMPTY finding list, so a
+    // gate that dropped every page-relative reference on the floor —
+    // never joining a target to anything, never resolving one — passes
+    // all three and looks correct. This is the case that fails unless a
+    // link target is really resolved: from `docs/` the same link means
+    // `docs/cli/commands.json`, which does not exist. Silence only
+    // means something once noise is reachable.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nships as [`cli/commands.json`](cli/commands.json), which\n";
+    let found = of(
+        &gate.check_source("docs/index.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("docs/cli/commands.json"), "{found:?}");
+}
+
 // ---- helpers -----------------------------------------------------------
 
 /// A complete `Application` document with `expose` holding `field`.
