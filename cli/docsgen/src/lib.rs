@@ -17,6 +17,7 @@
 pub mod check;
 pub mod model;
 pub mod render;
+pub mod scan;
 
 use std::error::Error;
 use std::path::PathBuf;
