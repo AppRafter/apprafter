@@ -115,7 +115,7 @@ spec:
   base:
     image: nginxdemos/hello:plain-text
     replicas: 1
-    expose: { port: 80, public: false }
+    expose: { port: 80, network: internal }
     needs:
       pg:
         selector: { tier: integrated }
@@ -133,7 +133,7 @@ spec:
   base:
     image: nginxdemos/hello:plain-text
     replicas: 1
-    expose: { port: 80, public: false }
+    expose: { port: 80, network: internal }
 YAML
 ```
 

@@ -49,7 +49,7 @@ apprafter app status <app-name>
 The image line reads as the written tag, an arrow, and the resolved
 digest, with the age of the resolution:
 
-```
+```text
 AppRafter phase: Ready
   image:         ghcr.io/acme/web:latest -> @sha256:9f2c… (resolved 41s ago)
 ```

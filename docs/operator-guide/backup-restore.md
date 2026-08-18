@@ -28,7 +28,7 @@ self-contained folder. It writes **no** custom resources, **no** secrets, and
 applies **no** encryption — use it to inspect a database locally or to migrate
 out of the platform, not as a disaster-recovery artifact.
 
-```
+```text
 apprafter export [--out <dir>] [--namespace <ns> ...] [--select]
 ```
 
@@ -42,7 +42,7 @@ apprafter export [--out <dir>] [--namespace <ns> ...] [--select]
 
 The layout:
 
-```
+```text
 apprafter-export/
   pg/<ns>/<claim>.dump          # pg_dump -Fc (custom format)
   volumes/<ns>/<claim>/data.tar # tar of the volume contents
@@ -62,7 +62,7 @@ plain tarballs: `tar -tf volumes/demo/shop-disk/data.tar`.
 serializes the config and app custom resources and the decrypted user
 secrets, and wraps everything into an encrypted restic repository.
 
-```
+```text
 apprafter backup create [--repo <path>] [--passphrase <value>] \
                         [--namespace <ns> ...] [--select]
 apprafter backup list   [--repo <path>] [--passphrase <value>]
@@ -120,7 +120,7 @@ supply once S3 backends ship (below) — AppRafter never persists them.
 
 ## `apprafter restore` — replay a backup into a running target
 
-```
+```text
 apprafter restore <repo> [--target <name>] [--snapshot <id>] \
                   [--data-only] [--passphrase <value>] [--reprovision]
 ```
@@ -167,7 +167,7 @@ specific snapshot (default `latest`).
 
 The full restore is a fixed sequence:
 
-```
+```text
 RestoreArtifact -> ApplyPlatformStack -> ApplySourceCredentials ->
 ApplyAppsGated -> WaitClaimsBound -> LoadData -> ReSealUserSecrets ->
 ResumeWorkloads
@@ -284,7 +284,7 @@ The in-cluster backup CronJobs read credentials from a Kubernetes Secret in
 the cluster and enables the scheduled backup in one step, with no separate
 `apprafter secret seal` required:
 
-```
+```text
 apprafter backup enable --bucket s3:<endpoint>/<bucket>/<prefix> \
                         --credential-file <dotenv> \
                         [--credential apprafter-backup-s3] \
@@ -388,14 +388,14 @@ backup), `--staging-mode` `monolithic`, `--enforce` `operator`, retention
 
 ### Disable and status
 
-```
+```sh
 apprafter backup disable
 ```
 
 `disable` sets `spec.backup.enabled=false` and **keeps** every other configured
 field, so a later `enable` re-uses the same bucket, credential, and retention.
 
-```
+```sh
 apprafter backup status
 ```
 
@@ -516,7 +516,7 @@ Retention uses **restic's own** snapshot retention — a host- and format-aware
 defaults **7 / 4 / 6**). In the default `enforce: operator` mode you run it
 yourself, outside the cluster, with full credentials:
 
-```
+```text
 apprafter backup prune [--repo s3:…] \
                        [--credential-file <dotenv>] \
                        [--keep-daily N] [--keep-weekly N] [--keep-monthly N]
@@ -542,7 +542,7 @@ a per-run one.
 
 ### Integrity checks and locks
 
-```
+```text
 apprafter backup check [--repo s3:…] [--credential-file <dotenv>] [--read-data]
 ```
 
@@ -563,7 +563,7 @@ a manual verification with full credentials.
 > `apprafter-backup-check` Job history (`kubectl get jobs -n apprafter-system`)
 > or run `apprafter backup check` yourself.
 
-```
+```text
 apprafter backup unlock [--repo s3:…] [--credential-file <dotenv>]
 ```
 
@@ -579,7 +579,7 @@ in-cluster run died unexpectedly.
 Restore reads the repository over S3 using the **operator's** credentials —
 **never** from the cluster (in a real DR the source cluster is gone):
 
-```
+```text
 apprafter restore s3:<endpoint>/<bucket>/<prefix> \
                   --credential-file <dotenv> \
                   [--reprovision | --data-only] [--target <name>] \

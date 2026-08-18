@@ -1,3 +1,11 @@
+---
+schema-check-ignore:
+  - path: "spec.source.path"
+    reason: external-tool
+    since: v0.2.44
+    note: Argo CD's Application CR, whose field set AppRafter does not model
+---
+
 # Writing Application.cue
 
 AppRafter applications are described by a CUE manifest that lives
@@ -54,8 +62,8 @@ app: v1alpha1.#Application & {
         image:    "ghcr.io/my-org/my-service:1.0.0"
         replicas: 1
         expose: {
-            port:   8080
-            public: false
+            port:    8080
+            network: "internal"
         }
         env: {
             LOG_LEVEL: "info"
@@ -73,11 +81,16 @@ overrides — see below). The Rust operator mirrors this exactly via
 | Field             | Type                        | Notes                                               |
 | ----------------- | --------------------------- | --------------------------------------------------- |
 | `image`           | `string`                    | OCI image reference. Required (via base or all envs). |
+| `imagePolicy.resolve` | `"digest" \| "off"` (default `"digest"`) | `digest`: the operator re-resolves the tag to its current registry digest every reconcile, so pushing a moved tag rolls the Deployment. `off`: render the reference verbatim. |
 | `replicas`        | `int & >=0`                 | Zero is valid (scale-to-zero). Defaults to 1 at render time. |
-| `expose.port`     | `int & >0 & <=65535`        | Container port to expose.                           |
-| `expose.public`   | `bool` (default `false`)    | Whether to create a public-facing HTTPRoute.        |
-| `expose.network`  | `"public" \| "internal" \| "vpn"` (default `"internal"`) | Network visibility for the generated HTTPRoute. |
-| `env`             | `[string]: string`          | Literal string env-vars only (no secret refs in v1alpha1). |
+| `resources.requests` / `resources.limits` | `[string]: string` | Container resource requests/limits keyed by resource name (`cpu`, `memory`, `ephemeral-storage`), valued as Kubernetes quantities (`"100m"`, `"128Mi"`). The webhook checks the quantity format and `request <= limit`. |
+| `expose.port`     | `int & >0 & <=65535`        | Container port to expose. Required when `expose` is set on `base`. |
+| `expose.network`  | `"public" \| "internal" \| "vpn"` (default `"internal"`) | Visibility. `public` emits an HTTPRoute on the platform Gateway; `internal` is ClusterIP only; `vpn` is reserved and rejected by the webhook today. |
+| `expose.hostname` | `string \| [...string]`     | One or more public hostnames. Read only when `network: "public"`, where the webhook requires it and checks each is a DNS-1123 subdomain. |
+| `expose.tls`      | `bool` (default `true`)     | Terminate TLS. The public route attaches to `:443`, so `tls: false` with `network: "public"` is webhook-rejected. |
+| `env`             | `[string]: string \| {claim: string} \| {secret: string}` | A literal string, or a reference to a claim field or a sealed secret — see *Referencing claims and secrets* below. |
+| `needs`           | `#Needs`                    | Declared platform-service dependencies — see *Declaring dependencies* below. |
+| `environments`    | `[string]: override`        | Per-environment overrides. Lives under `spec`, not `spec.base` — see *Multi-environment patterns* below. |
 
 The admission webhook enforces non-empty `image` and the
 cross-field rule (image must be reachable through `spec.base.image`
@@ -89,7 +102,10 @@ rejects negative replicas and out-of-range port numbers.
 `spec.base.needs` declares the backing services and storage your
 workload requires. The operator provisions each on demand (a
 `ResourceClaim` per entry), pauses the Application until they are
-ready, and injects the connection details into your container.
+ready, and writes the connection details to a `Secret`. Nothing is
+injected into your container automatically: you name the env-vars you
+want and bind them to claim fields yourself (see *Referencing claims
+and secrets* below).
 
 ```cue
 spec: base: {
@@ -103,16 +119,15 @@ spec: base: {
 }
 ```
 
-| Need | What you get | Injected as |
-| ---- | ------------ | ----------- |
-| `pg` | A Postgres database + role (CloudNativePG). | `DATABASE_URL` env-var (from a Secret). |
-| `redis` | An isolated Redis-compatible logical DB (Dragonfly). | `REDIS_URL` + `REDIS_CHANNEL_PREFIX` env-vars. |
+| Need | What you get | How you reach it |
+| ---- | ------------ | ---------------- |
+| `pg` | A Postgres database + role (CloudNativePG). | A connection `Secret` keyed `url`, `user`, `pass`, `host`, `port`, `db` — referenced as `claim.pg.<field>`. |
+| `redis` | An isolated Redis-compatible logical DB (Dragonfly). | A connection `Secret` keyed `url`, `user`, `pass`, `host`, `port`, `db`, `channelPrefix` — referenced as `claim.redis.<field>`. |
 | `disk` | A persistent `ReadWriteOnce` volume. | Mounted at `mountPath` (pins `replicas: 1`, `strategy: Recreate`). |
 
 **Named, multiple dependencies.** Each key accepts a single entry
 (above) **or an array of named entries**. A named entry provisions
-its own claim and — for service needs — disambiguates the injected
-env-var with an `UPPER_SNAKE` suffix:
+its own claim, addressed by name as `claim.<type>.<name>.<field>`:
 
 ```cue
 needs: {
@@ -127,9 +142,9 @@ needs: {
 }
 ```
 
-Here the two databases inject `DATABASE_URL_PRIMARY` and
-`DATABASE_URL_ANALYTICS` (an unnamed single `pg` stays plain
-`DATABASE_URL`). Each disk mounts at its own path. Within a type,
+Here the two databases are reached as `claim.pg.primary.url` and
+`claim.pg.analytics.url` (an unnamed single `pg` stays plain
+`claim.pg.url`). Each disk mounts at its own path. Within a type,
 every `name` (or, for an unnamed disk, the last `mountPath` segment)
 must be unique, and at most one entry per type may be unnamed.
 
@@ -139,6 +154,51 @@ provisioning, isolation, retention, and GC — live in the operator
 guide: [needs.pg](../operator-guide/needs-pg-walk.md),
 [needs.redis](../operator-guide/needs-redis-walk.md),
 [needs.disk](../operator-guide/needs-disk-walk.md).
+
+### Referencing claims and secrets
+
+An `env` value is one of three things: a literal string, a **claim
+reference**, or an **external secret reference**. The operator resolves
+the latter two into a Kubernetes `secretKeyRef`, so the value itself
+never appears in your manifest or in Git (ADR 0046).
+
+```cue
+spec: base: {
+    image: "ghcr.io/my-org/api:1.0.0"
+    needs: {
+        pg:    { selector: { tier: "integrated" } }
+        redis: { selector: { tier: "integrated" } }
+    }
+    env: {
+        LOG_LEVEL:    "info"                    // literal
+        DATABASE_URL: claim.pg.url              // claim reference
+        DB_HOST:      claim.pg.host             // any decomposed field
+        REDIS_URL:    claim.redis.url
+        STRIPE_KEY:   secret: "stripe/api-key"  // external secret
+    }
+}
+```
+
+**You choose the env-var names.** Declaring `needs.pg` provisions a
+database and writes its connection `Secret`; it does not put anything in
+your container's environment. An app that wants `DATABASE_URL` must bind
+it, as above.
+
+`claim.<type>.<field>` — or `claim.<type>.<name>.<field>` for a named
+entry — is a bare CUE selector. The `claim` value is generated from your
+own `needs` block by the CUE CMP at render time, and by `apprafter app
+validate` locally, so referencing a field you did not provision is a
+compile error rather than a runtime surprise. The available fields are
+exactly the connection-`Secret` keys listed in the table above; `disk`
+has none, since a volume is mounted rather than referenced.
+
+`secret: "<name>/<key>"` reads a `Secret` **in the application's own
+namespace**. Create it with
+[`apprafter secret seal`](../reference/cli/secret.md) — and pass that
+namespace explicitly, because `secret seal` defaults to
+`apprafter-system` (where platform credentials live). A sealed secret is
+bound to the namespace it was sealed for; if the app cannot find it the
+operator reports `EnvSecretMissing`.
 
 ### Egress profiles — `needs` also gates the network
 
@@ -170,16 +230,29 @@ Hubble drop, flipping the profile — is the operator guide's
 
 ## Multi-environment patterns
 
-`spec.environments` holds per-environment overrides. The operator
-reads `APPRAFTER_ENV` to select which environment key to unify
-onto `spec.base` before rendering.
+`spec.environments` holds per-environment overrides. Which one applies
+is a property of the deployment, not of the cluster: `apprafter app add
+--env staging` registers a deployment carrying
+`spec.environment: "staging"`, and the operator unifies
+`spec.environments.staging` onto `spec.base` before rendering
+(ADR 0044). Register the same manifest twice with different `--env`
+values and you get two independent deployments from one file.
 
-Unification rules:
-- `image`, `replicas`, `expose` — **replace**: the environment
-  value overwrites the base value when present.
+Merge rules, per field:
+
+- `image`, `replicas` — **replace**: a value set in the environment
+  overwrites the base value.
+- `expose`, `imagePolicy` — **merge per subfield**: fields the
+  environment sets win, fields it omits inherit from base — so an
+  environment overriding only `network` keeps the base `port`.
+- `resources` — **merge per key** inside `requests` and `limits`, so an
+  environment setting `limits.memory` does not drop the base
+  `limits.cpu`.
 - `env` — **merge with override-wins**: base env-vars are preserved
   and environment-specific vars are added; if the same key appears
   in both, the environment value wins.
+- `needs` — **replace per service key**: an environment entry for `pg`
+  replaces the base `pg` wholesale; base-only keys survive.
 
 ```cue
 // apprafter/Application.cue
@@ -197,8 +270,8 @@ app: v1alpha1.#Application & {
             image:    "ghcr.io/my-org/parser:1.2.0"
             replicas: 2
             expose: {
-                port:   8080
-                public: false
+                port:    8080
+                network: "internal"
             }
             env: {
                 LOG_LEVEL: "info"
@@ -208,10 +281,6 @@ app: v1alpha1.#Application & {
         environments: {
             dev: {
                 replicas: 1
-                expose: {
-                    port:    8080
-                    network: "vpn"
-                }
                 env: {
                     LOG_LEVEL: "debug"   // overrides base LOG_LEVEL
                 }
@@ -219,8 +288,9 @@ app: v1alpha1.#Application & {
             prod: {
                 replicas: 5
                 expose: {
-                    port:   8080
-                    public: true
+                    // `port` inherits from base (subfield merge)
+                    network:  "public"
+                    hostname: "parser.example.com"
                 }
             }
         }
@@ -228,21 +298,22 @@ app: v1alpha1.#Application & {
 }
 ```
 
-With `APPRAFTER_ENV=dev` the operator renders:
+Registered with `apprafter app add --env dev`, the operator renders:
 
 - `image`: `ghcr.io/my-org/parser:1.2.0` (from base, no dev override)
 - `replicas`: 1 (dev overrides base)
-- `expose.network`: `"vpn"` (dev overrides base)
+- `expose`: `port: 8080`, `network: "internal"` (base unchanged)
 - `env`: `{ LOG_LEVEL: "debug", DB_HOST: "postgres.svc" }` (merge, dev wins on LOG_LEVEL)
 
-With `APPRAFTER_ENV=prod`:
+With `--env prod`:
 
 - `image`: `ghcr.io/my-org/parser:1.2.0`
 - `replicas`: 5
-- `expose.public`: `true`
+- `expose`: `port: 8080` inherited from base, `network: "public"` and
+  `hostname` from prod (subfield merge)
 - `env`: `{ LOG_LEVEL: "info", DB_HOST: "postgres.svc" }` (base unchanged)
 
-If `APPRAFTER_ENV` is not set, the operator uses `spec.base` directly
+Registered without `--env`, the operator uses `spec.base` directly
 without applying any environment overlay.
 
 ## How the CUE CMP works
@@ -312,7 +383,8 @@ in v1alpha1 and will produce this error.
 
 A CUE unification conflict. Typically caused by assigning a string
 to an integer field or vice versa. Check `expose.port` (integer),
-`replicas` (integer), and `env` values (must be strings).
+`replicas` (integer), and `env` values (a literal string, or a `claim` /
+`secret` reference — see *Referencing claims and secrets*).
 
 **Admission-webhook rejection after sync**
 
@@ -352,9 +424,15 @@ a running Deployment.
   — the CUE schema `#Application` and `#ApplicationSpec` are defined
   here. This is the authoritative field list.
 - [`operator/operator-core/src/application.rs`](https://github.com/apprafter/apprafter/blob/master/operator/operator-core/src/application.rs)
-  — the Rust mirror of the schema; `APPRAFTER_ENV` selection and the
-  per-environment merge semantics are implemented here.
+  — the Rust mirror of the schema.
+- [`operator/operator-rendering/src/lib.rs`](https://github.com/apprafter/apprafter/blob/master/operator/operator-rendering/src/lib.rs)
+  — `effective_spec()`, where the per-environment merge rules above are
+  implemented.
 - [ADR 0029](../adr/0029-cue-cmp.md) — CUE CMP design rationale.
+- [ADR 0044](../adr/0044-per-environment-deploy.md) — why the active
+  environment is a per-deployment property.
+- [ADR 0046](../adr/0046-env-value-references.md) — the `claim` /
+  `secret` env-value references.
 - [`examples/applications/parser.cue`](https://github.com/apprafter/apprafter/blob/master/examples/applications/parser.cue)
   — a worked multi-environment example.
 - [`docs/dev-guide/quickstart.md`](./quickstart.md) — scaffold and

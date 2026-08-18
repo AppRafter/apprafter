@@ -353,9 +353,11 @@ curl --resolve <zone>:443:<node-ip> https://<zone>/   # refused / times out
   node firewalled to Cloudflare's ranges only.
 - Per-environment overrides via `spec.environments.<env>`: deploy a
   named environment with `apprafter app add --env staging` (a separate
-  deployment you reach with `apprafter app status my-service --env
-  staging`), and set the cluster's default environment with
-  `apprafter platform env set`.
+  deployment — `apprafter app status my-service` reports every
+  environment of the app, one section each, while `--env staging`
+  narrows `app logs`, `app rollback` and `app remove` to that one), and
+  set the cluster's default environment with `apprafter platform env
+  set`.
 
 ## Clean up
 

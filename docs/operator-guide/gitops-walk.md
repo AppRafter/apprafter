@@ -77,7 +77,7 @@ in this runbook: `kubectl get applications.argoproj.io bootstrap -n argocd`.
        replicas: 1
        expose:
          port: 80
-         public: false
+         network: internal
    ```
 
    The AppRafter operator reconciles this CR into a Deployment and

@@ -211,14 +211,16 @@ apprafter app add writer  --namespace apps
 apprafter app add reader  --namespace apps
 
 # 4. Confirm both apps are healthy and the volume shows refCount 2.
-apprafter app status writer --namespace apps
-apprafter app status reader --namespace apps
+#    `app status` takes no --namespace: the namespace was fixed by
+#    `app add` above and is read back off the app's Argo CD Application.
+apprafter app status writer
+apprafter app status reader
 apprafter volume status shared-uploads --namespace apps
 # → Ready: True  refCount: 2
 
 # 5. Remove apps, then the volume.
-apprafter app rm writer --namespace apps
-apprafter app rm reader --namespace apps
+apprafter app rm writer --yes
+apprafter app rm reader --yes
 # wait for refCount to drop to 0 …
 apprafter volume rm shared-uploads --namespace apps
 ```

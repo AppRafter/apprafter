@@ -2,10 +2,10 @@
 
 This guide walks a Tier-1 operator through the full `needs.redis` chain:
 an Application that declares `spec.base.needs.redis` gets an isolated,
-Redis-compatible connection provisioned on demand, its connection string
-injected as `REDIS_URL` (plus `REDIS_CHANNEL_PREFIX` for pub/sub), and —
-when the dependency is removed — the data retained for a 7-day grace
-period and then physically flushed.
+Redis-compatible connection provisioned on demand, its connection
+details published in a `Secret` the app binds to env-vars of its
+choosing, and — when the dependency is removed — the data retained for a
+7-day grace period and then physically flushed.
 
 The backend is [Dragonfly](https://www.dragonflydb.io/), a single-process
 Redis-compatible server. Each claim gets its **own numbered logical DB**
@@ -23,10 +23,11 @@ to a `ServiceProvider` (the seeded `redis-integrated`) and marks it
 `Scheduled=True`. The provisioner lazily creates a shared Dragonfly
 instance (first claim only), allocates the claim a numbered logical DB
 (`status.dbnum`), creates a `$N`-pinned ACL user over the Redis protocol,
-and writes a connection `Secret` carrying `REDIS_URL` +
-`REDIS_CHANNEL_PREFIX`; it marks the claim `ready=true`. The Application
-then **resumes** to `Ready`, and the rendered Deployment mounts both env
-vars from that Secret. When you delete the claim (or remove the
+and writes a connection `Secret` carrying the decomposed fields `url`,
+`user`, `pass`, `host`, `port`, `db`, `channelPrefix`; it marks the claim
+`ready=true`. The Application then **resumes** to `Ready`, and the
+rendered Deployment carries a `secretKeyRef` for every claim field the
+manifest referenced. When you delete the claim (or remove the
 dependency), a finalizer snapshots an immutable `RetainedClaim`
 (deletion + 7 days, `backend: dragonfly`) and the connection Secret
 cascades away — but the ACL user and the DB's data survive the grace
@@ -37,13 +38,14 @@ the snapshot.
 
 ## How an app uses the connection
 
-- **Keys:** use the DSN (`REDIS_URL`) with **ordinary key names** — no
+- **Keys:** use the DSN (`claim.redis.url`) with **ordinary key names** — no
   prefix. The `$N` ACL pins the user to one logical DB, so `SET foo`,
   `GET foo`, `SCAN` etc. are naturally confined to that DB and cannot
   see, enumerate, or collide with any other tenant's keys.
 - **Pub/sub channels:** channels are **server-wide** (not DB-scoped), so
-  the app **must** prefix every channel name with `REDIS_CHANNEL_PREFIX`
-  (`<aclUser>:`). The ACL enforces it — `PUBLISH`/`SUBSCRIBE` to an
+  the app **must** prefix every channel name with the claim's
+  `channelPrefix` field (`claim.redis.channelPrefix`, whose value is
+  `<aclUser>:`). The ACL enforces it — `PUBLISH`/`SUBSCRIBE` to an
   unprefixed channel returns `NOPERM`.
 - **Persistence:** add `persistent: true` to the need to route the claim
   onto a *persistent* pool instance (whole-instance snapshot → PVC)
@@ -128,6 +130,24 @@ apprafter app scaffold --name web --namespace demo --needs redis
 > ```
 >
 > `cue vet ./apprafter/...` validates it locally before you push.
+
+`needs.redis` provisions the logical DB and publishes its connection
+`Secret`, but injects nothing into your container (ADR 0046). Bind the
+env-vars you want to the claim fields yourself:
+
+```cue
+spec: base: {
+    // ... image / replicas / expose / needs ...
+    env: {
+        REDIS_URL:            claim.redis.url
+        REDIS_CHANNEL_PREFIX: claim.redis.channelPrefix
+    }
+}
+```
+
+The env-var names are yours to pick; `claim.redis.<field>` names a field
+in the connection `Secret`. The rest of this walk assumes both bindings
+are in place.
 
 ### Register the app with `apprafter app add`
 
@@ -232,16 +252,16 @@ kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
 # -> the user's rules, including the `$<dbnum>` selector and `&claim_demo_web-redis_redis:*` channel pattern
 ```
 
-**7. The connection Secret carries both env vars.**
+**7. The connection Secret carries the decomposed fields.**
 
 ```sh
 kubectl -n demo get resourceclaim.apprafter.io web-redis \
   -o jsonpath='{.status.connectionSecretRef}{"\n"}'         # -> web-redis-conn
 kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.data.REDIS_URL}' | base64 -d; echo
+  -o jsonpath='{.data.url}' | base64 -d; echo
 # -> redis://claim_demo_web-redis_redis:…@platform-redis-ephemeral-000.dragonfly-system.svc:6379/<dbnum>
 kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.data.REDIS_CHANNEL_PREFIX}' | base64 -d; echo
+  -o jsonpath='{.data.channelPrefix}' | base64 -d; echo
 # -> claim_demo_web-redis_redis:
 kubectl -n demo get secret web-redis-conn \
   -o jsonpath='{.metadata.ownerReferences[0].kind}{"\n"}'   # -> ResourceClaim
@@ -262,7 +282,7 @@ kubectl -n demo get application.apprafter.io web -o jsonpath='{.status.phase}{"\
 # -> Ready
 ```
 
-**9. Both env vars are injected into the Deployment.**
+**9. Both declared claim references resolved in the Deployment.**
 
 ```sh
 kubectl -n demo get deployment web -o \
@@ -279,7 +299,7 @@ own user from inside the cluster:
 
 ```sh
 DSN=$(kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.data.REDIS_URL}' | base64 -d)
+  -o jsonpath='{.data.url}' | base64 -d)
 kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
   redis-cli -u "$DSN" --no-auth-warning SET hello world   # -> OK
 kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
@@ -292,7 +312,7 @@ then:
 
 ```sh
 # As the api user, SELECT of web's DB number returns NOPERM:
-DSN2=$(kubectl -n demo get secret api-redis-conn -o jsonpath='{.data.REDIS_URL}' | base64 -d)
+DSN2=$(kubectl -n demo get secret api-redis-conn -o jsonpath='{.data.url}' | base64 -d)
 WEB_DB=$(kubectl -n demo get resourceclaim.apprafter.io web-redis -o jsonpath='{.status.dbnum}')
 kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
   redis-cli -u "$DSN2" --no-auth-warning SELECT "$WEB_DB"
@@ -414,8 +434,8 @@ The walk must exercise both shipped surfaces. Check every box.
       `status.instance` + `status.dbnum` (steps 2, 4, 6).
 - [ ] Application `web` transitions `AwaitingResourceClaim → Ready`
       (steps 3, 8).
-- [ ] `REDIS_URL` **and** `REDIS_CHANNEL_PREFIX` are injected into the
-      Deployment (step 9).
+- [ ] The `claim.redis.url` **and** `claim.redis.channelPrefix`
+      references render as `secretKeyRef`s on the Deployment (step 9).
 - [ ] **Isolation: a second claim's user gets `NOPERM` on the first
       claim's DB** (step 10).
 - [ ] Deleting the claim cascades the connection Secret + writes a
@@ -430,8 +450,9 @@ The walk must exercise both shipped surfaces. Check every box.
 | ------- | ------------ | --- |
 | Claim stuck `Scheduled` absent / Application stuck `AwaitingResourceClaim` | `needs.redis.selector` does not match any provider's `metadata.labels` | Confirm `selector.tier=integrated` and that `redis-integrated` carries `tier=integrated`: `kubectl get serviceprovider redis-integrated -n apprafter-system -o yaml`. |
 | `status.ready` never `true` | shared Dragonfly instance not Ready, or a provisioner error reaching it over the Redis protocol | `kubectl -n dragonfly-system get dragonfly.dragonflydb.io`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
-| `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key, or a literal `REDIS_URL` / `REDIS_CHANNEL_PREFIX` colliding with the injected ones | Use only the closed `needs` key set; do not declare a literal `env.REDIS_URL` / `env.REDIS_CHANNEL_PREFIX` alongside `needs.redis`. |
-| App gets `NOPERM` on a pub/sub channel | the app published/subscribed to an unprefixed channel | Prefix every channel name with `REDIS_CHANNEL_PREFIX`; keys need no prefix. |
+| `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key | Use only the closed `needs` key set. |
+| App starts but the Redis env-vars are empty or absent | the manifest declares `needs.redis` but never binds it — nothing is auto-injected | Add `env: { REDIS_URL: claim.redis.url }` (see *Author the manifest*). |
+| App gets `NOPERM` on a pub/sub channel | the app published/subscribed to an unprefixed channel | Prefix every channel name with the claim's `channelPrefix`; keys need no prefix. |
 | ACL user missing after a Dragonfly pod restart | runtime ACL users are in-memory and lost on reload | The reconcile loop re-pins them on instance readiness; if it lingers, check the operator logs for the ACL reconcile task. |
 
 ## Cleanup

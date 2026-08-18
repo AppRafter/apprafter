@@ -1,3 +1,11 @@
+---
+cli-check-ignore:
+  - span: "apprafter node reserve-headroom"
+    reason: historical
+    since: v0.2.44
+    note: names the removed command so scripts calling it can be migrated
+---
+
 # Node preparation — reservations and swap
 
 `apprafter node prep` prepares a Tier-1 node for resilient operation: it

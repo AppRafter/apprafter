@@ -124,7 +124,7 @@ applies-and-clears rather than re-creating a new gate.
 
 A `MigrationPlan` moves through these phases:
 
-```
+```text
 pending-approval → approved → executing → completed
                 → rejected (platform scope only)
                 → failed

@@ -2,9 +2,10 @@
 
 This guide walks a Tier-1 operator through the full `needs.pg` chain:
 an Application that declares `spec.base.needs.pg` gets a Postgres
-database provisioned on demand, its connection string injected as
-`DATABASE_URL`, and — when the dependency is removed — the database
-retained for a 7-day grace period and then physically dropped.
+database provisioned on demand, its connection details published in a
+`Secret` the app binds to an env-var of its choosing, and — when the
+dependency is removed — the database retained for a 7-day grace period
+and then physically dropped.
 
 ## The chain in one paragraph
 
@@ -14,10 +15,11 @@ generates a `ResourceClaim` and **pauses** the Application
 claim to a `ServiceProvider` (the seeded `pg-integrated`) and marks it
 `Scheduled=True`. The provisioner lazily creates the shared
 CloudNativePG `Cluster` (first claim only), a per-claim Postgres role +
-database + password Secret, and a connection `Secret` carrying
-`DATABASE_URL`; it marks the claim `ready=true`. The Application then
-**resumes** to `Ready`, and the rendered Deployment mounts
-`DATABASE_URL` from that Secret. When you delete the claim (or remove
+database + password Secret, and a connection `Secret` carrying the
+decomposed fields `url`, `user`, `pass`, `host`, `port`, `db`; it marks
+the claim `ready=true`. The Application then **resumes** to `Ready`, and
+the rendered Deployment carries a `secretKeyRef` for every claim field
+the manifest referenced. When you delete the claim (or remove
 the dependency), a finalizer snapshots an immutable `RetainedClaim`
 (deletion + 7 days) and the connection Secret cascades away — but the
 role and database survive the grace window. Once `retainUntil` passes,
@@ -102,6 +104,26 @@ apprafter app scaffold --name parser --namespace demo --needs pg
 > ```
 >
 > `cue vet ./apprafter/...` validates it locally before you push.
+
+`needs.pg` provisions the database and publishes its connection
+`Secret`, but injects nothing into your container (ADR 0046). Bind the
+env-var you want to the claim field yourself:
+
+```cue
+spec: base: {
+    // ... image / replicas / expose / needs ...
+    env: {
+        DATABASE_URL: claim.pg.url
+    }
+}
+```
+
+The env-var name is yours to pick; `claim.pg.url` names the field in the
+connection `Secret`. The `claim` binding is generated from your own
+`needs` block by `apprafter app validate` and by the CUE CMP at render
+time, so referencing a field you did not provision fails to compile
+rather than at runtime. The rest of this walk assumes that binding is in
+place.
 
 ### Register the app with `apprafter app add`
 
@@ -210,8 +232,11 @@ kubectl -n cnpg-system get secret claim-demo-parser-pg-pw \
 kubectl -n demo get resourceclaim.apprafter.io parser-pg \
   -o jsonpath='{.status.connectionSecretRef}{"\n"}'         # -> parser-pg-conn
 kubectl -n demo get secret parser-pg-conn \
-  -o jsonpath='{.data.DATABASE_URL}' | base64 -d; echo
+  -o jsonpath='{.data.url}' | base64 -d; echo
 # -> postgresql://claim_demo_parser_pg:…@platform-postgres-rw.cnpg-system.svc:5432/claim_demo_parser_pg
+kubectl -n demo get secret parser-pg-conn \
+  -o jsonpath='{.data}{"\n"}' | tr ',' '\n' | cut -d'"' -f2
+# -> url user pass host port db   (the decomposed fields, ADR 0046)
 kubectl -n demo get secret parser-pg-conn \
   -o jsonpath='{.metadata.ownerReferences[0].kind}{"\n"}'   # -> ResourceClaim
 ```
@@ -232,12 +257,17 @@ kubectl -n demo get application.apprafter.io parser -o jsonpath='{.status.phase}
 # -> Ready
 ```
 
-**9. DATABASE_URL is injected into the Deployment.**
+**9. The declared claim reference resolved in the Deployment.** The
+env-var the manifest bound to `claim.pg.url` renders as a `secretKeyRef`
+pointing at the connection Secret's `url` key:
 
 ```sh
 kubectl -n demo get deployment parser -o \
   jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")].valueFrom.secretKeyRef.name}{"\n"}'
 # -> parser-pg-conn
+kubectl -n demo get deployment parser -o \
+  jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")].valueFrom.secretKeyRef.key}{"\n"}'
+# -> url
 ```
 
 **10. (Optional) connect from a consumer pod.** With a
@@ -247,7 +277,7 @@ kubectl -n demo get deployment parser -o \
 kubectl -n demo run dsn-check --rm -it --restart=Never \
   --image=postgres:16 \
   --env="DATABASE_URL=$(kubectl -n demo get secret parser-pg-conn \
-    -o jsonpath='{.data.DATABASE_URL}' | base64 -d)" \
+    -o jsonpath='{.data.url}' | base64 -d)" \
   -- psql "$DATABASE_URL" -tAc "SELECT 1"          # -> 1
 ```
 
@@ -412,7 +442,8 @@ The walk must exercise both shipped surfaces. Check every box.
       (steps 2, 4, 6).
 - [ ] Application `parser` transitions `AwaitingResourceClaim → Ready`
       (steps 3, 8).
-- [ ] `DATABASE_URL` is injected into the Deployment (step 9).
+- [ ] The `claim.pg.url` reference renders as a `secretKeyRef` on the
+      Deployment, keyed `url` (step 9).
 - [ ] Deleting the claim cascades the connection Secret + writes a
       `RetainedClaim`; the role/database survive the grace floor
       (step 12).
@@ -427,7 +458,8 @@ The walk must exercise both shipped surfaces. Check every box.
 | ------- | ------------ | --- |
 | Claim stuck `Scheduled` absent / Application stuck `AwaitingResourceClaim` | `needs.pg.selector` does not match any provider's `metadata.labels` | Confirm `selector.tier=integrated` and that `pg-integrated` carries `tier=integrated`: `kubectl get serviceprovider pg-integrated -n apprafter-system -o yaml`. |
 | `status.ready` never `true` | shared CNPG Cluster not Ready, or a provisioner error | `kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
-| `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key, or a literal `DATABASE_URL` colliding with the injected one | Use only the closed `needs` key set (`pg`); do not declare a literal `env.DATABASE_URL` alongside `needs.pg`. |
+| `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key | Use only the closed `needs` key set (`pg`). |
+| App starts but the DSN env-var is empty or absent | the manifest declares `needs.pg` but never binds it — nothing is auto-injected | Add `env: { DATABASE_URL: claim.pg.url }` (see *Author the manifest*). |
 | Database still present after the GC | CloudNativePG has not reconciled `ensure: absent` yet | Re-run the psql query after a short wait; check the CNPG operator logs in `cnpg-system`. If it persists, this is a closure-blocking bug. |
 
 ## Cleanup
