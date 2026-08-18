@@ -17,7 +17,9 @@ generated CLI reference under `docs/reference/cli/`). Subphases c–j — the
 prose and table gate, xref and health metrics, the mkdocs hooks and LLM
 artefacts, the information-architecture restructure, publication, the CLI-UX
 work and the guide content — are decided here but **not implemented**. Each
-such decision is marked at the point it is stated.
+such decision is marked at the point it is stated. **2.19c and 2.19d have
+shipped since**; the amendment below records 2.19d, including the decisions
+this document made that measurement then overturned.
 
 No release rides this decision so far: shipped CLI behaviour is unchanged (a
 lib target plus doc-comment corrections), no chart, operator or cue-cmp
@@ -336,12 +338,38 @@ generator lives in the CLI workspace but ships in no release artefact.
 
 ## Amendment — 2.19d (xref and health) as delivered, 2026-08-18
 
-The "xref tags and health metrics" bullet under *Deferred* below named five
-mechanisms. Three shipped in a different shape than the bullet described, one
-was dropped on measurement and one was deferred on measurement. Recording
-what was **rejected**, and why, is the point of this amendment: an ADR that
-lists only what was built invites the next person to rebuild what was
-rejected.
+The "xref tags and health metrics" bullet under *Deferred* below names three
+things. Here is what became of each, because recording what was **rejected**
+is the point of this amendment — an ADR that lists only what was built
+invites the next person to rebuild what was rejected.
+
+| The bullet said | What happened |
+|---|---|
+| explicit code-to-docs tags | **Dropped**, and the goal met from the other direction. See below. |
+| graded test bindings | **Deferred on measurement** — 17 of the 28 tracked `e2e/*.sh` walks are run by nothing automated. |
+| a committed metrics file and its ratchets | **Shipped**, with the ratchets re-chosen: all three originally proposed were unimplementable or inverted. |
+
+**Explicit code-to-docs tags were dropped, and the same goal is met by
+`code-path` and `adr-reference` running the other way.** The original idea
+was a `// docs: <path>#<anchor>` comment in Rust and CUE, so that changing a
+function would surface the pages describing it. Measurement made the
+obligation unpayable: roughly 979 public items across 185 non-test modules,
+and even a module-level rule means 73 new tags on the doc-facing surface
+alone — 73 assertions written at authoring time to satisfy a checker, which
+is the defect class this whole system exists to remove. Sniffing the tags
+implicitly is worse: `cli/cli-providers/src/k8s/sealing.rs:7` already cites a
+`docs/developer/crypto.md` belonging to bitnami's sealed-secrets, scoped only
+by prose on the preceding line, and it cannot be fixed by renaming because
+the file is not ours.
+
+So the direction was inverted. A reference from documentation *into* the
+repository is written by the person who is already looking at both, is
+checkable without anyone maintaining a second index, and fails loudly when
+the target moves — which is the property the tags were wanted for. What is
+given up is the reverse lookup: nothing tells a contributor editing
+`server_type.rs` which pages describe it. That remains open, and if it is
+ever built it should be built as a query over the references that already
+exist rather than as a second set of hand-written tags.
 
 No release and no monorepo tag rides it. `cli/Cargo.toml` is untouched, no
 chart, operator or cue-cmp artefact moved, and `docsgen` is a build-time crate
@@ -356,7 +384,7 @@ that ships in no release artefact.
   identically as code and was invisible to every check. Container tracking is
   load-bearing rather than incidental — tabbed blocks, admonitions and list
   items all indent four spaces, and without it the check reports six false
-  positives on `dev-guide/quickstart.md` alone. A `pre` element that never
+  positives on `docs/dev-guide/quickstart.md` alone. A `pre` element that never
   closes is its own finding class, because the remedy is a different edit from
   closing a fence.
 - **`code-path`** — a repository path named in a code span, or in a relative

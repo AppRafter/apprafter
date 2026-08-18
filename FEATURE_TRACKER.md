@@ -79,7 +79,7 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 ---
 
-## order 3.7 — documentation as a product surface
+## order 3.7b — documentation as a product surface
 
 | Status | Feature | plan.md | Checkpoint |
 |---|---|---|---|
@@ -89,7 +89,7 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 >
 > Remaining, and each of them user-visible in a way the four above are not: the mkdocs hooks and LLM artefacts (2.19e), the information-architecture restructure (2.19f), **publication** — the site is still unserved and the landing page still renders a "Soon" badge (2.19g), the CLI-UX examples and completions (2.19h), roughly **fifteen missing guides** for capabilities that exist only in `--help` today (2.19i), and the closing walk over every guide (2.19j). The row flips `✅` at 2.19j, not before: a documentation site nobody can open is not a delivered feature.
 >
-> No release and no monorepo tag rides any of a–d. `docsgen` is a build-time crate that ships in no release artefact; a–b touched CLI doc comments only, 2.19c widened the schema bundle `apprafter app validate` embeds, and 2.19d touched the shipped binary not at all.
+> No release and no monorepo tag rides any of a–d. `docsgen` is a build-time crate that ships in no release artefact; a–b changed no shipped behaviour (2.19b added a lib target and a narrow two-item `docs_api` facade; 2.19a and the doc-comment audit touched help text), 2.19c widened the schema bundle `apprafter app validate` embeds, and 2.19d touched the shipped binary not at all.
 
 ---
 

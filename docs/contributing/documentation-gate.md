@@ -44,15 +44,15 @@ Ten classes. The first five resolve a claim about the product, and
 **none of them is selected by a fence's language tag** — obligations
 come from a block's content, so deleting a tag cannot quietly turn a
 finding green. Nor can deleting the fence: an indented block and an
-HTML `pre` element carry everything a fence carries, for the reason
-below.
+HTML `pre` element still owe the content checks — with two limits
+worth knowing, set out below.
 
 | Code | What it means |
 | --- | --- |
-| `cli-invocation` | An `apprafter …` line — in a fence or an inline span — whose command path or flag names do not resolve against the clap tree. Values and required-ness are **not** checked: a documented command is a reference, not a runnable line. |
+| `cli-invocation` | An `apprafter …` line — in a fence, a literal block, or an inline span — whose command path or flag names do not resolve against the clap tree. Values and required-ness are **not** checked: a documented command is a reference, not a runnable line. |
 | `schema-identifier` | A backticked field path (`spec.…`, `base.…`, `expose.…`, `needs.…`, `Kind.spec.…`) that no shipped schema declares, or one naming a `needs` type no provider ships. Runs page-wide — prose, tables and fences alike. |
-| `cue-document` | A fence that is a complete CUE manifest (a `package` clause *and* the schema import) which `cue vet` rejects. Fragments are out of scope. |
-| `code-path` | A repository path the page names — in a code span, or as a relative link target — that does not exist in the repository. |
+| `cue-document` | A fence or literal block that is a complete CUE manifest (a `package` clause *and* the schema import) which `cue vet` rejects. Fragments are out of scope. |
+| `code-path` | A repository path the page names — in a code span opening on a real top-level directory, or as a relative link target — that does not exist in the repository. |
 | `adr-reference` | An ADR citation that names no ADR at all, or one whose decision no longer stands: `Superseded`, `Deprecated`, or an `Unused` reserved slot. |
 | `unlabelled-fence` | A fence with no info string. |
 | `unterminated-fence` | A fence that never closes, so everything below it renders as code. |
@@ -72,23 +72,38 @@ the documentation: `docs-marker` (malformed marker), `front-matter`
 
 Every finding prints its own remedy. Read it — they differ by class.
 
-### Unfencing a block silences nothing
+### Unfencing a block keeps its content obligations
 
 A run indented four spaces at the top level, and an HTML `pre`
-element, both render as code and both owe every obligation a fence
-owes. That is deliberate rather than thorough: the remedy for an
-unlabelled fence is "give the fence an info string", and deleting the
-delimiters and indenting the body instead is the shorter way to make
-that report go away. The page would render identically, every
-content-derived obligation would lapse, and nothing in the diff would
-read as suppression.
+element, both render as code and both owe the obligations that come
+from a block's **content** — the CLI, CUE and identifier checks. That
+is deliberate rather than thorough: the remedy for an unlabelled fence
+is "give the fence an info string", and deleting the delimiters and
+indenting the body instead is the shorter way to make that report go
+away. The page renders identically and nothing in the diff reads as
+suppression, so the content checks have to follow the content.
 
-Indentation *inside a container* is not a literal block. Tabbed
-blocks, admonitions and list items all indent their contents four
-spaces, and those contents are prose; only a run indented at the top
-level is code. A `pre` element that never closes is `unclosed-pre`,
-because everything below it is inside the block — including any fence,
-which stops being read as a fence.
+Two limits on that, stated because a heading like the one above used
+to overstate them:
+
+- **The `unlabelled-fence` finding itself does go away.** A literal
+  block has no fence to label, so reporting it would name a remedy
+  that does not apply. That escape is real and no census field counts
+  unlabelled fences, so nothing ratchets it either.
+- **Indentation inside a container is not a literal block at all.**
+  Tabbed blocks, admonitions and list items all indent their contents
+  four spaces, and those contents are read as prose — so a block
+  indented under a list item sheds the CLI, CUE and identifier checks
+  entirely. Only a run indented at the top level is code. That is the
+  price of not reporting six false positives on
+  `docs/dev-guide/quickstart.md`, whose install instructions are
+  tabbed, and it is a price worth naming: these checks defend against
+  the careless, not against the motivated. Review defends against the
+  motivated.
+
+A `pre` element that never closes is `unclosed-pre`, because
+everything below it is inside the block — including any fence, which
+stops being read as a fence.
 
 A literal block **cannot be exempted by a marker**: a marker annotates
 the fence on the line below it, and a literal block has no such line.
@@ -114,6 +129,22 @@ The pattern characters are `*`, `?` and the two braces — deliberately
 **not** the square brackets, because three tracked files carry
 brackets in their names, and counting those as patterns would suppress
 exactly the references that matter most on the day one of them moves.
+
+**A code span is only read as a path when it opens on a real
+top-level directory of the repository** — and that is the largest
+thing this check does not see, so write with it in mind.
+`cli/cli-core/src/style.rs` is checked; the crate-relative
+`cli-core/src/style.rs` is invisible, because `cli-core` is a crate
+name and not a directory of the repository. That is not
+hypothetical: `docs/reference/environment.md` writes 24 such
+references across 16 distinct paths, the largest concentration of file
+references anywhere in the corpus, and not one of them is verified.
+The anchor stays narrow because widening it to any slash-shaped token
+would admit some seventy non-repository tokens the corpus legitimately
+writes — `$HOME/.config/apprafter/age.key`,
+`/api/v1/nodes/{node}/proxy/stats/summary`, `.apprafter/state.json`
+and the rest — and a check that reports those is a check people switch
+off. **Write the `cli/` prefix and your path gets checked.**
 
 This class has **no ignore key**. A path belonging to someone else's
 project is named as theirs in the sentence rather than exempted,

@@ -13,7 +13,8 @@ patch of each phase.
 
 > No version bump and no monorepo tag, without the caveat 2.19c carried:
 > `cli/Cargo.toml` is untouched, no chart, operator or cue-cmp artefact
-> moved, and every line of this subphase lives in `cli/docsgen`, a
+> moved, and every line of this subphase lives in `cli/docsgen` plus its
+> wiring in `lefthook.yml` and `.github/workflows/docs.yml` — a
 > build-time crate that ships in no release artefact.
 > Fourth of the documentation track's ten subphases — branch
 > `feat/2.19d-docs-xref-health`, **ADR 0057** (see its 2.19d amendment
@@ -37,7 +38,7 @@ patch of each phase.
   Container tracking is load-bearing rather than incidental: tabbed
   blocks, admonitions and list items all indent four spaces, and without
   it the check reports six false positives on
-  `dev-guide/quickstart.md` alone. A `pre` element that never closes is
+  `docs/dev-guide/quickstart.md` alone. A `pre` element that never closes is
   its own class, `unclosed-pre`, because closing a tag is a different
   edit from closing a fence.
 - **`code-path` — a repository path the documentation names that does not
@@ -115,7 +116,7 @@ patch of each phase.
   explanation with every number unchanged. These ratchets defend against
   the careless, not against the motivated.
 - **Crate-relative paths are invisible to `code-path`.** The check anchors
-  on a real top-level directory, so `reference/environment.md`'s 24
+  on a real top-level directory, so `docs/reference/environment.md`'s 24
   crate-relative references (`platform-cli/src/…`, `cli-core/src/…`) are
   dropped — all of them correct today, and one `cli/` prefix away from
   being exactly the defect the check exists for. Widening the anchor to
