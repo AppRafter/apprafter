@@ -3,34 +3,80 @@
 # Local Git hooks managed by lefthook (https://lefthook.dev).
 # Install with `lefthook install` after `nix run nixpkgs#lefthook --`
 # or `bun add -D lefthook && bun lefthook install`.
+#
+# `pre-commit` uses the `jobs` form (lefthook >= 1.10) rather than
+# `commands`, because only a job can carry a `group` — and the
+# docsgen/docs-check pair needs one. See the comment on that group.
 
 pre-commit:
   parallel: true
-  commands:
-    cue:
+  jobs:
+    - name: cue
       glob: "{cue.mod/**,schemas/**,examples/**}/*.cue"
       run: ./scripts/lint-cue.sh
-    spdx:
+    - name: spdx
       run: ./scripts/check-spdx-headers.sh
-    cyrillic:
+    - name: cyrillic
       run: ./scripts/check-no-cyrillic.sh
-    crd-check:
+    - name: crd-check
       glob: "{schemas/v1alpha1/*.cue,operator/operator-core/src/*.rs,operator/charts/apprafter-operator/templates/crd-*.yaml}"
       run: ./scripts/crd-check.sh
-    docs-check:
-      glob: "{docs/**/*.md,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh}"
-      run: ./scripts/docs-check.sh
-    # The CLI reference is generated from the clap tree, so a touched
-    # cli.rs (or anything else under platform-cli) is a docs change
-    # too. Regenerating and staging it here means a contributor never
-    # sees "the docs drifted" for a file they were never asked to
-    # edit — the gate in docs-check then only fires for a hand-edited
-    # generated page.
-    # `cli/Cargo.toml` is in the glob because commands.json embeds
-    # `cli_version` — a release bump is a reference change.
-    docsgen:
-      glob: "{cli/platform-cli/src/**,cli/Cargo.toml}"
-      run: just docsgen-generate && git add docs/reference/cli
+    # These two are ORDERED, and the rest of the hook is not.
+    #
+    # `docsgen` WRITES docs/reference/cli/; `docs-check` READS it (the
+    # strict mkdocs build, then the byte-compare). A commit touching
+    # both `cli/platform-cli/src/**` and `docs/**/*.md` matches both
+    # globs — and that is the prescribed shape for a CLI change, which
+    # regenerates the reference in the same commit — so under the
+    # hook's `parallel: true` they would race: docs-check could read a
+    # half-written tree, or the pre-regeneration one, and fail or pass
+    # for the wrong reason.
+    #
+    # A `piped` group is lefthook's sequential construct: its jobs run
+    # in listed order and the group stops at the first failure (so a
+    # docsgen failure never reports itself as reference drift). The
+    # group as a whole still runs in parallel with cue/spdx/cyrillic/
+    # crd-check, which share no files with it. A job whose glob does
+    # not match is skipped without failing the group, so a docs-only
+    # commit still runs docs-check and a cli-only commit still runs
+    # docsgen.
+    #
+    # `priority` is NOT the mechanism here: it only orders jobs when
+    # the hook is sequential (`parallel: false` or `piped: true`), and
+    # this hook is parallel by design.
+    - name: docs
+      group:
+        piped: true
+        jobs:
+          # The CLI reference is generated from the clap tree, so a
+          # touched cli.rs (or anything else under platform-cli) is a
+          # docs change too. Regenerating and staging it here means a
+          # contributor never sees "the docs drifted" for a file they
+          # were never asked to edit — the gate in docs-check then
+          # only fires for a hand-edited generated page.
+          # `cli/Cargo.toml` is in the glob because commands.json
+          # embeds `cli_version` — a release bump is a reference
+          # change.
+          # The nix guard mirrors scripts/docs-check.sh: `just
+          # docsgen-generate` runs under `nix develop` for the pinned
+          # toolchain a byte-compare needs, and without nix a raw
+          # "command not found" says nothing about what to do next.
+          - name: docsgen
+            glob: "{cli/platform-cli/src/**,cli/Cargo.toml}"
+            run: |
+              command -v nix >/dev/null 2>&1 || {
+                echo "ERROR: regenerating the CLI reference needs nix — docsgen runs" >&2
+                echo "under 'nix develop' so local and CI render with one pinned" >&2
+                echo "toolchain. Install nix (flakes enabled) — see" >&2
+                echo "docs/contributing/setup.md — or skip the local hook with" >&2
+                echo "'git commit --no-verify'; the docs workflow still runs on the" >&2
+                echo "pull request." >&2
+                exit 2
+              }
+              just docsgen-generate && git add docs/reference/cli
+          - name: docs-check
+            glob: "{docs/**/*.md,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh}"
+            run: ./scripts/docs-check.sh
 
 commit-msg:
   commands:
