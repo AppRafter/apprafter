@@ -15,6 +15,7 @@
 //! precedent.
 
 pub mod check;
+pub mod marker;
 pub mod model;
 pub mod render;
 pub mod scan;
