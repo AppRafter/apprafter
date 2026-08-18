@@ -9,7 +9,7 @@
 //! fiction rather than this checkout's: what a claim *looks like* must
 //! not change with the tree.
 
-use docsgen::codepath::{references, Reference};
+use docsgen::codepath::{is_pattern, references, Reference};
 
 /// The repository's top-level directories, as the extractor is given
 /// them — a fixed list here so a test never depends on the checkout.
@@ -57,8 +57,10 @@ fn a_code_span_that_is_a_links_text_is_page_relative() {
 #[test]
 fn prose_that_merely_contains_a_slash_is_not_a_claim() {
     // Unbackticked prose is not checked at all: "look under cli/ for
-    // the crates" is English, and 161 of 213 inline spans in the
-    // corpus are bare paths, so the span is the signal.
+    // the crates" is English, and the backticks are the author saying
+    // this one is a path. Every one of the corpus's 54 code-span
+    // references is written that way, so the span costs no coverage
+    // and buys the whole separation from prose.
     let r = found("Look under cli/docsgen/src for the rules.\n");
     assert!(r.is_empty(), "{r:?}");
 }
@@ -96,18 +98,59 @@ fn an_external_url_is_not_a_claim() {
 // ---- cases the plan's eight leave open --------------------------------
 
 #[test]
-fn a_glob_names_a_set_of_paths_and_so_names_no_path() {
+fn a_glob_is_extracted_here_and_answered_at_resolution() {
     // Eight corpus spans are patterns rather than paths — README's
-    // `providers/*` and `backstage-plugins/*`, the five `**` exclusions
-    // on `docs/contributing/documentation-gate.md`, and
-    // `docs/reference/environment.md`'s `e2e/*.sh`. Every one of them
-    // is correct documentation, and every one of them would be a
-    // finding if a pattern were resolved as a filename. They are the
-    // ONLY unresolved references in the corpus, so this rule is the
-    // difference between a check that ships green and one that ships
-    // with eight false positives.
+    // `providers/*` and `backstage-plugins/*`, the five `**`
+    // exclusions on `docs/contributing/documentation-gate.md`, and
+    // `docs/reference/environment.md`'s `e2e/*.sh`. Every one is
+    // correct documentation and would be a finding if a pattern were
+    // resolved as a filename; they are the ONLY corpus references that
+    // do not resolve.
+    //
+    // They are still extracted. The suppression belongs to the gate,
+    // which asks `is_pattern` only after a path has FAILED to resolve
+    // — because the characters that make a glob are legal in a
+    // filename, and rejecting the shape here would put the repository's
+    // three `[...slug]` Next.js routes beyond this check for good.
     let r = found("Under `docs/**/*.md` and `docs/adr/**`, plus `e2e/*.sh`.\n");
-    assert!(r.is_empty(), "{r:?}");
+    assert_eq!(r.len(), 3, "{r:?}");
+    assert!(
+        r.iter().all(|found| is_pattern(&found.path)),
+        "each one must be recognisable as a pattern downstream: {r:?}"
+    );
+}
+
+#[test]
+fn a_bracketed_filename_is_not_a_pattern_but_a_star_is() {
+    // Brackets are glob syntax and are also legal in a filename; this
+    // repository has three files that use them, because that is how
+    // Next.js spells a dynamic route. Counting them as patterns would
+    // suppress those references precisely when one is MOVED — the
+    // reference stops resolving, gets read as a pattern, and goes
+    // silent, which is the one moment this check exists for.
+    //
+    // Excluding brackets is free: all eight corpus patterns carry a
+    // `*`, and none is bracket-only.
+    assert!(!is_pattern("cli/docsgen/src/gate.rs"));
+    assert!(!is_pattern("cli"));
+    assert!(!is_pattern(
+        "landing/cms/src/app/(payload)/api/[...slug]/route.ts"
+    ));
+    assert!(is_pattern("docs/**/*.md"));
+    assert!(is_pattern("providers/*"));
+    assert!(is_pattern("docs/{adr,changelog}/**"));
+}
+
+#[test]
+fn a_relative_target_beginning_with_http_is_still_a_claim() {
+    // The URL filter keys on `://`, not on a four-letter prefix. A
+    // relative `httpd/conf.yaml` starts with those letters and is a
+    // file, and dropping it would be a false negative nothing
+    // downstream could recover.
+    let r = found("Edit [the config](../httpd/conf.yaml) first.\n");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].path, "../httpd/conf.yaml");
+    assert!(r[0].page_relative, "{r:?}");
 }
 
 #[test]

@@ -551,6 +551,81 @@ fn the_same_link_from_a_page_one_directory_over_does_not_resolve() {
     assert!(found[0].contains("docs/cli/commands.json"), "{found:?}");
 }
 
+#[test]
+fn a_broken_link_on_a_root_page_names_the_repository_root() {
+    // `page_directory("README.md")` is empty, so a message that glued a
+    // `/` onto it read "from `/`" — filesystem-absolute, which is a
+    // different claim from the one being made. README is the only page
+    // in the corpus at this depth, so nothing else would have caught it.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nRun [the walk](e2e/nope.sh) first.\n";
+    let found = of(
+        &gate.check_source("README.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("the repository root"), "{found:?}");
+    assert!(!found[0].contains("from `/`"), "{found:?}");
+}
+
+#[test]
+fn a_target_that_climbs_above_the_repository_root_says_so() {
+    // The `None` arm of `normalise`. Climbing above the root is not a
+    // path that happens not to exist — no edit to the tree could make
+    // it resolve — so the message has to say something different, and
+    // this is the only test that reaches it.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [it](../../../../elsewhere/thing.sh).\n";
+    let found = of(
+        &gate.check_source("docs/reference/index.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("climbs above"), "{found:?}");
+}
+
+#[test]
+fn a_bracketed_path_is_checked_in_both_directions() {
+    // The reason `is_pattern` excludes brackets. Three tracked files
+    // carry them — Next.js dynamic routes — and the pair below is what
+    // makes the rule observable at all: the real one resolves silently,
+    // and a MOVED one is reported rather than mistaken for a glob.
+    // Asserting only the silence would pass just as well under a rule
+    // that skipped every bracketed path on sight.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let real = "# Page\n\nSee `landing/cms/src/app/(payload)/api/[...slug]/route.ts`.\n";
+    let moved = "# Page\n\nSee `landing/cms/src/app/(payload)/api/[...slug]/gone.ts`.\n";
+    let ok = of(
+        &gate.check_source("docs/t.md", real).unwrap(),
+        gate::CODE_PATH,
+    );
+    let bad = of(
+        &gate.check_source("docs/t.md", moved).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert!(ok.is_empty(), "the real route must resolve: {ok:?}");
+    assert_eq!(bad.len(), 1, "the moved one must be reported: {bad:?}");
+    assert!(bad[0].contains("gone.ts"), "{bad:?}");
+}
+
+#[test]
+fn a_glob_is_silent_even_though_it_never_resolves() {
+    // Eight corpus spans are patterns and all eight are correct
+    // documentation. They are extracted like anything else and answered
+    // at resolution, which is what keeps the census honest about them.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nUnder `docs/**/*.md` and `providers/*`, plus `e2e/*.sh`.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::CODE_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
 // ---- helpers -----------------------------------------------------------
 
 /// A complete `Application` document with `expose` holding `field`.

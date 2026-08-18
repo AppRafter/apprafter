@@ -246,10 +246,10 @@ fn remedy(code: &str) -> &'static str {
              names (matching is exact, not substring)"
         }
         CODE_PATH => {
-            "A path named here is not in the repository. Correct it, \
-             or — if it is a path in someone else's project — say whose \
-             it is in the sentence, because a reader will otherwise \
-             grep this repository for it."
+            "fix the path against the repository — this class has no ignore key, \
+             so a path belonging to someone else's project has to be named as \
+             theirs in the sentence rather than exempted, because a reader will \
+             otherwise grep this repository for it"
         }
         _ => "see cli/docsgen/src/gate.rs",
     }
@@ -777,8 +777,18 @@ impl Gate {
         // not distinguish: it hands back a span's text with no offset
         // and no idea whether that span was a link's label. See
         // [`codepath`] for why the distinction decides the answer.
+        // Loop-invariant: every reference on this page resolves from the
+        // same directory.
+        let directory = page_directory(file);
+        // Named for the message rather than interpolated with a `/`
+        // glued on: a page at the repository root has no directory, and
+        // "from `/`" reads as filesystem-absolute.
+        let from = if directory.is_empty() {
+            "the repository root".to_string()
+        } else {
+            format!("`{directory}/`")
+        };
         for reference in codepath::references(source, &self.tops) {
-            let directory = page_directory(file);
             let resolved = if reference.page_relative {
                 normalise(directory, &reference.path)
             } else {
@@ -786,14 +796,20 @@ impl Gate {
             };
             let message = match resolved {
                 Some(target) if self.resolves(&target) => continue,
+                // A pattern is only recognised as one AFTER it fails to
+                // resolve, which is what keeps the three tracked Next.js
+                // route files — `[...slug]`, `[[...segments]]` — checked
+                // rather than dropped for the brackets in their names.
+                // See [`codepath::is_pattern`].
+                _ if codepath::is_pattern(&reference.path) => continue,
                 Some(target) if reference.page_relative => format!(
-                    "`{}`: no such path — from `{directory}/` it resolves to `{target}`, \
+                    "`{}`: no such path — from {from} it resolves to `{target}`, \
                      which is not in the repository",
                     reference.path
                 ),
                 Some(target) => format!("`{target}`: no such path in the repository"),
                 None => format!(
-                    "`{}`: no such path — from `{directory}/` it climbs above the \
+                    "`{}`: no such path — from {from} it climbs above the \
                      repository root",
                     reference.path
                 ),

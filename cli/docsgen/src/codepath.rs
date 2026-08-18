@@ -58,11 +58,33 @@
 //!   grammar closes over the tree rather than over a hand-kept list —
 //!   same reasoning as [`crate::identifier::TEXT_ROOTS`], with the
 //!   difference that this one cannot go stale.
-//! * **A glob.** `providers/*`, `docs/**/*.md`, `docs/adr/**` and
-//!   `e2e/*.sh` name a *set* of paths. Eight corpus spans are patterns
-//!   of this kind and they are the only ones that do not resolve as
-//!   filenames, so resolving a pattern as a filename is exactly eight
-//!   false positives and no true findings.
+//!
+//! A glob — `providers/*`, `docs/**/*.md`, `e2e/*.sh` — is extracted
+//! like anything else and suppressed at *resolution*, by
+//! [`is_pattern`]. Rejecting the shape here instead would be one line
+//! shorter and would put three tracked files beyond this check
+//! permanently; the predicate says why.
+//!
+//! # The blind spot this anchor rule creates
+//!
+//! Requiring a top-level directory means a **crate-relative** path is
+//! invisible. `docs/reference/environment.md` writes 24 of them across
+//! 16 distinct paths — `platform-cli/src/commands/backup.rs`,
+//! `cli-core/src/style.rs`,
+//! `cli-providers/src/hetzner_cloud/kubeconfig.rs` and the rest — and
+//! every one is dropped, because `platform-cli` is a crate name rather
+//! than a directory of the repository. All 24 exist today under `cli/`,
+//! so nothing is wrong; but they are one `cli/` prefix away from being
+//! exactly the defect that motivates this module, and that page is the
+//! single largest concentration of file references in the corpus.
+//!
+//! It is recorded rather than fixed. Widening the anchor to any
+//! slash-shaped token would admit `$HOME/.config/apprafter/age.key`,
+//! `/api/v1/nodes/{node}/proxy/stats/summary`, `.apprafter/state.json`
+//! and 70 other distinct non-repository tokens the corpus writes in
+//! spans — a check that reports those is a check that gets switched
+//! off. A blind spot named and counted is a smaller problem than a
+//! grammar nobody can predict.
 //!
 //! # Anchored, and line-local
 //!
@@ -80,13 +102,15 @@
 //!
 //! # Measured over the corpus
 //!
-//! 46 repo-root-relative references in code spans — 28 of them the bare
-//! `` `cli/` `` directory form and 18 with a deeper path — and 19
-//! page-relative link targets across 17 distinct destinations.
-//! **Every one of them resolves**, so this check ships with no finding
-//! and no exemption: it is a regression guard on a surface that is
-//! correct today, which is the only moment at which such a guard can be
-//! installed honestly.
+//! 54 repo-root-relative references in code spans and 19 page-relative
+//! link targets across 17 distinct destinations. Of the 54, **46
+//! resolve** — 28 of them the bare `` `cli/` `` directory form and 18
+//! with a deeper path — and the remaining 8 are the globs, suppressed
+//! by [`is_pattern`]. Of the 19 link targets, every one resolves.
+//!
+//! So this check ships with no finding and no exemption: it is a
+//! regression guard on a surface that is correct today, which is the
+//! only moment at which such a guard can be installed honestly.
 
 /// One path-shaped claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,7 +304,19 @@ fn links(line: &str) -> Vec<Link<'_>> {
 }
 
 /// Offset of the `close` delimiter matching the `open` one at `at`.
+///
+/// # Panics
+///
+/// Debug-asserts that `at` really is an `open`, which is the
+/// precondition for the depth never going below zero. Both call sites
+/// check it first; asserting it makes the contract the callee's rather
+/// than a property of two call sites that could gain a third.
 fn matching(bytes: &[u8], at: usize, open: u8, close: u8) -> Option<usize> {
+    debug_assert_eq!(
+        bytes.get(at),
+        Some(&open),
+        "`matching` must start on its opening delimiter"
+    );
     let mut depth = 0usize;
     for (offset, byte) in bytes.iter().enumerate().skip(at) {
         if *byte == open {
@@ -316,7 +352,11 @@ fn destination(target: &str) -> Option<String> {
     if bare.is_empty() || bare.starts_with('#') || bare.starts_with('/') {
         return None;
     }
-    if bare.starts_with("http") || bare.starts_with("mailto:") {
+    // The scheme separator rather than a `http` prefix: a relative
+    // `httpd/conf.yaml` starts with those four letters and is a file in
+    // this repository, not somewhere on the internet. `://` also covers
+    // every other scheme without listing them.
+    if bare.contains("://") || bare.starts_with("mailto:") {
         return None;
     }
     if bare.ends_with(".md") || bare.contains(".md#") {
@@ -334,10 +374,6 @@ fn repo_path(body: &str, tops: &[String]) -> Option<String> {
     if token.is_empty() || token.chars().any(char::is_whitespace) {
         return None;
     }
-    // A pattern names a set of paths, so there is no file to look for.
-    if token.contains(['*', '?', '[', ']', '{', '}']) {
-        return None;
-    }
     let path = position_off(token);
     // The slash is what makes it a path rather than a word: a bare
     // `cli` is one, and `cli/` is not.
@@ -351,6 +387,41 @@ fn repo_path(body: &str, tops: &[String]) -> Option<String> {
     // `cli/` and `cli` are one claim, resolved against the one spelling
     // the git listing uses.
     Some(path.trim_end_matches('/').to_string())
+}
+
+/// Whether `path` is shaped like a glob rather than like a filename.
+///
+/// Consulted **after** resolution fails, never before it. A pattern
+/// names a set of paths and there is no single file to look for, so
+/// `providers/*`, `docs/**/*.md`, `docs/adr/**` and `e2e/*.sh` — eight
+/// corpus spans, and the only ones that do not resolve as filenames —
+/// must not be reported.
+///
+/// # Why `[` and `]` are not pattern characters here
+///
+/// They are glob syntax, and the obvious set to test for is
+/// `* ? [ ] { }`. But brackets are also legal in a filename and this
+/// repository has three that use them —
+/// `landing/cms/src/app/(payload)/api/[...slug]/route.ts` and the two
+/// `[[...segments]]` pages beside it, which is how Next.js spells a
+/// dynamic route. Including brackets would suppress those, and
+/// suppress them **hardest in the case that matters**: while the file
+/// exists the reference resolves and the predicate is never reached,
+/// but the day one is moved — the entire point of this check — the
+/// reference fails to resolve, is read as a pattern, and goes silent.
+/// A rule whose blind spot opens exactly when the defect appears is
+/// worse than no rule.
+///
+/// Excluding them costs nothing, and that is measured rather than
+/// hoped: every one of the eight corpus patterns contains `*`, and
+/// **none is bracket-only**. So `* ? { }` suppresses all eight and
+/// leaves every bracketed real path checked, moved or not. If a
+/// bracket-only glob is ever written — `docs/adr/00[0-5]*.md` — it
+/// carries a `*` in practice; a genuinely bracket-only one would be
+/// reported, and the remedy is the same as for any other unresolvable
+/// claim: name a path, or say it is a pattern in the prose.
+pub fn is_pattern(path: &str) -> bool {
+    path.contains(['*', '?', '{', '}'])
 }
 
 /// Drop a `#anchor` and a trailing `:NNN` line number.
