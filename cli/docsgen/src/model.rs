@@ -28,7 +28,9 @@ pub struct Tree {
     pub commands: Vec<CommandNode>,
 }
 
-/// One command. The root binary is not a node — only its descendants.
+/// One command, including the root binary itself (empty `path`) —
+/// otherwise `apprafter --version` and `apprafter <cmd> --help` have
+/// no node to resolve against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandNode {
     /// Full path without the binary name, e.g. `["secret", "seal"]`.
@@ -115,9 +117,20 @@ pub fn tree_from(root: &Command, cli_version: &str) -> Tree {
     built.build();
 
     let mut commands = Vec::new();
+    // The root binary itself is a node (empty `path`), not just its
+    // subcommands: `apprafter --version` and `apprafter <cmd> --help`
+    // resolve against IT, and without a node here the projection has
+    // nowhere to answer either. It is the one node that keeps clap's
+    // generated `--help`/`--version` — every other node has them
+    // filtered by `node_from`, because at every other level they are
+    // documented once, globally, right here.
+    commands.push(node_from_keeping_generated(&built));
     collect(&built, &mut Vec::new(), false, &mut commands);
     // Sorting by path makes the projection independent of declaration
-    // order, so reordering an enum variant is not spurious drift.
+    // order, so reordering an enum variant is not spurious drift. An
+    // empty path sorts first, so the root node lands at index 0 —
+    // stable, and never a candidate for the `path.len() == 1` filter
+    // `render.rs` uses to pick top-level pages.
     commands.sort_by(|a, b| a.path.cmp(&b.path));
 
     Tree {
@@ -155,6 +168,23 @@ fn collect(
 }
 
 fn node_from(cmd: &Command, path: Vec<String>, hidden: bool) -> CommandNode {
+    node_from_inner(cmd, path, hidden, false)
+}
+
+/// The root binary's own node: everywhere else `--help`/`--version` are
+/// filtered out because they are documented once, globally — but the
+/// root IS that "once, globally", so it must keep them or the gate has
+/// nowhere to resolve `apprafter --version` against.
+fn node_from_keeping_generated(cmd: &Command) -> CommandNode {
+    node_from_inner(cmd, Vec::new(), false, true)
+}
+
+fn node_from_inner(
+    cmd: &Command,
+    path: Vec<String>,
+    hidden: bool,
+    keep_generated: bool,
+) -> CommandNode {
     let mut aliases: Vec<String> = cmd.get_all_aliases().map(str::to_string).collect();
     aliases.sort();
     aliases.dedup();
@@ -163,8 +193,9 @@ fn node_from(cmd: &Command, path: Vec<String>, hidden: bool) -> CommandNode {
     let mut positionals = Vec::new();
     for arg in cmd.get_arguments() {
         let id = arg.get_id().as_str();
-        // clap generates these; they are documented once, globally.
-        if id == "help" || id == "version" {
+        // clap generates these; they are documented once, globally —
+        // except on the root node itself, which IS that one place.
+        if !keep_generated && (id == "help" || id == "version") {
             continue;
         }
         if arg.is_positional() {

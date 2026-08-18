@@ -223,6 +223,19 @@ fn usage_carries_positional_order_which_the_sorted_table_loses() {
 /// would have passed identically had usage become width-sensitive by
 /// any other route.
 #[test]
+fn the_root_binary_is_a_node_so_global_flags_resolve() {
+    let t = tree();
+    let root = t
+        .commands
+        .iter()
+        .find(|c| c.path.is_empty())
+        .expect("the root binary must be projected, or `apprafter --version` cannot resolve");
+    let longs: Vec<_> = root.args.iter().filter_map(|a| a.long.clone()).collect();
+    assert!(longs.contains(&"help".to_string()));
+    assert!(longs.contains(&"version".to_string()));
+}
+
+#[test]
 fn usage_is_a_single_unwrapped_line() {
     let t = tree();
     for c in &t.commands {

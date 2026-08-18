@@ -2,6 +2,42 @@
   "cli_version": "0.2.44",
   "commands": [
     {
+      "path": [],
+      "aliases": [],
+      "about": "AppRafter CLI: bootstrap and lifecycle of clusters.",
+      "long_about": null,
+      "usage": "Usage: apprafter <COMMAND>",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "help",
+          "long": "help",
+          "short": "h",
+          "takes_value": false,
+          "value_name": null,
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Print help"
+        },
+        {
+          "id": "version",
+          "long": "version",
+          "short": "V",
+          "takes_value": false,
+          "value_name": null,
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Print version"
+        }
+      ],
+      "positionals": []
+    },
+    {
       "path": [
         "app"
       ],
