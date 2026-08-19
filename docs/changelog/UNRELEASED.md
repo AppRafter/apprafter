@@ -9,6 +9,183 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.46 — 2.19h CLI UX: a worked example on every command, shell completions, and two guards (2026-08-19)
+
+> **CLI patch release; no chart, operator or cue-cmp release.** Re-derive
+> with `git diff --name-only <base>..HEAD -- cli/ operator/ schemas/
+> platform-stack/ argocd-cue-cmp/`: every path but `cli/` is empty. `cli/`
+> is not, and the shipped binary changes twice over — a new `completion`
+> command and an `Examples:` section in the help of 75 commands — so
+> `cli/Cargo.toml` is bumped 0.2.45 → 0.2.46 in the same commit, per the
+> rule that `apprafter --version` names the code it is running.
+> `docs/reference/cli/commands.json` moves by its `cli_version` line and by
+> the new `completion` node, regenerated in the same commit.
+>
+> Eighth of the documentation track's ten subphases — branch
+> `feat/2.19h-cli-ux`, **ADR 0057** (see its 2.19h amendment for the
+> blind-spot reasoning, the structural-table-over-delimiter decision, the
+> two upstream `clap_complete` behaviours found by walking the recipes, and
+> the five scope items this subphase did not build).
+>
+> ### The defect this track was named for was already fixed, and this is not it
+>
+> The request that opened this work cited `apprafter secret seal` as a
+> command whose `--namespace` option was not described. **It is described,
+> and it was described before this subphase started.** Re-measured at the
+> closing commit rather than quoted: `apprafter secret seal --help` prints
+> `-n, --namespace <NAMESPACE>` with its description and default, and the
+> doc comment also carries the consequence that bites — "the sealed blob
+> only unseals as `<namespace>/<name>`". Corpus-wide, read out of what clap
+> itself prints across all 97 help pages rather than out of the projection
+> of it: **187 arguments, 0 with no description, 0 commands with no
+> `about`.** Earlier walk-fixes closed that.
+>
+> What this subphase contributed is the other half of the same request —
+> "current examples are shown" — and the machinery that stops either half
+> rotting. Saying otherwise would make this entry the kind of false record
+> the gate it describes exists to prevent.
+
+### Added
+
+- **A worked example on every visible leaf command** — 124 lines over all
+  75 of them, rendered into `--help` as an `Examples:` section and into
+  `docs/reference/cli/**`. The root, the 18 group nodes and the 3 hidden
+  `auth` leaves carry none, by rule: a hidden command is hidden because it
+  is not for users, and an example would re-advertise it in both surfaces.
+
+  One source of truth: `pub const EXAMPLES: &[CommandExamples]` in
+  `cli/platform-cli/src/examples.rs`, reached by the binary through
+  `examples::attach` and by `docsgen` through the `docs_api` facade. The
+  examples are **not** parsed back out of `after_help` — see *Notes*.
+
+  Editorial rules, recorded on the constant with their reasons: a comment
+  is kept only where it makes a bare or ambiguous line legible or names the
+  scenario for a multi-flag combination (a second pass deleted 32 comments,
+  and one whole entry, that merely restated the flag help printed six lines
+  above); no alias appears in an example, because the generated reference
+  already lists every alias and teaching one on one command would be the
+  inconsistency; and value shapes are checked against the code that parses
+  them, never against memory — `up-only`/`off`, `internet|internal|strict`,
+  `pg|redis|disk`, `monolithic|sequential`, `solo|team|prod|regulated`, and
+  the two `backup enable` examples which are exactly the two legal forms
+  `construct_repo_url` accepts (mutually exclusive, so neither mixes
+  `--endpoint` with a schemed bucket).
+
+- **`apprafter completion <shell>`** over `clap_complete`, emitting a script
+  on stdout for bash, elvish, fish, powershell or zsh. The argument's type
+  **is** `clap_complete::Shell` rather than a local enum mapping onto it:
+  `Shell` is `#[non_exhaustive]`, so a hand-kept second list would freeze at
+  today's five the next time the generator grows one, with nothing to say
+  so. All five are asserted in `cargo test`, driving the shipped binary and
+  iterating `Shell::value_variants()` rather than a list written in the
+  test.
+
+  Install recipes for **bash, zsh and fish** in the developer quickstart's
+  `## Install` section — the page the operator quickstart already declares
+  the deeper of the two. Elvish and PowerShell get a script and no recipe,
+  because a recipe for conventions nobody here has walked would be invented
+  rather than written; the page names the three it covers and points at
+  `apprafter completion --help` for the full list, so the documented set
+  cannot drift from the argument's.
+
+- **`docsgen check` now resolves every example against the clap tree**
+  (`cli/docsgen/src/examples.rs`), reusing `invocation::resolve_to` rather
+  than a second walk. Five finding classes: unresolvable command path,
+  unresolvable flag, an entry naming no `apprafter` invocation, an empty
+  entry, and an example filed under a command it does not invoke. Values
+  and required-ness stay unchecked, which is the settled rule from 2.19c.
+
+- **`cli/platform-cli/tests/help_rot_test.rs`** — seven properties, each
+  chosen because a diff reviewer would not notice it breaking and it breaks
+  something outside the diff when it does: every visible leaf carries an
+  example; no hidden command carries one; no example is blank and no table
+  row promises lines it has none of; every command still has `about`; every
+  flag and positional still has short help; the alias invocations the guides
+  type still reach their command; and the guides still type every alias the
+  table claims. Each was shown failing and restored.
+
+- **`cli/platform-cli/tests/examples_help_test.rs`** — three tests pinning
+  that `--help` actually renders the block, that a command with no examples
+  grows no empty section, and that the root is untouched. Without them every
+  other gate stays green if `run()` reverts to `Cli::parse()` and the
+  examples vanish from the only surface a user meets.
+
+### Changed
+
+- `run()` expands `Cli::parse()` into build → `examples::attach` → match, so
+  `after_help` is attached at run time from the one table.
+  `get_matches_mut` keeps the command alive, so a parse error still renders
+  against it.
+- `clap_complete = "4.5"` added to `[workspace.dependencies]`, carrying
+  clap's own requirement string verbatim rather than a floor of its own, so
+  one edit moves both and neither can float to a different major alone.
+- `docs/dev-guide/quickstart.md` gains `### Shell completion` inside
+  `## Install`; `docs/operator-guide/quickstart.md` gains a five-line
+  pointer to it rather than a copy.
+
+### Notes
+
+- **The examples were in a blind spot between the two gates, which is why
+  the guard shipped first.** `docsgen check` byte-compares the reference
+  against a fresh render — it proves the pages match the source, never that
+  the source is correct, and an example with a misspelled flag renders
+  identically both times. `docsgen gate` excludes that tree because `check`
+  owns it, so it never reads an example. Each gate derives its expectation
+  from the same side it checks. The guard was demonstrated with
+  `docsgen generate` run **first**, so the byte-compare was clean while
+  `docs/reference/cli/secret.md:65` published
+  `apprafter secret seal db-url --namesapce web`.
+- **The examples are a structural table, not a delimiter in `after_help`,
+  because a parse that finds nothing passes.** Change the delimiter, wrap
+  the block, restyle it, or write an example containing the delimiter, and a
+  parsing guard silently judges zero entries while printing OK. The same
+  reasoning makes an entry the guard cannot read a finding rather than a
+  skip.
+- **One committed list, on purpose.** Six of the seven help-rot properties
+  derive from the clap tree at test time. The seventh cannot: deriving
+  "which aliases the guides use" from the clap tree is circular — delete an
+  alias and a clap-derived list stops containing it, so the check passes on
+  an alias that no longer exists. The list is the other side, and a seventh
+  assertion keeps it honest against the corpus. It was derived rather than
+  assumed: seven invocations across five pages type `t`, `ls`, `info`, `rm`,
+  `kc`, `cb` and `up`; `apprafter volume rm` correctly is not among them.
+- **Two upstream `clap_complete` behaviours**, found by following the
+  recipes under an isolated `HOME` rather than by sizing the files, recorded
+  rather than worked around: a hidden subcommand still completes (the filter
+  covers hidden *possible values* only, and clap exposes no way to remove a
+  subcommand from a built tree), and only bash and zsh complete a
+  positional's value set.
+- **Five items this subphase's own scope list named are not built**, each
+  probed at closing rather than assumed, and named in `plan.md` rather than
+  dropped: `secret list` (absent), a namespace picker for `secret seal`
+  (absent — `--namespace` still defaults to `apprafter-system`),
+  `status.conditions[]` with remediation in `app status` (absent — the CLI
+  reads `/status/phase` and the claim's `Scheduled` condition; the
+  Application CR's own conditions, which `operator-core` emits, are never
+  read), `requires = "select"` on `--namespace` (absent — no clap `requires`
+  attribute anywhere in `cli.rs`), and `app open --yes` (absent — the
+  command prompts `Continue anyway?` on an unhealthy app and hard-refuses in
+  a non-interactive shell, so CI has no escape). The first two have a
+  trigger inside this track; the last two are command-semantics changes
+  needing a decision of their own.
+- **clap aliases are invisible and the two surfaces disagree.** `alias =`
+  renders nowhere in `--help`, while the generated reference lists all 16
+  and the guides teach seven. `visible_alias` would close it and is a
+  shipped-surface change, so it is flagged rather than fixed.
+- The census held or grew on every counter: 33 pages, 427 invocations, 248
+  identifiers (119 opaque), 104 code paths, 70 ADR references, 2 exemptions;
+  llm artefacts 60 / 119 / 119.
+
+### Reported, not fixed
+
+- **`scripts/docs-artefacts-check.py` crashes on a new page that is written
+  but not yet staged** — met again, this time as
+  `KeyError: 'reference/cli/completion/'`. Same defect recorded as finding
+  (d) in the 2.19g entry: `source` is built from `git ls-files` while
+  `published` comes from the build, and the `orphan_pages` guard for exactly
+  this case sits below the line that dereferences the missing key. Staging
+  fixes it; the traceback is what a contributor meets first. Second report.
+
 ## cli v0.2.45 — 2.19g publication: the documentation site becomes a deployable application (2026-08-19)
 
 > **CLI patch release; no chart, operator or cue-cmp release.** Re-derive
