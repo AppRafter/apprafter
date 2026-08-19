@@ -300,7 +300,15 @@ fn every_flag_and_positional_still_has_help_text() {
             let id = arg.get_id().as_str();
             // clap generates `--help` / `--version`; their text is
             // clap's, and the root documents them once for everybody.
-            if id == "help" || id == "version" {
+            //
+            // Keyed on the ACTION, not on the id: `apprafter platform
+            // freeze` declares a real `--version <VERSION>` whose clap
+            // id is its field name, so the id test that used to stand
+            // here excused the one flag on this tree that a name-based
+            // rule gets wrong. `docsgen::model` was skipping the same
+            // flag by the same reasoning, and the page shipped without
+            // an options table at all.
+            if is_clap_generated(arg) {
                 continue;
             }
             checked += 1;
@@ -331,6 +339,234 @@ fn every_flag_and_positional_still_has_help_text() {
          nothing says what they do:\n  {}",
         silent.len(),
         silent.join("\n  ")
+    );
+}
+
+/// Whether clap generated this argument, rather than the CLI declaring
+/// it. Same rule, and the same reason, as `docsgen::model`'s filter of
+/// the same name — an id test mistakes `apprafter platform freeze
+/// --version <VERSION>` for clap's own.
+fn is_clap_generated(arg: &clap::Arg) -> bool {
+    matches!(
+        arg.get_action(),
+        clap::ArgAction::Help
+            | clap::ArgAction::HelpShort
+            | clap::ArgAction::HelpLong
+            | clap::ArgAction::Version
+    )
+}
+
+// ------------------------------------ the published page vs. what clap prints
+
+/// The arguments `-h` prints for one command, as it spells them.
+///
+/// The long flag when there is one, otherwise the short; a positional
+/// by its value name. Headings are clap's own, and **any** other
+/// unindented line closes the current section — which is what keeps the
+/// `Examples:` block, the `Usage:` line and the wrapped `about`
+/// paragraph from being read as arguments.
+fn printed_arguments(help: &str) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum Section {
+        Options,
+        Arguments,
+        Other,
+    }
+
+    let mut section = Section::Other;
+    let mut out = Vec::new();
+    for line in help.lines() {
+        if !line.starts_with(' ') {
+            section = match line.trim_end() {
+                "Options:" => Section::Options,
+                "Arguments:" => Section::Arguments,
+                _ => Section::Other,
+            };
+            continue;
+        }
+        // An argument's own line is indented two to six spaces; clap's
+        // second layout puts a long description on the NEXT line at a
+        // deeper indent, and a shallow-indent continuation does not
+        // occur. The leading token decides the rest.
+        let indent = line.len() - line.trim_start().len();
+        if !(2..=6).contains(&indent) {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else { continue };
+        match section {
+            Section::Options => {
+                if !first.starts_with('-') {
+                    continue;
+                }
+                // `-n, --namespace <NS>` / `--version <VERSION>` / `-v`.
+                let (short, mut long) = match first.strip_suffix(',') {
+                    Some(short) => (Some(short), None),
+                    None if first.starts_with("--") => (None, Some(first)),
+                    None => (Some(first), None),
+                };
+                if long.is_none() {
+                    long = tokens.next().filter(|next| next.starts_with("--"));
+                }
+                out.push(long.or(short).expect("one of the two is set").to_string());
+            }
+            Section::Arguments => {
+                if !(first.starts_with('<') || first.starts_with('[')) {
+                    continue;
+                }
+                out.push(
+                    first
+                        .trim_end_matches(['.', '…'])
+                        .trim_matches(['<', '>', '[', ']'])
+                        .to_string(),
+                );
+            }
+            Section::Other => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The same reduction over the published projection.
+fn projected_arguments(node: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for arg in node["args"].as_array().expect("args is an array") {
+        let spelling = match (arg["long"].as_str(), arg["short"].as_str()) {
+            (Some(long), _) => format!("--{long}"),
+            (None, Some(short)) => format!("-{short}"),
+            (None, None) => panic!("an arg with neither a long nor a short: {arg}"),
+        };
+        out.push(spelling);
+    }
+    for positional in node["positionals"]
+        .as_array()
+        .expect("positionals is an array")
+    {
+        out.push(
+            positional["value_name"]
+                .as_str()
+                .expect("a positional has a value name")
+                .to_string(),
+        );
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn short_help_for(path: &[&str]) -> String {
+    let output = ShippedBinary::cargo_bin("apprafter")
+        .unwrap()
+        .args(path)
+        .arg("-h")
+        .output()
+        .expect("the binary runs");
+    assert!(
+        output.status.success(),
+        "`apprafter {} -h` exited {:?}:\n{}",
+        path.join(" "),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("help is UTF-8")
+}
+
+/// The published `commands.json`, as data.
+fn published_commands() -> Vec<serde_json::Value> {
+    let path = repo_root().join("docs/reference/cli/commands.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let tree: serde_json::Value = serde_json::from_str(&text).expect("commands.json parses");
+    tree["commands"]
+        .as_array()
+        .expect("commands is an array")
+        .clone()
+}
+
+#[test]
+fn every_command_projects_the_arguments_its_help_prints() {
+    // The assertion that would have caught `docsgen::model` dropping
+    // `apprafter platform freeze --version`, and did not exist to.
+    //
+    // The two sides are genuinely different derivations of the same
+    // tree: the SHIPPED binary's own help writer, and the projection
+    // that publishes `docs/reference/cli/**`. **Per command** is the
+    // whole point. An aggregate equality was recorded in ADR 0057 as
+    // corroboration — "187 arguments, exactly the count in
+    // commands.json, so the two derivations agree from opposite sides"
+    // — and it was the sentence that HID the defect: the root's
+    // generated `help` was counted on one side only (-1) and `platform
+    // freeze --version` on the other (+1), and the two cancelled. A
+    // total is not an assertion.
+    //
+    // `--help` is the one argument the two sides legitimately differ
+    // on: clap prints it for every command, and the projection carries
+    // it once, on the root, because that is where it is documented.
+    // That shape is asserted here rather than silently exempted.
+    let published = published_commands();
+    assert!(
+        published.len() >= 90,
+        "only {} command(s) in commands.json — the artefact is not the \
+         shipped tree, and a comparison over almost nothing passes for \
+         the wrong reason",
+        published.len()
+    );
+
+    let mut compared = 0usize;
+    let mut wrong: Vec<String> = Vec::new();
+    for node in &published {
+        let path: Vec<String> = node["path"]
+            .as_array()
+            .expect("path is an array")
+            .iter()
+            .map(|part| part.as_str().expect("a path part is a string").to_string())
+            .collect();
+        let key: Vec<&str> = path.iter().map(String::as_str).collect();
+        let display = if key.is_empty() {
+            "apprafter".to_string()
+        } else {
+            format!("apprafter {}", key.join(" "))
+        };
+
+        let mut printed = printed_arguments(&short_help_for(&key));
+        let mut projected = projected_arguments(node);
+
+        assert!(
+            printed.iter().any(|arg| arg == "--help"),
+            "`{display} -h` prints no `--help`, so the section parser \
+             read nothing and this comparison would hold vacuously"
+        );
+        assert_eq!(
+            projected.iter().any(|arg| arg == "--help"),
+            key.is_empty(),
+            "`{display}`: clap's generated `--help` belongs in the \
+             projection on the root and nowhere else"
+        );
+        printed.retain(|arg| arg != "--help");
+        projected.retain(|arg| arg != "--help");
+        compared += printed.len();
+
+        if printed != projected {
+            wrong.push(format!(
+                "{display}\n    prints:  {printed:?}\n    projects: {projected:?}"
+            ));
+        }
+    }
+
+    assert!(
+        compared >= 150,
+        "only {compared} argument(s) read out of the help pages — the \
+         parser stopped matching clap's layout"
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} command(s) whose published arguments differ from the ones \
+         their help prints — fix `docsgen::model` and re-run \
+         `just docsgen-generate`:\n  {}",
+        wrong.len(),
+        wrong.join("\n  ")
     );
 }
 

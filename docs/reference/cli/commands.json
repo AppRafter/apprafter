@@ -2193,7 +2193,20 @@
         "apprafter platform freeze cilium",
         "apprafter platform freeze cilium --version 1.16.5"
       ],
-      "args": [],
+      "args": [
+        {
+          "id": "version",
+          "long": "version",
+          "short": null,
+          "takes_value": true,
+          "value_name": "VERSION",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Pin version. Omit to lock the current effective version (read from `status.componentVersions`)"
+        }
+      ],
       "positionals": [
         {
           "id": "component",

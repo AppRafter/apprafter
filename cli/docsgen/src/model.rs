@@ -234,10 +234,9 @@ fn node_from_inner(
     let mut args = Vec::new();
     let mut positionals = Vec::new();
     for arg in cmd.get_arguments() {
-        let id = arg.get_id().as_str();
         // clap generates these; they are documented once, globally —
         // except on the root node itself, which IS that one place.
-        if !keep_generated && (id == "help" || id == "version") {
+        if !keep_generated && is_clap_generated(arg) {
             continue;
         }
         if arg.is_positional() {
@@ -262,6 +261,40 @@ fn node_from_inner(
         args,
         positionals,
     }
+}
+
+/// Whether clap generated this argument itself, rather than the CLI
+/// declaring it.
+///
+/// Keyed on the arg's **action**, which is what clap's own generation
+/// sets, never on its id. The id test this replaced — `id == "help" ||
+/// id == "version"` — dropped `apprafter platform freeze --version`,
+/// a genuine `Option<String>` flag whose clap id is its field name
+/// `version`. The published page then carried `Usage: apprafter
+/// platform freeze <COMPONENT>` and no options table at all, while
+/// `apprafter platform freeze -h` printed the flag and the page's own
+/// `about` said "Without `--version` — …". Every gate stayed green,
+/// because both sides of the byte-compare are this same projection.
+///
+/// `ArgAction` is `#[non_exhaustive]`, so the fallback is "declared by
+/// the CLI": a new clap action is something the CLI could ask for, and
+/// showing an arg that should have been hidden is a visible, fixable
+/// defect where hiding one that should have been shown is the silent
+/// one this comment exists about.
+///
+/// `the_projection_carries_a_commands_own_version_flag` in
+/// `model_test.rs` pins the case; the standing two-sided guard is
+/// `every_command_projects_the_arguments_its_help_prints` in
+/// `platform-cli/tests/help_rot_test.rs`, which compares what clap
+/// PRINTS against this projection **per command**.
+fn is_clap_generated(arg: &Arg) -> bool {
+    matches!(
+        arg.get_action(),
+        clap::ArgAction::Help
+            | clap::ArgAction::HelpShort
+            | clap::ArgAction::HelpLong
+            | clap::ArgAction::Version
+    )
 }
 
 fn arg_from(arg: &Arg) -> ArgSpec {

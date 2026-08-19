@@ -324,6 +324,49 @@ fn the_root_binary_is_a_node_so_global_flags_resolve() {
     assert!(longs.contains(&"version".to_string()));
 }
 
+/// A command's OWN `--version` survives the generated-arg filter.
+///
+/// `apprafter platform freeze --version <VERSION>` is a declared
+/// `Option<String>`, and its clap id is the field name `version`. A
+/// filter keyed on the id string dropped it: the published page showed
+/// `Usage: apprafter platform freeze <COMPONENT>`, an Arguments table
+/// with only `<COMPONENT>` and no options table at all, while the
+/// binary printed the flag and the page's own `about` read "Without
+/// `--version` — …". Nothing caught it, because `docsgen check`
+/// byte-compares this projection against itself.
+///
+/// The generated `--help` is asserted absent in the same test on
+/// purpose: it is what stops the fix from degenerating into "keep
+/// everything", which would put `-h, --help` in all 97 options tables.
+#[test]
+fn a_commands_own_version_flag_is_not_mistaken_for_claps() {
+    let t = tree();
+    let freeze = node(&t, &["platform", "freeze"]);
+    let version = freeze
+        .args
+        .iter()
+        .find(|a| a.long.as_deref() == Some("version"))
+        .unwrap_or_else(|| {
+            panic!(
+                "`apprafter platform freeze` declares `--version <VERSION>`; \
+                 the projection has {:?}",
+                freeze.args.iter().map(|a| &a.long).collect::<Vec<_>>()
+            )
+        });
+    assert!(version.takes_value, "it is an `Option<String>`, not a flag");
+    assert!(
+        !version.help.is_empty(),
+        "the flag's own help must reach the page"
+    );
+    assert!(
+        !freeze
+            .args
+            .iter()
+            .any(|a| a.long.as_deref() == Some("help")),
+        "clap's generated `--help` must still be filtered off a non-root node"
+    );
+}
+
 #[test]
 fn usage_is_a_single_unwrapped_line() {
     let t = tree();

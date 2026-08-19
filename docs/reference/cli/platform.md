@@ -174,6 +174,10 @@ Usage: apprafter platform freeze <COMPONENT>
 | --- | --- | --- |
 | `<COMPONENT>` | yes | Component name (must match a key in the umbrella chart's `values.components` map; e.g. `cilium`, `argocd`, `cert-manager`, `apprafter-operator`) |
 
+| Flag | Value | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--version` | — | — | no | Pin version. Omit to lock the current effective version (read from `status.componentVersions`) |
+
 Examples:
 
 ```sh
