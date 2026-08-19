@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 site_name: AppRafter
 site_description: Opinionated, vertically-integrated PaaS on Kubernetes
-site_url: https://apprafter.dev/docs
+# ADR 0057 decision 8: the docs are their own deployable on their own
+# hostname. A path on the landing origin (`apprafter.dev/docs`) was
+# considered and REJECTED there — it couples the docs release cadence
+# to the landing's and shares one cache and one rollback unit between
+# two artefacts with unrelated change rates. This value is not
+# cosmetic: `docs/hooks/llm_export.py` bakes it into every absolute URL
+# in llms.txt, llms-full.txt and the per-page markdown twins, and
+# mkdocs bakes it into sitemap.xml, so the wrong value here publishes
+# the rejected design in four artefacts.
+site_url: https://docs.apprafter.dev/
 copyright: >
   © 2026 AppRafter Authors. Documentation licensed CC-BY-4.0;
   code samples Apache-2.0. Platform core FSL-1.1-Apache-2.0.

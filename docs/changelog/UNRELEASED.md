@@ -109,10 +109,11 @@ patch of each phase.
 
 - **The redirect map.** ADR 0057 named one, and there is nothing to redirect
   from: no URL this site serves has ever been public. The site is
-  unpublished, no workflow publishes it, `docs.apprafter.dev` appears in no
-  deployable source, and the landing page renders a "Soon" badge from an
-  empty `docsUrl`. An entry would map a URL nobody has ever held onto one
-  nobody can yet reach.
+  unpublished, no workflow publishes it, and the landing page renders a
+  "Soon" badge from an empty `docsUrl`. An entry would map a URL nobody has
+  ever held onto one nobody can yet reach. (`mkdocs.yml` now carries
+  `docs.apprafter.dev` — see the `site_url` correction below — but nothing
+  serves it.)
 
   **The trigger is explicit: the first page that moves after publication
   needs an entry**, and `mkdocs-redirects` is already in the flake's python

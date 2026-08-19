@@ -776,9 +776,12 @@ R5's mitigation names "a committed redirect map", and the Deferred bullet
 below names one too. There is nothing to redirect **from**.
 
 No URL this site serves has ever been public. The site is unpublished, no
-workflow publishes it, `docs.apprafter.dev` appears in no deployable source
-(only in this ADR, `plan.md` and `FEATURE_TRACKER.md`), and the landing page
-renders a "Soon" badge from an empty `docsUrl`. A redirect entry would
+workflow publishes it, and the landing page renders a "Soon" badge from an
+empty `docsUrl`. The hostname is now in the one deployable source that
+decides it — `git grep -n 'docs\.apprafter\.dev'` names `mkdocs.yml` beside
+this ADR, `plan.md`, `FEATURE_TRACKER.md` and the two changelogs — and it got
+there by this amendment's own correction below, not by a publication step.
+Nothing serves it. A redirect entry would
 therefore map a URL nobody has ever held onto one nobody can yet reach:
 machinery for no user, which is the shape this track has refused at every
 previous opportunity — the staleness gate, the typed `verified-by` bindings,
@@ -902,6 +905,32 @@ the next subphase can decide rather than discover.
   it, giving an application a dependency, and day-2 work. Not a defect, and
   deliberately not fixed here: this subphase's remit was to settle URLs, not
   to import a documentation framework.
+
+### Corrections after review
+
+Three reviews ran on this subphase and each of the following was found by
+**reading** something this amendment had asserted from a pattern. They are
+recorded here rather than edited into the paragraphs above, so that the shape
+of the mistake stays visible: *a census pattern is not a reading, and a check
+that derives its expectation from the same side it checks is vacuous.*
+
+- **`site_url` encoded the design decision 8 rejected.** `mkdocs.yml` read
+  `site_url: https://apprafter.dev/docs` — a path on the landing origin,
+  which decision 8 names and rejects for coupling two release cadences,
+  caches and rollback units. That value is not cosmetic: `llm_export.py`
+  bakes it into every absolute URL in `llms.txt`, `llms-full.txt` and the
+  per-page markdown twins, and mkdocs bakes it into `sitemap.xml`, so all
+  four artefact classes published the rejected design. **"The URLs are
+  settled" was not true while it stood**, and settling them is what this
+  subphase exists to do. Now `https://docs.apprafter.dev/`; rebuilt, and the
+  artefacts follow — 59 absolute URLs in `llms.txt`, 119 in `llms-full.txt`,
+  117 in `sitemap.xml`, and zero occurrences of `apprafter.dev/docs` anywhere
+  under the built site. Re-derive with:
+
+  ```sh
+  nix develop --command mkdocs build --strict -d /tmp/site
+  grep -rl 'apprafter\.dev/docs' /tmp/site | wc -l   # must be 0
+  ```
 
 ### Consequences
 
