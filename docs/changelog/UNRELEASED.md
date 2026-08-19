@@ -95,7 +95,7 @@ patch of each phase.
   entry, and an example filed under a command it does not invoke. Values
   and required-ness stay unchecked, which is the settled rule from 2.19c.
 
-- **`cli/platform-cli/tests/help_rot_test.rs`** — seven properties, each
+- **`cli/platform-cli/tests/help_rot_test.rs`** — eight properties, each
   chosen because a diff reviewer would not notice it breaking and it breaks
   something outside the diff when it does: every visible leaf carries an
   example; no hidden command carries one; no example is blank and no table
@@ -141,7 +141,7 @@ patch of each phase.
   parsing guard silently judges zero entries while printing OK. The same
   reasoning makes an entry the guard cannot read a finding rather than a
   skip.
-- **One committed list, on purpose.** Six of the seven help-rot properties
+- **One committed list, on purpose.** Seven of the eight help-rot properties
   derive from the clap tree at test time. The seventh cannot: deriving
   "which aliases the guides use" from the clap tree is circular — delete an
   alias and a clap-derived list stops containing it, so the check passes on
@@ -221,11 +221,20 @@ pass. The machinery held. What follows is what got through it.
   debugs their cluster instead of their shell. `export X="$(cmd)"` also
   exits 0 when `cmd` fails, so a failed fetch passed silently too. The
   example is now `apprafter kubeconfig > /tmp/kc && export
-  KUBECONFIG=/tmp/kc`, which is the quickstarts' idiom and stops on a failed
-  fetch. The same wrong form shipped in five guide pages
-  (`operator-guide/`'s `postgres.md`, `redis.md`, `persistent-disk.md`,
-  `egress-policy.md`, `connect-a-git-repository.md`) and is corrected there
-  too, so the corpus and `--help` say the same thing.
+  KUBECONFIG=/tmp/kc`, which stops on a failed fetch. The same wrong form
+  shipped in five guide pages (`operator-guide/`'s `postgres.md`,
+  `redis.md`, `persistent-disk.md`, `egress-policy.md`,
+  `connect-a-git-repository.md`) and is corrected there.
+
+  A review then caught the claim this entry first made — that the new form
+  "is the quickstarts' idiom". It was not: both quickstarts and one prose
+  line still wrote `apprafter kubeconfig | tee /tmp/kc`, which has the
+  *second* failure mode intact (a pipeline exits 0 when its first command
+  fails, leaving an empty `/tmp/kc` and the same walk to
+  `localhost:8080`). Those three are converted too, so the claim is now
+  true rather than aspirational — and worth recording as a caution: the
+  first fix corrected every site the finding named and none that it did
+  not.
 - **The examples guard treated `--version` as global on every command.**
   `invocation::Tree::knows_flag` chained the whole root node's argument list
   as globals, and the root's list is `--help/-h` **and** `--version/-V`.

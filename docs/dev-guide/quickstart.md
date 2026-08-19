@@ -203,8 +203,7 @@ A non-zero exit (any `✗ FAIL`) means something is broken — see
 raw resources):
 
 ```sh
-apprafter kubeconfig | tee /tmp/kc
-export KUBECONFIG=/tmp/kc
+apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
 kubectl get nodes                # ↳ Ready
 ```
 

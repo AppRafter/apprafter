@@ -40,7 +40,7 @@ Argo CD `Application` manifests in their bootstrap repository.
   nested Argo CD `Application` manifests all work. A bare empty repo
   syncs as a no-op.
 - `kubectl` configured against the cluster (run `apprafter kubeconfig
-  | tee /tmp/kc` and `export KUBECONFIG=/tmp/kc`).
+  > /tmp/kc && export KUBECONFIG=/tmp/kc`).
 - For the **private** quadrants: ability to generate a PAT (Personal Access
   Token) on the platform, scoped to read the bootstrap repo.
 

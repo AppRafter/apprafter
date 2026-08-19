@@ -1652,7 +1652,8 @@ sweep's 187.
 - **`apprafter completion <shell>`** over `clap_complete`, with install
   recipes in the developer quickstart.
 - **A help-rot guard**, `cli/platform-cli/tests/help_rot_test.rs`,
-  seven properties derived from the clap tree at test time.
+  eight properties, seven derived from the clap tree at test time and one
+  comparing the shipped binary's help against the published projection.
 
 ### The examples were in a blind spot between the two gates
 
@@ -1751,15 +1752,24 @@ the files, and are recorded rather than worked around:
 A full snapshot of every help page fails on every wording improvement and gets
 regenerated without being read — worse than no test. The bar each property had
 to clear instead: **a diff reviewer would not notice it breaking, and it
-breaks something outside the diff when it does.** Seven passed it: every
+breaks something outside the diff when it does.** Eight passed it: every
 visible leaf carries an example; no hidden command carries one; no example is
 blank and no row promises lines it has none of; every command still has
 `about`; every flag and positional still has short help; the alias
-invocations the guides type still reach their command; and the guides still
-type every alias the table claims.
+invocations the guides type still reach their command; the guides still
+type every alias the table claims; and every command publishes exactly the
+arguments its own `-h` prints.
 
-Six of the seven derive from the clap tree at test time. **The seventh is a
-committed list, and that is the design rather than a shortcut.** Deriving
+The eighth arrived late — it is the standing check the repair for the dropped
+`platform freeze --version` flag needed, and its absence is why this
+paragraph said *seven* until a review re-counted the file. That is the rule
+this document states, broken inside the branch that states it, so the number
+now carries its witness: `grep -c '#\[test\]'
+cli/platform-cli/tests/help_rot_test.rs`.
+
+Seven of the eight derive from the clap tree at test time; the eighth
+compares the shipped binary's help against the published projection. **One is
+a committed list, and that is the design rather than a shortcut.** Deriving
 "which aliases the guides use" from the clap tree is exactly circular: delete
 the `t` alias and a clap-derived list simply stops containing it, so the check
 passes on an alias that no longer exists. The list is the other side, and the

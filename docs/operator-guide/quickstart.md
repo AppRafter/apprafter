@@ -160,8 +160,7 @@ FAIL with a hint pointing at the right next command.
 Export the kubeconfig and check the cluster:
 
 ```sh
-apprafter kubeconfig | tee /tmp/kc
-export KUBECONFIG=/tmp/kc
+apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
 
 kubectl get nodes
 # <hostname>   Ready   control-plane,master   <age>   v1.31.x+k3s
