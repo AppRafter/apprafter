@@ -120,6 +120,12 @@ hooks:
   # falls back to `text`, so without that self-check a broken hook is a
   # green build with every ```cue fence silently unhighlighted.
   - docs/hooks/cue_lexer.py
+  # Writes llms.txt, llms-full.txt and a markdown twin per page into
+  # the built site. Nothing it writes is committed: all three derive
+  # from committed content at build time, so they cannot drift from it.
+  # Listed after the lexer because it captures each page's markdown and
+  # a hook that edited markdown would have to run first to be seen.
+  - docs/hooks/llm_export.py
 
 markdown_extensions:
   - attr_list          # explicit {#stable-anchor} ids — the docs cross-reference gate resolves against these
