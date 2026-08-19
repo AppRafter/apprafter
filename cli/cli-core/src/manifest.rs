@@ -246,9 +246,32 @@ pub enum EnvValue {
     Reference(Value),
 }
 
+/// An `Application.spec.*.expose` block.
+///
+/// **Every field is optional, `port` included**, because this type only has to
+/// DESERIALISE every shape the schema permits — the CLI never produces one.
+/// A per-environment override that changes visibility and nothing else,
+///
+/// ```cue
+/// environments: dev: expose: network: "internal"
+/// ```
+///
+/// is legal at every other layer: `cue vet` accepts it, `apprafter app
+/// validate` reports valid, the admission webhook returns no errors, and the
+/// operator merges `port` from `base`. While `port` was required here the CLI
+/// was the only layer that refused it, and it refused the WHOLE manifest —
+/// `app add`'s picker setup (`commands/app.rs`) is the sole caller, and on a
+/// parse error it warns, hides the environment picker and skips the namespace
+/// preselect. So a manifest the rest of the platform accepts lost two pieces
+/// of the wizard.
+///
+/// Requiring a field here can only ever cost reach, never buy safety: the
+/// schema, the CRD and the webhook are where `expose.port`'s presence is
+/// actually enforced, on the manifests that reach a cluster.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApplicationExpose {
-    pub port: u16,
+    #[serde(default)]
+    pub port: Option<u16>,
     #[serde(default)]
     pub network: Option<String>,
 }

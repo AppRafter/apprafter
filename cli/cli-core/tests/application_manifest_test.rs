@@ -64,7 +64,7 @@ fn parse_full_application_fixture() {
     assert_eq!(base.replicas, Some(3));
 
     let expose = base.expose.expect("expose decoded");
-    assert_eq!(expose.port, 8080);
+    assert_eq!(expose.port, Some(8080));
     assert_eq!(expose.network.as_deref(), None);
 
     let env = base.env.expect("env decoded");
@@ -225,4 +225,71 @@ fn application_fixture_vets_against_schema() {
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// An `expose` block that sets only `network` must decode.
+///
+/// This is legal everywhere else in the stack and is what a per-environment
+/// override looks like when it changes visibility and nothing else: `cue vet`
+/// accepts it, `apprafter app validate` reports valid, the admission webhook
+/// returns no errors, and the operator merges the port from `base`. The CLI
+/// was the one layer that refused it — `ApplicationExpose::port` was a
+/// REQUIRED serde field, so `docs-site/apprafter/Application.cue`'s
+///
+///     environments: dev: expose: network: "internal"
+///
+/// failed to deserialise with `missing field `port``. The only caller of that
+/// parse is `app add`'s picker setup, which warns and then hides the
+/// environment picker and skips the namespace preselect — so a manifest the
+/// whole rest of the platform accepts silently lost two pieces of the wizard.
+///
+/// The shape is asserted here rather than in a fixture file because it is a
+/// DESERIALISATION contract: the CLI only ever has to read every shape the
+/// schema permits, never to produce them.
+#[test]
+fn expose_override_without_port_decodes() {
+    let doc = serde_json::json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "Application",
+        "metadata": {"name": "docs", "namespace": "apprafter"},
+        "spec": {
+            "base": {
+                "image": "ghcr.io/apprafter/docs:latest",
+                "replicas": 2,
+                "expose": {"port": 80, "network": "public", "hostname": "docs.example.dev"}
+            },
+            "environments": {
+                // The override under test: visibility only, port inherited.
+                "dev": {"replicas": 1, "expose": {"network": "internal"}}
+            }
+        }
+    });
+
+    let parsed: ApplicationManifest = serde_json::from_value(doc)
+        .expect("an expose override carrying only `network` must decode");
+
+    let base_expose = parsed
+        .spec
+        .base
+        .expect("base decoded")
+        .expose
+        .expect("base expose decoded");
+    assert_eq!(
+        base_expose.port,
+        Some(80),
+        "a port that IS present must still decode"
+    );
+
+    let envs = parsed.spec.environments.expect("environments decoded");
+    let dev_expose = envs
+        .get("dev")
+        .expect("dev environment decoded")
+        .expose
+        .as_ref()
+        .expect("dev expose decoded");
+    assert_eq!(
+        dev_expose.port, None,
+        "an absent port must decode as None, not fail the whole manifest"
+    );
+    assert_eq!(dev_expose.network.as_deref(), Some("internal"));
 }

@@ -1178,15 +1178,29 @@ between this branch and a reader reaching `https://docs.apprafter.dev/` is
 entirely manual — see the handoff below, which is the part of this amendment
 that must not be skimmed.
 
-No release and no monorepo tag rides it. `cli/`, `operator/`, `schemas/`,
-`platform-stack/` and `argocd-cue-cmp/` are untouched — re-derive with
-`git diff --name-only <base>..HEAD -- cli/ operator/ schemas/ platform-stack/
-argocd-cue-cmp/`, which is empty — so `apprafter --help` is byte-identical,
-the byte-compared `commands.json` did not move, and no chart artefact
-changed. `cli/Cargo.toml` is bumped to match a *released* tag in the commit
-that cuts it; docs and CI work cuts none. The new `ghcr.io/apprafter/docs`
-image is versioned by commit SHA rather than by a git tag, so publication
-introduces no tag stream of its own either.
+**This subphase does cut a CLI release, and the answer changed during
+review** — it is recorded here in the direction it moved, because the earlier
+answer was derived correctly from a tree that then grew a `cli/` change.
+
+Re-derive rather than reading the conclusion:
+
+```sh
+git diff --name-only <base>..HEAD -- cli/ operator/ schemas/ \
+    platform-stack/ argocd-cue-cmp/
+```
+
+`operator/`, `schemas/`, `platform-stack/` and `argocd-cue-cmp/` are empty,
+so no chart artefact moved and no operator image is implicated. `cli/` is
+not: `cli-core`'s `ApplicationExpose` gained an optional `port` (see the
+consequence below), which changes shipped `apprafter app add` behaviour, so
+`cli/Cargo.toml` is bumped in the commit that makes the change and the branch
+carries a monorepo patch tag. `docs/reference/cli/commands.json` moves by
+exactly one line — `cli_version` — which is the bump propagating rather than
+a command-surface change; it is regenerated in the same commit, and
+`docsgen check` is what would fail if it were not.
+
+The new `ghcr.io/apprafter/docs` image is versioned by commit SHA rather than
+by a git tag, so publication introduces no tag stream of its own.
 
 ### The site is built in the workflow, not in the Dockerfile
 
@@ -1417,6 +1431,27 @@ reader anywhere. That is the correct state for a site that is not serving.
   README.md`, where `docs` is a git leading-directory pathspec rather than a
   string prefix, and `exclude_docs` is relative to `docs_dir`. Verified by
   probe rather than assumed.
+- **The shipped manifest was the first in the repository the CLI's own
+  parser could not read, and that is a CLI defect rather than a manifest
+  one.** `cli-core`'s `ApplicationExpose` declared `port` as a REQUIRED serde
+  field, so `environments.dev.expose.network: "internal"` — an override that
+  changes visibility and inherits the port, which is what a per-environment
+  override is FOR — failed to deserialise with ``missing field `port` ``.
+  Every other layer accepted it: `cue vet`, `apprafter app validate`, the
+  admission webhook (zero errors) and the operator, which merges base's port.
+  The sole caller of that parse is `app add`'s picker setup, and it responds
+  to a parse error by warning, hiding the environment picker and skipping the
+  namespace preselect — so a manifest the whole platform accepts silently
+  lost two pieces of the wizard.
+
+  Fixed in the model (`#[serde(default)] port: Option<u16>`), **not** by
+  adding `port: 80` to the override. An A/B settled that: restating the port
+  in `dev` makes the effective environment deployable-looking and pushes an
+  operator toward the very environment the runbook forbids, which is a worse
+  failure than a hidden picker. Requiring a field in this type can only cost
+  reach — the CLI reads manifests and never writes them, and presence is
+  enforced where it matters, in the schema, the CRD and the webhook.
+
 - **Two deployable manifests are validated by nobody.** `scripts/lint-cue.sh`
   vets `schemas/`, `platform-stack/cue/` and `examples/` — not `docs-site/`
   and not `landing/`. The evidence that this matters is not hypothetical:

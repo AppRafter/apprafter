@@ -11,15 +11,18 @@ patch of each phase.
 
 ## docs (no release) — 2.19g publication: the documentation site becomes a deployable application (2026-08-19)
 
-> **No version bump and no monorepo tag, and the answer is derived rather
-> than assumed.** `git diff --name-only <base>..HEAD -- cli/ operator/
-> schemas/ platform-stack/ argocd-cue-cmp/` is empty, so `apprafter --help`
-> is byte-identical, the byte-compared `docs/reference/cli/commands.json` did
-> not move, and no chart artefact changed. `cli/Cargo.toml` is bumped to
-> match a **released tag** in the commit that cuts it; documentation and CI
-> work cuts none. The new `ghcr.io/apprafter/docs` image is versioned by
-> commit SHA rather than by a git tag, so publication introduces no tag
-> stream of its own either.
+> **CLI patch release; no chart, operator or cue-cmp release.** Re-derive
+> with `git diff --name-only <base>..HEAD -- cli/ operator/ schemas/
+> platform-stack/ argocd-cue-cmp/`: every path but `cli/` is empty. `cli/`
+> is not — `cli-core`'s `ApplicationExpose` gained an optional `port`, which
+> changes shipped `apprafter app add` behaviour — so `cli/Cargo.toml` is
+> bumped in the commit that changes it, per the rule that
+> `apprafter --version` must name the code it is running.
+> `docs/reference/cli/commands.json` moves by exactly one line
+> (`cli_version`), regenerated in the same commit; the command surface
+> itself is unchanged, which is what makes that the only line. The new
+> `ghcr.io/apprafter/docs` image is versioned by commit SHA rather than by a
+> git tag, so publication introduces no tag stream of its own.
 >
 > Seventh of the documentation track's ten subphases — branch
 > `feat/2.19g-publication`, **ADR 0057** (decision 8 is no longer "decided,
@@ -194,6 +197,26 @@ patch of each phase.
   Removing an `exclude_docs` entry publishes a page whose edits no longer cut
   a release, and nothing checks it. Recorded here rather than in a comment
   nobody re-runs.
+
+### Fixed
+
+- **`apprafter app add` could not read the manifest this subphase ships**, and
+  the defect was in the CLI. `cli-core`'s `ApplicationExpose` declared `port`
+  as a **required** serde field, so an `expose` override carrying only
+  `network` — the shape a per-environment visibility override takes, and what
+  `docs-site/apprafter/Application.cue`'s `dev` entry uses — failed to decode
+  with ``missing field `port` ``. Every other layer accepts it: `cue vet`,
+  `apprafter app validate`, the admission webhook, and the operator, which
+  merges the port from `base`. The consequence was not a hard error but a
+  quiet loss: `app add` warns, hides the environment picker and stops
+  preselecting the namespace.
+
+  `port` is now `Option<u16>`. The fix is in the model rather than the
+  manifest deliberately — adding `port: 80` to the `dev` override was measured
+  and is worse, because it makes the environment the runbook tells operators
+  not to deploy look deployable. This type only ever has to READ every shape
+  the schema permits; presence is enforced in the schema, the CRD and the
+  webhook, on the manifests that reach a cluster.
 
 ### Reported, not fixed
 
