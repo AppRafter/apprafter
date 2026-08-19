@@ -20,3 +20,10 @@ Usage: apprafter import [OPTIONS]
 | `--dry-run` | flag | — | no | Print what would be imported without writing state |
 | `--force` | flag | — | no | Overwrite an already-populated `state.hetzner_cloud` |
 | `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
+
+Examples:
+
+```sh
+apprafter import --dry-run
+apprafter import --force
+```

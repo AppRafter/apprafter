@@ -16,3 +16,9 @@ Usage: apprafter cluster-bootstrap
 ```
 
 Aliases: `cb` — accepted on the command line, not listed in `--help`.
+
+Examples:
+
+```sh
+apprafter cluster-bootstrap  # phase 3 of bootstrap-all, on its own
+```

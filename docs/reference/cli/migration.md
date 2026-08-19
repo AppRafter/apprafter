@@ -37,6 +37,13 @@ Usage: apprafter migration approve [OPTIONS] <NAME>
 | --- | --- | --- | --- | --- |
 | `--namespace`, `-n` | — | — | no | Namespace of the MigrationPlan. Omit to auto-resolve from `apprafter migration list`; required only when the same name exists in more than one namespace |
 
+Examples:
+
+```sh
+apprafter migration approve <plan>
+apprafter migration approve <plan> --namespace <ns>
+```
+
 ## `apprafter migration list`
 
 List MigrationPlans across all namespaces — namespace, name, scope, classification, phase. Platform-scope plans live in `apprafter-system`; app-scope plans live in the Application's own namespace
@@ -46,6 +53,12 @@ Usage: apprafter migration list
 ```
 
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
+
+Examples:
+
+```sh
+apprafter migration list
+```
 
 ## `apprafter migration reject`
 
@@ -58,3 +71,9 @@ Usage: apprafter migration reject <NAME>
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | MigrationPlan name |
+
+Examples:
+
+```sh
+apprafter migration reject <plan>
+```

@@ -58,18 +58,511 @@ pub struct CommandExamples {
 
 /// Every documented example, in command-path order.
 ///
-/// Empty today. The guard that judges an entry
-/// (`docsgen::examples::check`) ships before the content does, on
-/// purpose: `docs/reference/cli/**` is byte-compared rather than
-/// resolved, so an unverified example lands in a blind spot between the
-/// two documentation gates. Filling this array without the guard would
-/// ship unverified invocations inside the artefact whose whole purpose
-/// is to be true.
-pub const EXAMPLES: &[CommandExamples] = &[];
+/// The guard that judges an entry (`docsgen::examples::check`) shipped
+/// before this content did, on purpose: `docs/reference/cli/**` is
+/// byte-compared rather than resolved, so an unverified example lands
+/// in a blind spot between the two documentation gates. Filling this
+/// array without the guard would have shipped unverified invocations
+/// inside the artefact whose whole purpose is to be true.
+///
+/// # House rules for an entry
+///
+/// * **One line, opening with `apprafter`.** Two lines in one entry
+///   would be tokenised as one command with the second line's flags
+///   charged to the first, so the guard rejects it; write two entries.
+/// * **A leaf command carries at least one; a hidden command carries
+///   none.** `auth login` / `logout` / `status` are hidden because
+///   AppRafter Cloud is not available yet — an example would advertise
+///   a command `--help` deliberately does not list.
+/// * **Never invent a flag or a value shape.** The guard resolves flag
+///   names against the clap tree, but it does not know that `cx22` is a
+///   real Hetzner SKU and `cpx99` is not. Values here were checked
+///   against the code that parses them — the tier enum, the egress and
+///   autoscale validators, `KNOWN_NEEDS`, `construct_repo_url`.
+/// * **Show what the flag table cannot**: the shape of a value, the
+///   combination that changes behaviour, the thing a reader gets wrong.
+///   An entry that only restates a flag's help text is noise and should
+///   be deleted rather than kept to round out a count.
+/// * **A placeholder is spelled `<like-this>`** — the notation the
+///   operator guides already use. A name that looks real (`my-app`)
+///   invites a copy-paste that half-works.
+/// * **Aliases are not taught here.** The generated reference lists
+///   them; an example's job is to show what the command does, not what
+///   else it may be called.
+pub const EXAMPLES: &[CommandExamples] = &[
+    CommandExamples {
+        path: &["app", "add"],
+        lines: &[
+            "apprafter app add  # register the repo in the cwd, from its git origin",
+            "apprafter app add https://github.com/<org>/<repo>.git --name <name>",
+            "apprafter app add --env prod  # registers the Argo app <name>-prod",
+            "apprafter app add --no-interactive --scaffold  # CI: scaffold, then register",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "list"],
+        lines: &[
+            "apprafter app list",
+            "apprafter app list --all-projects --all-managed  # drop both filters",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "logs"],
+        lines: &[
+            "apprafter app logs <name> -f --tail 100",
+            "apprafter app logs <name> --env prod",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "open"],
+        lines: &[
+            "apprafter app open <name>",
+            "apprafter app open <name> --port 3000 --no-browser",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "remove"],
+        lines: &[
+            "apprafter app remove <name> --yes  # removes EVERY environment of <name>",
+            "apprafter app remove <name> --env prod --keep-data  # one env, data kept",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "rollback"],
+        lines: &[
+            "apprafter app rollback <name>  # to the previous entry in Argo CD history",
+            "apprafter app rollback <name> --to <revision> --yes",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "scaffold"],
+        lines: &[
+            "apprafter app scaffold --runtime bun --name <name> --namespace <ns>",
+            "apprafter app scaffold --needs pg --needs redis",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "status"],
+        lines: &[
+            "apprafter app status <name>",
+            "apprafter app status <name> --resources",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "validate"],
+        lines: &[
+            "apprafter app validate  # auto-discovers <cwd>/apprafter/Application.cue",
+            "apprafter app validate apprafter/Application.cue",
+        ],
+    },
+    CommandExamples {
+        path: &["apply"],
+        lines: &[
+            "apprafter apply",
+            "apprafter apply --target <target> --server-type cx22",
+        ],
+    },
+    CommandExamples {
+        path: &["argocd-password"],
+        lines: &[
+            "apprafter argocd-password",
+            "apprafter argocd-password --refresh  # after the admin secret is rotated",
+        ],
+    },
+    CommandExamples {
+        path: &["backup", "check"],
+        lines: &["apprafter backup check --credential-file <dotenv>"],
+    },
+    CommandExamples {
+        path: &["backup", "create"],
+        lines: &[
+            "apprafter backup create",
+            "apprafter backup create --namespace <ns> --select  # only that namespace",
+            "apprafter backup create --repo <path> --staging-mode sequential",
+        ],
+    },
+    CommandExamples {
+        path: &["backup", "disable"],
+        lines: &["apprafter backup disable"],
+    },
+    CommandExamples {
+        path: &["backup", "enable"],
+        lines: &[
+            "apprafter backup enable --bucket <bucket> --endpoint <host> \
+             --credential-file <dotenv> --i-have-saved-credentials",
+            "apprafter backup enable --bucket s3:https://<host>/<bucket> \
+             --credential <secret> --i-have-saved-credentials",
+        ],
+    },
+    CommandExamples {
+        path: &["backup", "list"],
+        lines: &[
+            "apprafter backup list",
+            "apprafter backup list --repo <path>",
+        ],
+    },
+    CommandExamples {
+        path: &["backup", "prune"],
+        lines: &[
+            "apprafter backup prune --credential-file <dotenv>",
+            "apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 8",
+        ],
+    },
+    CommandExamples {
+        path: &["backup", "status"],
+        lines: &["apprafter backup status"],
+    },
+    CommandExamples {
+        path: &["backup", "unlock"],
+        lines: &["apprafter backup unlock --credential-file <dotenv>"],
+    },
+    CommandExamples {
+        path: &["bootstrap-all"],
+        lines: &[
+            "apprafter bootstrap-all --server-type cx22",
+            "apprafter bootstrap-all --dry-run",
+        ],
+    },
+    CommandExamples {
+        path: &["cluster-bootstrap"],
+        lines: &["apprafter cluster-bootstrap  # phase 3 of bootstrap-all, on its own"],
+    },
+    CommandExamples {
+        path: &["destroy"],
+        lines: &[
+            "apprafter destroy --yes  # every Hetzner resource tagged apprafter=true",
+            "apprafter destroy --target <target> --yes",
+        ],
+    },
+    CommandExamples {
+        path: &["doctor"],
+        lines: &[
+            "apprafter doctor",
+            "apprafter doctor --target <target> --no-ping",
+        ],
+    },
+    CommandExamples {
+        path: &["export"],
+        lines: &[
+            "apprafter export --out <dir>",
+            "apprafter export --namespace <ns> --select",
+        ],
+    },
+    CommandExamples {
+        path: &["import"],
+        lines: &["apprafter import --dry-run", "apprafter import --force"],
+    },
+    CommandExamples {
+        path: &["init"],
+        lines: &["apprafter init --provider hetzner-cloud --tier solo --region nbg1"],
+    },
+    CommandExamples {
+        path: &["kubeconfig"],
+        lines: &[
+            "apprafter kubeconfig --refresh",
+            "export KUBECONFIG=\"$(apprafter kubeconfig)\"",
+        ],
+    },
+    CommandExamples {
+        path: &["login"],
+        lines: &["apprafter login"],
+    },
+    CommandExamples {
+        path: &["migration", "approve"],
+        lines: &[
+            "apprafter migration approve <plan>",
+            "apprafter migration approve <plan> --namespace <ns>",
+        ],
+    },
+    CommandExamples {
+        path: &["migration", "list"],
+        lines: &["apprafter migration list"],
+    },
+    CommandExamples {
+        path: &["migration", "reject"],
+        lines: &["apprafter migration reject <plan>"],
+    },
+    CommandExamples {
+        path: &["node", "prep"],
+        lines: &["apprafter node prep", "apprafter node prep --yes"],
+    },
+    CommandExamples {
+        path: &["node", "status"],
+        lines: &["apprafter node status"],
+    },
+    CommandExamples {
+        path: &["open", "argocd"],
+        lines: &[
+            "apprafter open argocd",
+            "apprafter open argocd --project platform",
+        ],
+    },
+    CommandExamples {
+        path: &["plan"],
+        lines: &["apprafter plan"],
+    },
+    CommandExamples {
+        path: &["platform", "autoscale", "set"],
+        lines: &[
+            "apprafter platform autoscale set up-only",
+            "apprafter platform autoscale set off",
+        ],
+    },
+    CommandExamples {
+        path: &["platform", "autoscale", "show"],
+        lines: &["apprafter platform autoscale show"],
+    },
+    CommandExamples {
+        path: &["platform", "egress", "set"],
+        lines: &["apprafter platform egress set internal"],
+    },
+    CommandExamples {
+        path: &["platform", "egress", "show"],
+        lines: &["apprafter platform egress show"],
+    },
+    CommandExamples {
+        path: &["platform", "env", "set"],
+        lines: &["apprafter platform env set prod"],
+    },
+    CommandExamples {
+        path: &["platform", "env", "show"],
+        lines: &["apprafter platform env show"],
+    },
+    CommandExamples {
+        path: &["platform", "freeze"],
+        lines: &[
+            "apprafter platform freeze cilium",
+            "apprafter platform freeze cilium --version 1.16.5",
+        ],
+    },
+    CommandExamples {
+        path: &["platform", "rescue"],
+        lines: &["apprafter platform rescue --yes"],
+    },
+    CommandExamples {
+        path: &["platform", "status"],
+        lines: &[
+            "apprafter platform status",
+            "apprafter platform status --cached",
+        ],
+    },
+    CommandExamples {
+        path: &["platform", "unfreeze"],
+        lines: &["apprafter platform unfreeze cilium"],
+    },
+    CommandExamples {
+        path: &["platform", "upgrade"],
+        lines: &[
+            "apprafter platform upgrade  # clear the pin, follow the channel",
+            "apprafter platform upgrade --to 0.2.54",
+        ],
+    },
+    CommandExamples {
+        path: &["repo", "creds", "add"],
+        lines: &[
+            "apprafter repo creds add <name> --url-prefix https://github.com/<org>",
+            "apprafter repo creds add <name> --url-prefix <prefix> --no-validate",
+        ],
+    },
+    CommandExamples {
+        path: &["repo", "creds", "list"],
+        lines: &["apprafter repo creds list"],
+    },
+    CommandExamples {
+        path: &["repo", "creds", "remove"],
+        lines: &[
+            "apprafter repo creds remove <name>",
+            "apprafter repo creds remove <name> --force",
+        ],
+    },
+    CommandExamples {
+        path: &["repo", "creds", "rotate"],
+        lines: &["apprafter repo creds rotate <name>"],
+    },
+    CommandExamples {
+        path: &["repo", "creds", "show"],
+        lines: &["apprafter repo creds show <name>"],
+    },
+    CommandExamples {
+        path: &["restore"],
+        lines: &[
+            "apprafter restore <repo> --credential-file <dotenv>",
+            "apprafter restore <repo> --credential-file <dotenv> --data-only",
+            "apprafter restore <repo> --credential-file <dotenv> --reprovision \
+             --server-type cx22",
+        ],
+    },
+    CommandExamples {
+        path: &["secret", "remove"],
+        lines: &["apprafter secret remove <name> --namespace <ns> --yes"],
+    },
+    CommandExamples {
+        path: &["secret", "seal"],
+        lines: &[
+            "apprafter secret seal <name> --from-literal TOKEN=<value> --namespace <ns>",
+            "apprafter secret seal <name> --from-literal USER=<user> --from-literal PASS=<pass>",
+            "apprafter secret seal <name> --from-literal TOKEN=<value> --stdout",
+        ],
+    },
+    CommandExamples {
+        path: &["status"],
+        lines: &["apprafter status"],
+    },
+    CommandExamples {
+        path: &["target", "add"],
+        lines: &[
+            "apprafter target add <name> --provider hetzner-cloud --region nbg1 --tier solo",
+            "apprafter target add <name> --ssh-key ~/.ssh/id_ed25519.pub --server-type cx22",
+            "apprafter target add <name> --renew --token <token>",
+        ],
+    },
+    CommandExamples {
+        path: &["target", "cert", "import"],
+        lines: &[
+            "apprafter target cert import <name> --cert ./origin.crt --key ./origin.key",
+            "apprafter target cert import <name> --cert ./new.crt --key ./new.key --replace",
+        ],
+    },
+    CommandExamples {
+        path: &["target", "domain", "add"],
+        lines: &["apprafter target domain add apprafter.dev --cert <name>"],
+    },
+    CommandExamples {
+        path: &["target", "domain", "list"],
+        lines: &["apprafter target domain list"],
+    },
+    CommandExamples {
+        path: &["target", "domain", "remove"],
+        lines: &[
+            "apprafter target domain remove apprafter.dev",
+            "apprafter target domain remove apprafter.dev --force",
+        ],
+    },
+    CommandExamples {
+        path: &["target", "firewall", "cloudflare-origin"],
+        lines: &[
+            "apprafter target firewall cloudflare-origin enable",
+            "apprafter target firewall cloudflare-origin disable",
+        ],
+    },
+    CommandExamples {
+        path: &["target", "ip"],
+        lines: &["apprafter target ip"],
+    },
+    CommandExamples {
+        path: &["target", "list"],
+        lines: &["apprafter target list"],
+    },
+    CommandExamples {
+        path: &["target", "machine"],
+        lines: &[
+            "apprafter target machine  # picker over the live Hetzner catalogue",
+            "apprafter target machine --server-type cx32 --target <target>",
+            "apprafter target machine --server-type cx32 --no-ping",
+        ],
+    },
+    CommandExamples {
+        path: &["target", "remove"],
+        lines: &["apprafter target remove <name> --yes"],
+    },
+    CommandExamples {
+        path: &["target", "rename"],
+        lines: &["apprafter target rename <from> <to>"],
+    },
+    CommandExamples {
+        path: &["target", "show"],
+        lines: &["apprafter target show", "apprafter target show <name>"],
+    },
+    CommandExamples {
+        path: &["target", "use"],
+        lines: &["apprafter target use <name>"],
+    },
+    CommandExamples {
+        path: &["upgrade-tier"],
+        lines: &["apprafter upgrade-tier --to team"],
+    },
+    CommandExamples {
+        path: &["volume", "create"],
+        lines: &["apprafter volume create <name> --size 2Gi --namespace <ns>"],
+    },
+    CommandExamples {
+        path: &["volume", "list"],
+        lines: &[
+            "apprafter volume list  # cluster-wide",
+            "apprafter volume list --namespace <ns>",
+        ],
+    },
+    CommandExamples {
+        path: &["volume", "rm"],
+        lines: &["apprafter volume rm <name> --namespace <ns> --yes"],
+    },
+    CommandExamples {
+        path: &["volume", "status"],
+        lines: &["apprafter volume status <name> --namespace <ns>"],
+    },
+    CommandExamples {
+        path: &["whoami"],
+        lines: &["apprafter whoami", "apprafter whoami --no-ping"],
+    },
+];
 
 /// The examples declared for `path`, or an empty slice.
 pub fn examples_for(path: &[&str]) -> &'static [&'static str] {
     lookup(EXAMPLES, path)
+}
+
+/// The `Examples:` block `--help` shows below the flag list, or `None`
+/// when the command declares no example.
+///
+/// `Examples:` matches clap's own section headings (`Usage:`,
+/// `Arguments:`, `Options:`) and the two-space indent matches the
+/// column clap starts an argument on, so the block reads as one more
+/// section rather than an appendix.
+fn after_help(path: &[&str]) -> Option<String> {
+    let lines = examples_for(path);
+    if lines.is_empty() {
+        return None;
+    }
+    let mut block = String::from("Examples:");
+    for line in lines {
+        block.push_str("\n  ");
+        block.push_str(line);
+    }
+    Some(block)
+}
+
+/// Hang every declared example off its command as `after_help`.
+///
+/// Applied to [`crate::cli::Cli::command()`] before matching, so the
+/// binary and `docsgen` read the SAME array: one renders it into
+/// `--help`, the other into `docs/reference/cli/**`. Writing the block
+/// into a `#[command(after_help = …)]` attribute per variant instead
+/// would put the text in a second place, which is the drift this table
+/// exists to prevent.
+///
+/// The walk keys on the same path `docsgen`'s projection uses — the
+/// subcommand names from the root down — so a command that gains an
+/// example in the reference gains it in `--help` with no second edit.
+pub fn attach(command: clap::Command) -> clap::Command {
+    attach_at(command, &mut Vec::new())
+}
+
+fn attach_at(mut command: clap::Command, path: &mut Vec<String>) -> clap::Command {
+    let names: Vec<String> = command
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_string())
+        .collect();
+    for name in names {
+        path.push(name.clone());
+        command = command.mut_subcommand(name.as_str(), |sub| attach_at(sub, path));
+        path.pop();
+    }
+
+    let key: Vec<&str> = path.iter().map(String::as_str).collect();
+    match after_help(&key) {
+        Some(block) => command.after_help(block),
+        None => command,
+    }
 }
 
 /// The lookup, over an arbitrary table so it can be exercised on one

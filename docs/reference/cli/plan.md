@@ -14,3 +14,9 @@ Show the diff between the desired state and what is live
 ```text
 Usage: apprafter plan
 ```
+
+Examples:
+
+```sh
+apprafter plan
+```

@@ -28,3 +28,11 @@ Usage: apprafter restore [OPTIONS] <REPO>
 | `--server-type` | — | — | no | Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase. Resolution: this flag > manifest `spec.nodes[0].type` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected` |
 | `--snapshot` | — | — | no | Snapshot id to restore (defaults to the latest) |
 | `--target` | — | — | no | Target name to restore into (defaults to the active target) |
+
+Examples:
+
+```sh
+apprafter restore <repo> --credential-file <dotenv>
+apprafter restore <repo> --credential-file <dotenv> --data-only
+apprafter restore <repo> --credential-file <dotenv> --reprovision --server-type cx22
+```

@@ -34,10 +34,23 @@ Usage: apprafter node prep [OPTIONS]
 | --- | --- | --- | --- | --- |
 | `--yes` | flag | — | no | Skip the confirmation prompt (k3s restart briefly takes the API offline). Required in non-interactive shells |
 
+Examples:
+
+```sh
+apprafter node prep
+apprafter node prep --yes
+```
+
 ## `apprafter node status`
 
 Report the active target's node swap posture: `swapBehavior` / `failSwapOn` / swap capacity / k8s version (kube-API), plus live `swapon`, `vm.swappiness`, k3s `GOMEMLIMIT`, and the provision breadcrumb (SSH). Each field is labelled with its source (`[api]` / `[ssh]`); if SSH is unavailable the SSH-derived fields read `unknown` but the kube-API fields still render
 
 ```text
 Usage: apprafter node status
+```
+
+Examples:
+
+```sh
+apprafter node status
 ```

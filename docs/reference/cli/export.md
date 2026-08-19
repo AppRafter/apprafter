@@ -20,3 +20,10 @@ Usage: apprafter export [OPTIONS]
 | `--namespace` | — | — | no | Narrow scope to these namespaces (repeatable). Ignored unless `--select` is also passed |
 | `--out` | — | — | no | Output directory. Defaults to `./apprafter-export` |
 | `--select` | flag | — | no | When set, only the namespaces given via `--namespace` are exported. Without `--select` the scope is the whole cluster |
+
+Examples:
+
+```sh
+apprafter export --out <dir>
+apprafter export --namespace <ns> --select
+```

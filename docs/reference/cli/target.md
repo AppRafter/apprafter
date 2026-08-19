@@ -59,6 +59,14 @@ Usage: apprafter target add [OPTIONS] [NAME]
 | `--tier` | — | — | no | Default tier identifier (`solo` / `team` / `prod` / `regulated`). Hint for `init` / `bootstrap-all`; can always be overridden per-command |
 | `--token` | — | — | no | Hetzner Cloud API token. Required when `--provider hetzner-cloud`. Format `hcloud_<64+ alphanumeric>`; passed via `--token` or env `HCLOUD_TOKEN` (the env fallback is for CI ergonomics — interactive use should prefer the flag so the token doesn't linger in shell history's env-leak surface). Env: `HCLOUD_TOKEN`. |
 
+Examples:
+
+```sh
+apprafter target add <name> --provider hetzner-cloud --region nbg1 --tier solo
+apprafter target add <name> --ssh-key ~/.ssh/id_ed25519.pub --server-type cx22
+apprafter target add <name> --renew --token <token>
+```
+
 ## `apprafter target cert`
 
 Manage imported TLS certificates for the platform Gateway
@@ -89,6 +97,13 @@ Usage: apprafter target cert import [OPTIONS] --cert <CERT> --key <KEY> <NAME>
 | `--key` | — | — | yes | Path to the PEM-encoded private key (RSA only in this slice) |
 | `--namespace`, `-n` | — | `apprafter-system` | no | Namespace for the cert Secret (the platform Gateway reads certs from apprafter-system) |
 | `--replace` | flag | — | no | Update an existing cert Secret in place (no downtime — the Gateway picks up the new cert). Without this, importing over an existing name is rejected |
+
+Examples:
+
+```sh
+apprafter target cert import <name> --cert ./origin.crt --key ./origin.key
+apprafter target cert import <name> --cert ./new.crt --key ./new.key --replace
+```
 
 ## `apprafter target domain`
 
@@ -121,6 +136,12 @@ Usage: apprafter target domain add [OPTIONS] --cert <CERT> <DOMAIN>
 | `--added-by` | — | — | no | Audit "added by" (defaults to $USER) |
 | `--cert` | — | — | yes | Imported cert name (the Secret from `target cert import`) |
 
+Examples:
+
+```sh
+apprafter target domain add apprafter.dev --cert <name>
+```
+
 ### `apprafter target domain list`
 
 List registered zones + the apps using each
@@ -130,6 +151,12 @@ Usage: apprafter target domain list
 ```
 
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
+
+Examples:
+
+```sh
+apprafter target domain list
+```
 
 ### `apprafter target domain remove`
 
@@ -146,6 +173,13 @@ Usage: apprafter target domain remove [OPTIONS] <DOMAIN>
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--force` | flag | — | no | Remove even if applications still reference the domain |
+
+Examples:
+
+```sh
+apprafter target domain remove apprafter.dev
+apprafter target domain remove apprafter.dev --force
+```
 
 ## `apprafter target firewall`
 
@@ -171,12 +205,25 @@ Usage: apprafter target firewall cloudflare-origin <STATE>
 | --- | --- | --- |
 | `<STATE>` | yes | enable \| disable. One of `enable`, `disable`. |
 
+Examples:
+
+```sh
+apprafter target firewall cloudflare-origin enable
+apprafter target firewall cloudflare-origin disable
+```
+
 ## `apprafter target ip`
 
 Show the cluster node's public IPv4 + IPv6 (for DNS A/AAAA records)
 
 ```text
 Usage: apprafter target ip
+```
+
+Examples:
+
+```sh
+apprafter target ip
 ```
 
 ## `apprafter target list`
@@ -188,6 +235,12 @@ Usage: apprafter target list
 ```
 
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
+
+Examples:
+
+```sh
+apprafter target list
+```
 
 ## `apprafter target machine`
 
@@ -202,6 +255,14 @@ Usage: apprafter target machine [OPTIONS]
 | `--no-ping` | flag | — | no | Skip the provider API. Requires `--server-type` — the picker cannot work without the API. Without `--server-type` this flag is an error, never a silent no-op. Also settable via `APPRAFTER_NO_PING`, which takes a boolish value: `1` `true` `yes` `y` `t` `on` skip the ping, `0` `false` `no` `n` `f` `off` keep it. Any other value, including the empty string, is an error rather than a no-op. Env: `APPRAFTER_NO_PING`. |
 | `--server-type` | — | — | no | Set the type non-interactively (skips the picker). When `--no-ping` is also passed the SKU is saved without API validation; without `--no-ping` the SKU is validated against the live Hetzner API for the target's current region |
 | `--target` | — | — | no | Target to modify (defaults to the active target) |
+
+Examples:
+
+```sh
+apprafter target machine  # picker over the live Hetzner catalogue
+apprafter target machine --server-type cx32 --target <target>
+apprafter target machine --server-type cx32 --no-ping
+```
 
 ## `apprafter target remove`
 
@@ -221,6 +282,12 @@ Aliases: `rm` — accepted on the command line, not listed in `--help`.
 | --- | --- | --- | --- | --- |
 | `--yes` | flag | — | no | Skip the confirmation prompt |
 
+Examples:
+
+```sh
+apprafter target remove <name> --yes
+```
+
 ## `apprafter target rename`
 
 Rename a target, moving its config + credentials + state cache to the new name. Updates `active_target` when needed
@@ -233,6 +300,12 @@ Usage: apprafter target rename <FROM> <TO>
 | --- | --- | --- |
 | `<FROM>` | yes | Source target name (must exist) |
 | `<TO>` | yes | Destination target name (must not exist) |
+
+Examples:
+
+```sh
+apprafter target rename <from> <to>
+```
 
 ## `apprafter target show`
 
@@ -248,6 +321,13 @@ Aliases: `info` — accepted on the command line, not listed in `--help`.
 | --- | --- | --- |
 | `<NAME>` | no | Target name. Defaults to the active target |
 
+Examples:
+
+```sh
+apprafter target show
+apprafter target show <name>
+```
+
 ## `apprafter target use`
 
 Switch the active target. Fails when the named target does not exist; subsequent operational commands (`apply`, `cluster-bootstrap`, ...) act on the new active target
@@ -259,3 +339,9 @@ Usage: apprafter target use <NAME>
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | Name of the target to make active |
+
+Examples:
+
+```sh
+apprafter target use <name>
+```

@@ -14,3 +14,9 @@ Print the current cluster status — SKELETON, it reads local state and never co
 ```text
 Usage: apprafter status
 ```
+
+Examples:
+
+```sh
+apprafter status
+```

@@ -31,3 +31,10 @@ Usage: apprafter open argocd [OPTIONS]
 | --- | --- | --- | --- | --- |
 | `--all-projects` | flag | — | no | Drop the `?proj=<name>` filter — UI shows all AppProjects |
 | `--project` | — | `apps,default` | no | AppProject filter applied to the opened URL — Argo CD's UI honours `?proj=<name>` (comma-separated list) to scope the Applications list. Defaults to `apps,default` so the operator lands on their own apps plus the platform root Application (in `default`), while the platform component apps stay hidden; pass `--project platform` to inspect chart-managed components, or `--all-projects` to drop the filter entirely |
+
+Examples:
+
+```sh
+apprafter open argocd
+apprafter open argocd --project platform
+```

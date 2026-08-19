@@ -18,3 +18,10 @@ Usage: apprafter argocd-password [OPTIONS]
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--refresh` | flag | — | no | Force a re-fetch of the secret even if a cached password is already in state |
+
+Examples:
+
+```sh
+apprafter argocd-password
+apprafter argocd-password --refresh  # after the admin secret is rotated
+```

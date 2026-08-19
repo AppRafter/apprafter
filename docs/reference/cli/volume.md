@@ -39,6 +39,12 @@ Usage: apprafter volume create [OPTIONS] --size <SIZE> <NAME>
 | `--namespace`, `-n` | — | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system` |
 | `--size` | — | — | yes | Requested storage size (e.g. `5Gi`, `100Mi`) |
 
+Examples:
+
+```sh
+apprafter volume create <name> --size 2Gi --namespace <ns>
+```
+
 ## `apprafter volume list`
 
 List SharedVolumes with refCount and used/free capacity
@@ -52,6 +58,13 @@ Aliases: `ls` — accepted on the command line, not listed in `--help`.
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--namespace`, `-n` | — | — | no | Namespace to list. Omit for cluster-wide listing |
+
+Examples:
+
+```sh
+apprafter volume list  # cluster-wide
+apprafter volume list --namespace <ns>
+```
 
 ## `apprafter volume rm`
 
@@ -70,6 +83,12 @@ Usage: apprafter volume rm [OPTIONS] <NAME>
 | `--namespace`, `-n` | — | `apprafter-system` | no | Namespace. Defaults to `apprafter-system` |
 | `--yes` | flag | — | no | Skip the confirmation prompt |
 
+Examples:
+
+```sh
+apprafter volume rm <name> --namespace <ns> --yes
+```
+
 ## `apprafter volume status`
 
 Show detail for one SharedVolume (pvcRef, refCount, capacity)
@@ -85,3 +104,9 @@ Usage: apprafter volume status [OPTIONS] <NAME>
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--namespace`, `-n` | — | `apprafter-system` | no | Namespace. Defaults to `apprafter-system` |
+
+Examples:
+
+```sh
+apprafter volume status <name> --namespace <ns>
+```

@@ -51,12 +51,25 @@ Usage: apprafter platform autoscale set <MODE>
 | --- | --- | --- |
 | `<MODE>` | yes | One of `full` (apply up and down), `up-only` (scale up only), or `off` (record recommendations but do not apply them) |
 
+Examples:
+
+```sh
+apprafter platform autoscale set up-only
+apprafter platform autoscale set off
+```
+
 ### `apprafter platform autoscale show`
 
 Show the cluster's current VPA autoscale mode and available presets
 
 ```text
 Usage: apprafter platform autoscale show
+```
+
+Examples:
+
+```sh
+apprafter platform autoscale show
 ```
 
 ## `apprafter platform egress`
@@ -84,12 +97,24 @@ Usage: apprafter platform egress set <PROFILE>
 | --- | --- | --- |
 | `<PROFILE>` | yes | One of `internet` (DNS + same-ns + world + needs), `internal` (DNS + same-ns + needs), or `strict` (DNS + needs; same-namespace also denied) |
 
+Examples:
+
+```sh
+apprafter platform egress set internal
+```
+
 ### `apprafter platform egress show`
 
 Print the current egress profile and what each profile allows. Reads the singleton PlatformStack; an absent field reports the documented default (`internet`)
 
 ```text
 Usage: apprafter platform egress show
+```
+
+Examples:
+
+```sh
+apprafter platform egress show
 ```
 
 ## `apprafter platform env`
@@ -117,12 +142,24 @@ Usage: apprafter platform env set <ENV>
 | --- | --- | --- |
 | `<ENV>` | yes | Environment name (e.g. prod, staging) |
 
+Examples:
+
+```sh
+apprafter platform env set prod
+```
+
 ### `apprafter platform env show`
 
 Show the cluster's default environment
 
 ```text
 Usage: apprafter platform env show
+```
+
+Examples:
+
+```sh
+apprafter platform env show
 ```
 
 ## `apprafter platform freeze`
@@ -137,6 +174,13 @@ Usage: apprafter platform freeze <COMPONENT>
 | --- | --- | --- |
 | `<COMPONENT>` | yes | Component name (must match a key in the umbrella chart's `values.components` map; e.g. `cilium`, `argocd`, `cert-manager`, `apprafter-operator`) |
 
+Examples:
+
+```sh
+apprafter platform freeze cilium
+apprafter platform freeze cilium --version 1.16.5
+```
+
 ## `apprafter platform rescue`
 
 Emergency recovery: re-run the loader's cluster-bootstrap path (Cilium → Argo CD → CRDs → operator) against the active target. Useful when Argo CD itself is unable to self-adopt — a stale chart, a corrupted ConfigMap, or a pod-eviction loop that no `apprafter platform upgrade` can resolve. Thin wrapper around `apprafter cluster-bootstrap` with the recovery banner
@@ -148,6 +192,12 @@ Usage: apprafter platform rescue [OPTIONS]
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
+
+Examples:
+
+```sh
+apprafter platform rescue --yes
+```
 
 ## `apprafter platform status`
 
@@ -161,6 +211,13 @@ Usage: apprafter platform status [OPTIONS]
 | --- | --- | --- | --- | --- |
 | `--cached` | flag | — | no | Skip the upstream re-check and render the last-known status immediately (no wait). For scripting / when the 6h-cadence snapshot is good enough |
 
+Examples:
+
+```sh
+apprafter platform status
+apprafter platform status --cached
+```
+
 ## `apprafter platform unfreeze`
 
 Remove a previously-set `PlatformStack.spec.overrides.<component>` entry — component falls back to the umbrella chart's curated pin
@@ -172,6 +229,12 @@ Usage: apprafter platform unfreeze <COMPONENT>
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<COMPONENT>` | yes | Component name |
+
+Examples:
+
+```sh
+apprafter platform unfreeze cilium
+```
 
 ## `apprafter platform upgrade`
 
@@ -185,3 +248,10 @@ Usage: apprafter platform upgrade [OPTIONS]
 | --- | --- | --- | --- | --- |
 | `--cached` | flag | — | no | Skip the upstream re-check and act on the last-known status immediately (no wait) |
 | `--to` | `<version>` | — | no | Platform-stack version to pin, e.g. `0.2.33` — written to `PlatformStack.spec.pin`, which the operator then holds the cluster at. Omit to clear the pin and follow the channel (autoUpgrade) |
+
+Examples:
+
+```sh
+apprafter platform upgrade  # clear the pin, follow the channel
+apprafter platform upgrade --to 0.2.54
+```

@@ -37,6 +37,12 @@ Usage: apprafter secret remove [OPTIONS] <NAME>
 | `--namespace`, `-n` | — | `apprafter-system` | no | Target namespace. Defaults to `apprafter-system` (matches `secret seal`); pass the app's namespace for app secrets |
 | `--yes` | flag | — | no | Skip the confirmation prompt |
 
+Examples:
+
+```sh
+apprafter secret remove <name> --namespace <ns> --yes
+```
+
 ## `apprafter secret seal`
 
 Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`. Fetches the controller's public cert over the TLS-authenticated kube API (strict scope: the sealed blob only unseals as `<namespace>/<name>`).
@@ -58,3 +64,11 @@ Usage: apprafter secret seal [OPTIONS] --from-literal <FROM_LITERAL> <NAME>
 | `--type` | — | `Opaque` | no | Resulting Secret `type` (e.g. `Opaque`, `kubernetes.io/dockerconfigjson`) |
 | `--stdout` | flag | — | no | Print the SealedSecret YAML to stdout instead of applying it (for `kubectl apply -f -` or committing to a config repo) |
 | `--yes` | flag | — | no | Skip the overwrite confirmation prompt when a secret of the same name already exists. In non-interactive shells this flag is required to replace an existing secret (without it the command errors instead of silently overwriting) |
+
+Examples:
+
+```sh
+apprafter secret seal <name> --from-literal TOKEN=<value> --namespace <ns>
+apprafter secret seal <name> --from-literal USER=<user> --from-literal PASS=<pass>
+apprafter secret seal <name> --from-literal TOKEN=<value> --stdout
+```

@@ -20,3 +20,9 @@ Usage: apprafter init --provider <PROVIDER> --tier <TIER> --region <REGION>
 | `--provider` | — | — | yes | Infrastructure provider identifier |
 | `--region` | — | — | yes | Provider-specific region |
 | `--tier` | — | — | yes | Deployment tier |
+
+Examples:
+
+```sh
+apprafter init --provider hetzner-cloud --tier solo --region nbg1
+```

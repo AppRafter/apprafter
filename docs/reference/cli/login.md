@@ -14,3 +14,9 @@ Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints what it would do
 ```text
 Usage: apprafter login
 ```
+
+Examples:
+
+```sh
+apprafter login
+```

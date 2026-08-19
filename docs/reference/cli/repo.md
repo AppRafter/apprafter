@@ -56,6 +56,13 @@ Usage: apprafter repo creds add [OPTIONS] --url-prefix <URL_PREFIX> <NAME>
 | `--url-prefix` | — | — | yes | URL prefix for which these creds apply (e.g. `https://github.com/myorg`). Required |
 | `--username` | — | `git` | no | Username. When `--type pat` — usually the token holder's git username (GitHub: any non-empty string works; GitLab requires the username). Defaults to `git` for PAT auth which works across most providers |
 
+Examples:
+
+```sh
+apprafter repo creds add <name> --url-prefix https://github.com/<org>
+apprafter repo creds add <name> --url-prefix <prefix> --no-validate
+```
+
 ### `apprafter repo creds list`
 
 List registered creds
@@ -65,6 +72,12 @@ Usage: apprafter repo creds list
 ```
 
 Aliases: `ls` — accepted on the command line, not listed in `--help`.
+
+Examples:
+
+```sh
+apprafter repo creds list
+```
 
 ### `apprafter repo creds remove`
 
@@ -85,6 +98,13 @@ Aliases: `rm` — accepted on the command line, not listed in `--help`.
 | `--force` | flag | — | no | Skip confirmation + the dependency check |
 | `--yes` | flag | — | no | Skip confirmation prompt only (still runs dependency check) |
 
+Examples:
+
+```sh
+apprafter repo creds remove <name>
+apprafter repo creds remove <name> --force
+```
+
 ### `apprafter repo creds rotate`
 
 Rotate a creds entry's token in-place. Patches the existing Secret rather than recreating it — Argo CD repo-server holds a cached reference to the Secret's resourceVersion and a recreate would cause a brief reconnect window
@@ -102,6 +122,12 @@ Usage: apprafter repo creds rotate [OPTIONS] <NAME>
 | `--no-validate` | flag | — | no | Skip token format validation. See `repo creds add --no-validate` |
 | `--token` | — | — | no | New token. Reads from stdin (masked) when omitted and stdin is a TTY. Env: `APPRAFTER_REPO_TOKEN`. |
 
+Examples:
+
+```sh
+apprafter repo creds rotate <name>
+```
+
 ### `apprafter repo creds show`
 
 Show a creds entry; token is masked
@@ -113,3 +139,9 @@ Usage: apprafter repo creds show <NAME>
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | Creds name (as listed via `repo creds list`) |
+
+Examples:
+
+```sh
+apprafter repo creds show <name>
+```

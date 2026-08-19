@@ -40,6 +40,12 @@ Usage: apprafter backup check [OPTIONS]
 | `--read-data` | flag | — | no | Deep verify: download and re-hash every pack (`--read-data`) |
 | `--repo` | — | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
 
+Examples:
+
+```sh
+apprafter backup check --credential-file <dotenv>
+```
+
 ## `apprafter backup create`
 
 Create a full encrypted backup of the cluster (default scope: whole cluster). Wraps native data + CRs + secrets into a restic repository
@@ -56,12 +62,26 @@ Usage: apprafter backup create [OPTIONS]
 | `--select` | flag | — | no | When set, only the namespaces given via `--namespace` are backed up |
 | `--staging-mode` | — | — | no | Staging strategy: `monolithic` (default — stage every namespace's native data at once, one snapshot) or `sequential` (stage + snapshot one namespace at a time, bounding peak staging disk on large clusters) |
 
+Examples:
+
+```sh
+apprafter backup create
+apprafter backup create --namespace <ns> --select  # only that namespace
+apprafter backup create --repo <path> --staging-mode sequential
+```
+
 ## `apprafter backup disable`
 
 Disable scheduled backup (sets spec.backup.enabled=false; keeps config)
 
 ```text
 Usage: apprafter backup disable
+```
+
+Examples:
+
+```sh
+apprafter backup disable
 ```
 
 ## `apprafter backup enable`
@@ -97,6 +117,13 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 | `--prefix` | — | — | no | Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket` |
 | `--staging-mode` | — | — | no | `monolithic` (default) or `sequential` |
 
+Examples:
+
+```sh
+apprafter backup enable --bucket <bucket> --endpoint <host> --credential-file <dotenv> --i-have-saved-credentials
+apprafter backup enable --bucket s3:https://<host>/<bucket> --credential <secret> --i-have-saved-credentials
+```
+
 ## `apprafter backup list`
 
 List snapshots stored in a backup repo
@@ -111,6 +138,13 @@ Aliases: `ls` — accepted on the command line, not listed in `--help`.
 | --- | --- | --- | --- | --- |
 | `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
 | `--repo` | — | — | no | Path to the restic repository. Defaults to `<config>/backups/<target>` |
+
+Examples:
+
+```sh
+apprafter backup list
+apprafter backup list --repo <path>
+```
 
 ## `apprafter backup prune`
 
@@ -128,12 +162,25 @@ Usage: apprafter backup prune [OPTIONS]
 | `--keep-weekly` | — | — | no | Keep-weekly retention override (else spec.backup.retention, else 4) |
 | `--repo` | — | — | no | S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`). Defaults to `PlatformStack.spec.backup.bucket` |
 
+Examples:
+
+```sh
+apprafter backup prune --credential-file <dotenv>
+apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 8
+```
+
 ## `apprafter backup status`
 
 Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
 
 ```text
 Usage: apprafter backup status
+```
+
+Examples:
+
+```sh
+apprafter backup status
 ```
 
 ## `apprafter backup unlock`
@@ -148,3 +195,9 @@ Usage: apprafter backup unlock [OPTIONS]
 | --- | --- | --- | --- | --- |
 | `--credential-file` | — | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars |
 | `--repo` | — | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
+
+Examples:
+
+```sh
+apprafter backup unlock --credential-file <dotenv>
+```

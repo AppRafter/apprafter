@@ -16,7 +16,7 @@ pub(crate) mod commands;
 mod dispatch;
 pub(crate) mod examples;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use cli_core::logging;
 use miette::{IntoDiagnostic, Result};
 
@@ -91,6 +91,18 @@ pub fn run() -> Result<()> {
     // network round-trip happens four times a day at most.
     commands::version_check::maybe_warn_about_newer_version();
 
-    let args = Cli::parse();
+    // `Cli::parse()` would build the clap tree WITHOUT the worked
+    // examples, so `--help` would be the one consumer of
+    // `examples::EXAMPLES` that never sees it. Expanded here to the
+    // three steps `parse()` performs, with `examples::attach` between
+    // building and matching. `get_matches_mut` keeps the command
+    // alive so a parse error can still be rendered against it, which
+    // is what `parse()` does internally.
+    let mut command = examples::attach(Cli::command());
+    let mut matches = command.get_matches_mut();
+    let args = match Cli::from_arg_matches_mut(&mut matches) {
+        Ok(args) => args,
+        Err(error) => error.format(&mut command).exit(),
+    };
     dispatch(args).map_err(miette::Report::new)
 }

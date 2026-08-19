@@ -19,3 +19,10 @@ Usage: apprafter destroy [OPTIONS]
 | --- | --- | --- | --- | --- |
 | `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
 | `--yes` | flag | — | no | Confirm without prompting |
+
+Examples:
+
+```sh
+apprafter destroy --yes  # every Hetzner resource tagged apprafter=true
+apprafter destroy --target <target> --yes
+```

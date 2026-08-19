@@ -18,3 +18,9 @@ Usage: apprafter upgrade-tier --to <TO>
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--to` | — | — | yes | Target tier (solo/team/prod/regulated) |
+
+Examples:
+
+```sh
+apprafter upgrade-tier --to team
+```

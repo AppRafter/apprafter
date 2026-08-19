@@ -62,7 +62,12 @@
       "long_about": null,
       "usage": "Usage: apprafter app add [OPTIONS] [GIT_URL]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app add  # register the repo in the cwd, from its git origin",
+        "apprafter app add https://github.com/<org>/<repo>.git --name <name>",
+        "apprafter app add --env prod  # registers the Argo app <name>-prod",
+        "apprafter app add --no-interactive --scaffold  # CI: scaffold, then register"
+      ],
       "args": [
         {
           "id": "branch",
@@ -223,7 +228,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app list [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app list",
+        "apprafter app list --all-projects --all-managed  # drop both filters"
+      ],
       "args": [
         {
           "id": "all_managed",
@@ -274,7 +282,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app logs [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app logs <name> -f --tail 100",
+        "apprafter app logs <name> --env prod"
+      ],
       "args": [
         {
           "id": "container",
@@ -358,7 +369,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app open [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app open <name>",
+        "apprafter app open <name> --port 3000 --no-browser"
+      ],
       "args": [
         {
           "id": "container_port",
@@ -432,7 +446,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app remove [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app remove <name> --yes  # removes EVERY environment of <name>",
+        "apprafter app remove <name> --env prod --keep-data  # one env, data kept"
+      ],
       "args": [
         {
           "id": "env",
@@ -492,7 +509,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app rollback [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app rollback <name>  # to the previous entry in Argo CD history",
+        "apprafter app rollback <name> --to <revision> --yes"
+      ],
       "args": [
         {
           "id": "env",
@@ -552,7 +572,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app scaffold [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app scaffold --runtime bun --name <name> --namespace <ns>",
+        "apprafter app scaffold --needs pg --needs redis"
+      ],
       "args": [
         {
           "id": "force",
@@ -639,7 +662,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app status [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app status <name>",
+        "apprafter app status <name> --resources"
+      ],
       "args": [
         {
           "id": "resources",
@@ -675,7 +701,10 @@
       "long_about": null,
       "usage": "Usage: apprafter app validate [MANIFEST]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter app validate  # auto-discovers <cwd>/apprafter/Application.cue",
+        "apprafter app validate apprafter/Application.cue"
+      ],
       "args": [],
       "positionals": [
         {
@@ -697,7 +726,10 @@
       "long_about": null,
       "usage": "Usage: apprafter apply [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter apply",
+        "apprafter apply --target <target> --server-type cx22"
+      ],
       "args": [
         {
           "id": "server_type",
@@ -735,7 +767,10 @@
       "long_about": null,
       "usage": "Usage: apprafter argocd-password [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter argocd-password",
+        "apprafter argocd-password --refresh  # after the admin secret is rotated"
+      ],
       "args": [
         {
           "id": "refresh",
@@ -830,7 +865,9 @@
       "long_about": null,
       "usage": "Usage: apprafter backup check [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup check --credential-file <dotenv>"
+      ],
       "args": [
         {
           "id": "credential_file",
@@ -881,7 +918,11 @@
       "long_about": null,
       "usage": "Usage: apprafter backup create [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup create",
+        "apprafter backup create --namespace <ns> --select  # only that namespace",
+        "apprafter backup create --repo <path> --staging-mode sequential"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -956,7 +997,9 @@
       "long_about": null,
       "usage": "Usage: apprafter backup disable",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup disable"
+      ],
       "args": [],
       "positionals": []
     },
@@ -970,7 +1013,10 @@
       "long_about": "Enable scheduled off-site S3 backup by patching PlatformStack.spec.backup.\n\nCredential input — exactly ONE of the following is required:\n\n--credential-file <dotenv> Parse the dotenv file (KEY=VALUE lines), probe the repo, and auto-seal the creds as a SealedSecret in apprafter-system. --credential names the Secret (optional; defaults to \"apprafter-backup-s3\").\n\n--credential <name> Name an existing Secret already in apprafter-system. The Secret's keys are read from the cluster and used to probe the repo. No sealing step.\n\nAccepted credential keys: S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD (optional: S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION are accepted as aliases.",
       "usage": "Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup enable --bucket <bucket> --endpoint <host> --credential-file <dotenv> --i-have-saved-credentials",
+        "apprafter backup enable --bucket s3:https://<host>/<bucket> --credential <secret> --i-have-saved-credentials"
+      ],
       "args": [
         {
           "id": "bucket",
@@ -1155,7 +1201,10 @@
       "long_about": null,
       "usage": "Usage: apprafter backup list [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup list",
+        "apprafter backup list --repo <path>"
+      ],
       "args": [
         {
           "id": "passphrase",
@@ -1194,7 +1243,10 @@
       "long_about": null,
       "usage": "Usage: apprafter backup prune [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup prune --credential-file <dotenv>",
+        "apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 8"
+      ],
       "args": [
         {
           "id": "credential_file",
@@ -1269,7 +1321,9 @@
       "long_about": null,
       "usage": "Usage: apprafter backup status",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup status"
+      ],
       "args": [],
       "positionals": []
     },
@@ -1283,7 +1337,9 @@
       "long_about": null,
       "usage": "Usage: apprafter backup unlock [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter backup unlock --credential-file <dotenv>"
+      ],
       "args": [
         {
           "id": "credential_file",
@@ -1323,7 +1379,10 @@
       "long_about": null,
       "usage": "Usage: apprafter bootstrap-all [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter bootstrap-all --server-type cx22",
+        "apprafter bootstrap-all --dry-run"
+      ],
       "args": [
         {
           "id": "dry_run",
@@ -1375,7 +1434,9 @@
       "long_about": null,
       "usage": "Usage: apprafter cluster-bootstrap",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter cluster-bootstrap  # phase 3 of bootstrap-all, on its own"
+      ],
       "args": [],
       "positionals": []
     },
@@ -1388,7 +1449,10 @@
       "long_about": null,
       "usage": "Usage: apprafter destroy [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter destroy --yes  # every Hetzner resource tagged apprafter=true",
+        "apprafter destroy --target <target> --yes"
+      ],
       "args": [
         {
           "id": "target",
@@ -1426,7 +1490,10 @@
       "long_about": null,
       "usage": "Usage: apprafter doctor [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter doctor",
+        "apprafter doctor --target <target> --no-ping"
+      ],
       "args": [
         {
           "id": "no_ping",
@@ -1464,7 +1531,10 @@
       "long_about": null,
       "usage": "Usage: apprafter export [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter export --out <dir>",
+        "apprafter export --namespace <ns> --select"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -1514,7 +1584,10 @@
       "long_about": null,
       "usage": "Usage: apprafter import [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter import --dry-run",
+        "apprafter import --force"
+      ],
       "args": [
         {
           "id": "dry_run",
@@ -1564,7 +1637,9 @@
       "long_about": null,
       "usage": "Usage: apprafter init --provider <PROVIDER> --tier <TIER> --region <REGION>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter init --provider hetzner-cloud --tier solo --region nbg1"
+      ],
       "args": [
         {
           "id": "provider",
@@ -1616,7 +1691,10 @@
       "long_about": null,
       "usage": "Usage: apprafter kubeconfig [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter kubeconfig --refresh",
+        "export KUBECONFIG=\"$(apprafter kubeconfig)\""
+      ],
       "args": [
         {
           "id": "refresh",
@@ -1654,7 +1732,9 @@
       "long_about": null,
       "usage": "Usage: apprafter login",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter login"
+      ],
       "args": [],
       "positionals": []
     },
@@ -1681,7 +1761,10 @@
       "long_about": null,
       "usage": "Usage: apprafter migration approve [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter migration approve <plan>",
+        "apprafter migration approve <plan> --namespace <ns>"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -1719,7 +1802,9 @@
       "long_about": null,
       "usage": "Usage: apprafter migration list",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter migration list"
+      ],
       "args": [],
       "positionals": []
     },
@@ -1733,7 +1818,9 @@
       "long_about": null,
       "usage": "Usage: apprafter migration reject <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter migration reject <plan>"
+      ],
       "args": [],
       "positionals": [
         {
@@ -1769,7 +1856,10 @@
       "long_about": "Prepare the active target's cluster node: retrofit the kubelet node reservations + k3s OOM-protection AND provision host swap.\n\nWrites `/etc/rancher/k3s/config.yaml` reservations + `k3s.service.d/oom.conf` and — when the node is eligible (k8s ≥1.34 for the NoSwap GA gate + cgroup v2) — layers a host swapfile with `swapBehavior: NoSwap` so a control-plane spike degrades to swap instead of an OOM-kill while pods never swap. Applied atomically over one k3s restart (the API is briefly unavailable, ~30s), with a whole-step rollback on a `/readyz` timeout. Idempotent — a re-run refreshes the drop-in and is otherwise a near no-op.",
       "usage": "Usage: apprafter node prep [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter node prep",
+        "apprafter node prep --yes"
+      ],
       "args": [
         {
           "id": "yes",
@@ -1796,7 +1886,9 @@
       "long_about": null,
       "usage": "Usage: apprafter node status",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter node status"
+      ],
       "args": [],
       "positionals": []
     },
@@ -1823,7 +1915,10 @@
       "long_about": null,
       "usage": "Usage: apprafter open argocd [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter open argocd",
+        "apprafter open argocd --project platform"
+      ],
       "args": [
         {
           "id": "all_projects",
@@ -1861,7 +1956,9 @@
       "long_about": null,
       "usage": "Usage: apprafter plan",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter plan"
+      ],
       "args": [],
       "positionals": []
     },
@@ -1903,7 +2000,10 @@
       "long_about": null,
       "usage": "Usage: apprafter platform autoscale set <MODE>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform autoscale set up-only",
+        "apprafter platform autoscale set off"
+      ],
       "args": [],
       "positionals": [
         {
@@ -1927,7 +2027,9 @@
       "long_about": null,
       "usage": "Usage: apprafter platform autoscale show",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform autoscale show"
+      ],
       "args": [],
       "positionals": []
     },
@@ -1956,7 +2058,9 @@
       "long_about": null,
       "usage": "Usage: apprafter platform egress set <PROFILE>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform egress set internal"
+      ],
       "args": [],
       "positionals": [
         {
@@ -1980,7 +2084,9 @@
       "long_about": null,
       "usage": "Usage: apprafter platform egress show",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform egress show"
+      ],
       "args": [],
       "positionals": []
     },
@@ -2009,7 +2115,9 @@
       "long_about": null,
       "usage": "Usage: apprafter platform env set <ENV>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform env set prod"
+      ],
       "args": [],
       "positionals": [
         {
@@ -2033,7 +2141,9 @@
       "long_about": null,
       "usage": "Usage: apprafter platform env show",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform env show"
+      ],
       "args": [],
       "positionals": []
     },
@@ -2047,7 +2157,10 @@
       "long_about": null,
       "usage": "Usage: apprafter platform freeze <COMPONENT>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform freeze cilium",
+        "apprafter platform freeze cilium --version 1.16.5"
+      ],
       "args": [],
       "positionals": [
         {
@@ -2070,7 +2183,9 @@
       "long_about": null,
       "usage": "Usage: apprafter platform rescue [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform rescue --yes"
+      ],
       "args": [
         {
           "id": "yes",
@@ -2097,7 +2212,10 @@
       "long_about": null,
       "usage": "Usage: apprafter platform status [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform status",
+        "apprafter platform status --cached"
+      ],
       "args": [
         {
           "id": "cached",
@@ -2124,7 +2242,9 @@
       "long_about": null,
       "usage": "Usage: apprafter platform unfreeze <COMPONENT>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform unfreeze cilium"
+      ],
       "args": [],
       "positionals": [
         {
@@ -2147,7 +2267,10 @@
       "long_about": null,
       "usage": "Usage: apprafter platform upgrade [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter platform upgrade  # clear the pin, follow the channel",
+        "apprafter platform upgrade --to 0.2.54"
+      ],
       "args": [
         {
           "id": "cached",
@@ -2214,7 +2337,10 @@
       "long_about": null,
       "usage": "Usage: apprafter repo creds add [OPTIONS] --url-prefix <URL_PREFIX> <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter repo creds add <name> --url-prefix https://github.com/<org>",
+        "apprafter repo creds add <name> --url-prefix <prefix> --no-validate"
+      ],
       "args": [
         {
           "id": "auth_type",
@@ -2313,7 +2439,9 @@
       "long_about": null,
       "usage": "Usage: apprafter repo creds list",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter repo creds list"
+      ],
       "args": [],
       "positionals": []
     },
@@ -2330,7 +2458,10 @@
       "long_about": null,
       "usage": "Usage: apprafter repo creds remove [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter repo creds remove <name>",
+        "apprafter repo creds remove <name> --force"
+      ],
       "args": [
         {
           "id": "force",
@@ -2379,7 +2510,9 @@
       "long_about": null,
       "usage": "Usage: apprafter repo creds rotate [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter repo creds rotate <name>"
+      ],
       "args": [
         {
           "id": "no_validate",
@@ -2428,7 +2561,9 @@
       "long_about": null,
       "usage": "Usage: apprafter repo creds show <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter repo creds show <name>"
+      ],
       "args": [],
       "positionals": [
         {
@@ -2450,7 +2585,11 @@
       "long_about": null,
       "usage": "Usage: apprafter restore [OPTIONS] <REPO>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter restore <repo> --credential-file <dotenv>",
+        "apprafter restore <repo> --credential-file <dotenv> --data-only",
+        "apprafter restore <repo> --credential-file <dotenv> --reprovision --server-type cx22"
+      ],
       "args": [
         {
           "id": "credential_file",
@@ -2571,7 +2710,9 @@
       "long_about": null,
       "usage": "Usage: apprafter secret remove [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter secret remove <name> --namespace <ns> --yes"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -2619,7 +2760,11 @@
       "long_about": "Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`. Fetches the controller's public cert over the TLS-authenticated kube API (strict scope: the sealed blob only unseals as `<namespace>/<name>`).\n\nRe-sealing an existing name REPLACES its keys — it does not merge; pass all keys in one command. Use `--yes` to skip the overwrite prompt.",
       "usage": "Usage: apprafter secret seal [OPTIONS] --from-literal <FROM_LITERAL> <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter secret seal <name> --from-literal TOKEN=<value> --namespace <ns>",
+        "apprafter secret seal <name> --from-literal USER=<user> --from-literal PASS=<pass>",
+        "apprafter secret seal <name> --from-literal TOKEN=<value> --stdout"
+      ],
       "args": [
         {
           "id": "from_literal",
@@ -2702,7 +2847,9 @@
       "long_about": null,
       "usage": "Usage: apprafter status",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter status"
+      ],
       "args": [],
       "positionals": []
     },
@@ -2731,7 +2878,11 @@
       "long_about": "Add (or update, with `--renew`) a deployment target.\n\nOn a TTY without `--no-interactive` the command launches a wizard that prompts for whatever flags were not provided. On a non-TTY (CI, pipe) the command is purely flag-driven and missing required inputs error out fast.",
       "usage": "Usage: apprafter target add [OPTIONS] [NAME]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target add <name> --provider hetzner-cloud --region nbg1 --tier solo",
+        "apprafter target add <name> --ssh-key ~/.ssh/id_ed25519.pub --server-type cx22",
+        "apprafter target add <name> --renew --token <token>"
+      ],
       "args": [
         {
           "id": "cluster_name",
@@ -2902,7 +3053,10 @@
       "long_about": null,
       "usage": "Usage: apprafter target cert import [OPTIONS] --cert <CERT> --key <KEY> <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target cert import <name> --cert ./origin.crt --key ./origin.key",
+        "apprafter target cert import <name> --cert ./new.crt --key ./new.key --replace"
+      ],
       "args": [
         {
           "id": "cert",
@@ -2989,7 +3143,9 @@
       "long_about": null,
       "usage": "Usage: apprafter target domain add [OPTIONS] --cert <CERT> <DOMAIN>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target domain add apprafter.dev --cert <name>"
+      ],
       "args": [
         {
           "id": "added_by",
@@ -3040,7 +3196,9 @@
       "long_about": null,
       "usage": "Usage: apprafter target domain list",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target domain list"
+      ],
       "args": [],
       "positionals": []
     },
@@ -3055,7 +3213,10 @@
       "long_about": null,
       "usage": "Usage: apprafter target domain remove [OPTIONS] <DOMAIN>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target domain remove apprafter.dev",
+        "apprafter target domain remove apprafter.dev --force"
+      ],
       "args": [
         {
           "id": "force",
@@ -3106,7 +3267,10 @@
       "long_about": null,
       "usage": "Usage: apprafter target firewall cloudflare-origin <STATE>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target firewall cloudflare-origin enable",
+        "apprafter target firewall cloudflare-origin disable"
+      ],
       "args": [],
       "positionals": [
         {
@@ -3132,7 +3296,9 @@
       "long_about": null,
       "usage": "Usage: apprafter target ip",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target ip"
+      ],
       "args": [],
       "positionals": []
     },
@@ -3148,7 +3314,9 @@
       "long_about": null,
       "usage": "Usage: apprafter target list",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target list"
+      ],
       "args": [],
       "positionals": []
     },
@@ -3162,7 +3330,11 @@
       "long_about": null,
       "usage": "Usage: apprafter target machine [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target machine  # picker over the live Hetzner catalogue",
+        "apprafter target machine --server-type cx32 --target <target>",
+        "apprafter target machine --server-type cx32 --no-ping"
+      ],
       "args": [
         {
           "id": "no_ping",
@@ -3215,7 +3387,9 @@
       "long_about": null,
       "usage": "Usage: apprafter target remove [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target remove <name> --yes"
+      ],
       "args": [
         {
           "id": "yes",
@@ -3251,7 +3425,9 @@
       "long_about": null,
       "usage": "Usage: apprafter target rename <FROM> <TO>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target rename <from> <to>"
+      ],
       "args": [],
       "positionals": [
         {
@@ -3284,7 +3460,10 @@
       "long_about": null,
       "usage": "Usage: apprafter target show [NAME]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target show",
+        "apprafter target show <name>"
+      ],
       "args": [],
       "positionals": [
         {
@@ -3307,7 +3486,9 @@
       "long_about": null,
       "usage": "Usage: apprafter target use <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter target use <name>"
+      ],
       "args": [],
       "positionals": [
         {
@@ -3329,7 +3510,9 @@
       "long_about": null,
       "usage": "Usage: apprafter upgrade-tier --to <TO>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter upgrade-tier --to team"
+      ],
       "args": [
         {
           "id": "to",
@@ -3369,7 +3552,9 @@
       "long_about": null,
       "usage": "Usage: apprafter volume create [OPTIONS] --size <SIZE> <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter volume create <name> --size 2Gi --namespace <ns>"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -3419,7 +3604,10 @@
       "long_about": null,
       "usage": "Usage: apprafter volume list [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter volume list  # cluster-wide",
+        "apprafter volume list --namespace <ns>"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -3446,7 +3634,9 @@
       "long_about": null,
       "usage": "Usage: apprafter volume rm [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter volume rm <name> --namespace <ns> --yes"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -3494,7 +3684,9 @@
       "long_about": null,
       "usage": "Usage: apprafter volume status [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter volume status <name> --namespace <ns>"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -3529,7 +3721,10 @@
       "long_about": null,
       "usage": "Usage: apprafter whoami [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter whoami",
+        "apprafter whoami --no-ping"
+      ],
       "args": [
         {
           "id": "no_ping",

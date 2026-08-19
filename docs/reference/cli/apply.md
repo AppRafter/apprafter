@@ -19,3 +19,10 @@ Usage: apprafter apply [OPTIONS]
 | --- | --- | --- | --- | --- |
 | `--server-type` | — | — | no | Server type (SKU) to provision (e.g. `cx22`, `cx32`). Resolution: this flag > manifest `spec.nodes[0].type` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning a new cluster fails with `apprafter::provider::server_type_not_selected` (pick one via the `target add` picker or `apprafter target machine`) |
 | `--target` | — | — | no | Inspect a target other than the active one for the resolution chain (`--token` flag / `HCLOUD_TOKEN` env / target store). Useful when scripting against multiple targets without `apprafter target use` |
+
+Examples:
+
+```sh
+apprafter apply
+apprafter apply --target <target> --server-type cx22
+```

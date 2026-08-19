@@ -21,3 +21,10 @@ Aliases: `kc` — accepted on the command line, not listed in `--help`.
 | --- | --- | --- | --- | --- |
 | `--refresh` | flag | — | no | Force a re-fetch over SSH even if a cached kubeconfig is already in state |
 | `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
+
+Examples:
+
+```sh
+apprafter kubeconfig --refresh
+export KUBECONFIG="$(apprafter kubeconfig)"
+```
