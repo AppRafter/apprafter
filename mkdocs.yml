@@ -196,6 +196,7 @@ nav:
       - Environment variables: reference/environment.md
   - Contributing:
       - Setup: contributing/setup.md
+      - Writing documentation: contributing/documentation.md
       - Documentation gate: contributing/documentation-gate.md
       - License Headers: contributing/license-headers.md
   - ADRs: adr/README.md

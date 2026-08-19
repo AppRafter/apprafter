@@ -9,6 +9,126 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## docs tooling (no release) — 2.19e build hooks: CUE highlighting and an LLM-readable corpus (2026-08-19)
+
+> No version bump and no monorepo tag: `cli/Cargo.toml` is untouched, no
+> chart, operator or cue-cmp artefact moved, and the only Rust edit is a
+> docstring in `cli/docsgen/src/scan.rs` that a count taken in this
+> subphase falsified. Fifth of the documentation track's ten subphases —
+> branch `feat/2.19e-hooks-llm`, **ADR 0057** (see its 2.19e amendment
+> for the two front-matter features that were dropped and deferred, and
+> the measurement behind each).
+>
+> **Nothing here is committed as an artefact.** Two mkdocs build hooks
+> derive everything from committed content at build time, so none of it
+> can drift from the pages it describes. The one authored input is a
+> `description:` line per page, because that is the one thing that
+> cannot be derived from the tree.
+
+### Added
+
+- **CUE renders as code.** Pygments ships no CUE lexer, so every ` ```cue `
+  fence on the site was rendering as unstyled text — 31 of them on the
+  built site, out of 37 across 20 tracked pages. A build hook registers
+  one.
+
+  **The self-check is the deliverable, not the lexer.** The markdown
+  extension that highlights code catches a failed lexer lookup and falls
+  back to plain text, so a broken registration is otherwise a green
+  build, finished-looking pages, and nothing in the log. The hook
+  therefore resolves the alias (catching `ClassNotFound` and naming the
+  consequence), asserts the alias resolves to **this** lexer rather than
+  to something else that claimed the name, and requires a sample to come
+  back carrying six token families — comment, keyword, string, name,
+  number, operator — tested through pygments' token hierarchy, so
+  retokenising a construct to a sibling subtype does not misfire while
+  losing the construct entirely does. Both failure modes were watched
+  firing before the hook was committed.
+- **Every page the index lists carries a one-line `description`.** 31
+  hand-written pages gained one; before this, exactly one had. It is read
+  twice — as the page's entry in `llms.txt` and as its HTML `meta`
+  description — and pages emitting their **own** meta description went 28
+  to 60, the rest falling back to the site-wide sentence that is
+  identical on every page. A build hook fails the build, naming the
+  pages, when an indexed page has none.
+- **`llms.txt`, `llms-full.txt` and a markdown twin beside every page.**
+  The index carries the site name, its description, the licence line
+  (documentation CC-BY-4.0, code samples Apache-2.0) and one section per
+  nav group with absolute URLs; the bundle carries every published page's
+  markdown behind a header with its URL, description and audience; the
+  twin is the page's own markdown at the page URL with the trailing `/`
+  dropped and `.md` appended. Measured on the built site: 119 published
+  pages, 59 of them ADRs; 60 indexed, 119 bundled, 119 twinned.
+
+  **The ADRs are bundled and twinned but not indexed.** Each describes
+  the world as it was on the day it was ratified — which is why the drift
+  gate holds them out of scope too — and they are half of everything the
+  site publishes. A model handed the whole corpus should have them; a
+  model handed a map should not have to walk past them. A generated
+  sentence in the index says so and names the count.
+- **A fourth pass in `scripts/docs-check.sh`**, because a hook that
+  stopped writing these three artefacts is invisible: mkdocs does not
+  know they were supposed to exist and the build stays green either way.
+  Ten assertions — the index exists and names the licence, its links are
+  absolute and every one resolves to a page the site contains, every
+  published non-ADR page is listed, the bundle holds one entry per
+  published page with a body rather than a bare header, a named twin
+  exists, and the twin count matches the page count. Every expectation is
+  derived from the site that was just built, so a page added tomorrow is
+  covered without editing the script.
+- **`docs/contributing/documentation.md`** — the author's half of the
+  contract: what front matter a page owes, what the two hooks do with it,
+  and what an author gets for free. It is inside the gate's corpus, so
+  the machinery it describes checks it.
+
+### Changed
+
+- **`.github/workflows/docs.yml` triggers on `docs/hooks/**`** on both
+  the pull-request and push filters. Redundant under `docs/**` and listed
+  anyway, for the reason the committed census is: a hook is not a page,
+  it is what renders and exports every page, and a future narrowing of
+  `docs/**` must not silently drop the trigger for the one change class
+  whose diff contains no page.
+
+### Deliberately not built
+
+- **`since` in front matter — dropped.** A per-page version claim that
+  nothing can check: no gate reads it, no build fails on it, and no
+  reader can tell a page whose `since` is current from one whose `since`
+  was correct two releases ago. It is the same shape as the test binding
+  dropped one subphase earlier. The contrast that decides it is already
+  in the repository — the `since=` on an *exemption* stays, because the
+  gate resolves that tag to its commit date and voids the exemption after
+  180 days. A version a page genuinely needs is named in the prose, where
+  a reader sees it.
+- **`audience` — optional rather than required**, for the same test from
+  the other side: it is derivable (front matter, else the nav group, else
+  the nearest ancestor directory's group, else `general`), and a field an
+  author must retype to state what the tree already says is a field that
+  will one day disagree with the tree.
+- **`<llm-only>` / `<llm-exclude>` — deferred**, with the reason recorded
+  rather than the feature half-built. Measured: **zero use sites** —
+  nothing in the repository writes either tag. The markdown-twin
+  transform is their natural home and that pass now exists, so adding
+  them later is a handful of lines against a real use site rather than a
+  mechanism guessed at in advance.
+
+### Known gaps (recorded, not fixed)
+
+- **A description is prose, so nothing checks it but review.** Three of
+  the first drafts were rewritten before landing because each asserted
+  something its page did not support. The gate cannot see this class: it
+  resolves commands, paths, schemas and citations, and a summary is none
+  of those.
+- **Markdown twins carry `pymdownx.snippets` include lines rather than
+  resolving them**, because includes are expanded during the
+  markdown-to-HTML conversion. Currently academic — the corpus has zero
+  include sites — and recorded rather than pre-solved for the same reason
+  as the tags above.
+- **The site is still unpublished.** This subphase ships an LLM-readable
+  corpus into a build output that nothing yet serves; it becomes reachable
+  at 2.19g.
+
 ## docs tooling (no release) — 2.19d xref and health: paths, ADR citations, a corpus census (2026-08-18)
 
 > No version bump and no monorepo tag, without the caveat 2.19c carried:

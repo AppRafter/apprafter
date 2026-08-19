@@ -9,5 +9,6 @@ Contributor-facing documents:
 | File                  | Purpose                                              |
 | --------------------- | ---------------------------------------------------- |
 | `setup.md`            | Local development environment and bootstrap.         |
-| `license-headers.md`  | SPDX-License-Identifier conventions per language.    |
+| `documentation.md`    | Writing a page: the front-matter contract and what the build hooks do with it. |
 | `documentation-gate.md` | What `just lint` checks in `docs/`, and how to exempt a line. |
+| `license-headers.md`  | SPDX-License-Identifier conventions per language.    |

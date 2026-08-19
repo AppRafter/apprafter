@@ -10,6 +10,16 @@ on:
   pull_request:
     paths:
       - 'docs/**'
+      # Redundant under `docs/**` above, and listed for the same reason
+      # the census is: the two mkdocs build hooks are not pages, they are
+      # the machinery that renders and exports EVERY page. A one-line
+      # change in either alters the whole site — CUE fences stop being
+      # highlighted, or llms.txt/llms-full.txt/the markdown twins stop
+      # being written, and the mkdocs build stays green through both.
+      # Spelling the path out means a future narrowing of `docs/**` (to
+      # `docs/**/*.md`, say) cannot silently drop the trigger for the one
+      # change class that has no page in its diff.
+      - 'docs/hooks/**'
       # The corpus is `docs/**` PLUS the root README: `scan::in_scope`
       # lists `git ls-files -- docs README.md`, and the README is page
       # 1 of the 33 the census counts. No `docs/` pattern reaches it,
@@ -56,6 +66,8 @@ on:
     branches: [master]
     paths:
       - 'docs/**'
+      # See the identical entry on the pull_request trigger above.
+      - 'docs/hooks/**'
       # See the identical entry on the pull_request trigger above.
       - 'README.md'
       # See the identical entry on the pull_request trigger above.

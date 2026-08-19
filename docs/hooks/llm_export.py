@@ -59,11 +59,12 @@ Re-derive the shape of the corpus with::
     grep -c '^url: ' /tmp/e-llm/llms-full.txt       # bundled pages
     find /tmp/e-llm -name '*.md' | wc -l            # markdown twins
 
-At 2026-08-19 those read 59, 118 and 118: 118 published pages, of which
+At 2026-08-19 those read 60, 119 and 119: 119 published pages, of which
 59 are under ``adr/`` and so appear in the bundle and as twins but not
 in the index.  ``scripts/docs-check.sh`` asserts all three counts
 against the built site on every run, so they are checked rather than
-recorded.
+recorded — which is why a page added to the nav moves these three
+numbers and breaks nothing.
 
 One thing this does not do
 --------------------------

@@ -17,9 +17,14 @@ generated CLI reference under `docs/reference/cli/`). Subphases c–j — the
 prose and table gate, xref and health metrics, the mkdocs hooks and LLM
 artefacts, the information-architecture restructure, publication, the CLI-UX
 work and the guide content — are decided here but **not implemented**. Each
-such decision is marked at the point it is stated. **2.19c and 2.19d have
-shipped since**; the amendment below records 2.19d, including the decisions
-this document made that measurement then overturned.
+such decision is marked at the point it is stated. **Those marks record the
+world on the day this was ratified and are deliberately not rewritten as
+subphases land** — an ADR describes a decision as it was made. This paragraph
+is the pointer to what has happened since: **2.19c, 2.19d and 2.19e have
+shipped**, so the "not yet implemented" marks on decisions 1, 6 and 7 are
+history rather than status. The amendments below record what each delivered
+and — the part worth reading — the decisions this document made that
+measurement then overturned.
 
 No release rides this decision so far: shipped CLI behaviour is unchanged (a
 lib target plus doc-comment corrections), no chart, operator or cue-cmp
@@ -468,6 +473,160 @@ carrying no counted claim is invisible to all seven numbers. These ratchets
 defend against the careless; review defends against the motivated, and no
 arithmetic over a corpus can take that job.
 
+## Amendment — 2.19e (the two build hooks and the LLM layer) as delivered, 2026-08-19
+
+Decision 1 accepted two costs of staying on MkDocs-Material and marked both
+unimplemented: pygments ships no CUE lexer, and nixpkgs has no `llms.txt`
+plugin. Both are now paid, by two build hooks in `docs/hooks/` registered
+under a `hooks:` key in `mkdocs.yml`. **Neither hook commits an artefact.**
+Everything they produce derives from committed content at build time, so
+none of it can drift from the pages it describes — which is why this package
+could land at any point in the track, exactly as the Deferred list said.
+
+No release and no monorepo tag rides it. `cli/Cargo.toml` is untouched, no
+chart, operator or cue-cmp artefact moved, and the only Rust edit is a
+docstring in `cli/docsgen/src/scan.rs` that a count taken in this subphase
+falsified.
+
+### Delivered
+
+- **A CUE lexer, whose self-check is the actual deliverable.** The corpus
+  writes **37** `cue` fences across 20 tracked pages, **31** of them on the
+  built site — the changelog working file holds the other six and is excluded
+  from the site. Without the hook all 31 render as unstyled text.
+
+  R1 named the mitigation as "a mandatory unit test asserting
+  `get_lexer_by_name("cue")` resolves". What shipped is stricter and runs
+  more often. It is an `on_config` handler, so it runs on **every** build —
+  local preview, `just lint` and CI alike — rather than in a suite that has
+  to be invoked; and it is three checks rather than one. The alias must
+  resolve, with `ClassNotFound` caught and reported in a sentence that names
+  the consequence. It must resolve to **this** hook's lexer, so a different
+  lexer claiming the name is caught rather than trusted. And a sample must
+  come back carrying six token families — comment, keyword, string, name,
+  number, operator — tested through pygments' token hierarchy, so
+  retokenising a construct to a sibling subtype does not misfire while losing
+  the construct entirely does. Both failure modes were watched firing before
+  the hook was committed: a self-check nobody has seen fire is a self-check
+  nobody knows works.
+
+  **One measurement in the subphase plan did not reproduce, and is corrected
+  here rather than adjusted away:** the plan recorded 34 CUE fences. It is 37
+  tracked and 31 on-site. A count that requires the fence to open the line
+  returns 33, silently missing four — three written inside blockquotes, one
+  indented under a list item. The build settles it independently: the
+  site-wide number of token-carrying code blocks rose by exactly 31 when the
+  hook was registered.
+
+- **A `description` on every page the index lists.** 31 hand-written pages
+  gained one. Of the **34** pages in the gate's corpus, 33 now carry front
+  matter with a description; the hold-out is the root `README.md`, which is
+  not a site page and so has no index entry and no meta tag to fill. Before
+  this subphase exactly **one** hand-written page had a description — the
+  generated command pages already carried `title`, `description`, `audience`
+  and `status`, because the generator writes them. On the built site, pages
+  emitting their **own** HTML meta description went 28 to **60**; the
+  remaining 60 are the 59 ADRs and the 404 page, and they fall back to
+  `site_description`, which is the same sentence everywhere and therefore
+  worth nothing in a search result.
+
+  Its cost is also its limit, and it was paid immediately: three of the first
+  drafts were rewritten before landing because each asserted something its
+  page did not support — a future-tense enforcement section described as
+  present, a command counted into a group it does not belong to, a
+  platform-scope verb described as available per-application. A description
+  is prose, so nothing checks it but review.
+
+- **`llms.txt`, `llms-full.txt` and a markdown twin beside every page.**
+  Measured on the built site: **119** published pages, 59 of them under
+  `adr/`; **60** indexed, **119** bundled, **119** twinned. The ADR split
+  holds — bundled and twinned but not indexed, because each ADR describes
+  the world as it was on the day it was ratified (which is why the drift gate
+  holds them out of scope too) and they are half of everything the site
+  publishes, so indexing them would bury the guides.
+
+  Two shapes the design did not anticipate. The index needed an **`Other
+  pages`** section: two published pages sit on the `not_in_nav` allow-list,
+  so a purely nav-driven index would have dropped them silently — with the
+  section, the index is *complete* over published non-ADR pages, which is
+  what let the guard below be written as completeness rather than as a
+  restated list of group names. And nested nav sections are carried as a
+  **label prefix** rather than flattened, because flattened outright the
+  *Reference* group listed two different pages as "Overview".
+
+  The hook **fails the build** when an indexed page carries no
+  `description`. The plan stated that as a contract and nothing enforced it;
+  this is its natural home, and it passes today over every indexed page.
+
+- **A fourth pass in `scripts/docs-check.sh`.** The mkdocs build does not
+  know these three artefacts were supposed to exist, so a hook that stopped
+  writing them leaves a green build and a published site with a broken
+  machine-readable layer. The pass makes **ten** assertions — the index
+  exists and names the licence, its links are absolute, every link resolves
+  to a page the site contains, every published non-ADR page is listed, the
+  bundle exists and holds one entry per published page with a body rather
+  than a bare header, a named twin exists, and the twin count matches the
+  page count. Every expectation is **derived from the site that was just
+  built**; nothing here restates a page list, so a page added tomorrow is
+  covered without editing the script.
+
+### The two things it deliberately did not build
+
+Recording these is the point of the amendment. Both were in the design, both
+were dropped or deferred on a stated reason, and each is a shape this track
+has already been burned by once.
+
+- **`since` in front matter: dropped.** The design called for the
+  front-matter gate to cover `description`, `audience` and `since`. `since`
+  is exactly the shape that failed for `verified-by` one subphase earlier:
+  **a per-page version claim that nothing can check.** No gate reads it, no
+  build fails on it, and no reader can distinguish a page whose `since` is
+  current from one whose `since` was correct two releases ago — it is written
+  once at authoring time and rots in silence. Requiring it would manufacture
+  one unverifiable claim per page, which is the defect class this whole
+  system exists to remove.
+
+  The contrast that decides it is inside this repository already: the
+  `since=` on an **exemption** stays, because the gate resolves that tag to
+  its commit date and voids the exemption after 180 days. The distinction is
+  not the field name but whether anything in the tree can call the claim
+  wrong. Where a page needs to name a version it names it in the prose, where
+  a reader sees it and a reviewer questions it.
+
+  `audience` survives the same test from the other side: it is derivable —
+  front matter, else the nav group, else the nearest ancestor directory's
+  group, else `general` — so it is optional rather than required. A field an
+  author must retype to state what the tree already says is a field that will
+  one day disagree with the tree.
+
+- **`<llm-only>` and `<llm-exclude>`: deferred, with the reason recorded
+  rather than the feature half-built.** Measured: **zero use sites** —
+  nothing in the repository writes either tag. The markdown-twin transform is
+  their natural home, and that pass now exists, so adding them later is a
+  handful of lines against a real use site instead of a mechanism guessed at
+  in advance. Building a stripping mechanism nobody has asked for is
+  precisely how the documentation system audited in *Context* accumulated
+  machinery that no CI job ran.
+
+  The same reasoning is recorded in the hook itself for `pymdownx.snippets`
+  include lines, which a twin currently carries rather than resolves: also
+  zero use sites today, also a handful of lines on the day there is one to
+  test against.
+
+### Consequences
+
+- **Writing a page costs one line of front matter**, and forgetting it fails
+  the build with the page named. That is the intended cost, and it is the
+  only new obligation this subphase puts on an author.
+- **A hook change alters every page on the site**, so `docs/hooks/**` is
+  listed explicitly in the docs workflow's path filters even though `docs/**`
+  already covers it — the same reason the committed census is listed there.
+- **The contributor-facing half is `docs/contributing/documentation.md`**,
+  which is itself inside the gate's corpus. A page explaining the gate that
+  the gate does not read is the first page to go stale.
+- **The census grew rather than shrank**, which passes silently by design:
+  pages went 33 to 34 and no other count moved.
+
 ## Alternatives considered
 
 - **Port the site to VitePress or Astro Starlight.** Rejected. The 93 existing
@@ -537,6 +696,10 @@ arithmetic over a corpus can take that job.
 - **The LLM artefacts** — `llms.txt`, `llms-full.txt` and per-page markdown
   twins. They derive from committed content, so they cannot drift and can
   land at any point; the licence they need was named in this decision.
+  *(Delivered in 2.19e, together with the CUE lexer decision 1 accepted as
+  the other cost of staying on MkDocs-Material — see the 2.19e amendment
+  above for what shipped, and for the two front-matter features that were
+  dropped and deferred on measurement.)*
 - **The information-architecture restructure** — nav rebuild, splitting the
   contributor walks from the user guides, and a redirect map. Sequenced
   immediately before publication so URLs settle once.
@@ -589,6 +752,10 @@ Andrey Ryahovskiy.
 - `cli/platform-cli/src/lib.rs` — the `docs_api` facade.
 - `scripts/docs-check.sh`, `Justfile` (`docs-check`, `docs-build`,
   `docsgen-generate`), `.github/workflows/docs.yml` — the three wiring points.
+- `docs/hooks/cue_lexer.py`, `docs/hooks/llm_export.py` — the two build
+  hooks decision 1 accepted as the cost of staying on MkDocs-Material.
+- `docs/contributing/documentation.md` — the author-facing front-matter
+  contract; `docs/contributing/documentation-gate.md` — the gate's own page.
 - `mkdocs.yml` — the validation settings, the `not_in_nav` allow-list and the
   site exclusions.
 - `LICENSE-CC-BY-4.0`, `NOTICE` — the documentation licence texts.
