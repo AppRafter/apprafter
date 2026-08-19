@@ -821,11 +821,17 @@ executed at all.
   documentation.
 
   ```sh
-  # 25 at fa3472e, 7 at the close of 2.19f
+  # 36 at fa3472e, 7 after the review corrections below
   git ls-files -- 'docs/*.md' \
     | grep -vE '^docs/(adr|changelog|measurements|superpowers)/' \
-    | xargs grep -nEi '\bphase [0-9]|\b[0-9]+\.[0-9]+[a-z]\b|\bplan\.md\b|\bspec\.md\b'
+    | xargs grep -nEi 'phase[- ]?[0-9]|\b[0-9]+\.[0-9]+[a-z]\b|\bplan\.md\b|\bspec\.md\b|\bM[0-9]|track [ab]\b|sub-?phase|plan item'
   ```
+
+  **That is the widened pattern, and the widening is the point** — see
+  "the sweep's pattern defined its own success criterion" under Corrections
+  below. The first pattern (`\bphase [0-9]` and three literals) read 25 at
+  `fa3472e` and 7 at the first close, and ten insider coordinates spelled
+  any other way passed straight through it.
 
   The seven that remain are deliberate and each is a different thing: four
   are the absolute-URL specification citations just described; one is
@@ -877,14 +883,18 @@ executed at all.
 ### What the Deferred bullet said and did not happen
 
 The bullet names "splitting the contributor walks from the user guides".
-**That split was not made, because measurement says there is nothing to
-split.** Every one of those pages is `apprafter`-command-dominated and
-describes a task a cluster owner performs; the one page with more `kubectl`
-than `apprafter` is the Git-repository guide, which is still a user task. They
-were never contributor material. What was contributor-shaped was the
-*vocabulary*, and removing that is what this subphase did instead. The
-operator/developer axis — who owns the cluster versus who ships an app — was
-measured to hold and was kept.
+**That split was not made, because every one of those pages describes a task
+a cluster owner performs.** There is no contributor/user axis running through
+them to split them along. What was contributor-shaped was the *vocabulary*
+and a handful of contributor-only sections, and removing the first and
+demoting the second is what this subphase did instead. The operator/developer
+axis — who owns the cluster versus who ships an app — holds and was kept.
+
+An earlier version of this bullet supported that with a command count, and
+the count was wrong: see "the command-dominance evidence was false" under
+Corrections below. The four dependency guides are in fact `kubectl`-dominated
+inside their fences, because the observations they teach are `kubectl` reads.
+That is a reason to keep them together, not evidence for a split.
 
 ### Known gaps, recorded rather than papered over
 
@@ -900,11 +910,22 @@ the next subphase can decide rather than discover.
   nowhere.** No guide walks the local manifest; the nearest published surface
   is the `APPRAFTER_MANIFEST` row in `docs/reference/environment.md`. A reader
   who wants to write one has nowhere to go — a 2.19i guide.
-- **The operator guide is seventeen pages in one flat list**, the longest
-  section on the site, with no grouping between setting a cluster up, exposing
-  it, giving an application a dependency, and day-2 work. Not a defect, and
-  deliberately not fixed here: this subphase's remit was to settle URLs, not
-  to import a documentation framework.
+- **The operator guide's *nav* is still one flat list of seventeen entries**,
+  the longest on the site. The section's *index* now groups every page by job
+  — set a cluster up, put it on the internet, give an application a
+  dependency, day 2 — because it was failing as a map (it linked 11 of 16
+  pages). The nav itself was left alone deliberately: grouping it means
+  `navigation.sections` behaviour and possibly URL segments, and this
+  subphase's remit was to settle URLs, not to import a documentation
+  framework. A reader who lands on the index is served; a reader scanning the
+  sidebar still sees seventeen undifferentiated lines.
+- **Three sections on the dependency guides remain contributor-shaped**, and
+  are demoted rather than removed: "Commands used on this page", the
+  end-to-end-script note now at the foot of each page, and the checklists.
+  They are useful to an operator running the chain for the first time, so
+  deleting them would cost a reader something; they are also the last place
+  where these pages read as a verification procedure rather than a guide. A
+  content subphase should decide.
 
 ### Corrections after review
 
@@ -931,6 +952,99 @@ that derives its expectation from the same side it checks is vacuous.*
   nix develop --command mkdocs build --strict -d /tmp/site
   grep -rl 'apprafter\.dev/docs' /tmp/site | wc -l   # must be 0
   ```
+
+- **The sweep's pattern defined its own success criterion, and four
+  documents recorded the result as completeness.** The vocabulary sweep
+  grepped `\bphase [0-9]`, `\b[0-9]+\.[0-9]+[a-z]\b`, `plan.md` and
+  `spec.md`, hit zero on the site's pages, and the ledgers reported the site
+  clean. Ten insider coordinates spelled any other way had passed straight
+  through it — `Phase-4` and `Phase-8.5` (hyphenated, so `phase\s+[0-9]`
+  cannot see them), `M3 target`, `M2+`, `Track A`, `Track B 1.70`, `plan
+  item 1.80`, "later sub-phases" in a clap doc comment reaching
+  `apprafter --help` and two generated pages, and two rows using "walk" as
+  a noun for a document the reader has never heard of. One of them sat three
+  lines below a blockquote this same sweep had cleaned, so the page
+  contradicted its own cleanup.
+
+  **This is the P1 shape the whole track is built to refuse** — an
+  expectation derived from the same side it checks. The pattern is now
+  `phase[- ]?[0-9]`, `\bM[0-9]`, `track [ab]`, `sub-?phase` and `plan item`
+  alongside the originals; it reads **36** at `fa3472e` and **7** here, and
+  the command in the Delivered bullet above is the one to re-run.
+
+  **And the widened pattern is still a pattern.** Reading the pages found
+  what no term above matches: `DoD checklist` as a user-facing heading on
+  four pages, `MANDATORY: psql DROP assertion` and its two siblings, and
+  `## Platform-CLI coverage` opening with "this guide exercises every
+  shipped `platform-cli` subcommand … `kubectl` are sanity-only
+  supplements" — the crate name rather than the product's, and this
+  repository's walk-discipline vocabulary, in three guides' headings. All
+  rewritten in reader terms. **Widen the pattern after reading, never
+  instead of it.**
+
+- **The command-dominance evidence was false, and it was the sole stated
+  ground for a decision.** "Every one of those pages is
+  `apprafter`-command-dominated … the one page with more `kubectl` than
+  `apprafter` is the Git-repository guide" came from a regex counting
+  `apprafter\s+[a-z]`, which sweeps up every prose mention — the same
+  wrong-instrument error as the census, in the measurement that justified
+  not splitting contributor pages from user pages.
+
+  Counting **commands in command position inside fences** — what a reader
+  actually runs — the four dependency guides are not close:
+  `postgres.md` 40 `kubectl` against 10 `apprafter`, `redis.md` 39/10,
+  `persistent-disk.md` 36/10, `egress-policy.md` 17/5. Counting command
+  position anywhere on the page, five pages beyond the acknowledged one are
+  `kubectl`-dominated. The naive regex found exactly one because prose
+  mentions of `apprafter` outnumber prose mentions of `kubectl` everywhere.
+
+  ```sh
+  # commands in command position, inside fences only
+  for p in docs/operator-guide/*.md docs/dev-guide/*.md; do
+    body=$(awk '/^[[:space:]]*```/{f=!f;next} f' "$p")
+    a=$(printf '%s\n' "$body" | grep -coE '(^|[|;(]|&&|\$\()[[:space:]]*apprafter\b')
+    k=$(printf '%s\n' "$body" | grep -coE '(^|[|;(]|&&|\$\()[[:space:]]*kubectl\b')
+    printf '%-50s apprafter=%-4s kubectl=%s\n' "$p" "$a" "$k"
+  done
+  ```
+
+  **The conclusion stands on its other ground and only on that:** these are
+  all tasks a cluster owner performs, so there is no contributor/user axis
+  to split them along. The true shape is worth stating rather than hiding —
+  the dependency guides are `kubectl`-dominated inside their fences because
+  the observations they teach (a claim reaching `ready`, a role appearing in
+  `pg_roles`, a policy dropping a packet) are `kubectl` reads. That is a
+  reason to keep them together, not to split them.
+
+- **`ServiceProvider` was marked "Who writes it: Operator".** No `apprafter`
+  subcommand creates one; the platform-stack umbrella seeds every one on a
+  shipped cluster (`platform-stack/cue/service_providers.cue` —
+  `pg-integrated`, `redis-integrated`, `disk-local`, `shared-local`), and
+  four other pages on this site already say "the **seeded** `pg-integrated`
+  ServiceProvider". The cell was carried over verbatim from the stub table
+  the Delivered bullet above says was re-derived — so the re-derivation
+  covered the row set and not the cells. The other four "Operator" cells
+  were then re-derived by finding each writer in the tree rather than by
+  inspection, and each cell now names the command or component that creates
+  the object: `apprafter repo creds add`, `apprafter volume create`,
+  `cluster_bootstrap.rs` plus `apprafter platform`.
+
+- **Three references outside `docs/` still named renamed pages**, one of
+  them program output. See the corrected rename bullet under Consequences
+  below — that is the durable half of this finding.
+
+- **Two front doors failed the jobs they exist for.** The operator index
+  linked 11 of its section's 16 pages and mentioned backups only inside
+  lists of unbuilt futures, while `backup-restore.md` is a 650-line shipped
+  guide; it is now a map, grouped by job, with the unbuilt items in one
+  labelled block. The operator quickstart offered a first-time operator one
+  install path — `nix develop` plus `cargo install --path
+  cli/platform-cli` — i.e. it answered "run this on my own server" by
+  assuming a repository checkout; it now leads with the release binary the
+  developer quickstart already documented. In the same shape, the four
+  dependency guides opened with "## Step 0 — run the k3d e2e first", which
+  told a site reader to run this project's test suite before using the
+  product; moved to the foot of each page as an optional contributor note.
 
 ### Consequences
 

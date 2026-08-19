@@ -124,10 +124,12 @@ patch of each phase.
   rename, which is what happened.
 
 - **The contributor/user split** ADR 0057's deferred bullet called for.
-  Measurement says there is nothing to split: every one of those pages is
-  `apprafter`-command-dominated and describes a task a cluster owner
-  performs. They were never contributor material — the *vocabulary* was, and
-  removing that is what this subphase did instead.
+  Every one of those pages describes a task a cluster owner performs, so
+  there is no contributor/user axis running through them to split them
+  along. What was contributor-shaped was the *vocabulary* and a handful of
+  contributor-only sections; removing the first and demoting the second is
+  what this subphase did instead. (The command count that first supported
+  this was wrong — see the corrections below.)
 
 ### Notes
 
@@ -151,17 +153,146 @@ patch of each phase.
   a clap doc comment is a markdown link target for the `apprafter plan`
   command page (`grep -c 'plan.md' commands.json` is 0, and `apprafter
   --help` contains no such string); the CRD table said to be "true today" was
-  wrong in both directions; and the inbound-link count was low by nearly
-  half, because the obvious grep cannot see same-directory relative links.
+  wrong in both directions; and the inbound-link count was low by a wide
+  margin, because the obvious grep cannot see same-directory relative links.
+  No corrected figure is recorded for the third — one wrong figure there is
+  enough. Re-derive it:
+
+  ```sh
+  git grep -nE '\]\((\./)?(\.\./)*(docs/operator-guide/|operator-guide/|public-ingress/)?(gitops-walk|needs-pg-walk|needs-redis-walk|needs-disk-walk|needs-networkpolicy-walk|cloudflare-origin-cert|connect-a-domain)\.md' \
+    fa3472e -- . | grep -v '^fa3472e:docs/changelog/'
+  ```
+
   The corpus-wide counters all reproduced exactly — it was the claims about
   *content* that did not.
 
-- **Three gaps are recorded rather than papered over**: the site now has no
+- **Gaps are recorded rather than papered over**: the site now has no
   conceptual page at all (its entire conceptual explanation is a table on a
   reference page — more honest than two apologies in prime nav position, and
   less than 2.19g's landing link will imply); `Infrastructure` is named on
-  the reference page and documented nowhere; and the operator guide is
-  seventeen pages in one flat list. All three belong to the content subphase.
+  the reference page and documented nowhere; the operator guide's *nav* is
+  still seventeen entries in one flat list, though its index is now grouped
+  by job; and three sections on the dependency guides ("Commands used on this
+  page", the end-to-end-script note, the checklists) are still
+  contributor-shaped and were demoted rather than removed. All belong to the
+  content subphase.
+
+### Fixed after review
+
+Three reviews ran on this subphase (first-time visitor, honesty,
+adversarial). Every finding below has one shape: **a census pattern is not a
+reading.** The sweep's regex defined its own success criterion, and four
+documents recorded its zero as completeness — which is the P1 failure this
+track exists to refuse, an expectation derived from the same side it checks.
+
+- **Ten insider coordinates survived the sweep, and four documents said they
+  had not.** `Phase-4` and `Phase-8.5` (hyphenated, so `phase\s+[0-9]` cannot
+  match), `M3 target`, `M2+`, `Track A`, `Track B 1.70`, `plan item 1.80`,
+  "Backstage / Grafana / Hubble follow in later **sub-phases**" in a clap doc
+  comment — which reaches `apprafter --help`, `commands.json` and two
+  generated reference pages — and two rows using "walk" as a noun for a
+  document the reader has never heard of. One sat three lines below a
+  blockquote this same sweep had cleaned, so the page contradicted its own
+  cleanup. Each is now written in reader terms ("not implemented yet", "not
+  yet shipped"), never swapped for another internal coordinate;
+  `just docsgen-generate` ran in the same commit and the byte-compare passes.
+  **Still no version bump and no tag** — `cli/Cargo.toml` is bumped to match
+  a released tag in the commit that cuts it; a help-string change requires
+  regenerating `commands.json`, which the gate enforces, not a bump.
+
+  The pattern was widened **after** reading the pages, not instead of it:
+
+  ```sh
+  # 36 at fa3472e, 7 now
+  git ls-files -- 'docs/*.md' \
+    | grep -vE '^docs/(adr|changelog|measurements|superpowers)/' \
+    | xargs grep -nEi 'phase[- ]?[0-9]|\b[0-9]+\.[0-9]+[a-z]\b|\bplan\.md\b|\bspec\.md\b|\bM[0-9]|track [ab]\b|sub-?phase|plan item'
+  ```
+
+  Reading found what the widened pattern still cannot: `DoD checklist` as a
+  user-facing heading on four pages, `MANDATORY: psql DROP assertion` and its
+  two siblings, and `## Platform-CLI coverage` opening "this guide exercises
+  every shipped `platform-cli` subcommand … `kubectl` are sanity-only
+  supplements" — the crate name instead of the product's, and this
+  repository's verification vocabulary, in three guides' headings. All
+  rewritten.
+
+- **The command-dominance evidence was false**, and it was the sole stated
+  ground for not splitting contributor pages from user pages. The figure came
+  from a regex counting `apprafter\s+[a-z]`, which sweeps up prose mentions.
+  Counting commands in command position **inside fences** — what a reader
+  runs — `postgres.md` is 40 `kubectl` against 10 `apprafter`, `redis.md`
+  39/10, `persistent-disk.md` 36/10, `egress-policy.md` 17/5. The false
+  evidence is deleted; the conclusion stands on its other ground (these are
+  all cluster-owner tasks), and the true shape is now stated: the dependency
+  guides are `kubectl`-dominated inside their fences because the observations
+  they teach are `kubectl` reads.
+
+- **`ServiceProvider` was marked "Who writes it: Operator"** under a lead-in
+  saying some objects are written by the platform. No `apprafter` subcommand
+  creates one — the platform-stack umbrella seeds every one
+  (`platform-stack/cue/service_providers.cue`), and four other pages already
+  say "the **seeded** `pg-integrated` ServiceProvider". The cell had been
+  carried over verbatim from the stub table this entry says was re-derived,
+  so the re-derivation had covered the row set and not the cells. The other
+  four "Operator" cells were re-derived by finding each writer in the tree,
+  and each cell now names the command or component that creates the object.
+
+- **`site_url` encoded the design ADR 0057 rejected.** `mkdocs.yml` read
+  `https://apprafter.dev/docs`; decision 8 names that option and rejects it
+  in favour of `docs.apprafter.dev`. The value is baked into every absolute
+  URL in `llms.txt`, `llms-full.txt`, the markdown twins and `sitemap.xml`,
+  so all four artefact classes published the rejected design — "the URLs are
+  settled" was not true while it stood. Now `https://docs.apprafter.dev/`;
+  rebuilt, artefacts follow, zero occurrences of `apprafter.dev/docs` under
+  the built site.
+
+- **Three references to renamed pages survived outside `docs/`**, where the
+  build structurally cannot see them: a live markdown link in `e2e/README.md`
+  (404 on GitHub), a comment in `cli/docsgen/tests/invocation_test.rs`, and —
+  worst — `e2e/lib.sh`, printing a dead page name to an operator whose
+  preflight had just failed, immediately before `exit 2`. This falsifies the
+  rule ADR 0057 institutionalised ("a page rename is a `mkdocs --strict`
+  problem, not a grep problem"): the gate's corpus is
+  `git ls-files -- docs README.md`, `--strict` sees nothing outside
+  `docs_dir`, and `docs.yml` has no `e2e/**` trigger. The rule now says what
+  is true, names the directories the build cannot reach, and carries the
+  sweep command.
+
+- **Both front doors failed their jobs.** `operator-guide/index.md` linked 11
+  of its section's 16 pages — `node-prep`, `shared-volumes`,
+  `backup-restore`, `platform-management` and `migration-plans` appeared
+  nowhere, and "backups" appeared twice, unlinked, inside lists of unbuilt
+  futures, while `backup-restore.md` is a 650-line shipped guide. Rewritten
+  as a map grouped by job, with the unbuilt items in one labelled block and
+  the "per-tier guidance are live" claim dropped (every guide is Tier-1).
+  `operator-guide/quickstart.md` answered "run this on my own server" with
+  `nix develop` plus `cargo install --path cli/platform-cli`; it now leads
+  with the release binary. The four dependency guides opened with "## Step 0
+  — run the k3d e2e first (cheap gate)", instructing a site reader to run
+  this project's own test suite as a mandatory gate; moved to the foot of
+  each page as an optional contributor note.
+
+- **`docs/index.md` claimed "generated reference for every command and
+  object".** There is no generated object reference — `reference/index.md`,
+  rewritten in this same subphase, says so. The overclaim was net-new here
+  and is now what ships: a CLI reference generated from the binary.
+
+- **Smaller corrections.** The developer quickstart's `VERSION=v0.2.27` was
+  17 releases stale on a copy-paste install line — replaced with a command
+  that resolves the newest release rather than naming one. `docs/adr/README.md`
+  rendered `# docs/adr/` as its title in the browser tab, the sidebar and the
+  search index and opened with contributor process; it is now "Architecture
+  Decision Records" with a description, the index under a one-paragraph lead,
+  and number assignment at the bottom. The contributor instruction "do not
+  hand-edit anything under `docs/reference/cli/`" moved off the user-facing
+  reference index into `docs/contributing/documentation.md`. Both section
+  indexes use page titles as link text instead of bare filenames.
+  `contributing/README.md` is a list of links instead of a table of unlinked
+  code spans headed "File". And the stale measurement beside an edited
+  paragraph in `cli/docsgen/src/health.rs` was deleted for the property that
+  re-derives, its sibling bullet corrected to name the page
+  `cli/docsgen/src/render.rs` actually moved to.
 
 ## docs tooling (no release) — 2.19e build hooks: CUE highlighting and an LLM-readable corpus (2026-08-19)
 
