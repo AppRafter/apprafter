@@ -39,8 +39,9 @@ trees, each out for its own reason:
 | `docs/changelog/**` | Same — a record, not a description of today. |
 | `docs/measurements/**` | Internal working data. |
 
-`spec.md` is out by decision: it is the roadmap and deliberately names
-capabilities that do not exist yet.
+The repository's architectural specification, `spec.md`, is out by
+decision and is not published on this site: it is the roadmap and
+deliberately names capabilities that do not exist yet.
 
 ## What is checked
 

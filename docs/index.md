@@ -1,5 +1,5 @@
 ---
-description: "Where to start: the four hardware tiers, what each section of this site covers, and where the specification of record lives."
+description: "Where to start: the four hardware tiers and what each section of this site covers."
 ---
 
 # AppRafter
@@ -8,10 +8,9 @@ description: "Where to start: the four hardware tiers, what each section of this
 Kubernetes — the same `Application` manifest from a €5 VDS to
 confidential bare metal.**
 
-This site documents the AppRafter platform. The architectural
-specification of record lives in `spec.md` at the repository root;
-this site presents the same material in a navigable form, plus
-operator and developer guides.
+This site documents the AppRafter platform as it ships today:
+guides for running a cluster, guides for shipping an application
+onto one, and generated reference for every command and object.
 
 ## Tier model
 

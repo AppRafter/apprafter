@@ -4,22 +4,22 @@ description: "The AppRafter object model at a glance — which custom resource e
 
 # Concepts
 
-> **Status:** stub. Each concept gets its own page in phase 8.2.
+> **Status:** stub. Each concept still needs its own page.
 
 The AppRafter object model — the CRDs that developers and operators
-interact with directly. See `spec.md` §3 for the complete
-descriptions; the v1alpha1 schemas live in `schemas/v1alpha1/`.
+interact with directly. The v1alpha1 schemas in `schemas/v1alpha1/`
+are the source of truth for every field.
 
-| Concept                  | Owner   | Section in spec.md |
-| ------------------------ | ------- | ------------------ |
-| `Application`            | Dev     | §3.1               |
-| `ServiceProvider`        | Operator| §3.2               |
-| `ResourceClaim`          | Operator (auto-generated) | §3.3 |
-| `AccessGrant`            | Operator| §3.4               |
-| `ExternalSurface`        | Operator| §3.5               |
-| `ServiceProviderPlugin`  | Community | §3.6             |
-| `Infrastructure`         | Operator| §3.7               |
-| `MigrationPlan`          | Operator (auto-generated) | §3.8 |
+| Concept                  | Owner   | What it is for |
+| ------------------------ | ------- | -------------- |
+| `Application`            | Dev     | The unit of deployment. |
+| `ServiceProvider`        | Operator| A backing service a `needs` entry can resolve to. |
+| `ResourceClaim`          | Operator (auto-generated) | One application's claim on one backing service. |
+| `AccessGrant`            | Operator| How humans get into the cluster. |
+| `ExternalSurface`        | Operator| What the platform manages outside the cluster — git host, registry, access plane, monitoring, backups. |
+| `ServiceProviderPlugin`  | Community | A new service type, shipped as a gRPC plugin sidecar. |
+| `Infrastructure`         | Operator| The substrate the platform runs on — provider, nodes, network, firewall, OS image. |
+| `MigrationPlan`          | Operator (auto-generated) | The approval gate a destructive change waits behind. |
 
 ## Reading order
 

@@ -4,11 +4,10 @@ description: "Outline of the layers the platform is built from, and where to rea
 
 # Architecture
 
-> **Status:** stub. Full TechDocs migration of the architecture
-> chapter happens in phase 8.2.
+> **Status:** stub. The chapters listed below are not written yet.
 
-This section will mirror `spec.md` §2 (Architecture Overview) and §4
-(Layer Specifications), broken into navigable subpages:
+This section will cover the layers the platform is built from, one
+navigable page each:
 
 - Compute substrate (per tier).
 - Control-plane storage — kine + NATS JetStream.
@@ -25,6 +24,9 @@ This section will mirror `spec.md` §2 (Architecture Overview) and §4
 - UX layer (Backstage + custom plugins).
 - Infrastructure tooling (`apprafter`).
 
-Until those pages exist, refer to `spec.md` §2 and §4 in the repo
-root, and to the [ADRs](../adr/README.md) for the rationale behind
-specific choices.
+Until those pages exist, the [ADRs](../adr/README.md) carry the
+rationale behind each specific choice, and §2 and §4 of
+[the repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
+carry the layer-by-layer description. That specification is a
+roadmap: it is not published on this site, and it names capabilities
+that do not exist yet.

@@ -4,11 +4,10 @@ description: "Map of the operator-facing tasks — provisioning, the target stor
 
 # Operator Guide
 
-> **Status:** Track A (M1.5 Phase 1.5) CLI rework is closed —
-> CLI quickstart, target-store reference, troubleshooting
-> catalogue, and per-tier guidance are live. Full handbook for
-> tiers 2+ and disaster recovery lands incrementally as Phase 3
-> / Phase 4 features stabilise.
+> **Status:** the single-node tier-1 path is documented end to
+> end — CLI quickstart, target-store reference, troubleshooting
+> catalogue and per-tier guidance are live. The full handbook for
+> tiers 2+ and for disaster recovery is not written yet.
 
 Tasks for operators (anyone running an AppRafter cluster):
 

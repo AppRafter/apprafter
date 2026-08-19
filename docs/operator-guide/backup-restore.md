@@ -188,7 +188,7 @@ Two behaviours are load-bearing:
   see the restored state and **skip** on boot, instead of racing the load.
 - **R1 — wait for the claim, not for the volume to bind.** `WaitClaimsBound`
   polls each regenerated `ResourceClaim` until `status.ready == true`, **not**
-  until the PVC is `Bound`. A 2.6b disk claim reports ready as soon as its
+  until the PVC is `Bound`. A disk claim reports ready as soon as its
   `volumeClaimRef` is set; on a `WaitForFirstConsumer` StorageClass the PVC
   only binds when its first consumer pod schedules — and the restore's own
   load helper is that first consumer. Waiting for `Bound` would deadlock.

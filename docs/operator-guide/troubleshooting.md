@@ -247,7 +247,7 @@ fallback. If you still see this on v0.1.83+, your store's
 `config.yaml` for the active target is missing the `provider`
 field — fix by hand or recreate the target.
 
-### Phase 2 of `bootstrap-all` (`k3s-ready`) takes longer than expected
+### The `k3s-ready` step of `bootstrap-all` takes longer than expected
 
 The `k3s-ready` phase is **waiting for cloud-init + k3s on the
 new node**, not the kubeconfig fetch itself — that's why the
@@ -359,7 +359,7 @@ If `kubectl get nodes` doesn't reach `Ready` within a couple of
 minutes of `up` completing, the Cilium agent is usually the
 culprit — `kubectl -n kube-system get pods -l k8s-app=cilium` and,
 if it's crash-looping, check its logs. This is distinct from the
-[`k3s-ready` phase](#phase-2-of-bootstrap-all-k3s-ready-takes-longer-than-expected),
+[`k3s-ready` step](#the-k3s-ready-step-of-bootstrap-all-takes-longer-than-expected),
 which is the node coming up at all, before the CNI install.
 
 ## Reading the rendered output

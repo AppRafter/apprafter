@@ -12,9 +12,10 @@ version keeps running until you act.
 
 See [ADR 0027](../adr/0027-migrationplan-unification.md) for the
 unified-CRD design rationale, [ADR 0051](../adr/0051-app-scope-migration.md)
-for application-scope detection and gating, and
-[`spec.md` §3.8](https://github.com/apprafter/apprafter/blob/master/spec.md)
-for the full field reference.
+for application-scope detection and gating, and, for the full field
+reference, §3.8 of
+[the repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
+— a roadmap document that is not published on this site.
 
 ## What counts as destructive
 
@@ -213,4 +214,6 @@ Later approval surface (not yet shipped):
 - [ADR 0025](../adr/0025-gitops-control-surface.md) — why the gate
   lives inside the operator/controller rather than at the Argo CD
   sync layer.
-- `spec.md` §3.8 — full field reference for the `MigrationPlan` CRD.
+- [The repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md),
+  §3.8 — full field reference for the `MigrationPlan` CRD. It is a
+  roadmap document and is not published on this site.

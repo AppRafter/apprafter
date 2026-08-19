@@ -56,8 +56,10 @@ status:
       message: "0.2.0 → 0.2.1 (safe)"
 ```
 
-See [`spec.md` §3.11](https://github.com/apprafter/apprafter/blob/master/spec.md)
-and [ADR 0026](../adr/0026-platformstack-crd.md) for the full field
+See §3.11 of
+[the repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
+— a roadmap document that is not published on this site — and
+[ADR 0026](../adr/0026-platformstack-crd.md) for the full field
 reference and design rationale.
 
 ## Release channels
@@ -202,4 +204,6 @@ Forking the platform repository is a power-user path (plan item
   platform reconciles itself through Argo CD.
 - [ADR 0028](../adr/0028-platform-stack-distribution.md) — OCI
   chart distribution model.
-- `spec.md` §3.11 (PlatformStack), §3.8 (MigrationPlan).
+- [The repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
+  — §3.11 (PlatformStack), §3.8 (MigrationPlan). A roadmap document,
+  not published on this site.

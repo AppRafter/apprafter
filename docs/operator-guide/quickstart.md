@@ -116,12 +116,13 @@ apprafter up --dry-run
 The dry-run prints the resolved target name, every field from
 `config.yaml`, and the three-phase plan. No provider calls.
 
-Each phase also has its own subcommand for partial re-runs:
+Each phase also has its own subcommand for partial re-runs. The
+labels match what `bootstrap-all` prints as it runs:
 
 ```sh
-apprafter apply                 # Phase 1 alone
-apprafter kubeconfig --refresh  # Phase 2 alone (force re-fetch over SSH)
-apprafter cluster-bootstrap     # Phase 3 alone (re-runs the loader)
+apprafter apply                 # [1/3] apply alone
+apprafter kubeconfig --refresh  # [2/3] k3s-ready alone (force re-fetch over SSH)
+apprafter cluster-bootstrap     # [3/3] bootstrap alone (re-runs the loader)
 apprafter cb                    # alias for cluster-bootstrap
 ```
 

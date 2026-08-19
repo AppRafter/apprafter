@@ -77,8 +77,7 @@ just e2e-down
 ```
 
 The cluster is created **without** traefik and servicelb; Cilium and
-Gateway API are installed later by the platform bootstrap (phase 1.4
-in `plan.md`).
+Gateway API are installed later by the platform bootstrap.
 
 ## Common issues
 
