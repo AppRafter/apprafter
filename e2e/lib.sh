@@ -440,7 +440,7 @@ One-time host fix (root), then re-login:
   # verify: podman run --rm busybox sh -c 'ulimit -Hl'   # must print: unlimited
 
 GitHub Actions / rootful Docker need nothing (dockerd runs LimitMEMLOCK=infinity).
-See docs/operator-guide/needs-networkpolicy-walk.md.
+See docs/operator-guide/egress-policy.md.
 EOF
     exit 2
 }

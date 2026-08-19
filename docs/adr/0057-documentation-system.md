@@ -938,11 +938,39 @@ that derives its expectation from the same side it checks is vacuous.*
   was free.** After 2.19g every page move costs a redirect entry, and any move
   that crosses to a GitHub blob URL costs a README edit that no redirect can
   substitute for.
-- **A page rename is a `mkdocs --strict` problem, not a grep problem.** The
-  measured inbound-link count for the renames was wrong by nearly half —
-  same-directory relative links are invisible to the obvious grep — and the
-  strict build is what found the remainder. Trust the build; use the grep to
-  start.
+- **Inside `docs/`, a page rename is a `mkdocs --strict` problem. Outside it,
+  the grep is the only instrument there is.** The first half of that was
+  measured and holds: the inbound-link count for the renames was wrong by
+  nearly half — same-directory relative links are invisible to the obvious
+  grep — and the strict build found the remainder, naming both ends.
+
+  The second half was asserted and is false, and every rename break that
+  actually survived this subphase is in the blind spot it created. The gate's
+  corpus is `git ls-files -- docs README.md` (the **root** README only),
+  `mkdocs --strict` sees nothing outside `docs_dir`, and
+  `.github/workflows/docs.yml` carries no `e2e/**` trigger — so three stale
+  references to renamed pages shipped: a live markdown link in
+  `e2e/README.md`, a comment in `cli/docsgen/tests/invocation_test.rs`, and —
+  worst of the three — `e2e/lib.sh`, which printed a dead page name to an
+  operator whose preflight had just failed, immediately before `exit 2`.
+
+  **Name the directories, because the build cannot:** `e2e/`, `cli/`,
+  `operator/`, `platform-stack/`, `scripts/`, `landing/`, `.github/` and the
+  root working documents. Rename a page and sweep all of them; the excluded
+  changelogs and `plan.md` are historical records and stay as they are.
+
+  ```sh
+  # after any page rename: references into docs/ that no longer resolve
+  git grep -nE '(docs/[A-Za-z0-9_./-]+\.md)' -- \
+    ':!docs/changelog' ':!docs/superpowers' ':!plan.md'
+  ```
+
+  Read the hits: in-test fixture paths (`docs/t.md`), a path belonging to
+  another project (`docs/developer/crypto.md` in
+  `cli/cli-providers/src/k8s/sealing.rs`, bitnami's), and the ADR-slug
+  citations frozen into `platform-stack/cue/compatibility.cue` are all
+  expected not to resolve. What must resolve is anything naming a page this
+  site still serves.
 - **The census caught one real loss and was not re-recorded around it.**
   Rewriting a page's reference list deleted a schema identifier along with the
   link text it sat inside; `identifiers` came back one below its floor, and

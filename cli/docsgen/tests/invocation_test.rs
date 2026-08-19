@@ -119,7 +119,7 @@ fn a_command_family_named_in_one_span_resolves() {
     // checked, so the notation costs the gate nothing.
     let t = tree();
     for line in [
-        // docs/operator-guide/needs-{disk,pg,redis}-walk.md
+        // docs/operator-guide/{persistent-disk,postgres,redis}.md
         "apprafter repo creds add/list/show",
         // docs/operator-guide/migration-plans.md
         "apprafter migration list/approve/reject",

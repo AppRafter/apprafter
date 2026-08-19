@@ -103,7 +103,7 @@ APPRAFTER_E2E_LOCAL_OPERATOR=1 APPRAFTER_E2E_SKIP_DESTROY=1 bash e2e/needs-pg-wa
 Without `APPRAFTER_E2E_SKIP_DESTROY` the script tears the k3d cluster
 down on both success and failure (diagnostics are dumped before
 teardown on failure). It is the **pre-manual-walk gate** for the
-Tier-1 [`needs.pg manual walk`](../docs/operator-guide/needs-pg-walk.md)
+Tier-1 [Postgres guide](../docs/operator-guide/postgres.md)
 and runs nightly via
 [`.github/workflows/e2e-pg-nightly.yml`](../.github/workflows/e2e-pg-nightly.yml)
 (cron 05:00 UTC, `workflow_dispatch`). It is deliberately **not** part
