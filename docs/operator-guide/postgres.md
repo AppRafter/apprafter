@@ -82,7 +82,10 @@ apprafter app scaffold --name parser --namespace demo --needs pg
 ```
 
 > The repeatable `--needs pg` flag emits the `spec.base.needs` block for
-> you (closed launch set: `pg`); an unknown type is a clear error.
+> you; an unknown type is a clear error. The key set is closed —
+> `pg`, `jetstream`, `clickhouse`, `redis`, `s3`, `notifications` and
+> `disk` — and of those, providers ship today for `pg`, `redis` and
+> `disk`, each with its own guide in this section.
 > The generated `apprafter/Application.cue` carries:
 >
 > ```cue
@@ -453,7 +456,7 @@ box.
 | ------- | ------------ | --- |
 | Claim stuck `Scheduled` absent / Application stuck `AwaitingResourceClaim` | `needs.pg.selector` does not match any provider's `metadata.labels` | Confirm `selector.tier=integrated` and that `pg-integrated` carries `tier=integrated`: `kubectl get serviceprovider pg-integrated -n apprafter-system -o yaml`. |
 | `status.ready` never `true` | shared CNPG Cluster not Ready, or a provisioner error | `kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
-| `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key | Use only the closed `needs` key set (`pg`). |
+| `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key | Use a key from the closed set — `pg`, `jetstream`, `clickhouse`, `redis`, `s3`, `notifications`, `disk`. Providers ship for `pg`, `redis` and `disk`. |
 | App starts but the DSN env-var is empty or absent | the manifest declares `needs.pg` but never binds it — nothing is auto-injected | Add `env: { DATABASE_URL: claim.pg.url }` (see *Author the manifest*). |
 | Database still present after the GC | CloudNativePG has not reconciled `ensure: absent` yet | Re-run the psql query after a short wait; check the CNPG operator logs in `cnpg-system`. If it persists, stop and [report it](https://github.com/apprafter/apprafter/issues) — data you were told was dropped is still on disk. |
 

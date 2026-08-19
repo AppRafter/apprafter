@@ -762,13 +762,23 @@ not churn under a live link from the landing page.* This amendment records
 what moved, and — the part worth reading — the one thing this document named
 that measurement then said not to build.
 
-No release and no monorepo tag rides it. `cli/Cargo.toml` is untouched, no
-chart, operator or cue-cmp artefact moved, and **nothing under
-`cli/platform-cli` changed at all**, so `apprafter --help` and the
-byte-compared `commands.json` are both untouched. The only Rust edits are
-comments inside `cli/docsgen` that cited pages this subphase renamed — a
-comment naming a file that no longer exists is the defect class this whole
-system gates for, so they moved with the files.
+No release and no monorepo tag rides it. `cli/Cargo.toml` is untouched at
+0.2.44, and no chart, operator or cue-cmp artefact moved.
+
+Rust did change, and the first version of this paragraph said it had not —
+falsified by the subphase's own commits, which is worth recording rather
+than quietly correcting. A doc comment in `cli/platform-cli/src/cli.rs`
+carried an internal coordinate ("later sub-phases"), and a user reads that
+in `apprafter --help`, so it was rewritten; the byte-compared
+`commands.json` moved with it, regenerated in the same commit as the gate
+requires. The remaining Rust edits are comments inside `cli/docsgen` that
+cited pages this subphase renamed — a comment naming a file that no longer
+exists is the defect class this whole system gates for, so they moved with
+the files.
+
+A help-string change still carries no bump: `cli/Cargo.toml` is bumped to
+match a *released* tag in the commit that cuts it, and docs-only work cuts
+none.
 
 ### The redirect map was not built, and its trigger is recorded instead
 

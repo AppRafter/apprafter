@@ -86,7 +86,7 @@ apprafter backup list   [--repo <path>] [--passphrase <value>]
 
 The backup distinguishes **user** material from **platform** material — the
 load-bearing discrimination that keeps a restore from clobbering the target's
-own bootstrap (H1 in the ADR):
+own bootstrap:
 
 - **Config CRs** are captured by kind: the `PlatformStack/default` singleton
   and every `SourceCredential` (cluster-wide). There is no in-cluster
@@ -180,14 +180,14 @@ ResumeWorkloads
 
 Two behaviours are load-bearing:
 
-- **H2 — workloads are gated during the load.** The apps are applied with
+- **Workloads are gated during the load.** The apps are applied with
   `replicas: 0` (and the user Argo Applications have their `syncPolicy.automated`
   stripped) so the operator provisions fresh claims but **no pod runs yet**.
   The data is loaded into the empty, freshly-provisioned backends, and only
   then are the workloads resumed at their original replica count (and Argo
   auto-sync re-enabled). This is what lets a framework-style tracked migration
   see the restored state and **skip** on boot, instead of racing the load.
-- **R1 — wait for the claim, not for the volume to bind.** `WaitClaimsBound`
+- **Wait for the claim, not for the volume to bind.** `WaitClaimsBound`
   polls each regenerated `ResourceClaim` until `status.ready == true`, **not**
   until the PVC is `Bound`. A disk claim reports ready as soon as its
   `volumeClaimRef` is set; on a `WaitForFirstConsumer` StorageClass the PVC
@@ -464,7 +464,7 @@ compensating provider controls (object versioning / object lock).
 > works (restic uses non-exclusive locks), but the in-cluster `check` cannot
 > drop its own lock — set `--check-cron off` to disable the in-cluster check and
 > run `apprafter backup check` operator-side instead. Verify your provider's
-> behavior (this is spec item **V2** in the Verify checklist below).
+> behavior — the Verify checklist below has a step for confirming it.
 
 > **Hetzner Object Storage (the flagship provider) — branch (a), verified.**
 > Hetzner OS supports statement-level bucket policies with per-key `Principal`
@@ -477,7 +477,7 @@ compensating provider controls (object versioning / object lock).
 >   so you narrow a key with explicit **`Deny`** statements (an Allow-only policy
 >   does *not* reduce the default). Reference a key as the principal via
 >   `arn:aws:iam:::user/p<project_id>:<access_key>`.
-> - **V7 reduction (also verified):** you may additionally deny the cluster key
+> - **A further reduction, also verified:** you may additionally deny the cluster key
 >   `s3:GetObject` on `data/*` — a `restic backup` still succeeds (it reads
 >   `index/` + `snapshots/`, never the `data/` packs), so a compromised cluster
 >   can neither *erase* nor *read* the historical backup data, only the small
@@ -494,7 +494,7 @@ compensating provider controls (object versioning / object lock).
 >       "Principal": { "AWS": "arn:aws:iam:::user/p<project_id>:<cluster_key>" },
 >       "Action": "s3:DeleteObject",
 >       "NotResource": "arn:aws:s3:::my-bucket/my-prefix/locks/*" },
->     { "Sid": "ClusterDenyReadData", "Effect": "Deny",           // V7 (optional)
+>     { "Sid": "ClusterDenyReadData", "Effect": "Deny",           // optional
 >       "Principal": { "AWS": "arn:aws:iam:::user/p<project_id>:<cluster_key>" },
 >       "Action": "s3:GetObject",
 >       "Resource": "arn:aws:s3:::my-bucket/my-prefix/data/*" }
@@ -616,7 +616,7 @@ The DR steps:
    freshest run of **either** format. Both staging formats restore identically
    from the operator's side; the only difference is on the write path.
 
-The restore ordering, the H2/R1 invariants, and the secret re-sealing behavior
+The restore ordering, the gating and replay-order invariants, and the secret re-sealing behavior
 are identical to the local-pull restore documented above — the only difference
 is the repository lives in S3 and the credentials come from the operator, not
 the target.
@@ -626,14 +626,14 @@ the target.
 Two checks are worth running before you trust the off-site backup, mapping to
 the design's Verify items:
 
-- **V2 — confirm your provider honors a prefix-scoped delete.** With the
+- **Confirm your provider honors a prefix-scoped delete.** With the
   `enforce: operator` scoped credential, actively **test** that the cluster
   credential can delete an object under `locks/*` but is **refused** deleting an
   object under `data/` (or `snapshots/`). If the deny doesn't hold, your
   provider can't express the append-only guarantee — fall back to
   `enforce: cluster` with provider object-lock, or to the no-delete +
   `--check-cron off` variant.
-- **V7 — a minimal end-to-end.** `apprafter backup enable` → wait for (or
+- **A minimal end-to-end.** `apprafter backup enable` → wait for (or
   trigger) one backup Job → `apprafter backup status` shows a fresh
   `lastSuccess` → `apprafter restore s3:… --reprovision` into a **throwaway**
   cluster (or `--target` a running one) and confirm your data and a sealed
