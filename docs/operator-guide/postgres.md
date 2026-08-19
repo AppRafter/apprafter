@@ -241,15 +241,6 @@ kubectl -n demo get secret parser-pg-conn \
   -o jsonpath='{.metadata.ownerReferences[0].kind}{"\n"}'   # -> ResourceClaim
 ```
 
-**SSA-split guard.** The provisioner's status write must NOT clobber
-the scheduler's verdict — `Scheduled` is still `True` after
-provisioning:
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io parser-pg -o \
-  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
-```
-
 **8. The Application resumed.**
 
 ```sh
@@ -423,7 +414,10 @@ drains the DB then the role over a few ~15s cycles (see the phased drop
 above), so give these queries a few reconcile cycles before trusting the
 result — the database row clears first, then the role row. **If a row is
 still present after several cycles, CloudNativePG did NOT honor
-`ensure: absent` — STOP, this is a closure-blocking bug.**
+`ensure: absent`. Stop here and
+[report it](https://github.com/apprafter/apprafter/issues) — the platform
+is not doing what it promises, and data you were told was dropped is still
+on disk.**
 
 ## Checklist — did it work?
 
@@ -461,12 +455,15 @@ box.
 | `status.ready` never `true` | shared CNPG Cluster not Ready, or a provisioner error | `kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
 | `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key | Use only the closed `needs` key set (`pg`). |
 | App starts but the DSN env-var is empty or absent | the manifest declares `needs.pg` but never binds it — nothing is auto-injected | Add `env: { DATABASE_URL: claim.pg.url }` (see *Author the manifest*). |
-| Database still present after the GC | CloudNativePG has not reconciled `ensure: absent` yet | Re-run the psql query after a short wait; check the CNPG operator logs in `cnpg-system`. If it persists, this is a closure-blocking bug. |
+| Database still present after the GC | CloudNativePG has not reconciled `ensure: absent` yet | Re-run the psql query after a short wait; check the CNPG operator logs in `cnpg-system`. If it persists, stop and [report it](https://github.com/apprafter/apprafter/issues) — data you were told was dropped is still on disk. |
 
-## For contributors — the automated end-to-end script
+## For contributors
 
-Optional, and it needs a checkout of the AppRafter repository — nothing
-above does. If you are changing the platform, `e2e/needs-pg-walk.sh`
+Nothing in this section is needed to run Postgres — it is here for people
+changing the platform itself.
+
+**The automated end-to-end script.** It needs a checkout of the AppRafter
+repository, which nothing above does. `e2e/needs-pg-walk.sh`
 exercises this identical chain on a local k3d cluster, and is the cheap
 gate to clear before anyone spends a real one on it:
 
@@ -476,6 +473,19 @@ bash e2e/needs-pg-walk.sh        # green in ~8-12 min on k3d
 
 If that is red, fix it before continuing: working through this guide
 by hand only adds value once the automated chain is green.
+
+**One assertion to re-run by hand if you touch the claim controllers.**
+Two of them write this claim's status — the scheduler records which
+provider it picked, the provisioner records the database it created — and
+each writes through server-side apply (SSA) under its own field manager.
+Get a field manager wrong in either one and it silently erases the other's
+verdict, which no step above would notice. After provisioning, the
+scheduler's condition must still read `True`:
+
+```sh
+kubectl -n demo get resourceclaim.apprafter.io parser-pg -o \
+  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
+```
 
 ## Cleanup
 

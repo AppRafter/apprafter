@@ -42,9 +42,19 @@ provider-side detail ("401/403/429/5xx breakdown").
 
 The `cue` binary isn't on `PATH`.
 
-**Fix.** Enter the project's Nix dev shell (`nix develop` from the
-repo root). If you don't use Nix, follow `docs/contributing/setup.md`
-for direct-install options.
+**Fix.** Install CUE 0.10 or newer — from
+<https://cuelang.org/docs/install/> or your package manager — and put it
+on `PATH`. If you keep it somewhere off `PATH`, point `CUE_BIN` at the
+binary instead; see
+[Environment variables](../reference/environment.md).
+
+Only the local commands need it — `apprafter app validate` and the
+manifest parse inside `apprafter app add`. The cluster validates every
+change server-side regardless, so nothing you deploy goes unchecked.
+
+If you are working from a checkout of the AppRafter repository, the
+[contributor setup page](../contributing/setup.md) covers the Nix dev
+shell, which puts `cue` on `PATH` for you.
 
 ### `apprafter::env::cue_export_failed`
 

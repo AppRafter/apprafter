@@ -847,6 +847,39 @@ executed at all.
   corpus but is not a site page, and its roadmap references resolve for its
   reader: someone on the repository's front page can open `plan.md`.
 
+  **And it excludes four directories, one of which is a published site
+  section — say so, or the count reads as a claim about the whole site.**
+  `docs/changelog/`, `docs/measurements/` and `docs/superpowers/` do not
+  publish at all. `docs/adr/` does: 59 pages behind a top-level nav tab,
+  and at this commit 57 of them match the widened pattern
+  — `plan.md` and `spec.md` citations, `Phase-4` and `Phase-8.5`,
+  `Track A` and `Track B`, `sub-phases 1.5–1.18`, and "Phase 6.2" in a
+  title that renders on the index.
+
+  ```sh
+  git ls-files -- 'docs/adr/*.md' | wc -l          # pages in the section
+  git ls-files -- 'docs/adr/*.md' \
+    | xargs grep -lEi 'phase[- ]?[0-9]|\b[0-9]+\.[0-9]+[a-z]\b|\bplan\.md\b|\bspec\.md\b|\bM[0-9]|track [ab]\b|sub-?phase|plan item' \
+    | wc -l                                        # of those, matching
+  ```
+
+  Swap `-l` for `-n` to see the matching lines; their count is deliberately
+  not written down, because the paragraph you are reading is inside the
+  corpus that command counts and naming those coordinates above moved it —
+  the same self-reference that made one of the artefact figures below
+  wrong.
+
+  **That is correct, and sweeping them would be the error.** An ADR is a
+  dated record of a decision, written in the coordinates its authors were
+  working in on the day they made it; rewriting one for an outside audience
+  falsifies the record, and supersession — not editing — is how this
+  repository moves a decision on. The section's own index says so before a
+  reader opens anything: *"Read a record as history, not as status. Each
+  describes the world on the day it was ratified."* So the count above is
+  scoped to what it actually covers — **the guides and the reference**, the
+  pages a reader arrives at to get something done — and is not a statement
+  about the site's whole page count.
+
 - **Two stub sections retired.** `architecture/index.md` and
   `concepts/index.md` each opened with "**Status:** stub" and pointed at a
   file the site does not carry, while holding two of nine top-level nav slots.
@@ -944,13 +977,39 @@ that derives its expectation from the same side it checks is vacuous.*
   four artefact classes published the rejected design. **"The URLs are
   settled" was not true while it stood**, and settling them is what this
   subphase exists to do. Now `https://docs.apprafter.dev/`; rebuilt, and the
-  artefacts follow — 59 absolute URLs in `llms.txt`, 119 in `llms-full.txt`,
-  117 in `sitemap.xml`, and zero occurrences of `apprafter.dev/docs` anywhere
-  under the built site. Re-derive with:
+  artefacts follow.
+
+  **The first proof committed here was itself false, and its replacement is
+  the lesson.** It asserted "zero occurrences of `apprafter.dev/docs`
+  anywhere under the built site" and committed
+  `grep -rl 'apprafter\.dev/docs' /tmp/site | wc -l   # must be 0`. Run
+  against a fresh strict build that returns **4**: this ADR's rendered page,
+  its markdown twin, `llms-full.txt` and `search_index.json` — because the
+  paragraph you are reading *describes* the rejected origin, and every
+  artefact that carries prose carries it with them. A raw-string grep over
+  the whole site cannot distinguish a URL the build **generated** from a URL
+  a document **discusses**, and this ADR guarantees the second kind forever.
+  Assert on the artefacts that carry generated URLs and nothing else —
+  `sitemap.xml`, written by mkdocs, and `llms.txt`, written by
+  `llm_export.py`, both of which are pure link indexes:
 
   ```sh
   nix develop --command mkdocs build --strict -d /tmp/site
-  grep -rl 'apprafter\.dev/docs' /tmp/site | wc -l   # must be 0
+  # every generated absolute URL is on the new origin
+  grep -ohE 'https://[A-Za-z0-9.-]*apprafter\.dev[^ )">]*' \
+      /tmp/site/sitemap.xml /tmp/site/llms.txt \
+    | grep -v '^https://docs\.apprafter\.dev/' | wc -l   # -> 0
+  ```
+
+  The counts those artefacts carry are deliberately **not** recorded here.
+  Each is a total over the corpus, so every page added or removed rots the
+  figure while the command that produces it stays true — and one of the
+  three originally written down (`llms-full.txt`) counted an artefact
+  containing this document, so the act of recording it changed it. Read them
+  off a build when you need them:
+
+  ```sh
+  grep -c 'https://docs\.apprafter\.dev' /tmp/site/llms.txt /tmp/site/sitemap.xml
   ```
 
 - **The sweep's pattern defined its own success criterion, and four
@@ -993,10 +1052,16 @@ that derives its expectation from the same side it checks is vacuous.*
   Counting **commands in command position inside fences** — what a reader
   actually runs — the four dependency guides are not close:
   `postgres.md` 40 `kubectl` against 10 `apprafter`, `redis.md` 39/10,
-  `persistent-disk.md` 36/10, `egress-policy.md` 17/5. Counting command
-  position anywhere on the page, five pages beyond the acknowledged one are
-  `kubectl`-dominated. The naive regex found exactly one because prose
-  mentions of `apprafter` outnumber prose mentions of `kubectl` everywhere.
+  `persistent-disk.md` 36/10, `egress-policy.md` 17/5. Those four are the
+  output of the command below, re-run at this commit because they carry
+  the argument. The rest of its table is deliberately not transcribed
+  here: it moves with every fence anyone edits, and the command reproduces
+  all of it in a second.
+
+  **The instrument is the whole finding.** The claim it replaces counted
+  `apprafter\s+[a-z]` across each page's full text, prose included — and a
+  page's prose says "apprafter" because that is what the page is about, so
+  the count measured subject matter and was read as command mix.
 
   ```sh
   # commands in command position, inside fences only

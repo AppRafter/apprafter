@@ -185,10 +185,25 @@ within a few minutes of `cluster-bootstrap` completing.
 
 The AppRafter operator and admission webhook are installed by
 `cluster-bootstrap` as part of the platform stack. Verify the
-end-to-end path by applying an `Application` CR:
+end-to-end path by applying an `Application` CR. It is inlined here so
+that nothing on this page needs a checkout; the same manifest also ships
+in the repository as `manifests/tier-1/application/example-app.yaml`.
 
 ```sh
-kubectl apply -f manifests/tier-1/application/example-app.yaml
+kubectl apply -f - <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: parser
+  namespace: default
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose: { port: 80, network: internal }
+    env:
+      LOG_LEVEL: info
+YAML
 
 kubectl get applications.apprafter.io parser -n default \
     -o jsonpath='{.status.phase}'
@@ -272,5 +287,6 @@ byte-identical to the pre-colour baseline.
   reference with every flag + alias.
 - [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md) —
   scaffold and deploy a first Application.
-- `schemas/v1alpha1/` — the CRD CUE schemas that admission validates
-  against.
+- [The CRD CUE schemas that admission validates
+  against](https://github.com/apprafter/apprafter/tree/master/schemas/v1alpha1)
+  — `schemas/v1alpha1/` in the AppRafter repository on GitHub.

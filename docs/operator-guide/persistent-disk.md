@@ -208,15 +208,6 @@ kubectl -n demo get pvc claim-demo-web-disk \
   -o jsonpath='{.metadata.ownerReferences}{"\n"}'           # -> (empty)
 ```
 
-**SSA-split guard.** The provisioner's status write (ready / volumeClaimRef
-/ Ready) must NOT clobber the scheduler's verdict — `Scheduled` is still
-`True` after provisioning:
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io web-disk -o \
-  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
-```
-
 **5. The Application resumed.**
 
 ```sh
@@ -339,7 +330,10 @@ kubectl -n apprafter-system get retainedclaim claim-demo-web-disk   # -> NotFoun
 ```
 
 **If the PVC is still present after the snapshot is gone, the GC did NOT
-delete it — STOP, this is a closure-blocking bug.**
+delete it. Stop here and
+[report it](https://github.com/apprafter/apprafter/issues) — the platform
+is not doing what it promises, and a volume you were told was reclaimed is
+still allocated and still billed.**
 
 ## Checklist — did it work?
 
@@ -377,10 +371,13 @@ box.
 | Data lost after deleting + recreating the app | you deleted the bare ResourceClaim (which can race the regenerated claim) instead of the Application, or the grace window already elapsed | Delete the **Application** to snapshot a RetainedClaim; the PVC survives until `retainUntil`. Re-declaring the need reattaches it. |
 | PVC not deleted after `retainUntil` passes | GC controller error, or the source ResourceClaim is still live (the GC live-guard skips the delete while the claim exists) | Confirm the claim is gone: `kubectl -n demo get resourceclaim.apprafter.io web-disk`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
 
-## For contributors — the automated end-to-end script
+## For contributors
 
-Optional, and it needs a checkout of the AppRafter repository — nothing
-above does. If you are changing the platform, `just e2e-disk` exercises
+Nothing in this section is needed to run a persistent disk — it is here
+for people changing the platform itself.
+
+**The automated end-to-end script.** It needs a checkout of the AppRafter
+repository, which nothing above does. `just e2e-disk` exercises
 this identical chain on a local k3d/kind cluster (provision → mount →
 data durability → delete + snapshot → reattach → force-GC) plus a
 `needs.pg`-array multi-claim assertion, and is the cheap gate to clear
@@ -392,6 +389,20 @@ just e2e-disk        # green in ~3-5 min (kind+podman, LOCAL_OPERATOR build)
 
 If that is red, fix it before continuing: working through this guide
 by hand only adds value once the automated chain is green.
+
+**One assertion to re-run by hand if you touch the claim controllers.**
+Two of them write this claim's status — the scheduler records which
+provider it picked, the provisioner records the volume it bound (ready,
+`volumeClaimRef`, `Ready`) — and each writes through server-side apply
+(SSA) under its own field manager. Get a field manager wrong in either one
+and it silently erases the other's verdict, which no step above would
+notice. After provisioning, the scheduler's condition must still read
+`True`:
+
+```sh
+kubectl -n demo get resourceclaim.apprafter.io web-disk -o \
+  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
+```
 
 ## Cleanup
 

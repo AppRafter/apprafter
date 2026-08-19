@@ -244,8 +244,15 @@ track exists to refuse, an expectation derived from the same side it checks.
   URL in `llms.txt`, `llms-full.txt`, the markdown twins and `sitemap.xml`,
   so all four artefact classes published the rejected design — "the URLs are
   settled" was not true while it stood. Now `https://docs.apprafter.dev/`;
-  rebuilt, artefacts follow, zero occurrences of `apprafter.dev/docs` under
-  the built site.
+  rebuilt, artefacts follow. **The proof first committed with it was itself
+  false**: "zero occurrences of `apprafter.dev/docs` under the built site"
+  re-derives as **4** — ADR 0057's rendered page, its markdown twin,
+  `llms-full.txt` and `search_index.json`, because the ADR's prose describes
+  the rejected origin. A raw-string grep cannot tell a URL the build
+  generated from a URL a document discusses; the committed assertion now
+  reads only the two artefacts that carry generated URLs
+  (`sitemap.xml`, `llms.txt`) and requires every absolute URL in them to be
+  on the new origin.
 
 - **Three references to renamed pages survived outside `docs/`**, where the
   build structurally cannot see them: a live markdown link in `e2e/README.md`
@@ -293,6 +300,58 @@ track exists to refuse, an expectation derived from the same side it checks.
   paragraph in `cli/docsgen/src/health.rs` was deleted for the property that
   re-derives, its sibling bullet corrected to name the page
   `cli/docsgen/src/render.rs` actually moved to.
+
+- **Four more insider-vocabulary classes, found by reading and not by any
+  pattern.** The widened census reads 7 and every one is deliberate, so
+  these were invisible to it. (a) **"closure-blocking bug"** appeared in
+  bold on three dependency guides, four times, inside the instruction a
+  reader follows when data they were told was deleted is still there —
+  "closure" is this repository's phase discipline and a cluster owner has
+  no closure to block; each now says to stop and report it, and names the
+  consequence (a volume still billed, data still on disk, a credential that
+  still opens the database). (b) **"SSA-split guard"** was a mandatory step
+  on three guides — an internal regression assertion between two of the
+  operator's own controllers, with `SSA` never expanded — and has moved into
+  each page's "For contributors" section, where the acronym is expanded and
+  the reason is stated. Those sections are now headed `For contributors`
+  and open by saying nothing in them is needed to run the thing the page
+  teaches. (c) **The operator quickstart, rewritten in this subphase to
+  need no checkout, still required one twice** — `kubectl apply -f
+  manifests/tier-1/application/example-app.yaml` is a path that exists only
+  in a clone; the `Application` is now inlined as a heredoc, the way
+  `egress-policy.md` already did it, and the trailing `schemas/v1alpha1/`
+  pointer is an absolute GitHub URL. (d) **The documented fix for
+  `apprafter::env::cue_not_found`** — reachable by any user of
+  `apprafter app validate` or `apprafter app add` — sent the reader into
+  this project's Nix dev
+  shell "from the repo root", which an operator who installed the release
+  binary does not have; it now leads with installing CUE 0.10 or newer, or
+  pointing `CUE_BIN` at an existing binary, notes that the cluster
+  validates server-side regardless, and links the contributor page last and
+  as a page.
+
+- **Three more figures in ADR 0057's own corrections did not re-derive, and
+  one excluded corpus was not declared.** The three artefact counts beside
+  the `site_url` fix (`llms.txt` "59", `llms-full.txt` "119",
+  `sitemap.xml` "117") re-derive as 60 occurrences on 59 lines, **118** and
+  117 — and the `llms-full` figure is self-referential, since the document
+  stating it is inside the artefact it counts. Every one is a total over
+  the corpus, so all three rot on the next page added: deleted, with the
+  command that reads them off a build recorded in their place. The
+  in-fence command-dominance table keeps its four ratios — they carry the
+  argument and re-run unchanged at this commit — and drops the two figures
+  whose instrument was never committed; the naive regex is now named
+  instead of counted. And the census command **excludes `docs/adr/`, which
+  is 59 published pages behind a top-level nav tab**, 57 of them matching
+  the widened pattern. The exclusion and its reason are
+  now stated in the same bullet as the command, with its own re-derivation:
+  an ADR is a dated record written in the coordinates of the day it was
+  ratified, its index says exactly that, and sweeping them would falsify
+  the record. The census claim is scoped to the guides and the reference it
+  actually covers. The census itself ratcheted **up** on these edits and
+  never down — `invocations` 396 → 398, `identifiers` 238 → 246, the other
+  six counters unmoved — re-recorded with `docsgen metrics` in this same
+  commit.
 
 ## docs tooling (no release) — 2.19e build hooks: CUE highlighting and an LLM-readable corpus (2026-08-19)
 

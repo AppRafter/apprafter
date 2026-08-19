@@ -257,14 +257,6 @@ kubectl -n demo get secret web-redis-conn \
   -o jsonpath='{.metadata.ownerReferences[0].kind}{"\n"}'   # -> ResourceClaim
 ```
 
-**SSA-split guard.** The provisioner's status write must NOT clobber the
-scheduler's verdict — `Scheduled` is still `True` after provisioning:
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io web-redis -o \
-  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
-```
-
 **8. The Application resumed.**
 
 ```sh
@@ -405,7 +397,10 @@ kubectl -n apprafter-system get retainedclaim claim-demo-web-redis   # -> NotFou
 The freed DB number returns to the pool implicitly — the next allocation
 scan reads only LIVE claims' `status.dbnum`, so this DB is reusable.
 **If the ACL user is still present after the snapshot is gone, the GC did
-NOT run `ACL DELUSER` — STOP, this is a closure-blocking bug.**
+NOT run `ACL DELUSER`. Stop here and
+[report it](https://github.com/apprafter/apprafter/issues) — the platform
+is not doing what it promises, and a credential you were told was revoked
+still opens the database.**
 
 ## Checklist — did it work?
 
@@ -446,10 +441,13 @@ box.
 | App gets `NOPERM` on a pub/sub channel | the app published/subscribed to an unprefixed channel | Prefix every channel name with the claim's `channelPrefix`; keys need no prefix. |
 | ACL user missing after a Dragonfly pod restart | runtime ACL users are in-memory and lost on reload | The reconcile loop re-pins them on instance readiness; if it lingers, check the operator logs for the ACL reconcile task. |
 
-## For contributors — the automated end-to-end script
+## For contributors
 
-Optional, and it needs a checkout of the AppRafter repository — nothing
-above does. If you are changing the platform, `e2e/needs-redis-walk.sh`
+Nothing in this section is needed to run Redis — it is here for people
+changing the platform itself.
+
+**The automated end-to-end script.** It needs a checkout of the AppRafter
+repository, which nothing above does. `e2e/needs-redis-walk.sh`
 exercises this identical chain on a local k3d cluster (including the
 `$N`-ACL isolation proof and the `FLUSHDB`/`DELUSER` GC proof), and is
 the cheap gate to clear before anyone spends a real one on it:
@@ -460,6 +458,19 @@ bash e2e/needs-redis-walk.sh        # green in ~8-12 min on k3d
 
 If that is red, fix it before continuing: working through this guide
 by hand only adds value once the automated chain is green.
+
+**One assertion to re-run by hand if you touch the claim controllers.**
+Two of them write this claim's status — the scheduler records which
+provider it picked, the provisioner records the database it allocated —
+and each writes through server-side apply (SSA) under its own field
+manager. Get a field manager wrong in either one and it silently erases
+the other's verdict, which no step above would notice. After provisioning,
+the scheduler's condition must still read `True`:
+
+```sh
+kubectl -n demo get resourceclaim.apprafter.io web-redis -o \
+  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
+```
 
 ## Cleanup
 
