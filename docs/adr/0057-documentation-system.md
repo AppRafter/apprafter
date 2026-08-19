@@ -584,10 +584,21 @@ falsified.
   read it **as CUE** — a `//` line coming back as a comment token, a
   `#Definition` as a definition.
 
+  It also reads the **published page itself**, which the list above does
+  not: every artefact there derives from `page.markdown`, the text as it
+  stands *before* the page renders, so all three can be perfect on a site
+  that publishes nothing. Each published page's rendered `<article>` must
+  therefore carry that page's committed H1 and the longest runs of its
+  committed prose, must have **consumed** the lines the source wrote as
+  block syntax (an admonition, a tab, a table row, a task item, a snippet
+  include — one rule covering six extensions), and must carry the page's
+  authored description, or `site_description` where it has none, as its
+  HTML meta description.
+
   Every expectation is derived from **the other side**: the page set
   from the built site, the content from the committed source, never a
   thing against itself and never against its own length. That rule was
-  arrived at by attack, over three adversarial passes, and every hole
+  arrived at by attack, over four adversarial passes, and every hole
   found was one violation of it:
 
   - the lexer's only detector was the hook's own `on_config`
@@ -612,21 +623,51 @@ falsified.
     highlighted CUE and were never checked — while
     `cli/docsgen/src/scan.rs` already accepted `~`, so the gate held two
     scanners disagreeing about what a fence is;
-  - and `exclude_docs` could unpublish any page outside `nav:` with no
+  - `exclude_docs` could unpublish any page outside `nav:` with no
     ERROR and no WARNING — mkdocs reports a link into an excluded page
     at INFO, which `--strict` does not promote. `scripts/docs-check.sh`
     now fails on that line, naming both pages, and the pass cross-checks
     `not_in_nav` against what was published for the case nothing links.
+    That closed the *declared* case only: **any** page could still be
+    dropped from `nav:` and added to `exclude_docs` together, which is a
+    clean build with nothing logged at all. The reverse direction —
+    every page the drift gate counts must be published — is now asserted
+    against the gate's own scope rule, read out of
+    `cli/docsgen/src/scan.rs`, so unpublishing a guide has to move a
+    Rust constant as well as two lines of `mkdocs.yml`;
+  - the bundle was compared by **cardinality**, so a dropped page hid
+    behind a duplicated one — the exact reasoning the twins block
+    already carried, forty lines further down the same file, and not
+    carried across;
+  - the index's **shape** was unasserted and the label it parsed was
+    discarded, so an index reduced to the licence line plus one flat
+    `- [Page](url): description` per entry lost its H1, its
+    site-description blockquote, every `##` section and the generated
+    twin-rule sentence with the pass reporting OK;
+  - and the whole pass read the artefacts and never the rendered HTML,
+    so a hook stripping every `<p>` from `on_page_content` published a
+    site with no prose at all and every artefact assertion stayed true,
+    because the artefacts derive from the markdown rather than from the
+    page.
 
 - **An eighth census counter, `cue_fences`.** The lexer check is only as
   strong as the number of fences it has to check, and it had a
   zero-check rather than a floor. The counter is recorded **and**
   enforced by `docsgen` — the tool that reads the corpus — rather than
   by the Python pass that reads the site: a counter one tool records and
-  another enforces is a seam. The scopes differ deliberately: the census
-  counts the in-scope corpus, the Python pass covers every published
-  page including `docs/adr/`, which is out of the census's scope for the
-  same reason it is out of every other counter's.
+  another enforces is a seam.
+
+  The scopes differ, and the gap that leaves is recorded rather than
+  closed. The census counts the **in-scope** corpus; the Python pass
+  checks every **published** page, `docs/adr/` included. So the `cue`
+  fences under `docs/adr/` are checked and floored by nothing —
+  retagging one ` ```yaml ` takes it out of the checked set with the
+  counter unmoved. Widening this one counter to the published corpus
+  would make the census two measurements of two different trees, when
+  every other field in it counts claims the gate *resolves* and
+  `docs/adr/` is out of all of them; one field silently spanning a
+  different corpus from its seven siblings is the worse defect. The
+  artefact pass prints the split on every run instead.
 
 ### The two things it deliberately did not build
 
@@ -683,14 +724,29 @@ has already been burned by once.
   which is itself inside the gate's corpus. A page explaining the gate that
   the gate does not read is the first page to go stale.
 - **The census grew rather than shrank**, which passes silently by design:
-  the property that holds is that **no counter fell**. Running `docsgen
-  gate` at the subphase's base (`a761860`) and at its last commit
-  (`57e48dd`) moves four of the seven counters recorded then — pages 33 → 34, invocations
-  384 → 385, code paths 80 → 87, ADR references 67 → 68 — and every one of
-  those is the new contributor page's own claims resolving. (An earlier
-  draft of this line said no other count moved. It was written from a
-  commit report that had the delta right, and is corrected here rather
-  than quietly bumped: a permanent record stating a measurement that does
+  the property that holds is that **no counter fell**. Measured mid-subphase
+  — `docsgen gate` at the base (`a761860`) and at `57e48dd`, with the seven
+  counters and the scanners as they stood *then* — four of seven moved:
+  pages 33 → 34, invocations 384 → 385, code paths 80 → 87, ADR references
+  67 → 68, every one of them the new contributor page's own claims
+  resolving. Five commits followed `57e48dd`, and one of them moved the
+  census again: `c5ae92b` widened the code-path scanner (87 → 90) and added
+  an **eighth** counter, `cue_fences`. The base-to-tip pair as committed is
+  therefore what re-derives, and it re-derives from the repository rather
+  than from this sentence:
+
+  ```sh
+  git show a761860:docs/measurements/docs-health.json   # seven counters
+  git show HEAD:docs/measurements/docs-health.json      # eight
+  ```
+
+  Read that pair as content growth *plus* a widened scanner, not as
+  content growth alone — the two ends were recorded by different versions
+  of the tool, which is exactly why the mid-subphase measurement above is
+  labelled with the commit it was taken at. (Two earlier drafts of this
+  line were wrong: the first said no other count moved, the second named
+  `57e48dd` as the subphase's last commit. Both are corrected here rather
+  than quietly bumped — a permanent record stating a measurement that does
   not re-derive is the defect this ADR exists to remove.)
 
 ## Alternatives considered

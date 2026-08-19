@@ -205,6 +205,68 @@ patch of each phase.
   `cli/docsgen/src` but not `cli/docsgen/tests`, where nine citations
   still pointed at lines the front matter had moved.
 
+### Fixed — the fourth adversarial pass
+
+- **The published HTML was asserted for nothing but its `cue` blocks.**
+  All three LLM artefacts derive from `page.markdown`, which mkdocs
+  settles *before* the page renders — so an `on_page_content` hook
+  returning `re.sub(r"<p>.*?</p>", "", html)` published every page with
+  its paragraphs gone and the whole gate stayed green, artefacts and all,
+  because the artefacts were intact. Two cheaper instances landed the
+  same way: deleting `admonition` from `markdown_extensions` published
+  `!!! warning "…"` as literal text, and an `on_post_page` hook stripping
+  `meta name="description"` removed half of this subphase's own feature
+  from every page. The pass now reads each published page's `article`
+  and requires it to carry that page's committed H1 and the longest runs
+  of its committed prose, to consume the lines the source wrote as block
+  syntax, and to carry the page's authored description (or
+  `site_description`, for a page with none) as its meta description.
+- **Any page in `nav:` could be unpublished with everything green.**
+  `orphan_pages` asserted published ⊆ source and nothing asserted the
+  reverse, so deleting a nav line and adding the page to `exclude_docs`
+  removed `operator-guide/node-prep.md` — the page ADR 0057 cites as the
+  orphan nobody noticed for months — from the site, the index, the bundle
+  and the twins, with a clean `--strict` build and no INFO to grep for.
+  The missing direction is now asserted against the **drift gate's**
+  scope rule, parsed out of `cli/docsgen/src/scan.rs`, so unpublishing a
+  guide has to move a Rust constant as well as two lines of `mkdocs.yml`.
+- **`llms-full.txt` was compared by cardinality.** Dropping
+  `operator-guide/troubleshooting.md` and appending a second copy of
+  `license.md` left the bundle the right length with one page missing —
+  the exact failure the twins block had already been fixed for, forty
+  lines further down the same file. It is a set comparison in both
+  directions now, with repeated URLs named.
+- **The index's shape was unasserted and its label discarded.** Reduced
+  to the licence line plus one flat `- [Page](url): description` per
+  entry, every structural element ADR 0057 calls the deliverable was gone
+  — H1, description blockquote, a section per nav group, the generated
+  twin-rule sentence — and the pass still printed OK. Each is now derived
+  from the other side: `site_name`, `site_description` and `copyright`
+  from `mkdocs.yml`; the section set and order from its `nav:`; each
+  entry's label from the nav, from the literate-nav `SUMMARY.md` fragment
+  or from the page's own `title:`/H1; the twin-rule sentence against
+  `twin_for` and against the count of published `adr/` pages. The
+  guides-in / records-out split is asserted in both directions too.
+- **A fifth stale-count sweep, run mechanically rather than by
+  inspection.** Every digit in every file this branch touches was
+  re-derived. Deleted where the figure carried nothing the argument
+  needed and the command that produces it was kept: `gate.rs`'s "`sh` is
+  now 164" (169, and wrong at four successive commits), its three
+  "33 pages" (34), `health.rs`'s troubleshooting arithmetic (which did
+  not add up, on a file this branch lengthened) and its "all 33 corpus
+  pages" sweep, `scan.rs`'s "298 of the 301" and "427 top-level list
+  items", `codepath.rs`'s "70 other distinct tokens", `docs.yml`'s "459
+  crates", and five tallies in `cli/docsgen/tests` — one of them counting
+  a schema field the schema has since renamed. Kept where the number
+  carries the argument and re-derives: `scan.rs`'s SHA-anchored `dc4c5de`
+  distribution, `adr.rs`'s partial-supersession table (every row re-runs
+  exact), `codepath.rs`'s "24 across 16 distinct paths", `gate.rs`'s "57
+  file reads" and "9 Draft citations", `mkdocs.yml`'s "26 command pages",
+  `docs-check.sh`'s "58 numbered ADRs". ADR 0057's census delta named a
+  mid-subphase commit as the subphase's last; it now says so, adds the
+  pair `c5ae92b` moved afterwards, and gives the two `git show` commands
+  that re-derive the committed ends.
+
 ### Known gaps (recorded, not fixed)
 
 - **A description is prose, so nothing checks it but review.** Three of
@@ -220,6 +282,16 @@ patch of each phase.
 - **The site is still unpublished.** This subphase ships an LLM-readable
   corpus into a build output that nothing yet serves; it becomes reachable
   at 2.19g.
+- **`cue_fences` floors the in-scope corpus, not the published one.** The
+  artefact pass checks every `cue` fence on the site, `docs/adr/`
+  included; the census counter that floors it counts only what the drift
+  gate's corpus holds. So the ADR fences are checked and floored by
+  nothing — retagging one ` ```yaml ` takes it out of the checked set
+  silently. Left open deliberately: widening this one counter to the
+  published corpus would make the census two measurements of two
+  different trees, and one field silently spanning a different corpus
+  from its seven siblings is the worse defect. The pass now prints the
+  split on every run.
 
 ## docs tooling (no release) — 2.19d xref and health: paths, ADR citations, a corpus census (2026-08-18)
 
