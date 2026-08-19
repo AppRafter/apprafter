@@ -178,6 +178,11 @@ nav:
       # a tab of their own.
       - Connect a domain: operator-guide/connect-a-domain.md
       - Cloudflare Origin CA cert: operator-guide/cloudflare-origin-cert.md
+      # The worked instance of the two pages above: one application on a
+      # subdomain of an already-connected zone. It sits here rather than
+      # under Contributing because its three steps are cluster and DNS
+      # work, which is the operator's, not a contributor's.
+      - Publish the docs site: operator-guide/publish-the-docs-site.md
       - Postgres: operator-guide/postgres.md
       - Redis: operator-guide/redis.md
       - Persistent disk: operator-guide/persistent-disk.md

@@ -39,6 +39,10 @@ Guide](../dev-guide/index.md) is the shorter path.
 - [Cloudflare Origin CA certificate](cloudflare-origin-cert.md) —
   minting the certificate Cloudflare's edge trusts, importing it, and
   rotating it.
+- [Publish the documentation site](publish-the-docs-site.md) — the two
+  pages above worked through end to end on one application: confirming a
+  registered zone covers a subdomain, the Cloudflare record, and the sync
+  that follows. The instance is this site, on `docs.apprafter.dev`.
 
 ## Give an application a dependency
 
