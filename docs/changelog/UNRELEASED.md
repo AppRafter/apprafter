@@ -147,8 +147,11 @@ patch of each phase.
   alias and a clap-derived list stops containing it, so the check passes on
   an alias that no longer exists. The list is the other side, and a seventh
   assertion keeps it honest against the corpus. It was derived rather than
-  assumed: seven invocations across five pages type `t`, `ls`, `info`, `rm`,
-  `kc`, `cb` and `up`; `apprafter volume rm` correctly is not among them.
+  assumed: seven distinct alias invocations over **six** instructional pages
+  (`dev-guide/quickstart.md`; `operator-guide/`'s `backup-restore.md`,
+  `quickstart.md`, `shared-volumes.md`, `target-store.md`,
+  `troubleshooting.md`) type `t`, `ls`, `info`, `rm`, `kc`, `cb` and `up`;
+  `apprafter volume rm` correctly is not among them.
 - **Two upstream `clap_complete` behaviours**, found by following the
   recipes under an isolated `HOME` rather than by sizing the files, recorded
   rather than worked around: a hidden subcommand still completes (the filter
@@ -175,6 +178,102 @@ patch of each phase.
 - The census held or grew on every counter: 33 pages, 427 invocations, 248
   identifiers (119 opaque), 104 code paths, 70 ADR references, 2 exemptions;
   llm artefacts 60 / 119 / 119.
+
+### Fixed after review
+
+Three reviews ran over this subphase — a user at a terminal who dumped all 97
+help pages, ran all 124 examples twice, installed the completions and injected
+a new leaf command to test the rot guard; plus an honesty and an adversarial
+pass. The machinery held. What follows is what got through it.
+
+- **`docsgen::model` dropped a real flag, and had since 2.19b.** It filtered
+  clap's generated arguments by id string — `id == "help" || id ==
+  "version"` — and `apprafter platform freeze` declares a genuine
+  `--version <VERSION>` whose clap id is its field name. The published page
+  carried `Usage: apprafter platform freeze <COMPONENT>`, an Arguments table
+  with only `<COMPONENT>` and **no options table at all**, while the binary
+  printed the flag and the page's own `about` read "Without `--version` —
+  …". Every gate was green: both sides of `docsgen check`'s byte-compare are
+  that same projection. The filter is now keyed on the argument's **action**
+  (`ArgAction::Help*` / `Version`), which is what distinguishes an argument
+  clap generated from one the CLI declared.
+  `every_flag_and_positional_still_has_help_text` carried the same id test
+  and had been excusing the same flag; it is keyed the same way now.
+- **The ADR sentence that hid it, and the standing check that replaces it.**
+  ADR 0057 offered "187 arguments, exactly the count in `commands.json`, so
+  the two derivations agree from opposite sides" as corroboration. The
+  totals agreed; **per command they disagreed in exactly two places that
+  cancelled** — the root's generated `help`, counted by `commands.json` and
+  skipped by the sweep, against `platform freeze --version`, printed by the
+  binary and dropped from `commands.json`. An aggregate equality presented
+  as independent corroboration is vacuity: a count is not an assertion. The
+  comparison is now per command and standing —
+  `every_command_projects_the_arguments_its_help_prints` runs the shipped
+  binary's `-h` over all 97 paths and compares the argument spellings it
+  prints against the published `commands.json`, one command at a time, with
+  the `--help` asymmetry asserted rather than exempted. Re-derived at the
+  parent commit it reports `apprafter platform freeze / prints
+  ["--version", "COMPONENT"] / projects ["COMPONENT"]`.
+- **`export KUBECONFIG="$(apprafter kubeconfig)"` never worked, and failed
+  silently.** The command prints the kubeconfig **document**; `KUBECONFIG`
+  is a colon-separated list of **paths**. kubectl finds no file, falls back
+  to `https://localhost:8080` and reports a connection error — so a reader
+  debugs their cluster instead of their shell. `export X="$(cmd)"` also
+  exits 0 when `cmd` fails, so a failed fetch passed silently too. The
+  example is now `apprafter kubeconfig > /tmp/kc && export
+  KUBECONFIG=/tmp/kc`, which is the quickstarts' idiom and stops on a failed
+  fetch. The same wrong form shipped in five guide pages
+  (`operator-guide/`'s `postgres.md`, `redis.md`, `persistent-disk.md`,
+  `egress-policy.md`, `connect-a-git-repository.md`) and is corrected there
+  too, so the corpus and `--help` say the same thing.
+- **The examples guard treated `--version` as global on every command.**
+  `invocation::Tree::knows_flag` chained the whole root node's argument list
+  as globals, and the root's list is `--help/-h` **and** `--version/-V`.
+  clap generates `--version` for the root alone, so
+  `apprafter app list --version` resolved while the shipped binary answers
+  `error: unexpected argument '--version' found` — the false-published-
+  example class the guard exists to close. Only the `--help` pair is global
+  now, derived from the root rather than written out.
+- **One ordinary clap attribute could remove `Examples:` from `--help`.**
+  `after_long_help` on a variant takes over the long rendering and falls
+  back to `after_help` for the short, so `--help` lost its examples while
+  `-h`, the reference page and `docsgen check` stayed green —
+  `examples_help_test` sampled 4 of the 75 commands and only the long flag,
+  and all four sampled commands were unaffected. Two repairs:
+  `examples::attach` now **refuses** a command that already declares its own
+  after-help instead of silently overwriting it, and the help assertion
+  walks the whole `EXAMPLES` table in **both** renderings (≈150 spawns,
+  under a second).
+- **All three `completion` examples failed on a clean machine.** Run
+  verbatim under a fresh `HOME` each returned `No such file or directory`,
+  exit 1 — the destination directory does not exist. The developer
+  quickstart's three recipes each open with `mkdir -p`; these are those
+  recipes, and now open with it too. It is the one command where the
+  example *is* the instruction.
+- **`target add --token` help contradicted its own validator.** It said
+  ``Format `hcloud_<64+ alphanumeric>` `` while
+  `validate_hetzner_token_format` requires exactly 64 characters, all
+  `[A-Za-z0-9]` — so an `hcloud_`-prefixed value is rejected twice over, for
+  length and for the underscore. The validator was corrected in v0.1.74 and
+  this flag's help was not. The help-sweep could not catch it: it proves
+  every argument *carries* a description, never that a description is
+  *true*. A pattern is not a reading.
+- **"seven invocations across five pages" did not re-derive.** It is
+  **six** — `dev-guide/quickstart.md` plus `operator-guide/`'s
+  `backup-restore.md`, `quickstart.md`, `shared-volumes.md`,
+  `target-store.md` and `troubleshooting.md`. The seven invocations and
+  seven alias tokens both reproduce; only the page count was wrong, copied
+  from one narrative slip into this entry, ADR 0057 and
+  `plan-history.md` — the governing rule broken by the closure that states
+  it. All three are corrected, and the six are named so the claim carries
+  its own witness.
+
+`nix develop --command just lint` green; census held on every counter (33 /
+427 / 248 / 104 / 70 / 2; llm 60 / 119 / 119). `cargo build --workspace` and
+`cargo test --workspace` green — 1527 passed, 0 failed (1520 before; the seven
+new tests are the ones named above). No version bump: `cli/Cargo.toml` is
+already at 0.2.46 and no `v0.2.46` tag has been cut, so these repairs ride the
+release they repair.
 
 ### Reported, not fixed
 

@@ -1584,13 +1584,57 @@ the machinery that keeps both halves from rotting.** A closure that let a
 reader believe otherwise would be the same class of false record this track
 was built to police.
 
-Two details of that sweep are worth keeping, because a shorter version of it
-is wrong. It reads what clap prints, not `commands.json`, so it is independent
-of the artefact; but it counts 187 arguments, which is exactly the count in
-`commands.json`, so the two derivations agree from opposite sides. And clap
-uses **two** layouts — description on the same line, or indented on the next
-when the help is long — so a parser that knows only the first reports five
-false blanks on this tree. The first draft of the sweep did.
+The sweep does **not** prove every description is *true*, only that every
+argument carries one. It cannot: it reads the same text it judges. `apprafter
+target add --token` was found by reading, not by this pattern — its help said
+``Format `hcloud_<64+ alphanumeric>` `` while `validate_hetzner_token_format`
+requires exactly 64 characters, all `[A-Za-z0-9]`, so an `hcloud_`-prefixed
+value is rejected twice over. The validator was corrected in v0.1.74 and the
+flag's help was not; the doc comment is fixed at this commit. A pattern is not
+a reading.
+
+One detail of the sweep is worth keeping: clap uses **two** layouts —
+description on the same line, or indented on the next when the help is long —
+so a parser that knows only the first reports five false blanks on this tree.
+The first draft of the sweep did.
+
+**This ADR previously offered a second detail as corroboration, and that
+sentence was itself the defect it should have caught.** It read: the sweep
+counts 187 arguments, "which is exactly the count in `commands.json`, so the
+two derivations agree from opposite sides". The totals did agree. Per command
+they disagreed in exactly two places that cancelled: the root's clap-generated
+`help`, counted by `commands.json` and skipped by the sweep (−1), and
+`apprafter platform freeze --version`, printed by the binary and **dropped**
+from `commands.json` (+1). `docsgen::model` was filtering clap's generated
+args by id string — `id == "help" || id == "version"` — and `platform freeze`
+declares a genuine `--version <VERSION>` whose clap id is its field name. The
+published page carried `Usage: apprafter platform freeze <COMPONENT>`, no
+options table at all, and an `about` reading "Without `--version` — …" about a
+flag the page never listed; every gate was green, because both sides of the
+byte-compare are that same projection. **An aggregate equality presented as
+independent corroboration is the vacuity of P1 in its purest form: a count is
+not an assertion.**
+
+The repair is on both sides. The filter is keyed on the arg's **action**
+(`ArgAction::Help*` / `Version`) rather than its name, which is what
+distinguishes an arg clap generated from one the CLI declared. And the
+comparison is now a standing check made **per command** —
+`every_command_projects_the_arguments_its_help_prints` in
+`cli/platform-cli/tests/help_rot_test.rs` — running the SHIPPED binary's `-h`
+over all 97 command paths and comparing the argument spellings it prints
+against `docs/reference/cli/commands.json`, one command at a time. `--help` is
+the one argument the two sides legitimately differ on (clap prints it
+everywhere; the projection carries it once, on the root, where it is
+documented), so that shape is asserted rather than exempted.
+
+Re-derived at the parent commit, with that `--help` shape asserted rather than
+skipped: **96 commands agreed, 1 disagreed** — `apprafter platform freeze`,
+`prints ["--version", "COMPONENT"]`, `projects ["COMPONENT"]`. Counting the
+root's generated `--help` as a difference too, the way the original sweep's
+totals did, makes it 95 and 2. At this commit: 97 and 0, and the totals that
+used to cancel now agree term by term — `commands.json` holds 188 arguments,
+187 of them once the root's generated `--help` is set aside, which is the
+sweep's 187.
 
 ### What shipped
 
@@ -1724,8 +1768,16 @@ stopped carrying fails, so the list cannot decay into folklore.
 
 It was derived, not assumed. Building an alias-aware child index from
 `commands.json` and walking every `apprafter …` token run in `docs/**`, seven
-invocations across five pages type seven alias tokens — `t`, `ls`, `info`,
-`rm`, `kc`, `cb`, `up`. `apprafter volume rm` is correctly **not** among them
+distinct alias invocations type seven alias tokens — `t`, `ls`, `info`, `rm`,
+`kc`, `cb`, `up` — over **six** instructional pages, named here so the claim
+carries its own witness: `docs/dev-guide/quickstart.md` and
+`docs/operator-guide/`'s `backup-restore.md`, `quickstart.md`,
+`shared-volumes.md`, `target-store.md` and `troubleshooting.md`. (This ADR,
+`UNRELEASED.md` and `plan-history.md` all said *five*, copied from one slip in
+the closing report's narrative — whose own table listed six. The seven
+invocations and seven tokens re-derive; the page count did not. A count is
+not an assertion, including this one: the command that produces it is on
+`GUIDE_ALIASES`.) `apprafter volume rm` is correctly **not** among them
 (`rm` there is the canonical name) while `apprafter app rm` is. Three parts of
 the corpus type an alias and are excluded with a reason each: the generated
 reference re-renders rather than going stale, `changelog/` and `adr/` are
