@@ -21,7 +21,7 @@ a markdown twin per page
 Nothing here is committed because nothing here is authored: all three
 derive from committed content at build time, so they cannot drift from
 it.  The one authored input is the ``description:`` line in each page's
-front matter, and :func:`_index_entries` **fails the build** when an
+front matter, and :func:`_require_descriptions` **fails the build** when an
 indexed page lacks one — the index is worthless without it, and a
 silently-absent description is the failure mode this whole gate exists
 to remove.
@@ -43,8 +43,8 @@ that goes stale.
 - **excluded from ``llms.txt``.**  The ADRs are historical records —
   each describes the world as it was on the day it was ratified, which
   is why the drift gate holds them out of scope too.  Indexing them
-  would also bury the guides: they are half of everything the site
-  publishes (see the counts below).
+  would also bury the guides: they are about half of everything the
+  site publishes.
 - **included in ``llms-full.txt``**, and in the markdown twins.  They
   are the densest available explanation of *why* the system is shaped
   the way it is — which is exactly what is wanted when the question is
@@ -59,12 +59,14 @@ Re-derive the shape of the corpus with::
     grep -c '^url: ' /tmp/e-llm/llms-full.txt       # bundled pages
     find /tmp/e-llm -name '*.md' | wc -l            # markdown twins
 
-At 2026-08-19 those read 60, 119 and 119: 119 published pages, of which
-59 are under ``adr/`` and so appear in the bundle and as twins but not
-in the index.  ``scripts/docs-check.sh`` asserts all three counts
-against the built site on every run, so they are checked rather than
-recorded — which is why a page added to the nav moves these three
-numbers and breaks nothing.
+No numbers are recorded beside those commands, deliberately.  A count
+written next to the command that produces it is the one thing in this
+file that goes stale on its own — a page added to the nav moves all
+three.  What holds regardless is the *relation*: the bundle and the
+twins cover every published page, and the index covers that set minus
+``adr/``.  ``scripts/docs-check.sh`` asserts exactly those relations
+against the site on every run, so they are checked rather than written
+down.
 
 One thing this does not do
 --------------------------
@@ -72,12 +74,20 @@ One thing this does not do
 ``pymdownx.snippets`` include lines (``--8<--``) are resolved during the
 markdown-to-HTML conversion, not before it, so a twin carries the
 include line rather than the included file.  That is currently
-academic — ``git grep -c -- '--8<--' -- docs`` reports no matches, the
-extension is configured and available but unused — and it is recorded
-here rather than pre-solved because the fix (running the real
-``snippet`` preprocessor over the source) is a handful of lines to add
-against a real use site, and guessing at it now would be untested
-machinery of exactly the kind ADR 0057 set out to stop accumulating.
+academic: no published page uses one.  Re-derive with::
+
+    git grep -c -- '--8<--' -- docs ':!docs/hooks' ':!docs/changelog'
+
+(no matches).  The two exclusions are what make that a measurement of
+the *corpus* rather than of this paragraph: this file mentions the
+marker while explaining it, and the plan ledger quotes it while
+recording the explanation — neither is a page, and both would otherwise
+show up as the very use sites the sentence denies.  The extension is
+configured and available but unused, and this is recorded rather than
+pre-solved because the fix (running the real ``snippet`` preprocessor
+over the source) is a handful of lines to add against a real use site,
+and guessing at it now would be untested machinery of exactly the kind
+ADR 0057 set out to stop accumulating.
 """
 
 from __future__ import annotations
@@ -87,7 +97,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from mkdocs.config.defaults import MkDocsConfig
 from mkdocs.exceptions import PluginError
+from mkdocs.structure.files import Files
+from mkdocs.structure.nav import Navigation
 from mkdocs.structure.nav import Page as NavPage
 from mkdocs.structure.nav import Section
 
@@ -121,6 +134,10 @@ class _Doc:
     markdown: str
 
 
+# One index section: its heading, and (label, page) in nav order.
+_Section = tuple[str, list[tuple[str, "_Doc"]]]
+
+
 # Rebuilt from scratch on every `on_config`, because `mkdocs serve`
 # reuses this module across rebuilds and stale entries would resurrect
 # a page that was deleted.
@@ -141,8 +158,33 @@ def _slug(text: str) -> str:
 
 
 def _one_line(text: object) -> str:
-    """Collapse a front-matter value to one line, or '' when absent."""
+    """Collapse a value to one line, or '' when absent."""
     return " ".join(str(text).split()) if text else ""
+
+
+def _authored_line(value: object, src_uri: str, field: str) -> str:
+    """The same, for an AUTHORED front-matter field — and typed.
+
+    Every other malformed shape of ``description:`` fails loudly with
+    the page named: absent fails in :func:`_require_descriptions`, empty
+    is absent, and a multi-line block is collapsed to one line.  A wrong
+    *type* was the hole.  YAML infers, so ``description: [a, b]`` is a
+    list, ``description: {a: b}`` is a map and ``description: 3`` is an
+    int — and ``str()`` renders all three into something that reaches
+    ``llms.txt`` as the page's summary reading ``['a', 'b']``, with
+    nothing anywhere reporting it.  A summary is prose or it is a
+    defect, so a non-string is a build failure.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise PluginError(
+            f"docs/hooks/llm_export.py: {src_uri!r} has a `{field}:` that YAML read "
+            f"as {type(value).__name__}, not as text: {value!r}. It would reach "
+            "llms.txt as this page's summary in exactly that shape. Write it as one "
+            "quoted sentence."
+        )
+    return _one_line(value)
 
 
 def _twin_uri(dest_uri: str) -> str:
@@ -167,9 +209,9 @@ def _twin_uri(dest_uri: str) -> str:
         return dest_uri[: -len(".html")] + ".md"
     raise PluginError(
         f"docs/hooks/llm_export.py cannot place a markdown twin for {dest_uri!r}: "
-        f"it does not end in '.html', so it is not a rendered page. Either mkdocs "
-        f"changed how it names page output or this hook is being handed something "
-        f"that is not a page."
+        "it does not end in '.html', so it is not a rendered page. Either mkdocs "
+        "changed how it names page output or this hook is being handed something "
+        "that is not a page."
     )
 
 
@@ -193,8 +235,8 @@ def _section_pages(
     """Every page under a nav section, at any depth, in nav order.
 
     Depth matters: `literate-nav` expands ``reference/cli/`` into a
-    nested section, so the 27 generated CLI pages are grandchildren of
-    ``Reference``, not children.  They belong under the ``Reference``
+    nested section, so every generated CLI page is a grandchild of
+    ``Reference`` rather than a child.  They belong under the ``Reference``
     heading all the same — the index has one level of section, matching
     the top-level nav groups a reader sees as tabs — but the nesting is
     carried out as a label prefix rather than dropped: flattened
@@ -256,7 +298,7 @@ def _audience(doc: _Doc, nav_audience: dict[str, str], dir_audience: dict[str, s
     return _DEFAULT_AUDIENCE
 
 
-def _ordered() -> tuple[list[tuple[str, list[tuple[str, _Doc]]]], list[_Doc]]:
+def _ordered() -> tuple[list[_Section], list[_Doc]]:
     """Split the captured pages into the index's sections and the bundle's order.
 
     Returns ``(sections, bundle)`` where ``sections`` is
@@ -265,7 +307,7 @@ def _ordered() -> tuple[list[tuple[str, list[tuple[str, _Doc]]]], list[_Doc]]:
     indexed ones in index order, then the excluded ones (the ADRs)
     sorted by source path so the bundle is byte-stable across builds.
     """
-    sections: list[tuple[str, list[tuple[str, _Doc]]]] = []
+    sections: list[_Section] = []
     seen: set[str] = set()
 
     for item, pages in _groups:
@@ -299,7 +341,7 @@ def _ordered() -> tuple[list[tuple[str, list[tuple[str, _Doc]]]], list[_Doc]]:
     return sections, indexed + rest
 
 
-def _index_entries(sections) -> None:
+def _require_descriptions(sections: list[_Section]) -> None:
     """Fail the build when an indexed page has no description.
 
     A description is authored content and cannot be derived: falling
@@ -326,7 +368,7 @@ def _index_entries(sections) -> None:
         )
 
 
-def _render_index(config, sections, n_excluded: int) -> str:
+def _render_index(config: MkDocsConfig, sections: list[_Section], n_excluded: int) -> str:
     """The curated map: H1, blockquote, licence, then a section per nav group."""
     site_url = config["site_url"]
     lines = [f"# {config['site_name']}", ""]
@@ -343,10 +385,10 @@ def _render_index(config, sections, n_excluded: int) -> str:
     # Both sentences are generated rather than written, so neither can
     # name a count or a URL the build did not just produce.
     lines += [
-        f"Every page below is also published as markdown, at its own URL with the "
+        "Every page below is also published as markdown, at its own URL with the "
         f"trailing `/` dropped and `.md` appended ({site_url}index.md for the site "
         f"root itself). The whole corpus — including the {n_excluded} pages under "
-        f"`adr/` that this index does not list — is bundled at "
+        "`adr/` that this index does not list — is bundled at "
         f"{site_url}llms-full.txt.",
         "",
     ]
@@ -359,7 +401,12 @@ def _render_index(config, sections, n_excluded: int) -> str:
     return "\n".join(lines)
 
 
-def _render_bundle(config, bundle, nav_audience, dir_audience) -> str:
+def _render_bundle(
+    config: MkDocsConfig,
+    bundle: list[_Doc],
+    nav_audience: dict[str, str],
+    dir_audience: dict[str, str],
+) -> str:
     """Every page's markdown, each behind a front-matter-shaped header.
 
     The header repeats the shape the page itself uses, which is the
@@ -384,14 +431,14 @@ def _render_bundle(config, bundle, nav_audience, dir_audience) -> str:
     return "\n".join(out)
 
 
-def on_config(config):
+def on_config(config: MkDocsConfig) -> MkDocsConfig:
     """Drop anything held over from a previous build (`mkdocs serve` rebuilds)."""
     _docs.clear()
     _groups.clear()
     return config
 
 
-def on_nav(nav, config, files):
+def on_nav(nav: Navigation, config: MkDocsConfig, files: Files) -> Navigation:
     """Capture the nav groups — the sections `llms.txt` is organised by.
 
     The nav is read here rather than from ``config['nav']`` because by
@@ -415,7 +462,7 @@ def on_nav(nav, config, files):
     return nav
 
 
-def on_page_content(html, page, config, files):
+def on_page_content(html: str, page: NavPage, config: MkDocsConfig, files: Files) -> str:
     """Capture each page's markdown at the point it is final.
 
     ``on_page_content`` rather than ``on_page_markdown``, because the
@@ -438,14 +485,16 @@ def on_page_content(html, page, config, files):
         url=page.url,
         twin_uri=_twin_uri(page.file.dest_uri),
         title=_one_line(page.title) or page.file.src_uri,
-        description=_one_line(page.meta.get("description")),
-        meta_audience=_one_line(page.meta.get("audience")),
+        description=_authored_line(
+            page.meta.get("description"), page.file.src_uri, "description"
+        ),
+        meta_audience=_authored_line(page.meta.get("audience"), page.file.src_uri, "audience"),
         markdown=page.markdown or "",
     )
     return html
 
 
-def on_post_build(config):
+def on_post_build(config: MkDocsConfig) -> None:
     """Write the three artefacts into the built site."""
     if not _docs:
         raise PluginError(
@@ -455,10 +504,24 @@ def on_post_build(config):
             "hook is still listed under `hooks:` in mkdocs.yml and that mkdocs still "
             "fires that event."
         )
+    # Every URL written below is absolute, and `site_url` is the only
+    # place one can come from. Without it mkdocs leaves the value None
+    # and `f"{site_url}{doc.url}"` yields the string "None" — the build
+    # stays GREEN and publishes an index whose every link, and every
+    # generated sentence naming a path, reads `None`. There is no
+    # sensible fallback (a relative index is not what the convention
+    # asks for), so this is a hard requirement, stated where it bites.
+    if not config["site_url"]:
+        raise PluginError(
+            "docs/hooks/llm_export.py needs `site_url:` in mkdocs.yml: every URL it "
+            "writes into llms.txt and llms-full.txt is absolute, and with no site_url "
+            "each one would be published as the literal string 'None'. Set site_url, "
+            "or remove this hook from `hooks:`."
+        )
 
     site_dir = Path(config["site_dir"])
     sections, bundle = _ordered()
-    _index_entries(sections)
+    _require_descriptions(sections)
 
     nav_audience = {
         page.file.src_uri: _slug(_group_label(item))

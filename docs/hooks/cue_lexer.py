@@ -1,20 +1,32 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 """A pygments lexer for CUE, registered at build time — and self-checked.
 
-pygments 2.20.0 (the version `flake.lock` pins) ships no CUE lexer:
-``get_lexer_by_name("cue")`` raises ``ClassNotFound``.  Re-derive both
-halves of that claim with::
+The pygments version ``flake.lock`` pins ships no CUE lexer:
+``get_lexer_by_name("cue")`` raises ``ClassNotFound``, and every
+``cue`` fence in the corpus renders as unstyled text.  Re-derive both
+halves of that with::
 
-    nix develop --command python3 -c "import pygments; print(pygments.__version__)"
+    nix develop --command python3 -c "import pygments.lexers as l; l.get_lexer_by_name('cue')"
     git grep -cE '^[ >]*```cue$' -- docs | awk -F: '{n+=$2} END {print n}'
     git grep -cE '^[ >]*```cue$' -- docs ':!docs/changelog' | awk -F: '{n+=$2} END {print n}'
+    git grep -cE '^```cue$'      -- docs | awk -F: '{n+=$2} END {print n}'
 
-At 2026-08-19 those read 2.20.0, 37 fences across 20 pages, and 31 of
-them on the built site (``exclude_docs`` drops the changelog working
-file).  Without this hook all 31 render as unstyled text.  Note the
-``[ >]*`` prefix in the pattern: four of those fences are indented or
-inside a blockquote, and an ``^```cue$``-anchored count silently misses
-them — it reports 33.
+No counts are recorded beside those commands: the corpus writes more
+CUE every subphase, and a number written next to the command that
+measures it is the first thing here to rot.  What the four commands
+say, and go on saying, is: the alias does not resolve without this
+hook; the second count is smaller than the first because
+``exclude_docs`` drops the changelog working file, and it is the number
+of fences on the built site; and the fourth is smaller again, because
+that pattern requires the fence to open its line.  That last gap is why
+the ``[ >]*`` prefix is in the pattern at all — fences written inside a
+blockquote or indented under a list item are real fences, and an
+anchored count silently loses exactly them.
+
+The measurement that settles it independently of any of these is the
+built site: ``scripts/docs-check.sh`` matches every ``cue`` fence in a
+page's source to the block the build produced for it and requires that
+block to carry syntax tokens.
 
 Registering the lexer is the easy half.  The hard half is that the
 registration must not be allowed to fail quietly, and by default it
@@ -40,6 +52,7 @@ toolchain will report this.
 
 from __future__ import annotations
 
+from mkdocs.config.defaults import MkDocsConfig
 from mkdocs.exceptions import PluginError
 from pygments.lexer import RegexLexer, bygroups, include, words
 from pygments.lexers import LEXERS, _lexer_cache, get_lexer_by_name
@@ -209,9 +222,24 @@ app: v1alpha1.#Application & {
 
 # (label, token family) pairs the sample must produce.  Membership uses
 # pygments' token hierarchy (`Token.Comment.Single in Token.Comment`),
-# so retokenising a construct to a sibling subtype does not fire this;
-# only losing the construct entirely does — which is exactly the
-# "everything came back as Text" failure being guarded.
+# so the test is at FAMILY granularity — and that cuts both ways, which
+# is worth stating precisely rather than in the flattering direction.
+#
+# It does NOT fire when a construct is retokenised to a sibling subtype.
+# That is the point: the failure being guarded is "the alias resolved to
+# nothing and everything came back as Text", and a refinement of this
+# lexer is not a defect.
+#
+# It equally does NOT fire when one construct inside a family is lost
+# while some other rule still contributes that family. Delete the
+# field-name rule and `Name.Tag` disappears from the output, but the
+# bare-identifier rule at the bottom of `root` still produces `Name`, so
+# this check stays green while every CUE block on the site loses the
+# colouring that makes a struct read as a struct. Tightening to exact
+# subtypes would close that at the cost of the property above — every
+# future refinement would fail the build — so the granularity is kept
+# and the limit is recorded: this check answers "did a lexer take?",
+# not "is this lexer good?". The second question is review's.
 _REQUIRED_TOKENS = (
     ("comment", Comment),
     ("keyword", Keyword),
@@ -253,7 +281,7 @@ def _register() -> None:
     )
 
 
-def on_config(config):
+def on_config(config: MkDocsConfig) -> MkDocsConfig:
     """Register the lexer, then prove it took.
 
     ``pymdownx.highlight`` swallows a ``ClassNotFound`` and renders the
@@ -271,16 +299,16 @@ def on_config(config):
         raise PluginError(
             f"the CUE lexer did not register: resolving the `cue` alias still "
             f"raises {type(exc).__name__}: {exc}. Every ```cue fence would render "
-            f"through the `text` lexer and the build would otherwise stay green "
-            f"— see the module docstring in docs/hooks/cue_lexer.py."
+            "through the `text` lexer and the build would otherwise stay green "
+            "— see the module docstring in docs/hooks/cue_lexer.py."
         ) from exc
 
     if not isinstance(lexer, CueLexer):
         raise PluginError(
-            f"the `cue` alias resolves to "
+            "the `cue` alias resolves to "
             f"{type(lexer).__module__}.{type(lexer).__qualname__}, not this "
-            f"hook's CueLexer — something else claimed the alias, and what it "
-            f"makes of CUE is unknown. Check pygments' LEXERS table."
+            "hook's CueLexer — something else claimed the alias, and what it "
+            "makes of CUE is unknown. Check pygments' LEXERS table."
         )
 
     kinds = {tok for tok, _ in lexer.get_tokens(SAMPLE)}
@@ -295,11 +323,11 @@ def on_config(config):
         problems.append("it produced no " + ", ".join(missing))
     if problems:
         raise PluginError(
-            f"the CUE lexer registered but tokenised the sample into nothing "
+            "the CUE lexer registered but tokenised the sample into nothing "
             f"usable: {'; and '.join(problems)}. It would render as plain text, "
-            f"which is what a missing lexer looks like — and `pymdownx.highlight` "
-            f"catches the failure itself, so nothing else would report this. "
-            f"See SAMPLE and _REQUIRED_TOKENS in docs/hooks/cue_lexer.py."
+            "which is what a missing lexer looks like — and `pymdownx.highlight` "
+            "catches the failure itself, so nothing else would report this. "
+            "See SAMPLE and _REQUIRED_TOKENS in docs/hooks/cue_lexer.py."
         )
 
     return config

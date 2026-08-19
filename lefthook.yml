@@ -109,10 +109,10 @@ pre-commit:
           #
           # The corpus is `docs/**` PLUS the root `README.md`, which is
           # what `scan::in_scope` lists (`git ls-files -- docs
-          # README.md`) and page 1 of the 33 the census counts. It is
+          # README.md`) and one of the pages the census counts. It is
           # named here because no `docs/` glob can reach it: without
-          # the entry, deleting or rewriting the README moved four
-          # census fields and fired nothing on that commit, leaving the
+          # the entry, deleting or rewriting the README moved the
+          # census and fired nothing on that commit, leaving the
           # finding to land on the NEXT contributor's unrelated docs
           # pull request — the failure the wide globs below exist
           # against.
@@ -136,7 +136,7 @@ pre-commit:
           # metrics` by hand, in the same commit, and say why in the
           # commit message.
           - name: docs-check
-            glob: "{README.md,docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
+            glob: "{README.md,docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,scripts/docs-artefacts-check.py,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
             run: ./scripts/docs-check.sh
 
 commit-msg:
