@@ -190,8 +190,8 @@ live Argo CD installation.
 
 ## Fork support
 
-Forking the platform repository is a power-user path (plan item
-1.80) not yet shipped.
+Forking the platform repository is a power-user path that is not
+yet shipped.
 
 ## Where to look next
 

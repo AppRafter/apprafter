@@ -1,6 +1,6 @@
 ---
 title: "apprafter open"
-description: "Open a platform UI (Argo CD today; Backstage / Grafana / Hubble follow in later sub-phases)."
+description: "Open a platform UI (Argo CD today; Backstage, Grafana and Hubble are not wired up yet)."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter open`
 
-Open a platform UI (Argo CD today; Backstage / Grafana / Hubble follow in later sub-phases). Spawns a local port-forward, prints credentials, opens the default browser, blocks until Ctrl+C
+Open a platform UI (Argo CD today; Backstage, Grafana and Hubble are not wired up yet). Spawns a local port-forward, prints credentials, opens the default browser, blocks until Ctrl+C
 
 ```text
 Usage: apprafter open <COMMAND>

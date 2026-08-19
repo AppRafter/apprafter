@@ -229,10 +229,10 @@ pub enum Commands {
         #[command(subcommand)]
         action: MigrationCommand,
     },
-    /// Open a platform UI (Argo CD today; Backstage / Grafana /
-    /// Hubble follow in later sub-phases). Spawns a local
-    /// port-forward, prints credentials, opens the default
-    /// browser, blocks until Ctrl+C.
+    /// Open a platform UI (Argo CD today; Backstage, Grafana and
+    /// Hubble are not wired up yet). Spawns a local port-forward,
+    /// prints credentials, opens the default browser, blocks
+    /// until Ctrl+C.
     Open {
         #[command(subcommand)]
         ui: OpenUi,

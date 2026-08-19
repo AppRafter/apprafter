@@ -287,10 +287,10 @@ you see the value echoed anywhere in v0.1.78+, file an issue.
 
 ### Cilium CNI did not roll over to v6 after Cilium chart update
 
-Track B 1.70 territory. The Cilium chart `upgrade-install` does
-not trigger a DaemonSet restart on every config change; manually
+The Cilium chart `upgrade-install` does not trigger a DaemonSet
+restart on every config change; manually
 `kubectl -n kube-system rollout restart ds/cilium` after the
-chart bump.
+chart bump. Doing it for you is not implemented yet.
 
 ### Provisioning fails on a Hetzner quota or server-type limit {#quota}
 

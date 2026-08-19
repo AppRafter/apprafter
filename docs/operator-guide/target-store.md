@@ -65,7 +65,7 @@ Field reference:
 
 | Field          | Required | Notes                                                              |
 | -------------- | -------- | ------------------------------------------------------------------ |
-| `provider`     | yes      | Today: `hetzner-cloud`. AWS / OpenBao / Managed land in M2+.       |
+| `provider`     | yes      | Today: `hetzner-cloud`. AWS and OpenBao are not implemented yet.   |
 | `region`       | no       | Provider-specific (Hetzner: `nbg1`, `fsn1`, `hel1`, …).            |
 | `default_tier` | no       | `solo` / `team` / `prod` / `regulated`. Hint for `init` / `up`.    |
 | `cluster_name` | no       | Falls back to `platform-1`.                                        |

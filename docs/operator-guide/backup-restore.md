@@ -163,9 +163,10 @@ specific snapshot (default `latest`).
   other reloads data into a running one) and the combination is rejected up
   front. Platform-version alignment rides the backup's captured `PlatformStack`
   (applied during the replay) plus a cross-version warning if the freshly
-  bootstrapped platform differs. This is the flow the Phase-4 external-S3 DR
-  drill ("restore a new cluster from backup in < 1 hour") and the Phase-8.5
-  `DisasterRecoveryPlan` build on.
+  bootstrapped platform differs. This is the flow a full disaster-recovery
+  drill exercises — restore a new cluster from a backup in under an hour. A
+  `DisasterRecoveryPlan` object that automates the drill is not implemented
+  yet; today the drill is this command, run deliberately.
 
 ### Restore ordering and the two safety invariants
 

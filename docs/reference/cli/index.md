@@ -66,7 +66,7 @@ specific release rather than scraping these pages.
 | [`apprafter login`](login.md) | — | Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints what it would do and writes nothing. |
 | [`apprafter migration`](migration.md) | — | Inspect and approve / reject MigrationPlans. |
 | [`apprafter node`](node.md) | — | Node-level operations on the active target's cluster node. |
-| [`apprafter open`](open.md) | — | Open a platform UI (Argo CD today; Backstage / Grafana / Hubble follow in later sub-phases). |
+| [`apprafter open`](open.md) | — | Open a platform UI (Argo CD today; Backstage, Grafana and Hubble are not wired up yet). |
 | [`apprafter plan`](plan.md) | — | Show the diff between the desired state and what is live |
 | [`apprafter platform`](platform.md) | — | Inspect and control the cluster's PlatformStack — the declarative platform-version resource managed by PlatformController |
 | [`apprafter repo`](repo.md) | — | Manage git-repo creds Argo CD uses to pull private user repos. |

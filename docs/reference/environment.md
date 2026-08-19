@@ -125,8 +125,8 @@ undocumented feature.
 
 | Variable | Why it exists |
 | --- | --- |
-| `APPRAFTER_SKIP_NODE_SWAP` | Forces swap ineligible (any value, including empty) so the e2e walk can provision a deliberately cushionless node and exercise the `node prep` retrofit path. Intentionally absent from `--help`. |
-| `APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN` | Makes `node prep` write a deliberately malformed systemd drop-in, so the walk can assert the failure path. |
+| `APPRAFTER_SKIP_NODE_SWAP` | Forces swap ineligible (any value, including empty) so the end-to-end harness can provision a deliberately cushionless node and exercise the `node prep` retrofit path. Intentionally absent from `--help`. |
+| `APPRAFTER_NODE_SWAP_FORCE_INVALID_DROPIN` | Makes `node prep` write a deliberately malformed systemd drop-in, so the harness can assert the failure path. |
 | `APPRAFTER_CILIUM_IPV4_ONLY` | Disables Cilium IPv6 during bootstrap. For the k3d e2e, whose ULA IPv6 does not route; production Tier 1 is dual-stack per ADR 0017. |
 | `APPRAFTER_BOOTSTRAP_SKIP_CILIUM` | Leaves the cluster's existing CNI alone during bootstrap. k3d-e2e only. |
 | `APPRAFTER_HCLOUD_E2E`, `APPRAFTER_K8S_SMOKE`, `APPRAFTER_E2E_*` | Gates for `#[ignore]`d integration tests and for `e2e/*.sh`. Read by the test harness, never by the shipped binary. |
