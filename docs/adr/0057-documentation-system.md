@@ -1386,38 +1386,69 @@ one level deep is free; anything deeper is a new zone.
 
 ### The handoff — what is left, and who does it
 
-The software is complete and the site does not exist. Five steps stand
+The software is complete and the site does not exist. **Six** steps stand
 between this branch and a reader, none of which this repository can take.
-`docs/operator-guide/publish-the-docs-site.md` is the runbook for the middle
-three and is written to be followed without this ADR or the plan.
+`docs/operator-guide/publish-the-docs-site.md` is the runbook for the last
+five and is written to be followed without this ADR or the plan.
 
 1. **Push the branch.** Standing policy is that the agent commits locally and
    the operator pushes. Nothing else can start until the release workflow has
    run once and `ghcr.io/apprafter/docs:latest` exists.
-2. **Confirm the zone.** `apprafter target domain list` must show
+2. **Make the package pullable.** A package published under an organisation
+   for the first time is **private**, and nothing in the release workflow
+   changes that. The cluster currently holds no `SourceCredential` matching
+   `ghcr.io/apprafter/` — the credentials it does hold cover other orgs — so
+   as things stand this lands as `ResolveFailed` plus `ImagePullBackOff`
+   after every other step was done correctly. Either make the package public
+   (which is why `landing-web` works today: it is anonymously pullable) or
+   register a credential for the prefix. The runbook gives an anonymous-pull
+   probe that distinguishes the two states, because GHCR's `403` does not.
+3. **Confirm the zone.** `apprafter target domain list` must show
    `apprafter.dev`; the wildcard listener covers `docs.` by the rule above.
    If it is absent, registering it has certificate implications the runbook
    sets out.
-3. **The DNS record**, in the operator's Cloudflare account: a proxied record
+4. **The DNS record**, in the operator's Cloudflare account: a proxied record
    for `docs` in the `apprafter.dev` zone. Outside the repository entirely.
-4. **Register the application once** —
+5. **Register the application once**, from a checkout's `docs-site/`
+   directory —
    `apprafter app add https://github.com/AppRafter/apprafter --name docs
-   --path docs-site --branch master`. `--path` is load-bearing: a root
-   registration sweeps in every other manifest this repository carries. Every
-   later documentation change then deploys itself, because the operator
-   re-resolves the rolling tag to its current digest each reconcile (ADR
-   0040), so this step happens exactly once.
-5. **Set `docsUrl` in the CMS**, and only then land the held-back landing
-   commit. This is the ordering hazard, and it is why the landing switch is a
-   commit of its own: the tracked fallback JSON feeds the *release* path and
-   the Payload global feeds the *preview* path, so both must be set, and
+   --path docs-site --branch master --no-interactive`. The working directory
+   is part of the step: `app add` checks `<cwd>/apprafter/Application.cue`
+   before anything else and, on a TTY, scaffolds a brand-new unrelated
+   manifest when it is missing. `--path` is load-bearing in the other
+   direction: a root registration sweeps in every other manifest this
+   repository carries. Every later documentation change then deploys itself,
+   because the operator re-resolves the rolling tag to its current digest
+   each reconcile (ADR 0040), so this step happens exactly once.
+6. **Set `docsUrl`** — in the CMS global *and* in
+   `landing/web/src/data/fallback/siteSettings.json` — once, and only once,
+   `https://docs.apprafter.dev/` answers. The tracked JSON feeds the
+   *release* path (the landing image builds with `LANDING_USE_FALLBACK=1`)
+   and the Payload global feeds the *preview* path, so both must be set;
    either one set before DNS resolves points the landing's front door at a
-   host that does not answer — a worse failure than the "Soon" badge it
-   replaces, because it looks shipped. The commit can be dropped from a push
-   without unpicking anything else on the branch.
+   host that does not answer, which is worse than the "Soon" badge it
+   replaces because it looks shipped.
 
-Until step 5, the landing keeps rendering the badge and nothing links a
+Until step 6, the landing keeps rendering the badge and nothing links a
 reader anywhere. That is the correct state for a site that is not serving.
+
+**Step 6 is a step and not a held-back commit, and the difference is not
+stylistic.** It was first written as a commit of its own on the publication
+branch, on the premise that a commit can be dropped from a push. That
+premise is false in this repository: `.github/workflows/landing-autotag.yml`
+fires on any push to the default branch whose diff touches `landing/**`,
+bumps the newest `landing-v*` patch, pushes the tag and dispatches
+`release-landing.yml`, which publishes `ghcr.io/apprafter/landing-web` at
+`:<tag>` **and `:latest`** — and the landing's manifest watches `:latest`,
+which the operator re-resolves each reconcile. Merging such a commit is
+therefore the same act as deploying it, and holding it back would have meant
+rebasing a commit out from under the closure that sits on top of it. The
+commit was removed from the branch; the repository cannot make that ordering
+safe, so the ordering belongs to the operator, written down where the
+operator is already reading.
+
+The same mechanism is why an unrelated landing defect found during this
+subphase is recorded rather than fixed here — see the consequences below.
 
 ### Consequences
 
@@ -1468,8 +1499,17 @@ reader anywhere. That is the correct state for a site that is not serving.
 - **A finding about the landing, reported and not touched:** its Caddyfile's
   `try_files … /404.html` rewrites unknown URLs to a file that exists, so
   `file_server` never fails and every unknown URL answers **200** with the
-  404 page body. A/B measured on one image with only that line changed. The
-  docs Caddyfile omits the fallback and returns a real 404.
+  404 page body — a soft 404, which crawlers index as a real page. A/B
+  measured on one image with only that line changed. The docs Caddyfile omits
+  the fallback and returns a real 404, which is how the difference surfaced.
+
+  **The reason it is not fixed here is the same mechanism as the handoff's
+  step 6:** any commit touching `landing/**` that reaches the default branch
+  auto-tags and publishes the landing, so a drive-by one-line fix in a
+  documentation subphase would ship an unrelated production deploy of a
+  different site. It belongs to whoever next changes the landing
+  deliberately, which is why it is recorded in `plan.md`'s landing-migration
+  item as well as here.
 - **`scripts/docs-artefacts-check.py` crashes on a new page that is written
   but not yet staged** — `source` is built from `git ls-files` while
   `published` comes from the build output, and the `orphan_pages` guard that

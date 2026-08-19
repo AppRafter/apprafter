@@ -31,13 +31,14 @@ patch of each phase.
 > on and why it is not `exclude_docs`, and the wildcard listener that made a
 > new zone and certificate unnecessary).
 >
-> **The software is complete and the site is not serving.** Five manual steps
+> **The software is complete and the site is not serving.** Six manual steps
 > stand between this branch and a reader, none of which the repository can
-> take: the push, confirming the zone, a Cloudflare DNS record, one
-> `apprafter app add`, and setting `docsUrl` in the CMS before landing the
-> held-back landing commit. `docs/operator-guide/publish-the-docs-site.md` is
-> the runbook for the middle three and is written to be followed without the
-> ADR or the plan.
+> take: the push, making the GHCR package pullable by the cluster, confirming
+> the zone, a Cloudflare DNS record, one `apprafter app add` run from
+> `docs-site/`, and setting `docsUrl` on both the landing's paths once the
+> site answers. `docs/operator-guide/publish-the-docs-site.md` is the runbook
+> for the last five and is written to be followed without the ADR or the
+> plan; every command on it was run against the live cluster.
 
 ### Added
 
@@ -146,33 +147,75 @@ patch of each phase.
   change unreleasable, silently.
 
 - **`docs/operator-guide/publish-the-docs-site.md`** — the runbook for the
-  three cluster-and-DNS steps, written as the worked instance of "add an
-  application on a subdomain of a zone you already connected". It documents
-  two surfaces that had no published page: the operator's
-  `PublicRouteReady` condition, including the `NoMatchingZone` reason a
-  reader most needs, and the `apprafter.io/cert-sans` annotation that makes
-  the certificate's hostname list readable off the live Secret.
+  five operator steps, written as the worked instance of "add an application
+  on a subdomain of a zone you already connected". It documents two surfaces
+  that had no published page: the operator's `PublicRouteReady` condition,
+  including the `NoMatchingZone` reason a reader most needs, and the
+  `apprafter.io/cert-sans` annotation that makes the certificate's hostname
+  list readable off the live Secret.
+
+  Three things in it were corrected by running them rather than reading
+  them, and each was wrong in a way that reads fine on the page:
+
+    - **The registration step named no working directory.** `app add` checks
+      `<cwd>/apprafter/Application.cue` before anything else; from a
+      directory without one it either refuses (no TTY) or — on a TTY —
+      opens the scaffold wizard and writes a **new, unrelated manifest named
+      after the current directory**, into the monorepo if that is where you
+      stood. The step now says to `cd docs-site` and passes
+      `--no-interactive`, the only shape that behaves as the page describes.
+      `--path docs-site` stays: it is repo-root-relative, not cwd-relative.
+    - **The certificate check named a Secret that does not exist.** The name
+      is chosen by whoever ran `apprafter target cert import`, not by the
+      platform — on the cluster it is `cf-origin-cert-apprafter`, not the
+      `…-apprafter-dev` the page invented, and the SAN list comes back
+      wildcard-first. The check now *derives* the name from the wildcard
+      listener that will serve `docs.`, and says what covered, unregistered
+      and apex-only each look like.
+    - **A whole step was missing** — see the registry-access note below.
 
 ### Changed
 
-- **The landing's nav Docs link now points at `https://docs.apprafter.dev/`**
-  — in a **commit of its own**, which is the deliverable. The tracked
-  `landing/web/src/data/fallback/siteSettings.json` feeds the *release* path
-  (the image builds with `LANDING_USE_FALLBACK=1`) while the Payload global
-  feeds the *preview* path, so setting it turns the front door's Docs item
-  from a "Soon" badge into a live link the next time the landing image is
-  built. Landing it before DNS resolves points that link at a host that does
-  not answer — worse than the badge, because it looks shipped — so the commit
-  is isolated and its message says so, and it can be dropped from a push
-  without unpicking the rest of the branch.
+- **The landing's Docs link is an operator step, not a commit on this
+  branch**, and `landing/web/src/data/fallback/siteSettings.json` stays at
+  `"docsUrl": ""`. Re-derive: `git diff --name-only <base>..HEAD --
+  'landing/**'` is empty.
 
-  The value is not typed from memory: it is byte-identical to `mkdocs.yml`'s
-  `site_url` and its host equals `expose.hostname` in the manifest. Verified
-  through the release path itself — `astro build` under
-  `LANDING_USE_FALLBACK=1`, with the nav anchor read out of `dist/index.html`
-  in both states, so the check distinguishes rather than confirms itself.
+  It was first written as a held-back commit, on the premise that a commit
+  can be dropped from a push. **That premise is false here.**
+  `.github/workflows/landing-autotag.yml` fires on any push to the default
+  branch whose diff touches `landing/**`; it bumps the newest `landing-v*`
+  patch, pushes the tag and dispatches `release-landing.yml`, which publishes
+  `ghcr.io/apprafter/landing-web` at `:<tag>` **and `:latest`** — the tag the
+  landing's own manifest watches and the operator re-resolves to a digest on
+  every reconcile. Merging such a commit *is* deploying it, so it would have
+  put a live `docs.apprafter.dev` link on the front door before DNS, the
+  image or the app existed. It also was not the branch tip, so dropping it
+  from a push would have meant rebasing the closure out from under itself.
+
+  The substance is unchanged and now lives in the runbook's Step 5: **both**
+  values must be set — the tracked JSON feeds the *release* path (the image
+  builds with `LANDING_USE_FALLBACK=1`), the Payload global feeds the
+  *preview* path — and the value is `mkdocs.yml`'s `site_url`, whose host is
+  `expose.hostname` in the manifest. The ordering the repository cannot
+  enforce (site answers first, link second) is stated as the operator's,
+  where the operator is already reading.
 
 ### Notes
+
+- **The cluster cannot pull this image yet, and that is a sixth handoff step
+  nobody had named.** `kubectl get sourcecredentials.apprafter.io -n
+  apprafter-system` lists credentials for two other orgs; neither prefix
+  matches `ghcr.io/apprafter/docs`. The landing works only because its
+  package is anonymously pullable — confirmed by fetching
+  `ghcr.io/v2/apprafter/landing-web/manifests/latest` with an anonymous
+  token, which answers `200` where the same probe for `apprafter/docs`
+  answers `403`. **A first publish under an organisation is private**, so
+  without action this lands as `ResolveFailed` plus `ImagePullBackOff` after
+  every other step was done correctly. The step is now explicit in the ADR
+  handoff and is Step 1 of the runbook, with that probe as its check —
+  GHCR's `403` cannot distinguish private from absent, so the workflow run
+  answers existence and the probe answers reachability.
 
 - **A new subdomain needs no new zone and no new certificate**, and this is
   re-derived rather than cited because every future subdomain gets the same
@@ -223,9 +266,17 @@ patch of each phase.
 - **The landing serves `200` for unknown URLs.** `landing/web/Caddyfile`'s
   `try_files … /404.html` rewrites an unknown URL to a file that exists, so
   `file_server` has nothing to fail on and every unknown URL answers 200 with
-  the 404 page body. Measured on the real Caddyfile over the real built
-  `dist`. The docs Caddyfile omits the fallback and returns a real 404, which
-  is why the difference surfaced.
+  the 404 page body — a soft 404, which crawlers index as a real page.
+  Measured on the real Caddyfile over the real built `dist`. The docs
+  Caddyfile omits the fallback and returns a real 404, which is why the
+  difference surfaced.
+
+  **Not fixed here for the same reason the docs link is not a commit:** any
+  change under `landing/**` reaching the default branch auto-publishes the
+  landing, so a one-line drive-by in a documentation subphase would ship an
+  unrelated production deploy of a different site. Recorded on `plan.md`'s
+  open landing-manifest migration item, where whoever next changes the
+  landing deliberately will meet it.
 
 - **Two deployable manifests are validated by nobody.**
   `scripts/lint-cue.sh` covers `schemas/`, `platform-stack/cue/` and
