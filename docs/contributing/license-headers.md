@@ -72,6 +72,8 @@ not already have one.
 
 ## Enforcement
 
-Once CI is wired up, it will verify that every tracked source file under
-the paths above declares an appropriate `SPDX-License-Identifier`. Files
-without one will fail the lint stage.
+`scripts/check-spdx-headers.sh` verifies that every tracked source file
+under the paths above declares an `SPDX-License-Identifier`, and it runs
+at three points: `just lint` locally, the pre-commit hook
+(`lefthook.yml`), and the `license-check` workflow on every pull
+request. A file without a header fails all three.

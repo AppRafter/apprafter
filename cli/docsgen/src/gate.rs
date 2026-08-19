@@ -1218,7 +1218,7 @@ impl Gate {
         // Page-wide and off the source, like the paths above, and for a
         // stronger reason than theirs: an ADR is cited as authority
         // wherever it is written, and the corpus writes one **inside a
-        // fence** — `docs/operator-guide/needs-pg-walk.md:247`, a
+        // fence** — in `docs/operator-guide/needs-pg-walk.md`, a
         // comment in a shell block reading "(the decomposed fields, ADR
         // 0046 …)". Restricting this to prose would drop that citation,
         // and would make "move the sentence into the block" a way to

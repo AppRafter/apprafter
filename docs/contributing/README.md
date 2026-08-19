@@ -2,9 +2,9 @@
 description: "Index of the contributor-facing documents and what each one covers."
 ---
 
-# docs/contributing/
+# Contributor documentation
 
-Contributor-facing documents:
+The documents in `docs/contributing/`:
 
 | File                  | Purpose                                              |
 | --------------------- | ---------------------------------------------------- |

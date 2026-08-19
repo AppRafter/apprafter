@@ -546,11 +546,13 @@ falsified.
   publishes, so indexing them would bury the guides.
 
   Two shapes the design did not anticipate. The index needed an **`Other
-  pages`** section: two published pages sit on the `not_in_nav` allow-list,
-  so a purely nav-driven index would have dropped them silently — with the
-  section, the index is *complete* over published non-ADR pages, which is
-  what let the guard below be written as completeness rather than as a
-  restated list of group names. And nested nav sections are carried as a
+  pages`** section: two published **non-ADR** pages sit on the `not_in_nav`
+  allow-list (`license.md` and `contributing/README.md`; the list's third
+  entry, `adr/*`, covers every ADR and those are excluded from the index
+  anyway), so a purely nav-driven index would have dropped them silently —
+  with the section, the index is *complete* over published non-ADR pages,
+  which is what let the guard below be written as completeness rather than
+  as a restated list of group names. And nested nav sections are carried as a
   **label prefix** rather than flattened, because flattened outright the
   *Reference* group listed two different pages as "Overview".
 
@@ -558,17 +560,36 @@ falsified.
   `description`. The plan stated that as a contract and nothing enforced it;
   this is its natural home, and it passes today over every indexed page.
 
-- **A fourth pass in `scripts/docs-check.sh`.** The mkdocs build does not
-  know these three artefacts were supposed to exist, so a hook that stopped
-  writing them leaves a green build and a published site with a broken
-  machine-readable layer. The pass makes **ten** assertions — the index
-  exists and names the licence, its links are absolute, every link resolves
-  to a page the site contains, every published non-ADR page is listed, the
-  bundle exists and holds one entry per published page with a body rather
-  than a bare header, a named twin exists, and the twin count matches the
-  page count. Every expectation is **derived from the site that was just
-  built**; nothing here restates a page list, so a page added tomorrow is
-  covered without editing the script.
+- **A new pass in `scripts/docs-check.sh` — its second, right after the
+  strict build — covering BOTH hooks.** The
+  mkdocs build does not know these three artefacts were supposed to exist,
+  so a hook that stopped writing them leaves a green build and a published
+  site with a broken machine-readable layer — and `pymdownx.highlight`
+  swallows a failed lexer lookup, so an unregistered CUE lexer leaves a
+  green build too. The pass asserts, over the site just built: the index
+  exists and names the licence; its links carry an `http`/`https` scheme
+  **and** sit under `site_url` (two properties, because the second alone
+  is vacuous — `site_url` comes from the same config the hook read); every
+  link resolves to a page the site contains; every published non-ADR page
+  is listed; the bundle holds one entry per published page, each with a
+  body, and the bodies together carry at least half the text the site
+  renders; the twin **paths** match the published page set as a set, and
+  no twin is thinner than half its page; and every ` ```cue ` fence in a
+  page's source matched a rendered block on that page carrying syntax
+  tokens. Every expectation is **derived from the site that was just
+  built**; nothing here restates a page list, a page count or a language,
+  so a page added tomorrow is covered without editing the script.
+
+  The lexer half of that pass was added in review, and the reason
+  generalises: the hook's own `on_config` self-check lives **inside the
+  thing it guards**, so deleting its one line from `hooks:` in `mkdocs.yml`
+  removes the detector along with the deliverable and leaves a green build
+  with every CUE fence unstyled. So did two other routes — a later hook
+  overwriting the registration, and `use_pygments: false`. Reading the
+  artefact rather than the registry closes all three at once. The
+  substance floors on the bundle and the twins come from the same review:
+  the original checks detected absence and miscount but not *hollowing*,
+  and a hook writing `doc.markdown[:40]` passed every one of them.
 
 ### The two things it deliberately did not build
 
@@ -625,7 +646,15 @@ has already been burned by once.
   which is itself inside the gate's corpus. A page explaining the gate that
   the gate does not read is the first page to go stale.
 - **The census grew rather than shrank**, which passes silently by design:
-  pages went 33 to 34 and no other count moved.
+  the property that holds is that **no counter fell**. Running `docsgen
+  gate` at the subphase's base (`a761860`) and at its last commit
+  (`57e48dd`) moves four of the seven — pages 33 → 34, invocations
+  384 → 385, code paths 80 → 87, ADR references 67 → 68 — and every one of
+  those is the new contributor page's own claims resolving. (An earlier
+  draft of this line said no other count moved. It was written from a
+  commit report that had the delta right, and is corrected here rather
+  than quietly bumped: a permanent record stating a measurement that does
+  not re-derive is the defect this ADR exists to remove.)
 
 ## Alternatives considered
 

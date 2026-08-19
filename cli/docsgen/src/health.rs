@@ -128,7 +128,7 @@
 //! one exemption while retiring another passes green: trading
 //! `docs/dev-guide/application-cue.md`'s narrow one-path
 //! `schema-check-ignore` for a blanket `check=none` over the
-//! four-invocation fence at `docs/operator-guide/quickstart.md:117`
+//! four-invocation fence in `docs/operator-guide/quickstart.md`
 //! printed `2 exemptions (2 historical)` and exited 0, having widened
 //! the exempted surface from a single identifier to a whole fence's
 //! CLI, CUE and identifier checks. Committing the per-kind breakdown

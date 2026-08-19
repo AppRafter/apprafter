@@ -92,7 +92,7 @@
 //!   page is about can resolve against some other kind (a silent
 //!   pass), and a *correct* path belonging to a third-party CRD can be
 //!   reported. The corpus has one of the latter —
-//!   `docs/dev-guide/application-cue.md:36` names Argo CD's
+//!   `docs/dev-guide/application-cue.md` names Argo CD's
 //!   `spec.source.path`, and our `SourceCredential` has a
 //!   `spec.source` with no `path`.
 //!

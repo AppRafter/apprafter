@@ -25,7 +25,7 @@
 //!   is what a reader clicks, and MkDocs resolves it against the page's
 //!   own directory, so this module does too.
 //!
-//! The two are not separable by shape, and `docs/reference/index.md:10`
+//! The two are not separable by shape, and `docs/reference/index.md`
 //! is the proof — it writes the same text in both roles on one line:
 //!
 //! ```text
@@ -206,7 +206,8 @@ struct Link<'a> {
 /// `identifier`'s helper returns contents alone. The offset is the one
 /// thing this module needs that neither has: without it there is no way
 /// to ask whether a span sits inside a link's text, and that question is
-/// what separates `docs/reference/index.md:10` from a false positive.
+/// what separates the `cli/commands.json` line quoted in this module's
+/// own docs from a false positive.
 /// (`scan`'s also runs over a joined multi-line region, so its offsets
 /// would not be this line's even if it kept them.)
 ///

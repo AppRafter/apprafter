@@ -14,36 +14,43 @@
 //!
 //! # Three spellings, and why one checker cannot know only one
 //!
-//! Over the 33 in-scope pages there are **66 citations across 22
-//! distinct ADRs**:
+//! The corpus writes a citation in four shapes, and this module reads
+//! all four. No count is recorded for them: the corpus grows, and a
+//! tally written into a comment is exactly the claim this gate exists
+//! to stop shipping (the figures that used to open this section were
+//! falsified twice). `docsgen gate` prints the live total on every run;
+//! what follows is the shapes, each named at a site that can be opened.
 //!
-//! * 57 spelled `ADR 0046`;
-//! * 4 spelled `ADR-0032` — all four in `docs/license.md`, as
-//!   `Pre-ADR-0032` / `Post-ADR-0032`;
-//! * 1 wrapped across a line break (below);
-//! * 4 carrying **no `ADR NNNN` text at all**, where the number is
-//!   readable only inside an ADR's filename: `README.md:121` writes
+//! * the space form — `ADR 0046`, and by far the commonest;
+//! * the hyphen form — `ADR-0032`, written only in `docs/license.md`,
+//!   as `Pre-ADR-0032` / `Post-ADR-0032`;
+//! * one wrapped across a line break (below);
+//! * citations carrying **no `ADR NNNN` text at all**, where the number
+//!   is readable only inside an ADR's filename: `README.md:121` writes
 //!   `and ADRs [0001](./docs/adr/0001-license-fsl-1-1-mit.md) … and
 //!   [0032](…)`, and `docs/license.md` names one ADR per line in a code
-//!   span — `:91` `` `docs/adr/0001-license-fsl-1-1-mit.md` `` and
-//!   `:93` `` `docs/adr/0032-license-fsl-1-1-apache-2-0.md` ``.
+//!   span — `` `docs/adr/0001-license-fsl-1-1-mit.md` `` and
+//!   `` `docs/adr/0032-license-fsl-1-1-apache-2-0.md` ``.
 //!
-//! The first three are the `ADR NNNN` grammar — **62 of the 66**. An
-//! earlier revision of this module measured those 62 and presented the
-//! figure as the count in the corpus. It was not: the other four are
-//! citations a reader follows exactly like the rest, and every one of
-//! them is a link or a path — the very form the first version of this
-//! check's remedy told an author to write instead of naming a number.
-//! A grammar blind to the shape its own advice recommends has a hole
-//! shaped like that advice. So [`references`] reads `adr/NNNN-` as
-//! well: the number is embedded in every ADR's filename, so this costs
-//! one more scan of the line and no new vocabulary.
+//! The first three are the `ADR NNNN` grammar. An earlier revision of
+//! this module measured only those and presented the figure as the
+//! count in the corpus. It was not: the fourth shape is a citation a
+//! reader follows exactly like the rest, and every one of them is a
+//! link or a path — the very form the first version of this check's
+//! remedy told an author to write instead of naming a number. A grammar
+//! blind to the shape its own advice recommends has a hole shaped like
+//! that advice. So [`references`] reads `adr/NNNN-` as well: the number
+//! is embedded in every ADR's filename, so this costs one more scan of
+//! the line and no new vocabulary.
 //!
-//! Over every tracked `*.md` (188 files) the `ADR NNNN` split is 960
-//! space-spelled and 19 hyphen-spelled. A checker written against the
-//! space form alone would skip `docs/license.md` entirely **and report
-//! success**, which is the failure mode a gate must not have: a silent
-//! blind spot reads exactly like a clean page.
+//! Across the tracked `*.md` the hyphen form is rare and the space form
+//! is everywhere; re-derive with
+//! `git grep -cE '(^|[^A-Za-z0-9])ADRs?-[0-9]{4}' -- '*.md'` against its
+//! space-form twin. Rare is not zero, and that is the whole point: a
+//! checker written against the space form alone would skip
+//! `docs/license.md` entirely **and report success**, which is the
+//! failure mode a gate must not have — a silent blind spot reads
+//! exactly like a clean page.
 //!
 //! So [`references`] accepts a space **or** a hyphen. The left boundary
 //! is "not a letter or digit" rather than "whitespace" precisely because
@@ -79,13 +86,12 @@
 //! platform-stack side"; every one of those cites. Excluding the plural
 //! also made a trailing `s` a one-keystroke suppression, the same hole
 //! the wrap rule is here to close. Over the tracked `*.md` the plural
-//! is worth **8 raw occurrences** (the space-spelled scan goes 952 →
-//! 960) but **7 references** — the unit [`references`] returns, and the
-//! unit the 66/62/57/4 figures above are in — because `spec.md:7`
-//! writes both `ADRs 0034–0038` and `ADR 0034`, and per-line
-//! deduplication collapses those two spellings of one citation into
-//! one. In scope it is worth none: of the corpus's 4 `ADRs`, one is a
-//! bare plural noun, two link the directory index, and the fourth is
+//! is worth fewer **references** — the unit [`references`] returns, and
+//! the unit `docsgen gate` counts in — than raw occurrences, because
+//! `spec.md:7` writes both `ADRs 0034–0038` and `ADR 0034`, and
+//! per-line deduplication collapses those two spellings of one citation
+//! into one. In scope it is worth none: every `ADRs` in the corpus is
+//! either a bare plural noun, or a link to the directory index, or
 //! `README.md:121`, whose numbers are links the filename rule reads.
 //!
 //! Only the **first** number after `ADRs` is read. Continuing the list
@@ -105,7 +111,7 @@
 //!
 //! # The wrapped reference, and what it must not swallow
 //!
-//! `docs/operator-guide/target-store.md:8` writes the citation across a
+//! `docs/operator-guide/target-store.md` writes the citation across a
 //! blockquote line break:
 //!
 //! ```text
@@ -113,8 +119,8 @@
 //! > 0030](../adr/0030-cli-target-store-and-credential-chain.md).
 //! ```
 //!
-//! A line-local scan finds 61 of the 62 in-grammar citations and is
-//! silent about this one. That is one reference, and it would not matter
+//! A line-local scan finds every in-grammar citation in the corpus
+//! except this one. That is one reference, and it would not matter
 //! today — 0030 is Accepted — except that "wrap the line" is then a
 //! one-keystroke way to take a citation out of the gate's sight, with
 //! nothing in the diff that reads as suppression. So a line ending in a
@@ -129,7 +135,7 @@
 //! immediately followed by `]`. Without that condition the rule
 //! manufactures findings out of ordinary prose, because `ADR` is an
 //! ordinary English noun in this register —
-//! `docs/operator-guide/index.md:54` writes "An ADR describes the world
+//! `docs/operator-guide/index.md` writes "An ADR describes the world
 //! as it was when it was ratified" — and a year is the commonest
 //! four-digit run in the corpus. So
 //!
@@ -160,10 +166,18 @@
 //! positive is a page the gate is *wrong* about — unfixable except by
 //! rewording a correct sentence — while a missed citation is one it is
 //! merely quiet about. And what is given up is real rather than
-//! hypothetical: **26 of the 66** in-scope citations are bare
+//! hypothetical: a **large minority** of in-scope citations are bare
 //! `ADR NNNN` prose with no path anywhere on the line, so a
-//! deliberately wrapped bare-prose citation goes unseen. That cost is
-//! accepted, not argued away.
+//! deliberately wrapped bare-prose citation goes unseen. Re-derive that
+//! against the total `docsgen gate` prints:
+//!
+//! ```text
+//! git grep -nE '(^|[^A-Za-z0-9])ADRs? [0-9]{4}' -- docs README.md |
+//!     grep -vE '^docs/(adr|changelog|measurements|reference/cli)/' |
+//!     grep -vc 'adr/'
+//! ```
+//!
+//! That cost is accepted, not argued away.
 //!
 //! # A leading token, not a substring
 //!
@@ -228,7 +242,7 @@
 //! number names nothing at all, exactly like a typo.
 //!
 //! `Draft` is **not** a finding, and this is a deliberate policy rather
-//! than an omission: 9 of the 66 in-scope references point at ADRs
+//! than an omission: 9 in-scope references point at ADRs
 //! 0025–0029, all Draft, and documentation legitimately cites a decision
 //! the project is working to. `Proposed` is not a finding for the same
 //! reason. A gate that demanded `Accepted` would be demanding that nine

@@ -66,16 +66,34 @@ patch of each phase.
   site publishes. A model handed the whole corpus should have them; a
   model handed a map should not have to walk past them. A generated
   sentence in the index says so and names the count.
-- **A fourth pass in `scripts/docs-check.sh`**, because a hook that
-  stopped writing these three artefacts is invisible: mkdocs does not
-  know they were supposed to exist and the build stays green either way.
-  Ten assertions — the index exists and names the licence, its links are
-  absolute and every one resolves to a page the site contains, every
-  published non-ADR page is listed, the bundle holds one entry per
-  published page with a body rather than a bare header, a named twin
-  exists, and the twin count matches the page count. Every expectation is
-  derived from the site that was just built, so a page added tomorrow is
-  covered without editing the script.
+- **A new pass in `scripts/docs-check.sh`** — its second, right after the
+  strict build — covering **both** hooks, because either one is invisible
+  when it breaks: mkdocs does not know the three artefacts were supposed
+  to exist, and `pymdownx.highlight` swallows a failed lexer lookup, so
+  the build stays green through both. It asserts, over the site just
+  built: the index exists and names the licence; its links carry an
+  `http`/`https` scheme **and** sit under `site_url` (two properties,
+  because the second alone is vacuous — `site_url` comes from the same
+  config the hook read); every link resolves to a page the site contains;
+  every published non-ADR page is listed; the bundle holds one bodied
+  entry per published page, and those bodies together carry at least half
+  the text the site renders; the twin **paths** match the published page
+  set as a set, with no twin thinner than half its page; and every
+  ` ```cue ` fence in a page's source matched a rendered block on that
+  page carrying syntax tokens. Every expectation is derived from the site
+  that was just built, so a page added tomorrow is covered without
+  editing the script.
+
+  The lexer half is there because the hook's own `on_config` self-check
+  lives **inside the thing it guards**: deleting its one line from
+  `hooks:` in `mkdocs.yml` removes the detector with the deliverable and
+  leaves a green build with every CUE fence unstyled, as do a later hook
+  overwriting the registration and `use_pygments: false`. Reading the
+  artefact instead of the registry closes all three. The two substance
+  floors are there because absence and miscount were caught and
+  *hollowing* was not — a hook writing `doc.markdown[:40]` passed every
+  earlier check while `llms-full.txt` collapsed to one truncated heading
+  per page.
 - **`docs/contributing/documentation.md`** — the author's half of the
   contract: what front matter a page owes, what the two hooks do with it,
   and what an author gets for free. It is inside the gate's corpus, so
@@ -112,6 +130,37 @@ patch of each phase.
   transform is their natural home and that pass now exists, so adding
   them later is a handful of lines against a real use site rather than a
   mechanism guessed at in advance.
+
+### Fixed
+
+- **`site_url:` is now a hard requirement of `docs/hooks/llm_export.py`.**
+  Without it mkdocs leaves the value `None`, and the build stayed green
+  while publishing an `llms.txt` whose every URL was the literal string
+  `None`. `on_post_build` now raises a `PluginError` naming the setting.
+- **A non-string `description:` fails the build with the page named.**
+  YAML infers, so a list, a map or a number all reached `llms.txt` as
+  that page's summary in exactly that shape. Every other malformed shape
+  already failed loudly; a wrong type was the hole.
+- **`docs/contributing/documentation.md` stated a front-matter contract
+  that was false against 28 published pages.** `title` and `status` are
+  carried by the generated CLI reference and by
+  `docs/reference/environment.md`, and neither is an exemption key —
+  `title` is read by the site (MkDocs prefers it over the page's `#`
+  heading) and `status` is read by nothing here. The page now says so and
+  carries the command that re-derives the whole key census.
+- **`docs/contributing/license-headers.md` said SPDX enforcement was
+  future work.** It runs today at three points — `just lint`, the
+  pre-commit hook and the `license-check` workflow — and the Enforcement
+  section now names them.
+- **Stale corpus counts swept out of the comments that carried them.**
+  `cli/docsgen/src/{scan,adr}.rs`, `.github/workflows/docs.yml` and
+  `lefthook.yml` each quoted a page or citation count this subphase's own
+  new page falsified. The figures are deleted and their re-derivation
+  commands kept, which is the durable half. In the same sweep, the
+  `file.md:NN` citations in five `cli/docsgen` modules lost their line
+  numbers: adding four lines of front matter to 31 pages shifted every
+  one of them, and a file plus a quoted phrase is greppable where a line
+  number is not.
 
 ### Known gaps (recorded, not fixed)
 

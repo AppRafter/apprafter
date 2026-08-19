@@ -4,10 +4,17 @@ description: "The front matter a page owes, what the two build hooks do with it,
 
 # Writing a documentation page
 
-Everything under `docs/` is built by one pinned MkDocs toolchain and
-checked by one gate. This page is the author's half of that contract:
-what a page owes in its front matter, what the build does with it, and
-what you get without asking for it.
+A page under `docs/` is built by one pinned MkDocs toolchain and checked
+by one gate — with two sets of exceptions worth knowing before you pick
+a path. `exclude_docs` in `mkdocs.yml` keeps a handful of internal files
+out of the built site, and the gate's corpus additionally leaves out
+`adr/`, `changelog/`, `measurements/` and the generated
+`reference/cli/`; both lists carry their reasons where they are defined.
+A file you add under one of those paths gets less than what follows.
+
+This page is the author's half of the contract: what a page owes in its
+front matter, what the build does with it, and what you get without
+asking for it.
 
 Its companion is [the documentation drift gate](documentation-gate.md),
 which covers what `just lint` checks in the *body* of a page — the
@@ -28,9 +35,28 @@ audience: operators
 ---
 ```
 
-Two fields are part of the authoring contract. Everything else in a
-page's front matter is an [exemption key](#the-exemption-keys), read by
-the gate rather than by the site.
+`description` and `audience` are the authoring contract, and they are
+the only two fields you write. Three other keys exist in the tree, and
+none of them is one you add:
+
+- `title` overrides the page's own `#` heading as the title MkDocs
+  gives the page. It is carried only by the generated CLI reference and
+  by [the environment-variable page](../reference/environment.md), and
+  the generator writes it. It is read by the **site**, not by the gate.
+- `status` sits beside `title` on those same pages and is read by
+  nothing here: the theme's status feature needs an `extra.status` map
+  that `mkdocs.yml` does not define.
+- The [exemption keys](#the-exemption-keys) are read by the gate rather
+  than by the site.
+
+Re-derive that census — every front-matter key in the tree, and how
+many pages carry it — with:
+
+```sh
+git ls-files -- docs README.md | grep '\.md$' |
+    xargs awk 'FNR==1{inf=/^---$/; next} inf && /^---$/{inf=0} inf' |
+    grep -oE '^[A-Za-z_-]+:' | sort | uniq -c
+```
 
 ### `description` — required {#description}
 
@@ -58,7 +84,7 @@ title:
   resolution chain, and the multi-target patterns operators actually
   use."
 - **Bad** — "Overview of the target store." It is read out of context,
-  as one line in a list of thirty, where "Overview" tells a reader
+  as one line in a long list of them, where "Overview" tells a reader
   nothing they did not get from the title.
 
 Say only what the page supports. A description is prose, so the gate
@@ -138,7 +164,13 @@ syntax highlighting catches a failed lexer lookup and quietly falls back
 to plain text, so a broken registration is otherwise a green build,
 finished-looking pages, and nothing in the log. The hook resolves the
 alias, tokenises a sample, and raises unless the sample comes back as
-CUE. Nothing else in the toolchain reports this.
+CUE.
+
+That self-check lives inside the hook, though, so removing the hook
+takes its guard with it. `just lint` therefore carries a second one
+outside it: the gate reads the *built page*, matches every ` ```cue `
+fence back to the block the build produced for it, and fails when that
+block came out as plain text. Nothing in MkDocs itself reports either.
 
 As an author you owe it nothing: tag a fence `cue` and it is
 highlighted.
@@ -152,8 +184,8 @@ three things into the built site:
 | Artefact | What it is |
 | --- | --- |
 | `llms.txt` | The curated index — the site name, its description, the licence line, then one section per nav group (plus one for pages deliberately kept out of the nav, so the index stays complete), each entry an absolute URL and the page's `description`. |
-| `llms-full.txt` | Every published page's markdown in one file, each behind a header carrying its URL, description and audience. |
-| a markdown twin | The page's own source markdown, published beside it: the page URL with the trailing `/` dropped and `.md` appended. |
+| `llms-full.txt` | Every published page's markdown in one file, each behind a header carrying its URL and audience, plus its `description` where the page has one. The ADRs carry no front matter, so their entries carry no description line — the hook omits it rather than inventing one. |
+| a markdown twin | The page's own source markdown, published beside it: the page URL with the trailing `/` dropped and `.md` appended. The site root is the one page with no trailing slash to drop, so its twin is `index.md` — the sentence the hook generates into `llms.txt` says so too. |
 
 Which pages are in is read from the build rather than restated: the site
 exclusions in `mkdocs.yml` already remove the internal trees, so those
@@ -199,8 +231,8 @@ just lint
 ```
 
 That runs `scripts/docs-check.sh`, which is the whole documentation gate
-in four passes: the strict MkDocs build, the LLM artefacts checked
-against the site that was just built, the generated CLI reference
+in four passes: the strict MkDocs build, what the two hooks left behind
+read back off the site that was just built, the generated CLI reference
 byte-compared against the code, and the drift gate over the hand-written
 pages. It needs Nix, because a byte-compare needs one pinned toolchain
 across your machine and CI.
