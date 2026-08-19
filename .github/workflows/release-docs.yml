@@ -113,9 +113,14 @@ on:
     #     change must not cut a documentation release.
     #   schemas/v1alpha1/**, operator/charts/**/crd-*.yaml
     #     inputs to `docsgen gate`'s identifier resolution only.
-    #   scripts/docs-check.sh, scripts/docs-artefacts-check.py
-    #     the gate itself. Strengthening it does not change a byte of
-    #     the site; the next real release runs the stronger version.
+    #   scripts/docs-check.sh, scripts/docs-artefacts-check.py,
+    #   scripts/docs-site-smoke.sh
+    #     the gates themselves. Strengthening one does not change a byte
+    #     of the site; the next real release runs the stronger version.
+    #     Note that the smoke script gates the SERVING layer and still
+    #     belongs here rather than under `docs-site/**` above: editing a
+    #     check must not mint a digest and roll the public site, which is
+    #     the same rule the manifest exclusion follows.
   workflow_dispatch: {}
 
 permissions:
@@ -229,7 +234,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push docs image
+      # ------------------------------------------------------------------
+      # BUILD, SMOKE, then PUSH — in that order, and not one combined step.
+      # ------------------------------------------------------------------
+      # `:latest` is a live deployment: the operator re-resolves it to its
+      # current digest on every reconcile (ADR 0040), so `push` and `roll
+      # the public site` are the same act. Anything checked AFTER the push
+      # is checked after the outage it was meant to prevent.
+      #
+      # The image's own build already runs `caddy validate`
+      # (docs-site/Dockerfile), which fails the build on a config the
+      # server cannot LOAD. That is a syntax check and nothing more. A
+      # config that loads and still serves the 40 KB HTML error page
+      # labelled `text/plain`, or pins a mutable asset URL `immutable` for
+      # a year, is a green build — both were measured green before the
+      # smoke step existed. So the container is started and probed here.
+      - name: Build the docs image (load into the runner, do not push)
         uses: docker/build-push-action@v5
         with:
           # Context is docs-site/ because the Dockerfile copies `site`
@@ -237,12 +257,41 @@ jobs:
           # local build in that file's header uses.
           context: docs-site
           file: docs-site/Dockerfile
+          push: false
+          # `load` puts the built image in the runner's docker daemon so
+          # the next step can run it. It requires a single platform, which
+          # is what this workflow builds anyway.
+          load: true
+          tags: docs-site-smoke:${{ github.sha }}
+          # Same x86-only stance as release-operator and release-landing,
+          # until the platform learns multi-arch (Hetzner CAX*).
+          platforms: linux/amd64
+          cache-from: type=gha,scope=docs
+          cache-to: type=gha,mode=max,scope=docs
+
+      # Runs the container and asserts how it ANSWERS: the four probes the
+      # plan specifies, a real 404 on an unknown path, a readable
+      # plain-text 404 on a markdown twin that does not exist, and the
+      # `immutable` split checked over EVERY file under assets/ rather
+      # than a sampled one. The probed URLs are derived from the tree
+      # inside the image, so a page rename cannot turn a probe into a
+      # request for something that never existed.
+      - name: Smoke-test the image before it is published
+        env:
+          IMAGE: docs-site-smoke:${{ github.sha }}
+        run: bash scripts/docs-site-smoke.sh "$IMAGE"
+
+      # A cache hit on the step above — same context, same Dockerfile,
+      # same digest — so this re-tags and uploads rather than rebuilding.
+      - name: Push the smoke-tested image
+        uses: docker/build-push-action@v5
+        with:
+          context: docs-site
+          file: docs-site/Dockerfile
           push: true
           tags: |
             ${{ steps.image-base.outputs.image }}:${{ github.sha }}
             ${{ steps.image-base.outputs.image }}:latest
-          # Same x86-only stance as release-operator and release-landing,
-          # until the platform learns multi-arch (Hetzner CAX*).
           platforms: linux/amd64
           cache-from: type=gha,scope=docs
           cache-to: type=gha,mode=max,scope=docs

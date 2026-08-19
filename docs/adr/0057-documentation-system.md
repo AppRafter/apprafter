@@ -1292,6 +1292,64 @@ which browsers offer as a download, defeating the twins' purpose — an input
 this repository neither pins nor tests, so the header is set explicitly
 rather than inherited.
 
+That last rule matches on the **request** path, so it also decorated the
+error response for a `.md` that does not exist: a missing twin answered `404`
+with `Content-Type: text/plain` and the rendered HTML error page as its body.
+`handle_errors` splits the two classes, so a reader who asked for plain text
+is answered in plain text and a missing page still gets the rendered 404.
+
+### The serving layer is gated, because nothing else reads it
+
+Recorded because it was a real hole in this subphase as first written, not a
+hypothetical: **nothing in this repository read `docs-site/Caddyfile`.**
+`just lint` does not, `scripts/docs-check.sh` never looks below `docs/`, the
+drift gate's corpus excludes `docs-site/` by construction (see the
+consequence below), and no `caddy` binary is on a contributor's PATH. Every
+decision argued at length above — the three disjoint cache matchers, the
+content types, the deliberate absence of a `try_files` fallback — was
+enforced by nothing. A config that crashed the container on start and one
+that served every page `immutable` for a year were both published and
+measured green.
+
+Two guards, deliberately at different layers because they catch different
+failures:
+
+- **`caddy validate` as a build layer in `docs-site/Dockerfile`.** The
+  binary is already the base image's entrypoint, so this costs a layer and
+  turns a config the server cannot LOAD into a build failure instead of a
+  crash-loop after the push. It is a syntax and loadability check and says
+  nothing about behaviour.
+- **`scripts/docs-site-smoke.sh`, run by the release workflow between build
+  and push.** Starts the container and asserts how it ANSWERS: the four
+  probes this track has used throughout, a real `404` on an unknown path, a
+  readable plain-text `404` on a markdown twin that does not exist, and the
+  `immutable` split over **every** file under `assets/`.
+
+Two properties of the smoke script are the part worth keeping. Its probed
+URLs are **derived from the file tree inside the image** rather than
+hardcoded, so a page rename cannot turn a probe into a request for something
+that never existed — which would satisfy the 404 assertions and vacuously
+pass. And it asserts **both cache classes are non-empty** before claiming
+every member of each passed, because a theme that stopped fingerprinting (or
+started fingerprinting everything) would otherwise silently reduce one half
+of that check to a claim about the empty set.
+
+The expectations are not drawn from the side under test: the tree decides
+WHICH URLs exist, the Caddyfile decides HOW they are answered, and only the
+second is being checked.
+
+Both were shown firing before being trusted. `caddy validate` fails the build
+on a stray token, naming the file and line. The smoke script fails the
+pre-split image on the markdown-404 byte bound (40,994 bytes against a 2,000
+bound) and fails an image carrying the landing's blanket `/assets/*
+immutable` rule on all 35 undigested assets — the exact mistake the matcher
+argument above exists to prevent.
+
+The script lives under `scripts/` rather than `docs-site/` and is therefore
+**absent from the release path filter**, alongside the other gates: editing a
+check must not mint a digest and roll the public site. That is the same rule
+that carves `docs-site/apprafter/**` back out.
+
 ### A new subdomain needs no new zone and no new certificate
 
 Worth recording because every future subdomain gets the same treatment, and

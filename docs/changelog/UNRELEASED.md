@@ -67,6 +67,40 @@ patch of each phase.
   the base image's `mailcap` otherwise supplies `text/markdown`, which
   browsers offer as a download, defeating the twins' purpose.
 
+  **A missing page and a missing markdown twin get different bodies.** The
+  `.md` content-type rule matches the *request* path, so it also decorated
+  the error response: a twin that did not exist answered `404` with
+  `Content-Type: text/plain` and the rendered 40 KB HTML error page as its
+  body — measured on the built image at `/no-such-page.md`. `handle_errors`
+  now splits the two, and the markdown class gets a short plain-text
+  response a reader can actually read (170 bytes against 40,994).
+
+- **Two guards over the serving layer, which had none.** Nothing in this
+  repository read `docs-site/Caddyfile`: `just lint` does not,
+  `scripts/docs-check.sh` never looks below `docs/`, and the drift gate's
+  corpus excludes `docs-site/` by construction. A config that crashed the
+  container and one that pinned every HTML page `immutable` for a year both
+  passed every gate that existed.
+
+  - `docs-site/Dockerfile` runs
+    `caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile` as a
+    build layer. The binary is already the base image's entrypoint, so a
+    config the server cannot load is now a build failure rather than a
+    crash-loop after the push. Shown firing: a stray token appended to the
+    Caddyfile fails the build at that step with the file and line.
+  - `scripts/docs-site-smoke.sh` runs the built container and asserts how it
+    **answers**, which `caddy validate` cannot: the four probes the plan
+    specifies, a real `404` on an unknown path, a readable plain-text `404`
+    on a markdown twin that does not exist, and the `immutable` split over
+    **every** file under `assets/` rather than a sampled one. Probed URLs are
+    derived from the tree inside the image — a page rename cannot quietly
+    turn a probe into a request for something that never existed — and both
+    cache classes are asserted non-empty, so neither side's assertion can
+    pass over the empty set. Shown firing in both directions: it fails the
+    pre-fix image on the markdown-404 byte bound, and fails an image whose
+    `/assets/*` rule is the landing's blanket `immutable` on all 35
+    undigested assets.
+
 - **`docs-site/apprafter/Application.cue`** — the deployable manifest.
   `docs` in the `apprafter` namespace, two replicas, public on
   `docs.apprafter.dev`, one internal replica in `dev`. No `needs` (the site
@@ -90,6 +124,14 @@ patch of each phase.
   claim that no longer resolves against the product, a broken `llms.txt`, or
   a link into an `exclude_docs`'d page, which mkdocs reports at INFO, below
   `--strict`'s reach.
+
+  **It builds, smokes, then pushes — in that order.** `:latest` is a live
+  deployment, because the operator re-resolves it to its current digest on
+  every reconcile, so pushing and rolling the public site are one act and
+  anything checked after the push is checked after the outage. The image is
+  built with `load: true`, `scripts/docs-site-smoke.sh` probes the running
+  container, and only then does a (cache-hit) push step publish `:<sha>` and
+  `:latest`.
 
   **The filter fires when the published bytes change, and it is not a copy of
   `exclude_docs`.** The internal changelog and measurement paths are negated

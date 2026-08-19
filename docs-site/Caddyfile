@@ -82,6 +82,11 @@
 	#
 	# llms.txt and llms-full.txt need no rule: `.txt` resolves to
 	# text/plain from Go's own builtin table.
+	#
+	# This matcher is on the REQUEST path, so it also decorates the
+	# ERROR response for a `.md` that does not exist. handle_errors
+	# below splits that case back out; without the split a missing
+	# twin answers `text/plain` carrying the HTML error page.
 	@markdown path *.md
 	header @markdown Content-Type "text/plain; charset=utf-8"
 
@@ -96,8 +101,30 @@
 	# the other. A soft 404 is indexed by crawlers as a real page.
 	try_files {path} {path}/
 
+	# A missing page and a missing MARKDOWN TWIN are different failures
+	# and get different bodies. The @markdown rule above matches the
+	# request path, so it applies to the error response too: with one
+	# undifferentiated handler a fetch of a twin that does not exist
+	# answered `404` with `Content-Type: text/plain` and the rendered
+	# 40 KB HTML error page as its body — measured on the built image,
+	# `/no-such-page.md`. A reader who asked for plain text — and the
+	# twins exist precisely so a model can ask for plain text — must
+	# not be handed HTML relabelled as prose.
+	#
+	# Re-derive both halves against a running container rather than
+	# trusting this comment:
+	#
+	#   curl -sI http://localhost:8080/no-such-page.md   # 404 text/plain, short
+	#   curl -sI http://localhost:8080/no-such-page/     # 404 text/html,  the page
 	handle_errors {
-		rewrite * /404.html
-		file_server
+		@missing_twin path *.md
+		handle @missing_twin {
+			respond "404 Not Found. This site publishes a markdown twin beside every page it serves, and there is no page at this path. Fetch /llms.txt for the index of pages and their twins." 404
+		}
+
+		handle {
+			rewrite * /404.html
+			file_server
+		}
 	}
 }

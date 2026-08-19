@@ -38,6 +38,28 @@ FROM caddy:2-alpine
 COPY site /usr/share/caddy
 COPY Caddyfile /etc/caddy/Caddyfile
 
+# Fail the BUILD on a Caddyfile the server cannot load.
+#
+# Nothing else in this repository reads this file: `just lint` does not,
+# `scripts/docs-check.sh` never looks below docs/, and there is no
+# `caddy` on a contributor's PATH to run by hand. Without this layer a
+# syntax error, an unknown directive or a bad matcher ships a green
+# build and a container that exits on start — the image is only
+# exercised when it is already published and Argo CD has rolled it.
+#
+# The check costs nothing to add because the binary is already here:
+# `caddy` is the entrypoint of this base image. It parses and
+# provisions the config without binding a port, so it is safe in a
+# build sandbox. It is a SYNTAX and LOADABILITY check only — it says
+# nothing about whether the rules serve what they should, which is what
+# the smoke step in .github/workflows/release-docs.yml is for.
+#
+# Prove it fires before trusting it:
+#
+#   printf 'not a directive\n' >> docs-site/Caddyfile
+#   docker build -f docs-site/Dockerfile docs-site/   # must FAIL here
+RUN caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile
+
 EXPOSE 80
 
 # Healthcheck: hit / and expect HTTP 200.
