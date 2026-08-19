@@ -90,7 +90,23 @@ pub enum Commands {
         #[arg(long)]
         region: String,
     },
-    /// Show the diff between the desired state and what is live.
+    // Caveat-first, for the same reason as the three commands below
+    // the comment further down: the generated reference lifts the lead
+    // sentence into the overview table and the page description, so a
+    // caveat in sentence two is invisible exactly where a reader
+    // decides whether the command does what they need.
+    /// Preview infrastructure changes — NOT IMPLEMENTED, it prints
+    /// `no changes` unconditionally and never contacts the provider.
+    /// It resolves the active target (and fails when there is none),
+    /// loads that target's state file, and stops there: nothing is
+    /// compared against live infrastructure. The comparison lives in
+    /// `apprafter apply`, which lists what exists in the provider
+    /// account, creates or updates only what differs, and prints
+    /// `apply complete: N action(s)` — 0 when nothing differed. To
+    /// look without changing anything, use `apprafter target show`
+    /// (the target's recorded settings), `apprafter platform status`
+    /// (live platform components and versions) or
+    /// `apprafter app status <name>` (one workload).
     Plan,
     /// Apply the desired state.
     Apply {

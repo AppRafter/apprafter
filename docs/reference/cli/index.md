@@ -68,7 +68,7 @@ specific release rather than scraping these pages.
 | [`apprafter migration`](migration.md) | — | Inspect and approve / reject MigrationPlans. |
 | [`apprafter node`](node.md) | — | Node-level operations on the active target's cluster node. |
 | [`apprafter open`](open.md) | — | Open a platform UI (Argo CD today; Backstage, Grafana and Hubble are not wired up yet). |
-| [`apprafter plan`](plan.md) | — | Show the diff between the desired state and what is live |
+| [`apprafter plan`](plan.md) | — | Preview infrastructure changes — NOT IMPLEMENTED, it prints `no changes` unconditionally and never contacts the provider. |
 | [`apprafter platform`](platform.md) | — | Inspect and control the cluster's PlatformStack — the declarative platform-version resource managed by PlatformController |
 | [`apprafter repo`](repo.md) | — | Manage git-repo creds Argo CD uses to pull private user repos. |
 | [`apprafter restore`](restore.md) | — | Restore a backup into a target cluster: replays the CRs, secrets and native data (pg/redis/volumes) captured by `apprafter backup`. |
