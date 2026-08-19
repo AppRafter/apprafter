@@ -104,6 +104,55 @@ fn global_flags_and_hidden_commands_resolve() {
 }
 
 #[test]
+fn the_root_declares_the_help_flag_this_resolver_treats_as_global() {
+    // `knows_flag` chains ONE pair off the root for every command.
+    // Derived rather than written out — and if the derivation ever
+    // came back empty, `apprafter app add --help` above would start
+    // failing rather than passing, so the pair is proved present here
+    // from the tree itself.
+    let root = model_tree()
+        .commands
+        .into_iter()
+        .find(|c| c.path.is_empty())
+        .expect("the root binary is a node");
+    let help = root
+        .args
+        .iter()
+        .find(|a| a.long.as_deref() == Some("help"))
+        .expect("the root declares --help, or nothing is global");
+    assert_eq!(help.short, Some('h'));
+}
+
+#[test]
+fn only_help_is_global_so_a_borrowed_version_flag_is_caught() {
+    // `--version` sits beside `--help` on the root node, but clap
+    // generates it for the root ALONE. Treating the root's whole arg
+    // list as global made every command accept `--version`, which
+    // published a line the shipped binary answers with
+    // `error: unexpected argument '--version' found`.
+    let t = tree();
+    let borrowed = extract("apprafter app list --version");
+    assert_eq!(borrowed.len(), 1);
+    let error = resolve(&t, &borrowed[0])
+        .expect_err("`apprafter app list --version` is not a real invocation");
+    let shown = error.to_string();
+    assert!(shown.contains("--version"), "{shown}");
+    assert!(shown.contains("app list"), "{shown}");
+
+    // ...while the root's own `--version`, and the one command that
+    // declares its own, still resolve. Without these the fix above
+    // could be "reject `--version` everywhere" and still pass.
+    for line in [
+        "apprafter --version",
+        "apprafter platform freeze cilium --version 1.16.5",
+    ] {
+        for inv in extract(line) {
+            resolve(&t, &inv).unwrap_or_else(|e| panic!("{line} must resolve: {e}"));
+        }
+    }
+}
+
+#[test]
 fn a_bare_command_path_resolves_without_its_required_arguments() {
     // 161 of 213 inline spans are bare paths; demanding arguments would
     // fail every one, including inside docsgen's own generated output.

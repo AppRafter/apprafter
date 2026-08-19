@@ -73,8 +73,9 @@ const BINARY: &str = "apprafter";
 /// ambiguity the real tree has.
 pub struct Tree {
     nodes: Vec<model::CommandNode>,
-    /// Index of the node with the empty path. Global flags (`--help`,
-    /// `--version`) resolve against it from anywhere.
+    /// Index of the node with the empty path. It is where `apprafter
+    /// --version` resolves, and where [`Tree::global_args`] reads the
+    /// one genuinely global flag from.
     root: usize,
     /// Parallel to `nodes`: `(token, child index)` for every child of
     /// that node, under its name and under each of its aliases.
@@ -153,19 +154,42 @@ impl Tree {
         out
     }
 
-    /// Whether `flag` names a real flag of `at` — or a global one.
+    /// The flags every command accepts, wherever they are written.
     ///
-    /// The root is always consulted because `--help` / `--version` are
-    /// filtered off every other node by [`model`]: they are documented
-    /// once, globally, and the root node is that one place.
+    /// Exactly one pair: clap's generated `--help` / `-h`. [`model`]
+    /// filters it off every node but the root — it is documented once,
+    /// globally, and the root is that one place — so a resolver that
+    /// did not consult the root would reject `apprafter app list
+    /// --help`.
+    ///
+    /// **`--version` is not global**, though it sits beside `--help` on
+    /// the root node. clap generates it for the root alone, and the
+    /// only other command that has one is `apprafter platform freeze`,
+    /// which declares its own. Chaining the root's whole arg list here
+    /// made `apprafter app list --version` resolve — a documented line
+    /// the shipped binary answers with `error: unexpected argument
+    /// '--version' found`, which is the false-published-example class
+    /// this guard exists to close.
+    ///
+    /// Derived from the root rather than written out, so it cannot
+    /// claim a flag the CLI no longer has;
+    /// `the_root_declares_the_help_flag_this_resolver_treats_as_global`
+    /// in `invocation_test.rs` refuses to let it come back empty.
+    fn global_args(&self) -> impl Iterator<Item = &model::ArgSpec> {
+        self.nodes[self.root]
+            .args
+            .iter()
+            .filter(|arg| arg.long.as_deref() == Some("help"))
+    }
+
+    /// Whether `flag` names a real flag of `at` — or a global one.
     fn knows_flag(&self, at: usize, flag: &str) -> bool {
         let here = &self.nodes[at].args;
-        let global = &self.nodes[self.root].args;
         if let Some(long) = flag.strip_prefix("--") {
             let long = long.split('=').next().unwrap_or(long);
             return here
                 .iter()
-                .chain(global)
+                .chain(self.global_args())
                 .any(|arg| arg.long.as_deref() == Some(long));
         }
         let Some(shorts) = flag.strip_prefix('-') else {
@@ -175,9 +199,11 @@ impl Tree {
         // A single-dash token may bundle switches (`-rf`), which clap
         // accepts, so every character has to name a short.
         !shorts.is_empty()
-            && shorts
-                .chars()
-                .all(|c| here.iter().chain(global).any(|arg| arg.short == Some(c)))
+            && shorts.chars().all(|c| {
+                here.iter()
+                    .chain(self.global_args())
+                    .any(|arg| arg.short == Some(c))
+            })
     }
 }
 
