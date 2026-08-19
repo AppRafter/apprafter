@@ -1,3 +1,7 @@
+---
+description: "How a re-pushed mutable tag becomes a rollout with no manifest edit, how to confirm it happened, and how to opt out."
+---
+
 # Image iteration: push and it deploys
 
 When your CI re-pushes a container image under the same mutable tag

@@ -1,3 +1,7 @@
+---
+description: "Map of the developer-facing tasks — scaffolding, manifest authoring, platform services, private repositories, image iteration — and where each is documented."
+---
+
 # Developer Guide
 
 Tasks for application developers (anyone deploying an `Application`

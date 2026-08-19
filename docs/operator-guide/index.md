@@ -1,3 +1,7 @@
+---
+description: "Map of the operator-facing tasks — provisioning, the target store, tier upgrades, day-2 work, recovery — and what is documented today."
+---
+
 # Operator Guide
 
 > **Status:** Track A (M1.5 Phase 1.5) CLI rework is closed —

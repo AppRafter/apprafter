@@ -44,13 +44,34 @@
 //! nothing. The same rule keeps a `description:` holding a backtick (as
 //! the generated pages' do) from being checked as a command.
 //!
-//! Three in-scope files carry front matter. `docs/reference/environment.md`
-//! predates the gate and holds no backticks; the other two
-//! (`docs/dev-guide/application-cue.md`,
-//! `docs/operator-guide/node-prep.md`) carry exemption lists whose
-//! values quote the literal text they exempt — which is precisely the
-//! shape that would exempt nothing if front matter were scanned as
-//! prose.
+//! Front matter is now the norm rather than the exception: **32 of the
+//! 33 in-scope pages carry it**, the one hold-out being the root
+//! `README.md`, which is not a site page and so has no `llms.txt` index
+//! entry to fill. Two shapes live in there, and both depend on this
+//! rule:
+//!
+//! * **Exemption lists**, on `docs/dev-guide/application-cue.md` and
+//!   `docs/operator-guide/node-prep.md`, whose values quote the literal
+//!   text of the span or path they exempt. This is the shape that would
+//!   exempt nothing at all if front matter were scanned as prose.
+//! * **`description:` lines**, one per page since 2.19e, feeding the
+//!   `llms.txt` index and the page's own meta description. **2** of the
+//!   in-scope ones hold a backticked command today
+//!   (`docs/contributing/documentation-gate.md`,
+//!   `docs/operator-guide/node-prep.md`), as every generated page's
+//!   description does — a page summary naming a command is not the page
+//!   claiming that command exists, and masking is what keeps the two
+//!   apart.
+//!
+//! Both counts re-derive; neither is quoted from memory:
+//!
+//! ```text
+//! in=$(git ls-files -- 'docs/*.md' README.md |
+//!      grep -vE '^docs/(adr|changelog|measurements|reference/cli)/')
+//! echo "$in" | wc -l                    # 33 — in-scope pages
+//! echo "$in" | xargs -n1 head -1 |
+//!     grep -cx -- ---                   # 32 — of which carry front matter
+//! ```
 
 use crate::render::DIR;
 use std::error::Error;

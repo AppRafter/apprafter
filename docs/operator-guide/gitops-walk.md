@@ -1,3 +1,7 @@
+---
+description: "Wiring a bootstrap repository end to end, for each combination of GitHub or GitLab and public or private."
+---
+
 # AppRafter GitOps walk — bootstrap from Git
 
 This guide walks a cluster operator through wiring `spec.argocd.bootstrapRepo`

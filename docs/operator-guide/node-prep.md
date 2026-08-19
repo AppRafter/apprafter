@@ -1,4 +1,5 @@
 ---
+description: "Why a Tier-1 node needs control-plane headroom and host swap, what `apprafter node prep` applies, and how to read the resulting posture."
 cli-check-ignore:
   - span: "apprafter node reserve-headroom"
     reason: historical

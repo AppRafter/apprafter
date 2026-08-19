@@ -1,3 +1,7 @@
+---
+description: "Watching a declared Redis dependency all the way through, including the per-claim logical-database isolation on a shared Dragonfly pool."
+---
+
 # needs.redis manual walk — Redis from a declared dependency
 
 This guide walks a Tier-1 operator through the full `needs.redis` chain:

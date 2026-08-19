@@ -1,3 +1,7 @@
+---
+description: "Watching a declared Postgres dependency all the way through: claim, provisioning, credential binding, and the grace window after removal."
+---
+
 # needs.pg manual walk — Postgres from a declared dependency
 
 This guide walks a Tier-1 operator through the full `needs.pg` chain:

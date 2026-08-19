@@ -1,3 +1,7 @@
+---
+description: "The on-disk layout of target configuration, the credential resolution chain, and the multi-target patterns operators actually use."
+---
+
 # Target store reference
 
 > Reference companion to [`quickstart.md`](./quickstart.md). The

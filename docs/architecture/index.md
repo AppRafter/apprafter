@@ -1,3 +1,7 @@
+---
+description: "Outline of the layers the platform is built from, and where to read each one until the full chapter is written."
+---
+
 # Architecture
 
 > **Status:** stub. Full TechDocs migration of the architecture

@@ -1,3 +1,7 @@
+---
+description: "The once-per-cluster preparation and the per-zone steps that put an application behind Cloudflare on HTTPS."
+---
+
 # Connect a domain (public ingress)
 
 This is the end-to-end runbook for serving an application on a public domain

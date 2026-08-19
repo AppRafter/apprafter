@@ -1,3 +1,7 @@
+---
+description: "Three ways to get a working toolchain — Nix flake, dev container, manual install — and the bootstrap and local-cluster steps that follow."
+---
+
 # Local development setup
 
 > **TL;DR.** Pick **one** of the three install paths below, then run

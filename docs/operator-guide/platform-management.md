@@ -1,3 +1,7 @@
+---
+description: "How the platform upgrades itself — the PlatformStack resource, channels and pins, component freezes, and the CLI that edits them."
+---
+
 # Platform management
 
 AppRafter manages the platform stack — Cilium, cert-manager, the

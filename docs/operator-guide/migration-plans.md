@@ -1,3 +1,7 @@
+---
+description: "What the platform treats as a destructive change, how it pauses one behind an approval, and the CLI that approves it."
+---
+
 # Migration plans
 
 A `MigrationPlan` is a declarative resource that gates destructive

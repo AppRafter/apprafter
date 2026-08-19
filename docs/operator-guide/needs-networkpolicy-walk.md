@@ -1,3 +1,7 @@
+---
+description: "How a declared dependency is also what opens the egress path to it, how to watch an undeclared reach get dropped, and the cluster-wide profile knob."
+---
+
 # needs.networkpolicy manual walk — egress gated by declared dependencies
 
 This guide walks a Tier-1 operator through the `needs`-derived egress

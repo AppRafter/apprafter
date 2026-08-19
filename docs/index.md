@@ -1,3 +1,7 @@
+---
+description: "Where to start: the four hardware tiers, what each section of this site covers, and where the specification of record lives."
+---
+
 # AppRafter
 
 **Opinionated, vertically-integrated Platform-as-a-Service on

@@ -1,3 +1,7 @@
+---
+description: "Which SPDX identifier each directory takes, the comment syntax per language, and how generated and vendored files are handled."
+---
+
 # SPDX License Headers
 
 Every source file in this repository must declare its license via an

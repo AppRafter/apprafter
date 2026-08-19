@@ -1,3 +1,7 @@
+---
+description: "Watching a declared persistent-disk dependency all the way through, including the single-writer constraints it puts on the workload."
+---
+
 # needs.disk manual walk — persistent disk from a declared dependency
 
 This guide walks a Tier-1 operator through the full `needs.disk` chain: an

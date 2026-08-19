@@ -1,3 +1,7 @@
+---
+description: "Index of the contributor-facing documents and what each one covers."
+---
+
 # docs/contributing/
 
 Contributor-facing documents:

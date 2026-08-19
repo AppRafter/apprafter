@@ -1,4 +1,5 @@
 ---
+description: "Field-by-field guide to the CUE manifest that describes an application — image, expose, resources, needs, and per-environment overrides."
 schema-check-ignore:
   - path: "spec.source.path"
     reason: external-tool

@@ -1,3 +1,7 @@
+---
+description: "What the export and backup commands each capture, where it lands, and how a backup is replayed into a running cluster."
+---
+
 # Backup, export, and restore
 
 AppRafter ships a local-pull backup and restore engine built on

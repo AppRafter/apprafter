@@ -1,3 +1,7 @@
+---
+description: "Catalogue of the diagnostic codes the CLI emits, what each one means, and the exact command to run next."
+---
+
 # Troubleshooting
 
 > Catalogue of `apprafter::<area>::<reason>` diagnostic codes,

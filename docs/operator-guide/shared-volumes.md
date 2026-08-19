@@ -1,3 +1,7 @@
+---
+description: "When several applications in one namespace should share a directory, how to declare and manage that, and when to reach for an owned disk instead."
+---
+
 # Shared volumes — cross-app persistent storage
 
 A `SharedVolume` is a named, platform-managed PVC that multiple Applications

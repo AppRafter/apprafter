@@ -1,3 +1,7 @@
+---
+description: "The whole developer path in one session: register a target, ship an application, and serve it on a public domain through Cloudflare."
+---
+
 # Quickstart
 
 This walkthrough is the full developer path on AppRafter: from

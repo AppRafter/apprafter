@@ -1,3 +1,7 @@
+---
+description: "The two authentication surfaces a private application touches — Argo CD's repository clone and the node's image pull — and the single credential that covers both."
+---
+
 # Private repos & registries
 
 Shipping a private app touches **two distinct authentication

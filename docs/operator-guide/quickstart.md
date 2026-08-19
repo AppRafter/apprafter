@@ -1,3 +1,7 @@
+---
+description: "Three CLI steps from a blank Hetzner account to a self-managing cluster, and what each piece of the Tier-1 baseline is."
+---
+
 # Operator quickstart
 
 You are a cluster operator standing up AppRafter on Hetzner Cloud.

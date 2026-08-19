@@ -1,3 +1,7 @@
+---
+description: "What reference material is published today, what is still only source of truth in the repository, and which surface is canonical for each question."
+---
+
 # Reference
 
 Field-by-field reference for everything the platform exposes:

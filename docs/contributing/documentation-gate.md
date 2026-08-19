@@ -1,3 +1,7 @@
+---
+description: "What `just lint` checks in every documentation page, how to read a finding, and how to exempt a line that cannot be fixed."
+---
+
 # The documentation drift gate
 
 `just lint` runs `docsgen gate`, which resolves what the documentation

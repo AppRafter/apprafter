@@ -1,3 +1,7 @@
+---
+description: "Getting back into a VM that no longer answers SSH, via Hetzner Rescue Mode, and when to rebuild instead."
+---
+
 # Recovery and emergency console access
 
 When the AppRafter VM becomes unreachable over SSH (cloud-init

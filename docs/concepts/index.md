@@ -1,3 +1,7 @@
+---
+description: "The AppRafter object model at a glance — which custom resource each role owns, and the order to read them in."
+---
+
 # Concepts
 
 > **Status:** stub. Each concept gets its own page in phase 8.2.

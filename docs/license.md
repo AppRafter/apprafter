@@ -1,3 +1,7 @@
+---
+description: "Which license covers which part of the repository, how the two-year FSL conversion works, and the history the base-license migration left behind."
+---
+
 # License history and conversion model
 
 This page describes the AppRafter licensing landscape: which license

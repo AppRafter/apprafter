@@ -1,3 +1,7 @@
+---
+description: "Minting the origin certificate Cloudflare's edge trusts, importing it into the cluster, and rotating it."
+---
+
 # Cloudflare Origin CA certificate
 
 AppRafter's public ingress terminates TLS at the cluster Gateway using a
