@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+#
+# Minimal Caddy config baked into the docs container image.
+# The container exposes :80; the platform Gateway in front of it adds
+# TLS and the public hostname (docs.apprafter.dev).
+#
+# Trailing-slash URLs are what MkDocs generates (`use_directory_urls`
+# defaults to true, and mkdocs.yml does not override it), so every page
+# is `<dir>/index.html` reached as `/<dir>/`. The extensionless form
+# (`/operator-guide/postgres`) resolves too, via file_server's
+# canonical 308 to the slashed form — measured, not assumed.
+#
+# Everything below was derived from a real build, not copied from
+# landing/web/Caddyfile — the two sites emit different shapes. Rebuild
+# and re-check after a theme bump:
+#
+#   nix develop --command mkdocs build --strict --site-dir docs-site/site
+
+:80 {
+	root * /usr/share/caddy
+	file_server
+	encode gzip zstd
+
+	# ---- cache policy ------------------------------------------------
+	#
+	# MkDocs-Material content-hashes only SOME of what it writes under
+	# /assets/. The theme bundle, the search worker and the two
+	# stylesheets carry an 8-hex digest in the filename; the lunr
+	# language stemmers and the theme favicon do not. Re-derive the
+	# split — do not trust a count written here:
+	#
+	#   find docs-site/site/assets -type f |
+	#       grep -E  '\.[0-9a-f]{8}\.min\.(css|js)(\.map)?$'   # pinned
+	#   find docs-site/site/assets -type f |
+	#       grep -Ev '\.[0-9a-f]{8}\.min\.(css|js)(\.map)?$'   # not pinned
+	#
+	# So the landing's shape — a blanket `/_astro/*` immutable rule,
+	# correct there because Astro hashes every name it emits — must NOT
+	# be transliterated to `/assets/*` here. It would pin the stemmers
+	# and the favicon for a year, and a theme upgrade that changed them
+	# would reach nobody who had already loaded the old ones.
+	@fingerprinted path_regexp \.[0-9a-f]{8}\.min\.(css|js)(\.map)?$
+	header @fingerprinted Cache-Control "public, max-age=31536000, immutable"
+
+	# The theme's stable-named assets: the bytes change with the theme
+	# version, the URL does not, so they get a revalidation window
+	# rather than a pin.
+	@theme_stable path /assets/images/* /assets/javascripts/lunr/*
+	header @theme_stable Cache-Control "public, max-age=86400"
+
+	# Everything outside /assets/ is content: the HTML, the markdown
+	# twins, llms.txt, llms-full.txt, search/search_index.json,
+	# sitemap.xml and the images pages reference. Every one of those is
+	# a stable URL republished with new bytes on each docs release, and
+	# the search index in particular must not outlive the pages it
+	# indexes. Five minutes is the window between shipping a correction
+	# and a returning reader seeing it.
+	@content not path /assets/*
+	header @content Cache-Control "public, max-age=300"
+
+	# Anything that is under /assets/ but matches neither rule above —
+	# a future theme emitting a new directory, or changing its digest
+	# length — deliberately falls through with no Cache-Control at all.
+	# That under-caches; the alternative failure is a year-long pin on
+	# a mutable URL, which cannot be undone from the origin.
+
+	# ---- content types -----------------------------------------------
+	#
+	# docs/hooks/llm_export.py writes a markdown twin beside every page
+	# (`<page>.md` next to `<page>/index.html`) so a reader — human or
+	# model — can fetch the source instead of scraping HTML. Measured:
+	# caddy:2-alpine serves those as `text/markdown; charset=utf-8`,
+	# which browsers have no inline renderer for and so offer as a
+	# download, defeating the point.
+	#
+	# That type is not Caddy's either. It comes from /etc/mime.types,
+	# shipped by the base image's alpine `mailcap` package — an input
+	# this repository does not pin and does not test. Without the file
+	# Go's mime table has no .md entry at all and the type would come
+	# from content sniffing. Both paths are outside our control, so the
+	# type is set here explicitly.
+	#
+	# llms.txt and llms-full.txt need no rule: `.txt` resolves to
+	# text/plain from Go's own builtin table.
+	@markdown path *.md
+	header @markdown Content-Type "text/plain; charset=utf-8"
+
+	# ---- routing -----------------------------------------------------
+	#
+	# NOTE the absence of a `/404.html` fallback inside try_files. The
+	# landing's Caddyfile has one, and it makes every unknown URL answer
+	# 200 with the 404 page body — try_files rewrites to a file that
+	# exists, so file_server has nothing to fail on. Letting file_server
+	# 404 and catching it in handle_errors is what preserves the status;
+	# measured, /no-such-page/ answers 404 with this form and 200 with
+	# the other. A soft 404 is indexed by crawlers as a real page.
+	try_files {path} {path}/
+
+	handle_errors {
+		rewrite * /404.html
+		file_server
+	}
+}

@@ -33,7 +33,13 @@ cue.out/
 __pycache__/
 *.py[cod]
 
-# MkDocs build output
+# MkDocs build output. The pattern has no leading or interior slash, so
+# git applies it at every level: it covers both the repo-root `site/`
+# that a bare `mkdocs build` writes and `docs-site/site/`, which the
+# release workflow builds into the image's context. Verify rather than
+# assume, before adding a second rule:
+#
+#   git check-ignore -v docs-site/site/index.html
 site/
 
 # OS artefacts
