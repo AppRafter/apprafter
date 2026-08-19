@@ -9,6 +9,159 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## docs (no release) — 2.19f information architecture: the site's structure and URLs settled before publication (2026-08-19)
+
+> **No version bump and no monorepo tag, and the answer is recorded rather
+> than assumed.** `cli/platform-cli` was not touched at any point in this
+> subphase, so `apprafter --help` is byte-identical and the byte-compared
+> `docs/reference/cli/commands.json` did not move. The only Rust edits are
+> comments inside `cli/docsgen` — a build-time crate that ships in no release
+> artefact — which cited pages this subphase renamed.
+>
+> Had a help string changed, the convention would still not have called for a
+> bump here: `cli/Cargo.toml`'s version is bumped to match a **released tag**
+> in the commit that cuts it, and docs-only work carries no tag. The
+> precedent is in this same track: 2.19b's doc-comment audit rewrote help
+> text across the clap tree — three commands whose comments read as if they
+> worked, flags carrying no help at all, a `--no-ping` claim false in both
+> halves, and an internal Rust field name published as a manifest key — and
+> the commits that did it (`33d8eb4`, `f2f14ce`) touched `cli/Cargo.toml` in
+> neither case. What a help-text change *does* require is regenerating
+> `commands.json` in the same commit, which the gate enforces.
+>
+> Sixth of the documentation track's ten subphases — branch
+> `feat/2.19f-information-architecture`, **ADR 0057** (see its 2.19f
+> amendment for the redirect decision, the known gaps, and the three plan
+> measurements that did not reproduce).
+>
+> **This was the last subphase in which moving a page was free.** After
+> publication every page move costs a redirect entry, and any move that
+> crosses into a GitHub blob URL costs a README edit no redirect can
+> substitute for.
+
+### Changed
+
+- **The documentation stopped addressing people inside the project.**
+  Internal roadmap coordinates ("this chapter happens in phase 8.2"), a
+  subphase code, and pointers into `spec.md` are gone from the site's pages.
+  Each was judged individually rather than substituted wholesale: a clause a
+  reader cannot act on was deleted or restated in reader terms, never swapped
+  for a different internal coordinate. Where the repository's specification
+  genuinely is the answer, the citation is now an absolute GitHub URL **and
+  the sentence says it is the roadmap**, so a reader knows they are leaving
+  the documentation for a document that names capabilities which do not exist
+  yet.
+
+  Three passages turned out not to be roadmap leaks at all: the "Phase 1 / 2 /
+  3" comments in the quickstart were `bootstrap-all`'s own step numbers, and
+  the command prints `[1/3] apply`, `[2/3] k3s-ready`, `[3/3] bootstrap`. The
+  pages now quote what the user actually sees.
+
+- **Five guides are named for what a reader gets, and their URLs are now
+  permanent.** "walk" is this repository's word for an end-to-end
+  verification script (`e2e/needs-pg-walk.sh`); on the site it was a title
+  and a URL a reader had no way to interpret.
+
+  | Was | Is |
+  |---|---|
+  | `operator-guide/gitops-walk` | `operator-guide/connect-a-git-repository` |
+  | `operator-guide/needs-pg-walk` | `operator-guide/postgres` |
+  | `operator-guide/needs-redis-walk` | `operator-guide/redis` |
+  | `operator-guide/needs-disk-walk` | `operator-guide/persistent-disk` |
+  | `operator-guide/needs-networkpolicy-walk` | `operator-guide/egress-policy` |
+
+  The `e2e/*-walk.sh` scripts keep their names: that is what ships, and the
+  word is correct there. What was wrong was borrowing it for a reader.
+
+- **`Public ingress` folded into the operator guide**, directory as well as
+  nav slot — both pages are `apprafter target …` work on cluster-owned
+  resources, and leaving them under `/public-ingress/` while listing them
+  under Operator Guide is exactly the mismatch this subphase existed to
+  settle.
+
+- **The navigation is six top-level entries instead of nine**, and the
+  licence page and contributing index moved off the `not_in_nav` allow-list
+  into real nav positions — a visitor looks for the licence by name, and it
+  was findable only by search.
+
+- **`docs/reference/index.md` now lists the custom resources**, with a column
+  separating the three the platform generates from the five a person authors.
+
+### Removed
+
+- **Two stub sections.** `architecture/index.md` and `concepts/index.md` each
+  opened with "**Status:** stub", pointed the reader at a file the site does
+  not carry, and held two of nine top-level nav slots — the first two things
+  a visitor arriving from the landing page would have clicked. A page that
+  exists only to say it does not exist yet costs a click and returns nothing.
+
+  **The one table worth salvaging was re-derived, not moved.** The design
+  called for moving the CRD-to-owner table on the stated ground that it "is
+  true today". Checked against the CRDs the operator's Helm chart installs,
+  it was not: it named four objects that ship no CRD at all — including
+  `Infrastructure`, which is not a cluster object in any phase but the local
+  manifest the CLI parses — and omitted four that do ship. The table's shape
+  moved; its rows come from the chart templates and each purpose from that
+  schema's CUE docstring. Moving it unchanged would have promoted a stub's
+  error into reference material.
+
+### Deliberately not built
+
+- **The redirect map.** ADR 0057 named one, and there is nothing to redirect
+  from: no URL this site serves has ever been public. The site is
+  unpublished, no workflow publishes it, `docs.apprafter.dev` appears in no
+  deployable source, and the landing page renders a "Soon" badge from an
+  empty `docsUrl`. An entry would map a URL nobody has ever held onto one
+  nobody can yet reach.
+
+  **The trigger is explicit: the first page that moves after publication
+  needs an entry**, and `mkdocs-redirects` is already in the flake's python
+  environment, so adding it is a config block rather than a dependency
+  change. One class of URL *was* public and no redirect map could ever serve
+  it — `README.md`'s relative links into `docs/` are GitHub blob URLs, and
+  the only remedy there is editing the README in the same commit as the
+  rename, which is what happened.
+
+- **The contributor/user split** ADR 0057's deferred bullet called for.
+  Measurement says there is nothing to split: every one of those pages is
+  `apprafter`-command-dominated and describes a task a cluster owner
+  performs. They were never contributor material — the *vocabulary* was, and
+  removing that is what this subphase did instead.
+
+### Notes
+
+- **What made the renames safe is the strict build, not the census.** Every
+  counter in `docs/measurements/docs-health.json` is a total, so seven
+  renames left `pages` unmoved: a rename and a deletion are indistinguishable
+  to it. `mkdocs build --strict` with link **and** anchor validation is what
+  fails on the first inbound link or heading anchor a rename breaks, naming
+  both ends.
+
+- **The census caught one real loss and it was fixed rather than
+  re-recorded.** Rewriting the operator index's guide list deleted a
+  `needs.pg` identifier along with the link text it sat inside, and
+  `identifiers` came back one under its floor. The claim went back — better
+  placed, naming the field behind each of the three dependency guides — and
+  the recorded counts moved to `pages` 34 → 32 (the two deletions) and
+  `identifiers` 236 → 238. No other counter moved.
+
+- **Three of the plan's per-item measurements did not reproduce**, and are
+  corrected rather than adjusted away: a `plan.md` reference said to live in
+  a clap doc comment is a markdown link target for the `apprafter plan`
+  command page (`grep -c 'plan.md' commands.json` is 0, and `apprafter
+  --help` contains no such string); the CRD table said to be "true today" was
+  wrong in both directions; and the inbound-link count was low by nearly
+  half, because the obvious grep cannot see same-directory relative links.
+  The corpus-wide counters all reproduced exactly — it was the claims about
+  *content* that did not.
+
+- **Three gaps are recorded rather than papered over**: the site now has no
+  conceptual page at all (its entire conceptual explanation is a table on a
+  reference page — more honest than two apologies in prime nav position, and
+  less than 2.19g's landing link will imply); `Infrastructure` is named on
+  the reference page and documented nowhere; and the operator guide is
+  seventeen pages in one flat list. All three belong to the content subphase.
+
 ## docs tooling (no release) — 2.19e build hooks: CUE highlighting and an LLM-readable corpus (2026-08-19)
 
 > No version bump and no monorepo tag: `cli/Cargo.toml` is untouched, no

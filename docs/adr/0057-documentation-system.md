@@ -20,11 +20,13 @@ work and the guide content — are decided here but **not implemented**. Each
 such decision is marked at the point it is stated. **Those marks record the
 world on the day this was ratified and are deliberately not rewritten as
 subphases land** — an ADR describes a decision as it was made. This paragraph
-is the pointer to what has happened since: **2.19c, 2.19d and 2.19e have
-shipped**, so the "not yet implemented" marks on decisions 1, 6 and 7 are
-history rather than status. The amendments below record what each delivered
-and — the part worth reading — the decisions this document made that
-measurement then overturned.
+is the pointer to what has happened since: **2.19c, 2.19d, 2.19e and 2.19f
+have shipped**, so the "not yet implemented" marks on decisions 1, 6 and 7 are
+history rather than status, and decision 8's closing promise — that the
+information-architecture restructure lands before publication — has been kept,
+though publication itself has not happened. The amendments below record what
+each delivered and — the part worth reading — the decisions this document made
+that measurement then overturned.
 
 No release rides this decision so far: shipped CLI behaviour is unchanged (a
 lib target plus doc-comment corrections), no chart, operator or cue-cmp
@@ -752,6 +754,173 @@ has already been burned by once.
   than quietly bumped — a permanent record stating a measurement that does
   not re-derive is the defect this ADR exists to remove.)
 
+## Amendment — 2.19f (information architecture) as delivered, 2026-08-19
+
+Decision 8 closed with a sentence that has now been paid: *the
+information-architecture restructure lands **before** publication, so URLs do
+not churn under a live link from the landing page.* This amendment records
+what moved, and — the part worth reading — the one thing this document named
+that measurement then said not to build.
+
+No release and no monorepo tag rides it. `cli/Cargo.toml` is untouched, no
+chart, operator or cue-cmp artefact moved, and **nothing under
+`cli/platform-cli` changed at all**, so `apprafter --help` and the
+byte-compared `commands.json` are both untouched. The only Rust edits are
+comments inside `cli/docsgen` that cited pages this subphase renamed — a
+comment naming a file that no longer exists is the defect class this whole
+system gates for, so they moved with the files.
+
+### The redirect map was not built, and its trigger is recorded instead
+
+R5's mitigation names "a committed redirect map", and the Deferred bullet
+below names one too. There is nothing to redirect **from**.
+
+No URL this site serves has ever been public. The site is unpublished, no
+workflow publishes it, `docs.apprafter.dev` appears in no deployable source
+(only in this ADR, `plan.md` and `FEATURE_TRACKER.md`), and the landing page
+renders a "Soon" badge from an empty `docsUrl`. A redirect entry would
+therefore map a URL nobody has ever held onto one nobody can yet reach:
+machinery for no user, which is the shape this track has refused at every
+previous opportunity — the staleness gate, the typed `verified-by` bindings,
+`since` in front matter and the `<llm-only>` tags are all the same call, each
+recorded with the measurement behind it in the amendments above.
+
+**The trigger is explicit — the first page that moves after 2.19g publishes
+needs an entry.** `mkdocs-redirects` is already in the flake's python
+environment, so adding it is a config block in `mkdocs.yml`, not a dependency
+change. This is a recorded decision with a measured reason and a named
+trigger, not an oversight; a future reader finding the plugin installed and
+unconfigured is looking at that decision, not at a gap.
+
+One class of URL *was* public, and no redirect map could ever have served it:
+`README.md`'s relative links into `docs/` are GitHub blob URLs, served by
+GitHub out of the repository tree, where an MkDocs plugin has no reach. The
+only remedy for those is editing the README in the same commit as the rename,
+which is what this subphase did.
+
+**And what made the renames safe is not the census.** Every counter in
+`docs/measurements/docs-health.json` is a total, so seven renames left `pages`
+unmoved — to the census a rename and a deletion are indistinguishable. What
+distinguishes them is `mkdocs build --strict` with link **and anchor**
+validation, which fails on the first inbound link or heading anchor a rename
+breaks, naming both ends. The link validator, not the census, is what makes a
+URL change reviewable, and it is the reason a subphase of this shape could be
+executed at all.
+
+### Delivered
+
+- **The documentation stopped addressing people inside the project.**
+  Internal roadmap coordinates ("in phase 8.2"), subphase codes and pointers
+  into `spec.md` were rewritten in reader terms, or deleted where the sentence
+  was already complete without them. Where the specification genuinely is the
+  answer, the citation is now an absolute GitHub URL **and the sentence says
+  it is the repository's roadmap**, so a reader knows they are leaving the
+  documentation.
+
+  ```sh
+  # 25 at fa3472e, 7 at the close of 2.19f
+  git ls-files -- 'docs/*.md' \
+    | grep -vE '^docs/(adr|changelog|measurements|superpowers)/' \
+    | xargs grep -nEi '\bphase [0-9]|\b[0-9]+\.[0-9]+[a-z]\b|\bplan\.md\b|\bspec\.md\b'
+  ```
+
+  The seven that remain are deliberate and each is a different thing: four
+  are the absolute-URL specification citations just described; one is
+  `contributing/documentation-gate.md` naming `spec.md` as a **repository
+  path** in a table of paths the gate excludes, where an https link would
+  make the page describe its own scope in terms it does not use; and two are
+  the generated reference's link targets for the `apprafter plan` command
+  page, which is a real page named after a real command. The last two are a
+  standing false positive of the pattern, not a leak — recorded here so the
+  next reader does not go hunting for a clap doc comment that does not exist.
+
+  The command deliberately scopes to `docs/`. `README.md` is in the gate's
+  corpus but is not a site page, and its roadmap references resolve for its
+  reader: someone on the repository's front page can open `plan.md`.
+
+- **Two stub sections retired.** `architecture/index.md` and
+  `concepts/index.md` each opened with "**Status:** stub" and pointed at a
+  file the site does not carry, while holding two of nine top-level nav slots.
+  Both were deleted rather than resolved in place: a page that exists only to
+  say it does not exist yet costs a click and returns nothing.
+
+- **The one table worth salvaging was re-derived, not moved.** The design
+  called for moving the concepts page's CRD-to-owner table to
+  `docs/reference/index.md` on the stated ground that it "is true today". It
+  was not: checked against the CRDs the operator's Helm chart installs, it
+  named four objects that ship no CRD at all — `AccessGrant`,
+  `ExternalSurface`, `ServiceProviderPlugin` and `Infrastructure`, the last of
+  which is not a cluster object in any phase but the local manifest the CLI
+  parses — and omitted four that do ship. What moved is the table's *shape*;
+  the rows come from the chart templates and each purpose from that schema's
+  CUE docstring. Moving it unchanged would have promoted a stub's error into
+  reference material.
+
+- **Seven pages renamed, and `Public ingress` folded into the operator
+  section.** "walk" is this repository's word for an end-to-end verification
+  script (`e2e/needs-pg-walk.sh`); on the site it was a title and a URL a
+  reader has no way to interpret. The pages are now named for what a reader
+  gets. The two public-ingress pages moved directory as well as nav slot,
+  because leaving them under `/public-ingress/` while listing them under
+  Operator Guide is exactly the mismatch this subphase exists to settle. The
+  nav is down from nine top-level entries to six, and `license.md` and
+  `contributing/README.md` came off the `not_in_nav` allow-list into real nav
+  positions — the licence in particular is a page visitors look for by name.
+
+- **The `e2e/*-walk.sh` scripts keep their names.** That is what ships, the
+  gate's `code_paths` floor resolves them, and the word is correct there. What
+  was wrong was borrowing it for a reader.
+
+### What the Deferred bullet said and did not happen
+
+The bullet names "splitting the contributor walks from the user guides".
+**That split was not made, because measurement says there is nothing to
+split.** Every one of those pages is `apprafter`-command-dominated and
+describes a task a cluster owner performs; the one page with more `kubectl`
+than `apprafter` is the Git-repository guide, which is still a user task. They
+were never contributor material. What was contributor-shaped was the
+*vocabulary*, and removing that is what this subphase did instead. The
+operator/developer axis — who owns the cluster versus who ships an app — was
+measured to hold and was kept.
+
+### Known gaps, recorded rather than papered over
+
+Each of these is a real hole this subphase opened or left open, named here so
+the next subphase can decide rather than discover.
+
+- **There is no conceptual page.** Retiring both stubs means the site's entire
+  conceptual explanation is now a table on a reference page. That is more
+  honest than two apologies in prime nav position, and it is less than 2.19g's
+  landing-page link will imply. A "what is this" page belongs to the content
+  subphase, and a third stub is not an answer.
+- **`Infrastructure` is now named on the reference page and documented
+  nowhere.** No guide walks the local manifest; the nearest published surface
+  is the `APPRAFTER_MANIFEST` row in `docs/reference/environment.md`. A reader
+  who wants to write one has nowhere to go — a 2.19i guide.
+- **The operator guide is seventeen pages in one flat list**, the longest
+  section on the site, with no grouping between setting a cluster up, exposing
+  it, giving an application a dependency, and day-2 work. Not a defect, and
+  deliberately not fixed here: this subphase's remit was to settle URLs, not
+  to import a documentation framework.
+
+### Consequences
+
+- **The URLs are settled, and this was the last subphase in which moving one
+  was free.** After 2.19g every page move costs a redirect entry, and any move
+  that crosses to a GitHub blob URL costs a README edit that no redirect can
+  substitute for.
+- **A page rename is a `mkdocs --strict` problem, not a grep problem.** The
+  measured inbound-link count for the renames was wrong by nearly half —
+  same-directory relative links are invisible to the obvious grep — and the
+  strict build is what found the remainder. Trust the build; use the grep to
+  start.
+- **The census caught one real loss and was not re-recorded around it.**
+  Rewriting a page's reference list deleted a schema identifier along with the
+  link text it sat inside; `identifiers` came back one below its floor, and
+  the fix was to put the claim back, better placed, rather than to lower the
+  number. That is the counter working exactly as decided in the 2.19d
+  amendment.
+
 ## Alternatives considered
 
 - **Port the site to VitePress or Astro Starlight.** Rejected. The 93 existing
@@ -827,7 +996,10 @@ has already been burned by once.
   dropped and deferred on measurement.)*
 - **The information-architecture restructure** — nav rebuild, splitting the
   contributor walks from the user guides, and a redirect map. Sequenced
-  immediately before publication so URLs settle once.
+  immediately before publication so URLs settle once. *(Delivered in 2.19f —
+  see the amendment above for the vocabulary sweep and the renames, for why
+  the contributor/user split was **not** made, and for the measured reason the
+  redirect map was not built together with the trigger that will require it.)*
 - **Publication** — image, Caddy configuration, release workflow with a
   negated path filter, `Application.cue`, DNS zone, and the landing switch.
   Blocked on the restructure by design.
