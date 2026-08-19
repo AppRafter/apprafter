@@ -14,6 +14,14 @@
 //! and assertion A alone cannot see it (it only looks at files it
 //! expects).
 //!
+//! Assertion C (examples resolve): every worked example in the rendered
+//! tree resolves against the clap tree — path and flag names, through
+//! the same resolver `docsgen gate` uses on hand-written prose. A and B
+//! are both byte-compares, so neither can see a *wrong* example: it
+//! renders identically on both sides. And `docsgen gate` excludes this
+//! tree precisely because A owns it, so the resolver never reaches one.
+//! See [`crate::examples`] for the full argument.
+//!
 //! `operator/crdgen/src/check.rs` is the precedent; the diagnostic
 //! shape (first differing line, committed vs generated) is deliberately
 //! the same, because a contributor who has seen one gate should
@@ -34,12 +42,19 @@ const REGENERATE: &str = "regenerate with `just docsgen-generate` (the clap tree
 /// actually present.
 const DELETE: &str = "delete the stray file(s) — each line gives the `git rm`";
 
+/// The remedy for an example that does not resolve. Regenerating cannot
+/// help: the page already matches the source, and the source is wrong.
+const FIX_EXAMPLE: &str =
+    "fix the example in `cli/platform-cli/src/examples.rs` against `apprafter --help`";
+
 /// Byte-compare the committed CLI reference against a fresh render of
-/// `root_cmd`. Every artefact is compared before reporting, so one run
-/// surfaces the whole drift rather than one file per iteration.
+/// `root_cmd`, and resolve every example in it. Every artefact is
+/// compared before reporting, so one run surfaces the whole drift
+/// rather than one file per iteration.
 pub fn check(root_cmd: &Command, repo_root: &Path) -> Result<(), Box<dyn Error>> {
     let rendered = render_all(root_cmd, repo_root);
     let mut problems = Vec::new();
+    let mut drift = 0usize;
     let mut strays = 0usize;
 
     // Assertion A — every rendered artefact matches the committed file.
@@ -48,13 +63,18 @@ pub fn check(root_cmd: &Command, repo_root: &Path) -> Result<(), Box<dyn Error>>
         match std::fs::read_to_string(&artefact.path) {
             Ok(committed) => {
                 if let Some(diff) = first_diff(&committed, &artefact.text) {
+                    drift += 1;
                     problems.push(format!("[A drift] {shown}\n      {diff}"));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                drift += 1;
                 problems.push(format!("[A missing] {shown}: generated but not committed"));
             }
-            Err(e) => problems.push(format!("[A unreadable] {shown}: {e}")),
+            Err(e) => {
+                drift += 1;
+                problems.push(format!("[A unreadable] {shown}: {e}"));
+            }
         }
     }
 
@@ -71,23 +91,45 @@ pub fn check(root_cmd: &Command, repo_root: &Path) -> Result<(), Box<dyn Error>>
         }
     }
 
+    // Assertion C — every example in the tree resolves against clap.
+    //
+    // Judged on the projection the artefacts were rendered FROM, not on
+    // the committed pages: it is the same data (A has just proved so
+    // for every artefact), and reading it back out of markdown would
+    // put a second parser in the gate for nothing.
+    let version = root_cmd.get_version().unwrap_or("unknown").to_string();
+    let tree = crate::model::tree_from(root_cmd, &version);
+    let examples = crate::examples::check(&tree)?;
+    let bad_examples = examples.len();
+    problems.extend(examples.iter().map(|f| format!("[C example] {f}")));
+
     if problems.is_empty() {
         eprintln!(
-            "docsgen check OK: {} artefact(s) in {DIR} match the clap tree",
-            rendered.len()
+            "docsgen check OK: {} artefact(s) in {DIR} match the clap tree, \
+             {} example(s) resolve against it",
+            rendered.len(),
+            tree.commands
+                .iter()
+                .map(|c| c.examples.len())
+                .sum::<usize>()
         );
         return Ok(());
     }
     // One remedy per class actually present: a strays-only run must
     // not lead with "regenerate", which cannot delete anything, and a
     // drift-only run must not send the reader hunting for a file to
-    // remove.
+    // remove. Counted per class rather than inferred by subtraction —
+    // with three classes the arithmetic that worked for two would
+    // silently mislabel every mixed report.
     let mut remedies = Vec::new();
-    if problems.len() > strays {
+    if drift > 0 {
         remedies.push(REGENERATE);
     }
     if strays > 0 {
         remedies.push(DELETE);
+    }
+    if bad_examples > 0 {
+        remedies.push(FIX_EXAMPLE);
     }
     Err(format!(
         "docs-check FAILED: {} CLI-reference problem(s) in {DIR} — {}:\n  {}",

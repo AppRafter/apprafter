@@ -18,6 +18,7 @@ pub mod adr;
 pub mod check;
 pub mod codepath;
 pub mod cuedoc;
+pub mod examples;
 pub mod gate;
 pub mod health;
 pub mod identifier;

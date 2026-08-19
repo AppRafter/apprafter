@@ -3,7 +3,7 @@
 //! against: paths, aliases, flags, defaults, requiredness, enums.
 
 use clap::CommandFactory;
-use docsgen::model::{tree_from, Tree};
+use docsgen::model::{tree_from, tree_from_with, Tree};
 
 fn tree() -> Tree {
     tree_from(&apprafter::docs_api::Cli::command(), "test")
@@ -170,6 +170,95 @@ fn every_visible_command_has_an_about() {
     assert!(
         missing.is_empty(),
         "commands without an `about`: {missing:?}"
+    );
+}
+
+/// The examples plumbing, proven over a table that HAS entries.
+///
+/// `apprafter::docs_api::EXAMPLES` is empty until the examples are
+/// written, so a test that only called `tree_from` would pass
+/// identically against a lookup wired to nothing — it would be waiting
+/// on the content to prove the wiring, which is backwards.
+#[test]
+fn examples_reach_the_projection_keyed_by_path() {
+    let t = tree_from_with(&apprafter::docs_api::Cli::command(), "test", &|path| {
+        if path == ["secret", "seal"] {
+            vec!["apprafter secret seal db-url --namespace web".to_string()]
+        } else {
+            Vec::new()
+        }
+    });
+    assert_eq!(
+        node(&t, &["secret", "seal"]).examples,
+        vec!["apprafter secret seal db-url --namespace web".to_string()]
+    );
+    // Keyed by the FULL path, so a prefix does not inherit them.
+    assert!(node(&t, &["secret"]).examples.is_empty());
+    assert!(node(&t, &["app", "list"]).examples.is_empty());
+}
+
+/// ...and the root node is keyed too, not skipped by a walk that only
+/// visits subcommands.
+#[test]
+fn the_root_node_is_keyed_for_examples_like_any_other() {
+    let t = tree_from_with(&apprafter::docs_api::Cli::command(), "test", &|path| {
+        if path.is_empty() {
+            vec!["apprafter --version".to_string()]
+        } else {
+            Vec::new()
+        }
+    });
+    let root = t.commands.iter().find(|c| c.path.is_empty()).expect("root");
+    assert_eq!(root.examples, vec!["apprafter --version".to_string()]);
+}
+
+/// And `tree_from` is wired to the REAL table, not to a stub. Asserted
+/// against `docs_api` — the other side — so it stays true as examples
+/// are written rather than needing an update per entry.
+#[test]
+fn the_projection_carries_exactly_what_the_cli_declares() {
+    let t = tree();
+    for c in &t.commands {
+        let key: Vec<&str> = c.path.iter().map(String::as_str).collect();
+        let declared: Vec<String> = apprafter::docs_api::examples_for(&key)
+            .iter()
+            .map(|line| (*line).to_string())
+            .collect();
+        assert_eq!(
+            c.examples, declared,
+            "examples for {:?} do not match the CLI's own table",
+            c.path
+        );
+    }
+    // Every entry in the table must have found a home: a typo in a key
+    // (`["secret", "sael"]`) declares examples for a command that does
+    // not exist, and the loop above — which walks the TREE — cannot see
+    // one. The table is the other side, so it is checked from here.
+    let paths: Vec<&[String]> = t.commands.iter().map(|c| c.path.as_slice()).collect();
+    for entry in apprafter::docs_api::EXAMPLES {
+        assert!(
+            paths.iter().any(|path| path
+                .iter()
+                .map(String::as_str)
+                .eq(entry.path.iter().copied())),
+            "the examples table declares {:?}, which is not a command",
+            entry.path
+        );
+    }
+    // ...and none of them was swallowed. A path declared twice is not
+    // a compile error: the lookup serves the first entry and the
+    // second author's lines disappear from `--help` and the reference
+    // alike, with both sides of the equality above agreeing on the
+    // truncated answer. Counting lines is what sees it.
+    let declared: usize = apprafter::docs_api::EXAMPLES
+        .iter()
+        .map(|e| e.lines.len())
+        .sum();
+    let projected: usize = t.commands.iter().map(|c| c.examples.len()).sum();
+    assert_eq!(
+        projected, declared,
+        "the table declares {declared} example line(s) but only {projected} reached \
+         the projection — a duplicate path shadows the entries after it"
     );
 }
 

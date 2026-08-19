@@ -14,6 +14,7 @@
 pub(crate) mod cli;
 pub(crate) mod commands;
 mod dispatch;
+pub(crate) mod examples;
 
 use clap::Parser;
 use cli_core::logging;
@@ -40,6 +41,18 @@ pub mod docs_api {
     /// environment instead of embedding a second copy of the
     /// schemas that could drift from this one.
     pub use crate::commands::app_validate::{WORKSPACE_MODULE_CUE, WORKSPACE_SCHEMAS};
+    /// The worked examples, structurally — the one array the binary
+    /// renders into `--help` and `docsgen` projects into the reference.
+    ///
+    /// Exposed as data rather than recovered by parsing help text: a
+    /// guard that reads a rendering of its own subject can only ever
+    /// confirm the rendering, and a parse that finds nothing passes
+    /// silently. See `crate::examples` for the full argument.
+    ///
+    /// [`EXAMPLES`] itself is exported alongside [`examples_for`]
+    /// because coverage — "every leaf command has one" — has to be
+    /// asserted over the whole table, not one key at a time.
+    pub use crate::examples::{examples_for, CommandExamples, EXAMPLES};
 }
 
 /// Parse argv and run the CLI. `main` is a thin wrapper so the whole

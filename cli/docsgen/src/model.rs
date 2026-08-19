@@ -61,7 +61,14 @@ pub struct CommandNode {
     /// declared on, so this is inherited explicitly — otherwise
     /// `auth login` would look public while `auth` did not.
     pub hidden: bool,
-    /// Empty today; a later package fills these in.
+    /// Worked examples, verbatim from `apprafter::docs_api::EXAMPLES`
+    /// — the same array the binary renders into `after_help`, read
+    /// structurally rather than parsed back out of help text.
+    ///
+    /// They are the one part of this projection that clap cannot
+    /// vouch for: everything else here IS the clap tree, while an
+    /// example is a human claim ABOUT it. [`crate::examples::check`]
+    /// is what makes the claim checkable.
     pub examples: Vec<String>,
     /// Flags and options, sorted by id.
     pub args: Vec<ArgSpec>,
@@ -113,6 +120,30 @@ pub struct PositionalSpec {
 /// `num_args` — is still unset; clap documents `build()` as the entry
 /// point for exactly this kind of introspection.
 pub fn tree_from(root: &Command, cli_version: &str) -> Tree {
+    tree_from_with(root, cli_version, &|path| {
+        apprafter::docs_api::examples_for(path)
+            .iter()
+            .map(|line| (*line).to_string())
+            .collect()
+    })
+}
+
+/// [`tree_from`] with the example source injected.
+///
+/// The seam is not decoration. `tree_from` reads the real
+/// `apprafter::docs_api::EXAMPLES`, which is empty until the examples
+/// are written — so a test that only called `tree_from` would pass
+/// identically against a lookup wired to nothing, and the wiring would
+/// be proven by the content that depends on it rather than the other
+/// way round. `examples_reach_the_projection` in `model_test.rs` uses
+/// this to assert the plumbing over a table that HAS entries;
+/// `the_projection_carries_exactly_what_the_cli_declares` pins that
+/// `tree_from` is wired to the real one.
+pub fn tree_from_with(
+    root: &Command,
+    cli_version: &str,
+    examples: &dyn Fn(&[&str]) -> Vec<String>,
+) -> Tree {
     let mut built = root.clone();
     built.build();
 
@@ -132,6 +163,17 @@ pub fn tree_from(root: &Command, cli_version: &str) -> Tree {
     // stable, and never a candidate for the `path.len() == 1` filter
     // `render.rs` uses to pick top-level pages.
     commands.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Examples are keyed here rather than threaded through the walk:
+    // one pass over the finished node list makes it evident that EVERY
+    // node is looked up exactly once, root included, and that the key
+    // is the same `path` the node publishes. Threading the lookup down
+    // `collect` would put the root's key in a different function from
+    // the subcommands'.
+    for node in &mut commands {
+        let key: Vec<&str> = node.path.iter().map(String::as_str).collect();
+        node.examples = examples(&key);
+    }
 
     Tree {
         cli_version: cli_version.to_string(),
@@ -213,6 +255,9 @@ fn node_from_inner(
         long_about: cmd.get_long_about().map(|s| reflow(&s.to_string())),
         usage: cmd.clone().render_usage().to_string(),
         hidden,
+        // Keyed by `tree_from_with` once every node exists — see the
+        // comment there for why the lookup is one pass and not part of
+        // this walk.
         examples: Vec::new(),
         args,
         positionals,

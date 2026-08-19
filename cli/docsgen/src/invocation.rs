@@ -553,6 +553,28 @@ fn classify(token: &str) -> Token {
 /// the walk simply carries more than one candidate from there on, and
 /// a flag is accepted if any candidate declares it.
 pub fn resolve(tree: &Tree, invocation: &Invocation) -> Result<(), ResolveError> {
+    resolve_to(tree, invocation).map(|_| ())
+}
+
+/// [`resolve`], handing back the command path(s) the invocation landed
+/// on — canonical, so an alias comes back spelled out (`apprafter t
+/// use` resolves to `["target", "use"]`).
+///
+/// More than one path comes back only for the `add/list/show`
+/// alternation [`resolve`] documents; the order is the order the
+/// alternatives were written.
+///
+/// This exists for one caller — [`crate::examples::check`], which must
+/// know not just that an example resolves but WHICH command it
+/// resolves to, because an example filed under `backup enable` that
+/// invokes `app list` is a true invocation and a false page. Splitting
+/// it out of [`resolve`] rather than writing a second walk is
+/// deliberate: two resolvers in one gate eventually disagree, which
+/// this track has already lived through with fence scanners.
+pub fn resolve_to<'a>(
+    tree: &'a Tree,
+    invocation: &Invocation,
+) -> Result<Vec<&'a [String]>, ResolveError> {
     let mut at = vec![tree.root];
 
     for token in &invocation.path {
@@ -577,7 +599,10 @@ pub fn resolve(tree: &Tree, invocation: &Invocation) -> Result<(), ResolveError>
             });
         }
     }
-    Ok(())
+    Ok(at
+        .into_iter()
+        .map(|node| tree.nodes[node].path.as_slice())
+        .collect())
 }
 
 /// What one path token does to the candidate set.
