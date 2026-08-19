@@ -12,9 +12,9 @@ patch of each phase.
 ## docs tooling (no release) — 2.19e build hooks: CUE highlighting and an LLM-readable corpus (2026-08-19)
 
 > No version bump and no monorepo tag: `cli/Cargo.toml` is untouched, no
-> chart, operator or cue-cmp artefact moved, and the only Rust edit is a
-> docstring in `cli/docsgen/src/scan.rs` that a count taken in this
-> subphase falsified. Fifth of the documentation track's ten subphases —
+> chart, operator or cue-cmp artefact moved, and the Rust edits are
+> confined to `cli/docsgen`, a build-time crate that ships in no release
+> artefact. Fifth of the documentation track's ten subphases —
 > branch `feat/2.19e-hooks-llm`, **ADR 0057** (see its 2.19e amendment
 > for the two front-matter features that were dropped and deferred, and
 > the measurement behind each).
@@ -71,29 +71,32 @@ patch of each phase.
   when it breaks: mkdocs does not know the three artefacts were supposed
   to exist, and `pymdownx.highlight` swallows a failed lexer lookup, so
   the build stays green through both. It asserts, over the site just
-  built: the index exists and names the licence; its links carry an
-  `http`/`https` scheme **and** sit under `site_url` (two properties,
-  because the second alone is vacuous — `site_url` comes from the same
-  config the hook read); every link resolves to a page the site contains;
-  every published non-ADR page is listed; the bundle holds one bodied
-  entry per published page, and those bodies together carry at least half
-  the text the site renders; the twin **paths** match the published page
-  set as a set, with no twin thinner than half its page; and every
-  ` ```cue ` fence in a page's source matched a rendered block on that
-  page carrying syntax tokens. Every expectation is derived from the site
-  that was just built, so a page added tomorrow is covered without
-  editing the script.
+  built **and the committed source it was built from**: the index exists
+  and names the licence; its links carry an `http`/`https` scheme **and**
+  sit under `site_url` (two properties, because the second alone is
+  vacuous — `site_url` comes from the same config the hook read); every
+  link resolves to a page the site contains; every published non-ADR page
+  is listed, and every entry carries the description that page's front
+  matter authored; each bundle entry and each twin **is** its page's
+  committed markdown; every page declared `not_in_nav` was in fact
+  published; and every `cue` fence in a page's committed source matched a
+  rendered block on that page that read it **as CUE** — a `//` line
+  coming back as a comment token, a `#Definition` as a definition.
 
-  The lexer half is there because the hook's own `on_config` self-check
-  lives **inside the thing it guards**: deleting its one line from
-  `hooks:` in `mkdocs.yml` removes the detector with the deliverable and
-  leaves a green build with every CUE fence unstyled, as do a later hook
-  overwriting the registration and `use_pygments: false`. Reading the
-  artefact instead of the registry closes all three. The two substance
-  floors are there because absence and miscount were caught and
-  *hollowing* was not — a hook writing `doc.markdown[:40]` passed every
-  earlier check while `llms-full.txt` collapsed to one truncated heading
-  per page.
+  **Every expectation is derived from the other side**: the page set from
+  the built site, the content from the committed source. Never a thing
+  against itself, and never against its own length. That rule was arrived
+  at by attack, and it is what closes each of these: the lexer's only
+  detector living inside the hook it guarded (`hooks:` minus one line
+  removed both, as did a later hook overwriting the registration and
+  `use_pygments: false`); a "links are absolute" test taking its prefix
+  from the config that wrote the links; an index-entry pattern that did
+  not require the `: description` suffix at all; length floors that a
+  truncate-and-pad writer passed and that could not tell two swapped
+  twins apart; a fence set read from the twins, so a writer that stripped
+  fenced blocks took 28 of 31 fences out of scope silently; and a fence
+  check asserting only that *some* lexer took, which a hook installing
+  `class CUE(YamlLexer)` passed with every block tokenised as YAML.
 - **`docs/contributing/documentation.md`** — the author's half of the
   contract: what front matter a page owes, what the two hooks do with it,
   and what an author gets for free. It is inside the gate's corpus, so
@@ -161,6 +164,46 @@ patch of each phase.
   numbers: adding four lines of front matter to 31 pages shifted every
   one of them, and a file plus a quoted phrase is greppable where a line
   number is not.
+
+- **A page outside `nav:` could be unpublished with the whole gate
+  green.** Adding `adr/0*.md` to `exclude_docs` dropped all 58 numbered
+  ADRs with **no ERROR and no WARNING** while `docs/adr/README.md` went
+  on publishing its 58-row index with every link dead: mkdocs reports a
+  link into an excluded page at INFO, which `--strict` does not promote,
+  and `mkdocs.yml`'s own comment already named the hazard.
+  `scripts/docs-check.sh` now fails on that line, naming the linking page
+  and the target. The single-page version (`license.md`, which nothing
+  links) produces no INFO at all, so the artefact pass also cross-checks
+  `not_in_nav:` — which declares a page published-but-off-nav — against
+  what the build actually published.
+- **The fence scanner could not see two spellings MkDocs renders as
+  CUE.** `~~~cue` was invisible because the delimiter run had to be
+  backticks, and pymdownx's own ` ```{.cue} ` form was read as a language
+  literally called `{.cue}`. Both render as highlighted CUE and neither
+  was checked. `cli/docsgen/src/scan.rs::fence_open` already accepted
+  `~`, so the gate held two scanners disagreeing about what a fence is.
+- **An eighth census counter, `cue_fences`.** The lexer check had a
+  zero-check, not a floor: a twin writer that stripped fenced blocks took
+  it from 31 checked fences to 3 with every guard green. The counter is
+  recorded **and** enforced by `docsgen`, the tool that reads the corpus,
+  rather than by the Python pass that reads the site — a counter one tool
+  records and another enforces is a seam. Re-recording it also lifted the
+  other counters to this branch's corpus (pages 33 → 34, invocations
+  384 → 385, code paths 73 → 90, ADR references 66 → 68; all growth, none
+  fell), because `docsgen metrics` records every field at once.
+- **More stale corpus counts, in the files the last sweep had opened.**
+  `cli/docsgen/src/codepath.rs`'s "Measured over the corpus" paragraph
+  had seven figures of which five no longer re-derived; it now states the
+  two properties that carry the argument — every link target resolves,
+  and the only unresolved code spans are the globs — and names the
+  command that prints the shape (`codepath_test`'s `corpus_census`, which
+  also asserts both). `scan.rs`'s "`sh` is 165 today" was wrong at three
+  successive commits. `gate.rs` said "9 of the 66 in-scope citations"
+  after the corpus reached 68. ADR 0057's "all 28 in-scope anchored links
+  resolve" was falsified by this branch's own new page — the property
+  holds, the tally did not. And the `file.md:NN` sweep had covered
+  `cli/docsgen/src` but not `cli/docsgen/tests`, where nine citations
+  still pointed at lines the front matter had moved.
 
 ### Known gaps (recorded, not fixed)
 

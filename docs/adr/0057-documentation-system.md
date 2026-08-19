@@ -415,9 +415,9 @@ that ships in no release artefact.
   covers every spelling of one decision. Citing a reversed decision on purpose
   is legitimate and is this repository's idiom, and the class shipped without
   any way to say so.
-- **A committed corpus census** at `docs/measurements/docs-health.json`, seven
-  counts, compared **by value**: six obligation counts may not decrease
-  (growth passes silently), and the exemption count is equality in both
+- **A committed corpus census** at `docs/measurements/docs-health.json`,
+  compared **by value**: every obligation count may not decrease (growth
+  passes silently), and the exemption count is equality in both
   directions. `docsgen metrics` re-records it. A missing or unparseable census
   is the gate's BROKEN exit code, never a documentation finding.
 
@@ -443,9 +443,12 @@ that ships in no release artefact.
   manufacture about fifteen claims that read as verified and are not, which is
   worse than the absence it would replace.
 - **A dedicated anchor checker: unnecessary.** `validation.links.anchors: warn`
-  under `--strict` already fails the build on a dead anchor, and all 28
-  in-scope anchored links resolve. A second, less informed opinion could only
-  disagree with the first.
+  under `--strict` already fails the build on a dead anchor, and **every**
+  in-scope anchored link resolves. A second, less informed opinion could only
+  disagree with the first. (This read "all 28" until 2.19e added a page that
+  wrote two more. The property held; the tally did not, which is why it is a
+  property here now. Re-derive the occurrences with
+  `git ls-files -- 'docs/*.md' README.md | grep -vE '^docs/(adr|changelog|measurements|reference/cli)/' | xargs grep -ohE '\]\([^) ]*#[^) ]+\)'`.)
 - **Three earlier-proposed ratchets: replaced.** `blocks_executed` is
   unimplementable — the marker grammar's `run=` key accepts only `local`, and
   the gate reports that as a finding because nothing executes a documented
@@ -454,8 +457,8 @@ that ships in no release artefact.
   expiring exemption channel this ADR decided to build. And a **byte-compared**
   census would go red the day after it was committed with no commit in
   between, because three of the fields originally proposed for it are
-  functions of `now`. The seven kept fields are all obligation counts, and
-  none of them is `now`-derived.
+  functions of `now`. The kept fields are all obligation counts, and none of
+  them is `now`-derived.
 
 ### The three checks find nothing today, and that is the point
 
@@ -469,7 +472,7 @@ is correct today is the only kind that can be installed honestly.
 The census's own limits are stated rather than papered over, because they
 bound what any of this is worth: it counts cardinality and never specificity,
 so an obligation *substituted* rather than deleted costs nothing, and prose
-carrying no counted claim is invisible to all seven numbers. These ratchets
+carrying no counted claim is invisible to every one of them. These ratchets
 defend against the careless; review defends against the motivated, and no
 arithmetic over a corpus can take that job.
 
@@ -566,30 +569,64 @@ falsified.
   so a hook that stopped writing them leaves a green build and a published
   site with a broken machine-readable layer — and `pymdownx.highlight`
   swallows a failed lexer lookup, so an unregistered CUE lexer leaves a
-  green build too. The pass asserts, over the site just built: the index
-  exists and names the licence; its links carry an `http`/`https` scheme
-  **and** sit under `site_url` (two properties, because the second alone
-  is vacuous — `site_url` comes from the same config the hook read); every
-  link resolves to a page the site contains; every published non-ADR page
-  is listed; the bundle holds one entry per published page, each with a
-  body, and the bodies together carry at least half the text the site
-  renders; the twin **paths** match the published page set as a set, and
-  no twin is thinner than half its page; and every ` ```cue ` fence in a
-  page's source matched a rendered block on that page carrying syntax
-  tokens. Every expectation is **derived from the site that was just
-  built**; nothing here restates a page list, a page count or a language,
-  so a page added tomorrow is covered without editing the script.
+  green build too. The pass asserts, over the site just built and the
+  committed source it was built from: the index exists and names the
+  licence; its links carry an `http`/`https` scheme **and** sit under
+  `site_url` (two properties, because the second alone is vacuous —
+  `site_url` comes from the same config the hook read); every link
+  resolves to a page the site contains; every published non-ADR page is
+  listed, and every entry carries **the description that page's front
+  matter authored**; the bundle holds one entry per published page, and
+  each entry's body and description **are** that page's committed
+  markdown and committed description; each twin likewise; every page
+  declared `not_in_nav` was in fact published; and every `cue` fence in
+  a page's committed source matched a rendered block on that page which
+  read it **as CUE** — a `//` line coming back as a comment token, a
+  `#Definition` as a definition.
 
-  The lexer half of that pass was added in review, and the reason
-  generalises: the hook's own `on_config` self-check lives **inside the
-  thing it guards**, so deleting its one line from `hooks:` in `mkdocs.yml`
-  removes the detector along with the deliverable and leaves a green build
-  with every CUE fence unstyled. So did two other routes — a later hook
-  overwriting the registration, and `use_pygments: false`. Reading the
-  artefact rather than the registry closes all three at once. The
-  substance floors on the bundle and the twins come from the same review:
-  the original checks detected absence and miscount but not *hollowing*,
-  and a hook writing `doc.markdown[:40]` passed every one of them.
+  Every expectation is derived from **the other side**: the page set
+  from the built site, the content from the committed source, never a
+  thing against itself and never against its own length. That rule was
+  arrived at by attack, over three adversarial passes, and every hole
+  found was one violation of it:
+
+  - the lexer's only detector was the hook's own `on_config`
+    self-check, **inside the thing it guards** — deleting its line from
+    `hooks:` removed detector and deliverable together, as did a later
+    hook overwriting the registration and `use_pygments: false`;
+  - the "links are absolute" test read its prefix from the config that
+    wrote the links, so it could not fail;
+  - the index entry was matched by a pattern that did not require the
+    `: description` suffix, so a writer dropping every authored
+    description left the pass reporting OK;
+  - the bundle and twins were checked for **length**, so a writer that
+    truncated and padded passed, and two swapped twins were
+    indistinguishable;
+  - the fence set was read from the twins, so a writer that stripped
+    fenced blocks took 28 of 31 fences out of scope silently;
+  - the fence check asserted only that *some* lexer took, so a hook
+    installing `class CUE(YamlLexer)` passed with every block
+    tokenised as YAML;
+  - the fence scanner required a backtick run and a bare language word,
+    so `~~~cue` and pymdownx's own ` ```{.cue} ` spelling rendered as
+    highlighted CUE and were never checked — while
+    `cli/docsgen/src/scan.rs` already accepted `~`, so the gate held two
+    scanners disagreeing about what a fence is;
+  - and `exclude_docs` could unpublish any page outside `nav:` with no
+    ERROR and no WARNING — mkdocs reports a link into an excluded page
+    at INFO, which `--strict` does not promote. `scripts/docs-check.sh`
+    now fails on that line, naming both pages, and the pass cross-checks
+    `not_in_nav` against what was published for the case nothing links.
+
+- **An eighth census counter, `cue_fences`.** The lexer check is only as
+  strong as the number of fences it has to check, and it had a
+  zero-check rather than a floor. The counter is recorded **and**
+  enforced by `docsgen` — the tool that reads the corpus — rather than
+  by the Python pass that reads the site: a counter one tool records and
+  another enforces is a seam. The scopes differ deliberately: the census
+  counts the in-scope corpus, the Python pass covers every published
+  page including `docs/adr/`, which is out of the census's scope for the
+  same reason it is out of every other counter's.
 
 ### The two things it deliberately did not build
 
@@ -648,7 +685,7 @@ has already been burned by once.
 - **The census grew rather than shrank**, which passes silently by design:
   the property that holds is that **no counter fell**. Running `docsgen
   gate` at the subphase's base (`a761860`) and at its last commit
-  (`57e48dd`) moves four of the seven — pages 33 → 34, invocations
+  (`57e48dd`) moves four of the seven counters recorded then — pages 33 → 34, invocations
   384 → 385, code paths 80 → 87, ADR references 67 → 68 — and every one of
   those is the new contributor page's own claims resolving. (An earlier
   draft of this line said no other count moved. It was written from a
