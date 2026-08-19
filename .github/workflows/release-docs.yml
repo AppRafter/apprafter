@@ -1,0 +1,248 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: release-docs
+
+# Builds the documentation site and pushes it to ghcr.io as the image
+# `docs-site/apprafter/Application.cue` deploys (ADR 0057 decision 8 —
+# the docs are their own deployable on their own hostname).
+#
+# Image references after a successful run:
+#
+#   ghcr.io/<owner-lowercased>/docs:<git sha>   immutable per-build pin
+#   ghcr.io/<owner-lowercased>/docs:latest      what the manifest watches
+#
+# NOT `${{ github.ref_name }}`, which release-landing.yml uses. That
+# workflow fires on a `landing-v*` TAG, so ref_name is the version. This
+# one fires on a path-filtered push to master, so ref_name is the
+# literal string `master` and a `:master` alias would be useless.
+# `github.sha` is the only per-build identifier this trigger has.
+#
+# Why the lowercase shim: registry names MUST be lowercase but
+# ${{ github.repository_owner }} preserves the org's display casing
+# (`AppRafter`). Actions has no `toLower`, so a shell step computes it —
+# same shim, same reason, as release-landing.yml.
+#
+# Security: dynamic github.* values flow only into action inputs; the
+# shell steps take them through an `env:` binding to avoid expression
+# injection (the anti-injection pattern release-operator.yml set).
+
+on:
+  push:
+    branches: [master]
+    # ------------------------------------------------------------------
+    # The negated path filter ADR 0057 calls for, in its Deferred list:
+    # "Publication — image, Caddy configuration, release workflow with a
+    # NEGATED PATH FILTER, Application.cue, DNS zone, and the landing
+    # switch." The ADR does not say what is negated; its Re-evaluation
+    # does: "At the first documentation release after publication:
+    # confirm the release path filter does not fire on internal
+    # changelog and measurement edits, which touch docs/ on nearly every
+    # commit."
+    #
+    # So the rule this filter encodes is: FIRE WHEN THE PUBLISHED BYTES
+    # CHANGE. A release that fires on a change the site never serves
+    # republishes an identical site, and — because the operator resolves
+    # `:latest` to its current digest on every reconcile (ADR 0040) — a
+    # fresh digest restarts a live public site for nothing.
+    #
+    # The negations are NOT a copy of mkdocs.yml's `exclude_docs`. Two of
+    # that list's entries are build machinery rather than content and are
+    # deliberately absent here:
+    #
+    #   docs/hooks/**              excluded from the site as static
+    #                              files, but they RUN at build time and
+    #                              shape every page (the CUE lexer, the
+    #                              llms.txt/twin writer). A one-line
+    #                              change there alters the whole site.
+    #   docs/reference/cli/SUMMARY.md
+    #                              excluded from the site, but it is the
+    #                              literate-nav fragment — it is the nav
+    #                              of every published page.
+    #
+    # Both must fire, so neither is negated. Re-derive the comparison:
+    #
+    #   sed -n '/^exclude_docs:/,/^$/p' mkdocs.yml
+    #
+    # `docs/superpowers/**` is on `exclude_docs` and is absent from both
+    # lists because it cannot appear in a push diff at all: the tree is
+    # gitignored (`git check-ignore -v docs/superpowers/<any>` →
+    # `.gitignore:10`). A pattern for an unreachable case is dead config.
+    #
+    # Negation semantics: patterns are evaluated IN ORDER and the last
+    # one matching a given file decides it; the job runs if any changed
+    # file ends up included. A list of only negatives matches nothing, so
+    # every group below opens with its positive.
+    paths:
+      # The corpus and every static file mkdocs copies out of docs_dir
+      # (the four root images, docs/reference/cli/commands.json).
+      - 'docs/**'
+      # …minus the three tracked paths `exclude_docs` drops, which is
+      # the Re-evaluation bullet above, verbatim. Spelled as the two
+      # exact changelog FILES rather than `docs/changelog/**`, exactly as
+      # mkdocs.yml spells them: a future published page in that
+      # directory must not be silently unreleasable.
+      - '!docs/changelog/UNRELEASED.md'
+      - '!docs/changelog/plan-history.md'
+      - '!docs/measurements/**'
+      # nav, theme, site_url, the `hooks:` registration, exclude_docs.
+      - 'mkdocs.yml'
+      # The toolchain that produces the published bytes. A
+      # mkdocs-material bump rewrites every page's HTML and changes the
+      # fingerprinted asset filenames the Caddyfile pins for a year;
+      # nothing under docs/ moves when it does.
+      - 'flake.nix'
+      - 'flake.lock'
+      # The other half of the image: the Caddyfile is baked in, so a
+      # cache-header or content-type fix reaches production only through
+      # a rebuild. Without this entry such a fix would ship whenever
+      # someone next happened to edit a page — correct in git, wrong in
+      # production, for an unbounded time.
+      - 'docs-site/**'
+      # …minus the manifest, which Argo CD reads from the cluster's
+      # config source and which is not an input to the image. Editing it
+      # must not mint a new digest.
+      - '!docs-site/apprafter/**'
+      - '.github/workflows/release-docs.yml'
+    # Deliberately ABSENT, and each for the same reason — they change
+    # what the gate CHECKS, not what the site CONTAINS:
+    #   cli/platform-cli/src/**, cli/docsgen/**, cli/Cargo.toml
+    #     the CLI reference is GENERATED but COMMITTED, under
+    #     docs/reference/cli/. A CLI change alone publishes nothing; the
+    #     regeneration that follows it touches docs/ and fires this. In
+    #     between, docs.yml fails on the drift — which is the wanted
+    #     outcome, and is the "vice versa" direction: a product-source
+    #     change must not cut a documentation release.
+    #   schemas/v1alpha1/**, operator/charts/**/crd-*.yaml
+    #     inputs to `docsgen gate`'s identifier resolution only.
+    #   scripts/docs-check.sh, scripts/docs-artefacts-check.py
+    #     the gate itself. Strengthening it does not change a byte of
+    #     the site; the next real release runs the stronger version.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+# Two pushes to master in quick succession would otherwise race on
+# `:latest`, and the loser of that race is whichever finishes last —
+# possibly the older commit. Cancelling the in-flight older run makes
+# the newest commit win deterministically. release-landing.yml has no
+# such group and needs none: it fires on tags, which are not pushed in
+# bursts.
+concurrency:
+  group: release-docs
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    name: build + push docs image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # `:latest` is what docs-site/apprafter/Application.cue watches, so
+      # publishing it means deploying it — the operator resolves the tag
+      # to its current digest on every reconcile (ADR 0040) and rolls the
+      # public site. workflow_dispatch accepts any ref, so without this
+      # a dispatch from a feature branch would deploy unmerged content to
+      # docs.apprafter.dev with a green check mark. Fails loudly rather
+      # than skipping, because a silent no-op reads as success too.
+      - name: Refuse to publish from a non-master ref
+        if: github.ref != 'refs/heads/master'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::release-docs publishes :latest, the tag the docs Application watches; refusing to publish from $REF. Merge to master first."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          # `docsgen gate` (pass 4 of scripts/docs-check.sh) ages every
+          # documentation exemption by resolving its `since=vX.Y.Z` to
+          # that tag's commit date, and an exemption it cannot age is
+          # VOID. The default `fetch-depth: 1` fetches no tags, so the
+          # gate would behave differently here than on a developer's
+          # machine — see the identical note in docs.yml.
+          fetch-depth: 0
+
+      - name: Install Nix (flake toolchain — mkdocs + cargo)
+        uses: DeterminateSystems/nix-installer-action@main
+
+      # Same workspace and same key expression as docs.yml, so the two
+      # workflows share one cache: `docsgen check` links the whole CLI.
+      - name: Cache cargo build (docsgen links the CLI)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+          key: docsgen-${{ hashFiles('cli/Cargo.lock', 'flake.lock') }}
+
+      # ------------------------------------------------------------------
+      # THE GATE RUNS HERE, IN THIS JOB. Do not remove it on the grounds
+      # that docs.yml already covers these commits.
+      # ------------------------------------------------------------------
+      # docs.yml runs on the same push, but workflows triggered by one
+      # event run INDEPENDENTLY and in PARALLEL: there is no `needs:`
+      # across workflows and nothing here observes that one's conclusion.
+      # A push to master that fails docs.yml would run this workflow to
+      # completion and publish the site anyway.
+      #
+      # The path sets also differ in this direction: `docs-site/**` and
+      # this file fire a release and do not fire docs.yml, so commits
+      # exist that publish without that gate ever having run on them.
+      #
+      # And `--strict` alone is NOT the gate. It catches dead links, dead
+      # anchors, unlisted pages and missing snippet includes. It does not
+      # catch a stale generated CLI reference (`docsgen check`), a claim
+      # that no longer resolves against the product (`docsgen gate`), a
+      # broken llms.txt / markdown twin / unhighlighted CUE fence
+      # (docs-artefacts-check.py), or a link into an excluded page, which
+      # mkdocs reports at INFO where --strict cannot reach it. Publishing
+      # on --strict alone would ship every one of those and report
+      # success — the failure this whole track exists to prevent.
+      - name: Documentation gate (strict build + artefacts + drift)
+        run: bash scripts/docs-check.sh
+
+      # A second build, into the image's build context. The gate builds
+      # into a scratch dir on purpose ("so ./site is never clobbered by a
+      # check" — scripts/docs-check.sh), so it has no output to hand
+      # over. Both builds run the same pinned toolchain over the same
+      # checkout, and this one also passes --strict, so the published
+      # bytes are produced by a validating build rather than merely
+      # vouched for by one.
+      - name: Build the published site (--strict, flake toolchain)
+        run: nix develop --command mkdocs build --strict --site-dir docs-site/site
+
+      - name: Compute lowercase image base
+        id: image-base
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          owner_lc=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/docs" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push docs image
+        uses: docker/build-push-action@v5
+        with:
+          # Context is docs-site/ because the Dockerfile copies `site`
+          # and `Caddyfile` by their names inside it — the same paths the
+          # local build in that file's header uses.
+          context: docs-site
+          file: docs-site/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image-base.outputs.image }}:${{ github.sha }}
+            ${{ steps.image-base.outputs.image }}:latest
+          # Same x86-only stance as release-operator and release-landing,
+          # until the platform learns multi-arch (Hetzner CAX*).
+          platforms: linux/amd64
+          cache-from: type=gha,scope=docs
+          cache-to: type=gha,mode=max,scope=docs
