@@ -76,8 +76,10 @@ fn an_invocation_in_a_fence_is_checked_whatever_the_tag() {
 
 #[test]
 fn a_flag_on_a_continuation_line_is_still_the_commands_flag() {
-    // 18 corpus invocations put the command on one line and its flags on
-    // the next. Reading the body with `str::lines()` would see
+    // Corpus invocations put the command on one line and its flags on
+    // the next — a couple of dozen of them, re-derivable with
+    // `git grep -cE 'apprafter .*\\$' -- docs README.md`. Reading the
+    // body with `str::lines()` would see
     // `apprafter app status writer` — which resolves — and judge the
     // flags this check exists to judge on none of them.
     let (repo, now) = tag_repo();
@@ -117,7 +119,10 @@ fn a_complete_cue_document_is_checked_whatever_the_tag() {
 
 #[test]
 fn a_fragment_is_not_a_document_and_owes_no_cue_check() {
-    // 13 of 26 `cue` fences are bare fragments at seven anchor depths.
+    // Nearly every `cue` fence in the corpus is a bare fragment, at a
+    // range of anchor depths: `docsgen gate` prints both numbers on
+    // every run ("N complete CUE document(s) in M `cue` fence(s)"), and
+    // the two are far apart.
     // They are out of the CUE check by design — see cuedoc's module docs
     // — so a fragment must not become a finding for lacking a package
     // clause it was never going to have.
@@ -977,9 +982,9 @@ fn a_silenced_fence_still_counts_toward_the_census() {
     // `invocations` assertion compares two runs in which nothing was
     // ever silenced — it reads as coverage and pins nothing. Moving
     // `stats.invocations` inside the silencing branch then leaves the
-    // whole suite green while the corpus measures 383 against 384 for
-    // identical bytes, which is the exact regression this test is here
-    // to stop.
+    // whole suite green while the corpus measures one invocation fewer
+    // for identical bytes, which is the exact regression this test is
+    // here to stop.
     for since in ["v0.9.0", "v9.9.9"] {
         let marker = format!("<!-- docs: check=none reason=historical since={since} — why -->\n");
         let marked = body

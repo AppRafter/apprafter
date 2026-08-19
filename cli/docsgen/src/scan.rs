@@ -342,8 +342,8 @@ pub fn scan_markdown(src: &str) -> Vec<Block> {
     let mut out = Vec::new();
     // Prose lines since the last blank line or fence. Spans are scanned
     // over the region rather than line by line, because a span may wrap
-    // across a line break — 11 command invocations in the corpus do,
-    // and a per-line scan silently loses every one of them.
+    // across a line break — command invocations in the corpus do, and
+    // a per-line scan silently loses every one of them.
     let mut region: Vec<(usize, String)> = Vec::new();
     let mut open: Option<Open> = None;
     // The HTML comment on the previous line, if that line was one.
@@ -736,9 +736,16 @@ fn boundary(line: &str) -> Boundary {
     // wrapped onto its own line also starts with `|`, and treating one
     // as a table row splits the span in half and destroys the command
     // inside it. Measured over the corpus the two forms separate
-    // perfectly — 298 of the 301 `|`-leading lines close with a pipe
-    // and every one is a real row; the 3 that do not are all wrapped
-    // pipelines, one of them `apprafter kubeconfig | tee /tmp/kc`.
+    // perfectly: every `|`-leading line that closes with a pipe is a
+    // real row, and the handful that do not are all wrapped pipelines,
+    // one of them `apprafter kubeconfig | tee /tmp/kc`. Re-derive the
+    // split — the totals move with every table anyone adds, which is
+    // why they are not written here:
+    //
+    //   in=$(git ls-files -- 'docs/*.md' README.md |
+    //        grep -vE '^docs/(adr|changelog|measurements|reference/cli)/')
+    //   echo "$in" | xargs grep -hE '^\s*\|' | wc -l          # |-leading
+    //   echo "$in" | xargs grep -hE '^\s*\|.*\|\s*$' | wc -l  # real rows
     let trimmed = text.trim_end();
     if trimmed.starts_with('|') && trimmed.ends_with('|') {
         return Boundary::Standalone;
@@ -860,9 +867,11 @@ fn strip_indent_chars(line: &str, indent: usize) -> &str {
 /// `dev-guide/quickstart.md`, whose install instructions are tabbed —
 /// so container tracking is not a refinement of the literal-block rule
 /// but a precondition for it being right at all. The corpus holds three
-/// tab openers, three admonitions and 427 top-level list items, and
-/// every one of them indents exactly the way an indented code block
-/// does.
+/// tab openers, three admonitions and several hundred top-level list
+/// items, and every one of them indents exactly the way an indented
+/// code block does. (The first two are small enough to be worth
+/// naming and stable; the third moves with every list anyone writes,
+/// so it is a magnitude here rather than a tally that goes stale.)
 ///
 /// The list grammar is [`list_item`], shared with [`boundary`] so that
 /// "a bare `-` is not a list item" and "`1.` needs a following space"

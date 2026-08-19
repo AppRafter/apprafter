@@ -81,10 +81,12 @@
 //! It is recorded rather than fixed. Widening the anchor to any
 //! slash-shaped token would admit `$HOME/.config/apprafter/age.key`,
 //! `/api/v1/nodes/{node}/proxy/stats/summary`, `.apprafter/state.json`
-//! and 70 other distinct non-repository tokens the corpus writes in
-//! spans — a check that reports those is a check that gets switched
-//! off. A blind spot named and counted is a smaller problem than a
-//! grammar nobody can predict.
+//! and dozens of other distinct non-repository tokens the corpus writes
+//! in spans — a check that reports those is a check that gets switched
+//! off. A blind spot named is a smaller problem than a grammar nobody
+//! can predict. (A count of those tokens stood here and re-derived
+//! through no command anybody could run, which is the one shape of
+//! figure this file has already deleted seven of.)
 //!
 //! # Anchored, and line-local
 //!

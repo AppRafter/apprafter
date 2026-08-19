@@ -13,12 +13,17 @@
 //! the corpus was **found**, at `dc4c5de` — the commit this gate was
 //! written against — that was `sh` (162), `bash` (11), `console` (1)
 //! and **nothing at all** (14). The gate's own unlabelled-fence
-//! finding has since taken that last group to 0 (`sh` is now 164),
-//! which is the argument rather than a footnote to it: the
-//! distribution is a moving target, and an obligation keyed on it
-//! would have moved with it. A tag-keyed gate would see a fraction of
-//! the surface, and — worse — deleting a tag would turn a finding
-//! green with nothing in the diff that reads as suppression. So:
+//! finding has since taken that last group to 0, and the `sh` group
+//! has absorbed it and gone on growing — which is the argument rather
+//! than a footnote to it: the distribution is a moving target, and an
+//! obligation keyed on it would have moved with it. (No live figure
+//! stands beside those four. A standalone "`sh` is N today" has now
+//! been wrong at four successive commits, twice in this file;
+//! `corpus_census` in `cli/docsgen/tests/scan_test.rs` prints the live
+//! distribution, which is the only form of that fact worth writing
+//! down.) A tag-keyed gate would see a fraction of the surface, and —
+//! worse — deleting a tag would turn a finding green with nothing in
+//! the diff that reads as suppression. So:
 //!
 //! * a fence whose body holds an `apprafter` invocation owes the CLI
 //!   check, whatever its tag;
@@ -166,8 +171,8 @@
 //! Every check above resolves a claim that is **present**. None of them
 //! can notice a claim that is gone: delete a page and the gate reports
 //! nothing, because there is nothing left to be wrong. [`Stats`] prints
-//! a census on every run, and a run finding 20 pages where the last one
-//! found 33 prints its 20 as calmly as its predecessor printed 33.
+//! a census on every run, and a run that finds half the corpus prints
+//! its half as calmly as its predecessor printed the whole of it.
 //!
 //! [`health`] closes that by committing the census and comparing the
 //! next run against it by value — the obligation counts may only grow,
@@ -435,11 +440,31 @@ pub struct Stats {
     /// It is recorded and enforced **here**, in the tool that reads the
     /// corpus, rather than in the Python pass that reads the site: a
     /// counter one tool records and another enforces is a seam, and
-    /// `docsgen metrics` is what re-records the census. The two scopes
-    /// differ and are meant to — this counts the in-scope corpus, the
-    /// Python pass covers every published page including `docs/adr/`,
-    /// which is out of the census's scope for the same reason it is out
-    /// of every other counter's.
+    /// `docsgen metrics` is what re-records the census.
+    ///
+    /// # The floor is narrower than the check, and by how much
+    ///
+    /// The two scopes differ. This counts the **in-scope corpus**; the
+    /// Python pass checks every **published** page, `docs/adr/`
+    /// included. So every `cue` fence under `docs/adr/` is checked and
+    /// floored by nothing: retagging three of them ```` ```yaml ````
+    /// takes them out of the checked set with this counter unmoved and
+    /// nothing loud anywhere, and at ADR scale that is most of the
+    /// difference between the two numbers. It is a real hole and it is
+    /// stated rather than papered over — no figure beside it, because
+    /// the pass prints the split on every run ("N highlighted fence(s)
+    /// … M of them on `adr/` pages the committed census does not
+    /// floor") and a copy here would be a third number to keep in step.
+    ///
+    /// It is left open rather than closed by widening this counter to
+    /// the published corpus, and the reason is that the census would
+    /// then be two measurements of two different trees: every other
+    /// field here counts claims the gate RESOLVES, and `docs/adr/` is
+    /// out of all of them because an ADR describes the world as it was
+    /// on the day it was ratified. One field silently spanning a
+    /// different corpus from its seven siblings is a worse defect than
+    /// a named gap — a reader comparing two fields of one census would
+    /// have no way to know.
     pub cue_fences: usize,
     /// One entry per exemption declared, whichever channel declared it:
     /// a fence's `check=none` marker or any of the three front-matter
@@ -677,7 +702,7 @@ impl Gate {
         let cli = apprafter::docs_api::Cli::command();
         let version = cli.get_version().unwrap_or("unknown").to_string();
         // Once, here, rather than once per page: the listing is the
-        // same for every page, and shelling out 33 times would put a
+        // same for every page, and doing it per page would put a
         // subprocess per page in a pre-commit path.
         let tracked = tracked_files(repo_root)?;
         let mut directories = BTreeSet::new();

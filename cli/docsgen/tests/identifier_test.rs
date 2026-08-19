@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! `expose.public` sits in 8 places across 3 files — 6 fences, a table
-//! row and a prose bullet — and 3 of the fences are `kubectl apply` YAML
-//! where the apiserver silently PRUNES the unknown key. Only membership
-//! catches those, which is why this check runs page-wide.
+//! One schema identifier is written wherever prose is. `expose.network`
+//! and its `public` value sit in fences, in table rows and in prose
+//! bullets across three different guides (`git grep -n 'expose\.network'
+//! -- docs`); and elsewhere the corpus writes whole `apprafter.io`
+//! resources inside `kubectl apply` YAML fences, where the apiserver
+//! silently PRUNES an unknown key rather than rejecting it. Only
+//! membership catches either, which is why this check runs
+//! page-wide. (A per-surface tally stood here, of a field spelled
+//! `expose.public` that the schema has since replaced — a count is the
+//! part of a sentence that goes stale first, and a count of something
+//! renamed goes stale invisibly.)
 //!
 //! The whole-corpus survey that used to live here as an `#[ignore]`d
 //! reporter is now `docsgen::gate`, which prints the same census

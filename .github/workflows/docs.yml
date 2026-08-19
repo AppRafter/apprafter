@@ -116,9 +116,10 @@ jobs:
           fetch-depth: 0
       - name: Install Nix (flake toolchain — mkdocs + cargo)
         uses: DeterminateSystems/nix-installer-action@main
-      # `docsgen check` links the whole CLI (459 crates) to read its
-      # clap tree, so an uncached docs-only PR spent minutes compiling
-      # dependencies that had not changed. Keyed on the lockfile (it
+      # `docsgen check` links the whole CLI to read its clap tree —
+      # hundreds of crates, per `cargo tree -p docsgen` — so an uncached
+      # docs-only PR spent minutes compiling dependencies that had not
+      # changed. Keyed on the lockfile (it
       # decides the dependency graph) plus flake.lock: the compiler
       # doing the work comes from the flake, not from the runner's
       # preinstalled toolchain that rust-cache reads for its own key.

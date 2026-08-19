@@ -58,9 +58,11 @@ fn a_code_span_that_is_a_links_text_is_page_relative() {
 fn prose_that_merely_contains_a_slash_is_not_a_claim() {
     // Unbackticked prose is not checked at all: "look under cli/ for
     // the crates" is English, and the backticks are the author saying
-    // this one is a path. Every one of the corpus's 54 code-span
+    // this one is a path. Every one of the corpus's code-span
     // references is written that way, so the span costs no coverage
-    // and buys the whole separation from prose.
+    // and buys the whole separation from prose. (`corpus_census` below
+    // prints how many there are; a figure here went stale the first
+    // time anyone added a guide.)
     let r = found("Look under cli/docsgen/src for the rules.\n");
     assert!(r.is_empty(), "{r:?}");
 }

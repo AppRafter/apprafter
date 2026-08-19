@@ -3,10 +3,10 @@
 //!
 //! [`crate::gate::Stats`] measures the documentation on every run and
 //! prints one line. That line is a fact about the checkout it was
-//! printed in and nothing else: a run that finds 20 pages where the
-//! last one found 33 prints its 20 as calmly as its predecessor printed
-//! 33, and passes. This module commits the numbers so that the *next*
-//! run has something to disagree with.
+//! printed in and nothing else: a run that finds half the corpus prints
+//! its half as calmly as its predecessor printed the whole of it, and
+//! passes. This module commits the numbers so that the *next* run has
+//! something to disagree with.
 //!
 //! # Compared by value, never by bytes
 //!
@@ -209,17 +209,30 @@
 //! carries no counted claim is invisible to all of them, so a page can
 //! lose its entire explanation with the census unchanged. Both re-run
 //! through the whole of `scripts/docs-check.sh`, not just the gate:
-//! deleting 145 non-claim prose lines from
-//! `docs/operator-guide/troubleshooting.md` (405 → 261) printed the
-//! committed census byte for byte and exited 0; and `docs/index.md` —
-//! which makes no counted claim at all — can be gutted **in place** to
-//! a single `# AppRafter` heading, with no `git rm` and nothing added
-//! beside it, and every number still holds. That is the honest
-//! reading of "a file cannot leave on its own" above: they notice
-//! a page leaving `git ls-files`, not a page being emptied where it
-//! stands. Sweeping all 33 corpus pages, `docs/index.md` is the only
-//! one that can be gutted for free today — but every one of them can
-//! lose all of its non-claim prose for free.
+//! deleting the non-claim prose of
+//! `docs/operator-guide/troubleshooting.md` — well over a third of the
+//! longest operator guide there is — printed the committed census byte
+//! for byte and exited 0; and `docs/index.md` — which makes no counted
+//! claim at all — can be gutted **in place** to a single `# AppRafter`
+//! heading, with no `git rm` and nothing added beside it, and every
+//! number still holds. (No before-and-after line count stands here.
+//! The first version of this paragraph carried one whose arithmetic did
+//! not add up, on a file this branch then lengthened; the property is
+//! what re-derives, and re-running the deletion is what checks it.)
+//! That is the honest reading of "a file cannot leave on its own"
+//! above: they notice a page leaving `git ls-files`, not a page being
+//! emptied where it stands. Sweeping **every** page of the corpus —
+//!
+//! ```text
+//! git ls-files -- 'docs/*.md' README.md |
+//!     grep -vE '^docs/(adr|changelog|measurements|reference/cli)/'
+//! ```
+//!
+//! — `docs/index.md` is the only one that can be gutted for free
+//! today; the sweep was re-run over the whole list after this branch
+//! added `docs/contributing/documentation.md`, and gutting that new
+//! page fires `health-baseline` three times over. But every page in it
+//! can lose all of its non-claim prose for free.
 //!
 //! **These ratchets defend against the careless, not against the
 //! motivated** — review defends against the motivated, and no
@@ -279,7 +292,9 @@ pub struct Baseline {
     /// the built site's lexer check. See [`crate::gate::Stats::cue_fences`]
     /// for why the number is recorded and enforced on this side rather
     /// than in `scripts/docs-artefacts-check.py`, which is what reads
-    /// the rendered blocks.
+    /// the rendered blocks — **and** for the gap that leaves: this
+    /// floors the in-scope corpus only, so the `cue` fences on `adr/`
+    /// pages are checked by that pass and floored by nothing.
     pub cue_fences: usize,
     /// Repository paths the documentation names, in code spans and in
     /// link targets alike.

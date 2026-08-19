@@ -217,10 +217,13 @@ fn a_reference_wrapped_across_a_line_break_is_still_a_reference() {
     // Added because the corpus holds exactly one, and it would otherwise
     // be the single reference nobody checks:
     // `docs/operator-guide/target-store.md` wraps `[ADR` / `> 0030]`
-    // across a blockquote line break. A line-local scan alone reports 61
-    // of the 62 IN-GRAMMAR citations and is silent about the 62nd — the
-    // corpus holds 66, the other 4 carrying no `ADR NNNN` text at all —
-    // and "wrap the line" is a one-keystroke way to hide a citation.
+    // across a blockquote line break. A line-local scan alone reports
+    // every OTHER in-grammar citation in the corpus and is silent about
+    // that one, and "wrap the line" is a one-keystroke way to hide a
+    // citation. (The split between citations carrying `ADR NNNN` text
+    // and citations that are a link and nothing else moves with the
+    // corpus, so it is not written down; `docsgen gate` prints the
+    // total on every run.)
     let src = "> Authoritative design rationale: [ADR\n\
                > 0030](../adr/0030-cli-target-store-and-credential-chain.md).\n";
     let r = references(src);
