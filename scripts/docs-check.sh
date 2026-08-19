@@ -11,8 +11,10 @@
 #      back off the site that was just built and checked against the
 #      COMMITTED SOURCE it was built from: llms.txt, llms-full.txt and
 #      one markdown twin per page — each carrying its page's own
-#      markdown and its authored description — and every ```cue fence
-#      rendered as highlighted CUE;
+#      markdown and its authored description — plus the PUBLISHED PAGE
+#      itself, which must still carry its own heading, its own prose
+#      and its own meta description, and every ```cue fence rendered as
+#      highlighted CUE;
 #   3. `docsgen check` — the byte-compare of the GENERATED CLI
 #      reference under docs/reference/cli/ against the clap tree;
 #   4. `docsgen gate` — every claim in the HAND-WRITTEN documentation
@@ -34,6 +36,12 @@
 # ARTEFACT instead of the registry, so unregistering the hook, having a
 # later hook overwrite the lexer, and turning pygments off site-wide
 # are all one failure here.
+#
+# And it reads the RENDERED PAGE, not only the artefacts, because all
+# three artefacts derive from `page.markdown` — the text as it stands
+# BEFORE the page is rendered. A hook that stripped every paragraph out
+# of the HTML left all three intact and the whole gate green: the
+# machine-readable layer vouched for a site it had not read.
 #
 # Every expectation it asserts is derived from THE OTHER SIDE — the
 # page set from the site that was just built, the content of each
