@@ -82,21 +82,6 @@ the GC controller deletes the PVC and removes the snapshot.
     deploy admission-webhook                                      # -> available
   ```
 
-## Step 0 — run the k3d e2e first (cheap gate)
-
-Before spending a real Tier-1 cluster, run the automated end-to-end
-script on a local k3d/kind cluster. It exercises the identical chain
-(provision → mount → data durability → delete + snapshot → reattach →
-force-GC) plus a `needs.pg`-array multi-claim assertion, and is the gate
-to clear before working through this guide by hand:
-
-```sh
-just e2e-disk        # green in ~3-5 min (kind+podman, LOCAL_OPERATOR build)
-```
-
-If that is red, fix it before continuing — going through it by hand
-only adds value once the automated chain is green.
-
 ## Platform-CLI coverage
 
 This guide exercises every shipped `platform-cli` subcommand. Raw `kubectl`
@@ -390,6 +375,22 @@ A complete run must exercise both shipped surfaces. Check every box.
 | `kubectl apply` of the Application rejected | admission webhook: `needs.disk` with `replicas > 1`, a duplicate disk name/mountPath, or a `size` that is not a k8s quantity | A `local` disk is single-writer — keep `replicas: 1`; give each disk a unique `name`/`mountPath`; write `size` as a quantity (`"1Gi"`, not a t-shirt size). |
 | Data lost after deleting + recreating the app | you deleted the bare ResourceClaim (which can race the regenerated claim) instead of the Application, or the grace window already elapsed | Delete the **Application** to snapshot a RetainedClaim; the PVC survives until `retainUntil`. Re-declaring the need reattaches it. |
 | PVC not deleted after `retainUntil` passes | GC controller error, or the source ResourceClaim is still live (the GC live-guard skips the delete while the claim exists) | Confirm the claim is gone: `kubectl -n demo get resourceclaim.apprafter.io web-disk`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
+
+## For contributors — the automated end-to-end script
+
+Optional, and it needs a checkout of the AppRafter repository — nothing
+above does. If you are changing the platform, `just e2e-disk` exercises
+this identical chain on a local k3d/kind cluster (provision → mount →
+data durability → delete + snapshot → reattach → force-GC) plus a
+`needs.pg`-array multi-claim assertion, and is the cheap gate to clear
+before anyone spends a real one on it:
+
+```sh
+just e2e-disk        # green in ~3-5 min (kind+podman, LOCAL_OPERATOR build)
+```
+
+If that is red, fix it before continuing: working through this guide
+by hand only adds value once the automated chain is green.
 
 ## Cleanup
 

@@ -10,7 +10,8 @@ confidential bare metal.**
 
 This site documents the AppRafter platform as it ships today:
 guides for running a cluster, guides for shipping an application
-onto one, and generated reference for every command and object.
+onto one, and a CLI reference generated from the binary itself, so
+it cannot fall behind it.
 
 ## Tier model
 

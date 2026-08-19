@@ -1,64 +1,107 @@
 ---
-description: "Map of the operator-facing tasks — provisioning, the target store, tier upgrades, day-2 work, recovery — and what is documented today."
+description: "A map of every page in the operator guide, grouped by the job you came to do — set a cluster up, put it on the internet, give an application a dependency, and day-2 work."
 ---
 
 # Operator Guide
 
-> **Status:** the single-node tier-1 path is documented end to
-> end — CLI quickstart, target-store reference, troubleshooting
-> catalogue and per-tier guidance are live. The full handbook for
-> tiers 2+ and for disaster recovery is not written yet.
+You are in the right place if you run the cluster: you own the machine,
+the platform on it, and the backups. If you are shipping an application
+onto a cluster somebody else runs, the [Developer
+Guide](../dev-guide/index.md) is the shorter path.
 
-Tasks for operators (anyone running an AppRafter cluster):
+> **Status:** every guide below is written for the single-node Tier-1
+> path and verified on it. Tiers 2 to 4 are not documented yet — where a
+> page says something tier-specific, it says Tier 1 unless it names
+> another. The pages listed under "not documented yet" at the foot of
+> this page are exactly that; nothing else on this page is a promise.
 
-- **Provisioning** — `apprafter target add` (recommended) +
-  `apprafter bootstrap-all`. See
-  [`quickstart.md`](quickstart.md) for the tier-1 walkthrough.
-  The legacy `apprafter init` one-shot stays available for
-  scripted setups.
-- **Target store** — multi-target setups, credential rotation,
-  the resolution chain. See
-  [`target-store.md`](target-store.md).
-- **Troubleshooting** — diagnostic-code catalogue + the common
-  failures found in end-to-end runs. See
-  [`troubleshooting.md`](troubleshooting.md).
-- **Tier upgrades** — `apprafter upgrade-tier 1 → 2 → 3 → 4`,
-  with safety semantics from `MigrationPlan`. Stub today;
-  M3 target.
-- **External surface** — wiring git, registry, OIDC SSO,
-  Headscale/Tailscale, synthetic monitoring, backups.
-- **Day-2** — debugging with k9s / Headlamp / Hubble; reading
-  audit logs from JetStream; managing AccessGrants.
-- **Recovery from a wedged VM** — see
-  [`recovery.md`](recovery.md) for the Hetzner Rescue Mode
-  runbook (the VM is key-only and the Hetzner web console is
-  unusable for emergency access; rescue mode + chroot is the
-  documented escape hatch).
-- **Disaster recovery** — restoring from `s3://`-backups,
-  cluster rebuild, `DisasterRecoveryPlan` runbooks.
+## Set a cluster up
 
-Canonical references:
+- [Operator quickstart](quickstart.md) — from a blank Hetzner account to
+  a self-managing cluster, with `apprafter target add` and then
+  `apprafter bootstrap-all`. Start here. (The older one-shot
+  `apprafter init` still works and suits scripted setups.)
+- [Target store reference](target-store.md) — where target
+  configuration and credentials live on disk, the resolution chain
+  between them, and multi-target setups.
+- [Node preparation](node-prep.md) — the control-plane reservations and
+  host swap a Tier-1 node needs, what `apprafter node prep` applies, and
+  how to read the result.
+- [Connect a Git repository](connect-a-git-repository.md) — pointing
+  Argo CD at your repository, for each combination of GitHub or GitLab
+  and public or private.
 
-- [`quickstart.md`](quickstart.md) — tier-1 walkthrough.
-- [`target-store.md`](target-store.md) — file layout + credential
-  resolution chain.
-- [`troubleshooting.md`](troubleshooting.md) — diagnostic codes.
-- [Connect a Git repository](connect-a-git-repository.md) — Argo CD +
-  repo credentials, for GitHub and GitLab, public and private.
-- [Connect a domain](connect-a-domain.md) and the
-  [Cloudflare Origin CA certificate](cloudflare-origin-cert.md) —
-  serving an application publicly over HTTPS.
-- [Postgres](postgres.md) (`needs.pg`), [Redis](redis.md)
-  (`needs.redis`) and [persistent disk](persistent-disk.md)
-  (`needs.disk`) from a declared dependency, and the
-  [egress](egress-policy.md) each declaration opens.
-- [`recovery.md`](recovery.md) — Hetzner rescue-mode runbook.
-- [`docs/reference/cli/`](../reference/cli/index.md) — every
-  subcommand + flag.
-- [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
-  — Track A design rationale.
+## Put it on the internet
+
+- [Connect a domain](connect-a-domain.md) — the once-per-cluster
+  preparation and the per-zone steps that put an application behind
+  Cloudflare on HTTPS.
+- [Cloudflare Origin CA certificate](cloudflare-origin-cert.md) —
+  minting the certificate Cloudflare's edge trusts, importing it, and
+  rotating it.
+
+## Give an application a dependency
+
+An application declares what it needs; the platform provisions it,
+binds the credentials, and opens exactly the egress that need implies.
+
+- [Postgres](postgres.md) — a `needs.pg` declaration end to end: claim,
+  provisioning, credential binding, and the grace window after removal.
+- [Redis](redis.md) — a `needs.redis` declaration end to end, including
+  the per-claim logical-database isolation on the shared pool.
+- [Persistent disk](persistent-disk.md) — a `needs.disk` declaration end
+  to end, and the single-writer constraint it puts on the workload.
+- [Shared volumes](shared-volumes.md) — one directory mounted by several
+  applications in a namespace, and when to reach for an owned disk
+  instead.
+- [Egress policy](egress-policy.md) — how a declaration is also what
+  opens the path to the thing declared, how to watch an undeclared reach
+  get dropped, and the cluster-wide profile knob.
+
+## Day 2, and getting out of trouble
+
+- [Backup and restore](backup-restore.md) — what each export and backup
+  command captures, where it lands, and how a backup is replayed into a
+  running cluster. Set this up before you need it.
+- [Platform management](platform-management.md) — how the platform
+  upgrades itself: the `PlatformStack` resource, channels and pins,
+  component freezes, and the CLI that edits them.
+- [Migration plans](migration-plans.md) — what counts as a destructive
+  change, how the platform pauses one behind an approval, and the CLI
+  that approves it.
+- [Troubleshooting](troubleshooting.md) — the diagnostic codes the CLI
+  emits, what each means, and the exact command to run next.
+- [Recovery and emergency console access](recovery.md) — getting back
+  into a VM that no longer answers SSH, via Hetzner Rescue Mode, and
+  when to rebuild instead.
+
+## Not documented yet
+
+Named so you can tell a gap from an oversight. None of these has a page
+on this site today.
+
+- **Tier upgrades.** `apprafter upgrade-tier` exists and the safety
+  semantics run through `MigrationPlan`, but no guide walks a 1 → 2
+  upgrade.
+- **Tiers 2, 3 and 4 generally.** Every page above is a Tier-1
+  procedure.
+- **Single sign-on, private networking, and synthetic monitoring** —
+  OIDC, Headscale or Tailscale, and uptime checks.
+- **Managing `AccessGrant`s**, and reading audit logs out of JetStream.
+- **Day-2 debugging with k9s, Headlamp and Hubble.**
+- **Disaster-recovery runbooks.** [Backup and
+  restore](backup-restore.md) documents the commands, including
+  rebuilding a cluster from a backup; what is missing is the drill
+  around them.
+
+## Where else to look
+
 - [Reference](../reference/index.md) — the generated CLI pages, the
-  environment variables, and where each CRD's field list lives.
-- [ADR index](../adr/README.md) — the decision behind each behaviour.
-  An ADR describes the world as it was when it was ratified, so read
-  it for *why*, and the pages above for *what ships*.
+  environment variables, and the custom resources the platform
+  installs. [`docs/reference/cli/`](../reference/cli/index.md) covers
+  every subcommand and flag.
+- [ADR index](../adr/README.md) — the decision behind each behaviour,
+  including [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
+  for the target store and its credential chain. An ADR describes the
+  world as it was when it was ratified, so read it for *why*, and the
+  pages above for *what ships*.

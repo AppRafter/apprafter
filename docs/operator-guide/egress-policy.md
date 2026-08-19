@@ -66,41 +66,6 @@ row with nothing declared.
   `cilium-cli`). Hubble is the lens that makes a drop **observable** —
   without it you only see a connection time out.
 
-## Step 0 — run the automated end-to-end script first (cheap gate)
-
-Before spending a real cluster, run the automated enforcement script on a
-local kind cluster. It brings kind up with the default CNI and kube-proxy
-disabled so Cilium owns the datapath, bootstraps with Cilium, enables
-Hubble, then proves the chain end to end (a needs-less app dropped to
-Postgres, a `needs.pg` app forwarded, profile switches via the CLI):
-
-```sh
-just e2e-networkpolicy
-```
-
-On **rootless podman** the script preflights the memlock limit and, if it is
-too low, fails in a few seconds with the exact fix (instead of a ~7-minute
-cilium-agent `CrashLoopBackOff`). Cilium's eBPF agent raises
-`RLIMIT_MEMLOCK` to infinity at startup; under rootless podman the kind
-node is capped at the host user's systemd memlock hard limit (default
-8 MB) and no container flag (privileged / `CAP_SYS_RESOURCE` / `--ulimit`)
-can exceed it. Raise it once, as root, then re-login:
-
-```sh
-sudo mkdir -p /etc/systemd/system/user@.service.d
-printf '[Service]\nLimitMEMLOCK=infinity\n' \
-  | sudo tee /etc/systemd/system/user@.service.d/90-memlock.conf
-sudo systemctl daemon-reload
-loginctl terminate-user "$USER"   # or log out / in (a reboot also works)
-# verify: podman run --rm busybox sh -c 'ulimit -Hl'   # must print: unlimited
-```
-
-**Rootful Docker** (including GitHub Actions `ubuntu-latest`) needs nothing —
-`dockerd` ships `LimitMEMLOCK=infinity`. In CI the script runs nightly on a
-rootful Docker runner (`.github/workflows/e2e-networkpolicy-nightly.yml`).
-The other AppRafter end-to-end scripts use kindnet (no Cilium) and
-never hit this.
-
 ## Step 1 — deploy one app with a need and one without
 
 Register two Applications in a tenant namespace. `web` declares
@@ -276,6 +241,43 @@ egress set` prints a warning — change the profile in the repo instead.
 - **L7 / DNS-aware rules and mTLS.** The policy is L3/L4 only at launch.
 - **`needs.disk`** — a mounted volume has no network target, so it adds no
   egress rule.
+
+## For contributors — the automated end-to-end script
+
+Optional, and it needs a checkout of the AppRafter repository — nothing
+above does. If you are changing the platform, `just e2e-networkpolicy`
+runs the enforcement script on a local kind cluster: it brings kind up
+with the default CNI and kube-proxy disabled so Cilium owns the
+datapath, bootstraps with Cilium, enables Hubble, then proves the chain
+end to end (a needs-less app dropped to Postgres, a `needs.pg` app
+forwarded, profile switches via the CLI):
+
+```sh
+just e2e-networkpolicy
+```
+
+On **rootless podman** the script preflights the memlock limit and, if it is
+too low, fails in a few seconds with the exact fix (instead of a ~7-minute
+cilium-agent `CrashLoopBackOff`). Cilium's eBPF agent raises
+`RLIMIT_MEMLOCK` to infinity at startup; under rootless podman the kind
+node is capped at the host user's systemd memlock hard limit (default
+8 MB) and no container flag (privileged / `CAP_SYS_RESOURCE` / `--ulimit`)
+can exceed it. Raise it once, as root, then re-login:
+
+```sh
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nLimitMEMLOCK=infinity\n' \
+  | sudo tee /etc/systemd/system/user@.service.d/90-memlock.conf
+sudo systemctl daemon-reload
+loginctl terminate-user "$USER"   # or log out / in (a reboot also works)
+# verify: podman run --rm busybox sh -c 'ulimit -Hl'   # must print: unlimited
+```
+
+**Rootful Docker** (including GitHub Actions `ubuntu-latest`) needs nothing —
+`dockerd` ships `LimitMEMLOCK=infinity`. In CI the script runs nightly on a
+rootful Docker runner (`.github/workflows/e2e-networkpolicy-nightly.yml`).
+The other AppRafter end-to-end scripts use kindnet (no Cilium) and
+never hit this.
 
 ## Related
 

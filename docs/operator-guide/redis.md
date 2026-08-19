@@ -81,21 +81,6 @@ the snapshot.
     deploy admission-webhook                                      # -> available
   ```
 
-## Step 0 — run the k3d e2e first (cheap gate)
-
-Before spending a real Tier-1 cluster, run the automated end-to-end
-script on a local k3d cluster. It exercises the identical chain
-(including the `$N`-ACL isolation proof and the `FLUSHDB`/`DELUSER` GC
-proof) and is the gate to clear before working through this guide by
-hand:
-
-```sh
-bash e2e/needs-redis-walk.sh        # green in ~8-12 min on k3d
-```
-
-If that is red, fix it before continuing — going through it by hand only adds
-value once the automated chain is green.
-
 ## Platform-CLI coverage
 
 This guide exercises every shipped `platform-cli` subcommand. Raw
@@ -459,6 +444,21 @@ A complete run must exercise both shipped surfaces. Check every box.
 | App starts but the Redis env-vars are empty or absent | the manifest declares `needs.redis` but never binds it — nothing is auto-injected | Add `env: { REDIS_URL: claim.redis.url }` (see *Author the manifest*). |
 | App gets `NOPERM` on a pub/sub channel | the app published/subscribed to an unprefixed channel | Prefix every channel name with the claim's `channelPrefix`; keys need no prefix. |
 | ACL user missing after a Dragonfly pod restart | runtime ACL users are in-memory and lost on reload | The reconcile loop re-pins them on instance readiness; if it lingers, check the operator logs for the ACL reconcile task. |
+
+## For contributors — the automated end-to-end script
+
+Optional, and it needs a checkout of the AppRafter repository — nothing
+above does. If you are changing the platform, `e2e/needs-redis-walk.sh`
+exercises this identical chain on a local k3d cluster (including the
+`$N`-ACL isolation proof and the `FLUSHDB`/`DELUSER` GC proof), and is
+the cheap gate to clear before anyone spends a real one on it:
+
+```sh
+bash e2e/needs-redis-walk.sh        # green in ~8-12 min on k3d
+```
+
+If that is red, fix it before continuing: working through this guide
+by hand only adds value once the automated chain is green.
 
 ## Cleanup
 

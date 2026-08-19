@@ -14,7 +14,7 @@ Field-by-field reference for everything the platform exposes:
   [`cli/commands.json`](cli/commands.json), which additionally
   carries the commands hidden from `--help` and the CLI version it
   was generated from.
-- **Environment variables** — [`environment.md`](environment.md).
+- **Environment variables** — [Environment variables](environment.md).
   Only four of them are flag fallbacks declared through clap, so the
   generated CLI reference cannot carry the rest; this page is
   hand-written and names the call site for each.

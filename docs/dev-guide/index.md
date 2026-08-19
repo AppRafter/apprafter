@@ -9,10 +9,10 @@ to AppRafter):
 
 - **Quickstart** — scaffold a service, register it with
   `apprafter app add`, and watch it deploy. See
-  [`quickstart.md`](quickstart.md).
+  [Quickstart](quickstart.md).
 - **Authoring `Application`** — `image`, `expose`, `resources`,
   `needs`, and per-environment overrides via `spec.environments`.
-  See [`application-cue.md`](application-cue.md).
+  See [Writing Application.cue](application-cue.md).
 - **Working with platform services** — declaring `needs.{pg, redis,
   disk}` and binding the provisioned credentials into env-vars with
   `claim` references (ADR 0046). The provisioning guides live in the
@@ -21,17 +21,17 @@ to AppRafter):
   [persistent disk](../operator-guide/persistent-disk.md).
 - **Private repos and registries** — source credentials for a private
   Git repository and image-pull secrets for a private registry. See
-  [`private-repos-and-registries.md`](private-repos-and-registries.md).
+  [Private repos and registries](private-repos-and-registries.md).
 - **Iterating on an image** — pushing a moved tag and having the
   cluster resolve and roll out the new digest. See
-  [`image-iteration.md`](image-iteration.md).
+  [Image iteration](image-iteration.md).
 - **Egress** — a declared `need` is also what opens your pods' network
   path to that backend; an undeclared reach is denied. See the
   [egress guide](../operator-guide/egress-policy.md).
 
 Canonical references:
 
-- [`docs/reference/cli/`](../reference/cli/index.md) — every
+- [The CLI reference](../reference/cli/index.md) — every
   subcommand + flag.
 - [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue)
   — the authoritative `Application` field list.

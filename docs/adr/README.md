@@ -1,15 +1,19 @@
-# docs/adr/
+---
+description: "Every architectural decision on the platform, one record each — what was decided, the context it was decided in, and what it cost."
+---
 
-Architecture Decision Records — numbered documents (`NNNN-title.md`)
-capturing non-trivial architectural decisions, their context, and
-consequences. Use [`0000-template.md`](./0000-template.md) as the
-starting point for new ADRs.
+# Architecture Decision Records
 
-## Naming
+One record per non-trivial architectural decision: what was decided,
+the context it was decided in, the alternatives that lost, and the
+consequences accepted. If you want to know *why* something is shaped
+the way it is, this is where the answer is; the guides cover *what
+ships*.
 
-`NNNN-kebab-case-slug.md`, where `NNNN` is the next free four-digit
-number. Numbers are assigned sequentially and never reused, even if
-an ADR is later superseded.
+Read a record as history, not as status. Each describes the world on
+the day it was ratified — later decisions supersede earlier ones rather
+than editing them, so the status column below is what tells you whether
+a record still governs.
 
 ## Statuses
 
@@ -85,3 +89,10 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0055 | [node swap policy — provisioned host swap + pod NoSwap, Tier-1](./0055-node-swap-policy.md) | Accepted |
 | 0056 | [machine-picker — live (region × SKU) matrix and no implicit server-type default](./0056-machine-picker.md) | Accepted |
 | 0057 | [documentation system — MkDocs-Material retained, generated CLI reference, content-detected drift gate](./0057-documentation-system.md) | Accepted |
+
+## Writing a new record
+
+`NNNN-kebab-case-slug.md`, where `NNNN` is the next free four-digit
+number. Numbers are assigned sequentially and never reused, even if an
+ADR is later superseded. Start from
+[`0000-template.md`](./0000-template.md).

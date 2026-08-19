@@ -27,11 +27,15 @@ recommended path; build-from-source is for contributors.
 
     Download the prebuilt binary for your platform from
     [GitHub Releases](https://github.com/AppRafter/apprafter/releases)
-    and drop it on your `PATH`. Pick the latest tag from the releases
-    page, then:
+    and drop it on your `PATH`. The asset name carries the tag, so the
+    first line resolves the newest release rather than naming one — a
+    literal tag written here goes stale the next time we cut a release,
+    which is what it had done. Substitute an explicit `v0.2.x` if you
+    want to pin.
 
     ```sh
-    VERSION=v0.2.27                              # latest tag from the releases page
+    VERSION=$(curl -fsSL https://api.github.com/repos/AppRafter/apprafter/releases/latest \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
     TARGET=x86_64-unknown-linux-gnu              # or x86_64-apple-darwin / aarch64-apple-darwin
     curl -fsSL "https://github.com/AppRafter/apprafter/releases/download/${VERSION}/apprafter-${VERSION}-${TARGET}.tar.gz" | tar xz
     sudo mv apprafter /usr/local/bin/

@@ -4,11 +4,15 @@ description: "Index of the contributor-facing documents and what each one covers
 
 # Contributor documentation
 
-The documents in `docs/contributing/`:
-
-| File                  | Purpose                                              |
-| --------------------- | ---------------------------------------------------- |
-| `setup.md`            | Local development environment and bootstrap.         |
-| `documentation.md`    | Writing a page: the front-matter contract and what the build hooks do with it. |
-| `documentation-gate.md` | What `just lint` checks in `docs/`, and how to exempt a line. |
-| `license-headers.md`  | SPDX-License-Identifier conventions per language.    |
+- [Local development setup](setup.md) — the pinned toolchain, and
+  getting a checkout to the point where `just lint` runs.
+- [Writing a documentation page](documentation.md) — the front-matter
+  contract, what the two build hooks do with it, and why you never
+  hand-edit the generated CLI reference.
+- [The documentation drift gate](documentation-gate.md) — what
+  `just lint` checks inside a page body, and how to exempt a line that
+  cannot be fixed.
+- [SPDX license headers](license-headers.md) — which header each
+  directory carries, and the conventions per language.
+- [Licensing](../license.md) — which licence covers which directory,
+  and how the FSL conversion works.

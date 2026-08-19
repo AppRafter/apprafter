@@ -56,19 +56,6 @@ the password Secret, and removes the snapshot.
     deploy admission-webhook                               # -> available
   ```
 
-## Step 0 — run the k3d e2e first (cheap gate)
-
-Before spending a real Tier-1 cluster, run the automated end-to-end
-script on a local k3d cluster. It exercises the identical chain, and is
-the gate to clear before working through this guide by hand:
-
-```sh
-bash e2e/needs-pg-walk.sh        # green in ~8-12 min on k3d
-```
-
-If that is red, fix it before continuing — going through it by hand
-only adds value once the automated chain is green.
-
 ## Platform-CLI coverage
 
 This guide exercises every shipped `platform-cli` subcommand. Raw
@@ -474,6 +461,20 @@ A complete run must exercise both shipped surfaces. Check every box.
 | `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key | Use only the closed `needs` key set (`pg`). |
 | App starts but the DSN env-var is empty or absent | the manifest declares `needs.pg` but never binds it — nothing is auto-injected | Add `env: { DATABASE_URL: claim.pg.url }` (see *Author the manifest*). |
 | Database still present after the GC | CloudNativePG has not reconciled `ensure: absent` yet | Re-run the psql query after a short wait; check the CNPG operator logs in `cnpg-system`. If it persists, this is a closure-blocking bug. |
+
+## For contributors — the automated end-to-end script
+
+Optional, and it needs a checkout of the AppRafter repository — nothing
+above does. If you are changing the platform, `e2e/needs-pg-walk.sh`
+exercises this identical chain on a local k3d cluster, and is the cheap
+gate to clear before anyone spends a real one on it:
+
+```sh
+bash e2e/needs-pg-walk.sh        # green in ~8-12 min on k3d
+```
+
+If that is red, fix it before continuing: working through this guide
+by hand only adds value once the automated chain is green.
 
 ## Cleanup
 

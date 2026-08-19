@@ -33,21 +33,34 @@ platform installs and upgrades itself through GitOps.
 
 ## Prerequisites
 
+Get the `apprafter` CLI onto your `PATH`. You do not need a repository
+checkout — the release binary is the normal path, and this page assumes
+nothing else:
+
 ```sh
-# In the AppRafter repo's nix dev shell:
-nix develop                              # ships cargo, kubectl, helm, cue, ...
-cargo install --path cli/platform-cli    # puts `apprafter` on PATH
+VERSION=$(curl -fsSL https://api.github.com/repos/AppRafter/apprafter/releases/latest \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+TARGET=x86_64-unknown-linux-gnu              # or x86_64-apple-darwin / aarch64-apple-darwin
+curl -fsSL "https://github.com/AppRafter/apprafter/releases/download/${VERSION}/apprafter-${VERSION}-${TARGET}.tar.gz" | tar xz
+sudo mv apprafter /usr/local/bin/
+apprafter --version
 ```
+
+Every release ships a `.sha256` beside each tarball. Prebuilt targets
+are Linux `x86_64`, macOS `x86_64` and macOS `aarch64`; Linux `aarch64`
+is not published yet, so ARM servers need a source build. The
+[developer quickstart](../dev-guide/quickstart.md#install) carries the
+same table with the source and Nix alternatives spelled out.
 
 You will also need:
 
 - A Hetzner Cloud API token with Read+Write access.
 - An SSH key whose **public** half you will hand to the provider for
   the new node. The CLI never touches the private half.
+- `kubectl`, for the verification steps on this page. The `apprafter`
+  steps do not need it.
 
-The rest of this page assumes `apprafter` is on PATH. If it is not,
-substitute `cargo run --bin apprafter -- <subcommand>` everywhere
-and run the commands from `cli/`.
+The rest of this page assumes `apprafter` is on `PATH`.
 
 ## Step 1 — Configure a target
 
