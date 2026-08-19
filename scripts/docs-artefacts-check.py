@@ -882,6 +882,7 @@ no_article = []
 no_heading = []
 lost_prose = []
 raw_syntax = []
+lost_block = []
 wrong_meta = []
 for url in published:
     if url not in source:
@@ -932,6 +933,23 @@ for url in published:
 
     blocks = code_blocks(page_html)
     page_fences = fences(page_md)
+    signatures = {signature for signature, _ in blocks}
+    # EVERY fenced block, not only the `cue` ones. The prose assertion
+    # above cannot cover these: `markdown_prose` deletes fenced blocks
+    # before `longest_runs` reads the source, deliberately -- a shell
+    # transcript is not a sentence -- so without this the largest
+    # content surface on the site is unasserted. The corpus is 169 `sh`
+    # fences against 17 in-scope `cue` ones, and an `on_page_content`
+    # hook that stripped code blocks from every page holding no ```cue
+    # fence removed 185 of 358 published blocks across 50 pages with the
+    # whole gate green, `operator-guide/troubleshooting` going from 2 to
+    # 0. Source -> artefact, so a stripped, truncated or swapped block
+    # all fail it; every one of the corpus's fences matches today, so
+    # this ships with no exemption.
+    for lang, body in page_fences:
+        if squash(body) not in signatures:
+            first = next((line for line in body.split("\n") if line.strip()), "")
+            lost_block.append(url + " (```" + (lang or "") + " `" + first.strip()[:50] + "`)")
     # `docs/adr/` is out of the drift gate's corpus, so the committed
     # census's `cue_fences` floor does not reach these -- reported on the
     # OK line rather than left to be discovered.
@@ -981,6 +999,14 @@ if no_article:
         str(len(no_article)) + " published page(s) have no `<article>` element at all,"
         + " so the theme rendered no content region and nothing about what a reader"
         + " sees can be judged here: " + show(no_article)
+    )
+if lost_block:
+    problems.append(
+        str(len(lost_block)) + " fenced block(s) in a page's committed source do not appear"
+        + " among the code blocks that page rendered -- stripped, truncated or replaced"
+        + " somewhere between the markdown and the published HTML, with the LLM artefacts"
+        + " (which are built from the source, before rendering) still vouching for them: "
+        + show(lost_block)
     )
 if no_heading:
     problems.append(

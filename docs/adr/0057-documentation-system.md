@@ -724,16 +724,19 @@ has already been burned by once.
   which is itself inside the gate's corpus. A page explaining the gate that
   the gate does not read is the first page to go stale.
 - **The census grew rather than shrank**, which passes silently by design:
-  the property that holds is that **no counter fell**. Measured mid-subphase
-  — `docsgen gate` at the base (`a761860`) and at `57e48dd`, with the seven
-  counters and the scanners as they stood *then* — four of seven moved:
-  pages 33 → 34, invocations 384 → 385, code paths 80 → 87, ADR references
-  67 → 68, every one of them the new contributor page's own claims
-  resolving. Five commits followed `57e48dd`, and one of them moved the
-  census again: `c5ae92b` widened the code-path scanner (87 → 90) and added
-  an **eighth** counter, `cue_fences`. The base-to-tip pair as committed is
-  therefore what re-derives, and it re-derives from the repository rather
-  than from this sentence:
+  the property that holds is that **no counter fell**. The growth is the
+  subphase's own pages and their claims resolving, plus one widened
+  code-path scanner and an **eighth** counter, `cue_fences`, added late in
+  the subphase.
+
+  This paragraph carried a per-commit table of deltas through four
+  revisions and was wrong in three of them — the last time attributing a
+  step to the commit after the one that made it. The deltas are not
+  recorded here any more, and that is the point rather than an omission:
+  the numbers are committed in the repository, one file per side, so the
+  pair re-derives from the tree rather than from this sentence, and a
+  sentence that cannot go stale is worth more than one that is accurate
+  the day it is written.
 
   ```sh
   git show a761860:docs/measurements/docs-health.json   # seven counters
