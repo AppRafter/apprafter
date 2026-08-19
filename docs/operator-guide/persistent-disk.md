@@ -82,11 +82,11 @@ the GC controller deletes the PVC and removes the snapshot.
     deploy admission-webhook                                      # -> available
   ```
 
-## Platform-CLI coverage
+## Commands used on this page
 
-This guide exercises every shipped `platform-cli` subcommand. Raw `kubectl`
-is a sanity-only supplement that confirms the machine state behind each CLI
-surface.
+Every step below runs through the `apprafter` CLI. The `kubectl` reads
+are there to show you the machine state behind each one; you never need
+them to drive the chain.
 
 | Stage | Command |
 | ----- | ------- |
@@ -299,7 +299,7 @@ POD3=$(kubectl -n demo get pod -l app.kubernetes.io/name=web -o jsonpath='{.item
 kubectl -n demo exec "$POD3" -- cat /data/probe           # -> hello-disk (data reattached)
 ```
 
-## MANDATORY: force the GC (the PVC is physically deleted)
+## Confirm the volume is physically deleted
 
 The `RetainedClaim` is immutable (a CEL `self == oldSelf` rule), so an
 in-place `kubectl patch` of `retainUntil` is **rejected**. Delete the app
@@ -341,9 +341,10 @@ kubectl -n apprafter-system get retainedclaim claim-demo-web-disk   # -> NotFoun
 **If the PVC is still present after the snapshot is gone, the GC did NOT
 delete it — STOP, this is a closure-blocking bug.**
 
-## DoD checklist
+## Checklist — did it work?
 
-A complete run must exercise both shipped surfaces. Check every box.
+A complete run exercises both surfaces AppRafter ships. Check every
+box.
 
 **Surface 1 — Argo CD UI (`apprafter open argocd`):**
 

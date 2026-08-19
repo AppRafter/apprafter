@@ -114,9 +114,9 @@ in this runbook: `kubectl get applications.argoproj.io bootstrap -n argocd`.
    `+ bootstrap Application from <repo>` and (for public repos)
    does NOT include `+ Argo CD repo-creds Secret`.
 
-### DoD checklist
+### Checklist — did it work?
 
-The DoD must exercise the **two surfaces AppRafter ships** for this
+Check the **two surfaces AppRafter ships** for this
 feature — the Argo CD web UI (`cluster-bootstrap` installs it) and the
 `apprafter argocd-password` subcommand. `kubectl` checks are
 sanity-only supplements.
@@ -166,7 +166,7 @@ Log in as `admin` / `<password from CLI output>` and confirm:
 Same as Quadrant 1, but with `https://gitlab.com/your-group/state.git` as the
 repo URL. GitLab also supports nested groups: `https://gitlab.com/your-group/sub-group/state.git`.
 
-### DoD checklist
+### Checklist — did it work?
 
 Identical to Quadrant 1.
 
@@ -201,7 +201,7 @@ Identical to Quadrant 1, with one addition:
 5. Set `spec.argocd.bootstrapRepo` in `Infrastructure.cue` exactly as in Quadrant 1.
 6. Run `apprafter cluster-bootstrap`. The summary line at the end includes `+ Argo CD repo-creds Secret in argocd namespace` confirming the Secret was applied.
 
-### DoD checklist
+### Checklist — did it work?
 
 Same two-surface pattern as Quadrant 1, plus a Secret-presence check
 (`kubectl` only, since AppRafter doesn't ship a UI for repo creds).
@@ -250,7 +250,7 @@ Log in as `admin` / `<password from CLI output>`, then on the `bootstrap` App:
 4. Export the env-vars + set `Infrastructure.cue` + run `cluster-bootstrap` (same as Quadrant 3).
 5. Optional: prefer Project Access Token over personal PAT when the repo is owned by a project rather than a user — easier to rotate without affecting other access.
 
-### DoD checklist
+### Checklist — did it work?
 
 Identical to Quadrant 3.
 

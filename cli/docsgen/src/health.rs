@@ -195,14 +195,19 @@
 //! * **A deep identifier for a shallow one.**
 //!   `docs/operator-guide/postgres.md` claims `spec.base.needs.pg`
 //!   in its opening sentence. Rewritten to `spec.base`, `identifiers`
-//!   held at 236 and the gate exited 0. The one number that moved was
-//!   the opaque share (115 → 114) — which is printed and not committed,
-//!   so nothing compared it.
+//!   held and the gate exited 0; the only number that moved was the
+//!   opaque share, which is printed and not committed, so nothing
+//!   compared it. (No figures stand beside that. They were written
+//!   here once and were stale within the branch that wrote them —
+//!   every counter is a corpus total, so any unrelated page edit moves
+//!   them. The property is what re-derives: shorten the identifier,
+//!   re-run `docsgen gate`, watch `identifiers` hold.)
 //! * **A specific path for its parent directory.**
-//!   `docs/reference/index.md` names `cli/docsgen/src/render.rs`.
-//!   Rewritten to `cli/docsgen/src`, every number held and the
-//!   gate exited 0: a directory resolves exactly as a blob does, and
-//!   `code_paths` counts references, not depth.
+//!   `docs/contributing/documentation.md` names
+//!   `cli/docsgen/src/render.rs`. Rewritten to `cli/docsgen/src`,
+//!   every number held and the gate exited 0: a directory resolves
+//!   exactly as a blob does, and `code_paths` counts references, not
+//!   depth.
 //!
 //! And a fourth shape, larger than the three above and the one to read
 //! first: **the counters count claims, not documentation.** Prose that

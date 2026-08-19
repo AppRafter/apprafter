@@ -56,11 +56,11 @@ the password Secret, and removes the snapshot.
     deploy admission-webhook                               # -> available
   ```
 
-## Platform-CLI coverage
+## Commands used on this page
 
-This guide exercises every shipped `platform-cli` subcommand. Raw
-`kubectl` / `psql` are sanity-only supplements that confirm the
-machine state behind each CLI surface.
+Every step below runs through the `apprafter` CLI. The `kubectl` and
+`psql` reads are there to show you the machine state behind each one;
+you never need them to drive the chain.
 
 | Stage | Command |
 | ----- | ------- |
@@ -391,7 +391,7 @@ stays wedged for many cycles is surfaced in the operator logs as a
 `role drop BLOCKED (CNPG cannotReconcile)` warning, e.g. the role still
 owns a database with live connections.)
 
-## MANDATORY: psql DROP assertion
+## Confirm the database is physically gone
 
 **The `ensure: absent` flip is the operator's intent, not proof.** You
 must confirm the database is **physically gone from Postgres** — not
@@ -425,9 +425,10 @@ result — the database row clears first, then the role row. **If a row is
 still present after several cycles, CloudNativePG did NOT honor
 `ensure: absent` — STOP, this is a closure-blocking bug.**
 
-## DoD checklist
+## Checklist — did it work?
 
-A complete run must exercise both shipped surfaces. Check every box.
+A complete run exercises both surfaces AppRafter ships. Check every
+box.
 
 **Surface 1 — Argo CD UI (`apprafter open argocd`):**
 

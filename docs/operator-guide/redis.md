@@ -81,11 +81,11 @@ the snapshot.
     deploy admission-webhook                                      # -> available
   ```
 
-## Platform-CLI coverage
+## Commands used on this page
 
-This guide exercises every shipped `platform-cli` subcommand. Raw
-`kubectl` / `redis-cli` are sanity-only supplements that confirm the
-machine state behind each CLI surface.
+Every step below runs through the `apprafter` CLI. The `kubectl` and
+`redis-cli` reads are there to show you the machine state behind each
+one; you never need them to drive the chain.
 
 | Stage | Command |
 | ----- | ------- |
@@ -346,7 +346,7 @@ kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
 # -> still present
 ```
 
-## MANDATORY: FLUSHDB / DELUSER assertion (force the GC)
+## Confirm the data and the ACL user are physically gone
 
 The `RetainedClaim` is immutable (a CEL `self == oldSelf` rule), so an
 in-place `kubectl patch` of `retainUntil` is **rejected**. Delete it and
@@ -407,9 +407,10 @@ scan reads only LIVE claims' `status.dbnum`, so this DB is reusable.
 **If the ACL user is still present after the snapshot is gone, the GC did
 NOT run `ACL DELUSER` — STOP, this is a closure-blocking bug.**
 
-## DoD checklist
+## Checklist — did it work?
 
-A complete run must exercise both shipped surfaces. Check every box.
+A complete run exercises both surfaces AppRafter ships. Check every
+box.
 
 **Surface 1 — Argo CD UI (`apprafter open argocd`):**
 
