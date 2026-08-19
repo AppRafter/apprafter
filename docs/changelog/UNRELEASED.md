@@ -9,7 +9,7 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## docs (no release) — 2.19g publication: the documentation site becomes a deployable application (2026-08-19)
+## cli v0.2.45 — 2.19g publication: the documentation site becomes a deployable application (2026-08-19)
 
 > **CLI patch release; no chart, operator or cue-cmp release.** Re-derive
 > with `git diff --name-only <base>..HEAD -- cli/ operator/ schemas/
